@@ -5,8 +5,9 @@
  */
 
 import { backend } from "../tauri";
-import type { Clip, SidecarEvent, StemName } from "../types/ipc";
+import { IMPORT_AUDIO_EXTS, type Clip, type SidecarEvent, type StemName } from "../types/ipc";
 import { project } from "./project.svelte";
+import { toasts } from "./toasts.svelte";
 
 export interface StemJob {
   jobId: string;
@@ -118,6 +119,110 @@ class JobsStore {
         }
         break;
       }
+    }
+  }
+
+  // ── drag-and-drop import (wave 1.5) ──
+
+  /** Does this file look importable (wav/mp3/flac/ogg/aac/m4a)? */
+  static importable(path: string): boolean {
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    return (IMPORT_AUDIO_EXTS as readonly string[]).includes(ext);
+  }
+
+  /**
+   * Import a dropped file; with `split` the backend chains a Demucs stem
+   * split on the imported copy and auto-lands the stems as new tracks.
+   */
+  async importDropped(path: string, split: boolean): Promise<void> {
+    const name = path.split("/").pop() ?? path;
+    if (!JobsStore.importable(path)) {
+      toasts.error("UNSUPPORTED FILE", name, "supported: wav · mp3 · flac · ogg · aac · m4a");
+      return;
+    }
+    if (!split) {
+      try {
+        const clip = await backend.importAudioClip({ path });
+        await project.reload();
+        project.select(clip.id);
+        toasts.success("IMPORTED", `${name} → ${project.trackById(clip.trackId)?.name ?? "new track"}`);
+      } catch (err) {
+        toasts.error("IMPORT FAILED", name, String(err));
+      }
+      return;
+    }
+
+    // import + split: the reply arrives after the import lands; the job id
+    // keys the Demucs progress that streams over the channel.
+    let jobId = "";
+    const early: SidecarEvent[] = [];
+    const handle = (e: SidecarEvent) => {
+      if (!jobId) {
+        early.push(e);
+        return;
+      }
+      this.onImportSplitEvent(name, e);
+    };
+    try {
+      const reply = await backend.importAudioClipSplitStems({ path }, handle);
+      await project.reload();
+      project.select(reply.clip.id);
+      jobId = reply.jobId;
+      this.jobs = {
+        ...this.jobs,
+        [jobId]: {
+          jobId,
+          kind: "stemSplit",
+          clipId: reply.clip.id,
+          trackId: reply.clip.trackId,
+          progress: 0,
+          stage: "queued",
+          state: "queued",
+        },
+      };
+      toasts.info("IMPORT + STEMS", `${name} imported — Demucs separating…`);
+      for (const e of early) this.onImportSplitEvent(name, e);
+    } catch (err) {
+      toasts.error("IMPORT FAILED", name, String(err));
+    }
+  }
+
+  /** Events of the chained Demucs job. The BACKEND lands the stems AFTER the
+   * `done` event, announcing each as a follow-up `log` line ("auto-import
+   * stem `drums`: …") — so the project re-pull rides those lines, never a
+   * frontend materialization. */
+  private stemToastShown = new Set<string>();
+
+  private onImportSplitEvent(name: string, e: SidecarEvent) {
+    switch (e.type) {
+      case "progress":
+        this.patch(e.jobId, { progress: e.progress, stage: e.stage, state: "running" });
+        break;
+      case "done":
+        this.patch(e.jobId, { state: "done", progress: 1, stage: "importing stems" });
+        break;
+      case "error": {
+        const wasCancelled = this.jobs[e.jobId]?.state === "cancelled";
+        this.patch(e.jobId, {
+          state: wasCancelled ? "cancelled" : "error",
+          error: e.message,
+        });
+        if (!wasCancelled) toasts.error("STEM SPLIT FAILED", name, e.message);
+        break;
+      }
+      case "log":
+        if (/^auto-import stem `[^`]+` failed/.test(e.line)) {
+          toasts.error("STEM IMPORT FAILED", e.line);
+        } else if (e.line.startsWith("auto-import stem")) {
+          // one new stem track landed control-side — mirror it
+          void project.reload();
+          if (!this.stemToastShown.has(e.jobId)) {
+            this.stemToastShown.add(e.jobId);
+            this.patch(e.jobId, { stage: "done" });
+            toasts.success("STEMS LANDING", `${name} → drums · bass · vocals · other`);
+          }
+        }
+        break;
     }
   }
 

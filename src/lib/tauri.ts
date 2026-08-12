@@ -13,8 +13,15 @@ import type {
   AuraEventMap,
   AuraEventName,
   Clip,
+  EvolveOptions,
+  ExportCapabilities,
+  ExportJobStatus,
+  ExportRequest,
+  HumToSongRequest,
   ImportClipRequest,
+  ImportSplitReply,
   InstrumentInfo,
+  LoopJamStatus,
   McpPolicy,
   McpStatus,
   MeterFrame,
@@ -37,9 +44,20 @@ import type {
   TranscribeRequest,
   TransportState,
   WaveformTileRequest,
+  ZynPatch,
 } from "./types/ipc";
 
 export type Unsubscribe = () => void;
+
+/** Native file drag over the window (Tauri webview drag-drop events). */
+export interface FileDropEvent {
+  type: "enter" | "over" | "drop" | "leave";
+  /** Absolute paths (enter/drop only). */
+  paths: string[];
+  /** Window-local position in CSS px, when the webview reports one. */
+  x: number;
+  y: number;
+}
 
 export interface Backend {
   readonly mode: "tauri" | "demo";
@@ -83,7 +101,8 @@ export interface Backend {
   setTrackArm(trackId: string, armed: boolean): Promise<void>;
 
   // project
-  createProject(name: string): Promise<Project>;
+  /** Create `<parentDir>/<name>.aura`; parentDir defaults to the home dir. */
+  createProject(name: string, parentDir?: string | null): Promise<Project>;
   openProject(path: string): Promise<Project>;
   saveProject(): Promise<void>;
   /** Demo mode also serves the current project from here; live mode asks Tauri. */
@@ -150,6 +169,48 @@ export interface Backend {
   pluginGetParams(instanceId: string): Promise<PluginParamInfo[]>;
   /** Batched (D-03): one invoke carries N parameter changes. */
   pluginSetParam(instanceId: string, changes: PluginParamChange[]): Promise<PluginParamInfo[]>;
+
+  // ── wave 1.5 ──
+
+  /**
+   * Hum/voice recording → MIDI melody clip (optional AMT accompaniment).
+   * Returns the job id; progress/done/error + follow-up apply logs stream
+   * over the channel (same envelope as the other sidecar jobs).
+   */
+  humToSong(
+    request: HumToSongRequest,
+    onEvent: (e: SidecarEvent) => void,
+  ): Promise<string>;
+
+  /** Offline bounce; returns the export job id (export://* events follow). */
+  exportSong(request: ExportRequest): Promise<string>;
+  exportJobStatus(jobId: string): Promise<ExportJobStatus>;
+  /** Which formats are exportable right now (ffmpeg-gated ones included only
+   * when ffmpeg is on PATH). */
+  exportCapabilities(): Promise<ExportCapabilities>;
+
+  /** Import an audio file AND submit a Demucs stem split on the imported
+   * copy in one step; stems auto-land as new tracks on the job's done. */
+  importAudioClipSplitStems(
+    request: ImportClipRequest,
+    onEvent: (e: SidecarEvent) => void,
+  ): Promise<ImportSplitReply>;
+
+  // loop-jam (ACE-Step repaint of the loop region, applied at wrap)
+  loopjamEvolve(options?: EvolveOptions): Promise<LoopJamStatus>;
+  loopjamCancel(): Promise<LoopJamStatus>;
+  loopjamStatus(): Promise<LoopJamStatus>;
+
+  // ZynAddSubFX bank patches
+  zynListPatches(): Promise<ZynPatch[]>;
+  zynLoadPatch(instanceId: string, path: string): Promise<void>;
+
+  /**
+   * Native file drags over the window (real app only — the webview swallows
+   * HTML5 drag events when Tauri's drag-drop handling is on). Demo mode uses
+   * plain browser DnD instead and leaves this undefined.
+   */
+  onFileDrop?(cb: (e: FileDropEvent) => void): Unsubscribe;
 
   // mcp
   mcpGetStatus(): Promise<McpStatus>;
@@ -267,8 +328,13 @@ class TauriBackend implements Backend {
     await invoke("set_track_arm", { trackId, armed });
   }
 
-  createProject(name: string) {
-    return invoke<Project>("create_project", { name });
+  createProject(name: string, parentDir: string | null = null) {
+    // Rust signature: create_project(parent_dir, name). Default the parent
+    // to a writable per-user location so "new project" works out of the box.
+    return invoke<Project>("create_project", {
+      parentDir: parentDir ?? "/tmp/aura-projects",
+      name,
+    });
   }
   openProject(path: string) {
     return invoke<Project>("open_project", { path });
@@ -392,6 +458,81 @@ class TauriBackend implements Backend {
   }
   pluginSetParam(instanceId: string, changes: PluginParamChange[]) {
     return invoke<PluginParamInfo[]>("plugin_set_param", { instanceId, changes });
+  }
+
+  // ── wave 1.5 ──
+
+  humToSong(request: HumToSongRequest, onEvent: (e: SidecarEvent) => void) {
+    const channel = new Channel<SidecarEvent>();
+    channel.onmessage = onEvent;
+    return invoke<string>("hum_to_song", { request, onEvent: channel });
+  }
+
+  exportSong(request: ExportRequest) {
+    return invoke<string>("export_song", { request });
+  }
+  exportJobStatus(jobId: string) {
+    return invoke<ExportJobStatus>("export_job_status", { jobId });
+  }
+  exportCapabilities() {
+    return invoke<ExportCapabilities>("export_capabilities");
+  }
+
+  importAudioClipSplitStems(request: ImportClipRequest, onEvent: (e: SidecarEvent) => void) {
+    const channel = new Channel<SidecarEvent>();
+    channel.onmessage = onEvent;
+    return invoke<ImportSplitReply>("import_audio_clip_split_stems", {
+      request,
+      onEvent: channel,
+    });
+  }
+
+  loopjamEvolve(options: EvolveOptions = {}) {
+    return invoke<LoopJamStatus>("loopjam_evolve", { options });
+  }
+  loopjamCancel() {
+    return invoke<LoopJamStatus>("loopjam_cancel");
+  }
+  loopjamStatus() {
+    return invoke<LoopJamStatus>("loopjam_status");
+  }
+
+  zynListPatches() {
+    return invoke<ZynPatch[]>("zyn_list_patches");
+  }
+  async zynLoadPatch(instanceId: string, path: string) {
+    await invoke("zyn_load_patch", { instanceId, path });
+  }
+
+  onFileDrop(cb: (e: FileDropEvent) => void): Unsubscribe {
+    // Webview drag-drop events (Tauri v2). Physical → CSS px for hit tests.
+    const scale = () => window.devicePixelRatio || 1;
+    const norm = (
+      type: FileDropEvent["type"],
+      payload: { paths?: string[]; position?: { x: number; y: number } },
+    ): FileDropEvent => ({
+      type,
+      paths: payload.paths ?? [],
+      x: (payload.position?.x ?? 0) / scale(),
+      y: (payload.position?.y ?? 0) / scale(),
+    });
+    const subs = [
+      listen<{ paths: string[]; position: { x: number; y: number } }>(
+        "tauri://drag-enter",
+        (e) => cb(norm("enter", e.payload)),
+      ),
+      listen<{ position: { x: number; y: number } }>("tauri://drag-over", (e) =>
+        cb(norm("over", e.payload)),
+      ),
+      listen<{ paths: string[]; position: { x: number; y: number } }>(
+        "tauri://drag-drop",
+        (e) => cb(norm("drop", e.payload)),
+      ),
+      listen("tauri://drag-leave", () => cb(norm("leave", {}))),
+    ];
+    return () => {
+      for (const p of subs) p.then((un) => un()).catch(() => {});
+    };
   }
 
   mcpGetStatus() {

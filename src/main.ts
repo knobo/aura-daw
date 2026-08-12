@@ -10,6 +10,7 @@ const app = mount(App, {
 // (Harmless in production — same objects the UI already holds.)
 if (import.meta.env.DEV) {
   void (async () => {
+    (await import("./lib/dev-drive")).startDevDrive();
     (window as unknown as Record<string, unknown>).__aura = {
       backend: (await import("./lib/tauri")).backend,
       project: (await import("./lib/state/project.svelte")).project,

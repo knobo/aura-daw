@@ -15,12 +15,16 @@
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
   import { view } from "./lib/state/view.svelte";
   import { ui } from "./lib/state/ui.svelte";
+  import { exporter } from "./lib/state/exporter.svelte";
+  import { loopjam } from "./lib/state/loopjam.svelte";
   import TransportBar from "./lib/components/TransportBar.svelte";
   import Timeline from "./lib/components/Timeline.svelte";
   import MasterBar from "./lib/components/MasterBar.svelte";
   import PianoRoll from "./lib/components/pianoroll/PianoRoll.svelte";
   import Dock from "./lib/components/Dock.svelte";
   import McpConfirmDialog from "./lib/components/mcp/McpConfirmDialog.svelte";
+  import ExportDialog from "./lib/components/export/ExportDialog.svelte";
+  import Toasts from "./lib/components/Toasts.svelte";
 
   onMount(() => {
     void transport.init();
@@ -29,6 +33,8 @@
     void instruments.refresh();
     void plugins.refresh();
     void mcp.init();
+    exporter.init();
+    void loopjam.init();
     void startMeterStream();
     return () => stopMeterStream();
   });
@@ -68,13 +74,16 @@
 </div>
 
 <McpConfirmDialog />
+<ExportDialog />
+<Toasts />
 
 <style>
   .app {
     height: 100vh;
     display: flex;
     flex-direction: column;
-    overflow: hidden;
+    /* clip (not hidden): focus moves must never scroll the app shell */
+    overflow: clip;
   }
   .main {
     flex: 1;

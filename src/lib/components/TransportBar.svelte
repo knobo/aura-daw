@@ -9,6 +9,8 @@
   import { view } from "../state/view.svelte";
   import { ui, toggleDock } from "../state/ui.svelte";
   import { mcp } from "../state/mcp.svelte";
+  import { exporter } from "../state/exporter.svelte";
+  import { hum } from "../state/hum.svelte";
   import { formatBarsBeats, formatClock } from "../utils/format";
 
   let clockEl: HTMLSpanElement | undefined = $state();
@@ -110,6 +112,13 @@
       onclick={() => toggleDock("generate")}>✦ AI STUDIO</button
     >
     <button
+      class="chip hum"
+      class:on={ui.dock === "hum"}
+      class:busychip={hum.busy}
+      title="Hum a melody — sing/hum into a mic, get a MIDI melody clip"
+      onclick={() => toggleDock("hum")}>🎤 HUM</button
+    >
+    <button
       class="chip"
       class:on={ui.dock === "instruments"}
       title="Sampler instrument browser"
@@ -155,6 +164,13 @@
       class:on={ui.noteFlash}
       title="Flash notes at the moment they play"
       onclick={() => (ui.noteFlash = !ui.noteFlash)}>FLASH</button
+    >
+    <button
+      class="chip exportchip"
+      class:on={exporter.open}
+      class:busychip={exporter.busy}
+      title="Export — offline bounce to wav/mp3/flac/ogg/m4a"
+      onclick={() => exporter.openDialog()}>⤓ EXPORT</button
     >
     <span class="badge mono" title="Waveform renderer in use">{ui.rendererKind || "· · ·"}</span>
     <span class="badge mode mono" title={backend.mode === "demo" ? "Engine offline — synthetic data" : "Rust engine connected"}>
@@ -308,6 +324,7 @@
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
+    white-space: nowrap;
   }
   .chip.on {
     color: var(--cyan);
@@ -330,6 +347,33 @@
     color: var(--cyan);
     border-color: var(--cyan-dim);
     box-shadow: 0 0 10px rgba(82, 229, 255, 0.2);
+  }
+  .chip.hum {
+    background: linear-gradient(
+      100deg,
+      rgba(255, 79, 216, 0.08),
+      rgba(157, 123, 255, 0.08)
+    );
+  }
+  .chip.hum:hover,
+  .chip.hum.on {
+    color: var(--magenta);
+    border-color: var(--magenta-dim);
+    box-shadow: 0 0 10px rgba(255, 79, 216, 0.2);
+  }
+  .chip.exportchip:hover,
+  .chip.exportchip.on {
+    color: #5cf2b8;
+    border-color: rgba(92, 242, 184, 0.45);
+    box-shadow: 0 0 10px rgba(92, 242, 184, 0.2);
+  }
+  .chip.busychip {
+    animation: chip-busy 1s ease-in-out infinite;
+  }
+  @keyframes chip-busy {
+    50% {
+      opacity: 0.55;
+    }
   }
   .mcpchip {
     display: inline-flex;

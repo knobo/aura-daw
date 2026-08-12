@@ -13,8 +13,16 @@ import {
   type AuraEventMap,
   type AuraEventName,
   type Clip,
+  type EvolveOptions,
+  type ExportCapabilities,
+  type ExportJobStatus,
+  type ExportRequest,
+  type ExportResult,
   type GenJobResult,
+  type HumToSongRequest,
   type ImportClipRequest,
+  type ImportSplitReply,
+  type LoopJamStatus,
   type InstrumentInfo,
   type McpPolicy,
   type McpStatus,
@@ -40,6 +48,7 @@ import {
   type TranscribeRequest,
   type TransportState,
   type WaveformTileRequest,
+  type ZynPatch,
 } from "./types/ipc";
 import type { Backend, Unsubscribe } from "./tauri";
 
@@ -308,6 +317,43 @@ function demoPluginParams(uid: string): PluginParamInfo[] {
   return [];
 }
 
+// ── Demo Zyn patch bank (wave 1.5) ──────────────────────────────────────────
+//
+// A believable slice of the real /usr/share/zynaddsubfx/banks layout: a few
+// banks, dozens of entries each — enough rows to exercise the search +
+// virtualized list without shipping 1318 strings.
+
+const ZYN_BANK_SEED: [string, string[]][] = [
+  ["Arpeggios", ["Arpeggio", "Sequence", "Echoed Arp", "Broken Chord"]],
+  ["Bass", ["Analog Bass", "Wah Bass", "Sub Bass", "Metal Bass", "Fretless"]],
+  ["Choir_and_Voice", ["Choir", "Voice", "Aahs", "Space Voice"]],
+  ["Pads", ["Warm Pad", "Analog Pad", "Sweep Pad", "Dream of the Saw", "Glass Pad"]],
+  ["Plucked", ["Plucked String", "Nylon", "Harp", "Koto", "Music Box"]],
+  ["Synth_Leads", ["Analog Lead", "Soft Lead", "Screaming Lead", "Sync Lead", "Fat Lead"]],
+  ["The_Mysterious_Bank", ["Signal", "Anomaly", "Transmission"]],
+];
+
+function demoZynPatches(): ZynPatch[] {
+  const out: ZynPatch[] = [];
+  for (const [bank, names] of ZYN_BANK_SEED) {
+    let program = 1;
+    for (const base of names) {
+      const variants = 2 + (hashString(bank + base) % 5); // 2..6 per family
+      for (let v = 1; v <= variants; v++) {
+        const name = `${base} ${v}`;
+        out.push({
+          bank,
+          name,
+          program,
+          path: `/usr/share/zynaddsubfx/banks/${bank}/${String(program).padStart(4, "0")}-${name.replace(/\s+/g, "_")}.xiz`,
+        });
+        program++;
+      }
+    }
+  }
+  return out;
+}
+
 /** What the WebAudio voices read from a plugin instance's live params. */
 interface DemoVoiceShape {
   cutoffHz: number | null;
@@ -427,6 +473,17 @@ export class DemoBackend implements Backend {
   private pluginParams = new Map<string, PluginParamInfo[]>();
   /** Coalesced audio re-schedule after param edits (knob-drag safe). */
   private pluginResyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // wave 1.5 — export / loop-jam / zyn patches
+  private exportJobs = new Map<string, ExportJobStatus>();
+  private ljState: LoopJamStatus["state"] = "idle";
+  private ljJobId: string | null = null;
+  private ljTrackId: string | null = null;
+  private ljGeneration = 0;
+  private ljLastError: string | null = null;
+  private ljTimers: ReturnType<typeof setTimeout>[] = [];
+  private zynPatches: ZynPatch[] = demoZynPatches();
+  private zynLoaded = new Map<string, ZynPatch>();
 
   // WebAudio playback graph (see "demo playback audio" section below)
   private master: GainNode | null = null;
@@ -1198,7 +1255,7 @@ export class DemoBackend implements Backend {
     };
   }
 
-  async createProject(name: string): Promise<Project> {
+  async createProject(name: string, _parentDir: string | null = null): Promise<Project> {
     return { ...this.projectSnapshot(), name };
   }
   async openProject(_path: string): Promise<Project> {
@@ -1747,6 +1804,521 @@ export class DemoBackend implements Backend {
       this.resyncAudio();
     }
     return { kind, outputPath, durationSeconds, sampleRate: SR, simulated: true };
+  }
+
+  // ── wave 1.5: hum-to-song ──
+
+  /** A plausible hummed phrase: A-minor pentatonic, phrase-shaped, ~2 bars. */
+  private fakeHumNotes(seed: number, quantizeGrid: number): MidiNote[] {
+    const scale = [57, 60, 62, 64, 67, 69, 72, 74];
+    const grid = quantizeGrid > 0 ? (this.ppq * 4) / quantizeGrid : this.ppq / 2;
+    const notes: MidiNote[] = [];
+    let tick = 0;
+    let degree = 2 + (seed % 3);
+    for (let i = 0; i < 11; i++) {
+      const rest = noise(seed ^ 0x51ab, i) < 0.18;
+      const lenSteps = noise(seed ^ 0x77, i) > 0.72 ? 2 : 1;
+      if (!rest) {
+        degree = Math.max(
+          0,
+          Math.min(scale.length - 1, degree + Math.round((noise(seed, i) - 0.5) * 3)),
+        );
+        notes.push({
+          tick: Math.round(tick),
+          lengthTicks: Math.max(1, Math.round(grid * lenSteps * 0.92)),
+          key: scale[degree],
+          velocity: 84 + Math.floor(noise(seed ^ 0xbeef, i) * 36),
+          channel: 0,
+        });
+      }
+      tick += grid * lenSteps;
+    }
+    return notes;
+  }
+
+  async humToSong(
+    request: HumToSongRequest,
+    onEvent: (e: SidecarEvent) => void,
+  ): Promise<string> {
+    if (request.clipId && request.path) throw new Error("pass either clipId or path, not both");
+    if (!request.clipId && !request.path) {
+      throw new Error("pass clipId (a recorded clip) or path (a WAV file)");
+    }
+    let sourceName = "hum";
+    if (request.clipId) {
+      const clip = this.clips.find((c) => c.id === request.clipId);
+      if (!clip) throw new Error(`unknown audio clip: ${request.clipId}`);
+      sourceName = clip.name;
+    } else if (request.path) {
+      if (!request.path.startsWith("/")) throw new Error(`path must be absolute: ${request.path}`);
+      sourceName = request.path.split("/").pop()?.replace(/\.\w+$/, "") ?? "hum";
+    }
+    if (request.trackId) {
+      const t = this.track(request.trackId);
+      if (!t) throw new Error(`unknown track: ${request.trackId}`);
+      if (t.kind !== "midi") {
+        throw new Error(`track ${request.trackId} is kind "${t.kind}" (hummed melodies need a midi track)`);
+      }
+    }
+
+    const jobId = uuid();
+    const job: DemoJob = {
+      status: { jobId, kind: "humToMidi", state: "queued", progress: 0, stage: "queued" },
+      onEvent,
+      timer: null,
+      request: request as Record<string, unknown>,
+    };
+    this.jobs.set(jobId, job);
+    const stages = [
+      { until: 0.14, stage: "loadingAudio" },
+      { until: 0.55, stage: "trackingPitch" },
+      { until: 0.8, stage: "segmenting" },
+      { until: 1.0, stage: "quantizing" },
+    ];
+    const emitBoth = (e: SidecarEvent) => {
+      onEvent(e);
+      if (e.type === "progress") this.emit("sidecar://progress", e);
+      else if (e.type === "done") this.emit("sidecar://done", e);
+      else if (e.type === "error") this.emit("sidecar://error", e);
+    };
+    const durationMs = 4200;
+    const started = this.now();
+    job.status.state = "running";
+    job.timer = setInterval(() => {
+      const p = Math.min(1, (this.now() - started) / durationMs);
+      const stage = stages.find((s) => p <= s.until)?.stage ?? "quantizing";
+      job.status.progress = p;
+      job.status.stage = stage;
+      emitBoth({ type: "progress", jobId, progress: p, stage });
+      if (p >= 1) {
+        if (job.timer) clearInterval(job.timer);
+        job.timer = null;
+        job.status.state = "done";
+        const seed = hashString(sourceName + jobId);
+        const notes = this.fakeHumNotes(seed, request.quantizeGrid ?? 0);
+        const end = notes.reduce((m, n) => Math.max(m, n.tick + n.lengthTicks), 0);
+        const lengthTicks = Math.max(BAR_TICKS, Math.ceil(end / BAR_TICKS) * BAR_TICKS);
+        const result = {
+          kind: "humToMidi",
+          ppq: this.ppq,
+          bpm: request.bpm ?? TEMPO,
+          lengthTicks,
+          notes,
+          simulated: true,
+        };
+        job.status.result = result as unknown as SidecarJobStatus["result"];
+        emitBoth({
+          type: "done",
+          jobId,
+          // humToMidi rides the open sidecar envelope (kind-discriminated blob)
+          result: result as unknown as NonNullable<SidecarJobStatus["result"]>,
+        });
+        // The real control plane applies the clip AFTER done and reports it
+        // as a follow-up log line on the same channel.
+        setTimeout(() => {
+          const { clip, created } = this.applyHumClip(
+            notes,
+            lengthTicks,
+            request.trackId ?? null,
+            request.atTicks ?? 0,
+            `${sourceName} melody`,
+          );
+          let line = `hum-to-song: melody clip ${clip.id} (${clip.notes.length} notes) on track ${clip.trackId}${created ? ` (auto-created "${created.name}")` : ""}`;
+          if (request.accompany) {
+            const accompId = this.runFakeAccompany(clip, onEvent);
+            line += `; accompaniment job ${accompId} submitted`;
+          }
+          onEvent({ type: "log", jobId, line });
+        }, 350);
+      }
+    }, 100);
+    return jobId;
+  }
+
+  private applyHumClip(
+    notes: MidiNote[],
+    lengthTicks: number,
+    trackId: string | null,
+    atTicks: number,
+    name: string,
+  ): { clip: MidiClip; created: TrackState | null } {
+    let created: TrackState | null = null;
+    let target = trackId;
+    if (!target) {
+      created = this.makeTrack({ name, color: "#52e5ff", kind: "midi" });
+      this.tracks.push(created);
+      target = created.id;
+    }
+    const clip: MidiClip = {
+      id: uuid(),
+      trackId: target,
+      name,
+      timelineStartTicks: atTicks,
+      lengthTicks,
+      notes: [...notes].sort((a, b) => a.tick - b.tick || a.key - b.key),
+    };
+    this.midiClips.push(clip);
+    this.resyncAudio();
+    return { clip, created };
+  }
+
+  /** Chained accompaniment job: events stream over the SAME channel. */
+  private runFakeAccompany(melody: MidiClip, onEvent: (e: SidecarEvent) => void): string {
+    const jobId = uuid();
+    const job: DemoJob = {
+      status: { jobId, kind: "amtInfill", state: "running", progress: 0, stage: "queued" },
+      onEvent,
+      timer: null,
+      request: {},
+    };
+    this.jobs.set(jobId, job);
+    const started = this.now();
+    const durationMs = 3600;
+    job.timer = setInterval(() => {
+      const p = Math.min(1, (this.now() - started) / durationMs);
+      const stage = p < 0.25 ? "loading anticipation" : p < 0.9 ? "sampling tokens" : "merging notes";
+      job.status.progress = p;
+      job.status.stage = stage;
+      onEvent({ type: "progress", jobId, progress: p, stage });
+      if (p >= 1) {
+        if (job.timer) clearInterval(job.timer);
+        job.timer = null;
+        job.status.state = "done";
+        // Low chord tones under the melody, half-note pulse.
+        const seed = hashString(jobId);
+        const roots = [45, 41, 36, 43]; // A F C G
+        const notes: MidiNote[] = [];
+        for (let t = 0; t + this.ppq * 2 <= melody.lengthTicks; t += this.ppq * 2) {
+          const bar = Math.floor(t / BAR_TICKS);
+          const root = roots[bar % roots.length];
+          notes.push(
+            { tick: t, lengthTicks: this.ppq * 2 - 60, key: root, velocity: 92, channel: 0 },
+            {
+              tick: t,
+              lengthTicks: this.ppq * 2 - 60,
+              key: root + (noise(seed, bar) > 0.5 ? 7 : 12),
+              velocity: 78,
+              channel: 0,
+            },
+          );
+        }
+        onEvent({
+          type: "done",
+          jobId,
+          result: { kind: "amtInfill", ppq: this.ppq, notes, simulated: true } as unknown as NonNullable<
+            SidecarJobStatus["result"]
+          >,
+        });
+        setTimeout(() => {
+          const { clip } = this.applyHumClip(notes, melody.lengthTicks, null, melody.timelineStartTicks, "Hum Accompaniment");
+          onEvent({
+            type: "log",
+            jobId,
+            line: `hum-to-song: accompaniment clip ${clip.id} (${clip.notes.length} notes) on track ${clip.trackId}`,
+          });
+        }, 300);
+      }
+    }, 100);
+    return jobId;
+  }
+
+  // ── wave 1.5: export ──
+
+  async exportCapabilities(): Promise<ExportCapabilities> {
+    return {
+      formats: ["wav", "mp3", "flac", "ogg", "m4a"],
+      ffmpeg: true,
+      ffmpegPath: "/usr/bin/ffmpeg",
+      hint: null,
+    };
+  }
+
+  async exportJobStatus(jobId: string): Promise<ExportJobStatus> {
+    const st = this.exportJobs.get(jobId);
+    if (!st) throw new Error(`unknown export job: ${jobId}`);
+    return { ...st };
+  }
+
+  async exportSong(request: ExportRequest): Promise<string> {
+    if (!request.path.startsWith("/")) throw new Error(`path must be absolute: ${request.path}`);
+    const format = (
+      request.format ?? request.path.split(".").pop() ?? "wav"
+    ).toLowerCase();
+    if (!["wav", "mp3", "flac", "ogg", "m4a", "aac", "mp4"].includes(format)) {
+      throw new Error(`unsupported export format: ${format} (wav|mp3|flac|ogg|m4a)`);
+    }
+    const region = request.region ?? "full";
+    if (region === "loop" && this.loopEnd <= this.loopStart) {
+      throw new Error("no loop region set — set one with transport_set_loop first");
+    }
+    if (this.clips.length === 0 && !this.midiClips.some((c) => c.notes.length > 0)) {
+      throw new Error("nothing to export — the project has no audio clips or midi notes");
+    }
+    const bitDepth = request.bitDepth ?? 24;
+    if (![16, 24, 32].includes(bitDepth)) {
+      throw new Error(`unsupported bit depth: ${bitDepth} (16|24|32)`);
+    }
+    const tail = request.tailSeconds ?? (region === "loop" ? 0 : 1);
+    let frames: number;
+    if (region === "loop") {
+      frames = this.loopEnd - this.loopStart + Math.round(tail * SR);
+    } else {
+      let end = 0;
+      for (const c of this.clips) end = Math.max(end, c.timelineStartSamples + c.lengthSamples);
+      for (const m of this.midiClips) {
+        end = Math.max(end, this.ticksToSamples(m.timelineStartTicks + m.lengthTicks));
+      }
+      frames = Math.round(end + tail * SR);
+    }
+    const rate = request.sampleRate ?? SR;
+    const durationSeconds = frames / SR;
+
+    const jobId = uuid();
+    const status: ExportJobStatus = {
+      jobId,
+      kind: "exportSong",
+      state: "queued",
+      progress: 0,
+      stage: "queued",
+      result: null,
+      error: null,
+    };
+    this.exportJobs.set(jobId, status);
+    this.emit("export://progress", { jobId, progress: 0, stage: "queued" });
+
+    const needsEncode = format !== "wav" || rate !== SR;
+    const renderTop = needsEncode ? 0.75 : 0.9;
+    const durationMs = 2600 + Math.random() * 900;
+    const started = this.now();
+    const tick = setInterval(() => {
+      const p = Math.min(1, (this.now() - started) / durationMs);
+      let stage: string;
+      let progress: number;
+      if (p < 0.05) {
+        stage = "building graph";
+        progress = 0.02 + p;
+      } else if (p < 0.8) {
+        stage = "rendering";
+        progress = 0.05 + ((p - 0.05) / 0.75) * (renderTop - 0.05);
+      } else if (p < 0.88 || !needsEncode) {
+        stage = "writing wav";
+        progress = Math.min(1, renderTop + ((p - 0.8) / 0.2) * (1 - renderTop));
+      } else {
+        stage = "encoding";
+        progress = 0.85 + ((p - 0.88) / 0.12) * 0.15;
+      }
+      status.state = "running";
+      status.progress = Math.min(1, progress);
+      status.stage = stage;
+      this.emit("export://progress", { jobId, progress: status.progress, stage });
+      if (p >= 1) {
+        clearInterval(tick);
+        const bytesPerSample = format === "wav" ? bitDepth / 8 : 0.18; // lossy ≈ estimate
+        const result: ExportResult = {
+          path: request.path,
+          format: format === "aac" || format === "mp4" ? "m4a" : format,
+          region,
+          sampleRate: rate,
+          bitDepth,
+          frames,
+          durationSeconds,
+          sizeBytes: Math.round(frames * 2 * bytesPerSample) + 44,
+        };
+        status.state = "done";
+        status.progress = 1;
+        status.stage = "done";
+        status.result = result;
+        this.emit("export://done", { ...result, jobId });
+      }
+    }, 90);
+    return jobId;
+  }
+
+  // ── wave 1.5: import + split stems ──
+
+  async importAudioClipSplitStems(
+    request: ImportClipRequest,
+    onEvent: (e: SidecarEvent) => void,
+  ): Promise<ImportSplitReply> {
+    const clip = await this.importAudioClip(request);
+    const jobId = await this.runFakeJob("stemSplit", { inputPath: request.path }, (e) => {
+      onEvent(e);
+      if (e.type === "done") {
+        // Real-backend protocol: `done` first, then the stems land one by
+        // one, each announced by a follow-up `log` line.
+        setTimeout(() => {
+          for (const line of this.materializeDemoStems(clip)) {
+            onEvent({ type: "log", jobId: e.jobId, line });
+          }
+        }, 250);
+      }
+    });
+    return { clip, jobId };
+  }
+
+  private materializeDemoStems(source: Clip): string[] {
+    const stems: { name: StemName; label: string; color: string; character: ClipCharacter }[] = [
+      { name: "drums", label: "Drums", color: "#ffc857", character: "drums" },
+      { name: "bass", label: "Bass", color: "#ff4fd8", character: "bass" },
+      { name: "vocals", label: "Vocals", color: "#52e5ff", character: "vocals" },
+      { name: "other", label: "Other", color: "#9d7bff", character: "pad" },
+    ];
+    let at = this.tracks.findIndex((t) => t.id === source.trackId);
+    const lines: string[] = [];
+    for (const stem of stems) {
+      const track = this.makeTrack({ name: `${stem.label} · ${source.name}`, color: stem.color });
+      this.tracks.splice(at >= 0 ? ++at : this.tracks.length, 0, track);
+      const clip = this.makeClip(track.id, `${source.name} — ${stem.name}`, source.timelineStartSamples, source.lengthSamples);
+      clip.sourcePath = `stems/${source.id}/${stem.name}.wav`;
+      this.characters.set(clip.id, stem.character);
+      this.clips.push(clip);
+      lines.push(`auto-import stem \`${stem.name}\`: clip ${clip.id} on track ${track.name} (${track.id})`);
+    }
+    this.resyncAudio();
+    return lines;
+  }
+
+  // ── wave 1.5: loop-jam ──
+
+  private ljStatus(): LoopJamStatus {
+    return {
+      state: this.ljState,
+      jobId: this.ljJobId,
+      trackId: this.ljTrackId,
+      loopStartSamples: Math.round(this.loopStart),
+      loopEndSamples: Math.round(this.loopEnd),
+      generation: this.ljGeneration,
+      lastError: this.ljLastError,
+    };
+  }
+
+  private ljEmit() {
+    this.emit("loopjam://state", this.ljStatus());
+  }
+
+  private ljSchedule(ms: number, fn: () => void) {
+    this.ljTimers.push(setTimeout(fn, ms));
+  }
+
+  private ljClearTimers() {
+    for (const t of this.ljTimers) clearTimeout(t);
+    this.ljTimers = [];
+  }
+
+  async loopjamStatus(): Promise<LoopJamStatus> {
+    return this.ljStatus();
+  }
+
+  async loopjamEvolve(options: EvolveOptions = {}): Promise<LoopJamStatus> {
+    if (this.loopEnd <= this.loopStart) {
+      throw new Error("no loop region set — set one with transport_set_loop first");
+    }
+    if (this.ljState === "generating" || this.ljState === "ready") {
+      throw new Error("an evolve cycle is already in flight — cancel it first");
+    }
+    let target = options.trackId ?? null;
+    if (target && !this.track(target)) throw new Error(`unknown track: ${target}`);
+    if (!target) {
+      const hit = this.clips.find(
+        (c) =>
+          c.timelineStartSamples < this.loopEnd &&
+          c.timelineStartSamples + c.lengthSamples > this.loopStart &&
+          this.track(c.trackId)?.kind !== "midi",
+      );
+      if (!hit) throw new Error("no audio clip inside the loop region to evolve");
+      target = hit.trackId;
+    }
+    this.ljClearTimers();
+    this.ljState = "generating";
+    this.ljJobId = uuid();
+    this.ljTrackId = target;
+    this.ljLastError = null;
+    this.ljEmit();
+
+    const seed = options.seed ?? Date.now();
+    this.ljSchedule(3400 + Math.random() * 900, () => {
+      if (this.ljState !== "generating") return;
+      this.ljState = "ready";
+      this.ljEmit();
+      // Apply at the next loop wrap while rolling; ~1.2 s later when parked.
+      const pos = this.position();
+      const applyIn =
+        this.tState !== "stopped" && this.loopEnabled && pos < this.loopEnd
+          ? ((this.loopEnd - pos) / SR) * 1000
+          : 1200;
+      this.ljSchedule(applyIn, () => {
+        if (this.ljState !== "ready") return;
+        const clip = this.clips.find(
+          (c) =>
+            c.trackId === this.ljTrackId &&
+            c.timelineStartSamples < this.loopEnd &&
+            c.timelineStartSamples + c.lengthSamples > this.loopStart,
+        );
+        if (clip) {
+          // Repaint = new audio in place: reseed the synth + fresh tiles.
+          this.clipSeeds.set(clip.id, hashString(`${clip.id}:${seed}:${this.ljGeneration}`));
+          this.clipBuffers.delete(clip.id);
+          const cycle: ClipCharacter[] = ["other", "pad", "bass"];
+          this.characters.set(clip.id, cycle[this.ljGeneration % cycle.length]);
+          this.resyncAudio();
+        }
+        this.ljGeneration++;
+        this.ljState = "applied";
+        this.ljJobId = null;
+        this.ljEmit();
+      });
+    });
+    return this.ljStatus();
+  }
+
+  async loopjamCancel(): Promise<LoopJamStatus> {
+    if (this.ljState === "generating" || this.ljState === "ready") {
+      this.ljClearTimers();
+      this.ljState = "idle";
+      this.ljJobId = null;
+      this.ljEmit();
+    }
+    return this.ljStatus();
+  }
+
+  // ── wave 1.5: Zyn patches ──
+
+  async zynListPatches(): Promise<ZynPatch[]> {
+    await new Promise((r) => setTimeout(r, 180 + Math.random() * 200));
+    return this.zynPatches.map((p) => ({ ...p }));
+  }
+
+  async zynLoadPatch(instanceId: string, path: string): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+    if (!inst.uid.toLowerCase().includes("zyn")) {
+      throw new Error(`${inst.name} is not a ZynAddSubFX instance`);
+    }
+    const patch = this.zynPatches.find((p) => p.path === path);
+    if (!patch) throw new Error(`patch not found: ${path}`);
+    await new Promise((r) => setTimeout(r, 250));
+    this.zynLoaded.set(instanceId, patch);
+    // Audible in the demo synth: bank shapes the voice's filter/detune.
+    const params = this.pluginParams.get(instanceId) ?? [];
+    const cutoff = params.find((p) => p.name.toLowerCase().includes("cutoff"));
+    const detune = params.find((p) => p.name.toLowerCase().includes("detune"));
+    const byBank: Record<string, [number, number]> = {
+      Bass: [700, 3],
+      Pads: [1100, 14],
+      Choir_and_Voice: [1600, 9],
+      Arpeggios: [3800, 6],
+      Plucked: [5600, 2],
+      Synth_Leads: [8600, 11],
+    };
+    const [hz, ct] = byBank[patch.bank] ?? [3400, 6];
+    if (cutoff) cutoff.value = Math.min(cutoff.max, Math.max(cutoff.min, hz));
+    if (detune) detune.value = Math.min(detune.max, Math.max(detune.min, ct));
+    this.resyncAudio();
+  }
+
+  /** Patch currently loaded into a demo Zyn instance (UI affordance). */
+  zynLoadedPatch(instanceId: string): ZynPatch | undefined {
+    return this.zynLoaded.get(instanceId);
   }
 
   // ── phase 2: mcp ──

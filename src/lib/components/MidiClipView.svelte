@@ -68,6 +68,8 @@
   const visR = $derived(Math.min(widthPx, view.width - leftPx));
   const selected = $derived(midi.selectedClipId === clip.id);
   const open = $derived(midi.openClipId === clip.id);
+  // freshly landed (hum-to-song etc.) — transient glow set by midi.flash()
+  const landed = $derived(midi.flashClipId === clip.id);
 
   // ── mini note preview ──
   $effect(() => {
@@ -157,6 +159,7 @@
     class="mclip"
     class:selected
     class:open
+    class:landed
     style:left="{leftPx}px"
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
@@ -207,6 +210,22 @@
     box-shadow:
       inset 0 0 0 1px color-mix(in srgb, var(--clip-color) 45%, transparent),
       0 0 14px color-mix(in srgb, var(--clip-color) 30%, transparent);
+  }
+  /* a clip a job just landed (hum-to-song melody/accompaniment) */
+  .mclip.landed {
+    animation: clip-landed 1.1s ease-in-out 3;
+  }
+  @keyframes clip-landed {
+    0%,
+    100% {
+      box-shadow: 0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent);
+    }
+    50% {
+      border-color: var(--clip-color);
+      box-shadow:
+        0 0 0 2px color-mix(in srgb, var(--clip-color) 70%, white 10%),
+        0 0 26px color-mix(in srgb, var(--clip-color) 60%, transparent);
+    }
   }
 
   .pulse {

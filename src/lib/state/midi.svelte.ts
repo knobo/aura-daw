@@ -25,6 +25,9 @@ class MidiStore {
   selectedClipId = $state<string | null>(null);
   /** Tick region marquee-selected in the piano roll — feeds AMT infill. */
   region = $state<MidiRegion | null>(null);
+  /** Clip glowing from a just-landed result (hum-to-song etc.); transient. */
+  flashClipId = $state<string | null>(null);
+  private flashTimer: ReturnType<typeof setTimeout> | null = null;
 
   get openClip(): MidiClip | null {
     return this.clips.find((c) => c.id === this.openClipId) ?? null;
@@ -156,6 +159,16 @@ class MidiStore {
 
   select(clipId: string | null) {
     this.selectedClipId = clipId;
+  }
+
+  /** Glow a clip for a few seconds (freshly landed hum/generation results). */
+  flash(clipId: string, ms = 4000) {
+    if (this.flashTimer) clearTimeout(this.flashTimer);
+    this.flashClipId = clipId;
+    this.flashTimer = setTimeout(() => {
+      if (this.flashClipId === clipId) this.flashClipId = null;
+      this.flashTimer = null;
+    }, ms);
   }
 }
 

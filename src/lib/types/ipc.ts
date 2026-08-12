@@ -421,10 +421,144 @@ export interface McpStatus {
 // ── control plane (phase 2) ────────────────────────────────────────────────
 
 export interface ImportClipRequest {
-  /** Absolute path to a wav/flac file. */
+  /** Absolute path to an audio file (wav/mp3/flac/ogg/aac/m4a — wave 1B). */
   path: string;
   trackId?: string | null;
   atSamples?: number | null;
+}
+
+// ── wave 1.5: hum-to-song (control/hum.rs) ─────────────────────────────────
+
+/** Argument of `hum_to_song`. Exactly one of clipId/path selects the input. */
+export interface HumToSongRequest {
+  /** Id of an existing recorded/imported AUDIO clip in the open project. */
+  clipId?: string | null;
+  /** Absolute path to a WAV recording (alternative to clipId). */
+  path?: string | null;
+  /** Target MIDI track for the melody clip; null = auto-create one. */
+  trackId?: string | null;
+  /** Timeline placement of the melody clip in ticks (default 0). */
+  atTicks?: number | null;
+  /** Grid snap for note onsets: 4 = quarters, 8 = eighths… 0/null = off. */
+  quantizeGrid?: number | null;
+  /** Tempo override for seconds→ticks; default: the project tempo. */
+  bpm?: number | null;
+  /** Chain an amtInfill accompaniment over the melody span. */
+  accompany?: boolean | null;
+}
+
+// ── wave 1.5: export (control/export.rs) ───────────────────────────────────
+
+export interface ExportRequest {
+  /** Absolute destination file path. */
+  path: string;
+  /** "wav" | "mp3" | "flac" | "ogg" | "m4a"; default inferred from path. */
+  format?: string | null;
+  /** "full" (default) or "loop" (the transport loop region). */
+  region?: string | null;
+  /** WAV bit depth: 16 | 24 | 32 (32 = IEEE float). Default 24. */
+  bitDepth?: number | null;
+  /** Output sample rate; differing from the engine rate requires ffmpeg. */
+  sampleRate?: number | null;
+  /** Master gain on the summed stereo bus, dB. Default 0. */
+  masterGainDb?: number | null;
+  /** Release tail after the region end, seconds (default 1 full / 0 loop). */
+  tailSeconds?: number | null;
+}
+
+/** Result payload of a finished export (export://done, minus jobId). */
+export interface ExportResult {
+  path: string;
+  format: string;
+  region: string;
+  sampleRate: number;
+  bitDepth: number;
+  frames: number;
+  durationSeconds: number;
+  sizeBytes: number;
+}
+
+export interface ExportJobStatus {
+  jobId: string;
+  /** Always "exportSong". */
+  kind: string;
+  state: "queued" | "running" | "done" | "error";
+  progress: number;
+  stage: string;
+  result?: ExportResult | null;
+  error?: string | null;
+}
+
+export interface ExportCapabilities {
+  /** Formats exportable right now ("wav" always; the rest with ffmpeg). */
+  formats: string[];
+  ffmpeg: boolean;
+  ffmpegPath?: string | null;
+  /** Present when ffmpeg is missing: how to get the extra formats. */
+  hint?: string | null;
+}
+
+export interface ExportProgressEvent {
+  jobId: string;
+  progress: number;
+  stage: string;
+}
+
+export type ExportDoneEvent = ExportResult & { jobId: string };
+
+export interface ExportErrorEvent {
+  jobId: string;
+  message: string;
+}
+
+// ── wave 1.5: import + split stems (control/import.rs) ─────────────────────
+
+/** Reply of import_audio_clip_split_stems: the imported clip + Demucs job. */
+export interface ImportSplitReply {
+  clip: Clip;
+  jobId: string;
+  createdTrack?: TrackState | null;
+}
+
+/** Extensions the universal import decode path accepts. */
+export const IMPORT_AUDIO_EXTS = ["wav", "mp3", "flac", "ogg", "aac", "m4a", "mp4"] as const;
+
+// ── wave 1.5: loop-jam (control/loopjam.rs) ────────────────────────────────
+
+export interface EvolveOptions {
+  /** Target track; null = first audio track with clip audio in the region. */
+  trackId?: string | null;
+  /** Style prompt forwarded to the repaint worker. */
+  prompt?: string | null;
+  /** Generation seed; null = derived from the generation counter. */
+  seed?: number | null;
+  /** Force/deny simulate mode; null = follow AURA_SIDECAR_SIMULATE. */
+  simulate?: boolean | null;
+}
+
+/** Snapshot of the loop-jam state machine (the loopjam://state payload). */
+export interface LoopJamStatus {
+  state: "idle" | "generating" | "ready" | "applied";
+  jobId?: string | null;
+  trackId?: string | null;
+  loopStartSamples: number;
+  loopEndSamples: number;
+  /** Completed hot-swaps since construction. */
+  generation: number;
+  lastError?: string | null;
+}
+
+// ── wave 1.5: Zyn patch bank (plugins/patches.rs) ──────────────────────────
+
+export interface ZynPatch {
+  /** Bank directory name, e.g. "Arpeggios". */
+  bank: string;
+  /** Patch display name, e.g. "Arpeggio 1". */
+  name: string;
+  /** Program number inside the bank. */
+  program: number;
+  /** Absolute path of the .xiz file. */
+  path: string;
 }
 
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────
@@ -437,6 +571,10 @@ export interface AuraEventMap {
   "sidecar://error": SidecarErrorEvent;
   "project://changed": Project;
   "mcp://confirm-requested": PendingConfirmation;
+  "export://progress": ExportProgressEvent;
+  "export://done": ExportDoneEvent;
+  "export://error": ExportErrorEvent;
+  "loopjam://state": LoopJamStatus;
 }
 
 export type AuraEventName = keyof AuraEventMap;

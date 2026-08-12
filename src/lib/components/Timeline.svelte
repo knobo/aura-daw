@@ -10,9 +10,12 @@
   import { transport } from "../state/transport.svelte";
   import { view } from "../state/view.svelte";
   import { midi } from "../state/midi.svelte";
+  import { loopjam } from "../state/loopjam.svelte";
   import TrackHeader from "./TrackHeader.svelte";
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
+  import ImportDropZone from "./ImportDropZone.svelte";
+  import LoopJamPanel from "./loopjam/LoopJamPanel.svelte";
   import type { TrackState } from "../types/ipc";
 
   const TRACK_PALETTE = ["#52e5ff", "#ff4fd8", "#ffc857", "#9d7bff", "#5cf2b8", "#ff8b5c"];
@@ -250,6 +253,17 @@
     return { start, end, has: end > start, on: t.loopEnabled };
   });
 
+  // loop-jam visual language: the band breathes while a generation is in
+  // flight and flashes when a swap lands at the wrap
+  const jamBreathing = $derived(loopjam.busy);
+  let jamFlash = $state(false);
+  $effect(() => {
+    if (loopjam.appliedFlash === 0) return;
+    jamFlash = true;
+    const t = setTimeout(() => (jamFlash = false), 1400);
+    return () => clearTimeout(t);
+  });
+
   /** Snapped sample under the pointer, measured against the ruler. */
   function loopSampleAt(e: PointerEvent): number {
     const el = rulerEl;
@@ -361,6 +375,8 @@
         <div
           class="loopband"
           class:on={loopRegion.on}
+          class:breathing={jamBreathing}
+          class:jamflash={jamFlash}
           style="left:{view.xOf(loopRegion.start).toFixed(1)}px; width:{Math.max(
             2,
             (loopRegion.end - loopRegion.start) / view.spp,
@@ -443,12 +459,16 @@
       {#if loopRegion.has && loopRegion.on}
         <div
           class="loopshade"
+          class:breathing={jamBreathing}
+          class:jamflash={jamFlash}
           style="left:{view.xOf(loopRegion.start).toFixed(1)}px; width:{Math.max(
             2,
             (loopRegion.end - loopRegion.start) / view.spp,
           ).toFixed(1)}px"
         ></div>
       {/if}
+      <LoopJamPanel />
+      <ImportDropZone />
       <div bind:this={playheadEl} class="playhead"></div>
     </div>
   </div>
@@ -569,6 +589,54 @@
     border-left: 1px solid rgba(255, 200, 87, 0.18);
     border-right: 1px solid rgba(255, 200, 87, 0.18);
     pointer-events: none;
+  }
+
+  /* loop-jam: the region breathes while ACE-Step regenerates it… */
+  .loopband.breathing {
+    animation: jam-breathe 1.6s ease-in-out infinite;
+  }
+  .loopshade.breathing {
+    animation: jam-breathe-shade 1.6s ease-in-out infinite;
+  }
+  @keyframes jam-breathe {
+    50% {
+      background: rgba(255, 79, 216, 0.22);
+      border-bottom-color: rgba(255, 79, 216, 0.7);
+      box-shadow: inset 0 0 16px rgba(255, 79, 216, 0.25);
+    }
+  }
+  @keyframes jam-breathe-shade {
+    50% {
+      background: rgba(255, 79, 216, 0.06);
+      border-left-color: rgba(255, 79, 216, 0.35);
+      border-right-color: rgba(255, 79, 216, 0.35);
+    }
+  }
+  /* …and flashes when the evolved audio swaps in at the wrap */
+  .loopband.jamflash {
+    animation: jam-flash 1.4s ease-out 1;
+  }
+  .loopshade.jamflash {
+    animation: jam-flash-shade 1.4s ease-out 1;
+  }
+  @keyframes jam-flash {
+    0% {
+      background: rgba(92, 242, 184, 0.55);
+      box-shadow: inset 0 0 20px rgba(92, 242, 184, 0.6);
+    }
+    100% {
+      background: rgba(255, 200, 87, 0.14);
+    }
+  }
+  @keyframes jam-flash-shade {
+    0% {
+      background: rgba(92, 242, 184, 0.16);
+      border-left-color: rgba(92, 242, 184, 0.7);
+      border-right-color: rgba(92, 242, 184, 0.7);
+    }
+    100% {
+      background: rgba(255, 200, 87, 0.035);
+    }
   }
 
   .body {

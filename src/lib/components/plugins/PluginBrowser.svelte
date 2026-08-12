@@ -7,6 +7,7 @@
    */
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
+  import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
   import type { PluginDescriptor, PluginInstanceInfo } from "../../types/ipc";
 
   let instrumentsOnly = $state(true);
@@ -121,6 +122,15 @@
             <button class="params mono" onclick={() => plugins.openParams(inst.id)}>
               ⚙ PARAMS
             </button>
+            {#if isZynInstance(inst)}
+              <button
+                class="patches mono"
+                title="Browse the ZynAddSubFX bank patches"
+                onclick={() => zyn.openFor(inst.id)}
+              >
+                ▤ PATCHES
+              </button>
+            {/if}
             <select title="Bind to a MIDI track" onchange={(e) => onBind(inst, e)}>
               <option value="">{inst.trackId ? "rebind…" : "bind to track…"}</option>
               {#each midiTracks as t (t.id)}
@@ -327,6 +337,21 @@
   }
   .params:hover {
     background: rgba(82, 229, 255, 0.16);
+  }
+
+  .patches {
+    padding: 4px 8px;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    border-radius: 4px;
+    border: 1px solid rgba(157, 123, 255, 0.35);
+    background: rgba(157, 123, 255, 0.07);
+    color: var(--violet);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .patches:hover {
+    background: rgba(157, 123, 255, 0.18);
   }
 
   .del {

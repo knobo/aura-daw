@@ -7,14 +7,18 @@
   import { ui, type DockTab } from "../state/ui.svelte";
   import { mcp } from "../state/mcp.svelte";
   import { plugins } from "../state/plugins.svelte";
+  import { zyn } from "../state/zynpatches.svelte";
   import AiStudio from "./generate/AiStudio.svelte";
+  import HumPanel from "./hum/HumPanel.svelte";
   import InstrumentBrowser from "./instruments/InstrumentBrowser.svelte";
   import PluginBrowser from "./plugins/PluginBrowser.svelte";
   import PluginParamPanel from "./plugins/PluginParamPanel.svelte";
+  import ZynPatchBrowser from "./plugins/ZynPatchBrowser.svelte";
   import McpPanel from "./mcp/McpPanel.svelte";
 
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
     { id: "generate", label: "AI STUDIO" },
+    { id: "hum", label: "🎤 HUM" },
     { id: "instruments", label: "INSTRUMENTS" },
     { id: "plugins", label: "PLUGINS" },
     { id: "mcp", label: "MCP" },
@@ -44,10 +48,14 @@
     <div class="content">
       {#if ui.dock === "generate"}
         <AiStudio />
+      {:else if ui.dock === "hum"}
+        <HumPanel />
       {:else if ui.dock === "instruments"}
         <InstrumentBrowser />
       {:else if ui.dock === "plugins"}
-        {#if plugins.openInstanceId}
+        {#if zyn.openInstanceId}
+          <ZynPatchBrowser />
+        {:else if plugins.openInstanceId}
           <PluginParamPanel />
         {:else}
           <PluginBrowser />
@@ -93,8 +101,9 @@
   .tab {
     position: relative;
     font-size: 9px;
-    letter-spacing: 0.18em;
-    padding: 7px 10px 9px;
+    letter-spacing: 0.14em;
+    padding: 7px 7px 9px;
+    white-space: nowrap;
     border: none;
     background: transparent;
     color: var(--text-faint);
