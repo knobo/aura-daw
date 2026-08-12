@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/project.schema.json",
+  "title": "Project",
+  "description": "The project.json file at the root of a '<Name>.aura' project directory, and the payload returned by create_project / open_project and emitted on 'project://changed'. All paths inside are relative to the .aura directory (POSIX separators) so projects stay portable.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "description": "project.json format version; this document describes version 1.",
+      "type": "integer",
+      "const": 1
+    },
+    "name": {
+      "description": "Project display name (usually the directory name without '.aura').",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "path": {
+      "description": "Absolute path of the .aura directory on THIS machine. Informational; rewritten on open, never used for intra-project references.",
+      "type": "string"
+    },
+    "createdAt": {
+      "description": "Creation timestamp, RFC 3339 / ISO-8601 UTC.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "modifiedAt": {
+      "description": "Last-save timestamp, RFC 3339 / ISO-8601 UTC.",
+      "type": "string",
+      "format": "date-time"
+    },
+    "sampleRate": {
+      "description": "Project sample rate in Hz; the unit for every *Samples field in the project and IPC surface.",
+      "type": "integer",
+      "minimum": 8000,
+      "maximum": 384000,
+      "default": 48000
+    },
+    "tempoBpm": {
+      "description": "Project tempo in beats per minute (single global tempo in v1).",
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "default": 120
+    },
+    "timeSignature": {
+      "description": "Global time signature as [beatsPerBar, beatUnit], e.g. [4, 4].",
+      "type": "array",
+      "prefixItems": [
+        { "type": "integer", "minimum": 1, "maximum": 32 },
+        { "type": "integer", "enum": [1, 2, 4, 8, 16] }
+      ],
+      "items": false,
+      "minItems": 2
+    },
+    "tracks": {
+      "description": "Mixer tracks in display order.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/track-state.schema.json" }
+    },
+    "clips": {
+      "description": "All clips across all tracks (flat list; clip.trackId links them).",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/clip.schema.json" }
+    },
+    "transport": {
+      "description": "Last-saved transport snapshot (position, loop region). state is saved as \"stopped\".",
+      "$ref": "aura:ipc/transport-state.schema.json"
+    }
+  },
+  "required": ["schemaVersion", "name", "sampleRate", "tempoBpm", "tracks", "clips"],
+  "additionalProperties": false
+}

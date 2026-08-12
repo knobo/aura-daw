@@ -1,0 +1,36 @@
+/** Time/level formatting helpers. */
+
+/** samples → "MM:SS.mmm" */
+export function formatClock(samples: number, sampleRate: number): string {
+  const totalMs = Math.max(0, (samples / sampleRate) * 1000);
+  const m = Math.floor(totalMs / 60000);
+  const s = Math.floor((totalMs % 60000) / 1000);
+  const ms = Math.floor(totalMs % 1000);
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
+}
+
+/** samples → "BBB.B.QQ" bars.beats.sixteenths (1-based) */
+export function formatBarsBeats(
+  samples: number,
+  sampleRate: number,
+  tempoBpm: number,
+  beatsPerBar = 4,
+): string {
+  const beatLen = (60 / tempoBpm) * sampleRate;
+  const totalBeats = Math.max(0, samples / beatLen);
+  const bar = Math.floor(totalBeats / beatsPerBar) + 1;
+  const beat = Math.floor(totalBeats % beatsPerBar) + 1;
+  const sixteenth = Math.floor((totalBeats % 1) * 4) + 1;
+  return `${String(bar).padStart(3, "0")}.${beat}.${sixteenth}`;
+}
+
+/** linear (1.0 = FS) → dBFS, floored */
+export function linToDb(x: number): number {
+  if (x <= 0.00001) return -100;
+  return 20 * Math.log10(x);
+}
+
+export function formatDb(db: number): string {
+  if (db <= -90) return "-∞";
+  return `${db > 0 ? "+" : ""}${db.toFixed(1)}`;
+}

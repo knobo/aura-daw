@@ -1,0 +1,20 @@
+# Rust
+/src-tauri/target/
+
+# Node
+/node_modules/
+/dist/
+
+# Python sidecar environment (local, machine-specific)
+/.venv-sidecars/
+
+# Tauri
+/src-tauri/gen/
+
+# Local project data / caches
+*.wav.tmp
+project.json.v1.bak
+
+# Editors / OS
+.DS_Store
+*.swp

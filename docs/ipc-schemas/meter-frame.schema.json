@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/meter-frame.schema.json",
+  "title": "MeterFrame",
+  "description": "One batched metering frame, pushed over the Tauri Channel passed to subscribe_meters at ~60 Hz (one frame per tick containing ALL tracks). Values aggregate the interval since the previous frame. Mirrors Rust struct audio::MeterFrame.",
+  "type": "object",
+  "properties": {
+    "seq": {
+      "description": "Monotonic frame counter, per subscription, starting at 0. Gaps indicate dropped frames (UI may ignore).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "positionSamples": {
+      "description": "Engine playhead position (samples at the project sample rate) when this frame was captured.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "tracks": {
+      "description": "Per-track meters, one entry per existing track (order unspecified; match by trackId).",
+      "type": "array",
+      "items": { "$ref": "#/$defs/trackMeter" }
+    },
+    "master": {
+      "description": "Master bus meter (trackId == \"master\").",
+      "$ref": "#/$defs/trackMeter"
+    }
+  },
+  "required": ["seq", "positionSamples", "tracks", "master"],
+  "additionalProperties": false,
+  "$defs": {
+    "trackMeter": {
+      "title": "TrackMeter",
+      "type": "object",
+      "properties": {
+        "trackId": {
+          "description": "Track UUID, or the literal \"master\" for the master bus.",
+          "type": "string"
+        },
+        "peakL": {
+          "description": "Maximum absolute sample value (linear, full scale = 1.0; may exceed 1.0 when clipping) on the left channel over the frame interval. Convert to dBFS with 20*log10(x).",
+          "type": "number",
+          "minimum": 0
+        },
+        "peakR": {
+          "description": "Peak, right channel (same units as peakL). Mono tracks mirror peakL.",
+          "type": "number",
+          "minimum": 0
+        },
+        "rmsL": {
+          "description": "Root-mean-square level (linear, full scale = 1.0) on the left channel over the frame interval.",
+          "type": "number",
+          "minimum": 0
+        },
+        "rmsR": {
+          "description": "RMS, right channel.",
+          "type": "number",
+          "minimum": 0
+        },
+        "clipped": {
+          "description": "True if any sample in the interval reached/exceeded full scale.",
+          "type": "boolean"
+        }
+      },
+      "required": ["trackId", "peakL", "peakR", "rmsL", "rmsR", "clipped"],
+      "additionalProperties": false
+    }
+  }
+}

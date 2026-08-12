@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/midi-clip.schema.json",
+  "title": "MidiClip",
+  "description": "MIDI clip + note payloads: arguments/results of midi_add_clip, midi_set_notes, midi_get_clips (Rust mirror: src-tauri/src/midi/types.rs). ALL musical positions are integer ticks at the project PPQ (debt D-02: never seconds, never samples). On the IPC surface notes travel as JSON arrays on the clip; in project.json v2 they are persisted as AMEV binary chunks ($defs persistedClip). Emitter contract — no additionalProperties:false (D-06).",
+  "oneOf": [
+    { "$ref": "#/$defs/clip" },
+    { "$ref": "#/$defs/persistedClip" }
+  ],
+  "$defs": {
+    "note": {
+      "title": "MidiNote",
+      "type": "object",
+      "properties": {
+        "tick": {
+          "description": "Onset, ticks relative to clip start.",
+          "type": "integer", "minimum": 0, "maximum": 4294967295
+        },
+        "lengthTicks": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
+        "key": { "description": "MIDI key, 60 = C4.", "type": "integer", "minimum": 0, "maximum": 127 },
+        "velocity": { "type": "integer", "minimum": 1, "maximum": 127 },
+        "channel": { "type": "integer", "minimum": 0, "maximum": 15, "default": 0 }
+      },
+      "required": ["tick", "lengthTicks", "key", "velocity"]
+    },
+    "clip": {
+      "title": "MidiClip (IPC)",
+      "description": "In-memory/IPC form: notes inline, sorted by (tick, key).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "trackId": { "description": "A kind:\"midi\" track.", "type": "string" },
+        "name": { "type": "string" },
+        "timelineStartTicks": { "type": "integer", "minimum": 0 },
+        "lengthTicks": { "type": "integer", "minimum": 1 },
+        "notes": { "type": "array", "items": { "$ref": "#/$defs/note" } }
+      },
+      "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks", "notes"]
+    },
+    "persistedClip": {
+      "title": "MidiClip (project.json v2)",
+      "description": "Persisted form: notes live in an AMEV chunk file (16-byte records; layout in src-tauri/src/midi/events.rs), referenced relative to the .aura dir.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "trackId": { "type": "string" },
+        "name": { "type": "string" },
+        "timelineStartTicks": { "type": "integer", "minimum": 0 },
+        "lengthTicks": { "type": "integer", "minimum": 1 },
+        "eventsRef": {
+          "description": "Relative path of the AMEV chunk, e.g. \"events/<clipId>.bin\". Chunks are immutable-once-written; edits write a new chunk under a new UUID (SCALABILITY §4).",
+          "type": "string",
+          "pattern": "^events/[^/]+\\.bin$"
+        },
+        "patternId": {
+          "description": "RESERVED for the pattern/playlist milestone (SCALABILITY §3): when set, this clip is an instance of a shared pattern and eventsRef is absent.",
+          "type": "string"
+        }
+      },
+      "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks"]
+    }
+  }
+}

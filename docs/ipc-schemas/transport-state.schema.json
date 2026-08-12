@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/transport-state.schema.json",
+  "title": "TransportState",
+  "description": "Snapshot of the transport, returned by every transport command and emitted on the 'transport://state' app event when state or position jumps discontinuously. Mirrors Rust struct audio::TransportState.",
+  "type": "object",
+  "properties": {
+    "state": {
+      "description": "Current transport mode.",
+      "type": "string",
+      "enum": ["stopped", "playing", "recording"]
+    },
+    "positionSamples": {
+      "description": "Playhead position in samples at sampleRate, measured from project start (0).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "sampleRate": {
+      "description": "Engine sample rate in Hz (e.g. 44100, 48000). All *Samples fields in the IPC surface are in this unit.",
+      "type": "integer",
+      "minimum": 8000,
+      "maximum": 384000
+    },
+    "tempoBpm": {
+      "description": "Project tempo in beats per minute.",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "loopEnabled": {
+      "description": "Whether loop playback is active.",
+      "type": "boolean"
+    },
+    "loopStartSamples": {
+      "description": "Loop region start (inclusive), in samples.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "loopEndSamples": {
+      "description": "Loop region end (exclusive), in samples. 0 when no loop region is set.",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "state",
+    "positionSamples",
+    "sampleRate",
+    "tempoBpm",
+    "loopEnabled",
+    "loopStartSamples",
+    "loopEndSamples"
+  ],
+  "additionalProperties": false
+}

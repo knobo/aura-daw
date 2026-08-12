@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/clip.schema.json",
+  "title": "Clip",
+  "description": "One audio clip placed on a track's timeline. Returned by stop_recording (the finished take) and embedded in project.json. All sample units are at the project sample rate.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "Clip UUIDv4.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "trackId": {
+      "description": "UUID of the track this clip sits on.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "name": {
+      "description": "User-visible clip name (defaults to the source file stem).",
+      "type": "string",
+      "maxLength": 256
+    },
+    "sourcePath": {
+      "description": "Audio file path RELATIVE to the .aura project directory, POSIX separators (e.g. \"audio/3f2a....wav\" or \"stems/<clipId>/vocals.wav\").",
+      "type": "string"
+    },
+    "sourceChannels": {
+      "description": "Channel count of the source file (1 = mono, 2 = stereo).",
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 2
+    },
+    "sourceSampleRate": {
+      "description": "Sample rate of the source FILE in Hz. If it differs from the project rate, the engine resamples on playback.",
+      "type": "integer",
+      "minimum": 8000,
+      "maximum": 384000
+    },
+    "sourceLengthSamples": {
+      "description": "Total length of the source file, in SOURCE-file samples.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "timelineStartSamples": {
+      "description": "Position of the clip's left edge on the timeline, in project samples from project start.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "offsetSamples": {
+      "description": "Trim: offset into the source where playback begins, in project samples.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "lengthSamples": {
+      "description": "Audible length on the timeline, in project samples.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "gainDb": {
+      "description": "Per-clip gain in dB, applied on top of track gain. 0.0 = unity.",
+      "type": "number",
+      "minimum": -160.0,
+      "maximum": 24.0
+    },
+    "fadeInSamples": {
+      "description": "Linear fade-in length at the clip head, in project samples.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "fadeOutSamples": {
+      "description": "Linear fade-out length at the clip tail, in project samples.",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "id",
+    "trackId",
+    "name",
+    "sourcePath",
+    "sourceChannels",
+    "sourceSampleRate",
+    "sourceLengthSamples",
+    "timelineStartSamples",
+    "offsetSamples",
+    "lengthSamples",
+    "gainDb",
+    "fadeInSamples",
+    "fadeOutSamples"
+  ],
+  "additionalProperties": false
+}

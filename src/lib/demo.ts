@@ -1,0 +1,1832 @@
+/**
+ * Demo engine — a fully synthetic backend used when the page runs outside
+ * Tauri (plain browser `vite dev`). It fakes the real engine's observable
+ * behavior: a sample-accurate transport clock, 60 Hz meter frames, AWTF
+ * waveform tiles (bit-identical wire format), and sidecar jobs with staged
+ * progress. The rest of the app cannot tell the difference.
+ */
+
+import {
+  AWTF_BINS_PER_TILE,
+  AWTF_MAGIC,
+  type AudioDevice,
+  type AuraEventMap,
+  type AuraEventName,
+  type Clip,
+  type GenJobResult,
+  type ImportClipRequest,
+  type InstrumentInfo,
+  type McpPolicy,
+  type McpStatus,
+  type MeterFrame,
+  type MidiClip,
+  type MidiNote,
+  type OpenSidecarEvent,
+  type PendingConfirmation,
+  type PluginDescriptor,
+  type PluginInstanceInfo,
+  type PluginListResult,
+  type PluginParamChange,
+  type PluginParamInfo,
+  type Project,
+  type ProjectSnapshot,
+  type SidecarEvent,
+  type SidecarJobStatus,
+  type StemName,
+  type StemSplitRequest,
+  type TempoEvent,
+  type TrackMeter,
+  type TrackState,
+  type TranscribeRequest,
+  type TransportState,
+  type WaveformTileRequest,
+} from "./types/ipc";
+import type { Backend, Unsubscribe } from "./tauri";
+
+const SR = 48000;
+const TEMPO = 120;
+const BAR = (60 / TEMPO) * 4 * SR; // samples per bar (4/4)
+
+const uuid = () =>
+  typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+function hashString(s: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+/** Deterministic 0..1 noise from integers. */
+function noise(seed: number, n: number): number {
+  let x = Math.imul(seed ^ n, 2654435761);
+  x ^= x >>> 13;
+  x = Math.imul(x, 1274126177);
+  x ^= x >>> 16;
+  return (x >>> 0) / 4294967296;
+}
+
+export type ClipCharacter = "drums" | "bass" | "vocals" | "pad" | "other";
+
+/**
+ * Amplitude envelope (0..1) of a synthetic clip at time t (seconds from the
+ * clip's own start). This drives both waveform tiles and playback meters, so
+ * what you hear-see in the meters matches the drawn waveform.
+ */
+function envelope(character: ClipCharacter, seed: number, t: number): number {
+  const beat = 60 / TEMPO;
+  switch (character) {
+    case "drums": {
+      const bt = t / beat; // beats
+      const beatIdx = Math.floor(bt);
+      const frac = bt - beatIdx;
+      // kick on quarters
+      let v = Math.exp(-frac * 9) * 0.95;
+      // snare on 2 & 4
+      if (beatIdx % 2 === 1) v = Math.max(v, Math.exp(-frac * 7) * 0.8);
+      // 8th hats
+      const eighth = (bt * 2) % 1;
+      v = Math.max(v, Math.exp(-eighth * 14) * 0.35);
+      return v * (0.92 + 0.08 * noise(seed, beatIdx));
+    }
+    case "bass": {
+      const step = Math.floor(t / (beat / 2)); // 8ths
+      const gate = noise(seed, step) > 0.2 ? 1 : 0;
+      const level = 0.55 + 0.35 * noise(seed ^ 0x9e37, step);
+      const frac = (t / (beat / 2)) % 1;
+      const shape = Math.min(1, frac * 10) * Math.exp(-frac * 1.2);
+      return gate * level * (0.65 + 0.35 * shape);
+    }
+    case "vocals": {
+      // phrases ~2.4 s with gaps, vibrato ripple
+      const phrase = Math.floor(t / 3.2);
+      const pt = t - phrase * 3.2;
+      const sing = noise(seed, phrase) > 0.25 && pt < 2.4;
+      if (!sing) return 0.02;
+      const env = Math.sin((Math.PI * pt) / 2.4) ** 0.6;
+      const vib = 0.85 + 0.15 * Math.sin(t * 35 + noise(seed, phrase) * 7);
+      const syll = 0.7 + 0.3 * Math.abs(Math.sin(t * 9 + phrase));
+      return 0.85 * env * vib * syll;
+    }
+    case "pad": {
+      const slow = 0.45 + 0.3 * Math.sin(t * 0.5 + seed % 7) + 0.12 * Math.sin(t * 1.7);
+      return Math.max(0.12, Math.min(0.8, slow));
+    }
+    default: {
+      const s = Math.floor(t * 8);
+      return 0.25 + 0.45 * noise(seed, s) * (0.6 + 0.4 * Math.sin(t * 2.2));
+    }
+  }
+}
+
+// ── Demo MIDI content ───────────────────────────────────────────────────────
+
+const PPQ = 960;
+const BAR_TICKS = PPQ * 4;
+
+/** A synthwave A-minor arpeggio: 16th-note cycle over Am–F–C–G, 4 bars. */
+function demoArpNotes(): MidiNote[] {
+  const chords = [
+    [57, 60, 64, 69], // Am
+    [53, 57, 60, 65], // F
+    [48, 52, 55, 60], // C
+    [55, 59, 62, 67], // G
+  ];
+  const step = PPQ / 4; // 16ths
+  const notes: MidiNote[] = [];
+  for (let bar = 0; bar < 4; bar++) {
+    const chord = chords[bar % chords.length];
+    for (let s = 0; s < 16; s++) {
+      const idx = s % 8 < 4 ? s % 4 : 3 - (s % 4); // up-down
+      const octave = s % 8 < 4 ? 0 : 12;
+      notes.push({
+        tick: bar * BAR_TICKS + s * step,
+        lengthTicks: Math.round(step * 0.9),
+        key: chord[idx] + octave,
+        velocity: s % 4 === 0 ? 112 : 82 + ((s * 7) % 20),
+        channel: 0,
+      });
+    }
+  }
+  return notes;
+}
+
+/** Held pad chords, 4 bars. */
+function demoChordNotes(): MidiNote[] {
+  const chords = [
+    [57, 64, 69, 72],
+    [53, 60, 65, 69],
+    [48, 55, 60, 64],
+    [55, 62, 67, 71],
+  ];
+  const notes: MidiNote[] = [];
+  chords.forEach((chord, bar) => {
+    for (const key of chord) {
+      notes.push({
+        tick: bar * BAR_TICKS,
+        lengthTicks: BAR_TICKS - PPQ / 8,
+        key,
+        velocity: 74,
+        channel: 0,
+      });
+    }
+  });
+  return notes;
+}
+
+const DEMO_INSTRUMENTS: InstrumentInfo[] = [
+  {
+    id: "d3m0-inst-neon-keys",
+    name: "Neon Keys",
+    sfzPath: "/home/demo/instruments/neon-keys/neon-keys.sfz",
+    regionCount: 26,
+    keyLow: 36,
+    keyHigh: 96,
+  },
+  {
+    id: "d3m0-inst-glass-bells",
+    name: "Glass Bells",
+    sfzPath: "/home/demo/instruments/glass-bells/glass-bells.sfz",
+    regionCount: 13,
+    keyLow: 48,
+    keyHigh: 108,
+  },
+  {
+    id: "d3m0-inst-tape-bass",
+    name: "Tape Bass 77",
+    sfzPath: "/home/demo/instruments/tape-bass-77/tape-bass-77.sfz",
+    regionCount: 18,
+    keyLow: 24,
+    keyHigh: 72,
+  },
+];
+
+// ── Demo plugins (phase 3) ──────────────────────────────────────────────────
+//
+// A plausible machine: ZynAddSubFX (the LV2 flagship the real backend hosts),
+// a fake CLAP synth, and one effect so the "instruments only in v1" rejection
+// path demos honestly.
+
+const DEMO_PLUGINS: PluginDescriptor[] = [
+  {
+    uid: "lv2:http://zynaddsubfx.sourceforge.net",
+    format: "lv2",
+    name: "ZynAddSubFX",
+    vendor: "ZynAddSubFX Team",
+    version: "3.0.6",
+    path: "/usr/lib/lv2/ZynAddSubFX.lv2",
+    isInstrument: true,
+    audioInputs: 0,
+    audioOutputs: 2,
+    hasNoteInput: true,
+    categories: ["Instrument Plugin", "synthesizer"],
+  },
+  {
+    uid: "clap:/usr/lib/clap/PolyCascade.clap#com.glasscoast.polycascade",
+    format: "clap",
+    name: "PolyCascade",
+    vendor: "Glasscoast Audio",
+    version: "1.4.2",
+    path: "/usr/lib/clap/PolyCascade.clap",
+    isInstrument: true,
+    audioInputs: 0,
+    audioOutputs: 2,
+    hasNoteInput: true,
+    categories: ["instrument", "synthesizer", "stereo"],
+  },
+  {
+    uid: "clap:/usr/lib/clap/ZamComp.clap#com.zamaudio.ZamComp",
+    format: "clap",
+    name: "ZamComp",
+    vendor: "Damien Zammit",
+    version: "4.1",
+    path: "/usr/lib/clap/ZamComp.clap",
+    isInstrument: false,
+    audioInputs: 2,
+    audioOutputs: 2,
+    hasNoteInput: false,
+    categories: ["audio-effect", "compressor"],
+  },
+];
+
+/** Fresh per-instance parameter list for a demo plugin uid. */
+function demoPluginParams(uid: string): PluginParamInfo[] {
+  const p = (
+    id: number,
+    name: string,
+    min: number,
+    max: number,
+    def: number,
+    steps = 0,
+  ): PluginParamInfo => ({ id, name, min, max, default: def, value: def, steps });
+
+  if (uid.includes("polycascade")) {
+    return [
+      p(0, "Master Volume", 0, 1, 0.78),
+      p(1, "Cutoff", 40, 12000, 2600),
+      p(2, "Resonance", 0, 1, 0.25),
+      p(3, "Detune", -50, 50, 6),
+      p(4, "Osc Wave", 0, 3, 0, 4),
+      p(5, "Sub Osc", 0, 1, 1, 2),
+      p(6, "Attack", 0.001, 2, 0.01),
+      p(7, "Release", 0.02, 4, 0.4),
+      p(8, "Glide", 0, 1, 0),
+      p(9, "Drive", 0, 1, 0.15),
+    ];
+  }
+  if (uid.includes("zynaddsubfx")) {
+    // ZynAddSubFX-scale surface: master + 16 parts × 8 controls ≈ 134 params,
+    // exercising the grouped/scrollable generic UI.
+    const params: PluginParamInfo[] = [
+      p(0, "Master / Volume", 0, 1, 0.72),
+      p(1, "Master / Cutoff", 40, 12000, 3400),
+      p(2, "Master / Detune", -50, 50, 0),
+      p(3, "Master / Pan", -1, 1, 0),
+      p(4, "Master / Key Shift", -36, 36, 0, 73),
+      p(5, "Master / NRPN Enable", 0, 1, 1, 2),
+    ];
+    let id = 8;
+    for (let part = 1; part <= 16; part++) {
+      const g = `Part ${String(part).padStart(2, "0")}`;
+      params.push(
+        p(id++, `${g} / Enable`, 0, 1, part <= 2 ? 1 : 0, 2),
+        p(id++, `${g} / Volume`, 0, 1, 0.6),
+        p(id++, `${g} / Pan`, -1, 1, 0),
+        p(id++, `${g} / Velocity Sense`, 0, 127, 64, 128),
+        p(id++, `${g} / Min Key`, 0, 127, 0, 128),
+        p(id++, `${g} / Max Key`, 0, 127, 127, 128),
+        p(id++, `${g} / Portamento`, 0, 1, 0, 2),
+        p(id++, `${g} / Kit Mode`, 0, 2, 0, 3),
+      );
+    }
+    return params;
+  }
+  return [];
+}
+
+/** What the WebAudio voices read from a plugin instance's live params. */
+interface DemoVoiceShape {
+  cutoffHz: number | null;
+  detuneCents: number;
+  wave: OscillatorType | null;
+  volume: number;
+}
+
+// ── Demo song ───────────────────────────────────────────────────────────────
+
+interface DemoTrackInit {
+  name: string;
+  color: string;
+  character: ClipCharacter;
+  kind?: "audio" | "midi";
+  instrumentId?: string;
+  clips: { name: string; startBar: number; lengthBars: number }[];
+  midiClips?: { name: string; startBar: number; lengthBars: number; notes: MidiNote[] }[];
+}
+
+const DEMO_SONG: DemoTrackInit[] = [
+  {
+    name: "Vox Lead",
+    color: "#52e5ff",
+    character: "vocals",
+    clips: [
+      { name: "verse take 3", startBar: 4, lengthBars: 8 },
+      { name: "chorus comp", startBar: 12, lengthBars: 8 },
+    ],
+  },
+  {
+    name: "Drum Machine",
+    color: "#ffc857",
+    character: "drums",
+    clips: [{ name: "beat 909", startBar: 0, lengthBars: 16 }],
+  },
+  {
+    name: "Synth Bass",
+    color: "#ff4fd8",
+    character: "bass",
+    clips: [
+      { name: "bassline a", startBar: 0, lengthBars: 8 },
+      { name: "bassline b", startBar: 8, lengthBars: 8 },
+    ],
+  },
+  {
+    name: "Nebula Pad",
+    color: "#9d7bff",
+    character: "pad",
+    clips: [{ name: "swell", startBar: 4, lengthBars: 12 }],
+  },
+  {
+    name: "Hyper Keys",
+    color: "#5cf2b8",
+    character: "other",
+    kind: "midi",
+    instrumentId: "d3m0-inst-neon-keys",
+    clips: [],
+    midiClips: [
+      { name: "arp seq", startBar: 0, lengthBars: 4, notes: demoArpNotes() },
+      { name: "chorus chords", startBar: 8, lengthBars: 4, notes: demoChordNotes() },
+    ],
+  },
+];
+
+// ── Engine ──────────────────────────────────────────────────────────────────
+
+interface DemoJob {
+  status: SidecarJobStatus;
+  onEvent: (e: SidecarEvent) => void;
+  timer: ReturnType<typeof setInterval> | null;
+  request: StemSplitRequest | TranscribeRequest | Record<string, unknown>;
+}
+
+export class DemoBackend implements Backend {
+  readonly mode = "demo" as const;
+
+  private tracks: TrackState[] = [];
+  private clips: Clip[] = [];
+  private characters = new Map<string, ClipCharacter>();
+  private clipSeeds = new Map<string, number>();
+
+  private tState: "stopped" | "playing" | "recording" = "stopped";
+  private anchorSamples = 0; // position when the clock was (re)anchored
+  private anchorWall = 0; // performance.now() at anchor
+  private recordStart = 0;
+
+  // Loop region (samples). Mirrors the engine's transport loop semantics:
+  // active only when enabled && end > start; positions already past the end
+  // free-run.
+  private loopEnabled = false;
+  private loopStart = 0;
+  private loopEnd = 0;
+  private loopTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private meterSubs = new Set<(f: MeterFrame) => void>();
+  private meterTimer: ReturnType<typeof setInterval> | null = null;
+  private meterSeq = 0;
+
+  private jobs = new Map<string, DemoJob>();
+  private listeners = new Map<string, Set<(payload: unknown) => void>>();
+
+  // phase 2 — midi / instruments / mcp
+  private ppq = PPQ;
+  private tempoEvents: TempoEvent[] = [{ tick: 0, bpm: TEMPO }];
+  private midiClips: MidiClip[] = [];
+  private instruments: InstrumentInfo[] = DEMO_INSTRUMENTS.map((i) => ({ ...i }));
+  private mcpPolicy: McpPolicy = { mode: "confirmDestructive", toolOverrides: {}, port: 41717 };
+  private mcpPending = new Map<string, PendingConfirmation & { apply?: () => void }>();
+  private mcpScriptStarted = false;
+  private audioCtx: AudioContext | null = null;
+
+  // phase 3 — plugins (mirrors the backend PluginRegistry semantics)
+  private pluginScanned = false;
+  private pluginDescriptors: PluginDescriptor[] = [];
+  private pluginInstances = new Map<string, PluginInstanceInfo>();
+  private pluginParams = new Map<string, PluginParamInfo[]>();
+  /** Coalesced audio re-schedule after param edits (knob-drag safe). */
+  private pluginResyncTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // WebAudio playback graph (see "demo playback audio" section below)
+  private master: GainNode | null = null;
+  private trackChains = new Map<string, { gain: GainNode; pan: StereoPannerNode }>();
+  private playNodes: AudioScheduledSourceNode[] = [];
+  private clipBuffers = new Map<string, AudioBuffer>();
+
+  constructor() {
+    for (const t of DEMO_SONG) {
+      const track = this.makeTrack({
+        name: t.name,
+        color: t.color,
+        kind: t.kind ?? "audio",
+        instrumentId: t.instrumentId ?? null,
+      });
+      this.tracks.push(track);
+      for (const c of t.clips) {
+        const clip = this.makeClip(track.id, c.name, c.startBar * BAR, c.lengthBars * BAR);
+        this.characters.set(clip.id, t.character);
+        this.clips.push(clip);
+      }
+      for (const m of t.midiClips ?? []) {
+        this.midiClips.push({
+          id: uuid(),
+          trackId: track.id,
+          name: m.name,
+          timelineStartTicks: m.startBar * BAR_TICKS,
+          lengthTicks: m.lengthBars * BAR_TICKS,
+          notes: m.notes,
+        });
+      }
+    }
+    this.scheduleMcpScript();
+  }
+
+  // ── helpers ──
+
+  private makeTrack(init: Partial<TrackState>): TrackState {
+    return {
+      id: uuid(),
+      name: init.name ?? `Track ${this.tracks.length + 1}`,
+      kind: init.kind ?? "audio",
+      gainDb: init.gainDb ?? 0,
+      pan: init.pan ?? 0,
+      muted: init.muted ?? false,
+      soloed: init.soloed ?? false,
+      armed: init.armed ?? false,
+      color: init.color ?? "#52e5ff",
+      instrumentId: init.instrumentId ?? null,
+    };
+  }
+
+  /** samples → ticks with the demo's single-entry tempo map. */
+  private samplesToTicks(samples: number): number {
+    return (samples / SR) * (TEMPO / 60) * this.ppq;
+  }
+
+  private makeClip(trackId: string, name: string, start: number, length: number): Clip {
+    return {
+      id: uuid(),
+      trackId,
+      name,
+      sourcePath: `audio/${name.replace(/\s+/g, "-")}.wav`,
+      sourceChannels: 2,
+      sourceSampleRate: SR,
+      sourceLengthSamples: length,
+      timelineStartSamples: start,
+      offsetSamples: 0,
+      lengthSamples: length,
+      gainDb: 0,
+      fadeInSamples: 0,
+      fadeOutSamples: 0,
+    };
+  }
+
+  private seedOf(clipId: string): number {
+    let s = this.clipSeeds.get(clipId);
+    if (s === undefined) {
+      s = hashString(clipId);
+      this.clipSeeds.set(clipId, s);
+    }
+    return s;
+  }
+
+  private characterOf(clipId: string): ClipCharacter {
+    return this.characters.get(clipId) ?? "other";
+  }
+
+  hintClipCharacter(clipId: string, character: string) {
+    this.characters.set(clipId, character as ClipCharacter);
+    this.clipBuffers.delete(clipId); // re-synthesize with the new character
+    this.resyncAudio();
+  }
+
+  registerClip(clip: Clip) {
+    if (!this.clips.some((c) => c.id === clip.id)) {
+      this.clips.push({ ...clip });
+      this.resyncAudio();
+    }
+  }
+
+  private now(): number {
+    return performance.now();
+  }
+
+  private position(): number {
+    if (this.tState === "stopped") return this.anchorSamples;
+    const raw = this.anchorSamples + ((this.now() - this.anchorWall) / 1000) * SR;
+    // Same wrap rule as the engine's transport::advance.
+    if (
+      this.loopEnabled &&
+      this.loopEnd > this.loopStart &&
+      this.anchorSamples < this.loopEnd &&
+      raw >= this.loopEnd
+    ) {
+      return this.loopStart + ((raw - this.loopStart) % (this.loopEnd - this.loopStart));
+    }
+    return raw;
+  }
+
+  private snapshot(): TransportState {
+    return {
+      state: this.tState,
+      positionSamples: Math.max(0, Math.round(this.position())),
+      sampleRate: SR,
+      tempoBpm: TEMPO,
+      loopEnabled: this.loopEnabled,
+      loopStartSamples: Math.round(this.loopStart),
+      loopEndSamples: Math.round(this.loopEnd),
+    };
+  }
+
+  /**
+   * (Re)arm the loop-wrap timer: when the rolling playhead reaches the loop
+   * end, re-anchor at the loop start and re-schedule the WebAudio graph so
+   * demo playback audibly wraps (not just the visual playhead).
+   */
+  private armLoopWrap() {
+    if (this.loopTimer) {
+      clearTimeout(this.loopTimer);
+      this.loopTimer = null;
+    }
+    if (this.tState === "stopped" || !this.loopEnabled || this.loopEnd <= this.loopStart) return;
+    const pos = this.position();
+    if (pos >= this.loopEnd) return; // past the region: free-running
+    const ms = ((this.loopEnd - pos) / SR) * 1000;
+    this.loopTimer = setTimeout(() => {
+      if (this.tState === "stopped" || !this.loopEnabled) return;
+      this.anchorSamples = this.loopStart;
+      this.anchorWall = this.now();
+      this.resyncAudio();
+      this.emitTransport();
+      this.armLoopWrap();
+    }, Math.max(0, ms));
+  }
+
+  private emit<K extends AuraEventName>(event: K, payload: AuraEventMap[K]) {
+    const subs = this.listeners.get(event);
+    if (subs) for (const cb of subs) cb(payload);
+  }
+
+  private emitTransport() {
+    this.emit("transport://state", this.snapshot());
+  }
+
+  // ── transport ──
+
+  async transportPlay(): Promise<TransportState> {
+    if (this.tState === "stopped") {
+      this.anchorWall = this.now();
+      this.tState = "playing";
+      // Called from the user's play gesture — the AudioContext may be
+      // created/resumed here, so playback is actually audible.
+      this.startAudio();
+      this.armLoopWrap();
+      this.emitTransport();
+    }
+    return this.snapshot();
+  }
+
+  async transportStop(): Promise<TransportState> {
+    if (this.tState === "recording") await this.stopRecording();
+    if (this.tState !== "stopped") {
+      this.anchorSamples = this.position();
+      this.tState = "stopped";
+      this.stopAudioNodes();
+      this.armLoopWrap(); // clears the wrap timer
+      this.emitTransport();
+    }
+    return this.snapshot();
+  }
+
+  async transportSeek(positionSamples: number): Promise<TransportState> {
+    this.anchorSamples = Math.max(0, positionSamples);
+    this.anchorWall = this.now();
+    this.resyncAudio();
+    this.armLoopWrap();
+    this.emitTransport();
+    return this.snapshot();
+  }
+
+  async transportSetLoop(
+    enabled: boolean,
+    startSamples: number,
+    endSamples: number,
+  ): Promise<TransportState> {
+    if (enabled && endSamples <= startSamples) {
+      throw new Error(`loop region is empty (start ${startSamples} >= end ${endSamples})`);
+    }
+    this.loopEnabled = enabled;
+    this.loopStart = Math.max(0, startSamples);
+    this.loopEnd = Math.max(0, endSamples);
+    this.armLoopWrap();
+    this.emitTransport();
+    return this.snapshot();
+  }
+
+  async getTransportState(): Promise<TransportState> {
+    return this.snapshot();
+  }
+
+  // ── demo playback audio (WebAudio) ──
+  //
+  // The demo engine is only honest if pressing PLAY makes sound. Audio clips
+  // are synthesized once into AudioBuffers from the SAME envelope() that
+  // drives the meters and waveform tiles, so what you hear matches what you
+  // see; midi clips schedule real oscillator voices from their note data.
+  // Track gain/pan/mute/solo apply live through per-track gain+panner nodes.
+
+  private ensureCtx(): AudioContext {
+    const ctx = (this.audioCtx ??= new (window.AudioContext ??
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)());
+    if (ctx.state === "suspended") void ctx.resume();
+    return ctx;
+  }
+
+  private masterBus(ctx: AudioContext): GainNode {
+    if (!this.master) {
+      this.master = ctx.createGain();
+      this.master.gain.value = 0.8;
+      this.master.connect(ctx.destination);
+    }
+    return this.master;
+  }
+
+  private trackChain(trackId: string): { gain: GainNode; pan: StereoPannerNode } | null {
+    const ctx = this.audioCtx;
+    if (!ctx || !this.track(trackId)) return null;
+    let chain = this.trackChains.get(trackId);
+    if (!chain) {
+      const gain = ctx.createGain();
+      const pan = ctx.createStereoPanner();
+      gain.connect(pan);
+      pan.connect(this.masterBus(ctx));
+      chain = { gain, pan };
+      this.trackChains.set(trackId, chain);
+    }
+    this.applyChainParams(trackId, chain);
+    return chain;
+  }
+
+  private applyChainParams(trackId: string, chain: { gain: GainNode; pan: StereoPannerNode }) {
+    const track = this.track(trackId);
+    if (!track) return;
+    const anySolo = this.tracks.some((t) => t.soloed);
+    const audible = !track.muted && (!anySolo || track.soloed);
+    const lin = track.gainDb <= -160 ? 0 : Math.pow(10, track.gainDb / 20);
+    chain.gain.gain.value = audible ? lin : 0;
+    chain.pan.pan.value = Math.max(-1, Math.min(1, track.pan));
+  }
+
+  /** Re-apply gain/pan/mute/solo to the live audio graph (knob-rate safe). */
+  private refreshTrackAudio() {
+    for (const [id, chain] of this.trackChains) this.applyChainParams(id, chain);
+  }
+
+  private dropTrackChain(trackId: string) {
+    const chain = this.trackChains.get(trackId);
+    if (chain) {
+      try {
+        chain.gain.disconnect();
+        chain.pan.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+      this.trackChains.delete(trackId);
+    }
+  }
+
+  private startAudio() {
+    const ctx = this.ensureCtx();
+    this.stopAudioNodes();
+    this.scheduleFrom(ctx, this.position());
+  }
+
+  private stopAudioNodes() {
+    for (const n of this.playNodes) {
+      try {
+        n.stop();
+      } catch {
+        /* not started yet / already stopped */
+      }
+      try {
+        n.disconnect();
+      } catch {
+        /* already disconnected */
+      }
+    }
+    this.playNodes = [];
+  }
+
+  /** Content or timing changed while rolling: re-schedule from the playhead. */
+  private resyncAudio() {
+    if (!this.audioCtx || this.tState === "stopped") return;
+    this.stopAudioNodes();
+    this.scheduleFrom(this.audioCtx, this.position());
+  }
+
+  /** samples from ticks with the demo's single-entry tempo map. */
+  private ticksToSamples(ticks: number): number {
+    const bpm = this.tempoEvents[0]?.bpm ?? TEMPO;
+    return (ticks / this.ppq) * (60 / bpm) * SR;
+  }
+
+  private scheduleFrom(ctx: AudioContext, pos: number) {
+    const t0 = ctx.currentTime + 0.05;
+
+    // Audio clips → envelope-synthesized buffers.
+    for (const clip of this.clips) {
+      const end = clip.timelineStartSamples + clip.lengthSamples;
+      if (end <= pos) continue;
+      const chain = this.trackChain(clip.trackId);
+      if (!chain) continue;
+      const src = ctx.createBufferSource();
+      src.buffer = this.bufferFor(ctx, clip);
+      const clipGain = ctx.createGain();
+      clipGain.gain.value = clip.gainDb <= -160 ? 0 : Math.pow(10, clip.gainDb / 20);
+      src.connect(clipGain);
+      clipGain.connect(chain.gain);
+      const startsIn = (clip.timelineStartSamples - pos) / SR;
+      if (startsIn >= 0) src.start(t0 + startsIn);
+      else src.start(t0, -startsIn); // already inside the clip: offset seconds
+      this.playNodes.push(src);
+    }
+
+    // MIDI clips → oscillator voices from the actual note data.
+    for (const mc of this.midiClips) {
+      const clipStart = this.ticksToSamples(mc.timelineStartTicks);
+      const clipEnd = this.ticksToSamples(mc.timelineStartTicks + mc.lengthTicks);
+      if (clipEnd <= pos) continue;
+      const chain = this.trackChain(mc.trackId);
+      if (!chain) continue;
+      const instId = this.track(mc.trackId)?.instrumentId;
+      const inst = instId ? this.instruments.find((i) => i.id === instId) : undefined;
+      const bells = !!inst?.name.toLowerCase().includes("bell");
+      // Plugin-bound track? "stub" instances honestly render silence; "active"
+      // ones voice through the demo synth shaped by their live parameters.
+      let shape: DemoVoiceShape | null = null;
+      if (instId?.startsWith("plugin:")) {
+        const pinst = this.pluginInstances.get(instId.slice("plugin:".length));
+        if (!pinst || pinst.status !== "active") continue;
+        shape = this.pluginVoiceShape(pinst.id);
+      }
+      for (const n of mc.notes) {
+        const ns = clipStart + this.ticksToSamples(n.tick);
+        const ne = Math.min(ns + this.ticksToSamples(n.lengthTicks), clipEnd);
+        if (ne <= pos) continue;
+        const when = t0 + Math.max(0, ns - pos) / SR;
+        const dur = Math.max(0.05, (ne - Math.max(ns, pos)) / SR);
+        this.scheduleVoice(ctx, chain.gain, when, dur, n.key, n.velocity, bells, shape);
+      }
+    }
+  }
+
+  /** One poly-synth voice: detuned saws (or sine for bells) + LP + envelope. */
+  private scheduleVoice(
+    ctx: AudioContext,
+    dest: AudioNode,
+    when: number,
+    dur: number,
+    key: number,
+    velocity: number,
+    bells: boolean,
+    shape: DemoVoiceShape | null = null,
+  ) {
+    const freq = 440 * Math.pow(2, (key - 69) / 12);
+    const vel = (Math.max(1, Math.min(127, velocity)) / 127) * (shape ? shape.volume : 1);
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, when);
+    gain.gain.linearRampToValueAtTime(0.13 * vel, when + 0.01);
+    gain.gain.setTargetAtTime(0.045 * vel, when + 0.01, 0.28);
+    gain.gain.setTargetAtTime(0, when + dur, 0.07); // release
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    const openHz = shape?.cutoffHz ?? Math.min(12000, freq * (bells ? 8 : 4.5));
+    filter.frequency.setValueAtTime(Math.max(60, openHz), when);
+    filter.frequency.setTargetAtTime(
+      Math.max(200, Math.min(openHz, Math.max(400, freq * 1.6))),
+      when + 0.02,
+      0.3,
+    );
+    filter.Q.value = 0.9;
+    filter.connect(gain);
+    gain.connect(dest);
+    const stopAt = when + dur + 0.5;
+    const wave: OscillatorType = shape?.wave ?? (bells ? "sine" : "sawtooth");
+    const spread = shape ? Math.max(1, Math.abs(shape.detuneCents)) : 0;
+    const detunes = shape ? [-spread, spread] : bells ? [0] : [-6, 5];
+    for (const detune of detunes) {
+      const osc = ctx.createOscillator();
+      osc.type = wave;
+      osc.frequency.value = freq;
+      osc.detune.value = detune;
+      osc.connect(filter);
+      osc.start(when);
+      osc.stop(stopAt);
+      this.playNodes.push(osc);
+    }
+  }
+
+  /** Read the audible controls out of a plugin instance's param mirror. */
+  private pluginVoiceShape(instanceId: string): DemoVoiceShape {
+    const params = this.pluginParams.get(instanceId) ?? [];
+    const find = (frag: string) =>
+      params.find((p) => p.name.toLowerCase().includes(frag));
+    const cutoff = find("cutoff");
+    const detune = find("detune");
+    const volume = find("volume");
+    const waveP = find("wave");
+    const WAVES: OscillatorType[] = ["sawtooth", "square", "triangle", "sine"];
+    return {
+      cutoffHz: cutoff ? cutoff.value : null,
+      detuneCents: detune ? detune.value : 6,
+      wave: waveP ? (WAVES[Math.round(waveP.value)] ?? "sawtooth") : null,
+      volume: volume ? volume.value / (volume.max || 1) : 1,
+    };
+  }
+
+  /**
+   * Synthesize a clip's audio from its meter/waveform envelope. Mono at a
+   * reduced sample rate (plenty for demo timbres, 4x lighter on memory);
+   * cached per clip id.
+   */
+  private bufferFor(ctx: AudioContext, clip: Clip): AudioBuffer {
+    const cached = this.clipBuffers.get(clip.id);
+    if (cached) return cached;
+    const rate = 24000;
+    const secs = Math.min(180, clip.lengthSamples / SR);
+    const frames = Math.max(1, Math.ceil(secs * rate));
+    const buffer = ctx.createBuffer(1, frames, rate);
+    const out = buffer.getChannelData(0);
+    const character = this.characterOf(clip.id);
+    const seed = this.seedOf(clip.id);
+    const beat = 60 / TEMPO;
+    let rng = (seed >>> 0) || 0x9e3779b9;
+    const white = () => {
+      rng ^= (rng << 13) >>> 0;
+      rng ^= rng >>> 17;
+      rng ^= (rng << 5) >>> 0;
+      rng >>>= 0;
+      return (rng / 4294967296) * 2 - 1;
+    };
+    const off = clip.offsetSamples / SR;
+    const TAU = 2 * Math.PI;
+    for (let i = 0; i < frames; i++) {
+      const t = off + i / rate;
+      const env = envelope(character, seed, t);
+      let s = 0;
+      switch (character) {
+        case "drums": {
+          const bt = t / beat;
+          const frac = bt - Math.floor(bt);
+          const kick = Math.exp(-frac * 11);
+          s =
+            0.75 * kick * Math.sin(TAU * (50 + 45 * kick) * t) +
+            0.3 * env * white();
+          break;
+        }
+        case "bass": {
+          const bar = Math.floor(t / (beat * 4));
+          const root = [33, 29, 36, 31][bar % 4]; // A1 F1 C2 G1
+          const f = 440 * Math.pow(2, (root - 69) / 12);
+          s =
+            env *
+            (0.55 * Math.sin(TAU * f * t) +
+              0.28 * Math.sin(TAU * 2 * f * t) +
+              0.12 * Math.sin(TAU * 3 * f * t));
+          break;
+        }
+        case "vocals": {
+          const f = 329.63 * (1 + 0.006 * Math.sin(TAU * 5.3 * t));
+          s =
+            env *
+            (0.55 * Math.sin(TAU * f * t) +
+              0.26 * Math.sin(TAU * 2 * f * t) +
+              0.12 * Math.sin(TAU * 3 * f * t));
+          break;
+        }
+        case "pad": {
+          s =
+            env *
+            0.28 *
+            (Math.sin(TAU * 110 * t) +
+              Math.sin(TAU * 164.81 * t + 0.5) +
+              Math.sin(TAU * 220.6 * t) +
+              0.6 * Math.sin(TAU * 329.63 * t));
+          break;
+        }
+        default: {
+          s =
+            env *
+            (0.5 * Math.sin(TAU * 523.25 * t) +
+              0.22 * Math.sin(TAU * 659.25 * t) +
+              0.12 * white());
+        }
+      }
+      out[i] = Math.max(-1, Math.min(1, s * 0.85));
+    }
+    this.clipBuffers.set(clip.id, buffer);
+    return buffer;
+  }
+
+  // ── devices ──
+
+  async listInputDevices(): Promise<AudioDevice[]> {
+    return [
+      { id: "demo-in", name: "Demo Interface — In 1/2", isDefault: true, maxChannels: 2, defaultSampleRate: SR },
+      { id: "demo-mic", name: "Built-in Microphone", isDefault: false, maxChannels: 1, defaultSampleRate: 44100 },
+    ];
+  }
+  async listOutputDevices(): Promise<AudioDevice[]> {
+    return [
+      { id: "demo-out", name: "Demo Interface — Out 1/2", isDefault: true, maxChannels: 2, defaultSampleRate: SR },
+      { id: "demo-spk", name: "Built-in Speakers", isDefault: false, maxChannels: 2, defaultSampleRate: 44100 },
+    ];
+  }
+  async selectInputDevice(_id: string): Promise<void> {}
+  async selectOutputDevice(_id: string): Promise<void> {}
+
+  // ── recording ──
+
+  async startRecording(trackIds: string[] | null = null): Promise<void> {
+    const armed = trackIds ?? this.tracks.filter((t) => t.armed).map((t) => t.id);
+    if (armed.length === 0) return;
+    this.recordStart = Math.round(this.position());
+    this.anchorSamples = this.recordStart;
+    this.anchorWall = this.now();
+    this.tState = "recording";
+    this.startAudio(); // existing clips keep playing under the take
+    this.emitTransport();
+    this.emit("recording://state", {
+      recording: true,
+      trackIds: armed,
+      startedAtSamples: this.recordStart,
+      xruns: 0,
+    });
+  }
+
+  async stopRecording(): Promise<Clip[]> {
+    if (this.tState !== "recording") return [];
+    const end = Math.round(this.position());
+    const armed = this.tracks.filter((t) => t.armed);
+    const clips: Clip[] = [];
+    const length = Math.max(SR / 4, end - this.recordStart);
+    for (const track of armed) {
+      const clip = this.makeClip(track.id, `take ${new Date().toLocaleTimeString()}`, this.recordStart, length);
+      this.characters.set(clip.id, "vocals");
+      this.clips.push(clip);
+      clips.push(clip);
+    }
+    this.anchorSamples = end;
+    this.anchorWall = this.now();
+    this.tState = "playing";
+    this.resyncAudio(); // the new takes are audible immediately
+    this.emitTransport();
+    this.emit("recording://state", { recording: false, trackIds: armed.map((t) => t.id), clips });
+    return clips;
+  }
+
+  // ── meters ──
+
+  async subscribeMeters(onFrame: (frame: MeterFrame) => void): Promise<Unsubscribe> {
+    this.meterSubs.add(onFrame);
+    if (!this.meterTimer) {
+      this.meterTimer = setInterval(() => this.tickMeters(), 1000 / 60);
+    }
+    return () => {
+      this.meterSubs.delete(onFrame);
+      if (this.meterSubs.size === 0 && this.meterTimer) {
+        clearInterval(this.meterTimer);
+        this.meterTimer = null;
+      }
+    };
+  }
+
+  private tickMeters() {
+    const pos = this.position();
+    const anySolo = this.tracks.some((t) => t.soloed);
+    const wall = this.now() / 1000;
+    let sumL = 0;
+    let sumR = 0;
+    const trackMeters: TrackMeter[] = this.tracks.map((track) => {
+      let env = 0;
+      if (this.tState === "recording" && track.armed) {
+        // live input: speech-ish noise
+        const n = noise(hashString(track.id), Math.floor(wall * 30));
+        env = 0.25 + 0.55 * n * (0.5 + 0.5 * Math.sin(wall * 6.1));
+      } else if (this.tState !== "stopped") {
+        for (const clip of this.clips) {
+          if (clip.trackId !== track.id) continue;
+          if (pos < clip.timelineStartSamples || pos >= clip.timelineStartSamples + clip.lengthSamples) continue;
+          const t = (pos - clip.timelineStartSamples + clip.offsetSamples) / SR;
+          env = Math.max(env, envelope(this.characterOf(clip.id), this.seedOf(clip.id), t));
+        }
+        // midi clips: envelope from the actual note data (attack + decay)
+        const posTicks = this.samplesToTicks(pos);
+        for (const mc of this.midiClips) {
+          if (mc.trackId !== track.id) continue;
+          const local = posTicks - mc.timelineStartTicks;
+          if (local < 0 || local >= mc.lengthTicks) continue;
+          for (const n of mc.notes) {
+            if (local < n.tick || local >= n.tick + n.lengthTicks) continue;
+            const age = (local - n.tick) / this.ppq; // beats since onset
+            const e = (n.velocity / 127) * (0.35 + 0.65 * Math.exp(-age * 2.2));
+            if (e > env) env = e;
+          }
+        }
+      }
+      const audible = !track.muted && (!anySolo || track.soloed);
+      const gain = track.gainDb <= -160 ? 0 : Math.pow(10, track.gainDb / 20);
+      const level = audible ? env * gain : 0;
+      const jitterL = 0.92 + 0.08 * noise(hashString(track.id) ^ 1, Math.floor(wall * 60));
+      const jitterR = 0.92 + 0.08 * noise(hashString(track.id) ^ 2, Math.floor(wall * 60));
+      const panL = Math.min(1, 1 - track.pan);
+      const panR = Math.min(1, 1 + track.pan);
+      const peakL = level * jitterL * panL;
+      const peakR = level * jitterR * panR;
+      sumL += peakL * peakL;
+      sumR += peakR * peakR;
+      return {
+        trackId: track.id,
+        peakL,
+        peakR,
+        rmsL: peakL * 0.62,
+        rmsR: peakR * 0.62,
+        clipped: peakL >= 1 || peakR >= 1,
+      };
+    });
+    const mL = Math.sqrt(sumL) * 0.7;
+    const mR = Math.sqrt(sumR) * 0.7;
+    const frame: MeterFrame = {
+      seq: this.meterSeq++,
+      positionSamples: Math.max(0, Math.round(pos)),
+      tracks: trackMeters,
+      master: {
+        trackId: "master",
+        peakL: mL,
+        peakR: mR,
+        rmsL: mL * 0.62,
+        rmsR: mR * 0.62,
+        clipped: mL >= 1 || mR >= 1,
+      },
+    };
+    for (const cb of this.meterSubs) cb(frame);
+  }
+
+  // ── waveform tiles (AWTF wire format) ──
+
+  async getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer> {
+    const channels = 2;
+    const bins = AWTF_BINS_PER_TILE;
+    const binWidth = Math.pow(2, 8 + req.lod); // source samples per bin
+    const headerBytes = 4 + 2 + 2 + 4 + 8 + 4;
+    const buf = new ArrayBuffer(headerBytes + channels * bins * 4);
+    const view = new DataView(buf);
+    view.setUint32(0, AWTF_MAGIC, true);
+    view.setUint16(4, 1, true);
+    view.setUint16(6, channels, true);
+    view.setUint32(8, req.lod, true);
+    view.setBigUint64(12, BigInt(req.tileIndex), true);
+    view.setUint32(20, bins, true);
+
+    const character = this.characterOf(req.clipId);
+    const seed = this.seedOf(req.clipId);
+    const i16 = new Int16Array(buf, headerBytes);
+    const firstBin = req.tileIndex * bins;
+    for (let ch = 0; ch < channels; ch++) {
+      const chSeed = seed ^ (ch * 0x5bd1);
+      for (let b = 0; b < bins; b++) {
+        const t = ((firstBin + b) * binWidth) / SR;
+        // sample the envelope a few times across the bin, keep extremes
+        let hi = 0;
+        for (let s = 0; s < 3; s++) {
+          const e = envelope(character, seed, t + (s * binWidth) / (3 * SR));
+          if (e > hi) hi = e;
+        }
+        const rough = 0.75 + 0.25 * noise(chSeed, firstBin + b);
+        const max = Math.min(1, hi * rough);
+        const min = -Math.min(1, hi * (0.7 + 0.3 * noise(chSeed ^ 0xa5a5, firstBin + b)));
+        i16[ch * bins * 2 + b * 2] = Math.round(min * 32767);
+        i16[ch * bins * 2 + b * 2 + 1] = Math.round(max * 32767);
+      }
+    }
+    // simulate a little IPC latency so loading states are honest
+    await new Promise((r) => setTimeout(r, 2 + Math.random() * 8));
+    return buf;
+  }
+
+  // ── tracks ──
+
+  async addTrack(init: Partial<TrackState> = {}): Promise<TrackState> {
+    const track = this.makeTrack(init);
+    this.tracks.push(track);
+    return track;
+  }
+
+  async removeTrack(trackId: string): Promise<void> {
+    this.tracks = this.tracks.filter((t) => t.id !== trackId);
+    this.clips = this.clips.filter((c) => c.trackId !== trackId);
+    this.dropTrackChain(trackId);
+    this.resyncAudio();
+  }
+
+  async getTracks(): Promise<TrackState[]> {
+    return this.tracks.map((t) => ({ ...t }));
+  }
+
+  private track(id: string): TrackState | undefined {
+    return this.tracks.find((t) => t.id === id);
+  }
+
+  async setTrackGain(trackId: string, gainDb: number) {
+    const t = this.track(trackId);
+    if (t) t.gainDb = gainDb;
+    this.refreshTrackAudio();
+  }
+  async setTrackPan(trackId: string, pan: number) {
+    const t = this.track(trackId);
+    if (t) t.pan = pan;
+    this.refreshTrackAudio();
+  }
+  async setTrackMute(trackId: string, muted: boolean) {
+    const t = this.track(trackId);
+    if (t) t.muted = muted;
+    this.refreshTrackAudio();
+  }
+  async setTrackSolo(trackId: string, soloed: boolean) {
+    const t = this.track(trackId);
+    if (t) t.soloed = soloed;
+    this.refreshTrackAudio();
+  }
+  async setTrackArm(trackId: string, armed: boolean) {
+    const t = this.track(trackId);
+    if (t) t.armed = armed;
+  }
+
+  // ── project ──
+
+  private projectSnapshot(): Project {
+    return {
+      schemaVersion: 1,
+      name: "Neon District",
+      sampleRate: SR,
+      tempoBpm: TEMPO,
+      timeSignature: [4, 4],
+      tracks: this.tracks.map((t) => ({ ...t })),
+      clips: this.clips.map((c) => ({ ...c })),
+      transport: this.snapshot(),
+    };
+  }
+
+  async createProject(name: string): Promise<Project> {
+    return { ...this.projectSnapshot(), name };
+  }
+  async openProject(_path: string): Promise<Project> {
+    return this.projectSnapshot();
+  }
+  async saveProject(): Promise<void> {}
+  async getProject(): Promise<Project> {
+    return this.projectSnapshot();
+  }
+
+  // ── sidecars ──
+
+  sidecarSplitStems(request: StemSplitRequest, onEvent: (e: SidecarEvent) => void) {
+    return this.runFakeJob("stemSplit", request, onEvent);
+  }
+  sidecarTranscribe(request: TranscribeRequest, onEvent: (e: SidecarEvent) => void) {
+    return this.runFakeJob("transcribe", request, onEvent);
+  }
+
+  private async runFakeJob(
+    kind: "stemSplit" | "transcribe",
+    request: StemSplitRequest | TranscribeRequest,
+    onEvent: (e: SidecarEvent) => void,
+  ): Promise<string> {
+    const jobId = uuid();
+    const stages =
+      kind === "stemSplit"
+        ? [
+            { until: 0.12, stage: "loading model" },
+            { until: 0.82, stage: "separating" },
+            { until: 1.0, stage: "writing stems" },
+          ]
+        : [
+            { until: 0.1, stage: "loading model" },
+            { until: 0.95, stage: "transcribing" },
+            { until: 1.0, stage: "writing transcript" },
+          ];
+    const job: DemoJob = {
+      status: { jobId, kind, state: "queued", progress: 0, stage: "queued" },
+      onEvent,
+      timer: null,
+      request,
+    };
+    this.jobs.set(jobId, job);
+
+    const durationMs = 6500 + Math.random() * 1500;
+    const started = this.now();
+    job.status.state = "running";
+    job.timer = setInterval(() => {
+      const p = Math.min(1, (this.now() - started) / durationMs);
+      const stage = stages.find((s) => p <= s.until)?.stage ?? stages[stages.length - 1].stage;
+      job.status.progress = p;
+      job.status.stage = stage;
+      const ev: SidecarEvent = { type: "progress", jobId, progress: p, stage };
+      onEvent(ev);
+      this.emit("sidecar://progress", ev);
+      if (p >= 1) {
+        if (job.timer) clearInterval(job.timer);
+        job.timer = null;
+        job.status.state = "done";
+        const result =
+          kind === "stemSplit"
+            ? {
+                kind: "stemSplit" as const,
+                stems: {
+                  vocals: "stems/demo/vocals.wav",
+                  drums: "stems/demo/drums.wav",
+                  bass: "stems/demo/bass.wav",
+                  other: "stems/demo/other.wav",
+                } as Partial<Record<StemName, string>>,
+                elapsedSeconds: durationMs / 1000,
+              }
+            : {
+                kind: "transcribe" as const,
+                language: "en",
+                segments: [
+                  { startSeconds: 0, endSeconds: 2.4, text: "neon rain on empty streets" },
+                  { startSeconds: 3.1, endSeconds: 5.8, text: "i hear the city breathing" },
+                ],
+              };
+        job.status.result = result;
+        const done: SidecarEvent = { type: "done", jobId, result };
+        onEvent(done);
+        this.emit("sidecar://done", done);
+      }
+    }, 100);
+    return jobId;
+  }
+
+  async sidecarJobStatus(jobId: string): Promise<SidecarJobStatus> {
+    const job = this.jobs.get(jobId);
+    if (!job) throw new Error(`unknown job ${jobId}`);
+    return { ...job.status };
+  }
+
+  async sidecarCancelJob(jobId: string): Promise<void> {
+    const job = this.jobs.get(jobId);
+    if (!job || job.status.state !== "running") return;
+    if (job.timer) clearInterval(job.timer);
+    job.timer = null;
+    job.status.state = "cancelled";
+    const ev: SidecarEvent = { type: "error", jobId, message: "cancelled" };
+    job.onEvent(ev);
+    this.emit("sidecar://error", ev);
+  }
+
+  async sidecarListJobs(): Promise<SidecarJobStatus[]> {
+    return [...this.jobs.values()].map((j) => ({ ...j.status }));
+  }
+
+  // ── phase 2: control plane ──
+
+  async getProjectState(): Promise<ProjectSnapshot> {
+    return {
+      projectName: "Neon District",
+      projectDir: "/home/demo/Neon District.aura",
+      transport: this.snapshot(),
+      tracks: this.tracks.map((t) => ({ ...t })),
+      clips: this.clips.map((c) => ({ ...c })),
+      midiClips: this.midiClips.map((c) => ({ ...c, notes: [...c.notes] })),
+      ppq: this.ppq,
+      tempoEvents: [...this.tempoEvents],
+    };
+  }
+
+  async importAudioClip(request: ImportClipRequest): Promise<Clip> {
+    let trackId = request.trackId ?? null;
+    if (!trackId) {
+      const base = request.path.split("/").pop()?.replace(/\.\w+$/, "") ?? "import";
+      const track = this.makeTrack({ name: base, color: "#ff8b5c" });
+      this.tracks.push(track);
+      trackId = track.id;
+    }
+    const clip = this.makeClip(
+      trackId,
+      request.path.split("/").pop() ?? "import",
+      request.atSamples ?? 0,
+      8 * BAR,
+    );
+    this.characters.set(clip.id, "other");
+    this.clips.push(clip);
+    this.resyncAudio();
+    return clip;
+  }
+
+  // ── phase 2: midi ──
+
+  async setTempoMap(ppq: number | null, events: TempoEvent[]) {
+    if (events.length === 0 || events[0].tick !== 0) {
+      throw new Error("tempo map must start at tick 0");
+    }
+    if (ppq) this.ppq = ppq;
+    this.tempoEvents = events.map((e) => ({ ...e }));
+    this.resyncAudio();
+    return { ppq: this.ppq, events: [...this.tempoEvents] };
+  }
+
+  async midiAddClip(
+    trackId: string,
+    name: string | null,
+    timelineStartTicks: number,
+    lengthTicks: number,
+  ): Promise<MidiClip> {
+    const track = this.track(trackId);
+    if (!track) throw new Error(`unknown track: ${trackId}`);
+    if (track.kind !== "midi") throw new Error(`track ${trackId} is not a midi track`);
+    const clip: MidiClip = {
+      id: uuid(),
+      trackId,
+      name: name ?? `MIDI Clip ${this.midiClips.length + 1}`,
+      timelineStartTicks,
+      lengthTicks,
+      notes: [],
+    };
+    this.midiClips.push(clip);
+    this.resyncAudio();
+    return { ...clip };
+  }
+
+  async midiSetNotes(clipId: string, notes: MidiNote[]): Promise<MidiClip> {
+    const clip = this.midiClips.find((c) => c.id === clipId);
+    if (!clip) throw new Error(`unknown MIDI clip: ${clipId}`);
+    clip.notes = [...notes].sort((a, b) => a.tick - b.tick || a.key - b.key);
+    this.resyncAudio();
+    return { ...clip, notes: [...clip.notes] };
+  }
+
+  async midiGetClips(): Promise<MidiClip[]> {
+    return this.midiClips.map((c) => ({ ...c, notes: [...c.notes] }));
+  }
+
+  async midiImportFile(path: string): Promise<MidiClip[]> {
+    // Fabricate one imported clip on a fresh midi track.
+    const base = path.split("/").pop()?.replace(/\.\w+$/, "") ?? "imported";
+    const track = this.makeTrack({ name: base, color: "#5cf2b8", kind: "midi" });
+    this.tracks.push(track);
+    const clip: MidiClip = {
+      id: uuid(),
+      trackId: track.id,
+      name: base,
+      timelineStartTicks: 0,
+      lengthTicks: 4 * BAR_TICKS,
+      notes: demoArpNotes(),
+    };
+    this.midiClips.push(clip);
+    this.resyncAudio();
+    return [{ ...clip }];
+  }
+
+  async midiExportFile(path: string): Promise<string> {
+    if (this.midiClips.length === 0) throw new Error("no MIDI clips to export");
+    return path;
+  }
+
+  // ── phase 2: sampler ──
+
+  async samplerLoadInstrument(sfzPath: string, name: string | null = null): Promise<InstrumentInfo> {
+    const base = name ?? sfzPath.split("/").pop()?.replace(/\.sfz$/, "") ?? "instrument";
+    const info: InstrumentInfo = {
+      id: uuid(),
+      name: base,
+      sfzPath,
+      regionCount: 12 + (hashString(sfzPath) % 20),
+      keyLow: 36,
+      keyHigh: 96,
+    };
+    this.instruments.push(info);
+    return { ...info };
+  }
+
+  async samplerListInstruments(): Promise<InstrumentInfo[]> {
+    return this.instruments.map((i) => ({ ...i }));
+  }
+
+  /** Browser preview: a tiny hand-rolled subtractive synth via WebAudio. */
+  async samplerPreviewNote(instrumentId: string, key: number, velocity: number): Promise<void> {
+    const inst = this.instruments.find((i) => i.id === instrumentId);
+    const ctx = this.ensureCtx();
+    const now = ctx.currentTime;
+    const freq = 440 * Math.pow(2, (key - 69) / 12);
+    const vel = Math.max(1, Math.min(127, velocity)) / 127;
+    const bells = inst?.name.toLowerCase().includes("bell");
+
+    const gain = ctx.createGain();
+    gain.gain.setValueAtTime(0, now);
+    gain.gain.linearRampToValueAtTime(0.22 * vel, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0004, now + (bells ? 1.4 : 0.7));
+    const filter = ctx.createBiquadFilter();
+    filter.type = "lowpass";
+    filter.frequency.setValueAtTime(Math.min(14000, freq * (bells ? 9 : 5)), now);
+    filter.frequency.exponentialRampToValueAtTime(Math.max(300, freq * 1.4), now + 0.55);
+    filter.Q.value = 1.1;
+    gain.connect(ctx.destination);
+    filter.connect(gain);
+
+    for (const detune of bells ? [0] : [-7, 6]) {
+      const osc = ctx.createOscillator();
+      osc.type = bells ? "sine" : "sawtooth";
+      osc.frequency.value = freq;
+      osc.detune.value = detune;
+      osc.connect(filter);
+      osc.start(now);
+      osc.stop(now + 1.6);
+    }
+    if (bells) {
+      const partial = ctx.createOscillator();
+      partial.type = "sine";
+      partial.frequency.value = freq * 2.76; // inharmonic shimmer
+      const pg = ctx.createGain();
+      pg.gain.setValueAtTime(0.08 * vel, now);
+      pg.gain.exponentialRampToValueAtTime(0.0003, now + 0.9);
+      partial.connect(pg);
+      pg.connect(ctx.destination);
+      partial.start(now);
+      partial.stop(now + 1.0);
+    }
+  }
+
+  async setTrackInstrument(trackId: string, instrumentId: string | null): Promise<TrackState> {
+    const track = this.track(trackId);
+    if (!track) throw new Error(`unknown track: ${trackId}`);
+    if (track.kind !== "midi") throw new Error(`track ${trackId} is not a midi track`);
+    if (instrumentId?.startsWith("plugin:")) {
+      const pid = instrumentId.slice("plugin:".length);
+      const inst = this.pluginInstances.get(pid);
+      if (!inst) throw new Error(`unknown plugin instance: ${pid} (plugin_instantiate first)`);
+      inst.trackId = trackId;
+    } else if (instrumentId && !this.instruments.some((i) => i.id === instrumentId)) {
+      throw new Error(`unknown instrument: ${instrumentId} (load it first)`);
+    }
+    // A rebind away from a plugin clears that instance's track ref.
+    for (const inst of this.pluginInstances.values()) {
+      if (inst.trackId === trackId && instrumentId !== `plugin:${inst.id}`) inst.trackId = null;
+    }
+    track.instrumentId = instrumentId;
+    this.resyncAudio();
+    return { ...track };
+  }
+
+  // ── phase 3: plugins ──
+
+  async pluginScan(): Promise<PluginDescriptor[]> {
+    // Simulated dlopen/world walk latency so scan UI states are honest.
+    await new Promise((r) => setTimeout(r, 650 + Math.random() * 350));
+    this.pluginDescriptors = DEMO_PLUGINS.map((d) => ({ ...d }));
+    this.pluginScanned = true;
+    return this.pluginDescriptors.map((d) => ({ ...d }));
+  }
+
+  async pluginList(): Promise<PluginListResult> {
+    return {
+      plugins: this.pluginDescriptors.map((d) => ({ ...d })),
+      instances: [...this.pluginInstances.values()].map((i) => ({ ...i })),
+      scanned: this.pluginScanned,
+    };
+  }
+
+  async pluginInstantiate(uid: string): Promise<PluginInstanceInfo> {
+    // Mirrors the backend PluginRegistry error surface verbatim.
+    if (!this.pluginScanned) throw new Error("no plugin scan yet — call plugin_scan first");
+    const desc = this.pluginDescriptors.find((d) => d.uid === uid);
+    if (!desc) throw new Error(`unknown plugin uid: ${uid}`);
+    if (!desc.isInstrument) {
+      throw new Error(`${desc.name} is an effect; v1 hosts instruments on midi tracks only`);
+    }
+    const info: PluginInstanceInfo = {
+      id: uuid(),
+      uid: desc.uid,
+      name: desc.name,
+      format: desc.format,
+      status: "stub",
+      trackId: null,
+    };
+    this.pluginInstances.set(info.id, info);
+    this.pluginParams.set(info.id, demoPluginParams(desc.uid));
+    // Demo "P1/P2 host": the DSP comes up shortly after registration.
+    setTimeout(() => {
+      const inst = this.pluginInstances.get(info.id);
+      if (inst && inst.status === "stub") {
+        inst.status = "active";
+        this.resyncAudio(); // audible immediately if a track is bound
+      }
+    }, 1100);
+    return { ...info };
+  }
+
+  async pluginRemove(instanceId: string): Promise<PluginInstanceInfo> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+    this.pluginInstances.delete(instanceId);
+    this.pluginParams.delete(instanceId);
+    this.resyncAudio(); // bound tracks fall back to silence/PolySynth
+    return { ...inst };
+  }
+
+  async pluginGetParams(instanceId: string): Promise<PluginParamInfo[]> {
+    if (!this.pluginInstances.has(instanceId)) {
+      throw new Error(`unknown plugin instance: ${instanceId}`);
+    }
+    return (this.pluginParams.get(instanceId) ?? []).map((p) => ({ ...p }));
+  }
+
+  async pluginSetParam(
+    instanceId: string,
+    changes: PluginParamChange[],
+  ): Promise<PluginParamInfo[]> {
+    if (!this.pluginInstances.has(instanceId)) {
+      throw new Error(`unknown plugin instance: ${instanceId}`);
+    }
+    const params = this.pluginParams.get(instanceId) ?? [];
+    for (const ch of changes) {
+      const p = params.find((x) => x.id === ch.id);
+      if (p) p.value = Math.min(p.max, Math.max(p.min, ch.value));
+    }
+    this.pluginParams.set(instanceId, params);
+    // Audible follow-up, coalesced: re-schedule voices at most ~6×/s while
+    // a knob is dragged (full-rate rescheduling would restart notes).
+    if (!this.pluginResyncTimer) {
+      this.pluginResyncTimer = setTimeout(() => {
+        this.pluginResyncTimer = null;
+        this.resyncAudio();
+      }, 160);
+    }
+    return params.map((p) => ({ ...p }));
+  }
+
+  // ── phase 2: open-kind generation jobs ──
+
+  async sidecarRunJob(
+    kind: string,
+    params: Record<string, unknown>,
+    onEvent: (e: OpenSidecarEvent) => void,
+  ): Promise<string> {
+    const staged: Record<string, { until: number; stage: string }[]> = {
+      aceStepGenerate: [
+        { until: 0.08, stage: "loading ACE-Step" },
+        { until: 0.2, stage: "encoding prompt" },
+        { until: 0.86, stage: "diffusion" },
+        { until: 1, stage: "decoding audio" },
+      ],
+      aceStepRepaint: [
+        { until: 0.1, stage: "loading ACE-Step" },
+        { until: 0.3, stage: "analyzing region" },
+        { until: 0.9, stage: "repainting" },
+        { until: 1, stage: "crossfading" },
+      ],
+      aceStepAudio2Audio: [
+        { until: 0.1, stage: "loading ACE-Step" },
+        { until: 0.32, stage: "encoding source" },
+        { until: 0.9, stage: "restyling" },
+        { until: 1, stage: "decoding audio" },
+      ],
+      elevenLabsMusic: [
+        { until: 0.15, stage: "contacting api" },
+        { until: 0.85, stage: "composing" },
+        { until: 1, stage: "downloading" },
+      ],
+      amtInfill: [
+        { until: 0.2, stage: "loading anticipation" },
+        { until: 0.9, stage: "sampling tokens" },
+        { until: 1, stage: "merging notes" },
+      ],
+      stableAudioSfz: [
+        { until: 0.1, stage: "loading stable audio" },
+        { until: 0.75, stage: "sampling keys" },
+        { until: 0.92, stage: "trimming + loops" },
+        { until: 1, stage: "writing sfz" },
+      ],
+    };
+    const stages = staged[kind];
+    if (!stages) throw new Error(`unknown job kind: ${kind}`);
+
+    const jobId = uuid();
+    const job: DemoJob = {
+      status: { jobId, kind, state: "queued", progress: 0, stage: "queued" },
+      onEvent: onEvent as (e: SidecarEvent) => void,
+      timer: null,
+      request: params,
+    };
+    this.jobs.set(jobId, job);
+
+    const emitBoth = (e: OpenSidecarEvent) => {
+      onEvent(e);
+      if (e.type === "progress") this.emit("sidecar://progress", e);
+      else if (e.type === "done")
+        this.emit("sidecar://done", e as unknown as AuraEventMap["sidecar://done"]);
+      else if (e.type === "error") this.emit("sidecar://error", e);
+    };
+
+    const logLines = [
+      `worker: ${kind} starting (simulate=demo)`,
+      `params: ${JSON.stringify(params).slice(0, 120)}`,
+    ];
+    setTimeout(() => {
+      for (const line of logLines) emitBoth({ type: "log", jobId, line } as OpenSidecarEvent);
+    }, 120);
+
+    const durationMs = kind === "amtInfill" ? 4200 : 7000 + Math.random() * 2500;
+    const started = this.now();
+    job.status.state = "running";
+    job.timer = setInterval(() => {
+      const p = Math.min(1, (this.now() - started) / durationMs);
+      const stage = stages.find((s) => p <= s.until)?.stage ?? stages[stages.length - 1].stage;
+      job.status.progress = p;
+      job.status.stage = stage;
+      emitBoth({ type: "progress", jobId, progress: p, stage });
+      if (p >= 1) {
+        if (job.timer) clearInterval(job.timer);
+        job.timer = null;
+        job.status.state = "done";
+        const result = this.finishGenJob(kind, params);
+        job.status.result = result as unknown as SidecarJobStatus["result"];
+        emitBoth({ type: "done", jobId, result: result as GenJobResult & Record<string, unknown> });
+      }
+    }, 100);
+    return jobId;
+  }
+
+  /** Build the per-kind result AND apply the control-plane conveniences the
+   * real backend performs (auto-import, auto-instrument-load). */
+  private finishGenJob(kind: string, params: Record<string, unknown>): GenJobResult {
+    if (kind === "amtInfill") {
+      const start = Number(params.regionStartTicks ?? 0);
+      const end = Number(params.regionEndTicks ?? start + 4 * this.ppq);
+      const step = this.ppq / 4;
+      const scale = [57, 60, 62, 64, 67, 69, 72, 76];
+      const notes: MidiNote[] = [];
+      const seed = hashString(JSON.stringify(params));
+      for (let t = start, i = 0; t + step <= end; t += step, i++) {
+        if (noise(seed, i) < 0.22) continue; // breathing room
+        notes.push({
+          tick: Math.round(t),
+          lengthTicks: Math.round(step * (noise(seed ^ 7, i) > 0.7 ? 1.8 : 0.9)),
+          key: scale[Math.floor(noise(seed ^ 13, i) * scale.length)],
+          velocity: 72 + Math.floor(noise(seed ^ 29, i) * 44),
+          channel: 0,
+        });
+      }
+      return { kind: "amtInfill", ppq: this.ppq, notes, simulated: true };
+    }
+    if (kind === "stableAudioSfz") {
+      const name = String(params.name ?? params.prompt ?? "generated").slice(0, 28);
+      const keys = Array.isArray(params.keys) ? (params.keys as number[]) : [36, 48, 60, 72];
+      const info: InstrumentInfo = {
+        id: uuid(),
+        name,
+        sfzPath: `${String(params.outputDir ?? "/home/demo/instruments")}/${name.replace(/\s+/g, "-")}.sfz`,
+        regionCount: keys.length * Number(params.velocityLayers ?? 1),
+        keyLow: Math.min(...keys),
+        keyHigh: Math.max(...keys),
+      };
+      this.instruments.push(info); // == control plane auto-load
+      return {
+        kind: "stableAudioSfz",
+        name: info.name,
+        sfzPath: info.sfzPath,
+        sampleCount: info.regionCount,
+        simulated: true,
+      };
+    }
+    // audio kinds — honor the importToTrackId convenience
+    const outputPath = String(params.outputPath ?? "/home/demo/gen/output.wav");
+    const durationSeconds =
+      Number(params.durationSeconds) > 0 ? Number(params.durationSeconds) : 30;
+    if ("importToTrackId" in params) {
+      const requested = params.importToTrackId ? String(params.importToTrackId) : null;
+      let trackId = requested && this.track(requested) ? requested : null;
+      if (!trackId) {
+        const prompt = String(params.prompt ?? "generated");
+        const track = this.makeTrack({
+          name: prompt.slice(0, 22) || "generated",
+          color: kind === "elevenLabsMusic" ? "#ffc857" : "#ff4fd8",
+        });
+        this.tracks.push(track);
+        trackId = track.id;
+      }
+      const at = Number(params.importAtSamples ?? 0);
+      const clip = this.makeClip(
+        trackId,
+        outputPath.split("/").pop() ?? "generated.wav",
+        at,
+        Math.round(durationSeconds * SR),
+      );
+      this.characters.set(clip.id, kind === "elevenLabsMusic" ? "pad" : "other");
+      this.clips.push(clip);
+      this.resyncAudio();
+    }
+    return { kind, outputPath, durationSeconds, sampleRate: SR, simulated: true };
+  }
+
+  // ── phase 2: mcp ──
+
+  async mcpGetStatus(): Promise<McpStatus> {
+    return {
+      running: true,
+      port: this.mcpPolicy.port ?? 41717,
+      tokenFingerprint: "d3a0f4c8",
+      policy: { ...this.mcpPolicy, toolOverrides: { ...this.mcpPolicy.toolOverrides } },
+      pending: [...this.mcpPending.values()].map(({ apply: _a, ...p }) => ({ ...p })),
+    };
+  }
+
+  async mcpSetPolicy(policy: McpPolicy): Promise<McpPolicy> {
+    this.mcpPolicy = { toolOverrides: {}, port: 41717, ...policy };
+    return { ...this.mcpPolicy };
+  }
+
+  async mcpConfirmPending(confirmationId: string, approve: boolean): Promise<void> {
+    const pending = this.mcpPending.get(confirmationId);
+    if (!pending) throw new Error(`unknown confirmation: ${confirmationId}`);
+    this.mcpPending.delete(confirmationId);
+    if (approve) {
+      pending.apply?.();
+      this.refreshTrackAudio();
+    }
+  }
+
+  private requestConfirm(tool: string, summary: string, apply?: () => void) {
+    if (this.mcpPolicy.mode !== "confirmDestructive") return;
+    const pending: PendingConfirmation & { apply?: () => void } = {
+      id: uuid(),
+      tool,
+      summary,
+      requestedAt: new Date().toISOString(),
+      apply,
+    };
+    this.mcpPending.set(pending.id, pending);
+    const { apply: _a, ...wire } = pending;
+    this.emit("mcp://confirm-requested", { ...wire });
+    // real server: 60 s timeout ⇒ deny
+    setTimeout(() => this.mcpPending.delete(pending.id), 60_000);
+  }
+
+  /** A scripted "agent session" so the confirm flow demos itself. */
+  private scheduleMcpScript() {
+    if (this.mcpScriptStarted) return;
+    this.mcpScriptStarted = true;
+    setTimeout(() => {
+      const bass = this.tracks.find((t) => t.name === "Synth Bass");
+      this.requestConfirm(
+        "set_track_mix",
+        `Set "${bass?.name ?? "Synth Bass"}" gain to -4.2 dB, pan 12% L`,
+        () => {
+          if (bass) {
+            bass.gainDb = -4.2;
+            bass.pan = -0.12;
+          }
+        },
+      );
+    }, 15_000);
+    setTimeout(() => {
+      this.requestConfirm(
+        "run_sidecar_job",
+        'aceStepGenerate: "rain-slick chrome arps, 118 bpm" (30 s → new track)',
+      );
+    }, 75_000);
+  }
+
+  // ── events ──
+
+  on<K extends AuraEventName>(event: K, cb: (payload: AuraEventMap[K]) => void): Unsubscribe {
+    let subs = this.listeners.get(event);
+    if (!subs) {
+      subs = new Set();
+      this.listeners.set(event, subs);
+    }
+    const wrapped = cb as (payload: unknown) => void;
+    subs.add(wrapped);
+    return () => subs.delete(wrapped);
+  }
+}

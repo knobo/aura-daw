@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/audio-device.schema.json",
+  "title": "AudioDevice",
+  "description": "One audio input/output device, as returned by list_input_devices / list_output_devices. Pass `id` to select_input_device / select_output_device. Mirrors Rust struct audio::AudioDevice.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "Stable device identifier (currently the cpal device name). Opaque to the UI.",
+      "type": "string"
+    },
+    "name": {
+      "description": "Human-readable device name for display.",
+      "type": "string"
+    },
+    "isDefault": {
+      "description": "True if this is the OS default device for its direction.",
+      "type": "boolean"
+    },
+    "maxChannels": {
+      "description": "Channel count of the device's default config.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "defaultSampleRate": {
+      "description": "Default sample rate in Hz.",
+      "type": "integer",
+      "minimum": 8000
+    }
+  },
+  "required": ["id", "name", "isDefault", "maxChannels", "defaultSampleRate"],
+  "additionalProperties": false
+}

@@ -1,0 +1,163 @@
+@import "tailwindcss";
+
+/* ────────────────────────────────────────────────────────────────────────────
+   AURA design tokens — committed dark cyberpunk console.
+   Deep blue-black void, cyan/magenta duotone accents, glass panels,
+   hardware-silkscreen micro-labels, mono numerics.
+   ──────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: dark;
+
+  /* surfaces */
+  --bg-0: #05070d; /* void */
+  --bg-1: #0a0d17; /* panel base */
+  --bg-2: #10142a; /* raised */
+  --glass: rgba(13, 17, 30, 0.62);
+  --glass-border: rgba(122, 160, 220, 0.12);
+  --grid-line: rgba(96, 130, 190, 0.09);
+  --grid-line-strong: rgba(96, 130, 190, 0.2);
+
+  /* duotone accents */
+  --cyan: #52e5ff;
+  --cyan-dim: rgba(82, 229, 255, 0.35);
+  --magenta: #ff4fd8;
+  --magenta-dim: rgba(255, 79, 216, 0.35);
+  --red: #ff4152;
+  --amber: #ffc857;
+  --violet: #9d7bff;
+
+  /* text */
+  --text: #d8e3f2;
+  --text-dim: #5f6c85;
+  --text-faint: #39435c;
+
+  /* type */
+  --font-mono: "SFMono-Regular", "JetBrains Mono", "Cascadia Mono", ui-monospace,
+    "Menlo", "Consolas", monospace;
+  --font-ui: "Inter", "SF Pro Text", system-ui, "Segoe UI", sans-serif;
+
+  /* chrome metrics */
+  --track-height: 88px;
+  --rail-width: 268px;
+  --ruler-height: 34px;
+}
+
+html,
+body {
+  height: 100%;
+  overscroll-behavior: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body {
+  background:
+    radial-gradient(1200px 500px at 75% -10%, rgba(82, 229, 255, 0.05), transparent 60%),
+    radial-gradient(900px 500px at 10% 110%, rgba(255, 79, 216, 0.045), transparent 60%),
+    var(--bg-0);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* silkscreen micro-label — the chrome's recurring voice */
+.silk {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.glass {
+  background: var(--glass);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border: 1px solid var(--glass-border);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* focus ring — visible, on-palette */
+:where(button, input, select, [tabindex]):focus-visible {
+  outline: 1px solid var(--cyan);
+  outline-offset: 1px;
+}
+
+/* scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(96, 130, 190, 0.2);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ── shared fader styling (input[type=range]) ── */
+
+input[type="range"].fader {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 14px;
+  background: transparent;
+  cursor: ew-resize;
+}
+input[type="range"].fader::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    to right,
+    var(--fader-fill, var(--cyan)) 0%,
+    var(--fader-fill, var(--cyan)) var(--fader-pct, 50%),
+    rgba(96, 130, 190, 0.18) var(--fader-pct, 50%)
+  );
+}
+input[type="range"].fader::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 4px;
+  height: 13px;
+  margin-top: -5px;
+  border-radius: 1px;
+  background: var(--text);
+  box-shadow: 0 0 6px rgba(216, 227, 242, 0.5);
+}
+input[type="range"].fader::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: rgba(96, 130, 190, 0.18);
+}
+input[type="range"].fader::-moz-range-progress {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--fader-fill, var(--cyan));
+}
+input[type="range"].fader::-moz-range-thumb {
+  width: 4px;
+  height: 13px;
+  border: none;
+  border-radius: 1px;
+  background: var(--text);
+  box-shadow: 0 0 6px rgba(216, 227, 242, 0.5);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

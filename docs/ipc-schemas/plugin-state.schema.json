@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura://ipc/plugin-state.schema.json",
+  "title": "PluginState",
+  "description": "Plugin instance + parameter state (phase 3). Emitter contract, no additionalProperties:false (D-06). Chunked opaque plugin state (CLAP state extension / LV2 state:interface) persists as binary files under <project>/plugins/<instanceId>.state referenced from project v2 — never inline JSON (same rule as AMEV event chunks).",
+  "type": "object",
+  "$defs": {
+    "instance": {
+      "type": "object",
+      "required": ["id", "uid", "name", "format", "status"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Instance uuid. A midi track binds it via instrumentId = 'plugin:<id>' (additive extension of set_track_instrument)."
+        },
+        "uid": { "type": "string", "description": "plugin-descriptor.schema.json uid" },
+        "name": { "type": "string" },
+        "format": { "type": "string", "enum": ["clap", "lv2"] },
+        "status": {
+          "type": "string",
+          "enum": ["stub", "active", "crashed"],
+          "description": "'stub': registered but DSP not hosted yet (renders silence). 'active': live in the graph. 'crashed': isolation evolution — node emits silence + UI badge."
+        },
+        "trackId": { "type": "string" }
+      }
+    },
+    "param": {
+      "type": "object",
+      "required": ["id", "name", "min", "max", "default", "value"],
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Stable per-plugin parameter id (CLAP param id / LV2 control-port index). Automation targets (targetNode=instanceId, paramId=id) use this."
+        },
+        "name": { "type": "string" },
+        "min": { "type": "number" },
+        "max": { "type": "number" },
+        "default": { "type": "number" },
+        "value": { "type": "number" },
+        "steps": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Discrete step count; 0 = continuous."
+        }
+      }
+    },
+    "paramChange": {
+      "type": "object",
+      "required": ["id", "value"],
+      "description": "One element of plugin_set_param's batched changes array (D-03: born batch-shaped; a knob drag is one invoke with N changes, not N invokes).",
+      "properties": {
+        "id": { "type": "integer", "minimum": 0 },
+        "value": { "type": "number" }
+      }
+    },
+    "persistedInstance": {
+      "type": "object",
+      "required": ["id", "uid"],
+      "description": "project v2 'plugins' array element: enough to re-instantiate and restore on open.",
+      "properties": {
+        "id": { "type": "string" },
+        "uid": { "type": "string" },
+        "stateRef": {
+          "type": "string",
+          "description": "Relative path to the chunked state blob, e.g. plugins/<id>.state"
+        },
+        "params": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/paramChange" },
+          "description": "Fallback param snapshot for plugins without a state interface."
+        }
+      }
+    }
+  }
+}

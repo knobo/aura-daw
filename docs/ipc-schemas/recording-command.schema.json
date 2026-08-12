@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/recording-command.schema.json",
+  "title": "RecordingCommand",
+  "description": "Arguments for start_recording / stop_recording, plus the recordingState payload emitted on the 'recording://state' app event.",
+  "type": "object",
+  "properties": {
+    "command": {
+      "description": "Which recording command this payload accompanies.",
+      "type": "string",
+      "enum": ["start", "stop"]
+    },
+    "trackIds": {
+      "description": "Optional explicit set of track UUIDs to capture (start only). Omitted/null = record all armed tracks.",
+      "type": ["array", "null"],
+      "items": { "type": "string", "format": "uuid" },
+      "uniqueItems": true
+    }
+  },
+  "required": ["command"],
+  "additionalProperties": false,
+  "$defs": {
+    "recordingState": {
+      "title": "RecordingState",
+      "description": "Payload of the 'recording://state' app event.",
+      "type": "object",
+      "properties": {
+        "recording": {
+          "description": "True while capture is active.",
+          "type": "boolean"
+        },
+        "trackIds": {
+          "description": "Tracks currently being captured.",
+          "type": "array",
+          "items": { "type": "string", "format": "uuid" }
+        },
+        "startedAtSamples": {
+          "description": "Timeline position (project samples) where the take began.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "xruns": {
+          "description": "Count of buffer over/underruns since capture started; nonzero means possible glitches in the take.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "clips": {
+          "description": "Present on the stop notification: finalized clip(s) created by the take.",
+          "type": "array",
+          "items": { "$ref": "aura:ipc/clip.schema.json" }
+        }
+      },
+      "required": ["recording", "trackIds"],
+      "additionalProperties": false
+    }
+  }
+}

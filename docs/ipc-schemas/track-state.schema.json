@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/track-state.schema.json",
+  "title": "TrackState",
+  "description": "One mixer track. Returned by add_track / get_tracks / set_track_* commands and embedded in project.json. Mirrors Rust struct audio::TrackState.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "description": "Track UUIDv4 (stable for the life of the project).",
+      "type": "string",
+      "format": "uuid"
+    },
+    "name": {
+      "description": "User-visible track name.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "kind": {
+      "description": "Track type. Only \"audio\" exists in the prototype; \"midi\" and \"bus\" are reserved.",
+      "type": "string",
+      "enum": ["audio", "midi", "bus"]
+    },
+    "gainDb": {
+      "description": "Fader gain in decibels relative to unity. -160.0 encodes -infinity (silence). Typical UI range -60..+12.",
+      "type": "number",
+      "minimum": -160.0,
+      "maximum": 24.0
+    },
+    "pan": {
+      "description": "Stereo pan: -1.0 = hard left, 0.0 = center, 1.0 = hard right.",
+      "type": "number",
+      "minimum": -1.0,
+      "maximum": 1.0
+    },
+    "muted": {
+      "description": "Track is muted (excluded from the mix unless soloed elsewhere logic applies).",
+      "type": "boolean"
+    },
+    "soloed": {
+      "description": "Track is soloed (when any track is soloed, only soloed tracks are audible).",
+      "type": "boolean"
+    },
+    "armed": {
+      "description": "Track is record-armed; start_recording captures onto armed tracks.",
+      "type": "boolean"
+    },
+    "color": {
+      "description": "UI accent color as lowercase hex \"#rrggbb\".",
+      "type": "string",
+      "pattern": "^#[0-9a-f]{6}$"
+    }
+  },
+  "required": ["id", "name", "kind", "gainDb", "pan", "muted", "soloed", "armed", "color"],
+  "additionalProperties": false
+}

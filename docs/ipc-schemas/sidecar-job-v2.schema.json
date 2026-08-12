@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/sidecar-job-v2.schema.json",
+  "title": "SidecarJob (v2 additions)",
+  "description": "Phase-2 sidecar surface: the open-kind sidecar_run_job command (debt D-07 paydown) and the per-kind params/result shapes for the generation job kinds. Stands BESIDE sidecar-job.schema.json (v1 kinds keep their dedicated commands; events/status shapes are unchanged, with `kind` now an OPEN string — consumers MUST render unknown kinds generically from progress+log). Emitter contract — no additionalProperties:false (D-06). API keys (e.g. ElevenLabs) travel via worker env vars, NEVER inside params.",
+  "oneOf": [{ "$ref": "#/$defs/runJobRequest" }],
+  "$defs": {
+    "jobKind": {
+      "description": "Open kind string. Kinds known to this app version are listed as examples; unknown kinds are rejected by sidecar_run_job but tolerated by all observers.",
+      "type": "string",
+      "examples": [
+        "aceStepGenerate", "aceStepRepaint", "aceStepAudio2Audio",
+        "elevenLabsMusic", "amtInfill", "stableAudioSfz"
+      ]
+    },
+    "runJobRequest": {
+      "title": "RunJobRequest",
+      "description": "Arguments of sidecar_run_job (an event Channel is passed alongside as `onEvent`) and of the MCP run_sidecar_job tool.",
+      "type": "object",
+      "properties": {
+        "kind": { "$ref": "#/$defs/jobKind" },
+        "params": {
+          "description": "Opaque per-kind blob, forwarded to the worker as --params-json. Known shapes below.",
+          "type": "object"
+        }
+      },
+      "required": ["kind", "params"]
+    },
+    "aceStepGenerateParams": {
+      "title": "AceStepGenerateParams",
+      "type": "object",
+      "properties": {
+        "prompt": { "type": "string", "minLength": 1 },
+        "lyrics": { "type": "string" },
+        "durationSeconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 600, "default": 30 },
+        "seed": { "type": "integer" },
+        "outputPath": { "description": "Absolute path for the generated WAV.", "type": "string" }
+      },
+      "required": ["prompt", "outputPath"]
+    },
+    "aceStepRepaintParams": {
+      "title": "AceStepRepaintParams",
+      "description": "Inpaint/repaint a region of existing audio.",
+      "type": "object",
+      "properties": {
+        "prompt": { "type": "string" },
+        "inputPath": { "type": "string" },
+        "startSeconds": { "type": "number", "minimum": 0 },
+        "endSeconds": { "type": "number", "exclusiveMinimum": 0 },
+        "seed": { "type": "integer" },
+        "outputPath": { "type": "string" }
+      },
+      "required": ["inputPath", "startSeconds", "endSeconds", "outputPath"]
+    },
+    "aceStepA2AParams": {
+      "title": "AceStepAudio2AudioParams",
+      "type": "object",
+      "properties": {
+        "prompt": { "type": "string" },
+        "inputPath": { "type": "string" },
+        "strength": { "description": "0 = keep input, 1 = ignore input.", "type": "number", "minimum": 0, "maximum": 1, "default": 0.7 },
+        "seed": { "type": "integer" },
+        "outputPath": { "type": "string" }
+      },
+      "required": ["inputPath", "outputPath"]
+    },
+    "elevenLabsParams": {
+      "title": "ElevenLabsMusicParams",
+      "description": "Cloud generation; the worker reads ELEVENLABS_API_KEY from its environment.",
+      "type": "object",
+      "properties": {
+        "prompt": { "type": "string", "minLength": 1 },
+        "durationSeconds": { "type": "number", "exclusiveMinimum": 0, "maximum": 300 },
+        "outputPath": { "type": "string" }
+      },
+      "required": ["prompt", "outputPath"]
+    },
+    "amtInfillParams": {
+      "title": "AmtInfillParams",
+      "description": "Conditioned MIDI infilling. All positions in TICKS at `ppq` (D-02).",
+      "type": "object",
+      "properties": {
+        "ppq": { "type": "integer", "minimum": 24, "default": 960 },
+        "contextNotes": {
+          "description": "Surrounding notes (clip-relative ticks) the model conditions on.",
+          "type": "array",
+          "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/note" }
+        },
+        "regionStartTicks": { "type": "integer", "minimum": 0 },
+        "regionEndTicks": { "type": "integer", "exclusiveMinimum": 0 },
+        "temperature": { "type": "number", "exclusiveMinimum": 0, "maximum": 2, "default": 1.0 },
+        "topP": { "type": "number", "exclusiveMinimum": 0, "maximum": 1, "default": 0.98 }
+      },
+      "required": ["contextNotes", "regionStartTicks", "regionEndTicks"]
+    },
+    "stableAudioSfzParams": {
+      "title": "StableAudioSfzParams",
+      "description": "Text -> multisampled SFZ instrument. Output MUST use only the AURA SFZ SUBSET v1 (src-tauri/src/audio/sampler.rs).",
+      "type": "object",
+      "properties": {
+        "prompt": { "type": "string", "minLength": 1 },
+        "name": { "type": "string" },
+        "outputDir": { "description": "Absolute dir for <name>.sfz + samples/.", "type": "string" },
+        "keys": {
+          "description": "MIDI keys to multisample (e.g. minor thirds C2..C6).",
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0, "maximum": 127 },
+          "default": [36, 39, 42, 45, 48, 51, 54, 57, 60, 63, 66, 69, 72]
+        },
+        "velocityLayers": { "type": "integer", "minimum": 1, "maximum": 4, "default": 1 },
+        "seed": { "type": "integer" }
+      },
+      "required": ["prompt", "outputDir"]
+    },
+    "audioResult": {
+      "title": "AudioGenerationResult",
+      "description": "Done-event result for aceStep* and elevenLabsMusic.",
+      "type": "object",
+      "properties": {
+        "kind": { "$ref": "#/$defs/jobKind" },
+        "outputPath": { "type": "string" },
+        "durationSeconds": { "type": "number" },
+        "sampleRate": { "type": "integer" },
+        "simulated": { "type": "boolean" }
+      },
+      "required": ["kind", "outputPath"]
+    },
+    "amtInfillResult": {
+      "title": "AmtInfillResult",
+      "type": "object",
+      "properties": {
+        "kind": { "const": "amtInfill" },
+        "ppq": { "type": "integer" },
+        "notes": { "type": "array", "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/note" } },
+        "simulated": { "type": "boolean" }
+      },
+      "required": ["kind", "notes"]
+    },
+    "sfzInstrumentResult": {
+      "title": "SfzInstrumentResult",
+      "type": "object",
+      "properties": {
+        "kind": { "const": "stableAudioSfz" },
+        "name": { "type": "string" },
+        "sfzPath": { "description": "Absolute path of the generated .sfz (AURA SFZ SUBSET v1).", "type": "string" },
+        "sampleCount": { "type": "integer" },
+        "simulated": { "type": "boolean" }
+      },
+      "required": ["kind", "sfzPath"]
+    }
+  }
+}

@@ -1,0 +1,275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/sidecar-job.schema.json",
+  "title": "SidecarJob",
+  "description": "All sidecar (Demucs / Whisper.cpp) IPC payloads: job submission requests (sidecar_split_stems, sidecar_transcribe), streamed events (Channel<SidecarEvent> + 'sidecar://*' app events), status polling (sidecar_job_status / sidecar_list_jobs), and result shapes. Top level validates any one of these payloads.",
+  "oneOf": [
+    { "$ref": "#/$defs/submitStemSplit" },
+    { "$ref": "#/$defs/submitTranscribe" },
+    { "$ref": "#/$defs/event" },
+    { "$ref": "#/$defs/status" }
+  ],
+  "$defs": {
+    "jobId": {
+      "description": "Job UUIDv4, returned by the submit commands.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "submitStemSplit": {
+      "title": "StemSplitRequest",
+      "description": "Argument `request` of sidecar_split_stems (a Channel for events is passed alongside as `onEvent`). Mirrors Rust sidecars::StemSplitRequest.",
+      "type": "object",
+      "properties": {
+        "inputPath": {
+          "description": "Absolute path to the source audio file (wav/flac/mp3).",
+          "type": "string"
+        },
+        "model": {
+          "description": "Demucs model name. Default \"htdemucs\".",
+          "type": ["string", "null"],
+          "examples": ["htdemucs", "htdemucs_ft", "mdx_extra"]
+        },
+        "stems": {
+          "description": "Subset of stems to produce; null = all four.",
+          "type": ["array", "null"],
+          "items": { "type": "string", "enum": ["vocals", "drums", "bass", "other"] },
+          "uniqueItems": true
+        },
+        "outputDir": {
+          "description": "Absolute output directory; null = '<project>/stems/<clipId>/'.",
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["inputPath"],
+      "additionalProperties": false
+    },
+    "submitTranscribe": {
+      "title": "TranscribeRequest",
+      "description": "Argument `request` of sidecar_transcribe. Mirrors Rust sidecars::TranscribeRequest.",
+      "type": "object",
+      "properties": {
+        "inputPath": {
+          "description": "Absolute path to the source audio file; conversion to 16 kHz mono happens internally.",
+          "type": "string"
+        },
+        "model": {
+          "description": "whisper.cpp GGML model file name or path. Default \"ggml-base.en.bin\".",
+          "type": ["string", "null"]
+        },
+        "language": {
+          "description": "ISO-639-1 language hint (e.g. \"en\", \"no\"); null = auto-detect.",
+          "type": ["string", "null"]
+        },
+        "withPitch": {
+          "description": "Also run per-word pitch estimation (vocal-to-pitch). Default false.",
+          "type": ["boolean", "null"]
+        }
+      },
+      "required": ["inputPath"],
+      "additionalProperties": false
+    },
+    "event": {
+      "title": "SidecarEvent",
+      "description": "Streamed over the Channel passed at submit time. Discriminated by `type`. Mirrors Rust enum sidecars::SidecarEvent.",
+      "oneOf": [
+        { "$ref": "#/$defs/progressEvent" },
+        { "$ref": "#/$defs/logEvent" },
+        { "$ref": "#/$defs/doneEvent" },
+        { "$ref": "#/$defs/errorEvent" }
+      ]
+    },
+    "progressEvent": {
+      "title": "SidecarProgressEvent",
+      "description": "Also the payload of the 'sidecar://progress' app event. Throttled to <= 10 Hz.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "progress" },
+        "jobId": { "$ref": "#/$defs/jobId" },
+        "progress": {
+          "description": "Completion fraction, 0.0 .. 1.0.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "stage": {
+          "description": "Free-form stage label for the UI, e.g. \"loading model\", \"separating\", \"writing stems\".",
+          "type": "string"
+        }
+      },
+      "required": ["type", "jobId", "progress", "stage"],
+      "additionalProperties": false
+    },
+    "logEvent": {
+      "title": "SidecarLogEvent",
+      "type": "object",
+      "properties": {
+        "type": { "const": "log" },
+        "jobId": { "$ref": "#/$defs/jobId" },
+        "line": {
+          "description": "One line of worker stdout/stderr, for a UI job console.",
+          "type": "string"
+        }
+      },
+      "required": ["type", "jobId", "line"],
+      "additionalProperties": false
+    },
+    "doneEvent": {
+      "title": "SidecarDoneEvent",
+      "description": "Also the payload of the 'sidecar://done' app event.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "done" },
+        "jobId": { "$ref": "#/$defs/jobId" },
+        "result": {
+          "description": "Job result; shape depends on job kind.",
+          "oneOf": [
+            { "$ref": "#/$defs/stemSplitResult" },
+            { "$ref": "#/$defs/transcribeResult" }
+          ]
+        }
+      },
+      "required": ["type", "jobId", "result"],
+      "additionalProperties": false
+    },
+    "errorEvent": {
+      "title": "SidecarErrorEvent",
+      "description": "Also the payload of the 'sidecar://error' app event.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "error" },
+        "jobId": { "$ref": "#/$defs/jobId" },
+        "message": {
+          "description": "Human-readable failure reason (last stderr lines included).",
+          "type": "string"
+        }
+      },
+      "required": ["type", "jobId", "message"],
+      "additionalProperties": false
+    },
+    "stemSplitResult": {
+      "title": "StemSplitResult",
+      "type": "object",
+      "properties": {
+        "kind": { "const": "stemSplit" },
+        "stems": {
+          "description": "Map of stem name to absolute output file path.",
+          "type": "object",
+          "properties": {
+            "vocals": { "type": "string" },
+            "drums": { "type": "string" },
+            "bass": { "type": "string" },
+            "other": { "type": "string" }
+          },
+          "additionalProperties": false
+        },
+        "elapsedSeconds": {
+          "description": "Wall-clock processing time in seconds.",
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": ["kind", "stems"],
+      "additionalProperties": false
+    },
+    "transcribeResult": {
+      "title": "TranscribeResult",
+      "type": "object",
+      "properties": {
+        "kind": { "const": "transcribe" },
+        "language": {
+          "description": "Detected/used ISO-639-1 language code.",
+          "type": "string"
+        },
+        "segments": {
+          "description": "Time-aligned transcript segments.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "startSeconds": {
+                "description": "Segment start in seconds from the start of the source file.",
+                "type": "number",
+                "minimum": 0
+              },
+              "endSeconds": {
+                "description": "Segment end in seconds.",
+                "type": "number",
+                "minimum": 0
+              },
+              "text": { "type": "string" },
+              "words": {
+                "description": "Optional per-word timing/pitch (present when withPitch).",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "word": { "type": "string" },
+                    "startSeconds": { "type": "number", "minimum": 0 },
+                    "endSeconds": { "type": "number", "minimum": 0 },
+                    "pitchHz": {
+                      "description": "Median fundamental frequency over the word, in Hz; null if unvoiced.",
+                      "type": ["number", "null"],
+                      "exclusiveMinimum": 0
+                    }
+                  },
+                  "required": ["word", "startSeconds", "endSeconds"],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": ["startSeconds", "endSeconds", "text"],
+            "additionalProperties": false
+          }
+        },
+        "transcriptPath": {
+          "description": "Absolute path of the cached transcript JSON ('<project>/cache/transcripts/<clipId>.json').",
+          "type": "string"
+        }
+      },
+      "required": ["kind", "language", "segments"],
+      "additionalProperties": false
+    },
+    "status": {
+      "title": "SidecarJobStatus",
+      "description": "Returned by sidecar_job_status and sidecar_list_jobs. Mirrors Rust sidecars::SidecarJobStatus.",
+      "type": "object",
+      "properties": {
+        "jobId": { "$ref": "#/$defs/jobId" },
+        "kind": {
+          "description": "Job kind discriminator.",
+          "type": "string",
+          "enum": ["stemSplit", "transcribe"]
+        },
+        "state": {
+          "description": "Lifecycle state.",
+          "type": "string",
+          "enum": ["queued", "running", "done", "error", "cancelled"]
+        },
+        "progress": {
+          "description": "Completion fraction, 0.0 .. 1.0.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "stage": {
+          "description": "Current stage label (see progressEvent.stage).",
+          "type": "string"
+        },
+        "result": {
+          "description": "Present when state == \"done\".",
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/stemSplitResult" },
+            { "$ref": "#/$defs/transcribeResult" }
+          ]
+        },
+        "error": {
+          "description": "Present when state == \"error\".",
+          "type": ["string", "null"]
+        }
+      },
+      "required": ["jobId", "kind", "state", "progress", "stage"],
+      "additionalProperties": false
+    }
+  }
+}

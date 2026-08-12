@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/mcp-policy.schema.json",
+  "title": "McpPolicy",
+  "description": "MCP server policy + status payloads: mcp_get_status / mcp_set_policy / mcp_confirm_pending (Rust mirror: src-tauri/src/mcp/policy.rs). Governs what a connected MCP agent may do; transport security (loopback bind, bearer token, Origin validation) is NOT configurable here by design — see ARCHITECTURE §12.3. Emitter contract — no additionalProperties:false (D-06).",
+  "oneOf": [
+    { "$ref": "#/$defs/policy" },
+    { "$ref": "#/$defs/status" }
+  ],
+  "$defs": {
+    "toolName": {
+      "description": "One of the curated MCP tools (frozen roster, ARCHITECTURE §12.2).",
+      "type": "string",
+      "enum": [
+        "get_project_state", "read_meters", "get_job_status",
+        "create_project", "add_track", "set_track_mix", "transport_control",
+        "record_take", "import_audio_clip", "run_sidecar_job"
+      ]
+    },
+    "policy": {
+      "title": "McpPolicy",
+      "type": "object",
+      "properties": {
+        "mode": {
+          "description": "readOnly: only read-only tools. confirmDestructive (default): destructive tools park on a UI confirmation. full: everything allowed (explicit user opt-in).",
+          "type": "string",
+          "enum": ["readOnly", "confirmDestructive", "full"],
+          "default": "confirmDestructive"
+        },
+        "toolOverrides": {
+          "description": "Per-tool rule overriding mode. Unknown tool names are always denied regardless of policy.",
+          "type": "object",
+          "propertyNames": { "$ref": "#/$defs/toolName" },
+          "additionalProperties": { "type": "string", "enum": ["allow", "confirm", "deny"] },
+          "default": {}
+        },
+        "port": {
+          "description": "TCP port on 127.0.0.1 (the bind address is not configurable). Applied on next server start.",
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 65535,
+          "default": 41717
+        }
+      },
+      "required": ["mode"]
+    },
+    "pendingConfirmation": {
+      "title": "PendingConfirmation",
+      "description": "A destructive tool call parked awaiting the user's approve/deny (resolved via mcp_confirm_pending; times out to deny).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "tool": { "$ref": "#/$defs/toolName" },
+        "summary": { "description": "Human-readable one-liner for the confirm dialog.", "type": "string" },
+        "requestedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "tool", "summary"]
+    },
+    "status": {
+      "title": "McpStatus",
+      "description": "Payload of mcp_get_status.",
+      "type": "object",
+      "properties": {
+        "running": { "type": "boolean" },
+        "port": { "type": "integer" },
+        "tokenFingerprint": {
+          "description": "First 8 hex chars of the session token. The full token is NEVER part of any IPC payload or log line.",
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 8
+        },
+        "policy": { "$ref": "#/$defs/policy" },
+        "pending": { "type": "array", "items": { "$ref": "#/$defs/pendingConfirmation" } }
+      },
+      "required": ["running", "port", "tokenFingerprint", "policy"]
+    }
+  }
+}

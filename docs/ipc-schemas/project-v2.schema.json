@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/project-v2.schema.json",
+  "title": "Project (v2)",
+  "description": "project.json format version 2 — v1 (project.schema.json) plus musical time (debt D-02 paydown): ppq + tempoMap in ticks, MIDI clips with binary AMEV event chunks, and sampler instrument references. ADDITIVE evolution: every v1 field keeps its exact v1 meaning; audio clip positions stay sample-based. Migration v1->v2 is mechanical: set schemaVersion=2, ppq=960, tempoMap=[{tick:0,bpm:<tempoBpm>}], midiClips=[], instruments=[]. tempoBpm is retained and MUST equal tempoMap[0].bpm (older tooling reads it). Per debt D-06, v2 schemas are emitter contracts WITHOUT additionalProperties:false — readers ignore unknown fields.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "description": "project.json format version; this document describes version 2.",
+      "type": "integer",
+      "const": 2
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "path": { "type": "string" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "modifiedAt": { "type": "string", "format": "date-time" },
+    "sampleRate": { "type": "integer", "minimum": 8000, "maximum": 384000, "default": 48000 },
+    "tempoBpm": {
+      "description": "Legacy single tempo, kept for older tooling; MUST equal tempoMap[0].bpm.",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "timeSignature": {
+      "type": "array",
+      "prefixItems": [
+        { "type": "integer", "minimum": 1, "maximum": 32 },
+        { "type": "integer", "enum": [1, 2, 4, 8, 16, 32] }
+      ],
+      "items": false
+    },
+    "ppq": {
+      "description": "Ticks per quarter note for ALL tick-valued fields in this file.",
+      "type": "integer",
+      "minimum": 24,
+      "maximum": 15360,
+      "default": 960
+    },
+    "tempoMap": {
+      "description": "Sorted tempo changes; first entry MUST be at tick 0. A one-entry map is exactly v1 semantics.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/tempoEvent" }
+    },
+    "tracks": {
+      "description": "track-state.schema.json objects; v2 adds kind:\"midi\" and the optional instrumentId field (sampler-instrument.schema.json id) on midi tracks.",
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "clips": {
+      "description": "Audio clips, unchanged from v1 (clip.schema.json, sample-based).",
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "midiClips": {
+      "description": "MIDI clip placements (ticks). Note payloads live in AMEV chunk files referenced by eventsRef — NEVER inline in project.json (SCALABILITY §3).",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedClip" }
+    },
+    "instruments": {
+      "description": "Sampler instruments used by midi tracks.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/sampler-instrument.schema.json#/$defs/projectRef" }
+    },
+    "transport": { "description": "transport-state.schema.json object.", "type": "object" }
+  },
+  "required": ["schemaVersion", "name", "sampleRate", "tempoBpm", "ppq", "tempoMap", "tracks", "clips"],
+  "$defs": {
+    "tempoEvent": {
+      "title": "TempoEvent",
+      "type": "object",
+      "properties": {
+        "tick": { "type": "integer", "minimum": 0 },
+        "bpm": { "type": "number", "exclusiveMinimum": 0 }
+      },
+      "required": ["tick", "bpm"]
+    }
+  }
+}

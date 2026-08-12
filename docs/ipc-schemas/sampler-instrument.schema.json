@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/sampler-instrument.schema.json",
+  "title": "SamplerInstrument",
+  "description": "Sampler instrument payloads: sampler_load_instrument / sampler_list_instruments results, and the project.json v2 instrument reference. The instrument CONTENT is an .sfz file restricted to the AURA SFZ SUBSET v1 — the normative opcode table lives in src-tauri/src/audio/sampler.rs and docs/PHASE2-PLAN.md; both the sampler (zone D loader) and the Stable Audio instrument-builder sidecar (zone D generator) are bound by it. Emitter contract — no additionalProperties:false (D-06).",
+  "oneOf": [
+    { "$ref": "#/$defs/instrumentInfo" },
+    { "$ref": "#/$defs/projectRef" }
+  ],
+  "$defs": {
+    "instrumentInfo": {
+      "title": "InstrumentInfo",
+      "description": "Wire summary of a loaded instrument (Rust: audio::sampler::InstrumentInfo).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" },
+        "sfzPath": { "description": "Absolute path of the source .sfz.", "type": "string" },
+        "regionCount": { "type": "integer", "minimum": 1 },
+        "keyLow": { "type": "integer", "minimum": 0, "maximum": 127 },
+        "keyHigh": { "type": "integer", "minimum": 0, "maximum": 127 }
+      },
+      "required": ["id", "name", "sfzPath", "regionCount"]
+    },
+    "projectRef": {
+      "title": "ProjectInstrumentRef",
+      "description": "project.json v2 `instruments[]` entry. Instruments used by a project are copied into `<project>/instruments/<id>/` so projects stay portable; sfzRef is relative to the .aura dir.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "name": { "type": "string" },
+        "sfzRef": {
+          "type": "string",
+          "pattern": "^instruments/.+\\.sfz$"
+        }
+      },
+      "required": ["id", "name", "sfzRef"]
+    }
+  }
+}

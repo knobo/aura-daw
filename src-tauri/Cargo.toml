@@ -1,0 +1,88 @@
+[package]
+name = "aura"
+version = "0.1.0"
+description = "AURA — Digital Audio Workstation prototype"
+authors = ["knobo"]
+edition = "2021"
+rust-version = "1.77"
+
+# FROZEN FILE — owned by Agent 1 (architecture).
+# Agents 2/3/4 must NOT edit this file. If you need another crate,
+# report the request; do not add it yourself.
+
+[lib]
+name = "aura_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# --- Tauri core & plugins ---
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-log = "2"
+
+# --- Serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# --- Async runtime / concurrency (engine control plane, sidecar workers) ---
+tokio = { version = "1", features = ["full"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# --- Real-time audio ---
+cpal = "0.16"          # audio I/O (ALSA/JACK on Linux)
+rtrb = "0.3"           # lock-free SPSC ringbuffer (audio thread <-> consumers) — PRIMARY
+ringbuf = "0.4"        # alternative lock-free ringbuffer (heap-backed, split producer/consumer)
+
+# --- Audio file I/O ---
+hound = "3.5"          # WAV read/write
+flacenc = "0.4"        # pure-Rust FLAC encoder (archival/export)
+
+# --- MCP server (embedded, streamable HTTP on 127.0.0.1 — phase 2, src/mcp/) ---
+rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server"] }
+
+# --- MIDI (phase 2, src/midi/: .mid import/export + realtime event types) ---
+midly = "0.5"
+
+# --- Plugin hosting (phase 3, src/plugins/: CLAP + LV2 — ARCHITECTURE §15) ---
+# CLAP: clack (safe host wrapper over clap-sys, CLAP 1.2 ABI, on crates.io
+# since 2026-05; pre-1.0 => pinned to the verified 0.1.x line). Verified on
+# this machine: PluginEntry::load + factory/descriptor read of
+# /usr/lib/clap/*.clap. Zone P1 builds the process/params host on this.
+clack-host = "0.1"
+clack-extensions = { version = "0.1", features = [
+    "clack-host", "params", "audio-ports", "note-ports", "state", "gui", "latency",
+] }
+# LV2: livi wraps lilv (SYSTEM liblilv-dev REQUIRED — Ubuntu:
+# `apt install liblilv-dev`; livi::Features provides urid/options/bufsize +
+# atom-sequence MIDI + worker — exactly ZynAddSubFX's required feature set).
+# Verified on this machine: Zyn instantiates AND renders audio through
+# livi 0.7. LV2 state save/restore needs raw-lilv work on top (zone P4).
+livi = "0.7"
+walkdir = "2"      # CLAP search-path scanning
+
+# --- Utilities ---
+rand = "0.9"           # MCP session-token generation (crypto-seeded via OsRng/StdRng)
+thiserror = "2"
+log = "0.4"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+byteorder = "1"
+
+[profile.dev]
+# Audio DSP is unusable at opt-level 0; keep deps optimized even in dev.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

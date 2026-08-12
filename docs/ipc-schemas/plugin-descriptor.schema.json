@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura://ipc/plugin-descriptor.schema.json",
+  "title": "PluginDescriptor",
+  "description": "One installed plugin as discovered by plugin_scan (phase 3). Emitter contract: readers must tolerate unknown fields (D-06 discipline — deliberately no additionalProperties:false). uid format: 'clap:<bundle-path>#<clap-plugin-id>' or 'lv2:<plugin-uri>'.",
+  "type": "object",
+  "required": [
+    "uid",
+    "format",
+    "name",
+    "isInstrument",
+    "audioInputs",
+    "audioOutputs",
+    "hasNoteInput"
+  ],
+  "properties": {
+    "uid": {
+      "type": "string",
+      "description": "Stable identity across scans and project saves; the value a project references, never an index."
+    },
+    "format": { "type": "string", "enum": ["clap", "lv2"] },
+    "name": { "type": "string" },
+    "vendor": { "type": "string" },
+    "version": { "type": "string" },
+    "path": {
+      "type": "string",
+      "description": "Bundle file (CLAP) or bundle dir (LV2). Informational; machine-local."
+    },
+    "isInstrument": {
+      "type": "boolean",
+      "description": "True for note-input->audio plugins. AURA v1 hosts instruments on midi tracks; effects come with the insert-chain round."
+    },
+    "audioInputs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "0 for CLAP descriptors until instantiation (port counts need the audio-ports extension)."
+    },
+    "audioOutputs": { "type": "integer", "minimum": 0 },
+    "hasNoteInput": { "type": "boolean" },
+    "categories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Format-reported features/classes (CLAP features, LV2 classes)."
+    }
+  }
+}

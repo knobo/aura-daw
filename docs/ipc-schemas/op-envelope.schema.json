@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/op-envelope.schema.json",
+  "title": "OpEnvelope (DRAFT v2 — NOT part of the frozen prototype surface)",
+  "description": "DRAFT. Versioned, batched mutation protocol planned for the post-prototype milestone (see docs/SCALABILITY.md §5, debt D-03). Purely ADDITIVE: it stands beside the frozen per-command surface; no existing schema or command changes. `applyBatch` is the argument of the future ops_apply command; `committedBatch` is what ops_subscribe streams to every window. Op payloads are intentionally open (additionalProperties true) so op kinds can be added without breaking validators (avoids re-creating debt D-06).",
+  "oneOf": [
+    { "$ref": "#/$defs/applyBatch" },
+    { "$ref": "#/$defs/committedBatch" }
+  ],
+  "$defs": {
+    "rev": {
+      "description": "Monotonic project-session revision number. Rev N+1 is the state after applying committed batch N+1 to state rev N.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "op": {
+      "title": "Op",
+      "description": "One mutation. `kind` is an open namespaced string (e.g. \"track.setGain\", \"clip.move\", \"param.set\"); unknown kinds must be rejected by the applier but tolerated by observers. Payload fields beyond these are kind-specific.",
+      "type": "object",
+      "properties": {
+        "kind": {
+          "description": "Namespaced op kind, \"<area>.<verb>\".",
+          "type": "string",
+          "pattern": "^[a-z][a-zA-Z0-9]*\\.[a-z][a-zA-Z0-9]*$"
+        },
+        "target": {
+          "description": "Primary target entity UUID (track, clip, node, ...), when the kind has one.",
+          "type": "string"
+        },
+        "transient": {
+          "description": "True for intermediate values of a continuous gesture (knob drag, scrub): latest-wins, not journaled, not undoable on its own. The gesture's final op omits this / sets false.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": ["kind"],
+      "additionalProperties": true
+    },
+    "applyBatch": {
+      "title": "ApplyBatch",
+      "description": "Argument of ops_apply. Applied atomically: all ops commit as one revision (one undo entry, at most one graph swap) or the batch is rejected as a whole.",
+      "type": "object",
+      "properties": {
+        "protocol": {
+          "description": "Op-protocol version this client speaks. This draft describes version 2.",
+          "type": "integer",
+          "minimum": 2
+        },
+        "baseRev": {
+          "description": "Revision the client built this batch against; null = unconditional (server rebases trivially or rejects on conflict, policy per kind).",
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "ops": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/op" }
+        },
+        "label": {
+          "description": "Optional human-readable gesture label for the undo history (e.g. \"Move 12 clips\").",
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": ["protocol", "ops"],
+      "additionalProperties": true
+    },
+    "committedBatch": {
+      "title": "CommittedBatch",
+      "description": "Streamed over the Channel passed to ops_subscribe, in strict rev order, to every subscriber (including the originator, which reconciles its optimistic state).",
+      "type": "object",
+      "properties": {
+        "rev": { "$ref": "#/$defs/rev" },
+        "ops": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/op" }
+        },
+        "origin": {
+          "description": "Opaque id of the submitting client/window/session; lets the originator recognize its own batches.",
+          "type": ["string", "null"]
+        },
+        "label": {
+          "type": "string",
+          "maxLength": 128
+        }
+      },
+      "required": ["rev", "ops"],
+      "additionalProperties": true
+    }
+  }
+}

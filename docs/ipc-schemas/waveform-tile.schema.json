@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/waveform-tile.schema.json",
+  "title": "WaveformTileRequest",
+  "description": "Arguments for get_waveform_tile. The RESPONSE is NOT JSON: it is a raw binary payload (tauri::ipc::Response -> ArrayBuffer). Little-endian layout: [magic u32 = 0x41575446 'AWTF'][version u16 = 1][channels u16][lod u32][tileIndex u64][bins u32] followed by channels*bins pairs of (min i16, max i16), where i16 full scale (32767) maps to +1.0 linear. Bin width = 2^(8+lod) source samples; a tile spans binsPerTile = 1024 bins.",
+  "type": "object",
+  "properties": {
+    "clipId": {
+      "description": "UUID of the clip whose waveform pyramid is queried.",
+      "type": "string",
+      "format": "uuid"
+    },
+    "lod": {
+      "description": "Level of detail. Bin width in source samples = 2^(8+lod): lod 0 = 256 samples/bin, lod 1 = 512, ... Higher lod = coarser.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 16
+    },
+    "tileIndex": {
+      "description": "Zero-based tile index at this LOD. Tile n covers bins [n*1024, (n+1)*1024).",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": ["clipId", "lod", "tileIndex"],
+  "additionalProperties": false
+}
