@@ -1,57 +1,158 @@
 # AURA
 
-AURA is a digital audio workstation (DAW) prototype built with **Tauri v2** and **Svelte 5**.
-The long-term ambition is an FL Studio-class DAW; this repository is the first working
-vertical slice: a native Rust audio engine, a reactive Svelte UI, and an AI sidecar layer
-for stem separation and transcription.
+**An AI-native digital audio workstation, built by AI agents — with a real-time Rust
+engine, local AI music models, and an embedded MCP server so AI agents can *play* it too.**
 
-## Features
+<!-- Recorded from the real app: Claude driving AURA over MCP end-to-end. -->
+![Claude composing a track in AURA over MCP](docs/screenshots/mcp-composition.gif)
 
-- **Rust audio engine** (`src-tauri/src/audio/`) — cpal-based playback/transport, lock-free
-  real-time mixer, per-track gain/pan, sample-accurate transport, and a **loop region**
-  (draggable pins in the timeline ruler + LOOP toggle; persisted with the project, voices
-  release cleanly on every wrap).
-- **Recording** — multitrack input capture straight to WAV.
-- **Meters** — peak/RMS metering streamed to the UI at 60 Hz.
-- **Waveform renderer** — tiled min/max waveform pyramid rendered on canvas in the frontend.
-- **AI stem separation** — Demucs Python sidecar (`sidecars/demucs_split.py`) splits a track
-  into vocals / drums / bass / other, with streamed JSON progress.
-- **AI transcription** — whisper.cpp sidecar (`sidecars/whisper_transcribe.py`) transcribes
-  audio to text.
-- **Job runner** (`src-tauri/src/sidecars/`) — queued, cancellable sidecar jobs with a
-  line-delimited JSON protocol, concurrency limits, and structured errors.
-- **MCP control** (`src-tauri/src/mcp/`) — an embedded MCP streamable-HTTP server on
-  `127.0.0.1:41717` lets agents (Claude Code, Claude Desktop) inspect, mix, record and
-  generate in the running session — token-authenticated, policy-gated with per-call
-  confirm-in-UI by default. See **[docs/mcp-usage.md](docs/mcp-usage.md)**.
-- **Generative music** — text→music via local **ACE-Step** (generate / repaint /
-  audio2audio, `sidecars/ace_step_worker.py`) and cloud **ElevenLabs Music**
-  (`sidecars/elevenlabs_music_worker.py`); results can auto-import straight onto the
-  timeline (`importToTrackId` job param).
-- **MIDI + AMT infilling** (`src-tauri/src/midi/`) — tick timeline with a tempo map,
-  MIDI clips audible through a built-in synth, `.mid` import/export
-  (`midi_import_file` / `midi_export_file`), and region infilling with the
-  **Anticipatory Music Transformer** (`sidecars/amt_infill_worker.py`).
-- **SFZ sampler + AI instrument builder** (`src-tauri/src/audio/sampler*.rs`) — loads
-  SFZ-subset instruments (64-voice, RT-safe), plays them on MIDI tracks
-  (`set_track_instrument`) and auditions without a project (`sampler_preview_note`);
-  **Stable Audio Open** generates whole instruments from a text prompt
-  (`sidecars/stable_audio_sfz_worker.py`) and auto-registers them on completion.
-- **Plugin hosting — CLAP + LV2 instruments** (`src-tauri/src/plugins/`) — real in-graph
-  hosting of third-party instruments on MIDI tracks (**ZynAddSubFX verified end-to-end**:
-  headless render is pitch-checked in the test suite). One shared plugin main thread
-  serves both formats; CLAP bundles are scanned by a **sacrificial subprocess** so a bad
-  `.clap` can't take AURA down. Ships a plugin browser + generic parameter panel in the
-  UI, **plugin state persistence** (opaque patch blobs — Zyn patches — saved with the
-  project and restored on open, with param-snapshot fallback), and **automation
-  groundwork** (`automation_get`/`automation_set` lanes persisted per project, plus the
-  sample-accurate ramp seam in the render path).
+![The AURA timeline — audio clips, MIDI clips, per-track mixing, live meters](docs/screenshots/timeline-hero.png)
 
-## Prerequisites
+AURA is a working vertical slice of an FL Studio-class DAW: a native
+**Tauri v2 + Svelte 5** app around a lock-free real-time audio engine in Rust,
+with local AI models (stem separation, music generation, MIDI infilling,
+hum-to-melody) wired in as sidecar processes, and a policy-gated **MCP server**
+embedded in the app so LLM agents can inspect, mix, record and generate in the
+open session.
+
+The code was written by orchestrated Claude agents working in parallel
+ownership zones against a frozen, schema-defined IPC surface — with an
+architect role paying down flagged debt between rounds and an independent
+adversarial review pass. The process and the boundaries are documented, not
+hidden: see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (start with §0,
+"Agent ownership boundaries") and the debt register in
+[docs/SCALABILITY.md](docs/SCALABILITY.md).
+
+---
+
+## Feature tour
+
+### Real-time audio engine
+
+cpal-based playback with **no allocation, no locks, and no syscalls in the audio
+callback** (the rules are binding — [ARCHITECTURE §2](docs/ARCHITECTURE.md)):
+lock-free SPSC rings, RCU snapshot swaps for the mix graph, per-track gain/pan,
+sample-accurate transport, multitrack recording to WAV, and peak/RMS meters
+streamed to the UI at ~60 Hz.
+
+![Loop region pins in the ruler, live track and master meters during playback](docs/screenshots/loop-pins-playback.png)
+
+A **loop region** (draggable pins in the ruler + LOOP toggle) is persisted with
+the project; voices release cleanly on every wrap. The master strip meters the
+mix bus:
+
+![Master bus meters](docs/screenshots/master-meters.png)
+
+### MIDI, piano roll and tick-based musical time
+
+A tick timeline with a tempo map (tick↔sample bijection), MIDI clips audible
+through built-in instruments, `.mid` import/export, and a piano roll with
+velocity editing, grid snap, and region infilling by Stanford's **Anticipatory
+Music Transformer** (select a region, INFILL fills it in context).
+
+![Piano roll under the timeline, editing the arp seq clip](docs/screenshots/piano-roll.png)
+
+Notes flash at the moment they sound during playback (FLASH toggle):
+
+![Note flash during playback](docs/screenshots/piano-roll-note-flash.png)
+
+### Plugin hosting — CLAP + LV2 instruments
+
+Real in-graph hosting of third-party instruments on MIDI tracks, with one shared
+plugin main thread serving both formats. **ZynAddSubFX is verified
+end-to-end** — the acceptance test renders a note headlessly and pitch-checks
+the output at 440 Hz. CLAP bundles are scanned by a **sacrificial subprocess**,
+so a bad `.clap` can't take AURA down.
+
+![Plugin browser with a live ZynAddSubFX instance](docs/screenshots/plugin-browser.png)
+
+Every instrument gets a generic parameter panel, and plugin state (opaque patch
+blobs, e.g. Zyn patches) is saved with the project and restored on open, with a
+param-snapshot fallback for stateless-API plugins:
+
+![Generic parameter panel for ZynAddSubFX](docs/screenshots/plugin-param-panel.png)
+
+Zyn's factory banks are browsable directly — loading a patch re-binds the track
+so the new sound reaches the engine:
+
+![ZynAddSubFX patch browser — 121 factory patches](docs/screenshots/zyn-patch-browser.png)
+
+See the [synth compatibility sweep](docs/synth-compatibility.md) for how the
+other synths fared (summary [below](#synth-compatibility)).
+
+### AI Studio — generative music
+
+Text→music via local **ACE-Step** (generate / repaint / audio-to-audio) and
+cloud **ElevenLabs Music**; MIDI region infilling via **AMT**; text→SFZ
+instrument via **Stable Audio Open**. Finished jobs can auto-import straight
+onto the timeline.
+
+![AI Studio: prompt, lyrics, duration/seed, job log — a generated clip landed on a new track](docs/screenshots/ai-studio.png)
+
+### Hum-to-song
+
+Sing or hum into the mic; a pitch tracker turns it into a MIDI melody clip on a
+new track (librosa-backed when the sidecar venv is present, pure-Python
+fallback otherwise), with an optional generated accompaniment:
+
+![Hum a melody: 9 notes landed on a new track, accompaniment generated](docs/screenshots/hum-to-song.png)
+
+### Universal import + stem separation
+
+Drop any audio file (wav/mp3/flac/ogg/aac/m4a) on the timeline — the left zone
+imports it to a new track, the right zone imports **and splits it into stems**
+with Demucs:
+
+![The two-zone drop target: import, or import + split stems](docs/screenshots/import-drop-zone.png)
+
+![night-drive.mp3 imported and split into drums / bass / vocals stems on separate tracks](docs/screenshots/import-split-stems.png)
+
+### AI loop-jam
+
+With a loop region active, **EVOLVE** has ACE-Step repaint the looped audio;
+the new generation swaps in seamlessly at the next wrap:
+
+![Loop-jam: generation 1 applied, swapped in at the wrap](docs/screenshots/loop-jam-evolved.png)
+
+### SFZ sampler + AI instrument builder
+
+An RT-safe 64-voice SFZ-subset sampler plays instruments on MIDI tracks;
+**Stable Audio Open** builds whole multisampled instruments from a text prompt
+and registers them in the browser on completion:
+
+![Instrument browser: generated SFZ instruments with per-key audition](docs/screenshots/instrument-builder.png)
+
+### MCP — agents operate the DAW
+
+An embedded MCP streamable-HTTP server on `127.0.0.1:41717` lets Claude Code,
+Claude Desktop, or any MCP client inspect the project, read the meters, mix,
+record and generate in the running session — token-authenticated, loopback-only,
+and **policy-gated**:
+
+![MCP panel: server status, token fingerprint, policy modes, agent activity](docs/screenshots/mcp-panel.png)
+
+In the default `confirmDestructive` policy, every destructive call parks until
+you approve it in the UI (60 s timeout ⇒ deny):
+
+![Confirm-in-UI: an agent asks to change the Synth Bass mix](docs/screenshots/mcp-confirm-dialog.png)
+
+### Export
+
+Offline bounce (faster than realtime) to WAV natively, or mp3/flac/ogg/m4a
+through ffmpeg — full song or loop region, with sample-rate, bit-depth, master
+gain and tail options:
+
+![Export dialog: bounce done, export-complete toast](docs/screenshots/export-dialog.png)
+
+---
+
+## Quickstart
+
+Prerequisites:
 
 - **Rust** (stable toolchain, via [rustup](https://rustup.rs))
 - **Node.js 18+** and npm
-- **Linux system packages** (for building Tauri on other machines):
+- **Linux system packages** (for building Tauri):
 
   ```sh
   sudo apt install libasound2-dev libwebkit2gtk-4.1-dev build-essential \
@@ -64,80 +165,116 @@ for stem separation and transcription.
   sudo apt install liblilv-dev
   ```
 
-- **Optional — plugins for the gated plugin tests / to actually play** (each test skips
-  cleanly when its plugin is absent):
-  - `sudo apt install zynaddsubfx-lv2` (universe) — the ZynAddSubFX instrument; enables
-    the LV2 acceptance + state round-trip tests.
-  - `sudo apt install dpf-plugins-clap dpf-plugins-lv2` — small open-source test
-    instruments/effects (Kars, Nekobi, …); enables the CLAP lifecycle tests.
-  - `sudo apt install mda-lv2` — mda EPiano etc., used by the LV2 param tests.
+- **ffmpeg** — compressed-format import (mp3/ogg/aac/m4a…) and export
+  (mp3/flac/ogg/m4a). WAV import/export works without it.
 
-- **Optional — real AI sidecars** (each worker degrades gracefully when its stack is
-  missing):
-  - `pip install demucs` — stem separation
-  - `whisper-cli` (whisper.cpp) on your `PATH` plus a GGML model — transcription
-  - `pip install git+https://github.com/ace-step/ACE-Step.git` — ACE-Step music
-    generation (checkpoints download on first use; CUDA GPU with ≥ 8 GB VRAM
-    recommended)
-  - `export ELEVENLABS_API_KEY=...` — ElevenLabs Music (cloud; no local model)
-  - `pip install anticipation torch transformers mido` — AMT MIDI infilling (CPU works)
-  - `pip install stable-audio-tools torch torchaudio einops` — Stable Audio Open
-    instrument builder (model `stabilityai/stable-audio-open-small`; GPU optional)
-  - **Or skip all of it and set `AURA_SIDECAR_SIMULATE=1`** for a fully offline demo:
-    every worker (generation, infilling, instrument building included) produces
-    deterministic placeholder output, so the whole generate → import → hear-it loop
-    works with zero model stacks.
+  ```sh
+  sudo apt install ffmpeg
+  ```
 
-## Running
+- **Optional — instruments to actually play** (and to un-skip the gated plugin
+  tests; each test skips cleanly when its plugin is absent):
+  - `sudo apt install zynaddsubfx-lv2` — the ZynAddSubFX instrument (LV2
+    acceptance + state round-trip tests)
+  - `sudo apt install dpf-plugins-clap dpf-plugins-lv2` — small open-source
+    test instruments/effects (CLAP lifecycle tests)
+  - `sudo apt install mda-lv2` — mda EPiano etc. (LV2 param tests)
+  - more options in [docs/synth-compatibility.md](docs/synth-compatibility.md)
+
+Run it:
 
 ```sh
 npm install
 npm run tauri dev      # or: npx tauri dev
 ```
 
-Pure-browser demo mode (no Rust build, mock engine data):
+Pure-browser demo mode (no Rust build — a mock engine demos every feature in
+the browser, which is also where most of this page's screenshots come from):
 
 ```sh
 npx vite
 ```
 
-## Tests
-
-```sh
-cd src-tauri && cargo test   # engine, MIDI, sampler, plugins, MCP, sidecars (~218 tests)
-npx svelte-check             # frontend type checking
-npm run build                # production frontend build
-```
-
-Plugin-dependent tests (Zyn acceptance, CLAP lifecycle, state round-trips) run for real
-when the optional plugins above are installed and skip cleanly otherwise.
-
-Note: the vite dev server uses port **1420** (`vite.config.ts`, `strictPort`). If 1420 is
-taken, you can run on another port without editing anything:
+Note: the vite dev server uses port **1420** (`vite.config.ts`, `strictPort`).
+If 1420 is taken, run on another port without editing anything:
 
 ```sh
 npx tauri dev --config '{"build":{"devUrl":"http://localhost:1430","beforeDevCommand":"npm run dev -- --port 1430 --strictPort"}}'
 ```
 
-## Repository layout
+**No models? No GPU?** Set `AURA_SIDECAR_SIMULATE=1` and every AI worker
+(generation, infilling, instrument building included) produces deterministic
+placeholder output — the whole generate → import → hear-it loop works with zero
+model stacks.
 
-| Path                      | Contents                                              |
-| ------------------------- | ----------------------------------------------------- |
-| `src/`                    | Svelte 5 frontend (components, state, canvas render)  |
-| `src/lib/tauri.ts`        | Typed IPC bridge to the Rust backend                  |
-| `src-tauri/src/audio/`    | Audio engine: transport, mixer, recorder, meters, waveform, project persistence, SFZ sampler |
-| `src-tauri/src/control/`  | Shared control plane — the one seam Tauri commands AND MCP tools drive |
-| `src-tauri/src/midi/`     | Tick timeline, tempo map, MIDI clips/synth, .mid interop, AMT infill |
-| `src-tauri/src/plugins/`  | CLAP/LV2 plugin hosting: shared plugin main thread, scan worker, state persistence, automation groundwork |
-| `src-tauri/src/mcp/`      | Embedded MCP server: tools, policy, auth, HTTP layer  |
-| `src-tauri/src/sidecars/` | Sidecar job runner (spawn, queue, cancel, JSON protocol) |
-| `sidecars/`               | Python sidecars: Demucs, Whisper, ACE-Step, ElevenLabs, AMT infill, Stable Audio SFZ |
-| `docs/`                   | Architecture and scaling docs, IPC schemas, MCP usage |
+---
 
-See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the system design and
-**[docs/SCALABILITY.md](docs/SCALABILITY.md)** for the path toward a full DAW.
+## AI features — real-model setup
 
-## Sidecar environment variables
+Every AI feature runs as a Python sidecar process. The stack below is the one
+the env-gated integration tests were verified against (real Demucs and real
+ACE-Step output through the app's own job pipeline).
+
+Create a venv **at the repo root, named `.venv-sidecars`** (the hum-to-song
+feature looks for exactly this path; everything else finds it via `PATH`):
+
+```sh
+uv venv .venv-sidecars --python 3.12
+source .venv-sidecars/bin/activate
+
+# Stem separation
+uv pip install demucs
+
+# ACE-Step music generation — pin torch to the cu126 wheels first
+uv pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
+uv pip install git+https://github.com/ace-step/ACE-Step.git
+
+# AMT MIDI infilling (CPU works)
+uv pip install git+https://github.com/jthickstun/anticipation.git mido transformers
+
+# Hum-to-song pitch tracking (optional — degrades to a pure-Python tracker without it)
+uv pip install librosa
+```
+
+**How the app finds this Python** (mechanism, verified in
+`src-tauri/src/sidecars/jobs.rs` and `src-tauri/src/control/hum.rs`):
+
+- The sidecar job runner spawns the **first `python3`/`python` on `PATH`** —
+  so launch the app with the venv prepended:
+
+  ```sh
+  PATH="$PWD/.venv-sidecars/bin:$PATH" npm run tauri dev
+  ```
+
+- The hum-to-song sidecar additionally prefers `<repo>/.venv-sidecars/bin/python`
+  automatically when it exists, PATH or not.
+
+On smaller GPUs, ACE-Step's 3.5B pipeline fits in about 7 GB VRAM with
+sequential offload:
+
+```sh
+export ACESTEP_CPU_OFFLOAD=1
+export ACESTEP_OVERLAPPED_DECODE=1
+```
+
+The rest of the roster:
+
+- **Transcription** — `whisper-cli` (whisper.cpp) on your `PATH` plus a GGML
+  model (`WHISPER_CPP_BIN` / `WHISPER_MODEL_DIR` to point elsewhere).
+- **ElevenLabs Music** (cloud) — `export ELEVENLABS_API_KEY=...`; no local model.
+- **Stable Audio Open instrument builder** — `uv pip install stable-audio-tools`;
+  the model `stabilityai/stable-audio-open-small` is **license-gated on Hugging
+  Face**: you must accept its terms with a logged-in HF account before the
+  worker can download it. We have not run this model for real for that reason —
+  the pipeline is verified in simulate mode only.
+
+Honest status summary: **Demucs and ACE-Step (generate / repaint /
+audio2audio) and AMT infilling are verified with real models on real hardware;
+Stable Audio Open and ElevenLabs are integrated but were exercised in
+simulate/mock mode.**
+
+<details>
+<summary>All sidecar environment variables</summary>
 
 | Variable                  | Effect                                                        |
 | ------------------------- | ------------------------------------------------------------- |
@@ -151,4 +288,128 @@ See **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** for the system design and
 | `ACESTEP_CHECKPOINT_DIR`  | Existing ACE-Step checkpoint directory (skips first-use download) |
 | `ACESTEP_DTYPE`           | ACE-Step inference dtype (default `bfloat16`)                 |
 | `ACESTEP_INFER_STEPS`     | ACE-Step diffusion step count override                        |
+| `ACESTEP_CPU_OFFLOAD`     | `1` = sequential CPU offload (fits ~7 GB VRAM)                |
+| `ACESTEP_OVERLAPPED_DECODE` | `1` = overlapped decode (pairs with CPU offload)            |
 | `AURA_AMT_MODEL`          | Hugging Face model id for AMT infilling (default `stanford-crfm/music-medium-800k`) |
+
+</details>
+
+---
+
+## Drive AURA from Claude (MCP)
+
+AURA embeds an MCP streamable-HTTP server at `http://127.0.0.1:41717/mcp`
+(loopback only). A fresh bearer token is generated per launch and written to
+`~/.local/share/aura/mcp-token` (0600). Connect Claude Code:
+
+```sh
+claude mcp add --transport http aura http://127.0.0.1:41717/mcp \
+  --header "Authorization: Bearer $(cat ~/.local/share/aura/mcp-token)"
+```
+
+Tools: read-only (`get_project_state`, `read_meters` — the agent's "ears",
+`get_job_status`) plus policy-gated destructive tools (`create_project`,
+`add_track`, `set_track_mix`, `transport_control`, `record_take`,
+`import_audio_clip`, `run_sidecar_job` for the generation kinds). The default
+policy is **confirm-in-UI for every destructive call**; `readOnly` and `full`
+modes plus per-tool overrides are available.
+
+Claude Desktop config, the tool contract, auto-import parameters, and the
+security model (constant-time token compare, Origin validation, DNS-rebinding
+defense) are in **[docs/mcp-usage.md](docs/mcp-usage.md)**.
+
+---
+
+## Synth compatibility
+
+The compatibility sweep drove every straightforwardly installable synth it
+could find through the same acceptance harness that gates ZynAddSubFX
+(instantiate → note → headless render → non-silence/pitch assert).
+Full details, versions and verdicts: **[docs/synth-compatibility.md](docs/synth-compatibility.md)**.
+
+| Synth | Format | Verdict |
+|---|---|---|
+| ZynAddSubFX | LV2 | **Stable in-process** — pitched-render acceptance gate, patch banks, state round-trip |
+| mda EPiano | LV2 | **Stable in-process** |
+| synthv1 | LV2 | **Stable in-process** — pitched render |
+| geonkick | LV2 | **Stable in-process** (needs ~1.5 s async warm-up) |
+| Surge XT | CLAP | Renders audio; stable in the isolated probe |
+| padthv1 | LV2 | Renders in isolation only — heap corruption when co-hosted (needs process isolation, D-11) |
+| Yoshimi | LV2 | Renders in isolation only — intermittent SIGSEGV co-hosted (D-11) |
+| Cardinal (Synth) | CLAP | Hosts cleanly, renders silence headlessly (installed without its resource dir) |
+| amsynth / sfizz | — | Untestable on Ubuntu 24.04 (no LV2/CLAP build / not packaged) |
+
+**Score: 6 of 8 testable synths render audio through AURA's hosts.** The
+co-hosting crashes are exactly the empirical case for out-of-process plugin
+hosting (see roadmap).
+
+---
+
+## Tests
+
+```sh
+cd src-tauri && cargo test    # 259 tests: engine, MIDI, sampler, plugins, MCP, sidecars, control plane
+npx svelte-check              # frontend type checking
+npm run build                 # production frontend build
+```
+
+- **Plugin-gated tests** (Zyn acceptance, CLAP lifecycle, state round-trips)
+  run for real when the optional plugins are installed and skip cleanly
+  otherwise.
+- **Real-model integration tests** (2) drive the actual Demucs and ACE-Step
+  models through the app's job pipeline; they skip politely unless enabled:
+
+  ```sh
+  AURA_REAL_MODELS=1 \
+  AURA_REAL_PYTHON=$PWD/.venv-sidecars/bin/python \
+      cargo test --test real_models -- --nocapture
+  ```
+
+---
+
+## Repository layout
+
+| Path                      | Contents                                              |
+| ------------------------- | ----------------------------------------------------- |
+| `src/`                    | Svelte 5 frontend (components, state, canvas render)  |
+| `src/lib/tauri.ts`        | Typed IPC bridge to the Rust backend                  |
+| `src-tauri/src/audio/`    | Audio engine: transport, mixer, recorder, meters, waveform, project persistence, SFZ sampler |
+| `src-tauri/src/control/`  | Shared control plane — the one seam Tauri commands AND MCP tools drive (import, export, hum, loop-jam) |
+| `src-tauri/src/midi/`     | Tick timeline, tempo map, MIDI clips/synth, .mid interop, AMT infill |
+| `src-tauri/src/plugins/`  | CLAP/LV2 hosting: shared plugin main thread, crash-isolated scan, patches, state persistence, automation groundwork |
+| `src-tauri/src/mcp/`      | Embedded MCP server: tools, policy, auth, HTTP layer  |
+| `src-tauri/src/sidecars/` | Sidecar job runner (spawn, queue, cancel, NDJSON protocol) |
+| `sidecars/`               | Python sidecars: Demucs, Whisper, ACE-Step, ElevenLabs, AMT, Stable Audio SFZ, hum-to-MIDI |
+| `docs/`                   | Architecture & scaling docs, IPC schemas, MCP usage — see [docs/README.md](docs/README.md) |
+
+---
+
+## Roadmap
+
+The near-term list, distilled from the [SCALABILITY debt register](docs/SCALABILITY.md):
+
+- **Out-of-process plugin hosting** (D-11, the open half) — scanning already
+  runs in a sacrificial subprocess; runtime DSP isolation behind the
+  `LiveNodeCell` seam is what unlocks padthv1/Yoshimi-class plugins.
+- **Undo/redo** — via the op-log protocol (D-03), not ad hoc; `set_track_mix`
+  already ships batch-shaped as its first step.
+- **Automation UI** — lanes and the sample-accurate ramp seam are in the
+  engine; drawing/editing UI is not built yet.
+- **Plugin GUI windows** — v1 = plugin-owned/floating windows alongside the
+  generic param panel.
+- **Plugin delay compensation (PDC)** — in the graph compiler, before
+  sends/sidechains ship.
+- **VST3** — later, behind the same internal plugin contract.
+
+## License
+
+[GPL-3.0](LICENSE).
+
+## Should this exist?
+
+Honest question, honestly meant. LMMS, Ardour and Zrythm exist and have real
+communities. Is "schema-driven core + local AI pipeline + MCP-native agent
+control" a genuine architectural reason for a new DAW — or should this energy
+flow into an existing one? If you have an opinion either way,
+[open an issue](https://github.com/knobo/aura-daw/issues). Blunt answers
+welcome; the engine code appreciates skeptical eyes most of all.
