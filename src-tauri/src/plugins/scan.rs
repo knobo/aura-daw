@@ -192,7 +192,11 @@ mod tests {
     }
 
     /// CLAP descriptor read against real bundles when present (Ubuntu:
-    /// zam-plugins ships /usr/lib/clap/*.clap); skipped otherwise.
+    /// zam-plugins ships /usr/lib/clap/*.clap); skipped otherwise. Scans
+    /// through the sacrificial worker (production path) so third-party
+    /// bundles are never dlopened into the shared test process — the same
+    /// descriptor code runs inside the child (see
+    /// `scan_worker::test_worker_command` for why: Cardinal teardown).
     #[test]
     fn clap_bundles_scan_when_present() {
         let roots = clap_search_paths();
@@ -201,7 +205,10 @@ mod tests {
             eprintln!("skipping: no CLAP bundles installed");
             return;
         }
-        let plugins = scan_clap_paths(&roots);
+        let plugins = crate::plugins::scan_worker::scan_with_worker(
+            &bundles,
+            &crate::plugins::scan_worker::test_worker_command(),
+        );
         assert!(!plugins.is_empty(), "installed bundles yield descriptors");
         for p in &plugins {
             assert!(p.uid.starts_with("clap:"));

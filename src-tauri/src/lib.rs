@@ -80,6 +80,11 @@ pub fn run() {
             ));
             app.manage(control_plane);
 
+            // Loop-jam session driver rides on the shared control plane.
+            app.manage(std::sync::Arc::new(control::loopjam::LoopJam::new(
+                app.state::<Arc<control::ControlPlane>>().inner().clone(),
+            )));
+
             mcp::init(handle)?;
             Ok(())
         })
@@ -124,6 +129,15 @@ pub fn run() {
             control::set_track_mix,
             control::import_audio_clip,
             control::seed_demo_project,
+            // ---- control plane: wave 1 features ----
+            control::hum::hum_to_song,
+            control::export::export_song,
+            control::export::export_job_status,
+            control::export::export_capabilities,
+            control::import::import_audio_clip_split_stems,
+            control::loopjam::loopjam_evolve,
+            control::loopjam::loopjam_cancel,
+            control::loopjam::loopjam_status,
             // ---- midi (phase 2, zone C) ----
             midi::set_tempo_map,
             midi::midi_add_clip,
@@ -149,6 +163,8 @@ pub fn run() {
             plugins::plugin_remove,
             plugins::plugin_get_params,
             plugins::plugin_set_param,
+            plugins::patches::zyn_list_patches,
+            plugins::patches::zyn_load_patch,
             // ---- automation groundwork (phase 3, zone P4) ----
             plugins::automation::automation_get,
             plugins::automation::automation_set,

@@ -26,6 +26,7 @@ pub mod clap_host;
 pub mod descriptor;
 pub mod host;
 pub mod lv2_host;
+pub mod patches;
 pub mod scan;
 pub mod scan_worker;
 pub mod state;

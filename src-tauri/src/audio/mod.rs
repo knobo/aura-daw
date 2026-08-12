@@ -32,6 +32,7 @@ pub mod sampler_voice;
 pub mod transport;
 pub mod types;
 pub mod waveform;
+pub mod offline;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};

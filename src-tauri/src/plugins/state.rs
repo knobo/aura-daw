@@ -1242,9 +1242,26 @@ mod tests {
     /// cleanly when no CLAP instrument is installed.
     #[test]
     fn clap_state_roundtrips_through_real_project_save_open() {
-        use crate::plugins::scan::{clap_search_paths, scan_clap_paths};
-        let scanned = scan_clap_paths(&clap_search_paths());
-        let Some(desc) = scanned.iter().find(|d| d.is_instrument).cloned() else {
+        use crate::plugins::scan::{clap_search_paths, find_clap_bundles};
+        // Scan through the sacrificial worker (production path): an
+        // in-process scan dlopens every bundle, and Cardinal's teardown
+        // corrupts the test process at exit (see
+        // `scan_worker::test_worker_command`). Same reason we never pick
+        // Cardinal as the instrument to instantiate here.
+        let bundles = find_clap_bundles(&clap_search_paths());
+        let scanned = if bundles.is_empty() {
+            Vec::new()
+        } else {
+            crate::plugins::scan_worker::scan_with_worker(
+                &bundles,
+                &crate::plugins::scan_worker::test_worker_command(),
+            )
+        };
+        let Some(desc) = scanned
+            .iter()
+            .find(|d| d.is_instrument && !d.uid.to_lowercase().contains("cardinal"))
+            .cloned()
+        else {
             eprintln!("skipping: no CLAP instrument installed");
             return;
         };

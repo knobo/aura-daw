@@ -226,8 +226,27 @@ pub fn scan_with_worker(bundles: &[PathBuf], cmd: &WorkerCommand) -> Vec<PluginD
     out
 }
 
+/// Worker command for TEST binaries: spawns this test binary filtered down
+/// to the hidden `worker_entry` test (the libtest harness has no
+/// `AURA_SCAN_WORKER` guard in `main`, so plain re-execution would run the
+/// whole suite). Lets other test modules scan third-party CLAP bundles
+/// through a sacrificial child instead of dlopening them into the shared
+/// test process (Cardinal's exit-time teardown corrupts the heap — observed
+/// intermittently killing full-suite runs when scanned in-process).
 #[cfg(test)]
-mod tests {
+pub fn test_worker_command() -> WorkerCommand {
+    WorkerCommand {
+        exe: std::env::current_exe().expect("test exe"),
+        args: vec![
+            "--exact".into(),
+            "plugins::scan_worker::tests::worker_entry".into(),
+            "--nocapture".into(),
+        ],
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
     use super::*;
     use crate::plugins::scan::{clap_search_paths, find_clap_bundles};
 
@@ -244,14 +263,7 @@ mod tests {
 
     /// Launch THIS test binary as the worker through the hidden entry.
     fn test_worker_cmd() -> WorkerCommand {
-        WorkerCommand {
-            exe: std::env::current_exe().expect("test exe"),
-            args: vec![
-                "--exact".into(),
-                "plugins::scan_worker::tests::worker_entry".into(),
-                "--nocapture".into(),
-            ],
-        }
+        super::test_worker_command()
     }
 
     /// The worker subprocess yields the same descriptors as the in-process
@@ -259,12 +271,20 @@ mod tests {
     #[test]
     fn worker_scan_matches_in_process_scan() {
         let roots = clap_search_paths();
-        let bundles = find_clap_bundles(&roots);
+        // The in-process side of this comparison must not dlopen Cardinal:
+        // its exit-time teardown corrupts the heap and intermittently kills
+        // the whole test binary (see `test_worker_command` docs). Compare on
+        // the remaining bundles; Cardinal itself is still scanned by the
+        // worker-only tests and probed in `plugins::patches`.
+        let bundles: Vec<_> = find_clap_bundles(&roots)
+            .into_iter()
+            .filter(|b| !b.to_string_lossy().contains("Cardinal"))
+            .collect();
         if bundles.is_empty() {
             eprintln!("skipping: no CLAP bundles installed");
             return;
         }
-        let mut in_proc: Vec<String> = scan::scan_clap_paths(&roots)
+        let mut in_proc: Vec<String> = scan::scan_clap_bundles_in_process(&bundles)
             .into_iter()
             .map(|d| d.uid)
             .collect();

@@ -247,9 +247,10 @@ pub fn run_generic_job(
         )
     })?;
     let (script, task): (&str, Option<&str>) = match job_kind {
-        JobKind::StemSplit | JobKind::Transcribe => {
+        JobKind::StemSplit | JobKind::Transcribe | JobKind::HumToMidi => {
             return Err(format!(
-                "kind `{kind}` uses its dedicated command (sidecar_split_stems / sidecar_transcribe)"
+                "kind `{kind}` uses its dedicated command (sidecar_split_stems / \
+                 sidecar_transcribe / hum_to_song)"
             ));
         }
         JobKind::AceStepGenerate => ("ace_step_worker.py", Some("generate")),

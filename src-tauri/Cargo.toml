@@ -42,6 +42,9 @@ ringbuf = "0.4"        # alternative lock-free ringbuffer (heap-backed, split pr
 # --- Audio file I/O ---
 hound = "3.5"          # WAV read/write
 flacenc = "0.4"        # pure-Rust FLAC encoder (archival/export)
+# Universal import decode (wave 1B): MP3/FLAC/OGG-Vorbis/AAC/M4A -> PCM.
+# WAV keeps the hound fast path; symphonia only decodes compressed sources.
+symphonia = { version = "0.5", features = ["mp3", "aac", "isomp4", "flac", "ogg", "vorbis"] }
 
 # --- MCP server (embedded, streamable HTTP on 127.0.0.1 — phase 2, src/mcp/) ---
 rmcp = { version = "3.1", features = ["server", "transport-streamable-http-server"] }

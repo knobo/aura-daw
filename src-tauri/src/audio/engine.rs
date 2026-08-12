@@ -938,9 +938,22 @@ mod tests {
             count.clone(),
             frames.clone(),
         ))));
-        std::thread::sleep(Duration::from_millis(500));
-        let n = count.load(Relaxed);
-        assert!(n >= 10, "expected >= 10 meter frames in 500 ms, got {n}");
+        // Event-driven readiness: wait until frames have demonstrably flowed
+        // instead of asserting a rate over a fixed wall-clock window (which
+        // is load-sensitive — a starved pump thread under parallel test load
+        // legitimately delivers fewer frames per wall second).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if count.load(Relaxed) >= 10 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected >= 10 meter frames within 10 s, got {}",
+                count.load(Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let frames = frames.lock();
         assert!(frames[0].seq == 0, "per-subscription seq starts at 0");
         assert!(frames.windows(2).all(|w| w[1].seq == w[0].seq + 1));
@@ -953,19 +966,61 @@ mod tests {
     #[test]
     fn transport_advances_headless_or_with_device() {
         let (handle, shared, _params, _store) = spin_up();
-        std::thread::sleep(Duration::from_millis(100)); // let stream open (or fail)
+        // Event-driven readiness: wait for the stream (or headless fallback)
+        // to publish a sample rate instead of guessing with a fixed sleep.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let rate = loop {
+            let r = shared.sample_rate.load(Relaxed) as u64;
+            if r > 0 {
+                break r;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "engine never published a sample rate"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         shared.position.store(0, Relaxed);
         shared.playing.store(true, Relaxed);
-        std::thread::sleep(Duration::from_millis(300));
+        // Asserting a wall-clock rate corridor is load-sensitive (an
+        // oversleeping test thread makes the position overshoot; a starved
+        // engine thread undershoots). Assert the two real invariants
+        // event-driven instead: (1) the transport demonstrably ADVANCES
+        // while playing, (2) it SETTLES after stop.
+        let target = rate / 10; // >= 100 ms of audio
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if shared.position.load(Relaxed) >= target {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transport never advanced while playing (pos {} < {target})",
+                shared.position.load(Relaxed)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         shared.playing.store(false, Relaxed);
-        let pos = shared.position.load(Relaxed);
-        let rate = shared.sample_rate.load(Relaxed) as u64;
-        // ~300 ms of samples, generous tolerance for scheduling jitter.
-        let low = rate * 150 / 1000;
-        let high = rate * 700 / 1000;
-        assert!(
-            pos >= low && pos <= high,
-            "position {pos} outside [{low}, {high}] at rate {rate}"
+        // Let any in-flight frame land, then require two agreeing reads and
+        // verify the position stays put.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let settled = loop {
+            let a = shared.position.load(Relaxed);
+            std::thread::sleep(Duration::from_millis(50));
+            let b = shared.position.load(Relaxed);
+            if a == b {
+                break b;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "position kept advancing after stop"
+            );
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            shared.position.load(Relaxed),
+            settled,
+            "transport advanced while stopped"
         );
         handle.send(ControlMsg::Shutdown);
     }

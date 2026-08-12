@@ -15,7 +15,10 @@
 //!                (`get_project_state`, `set_track_mix`, `import_audio_clip`).
 
 pub mod import;
+pub mod hum;
+pub mod export;
 pub mod ops;
+pub mod loopjam;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -283,12 +286,18 @@ impl ControlPlane {
         self.import_audio_clip_impl(req)
     }
 
-    /// Seed a content-less session with a small demo song (two midi tracks —
-    /// arp + bass — rendered through the built-in PolySynth), so the very
-    /// first press of PLAY makes sound. This is the control-plane end of the
-    /// UI's "load demo song" affordance; it refuses to run when the session
-    /// already has audible content, and needs no open project (the clips live
-    /// in memory exactly like any unsaved edit).
+    /// Seed a content-less session with a small demo song (demo v2: pad
+    /// chords + plucked lead + bass over Am–F–C–G), so the very first press
+    /// of PLAY makes sound. When ZynAddSubFX (LV2) and its stock banks are
+    /// installed, the three tracks are bound to Zyn instances loaded with
+    /// bank patches (Pads/Analog Pad 1, Plucked/Plucked 1, Bass/Analogue
+    /// Bass); on machines without Zyn the tracks keep the built-in PolySynth
+    /// — the demo NEVER fails for lack of plugins. This is the control-plane
+    /// end of the UI's "load demo song" affordance; it refuses to run when
+    /// the session already has audible content, and needs no open project
+    /// (the clips live in memory exactly like any unsaved edit). With a
+    /// project open, midi, track bindings AND plugin state are persisted so
+    /// the demo survives save/open.
     pub fn seed_demo_project(&self) -> Result<ProjectSnapshot, String> {
         {
             let s = self.store.lock();
@@ -305,12 +314,22 @@ impl ControlPlane {
         };
         crate::midi::notify_project_opened(dir.clone(), bpm);
 
-        let (keys, bass) = {
+        // Zyn upgrade path: build the three patched instances BEFORE the
+        // tracks so a failure leaves no half-bound state (None = PolySynth).
+        let zyn = try_seed_zyn_demo_instruments();
+
+        let (pad, lead, bass) = {
             let mut s = self.store.lock();
-            let keys = ops::add_track(
+            let pad = ops::add_track(
                 &mut s,
                 &self.params,
-                Some("Demo Keys".into()),
+                Some("Demo Pad".into()),
+                Some("midi".into()),
+            )?;
+            let lead = ops::add_track(
+                &mut s,
+                &self.params,
+                Some("Demo Lead".into()),
                 Some("midi".into()),
             )?;
             let bass = ops::add_track(
@@ -319,18 +338,53 @@ impl ControlPlane {
                 Some("Demo Bass".into()),
                 Some("midi".into()),
             )?;
-            (keys, bass)
+            if let Some(ids) = &zyn {
+                for (track_id, instance_id) in
+                    [(&pad.id, &ids[0]), (&lead.id, &ids[1]), (&bass.id, &ids[2])]
+                {
+                    if let Some(t) = s.tracks.iter_mut().find(|t| &t.id == track_id) {
+                        t.instrument_id = Some(format!("plugin:{instance_id}"));
+                    }
+                }
+            }
+            (pad, lead, bass)
         };
         {
             let mut m = self.midi.lock();
             let ppq = m.ppq;
-            let (arp, groove) = demo_seed_clips(&keys.id, &bass.id, ppq);
-            m.clips.push(arp);
-            m.clips.push(groove);
+            let (pad_clip, lead_clip, bass_clip) =
+                demo_seed_clips_v2(&pad.id, &lead.id, &bass.id, ppq);
+            m.clips.push(pad_clip);
+            m.clips.push(lead_clip);
+            m.clips.push(bass_clip);
             if let Some(d) = &dir {
                 if let Err(e) = crate::midi::persist::save_into_project(d, &m) {
                     log::warn!("seed demo: persisting midi failed: {e}");
                 }
+            }
+        }
+        // Persist the track bindings (project.json tracks) and the plugin
+        // instances + state blobs, so a save/open cycle replays the same
+        // demo through the same patches (zone P4 restore path).
+        if let (Some(d), Some(_)) = (&dir, &zyn) {
+            let snapshot = {
+                let s = self.store.lock();
+                project::from_store(
+                    &s,
+                    self.shared.position.load(Relaxed),
+                    self.shared.sample_rate.load(Relaxed),
+                )
+            };
+            match snapshot {
+                Ok(p) => {
+                    if let Err(e) = project::save(d, &p) {
+                        log::warn!("seed demo: persisting tracks failed: {e}");
+                    }
+                }
+                Err(e) => log::warn!("seed demo: project snapshot failed: {e}"),
+            }
+            if let Some(reg) = crate::plugins::registered_registry() {
+                crate::plugins::state::persist_after_mutation(&self.store, reg, true);
             }
         }
         self.engine.send(ControlMsg::Rebuild);
@@ -375,9 +429,75 @@ impl ControlPlane {
     }
 }
 
-/// The demo-song content for [`ControlPlane::seed_demo_project`]: a 4-bar
-/// A-minor arpeggio (Am–F–C–G, 16ths) and an 8th-note bass groove. Pure —
-/// unit-testable without an engine.
+/// Try to build the three Zyn demo instances (pad / lead / bass), each
+/// loaded with a stock bank patch. Returns their instance ids, or None when
+/// anything on the Zyn path is unavailable (plugin not installed, banks
+/// missing, no registered plugin registry) — the caller then keeps the
+/// PolySynth fallback, so a machine without plugins is never broken.
+/// Partial failures roll back (no orphan instances).
+fn try_seed_zyn_demo_instruments() -> Option<[String; 3]> {
+    use crate::plugins::{self, patches};
+    let registry = plugins::registered_registry()?;
+    // Patches chosen to sit well together: soft pad chords, a plucked lead
+    // that cuts through, and a round analog-style bass.
+    let wanted = [
+        patches::find_zyn_patch("Pads", "analog pad")?,
+        patches::find_zyn_patch("Plucked", "plucked")?,
+        patches::find_zyn_patch("Bass", "analogue bass")
+            .or_else(|| patches::find_zyn_patch("Bass", "bass"))?,
+    ];
+    let uid = plugins::descriptor::lv2_uid(patches::ZYN_URI);
+    {
+        let mut reg = registry.lock();
+        if reg.scanned.is_none() {
+            // LV2-only scan: metadata via the lilv world, no plugin code —
+            // safe to run inline (the CLAP subprocess scan stays on-demand).
+            reg.scanned = Some(plugins::scan::scan_lv2());
+        }
+        if !reg.scanned.as_ref().is_some_and(|s| s.iter().any(|d| d.uid == uid)) {
+            return None;
+        }
+    }
+    let mut ids: Vec<String> = Vec::with_capacity(3);
+    for patch in &wanted {
+        match plugins::instantiate_and_activate(registry, &uid) {
+            Ok(info) => {
+                if let Err(e) =
+                    patches::load_zyn_patch(&info.id, std::path::Path::new(&patch.path))
+                {
+                    // Zyn's default patch still sounds; keep the instance.
+                    log::warn!(
+                        "seed demo: loading patch {}/{} failed ({e}); using Zyn default",
+                        patch.bank,
+                        patch.name
+                    );
+                }
+                ids.push(info.id);
+            }
+            Err(e) => {
+                log::warn!("seed demo: Zyn instantiation failed ({e}); PolySynth fallback");
+                for id in &ids {
+                    let _ = registry.lock().remove(id);
+                    if let Some(host) = plugins::lv2_host::try_global() {
+                        host.unregister_instance(id);
+                    }
+                }
+                return None;
+            }
+        }
+    }
+    log::info!(
+        "seed demo: Zyn instances ready ({})",
+        wanted.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
+    );
+    ids.try_into().ok()
+}
+
+/// The ORIGINAL two-track demo content (v1: 16th-note arp + bass groove),
+/// kept byte-for-byte under the old name/signature for callers that pinned
+/// expectations to it (offline render / export tests assert its exact song
+/// length). The seeded demo song itself uses [`demo_seed_clips_v2`]'s
+/// three-track arrangement.
 pub fn demo_seed_clips(
     keys_track_id: &str,
     bass_track_id: &str,
@@ -434,6 +554,95 @@ pub fn demo_seed_clips(
     };
     (
         clip(keys_track_id, "demo arp", arp),
+        clip(bass_track_id, "demo bass", groove),
+    )
+}
+
+/// The demo-song content for [`ControlPlane::seed_demo_project`] (v2): four
+/// bars of Am–F–C–G as sustained pad chords, a plucked 8th-note lead
+/// melody, and an 8th-note bass groove. Pure — unit-testable without an
+/// engine; the same music renders through Zyn patches or PolySynth.
+pub fn demo_seed_clips_v2(
+    pad_track_id: &str,
+    lead_track_id: &str,
+    bass_track_id: &str,
+    ppq: u32,
+) -> (crate::midi::MidiClip, crate::midi::MidiClip, crate::midi::MidiClip) {
+    use crate::midi::{MidiClip, MidiNote};
+    let bar = 4 * ppq;
+    let eighth = ppq / 2;
+
+    // Pad: one voiced chord per bar, smooth voice leading, held nearly the
+    // whole bar so pad patches breathe.
+    let chords: [&[u8]; 4] = [
+        &[57, 60, 64], // Am
+        &[53, 57, 60], // F
+        &[55, 60, 64], // C (2nd inversion keeps the top line close)
+        &[55, 59, 62], // G
+    ];
+    let mut pad = Vec::new();
+    for b in 0..4u32 {
+        for &key in chords[(b % 4) as usize] {
+            pad.push(MidiNote {
+                tick: b * bar,
+                length_ticks: bar * 95 / 100,
+                key,
+                velocity: 72,
+                channel: 0,
+            });
+        }
+    }
+
+    // Lead: an 8th-note phrase per bar (A-minor melody over the changes) —
+    // short notes so plucked patches speak naturally.
+    let phrases: [[u8; 8]; 4] = [
+        [69, 72, 76, 72, 69, 76, 74, 72], // over Am
+        [67, 69, 72, 69, 65, 69, 72, 74], // over F
+        [76, 74, 72, 67, 64, 67, 72, 74], // over C
+        [71, 74, 79, 74, 71, 67, 69, 71], // over G
+    ];
+    let mut lead = Vec::new();
+    for b in 0..4u32 {
+        for (s, &key) in phrases[(b % 4) as usize].iter().enumerate() {
+            lead.push(MidiNote {
+                tick: b * bar + s as u32 * eighth,
+                length_ticks: eighth * 8 / 10,
+                key,
+                velocity: if s % 2 == 0 { 102 } else { 84 },
+                channel: 0,
+            });
+        }
+    }
+
+    // Bass: the v1 groove (roots with octave pushes, rests for air).
+    let roots: [u8; 4] = [33, 29, 36, 31]; // A1 F1 C2 G1
+    let mut groove = Vec::new();
+    for b in 0..4u32 {
+        for s in 0..8u32 {
+            if s == 3 || s == 6 {
+                continue; // breathing room
+            }
+            groove.push(MidiNote {
+                tick: b * bar + s * eighth,
+                length_ticks: eighth * 8 / 10,
+                key: roots[(b % 4) as usize] + if s % 4 == 2 { 12 } else { 0 },
+                velocity: if s == 0 { 118 } else { 92 },
+                channel: 0,
+            });
+        }
+    }
+
+    let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| MidiClip {
+        id: uuid::Uuid::new_v4().to_string(),
+        track_id: track_id.to_string(),
+        name: name.to_string(),
+        timeline_start_ticks: 0,
+        length_ticks: 4 * bar as u64,
+        notes,
+    };
+    (
+        clip(pad_track_id, "demo pad", pad),
+        clip(lead_track_id, "demo lead", lead),
         clip(bass_track_id, "demo bass", groove),
     )
 }
@@ -561,7 +770,15 @@ mod tests {
             Arc::new(Mutex::new(MidiStore::default())),
             Box::new(|_, _| {}),
         );
-        std::thread::sleep(Duration::from_millis(100)); // let the stream open (or fail)
+        // Round-trip barrier: once the engine thread answers, its startup
+        // `open_output` has finished, so the rate below is final (a fixed
+        // sleep races the stream open under load).
+        engine
+            .request(|reply| crate::audio::engine::ControlMsg::SelectInput {
+                device_id: None,
+                reply,
+            })
+            .expect("engine control thread responds");
         let rate = shared.sample_rate.load(Relaxed) as u64;
 
         // Empty regions are rejected when enabling.
@@ -621,13 +838,14 @@ mod tests {
     }
 
     /// Regression (user report "press play → no sound"): the seeded demo
-    /// song must render NON-ZERO audio through the midi graph path, headless
-    /// (no device, no tauri). A fresh session that seeds + plays is audible.
+    /// song (v2: pad + lead + bass) must render NON-ZERO audio through the
+    /// midi graph path, headless (no device, no tauri, no plugins — the
+    /// PolySynth fallback). A fresh session that seeds + plays is audible.
     #[test]
     fn seeded_demo_clips_render_nonzero_audio() {
         use crate::audio::types::{Store, TrackState};
         let mut store = Store::default();
-        for (id, name) in [("keys", "Demo Keys"), ("bass", "Demo Bass")] {
+        for (id, name) in [("pad", "Demo Pad"), ("lead", "Demo Lead"), ("bass", "Demo Bass")] {
             store.alloc_slot(id);
             store.tracks.push(TrackState {
                 id: id.into(),
@@ -642,21 +860,21 @@ mod tests {
                 instrument_id: None,
             });
         }
-        let (arp, groove) = demo_seed_clips("keys", "bass", 960);
-        assert!(!arp.notes.is_empty() && !groove.notes.is_empty());
-        for n in arp.notes.iter().chain(groove.notes.iter()) {
+        let (pad, lead, groove) = demo_seed_clips_v2("pad", "lead", "bass", 960);
+        assert!(!pad.notes.is_empty() && !lead.notes.is_empty() && !groove.notes.is_empty());
+        for n in pad.notes.iter().chain(lead.notes.iter()).chain(groove.notes.iter()) {
             n.validate().unwrap();
         }
         let midi = crate::midi::MidiStore {
             ppq: 960,
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
-            clips: vec![arp, groove],
+            clips: vec![pad, lead, groove],
             loaded_dir: None,
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
         crate::midi::playback::append_from(&midi, &store, 48_000, None, &mut nodes, &mut out);
-        assert_eq!(out.len(), 2, "both seeded tracks reach the RT graph");
+        assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
         let mut g = crate::audio::rt::RtGraph::new(out);
@@ -678,6 +896,92 @@ mod tests {
         }
         let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.05, "seeded tracks render audibly live (peak {peak})");
+    }
+
+    /// Demo v2's Zyn upgrade path (gated on zynaddsubfx-lv2 + banks): the
+    /// seeder's instance builder yields three ACTIVE patched Zyn instances,
+    /// and the demo arrangement bound to them renders non-silent audio
+    /// through the real graph path. Machines without Zyn skip (the
+    /// PolySynth fallback is covered by the test above).
+    #[test]
+    fn seeded_demo_zyn_instruments_bind_and_render() {
+        use crate::audio::types::{Store, TrackState};
+        // The seeder resolves instances through the registered app-global
+        // registry (register-once semantics shared across the test process).
+        crate::plugins::register_registry(Arc::new(Mutex::new(
+            crate::plugins::PluginRegistry::default(),
+        )));
+        let registry = crate::plugins::registered_registry().unwrap().clone();
+        let Some(ids) = try_seed_zyn_demo_instruments() else {
+            eprintln!("skipping: ZynAddSubFX or its banks not installed");
+            return;
+        };
+        for id in &ids {
+            let info = registry.lock().instances.get(id).cloned().expect("registered");
+            assert_eq!(info.status, "active", "demo Zyn instance is active");
+        }
+
+        let mut store = Store::default();
+        for (slot, id) in ["pad", "lead", "bass"].iter().enumerate() {
+            store.alloc_slot(id);
+            store.tracks.push(TrackState {
+                id: (*id).into(),
+                name: (*id).into(),
+                kind: "midi".into(),
+                gain_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                soloed: false,
+                armed: false,
+                color: "#7c9cff".into(),
+                instrument_id: Some(format!("plugin:{}", ids[slot])),
+            });
+        }
+        let (pad, lead, groove) = demo_seed_clips_v2("pad", "lead", "bass", 960);
+        let midi = crate::midi::MidiStore {
+            ppq: 960,
+            tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
+            clips: vec![pad, lead, groove],
+            loaded_dir: None,
+        };
+        let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
+        let mut out = Vec::new();
+        crate::midi::playback::append_from(&midi, &store, 48_000, None, &mut nodes, &mut out);
+        assert_eq!(out.len(), 3);
+        for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
+            assert_eq!(
+                nodes.key_of(track),
+                Some(format!("plugin:{inst}@48000").as_str()),
+                "track {track} resolved to its Zyn node (not the fallback)"
+            );
+        }
+        let mut g = crate::audio::rt::RtGraph::new(out);
+        let params = crate::audio::rt::ParamTable::default();
+        let mut buf = vec![0.0f32; 2 * 48_000 * 2];
+        let mut pos = 0u64;
+        for chunk in buf.chunks_mut(512 * 2) {
+            crate::audio::mixer::render(
+                &mut g,
+                &params,
+                pos,
+                &crate::audio::transport::LoopSpec::OFF,
+                chunk,
+                2,
+                48_000,
+                false,
+            );
+            pos += (chunk.len() / 2) as u64;
+        }
+        let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.01, "Zyn-bound demo renders audibly (peak {peak})");
+
+        // Cleanup: drop the demo instances from the shared registry/host.
+        for id in &ids {
+            let _ = registry.lock().remove(id);
+            if let Some(host) = crate::plugins::lv2_host::try_global() {
+                host.unregister_instance(id);
+            }
+        }
     }
 
     /// Item-4 integration: a finished `stableAudioSfz` job whose result

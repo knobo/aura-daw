@@ -791,7 +791,16 @@ mod tests {
         }
         let info = {
             let mut reg = reg.lock();
-            reg.scanned = Some(scanned);
+            // EXTEND the shared registry's scan results instead of replacing
+            // them: this registry is process-global (OnceLock) and the CLAP
+            // tests race us — overwriting with an LV2-only list would yank
+            // their descriptors out from under them.
+            let merged = reg.scanned.get_or_insert_with(Vec::new);
+            for d in scanned {
+                if !merged.iter().any(|m| m.uid == d.uid) {
+                    merged.push(d);
+                }
+            }
             reg.instantiate(&lv2_uid(ZYN_URI)).expect("Zyn instantiates in the registry")
         };
         assert_eq!(info.status, "stub");

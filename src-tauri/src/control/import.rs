@@ -1,23 +1,31 @@
 //! Audio import into the open project — phase 2, zone B (delegated by the
-//! architect; see PHASE2-PLAN §3.B).
+//! architect; see PHASE2-PLAN §3.B). Wave 1B extends it to universal decode.
 //!
-//! Two things live here:
+//! Three things live here:
 //!
-//! * [`ControlPlane::import_audio_clip`]'s real body: validate a WAV file,
-//!   copy it into `<project>/audio/<clipId>.wav`, probe channels/rate/length
-//!   (hound via [`engine::load_wav`]), build the waveform pyramid, register
-//!   the [`Clip`] (sample-anchored placement) and ask the engine to rebuild.
-//!   A target track is auto-created when `track_id` is `None`.
+//! * [`ControlPlane::import_audio_clip`]'s real body: validate an audio file,
+//!   land it in `<project>/audio/<clipId>.wav`, probe channels/rate/length,
+//!   build the waveform pyramid, register the [`Clip`] (sample-anchored
+//!   placement) and ask the engine to rebuild. A target track is auto-created
+//!   when `track_id` is `None`. WAV keeps the hound fast path (bit-exact file
+//!   copy); MP3/FLAC/OGG/AAC/M4A are decoded via symphonia and re-written as
+//!   an f32 WAV in the project (the rest of the pipeline — pyramid, RT cache,
+//!   resample-at-load — is identical from there).
 //! * The post-job import convenience: submitting a generation job with the
 //!   additive `importToTrackId` param (plus optional `importAtSamples`) makes
 //!   the `done` event's `outputPath` land on the timeline through the SAME
 //!   control-plane method — the "generate → hear it" loop, no UI round-trip.
+//! * The import→stem-split chain: [`ControlPlane::import_and_split_stems`]
+//!   imports a file and immediately submits the Demucs job on the imported
+//!   copy; the `done` result's `stems` map is auto-imported as four new
+//!   tracks (same post-job mechanism, same control-plane import method).
 //!
 //! The core is a tauri-free function over `Store`/`ParamTable` so it unit
 //! tests without an engine or webview (job-manager style).
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -26,11 +34,143 @@ use crate::audio::project;
 use crate::audio::rt::ParamTable;
 use crate::audio::types::{Clip, Store, TrackState};
 use crate::audio::waveform::{pyramid_exists, Pyramid};
-use crate::sidecars::jobs::EventSink;
-use crate::sidecars::SidecarEvent;
+use crate::sidecars::jobs::{self, EventSink, JobSpec};
+use crate::sidecars::{JobKind, SidecarEvent};
 
 use super::ops;
 use super::{ControlPlane, ImportClipRequest};
+
+/// Formats decoded through symphonia (everything except the WAV fast path).
+const SYMPHONIA_EXTS: [&str; 6] = ["mp3", "flac", "ogg", "aac", "m4a", "mp4"];
+
+/// Decode any supported audio file to interleaved f32 at its NATIVE rate:
+/// `(channels, sample_rate, samples)`. WAV goes through hound (fast path,
+/// identical to the original import); compressed formats through symphonia.
+pub(crate) fn decode_audio(path: &Path) -> Result<(u16, u32, Vec<f32>), String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "wav" => load_wav(path),
+        e if SYMPHONIA_EXTS.contains(&e) => decode_with_symphonia(path),
+        "aiff" | "aif" | "wma" | "opus" => Err(format!(
+            "unsupported import format `.{ext}` — supported: wav, mp3, flac, \
+             ogg, aac, m4a (convert to one of these for now)"
+        )),
+        other => Err(format!(
+            "unsupported import format `.{other}` — supported: wav, mp3, \
+             flac, ogg, aac, m4a"
+        )),
+    }
+}
+
+/// Symphonia decode path: probe container, pick the first decodable track,
+/// decode every packet to interleaved f32. Corrupt files fail with a clean
+/// message; a decode error mid-stream after audio was produced truncates
+/// (matching common DAW behavior for damaged tails) rather than failing.
+fn decode_with_symphonia(path: &Path) -> Result<(u16, u32, Vec<f32>), String> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+    use symphonia::core::errors::Error as SymErr;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|e| format!("cannot read {} (corrupt or not audio): {e}", path.display()))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| format!("no decodable audio track in {}", path.display()))?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("unsupported codec in {}: {e}", path.display()))?;
+
+    let mut channels: u16 = 0;
+    let mut sample_rate: u32 = 0;
+    let mut samples: Vec<f32> = Vec::new();
+    let mut sbuf: Option<SampleBuffer<f32>> = None;
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            // Clean end of stream (symphonia reports EOF as an IO error).
+            Err(SymErr::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(SymErr::ResetRequired) => break, // chained stream: keep first
+            Err(e) => {
+                if samples.is_empty() {
+                    return Err(format!("decode failed for {}: {e}", path.display()));
+                }
+                log::warn!("import: damaged tail in {} ({e}); truncating", path.display());
+                break;
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                let spec = *decoded.spec();
+                channels = spec.channels.count() as u16;
+                sample_rate = spec.rate;
+                let needed = decoded.capacity() as u64;
+                let recreate = sbuf
+                    .as_ref()
+                    .map_or(true, |b| b.capacity() < needed as usize * channels as usize);
+                if recreate {
+                    sbuf = Some(SampleBuffer::<f32>::new(needed, spec));
+                }
+                let sb = sbuf.as_mut().unwrap();
+                sb.copy_interleaved_ref(decoded);
+                samples.extend_from_slice(sb.samples());
+            }
+            // Skip isolated corrupt packets (decoder recovers on the next).
+            Err(SymErr::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("decode failed for {}: {e}", path.display())),
+        }
+    }
+    if channels == 0 || sample_rate == 0 || samples.is_empty() {
+        return Err(format!("no audio frames decoded from {}", path.display()));
+    }
+    Ok((channels, sample_rate, samples))
+}
+
+/// Write interleaved f32 as a 32-bit float WAV (the project-native format —
+/// same as the recorder's output).
+pub(crate) fn write_f32_wav(
+    path: &Path,
+    channels: u16,
+    sample_rate: u32,
+    samples: &[f32],
+) -> Result<(), String> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut w = hound::WavWriter::create(path, spec).map_err(|e| e.to_string())?;
+    for s in samples {
+        w.write_sample(*s).map_err(|e| e.to_string())?;
+    }
+    w.finalize().map_err(|e| e.to_string())
+}
 
 /// What `do_import` did (the caller decides how to announce it).
 #[derive(Debug)]
@@ -58,20 +198,11 @@ pub(crate) fn do_import(
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    match ext.as_str() {
-        "wav" => {}
-        "flac" | "mp3" | "ogg" | "aiff" | "aif" => {
-            return Err(format!(
-                "unsupported import format `.{ext}` — v1 imports WAV only \
-                 (FLAC/MP3 decode is planned; convert to WAV for now)"
-            ));
-        }
-        other => return Err(format!("unsupported import format `.{other}` (expected .wav)")),
-    }
+    let is_wav = ext == "wav";
 
     // Decode BEFORE touching the store: probes channels/rate/length and
-    // rejects corrupt files without mutating anything.
-    let (channels, sample_rate, samples) = load_wav(src)?;
+    // rejects unsupported/corrupt files without mutating anything.
+    let (channels, sample_rate, samples) = decode_audio(src)?;
     if channels == 0 || samples.is_empty() {
         return Err(format!("audio file has no samples: {}", req.path));
     }
@@ -112,13 +243,20 @@ pub(crate) fn do_import(
         }
     };
 
-    // Copy into the project layout and build the waveform pyramid cache.
+    // Land the audio in the project layout and build the waveform pyramid
+    // cache. WAV sources are copied bit-exact; compressed sources are written
+    // back as the decoded f32 WAV (project-native, same as recorded takes).
     let rel = format!("audio/{clip_id}.wav");
     let dst = project_dir.join(&rel);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
-    std::fs::copy(src, &dst).map_err(|e| format!("copy into project failed: {e}"))?;
+    if is_wav {
+        std::fs::copy(src, &dst).map_err(|e| format!("copy into project failed: {e}"))?;
+    } else {
+        write_f32_wav(&dst, channels, sample_rate, &samples)
+            .map_err(|e| format!("writing decoded audio into project failed: {e}"))?;
+    }
     let cache_dir = Store::cache_dir_for(&project_dir, &clip_id);
     if !pyramid_exists(&cache_dir) {
         Pyramid::from_interleaved(&samples, channels as usize)
@@ -263,6 +401,179 @@ pub(crate) fn wrap_sink_with_import(
 }
 
 // ---------------------------------------------------------------------------
+// Import → auto-stem-split chain (wave 1B)
+// ---------------------------------------------------------------------------
+
+/// Stem import order (stable track layout under the source clip).
+const STEM_ORDER: [&str; 4] = ["vocals", "drums", "bass", "other"];
+
+/// Mirror of the sidecar module's simulate switch (that fn is private there).
+fn simulate_mode() -> bool {
+    matches!(
+        std::env::var("AURA_SIDECAR_SIMULATE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Build the Demucs job spec for an imported clip: stems land in
+/// `<project>/stems/<clipId>/` (ARCHITECTURE §7).
+fn demucs_split_spec(input: &Path, out_dir: &Path, simulate: bool) -> Result<JobSpec, String> {
+    let python = jobs::resolve_python()?;
+    let script = jobs::resolve_script("demucs_split.py")?;
+    let mut args = vec![
+        script.to_string_lossy().into_owned(),
+        "--input".into(),
+        input.to_string_lossy().into_owned(),
+        "--out-dir".into(),
+        out_dir.to_string_lossy().into_owned(),
+        "--model".into(),
+        "htdemucs".into(),
+    ];
+    if simulate {
+        args.push("--simulate".into());
+    }
+    Ok(JobSpec {
+        kind: JobKind::StemSplit,
+        program: python,
+        args,
+        grace: Duration::from_secs(3),
+        env: Vec::new(),
+    })
+}
+
+/// Wrap a job event sink so a `stemSplit` `done` result (`stems` name→path
+/// map) is imported as one new audio track per stem, aligned with the source
+/// clip's timeline position. Runs on its own thread (decode + pyramid per
+/// stem must not stall the job supervisor); outcomes arrive as follow-up
+/// `log` events — the job itself already succeeded.
+pub(crate) fn wrap_sink_with_stem_import(
+    control: &Arc<ControlPlane>,
+    source_clip: &Clip,
+    inner: EventSink,
+) -> EventSink {
+    let control = Arc::clone(control);
+    let clip_name = source_clip.name.clone();
+    let at_samples = source_clip.timeline_start_samples;
+    Arc::new(move |ev: SidecarEvent| {
+        if let SidecarEvent::Done { job_id, result } = &ev {
+            if let Some(stems) = result.get("stems").and_then(|s| s.as_object()) {
+                // Fixed order first, then any extra stems a model produced.
+                let mut ordered: Vec<(String, String)> = Vec::new();
+                for name in STEM_ORDER {
+                    if let Some(p) = stems.get(name).and_then(|p| p.as_str()) {
+                        ordered.push((name.to_string(), p.to_string()));
+                    }
+                }
+                for (name, p) in stems {
+                    if !STEM_ORDER.contains(&name.as_str()) {
+                        if let Some(p) = p.as_str() {
+                            ordered.push((name.clone(), p.to_string()));
+                        }
+                    }
+                }
+                let control = Arc::clone(&control);
+                let inner2 = Arc::clone(&inner);
+                let job_id = job_id.clone();
+                let clip_name = clip_name.clone();
+                inner(ev.clone()); // deliver `done` first, imports are extra
+                std::thread::spawn(move || {
+                    for (stem, path) in ordered {
+                        let line = (|| -> Result<String, String> {
+                            let track = control
+                                .add_track(Some(format!("{clip_name} {stem}")), Some("audio".into()))?;
+                            let clip = control.import_audio_clip_impl(ImportClipRequest {
+                                path,
+                                track_id: Some(track.id.clone()),
+                                at_samples: Some(at_samples),
+                            })?;
+                            Ok(format!(
+                                "auto-import stem `{stem}`: clip {} on track {} ({})",
+                                clip.id, track.name, track.id
+                            ))
+                        })()
+                        .unwrap_or_else(|e| format!("auto-import stem `{stem}` failed: {e}"));
+                        inner2(SidecarEvent::Log { job_id: job_id.clone(), line });
+                    }
+                });
+                return;
+            }
+        }
+        inner(ev)
+    })
+}
+
+impl ControlPlane {
+    /// Import an audio file (any supported format) and immediately submit a
+    /// Demucs stem-split on the imported project copy. The job's `done`
+    /// result auto-imports the four stems as new audio tracks aligned with
+    /// the source clip. Returns `(imported clip, job id)`.
+    pub fn import_and_split_stems(
+        self: &Arc<Self>,
+        req: ImportClipRequest,
+        sink: EventSink,
+    ) -> Result<(Clip, String), String> {
+        let clip = self.import_audio_clip_impl(req)?;
+        let (input, out_dir) = {
+            let s = self.store.lock();
+            let dir = s.project_dir.clone().ok_or("no project open")?;
+            (dir.join(&clip.source_path), dir.join("stems").join(&clip.id))
+        };
+        let spec = demucs_split_spec(&input, &out_dir, simulate_mode())?;
+        let job_id = self.submit_split_job(&clip, spec, sink);
+        Ok((clip, job_id))
+    }
+
+    /// Spec-injectable submission seam (tests drive it with a fake sidecar).
+    pub(crate) fn submit_split_job(
+        self: &Arc<Self>,
+        clip: &Clip,
+        spec: JobSpec,
+        sink: EventSink,
+    ) -> String {
+        let sink = wrap_sink_with_stem_import(self, clip, sink);
+        self.jobs.submit(spec, sink)
+    }
+}
+
+/// Wire shape of [`import_audio_clip_split_stems`]'s reply.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSplitReply {
+    pub clip: Clip,
+    pub job_id: String,
+}
+
+/// Import + auto-stem-split front door (wave 1B; needs registration in the
+/// frozen lib.rs: `control::import::import_audio_clip_split_stems`). Job
+/// events stream over `on_event` and the `sidecar://*` app events, exactly
+/// like `sidecar_run_job`.
+#[tauri::command]
+pub async fn import_audio_clip_split_stems(
+    app: tauri::AppHandle,
+    request: ImportClipRequest,
+    on_event: tauri::ipc::Channel<SidecarEvent>,
+    control: tauri::State<'_, Arc<ControlPlane>>,
+) -> Result<ImportSplitReply, String> {
+    use tauri::Emitter;
+    // Same fan-out as sidecars::make_sink (private there): every event to the
+    // per-job channel; progress/done/error also as `sidecar://*` app events.
+    let sink: EventSink = Arc::new(move |ev: SidecarEvent| {
+        let _ = on_event.send(ev.clone());
+        let name = match &ev {
+            SidecarEvent::Progress { .. } => "sidecar://progress",
+            SidecarEvent::Done { .. } => "sidecar://done",
+            SidecarEvent::Error { .. } => "sidecar://error",
+            SidecarEvent::Log { .. } => return,
+        };
+        if let Err(e) = app.emit(name, &ev) {
+            log::warn!("import-split: failed to emit {name}: {e}");
+        }
+    });
+    let (clip, job_id) = control.import_and_split_stems(request, sink)?;
+    Ok(ImportSplitReply { clip, job_id })
+}
+
+// ---------------------------------------------------------------------------
 // Tests (tauri-free: temp project dir + hound-written WAVs)
 // ---------------------------------------------------------------------------
 
@@ -396,16 +707,26 @@ mod tests {
         let e = do_import(&store, &params, &req(&parent.join("nope.wav"))).unwrap_err();
         assert!(e.contains("not found"), "{e}");
 
-        // FLAC: clean "future work" message.
-        let flac = parent.join("song.flac");
-        std::fs::write(&flac, b"fLaC....").unwrap();
-        let e = do_import(&store, &params, &req(&flac)).unwrap_err();
-        assert!(e.contains("WAV only"), "{e}");
+        // Unsupported format: clean message listing what IS supported.
+        let aiff = parent.join("song.aiff");
+        std::fs::write(&aiff, b"FORM....AIFF").unwrap();
+        let e = do_import(&store, &params, &req(&aiff)).unwrap_err();
+        assert!(e.contains("unsupported import format"), "{e}");
+        assert!(e.contains("mp3"), "{e}");
 
         // Corrupt WAV.
         let bad = parent.join("bad.wav");
         std::fs::write(&bad, b"RIFFnope").unwrap();
         assert!(do_import(&store, &params, &req(&bad)).is_err());
+
+        // Corrupt compressed file (a .flac that isn't FLAC).
+        let flac = parent.join("song.flac");
+        std::fs::write(&flac, b"fLaC-not-really-a-flac-stream").unwrap();
+        let e = do_import(&store, &params, &req(&flac)).unwrap_err();
+        assert!(
+            e.contains("corrupt") || e.contains("decode") || e.contains("no audio"),
+            "{e}"
+        );
 
         // Unknown track id.
         let e = do_import(&store, &params, &ImportClipRequest {
@@ -461,5 +782,294 @@ mod tests {
         );
         // Malformed directive is ignored rather than failing the job.
         assert!(import_directive(&json!({"importToTrackId": 7})).is_none());
+    }
+
+    // -- universal decode (symphonia) ------------------------------------
+
+    /// Write a 0.5 s 44.1 kHz stereo sine WAV (the encode source).
+    fn write_sine_wav(path: &Path, frames: usize) {
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 44_100,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..frames {
+            let v = ((i as f32 * 2.0 * std::f32::consts::PI * 440.0 / 44_100.0).sin()
+                * 12_000.0) as i16;
+            w.write_sample(v).unwrap();
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    /// Encode `src` to `dst` with the ffmpeg CLI; false = ffmpeg missing
+    /// (test skips politely) — panics on an actual encode failure.
+    fn ffmpeg_encode(src: &Path, dst: &Path) -> bool {
+        let out = match std::process::Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-hide_banner")
+            .arg("-loglevel")
+            .arg("error")
+            .arg("-i")
+            .arg(src)
+            .arg(dst)
+            .output()
+        {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        assert!(
+            out.status.success(),
+            "ffmpeg encode to {} failed: {}",
+            dst.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn import_decodes_compressed_formats_via_symphonia() {
+        let frames = 22_050usize; // 0.5 s at 44.1 kHz
+        let (store, params, parent) = project_store("formats", 0);
+        let src_wav = parent.join("tone.wav");
+        write_sine_wav(&src_wav, frames);
+
+        for ext in ["mp3", "flac", "ogg", "m4a"] {
+            let enc = parent.join(format!("tone.{ext}"));
+            if !ffmpeg_encode(&src_wav, &enc) {
+                eprintln!("skipping compressed-format import test: ffmpeg not found");
+                return;
+            }
+            let out = do_import(&store, &params, &req(&enc))
+                .unwrap_or_else(|e| panic!("import .{ext} failed: {e}"));
+            let clip = &out.clip;
+            assert_eq!(clip.source_channels, 2, ".{ext} keeps stereo");
+            assert_eq!(clip.source_sample_rate, 44_100, ".{ext} keeps the rate");
+            // Lossy codecs pad (encoder delay/priming): duration must be the
+            // source ±0.25 s worth of samples, never wildly off.
+            let frames_u = frames as i64;
+            let got = clip.source_length_samples as i64;
+            assert!(
+                (got - frames_u).abs() < 11_025,
+                ".{ext}: decoded {got} frames, source {frames_u}"
+            );
+            // The project copy is a real (f32) WAV: hound decodes it and the
+            // frame count matches the probe.
+            let s = store.lock();
+            let dir = s.project_dir.clone().unwrap();
+            let copied = dir.join(&clip.source_path);
+            drop(s);
+            let (ch, rate, samples) = load_wav(&copied)
+                .unwrap_or_else(|e| panic!(".{ext}: project copy unreadable: {e}"));
+            assert_eq!((ch, rate), (2, 44_100));
+            assert_eq!(samples.len() as u64 / 2, clip.source_length_samples);
+            // Not silent, and the waveform pyramid exists.
+            assert!(samples.iter().any(|s| s.abs() > 0.05), ".{ext}: silent decode");
+            assert!(pyramid_exists(&Store::cache_dir_for(&dir, &clip.id)));
+        }
+        // Each import auto-created its own track.
+        assert_eq!(store.lock().tracks.len(), 4);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn corrupt_compressed_import_leaves_store_untouched() {
+        let (store, params, parent) = project_store("corrupt", 0);
+        for name in ["junk.mp3", "junk.ogg", "junk.m4a"] {
+            let p = parent.join(name);
+            std::fs::write(&p, b"\xffgarbage garbage garbage garbage").unwrap();
+            let e = do_import(&store, &params, &req(&p)).unwrap_err();
+            assert!(
+                e.contains("corrupt") || e.contains("decode") || e.contains("no audio"),
+                "{name}: {e}"
+            );
+        }
+        let s = store.lock();
+        assert!(s.clips.is_empty());
+        assert!(s.tracks.is_empty());
+        drop(s);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    // -- import → auto-stem-split chain ----------------------------------
+
+    struct NullEvents;
+    impl crate::audio::engine::EventSink for NullEvents {
+        fn emit(&self, _e: &str, _p: serde_json::Value) {}
+    }
+
+    /// Real ControlPlane over a headless engine + temp project.
+    fn control_plane(name: &str) -> (Arc<ControlPlane>, PathBuf) {
+        let shared = Arc::new(crate::audio::rt::SharedRt::default());
+        let params = Arc::new(ParamTable::default());
+        let store = Arc::new(Mutex::new(Store::default()));
+        let engine = crate::audio::engine::start(
+            shared.clone(),
+            params.clone(),
+            store.clone(),
+            Box::new(NullEvents),
+        );
+        let cp = Arc::new(ControlPlane::new(
+            store,
+            shared,
+            params,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Arc::new(Mutex::new(crate::midi::MidiStore::default())),
+            Box::new(|_, _| {}),
+        ));
+        let parent = tmp_parent(name);
+        cp.create_project(parent.to_str().unwrap(), "Split").unwrap();
+        (cp, parent)
+    }
+
+    fn write_sh(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn sh_spec(script: &Path) -> JobSpec {
+        JobSpec {
+            kind: JobKind::StemSplit,
+            program: PathBuf::from("/bin/sh"),
+            args: vec![script.to_string_lossy().into_owned()],
+            grace: Duration::from_millis(500),
+            env: Vec::new(),
+        }
+    }
+
+    /// Store-level chain test with a FAKE sidecar: import a wav, submit the
+    /// (injected) stem job, and assert the `done` result's stems land as four
+    /// new aligned audio tracks through the control plane.
+    #[tokio::test]
+    async fn import_and_split_chain_lands_four_stem_tracks() {
+        let (cp, parent) = control_plane("chain");
+        let src = parent.join("song.wav");
+        write_wav(&src, 2, 44_100, 2000);
+
+        // The "model output": four small stem wavs the fake sidecar reports.
+        let stems_dir = parent.join("fake-stems");
+        std::fs::create_dir_all(&stems_dir).unwrap();
+        let mut stems_json = serde_json::Map::new();
+        for stem in ["vocals", "drums", "bass", "other"] {
+            let p = stems_dir.join(format!("{stem}.wav"));
+            write_wav(&p, 2, 44_100, 500);
+            stems_json.insert(
+                stem.to_string(),
+                serde_json::Value::String(p.to_string_lossy().into_owned()),
+            );
+        }
+        let done = serde_json::json!({
+            "type": "done",
+            "result": {"kind": "stemSplit", "stems": stems_json}
+        });
+        let script = write_sh(
+            &parent,
+            "fake_demucs.sh",
+            &format!(
+                "#!/bin/sh\necho '{{\"type\":\"progress\",\"progress\":0.5,\"stage\":\"separating\"}}'\necho '{}'\n",
+                done
+            ),
+        );
+
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: Some(4_800),
+            })
+            .unwrap();
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let job_id = cp.submit_split_job(&clip, sh_spec(&script), sink);
+
+        // Wait for done + the four follow-up stem-import log lines.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            {
+                let evs = events.lock();
+                let done = evs.iter().any(|e| matches!(e, SidecarEvent::Done { .. }));
+                let stems_logged = evs
+                    .iter()
+                    .filter(|e| matches!(e, SidecarEvent::Log { line, .. } if line.contains("auto-import stem")))
+                    .count();
+                if done && stems_logged >= 4 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stem imports did not finish: {:?}",
+                events.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(cp.job_status(&job_id).unwrap().state, "done");
+
+        // 1 source + 4 stem tracks, stems aligned with the source clip.
+        let snap = cp.project_state();
+        assert_eq!(snap.tracks.len(), 5, "{:?}", snap.tracks);
+        assert_eq!(snap.clips.len(), 5);
+        for stem in ["vocals", "drums", "bass", "other"] {
+            let t = snap
+                .tracks
+                .iter()
+                .find(|t| t.name == format!("song {stem}"))
+                .unwrap_or_else(|| panic!("missing stem track for {stem}"));
+            assert_eq!(t.kind, "audio");
+            let c = snap
+                .clips
+                .iter()
+                .find(|c| c.track_id == t.id)
+                .unwrap_or_else(|| panic!("missing stem clip for {stem}"));
+            assert_eq!(c.timeline_start_samples, 4_800, "stem aligned with source");
+            assert_eq!(c.source_length_samples, 500);
+        }
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// A failed split job must not import anything (error passes through).
+    #[tokio::test]
+    async fn failed_split_job_imports_nothing() {
+        let (cp, parent) = control_plane("chain-err");
+        let src = parent.join("s.wav");
+        write_wav(&src, 1, 48_000, 100);
+        let script = write_sh(
+            &parent,
+            "fail.sh",
+            "#!/bin/sh\necho '{\"type\":\"error\",\"message\":\"demucs is not installed\"}'\nexit 1\n",
+        );
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: None,
+            })
+            .unwrap();
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let job_id = cp.submit_split_job(&clip, sh_spec(&script), sink);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = cp.job_status(&job_id).unwrap();
+            if st.state == "error" {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{st:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = cp.project_state();
+        assert_eq!(snap.tracks.len(), 1, "no stem tracks on failure");
+        assert_eq!(snap.clips.len(), 1);
+        assert!(events
+            .lock()
+            .iter()
+            .any(|e| matches!(e, SidecarEvent::Error { message, .. } if message.contains("demucs"))));
+        let _ = std::fs::remove_dir_all(parent);
     }
 }

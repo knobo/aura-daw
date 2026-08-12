@@ -27,6 +27,9 @@ pub enum JobKind {
     AmtInfill,
     /// Stable Audio Open multisample generation -> SFZ instrument.
     StableAudioSfz,
+    /// Hum/voice recording -> MIDI melody (hum-to-song pipeline, basic-pitch
+    /// style monophonic transcription tuned for hummed input).
+    HumToMidi,
 }
 
 impl JobKind {
@@ -40,6 +43,7 @@ impl JobKind {
             JobKind::ElevenLabsMusic => "elevenLabsMusic",
             JobKind::AmtInfill => "amtInfill",
             JobKind::StableAudioSfz => "stableAudioSfz",
+            JobKind::HumToMidi => "humToMidi",
         }
     }
 
@@ -55,6 +59,7 @@ impl JobKind {
             "elevenLabsMusic" => JobKind::ElevenLabsMusic,
             "amtInfill" => JobKind::AmtInfill,
             "stableAudioSfz" => JobKind::StableAudioSfz,
+            "humToMidi" => JobKind::HumToMidi,
             _ => return None,
         })
     }
@@ -171,6 +176,7 @@ mod tests {
             JobKind::ElevenLabsMusic,
             JobKind::AmtInfill,
             JobKind::StableAudioSfz,
+            JobKind::HumToMidi,
         ] {
             assert_eq!(JobKind::from_wire(k.as_str()), Some(k));
         }

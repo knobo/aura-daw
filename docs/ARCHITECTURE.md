@@ -233,6 +233,19 @@ ownership in `docs/PHASE2-PLAN.md`):
 * `set_track_instrument` additionally accepts `"plugin:<instanceId>"` refs
   (same command name, additive semantics)
 
+**Wave-1.5 additions** (registered in `lib.rs`; implementations in the
+owning modules):
+
+* control plane — `hum_to_song` (hum/voice WAV → MIDI melody clip, optional
+  AMT accompaniment), `export_song` / `export_job_status` /
+  `export_capabilities` (offline bounce to wav/flac/mp3/ogg),
+  `import_audio_clip_split_stems` (import + Demucs stem split in one step),
+  `loopjam_evolve` / `loopjam_cancel` / `loopjam_status` (ACE-Step repaint
+  of the loop region, applied at wrap)
+* plugins — `zyn_list_patches`, `zyn_load_patch` (ZynAddSubFX bank patches)
+* sidecars — job kind `humToMidi` (`JobKind::HumToMidi`, dedicated
+  `hum_to_song` command; rejected by the open-kind `sidecar_run_job` path)
+
 Payload shapes: see `docs/ipc-schemas/*.schema.json` (source of truth for the
 frontend; the Rust structs in the modules mirror them, `camelCase` on the
 wire). New v2 schemas are *emitter* contracts without
@@ -252,6 +265,10 @@ here — use the channels.
 | `sidecar://error` | `sidecar-job.schema.json#/$defs/errorEvent` | job failure |
 | `project://changed` | `project.schema.json` | project loaded/saved/renamed |
 | `mcp://confirm-requested` | `mcp-policy.schema.json#/$defs/pendingConfirmation` | (phase 2) an MCP tool call awaits user confirmation |
+| `export://progress` | `{ jobId, progress, stage }` (emitter contract in `control/export.rs`; ≤ 10 Hz, stage changes always pass) | (wave 1.5) offline export/bounce advances |
+| `export://done` | export result object + `jobId` (see `control/export.rs`) | (wave 1.5) export finished |
+| `export://error` | `{ jobId, message }`-shaped error (see `control/export.rs`) | (wave 1.5) export failed |
+| `loopjam://state` | Rust `LoopJamStatus` in `control/loopjam.rs` | (wave 1.5) loop-jam session state changes (idle/generating/ready/applied/cancelled) |
 
 ## 4. Threading model
 

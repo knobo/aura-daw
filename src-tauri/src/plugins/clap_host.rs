@@ -155,8 +155,11 @@ fn parse_clap_uid(uid: &str) -> Result<(String, String), String> {
     let rest = uid
         .strip_prefix("clap:")
         .ok_or_else(|| format!("not a clap uid: {uid}"))?;
+    // First '#' separates the bundle path from the plugin id: plugin ids may
+    // themselves contain '#' (Cardinal: `studio.kx.distrho.cardinal#synth`),
+    // so split at the first one, not the last.
     let (path, id) = rest
-        .rsplit_once('#')
+        .split_once('#')
         .ok_or_else(|| format!("malformed clap uid (missing #id): {uid}"))?;
     Ok((path.to_string(), id.to_string()))
 }
@@ -775,11 +778,21 @@ impl Drop for ClapNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::plugins::scan::{clap_search_paths, scan_clap_paths};
+    use crate::plugins::scan::{clap_search_paths, find_clap_bundles};
+    use crate::plugins::scan_worker;
     use crate::plugins::PluginDescriptor;
 
+    /// Scan installed bundles through the sacrificial worker (production
+    /// path) — an in-process scan would dlopen EVERY bundle, and Cardinal's
+    /// teardown intermittently corrupts the test process (see
+    /// `scan_worker::test_worker_command`). The instrument a test picks is
+    /// still loaded in-process by `instantiate`, but only that one bundle.
     fn installed() -> Vec<PluginDescriptor> {
-        scan_clap_paths(&clap_search_paths())
+        let bundles = find_clap_bundles(&clap_search_paths());
+        if bundles.is_empty() {
+            return Vec::new();
+        }
+        scan_worker::scan_with_worker(&bundles, &scan_worker::test_worker_command())
     }
 
     /// Preferred known-good open instrument (Nekobi > Kars > any instrument).
@@ -790,7 +803,12 @@ mod tests {
                 return Some(d.uid.clone());
             }
         }
-        all.into_iter().find(|d| d.is_instrument).map(|d| d.uid)
+        // Never fall back to Cardinal in-process (teardown corruption — see
+        // `scan_worker::test_worker_command`); it is probed in a subprocess
+        // by `plugins::patches` instead.
+        all.into_iter()
+            .find(|d| d.is_instrument && !d.uid.to_lowercase().contains("cardinal"))
+            .map(|d| d.uid)
     }
 
     fn render_blocks(node: &mut dyn LiveInstrument, blocks: usize, frames: usize) -> Vec<f32> {
@@ -926,7 +944,13 @@ mod tests {
         assert!(instantiate(&bad, "clap:/nonexistent/x.clap#no.such.plugin").is_err());
         assert!(instantiate(&bad, "lv2:not-a-clap-uid").is_err());
 
-        if let Some(fx) = installed().iter().find(|d| !d.is_instrument) {
+        // Skip Cardinal deliberately: negotiation-rejecting it still dlopens
+        // the bundle, and Cardinal's teardown corrupts the test process at
+        // exit (see `scan_worker::test_worker_command`).
+        if let Some(fx) = installed()
+            .iter()
+            .find(|d| !d.is_instrument && !d.uid.to_lowercase().contains("cardinal"))
+        {
             let id = format!("t-{}", uuid::Uuid::new_v4());
             let err = instantiate(&id, &fx.uid).expect_err("effect rejected");
             assert!(
