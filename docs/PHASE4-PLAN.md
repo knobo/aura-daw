@@ -78,3 +78,40 @@ migration, and its exit gate is the one that turns the op log on.
 - **A:** [`docs/superpowers/plans/2026-08-13-plan-a-session-transaction-channel.md`](superpowers/plans/2026-08-13-plan-a-session-transaction-channel.md) — ready.
 - B–F: authored when their predecessor lands (just-in-time, against the
   then-current tree). Each follows the same skill template as A.
+
+## Plan A handoff (2026-08-13, post whole-branch review)
+
+Whole-branch review of Plan A found round-2 §4.1's clause "the graph
+rebuild reads an immutable snapshot rather than holding the Session lock"
+is **not** delivered: `engine::rebuild` (`src-tauri/src/audio/engine.rs`)
+still takes `self.session.lock()` and holds it for the entire graph build
+(track/clip walk, RT-clip assembly, live-node binding). This is a widened
+lock footprint versus pre-merge — every command now blocks on that same
+merged `Session` lock during a rebuild, where before the split stores gave
+some commands a narrower lock to contend with. Plan A's own written plan
+never named this clause on an exclusion list, so per ADR 0007
+(no-silent-corrections) it is recorded here explicitly rather than left
+implicit: **snapshot-based rebuild is deferred, not delivered, by Plan A.**
+It requires Plan F's copy-on-write history store (§6) to give `rebuild` an
+immutable view it can read without holding the live document lock; until
+Plan F lands, rebuild latency (proportional to track/clip count) sits
+directly in the critical path of every command that touches the session.
+
+The following are binding carry-forwards for later plans, recorded here
+so they aren't lost between sub-plan hand-offs:
+
+- Plan E first item: `with_synced_store`/`apply_hum_clip` hold the
+  document lock across midi disk I/O — move persistence outside the lock.
+- Before Gate E turns the log on: `fold_ops` coalesces Sets across
+  intervening structural ops — harmless dark, wrong for replay; constrain
+  it before `Committed.ops` is ever persisted.
+- Plan B: add the duplicate-id guard on TrackAdd (rollback removes-by-id
+  can mis-target); make clip restore positional or define canonical clip
+  order (gate test 2 will fail on interleaved clip vecs otherwise); delete
+  dead `ops::apply_track_mix`; add the clamp round-trip test (999→24).
+- Standing caveat: `transact` has no panic rollback — transaction
+  closures must stay non-panicking until Plan F's snapshot rollback.
+- Op wire form: `ObjectRef` ids are raw Strings; typed id families must
+  serialize transparently or bump OP_FORMAT_VERSION.
+- Clip carriage is asymmetric by design: `TrackAdd.clips` authoritative,
+  `TrackRemove.clips` advisory (store truth wins).
