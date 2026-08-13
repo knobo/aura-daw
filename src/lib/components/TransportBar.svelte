@@ -61,7 +61,18 @@
     <div class="tbuttons">
       <button
         class="tbtn"
-        title="Stop (return)"
+        title="Jump to start (home) — keeps playing"
+        aria-label="Jump to start"
+        onclick={() => transport.seek(0)}
+      >
+        <svg viewBox="0 0 14 14" width="12" height="12">
+          <rect x="3" y="2.5" width="1.8" height="9" fill="currentColor" />
+          <path d="M11.5 2.5v9L5.6 7z" fill="currentColor" />
+        </svg>
+      </button>
+      <button
+        class="tbtn"
+        title="Stop and return to start"
         aria-label="Stop"
         onclick={() => transport.stop()}
       >
