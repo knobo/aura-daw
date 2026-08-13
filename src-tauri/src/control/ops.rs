@@ -93,6 +93,17 @@ pub fn apply_track_mix(
 pub const TRACK_COLORS: [&str; 6] =
     ["#7c9cff", "#ff9c7c", "#7cffb0", "#e07cff", "#ffe07c", "#7cd8ff"];
 
+/// Structural core: insert `track` into the store at `index` (clamped to
+/// the current length, so an out-of-range index appends). No slot
+/// allocation, no param reset — those stay in the `add_track` wrapper below
+/// until Plan B moves slot bookkeeping to the command's effect layer
+/// (round-2 §2.4). This is the part `control::session::apply_raw` reuses
+/// for `Op::TrackAdd`, so both paths insert a row the same way.
+pub(crate) fn insert_track(store: &mut Store, track: TrackState, index: usize) {
+    let index = index.min(store.tracks.len());
+    store.tracks.insert(index, track);
+}
+
 /// Create a track in the store and reset its RT param slot. STRUCTURAL —
 /// the caller must send `ControlMsg::Rebuild` afterwards.
 /// `kind`: "audio" (default) or "midi" (phase 2; "bus" reserved).
@@ -124,7 +135,7 @@ pub fn add_track(
         color: TRACK_COLORS[n % TRACK_COLORS.len()].into(),
         instrument_id: None,
     };
-    store.tracks.push(track.clone());
+    insert_track(store, track.clone(), n);
     Ok(track)
 }
 

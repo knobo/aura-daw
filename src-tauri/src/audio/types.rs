@@ -143,7 +143,7 @@ pub struct AudioDevice {
 // ---------------------------------------------------------------------------
 
 /// Mirrors docs/ipc-schemas/clip.schema.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
     pub id: String,

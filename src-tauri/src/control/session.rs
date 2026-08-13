@@ -117,6 +117,28 @@ fn apply_raw(session: &mut Session, op: &Op) -> Result<Op, String> {
                 to: from_now,    // the inverse's `to`: value to restore
             })
         }
+        Op::TrackAdd { track, index } => {
+            let idx = (*index).min(session.store.tracks.len());
+            crate::control::ops::insert_track(&mut session.store, track.clone(), idx);
+            // Inverse: remove the same row, same id, no slot bookkeeping
+            // here (round-2 §2.4 — slots stay in the command's effect
+            // layer until Plan B).
+            Ok(Op::TrackRemove { track: track.clone(), index: idx })
+        }
+        Op::TrackRemove { track, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `Op::Set`'s from/to). The
+            // slot is deliberately left untouched: slot bookkeeping is
+            // outside the op layer this plan (round-2 §2.4).
+            let pos = session
+                .store
+                .tracks
+                .iter()
+                .position(|t| t.id == track.id)
+                .ok_or_else(|| format!("unknown track: {}", track.id))?;
+            let removed = session.store.tracks.remove(pos);
+            Ok(Op::TrackAdd { track: removed, index: pos })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
@@ -280,6 +302,23 @@ mod tests {
         TxMeta { actor: Actor::User, run: "r-1".into(), label: label.into() }
     }
 
+    /// A standalone `TrackState` row (not yet in any store), for structural
+    /// op tests (`TrackAdd`/`TrackRemove` payloads).
+    fn test_track(id: &str) -> TrackState {
+        TrackState {
+            id: id.into(),
+            name: "New Track".into(),
+            kind: "audio".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        }
+    }
+
     /// `from` is intentionally `Null`: it's advisory only, apply_raw re-reads
     /// truth from the store and ignores the caller's `from`.
     fn set_gain(track_id: &str, to: f64) -> Op {
@@ -373,6 +412,41 @@ mod tests {
         assert!(r.is_err());
         let after = Session::transact(&m, meta, |_| Ok(())).unwrap().rev;
         assert_eq!(after, before + 1, "failed tx must not consume a revision");
+    }
+
+    #[test]
+    fn remove_then_inverse_restores_row_byte_identically() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let row = m.lock().store.tracks[0].clone();
+        let c = Session::transact(&m, user_meta("remove"), |tx| {
+            tx.apply(Op::TrackRemove { track: row.clone(), index: 0 })
+        }).unwrap();
+        assert!(m.lock().store.tracks.is_empty());
+        Session::transact(&m, user_meta("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        }).unwrap();
+        assert_eq!(m.lock().store.tracks[0], row, "same id, same everything");
+    }
+
+    #[test]
+    fn add_remove_batch_is_atomic_with_mixed_ops() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        // NB: each snapshot takes ONE lock guard and reads both fields off
+        // it — `(m.lock().x, m.lock().y)` would deadlock, since the first
+        // `m.lock()` temporary lives until the end of the full tuple
+        // statement and parking_lot's Mutex isn't reentrant.
+        let snapshot = { let g = m.lock(); (g.store.tracks.clone(), g.store.clips.clone()) };
+        let new_row = test_track("t-2");
+        let r = Session::transact(&m, user_meta("mixed-fail"), |tx| {
+            tx.apply(Op::TrackAdd { track: new_row, index: 1 })?;
+            tx.apply(set_gain("t-2", 0.5))?;
+            tx.apply(set_gain("ghost", 0.1))?;   // fails the batch
+            Ok(())
+        });
+        assert!(r.is_err());
+        let now = { let g = m.lock(); (g.store.tracks.clone(), g.store.clips.clone()) };
+        assert_eq!(now, snapshot, "rollback must undo the structural op too");
     }
 
     #[test]
