@@ -55,14 +55,53 @@ mod tests {
         assert!(s.contains("\"kind\":\"set\""), "wire form was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, op);
+
+        // TrackAdd with real TrackState: verify wire form and round-trip.
+        let track = crate::audio::types::TrackState {
+            id: "t-2".into(),
+            name: "Audio Track".into(),
+            kind: "audio".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        };
+        let track_add = Op::TrackAdd { track: track.clone(), index: 0 };
+        let s = serde_json::to_string(&track_add).unwrap();
+        // Print once to verify camelCase tag form: should be "trackAdd"
+        eprintln!("TrackAdd wire form: {}", s);
+        assert!(s.contains("\"kind\":\"trackAdd\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, track_add);
+
+        // TrackRemove with real TrackState: verify wire form and round-trip.
+        let track_remove = Op::TrackRemove { track, index: 0 };
+        let s = serde_json::to_string(&track_remove).unwrap();
+        // Print once to verify camelCase tag form: should be "trackRemove"
+        eprintln!("TrackRemove wire form: {}", s);
+        assert!(s.contains("\"kind\":\"trackRemove\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, track_remove);
     }
 
     #[test]
     fn meta_requires_actor_and_run() {
         // actor/run are non-optional by construction: TxMeta has no Default
-        // and no Option fields — this test just locks the shape.
+        // and no Option fields — this test locks the shape and verifies all
+        // required fields serialize and deserialize correctly.
         let m = TxMeta { actor: Actor::Engine, run: "r-1".into(), label: "auto-stop".into() };
         let s = serde_json::to_string(&m).unwrap();
-        assert!(s.contains("engine") && s.contains("r-1"));
+        // Print once to verify actual wire form
+        eprintln!("TxMeta wire form: {}", s);
+        // Verify exact key:value pairs for all required fields
+        assert!(s.contains("\"actor\":\"engine\""), "actor field must serialize as key:value, was: {s}");
+        assert!(s.contains("\"run\":\"r-1\""), "run field must serialize as key:value, was: {s}");
+        assert!(s.contains("\"label\":\"auto-stop\""), "label field must serialize as key:value, was: {s}");
+        // Round-trip and assert equality
+        let back: TxMeta = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, m, "TxMeta must deserialize to the original value");
     }
 }
