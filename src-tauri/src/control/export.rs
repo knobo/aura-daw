@@ -515,9 +515,11 @@ impl ControlPlane {
             }
         }
 
-        // Snapshot the project: a private Store (own slot table, so the
-        // offline ParamTable is self-consistent) + a cloned MidiStore. One
+        // Snapshot the project: a private Store + a cloned MidiStore. One
         // guard covers both — store and midi live behind the same lock.
+        // Round-2 §2.4: `offline::build_graph` derives slots itself
+        // (`types::derive_slots`) from `store.tracks`, so there is nothing
+        // to pre-seed here — every store track gets a slot, always.
         let snapshot = {
             let session = self.session.lock();
             let s = &session.store;
@@ -526,11 +528,6 @@ impl ControlPlane {
             store.project_dir = s.project_dir.clone();
             store.tracks = s.tracks.clone();
             store.clips = s.clips.clone();
-            for t in &s.tracks {
-                if s.slots.contains_key(&t.id) {
-                    store.alloc_slot(t.id.as_str());
-                }
-            }
             let m = &session.midi;
             ExportSnapshot {
                 store,
@@ -646,7 +643,6 @@ fn do_export(
     let render_top = if needs_ffmpeg { 0.75 } else { 0.90 };
     let samples = offline::render(
         &mut og.graph,
-        &og.params,
         start,
         frames,
         snap.rate,
@@ -740,10 +736,21 @@ pub fn export_capabilities() -> ExportCapabilities {
 mod tests {
     use super::*;
     use crate::audio::engine::load_wav;
-    use crate::audio::rt::{ParamTable, SharedRt};
+    use crate::audio::rt::{GraphTables, ParamTable, SharedGraphTables, SharedRt};
     use crate::midi::MidiStore;
     use crate::sidecars::jobs::JobManager;
     use serde_json::Value;
+
+    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) for real-engine
+    /// test harnesses — must be handed to BOTH `engine::start` and
+    /// `ControlPlane::new` as the SAME `Arc` (round-2 §2.4).
+    fn empty_tables() -> SharedGraphTables {
+        Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: std::collections::HashMap::new(),
+        }))
+    }
 
     fn tmp_dir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -875,14 +882,14 @@ mod tests {
 
     fn control_plane_with_demo() -> (Arc<ControlPlane>, Arc<SharedRt>, Arc<Mutex<Vec<(String, Value)>>>) {
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(crate::control::Session::new(
             Store::default(),
             MidiStore::default(),
         )));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
@@ -898,7 +905,7 @@ mod tests {
         let cp = Arc::new(ControlPlane::new(
             session.clone(),
             shared.clone(),
-            params.clone(),
+            tables,
             engine,
             Arc::new(JobManager::default()),
             Box::new(move |e, p| ev.lock().push((e.to_string(), p))),
@@ -906,8 +913,8 @@ mod tests {
         // Demo-song content, placed directly (no engine round-trip needed).
         let (keys, bass) = {
             let mut session = session.lock();
-            let k = super::super::ops::add_track(&mut session.store, &params, Some("Keys".into()), Some("midi".into())).unwrap();
-            let b = super::super::ops::add_track(&mut session.store, &params, Some("Bass".into()), Some("midi".into())).unwrap();
+            let k = super::super::ops::add_track(&mut session.store, Some("Keys".into()), Some("midi".into())).unwrap();
+            let b = super::super::ops::add_track(&mut session.store, Some("Bass".into()), Some("midi".into())).unwrap();
             (k, b)
         };
         {

@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use super::dsp::ProcessBlock;
 use super::meters::RawMeterBlock;
-use super::rt::{ParamTable, RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
+use super::rt::{RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use super::types::MAX_TRACKS;
 use crate::midi::synth::BlockNoteEvent;
@@ -209,7 +209,6 @@ fn render_live(
 /// be delivered.
 pub fn render(
     graph: &mut RtGraph,
-    params: &ParamTable,
     base_pos: u64,
     lp: &LoopSpec,
     out: &mut [f32],
@@ -221,8 +220,15 @@ pub fn render(
     let frames = out.len() / out_ch;
     out.fill(0.0);
     let mut blk = RawMeterBlock::new(base_pos, frames as u32);
+    // Round-2 §2.4 / [I6]: the graph's OWN params, not a passed-in
+    // reference — `render(g, &g.params, ...)` doesn't borrow-check
+    // (mutable borrow of `*g` + shared borrow of `g.params`), so this reads
+    // `graph.params` internally via a split borrow, which IS fine inside
+    // the function. This is also how the O-13 alias window stays dead: a
+    // retired graph always renders against the table it was built with.
+    let params = graph.params.clone();
     let any_solo = params.any_solo.load(Relaxed);
-    let RtGraph { tracks, scratch } = graph;
+    let RtGraph { tracks, scratch, .. } = graph;
 
     for tr in tracks.iter() {
         if tr.slot >= MAX_TRACKS {
@@ -289,6 +295,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::rt::ParamTable;
     use super::super::rt::RtClipData;
     use super::super::rt::RtTrack;
     use std::sync::Arc;
@@ -380,29 +387,29 @@ mod tests {
     // ---- full render ----
 
     fn one_track_graph(slot: usize, c: RtClip) -> RtGraph {
-        RtGraph::new(vec![RtTrack::clips(slot, vec![c])])
+        RtGraph::new(vec![RtTrack::clips(slot, vec![c])], 1, Arc::new(ParamTable::default()))
     }
 
-    /// Old-signature convenience: clip-only graphs, no discontinuity.
+    /// Old-signature convenience: clip-only graphs, no discontinuity. Params
+    /// now live on the graph (`g.params`); callers mutate that Arc directly
+    /// before rendering.
     fn render_simple(
         g: &mut RtGraph,
-        params: &ParamTable,
         base: u64,
         lp: &LoopSpec,
         out: &mut [f32],
         out_ch: usize,
     ) -> RawMeterBlock {
-        render(g, params, base, lp, out, out_ch, 48_000, false)
+        render(g, base, lp, out, out_ch, 48_000, false)
     }
 
     #[test]
     fn render_applies_gain_and_pan() {
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
-        let params = ParamTable::default();
-        params.set_gain_linear(0, 0.5);
-        params.set_pan(0, -1.0); // hard left
+        g.params.set_gain_linear(0, 0.5);
+        g.params.set_pan(0, -1.0); // hard left
         let mut out = vec![0.0f32; 8]; // 4 frames stereo
-        let blk = render_simple(&mut g, &params, 0, &LoopSpec::OFF, &mut out, 2);
+        let blk = render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!((out[0] - 0.5).abs() < 1e-6, "left gets gain*1.0");
         assert!(out[1].abs() < 1e-6, "right silent at hard left");
         assert!((blk.peak[0][0] - 0.5).abs() < 1e-6);
@@ -417,11 +424,10 @@ mod tests {
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
         g.tracks
             .push(RtTrack::clips(1, vec![clip(0, 0, 4, vec![0.5; 4], 1)]));
-        let params = ParamTable::default();
-        params.set_flag(1, FLAG_SOLO, true);
-        params.any_solo.store(true, Relaxed);
+        g.params.set_flag(1, FLAG_SOLO, true);
+        g.params.any_solo.store(true, Relaxed);
         let mut out = vec![0.0f32; 8];
-        let blk = render_simple(&mut g, &params, 0, &LoopSpec::OFF, &mut out, 2);
+        let blk = render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert_eq!(blk.peak[0][0], 0.0, "non-soloed track is silent");
         let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
         assert!((blk.peak[1][0] - expected).abs() < 1e-5, "soloed track plays center-panned");
@@ -432,11 +438,10 @@ mod tests {
     fn render_wraps_around_loop() {
         // 4-sample clip at [0,4), loop [0,4), render 8 frames -> plays twice
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![0.1, 0.2, 0.3, 0.4], 1));
-        let params = ParamTable::default();
-        params.set_pan(0, -1.0);
+        g.params.set_pan(0, -1.0);
         let lp = LoopSpec { enabled: true, start: 0, end: 4 };
         let mut out = vec![0.0f32; 16];
-        render_simple(&mut g, &params, 0, &lp, &mut out, 2);
+        render_simple(&mut g, 0, &lp, &mut out, 2);
         let lefts: Vec<f32> = out.iter().step_by(2).copied().collect();
         for (i, v) in lefts.iter().enumerate() {
             let expected = [0.1f32, 0.2, 0.3, 0.4][i % 4];
@@ -447,9 +452,8 @@ mod tests {
     #[test]
     fn render_mono_output_downmixes() {
         let mut g = one_track_graph(0, clip(0, 0, 2, vec![0.8, 0.8], 1));
-        let params = ParamTable::default();
         let mut out = vec![0.0f32; 2];
-        render_simple(&mut g, &params, 0, &LoopSpec::OFF, &mut out, 1);
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 1);
         // center pan: l = r = 0.8/sqrt(2); mono = (l+r)/2
         let expected = 0.8 * std::f32::consts::FRAC_1_SQRT_2;
         assert!((out[0] - expected).abs() < 1e-5);
@@ -457,17 +461,20 @@ mod tests {
 
     #[test]
     fn render_sums_overlapping_clips() {
-        let mut g = RtGraph::new(vec![RtTrack::clips(
-            0,
-            vec![
-                clip(0, 0, 4, vec![0.25; 4], 1),
-                clip(2, 0, 4, vec![0.25; 4], 1),
-            ],
-        )]);
-        let params = ParamTable::default();
-        params.set_pan(0, -1.0);
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(
+                0,
+                vec![
+                    clip(0, 0, 4, vec![0.25; 4], 1),
+                    clip(2, 0, 4, vec![0.25; 4], 1),
+                ],
+            )],
+            1,
+            Arc::new(ParamTable::default()),
+        );
+        g.params.set_pan(0, -1.0);
         let mut out = vec![0.0f32; 12];
-        render_simple(&mut g, &params, 0, &LoopSpec::OFF, &mut out, 2);
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         let lefts: Vec<f32> = out.iter().step_by(2).copied().collect();
         assert!((lefts[1] - 0.25).abs() < 1e-6);
         assert!((lefts[2] - 0.5).abs() < 1e-6, "overlap sums");
@@ -509,15 +516,14 @@ mod tests {
             AbsNoteEvent { sample: 1_000, key: 69, velocity: 110 },
             AbsNoteEvent { sample: 9_000, key: 69, velocity: 0 },
         ];
-        let mut g = RtGraph::new(vec![live_track(0, events, RATE)]);
+        let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         assert!(!g.scratch.is_empty(), "live graph allocates scratch at build");
-        let params = ParamTable::default();
         // Render 24000 frames in odd-sized callback blocks.
         let mut out = vec![0.0f32; 24_000 * 2];
         let mut pos = 0u64;
         for chunk in out.chunks_mut(700 * 2) {
             let blk =
-                render(&mut g, &params, pos, &LoopSpec::OFF, chunk, 2, RATE, false);
+                render(&mut g, pos, &LoopSpec::OFF, chunk, 2, RATE, false);
             pos += (chunk.len() / 2) as u64;
             assert_eq!(blk.frames, (chunk.len() / 2) as u32);
         }
@@ -537,18 +543,17 @@ mod tests {
             AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
             AbsNoteEvent { sample: 50_000, key: 60, velocity: 0 },
         ];
-        let mut g = RtGraph::new(vec![live_track(0, events, RATE)]);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; 512 * 2];
-        render(&mut g, &params, 0, &LoopSpec::OFF, &mut out, 2, RATE, false);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false);
         assert!(peak(&out) > 0.01, "note started");
         // Seek far past the note-off; the off event will never be delivered.
         // First block after the jump carries discontinuity=true.
-        render(&mut g, &params, 100_000, &LoopSpec::OFF, &mut out, 2, RATE, true);
+        render(&mut g, 100_000, &LoopSpec::OFF, &mut out, 2, RATE, true);
         // Render past the release tail: must decay to silence, not hang.
         let mut pos = 100_000 + 512;
         for _ in 0..20 {
-            render(&mut g, &params, pos, &LoopSpec::OFF, &mut out, 2, RATE, false);
+            render(&mut g, pos, &LoopSpec::OFF, &mut out, 2, RATE, false);
             pos += 512;
         }
         assert_eq!(peak(&out), 0.0, "no hung voice after discontinuity");
@@ -567,19 +572,18 @@ mod tests {
             AbsNoteEvent { sample: 40_000, key: 72, velocity: 0 },
         ];
         let lp = LoopSpec { enabled: true, start: 0, end: 8_192 };
-        let mut g = RtGraph::new(vec![live_track(0, events, RATE)]);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         // One callback block that crosses the wrap: frames [4096..8192) then
         // wraps to [0..4096).
         let mut out = vec![0.0f32; 8_192 * 2];
-        render(&mut g, &params, 4_096, &lp, &mut out, 2, RATE, false);
+        render(&mut g, 4_096, &lp, &mut out, 2, RATE, false);
         assert!(peak(&out) > 0.01, "audible across the wrap");
         // After many looped blocks the voice count must not grow without
         // bound: each wrap releases before the retrigger.
         let node_voices = {
             let mut pos = 4_096u64;
             for _ in 0..50 {
-                render(&mut g, &params, pos, &lp, &mut out, 2, RATE, false);
+                render(&mut g, pos, &lp, &mut out, 2, RATE, false);
                 pos = crate::audio::transport::advance(pos, 8_192, &lp);
             }
             let live = g.tracks[0].live.as_ref().unwrap();
@@ -589,7 +593,6 @@ mod tests {
             let mut tail = vec![0.0f32; 8_192 * 2];
             render(
                 &mut g,
-                &params,
                 1_000_000,
                 &LoopSpec::OFF,
                 &mut tail,

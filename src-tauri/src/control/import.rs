@@ -33,7 +33,6 @@ use parking_lot::Mutex;
 
 use crate::audio::engine::{load_wav, ControlMsg};
 use crate::audio::project;
-use crate::audio::rt::ParamTable;
 use crate::audio::types::{Clip, Store, TrackState};
 use crate::audio::waveform::{pyramid_exists, Pyramid};
 use crate::sidecars::jobs::{self, EventSink, JobSpec};
@@ -187,7 +186,6 @@ pub(crate) struct ImportOutcome {
 /// STRUCTURAL — the caller must send `ControlMsg::Rebuild` afterwards.
 pub(crate) fn do_import(
     session: &Mutex<Session>,
-    params: &ParamTable,
     req: &ImportClipRequest,
 ) -> Result<ImportOutcome, String> {
     let src = Path::new(&req.path);
@@ -244,7 +242,6 @@ pub(crate) fn do_import(
             None => {
                 let track = ops::add_track(
                     &mut session.store,
-                    params,
                     Some(stem.clone()),
                     Some("audio".into()),
                 )?;
@@ -305,7 +302,7 @@ impl ControlPlane {
     /// delegates here). Registers the clip, rebuilds the graph, auto-saves
     /// project.json and re-emits `project://changed`.
     pub(crate) fn import_audio_clip_impl(&self, req: ImportClipRequest) -> Result<Clip, String> {
-        let outcome = do_import(&self.session, &self.params, &req)?;
+        let outcome = do_import(&self.session, &req)?;
         self.engine.send(ControlMsg::Rebuild);
 
         // Persist the import right away (same convention as record-stop) and
@@ -602,7 +599,19 @@ pub async fn import_audio_clip_split_stems(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::rt::{GraphTables, ParamTable, SharedGraphTables};
     use std::path::PathBuf;
+
+    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) for real-engine
+    /// test harnesses — must be handed to BOTH `engine::start` and
+    /// `ControlPlane::new` as the SAME `Arc` (round-2 §2.4).
+    fn empty_tables() -> SharedGraphTables {
+        Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: std::collections::HashMap::new(),
+        }))
+    }
 
     fn tmp_parent(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -630,17 +639,16 @@ mod tests {
     }
 
     /// Store with an open temp project and `n` audio tracks.
-    fn project_session(name: &str, n: usize) -> (Mutex<Session>, ParamTable, PathBuf) {
+    fn project_session(name: &str, n: usize) -> (Mutex<Session>, PathBuf) {
         let parent = tmp_parent(name);
         let (_p, dir) = project::create(&parent, "Imp", 48_000, 120.0).unwrap();
         let mut store = Store::default();
         store.project_dir = Some(dir);
         store.project_name = Some("Imp".into());
-        let params = ParamTable::default();
         for i in 0..n {
-            ops::add_track(&mut store, &params, Some(format!("T{i}")), None).unwrap();
+            ops::add_track(&mut store, Some(format!("T{i}")), None).unwrap();
         }
-        (Mutex::new(Session::new(store, crate::midi::MidiStore::default())), params, parent)
+        (Mutex::new(Session::new(store, crate::midi::MidiStore::default())), parent)
     }
 
     fn req(path: &Path) -> ImportClipRequest {
@@ -653,14 +661,13 @@ mod tests {
 
     #[test]
     fn import_roundtrip_copies_probes_and_builds_pyramid() {
-        let (session, params, parent) = project_session("roundtrip", 1);
+        let (session, parent) = project_session("roundtrip", 1);
         let src = parent.join("source take.wav");
         write_wav(&src, 2, 44_100, 1000);
         let track_id = session.lock().store.tracks[0].id.clone();
 
         let out = do_import(
             &session,
-            &params,
             &ImportClipRequest {
                 track_id: Some(track_id.to_string()),
                 at_samples: Some(4800),
@@ -697,11 +704,11 @@ mod tests {
 
     #[test]
     fn import_auto_creates_audio_track_when_none_given() {
-        let (session, params, parent) = project_session("autotrack", 0);
+        let (session, parent) = project_session("autotrack", 0);
         let src = parent.join("melody.wav");
         write_wav(&src, 1, 48_000, 480);
 
-        let out = do_import(&session, &params, &req(&src)).unwrap();
+        let out = do_import(&session, &req(&src)).unwrap();
         let t = out.created_track.expect("track auto-created");
         assert_eq!(t.kind, "audio");
         assert_eq!(t.name, "melody");
@@ -709,50 +716,52 @@ mod tests {
         assert_eq!(out.clip.timeline_start_samples, 0, "default placement");
         let s = session.lock();
         assert_eq!(s.store.tracks.len(), 1);
-        assert!(s.store.slots.contains_key(&t.id), "RT slot allocated");
+        // Round-2 §2.4: slots are derived state, not a store side effect —
+        // assert the row itself landed (a later Rebuild derives its slot).
+        assert!(s.store.tracks.iter().any(|tr| tr.id == t.id), "track row exists");
         drop(s);
         let _ = std::fs::remove_dir_all(parent);
     }
 
     #[test]
     fn import_rejections_are_structured_and_mutation_free() {
-        let (session, params, parent) = project_session("reject", 1);
+        let (session, parent) = project_session("reject", 1);
         let wav = parent.join("ok.wav");
         write_wav(&wav, 1, 48_000, 100);
 
         // Relative path.
-        let e = do_import(&session, &params, &ImportClipRequest {
+        let e = do_import(&session, &ImportClipRequest {
             path: "relative.wav".into(), track_id: None, at_samples: None,
         }).unwrap_err();
         assert!(e.contains("absolute"), "{e}");
 
         // Missing file.
-        let e = do_import(&session, &params, &req(&parent.join("nope.wav"))).unwrap_err();
+        let e = do_import(&session, &req(&parent.join("nope.wav"))).unwrap_err();
         assert!(e.contains("not found"), "{e}");
 
         // Unsupported format: clean message listing what IS supported.
         let aiff = parent.join("song.aiff");
         std::fs::write(&aiff, b"FORM....AIFF").unwrap();
-        let e = do_import(&session, &params, &req(&aiff)).unwrap_err();
+        let e = do_import(&session, &req(&aiff)).unwrap_err();
         assert!(e.contains("unsupported import format"), "{e}");
         assert!(e.contains("mp3"), "{e}");
 
         // Corrupt WAV.
         let bad = parent.join("bad.wav");
         std::fs::write(&bad, b"RIFFnope").unwrap();
-        assert!(do_import(&session, &params, &req(&bad)).is_err());
+        assert!(do_import(&session, &req(&bad)).is_err());
 
         // Corrupt compressed file (a .flac that isn't FLAC).
         let flac = parent.join("song.flac");
         std::fs::write(&flac, b"fLaC-not-really-a-flac-stream").unwrap();
-        let e = do_import(&session, &params, &req(&flac)).unwrap_err();
+        let e = do_import(&session, &req(&flac)).unwrap_err();
         assert!(
             e.contains("corrupt") || e.contains("decode") || e.contains("no audio"),
             "{e}"
         );
 
         // Unknown track id.
-        let e = do_import(&session, &params, &ImportClipRequest {
+        let e = do_import(&session, &ImportClipRequest {
             track_id: Some("ghost".into()), ..req(&wav)
         }).unwrap_err();
         assert!(e.contains("unknown track"), "{e}");
@@ -760,9 +769,9 @@ mod tests {
         // Midi track target.
         let midi_id = {
             let mut s = session.lock();
-            ops::add_track(&mut s.store, &params, None, Some("midi".into())).unwrap().id
+            ops::add_track(&mut s.store, None, Some("midi".into())).unwrap().id
         };
-        let e = do_import(&session, &params, &ImportClipRequest {
+        let e = do_import(&session, &ImportClipRequest {
             track_id: Some(midi_id.to_string()), ..req(&wav)
         }).unwrap_err();
         assert!(e.contains("midi"), "{e}");
@@ -778,11 +787,10 @@ mod tests {
     #[test]
     fn import_without_project_is_an_error() {
         let session = Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default()));
-        let params = ParamTable::default();
         let parent = tmp_parent("noproj");
         let wav = parent.join("a.wav");
         write_wav(&wav, 1, 48_000, 10);
-        let e = do_import(&session, &params, &req(&wav)).unwrap_err();
+        let e = do_import(&session, &req(&wav)).unwrap_err();
         assert!(e.contains("no project open"), "{e}");
         let _ = std::fs::remove_dir_all(parent);
     }
@@ -855,7 +863,7 @@ mod tests {
     #[test]
     fn import_decodes_compressed_formats_via_symphonia() {
         let frames = 22_050usize; // 0.5 s at 44.1 kHz
-        let (session, params, parent) = project_session("formats", 0);
+        let (session, parent) = project_session("formats", 0);
         let src_wav = parent.join("tone.wav");
         write_sine_wav(&src_wav, frames);
 
@@ -865,7 +873,7 @@ mod tests {
                 eprintln!("skipping compressed-format import test: ffmpeg not found");
                 return;
             }
-            let out = do_import(&session, &params, &req(&enc))
+            let out = do_import(&session, &req(&enc))
                 .unwrap_or_else(|e| panic!("import .{ext} failed: {e}"));
             let clip = &out.clip;
             assert_eq!(clip.source_channels, 2, ".{ext} keeps stereo");
@@ -899,11 +907,11 @@ mod tests {
 
     #[test]
     fn corrupt_compressed_import_leaves_store_untouched() {
-        let (session, params, parent) = project_session("corrupt", 0);
+        let (session, parent) = project_session("corrupt", 0);
         for name in ["junk.mp3", "junk.ogg", "junk.m4a"] {
             let p = parent.join(name);
             std::fs::write(&p, b"\xffgarbage garbage garbage garbage").unwrap();
-            let e = do_import(&session, &params, &req(&p)).unwrap_err();
+            let e = do_import(&session, &req(&p)).unwrap_err();
             assert!(
                 e.contains("corrupt") || e.contains("decode") || e.contains("no audio"),
                 "{name}: {e}"
@@ -926,18 +934,18 @@ mod tests {
     /// Real ControlPlane over a headless engine + temp project.
     fn control_plane(name: &str) -> (Arc<ControlPlane>, PathBuf) {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
         let cp = Arc::new(ControlPlane::new(
             session,
             shared,
-            params,
+            tables,
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(|_, _| {}),
@@ -952,11 +960,11 @@ mod tests {
         name: &str,
     ) -> (Arc<ControlPlane>, PathBuf, Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
@@ -965,7 +973,7 @@ mod tests {
         let cp = Arc::new(ControlPlane::new(
             session,
             shared,
-            params,
+            tables,
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),

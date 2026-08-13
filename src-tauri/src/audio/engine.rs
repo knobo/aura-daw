@@ -27,9 +27,12 @@ use super::meters::{MeterAccum, RawMeterBlock};
 use super::mixer;
 use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
-use super::rt::{GraphPtr, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedRt, NO_PARK};
+use super::rt::{
+    GraphPtr, GraphTables, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedGraphTables,
+    SharedRt, NO_PARK,
+};
 use super::transport;
-use super::types::{Clip, MeterFrame, Store};
+use super::types::{derive_slots, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use super::project;
 use crate::control::Session;
@@ -127,7 +130,7 @@ impl EngineHandle {
 /// silent 60 Hz meter frames) so the UI and tests stay functional.
 pub fn start(
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
+    tables: SharedGraphTables,
     session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
 ) -> EngineHandle {
@@ -137,7 +140,9 @@ pub fn start(
         .spawn(move || {
             let mut ctl = Control {
                 shared,
-                params,
+                tables,
+                generation: 0,
+                rebuild_pending: false,
                 session,
                 events,
                 rx,
@@ -203,7 +208,6 @@ struct OutputCb {
     meter_tx: rtrb::Producer<RawMeterBlock>,
     evt_tx: rtrb::Producer<RtEvent>,
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
     /// Current graph snapshot (RCU: replaced whole; only live-node internals
     /// mutate, and only on this thread — see `LiveNodeCell`).
     graph: Option<Box<RtGraph>>,
@@ -254,7 +258,6 @@ impl OutputCb {
             (Some(g), true) => {
                 let blk = mixer::render(
                     g,
-                    &self.params,
                     base,
                     &lp,
                     out,
@@ -455,7 +458,20 @@ fn stale_sources(clips: &[Clip], cache: &HashMap<SourceId, CachedSource>) -> Vec
 
 struct Control {
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
+    /// Control-side view of the CURRENT graph's tables (round-2 §2.4) — see
+    /// `SharedGraphTables`'s doc for the lock-order rule [C1]: session
+    /// before tables, never the reverse.
+    tables: SharedGraphTables,
+    /// Monotonic graph generation, bumped once per `rebuild` call (even
+    /// headless, even when the graph queue is full) — echoed on every
+    /// `RtGraph`/`GraphTables` built from that rebuild.
+    generation: u64,
+    /// Set on `PushError::Full` [I1]: the tables already point at this
+    /// generation, but no graph was queued to serve it, so a retry is
+    /// scheduled for the next `run()` tick (after `drain_retired`, which is
+    /// what frees queue space) — otherwise every subsequent param write
+    /// would resolve into a table nothing reads.
+    rebuild_pending: bool,
     session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
     rx: Receiver<ControlMsg>,
@@ -501,6 +517,15 @@ impl Control {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
             self.drain_retired();
+            if self.rebuild_pending {
+                // [I1] the previous rebuild's tables already point at a
+                // generation no graph was queued for (the queue was full) —
+                // retry now that `drain_retired` has freed space, so knob
+                // traffic converges instead of writing into a table nothing
+                // reads forever.
+                self.rebuild_pending = false;
+                self.rebuild();
+            }
             self.drain_meters();
             self.drain_rt_events();
             self.headless_advance();
@@ -579,7 +604,6 @@ impl Control {
             meter_tx,
             evt_tx,
             shared: self.shared.clone(),
-            params: self.params.clone(),
             graph: None,
             channels,
             rate,
@@ -625,72 +649,127 @@ impl Control {
 
     // -- graph lifecycle (prepare on control thread, swap by pointer) -------
 
+    /// Rewrite for round-2 §2.4: slots are derived fresh from display order
+    /// every rebuild (nothing is ever "freed" for a later rebuild to
+    /// alias — see `types::derive_slots`), and this rebuild's `ParamTable`
+    /// is built fresh and travels WITH the graph it belongs to
+    /// (`RtGraph::params`) — a retired graph keeps reading its own table,
+    /// so the O-13 alias window is dead by construction (Step 5's test
+    /// pins this).
     fn rebuild(&mut self) {
         self.ensure_loaded();
+        self.generation += 1;
+        let headless = self.output.is_none();
+        let graph = {
+            let session = self.session.lock();
+            let store = &session.store;
+            let slots = derive_slots(&store.tracks);
+            let params = Arc::new(ParamTable::default());
+            for (i, t) in store.tracks.iter().enumerate() {
+                params.set_gain_linear(i, mixer::db_to_linear(t.gain_db));
+                params.set_pan(i, t.pan as f32);
+                params.set_flag(i, super::rt::FLAG_MUTE, t.muted);
+                params.set_flag(i, super::rt::FLAG_SOLO, t.soloed);
+            }
+            params.any_solo.store(store.any_solo(), Relaxed);
+            // PUBLISH UNDER THE SESSION LOCK [C1]: this is load-bearing, not
+            // style. Publishing after the lock is released would open a
+            // window where a commit transacts against a NEWER document
+            // revision than the one this rebuild read, resolves its param
+            // writes through the STILL-OLD tables (because these fresher
+            // ones aren't published yet), and then this rebuild publishes
+            // tables built from the OLDER revision — silently losing the
+            // commit's write forever (a plain `Set` never schedules a
+            // rebuild). Publishing here, still holding `session`, makes
+            // <read doc, publish tables> atomic against every commit's
+            // <transact, execute writes> sequence (see `SharedGraphTables`'s
+            // doc for the full argument and the lock-order rule).
+            *self.tables.lock() = GraphTables {
+                generation: self.generation,
+                params: params.clone(),
+                slots: slots.clone(),
+            };
+            if headless {
+                // Headless keeps its narrow scope [I5]: tables are enough
+                // to serve knob writes and recording resolution with no
+                // output device — no clip assembly, no live/plugin node
+                // instantiation, no `song_end` write. Enabling any of that
+                // headlessly (every structural commit in the whole backend
+                // test suite runs through here) would be a silent behavior
+                // change this refactor must not smuggle in.
+                None
+            } else {
+                let mut tracks = Vec::with_capacity(store.tracks.len());
+                for t in &store.tracks {
+                    let slot = slots[&t.id];
+                    let clips = store
+                        .clips
+                        .iter()
+                        .filter(|c| c.track_id == t.id)
+                        .filter_map(|c| {
+                            let samples = self.cache.get(&c.source_id).map(|e| e.data.clone())?;
+                            Some(RtClip {
+                                start: c.timeline_start_samples,
+                                offset: c.offset_samples,
+                                len: c.length_samples,
+                                gain: mixer::db_to_linear(c.gain_db),
+                                fade_in: c.fade_in_samples,
+                                fade_out: c.fade_out_samples,
+                                samples,
+                            })
+                        })
+                        .collect();
+                    tracks.push(RtTrack::clips(slot, clips));
+                }
+                // LIVE instrument tracks (phase 3, ARCHITECTURE §15): midi
+                // tracks become RtTracks carrying a live node (SamplerNode
+                // when the track's `instrument_id` resolves, plugin node
+                // for `plugin:` refs — stub until zones P1/P2 land —,
+                // PolySynth fallback) plus this snapshot's pre-scheduled
+                // events (ticks -> absolute samples via TempoMap, HERE on
+                // the control thread; the RT thread only slices
+                // sample-offset events). Nodes come from `live_nodes` so
+                // voice/plugin state SURVIVES rebuilds; brand-new nodes are
+                // prepared before the snapshot is published (RCU
+                // discipline). Store and midi share one guard now, so this
+                // reads `session.midi` directly instead of re-locking
+                // through the registered global.
+                let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
+                crate::midi::playback::append_from(
+                    &session.midi,
+                    store,
+                    &slots,
+                    self.cache_rate,
+                    bank.as_deref(),
+                    &mut self.live_nodes,
+                    &mut tracks,
+                );
+                // The timeline boundary belongs to the material, so it is
+                // derived exactly where the material is assembled — same
+                // helper the offline bounce uses, so live and export agree
+                // on where the song ends (clip ends AND the final scheduled
+                // note-off).
+                self.shared
+                    .song_end
+                    .store(offline::song_end(&tracks), Relaxed);
+                Some(Box::new(RtGraph::new(tracks, self.generation, params)))
+            }
+        };
+        let Some(graph) = graph else { return };
         let Some(out) = self.output.as_mut() else { return };
         // Free anything the callback already retired before queueing more.
         while let Ok(gp) = out.retire_rx.pop() {
             drop(gp);
         }
-        let graph = {
-            let session = self.session.lock();
-            let store = &session.store;
-            let mut tracks = Vec::with_capacity(store.tracks.len());
-            for t in &store.tracks {
-                let Some(&slot) = store.slots.get(&t.id) else { continue };
-                let clips = store
-                    .clips
-                    .iter()
-                    .filter(|c| c.track_id == t.id)
-                    .filter_map(|c| {
-                        let samples = self.cache.get(&c.source_id).map(|e| e.data.clone())?;
-                        Some(RtClip {
-                            start: c.timeline_start_samples,
-                            offset: c.offset_samples,
-                            len: c.length_samples,
-                            gain: mixer::db_to_linear(c.gain_db),
-                            fade_in: c.fade_in_samples,
-                            fade_out: c.fade_out_samples,
-                            samples,
-                        })
-                    })
-                    .collect();
-                tracks.push(RtTrack::clips(slot, clips));
-            }
-            // LIVE instrument tracks (phase 3, ARCHITECTURE §15): midi tracks
-            // become RtTracks carrying a live node (SamplerNode when the
-            // track's `instrument_id` resolves, plugin node for `plugin:`
-            // refs — stub until zones P1/P2 land —, PolySynth fallback) plus
-            // this snapshot's pre-scheduled events (ticks -> absolute samples
-            // via TempoMap, HERE on the control thread; the RT thread only
-            // slices sample-offset events). Nodes come from `live_nodes` so
-            // voice/plugin state SURVIVES rebuilds; brand-new nodes are
-            // prepared before the snapshot is published (RCU discipline).
-            // Store and midi share one guard now, so this reads `session.midi`
-            // directly instead of re-locking through the registered global.
-            let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-            crate::midi::playback::append_from(
-                &session.midi,
-                store,
-                self.cache_rate,
-                bank.as_deref(),
-                &mut self.live_nodes,
-                &mut tracks,
-            );
-            // The timeline boundary belongs to the material, so it is derived
-            // exactly where the material is assembled — same helper the
-            // offline bounce uses, so live and export agree on where the song
-            // ends (clip ends AND the final scheduled note-off).
-            self.shared
-                .song_end
-                .store(offline::song_end(&tracks), Relaxed);
-            Box::new(RtGraph::new(tracks))
-        };
         if let Err(rtrb::PushError::Full(_gp)) = out.graph_tx.push(GraphPtr::new(graph)) {
-            // Queue full (callback stalled?) — the returned GraphPtr frees
-            // the fresh graph on drop, here on the control thread; the next
-            // Rebuild retries.
-            log::warn!("audio: graph queue full, rebuild dropped");
+            // [I1] Queue full (callback stalled?) — the returned GraphPtr
+            // frees the fresh graph on drop, here on the control thread.
+            // The tables above are ALREADY published at this generation, so
+            // without a retry every subsequent knob write would resolve
+            // into a table no graph ever reads: schedule one for `run()`'s
+            // next tick, after `drain_retired` has freed queue space.
+            self.rebuild_pending = true;
+            log::warn!("audio: graph queue full, rebuild retried next tick");
         }
     }
 
@@ -798,7 +877,19 @@ impl Control {
             return;
         }
         self.last_frame = Instant::now();
-        let tracks = self.session.lock().store.track_slots();
+        // Interim (until Task 6 re-does the fold): display order comes from
+        // the session, slots come from the CURRENT graph's tables — lock
+        // order matters here too [C1], session before tables.
+        let tracks: Vec<(usize, String)> = {
+            let session = self.session.lock();
+            let tables = self.tables.lock();
+            session
+                .store
+                .tracks
+                .iter()
+                .filter_map(|t| tables.slots.get(&t.id).map(|&s| (s, t.id.to_string())))
+                .collect()
+        };
         let position = self.shared.position.load(Relaxed);
         let frame = self.accum.take_frame(0, &tracks, position);
         self.sinks.retain_mut(|(sink, seq)| {
@@ -946,16 +1037,20 @@ impl Control {
         let rate = cfg.sample_rate().0;
         let start_pos = self.shared.position.load(Relaxed);
 
-        // Rings + writer specs.
+        // Rings + writer specs. Slot resolution reads the CURRENT graph's
+        // tables, not the store — round-2 §2.4; lock order: session before
+        // tables [C1].
         let (project_dir, take_no, slots) = {
             let session = self.session.lock();
             let store = &session.store;
             let dir = store.project_dir.clone().ok_or("no project open")?;
+            let take_no = store.clips.len() + 1;
+            let tables = self.tables.lock();
             let slots: Vec<usize> = targets
                 .iter()
-                .filter_map(|id| store.slots.get(id.as_str()).copied())
+                .filter_map(|id| tables.slots.get(id.as_str()).copied())
                 .collect();
-            (dir, store.clips.len() + 1, slots)
+            (dir, take_no, slots)
         };
         let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
         let mut producers = Vec::with_capacity(targets.len());
@@ -1174,7 +1269,6 @@ mod tests {
                 meter_tx,
                 evt_tx,
                 shared,
-                params: Arc::new(ParamTable::default()),
                 graph: None,
                 channels: 2,
                 rate: 48_000,
@@ -1249,29 +1343,33 @@ mod tests {
         assert_eq!(shared.position.load(Relaxed), 8 * 128);
     }
 
-    fn spin_up() -> (EngineHandle, Arc<SharedRt>, Arc<ParamTable>, Arc<Mutex<Session>>) {
+    fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: HashMap::new(),
+        }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
         let handle = start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
-        (handle, shared, params, session)
+        (handle, shared, tables, session)
     }
 
     /// Runs with or without a real audio device: the engine falls back to
     /// headless mode, so meter frames must flow either way.
     #[test]
     fn engine_pumps_meter_frames_at_60hz() {
-        let (handle, _shared, _params, session) = spin_up();
+        let (handle, _shared, _tables, session) = spin_up();
         {
             let mut session = session.lock();
             let s = &mut session.store;
-            let slot = s.alloc_slot("t1").unwrap();
-            assert_eq!(slot, 0);
+            // Slots are derived state now (round-2 §2.4) — pushing the row
+            // and sending Rebuild is what seeds slot 0, not a direct alloc.
             s.tracks.push(super::super::types::TrackState {
                 id: "t1".into(),
                 name: "Track 1".into(),
@@ -1285,6 +1383,13 @@ mod tests {
                 instrument_id: None,
             });
         }
+        // Rebuild derives slots + publishes tables (round-2 §2.4). The
+        // engine channel is FIFO and single-consumer, so this message is
+        // always HANDLED before the Subscribe sent below, however the two
+        // sends happen to interleave with the control thread's poll loop —
+        // deterministic: by the time any sink can capture a frame, the
+        // tables are already published.
+        handle.send(ControlMsg::Rebuild);
         let count = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
         handle.send(ControlMsg::Subscribe(Box::new(CountingSink(
@@ -1318,7 +1423,7 @@ mod tests {
 
     #[test]
     fn transport_advances_headless_or_with_device() {
-        let (handle, shared, _params, _store) = spin_up();
+        let (handle, shared, _tables, _store) = spin_up();
         // Event-driven readiness: wait for the stream (or headless fallback)
         // to publish a sample rate instead of guessing with a fixed sleep.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1432,18 +1537,22 @@ mod tests {
     fn graph_ptr_frees_on_queue_teardown() {
         use super::super::rt::{GraphPtr, RtClip, RtClipData, RtGraph, RtTrack};
         let data = Arc::new(RtClipData { channels: 1, data: vec![0.0; 16] });
-        let graph = Box::new(RtGraph::new(vec![RtTrack::clips(
-            0,
-            vec![RtClip {
-                start: 0,
-                offset: 0,
-                len: 16,
-                gain: 1.0,
-                fade_in: 0,
-                fade_out: 0,
-                samples: data.clone(),
-            }],
-        )]));
+        let graph = Box::new(RtGraph::new(
+            vec![RtTrack::clips(
+                0,
+                vec![RtClip {
+                    start: 0,
+                    offset: 0,
+                    len: 16,
+                    gain: 1.0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    samples: data.clone(),
+                }],
+            )],
+            1,
+            Arc::new(ParamTable::default()),
+        ));
         assert_eq!(Arc::strong_count(&data), 2);
         let (mut tx, rx) = rtrb::RingBuffer::new(4);
         tx.push(GraphPtr::new(graph)).ok().unwrap();
@@ -1454,6 +1563,74 @@ mod tests {
             Arc::strong_count(&data),
             1,
             "graph queued at teardown was freed, not leaked"
+        );
+    }
+
+    /// Round-2 §2.4 / O-13 regression pin: a retired graph renders against
+    /// ITS OWN params, never a newer generation's — proving the alias
+    /// window is dead by construction. Written directly against the Step 4
+    /// implementation (there is no old "shared single ParamTable" code path
+    /// left in this tree to fail against; that design was deleted in this
+    /// same task), so this is a permanent pin rather than a red-then-green
+    /// TDD cycle — acceptable per the brief's note on Step 5.
+    ///
+    /// gen1 has one track on slot 0 with gain 0.5; gen2 has a DIFFERENT
+    /// track on the SAME slot 0 with gain 0.9. Both graphs carry a DC clip
+    /// (all samples 1.0) so gain is directly readable off the output peak.
+    /// `OutputCb::render` adopts a queued graph at the TOP of `render`, so
+    /// pushing gen2 only AFTER a render call means "the NEXT render adopts
+    /// it" — the test controls the queue, so the ordering is fully
+    /// deterministic, not a race.
+    #[test]
+    fn retired_graph_keeps_its_own_params_no_slot_aliasing() {
+        let dc = Arc::new(RtClipData { channels: 1, data: vec![1.0; 16] });
+        let dc_clip = || RtClip {
+            start: 0,
+            offset: 0,
+            len: 16,
+            gain: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+            samples: dc.clone(),
+        };
+
+        let p1 = Arc::new(ParamTable::default());
+        p1.set_gain_linear(0, 0.5);
+        let g1 = Box::new(RtGraph::new(vec![RtTrack::clips(0, vec![dc_clip()])], 1, p1));
+
+        let p2 = Arc::new(ParamTable::default());
+        p2.set_gain_linear(0, 0.9);
+        let g2 = Box::new(RtGraph::new(vec![RtTrack::clips(0, vec![dc_clip()])], 2, p2));
+
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        shared.playing.store(true, Relaxed);
+
+        // Center pan (default) on both channels: peak = gain * 1/sqrt(2).
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = vec![0.0f32; 4 * 2]; // 4 frames, stereo
+
+        // Adopt g1 (queued before this render).
+        graph_tx.push(GraphPtr::new(g1)).unwrap();
+        cb.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!((peak - 0.5 * K).abs() < 1e-5, "gen1's own gain (0.5), got {peak}");
+
+        // gen2 is NOT queued yet: this render must still read gen1's table.
+        cb.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - 0.5 * K).abs() < 1e-5,
+            "still gen1's gain while gen2 sits unqueued, got {peak}"
+        );
+
+        // Queue gen2 now: the NEXT render adopts it.
+        graph_tx.push(GraphPtr::new(g2)).unwrap();
+        cb.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - 0.9 * K).abs() < 1e-5,
+            "gen2's own gain (0.9) after adoption — no aliasing, got {peak}"
         );
     }
 
@@ -1599,13 +1776,12 @@ mod tests {
         }
         w.finalize().unwrap();
 
-        let (handle, _shared, _params, session) = spin_up();
+        let (handle, _shared, _tables, session) = spin_up();
         let sid = SourceId::mint();
         {
             let mut session = session.lock();
             let s = &mut session.store;
             s.project_dir = Some(dir.clone());
-            s.alloc_slot("t1");
             s.tracks.push(super::super::types::TrackState {
                 id: "t1".into(),
                 name: "T1".into(),

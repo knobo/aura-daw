@@ -561,10 +561,19 @@ mod tests {
             crate::midi::MidiStore::default(),
         )));
         let shared_rt = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(crate::audio::rt::ParamTable::default());
+        // A fresh, empty SharedGraphTables (gen 0, no tracks) — must be
+        // handed to BOTH `engine::start` and `ControlPlane::new` as the
+        // SAME `Arc` (round-2 §2.4).
+        let tables: crate::audio::rt::SharedGraphTables = Arc::new(Mutex::new(
+            crate::audio::rt::GraphTables {
+                generation: 0,
+                params: Arc::new(crate::audio::rt::ParamTable::default()),
+                slots: HashMap::new(),
+            },
+        ));
         let engine = crate::audio::engine::start(
             shared_rt.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullSink),
         );
@@ -575,7 +584,7 @@ mod tests {
         Arc::new(ControlPlane::new(
             session,
             shared_rt,
-            params,
+            tables,
             engine,
             jobs,
             Box::new(|_, _| {}),

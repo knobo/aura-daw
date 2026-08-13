@@ -11,8 +11,8 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::rt::{ParamTable, SharedRt};
-use crate::audio::types::{Store, TrackState, TransportState, MAX_TRACKS};
+use crate::audio::rt::SharedRt;
+use crate::audio::types::{Store, TrackState, TransportState};
 
 /// One batched mix change (op-log-shaped per debt D-03: a UI gesture or MCP
 /// tool call carries MANY of these in one request). `None` = leave unchanged.
@@ -54,18 +54,22 @@ pub(crate) fn insert_track(store: &mut Store, track: TrackState, index: usize) {
     store.tracks.insert(index, track);
 }
 
-/// Allocate an RT slot and build a fresh track row — everything `add_track`
-/// does EXCEPT inserting it into `store.tracks`. Split out (Task 7) so
-/// `ControlPlane::add_track` can insert the row through the transaction
-/// channel (`Op::TrackAdd`, via `Session::transact`) instead of a direct
-/// `Vec::insert`, while slot allocation + the RT param reset — like
-/// `remove_track`'s slot free — stay outside the op layer this plan
-/// (round-2 §2.4; `control::session`'s `Op::TrackAdd` arm never touches
-/// slots). Returns `(track, index)`; `index` is the row's intended position
-/// (end of the current list).
+/// Build a fresh track row — everything `add_track` does EXCEPT inserting
+/// it into `store.tracks`. Split out (Task 7) so `ControlPlane::add_track`
+/// can insert the row through the transaction channel (`Op::TrackAdd`, via
+/// `Session::transact`) instead of a direct `Vec::insert`.
+///
+/// Round-2 §2.4: slot allocation and the RT param reset are GONE — slots
+/// are derived fresh from display order on every rebuild
+/// (`types::derive_slots`) and a fresh row's params come from that same
+/// rebuild's build-time population (unity gain / center pan / no flags),
+/// an exact behavioral match for what the deleted `params.reset_slot` used
+/// to write. There is therefore no `MAX_TRACKS` limit here either — that
+/// error dies with the fixed arrays it used to guard (final removal of
+/// `MAX_TRACKS` itself is Task 7 territory). Returns `(track, index)`;
+/// `index` is the row's intended position (end of the current list).
 pub(crate) fn new_track_row(
     store: &mut Store,
-    params: &ParamTable,
     name: Option<String>,
     kind: Option<String>,
 ) -> Result<(TrackState, usize), String> {
@@ -75,10 +79,6 @@ pub(crate) fn new_track_row(
     }
     let n = store.tracks.len();
     let id = uuid::Uuid::new_v4().to_string();
-    let slot = store
-        .alloc_slot(&id)
-        .ok_or_else(|| format!("track limit reached ({MAX_TRACKS})"))?;
-    params.reset_slot(slot);
     let track = TrackState {
         id: id.into(),
         name: name.unwrap_or_else(|| format!("Track {}", n + 1)),
@@ -94,20 +94,20 @@ pub(crate) fn new_track_row(
     Ok((track, n))
 }
 
-/// Create a track in the store and reset its RT param slot. STRUCTURAL —
-/// the caller must send `ControlMsg::Rebuild` afterwards. `kind`: "audio"
-/// (default) or "midi" (phase 2; "bus" reserved). Used directly by callers
-/// that mutate the store outside the transaction channel (currently only
+/// Create a track in the store. STRUCTURAL — the caller must send
+/// `ControlMsg::Rebuild` afterwards (the next rebuild derives the row's
+/// slot and populates its params — round-2 §2.4). `kind`: "audio" (default)
+/// or "midi" (phase 2; "bus" reserved). Used directly by callers that
+/// mutate the store outside the transaction channel (currently only
 /// `seed_demo_project`, which builds several tracks under one lock before
 /// any engine/event side effect); the frozen `add_track` COMMAND goes
 /// through `ControlPlane::add_track` -> `commit` -> `new_track_row` instead.
 pub fn add_track(
     store: &mut Store,
-    params: &ParamTable,
     name: Option<String>,
     kind: Option<String>,
 ) -> Result<TrackState, String> {
-    let (track, index) = new_track_row(store, params, name, kind)?;
+    let (track, index) = new_track_row(store, name, kind)?;
     insert_track(store, track.clone(), index);
     Ok(track)
 }
@@ -131,20 +131,19 @@ pub fn transport_snapshot(store: &Store, shared: &SharedRt) -> TransportState {
 mod tests {
     use super::*;
 
-    fn store_with_tracks(n: usize) -> (Store, ParamTable) {
+    fn store_with_tracks(n: usize) -> Store {
         let mut store = Store::default();
-        let params = ParamTable::default();
         for i in 0..n {
-            add_track(&mut store, &params, Some(format!("T{i}")), None).unwrap();
+            add_track(&mut store, Some(format!("T{i}")), None).unwrap();
         }
-        (store, params)
+        store
     }
 
     #[test]
     fn add_track_rejects_unknown_kind_and_accepts_midi() {
-        let (mut store, params) = store_with_tracks(0);
-        assert!(add_track(&mut store, &params, None, Some("bus".into())).is_err());
-        let t = add_track(&mut store, &params, None, Some("midi".into())).unwrap();
+        let mut store = store_with_tracks(0);
+        assert!(add_track(&mut store, None, Some("bus".into())).is_err());
+        let t = add_track(&mut store, None, Some("midi".into())).unwrap();
         assert_eq!(t.kind, "midi");
     }
 }

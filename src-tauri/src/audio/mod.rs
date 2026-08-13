@@ -45,7 +45,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::control::{self, ControlPlane, Session, TrackMixChange};
 use crate::midi::MidiStore;
 use engine::{ControlMsg, EngineHandle};
-use rt::{ParamTable, SharedRt, FLAG_MUTE, FLAG_SOLO};
+use rt::{GraphTables, ParamTable, SharedGraphTables, SharedRt};
 use sampler::{InstrumentInfo, SamplerBank};
 
 pub use types::{
@@ -61,7 +61,9 @@ pub use types::{
 pub struct AudioState {
     session: Arc<Mutex<Session>>,
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
+    /// Control-side view of the CURRENT graph's tables (round-2 §2.4),
+    /// shared with the engine control thread and the `ControlPlane`.
+    tables: SharedGraphTables,
     engine: OnceLock<EngineHandle>,
     /// Loaded SFZ instruments (phase 2, sampler zone).
     samplers: Arc<Mutex<SamplerBank>>,
@@ -74,7 +76,11 @@ impl Default for AudioState {
         Self {
             session: Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default()))),
             shared: Arc::new(SharedRt::default()),
-            params: Arc::new(ParamTable::default()),
+            tables: Arc::new(Mutex::new(GraphTables {
+                generation: 0,
+                params: Arc::new(ParamTable::default()),
+                slots: std::collections::HashMap::new(),
+            })),
             engine: OnceLock::new(),
             samplers: Arc::new(Mutex::new(SamplerBank::default())),
             preview: OnceLock::new(),
@@ -98,8 +104,8 @@ impl AudioState {
 
     pub(crate) fn control_parts(
         &self,
-    ) -> (Arc<Mutex<Session>>, Arc<SharedRt>, Arc<ParamTable>) {
-        (self.session.clone(), self.shared.clone(), self.params.clone())
+    ) -> (Arc<Mutex<Session>>, Arc<SharedRt>, SharedGraphTables) {
+        (self.session.clone(), self.shared.clone(), self.tables.clone())
     }
 
     pub(crate) fn engine_handle(&self) -> Option<EngineHandle> {
@@ -116,7 +122,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     sampler::register_bank(state.samplers.clone());
     let handle = engine::start(
         state.shared.clone(),
-        state.params.clone(),
+        state.tables.clone(),
         state.session.clone(),
         Box::new(TauriEvents(app.clone())),
     );
@@ -615,25 +621,15 @@ fn open_project_impl(path: String, app: AppHandle) -> Result<Project, String> {
     {
         let mut session = state.session.lock();
         let s = &mut session.store;
-        // Reset slots/params and adopt the loaded tracks.
-        for t in s.tracks.clone() {
-            s.free_slot(t.id.as_str());
-        }
+        // Round-2 §2.4: no slot/param seeding here anymore — adoption
+        // (below) + the `Rebuild` sent after this block is enough; the
+        // next rebuild derives slots from display order and populates a
+        // fresh `ParamTable` from the adopted rows.
         s.tracks = project.tracks.clone();
         s.clips = project.clips.clone();
         s.project_dir = Some(dir);
         s.project_name = Some(project.name.clone());
         s.created_at = project.created_at.clone();
-        for t in project.tracks.clone() {
-            let slot = s
-                .alloc_slot(t.id.as_str())
-                .ok_or_else(|| format!("track limit reached ({})", types::MAX_TRACKS))?;
-            state.params.set_gain_linear(slot, mixer::db_to_linear(t.gain_db));
-            state.params.set_pan(slot, t.pan as f32);
-            state.params.set_flag(slot, FLAG_MUTE, t.muted);
-            state.params.set_flag(slot, FLAG_SOLO, t.soloed);
-        }
-        state.params.any_solo.store(s.any_solo(), Relaxed);
         if let Some(t) = &project.transport {
             s.transport.tempo_bpm = t.tempo_bpm;
             s.transport.state = "stopped".into();

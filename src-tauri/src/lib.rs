@@ -62,7 +62,7 @@ pub fn run() {
             // `MidiState::shared` wires the same Arc in and registers it with
             // the engine-rebuild hook (playback integration).
             let audio_state = app.state::<audio::AudioState>();
-            let (session, shared, params) = audio_state.control_parts();
+            let (session, shared, tables) = audio_state.control_parts();
             let engine = audio_state
                 .engine_handle()
                 .ok_or("audio engine failed to start")?;
@@ -72,7 +72,7 @@ pub fn run() {
             let control_plane = Arc::new(control::ControlPlane::new(
                 session,
                 shared,
-                params,
+                tables,
                 engine,
                 jobs,
                 Box::new(move |event, payload| {

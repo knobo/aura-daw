@@ -1000,7 +1000,6 @@ mod tests {
 
         // One midi track bound to the plugin instance, playing C3 for a beat.
         let mut store = Store::default();
-        store.alloc_slot("m1");
         let mut t = TrackState {
             id: "m1".into(),
             name: "m1".into(),
@@ -1040,7 +1039,8 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
-        append_from(&midi, &store, 48_000, None, &mut nodes, &mut tracks);
+        let slots = crate::audio::types::derive_slots(&store.tracks);
+        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             nodes.key_of("m1"),
@@ -1049,12 +1049,11 @@ mod tests {
         );
 
         // Render 1 s through the REAL RT path.
-        let mut g = RtGraph::new(tracks);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(tracks, 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; 48_000 * 2];
         let mut pos = 0u64;
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(&mut g, &params, pos, &LoopSpec::OFF, chunk, 2, 48_000, false);
+            mixer::render(&mut g, pos, &LoopSpec::OFF, chunk, 2, 48_000, false);
             pos += (chunk.len() / 2) as u64;
         }
         assert!(

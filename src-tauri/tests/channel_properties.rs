@@ -17,8 +17,6 @@
 //!
 //! Clip-carrying structural ops are exercised by Gate B (tests/identity_properties.rs).
 
-use std::collections::BTreeMap;
-
 use proptest::prelude::*;
 
 use aura_lib::audio::types::{Store, TrackState};
@@ -81,10 +79,11 @@ fn set_gain(track_id: &str, to: f64) -> Op {
 /// `Session.rev` (it's `pub(crate)`, unreachable from this integration test
 /// crate anyway) — `rev` increments on every transaction including undo
 /// transactions, which is correct behavior, not something snapshot equality
-/// should be sensitive to. `slots` is re-collected into a `BTreeMap` so its
-/// JSON key order is deterministic across runs (a `HashMap`'s iteration
-/// order is not guaranteed, and would otherwise make two logically-equal
-/// snapshots compare unequal as strings).
+/// should be sensitive to. Round-2 §2.4: `Store` no longer owns a `slots`
+/// map (slots are per-graph-generation state derived fresh by the engine on
+/// every rebuild, never part of the document) — so there is nothing RT-side
+/// left to snapshot here; `tracks`/`clips` order IS the display order the
+/// slots would be derived from, and that's already covered below.
 fn snapshot(m: &parking_lot::Mutex<Session>) -> String {
     #[derive(serde::Serialize)]
     struct StoreSnap<'a> {
@@ -94,7 +93,6 @@ fn snapshot(m: &parking_lot::Mutex<Session>) -> String {
         project_dir: &'a Option<std::path::PathBuf>,
         project_name: &'a Option<String>,
         created_at: &'a Option<String>,
-        slots: BTreeMap<String, usize>,
     }
     #[derive(serde::Serialize)]
     struct MidiSnap<'a> {
@@ -118,7 +116,6 @@ fn snapshot(m: &parking_lot::Mutex<Session>) -> String {
             project_dir: &g.store.project_dir,
             project_name: &g.store.project_name,
             created_at: &g.store.created_at,
-            slots: g.store.slots.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         },
         midi: MidiSnap {
             ppq: g.midi.ppq,

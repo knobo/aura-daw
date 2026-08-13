@@ -203,6 +203,7 @@ pub struct Project {
 // thread behind a parking_lot::Mutex; never touched by the RT threads).
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct Store {
     pub transport: TransportState,
     pub tracks: Vec<TrackState>,
@@ -211,54 +212,27 @@ pub struct Store {
     pub project_dir: Option<PathBuf>,
     pub project_name: Option<String>,
     pub created_at: Option<String>,
-    /// track id -> RT parameter slot (0..MAX_TRACKS).
-    pub slots: HashMap<TrackId, usize>,
-    slot_used: [bool; MAX_TRACKS],
 }
 
-impl Default for Store {
-    fn default() -> Self {
-        Self {
-            transport: TransportState::default(),
-            tracks: Vec::new(),
-            clips: Vec::new(),
-            project_dir: None,
-            project_name: None,
-            created_at: None,
-            slots: HashMap::new(),
-            slot_used: [false; MAX_TRACKS],
-        }
-    }
+/// Derive RT parameter slots from display order (round-2 §2.4). Pure: no
+/// stored allocation state, so there is nothing to free and therefore
+/// nothing that can be reused while a stale graph still reads it — the
+/// O-13 alias window this replaces is dead by construction. Every rebuild
+/// calls this fresh against the CURRENT track list and builds its OWN
+/// `ParamTable`/`GraphTables` from the result; a retired graph keeps
+/// reading the table it was built with, so a later renumbering (tracks
+/// added/removed) can never bleed into it.
+pub fn derive_slots(tracks: &[TrackState]) -> HashMap<TrackId, usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.clone(), i))
+        .collect()
 }
 
 impl Store {
-    /// Allocate a free RT slot for a track id. Returns None when full.
-    pub fn alloc_slot(&mut self, track_id: &str) -> Option<usize> {
-        if let Some(&s) = self.slots.get(track_id) {
-            return Some(s);
-        }
-        let slot = self.slot_used.iter().position(|u| !u)?;
-        self.slot_used[slot] = true;
-        self.slots.insert(TrackId::from(track_id), slot);
-        Some(slot)
-    }
-
-    pub fn free_slot(&mut self, track_id: &str) {
-        if let Some(slot) = self.slots.remove(track_id) {
-            self.slot_used[slot] = false;
-        }
-    }
-
     pub fn any_solo(&self) -> bool {
         self.tracks.iter().any(|t| t.soloed)
-    }
-
-    /// (slot, track_id) pairs in display order.
-    pub fn track_slots(&self) -> Vec<(usize, String)> {
-        self.tracks
-            .iter()
-            .filter_map(|t| self.slots.get(&t.id).map(|&s| (s, t.id.to_string())))
-            .collect()
     }
 
     /// Absolute path for a project-relative source path.
@@ -286,26 +260,32 @@ impl Store {
 mod tests {
     use super::*;
 
-    #[test]
-    fn slot_allocation_reuses_freed_slots() {
-        let mut s = Store::default();
-        let a = s.alloc_slot("a").unwrap();
-        let b = s.alloc_slot("b").unwrap();
-        assert_ne!(a, b);
-        // idempotent
-        assert_eq!(s.alloc_slot("a").unwrap(), a);
-        s.free_slot("a");
-        let c = s.alloc_slot("c").unwrap();
-        assert_eq!(c, a, "freed slot is reused");
+    fn test_track(id: &str) -> TrackState {
+        TrackState {
+            id: id.into(),
+            name: id.into(),
+            kind: "audio".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        }
     }
 
     #[test]
-    fn slot_allocation_exhausts_at_max() {
-        let mut s = Store::default();
-        for i in 0..MAX_TRACKS {
-            assert!(s.alloc_slot(&format!("t{i}")).is_some());
-        }
-        assert!(s.alloc_slot("overflow").is_none());
+    fn slots_are_display_order_and_never_reused_across_generations() {
+        let tracks = vec![test_track("a"), test_track("b"), test_track("c")];
+        let s = derive_slots(&tracks);
+        assert_eq!((s["a"], s["b"], s["c"]), (0, 1, 2));
+        // Remove "a": the NEXT derivation renumbers — that is fine, because
+        // the numbering is scoped to one graph (each graph has its own table);
+        // cross-generation aliasing is impossible by construction, which the
+        // engine-level test (Task 8) proves end to end.
+        let s2 = derive_slots(&tracks[1..]);
+        assert_eq!((s2["b"], s2["c"]), (0, 1));
     }
 
     #[test]

@@ -937,12 +937,11 @@ mod tests {
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(events) }),
         };
-        let mut g = RtGraph::new(vec![track]);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(vec![track], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; BAR * 2];
         let mut pos = 0u64;
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(&mut g, &params, pos, &LoopSpec::OFF, chunk, 2, RATE, false);
+            mixer::render(&mut g, pos, &LoopSpec::OFF, chunk, 2, RATE, false);
             pos += (chunk.len() / 2) as u64;
         }
         mono_of(&out)
@@ -1021,8 +1020,7 @@ mod tests {
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(vec![]) }),
         };
-        let mut g = RtGraph::new(vec![track]);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(vec![track], 1, Arc::new(ParamTable::default()));
 
         let expect = |buf: &[f32], base: u64, msg: &str| {
             for (i, frame) in buf.chunks_exact(2).enumerate() {
@@ -1037,11 +1035,11 @@ mod tests {
 
         // Continuous render from 0.
         let mut buf = vec![0.0f32; 512 * 2];
-        mixer::render(&mut g, &params, 0, &LoopSpec::OFF, &mut buf, 2, RATE, false);
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut buf, 2, RATE, false);
         expect(&buf, 0, "from start");
 
         // SEEK to 72000 (gain 0.25 there): discontinuity block.
-        mixer::render(&mut g, &params, 72_000, &LoopSpec::OFF, &mut buf, 2, RATE, true);
+        mixer::render(&mut g, 72_000, &LoopSpec::OFF, &mut buf, 2, RATE, true);
         expect(&buf, 72_000, "after seek mid-ramp");
 
         // LOOP [24000, 96000): one block crossing the wrap. First 256
@@ -1049,7 +1047,7 @@ mod tests {
         // loop start (gain 0.75) mid-block.
         let lp = LoopSpec { enabled: true, start: 24_000, end: 96_000 };
         let mut wrap_buf = vec![0.0f32; 1024 * 2];
-        mixer::render(&mut g, &params, 95_744, &lp, &mut wrap_buf, 2, RATE, true);
+        mixer::render(&mut g, 95_744, &lp, &mut wrap_buf, 2, RATE, true);
         expect(&wrap_buf[..256 * 2], 95_744, "pre-wrap tail");
         expect(&wrap_buf[256 * 2..], 24_000, "post-wrap re-seeded at loop start");
     }

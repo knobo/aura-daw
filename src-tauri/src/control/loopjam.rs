@@ -641,15 +641,17 @@ fn render_region_stereo(
             samples: Arc::new(RtClipData { channels, data }),
         });
     }
-    let mut graph = RtGraph::new(vec![RtTrack::clips(0, rt_clips)]);
-    let params = ParamTable::default();
+    let mut graph = RtGraph::new(
+        vec![RtTrack::clips(0, rt_clips)],
+        0,
+        Arc::new(ParamTable::default()),
+    );
     let frames = (end - start) as usize;
     let mut buf = vec![0.0f32; frames * 2];
     let mut pos = start;
     for chunk in buf.chunks_mut(1024 * 2) {
         mixer::render(
             &mut graph,
-            &params,
             pos,
             &LoopSpec::OFF,
             chunk,
@@ -724,6 +726,7 @@ pub fn loopjam_status(jam: tauri::State<'_, Arc<LoopJam>>) -> Result<LoopJamStat
 mod tests {
     use super::*;
     use crate::audio::engine::load_wav;
+    use crate::audio::rt::{GraphTables, SharedGraphTables};
     use crate::control::{ImportClipRequest, TransportAction};
     use crate::midi::MidiStore;
     use crate::sidecars::jobs::JobManager;
@@ -732,6 +735,17 @@ mod tests {
     struct NullEvents;
     impl crate::audio::engine::EventSink for NullEvents {
         fn emit(&self, _e: &str, _p: serde_json::Value) {}
+    }
+
+    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) for real-engine
+    /// test harnesses — must be handed to BOTH `engine::start` and
+    /// `ControlPlane::new` as the SAME `Arc` (round-2 §2.4).
+    fn empty_tables() -> SharedGraphTables {
+        Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: std::collections::HashMap::new(),
+        }))
     }
 
     /// Headless control plane + project + one audio track with a 1 s clip,
@@ -747,14 +761,14 @@ mod tests {
         (u64, u64),
     ) {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(crate::control::Session::new(
             Store::default(),
             MidiStore::default(),
         )));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
@@ -775,7 +789,7 @@ mod tests {
         let cp = Arc::new(ControlPlane::new(
             session,
             shared.clone(),
-            params,
+            tables,
             engine,
             Arc::new(JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),

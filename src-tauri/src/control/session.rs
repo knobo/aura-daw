@@ -3,6 +3,7 @@
 //! (automation, plugin rows, sampler bank) move in during Plan E.
 use crate::audio::types::{Store, TrackState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
+use crate::ids::TrackId;
 use crate::midi::MidiStore;
 
 pub struct Session {
@@ -89,22 +90,29 @@ impl Tx<'_> {
 /// session lock is released. Faithfully mirrors what the retired
 /// `ops::apply_track_mix` (deleted in Plan B, behavior preserved here)
 /// used to write:
-/// * `param_writes`: `(slot, path, value)` — `Gain` as linear (via
+/// * `param_writes`: `(track_id, path, value)` — `Gain` as linear (via
 ///   `mixer::db_to_linear`), `Pan` as-is, `Muted`/`Soloed` as 0.0/1.0 gates
 ///   (`ControlPlane::commit` turns those back into the RT param store's
-///   `set_flag` calls). The retired `apply_track_mix` rewrote ALL FOUR
-///   params from the post-write snapshot on every changed (slotted) track,
-///   regardless of which single field changed — so does this, per `Set`.
+///   `set_flag` calls). Round-2 §2.4: keyed by `TrackId`, not slot — slots
+///   are per-graph-generation state the session never sees; `commit`
+///   resolves `TrackId -> slot` through the CURRENT `GraphTables` after the
+///   session lock is released (a track with no slot yet, i.e. no rebuild
+///   has run since it was added, is simply skipped — see `commit`'s doc for
+///   why that is sound). The retired `apply_track_mix` rewrote ALL FOUR
+///   params from the post-write snapshot on every changed track, regardless
+///   of which single field changed — so does this, per `Set` (no slot
+///   gate — EVERY changed track contributes writes now, since resolving
+///   whether it has a slot is `commit`'s job, not `apply_raw`'s).
 ///   `Armed` has no RT param counterpart and never appears as its own entry
 ///   (matching the retired `apply_track_mix`, which also had nothing to
 ///   write for it).
-/// * `any_solo`: `Store::any_solo()` is a store-wide flag (not per-slot),
+/// * `any_solo`: `Store::any_solo()` is a store-wide flag (not per-track),
 ///   which the retired `apply_track_mix` recomputed unconditionally once per
-///   BATCH. A plain `Vec<(slot, PropPath, f32)>` can't express a slot-less,
-///   whole-store flag, so this is a minimal, justified extension beyond the
-///   brief's tuple sketch: recomputed on every track `Set` in the
-///   transaction (slot or not — `any_solo` doesn't require one); the last
-///   write is truth, so repeat recomputation is harmless. Also recomputed on
+///   BATCH. A plain `Vec<(TrackId, PropPath, f32)>` can't express a
+///   track-less, whole-store flag, so this is a minimal, justified extension
+///   beyond the brief's tuple sketch: recomputed on every track `Set` in the
+///   transaction; the last write is truth, so repeat recomputation is
+///   harmless. Also recomputed on
 ///   `Op::TrackRemove` (Task 7, controller ruling 2): the removed row may
 ///   have been the only soloed track. `Op::TrackAdd` does NOT need this — a
 ///   fresh row is never soloed, so an add can never flip the flag.
@@ -113,7 +121,7 @@ impl Tx<'_> {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineEffect {
     pub rebuild: bool,
-    pub param_writes: Vec<(usize, PropPath, f32)>,
+    pub param_writes: Vec<(TrackId, PropPath, f32)>,
     pub any_solo: Option<bool>,
 }
 
@@ -153,37 +161,42 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 to: from_now,    // the inverse's `to`: value to restore
             };
             // Mirror the retired `ops::apply_track_mix` (deleted in Plan B,
-            // behavior preserved here): a changed track WITH a slot gets
-            // all four mix params rewritten from the current (post-write)
-            // snapshot, not just the touched path — that's what
-            // apply_track_mix did too (unconditional per changed-track
-            // write of gain/pan/mute/solo). A track
-            // without a slot contributes no param_write (op::TrackAdd
-            // leaves slot bookkeeping untouched, round-2 §2.4).
-            if let Some(&slot) = session.store.slots.get(id) {
-                let t = session
-                    .store
-                    .tracks
-                    .iter()
-                    .find(|t| &t.id == id)
-                    .expect("just wrote this track above");
-                effect.param_writes.push((
-                    slot,
-                    PropPath::Gain,
-                    crate::audio::mixer::db_to_linear(t.gain_db),
-                ));
-                effect.param_writes.push((slot, PropPath::Pan, t.pan as f32));
-                effect.param_writes.push((
-                    slot,
-                    PropPath::Muted,
-                    if t.muted { 1.0 } else { 0.0 },
-                ));
-                effect.param_writes.push((
-                    slot,
-                    PropPath::Soloed,
-                    if t.soloed { 1.0 } else { 0.0 },
-                ));
-            }
+            // behavior preserved here): a changed track gets all four mix
+            // params rewritten from the current (post-write) snapshot, not
+            // just the touched path — that's what apply_track_mix did too
+            // (unconditional per changed-track write of gain/pan/mute/solo).
+            // Round-2 §2.4: slots are per-graph-generation state the
+            // session never sees, so the writes are always pushed here,
+            // keyed by `TrackId`; `commit` resolves `TrackId -> slot`
+            // through the CURRENT `GraphTables` AFTER this transaction
+            // commits (a track with no slot yet, i.e. no rebuild has run
+            // since it was added, is skipped there — sound only because
+            // rebuild publishes its tables under the session lock, so
+            // either this commit lands before that read (the rebuild bakes
+            // the value in) or after the publish (the write executes
+            // against the new table); see `GraphTables`/`commit` docs).
+            let t = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| &t.id == id)
+                .expect("just wrote this track above");
+            effect.param_writes.push((
+                id.clone(),
+                PropPath::Gain,
+                crate::audio::mixer::db_to_linear(t.gain_db),
+            ));
+            effect.param_writes.push((id.clone(), PropPath::Pan, t.pan as f32));
+            effect.param_writes.push((
+                id.clone(),
+                PropPath::Muted,
+                if t.muted { 1.0 } else { 0.0 },
+            ));
+            effect.param_writes.push((
+                id.clone(),
+                PropPath::Soloed,
+                if t.soloed { 1.0 } else { 0.0 },
+            ));
             // any_solo is store-wide (Store::any_solo), independent of
             // slot presence — the retired apply_track_mix (deleted in
             // Plan B) recomputed it unconditionally once per batch; here,
@@ -217,8 +230,9 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // structural ops it contains — a plain flag naturally folds.
             effect.rebuild = true;
             // Inverse: remove the same row (+ the clips just inserted with
-            // it), same id, no slot bookkeeping here (round-2 §2.4 — slots
-            // stay in the command's effect layer until Plan B).
+            // it), same id — no slot bookkeeping here or anywhere in the op
+            // layer (round-2 §2.4: slots are derived fresh from display
+            // order on every rebuild, not stored or freed anywhere).
             Ok(Op::TrackRemove {
                 track: track.clone(), index: idx, clips: clips.clone(),
                 clip_indices: clip_indices.clone(),
@@ -226,9 +240,10 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
         }
         Op::TrackRemove { track, .. } => {
             // Found by id, not blindly by the caller's recorded index —
-            // store truth wins (same rule as `Op::Set`'s from/to). The
-            // slot is deliberately left untouched: slot bookkeeping is
-            // outside the op layer this plan (round-2 §2.4).
+            // store truth wins (same rule as `Op::Set`'s from/to). There is
+            // no slot to free: slots are derived fresh from display order
+            // on every rebuild (round-2 §2.4), so the removed row simply
+            // stops appearing in the next `GraphTables`.
             let pos = session
                 .store
                 .tracks

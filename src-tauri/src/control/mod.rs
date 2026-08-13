@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
-use crate::audio::rt::{ParamTable, SharedRt, FLAG_MUTE, FLAG_SOLO};
+use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_MUTE, FLAG_SOLO};
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
@@ -98,7 +98,11 @@ pub type EventEmitter = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 pub struct ControlPlane {
     session: Arc<Mutex<Session>>,
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
+    /// Control-side view of the CURRENT graph's tables (round-2 §2.4),
+    /// shared with the engine control thread — `commit` resolves
+    /// `TrackId -> slot` through this AFTER the session lock is released
+    /// (see `SharedGraphTables`'s doc for the lock-order rule [C1]).
+    tables: SharedGraphTables,
     engine: EngineHandle,
     jobs: Arc<JobManager>,
     latest_meters: Arc<Mutex<Option<MeterFrame>>>,
@@ -132,7 +136,7 @@ impl ControlPlane {
     pub fn new(
         session: Arc<Mutex<Session>>,
         shared: Arc<SharedRt>,
-        params: Arc<ParamTable>,
+        tables: SharedGraphTables,
         engine: EngineHandle,
         jobs: Arc<JobManager>,
         emit: EventEmitter,
@@ -141,7 +145,7 @@ impl ControlPlane {
         engine.send(ControlMsg::Subscribe(Box::new(LatestMeterCache(
             latest_meters.clone(),
         ))));
-        Self { session, shared, params, engine, jobs, latest_meters, emit }
+        Self { session, shared, tables, engine, jobs, latest_meters, emit }
     }
 
     fn emit_transport(&self, snap: &TransportState) {
@@ -262,12 +266,11 @@ impl ControlPlane {
     // ---- structure ------------------------------------------------------
 
     /// Create a track and insert it through the transaction channel
-    /// (`Op::TrackAdd`, `commit`). Slot allocation + the RT param reset stay
-    /// outside the op layer (`ops::new_track_row`, round-2 §2.4) — RT
-    /// bookkeeping, not document state, unlike clips (fix below) — same
-    /// asymmetry `remove_track`'s slot free lives with, just on the other
-    /// side of the row's lifetime. A fresh track never has clips yet, so
-    /// `Op::TrackAdd`'s `clips` payload is empty here.
+    /// (`Op::TrackAdd`, `commit`). Round-2 §2.4: there is no slot to
+    /// allocate and no RT param to reset here anymore — the next rebuild
+    /// derives the row's slot from display order and populates its params
+    /// fresh (`ops::new_track_row`'s doc). A fresh track never has clips
+    /// yet, so `Op::TrackAdd`'s `clips` payload is empty here.
     pub fn add_track(
         &self,
         name: Option<String>,
@@ -276,7 +279,7 @@ impl ControlPlane {
     ) -> Result<TrackState, String> {
         let (track, index) = {
             let mut session = self.session.lock();
-            ops::new_track_row(&mut session.store, &self.params, name, kind)?
+            ops::new_track_row(&mut session.store, name, kind)?
         };
         self.commit(meta, |tx| {
             tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![] })
@@ -290,13 +293,14 @@ impl ControlPlane {
     /// `Op::TrackRemove` arm now collects and removes them from store truth
     /// as part of the op itself, so the computed inverse (`Op::TrackAdd`)
     /// carries them back too (an undo restores clips, not just an empty
-    /// track), and there is NO store write outside `commit` for them. Only
-    /// the slot free stays outside the op layer (round-2 §2.4: RT
-    /// bookkeeping, no document meaning) — and only AFTER `commit` succeeds,
-    /// so a failed commit never leaves an orphaned freed slot with the row
-    /// still present. `commit` sends the single `Rebuild` and recomputes
-    /// `any_solo` (controller ruling 2) — the removed row may have been the
-    /// only soloed track.
+    /// track), and there is NO store write outside `commit` for them.
+    /// Round-2 §2.4: there is no slot to free either — slots are derived
+    /// fresh from display order on every rebuild, so a removed row simply
+    /// stops appearing in the next `GraphTables`; nothing is "freed" for a
+    /// later `add_track` to alias (the O-13 defect this task fixes).
+    /// `commit` sends the single `Rebuild` and recomputes `any_solo`
+    /// (controller ruling 2) — the removed row may have been the only
+    /// soloed track.
     pub fn remove_track(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
         let track = {
             let session = self.session.lock();
@@ -311,10 +315,6 @@ impl ControlPlane {
         self.commit(meta, |tx| {
             tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
         })?;
-        // Slot free is the sanctioned effect-layer carve-out (RT bookkeeping,
-        // not document state) — runs ONLY after the commit above succeeded,
-        // in its own short lock.
-        self.session.lock().store.free_slot(id);
         Ok(())
     }
 
@@ -420,20 +420,30 @@ impl ControlPlane {
     }
 
     /// Runs a `Session::transact` closure, then — with the session lock
-    /// RELEASED — executes the folded `EngineEffect`: param writes to
-    /// `self.params`, at most one `ControlMsg::Rebuild`, and exactly one
-    /// `project://changed` event. `project://changed` is a FROZEN event
-    /// whose payload contract is the full `Project` shape
-    /// (project.schema.json; ARCHITECTURE §3.4) — this carries EXACTLY that
-    /// (via `project_changed_payload`, the same serialization
-    /// `create_project` uses), with `rev`/`label`/`actor` folded in as
-    /// ADDITIVE top-level fields (D-06: readers ignore fields they don't
-    /// recognize).
+    /// RELEASED — executes the folded `EngineEffect`: param writes resolved
+    /// through `self.tables` (the CURRENT graph's tables — round-2 §2.4),
+    /// at most one `ControlMsg::Rebuild`, and exactly one `project://changed`
+    /// event. `project://changed` is a FROZEN event whose payload contract
+    /// is the full `Project` shape (project.schema.json; ARCHITECTURE §3.4)
+    /// — this carries EXACTLY that (via `project_changed_payload`, the same
+    /// serialization `create_project` uses), with `rev`/`label`/`actor`
+    /// folded in as ADDITIVE top-level fields (D-06: readers ignore fields
+    /// they don't recognize).
     ///
-    /// Zero engine/param-table/event calls happen while the lock is held —
-    /// `Session::transact` (session.rs) only ever computes the effect
+    /// Zero engine/param-table/event calls happen while the SESSION lock is
+    /// held — `Session::transact` (session.rs) only ever computes the effect
     /// DESCRIPTION; everything below this comment runs after it returns
     /// (`project_changed_payload` takes its own fresh, separate lock).
+    ///
+    /// A track without a slot yet (`self.tables.lock().slots` doesn't have
+    /// it) is skipped — sound ONLY because `rebuild` publishes `GraphTables`
+    /// INSIDE the session lock it holds while reading the store [C1]:
+    /// either this commit's `Session::transact` above ran BEFORE that
+    /// rebuild read the document (so the fresh tables already bake this
+    /// write's value in), or it ran AFTER the rebuild published (so the
+    /// write below executes against the new table). There is no window
+    /// where a commit's own write can be silently lost. Same reasoning
+    /// covers `any_solo`.
     pub fn commit<F>(&self, meta: op::TxMeta, f: F) -> Result<session::Committed, String>
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
@@ -441,20 +451,24 @@ impl ControlPlane {
         let committed = Session::transact(&self.session, meta, f)?;
         // ---- session lock is released here; everything below executes
         // the effect the session merely described. ----
-        for &(slot, path, value) in &committed.effect.param_writes {
-            match path {
-                op::PropPath::Gain => self.params.set_gain_linear(slot, value),
-                op::PropPath::Pan => self.params.set_pan(slot, value),
-                op::PropPath::Muted => self.params.set_flag(slot, FLAG_MUTE, value != 0.0),
-                op::PropPath::Soloed => self.params.set_flag(slot, FLAG_SOLO, value != 0.0),
-                // No ParamTable counterpart for Armed (the retired
-                // apply_track_mix, deleted in Plan B, didn't write one
-                // either).
-                op::PropPath::Armed => {}
+        {
+            let tables = self.tables.lock();
+            for (tid, path, value) in &committed.effect.param_writes {
+                let Some(&slot) = tables.slots.get(tid) else { continue };
+                match path {
+                    op::PropPath::Gain => tables.params.set_gain_linear(slot, *value),
+                    op::PropPath::Pan => tables.params.set_pan(slot, *value),
+                    op::PropPath::Muted => tables.params.set_flag(slot, FLAG_MUTE, *value != 0.0),
+                    op::PropPath::Soloed => tables.params.set_flag(slot, FLAG_SOLO, *value != 0.0),
+                    // No ParamTable counterpart for Armed (the retired
+                    // apply_track_mix, deleted in Plan B, didn't write one
+                    // either).
+                    op::PropPath::Armed => {}
+                }
             }
-        }
-        if let Some(any_solo) = committed.effect.any_solo {
-            self.params.any_solo.store(any_solo, Relaxed);
+            if let Some(any_solo) = committed.effect.any_solo {
+                tables.params.any_solo.store(any_solo, Relaxed);
+            }
         }
         if committed.effect.rebuild {
             self.engine.send(ControlMsg::Rebuild);
@@ -500,9 +514,9 @@ impl ControlPlane {
         {
             let mut session = self.session.lock();
             let s = &mut session.store;
-            for t in s.tracks.clone() {
-                s.free_slot(t.id.as_str());
-            }
+            // Round-2 §2.4: nothing to free — slots are derived fresh from
+            // display order on the next rebuild, which an empty track list
+            // trivially satisfies.
             s.tracks.clear();
             s.clips.clear();
             s.project_dir = Some(dir.clone());
@@ -514,7 +528,10 @@ impl ControlPlane {
             s.transport.loop_start_samples = 0;
             s.transport.loop_end_samples = 0;
         }
-        self.params.any_solo.store(false, Relaxed);
+        // Immediate reset ahead of the async Rebuild below (which will
+        // publish fresh, empty tables anyway once processed) — keeps
+        // `any_solo` from reading stale-true between here and then.
+        self.tables.lock().params.any_solo.store(false, Relaxed);
         self.shared.playing.store(false, Relaxed);
         self.shared.position.store(0, Relaxed);
         self.shared.loop_enabled.store(false, Relaxed);
@@ -620,19 +637,16 @@ impl ControlPlane {
             let mut session = self.session.lock();
             let pad = ops::add_track(
                 &mut session.store,
-                &self.params,
                 Some("Demo Pad".into()),
                 Some("midi".into()),
             )?;
             let lead = ops::add_track(
                 &mut session.store,
-                &self.params,
                 Some("Demo Lead".into()),
                 Some("midi".into()),
             )?;
             let bass = ops::add_track(
                 &mut session.store,
-                &self.params,
                 Some("Demo Bass".into()),
                 Some("midi".into()),
             )?;
@@ -1083,7 +1097,8 @@ pub async fn seed_demo_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::types::Store;
+    use crate::audio::rt::{GraphTables, ParamTable};
+    use crate::audio::types::{derive_slots, Store};
     use crate::midi::MidiStore;
     use crate::sidecars::SidecarEvent;
     use std::time::{Duration, Instant};
@@ -1092,6 +1107,18 @@ mod tests {
     /// (real engine, headless-safe — the shared harness for the event-parity
     /// tests below).
     type RecordedEvents = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) — the shared
+    /// construction every real-engine test harness in this module needs to
+    /// hand BOTH `engine::start` and `ControlPlane::new` (they must share
+    /// the SAME `Arc`, round-2 §2.4).
+    fn empty_tables() -> SharedGraphTables {
+        Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: std::collections::HashMap::new(),
+        }))
+    }
 
     // ---- Task 6 helpers: commit() folding (for_tests engine double) ----
 
@@ -1129,24 +1156,36 @@ mod tests {
     /// thread — just a channel that records sent `ControlMsg`s) and a
     /// Vec-capturing event emitter, seeded with one slotted track per given
     /// id. Used by `commit()`'s folding tests.
+    ///
+    /// [M2] There is no real engine thread here, so nothing ever calls
+    /// `rebuild` to publish `GraphTables` — without seeding one by hand,
+    /// `self.tables` would stay the empty gen-0 default and EVERY param
+    /// write made through this harness would silently skip (`commit`
+    /// resolves `TrackId -> slot` through `self.tables.slots`, which would
+    /// have no entries). Publish a table matching the seeded tracks up
+    /// front so the next person asserting `params.gain` post-commit gets a
+    /// real failure instead of a silent no-op.
     fn test_plane_with_tracks(
         ids: &[&str],
     ) -> (ControlPlane, crossbeam_channel::Receiver<ControlMsg>, RecordedEvents) {
         let mut store = Store::default();
         for &id in ids {
-            store.alloc_slot(id);
             store.tracks.push(test_track(id));
         }
         let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            generation: 1,
+            params: Arc::new(ParamTable::default()),
+            slots: derive_slots(&session.lock().store.tracks),
+        }));
         let (engine, engine_rx) = EngineHandle::for_tests();
         let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let cp = ControlPlane::new(
             session,
             shared,
-            params,
+            tables,
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
@@ -1158,7 +1197,7 @@ mod tests {
     /// (`TrackAdd` x2) and one mix `Set` must fold to exactly one
     /// `ControlMsg::Rebuild` and emit exactly one `project://changed`, and
     /// both must land only AFTER the session lock is released (`commit`
-    /// itself proves this by construction: it can't touch `self.params` /
+    /// itself proves this by construction: it can't touch `self.tables` /
     /// `self.engine` / `self.emit` until `Session::transact` returns).
     #[test]
     fn three_ops_one_rebuild_one_event() {
@@ -1201,9 +1240,12 @@ mod tests {
             let mut session = plane.session().lock();
             session.store.tracks[0].soloed = true;
         }
-        plane.params.any_solo.store(true, Relaxed);
+        plane.tables.lock().params.any_solo.store(true, Relaxed);
         plane.remove_track("t-1", user_meta("remove soloed track")).unwrap();
-        assert!(!plane.params.any_solo.load(Relaxed), "any_solo must go false");
+        assert!(
+            !plane.tables.lock().params.any_solo.load(Relaxed),
+            "any_solo must go false"
+        );
     }
 
     fn test_clip(id: &str, track_id: &str) -> crate::audio::types::Clip {
@@ -1283,11 +1325,11 @@ mod tests {
             fn emit(&self, _e: &str, _p: serde_json::Value) {}
         }
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
@@ -1296,7 +1338,7 @@ mod tests {
         let cp = Arc::new(ControlPlane::new(
             session,
             shared,
-            params,
+            tables,
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
@@ -1498,18 +1540,18 @@ mod tests {
         }
         let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(Recorder(Arc::clone(&events))),
         );
         let cp = ControlPlane::new(
             session,
             shared.clone(),
-            params,
+            tables,
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::default()),
             Box::new(|_, _| {}),
@@ -1634,18 +1676,18 @@ mod tests {
             fn emit(&self, _e: &str, _p: serde_json::Value) {}
         }
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
+        let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
+            tables.clone(),
             session.clone(),
             Box::new(NullEvents),
         );
         let cp = ControlPlane::new(
             session.clone(),
             shared.clone(),
-            params,
+            tables,
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::default()),
             Box::new(|_, _| {}),
@@ -1727,7 +1769,6 @@ mod tests {
         use crate::audio::types::{Store, TrackState};
         let mut store = Store::default();
         for (id, name) in [("pad", "Demo Pad"), ("lead", "Demo Lead"), ("bass", "Demo Bass")] {
-            store.alloc_slot(id);
             store.tracks.push(TrackState {
                 id: id.into(),
                 name: name.into(),
@@ -1741,6 +1782,7 @@ mod tests {
                 instrument_id: None,
             });
         }
+        let slots = derive_slots(&store.tracks);
         let (pad, lead, groove) = demo_seed_clips_v2("pad", "lead", "bass", 960);
         assert!(!pad.notes.is_empty() && !lead.notes.is_empty() && !groove.notes.is_empty());
         for n in pad.notes.iter().chain(lead.notes.iter()).chain(groove.notes.iter()) {
@@ -1755,18 +1797,16 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&midi, &store, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
-        let mut g = crate::audio::rt::RtGraph::new(out);
-        let params = crate::audio::rt::ParamTable::default();
+        let mut g = crate::audio::rt::RtGraph::new(out, 1, Arc::new(ParamTable::default()));
         let mut buf = vec![0.0f32; 48_000 * 2];
         let mut pos = 0u64;
         for chunk in buf.chunks_mut(512 * 2) {
             crate::audio::mixer::render(
                 &mut g,
-                &params,
                 pos,
                 &crate::audio::transport::LoopSpec::OFF,
                 chunk,
@@ -1805,7 +1845,6 @@ mod tests {
 
         let mut store = Store::default();
         for (slot, id) in ["pad", "lead", "bass"].iter().enumerate() {
-            store.alloc_slot(id);
             store.tracks.push(TrackState {
                 id: (*id).into(),
                 name: (*id).into(),
@@ -1819,6 +1858,7 @@ mod tests {
                 instrument_id: Some(format!("plugin:{}", ids[slot])),
             });
         }
+        let slots = derive_slots(&store.tracks);
         let (pad, lead, groove) = demo_seed_clips_v2("pad", "lead", "bass", 960);
         let midi = crate::midi::MidiStore {
             ppq: 960,
@@ -1829,7 +1869,7 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&midi, &store, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3);
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(
@@ -1838,14 +1878,12 @@ mod tests {
                 "track {track} resolved to its Zyn node (not the fallback)"
             );
         }
-        let mut g = crate::audio::rt::RtGraph::new(out);
-        let params = crate::audio::rt::ParamTable::default();
+        let mut g = crate::audio::rt::RtGraph::new(out, 1, Arc::new(ParamTable::default()));
         let mut buf = vec![0.0f32; 2 * 48_000 * 2];
         let mut pos = 0u64;
         for chunk in buf.chunks_mut(512 * 2) {
             crate::audio::mixer::render(
                 &mut g,
-                &params,
                 pos,
                 &crate::audio::transport::LoopSpec::OFF,
                 chunk,

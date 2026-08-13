@@ -395,7 +395,7 @@ pub fn midi_import_file(
     }
     let bytes = std::fs::read(p).map_err(|e| format!("read {path}: {e}"))?;
 
-    let (session, _shared, params) = audio.control_parts();
+    let (session, _shared, _tables) = audio.control_parts();
     let ppq = {
         let mut s = session.lock();
         let dir = s.store.project_dir.clone();
@@ -436,7 +436,6 @@ pub fn midi_import_file(
                 for c in &mut clips {
                     let track = crate::control::ops::add_track(
                         &mut s.store,
-                        &params,
                         Some(c.name.clone()),
                         Some("midi".into()),
                     )?;

@@ -7,12 +7,14 @@
 //! deallocation of retired graphs happens on the control thread).
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::dsp::LiveInstrument;
 use super::transport::LoopSpec;
 use super::types::MAX_TRACKS;
+use crate::ids::TrackId;
 use crate::midi::schedule::AbsNoteEvent;
 
 pub const FLAG_MUTE: u32 = 1 << 0;
@@ -245,24 +247,42 @@ impl RtTrack {
     }
 }
 
-#[derive(Default)]
 pub struct RtGraph {
     pub tracks: Vec<RtTrack>,
     /// Preallocated stereo scratch for live-node rendering
     /// (`MAX_LIVE_BLOCK * 2` once any track is live; empty otherwise).
     /// Allocated at BUILD time on the control thread — never on the RT path.
     pub scratch: Vec<f32>,
+    /// Monotonic graph generation; meter blocks echo it (Task 6).
+    pub generation: u64,
+    /// THIS graph's parameters — round-2 §2.4: the param table versions
+    /// with the graph snapshot. A retired graph keeps reading its own
+    /// table (the `Arc` it holds), so the O-13 alias window (a freed slot
+    /// reused by a newer graph while an old graph still renders under it)
+    /// cannot happen — there is nothing to free; every rebuild derives
+    /// fresh slots and builds its own table. Knob traffic always targets
+    /// the NEWEST table via `GraphTables`/`SharedGraphTables`, never this
+    /// field directly.
+    pub params: Arc<ParamTable>,
+}
+
+impl Default for RtGraph {
+    /// Test/placeholder convenience only — production code always goes
+    /// through `RtGraph::new` with a real generation and param table.
+    fn default() -> Self {
+        Self::new(Vec::new(), 0, Arc::new(ParamTable::default()))
+    }
 }
 
 impl RtGraph {
     /// Build a snapshot, allocating live-node scratch when needed.
-    pub fn new(tracks: Vec<RtTrack>) -> Self {
+    pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
         let scratch = if tracks.iter().any(|t| t.live.is_some()) {
             vec![0.0; MAX_LIVE_BLOCK * 2]
         } else {
             Vec::new()
         };
-        Self { tracks, scratch }
+        Self { tracks, scratch, generation, params }
     }
 }
 
@@ -299,3 +319,44 @@ impl Drop for GraphPtr {
 // SAFETY: the pointee is only ever owned by exactly one side at a time; the
 // queue transfers ownership. RtGraph contains no thread-affine state.
 unsafe impl Send for GraphPtr {}
+
+// ---------------------------------------------------------------------------
+// Control-side view of the current graph's tables (round-2 §2.4)
+// ---------------------------------------------------------------------------
+
+/// Control-side view of the CURRENT graph's tables, published by the engine
+/// control thread on every rebuild (also headless — tables exist without an
+/// output device, so knob writes and recording keep working with no device
+/// open). Readers: `ControlPlane::commit` (knob writes), recording slot
+/// resolution, the meter fold (Task 6).
+///
+/// Live-node state already moves across rebuilds via `LiveNodeRegistry`
+/// keyed by track id (the pattern round-2 §2.4 names); parameter smoothing
+/// does not exist yet — when it lands (engine round), it keys by `TrackId`
+/// like the registry, not by slot (slots are per-generation and therefore
+/// not a stable key across rebuilds).
+pub struct GraphTables {
+    pub generation: u64,
+    pub params: Arc<ParamTable>,
+    pub slots: HashMap<TrackId, usize>,
+}
+
+/// `Mutex` (not `RwLock`): writes are rare (once per rebuild) and reads are
+/// short (a slot lookup + a handful of atomic stores), so a plain mutex is
+/// simplest and cheap enough — this is control-side only, never touched by
+/// an RT thread.
+///
+/// LOCK ORDER: session before tables, never the reverse [C1]. `rebuild`
+/// publishes a fresh `GraphTables` INSIDE the session-lock scope it already
+/// holds while reading the store — that is load-bearing, not style:
+/// publishing after the lock is released opens a window where a commit
+/// transacts against a newer document revision, resolves its param writes
+/// through the OLD tables (because the new ones aren't published yet), and
+/// the rebuild then publishes tables built from the OLDER revision it read
+/// before that commit — the knob write is silently lost forever, since a
+/// plain `Set` never schedules a rebuild. Publishing under the lock makes
+/// <read doc, publish tables> atomic against every commit's
+/// <transact, execute writes> sequence. `ControlPlane::commit` (tables
+/// only, after transact), `start_recording` (session then tables), and
+/// `pump_meter_frames` (session then tables) all conform to this order.
+pub type SharedGraphTables = Arc<parking_lot::Mutex<GraphTables>>;
