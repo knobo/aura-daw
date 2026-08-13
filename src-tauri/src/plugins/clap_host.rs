@@ -1030,9 +1030,12 @@ mod tests {
                     key: 48,
                     velocity: 110,
                     channel: 0,
+                    note_id: crate::ids::NoteId(0),
                 }],
+                next_note_id: 1,
             }],
             loaded_dir: None,
+            dirty: false,
         };
 
         let mut nodes = LiveNodeRegistry::default();

@@ -758,6 +758,7 @@ pub fn demo_seed_clips(
     bass_track_id: &str,
     ppq: u32,
 ) -> (crate::midi::MidiClip, crate::midi::MidiClip) {
+    use crate::ids::NoteId;
     use crate::midi::{MidiClip, MidiNote};
     let bar = 4 * ppq;
     let chords: [[u8; 4]; 4] = [
@@ -779,6 +780,7 @@ pub fn demo_seed_clips(
                 key: chord[idx] + octave,
                 velocity: if s % 4 == 0 { 110 } else { 84 },
                 channel: 0,
+                note_id: NoteId(0),
             });
         }
     }
@@ -796,16 +798,22 @@ pub fn demo_seed_clips(
                 key: roots[(b % 4) as usize] + if s % 4 == 2 { 12 } else { 0 },
                 velocity: if s == 0 { 118 } else { 92 },
                 channel: 0,
+                note_id: NoteId(0),
             });
         }
     }
-    let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| MidiClip {
-        id: uuid::Uuid::new_v4().to_string().into(),
-        track_id: track_id.into(),
-        name: name.to_string(),
-        timeline_start_ticks: 0,
-        length_ticks: 4 * bar as u64,
-        notes,
+    let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| {
+        let mut c = MidiClip {
+            id: uuid::Uuid::new_v4().to_string().into(),
+            track_id: track_id.into(),
+            name: name.to_string(),
+            timeline_start_ticks: 0,
+            length_ticks: 4 * bar as u64,
+            notes,
+            next_note_id: 1,
+        };
+        c.ensure_note_ids().expect("demo notes never collide");
+        c
     };
     (
         clip(keys_track_id, "demo arp", arp),
@@ -823,6 +831,7 @@ pub fn demo_seed_clips_v2(
     bass_track_id: &str,
     ppq: u32,
 ) -> (crate::midi::MidiClip, crate::midi::MidiClip, crate::midi::MidiClip) {
+    use crate::ids::NoteId;
     use crate::midi::{MidiClip, MidiNote};
     let bar = 4 * ppq;
     let eighth = ppq / 2;
@@ -844,6 +853,7 @@ pub fn demo_seed_clips_v2(
                 key,
                 velocity: 72,
                 channel: 0,
+                note_id: NoteId(0),
             });
         }
     }
@@ -865,6 +875,7 @@ pub fn demo_seed_clips_v2(
                 key,
                 velocity: if s % 2 == 0 { 102 } else { 84 },
                 channel: 0,
+                note_id: NoteId(0),
             });
         }
     }
@@ -883,17 +894,23 @@ pub fn demo_seed_clips_v2(
                 key: roots[(b % 4) as usize] + if s % 4 == 2 { 12 } else { 0 },
                 velocity: if s == 0 { 118 } else { 92 },
                 channel: 0,
+                note_id: NoteId(0),
             });
         }
     }
 
-    let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| MidiClip {
-        id: uuid::Uuid::new_v4().to_string().into(),
-        track_id: track_id.into(),
-        name: name.to_string(),
-        timeline_start_ticks: 0,
-        length_ticks: 4 * bar as u64,
-        notes,
+    let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| {
+        let mut c = MidiClip {
+            id: uuid::Uuid::new_v4().to_string().into(),
+            track_id: track_id.into(),
+            name: name.to_string(),
+            timeline_start_ticks: 0,
+            length_ticks: 4 * bar as u64,
+            notes,
+            next_note_id: 1,
+        };
+        c.ensure_note_ids().expect("demo notes never collide");
+        c
     };
     (
         clip(pad_track_id, "demo pad", pad),
@@ -1659,6 +1676,7 @@ mod tests {
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             clips: vec![pad, lead, groove],
             loaded_dir: None,
+            dirty: false,
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
@@ -1732,6 +1750,7 @@ mod tests {
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             clips: vec![pad, lead, groove],
             loaded_dir: None,
+            dirty: false,
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();

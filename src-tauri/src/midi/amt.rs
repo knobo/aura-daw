@@ -118,6 +118,12 @@ pub fn merge_infill(
         let mut n = *n;
         let max_len = region_end - n.tick;
         n.length_ticks = n.length_ticks.min(max_len).max(1);
+        // M-8: generated notes are copies, never identity carriers — force
+        // to the "unassigned" sentinel so a sidecar echoing a live note id
+        // can never masquerade as (and re-mint) an existing note. The
+        // caller applies this list through `midi_set_notes`, whose own
+        // keep-rule mints a fresh id for every zero.
+        n.note_id = crate::ids::NoteId(0);
         out.push(n);
     }
     out.sort_by_key(|n| (n.tick, n.key));
@@ -131,7 +137,11 @@ mod tests {
     use std::process::{Command, Stdio};
 
     fn note(tick: u32, len: u32, key: u8, vel: u8) -> MidiNote {
-        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0 }
+        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: crate::ids::NoteId(0) }
+    }
+
+    fn note_id(tick: u32, len: u32, key: u8, vel: u8, id: u32) -> MidiNote {
+        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: crate::ids::NoteId(id) }
     }
 
     fn clip(notes: Vec<MidiNote>) -> MidiClip {
@@ -142,6 +152,7 @@ mod tests {
             timeline_start_ticks: 0,
             length_ticks: 3840,
             notes,
+            next_note_id: 1,
         }
     }
 
@@ -197,6 +208,25 @@ mod tests {
                 note(2500, 100, 64, 100),
             ]
         );
+    }
+
+    /// M-8: surviving existing notes keep their real ids; generated notes
+    /// are ALWAYS forced to the unassigned sentinel, even one that happens
+    /// to echo a live id from the context payload — otherwise a sidecar
+    /// echoing a live id back could get an innocent existing note re-minted
+    /// when the merged list is later applied through `midi_set_notes`.
+    #[test]
+    fn merge_keeps_existing_ids_and_forces_generated_to_unassigned() {
+        let existing = vec![note_id(0, 100, 60, 100, 7), note_id(2500, 100, 64, 100, 9)];
+        // A generated note that (adversarially) echoes the surviving id 9.
+        let generated = vec![note_id(1200, 100, 71, 90, 9)];
+        let merged = merge_infill(&existing, 1000, 2000, &generated);
+        let survivor = merged.iter().find(|n| n.tick == 0).unwrap();
+        assert_eq!(survivor.note_id.0, 7, "surviving note keeps its real id");
+        let generated_out = merged.iter().find(|n| n.tick == 1200).unwrap();
+        assert_eq!(generated_out.note_id.0, 0, "generated note forced to unassigned, never 9");
+        let other_survivor = merged.iter().find(|n| n.tick == 2500).unwrap();
+        assert_eq!(other_survivor.note_id.0, 9, "id 9 still belongs to the ORIGINAL survivor");
     }
 
     /// End-to-end simulate-mode run of the actual worker script, exercising

@@ -162,6 +162,7 @@ pub fn render(
 mod tests {
     use super::*;
     use crate::audio::types::TrackState;
+    use crate::ids::NoteId;
     use crate::midi::types::TempoEvent;
     use crate::midi::{MidiClip, MidiNote};
 
@@ -194,6 +195,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             clips: vec![arp, groove],
             loaded_dir: None,
+            dirty: false,
         };
         (store, midi)
     }
@@ -256,8 +258,8 @@ mod tests {
         // ppq 960 @120bpm -> 25 samples/tick. Note A: on at tick 0 (sample 0),
         // long. Note B: on at tick 1200 (sample 30000).
         let notes = vec![
-            MidiNote { tick: 0, length_ticks: 800, key: 60, velocity: 100, channel: 0 },
-            MidiNote { tick: 1200, length_ticks: 400, key: 72, velocity: 100, channel: 0 },
+            MidiNote { tick: 0, length_ticks: 800, key: 60, velocity: 100, channel: 0, note_id: NoteId(1) },
+            MidiNote { tick: 1200, length_ticks: 400, key: 72, velocity: 100, channel: 0, note_id: NoteId(2) },
         ];
         let midi = MidiStore {
             ppq: 960,
@@ -269,8 +271,10 @@ mod tests {
                 timeline_start_ticks: 0,
                 length_ticks: 1920,
                 notes,
+                next_note_id: 3,
             }],
             loaded_dir: None,
+            dirty: false,
         };
         let mut og = build_graph(&store, &midi, None, RATE);
         // Region [24000, 44000): starts after note A's on (skipped) and

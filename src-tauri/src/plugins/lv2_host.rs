@@ -747,8 +747,10 @@ mod tests {
                 timeline_start_ticks: 0,
                 length_ticks: clip_len_ticks,
                 notes: vec![note],
+                next_note_id: 1,
             }],
             loaded_dir: None,
+            dirty: false,
         };
         (store, midi)
     }
@@ -824,7 +826,7 @@ mod tests {
         let Some(instance_id) = activate_zyn(&reg) else { return };
 
         // A4 for one beat (0.5 s @ 120 bpm): on at sample 0, off at 24000.
-        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0 };
+        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0, note_id: crate::ids::NoteId(0) };
         let (store, midi) = store_with_clip("zyn-track", &format!("plugin:{instance_id}"), note, 1920);
 
         let mut nodes = LiveNodeRegistry::default();
@@ -870,7 +872,7 @@ mod tests {
         let Some(instance_id) = activate_zyn(&reg) else { return };
 
         // Note held far beyond what we render: the off never arrives.
-        let note = MidiNote { tick: 0, length_ticks: 96_000, key: 64, velocity: 110, channel: 0 };
+        let note = MidiNote { tick: 0, length_ticks: 96_000, key: 64, velocity: 110, channel: 0, note_id: crate::ids::NoteId(0) };
         let (store, midi) = store_with_clip("zyn-hold", &format!("plugin:{instance_id}"), note, 96_000);
 
         let mut nodes = LiveNodeRegistry::default();

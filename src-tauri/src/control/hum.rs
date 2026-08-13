@@ -199,14 +199,19 @@ pub(crate) fn apply_hum_notes(
         .map(|n| n.tick as u64 + n.length_ticks as u64)
         .max()
         .unwrap_or(0);
-    let clip = MidiClip {
+    for n in &mut notes {
+        n.note_id = crate::ids::NoteId(0);
+    }
+    let mut clip = MidiClip {
         id: uuid::Uuid::new_v4().to_string().into(),
         track_id: target,
         name: name.to_string(),
         timeline_start_ticks: at_ticks,
         length_ticks: length_ticks.max(end).max(1),
         notes,
+        next_note_id: 1,
     };
+    clip.ensure_note_ids()?;
     session.midi.clips.push(clip.clone());
     Ok((clip, created_track))
 }
@@ -565,7 +570,14 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn note(tick: u32, len: u32, key: u8, vel: u8) -> MidiNote {
-        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0 }
+        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: crate::ids::NoteId(0) }
+    }
+
+    /// `apply_hum_notes` mints fresh ids (`ensure_note_ids`), so equality
+    /// checks against hand-built expectations compare everything BUT
+    /// identity.
+    fn without_ids(notes: &[MidiNote]) -> Vec<MidiNote> {
+        notes.iter().map(|n| MidiNote { note_id: crate::ids::NoteId(0), ..*n }).collect()
     }
 
     // ---- parse_hum_result -------------------------------------------------
@@ -646,9 +658,14 @@ mod tests {
         assert_eq!(clip.timeline_start_ticks, 960);
         assert_eq!(clip.length_ticks, 3840);
         assert_eq!(
-            clip.notes,
+            without_ids(&clip.notes),
             vec![note(0, 480, 69, 100), note(480, 240, 72, 90)],
             "sorted by (tick, key)"
+        );
+        assert_eq!(
+            clip.notes.iter().map(|n| n.note_id.0).collect::<Vec<_>>(),
+            vec![1, 2],
+            "ids minted in the sorted order, watermark advanced"
         );
         let g = session.lock();
         assert_eq!(g.midi.clips.len(), 1);
@@ -812,7 +829,7 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         assert_eq!(clip.timeline_start_ticks, 1920);
         assert_eq!(clip.length_ticks, 3840);
         assert_eq!(
-            clip.notes,
+            without_ids(&clip.notes),
             vec![note(0, 480, 69, 100), note(480, 480, 72, 90)],
             "pitchHz diagnostic field ignored, notes decoded"
         );

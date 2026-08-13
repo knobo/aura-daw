@@ -156,7 +156,11 @@ pub fn encode_points(ppq: u32, points: &[AutomationPoint]) -> Vec<u8> {
 }
 
 /// Decode an AMEV chunk's automation records -> `(ppq, points)`. Note
-/// records are skipped (mirror of `events::decode_notes`).
+/// records are skipped (mirror of `events::decode_notes`). Appended column
+/// blocks (e.g. `events::COLUMNS_NOTE_ID` on a note chunk) are walked and
+/// skipped wholesale — automation points carry no per-point ids yet, and a
+/// reader that errored on an unrecognised mask bit would break on every
+/// note chunk it was (incorrectly) asked to read [M-4].
 pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String> {
     let mut r = std::io::Cursor::new(bytes);
     let magic = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -169,9 +173,17 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
             "AMEV version {version} is newer than supported {AMEV_VERSION}"
         ));
     }
-    let _columns = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
+    let _mask = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?; // advisory only
     let ppq = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
     let count = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+
+    let core_bytes = (count as u64).saturating_mul(16);
+    if core_bytes > bytes.len() as u64 {
+        return Err(format!(
+            "AMEV chunk truncated: {count} records need {core_bytes} bytes, chunk has {}",
+            bytes.len()
+        ));
+    }
     let mut points = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let tick = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -183,6 +195,33 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
             points.push(AutomationPoint { tick, value });
         }
     }
+
+    // Walk and skip every appended column block (self-describing, D-06);
+    // automation never interprets any of them today.
+    let mut last_bit: i32 = -1;
+    loop {
+        let remaining = (bytes.len() as u64).saturating_sub(r.position());
+        if remaining < 6 {
+            break;
+        }
+        let col_bit = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
+        let byte_len = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let remaining_after_header = (bytes.len() as u64).saturating_sub(r.position());
+        if byte_len as u64 > remaining_after_header {
+            return Err(format!(
+                "AMEV chunk truncated: column 0x{col_bit:04x} declares {byte_len} bytes, {remaining_after_header} remain"
+            ));
+        }
+        if col_bit as i32 <= last_bit {
+            return Err(format!(
+                "AMEV column blocks out of order or duplicated: 0x{col_bit:04x} after 0x{last_bit:04x}"
+            ));
+        }
+        last_bit = col_bit as i32;
+        let mut buf = vec![0u8; byte_len as usize];
+        std::io::Read::read_exact(&mut r, &mut buf).map_err(|e| e.to_string())?;
+    }
+
     Ok((ppq, points))
 }
 
@@ -627,11 +666,13 @@ mod tests {
                 key: 60,
                 velocity: 100,
                 channel: 0,
+                note_id: crate::ids::NoteId(1),
             }],
+            2,
         );
         assert!(decode_points(&notes).unwrap().1.is_empty());
-        let (_, no_notes) = crate::midi::events::decode_notes(&bytes).unwrap();
-        assert!(no_notes.is_empty());
+        let decoded = crate::midi::events::decode_notes(&bytes).unwrap();
+        assert!(decoded.notes.is_empty());
 
         assert!(decode_points(&[0u8; 8]).is_err(), "garbage rejected");
     }

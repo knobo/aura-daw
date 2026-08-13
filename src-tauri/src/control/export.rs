@@ -539,6 +539,7 @@ impl ControlPlane {
                     tempo_events: m.tempo_events.clone(),
                     clips: m.clips.clone(),
                     loaded_dir: None,
+                    dirty: false,
                 },
                 rate: self.shared.sample_rate.load(Relaxed),
                 loop_region: (

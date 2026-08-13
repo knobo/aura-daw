@@ -79,10 +79,11 @@ pub fn slice_block<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ids::NoteId;
     use crate::midi::types::{MidiNote, TempoEvent};
 
     fn note(tick: u32, len: u32, key: u8, vel: u8) -> MidiNote {
-        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0 }
+        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: NoteId(0) }
     }
 
     fn clip(start_ticks: u64, len_ticks: u64, notes: Vec<MidiNote>) -> MidiClip {
@@ -93,6 +94,7 @@ mod tests {
             timeline_start_ticks: start_ticks,
             length_ticks: len_ticks,
             notes,
+            next_note_id: 1,
         }
     }
 

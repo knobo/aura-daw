@@ -226,6 +226,7 @@ mod tests {
     use crate::audio::rt::{ParamTable, RtGraph};
     use crate::audio::transport::LoopSpec;
     use crate::audio::types::TrackState;
+    use crate::ids::NoteId;
     use crate::midi::types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
 
     fn midi_store_with(clips: Vec<MidiClip>) -> MidiStore {
@@ -234,6 +235,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             clips,
             loaded_dir: None,
+            dirty: false,
         }
     }
 
@@ -260,6 +262,7 @@ mod tests {
             timeline_start_ticks: start_ticks,
             length_ticks: len_ticks,
             notes,
+            next_note_id: 1,
         }
     }
 
@@ -301,7 +304,7 @@ mod tests {
             "m1",
             960, // one beat in @120bpm/48k = sample 24000
             960,
-            vec![MidiNote { tick: 0, length_ticks: 480, key: 69, velocity: 100, channel: 0 }],
+            vec![MidiNote { tick: 0, length_ticks: 480, key: 69, velocity: 100, channel: 0, note_id: NoteId(0) }],
         )]);
 
         let mut nodes = LiveNodeRegistry::default();
@@ -331,7 +334,7 @@ mod tests {
         store.alloc_slot("m1");
         store.tracks.push(track("m1", "midi"));
         let midi = midi_store_with(vec![
-            clip("a1", 0, 960, vec![MidiNote { tick: 0, length_ticks: 10, key: 60, velocity: 100, channel: 0 }]),
+            clip("a1", 0, 960, vec![MidiNote { tick: 0, length_ticks: 10, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) }]),
             clip("m1", 0, 960, vec![]), // no notes
         ]);
         let mut nodes = LiveNodeRegistry::default();
@@ -352,7 +355,7 @@ mod tests {
             "m1",
             0,
             960,
-            vec![MidiNote { tick: 0, length_ticks: 480, key: 60, velocity: 90, channel: 0 }],
+            vec![MidiNote { tick: 0, length_ticks: 480, key: 60, velocity: 90, channel: 0, note_id: NoteId(0) }],
         )]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out1 = Vec::new();
@@ -413,7 +416,7 @@ mod tests {
         store.tracks.push(track("fallback", "midi"));
 
         // A4 (key 69) for half a second on both tracks.
-        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0 };
+        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0, note_id: NoteId(0) };
         let midi = midi_store_with(vec![
             clip("sampled", 0, 960, vec![note.clone()]),
             clip("fallback", 0, 960, vec![note]),
@@ -464,7 +467,7 @@ mod tests {
                 "m1",
                 0,
                 960,
-                vec![MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 100, channel: 0 }],
+                vec![MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 100, channel: 0, note_id: NoteId(0) }],
             )]);
             let bank = SamplerBank::default();
             let mut nodes = LiveNodeRegistry::default();
@@ -550,7 +553,7 @@ mod tests {
             "m1",
             960,
             1920,
-            vec![MidiNote { tick: 0, length_ticks: 1920, key: 60, velocity: 100, channel: 0 }],
+            vec![MidiNote { tick: 0, length_ticks: 1920, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) }],
         )]);
 
         let mut nodes = LiveNodeRegistry::default();
