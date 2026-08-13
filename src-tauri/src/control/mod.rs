@@ -312,23 +312,88 @@ impl ControlPlane {
         );
     }
 
+    /// New Project = blank slate: the previous session's tracks, clips, midi
+    /// state, plugin/automation registries, and transport are all reset, and
+    /// the freshly created `.aura` dir becomes the open project. (Until
+    /// 2026-08 this kept the session's tracks; the UI "New Project" flow
+    /// wants a true blank, and materializing an unsaved session is
+    /// [`Self::save_project_as`]'s job.)
     pub fn create_project(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
         let tempo = self.store.lock().transport.tempo_bpm;
-        let (mut project, dir) =
+        let (project, dir) =
             project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
         {
             let mut s = self.store.lock();
+            for t in s.tracks.clone() {
+                s.free_slot(&t.id);
+            }
+            s.tracks.clear();
             s.clips.clear();
             s.project_dir = Some(dir.clone());
             s.project_name = Some(name.to_string());
             s.created_at = project.created_at.clone();
-            project.tracks = s.tracks.clone();
+            s.transport.state = "stopped".into();
+            s.transport.position_samples = 0;
+            s.transport.loop_enabled = false;
+            s.transport.loop_start_samples = 0;
+            s.transport.loop_end_samples = 0;
         }
-        if !project.tracks.is_empty() {
-            project::save(&dir, &project)?;
+        self.params.any_solo.store(false, Relaxed);
+        self.shared.playing.store(false, Relaxed);
+        self.shared.position.store(0, Relaxed);
+        self.shared.loop_enabled.store(false, Relaxed);
+        {
+            // Blank midi state bound to the new dir; `sync_midi_store` then
+            // sees loaded_dir == dir and leaves it alone (self.midi is the
+            // same Arc as MidiState.inner / the playback-registered store).
+            let mut m = self.midi.lock();
+            let d0 = crate::midi::persist::v1_migration_defaults(tempo);
+            m.ppq = d0.ppq;
+            m.tempo_events = d0.tempo_events;
+            m.clips = d0.clips;
+            m.loaded_dir = Some(dir.clone());
         }
+        // App-global plugin/automation registries adopt the (empty) project.
+        crate::plugins::state::adopt_open_project(&dir);
+        crate::plugins::automation::adopt_open_project(&dir);
         self.engine.send(ControlMsg::Rebuild);
+        (self.emit)(
+            "project://changed",
+            serde_json::to_value(&project).unwrap_or_default(),
+        );
+        Ok(project)
+    }
+
+    /// First save of a session that never had a project: create the `.aura`
+    /// dir and persist the CURRENT in-memory content (tracks, clips, midi)
+    /// into it. Refuses when a project is already open — that is plain
+    /// `save_project` territory, not a fork.
+    pub fn save_project_as(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
+        if self.store.lock().project_dir.is_some() {
+            return Err("a project is already open; use save_project".into());
+        }
+        let rate = self.shared.sample_rate.load(Relaxed);
+        let tempo = self.store.lock().transport.tempo_bpm;
+        let (created, dir) = project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
+        let project = {
+            let mut s = self.store.lock();
+            s.project_dir = Some(dir.clone());
+            s.project_name = Some(name.to_string());
+            s.created_at = created.created_at.clone();
+            let position = self.shared.position.load(Relaxed);
+            project::from_store(&s, position, rate)?
+        };
+        project::save(&dir, &project)?;
+        {
+            // Adopt the in-memory midi state into the new project and write
+            // it now (normally that only happens on the next midi mutation).
+            let mut m = self.midi.lock();
+            m.loaded_dir = Some(dir.clone());
+            if let Err(e) = crate::midi::persist::save_into_project(&dir, &m) {
+                log::warn!("save_project_as: persisting midi failed: {e}");
+            }
+        }
         (self.emit)(
             "project://changed",
             serde_json::to_value(&project).unwrap_or_default(),
@@ -1451,5 +1516,117 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── project new / save-as semantics ──
+
+    fn cp_tmp_parent(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aura-cp-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn dummy_audio_clip(track_id: &str) -> Clip {
+        Clip {
+            id: "c1".into(),
+            track_id: track_id.into(),
+            name: "take".into(),
+            source_path: "audio/c1.wav".into(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 480,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 480,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
+    fn dummy_midi_clip(track_id: &str) -> crate::midi::MidiClip {
+        crate::midi::MidiClip {
+            id: "mc1".into(),
+            track_id: track_id.into(),
+            name: "riff".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: Vec::new(),
+        }
+    }
+
+    /// "New Project" is a blank slate: the previous session's tracks, clips,
+    /// midi state, and playhead must all be gone, and the on-disk project.json
+    /// must describe the empty project.
+    #[test]
+    fn create_project_resets_to_a_blank_slate() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let t = cp.add_track(Some("Old".into()), None).unwrap();
+        cp.store.lock().clips.push(dummy_audio_clip(&t.id));
+        cp.midi.lock().clips.push(dummy_midi_clip(&t.id));
+        cp.shared.position.store(1234, Relaxed);
+
+        let parent = cp_tmp_parent("blank");
+        let project = cp.create_project(parent.to_str().unwrap(), "Fresh").unwrap();
+
+        assert!(project.tracks.is_empty(), "returned project is empty");
+        {
+            let s = cp.store.lock();
+            assert!(s.tracks.is_empty(), "tracks cleared");
+            assert!(s.clips.is_empty(), "clips cleared");
+            assert_eq!(s.project_dir.as_deref(), Some(parent.join("Fresh.aura").as_path()));
+        }
+        assert!(cp.midi.lock().clips.is_empty(), "midi state reset");
+        assert_eq!(cp.shared.position.load(Relaxed), 0, "playhead back at 0");
+        let (loaded, _) = project::load(&parent.join("Fresh.aura")).unwrap();
+        assert!(loaded.tracks.is_empty(), "blank project on disk");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// First save of a session that never had a project: `save_project_as`
+    /// creates the .aura dir and persists the CURRENT content (tracks + midi),
+    /// unlike create_project which resets.
+    #[test]
+    fn save_project_as_materializes_an_unsaved_session() {
+        let (cp, events, _engine) = recording_control_plane();
+        let t = cp.add_track(Some("Keys".into()), None).unwrap();
+        cp.midi.lock().clips.push(dummy_midi_clip(&t.id));
+        events.lock().clear();
+
+        let parent = cp_tmp_parent("saveas");
+        let project = cp.save_project_as(parent.to_str().unwrap(), "First").unwrap();
+
+        assert_eq!(project.tracks.len(), 1, "session tracks kept");
+        {
+            let s = cp.store.lock();
+            assert_eq!(s.tracks.len(), 1);
+            assert_eq!(s.project_dir.as_deref(), Some(parent.join("First.aura").as_path()));
+        }
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(parent.join("First.aura/project.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["tracks"][0]["name"], "Keys", "tracks on disk");
+        assert_eq!(json["midiClips"][0]["id"], "mc1", "in-memory midi materialized");
+        assert!(
+            events.lock().iter().any(|(n, _)| n == "project://changed"),
+            "project://changed emitted"
+        );
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// With a project already open, plain save_project is the right call —
+    /// save_project_as must refuse instead of silently forking state.
+    #[test]
+    fn save_project_as_refuses_when_a_project_is_open() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("saveas-open");
+        cp.create_project(parent.to_str().unwrap(), "Open").unwrap();
+
+        let err = cp.save_project_as(parent.to_str().unwrap(), "Other").unwrap_err();
+        assert!(err.contains("already open"), "clear message: {err}");
+        assert!(!parent.join("Other.aura").exists(), "no dir left behind");
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }

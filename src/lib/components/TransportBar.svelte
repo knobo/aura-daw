@@ -12,6 +12,7 @@
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
   import { formatBarsBeats, formatClock } from "../utils/format";
+  import ProjectMenu from "./project/ProjectMenu.svelte";
 
   let clockEl: HTMLSpanElement | undefined = $state();
   let barsEl: HTMLSpanElement | undefined = $state();
@@ -51,10 +52,7 @@
 <header class="bar glass">
   <div class="left">
     <div class="wordmark mono">AURA</div>
-    <div class="project">
-      <span class="silk">project</span>
-      <span class="pname">{project.name}</span>
-    </div>
+    <ProjectMenu />
   </div>
 
   <div class="center">
@@ -234,16 +232,6 @@
       0 0 14px var(--cyan-dim),
       1px 0 0 rgba(255, 79, 216, 0.55),
       -1px 0 0 rgba(82, 229, 255, 0.55);
-  }
-
-  .project {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-  .pname {
-    font-size: 12px;
-    color: var(--text-dim);
   }
 
   .center {

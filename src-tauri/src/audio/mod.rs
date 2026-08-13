@@ -557,9 +557,9 @@ pub fn set_track_instrument(
 // ---------------------------------------------------------------------------
 
 /// Creates `<parent_dir>/<name>.aura/` with project.json + audio/stems/cache
-/// subdirs and makes it the open project. Existing in-memory tracks are kept
-/// (and saved); clips are reset (they belonged to the previous project).
-/// Thin wrapper over the shared control plane (§11).
+/// subdirs and makes it the open project, resetting the session to a blank
+/// slate (tracks, clips, midi, transport). Materializing an unsaved session
+/// is `save_project_as`. Thin wrapper over the shared control plane (§11).
 #[tauri::command]
 pub fn create_project(
     parent_dir: String,
@@ -567,6 +567,18 @@ pub fn create_project(
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<Project, String> {
     control.create_project(&parent_dir, &name)
+}
+
+/// First save of a session with no open project: creates the `.aura` dir and
+/// persists the current in-memory content into it. Fails when a project is
+/// already open. Thin wrapper over the shared control plane (§11).
+#[tauri::command]
+pub fn save_project_as(
+    parent_dir: String,
+    name: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Project, String> {
+    control.save_project_as(&parent_dir, &name)
 }
 
 #[tauri::command]
