@@ -14,9 +14,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::types::{Project, Store, TransportState};
+use super::types::{Clip, Project, Store, TransportState};
+use crate::ids::SourceId;
 
 pub const PROJECT_FILE: &str = "project.json";
+
+/// Fixed namespace for deterministic legacy `SourceId` minting
+/// ([`assign_source_ids`]). A project-specific constant, minted once and
+/// frozen forever — changing it would re-mint every legacy project's source
+/// ids on next open, breaking the decode-cache's stability guarantee.
+const AURA_SOURCE_NS: uuid::Uuid = uuid::uuid!("da93d478-7f57-41f5-a1a2-ffc2d1fc6c12");
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -162,7 +169,63 @@ pub fn load(path: &Path) -> Result<(Project, PathBuf), String> {
         return Err(format!("unsupported project schemaVersion {}", project.schema_version));
     }
     project.path = Some(dir.to_string_lossy().into_owned());
+    // Round-2 §2.2: legacy clips (no sourceId on disk) get one deterministically
+    // minted per unique source_path, so every clip entering the store from this
+    // point on carries a real identity for the decode cache.
+    assign_source_ids(&mut project.clips);
     Ok((project, dir))
+}
+
+/// Mint one `SourceId` per unique (normalized) `source_path` for every clip
+/// that doesn't already carry one (round-2 §2.2, H-3/M-6). Minting is
+/// DETERMINISTIC (UUIDv5 over the normalized path under [`AURA_SOURCE_NS`]),
+/// so the same legacy project opens with the SAME ids every session without
+/// requiring a save-on-open — two clips sharing a `source_path` end up
+/// sharing an id "for free" (same hash input), no bookkeeping map needed.
+/// Clips whose `source_path` cannot be normalized (path-traversal, L-1) are
+/// left unassigned with a loud warning rather than minting over a
+/// potentially-wrong path.
+pub(crate) fn assign_source_ids(clips: &mut [Clip]) {
+    for clip in clips.iter_mut() {
+        if !clip.source_id.as_str().is_empty() {
+            continue; // already assigned — never re-minted
+        }
+        match normalize_source_path(&clip.source_path) {
+            Ok(normalized) => clip.source_id = mint_deterministic_source_id(&normalized),
+            Err(e) => log::warn!(
+                "assign_source_ids: clip {} left unassigned: {e}",
+                clip.id
+            ),
+        }
+    }
+}
+
+/// Deterministic legacy-id mint: `SourceId(UuidV5(AURA_SOURCE_NS, normalized_path))`.
+fn mint_deterministic_source_id(normalized_path: &str) -> SourceId {
+    SourceId(uuid::Uuid::new_v5(&AURA_SOURCE_NS, normalized_path.as_bytes()).to_string())
+}
+
+/// Normalize a clip's `source_path` into a stable, project-relative POSIX
+/// form for deterministic id minting (L-1): strips a leading absolute-path
+/// anchor (an old file's accidental `project_dir`-style absolute path) down
+/// to its relative tail, collapses `.` segments, and REJECTS any `..`
+/// component outright (a normalized path must never escape the project —
+/// minting an id over a traversal path would be worse than leaving it
+/// unassigned).
+fn normalize_source_path(source_path: &str) -> Result<String, String> {
+    let slashed = source_path.replace('\\', "/");
+    let mut out: Vec<&str> = Vec::new();
+    for seg in slashed.split('/') {
+        match seg {
+            "" | "." => continue, // drop empty (leading '/') and current-dir segments
+            ".." => return Err(format!("source_path escapes the project: {source_path:?}")),
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("source_path is empty after normalization: {source_path:?}"));
+    }
+    Ok(out.join("/"))
 }
 
 /// Snapshot the control-plane store into a serializable Project.
@@ -366,6 +429,89 @@ mod tests {
         assert!(v.get("tempoBpm").is_some());
         assert!(v.get("timeSignature").is_some());
         assert_eq!(v["timeSignature"], serde_json::json!([4, 4]));
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    // ---- source-id assignment (round-2 §2.2) -------------------------------
+
+    fn clip_n(id: &str, source_path: &str, source_id: &str) -> Clip {
+        Clip {
+            id: id.into(),
+            track_id: "t0".into(),
+            name: id.into(),
+            source_path: source_path.into(),
+            source_id: source_id.into(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_clips_get_one_source_id_per_unique_path() {
+        // Two clips sharing audio/x.wav and one on audio/y.wav, none with a
+        // sourceId (legacy file): after load-fixup the two sharers have the
+        // SAME minted id, the third a different one; a clip that already has
+        // an id keeps it.
+        let mut p = Project {
+            schema_version: 1,
+            name: "legacy".into(),
+            path: None,
+            created_at: None,
+            modified_at: None,
+            sample_rate: 48_000,
+            tempo_bpm: 120.0,
+            time_signature: Some((4, 4)),
+            tracks: Vec::new(),
+            clips: vec![
+                clip_n("c0", "audio/x.wav", ""),
+                clip_n("c1", "audio/x.wav", ""),
+                clip_n("c2", "audio/y.wav", ""),
+                clip_n("c3", "audio/z.wav", "pre-existing"),
+            ],
+            transport: None,
+        };
+        assign_source_ids(&mut p.clips);
+        assert_eq!(p.clips[0].source_id, p.clips[1].source_id, "same path -> same id");
+        assert_ne!(p.clips[0].source_id, p.clips[2].source_id, "different path -> different id");
+        assert!(!p.clips[0].source_id.as_str().is_empty());
+        assert_eq!(p.clips[3].source_id.as_str(), "pre-existing", "already-assigned id kept");
+
+        // Deterministic minting (M-6): two independent runs over an
+        // identically-shaped clip list yield IDENTICAL ids — no save-on-open
+        // required for a legacy project to open with stable ids every time.
+        let mut p2_clips = vec![clip_n("c0", "audio/x.wav", ""), clip_n("c2", "audio/y.wav", "")];
+        assign_source_ids(&mut p2_clips);
+        assert_eq!(p2_clips[0].source_id, p.clips[0].source_id, "deterministic across runs");
+        assert_eq!(p2_clips[1].source_id, p.clips[2].source_id, "deterministic across runs");
+    }
+
+    #[test]
+    fn source_path_traversal_is_rejected_not_minted_over() {
+        let mut clips = vec![clip_n("c0", "../../etc/passwd", ""), clip_n("c1", "audio/ok.wav", "")];
+        assign_source_ids(&mut clips);
+        assert!(clips[0].source_id.as_str().is_empty(), "traversal path left unassigned");
+        assert!(!clips[1].source_id.as_str().is_empty());
+    }
+
+    #[test]
+    fn load_fixup_assigns_source_ids_from_disk() {
+        let parent = tmp_parent("source-ids");
+        let (mut project, dir) = create(&parent, "Legacy", 48_000, 120.0).unwrap();
+        project.clips = vec![clip_n("c0", "audio/a.wav", ""), clip_n("c1", "audio/a.wav", "")];
+        save(&dir, &project).unwrap();
+        // The file on disk has no sourceId field at all (pre-existing
+        // project) — the wire type's #[serde(default)] covers the absence,
+        // and `load`'s fixup mints deterministically on the way in.
+        let (loaded, _) = load(&dir).unwrap();
+        assert!(!loaded.clips[0].source_id.as_str().is_empty());
+        assert_eq!(loaded.clips[0].source_id, loaded.clips[1].source_id);
         let _ = fs::remove_dir_all(&parent);
     }
 }

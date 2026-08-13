@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ClipId, TrackId};
+use crate::ids::{ClipId, SourceId, TrackId};
 
 /// Hard cap on mixer tracks; slot indices and meter blocks are sized by this.
 /// 64 conveniently matches a `u64` presence mask.
@@ -153,6 +153,13 @@ pub struct Clip {
     pub name: String,
     /// Relative to the .aura project dir, POSIX separators.
     pub source_path: String,
+    /// Decode-cache/asset identity (round-2 §2.2). Empty (`Default`) means
+    /// "unassigned" — a legacy clip before `assign_source_ids` runs, or a
+    /// construction site that hasn't minted one yet. One `SourceId` names
+    /// exactly one `source_path`; the empty sentinel must never reach the
+    /// engine cache ([`crate::audio::engine`]'s `stale_sources`).
+    #[serde(default)]
+    pub source_id: SourceId,
     pub source_channels: u16,
     pub source_sample_rate: u32,
     /// Length of the source file in SOURCE samples.

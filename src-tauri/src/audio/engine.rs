@@ -13,7 +13,7 @@
 //!   and recorded samples out to the disk-writer thread.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,6 +33,7 @@ use super::types::{Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use super::project;
 use crate::control::Session;
+use crate::ids::SourceId;
 
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
@@ -374,6 +375,81 @@ impl InputCb {
 }
 
 // ---------------------------------------------------------------------------
+// Source-keyed decode cache (round-2 §2.2)
+// ---------------------------------------------------------------------------
+
+/// One decoded source's cache entry: the samples, plus the `source_path`
+/// they were decoded FROM (so a path change under the same id is detected as
+/// staleness rather than silently serving stale/wrong audio).
+struct CachedSource {
+    source_path: String,
+    data: Arc<RtClipData>,
+}
+
+/// Which sources need (re)decoding: absent from the cache, or cached from a
+/// different path than the clip now names (staleness — round-2 §2.2). Pure
+/// and unit-testable (the policy that `ensure_loaded` drives); deduped by
+/// source, in first-seen order.
+///
+/// Two hardening rules [H-3]:
+/// * a clip whose `source_id` is EMPTY is skipped (with a loud warning and a
+///   debug-build assertion — the store boundary, `assign_source_ids` /
+///   the production minting sites, should make this unreachable): it
+///   renders silent rather than risk playing another clip's audio through
+///   a shared empty-sentinel bucket.
+/// * two clips naming the SAME `source_id` but DIFFERENT `source_path`s
+///   violate the one-source-one-path invariant: warned loudly, and the
+///   source is treated as stale under the LAST conflicting path seen — never
+///   silently kept at the first path while reporting "nothing to do".
+fn stale_sources(clips: &[Clip], cache: &HashMap<SourceId, CachedSource>) -> Vec<(SourceId, String)> {
+    let mut wanted_path: HashMap<SourceId, String> = HashMap::new();
+    let mut order: Vec<SourceId> = Vec::new();
+
+    for clip in clips {
+        if clip.source_id.as_str().is_empty() {
+            log::warn!(
+                "audio: clip {} has no source id; skipping (renders silent, never another clip's audio)",
+                clip.id
+            );
+            debug_assert!(
+                false,
+                "clip {} reached the engine cache with an empty source_id — \
+                 the store boundary (assign_source_ids / minting sites) should make this unreachable",
+                clip.id
+            );
+            continue;
+        }
+        match wanted_path.get(&clip.source_id) {
+            None => {
+                wanted_path.insert(clip.source_id.clone(), clip.source_path.clone());
+                order.push(clip.source_id.clone());
+            }
+            Some(existing) if existing != &clip.source_path => {
+                log::warn!(
+                    "audio: source {} named by conflicting paths ({existing:?} vs {:?}) — \
+                     one SourceId must name one source_path; re-decoding under the latest path",
+                    clip.source_id, clip.source_path
+                );
+                wanted_path.insert(clip.source_id.clone(), clip.source_path.clone());
+            }
+            Some(_) => {} // same path already recorded — nothing to do
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|sid| {
+            let path = wanted_path.remove(&sid)?;
+            let stale = match cache.get(&sid) {
+                Some(cached) => cached.source_path != path,
+                None => true,
+            };
+            stale.then_some((sid, path))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Control thread
 // ---------------------------------------------------------------------------
 
@@ -389,8 +465,11 @@ struct Control {
     rec_track_ids: Vec<String>,
     sel_output: Option<String>,
     sel_input: Option<String>,
-    /// clip id -> decoded samples at `cache_rate`.
-    cache: HashMap<String, Arc<RtClipData>>,
+    /// source id -> decoded samples at `cache_rate` (round-2 §2.2: keyed by
+    /// SOURCE, not clip — two clips naming the same source share one decode,
+    /// and the cache survives one clip's deletion as long as another clip
+    /// still names the source ("sane asset GC", the other half of O-12).
+    cache: HashMap<SourceId, CachedSource>,
     cache_rate: u32,
     /// Live instrument nodes keyed by track id (phase 3, ARCHITECTURE §15).
     /// Nodes are SHARED between successive graph snapshots (voice state and
@@ -564,7 +643,7 @@ impl Control {
                     .iter()
                     .filter(|c| c.track_id == t.id)
                     .filter_map(|c| {
-                        let samples = self.cache.get(c.id.as_str())?.clone();
+                        let samples = self.cache.get(&c.source_id).map(|e| e.data.clone())?;
                         Some(RtClip {
                             start: c.timeline_start_samples,
                             offset: c.offset_samples,
@@ -615,48 +694,57 @@ impl Control {
         }
     }
 
-    /// Decode any clip sources missing from the cache (at the engine rate)
-    /// and make sure their waveform pyramids exist.
+    /// Decode any clip sources missing from the cache (at the engine rate,
+    /// or stale under a changed `source_path` — round-2 §2.2) and make sure
+    /// every referencing clip's waveform pyramid exists.
     fn ensure_loaded(&mut self) {
         let rate = self.engine_rate();
         if self.cache_rate != rate {
             self.cache.clear();
             self.cache_rate = rate;
         }
-        let todo: Vec<(String, PathBuf, PathBuf)> = {
+        // `stale_sources` decides WHAT needs decoding (one entry per source,
+        // deduped); pyramid dirs are still resolved per clip below (the
+        // visual cache stays clip-id-keyed — dedup opportunity ledgered,
+        // not taken here).
+        let (project_dir, todo, live_sources, clips_by_source) = {
             let session = self.session.lock();
             let store = &session.store;
-            store
-                .clips
-                .iter()
-                .filter(|c| !self.cache.contains_key(c.id.as_str()))
-                .filter_map(|c| {
-                    Some((
-                        c.id.to_string(),
-                        store.abs_path(&c.source_path)?,
-                        store.waveform_cache_dir(c.id.as_str())?,
-                    ))
-                })
-                .collect()
+            let todo = stale_sources(&store.clips, &self.cache);
+            let mut live_sources: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
+            let mut clips_by_source: HashMap<SourceId, Vec<String>> = HashMap::new();
+            for c in &store.clips {
+                if c.source_id.as_str().is_empty() {
+                    continue; // stale_sources already warned about this
+                }
+                live_sources.insert(c.source_id.clone());
+                clips_by_source.entry(c.source_id.clone()).or_default().push(c.id.to_string());
+            }
+            (store.project_dir.clone(), todo, live_sources, clips_by_source)
         };
-        // Retain only clips that still exist.
-        let live: std::collections::HashSet<String> =
-            self.session.lock().store.clips.iter().map(|c| c.id.to_string()).collect();
-        self.cache.retain(|id, _| live.contains(id));
+        // GC by source (round-2 §2.2's "sane asset GC" half of O-12): an
+        // asset shared by two clips survives one clip's deletion, since the
+        // SOURCE stays live as long as any clip still names it.
+        self.cache.retain(|sid, _| live_sources.contains(sid));
 
-        for (clip_id, path, cache_dir) in todo {
+        let Some(project_dir) = project_dir else { return };
+        for (source_id, source_path) in todo {
+            let path = project_dir.join(&source_path);
             match load_wav(&path) {
                 Ok((channels, file_rate, samples)) => {
-                    if !pyramid_exists(&cache_dir) {
-                        let pyr = Pyramid::from_interleaved(&samples, channels as usize);
-                        if let Err(e) = pyr.write_dir(&cache_dir) {
-                            log::warn!("waveform cache for {clip_id}: {e}");
+                    for clip_id in clips_by_source.get(&source_id).map(|v| v.as_slice()).unwrap_or(&[]) {
+                        let cache_dir = Store::cache_dir_for(&project_dir, clip_id);
+                        if !pyramid_exists(&cache_dir) {
+                            let pyr = Pyramid::from_interleaved(&samples, channels as usize);
+                            if let Err(e) = pyr.write_dir(&cache_dir) {
+                                log::warn!("waveform cache for {clip_id}: {e}");
+                            }
                         }
                     }
                     let data = linear_resample(&samples, channels as usize, file_rate, rate);
                     self.cache.insert(
-                        clip_id,
-                        Arc::new(RtClipData { channels, data }),
+                        source_id,
+                        CachedSource { source_path, data: Arc::new(RtClipData { channels, data }) },
                     );
                 }
                 Err(e) => log::warn!("audio: cannot load {}: {e}", path.display()),
@@ -857,7 +945,11 @@ impl Control {
         let mut specs = Vec::with_capacity(targets.len());
         for (i, track_id) in targets.iter().enumerate() {
             let clip_id = uuid::Uuid::new_v4().to_string();
-            let rel = format!("audio/{clip_id}.wav");
+            // The take's wav is named by a freshly-minted SourceId (round-2
+            // §2.2) — the decode cache re-keys by source, not by clip.
+            // Waveform pyramid cache dirs stay keyed by clip id.
+            let source_id = crate::ids::SourceId::mint();
+            let rel = format!("audio/{source_id}.wav");
             let (p, c) = rtrb::RingBuffer::new(capacity);
             producers.push(p);
             consumers.push(c);
@@ -866,6 +958,7 @@ impl Control {
                 take_name: format!("Take {}", take_no + i),
                 wav_path: project_dir.join(&rel),
                 rel_path: rel,
+                source_id,
                 cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
                 clip_id,
                 start_pos,
@@ -1370,5 +1463,93 @@ mod tests {
         assert!((s[1] + 1.0).abs() < 1e-6);
         assert_eq!(s[2], 0.0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- source-keyed decode cache policy (round-2 §2.2) -------------------
+
+    /// Same shape as `control::mod`'s `test_clip` helper.
+    fn test_clip(id: &str, track_id: &str) -> Clip {
+        Clip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: "clip".into(),
+            source_path: "audio/x.wav".into(),
+            source_id: SourceId::default(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
+    #[test]
+    fn cache_is_shared_per_source_and_invalidates_on_path_change() {
+        let mut cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        let sid = SourceId::from("s-1");
+        let c1 = { let mut c = test_clip("c-1", "t-1"); c.source_id = sid.clone(); c };
+        let c2 = { let mut c = test_clip("c-2", "t-1"); c.source_id = sid.clone(); c };
+        // Two clips, one source: exactly ONE decode wanted.
+        assert_eq!(stale_sources(&[c1.clone(), c2.clone()], &cache).len(), 1);
+        cache.insert(sid.clone(), CachedSource {
+            source_path: c1.source_path.clone(),
+            data: Arc::new(RtClipData { channels: 2, data: vec![0.0; 4] }),
+        });
+        // Cached and unchanged: nothing to do.
+        assert!(stale_sources(&[c1.clone(), c2.clone()], &cache).is_empty());
+        // source_path changes under the SAME source id: re-decode (staleness).
+        let mut c1b = c1.clone();
+        c1b.source_path = "audio/replaced.wav".into();
+        assert_eq!(stale_sources(&[c1b], &cache).len(), 1);
+    }
+
+    #[test]
+    fn stale_sources_skips_empty_source_id_clips() {
+        let cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        // Default SourceId is the empty-string sentinel — must never reach
+        // the cache (H-3). `stale_sources` both warns AND `debug_assert!`s on
+        // this (the store boundary should make it unreachable), so a debug
+        // build panics here — verify the assertion fires rather than calling
+        // straight through (which would abort this test binary).
+        let c = test_clip("c-1", "t-1");
+        assert!(c.source_id.as_str().is_empty());
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic's default print
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stale_sources(std::slice::from_ref(&c), &cache)
+        }));
+        std::panic::set_hook(hook);
+        assert!(
+            result.is_err(),
+            "debug_assert! catches an empty source_id reaching the cache boundary (H-3)"
+        );
+    }
+
+    #[test]
+    fn stale_sources_conflicting_paths_warn_and_take_the_latest() {
+        let cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        let sid = SourceId::from("s-conflict");
+        let c1 = { let mut c = test_clip("c-1", "t-1"); c.source_id = sid.clone(); c.source_path = "audio/a.wav".into(); c };
+        let c2 = { let mut c = test_clip("c-2", "t-1"); c.source_id = sid.clone(); c.source_path = "audio/b.wav".into(); c };
+        let todo = stale_sources(&[c1, c2], &cache);
+        assert_eq!(todo.len(), 1, "one source, one decode — never two entries for the same id");
+        assert_eq!(todo[0].0, sid);
+        assert_eq!(todo[0].1, "audio/b.wav", "the LAST conflicting path wins the re-decode");
+    }
+
+    #[test]
+    fn stale_sources_dedupes_and_preserves_first_seen_order() {
+        let cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        let s1 = SourceId::from("s-1");
+        let s2 = SourceId::from("s-2");
+        let c1 = { let mut c = test_clip("c-1", "t-1"); c.source_id = s1.clone(); c.source_path = "audio/1.wav".into(); c };
+        let c2 = { let mut c = test_clip("c-2", "t-1"); c.source_id = s2.clone(); c.source_path = "audio/2.wav".into(); c };
+        let c3 = { let mut c = test_clip("c-3", "t-1"); c.source_id = s1.clone(); c.source_path = "audio/1.wav".into(); c };
+        let todo = stale_sources(&[c1, c2, c3], &cache);
+        assert_eq!(todo.iter().map(|(sid, _)| sid.clone()).collect::<Vec<_>>(), vec![s1, s2]);
     }
 }

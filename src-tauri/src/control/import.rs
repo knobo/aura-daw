@@ -4,7 +4,9 @@
 //! Three things live here:
 //!
 //! * [`ControlPlane::import_audio_clip`]'s real body: validate an audio file,
-//!   land it in `<project>/audio/<clipId>.wav`, probe channels/rate/length,
+//!   land it in `<project>/audio/<sourceId>.wav` (round-2 §2.2 — the asset is
+//!   named by a freshly-minted source identity, not the clip), probe
+//!   channels/rate/length,
 //!   build the waveform pyramid, register the [`Clip`] (sample-anchored
 //!   placement) and ask the engine to rebuild. A target track is auto-created
 //!   when `track_id` is `None`. WAV keeps the hound fast path (bit-exact file
@@ -254,7 +256,13 @@ pub(crate) fn do_import(
     // Land the audio in the project layout and build the waveform pyramid
     // cache. WAV sources are copied bit-exact; compressed sources are written
     // back as the decoded f32 WAV (project-native, same as recorded takes).
-    let rel = format!("audio/{clip_id}.wav");
+    // The asset is named by a freshly-minted SourceId (round-2 §2.2) — the
+    // decode cache re-keys by source, not by clip, so a real asset identity
+    // is required at the point of creation. Waveform pyramid cache dirs stay
+    // keyed by clip id (visual cache; dedup opportunity ledgered, not taken
+    // here).
+    let source_id = crate::ids::SourceId::mint();
+    let rel = format!("audio/{source_id}.wav");
     let dst = project_dir.join(&rel);
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -277,6 +285,7 @@ pub(crate) fn do_import(
         track_id,
         name: stem,
         source_path: rel,
+        source_id,
         source_channels: channels,
         source_sample_rate: sample_rate,
         source_length_samples: frames,
@@ -668,7 +677,8 @@ mod tests {
         assert_eq!(clip.source_length_samples, 1000);
         assert_eq!(clip.length_samples, 1000);
         assert_eq!(clip.timeline_start_samples, 4800);
-        assert_eq!(clip.source_path, format!("audio/{}.wav", clip.id));
+        assert!(!clip.source_id.as_str().is_empty(), "a fresh SourceId is minted");
+        assert_eq!(clip.source_path, format!("audio/{}.wav", clip.source_id), "asset named by source, not clip");
 
         let s = session.lock();
         assert_eq!(s.store.clips.len(), 1);

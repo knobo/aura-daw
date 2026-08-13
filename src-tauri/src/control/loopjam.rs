@@ -414,7 +414,7 @@ impl LoopJam {
     }
 
     /// Decode the worker's output and stage a fully-prepared clip: file in
-    /// `<project>/audio/<clipId>.wav`, waveform pyramid built. Pure
+    /// `<project>/audio/<sourceId>.wav`, waveform pyramid built. Pure
     /// preparation — the store is not touched yet.
     fn prepare_swap(
         &self,
@@ -443,7 +443,13 @@ impl LoopJam {
             .clone()
             .ok_or("project closed while evolving")?;
         let clip_id = uuid::Uuid::new_v4().to_string();
-        let rel = format!("audio/{clip_id}.wav");
+        // H-4: the loop-evolve path is a production asset-creating site — the
+        // evolved-loop wav is named by a freshly-minted SourceId, same as
+        // import.rs and start_recording, so it enters the source-keyed
+        // decode cache correctly (skipping this site would feed the
+        // empty-sentinel bucket).
+        let source_id = crate::ids::SourceId::mint();
+        let rel = format!("audio/{source_id}.wav");
         let dst = project_dir.join(&rel);
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -461,6 +467,7 @@ impl LoopJam {
             track_id: track_id.into(),
             name: format!("evolve {}", generation + 1),
             source_path: rel,
+            source_id,
             source_channels: channels,
             source_sample_rate: rate,
             source_length_samples: frames,
@@ -905,6 +912,7 @@ mod tests {
             track_id: track.into(),
             name: id.into(),
             source_path: format!("audio/{id}.wav"),
+            source_id: crate::ids::SourceId::default(),
             source_channels: 2,
             source_sample_rate: 48_000,
             source_length_samples: len,

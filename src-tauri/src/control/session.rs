@@ -453,6 +453,7 @@ mod tests {
             track_id: track_id.into(),
             name: "clip".into(),
             source_path: "audio/x.wav".into(),
+            source_id: crate::ids::SourceId::default(),
             source_channels: 2,
             source_sample_rate: 48_000,
             source_length_samples: 48_000,
