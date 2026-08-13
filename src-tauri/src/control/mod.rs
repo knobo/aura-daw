@@ -116,6 +116,18 @@ impl MeterSink for LatestMeterCache {
     }
 }
 
+/// Build a property-addressed `Op::Set` for a track. `from` is advisory
+/// only (`apply_raw` re-reads store truth), so it's always `Null` here —
+/// same convention the op/session unit tests use.
+fn set_prop(track_id: &str, path: op::PropPath, to: serde_json::Value) -> op::Op {
+    op::Op::Set {
+        object: op::ObjectRef::Track(track_id.to_string()),
+        path,
+        from: serde_json::Value::Null,
+        to,
+    }
+}
+
 impl ControlPlane {
     pub fn new(
         session: Arc<Mutex<Session>>,
@@ -249,79 +261,166 @@ impl ControlPlane {
 
     // ---- structure ------------------------------------------------------
 
+    /// Create a track and insert it through the transaction channel
+    /// (`Op::TrackAdd`, `commit`). Slot allocation + the RT param reset stay
+    /// outside the op layer (`ops::new_track_row`, round-2 §2.4) — same
+    /// asymmetry `remove_track`'s slot free lives with, just on the other
+    /// side of the row's lifetime.
     pub fn add_track(
         &self,
         name: Option<String>,
         kind: Option<String>,
+        meta: op::TxMeta,
     ) -> Result<TrackState, String> {
-        let track = {
+        let (track, index) = {
             let mut session = self.session.lock();
-            ops::add_track(&mut session.store, &self.params, name, kind)?
+            ops::new_track_row(&mut session.store, &self.params, name, kind)?
         };
-        self.engine.send(ControlMsg::Rebuild);
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::TrackAdd { track: track.clone(), index })
+        })?;
         Ok(track)
     }
 
-    /// Batched mix changes: param-table writes only, no graph rebuild (§10.2).
+    /// Remove a track through the transaction channel (`Op::TrackRemove`,
+    /// `commit`). The clip cleanup and slot free are effect-layer bookkeeping
+    /// (like `add_track`'s slot alloc) — outside the op vocabulary this plan
+    /// (round-2 §2.4) — so they run in a short PRE-transaction lock, in the
+    /// same order the old direct-mutation command used (audio/mod.rs:369-379,
+    /// pre-Task-7): clips retained, slot freed, THEN the row disappears and
+    /// `commit` sends the (single) `Rebuild`. `commit` also recomputes
+    /// `any_solo` on `Op::TrackRemove` (controller ruling 2) — the removed
+    /// row may have been the only soloed track.
+    pub fn remove_track(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
+        let track = {
+            let mut session = self.session.lock();
+            let track = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id == id)
+                .cloned()
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            session.store.clips.retain(|c| c.track_id != id);
+            session.store.free_slot(id);
+            track
+        };
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::TrackRemove { track, index: 0 })
+        })?;
+        Ok(())
+    }
+
+    /// Batched mix changes through the transaction channel: one `Op::Set`
+    /// per present field, applied atomically (an unknown track id fails —
+    /// and rolls back — the whole batch, same as the pre-Task-7
+    /// `ops::apply_track_mix`). Param-table writes only, no graph rebuild
+    /// (§10.2) — `Op::Set`'s effect never sets `rebuild`.
     ///
-    /// Emits `project://changed` on success. The Tauri command path doesn't
-    /// need it (the frontend patches its store optimistically and gets the
-    /// updated `TrackState` back from the invoke), but non-webview front
-    /// doors — the MCP tools above all — have no return channel into the UI:
-    /// without this event an agent's gain/pan change is applied and audible
-    /// yet invisible in the mixer.
+    /// `commit` emits `project://changed` on success. The Tauri command path
+    /// doesn't strictly need it (the frontend patches its store optimistically
+    /// and gets the updated `TrackState`s back from the invoke), but
+    /// non-webview front doors — the MCP tools — have no return channel into
+    /// the UI: without this event an agent's gain/pan change is applied and
+    /// audible yet invisible in the mixer.
     pub fn set_track_mix(
         &self,
         changes: Vec<TrackMixChange>,
+        meta: op::TxMeta,
     ) -> Result<Vec<TrackState>, String> {
-        let updated = {
-            let mut session = self.session.lock();
-            ops::apply_track_mix(&mut session.store, &self.params, &changes)?
-        };
-        self.emit_project_changed();
+        // Validate every id BEFORE writing anything: `Session::transact`
+        // already rolls back a failed batch, but a change with every field
+        // `None` never calls `tx.apply`, so an unknown id in an all-None
+        // change would otherwise slip past a rollback that only guards
+        // ops that were actually applied. Pre-checking (as
+        // `ops::apply_track_mix` did) keeps ALL bad ids failing the batch
+        // atomically, before any commit.
+        {
+            let session = self.session.lock();
+            for c in &changes {
+                if !session.store.tracks.iter().any(|t| t.id == c.track_id) {
+                    return Err(format!("unknown track: {}", c.track_id));
+                }
+            }
+        }
+        self.commit(meta, |tx| {
+            for c in &changes {
+                if let Some(g) = c.gain_db {
+                    tx.apply(set_prop(&c.track_id, op::PropPath::Gain, serde_json::json!(g)))?;
+                }
+                if let Some(p) = c.pan {
+                    tx.apply(set_prop(&c.track_id, op::PropPath::Pan, serde_json::json!(p)))?;
+                }
+                if let Some(m) = c.muted {
+                    tx.apply(set_prop(&c.track_id, op::PropPath::Muted, serde_json::json!(m)))?;
+                }
+                if let Some(s) = c.soloed {
+                    tx.apply(set_prop(&c.track_id, op::PropPath::Soloed, serde_json::json!(s)))?;
+                }
+                if let Some(a) = c.armed {
+                    tx.apply(set_prop(&c.track_id, op::PropPath::Armed, serde_json::json!(a)))?;
+                }
+            }
+            Ok(())
+        })?;
+        let session = self.session.lock();
+        let mut updated = Vec::with_capacity(changes.len());
+        for c in &changes {
+            let t = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id == c.track_id)
+                .expect("validated above");
+            updated.push(t.clone());
+        }
         Ok(updated)
     }
 
-    /// Emit `project://changed` with the full project payload (the same
-    /// shape `project::from_store` serializes, minus its requirement of an
-    /// open project dir — mix changes are legal in an unsaved session).
-    fn emit_project_changed(&self) {
-        let payload = {
-            let session = self.session.lock();
-            let s = &session.store;
-            let sample_rate = self.shared.sample_rate.load(Relaxed);
-            let mut transport = s.transport.clone();
-            transport.position_samples = self.shared.position.load(Relaxed);
-            transport.sample_rate = sample_rate;
-            Project {
-                schema_version: 1,
-                name: s.project_name.clone().unwrap_or_else(|| "Untitled".into()),
-                path: s.project_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-                created_at: s.created_at.clone(),
-                modified_at: None,
-                sample_rate,
-                tempo_bpm: transport.tempo_bpm,
-                time_signature: Some((4, 4)),
-                tracks: s.tracks.clone(),
-                clips: s.clips.clone(),
-                transport: Some(transport),
-            }
-        };
-        (self.emit)(
-            "project://changed",
-            serde_json::to_value(&payload).unwrap_or_default(),
-        );
+    /// Compose the full-project payload `project://changed` carries (the
+    /// same shape `project::from_store` serializes, minus its requirement of
+    /// an open project dir — mix/structural changes are legal in an unsaved
+    /// session). `commit`'s event emission (Task 7: every A-slice command
+    /// now goes live through it) is the sole caller; `create_project` builds
+    /// its own `Project` from `project::create`'s return instead, since that
+    /// one always has an open project dir.
+    fn project_changed_payload(&self) -> Project {
+        let session = self.session.lock();
+        let s = &session.store;
+        let sample_rate = self.shared.sample_rate.load(Relaxed);
+        let mut transport = s.transport.clone();
+        transport.position_samples = self.shared.position.load(Relaxed);
+        transport.sample_rate = sample_rate;
+        Project {
+            schema_version: 1,
+            name: s.project_name.clone().unwrap_or_else(|| "Untitled".into()),
+            path: s.project_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            created_at: s.created_at.clone(),
+            modified_at: None,
+            sample_rate,
+            tempo_bpm: transport.tempo_bpm,
+            time_signature: Some((4, 4)),
+            tracks: s.tracks.clone(),
+            clips: s.clips.clone(),
+            transport: Some(transport),
+        }
     }
 
     /// Runs a `Session::transact` closure, then — with the session lock
     /// RELEASED — executes the folded `EngineEffect`: param writes to
     /// `self.params`, at most one `ControlMsg::Rebuild`, and exactly one
-    /// `project://changed` event carrying additive JSON `{rev, label,
-    /// actor}` (D-06: readers ignore fields they don't recognize).
+    /// `project://changed` event. `project://changed` is a FROZEN event
+    /// whose payload contract is the full `Project` shape
+    /// (project.schema.json; ARCHITECTURE §3.4) — this carries EXACTLY that
+    /// (via `project_changed_payload`, the same serialization
+    /// `create_project` uses), with `rev`/`label`/`actor` folded in as
+    /// ADDITIVE top-level fields (D-06: readers ignore fields they don't
+    /// recognize).
     ///
     /// Zero engine/param-table/event calls happen while the lock is held —
     /// `Session::transact` (session.rs) only ever computes the effect
-    /// DESCRIPTION; everything below this comment runs after it returns.
+    /// DESCRIPTION; everything below this comment runs after it returns
+    /// (`project_changed_payload` takes its own fresh, separate lock).
     pub fn commit<F>(&self, meta: op::TxMeta, f: F) -> Result<session::Committed, String>
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
@@ -346,20 +445,31 @@ impl ControlPlane {
         if committed.effect.rebuild {
             self.engine.send(ControlMsg::Rebuild);
         }
-        #[derive(Serialize)]
-        struct ChangeNotice<'a> {
-            rev: u64,
-            label: &'a str,
-            actor: &'a op::Actor,
+        // Full-Project payload (the frozen contract) + rev/label/actor as
+        // additive fields (D-06). `project_changed_payload` serializes to a
+        // JSON object (all of `Project`'s fields are named), so inserting
+        // extra keys is safe; the `unwrap_or_default` fallback (an empty
+        // object) only matters if serialization itself somehow failed.
+        let mut payload = serde_json::to_value(self.project_changed_payload())
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert("rev".into(), serde_json::json!(committed.rev));
+            map.insert("label".into(), serde_json::json!(committed.meta.label));
+            map.insert(
+                "actor".into(),
+                serde_json::to_value(&committed.meta.actor).unwrap_or_default(),
+            );
         }
-        let payload = serde_json::to_value(&ChangeNotice {
-            rev: committed.rev,
-            label: &committed.meta.label,
-            actor: &committed.meta.actor,
-        })
-        .unwrap_or_default();
         (self.emit)("project://changed", payload);
         Ok(committed)
+    }
+
+    /// Test-only accessor to the shared session lock, for tests that need
+    /// to assert on/mutate store state directly around a `commit`-driven
+    /// call (Task 7 brief).
+    #[cfg(test)]
+    pub fn session(&self) -> &Arc<Mutex<Session>> {
+        &self.session
     }
 
     pub fn create_project(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
@@ -840,7 +950,7 @@ pub fn set_track_mix(
     changes: Vec<TrackMixChange>,
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<Vec<TrackState>, String> {
-    control.set_track_mix(changes)
+    control.set_track_mix(changes, op::TxMeta::user("set track mix"))
 }
 
 /// Import an audio file as a clip (STUB until zone B lands).
@@ -964,6 +1074,33 @@ mod tests {
         );
     }
 
+    /// Task 7 brief, step 1: `remove_track` runs through the channel — the
+    /// row disappears from the store and exactly one `Rebuild` is sent
+    /// (today's asymmetry with `add_track`, which always went through
+    /// `commit`, is gone).
+    #[test]
+    fn remove_track_goes_through_the_channel_and_rebuilds_once() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
+        plane.remove_track("t-1", user_meta("remove track")).unwrap();
+        assert!(plane.session().lock().store.tracks.iter().all(|t| t.id != "t-1"));
+        assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
+    }
+
+    /// Controller ruling 2: removing the only soloed track through the
+    /// channel must recompute the store-wide `any_solo` RT atomic (old
+    /// `remove_track`, audio/mod.rs:378, did this too).
+    #[test]
+    fn remove_track_recomputes_any_solo() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
+        {
+            let mut session = plane.session().lock();
+            session.store.tracks[0].soloed = true;
+        }
+        plane.params.any_solo.store(true, Relaxed);
+        plane.remove_track("t-1", user_meta("remove soloed track")).unwrap();
+        assert!(!plane.params.any_solo.load(Relaxed), "any_solo must go false");
+    }
+
     fn recording_control_plane() -> (Arc<ControlPlane>, RecordedEvents, EngineHandle) {
         struct NullEvents;
         impl crate::audio::engine::EventSink for NullEvents {
@@ -999,15 +1136,20 @@ mod tests {
     #[test]
     fn set_track_mix_emits_project_changed_with_updated_tracks() {
         let (cp, events, engine) = recording_control_plane();
-        let track = cp.add_track(Some("Agent Mix".into()), None).unwrap();
+        let track = cp
+            .add_track(Some("Agent Mix".into()), None, TxMeta::user("add track"))
+            .unwrap();
         events.lock().clear();
 
-        cp.set_track_mix(vec![TrackMixChange {
-            gain_db: Some(-6.0),
-            pan: Some(0.5),
-            muted: Some(true),
-            ..TrackMixChange::new(&track.id)
-        }])
+        cp.set_track_mix(
+            vec![TrackMixChange {
+                gain_db: Some(-6.0),
+                pan: Some(0.5),
+                muted: Some(true),
+                ..TrackMixChange::new(&track.id)
+            }],
+            TxMeta::user("set track mix"),
+        )
         .unwrap();
 
         {
@@ -1033,7 +1175,9 @@ mod tests {
         }
 
         events.lock().clear();
-        assert!(cp.set_track_mix(vec![TrackMixChange::new("no-such-track")]).is_err());
+        assert!(cp
+            .set_track_mix(vec![TrackMixChange::new("no-such-track")], TxMeta::user("bad batch"))
+            .is_err());
         assert!(
             events.lock().iter().all(|(name, _)| name != "project://changed"),
             "failed batch must not announce a change"

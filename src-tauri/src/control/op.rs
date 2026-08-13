@@ -37,6 +37,31 @@ pub struct TxMeta {
     pub label: String,
 }
 
+impl TxMeta {
+    /// A fresh correlation id + `label`, attributed to a human through the
+    /// Tauri IPC surface. Every migrated A-slice command builds its own
+    /// `TxMeta` at the call site (Task 7) rather than defaulting one deep
+    /// inside `ControlPlane`, so the actor is always an explicit choice.
+    pub fn user(label: impl Into<String>) -> Self {
+        Self { actor: Actor::User, run: uuid::Uuid::new_v4().to_string(), label: label.into() }
+    }
+
+    /// Same, attributed to the named MCP tool call.
+    pub fn agent(tool: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            actor: Actor::Agent { tool: tool.into() },
+            run: uuid::Uuid::new_v4().to_string(),
+            label: label.into(),
+        }
+    }
+
+    /// Same, attributed to an automated system process (e.g. a sidecar
+    /// job's post-processing hook, not a direct user/agent request).
+    pub fn system(label: impl Into<String>) -> Self {
+        Self { actor: Actor::System, run: uuid::Uuid::new_v4().to_string(), label: label.into() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

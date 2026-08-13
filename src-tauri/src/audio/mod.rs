@@ -364,21 +364,18 @@ pub fn add_track(
     kind: Option<String>,
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<TrackState, String> {
-    control.add_track(name, kind)
+    control.add_track(name, kind, control::op::TxMeta::user("add track"))
 }
 
+/// Runs through the transaction channel (`ControlPlane::remove_track`) —
+/// the clip cleanup + slot free + single `Rebuild` sequencing that used to
+/// live directly in this command body now lives there.
 #[tauri::command]
-pub fn remove_track(track_id: String, state: State<'_, AudioState>) -> Result<(), String> {
-    {
-        let mut session = state.session.lock();
-        let s = &mut session.store;
-        s.tracks.retain(|t| t.id != track_id);
-        s.clips.retain(|c| c.track_id != track_id);
-        s.free_slot(&track_id);
-        state.params.any_solo.store(s.any_solo(), Relaxed);
-    }
-    state.engine()?.send(ControlMsg::Rebuild);
-    Ok(())
+pub fn remove_track(
+    track_id: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.remove_track(&track_id, control::op::TxMeta::user("remove track"))
 }
 
 #[tauri::command]
@@ -391,8 +388,9 @@ pub fn get_tracks(state: State<'_, AudioState>) -> Result<Vec<TrackState>, Strin
 fn single_mix_change(
     control: &ControlPlane,
     change: TrackMixChange,
+    label: &str,
 ) -> Result<TrackState, String> {
-    let mut updated = control.set_track_mix(vec![change])?;
+    let mut updated = control.set_track_mix(vec![change], control::op::TxMeta::user(label))?;
     updated.pop().ok_or_else(|| "empty mix result".to_string())
 }
 
@@ -406,6 +404,7 @@ pub fn set_track_gain(
     single_mix_change(
         &control,
         TrackMixChange { gain_db: Some(gain_db), ..TrackMixChange::new(track_id) },
+        "set gain",
     )
 }
 
@@ -419,6 +418,7 @@ pub fn set_track_pan(
     single_mix_change(
         &control,
         TrackMixChange { pan: Some(pan), ..TrackMixChange::new(track_id) },
+        "set pan",
     )
 }
 
@@ -431,6 +431,7 @@ pub fn set_track_mute(
     single_mix_change(
         &control,
         TrackMixChange { muted: Some(muted), ..TrackMixChange::new(track_id) },
+        "set mute",
     )
 }
 
@@ -443,6 +444,7 @@ pub fn set_track_solo(
     single_mix_change(
         &control,
         TrackMixChange { soloed: Some(soloed), ..TrackMixChange::new(track_id) },
+        "set solo",
     )
 }
 
@@ -455,6 +457,7 @@ pub fn set_track_arm(
     single_mix_change(
         &control,
         TrackMixChange { armed: Some(armed), ..TrackMixChange::new(track_id) },
+        "set arm",
     )
 }
 

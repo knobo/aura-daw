@@ -102,7 +102,10 @@ impl Tx<'_> {
 ///   whole-store flag, so this is a minimal, justified extension beyond the
 ///   brief's tuple sketch: recomputed on every track `Set` in the
 ///   transaction (slot or not — `any_solo` doesn't require one); the last
-///   write is truth, so repeat recomputation is harmless.
+///   write is truth, so repeat recomputation is harmless. Also recomputed on
+///   `Op::TrackRemove` (Task 7, controller ruling 2): the removed row may
+///   have been the only soloed track. `Op::TrackAdd` does NOT need this — a
+///   fresh row is never soloed, so an add can never flip the flag.
 /// * `rebuild`: `TrackAdd`/`TrackRemove` set it; N structural ops still
 ///   fold to a single flag, i.e. at most one `ControlMsg::Rebuild`.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -209,6 +212,12 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown track: {}", track.id))?;
             let removed = session.store.tracks.remove(pos);
             effect.rebuild = true;
+            // Removing a track can flip the store-wide any_solo flag (the
+            // removed row may have been the only soloed track) — recompute
+            // it here, same as TrackAdd's Set-path recompute above. A fresh
+            // TrackAdd row is never soloed (ops::new_track_row), so adding
+            // never changes any_solo and doesn't need this.
+            effect.any_solo = Some(session.store.any_solo());
             Ok(Op::TrackAdd { track: removed, index: pos })
         }
         _ => Err("op not yet supported".into()),

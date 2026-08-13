@@ -487,8 +487,13 @@ pub(crate) fn wrap_sink_with_stem_import(
                 std::thread::spawn(move || {
                     for (stem, path) in ordered {
                         let line = (|| -> Result<String, String> {
-                            let track = control
-                                .add_track(Some(format!("{clip_name} {stem}")), Some("audio".into()))?;
+                            let track = control.add_track(
+                                Some(format!("{clip_name} {stem}")),
+                                Some("audio".into()),
+                                crate::control::op::TxMeta::system(format!(
+                                    "auto-import stem: {stem}"
+                                )),
+                            )?;
                             let clip = control.import_audio_clip_impl(ImportClipRequest {
                                 path,
                                 track_id: Some(track.id.clone()),

@@ -104,15 +104,21 @@ pub(crate) fn insert_track(store: &mut Store, track: TrackState, index: usize) {
     store.tracks.insert(index, track);
 }
 
-/// Create a track in the store and reset its RT param slot. STRUCTURAL —
-/// the caller must send `ControlMsg::Rebuild` afterwards.
-/// `kind`: "audio" (default) or "midi" (phase 2; "bus" reserved).
-pub fn add_track(
+/// Allocate an RT slot and build a fresh track row — everything `add_track`
+/// does EXCEPT inserting it into `store.tracks`. Split out (Task 7) so
+/// `ControlPlane::add_track` can insert the row through the transaction
+/// channel (`Op::TrackAdd`, via `Session::transact`) instead of a direct
+/// `Vec::insert`, while slot allocation + the RT param reset — like
+/// `remove_track`'s slot free — stay outside the op layer this plan
+/// (round-2 §2.4; `control::session`'s `Op::TrackAdd` arm never touches
+/// slots). Returns `(track, index)`; `index` is the row's intended position
+/// (end of the current list).
+pub(crate) fn new_track_row(
     store: &mut Store,
     params: &ParamTable,
     name: Option<String>,
     kind: Option<String>,
-) -> Result<TrackState, String> {
+) -> Result<(TrackState, usize), String> {
     let kind = kind.unwrap_or_else(|| "audio".into());
     if !matches!(kind.as_str(), "audio" | "midi") {
         return Err(format!("unsupported track kind: {kind}"));
@@ -135,7 +141,24 @@ pub fn add_track(
         color: TRACK_COLORS[n % TRACK_COLORS.len()].into(),
         instrument_id: None,
     };
-    insert_track(store, track.clone(), n);
+    Ok((track, n))
+}
+
+/// Create a track in the store and reset its RT param slot. STRUCTURAL —
+/// the caller must send `ControlMsg::Rebuild` afterwards. `kind`: "audio"
+/// (default) or "midi" (phase 2; "bus" reserved). Used directly by callers
+/// that mutate the store outside the transaction channel (currently only
+/// `seed_demo_project`, which builds several tracks under one lock before
+/// any engine/event side effect); the frozen `add_track` COMMAND goes
+/// through `ControlPlane::add_track` -> `commit` -> `new_track_row` instead.
+pub fn add_track(
+    store: &mut Store,
+    params: &ParamTable,
+    name: Option<String>,
+    kind: Option<String>,
+) -> Result<TrackState, String> {
+    let (track, index) = new_track_row(store, params, name, kind)?;
+    insert_track(store, track.clone(), index);
     Ok(track)
 }
 
