@@ -25,7 +25,7 @@ naive-questions pass). The result:
 round 1, dossiers [06](06-time-travel-storage.md) and
 [10](10-aura-current-state.md) carry **marked corrections** (never silent
 edits), and the surviving decisions are distilled as ADRs — Status:
-Proposed — in [`docs/adr/`](../adr/README.md).
+Accepted 2026-08-13 — in [`docs/adr/`](../adr/README.md).
 
 **This directory is history, not law.** What binds code lives in
 `ARCHITECTURE.md` (as built), `SCALABILITY.md` (the debt register), and

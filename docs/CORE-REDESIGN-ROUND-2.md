@@ -1,6 +1,15 @@
 # AURA — Core redesign, round 2
 
-**Status: DRAFT. Not authoritative, and nothing here binds code yet.**
+**Status: ACCEPTED (2026-08-13, project owner). This document binds the
+core work; its decisions are recorded as ADRs 0001–0007 in
+[`docs/adr/`](adr/README.md), all Accepted.** A fresh-eyes consistency
+review verified the fold-in against the code at HEAD, its eleven
+precision findings were fixed, and the owner then resolved the six open
+owner decisions it identified: the WebView arranger continues under the
+binding thin-renderer rule; the full side-channel migration, the v3
+format migration, and the MAX_TRACKS removal are all in the round; the
+retention caps stand as measured.
+
 This document supersedes [`CORE-REDESIGN-ROUND-1.md`](CORE-REDESIGN-ROUND-1.md),
 which is kept for the record. Round 1 was subjected to an adversarial review
 on 2026-08-13 — six independent attack agents plus a naive-questions pass —
@@ -739,6 +748,10 @@ pushed state and emits ops/gestures. That rule costs nothing this round
 exit open.
 
 ### 9.3 Judgment
+
+**Owner-accepted 2026-08-13** (ADR 0006): the WebView-based arranger
+continues; the frontend stays thin both as exit insurance and because
+thinness is a performance requirement in its own right.
 
 Tauri is good enough to *start* with, on today's evidence: the failure
 modes are performance-shaped, not correctness-shaped, they are measurable

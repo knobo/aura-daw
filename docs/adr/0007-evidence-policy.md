@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** (2026-08-13). Distilled from `docs/CORE-REDESIGN-ROUND-2.md`
+**Accepted** (2026-08-13, project owner). Distilled from `docs/CORE-REDESIGN-ROUND-2.md`
 (header, §0, §6) — itself DRAFT; the owner accepts this ADR, not its authors.
 
 ## Context

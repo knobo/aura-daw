@@ -2,8 +2,8 @@
 
 ## Status
 
-**Proposed** (2026-08-13). Distilled from `docs/CORE-REDESIGN-ROUND-2.md`
-§2.3/§6 (DRAFT); the owner accepts this ADR, not its authors.
+**Accepted** (2026-08-13, project owner). Distilled from `docs/CORE-REDESIGN-ROUND-2.md`
+§2.3/§6; accepted together with the resolution of all six owner decisions from the consistency review.
 
 ## Context
 

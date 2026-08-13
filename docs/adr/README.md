@@ -1,13 +1,17 @@
 # AURA — Architecture Decision Records
 
-Decisions distilled from `docs/CORE-REDESIGN-ROUND-2.md` (2026-08-13, DRAFT)
+Decisions distilled from `docs/CORE-REDESIGN-ROUND-2.md` (2026-08-13)
 and the research dossiers in `docs/research/`.
 
 **Numbering:** `NNNN-<slug>.md`, monotonically increasing, never reused.
 **Status convention:** every ADR carries `Proposed` / `Accepted` /
-`Superseded (by NNNN)`. All seven below are **Proposed** — round 2 is a
-DRAFT, and acceptance is the owner's call, recorded by editing the Status
-line, not by the authors.
+`Superseded (by NNNN)`. Acceptance is the owner's call, recorded by
+editing the Status line, not by the authors. **All seven below were
+Accepted by the owner on 2026-08-13**, together with the resolution of
+the six open owner decisions from the round-2 consistency review
+(WebView arranger continues under the thin-renderer rule; the full
+side-channel migration, the v3 format migration, and the MAX_TRACKS
+removal are all in the round; retention caps set from measurement).
 
 | # | ADR | One line |
 |---|---|---|
