@@ -15,13 +15,21 @@
 //! and unreachable from an integration test) — this file defines its own,
 //! parallel but independent.
 //!
-//! Clip-carrying structural ops are exercised by Gate B (tests/identity_properties.rs).
+//! Gate B (Task 8) lifts Task 1's original clip-free exclusion:
+//! `arb_op_batches`'s `TrackAdd`/`TrackRemove` now attach 0..2 freshly-minted
+//! clips, so `undo_round_trip`'s byte-stability oracle also covers
+//! clip-carrying histories, not just bare track rows. (The dedicated
+//! delete-then-undo identity property — random SUBSETS of tracks removed one
+//! at a time, with interleaved clip ownership across the whole store — lives
+//! in `tests/identity_properties.rs`; this file's coverage is the general
+//! Gate A op-batch fuzzer, now clip-aware.)
 
 use proptest::prelude::*;
 
-use aura_lib::audio::types::{Store, TrackState};
+use aura_lib::audio::types::{Clip, Store, TrackState};
 use aura_lib::control::op::{Actor, ObjectRef, Op, PropPath, TxMeta};
 use aura_lib::control::Session;
+use aura_lib::ids::SourceId;
 use aura_lib::midi::MidiStore;
 
 // ---------------------------------------------------------------------------
@@ -61,6 +69,29 @@ fn test_track(id: &str) -> TrackState {
 
 fn user_meta(label: &str) -> TxMeta {
     TxMeta { actor: Actor::User, run: "prop-run".into(), label: label.into() }
+}
+
+/// A standalone `Clip` row for `TrackAdd`/`TrackRemove` op payloads (Gate B
+/// clip-carrying coverage). The empty/default `SourceId` is the documented
+/// "unassigned" sentinel (`audio/types.rs::Clip::source_id`) — fine here,
+/// these clips never reach the engine's decode cache.
+fn test_clip(id: &str, track_id: &str) -> Clip {
+    Clip {
+        id: id.into(),
+        track_id: track_id.into(),
+        name: format!("Clip {id}"),
+        source_path: "audio/x.wav".into(),
+        source_id: SourceId::default(),
+        source_channels: 2,
+        source_sample_rate: 48_000,
+        source_length_samples: 48_000,
+        timeline_start_samples: 0,
+        offset_samples: 0,
+        length_samples: 48_000,
+        gain_db: 0.0,
+        fade_in_samples: 0,
+        fade_out_samples: 0,
+    }
 }
 
 /// `from` is intentionally `Null`: it's advisory only — `apply_raw` re-reads
@@ -151,9 +182,15 @@ enum SetKind {
 enum RawAction {
     /// `pick` selects an alive track by `pick % alive.len()`.
     Set(usize, SetKind),
-    Add,
-    /// `pick` selects an alive track by `pick % alive.len()`.
-    Remove(usize),
+    /// `n_clips` (0..=2) freshly-minted clips travel with the new row
+    /// (Gate B: Task 1's clip-free exclusion lifted).
+    Add(usize),
+    /// `pick` selects an alive track by `pick % alive.len()`; `n_clips`
+    /// (0..=2) freshly-minted clips are attached to the op payload — advisory
+    /// only (`apply_raw` collects the REAL removed clips from store truth),
+    /// but exercised anyway so a clip-carrying `TrackRemove` payload is part
+    /// of the fuzzed op vocabulary too.
+    Remove(usize, usize),
 }
 
 fn set_kind_strategy() -> impl Strategy<Value = SetKind> {
@@ -173,17 +210,33 @@ fn set_kind_strategy() -> impl Strategy<Value = SetKind> {
 fn raw_action_strategy() -> impl Strategy<Value = RawAction> {
     prop_oneof![
         4 => (any::<usize>(), set_kind_strategy()).prop_map(|(p, k)| RawAction::Set(p, k)),
-        2 => Just(RawAction::Add),
-        3 => any::<usize>().prop_map(RawAction::Remove),
+        2 => (0usize..=2).prop_map(RawAction::Add),
+        3 => (any::<usize>(), 0usize..=2).prop_map(|(p, n)| RawAction::Remove(p, n)),
     ]
 }
 
-/// Resolves one `RawAction` against the threaded model, mutating `alive` and
-/// `counter` (used only to mint fresh, distinct generated-track ids). Returns
-/// `None` when the action is a no-op given current model state (e.g. a
-/// Set/Remove drawn while `alive` is empty) — the caller filters those out,
-/// so a batch may end up shorter than requested (never invalid).
-fn resolve_one(action: RawAction, alive: &mut Vec<String>, counter: &mut u32) -> Option<Op> {
+/// Mint `n` freshly-numbered clips owned by `track_id`, advancing
+/// `clip_counter` (kept separate from the track-id `counter` so ids never
+/// collide across the two families).
+fn mint_clips(track_id: &str, n: usize, clip_counter: &mut u32) -> Vec<Clip> {
+    (0..n)
+        .map(|_| {
+            let cid = format!("clip-{}", *clip_counter);
+            *clip_counter += 1;
+            test_clip(&cid, track_id)
+        })
+        .collect()
+}
+
+/// Resolves one `RawAction` against the threaded model, mutating `alive`,
+/// `counter` (fresh, distinct generated-track ids) and `clip_counter` (fresh,
+/// distinct generated-clip ids). Returns `None` when the action is a no-op
+/// given current model state (e.g. a Set/Remove drawn while `alive` is
+/// empty) — the caller filters those out, so a batch may end up shorter than
+/// requested (never invalid).
+fn resolve_one(
+    action: RawAction, alive: &mut Vec<String>, counter: &mut u32, clip_counter: &mut u32,
+) -> Option<Op> {
     match action {
         RawAction::Set(pick, kind) => {
             if alive.is_empty() {
@@ -199,27 +252,34 @@ fn resolve_one(action: RawAction, alive: &mut Vec<String>, counter: &mut u32) ->
             };
             Some(Op::Set { object: ObjectRef::Track(id.into()), path, from: serde_json::Value::Null, to })
         }
-        RawAction::Add => {
+        RawAction::Add(n_clips) => {
             let id = format!("gen-{}", *counter);
             *counter += 1;
             alive.push(id.clone());
-            // Clip-free by design — see the module doc comment.
+            // `clip_indices` stays empty: `apply_raw`'s TrackAdd arm falls
+            // back to appending (`clip_indices.len() == clips.len()` is
+            // false for empty indices against non-empty clips), which is
+            // exactly right for a genuinely NEW row — there is no prior
+            // position to restore.
+            let clips = mint_clips(&id, n_clips, clip_counter);
             Some(Op::TrackAdd {
-                track: test_track(&id), index: alive.len() - 1, clips: vec![], clip_indices: vec![],
+                track: test_track(&id), index: alive.len() - 1, clips, clip_indices: vec![],
             })
         }
-        RawAction::Remove(pick) => {
+        RawAction::Remove(pick, n_clips) => {
             if alive.is_empty() {
                 return None;
             }
             let idx = pick % alive.len();
             let id = alive.remove(idx);
-            // `track`'s non-id fields are advisory-ignored by `apply_raw`
-            // (store truth wins for the removed row and its clips) — only
-            // `.id` matters for finding the row to remove.
-            Some(Op::TrackRemove {
-                track: test_track(&id), index: idx, clips: vec![], clip_indices: vec![],
-            })
+            // `track`/`clips`/`clip_indices` are all advisory-ignored by
+            // `apply_raw` (store truth wins for the removed row and its
+            // real clips) — only `.id` matters for finding the row to
+            // remove. Attaching minted clips here anyway exercises that
+            // "advisory, ignored" path even when the payload itself carries
+            // clips.
+            let clips = mint_clips(&id, n_clips, clip_counter);
+            Some(Op::TrackRemove { track: test_track(&id), index: idx, clips, clip_indices: vec![] })
         }
     }
 }
@@ -229,12 +289,13 @@ fn arb_op_batches(num_batches: std::ops::Range<usize>) -> impl Strategy<Value = 
         .prop_map(|raw_batches| {
             let mut alive: Vec<String> = SEED_IDS.iter().map(|s| s.to_string()).collect();
             let mut counter: u32 = 0;
+            let mut clip_counter: u32 = 0;
             raw_batches
                 .into_iter()
                 .map(|batch| {
                     batch
                         .into_iter()
-                        .filter_map(|a| resolve_one(a, &mut alive, &mut counter))
+                        .filter_map(|a| resolve_one(a, &mut alive, &mut counter, &mut clip_counter))
                         .collect::<Vec<Op>>()
                 })
                 .collect()

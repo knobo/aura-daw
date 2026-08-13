@@ -1193,6 +1193,118 @@ mod tests {
         (cp, engine_rx, events)
     }
 
+    /// Round-2 O-13: the alias window (Gate B, Task 8 step 2). Sequence:
+    /// graph gen-N plays track X. X is removed and Y added (both through the
+    /// channel); the rebuild for gen-N+1 is queued but the callback has NOT
+    /// adopted it. A param write to Y (via commit) must land in gen-N+1's
+    /// table only; gen-N's table — which the still-playing old graph reads —
+    /// must be untouched. With Store-owned slots this was the aliasing bug;
+    /// with per-graph tables it is impossible, and this test pins it at the
+    /// `ControlPlane` level.
+    ///
+    /// In-crate (not `tests/identity_properties.rs`, controller ruling for
+    /// Task 8): `EngineHandle::for_tests` is `#[cfg(test)]`-gated, reachable
+    /// only when the crate compiles its own test target, not when pulled in
+    /// as a library dependency of an integration-test binary under `tests/`
+    /// — widening its visibility via a Cargo feature was ruled out for this
+    /// task, so the test lives here instead, alongside `test_plane_with_tracks`.
+    #[test]
+    fn old_graph_never_sees_the_new_tracks_params() {
+        use crate::audio::mixer::db_to_linear;
+        use crate::ids::TrackId;
+
+        let track_x = TrackId::from("track-x");
+
+        let mut store = Store::default();
+        store.tracks.push(test_track(track_x.as_str()));
+        let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
+
+        // gen-1 tables: X on slot 0, gain -6 dB (linear, as ParamTable
+        // stores it — `ControlPlane::commit` resolves `Op::Set`'s Gain path
+        // through `ParamTable::set_gain_linear`).
+        let gen1_params = Arc::new(ParamTable::default());
+        let x_gain_linear = db_to_linear(-6.0);
+        gen1_params.set_gain_linear(0, x_gain_linear);
+        let gen1_slots: std::collections::HashMap<TrackId, usize> =
+            [(track_x.clone(), 0)].into_iter().collect();
+        let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            generation: 1,
+            params: gen1_params.clone(),
+            slots: gen1_slots,
+        }));
+
+        let shared = Arc::new(SharedRt::default());
+        let (engine, _engine_rx) = EngineHandle::for_tests();
+        let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+
+        let plane = ControlPlane::new(
+            session,
+            shared,
+            tables.clone(),
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+        );
+
+        // Real ops through the real channel — remove X, add Y — mirroring
+        // round-2 O-13's actual sequence rather than manual store surgery.
+        plane.remove_track(track_x.as_str(), user_meta("remove x")).unwrap();
+        let track_y_row =
+            plane.add_track(Some("Y".into()), Some("audio".into()), user_meta("add y")).unwrap();
+        let track_y = track_y_row.id.clone();
+
+        // Simulate the control thread's rebuild WITHOUT adopting a new graph
+        // — this is the alias window itself: the rebuild for gen-2 is
+        // "queued" (here: hand-published) but no callback has adopted it,
+        // exactly as `engine::Control::rebuild` would publish under the
+        // session lock (rule [C1]) before the RT thread ever sees the new
+        // graph.
+        let gen2_params = Arc::new(ParamTable::default());
+        let gen2_slots: std::collections::HashMap<TrackId, usize> =
+            [(track_y.clone(), 0)].into_iter().collect();
+        *tables.lock() =
+            GraphTables { generation: 2, params: gen2_params.clone(), slots: gen2_slots };
+
+        // A param write to Y (through the real channel) must resolve
+        // through gen-2's CURRENT table.
+        let y_gain_db = -12.0;
+        plane
+            .commit(user_meta("mix y"), |tx| {
+                tx.apply(Op::Set {
+                    object: ObjectRef::Track(track_y.clone()),
+                    path: PropPath::Gain,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(y_gain_db),
+                })
+            })
+            .unwrap();
+
+        // gen-2's slot 0 changed to Y's write...
+        let gen2_slot0_gain =
+            f32::from_bits(gen2_params.gain[0].load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            (gen2_slot0_gain - db_to_linear(y_gain_db)).abs() < 1e-4,
+            "gen-2's table must carry Y's write (got {gen2_slot0_gain}, want ~{})",
+            db_to_linear(y_gain_db)
+        );
+
+        // ...but the RETAINED gen-1 Arc — held by this test exactly the way
+        // a still-rendering old `RtGraph` would hold it — must be untouched.
+        // With Store-owned slots this was the aliasing bug (a freed-then-
+        // reused slot 0 would show Y's gain under X's still-playing graph);
+        // with per-graph tables there is nothing to free, so gen-1's Arc is
+        // a wholly separate object and this assertion cannot fail by
+        // construction.
+        let gen1_slot0_gain =
+            f32::from_bits(gen1_params.gain[0].load(std::sync::atomic::Ordering::Relaxed));
+        assert!(
+            (gen1_slot0_gain - x_gain_linear).abs() < 1e-6,
+            "gen-1's retained table must be untouched by Y's write — this is the whole point of \
+             per-graph tables (round-2 O-13); got {gen1_slot0_gain}, want ~{x_gain_linear}"
+        );
+    }
+
     /// The gate test (task-6 brief): a batch with two structural ops
     /// (`TrackAdd` x2) and one mix `Set` must fold to exactly one
     /// `ControlMsg::Rebuild` and emit exactly one `project://changed`, and
