@@ -25,7 +25,7 @@ placeholder output — develop AI-adjacent features without any model stack.
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 295 tests (counted 2026-08-13)
+cd src-tauri && cargo test   # 296 tests (counted 2026-08-13)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```

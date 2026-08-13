@@ -370,17 +370,22 @@ impl ControlPlane {
             }
             Ok(())
         })?;
+        // Re-lock (a fresh acquisition, separate from the pre-check and the
+        // commit above) to read back the post-commit state. A track that
+        // existed at the pre-check can vanish here if a concurrent
+        // `remove_track` lands between `commit` returning and this lock —
+        // `.expect("validated above")` used to panic a command thread on
+        // that race. `filter_map` instead treats a vanished row as simply
+        // absent from "the final post-batch state": every OTHER requested
+        // track's up-to-date row is still returned, matching this method's
+        // contract (`Vec<TrackState>` reflecting store state after the
+        // batch), and the caller already gets `project://changed` off the
+        // authoritative post-commit store regardless.
         let session = self.session.lock();
-        let mut updated = Vec::with_capacity(changes.len());
-        for c in &changes {
-            let t = session
-                .store
-                .tracks
-                .iter()
-                .find(|t| t.id == c.track_id)
-                .expect("validated above");
-            updated.push(t.clone());
-        }
+        let updated: Vec<TrackState> = changes
+            .iter()
+            .filter_map(|c| session.store.tracks.iter().find(|t| t.id == c.track_id).cloned())
+            .collect();
         Ok(updated)
     }
 
@@ -1260,6 +1265,50 @@ mod tests {
             "failed batch must not announce a change"
         );
         engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// Post-review fix: `set_track_mix`'s read-back used to `.expect()` a
+    /// row that a concurrent `remove_track` could make vanish between the
+    /// commit and the read-back lock, panicking a command thread. A truly
+    /// concurrent repro of that exact window isn't cheap to make
+    /// deterministic (it depends on interleaving two lock acquisitions
+    /// inside one method with no test seam between them), so this test
+    /// takes the cheap, honest route the fix description calls out
+    /// explicitly: drive the track through a real mix change, remove it
+    /// through the channel (same machinery a racing `remove_track` command
+    /// would use), then confirm a mix call naming that now-gone id returns
+    /// a clean `Err` — never a panic — rather than reaching the vanished
+    /// row. It exercises the pre-check's guard for "id unknown by the time
+    /// we look" and proves `set_track_mix` never panics on this shape of
+    /// input; it does not, by itself, force execution through the
+    /// `filter_map` read-back line (that line's dead code without the
+    /// race), but it pins the observable contract the fix restores: no
+    /// path through this method panics on a track that isn't there
+    /// anymore.
+    #[test]
+    fn set_track_mix_on_a_removed_track_errs_cleanly_instead_of_panicking() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+
+        // The track is live: an ordinary mix change succeeds.
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-3.0), ..TrackMixChange::new("t-1") }],
+                user_meta("set mix"),
+            )
+            .unwrap();
+
+        // Removed through the channel — the same path a concurrent
+        // `remove_track` command takes.
+        plane.remove_track("t-1", user_meta("remove track")).unwrap();
+        assert!(plane.session().lock().store.tracks.iter().all(|t| t.id != "t-1"));
+
+        // A second mix call naming the now-gone id must fail cleanly, not
+        // panic.
+        let result = plane.set_track_mix(
+            vec![TrackMixChange { gain_db: Some(1.0), ..TrackMixChange::new("t-1") }],
+            user_meta("set mix on gone track"),
+        );
+        assert!(result.is_err(), "mix change on a removed track must error, not panic");
     }
 
     /// MCP-parity regression (found filming the MCP demo): jobs submitted
