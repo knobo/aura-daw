@@ -121,7 +121,7 @@ impl MeterSink for LatestMeterCache {
 /// same convention the op/session unit tests use.
 fn set_prop(track_id: &str, path: op::PropPath, to: serde_json::Value) -> op::Op {
     op::Op::Set {
-        object: op::ObjectRef::Track(track_id.to_string()),
+        object: op::ObjectRef::Track(track_id.into()),
         path,
         from: serde_json::Value::Null,
         to,
@@ -585,7 +585,7 @@ impl ControlPlane {
             let mut session = self.session.lock();
             let ppq = session.midi.ppq;
             let (pad_clip, lead_clip, bass_clip) =
-                demo_seed_clips_v2(&pad.id, &lead.id, &bass.id, ppq);
+                demo_seed_clips_v2(pad.id.as_str(), lead.id.as_str(), bass.id.as_str(), ppq);
             session.midi.clips.push(pad_clip);
             session.midi.clips.push(lead_clip);
             session.midi.clips.push(bass_clip);
@@ -800,8 +800,8 @@ pub fn demo_seed_clips(
         }
     }
     let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| MidiClip {
-        id: uuid::Uuid::new_v4().to_string(),
-        track_id: track_id.to_string(),
+        id: uuid::Uuid::new_v4().to_string().into(),
+        track_id: track_id.into(),
         name: name.to_string(),
         timeline_start_ticks: 0,
         length_ticks: 4 * bar as u64,
@@ -888,8 +888,8 @@ pub fn demo_seed_clips_v2(
     }
 
     let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| MidiClip {
-        id: uuid::Uuid::new_v4().to_string(),
-        track_id: track_id.to_string(),
+        id: uuid::Uuid::new_v4().to_string().into(),
+        track_id: track_id.into(),
         name: name.to_string(),
         timeline_start_ticks: 0,
         length_ticks: 4 * bar as u64,
@@ -1230,7 +1230,7 @@ mod tests {
                 gain_db: Some(-6.0),
                 pan: Some(0.5),
                 muted: Some(true),
-                ..TrackMixChange::new(&track.id)
+                ..TrackMixChange::new(track.id.as_str())
             }],
             TxMeta::user("set track mix"),
         )

@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{ClipId, TrackId};
+
 /// Hard cap on mixer tracks; slot indices and meter blocks are sized by this.
 /// 64 conveniently matches a `u64` presence mask.
 pub const MAX_TRACKS: usize = 64;
@@ -101,7 +103,7 @@ pub struct TrackMeter {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackState {
-    pub id: String,
+    pub id: TrackId,
     pub name: String,
     /// "audio" (future: "midi", "bus")
     pub kind: String,
@@ -146,8 +148,8 @@ pub struct AudioDevice {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
-    pub id: String,
-    pub track_id: String,
+    pub id: ClipId,
+    pub track_id: TrackId,
     pub name: String,
     /// Relative to the .aura project dir, POSIX separators.
     pub source_path: String,
@@ -203,7 +205,7 @@ pub struct Store {
     pub project_name: Option<String>,
     pub created_at: Option<String>,
     /// track id -> RT parameter slot (0..MAX_TRACKS).
-    pub slots: HashMap<String, usize>,
+    pub slots: HashMap<TrackId, usize>,
     slot_used: [bool; MAX_TRACKS],
 }
 
@@ -230,7 +232,7 @@ impl Store {
         }
         let slot = self.slot_used.iter().position(|u| !u)?;
         self.slot_used[slot] = true;
-        self.slots.insert(track_id.to_string(), slot);
+        self.slots.insert(TrackId::from(track_id), slot);
         Some(slot)
     }
 
@@ -248,7 +250,7 @@ impl Store {
     pub fn track_slots(&self) -> Vec<(usize, String)> {
         self.tracks
             .iter()
-            .filter_map(|t| self.slots.get(&t.id).map(|&s| (s, t.id.clone())))
+            .filter_map(|t| self.slots.get(&t.id).map(|&s| (s, t.id.to_string())))
             .collect()
     }
 
@@ -265,7 +267,7 @@ impl Store {
     }
 
     pub fn armed_track_ids(&self) -> Vec<String> {
-        self.tracks.iter().filter(|t| t.armed).map(|t| t.id.clone()).collect()
+        self.tracks.iter().filter(|t| t.armed).map(|t| t.id.to_string()).collect()
     }
 
     pub fn cache_dir_for(dir: &Path, clip_id: &str) -> PathBuf {

@@ -118,7 +118,7 @@ fn snapshot(m: &parking_lot::Mutex<Session>) -> String {
             project_dir: &g.store.project_dir,
             project_name: &g.store.project_name,
             created_at: &g.store.created_at,
-            slots: g.store.slots.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            slots: g.store.slots.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
         },
         midi: MidiSnap {
             ppq: g.midi.ppq,
@@ -200,7 +200,7 @@ fn resolve_one(action: RawAction, alive: &mut Vec<String>, counter: &mut u32) ->
                 SetKind::Soloed(v) => (PropPath::Soloed, serde_json::json!(v)),
                 SetKind::Armed(v) => (PropPath::Armed, serde_json::json!(v)),
             };
-            Some(Op::Set { object: ObjectRef::Track(id), path, from: serde_json::Value::Null, to })
+            Some(Op::Set { object: ObjectRef::Track(id.into()), path, from: serde_json::Value::Null, to })
         }
         RawAction::Add => {
             let id = format!("gen-{}", *counter);

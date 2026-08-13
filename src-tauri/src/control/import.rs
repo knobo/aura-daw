@@ -237,7 +237,7 @@ pub(crate) fn do_import(
                         track.kind
                     ));
                 }
-                (dir, id.clone(), None)
+                (dir, crate::ids::TrackId::from(id.clone()), None)
             }
             None => {
                 let track = ops::add_track(
@@ -273,7 +273,7 @@ pub(crate) fn do_import(
     }
 
     let clip = Clip {
-        id: clip_id,
+        id: clip_id.into(),
         track_id,
         name: stem,
         source_path: rel,
@@ -496,7 +496,7 @@ pub(crate) fn wrap_sink_with_stem_import(
                             )?;
                             let clip = control.import_audio_clip_impl(ImportClipRequest {
                                 path,
-                                track_id: Some(track.id.clone()),
+                                track_id: Some(track.id.to_string()),
                                 at_samples: Some(at_samples),
                             })?;
                             Ok(format!(
@@ -529,7 +529,7 @@ impl ControlPlane {
         let (input, out_dir) = {
             let session = self.session.lock();
             let dir = session.store.project_dir.clone().ok_or("no project open")?;
-            (dir.join(&clip.source_path), dir.join("stems").join(&clip.id))
+            (dir.join(&clip.source_path), dir.join("stems").join(clip.id.as_str()))
         };
         let spec = demucs_split_spec(&input, &out_dir, simulate_mode())?;
         let job_id = self.submit_split_job(&clip, spec, sink);
@@ -653,7 +653,7 @@ mod tests {
             &session,
             &params,
             &ImportClipRequest {
-                track_id: Some(track_id.clone()),
+                track_id: Some(track_id.to_string()),
                 at_samples: Some(4800),
                 ..req(&src)
             },
@@ -680,7 +680,7 @@ mod tests {
         assert_eq!((ch, rate), (2, 44_100));
         assert_eq!(samples.len(), 2000);
         // Waveform pyramid cache exists.
-        assert!(pyramid_exists(&Store::cache_dir_for(&dir, &clip.id)));
+        assert!(pyramid_exists(&Store::cache_dir_for(&dir, clip.id.as_str())));
         drop(s);
         let _ = std::fs::remove_dir_all(parent);
     }
@@ -753,7 +753,7 @@ mod tests {
             ops::add_track(&mut s.store, &params, None, Some("midi".into())).unwrap().id
         };
         let e = do_import(&session, &params, &ImportClipRequest {
-            track_id: Some(midi_id), ..req(&wav)
+            track_id: Some(midi_id.to_string()), ..req(&wav)
         }).unwrap_err();
         assert!(e.contains("midi"), "{e}");
 
@@ -880,7 +880,7 @@ mod tests {
             assert_eq!(samples.len() as u64 / 2, clip.source_length_samples);
             // Not silent, and the waveform pyramid exists.
             assert!(samples.iter().any(|s| s.abs() > 0.05), ".{ext}: silent decode");
-            assert!(pyramid_exists(&Store::cache_dir_for(&dir, &clip.id)));
+            assert!(pyramid_exists(&Store::cache_dir_for(&dir, clip.id.as_str())));
         }
         // Each import auto-created its own track.
         assert_eq!(session.lock().store.tracks.len(), 4);

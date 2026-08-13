@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{ClipId, TrackId};
+
 /// Default ticks-per-quarter-note for new (v2) projects.
 /// 960 divides cleanly by 2..=10 dotted/triplet grids and matches common DAWs.
 pub const DEFAULT_PPQ: u32 = 960;
@@ -51,8 +53,8 @@ pub struct MidiNote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MidiClip {
-    pub id: String,
-    pub track_id: String,
+    pub id: ClipId,
+    pub track_id: TrackId,
     pub name: String,
     /// Placement on the timeline, in ticks.
     pub timeline_start_ticks: u64,

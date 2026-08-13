@@ -181,7 +181,7 @@ pub(crate) fn apply_hum_notes(
                     track.kind
                 ));
             }
-            (id, None)
+            (crate::ids::TrackId::from(id), None)
         }
         None => {
             let track = ops::add_track(
@@ -200,7 +200,7 @@ pub(crate) fn apply_hum_notes(
         .max()
         .unwrap_or(0);
     let clip = MidiClip {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: uuid::Uuid::new_v4().to_string().into(),
         track_id: target,
         name: name.to_string(),
         timeline_start_ticks: at_ticks,
@@ -666,7 +666,7 @@ mod tests {
 
         let (clip, created) = apply_hum_notes(
             &session, &params,
-            vec![note(0, 100, 60, 90)], 0, Some(midi_id.clone()), 0, "m",
+            vec![note(0, 100, 60, 90)], 0, Some(midi_id.to_string()), 0, "m",
         )
         .unwrap();
         assert!(created.is_none());
@@ -677,7 +677,7 @@ mod tests {
         // no mutation.
         let e = apply_hum_notes(
             &session, &params,
-            vec![note(0, 100, 60, 90)], 0, Some(audio_id), 0, "m",
+            vec![note(0, 100, 60, 90)], 0, Some(audio_id.to_string()), 0, "m",
         )
         .unwrap_err();
         assert!(e.contains("midi track"), "{e}");

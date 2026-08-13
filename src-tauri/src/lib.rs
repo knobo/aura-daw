@@ -27,6 +27,7 @@
 
 pub mod audio;
 pub mod control;
+pub mod ids;
 pub mod mcp;
 pub mod midi;
 pub mod plugins;

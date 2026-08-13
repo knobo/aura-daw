@@ -211,8 +211,8 @@ pub fn import_smf(bytes: &[u8], target_ppq: u32) -> Result<ImportedMidi, String>
             .unwrap_or(1)
             .max(1);
         clips.push(MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
-            track_id: String::new(),
+            id: uuid::Uuid::new_v4().to_string().into(),
+            track_id: String::new().into(),
             name: name.unwrap_or_else(|| format!("Imported track {}", ti + 1)),
             timeline_start_ticks: 0,
             length_ticks: length,

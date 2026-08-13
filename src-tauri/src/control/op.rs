@@ -44,7 +44,7 @@ pub enum Op {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "family", content = "id", rename_all = "camelCase")]
-pub enum ObjectRef { Track(String), Clip(String), MidiClip(String) }
+pub enum ObjectRef { Track(crate::ids::TrackId), Clip(crate::ids::ClipId), MidiClip(crate::ids::ClipId) }
 
 /// Property paths are a closed enum, not strings — renaming a variant is a
 /// compile error at every use site, which is the §4.6 anti-drift rule.

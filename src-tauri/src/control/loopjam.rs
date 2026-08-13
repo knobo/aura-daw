@@ -244,7 +244,7 @@ impl LoopJam {
                             t.kind
                         ));
                     }
-                    id.clone()
+                    crate::ids::TrackId::from(id.clone())
                 }
                 None => s
                     .tracks
@@ -322,7 +322,7 @@ impl LoopJam {
                 let jam = Arc::clone(&jam);
                 let track_id = track_for_sink.clone();
                 std::thread::spawn(move || {
-                    jam.on_job_done(epoch, out, track_id, region);
+                    jam.on_job_done(epoch, out, track_id.to_string(), region);
                 });
             }
             SidecarEvent::Error { message, .. } => {
@@ -335,7 +335,7 @@ impl LoopJam {
             let mut i = self.inner.lock();
             i.phase = Phase::Generating;
             i.job_id = Some(job_id);
-            i.track_id = Some(track_id);
+            i.track_id = Some(track_id.to_string());
             i.region = region;
             i.pending = None;
             i.last_error = None;
@@ -457,8 +457,8 @@ impl LoopJam {
         }
         let generation = self.inner.lock().generation;
         let clip = Clip {
-            id: clip_id,
-            track_id: track_id.to_string(),
+            id: clip_id.into(),
+            track_id: track_id.into(),
             name: format!("evolve {}", generation + 1),
             source_path: rel,
             source_channels: channels,
@@ -599,7 +599,7 @@ pub(crate) fn replace_region_clips(
         if ce > end {
             // Right remainder: fresh id, offset advanced past the cut.
             let mut right = c.clone();
-            right.id = uuid::Uuid::new_v4().to_string();
+            right.id = uuid::Uuid::new_v4().to_string().into();
             right.timeline_start_samples = end;
             right.offset_samples = c.offset_samples + (end - cs);
             right.length_samples = ce - end;

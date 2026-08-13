@@ -591,7 +591,7 @@ pub fn open_project(
         let s = &mut session.store;
         // Reset slots/params and adopt the loaded tracks.
         for t in s.tracks.clone() {
-            s.free_slot(&t.id);
+            s.free_slot(t.id.as_str());
         }
         s.tracks = project.tracks.clone();
         s.clips = project.clips.clone();
@@ -600,7 +600,7 @@ pub fn open_project(
         s.created_at = project.created_at.clone();
         for t in project.tracks.clone() {
             let slot = s
-                .alloc_slot(&t.id)
+                .alloc_slot(t.id.as_str())
                 .ok_or_else(|| format!("track limit reached ({})", types::MAX_TRACKS))?;
             state.params.set_gain_linear(slot, mixer::db_to_linear(t.gain_db));
             state.params.set_pan(slot, t.pan as f32);

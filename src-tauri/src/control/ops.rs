@@ -80,7 +80,7 @@ pub(crate) fn new_track_row(
         .ok_or_else(|| format!("track limit reached ({MAX_TRACKS})"))?;
     params.reset_slot(slot);
     let track = TrackState {
-        id,
+        id: id.into(),
         name: name.unwrap_or_else(|| format!("Track {}", n + 1)),
         kind,
         gain_db: 0.0,

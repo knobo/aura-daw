@@ -564,7 +564,7 @@ impl Control {
                     .iter()
                     .filter(|c| c.track_id == t.id)
                     .filter_map(|c| {
-                        let samples = self.cache.get(&c.id)?.clone();
+                        let samples = self.cache.get(c.id.as_str())?.clone();
                         Some(RtClip {
                             start: c.timeline_start_samples,
                             offset: c.offset_samples,
@@ -629,19 +629,19 @@ impl Control {
             store
                 .clips
                 .iter()
-                .filter(|c| !self.cache.contains_key(&c.id))
+                .filter(|c| !self.cache.contains_key(c.id.as_str()))
                 .filter_map(|c| {
                     Some((
-                        c.id.clone(),
+                        c.id.to_string(),
                         store.abs_path(&c.source_path)?,
-                        store.waveform_cache_dir(&c.id)?,
+                        store.waveform_cache_dir(c.id.as_str())?,
                     ))
                 })
                 .collect()
         };
         // Retain only clips that still exist.
         let live: std::collections::HashSet<String> =
-            self.session.lock().store.clips.iter().map(|c| c.id.clone()).collect();
+            self.session.lock().store.clips.iter().map(|c| c.id.to_string()).collect();
         self.cache.retain(|id, _| live.contains(id));
 
         for (clip_id, path, cache_dir) in todo {
@@ -847,7 +847,7 @@ impl Control {
             let dir = store.project_dir.clone().ok_or("no project open")?;
             let slots: Vec<usize> = targets
                 .iter()
-                .filter_map(|id| store.slots.get(id).copied())
+                .filter_map(|id| store.slots.get(id.as_str()).copied())
                 .collect();
             (dir, store.clips.len() + 1, slots)
         };

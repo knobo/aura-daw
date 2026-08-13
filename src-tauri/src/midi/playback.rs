@@ -135,12 +135,12 @@ pub fn append_from(
             Ok(map) => {
                 for t in store.tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = store.slots.get(&t.id) else { continue };
-                    let events = track_events(midi, &t.id, &map);
+                    let events = track_events(midi, t.id.as_str(), &map);
                     if events.is_empty() {
                         continue;
                     }
                     let node = node_for_track(t, bank, rate, nodes);
-                    live_ids.insert(t.id.clone());
+                    live_ids.insert(t.id.to_string());
                     out.push(RtTrack {
                         slot,
                         clips: Vec::new(),
@@ -185,7 +185,7 @@ fn node_for_track(
         if let Some(pid) = id.strip_prefix("plugin:") {
             let key = format!("plugin:{pid}@{rate}");
             if let Some(cell) =
-                nodes.resolve_with(&t.id, &key, || crate::plugins::live_node_for(pid, rate))
+                nodes.resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(pid, rate))
             {
                 return cell;
             }
@@ -195,7 +195,7 @@ fn node_for_track(
             );
         } else if let Some(compiled) = bank.and_then(|b| b.compiled(id)) {
             let key = format!("sampler:{id}@{rate}");
-            if let Some(cell) = nodes.resolve_with(&t.id, &key, move || {
+            if let Some(cell) = nodes.resolve_with(t.id.as_str(), &key, move || {
                 let mut node = SamplerNode::new((*compiled).clone());
                 node.prepare(rate, MAX_LIVE_BLOCK);
                 Some(Box::new(node))
@@ -211,7 +211,7 @@ fn node_for_track(
     }
     let key = format!("synth@{rate}");
     nodes
-        .resolve_with(&t.id, &key, || {
+        .resolve_with(t.id.as_str(), &key, || {
             let mut synth = PolySynth::new();
             synth.prepare(rate, MAX_LIVE_BLOCK);
             Some(Box::new(synth))
@@ -254,7 +254,7 @@ mod tests {
 
     fn clip(track_id: &str, start_ticks: u64, len_ticks: u64, notes: Vec<MidiNote>) -> MidiClip {
         MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::new_v4().to_string().into(),
             track_id: track_id.into(),
             name: "c".into(),
             timeline_start_ticks: start_ticks,

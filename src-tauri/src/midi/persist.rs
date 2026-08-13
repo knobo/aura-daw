@@ -175,8 +175,8 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V2Data>, String> {
             None => Vec::new(),
         };
         clips.push(MidiClip {
-            id: row.id,
-            track_id: row.track_id,
+            id: row.id.into(),
+            track_id: row.track_id.into(),
             name: row.name,
             timeline_start_ticks: row.timeline_start_ticks,
             length_ticks: row.length_ticks.max(1),
@@ -299,7 +299,7 @@ mod tests {
 
     fn clip(track: &str, notes: Vec<MidiNote>) -> MidiClip {
         MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::new_v4().to_string().into(),
             track_id: track.into(),
             name: "Clip".into(),
             timeline_start_ticks: 960,

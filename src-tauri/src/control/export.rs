@@ -528,7 +528,7 @@ impl ControlPlane {
             store.clips = s.clips.clone();
             for t in &s.tracks {
                 if s.slots.contains_key(&t.id) {
-                    store.alloc_slot(&t.id);
+                    store.alloc_slot(t.id.as_str());
                 }
             }
             let m = &session.midi;
@@ -912,7 +912,7 @@ mod tests {
         {
             let mut session = session.lock();
             let ppq = session.midi.ppq;
-            let (arp, groove) = crate::control::demo_seed_clips(&keys.id, &bass.id, ppq);
+            let (arp, groove) = crate::control::demo_seed_clips(keys.id.as_str(), bass.id.as_str(), ppq);
             session.midi.clips.push(arp);
             session.midi.clips.push(groove);
         }

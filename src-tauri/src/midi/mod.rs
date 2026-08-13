@@ -257,8 +257,8 @@ pub fn midi_add_clip(
     with_synced_store(&audio, &state, true, move |s| {
         let n = s.clips.len();
         let clip = MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
-            track_id,
+            id: uuid::Uuid::new_v4().to_string().into(),
+            track_id: track_id.into(),
             name: name.unwrap_or_else(|| format!("MIDI Clip {}", n + 1)),
             timeline_start_ticks,
             length_ticks,
@@ -357,7 +357,7 @@ pub fn midi_import_file(
                     ));
                 }
                 for c in &mut clips {
-                    c.track_id = id.clone();
+                    c.track_id = id.clone().into();
                     c.timeline_start_ticks += start;
                 }
             }

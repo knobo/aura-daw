@@ -164,8 +164,8 @@ fn run_writer(
             .write_dir(&w.spec.cache_dir)
             .map_err(|e| format!("waveform cache: {e}"))?;
         clips.push(Clip {
-            id: w.spec.clip_id,
-            track_id: w.spec.track_id,
+            id: w.spec.clip_id.into(),
+            track_id: w.spec.track_id.into(),
             name: w.spec.take_name,
             source_path: w.spec.rel_path,
             source_channels: channels,

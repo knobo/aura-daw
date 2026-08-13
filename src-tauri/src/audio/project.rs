@@ -270,7 +270,7 @@ mod tests {
 
     fn track_n(i: usize) -> TrackState {
         TrackState {
-            id: format!("t{i}"),
+            id: format!("t{i}").into(),
             name: format!("T{i}"),
             kind: "audio".into(),
             gain_db: 0.0,
