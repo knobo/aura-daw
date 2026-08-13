@@ -553,6 +553,57 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
+    /// Reviewer finding 4: the `.bin.bad` rename path (C-2) had no test
+    /// coverage. A chunk that decodes to structural corruption (not just a
+    /// missing file) must be renamed out of GC's consideration — evidence
+    /// preserved — while the project still loads with that clip empty.
+    #[test]
+    fn corrupt_chunk_is_renamed_to_bin_bad_and_clip_loads_empty() {
+        let parent = tmp_parent("bin-bad");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let midi = store_with(vec![clip("t1", some_notes(3))]);
+        save_into_project(&dir, &midi).unwrap();
+
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        let ev_ref = raw["midiClips"][0]["eventsRef"].as_str().unwrap().to_string();
+        let chunk_path = dir.join(&ev_ref);
+        let bad_path = chunk_path.with_extension("bin.bad");
+        assert!(chunk_path.is_file(), "chunk exists before corruption");
+        assert!(!bad_path.exists());
+
+        // Corrupt the chunk in place: valid magic/version/header so it parses
+        // past the header, but claims 5 records with zero record bytes
+        // following — a structural (truncation) failure in `decode_notes`,
+        // not just an I/O error or a magic mismatch.
+        let mut corrupt = Vec::new();
+        corrupt.extend_from_slice(&events::AMEV_MAGIC.to_le_bytes());
+        corrupt.extend_from_slice(&events::AMEV_VERSION.to_le_bytes());
+        corrupt.extend_from_slice(&0u16.to_le_bytes()); // columnMask
+        corrupt.extend_from_slice(&960u32.to_le_bytes()); // ppq
+        corrupt.extend_from_slice(&5u32.to_le_bytes()); // count = 5, but NO record bytes follow
+        fs::write(&chunk_path, &corrupt).unwrap();
+        assert!(events::decode_notes(&corrupt).is_err(), "the corrupted bytes really are structurally invalid");
+
+        let v2 = load_from_project(&dir).unwrap().unwrap();
+        assert!(v2.clips[0].notes.is_empty(), "corrupt chunk degrades to an empty clip, not a failed open");
+        assert!(!chunk_path.exists(), "the original .bin is gone (renamed away, not deleted)");
+        assert!(bad_path.is_file(), "the evidence survives at .bin.bad");
+        assert_eq!(
+            fs::read(&bad_path).unwrap(),
+            corrupt,
+            "renamed file's bytes are exactly the corrupt original"
+        );
+
+        // GC on the NEXT save must not have anything to do with the .bad
+        // file (it's not a `.bin`), and must not resurrect the clip's notes
+        // from thin air — the watermark row is still authoritative (C-1),
+        // notes stay empty.
+        save_into_project(&dir, &midi).unwrap();
+        assert!(bad_path.is_file(), "GC does not touch .bin.bad (only *.bin names it tracks as live)");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
     /// Zone-P4 seam: `update_project_v2` upgrades v1 files (with backup),
     /// preserves every other writer's fields, and survives a later midi save
     /// AND a later typed v1-path save.

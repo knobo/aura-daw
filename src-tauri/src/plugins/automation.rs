@@ -173,7 +173,10 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
             "AMEV version {version} is newer than supported {AMEV_VERSION}"
         ));
     }
-    let _mask = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?; // advisory only
+    // Advisory for bits automation doesn't interpret — but a mask bit with
+    // no matching block consumed is still structural corruption (checked
+    // generically below, same rule as `events::decode_notes`).
+    let mask = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
     let ppq = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
     let count = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
 
@@ -199,9 +202,13 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
     // Walk and skip every appended column block (self-describing, D-06);
     // automation never interprets any of them today.
     let mut last_bit: i32 = -1;
+    let mut bits_consumed: u16 = 0; // every colBit actually seen as a block
     loop {
         let remaining = (bytes.len() as u64).saturating_sub(r.position());
         if remaining < 6 {
+            // Fewer than 6 trailing bytes can't be a block header; ignoring
+            // this slack (rather than erroring on it) is intentional, not a
+            // gap — reviewed and accepted (Minor), mirrors decode_notes.
             break;
         }
         let col_bit = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -218,8 +225,20 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
             ));
         }
         last_bit = col_bit as i32;
+        bits_consumed |= col_bit;
         let mut buf = vec![0u8; byte_len as usize];
         std::io::Read::read_exact(&mut r, &mut buf).map_err(|e| e.to_string())?;
+    }
+
+    // Reviewer finding 1 (CRITICAL): a mask bit set with no matching block
+    // consumed is structural corruption, never silently tolerated — the
+    // general form of the rule (mirrors decode_notes), even though
+    // automation doesn't interpret any column's content.
+    let missing_blocks = mask & !COLUMNS_CORE & !bits_consumed;
+    if missing_blocks != 0 {
+        return Err(format!(
+            "AMEV mask 0x{mask:04x} claims column(s) 0x{missing_blocks:04x} but no matching block was found"
+        ));
     }
 
     Ok((ppq, points))
@@ -675,6 +694,26 @@ mod tests {
         assert!(decoded.notes.is_empty());
 
         assert!(decode_points(&[0u8; 8]).is_err(), "garbage rejected");
+    }
+
+    /// Reviewer finding 1 (CRITICAL): a mask claiming a column is present
+    /// with its block missing (truncated away) must Err, mirroring
+    /// `events::decode_notes` — even though automation doesn't interpret
+    /// the column's content, the mask/block mismatch is structural
+    /// corruption on its own.
+    #[test]
+    fn decode_points_rejects_mask_claiming_a_column_whose_block_is_missing() {
+        let notes = vec![crate::midi::types::MidiNote {
+            tick: 0, length_ticks: 480, key: 60, velocity: 100, channel: 0,
+            note_id: crate::ids::NoteId(1),
+        }];
+        let mut bytes = crate::midi::events::encode_notes(960, &notes, 2);
+        // Truncate away the appended note-id block WITHOUT clearing the
+        // mask bit — the mask still claims 0x0002 is present.
+        bytes.truncate(16 + 1 * 16);
+        let mask = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert_eq!(mask & crate::midi::events::COLUMNS_NOTE_ID, crate::midi::events::COLUMNS_NOTE_ID);
+        assert!(decode_points(&bytes).is_err());
     }
 
     // ---- persistence -------------------------------------------------------

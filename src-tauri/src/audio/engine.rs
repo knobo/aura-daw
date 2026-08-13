@@ -732,15 +732,6 @@ impl Control {
             let path = project_dir.join(&source_path);
             match load_wav(&path) {
                 Ok((channels, file_rate, samples)) => {
-                    for clip_id in clips_by_source.get(&source_id).map(|v| v.as_slice()).unwrap_or(&[]) {
-                        let cache_dir = Store::cache_dir_for(&project_dir, clip_id);
-                        if !pyramid_exists(&cache_dir) {
-                            let pyr = Pyramid::from_interleaved(&samples, channels as usize);
-                            if let Err(e) = pyr.write_dir(&cache_dir) {
-                                log::warn!("waveform cache for {clip_id}: {e}");
-                            }
-                        }
-                    }
                     let data = linear_resample(&samples, channels as usize, file_rate, rate);
                     self.cache.insert(
                         source_id,
@@ -748,6 +739,33 @@ impl Control {
                     );
                 }
                 Err(e) => log::warn!("audio: cannot load {}: {e}", path.display()),
+            }
+        }
+
+        // Reviewer finding 2: pyramid building is DECOUPLED from the decode
+        // loop above — a clip whose source was already cached (shared with
+        // an earlier clip, so it never appeared in `todo`) still needs its
+        // OWN waveform pyramid dir checked/built. Walk every LIVE clip
+        // (grouped by source), building from the cached (resampled) source
+        // data — the pyramid is a peak/RMS visual overview, not
+        // audio-critical, so reusing the already-decoded cache entry here
+        // (rather than re-reading the file) is exact enough and avoids a
+        // second decode of every source on every call.
+        for (source_id, clip_ids) in &clips_by_source {
+            let Some(cached) = self.cache.get(source_id) else { continue };
+            let missing: Vec<&String> = clip_ids
+                .iter()
+                .filter(|clip_id| !pyramid_exists(&Store::cache_dir_for(&project_dir, clip_id)))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let pyr = Pyramid::from_interleaved(&cached.data.data, cached.data.channels as usize);
+            for clip_id in missing {
+                let cache_dir = Store::cache_dir_for(&project_dir, clip_id);
+                if let Err(e) = pyr.write_dir(&cache_dir) {
+                    log::warn!("waveform cache for {clip_id}: {e}");
+                }
             }
         }
     }
@@ -1551,5 +1569,90 @@ mod tests {
         let c3 = { let mut c = test_clip("c-3", "t-1"); c.source_id = s1.clone(); c.source_path = "audio/1.wav".into(); c };
         let todo = stale_sources(&[c1, c2, c3], &cache);
         assert_eq!(todo.iter().map(|(sid, _)| sid.clone()).collect::<Vec<_>>(), vec![s1, s2]);
+    }
+
+    /// Reviewer finding 2 regression test, end-to-end through a real
+    /// control thread: a SECOND clip added later, sharing an
+    /// ALREADY-cached source with an earlier clip, must still get its own
+    /// waveform pyramid built. The bug was that pyramid-building lived
+    /// nested inside the decode loop, so it only ran for sources
+    /// `stale_sources` returned as needing a fresh decode — a clip whose
+    /// source was already cached never got its `waveform_cache_dir`
+    /// checked at all.
+    #[test]
+    fn ensure_loaded_builds_pyramids_for_clips_sharing_an_already_cached_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "aura-eng-pyramid-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("audio/x.wav"), spec).unwrap();
+        for i in 0..480 {
+            w.write_sample((i as f32 / 48.0).sin()).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let (handle, _shared, _params, session) = spin_up();
+        let sid = SourceId::mint();
+        {
+            let mut session = session.lock();
+            let s = &mut session.store;
+            s.project_dir = Some(dir.clone());
+            s.alloc_slot("t1");
+            s.tracks.push(super::super::types::TrackState {
+                id: "t1".into(),
+                name: "T1".into(),
+                kind: "audio".into(),
+                gain_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                soloed: false,
+                armed: false,
+                color: "#7c9cff".into(),
+                instrument_id: None,
+            });
+            let mut c1 = test_clip("c1", "t1");
+            c1.source_id = sid.clone();
+            s.clips.push(c1);
+        }
+        handle.send(ControlMsg::Rebuild);
+
+        let cdir1 = Store::cache_dir_for(&dir, "c1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pyramid_exists(&cdir1) {
+            assert!(std::time::Instant::now() < deadline, "clip c1's pyramid never built");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A SECOND clip, added AFTER the first rebuild, sharing the SAME
+        // (already-cached) source.
+        {
+            let mut session = session.lock();
+            let mut c2 = test_clip("c2", "t1");
+            c2.source_id = sid.clone();
+            session.store.clips.push(c2);
+        }
+        handle.send(ControlMsg::Rebuild);
+
+        let cdir2 = Store::cache_dir_for(&dir, "c2");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pyramid_exists(&cdir2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clip c2's pyramid never built (finding 2 regression: source already cached, so \
+                 the old nested pyramid-build loop never visited c2)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        handle.send(ControlMsg::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

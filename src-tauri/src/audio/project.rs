@@ -206,18 +206,28 @@ fn mint_deterministic_source_id(normalized_path: &str) -> SourceId {
 }
 
 /// Normalize a clip's `source_path` into a stable, project-relative POSIX
-/// form for deterministic id minting (L-1): strips a leading absolute-path
-/// anchor (an old file's accidental `project_dir`-style absolute path) down
-/// to its relative tail, collapses `.` segments, and REJECTS any `..`
-/// component outright (a normalized path must never escape the project —
-/// minting an id over a traversal path would be worse than leaving it
-/// unassigned).
+/// form for deterministic id minting (L-1): collapses `.` segments and
+/// REJECTS any `..` component or a leading absolute-path anchor outright —
+/// a normalized path must never escape the project, and an absolute path is
+/// left unassigned rather than salvaged.
+///
+/// Reviewer finding 3: an earlier version stripped a leading `/` down to its
+/// relative tail, which was wrong in two ways — `/audio/x.wav` and
+/// `audio/x.wav` would normalize to the SAME string and mint the SAME
+/// `SourceId` for two potentially DIFFERENT files (the one-source-one-path
+/// invariant broken in the forbidden direction), and `project_dir.join(rel)`
+/// on the caller side discards the join base for an absolute `rel`, which
+/// can point straight out of the project. Absolute paths are now rejected
+/// exactly like `..`, never salvaged.
 fn normalize_source_path(source_path: &str) -> Result<String, String> {
     let slashed = source_path.replace('\\', "/");
+    if slashed.starts_with('/') {
+        return Err(format!("source_path is absolute, refusing to normalize: {source_path:?}"));
+    }
     let mut out: Vec<&str> = Vec::new();
     for seg in slashed.split('/') {
         match seg {
-            "" | "." => continue, // drop empty (leading '/') and current-dir segments
+            "" | "." => continue, // collapse repeated separators / current-dir segments
             ".." => return Err(format!("source_path escapes the project: {source_path:?}")),
             s => out.push(s),
         }
@@ -498,6 +508,28 @@ mod tests {
         assign_source_ids(&mut clips);
         assert!(clips[0].source_id.as_str().is_empty(), "traversal path left unassigned");
         assert!(!clips[1].source_id.as_str().is_empty());
+    }
+
+    /// Reviewer finding 3: an absolute `source_path` must be REJECTED, not
+    /// salvaged by stripping the leading `/` — otherwise `/audio/x.wav` and
+    /// `audio/x.wav` (two potentially DIFFERENT files) would normalize to
+    /// the same string and mint the SAME SourceId (the one-source-one-path
+    /// invariant broken in the forbidden direction), and the caller's
+    /// `project_dir.join(source_path)` on an absolute path discards the
+    /// project dir entirely (escapes the project).
+    #[test]
+    fn absolute_source_path_is_rejected_and_does_not_merge_with_the_relative_form() {
+        let mut clips = vec![
+            clip_n("c0", "/audio/x.wav", ""),
+            clip_n("c1", "audio/x.wav", ""),
+        ];
+        assign_source_ids(&mut clips);
+        assert!(clips[0].source_id.as_str().is_empty(), "absolute path left unassigned, not minted over");
+        assert!(!clips[1].source_id.as_str().is_empty(), "the relative sibling still mints normally");
+        assert_ne!(
+            clips[0].source_id, clips[1].source_id,
+            "an absolute path must NEVER merge with its relative-looking twin"
+        );
     }
 
     #[test]

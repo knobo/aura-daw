@@ -112,7 +112,12 @@ pub fn decode_notes(bytes: &[u8]) -> Result<DecodedNotes, String> {
     if version > AMEV_VERSION {
         return Err(format!("AMEV version {version} is newer than supported {AMEV_VERSION}"));
     }
-    let _mask = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?; // advisory only
+    // The mask is advisory for UNKNOWN bits (never rejected, never required
+    // to match a present block) — but for a bit this reader DOES know
+    // (COLUMNS_NOTE_ID), a mask claiming the column is present with no
+    // matching block consumed is structural corruption, not tolerance
+    // territory; checked once the block walk below has run.
+    let mask = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
     let ppq = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
     let count = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
 
@@ -157,9 +162,13 @@ pub fn decode_notes(bytes: &[u8]) -> Result<DecodedNotes, String> {
     let mut note_ids: Option<Vec<u32>> = None; // one per note, in record order
     let mut next_note_id: Option<u32> = None;
     let mut last_bit: i32 = -1;
+    let mut bits_consumed: u16 = 0; // every colBit actually seen as a block, known or not
     loop {
         let remaining = (bytes.len() as u64).saturating_sub(r.position());
         if remaining < 6 {
+            // Fewer than 6 trailing bytes can't be a block header; ignoring
+            // this slack (rather than erroring on it) is intentional, not a
+            // gap — reviewed and accepted (Minor).
             break;
         }
         let col_bit = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -176,6 +185,7 @@ pub fn decode_notes(bytes: &[u8]) -> Result<DecodedNotes, String> {
             ));
         }
         last_bit = col_bit as i32;
+        bits_consumed |= col_bit;
 
         if col_bit == COLUMNS_NOTE_ID {
             // Sized by the RECORD count, not the note count (M-1).
@@ -197,6 +207,19 @@ pub fn decode_notes(bytes: &[u8]) -> Result<DecodedNotes, String> {
             let mut buf = vec![0u8; byte_len as usize];
             std::io::Read::read_exact(&mut r, &mut buf).map_err(|e| e.to_string())?;
         }
+    }
+
+    // Reviewer finding 1 (CRITICAL): a mask bit set with no matching block
+    // consumed is structural corruption (a truncated/stripped block with a
+    // stale mask), never silently tolerated — this is the general form of
+    // the module doc's rule, not special-cased to COLUMNS_NOTE_ID. Bits
+    // above COLUMNS_CORE only, since COLUMNS_CORE is the fixed-format
+    // header+records themselves, not an appended block.
+    let missing_blocks = mask & !COLUMNS_CORE & !bits_consumed;
+    if missing_blocks != 0 {
+        return Err(format!(
+            "AMEV mask 0x{mask:04x} claims column(s) 0x{missing_blocks:04x} but no matching block was found"
+        ));
     }
 
     let next_note_id = match (note_ids, next_note_id) {
@@ -316,6 +339,28 @@ mod tests {
         assert_eq!(d.notes[0].note_id, NoteId(1));
         assert_eq!(d.notes[1].note_id, NoteId(2));
         assert_eq!(d.next_note_id, 3);
+    }
+
+    /// Reviewer finding 1 (CRITICAL): a mask claiming COLUMNS_NOTE_ID is
+    /// present but whose block is missing (truncated away, mask left
+    /// stale) must Err — NOT silently fall through to the v1-upgrade path
+    /// and mint fresh sequential ids, which would mask structural
+    /// corruption as a normal legacy chunk.
+    #[test]
+    fn amev_mask_claims_note_id_column_but_block_missing_is_rejected() {
+        let notes = vec![
+            MidiNote { tick: 0, length_ticks: 480, key: 60, velocity: 100, channel: 0, note_id: NoteId(1) },
+            MidiNote { tick: 480, length_ticks: 240, key: 64, velocity: 90, channel: 0, note_id: NoteId(2) },
+        ];
+        let mut bytes = encode_notes(960, &notes, 3);
+        // Truncate away the appended note-id block WITHOUT clearing the mask
+        // bit (unlike the v1-tolerant test above, which clears it) — the
+        // mask still claims 0x0002 is present.
+        bytes.truncate(16 + 2 * 16);
+        let mask = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert_eq!(mask & COLUMNS_NOTE_ID, COLUMNS_NOTE_ID, "mask bit left set");
+        let err = decode_notes(&bytes).unwrap_err();
+        assert!(err.contains("COLUMNS_NOTE_ID") || err.contains("0002"), "{err}");
     }
 
     #[test]
