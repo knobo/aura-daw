@@ -1,5 +1,7 @@
 # Plan B — Identity Groundwork Implementation Plan
 
+**Status: EXECUTED 2026-08-14, commits a31104f..a70bf67**
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Typed per-family ids (`TrackId`, `ClipId`, `ContentId`, `SourceId`, `NoteId`), persisted note identity with a per-content watermark in the AMEV header, source-keyed assets and decode cache, slots as derived per-graph state with graph-versioned param tables and generation-tagged meter blocks, and the `MAX_TRACKS = 64` ceiling removed — closed by the Gate B test suite.

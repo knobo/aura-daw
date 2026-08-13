@@ -1,4 +1,4 @@
-# Next: author and execute Plan B (identity groundwork)
+# Next: author and execute Plan C+D (time + project v3)
 
 Read this file, then do the work described below. Reply to the user in
 Norwegian — they write Norwegian; the repo documentation is English.
@@ -21,7 +21,7 @@ embedded MCP server so agents mutate the session alongside the user.
    blocks from the later review. History, not law.
 2. **Adversarial review**: `docs/CORE-REDESIGN-ROUND-2.md` is **ACCEPTED**
    and binding; it supersedes round 1 and lists all fourteen overturned
-   positions in its §0.1. ADRs 0001–0007 in `docs/adr/` are all Accepted.
+   positions in its §0.1. ADRs 0001-0007 in `docs/adr/` are all Accepted.
 3. **Measurements**: `benches/ui-probe/RESULTS.md` (three WebKitGTK
    render-gate measurements — all PASS) and `benches/bulkbench/RESULTS.md`
    (storage gesture mix — replay-only threshold 64 KB). Evidence policy
@@ -30,117 +30,102 @@ embedded MCP server so agents mutate the session alongside the user.
    over Store+MidiStore behind one lock; `Session::transact` as the only
    mutation door for the A-slice (mix/add/remove track); `control::op`
    vocabulary v1 with actor/run meta; inverses derived from store truth;
-   commit-time fold with no-op elision; effects (param writes, ≤1
-   Rebuild, exactly 1 `project://changed` with full-Project + additive
-   rev/label/actor) executed strictly after the lock; structural ops
-   carry their clips; Gate A property suite green
-   (`src-tauri/tests/channel_properties.rs`). Suites: **296 backend + 17
-   frontend**, all green, counts dated in README/CONTRIBUTING.
+   effects executed strictly after the lock. See `docs/PHASE4-PLAN.md`'s
+   "Plan A handoff" section for its binding carry-forwards (snapshot-
+   rebuild deferral chief among them).
+5. **Plan B is IMPLEMENTED** (`a31104f..a70bf67`): identity groundwork
+   — typed id families end to end through the op wire form; persisted note
+   identity (AMEV columnMask-honest); source-keyed assets + decode cache;
+   `Store`-owned slots deleted, replaced by per-graph `derive_slots` +
+   `GraphTables` (round-2 O-13's aliasing window closed by construction);
+   meter blocks carry the graph generation; `MAX_TRACKS` removed. Gate B
+   green (`src-tauri/tests/identity_properties.rs`). See
+   `docs/PHASE4-PLAN.md`'s "Plan B handoff" section for its binding
+   carry-forwards (id-preserving piano roll deferred to Plan E;
+   `next_note_id`'s move to the content object and the split/merge/copy
+   rules bind Plan C/D directly). Suites: **340 backend + 73 frontend**,
+   all green, counts dated in README/CONTRIBUTING.
 
 ## Your task
 
-**Author Plan B — identity groundwork — then execute it.** Scope was
-owner-approved in round 2 (incl. the MAX_TRACKS removal). Do not start
+**Author Plan C+D — time + project v3 — then execute it.** Scope was
+owner-approved in round 2. These two sub-plans ship as ONE format bump, not
+two (`docs/PHASE4-PLAN.md`'s sub-plan table: "D ships inside C's v3
+migration") — do not split them into separate schema versions. Do not start
 implementation before the plan document exists.
 
 ### Step 1 — read, in this order
 
-1. `docs/PHASE4-PLAN.md` — sub-plan B row, Gate B, the binding rules, and
-   **§"Plan A handoff"** (snapshot-rebuild deferral + six carry-forwards).
-2. `docs/CORE-REDESIGN-ROUND-2.md` §2 (identity) and §0.1 rows O-2, O-3,
-   O-12, O-13, O-14. ADR 0001.
-3. The landed code (round-2 §2 predates Plan A — the tree wins):
-   `src-tauri/src/control/op.rs`, `src-tauri/src/control/session.rs`,
-   `src-tauri/src/control/mod.rs`, `src-tauri/src/audio/types.rs`,
-   `src-tauri/src/audio/engine.rs` (rebuild + decode cache),
-   `src-tauri/src/audio/meters.rs`, `src-tauri/src/midi/events.rs`,
-   `src-tauri/src/midi/types.rs`.
-4. Only if re-litigating a decision: dossier 04 §4 (addressable-object
-   problem), dossier 07 rules 1–4/17/18, dossier 10 §1.9/§2.3 via
+1. `docs/PHASE4-PLAN.md` — sub-plan C and D rows, Gate C/D, the binding
+   rules, and **both** the "Plan A handoff" and "Plan B handoff" sections
+   (carry-forwards: snapshot-rebuild deferral; `fold_ops` coalescing
+   constraint before Gate E; `next_note_id`'s move to the content object;
+   split/merge/copy rules binding future content ops; the waveform pyramid
+   cache and `GraphTables`-under-Mutex items ledgered, not taken).
+2. `docs/CORE-REDESIGN-ROUND-2.md` §3 (time — supertick tempo, the section
+   table, `steady_time`, the v2→v3 migration) and §5 (content and
+   placement — `ContentId`, placements with `LaneId`, default lanes), plus
+   §0.1 rows O-4, O-5, O-9 (time) and whichever rows §5's own text points
+   at for the placement split. ADR 0002 (time model) and ADR 0004
+   (content/placement split), both in `docs/adr/`.
+3. The landed code (round-2 §3/§5 predate Plans A/B — the tree wins):
+   - Time: `src-tauri/src/midi/types.rs` (`TempoEvent { tick, bpm }`,
+     `MidiClip.next_note_id`), `src-tauri/src/audio/types.rs`
+     (`TransportState.tempo_bpm`, sample-based fields throughout —
+     `position_samples`/`loop_start_samples`/`loop_end_samples` etc.;
+     everything here is samples-or-bpm today, no `Ticks`/`Samples`
+     newtypes yet), the frontend tempo/tick math: `src/lib/tauri.ts`,
+     `src/lib/demo.ts`, `src/lib/types/ipc.ts` (`TempoMapState`,
+     `TempoEvent`), `src/lib/state/midi.svelte.ts` (its own header comment
+     says it mirrors `midi::TempoMap` — the piecewise tick<->sample math
+     (`ticksToSamples`/`samplesToTicks`) and `tempoEvents` state live here,
+     not behind any single named TS type; Gate C/D's frontend exit
+     condition is this piecewise math deleted, replaced by consuming the
+     shipped section table — read what it does today before deleting it).
+   - Project v3: `src-tauri/src/audio/project.rs` (`schema_version` field,
+     the `(1..=2).contains(&project.schema_version)` validation gate near
+     line 161 — this is what a v3 bump must extend, and what a fixture
+     corpus for lossless v2→v3 round-trip must exercise against).
+   - Content/placement: `src-tauri/src/ids.rs`'s `ContentId` (declared,
+     unpopulated — Plan B's handoff note); `src-tauri/src/audio/types.rs`'s
+     `Clip` (today IS the placement+content conflation §5 splits apart).
+4. Only if re-litigating a decision: dossier 02 (DAW engine architecture —
+   §5 on Ardour/Tracktion tempo maps and time representation), dossier
+   07's relevant rules, dossier 10's relevant sections, via
    `docs/research/00-INDEX.md`.
+
+**Verified code anchors** — re-checked against the tree at Plan B's real
+closing commit (`a70bf67`) while writing this file. Symbols still drift
+over time; grep for the name, don't trust the line number.
 
 ### Step 2 — write the plan
 
 Load `superpowers:writing-plans`; save as
-`docs/superpowers/plans/<today>-plan-b-identity-groundwork.md` with the
-standard header (Spec: round-2 §2 + ADR 0001; orchestration PHASE4-PLAN).
+`docs/superpowers/plans/<today>-plan-c-d-time-project-v3.md` with the
+standard header (Spec: round-2 §3 + §5, ADRs 0002 + 0004; orchestration
+PHASE4-PLAN). The plan author owns the task cut — Plan B's own plan
+document (`docs/superpowers/plans/2026-08-13-plan-b-identity-groundwork.md`)
+is a reasonable template for shape (files/interfaces/steps/gate per task),
+and its SDD ledger (`.superpowers/sdd/2026-08-13-plan-b-identity-groundwork/`)
+shows how a compressed, deadline-driven pipeline was actually run if that's
+useful precedent.
 
-**Verified code anchors** (symbols checked at `405af0b` — grep for them;
-line numbers drift):
-
-- `OP_FORMAT_VERSION: u16 = 1` and
-  `ObjectRef { Track(String), Clip(String), MidiClip(String) }` —
-  `control/op.rs`. Typed id families must serialize **transparently**
-  (`#[serde(transparent)]` newtypes over String) or bump the version —
-  op wire form is gated by exact-JSON tests in op.rs.
-- `MAX_TRACKS: usize = 64` — `audio/types.rs:13`; `slot_used:
-  [bool; MAX_TRACKS]` + `alloc_slot`/`free_slot`/`track_slots` —
-  `audio/types.rs` (~:205–250). The u64 presence-mask assumption lives in
-  `audio/meters.rs` (`RawMeterBlock`) and `audio/rt.rs` (fixed atomic
-  arrays).
-- AMEV chunk format — `midi/events.rs`: `AMEV_MAGIC`, `AMEV_VERSION: u16
-  = 1`, `COLUMNS_CORE: u16 = 0x0001`; header comment documents the
-  columnMask + appended-column-block extension path; **the reader
-  currently ignores the mask** (`let _columns =`) — the note_id column
-  must fix that read path too. `MidiNote` (no id today) — `midi/types.rs`.
-- Decode cache — `audio/engine.rs` `cache: HashMap<String, Arc<RtClipData>>`
-  keyed by **clip id** (comment "clip id -> decoded samples"); no
-  invalidation when a clip's `source_path` changes under the same id.
-  Re-key by source. Justify per round-2 §2.2 (dedup / GC / staleness —
-  NOT the falsified "wrong audio" claim).
-- Slot lifecycle today: alloc + param reset in `ControlPlane`'s track
-  creation (under a session lock, before commit); free in its own lock
-  after commit (`control/mod.rs::remove_track`); `engine::rebuild` maps
-  slots via `store.track_slots()` while holding the session lock (the
-  snapshot-rebuild deferral — do NOT try to fix that here, Plan F owns it).
-
-**Task-cut sketch** (the plan author owns the final cut; each task ends
-independently testable, TDD steps, foreground `timeout`-guarded runs):
-
-1. Carry-forward batch (small, same-shape): delete dead
-   `ops::apply_track_mix`; clamp round-trip test (999→24); duplicate-id
-   guard in `apply_raw`'s `TrackAdd` arm (reject, don't clamp — rollback
-   removes-by-id and can mis-target on duplicates); positional clip
-   restore (or canonical clip ordering) so byte-identity holds on
-   interleaved clip vecs — this is a Gate B prerequisite.
-2. Typed id newtypes (`TrackId`, `ClipId`, `ContentId`, `NoteId`,
-   `SourceId`, …) as `#[serde(transparent)]` wrappers; `ObjectRef`
-   migrates family by family; wire-form tests extended, version stays 1.
-3. `note_id: u32` on `MidiNote` + persisted per-content watermark in the
-   AMEV header (one u32, new columnMask bit; v1 chunks without the column
-   read tolerantly, writes upgrade); allocation only inside a
-   transaction; fix the reader's ignored-mask path.
-4. Source-keyed asset naming (`audio/<sourceId>.wav`) + source-keyed
-   decode cache with source-change invalidation; project-file field is
-   additive (D-06 readers ignore unknowns).
-5. Slots become derived per-graph state: kill `free_slot` reuse-in-place;
-   **each compiled graph carries its own param table** populated at build
-   time; smoothing/live-node state keyed by TrackId moves across rebuilds
-   (pattern exists: `midi/playback.rs` registry).
-6. Meter blocks carry the graph generation; the control thread folds
-   under the matching slot map (`engine.rs` meter fold + `meters.rs`).
-7. MAX_TRACKS removal: per-graph sizing replaces the fixed arrays and the
-   u64 presence mask (chunked meter blocks per D-05's direction).
-8. Gate B property/integration tests: delete-then-undo preserves identity
-   AND inbound references (now meaningful with typed ids + clips-on-ops);
-   the slot-aliasing race test (delete→add→old graph still playing —
-   headless, using the retire/adopt seam); meter-generation test.
-
-Order matters: 1 → 2 → 3/4 (parallel-safe) → 5 → 6 → 7 → 8. Task 5–7 are
-the RT-heavy part — their reviews go to the most capable model.
+Gate C/D, verbatim from `docs/PHASE4-PLAN.md`: *test 6 (section-table bound
+< 64 samples), test 7 (tempo round-trip + lossless v2→v3 against a fixture
+corpus, including meterMap and the placement/content split); frontend
+consumes the shipped section table (TS TempoMap deleted).*
 
 ### Step 3 — execute
 
-`superpowers:subagent-driven-development`: fresh implementer per task,
-task review after each, scoped re-review per fix round, final
-whole-branch review on the most capable model, ledger in the plan's own
-SDD workspace (`scripts/sdd-workspace`). Model policy that worked for
-Plan A: implementers sonnet (haiku only for pure transcription), task
-reviewers sonnet, riskiest + final review fable. **Foreground test runs
-only, with `timeout` guards** — a Plan A implementer wedged three times
-on background waits. Commit per task; push to PR #1 when the final
-review is clean (established flow). Update dated test counts when totals
-change.
+`superpowers:subagent-driven-development`: fresh implementer per task, task
+review after each, scoped re-review per fix round, final whole-branch
+review on the most capable model, ledger in the plan's own SDD workspace
+(`.superpowers/sdd/`). Model policy that worked for Plans A and B:
+implementers sonnet (haiku only for pure transcription), task reviewers
+sonnet, riskiest task(s) + the final review on the most capable model.
+**Foreground test runs only, with `timeout` guards.** Commit per task; push
+to PR #1 when the final review is clean (established flow). Update dated
+test counts when totals change.
 
 ## Ground rules (binding, from PHASE4-PLAN + ADRs)
 
@@ -152,6 +137,9 @@ change.
 - **Prepare-outside/commit-inside** for I/O; no blocking engine
   round-trips inside a transaction; `transact` closures must not panic
   (no panic rollback until Plan F).
+- **One format bump, not two** — C and D ship inside the same v3
+  migration; do not stage a separate schema version for the placement
+  split.
 - Corrections to docs are marked, never silent (ADR 0007).
 - The user's standing instruction: *"ikke ver skjenert"* — use as many
   agents as the work needs, and say plainly when something is wrong.
@@ -159,5 +147,5 @@ change.
 ---
 
 *Working note, committed on the PR branch for session continuity. When
-Plan B lands: update this file for the next stage (Plan C+D — time +
-project v3) in the same commit that closes Plan B.*
+Plan C+D lands: update this file for the next stage (Plan E — the
+side-channel totality) in the same commit that closes Plan C+D.*

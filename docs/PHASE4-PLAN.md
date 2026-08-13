@@ -115,3 +115,84 @@ so they aren't lost between sub-plan hand-offs:
   serialize transparently or bump OP_FORMAT_VERSION.
 - Clip carriage is asymmetric by design: `TrackAdd.clips` authoritative,
   `TrackRemove.clips` advisory (store truth wins).
+
+## Plan B handoff (2026-08-14, post whole-branch review)
+
+Plan B (identity groundwork, round-2 §2 + ADR 0001) is **IMPLEMENTED**
+(`a31104f..a70bf67`): typed id families (`TrackId`/`ClipId`/`ContentId`/
+`SourceId`/`NoteId`) end to end through `ObjectRef` and the op wire form
+(`OP_FORMAT_VERSION` unchanged — transparent serialization held); persisted
+note identity (`note_id` + per-clip `next_note_id` watermark, AMEV
+columnMask-honest reader); source-keyed asset naming and decode cache;
+`Store`-owned slots deleted in favor of per-graph derived slots
+(`derive_slots`) with a `GraphTables`/`SharedGraphTables` publish under the
+session lock (round-2 §2.4, O-13's aliasing window closed by construction,
+not by discipline); meter blocks stamped with the graph generation and
+folded through `GenerationMaps`; `MAX_TRACKS` removed, chunked meter blocks
+replace the fixed-array/u64-mask assumption. Gate B green: delete-then-undo
+identity property, the slot-aliasing pin, and the meter-generation pin all
+pass (`src-tauri/tests/identity_properties.rs`). Suites:
+**340 backend + 73 frontend**, all green, counts dated in
+README/CONTRIBUTING.
+
+The following are binding carry-forwards for later plans, recorded here so
+they aren't lost between sub-plan hand-offs:
+
+- **Plan E:** the id-preserving piano roll gesture path
+  (`midi_set_notes` still replaces arrays wholesale; ids churn on every
+  replace — the *allocator/keep-rule* is correct per Task 3/round-2 §2.1
+  (`assign_incoming_note_ids` in `src-tauri/src/midi/mod.rs` keeps an
+  incoming id iff it is non-zero, unique in the payload, and currently
+  live), but the frontend's `MidiNote` TS type (`src/lib/types/ipc.ts`)
+  carries no `noteId` field at all, so every gesture round-trip mints
+  fresh ids in practice — wiring the id through the wire type and gesture
+  path so preservation is actually observable is Plan E's job). Midi
+  mutations still bypass the transaction channel entirely; note-id
+  allocation is lock-serialized (correct, never reused) but not yet
+  op-attributed — no `Op` records a note mutation, so it carries no actor/
+  run and produces no inverse.
+- **Plan C/D:** `next_note_id` moves from `MidiClip` to the content object
+  in the v3 split, semantics unchanged (still a persisted, monotonic,
+  never-reset watermark); `ContentId` is declared (Task 2) but unpopulated
+  — nothing mints one yet. Round-2 §2.1's split/merge/copy rules bind the
+  content ops when they exist and not before: split keeps both halves' ids
+  and records the partition, merge remints the absorbed side, copy mints
+  fresh. No such operation exists yet; C/D's content-op work is bound by
+  these rules from the day it lands, not retrofitted after.
+- **Ledgered, not taken:** the waveform pyramid cache is still keyed by
+  clip id, not source id — a dedup-by-source opportunity Plan B's
+  source-keyed decode cache (Task 4) does NOT extend to the pyramid cache;
+  left for whichever later round touches waveform rendering. Pyramids are
+  now built from resampled engine-rate source data
+  (`AudioEngine::ensure_loaded`, `src-tauri/src/audio/engine.rs`) rather
+  than a fresh file read — this is visual-only (peak/RMS overview, not
+  audio-critical) and intentional, not a latent bug.
+  `GraphTables` under a `parking_lot::Mutex` is fine at today's track
+  counts and rebuild rates — revisit only with a measurement (round-2
+  §10.3's rule: no speculative lock-free rewrite without a bench showing
+  contention). `GenerationMaps::resolve` is unused API surface (no
+  production call site, only tests) — kept because Plan E's per-op
+  attribution will need to resolve `(generation, slot)` back to a
+  `TrackId`; deferred, not dead. `RtGraph`'s manual `impl Default` is
+  test/placeholder convenience only (documented as such in-tree);
+  production code always goes through `RtGraph::new` — deferred cleanup,
+  not a correctness gap. `create_project` and `save_project_as`
+  (`src-tauri/src/control/mod.rs`) do not reset `session.midi.dirty`;
+  deferred — does not affect correctness today since both paths persist
+  midi state as part of the same operation, but a future audit of dirty-
+  flag invariants should account for it.
+- **Coverage note:** `channel_properties.rs`'s clip-extension property
+  (Gate A) is a same-track-contiguous oracle; it cannot independently
+  catch positional restore bugs across interleaved clip vecs. Dedicated
+  coverage for that lives in `src-tauri/tests/identity_properties.rs`
+  instead (documented in its module comment) — this is by design, not a
+  gap to backfill in `channel_properties.rs`.
+- **Standing:** snapshot-rebuild deferral unchanged from the Plan A
+  handoff above — `engine::rebuild` still holds the session lock for the
+  whole graph build; Plan B's per-graph `GraphTables` changes what gets
+  published, not when the lock is held. Still requires Plan F's
+  copy-on-write history store. No panic rollback in `transact` (Plan F);
+  transaction closures must stay non-panicking. Split/merge/copy remint
+  rules (round-2 §2.1) bind future content ops from the day they land —
+  see the Plan C/D item above; repeated here because it binds Plan E's
+  content-adjacent work too, not only C/D's.
