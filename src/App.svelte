@@ -27,6 +27,8 @@
   import Dock from "./lib/components/Dock.svelte";
   import McpConfirmDialog from "./lib/components/mcp/McpConfirmDialog.svelte";
   import ExportDialog from "./lib/components/export/ExportDialog.svelte";
+  import ProjectDialog from "./lib/components/project/ProjectDialog.svelte";
+  import { projectops } from "./lib/state/projectops.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
 
   onMount(() => {
@@ -72,6 +74,25 @@
       if (e.key === "0") {
         e.preventDefault();
         resetUiZoom();
+        return;
+      }
+    }
+    // Project shortcuts work everywhere — inputs and piano roll included.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+      const k = e.key.toLowerCase();
+      if (k === "s") {
+        e.preventDefault();
+        void projectops.save();
+        return;
+      }
+      if (k === "o") {
+        e.preventDefault();
+        projectops.requestOpen();
+        return;
+      }
+      if (k === "n") {
+        e.preventDefault();
+        projectops.requestNew();
         return;
       }
     }
@@ -140,6 +161,7 @@
 
 <McpConfirmDialog />
 <ExportDialog />
+<ProjectDialog />
 <Toasts />
 
 <style>
