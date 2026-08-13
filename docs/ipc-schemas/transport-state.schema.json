@@ -39,6 +39,15 @@
       "description": "Loop region end (exclusive), in samples. 0 when no loop region is set.",
       "type": "integer",
       "minimum": 0
+    },
+    "songEndSamples": {
+      "description": "Last audible sample of the current material: the maximum of every clip end and the final scheduled note-off, recomputed by the engine on each structural rebuild. 0 when there is nothing to play. Derived state — never sent by a client.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "stopAtEnd": {
+      "description": "Policy: stop the transport when the playhead reaches songEndSamples. The engine detects the crossing regardless; this decides whether it acts on it. Ignored while a loop is active or while recording.",
+      "type": "boolean"
     }
   },
   "required": [
@@ -48,7 +57,9 @@
     "tempoBpm",
     "loopEnabled",
     "loopStartSamples",
-    "loopEndSamples"
+    "loopEndSamples",
+    "songEndSamples",
+    "stopAtEnd"
   ],
   "additionalProperties": false
 }

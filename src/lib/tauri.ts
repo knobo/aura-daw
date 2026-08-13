@@ -72,6 +72,8 @@ export interface Backend {
     startSamples: number,
     endSamples: number,
   ): Promise<TransportState>;
+  /** Stop the transport when the playhead reaches the end of the material. */
+  transportSetStopAtEnd(enabled: boolean): Promise<TransportState>;
   getTransportState(): Promise<TransportState>;
 
   // devices
@@ -260,6 +262,9 @@ class TauriBackend implements Backend {
       startSamples,
       endSamples,
     });
+  }
+  transportSetStopAtEnd(enabled: boolean) {
+    return invoke<TransportState>("transport_set_stop_at_end", { enabled });
   }
   getTransportState() {
     return invoke<TransportState>("get_transport_state");

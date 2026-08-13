@@ -431,6 +431,10 @@ impl AuraMcpHandler {
                 "Transport: loop {} [{start_samples}, {end_samples})",
                 if *enabled { "on" } else { "off" }
             ),
+            TransportAction::SetStopAtEnd { enabled } => format!(
+                "Transport: stop-at-end {}",
+                if *enabled { "on" } else { "off" }
+            ),
         };
         self.gate(tools::TRANSPORT_CONTROL, summary).await?;
         let res = self.blocking(move |c| c.transport(action)).await?;

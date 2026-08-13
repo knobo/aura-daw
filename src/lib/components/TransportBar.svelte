@@ -172,6 +172,12 @@
     >
     <button
       class="chip"
+      class:on={transport.snap.stopAtEnd}
+      title="Stop when the playhead reaches the end of the material (ignored while looping or recording)"
+      onclick={() => transport.setStopAtEnd(!transport.snap.stopAtEnd)}>STOP@END</button
+    >
+    <button
+      class="chip"
       class:on={ui.noteFlash}
       title="Flash notes at the moment they play"
       onclick={() => (ui.noteFlash = !ui.noteFlash)}>FLASH</button

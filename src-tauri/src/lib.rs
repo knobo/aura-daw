@@ -94,6 +94,7 @@ pub fn run() {
             audio::transport_stop,
             audio::transport_seek,
             audio::transport_set_loop,
+            audio::transport_set_stop_at_end,
             audio::get_transport_state,
             // ---- audio: devices ----
             audio::list_input_devices,

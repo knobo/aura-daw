@@ -17,6 +17,8 @@ class TransportStore {
     loopEnabled: false,
     loopStartSamples: 0,
     loopEndSamples: 0,
+    songEndSamples: 0,
+    stopAtEnd: true,
   });
 
   /** wall time (performance.now()) at which `snap` was captured */
@@ -51,6 +53,20 @@ class TransportStore {
   private accept(state: TransportState) {
     this.snap = state;
     this.anchorMs = performance.now();
+  }
+
+  /**
+   * Stop the transport when the playhead reaches the end of the material.
+   * The engine detects the boundary regardless; this is only the policy.
+   */
+  async setStopAtEnd(enabled: boolean) {
+    this.snap = { ...this.snap, stopAtEnd: enabled }; // optimistic
+    try {
+      this.accept(await backend.transportSetStopAtEnd(enabled));
+    } catch (err) {
+      console.warn("[aura] transport_set_stop_at_end failed:", err);
+      await this.init();
+    }
   }
 
   /**

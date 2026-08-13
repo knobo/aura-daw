@@ -448,6 +448,8 @@ export class DemoBackend implements Backend {
   private loopStart = 0;
   private loopEnd = 0;
   private loopTimer: ReturnType<typeof setTimeout> | null = null;
+  private stopAtEnd = true;
+  private endTimer: ReturnType<typeof setTimeout> | null = null;
 
   private meterSubs = new Set<(f: MeterFrame) => void>();
   private meterTimer: ReturnType<typeof setInterval> | null = null;
@@ -613,7 +615,51 @@ export class DemoBackend implements Backend {
       loopEnabled: this.loopEnabled,
       loopStartSamples: Math.round(this.loopStart),
       loopEndSamples: Math.round(this.loopEnd),
+      songEndSamples: this.songEnd(),
+      stopAtEnd: this.stopAtEnd,
     };
+  }
+
+  /** Last audible sample of the demo material (0 = nothing to play). */
+  private songEnd(): number {
+    let end = 0;
+    for (const c of this.clips) {
+      end = Math.max(end, c.timelineStartSamples + c.lengthSamples);
+    }
+    return Math.round(end);
+  }
+
+  /**
+   * (Re)arm the auto-stop timer — the demo mirror of the engine's boundary
+   * crossing: stop when the playhead reaches the end of the material, unless
+   * a loop owns it or the policy is off.
+   */
+  private armEndStop() {
+    if (this.endTimer) {
+      clearTimeout(this.endTimer);
+      this.endTimer = null;
+    }
+    if (this.tState !== "playing" || !this.stopAtEnd) return;
+    if (this.loopEnabled && this.loopEnd > this.loopStart) return;
+    const end = this.songEnd();
+    const pos = this.position();
+    if (end <= 0 || pos >= end) return;
+    this.endTimer = setTimeout(
+      () => {
+        if (this.tState !== "playing" || !this.stopAtEnd) return;
+        void this.transportStop().then(() => {
+          void this.transportSeek(end);
+        });
+      },
+      Math.max(0, ((end - pos) / SR) * 1000),
+    );
+  }
+
+  async transportSetStopAtEnd(enabled: boolean): Promise<TransportState> {
+    this.stopAtEnd = enabled;
+    this.armEndStop();
+    this.emitTransport();
+    return this.snapshot();
   }
 
   /**
@@ -637,6 +683,7 @@ export class DemoBackend implements Backend {
       this.resyncAudio();
       this.emitTransport();
       this.armLoopWrap();
+      this.armEndStop();
     }, Math.max(0, ms));
   }
 
@@ -659,6 +706,7 @@ export class DemoBackend implements Backend {
       // created/resumed here, so playback is actually audible.
       this.startAudio();
       this.armLoopWrap();
+      this.armEndStop();
       this.emitTransport();
     }
     return this.snapshot();
@@ -681,6 +729,7 @@ export class DemoBackend implements Backend {
     this.anchorWall = this.now();
     this.resyncAudio();
     this.armLoopWrap();
+    this.armEndStop();
     this.emitTransport();
     return this.snapshot();
   }
@@ -697,6 +746,7 @@ export class DemoBackend implements Backend {
     this.loopStart = Math.max(0, startSamples);
     this.loopEnd = Math.max(0, endSamples);
     this.armLoopWrap();
+    this.armEndStop();
     this.emitTransport();
     return this.snapshot();
   }

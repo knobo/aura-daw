@@ -138,6 +138,8 @@ pub fn transport_snapshot(store: &Store, shared: &SharedRt) -> TransportState {
         loop_enabled: shared.loop_enabled.load(Relaxed),
         loop_start_samples: shared.loop_start.load(Relaxed),
         loop_end_samples: shared.loop_end.load(Relaxed),
+        song_end_samples: shared.song_end.load(Relaxed),
+        stop_at_end: shared.stop_at_end.load(Relaxed),
     }
 }
 

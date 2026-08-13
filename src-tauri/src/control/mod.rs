@@ -78,6 +78,9 @@ pub enum TransportAction {
     /// Set the loop region (samples) and its enabled flag. `end <= start`
     /// with `enabled: true` is rejected; the region may be stored disabled.
     SetLoop { enabled: bool, start_samples: u64, end_samples: u64 },
+    /// Stop the transport when the playhead reaches the end of the material.
+    /// Pure policy — the engine detects the boundary either way.
+    SetStopAtEnd { enabled: bool },
 }
 
 // ---------------------------------------------------------------------------
@@ -166,6 +169,15 @@ impl ControlPlane {
     // ---- transport / recording -----------------------------------------
 
     pub fn transport(&self, action: TransportAction) -> Result<TransportState, String> {
+        // An explicit transport command supersedes any parking position the
+        // engine still owes (`SharedRt::park`) — otherwise a stop that is
+        // immediately followed by a seek would be undone a buffer later.
+        if matches!(
+            action,
+            TransportAction::Play | TransportAction::Stop | TransportAction::Seek { .. }
+        ) {
+            self.shared.park.store(crate::audio::rt::NO_PARK, Relaxed);
+        }
         match action {
             TransportAction::Play => {
                 {
@@ -204,6 +216,10 @@ impl ControlPlane {
                 s.transport.loop_enabled = enabled;
                 s.transport.loop_start_samples = start_samples;
                 s.transport.loop_end_samples = end_samples;
+            }
+            TransportAction::SetStopAtEnd { enabled } => {
+                self.shared.stop_at_end.store(enabled, Relaxed);
+                self.store.lock().transport.stop_at_end = enabled;
             }
         }
         let snap = self.transport_state();
@@ -960,6 +976,147 @@ mod tests {
         );
         drop(evs);
         let _ = std::fs::remove_dir_all(&dir);
+        engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// A real engine whose app events are recorded, for the auto-stop tests.
+    /// Headless-safe: both advance paths (RT callback and the wall-clock
+    /// headless tick) run the same boundary detection and policy.
+    fn engine_recording_events() -> (
+        ControlPlane,
+        Arc<SharedRt>,
+        RecordedEvents,
+        crate::audio::engine::EngineHandle,
+    ) {
+        struct Recorder(RecordedEvents);
+        impl crate::audio::engine::EventSink for Recorder {
+            fn emit(&self, e: &str, p: serde_json::Value) {
+                self.0.lock().push((e.to_string(), p));
+            }
+        }
+        let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(SharedRt::default());
+        let params = Arc::new(ParamTable::default());
+        let store = Arc::new(Mutex::new(Store::default()));
+        let engine = crate::audio::engine::start(
+            shared.clone(),
+            params.clone(),
+            store.clone(),
+            Box::new(Recorder(Arc::clone(&events))),
+        );
+        let cp = ControlPlane::new(
+            store,
+            shared.clone(),
+            params,
+            engine.clone(),
+            Arc::new(crate::sidecars::jobs::JobManager::default()),
+            Arc::new(Mutex::new(MidiStore::default())),
+            Box::new(|_, _| {}),
+        );
+        // Barrier: once the engine answers, its startup open_output is done.
+        engine
+            .request(|reply| crate::audio::engine::ControlMsg::SelectInput {
+                device_id: None,
+                reply,
+            })
+            .expect("engine control thread responds");
+        (cp, shared, events, engine)
+    }
+
+    /// Wait until `f` holds, or fail after `ms`.
+    fn wait_until(ms: u64, what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Auto-stop through the REAL engine: the playhead crossing the end of
+    /// the material stops the transport and parks EXACTLY on the boundary
+    /// (never a buffer past it — see `SharedRt::park`), and the stop is
+    /// announced on `transport://state` so every front door sees it.
+    #[test]
+    fn auto_stop_parks_exactly_at_song_end_and_announces_it() {
+        let (cp, shared, events, engine) = engine_recording_events();
+        let rate = shared.sample_rate.load(Relaxed) as u64;
+        let end = rate / 4; // 250 ms of "material"
+        shared.song_end.store(end, Relaxed);
+
+        cp.transport(TransportAction::Seek { position_samples: end - rate / 20 }).unwrap();
+        events.lock().clear();
+        cp.transport(TransportAction::Play).unwrap();
+
+        wait_until(4000, "the transport to stop itself", || {
+            !shared.playing.load(Relaxed)
+        });
+        // Let any callback still in flight write its position, so this
+        // asserts the SETTLED playhead rather than a lucky instant.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(
+            shared.position.load(Relaxed),
+            end,
+            "parks on the boundary sample, not a buffer past it"
+        );
+
+        let evs = events.lock();
+        let stopped = evs
+            .iter()
+            .filter(|(n, _)| n == "transport://state")
+            .find(|(_, p)| p["state"] == "stopped")
+            .map(|(_, p)| p.clone())
+            .expect("the engine announced the auto-stop");
+        assert_eq!(stopped["positionSamples"], end);
+        assert_eq!(stopped["songEndSamples"], end);
+        assert_eq!(stopped["stopAtEnd"], true);
+        drop(evs);
+        engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// The policy switch is the whole point of keeping the decision out of
+    /// the audio callback: with it off, the same crossing changes nothing.
+    #[test]
+    fn stop_at_end_off_runs_past_the_end() {
+        let (cp, shared, _events, engine) = engine_recording_events();
+        let rate = shared.sample_rate.load(Relaxed) as u64;
+        let end = rate / 20; // 50 ms
+        shared.song_end.store(end, Relaxed);
+        cp.transport(TransportAction::SetStopAtEnd { enabled: false }).unwrap();
+
+        cp.transport(TransportAction::Seek { position_samples: 0 }).unwrap();
+        cp.transport(TransportAction::Play).unwrap();
+        wait_until(4000, "the playhead to run past the end", || {
+            shared.position.load(Relaxed) > end * 2
+        });
+        assert!(shared.playing.load(Relaxed), "still rolling");
+        cp.transport(TransportAction::Stop).unwrap();
+        engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// An active loop owns the playhead: it can never reach the end, and the
+    /// two features must not fight over the transport.
+    #[test]
+    fn an_active_loop_suppresses_auto_stop() {
+        let (cp, shared, _events, engine) = engine_recording_events();
+        let rate = shared.sample_rate.load(Relaxed) as u64;
+        // Loop entirely before the end of the material.
+        let (start, lend) = (rate / 100, rate / 25);
+        shared.song_end.store(rate / 4, Relaxed);
+        cp.transport(TransportAction::SetLoop {
+            enabled: true,
+            start_samples: start,
+            end_samples: lend,
+        })
+        .unwrap();
+        cp.transport(TransportAction::Seek { position_samples: start }).unwrap();
+        cp.transport(TransportAction::Play).unwrap();
+
+        // Several loop spans' worth of wall time; the transport must survive.
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(shared.playing.load(Relaxed), "loop playback was cut short");
+        let pos = shared.position.load(Relaxed);
+        assert!(pos < lend, "playhead escaped the loop region: {pos} >= {lend}");
+        cp.transport(TransportAction::Stop).unwrap();
         engine.send(crate::audio::engine::ControlMsg::Shutdown);
     }
 

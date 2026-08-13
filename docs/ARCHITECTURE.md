@@ -125,7 +125,7 @@ Both are in `Cargo.toml`; **`rtrb` is the default choice**:
 |---|---|---|---|
 | `meters` | audio callback → engine control | `RawMeterBlock { track_peaks: [f32; MAX_TRACKS*2], rms_acc, position }` fixed-size POD | ~16 blocks (¼ s) |
 | `engine_cmd` | engine control → audio callback | `EngineCmd` enum (set gain, seek, start/stop, swap graph pointer) — POD, no heap payloads | 256 cmds |
-| `engine_evt` | audio callback → engine control | ack/xrun/position events | 256 |
+| `engine_evt` | audio callback → engine control | `RtEvent` — POD, `Copy`, no heap payloads (`ReachedEnd { at }`; §2.6) | 64 |
 | `rec_{track}` | input callback → disk writer | interleaved `f32` samples, chunked | ≥ 1 s of audio (headroom for slow disks) |
 
 Structural changes (add track, load clip) never travel through `engine_cmd`
@@ -169,6 +169,49 @@ Waveform rendering uses **min/max tiles** (audio "mipmaps"):
 [lod u32] [tileIndex u64] [bins u32]
 then channels × bins × (min i16, max i16)
 ```
+
+### 2.6 Timeline boundaries: the engine notices, the control plane decides
+
+Auto-stop ("stop when the material ends") is the first feature where the
+audio callback must *react to where the playhead is*. The rule that keeps
+this from metastasising into policy on the RT thread:
+
+> **The callback reports that a boundary was crossed. It never decides what
+> that means.**
+
+Three pieces, each usable on its own:
+
+1. **`transport::crossing(base, frames, loop, point) -> Option<u64>`** — pure,
+   allocation-free, unit-tested next to `advance`. Answers only *where* the
+   playhead crossed `point`, honouring loop wrap (an active loop can never
+   reach a point past its end). `point == 0` means "no point", the same
+   degenerate-means-off convention `LoopSpec` uses. Punch-in/out and markers
+   are the same call with a different point.
+2. **`SharedRt::song_end`** — the boundary itself, an atomic beside
+   `loop_start`/`loop_end`, recomputed by the control thread on every
+   structural rebuild via `offline::song_end` (so live playback and the
+   offline bounce agree on where a song ends, note-offs included).
+3. **`engine_evt` (§2.3)** — the callback pushes `RtEvent::ReachedEnd { at }`
+   and moves on. The control thread drains it and applies policy:
+   `stop_at_end` on, no active loop, not recording. New "the engine saw
+   something" features become new `RtEvent` variants, not new branches in
+   `OutputCb::render`.
+
+**The park handshake.** A control thread cannot place the playhead by itself.
+A callback that read `playing == true` before the stop still writes its
+advanced position afterwards, landing the playhead a buffer past the
+boundary — the smaller the buffer, the likelier the interleaving. So the
+control thread writes *where* to `SharedRt::park` **before** clearing
+`playing`, and the callback applies it (a `swap` against `NO_PARK`, so
+exactly once) the moment it sees the transport stopped. The last writer of
+the playhead is then always the one that knows where it belongs. This is
+mechanism, not policy: the callback carries out a position, it never chooses
+one. Any explicit transport command clears a pending park — a fresh
+instruction supersedes an owed one.
+
+Automation lanes will NOT reuse this: dense per-sample curves belong in the
+RCU graph snapshot next to the clips, not in atomics. Boundaries are sparse
+events; automation is continuous data. Keeping them separate is the point.
 
 ## 3. IPC strategy (Tauri v2)
 

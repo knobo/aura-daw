@@ -25,8 +25,9 @@ use parking_lot::Mutex;
 use super::dsp::linear_resample;
 use super::meters::{MeterAccum, RawMeterBlock};
 use super::mixer;
+use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
-use super::rt::{GraphPtr, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedRt};
+use super::rt::{GraphPtr, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedRt, NO_PARK};
 use super::transport;
 use super::types::{Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
@@ -53,6 +54,23 @@ pub trait MeterSink: Send + 'static {
 }
 
 pub type Reply<T> = Sender<Result<T, String>>;
+
+/// Something the audio callback NOTICED, reported to the control thread over
+/// the wait-free `engine_evt` ring (ARCHITECTURE §2.3).
+///
+/// The callback cannot act: policy needs state it must not read and decisions
+/// it must not make on a hard deadline (§2.1). So it reports the fact and the
+/// exact sample, and the control thread decides. Keep every variant POD and
+/// `Copy` — no heap payloads may cross this ring.
+///
+/// This is the seam for "the engine saw something happen": punch-out,
+/// markers and follow-actions are new variants here, not new code in
+/// `OutputCb::render`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtEvent {
+    /// The playhead crossed `SharedRt::song_end` at exactly this sample.
+    ReachedEnd { at: u64 },
+}
 
 pub enum ControlMsg {
     Subscribe(Box<dyn MeterSink>),
@@ -139,6 +157,7 @@ struct OutputBundle {
     graph_tx: rtrb::Producer<GraphPtr>,
     retire_rx: rtrb::Consumer<GraphPtr>,
     meter_rx: rtrb::Consumer<RawMeterBlock>,
+    evt_rx: rtrb::Consumer<RtEvent>,
 }
 
 impl Drop for OutputBundle {
@@ -166,6 +185,7 @@ struct OutputCb {
     graph_rx: rtrb::Consumer<GraphPtr>,
     retire_tx: rtrb::Producer<GraphPtr>,
     meter_tx: rtrb::Producer<RawMeterBlock>,
+    evt_tx: rtrb::Producer<RtEvent>,
     shared: Arc<SharedRt>,
     params: Arc<ParamTable>,
     /// Current graph snapshot (RCU: replaced whole; only live-node internals
@@ -199,6 +219,17 @@ impl OutputCb {
         }
 
         let playing = self.shared.playing.load(Relaxed);
+        // Carry out a parking request while stopped (see `SharedRt::park`).
+        // Taken with a swap so it is applied exactly once, and only here —
+        // which makes this callback the last writer of the playhead, closing
+        // the race against a stop that landed mid-render.
+        if !playing {
+            let park = self.shared.park.swap(NO_PARK, Relaxed);
+            if park != NO_PARK {
+                self.shared.position.store(park, Relaxed);
+                self.next_pos = park;
+            }
+        }
         let base = self.shared.position.load(Relaxed);
         let lp = self.shared.loop_spec();
         let discontinuity = playing && (!self.was_playing || base != self.next_pos);
@@ -225,6 +256,14 @@ impl OutputCb {
 
         if playing {
             let frames = (out.len() / self.channels.max(1)) as u64;
+            // Report boundary crossings, never act on them (§2.1): the ring
+            // push is wait-free, and a full ring is dropped rather than
+            // waited on. `crossing` is edge-triggered by construction — once
+            // the playhead is past the point, later blocks report nothing.
+            let end = self.shared.song_end.load(Relaxed);
+            if let Some(at) = transport::crossing(base, frames, &lp, end) {
+                let _ = self.evt_tx.push(RtEvent::ReachedEnd { at });
+            }
             let next = transport::advance(base, frames, &lp);
             self.shared.position.store(next, Relaxed);
             self.next_pos = next;
@@ -369,6 +408,7 @@ impl Control {
             }
             self.drain_retired();
             self.drain_meters();
+            self.drain_rt_events();
             self.headless_advance();
             self.pump_meter_frames();
         }
@@ -435,10 +475,15 @@ impl Control {
         let (graph_tx, graph_rx) = rtrb::RingBuffer::new(8);
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
+        // Boundary crossings are rare (one per playthrough), but the ring is
+        // sized for a burst of them so a stalled control thread never makes
+        // the callback drop one.
+        let (evt_tx, evt_rx) = rtrb::RingBuffer::new(64);
         let mut cb = OutputCb {
             graph_rx,
             retire_tx,
             meter_tx,
+            evt_tx,
             shared: self.shared.clone(),
             params: self.params.clone(),
             graph: None,
@@ -464,6 +509,7 @@ impl Control {
             graph_tx,
             retire_rx,
             meter_rx,
+            evt_rx,
         });
         self.shared.sample_rate.store(rate, Relaxed);
         {
@@ -531,6 +577,13 @@ impl Control {
                 &mut self.live_nodes,
                 &mut tracks,
             );
+            // The timeline boundary belongs to the material, so it is derived
+            // exactly where the material is assembled — same helper the
+            // offline bounce uses, so live and export agree on where the song
+            // ends (clip ends AND the final scheduled note-off).
+            self.shared
+                .song_end
+                .store(offline::song_end(&tracks), Relaxed);
             Box::new(RtGraph::new(tracks))
         };
         if let Err(rtrb::PushError::Full(_gp)) = out.graph_tx.push(GraphPtr::new(graph)) {
@@ -640,9 +693,75 @@ impl Control {
         if frames > 0 {
             let lp = self.shared.loop_spec();
             let pos = self.shared.position.load(Relaxed);
+            // Same boundary rule as the RT path, so headless behaviour (and
+            // every test that runs without an audio device) matches the real
+            // engine. Detection here is already on the control thread, so it
+            // applies the policy directly instead of going through the ring.
+            let end = self.shared.song_end.load(Relaxed);
+            let reached = transport::crossing(pos, frames, &lp, end);
             self.shared
                 .position
                 .store(transport::advance(pos, frames, &lp), Relaxed);
+            if let Some(at) = reached {
+                self.apply_end_policy(at);
+            }
+        }
+    }
+
+    /// Drain the `engine_evt` ring and apply policy to what the callback saw.
+    fn drain_rt_events(&mut self) {
+        let mut reached_end = None;
+        if let Some(out) = self.output.as_mut() {
+            while let Ok(ev) = out.evt_rx.pop() {
+                match ev {
+                    // Keep only the newest: several crossings can only mean
+                    // the control thread was starved, and stopping twice at
+                    // the same boundary is not a thing.
+                    RtEvent::ReachedEnd { at } => reached_end = Some(at),
+                }
+            }
+        }
+        if let Some(at) = reached_end {
+            self.apply_end_policy(at);
+        }
+    }
+
+    /// THE POLICY the RT thread is not allowed to have: does reaching the end
+    /// of the material stop the transport?
+    fn apply_end_policy(&mut self, at: u64) {
+        if !self.shared.stop_at_end.load(Relaxed) {
+            return;
+        }
+        // An active loop owns the playhead — it should never have got here,
+        // but a loop enabled between detection and now must still win.
+        if self.shared.loop_spec().active() {
+            return;
+        }
+        // Never cut a take short: recording past the end is how material
+        // gets ADDED past the end.
+        if self.shared.recording.load(Relaxed) {
+            return;
+        }
+        if !self.shared.playing.load(Relaxed) {
+            return;
+        }
+        // Order matters: hand the callback the parking position BEFORE
+        // clearing `playing`, so whichever thread writes the playhead last
+        // writes `at`. Without an output stream there is no callback to
+        // carry it out — the store below is authoritative instead.
+        if self.output.is_some() {
+            self.shared.park.store(at, Relaxed);
+        }
+        self.shared.playing.store(false, Relaxed);
+        self.shared.position.store(at, Relaxed);
+        let snap = {
+            let mut store = self.store.lock();
+            store.transport.state = "stopped".into();
+            store.transport.position_samples = at;
+            crate::control::ops::transport_snapshot(&store, &self.shared)
+        };
+        if let Ok(v) = serde_json::to_value(&snap) {
+            self.events.emit("transport://state", v);
         }
     }
 
@@ -895,6 +1014,104 @@ mod tests {
             self.1.lock().push(frame.clone());
             true
         }
+    }
+
+    /// Drive `OutputCb::render` directly — the only way to test the RT half
+    /// deterministically, without depending on a device's buffer size or on
+    /// how promptly the control thread happens to be scheduled.
+    /// The ring halves the engine would own; returned so the caller keeps
+    /// them alive for the callback's lifetime.
+    type CbPeers = (
+        rtrb::Producer<GraphPtr>,
+        rtrb::Consumer<GraphPtr>,
+        rtrb::Consumer<RawMeterBlock>,
+    );
+
+    fn output_cb(shared: Arc<SharedRt>) -> (OutputCb, rtrb::Consumer<RtEvent>, CbPeers) {
+        let (graph_tx, graph_rx) = rtrb::RingBuffer::new(8);
+        let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
+        let (evt_tx, evt_rx) = rtrb::RingBuffer::new(64);
+        (
+            OutputCb {
+                graph_rx,
+                retire_tx,
+                meter_tx,
+                evt_tx,
+                shared,
+                params: Arc::new(ParamTable::default()),
+                graph: None,
+                channels: 2,
+                rate: 48_000,
+                next_pos: u64::MAX,
+                was_playing: false,
+            },
+            evt_rx,
+            (graph_tx, retire_rx, meter_rx),
+        )
+    }
+
+    /// The RT half of auto-stop, end to end and deterministic: the callback
+    /// REPORTS the crossing (never acts on it), and carries out the parking
+    /// position the control thread asks for — exactly once, only while
+    /// stopped, and landing on the boundary sample rather than wherever the
+    /// buffer happened to end.
+    #[test]
+    fn render_reports_the_end_crossing_then_parks_exactly_once() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, mut evt_rx, _peers) = output_cb(shared.clone());
+        let mut out = vec![0.0f32; 128 * 2]; // 128 frames, stereo
+
+        shared.song_end.store(1000, Relaxed);
+        shared.position.store(900, Relaxed);
+        shared.playing.store(true, Relaxed);
+
+        cb.render(&mut out);
+        assert_eq!(
+            evt_rx.pop().ok(),
+            Some(RtEvent::ReachedEnd { at: 1000 }),
+            "the crossing is reported with the exact boundary sample"
+        );
+        assert_eq!(
+            shared.position.load(Relaxed),
+            1028,
+            "the callback took NO action — it advanced right past the end"
+        );
+
+        // What the control thread does once it pops that event.
+        shared.park.store(1000, Relaxed);
+        shared.playing.store(false, Relaxed);
+
+        cb.render(&mut out);
+        assert_eq!(shared.position.load(Relaxed), 1000, "parked on the boundary");
+        assert_eq!(shared.park.load(Relaxed), NO_PARK, "the request is consumed");
+
+        // A later stopped block must not re-apply it: the playhead is the
+        // user's to move once the transport has stopped.
+        shared.position.store(4242, Relaxed);
+        cb.render(&mut out);
+        assert_eq!(shared.position.load(Relaxed), 4242, "parked only once");
+
+        // And the crossing is edge-triggered: no repeat while sitting past
+        // the end, nor when playing resumes beyond it.
+        shared.playing.store(true, Relaxed);
+        cb.render(&mut out);
+        assert!(evt_rx.pop().is_err(), "no second ReachedEnd past the end");
+    }
+
+    /// Nothing to play means no boundary: an empty project must not report a
+    /// crossing at sample 0 the moment it starts rolling.
+    #[test]
+    fn render_reports_no_crossing_without_material() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, mut evt_rx, _peers) = output_cb(shared.clone());
+        let mut out = vec![0.0f32; 128 * 2];
+        shared.playing.store(true, Relaxed); // song_end stays 0
+        for _ in 0..8 {
+            cb.render(&mut out);
+        }
+        assert!(evt_rx.pop().is_err());
+        assert_eq!(shared.position.load(Relaxed), 8 * 128);
     }
 
     fn spin_up() -> (EngineHandle, Arc<SharedRt>, Arc<ParamTable>, Arc<Mutex<Store>>) {

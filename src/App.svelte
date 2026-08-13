@@ -18,6 +18,7 @@
   import { exporter } from "./lib/state/exporter.svelte";
   import { loopjam } from "./lib/state/loopjam.svelte";
   import { generation } from "./lib/state/generation.svelte";
+  import { clipEdges, edgeJump, gridStep } from "./lib/utils/timeline-nav";
   import TransportBar from "./lib/components/TransportBar.svelte";
   import Timeline from "./lib/components/Timeline.svelte";
   import MasterBar from "./lib/components/MasterBar.svelte";
@@ -44,6 +45,11 @@
     };
   });
 
+  /** Where the playhead is right now — interpolated while rolling. */
+  function playhead(): number {
+    return Math.round(transport.positionAt(performance.now()));
+  }
+
   function onKeydown(e: KeyboardEvent) {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
@@ -54,6 +60,36 @@
       void transport.togglePlay();
     } else if (e.key === "Home") {
       void transport.seek(0);
+    } else if (e.key === "End") {
+      // The engine's end, not our own guess from clip bounds: it also
+      // accounts for the final scheduled note-off.
+      void transport.seek(transport.snap.songEndSamples);
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      // Grid walk: a bar at a time, a beat with shift.
+      e.preventDefault();
+      const dir = e.key === "ArrowRight" ? 1 : -1;
+      const step = e.shiftKey ? project.samplesPerBeat : project.samplesPerBar;
+      void transport.seek(gridStep(playhead(), step, dir));
+    } else if (e.key === "," || e.key === ".") {
+      // Jump between clip edges across every track — the fastest way
+      // through an arrangement. Staying put beats jumping somewhere
+      // arbitrary when there is no edge left.
+      const dir = e.key === "." ? 1 : -1;
+      const target = edgeJump(
+        [
+          ...clipEdges(project.clips),
+          // MIDI clips are musical time; the tempo map converts them.
+          ...clipEdges(
+            midi.clips.map((c) => ({
+              timelineStartSamples: midi.ticksToSamples(c.timelineStartTicks),
+              lengthSamples: midi.ticksToSamples(c.lengthTicks),
+            })),
+          ),
+        ],
+        playhead(),
+        dir,
+      );
+      if (target !== null) void transport.seek(target);
     } else if (e.key === "+" || e.key === "=") {
       view.zoomAt(view.width / 2, 0.75);
     } else if (e.key === "-") {

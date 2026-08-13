@@ -187,6 +187,18 @@ pub fn transport_set_loop(
     control.transport(control::TransportAction::SetLoop { enabled, start_samples, end_samples })
 }
 
+/// Stop the transport when the playhead reaches the end of the material.
+/// Pure policy: the engine detects the boundary either way and reports it —
+/// this decides whether reaching it stops playback. Ignored while a loop is
+/// active or while recording. Persisted with the project.
+#[tauri::command]
+pub fn transport_set_stop_at_end(
+    enabled: bool,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<TransportState, String> {
+    control.transport(control::TransportAction::SetStopAtEnd { enabled })
+}
+
 #[tauri::command]
 pub fn get_transport_state(state: State<'_, AudioState>) -> Result<TransportState, String> {
     Ok(state.transport_snapshot())

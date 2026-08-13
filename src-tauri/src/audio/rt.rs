@@ -18,6 +18,10 @@ use crate::midi::schedule::AbsNoteEvent;
 pub const FLAG_MUTE: u32 = 1 << 0;
 pub const FLAG_SOLO: u32 = 1 << 1;
 
+/// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
+/// legitimate park target, so absence needs a value outside the timeline.)
+pub const NO_PARK: u64 = u64::MAX;
+
 /// Atomics shared between commands, control thread and RT callbacks.
 pub struct SharedRt {
     /// Playhead, samples at `sample_rate`. Written by the output callback
@@ -30,6 +34,27 @@ pub struct SharedRt {
     pub loop_enabled: AtomicBool,
     pub loop_start: AtomicU64,
     pub loop_end: AtomicU64,
+    /// Last audible sample of the current graph (clip ends + final note-off),
+    /// recomputed by the control thread on every structural rebuild. `0` =
+    /// nothing to play, so no end exists — same "degenerate means off"
+    /// convention as `LoopSpec`. Read by the RT callback to detect the
+    /// crossing; what to DO about it is policy and lives control-side.
+    pub song_end: AtomicU64,
+    /// Policy: stop the transport when the playhead reaches `song_end`.
+    /// Read by the control thread only — never by the audio callback.
+    pub stop_at_end: AtomicBool,
+    /// Where to park the playhead once the transport is no longer playing —
+    /// [`NO_PARK`] when nothing is pending.
+    ///
+    /// Stopping the transport from the control thread cannot place the
+    /// playhead by itself: a callback that read `playing == true` before the
+    /// stop still writes its advanced position afterwards, landing the
+    /// playhead a buffer past where it should be. So the control thread
+    /// says WHERE (policy), and the callback applies it the moment it sees
+    /// the transport stopped (mechanism) — the last writer is then always
+    /// the one that knows. Mechanism, not policy: the callback never decides
+    /// to park, only carries out a position already computed for it.
+    pub park: AtomicU64,
     /// Ring-buffer over/underrun count since engine start.
     pub xruns: AtomicU64,
 }
@@ -44,6 +69,9 @@ impl Default for SharedRt {
             loop_enabled: AtomicBool::new(false),
             loop_start: AtomicU64::new(0),
             loop_end: AtomicU64::new(0),
+            song_end: AtomicU64::new(0),
+            stop_at_end: AtomicBool::new(true),
+            park: AtomicU64::new(NO_PARK),
             xruns: AtomicU64::new(0),
         }
     }

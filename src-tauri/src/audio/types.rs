@@ -29,6 +29,22 @@ pub struct TransportState {
     pub loop_enabled: bool,
     pub loop_start_samples: u64,
     pub loop_end_samples: u64,
+    /// Last audible sample of the current material (0 = nothing to play).
+    /// Reported so the UI navigates to the same end the engine stops at,
+    /// rather than deriving its own from clip bounds alone. Derived state:
+    /// defaulted, never required from a project file.
+    #[serde(default)]
+    pub song_end_samples: u64,
+    /// Stop the transport when the playhead reaches `song_end_samples`.
+    /// Defaulted so projects written before this field still load.
+    #[serde(default = "stop_at_end_default")]
+    pub stop_at_end: bool,
+}
+
+/// Auto-stop is on unless a project says otherwise: a transport that runs
+/// forever into silence is the more surprising default.
+fn stop_at_end_default() -> bool {
+    true
 }
 
 impl Default for TransportState {
@@ -41,6 +57,8 @@ impl Default for TransportState {
             loop_enabled: false,
             loop_start_samples: 0,
             loop_end_samples: 0,
+            song_end_samples: 0,
+            stop_at_end: true,
         }
     }
 }

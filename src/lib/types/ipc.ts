@@ -26,6 +26,10 @@ export interface TransportState {
   loopEnabled: boolean;
   loopStartSamples: number;
   loopEndSamples: number;
+  /** Last audible sample of the material (clip ends + final note-off); 0 = nothing to play. */
+  songEndSamples: number;
+  /** Stop the transport on reaching songEndSamples (ignored while looping/recording). */
+  stopAtEnd: boolean;
 }
 
 // ── track-state.schema.json ─────────────────────────────────────────────────
