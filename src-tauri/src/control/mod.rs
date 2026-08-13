@@ -279,7 +279,7 @@ impl ControlPlane {
             ops::new_track_row(&mut session.store, &self.params, name, kind)?
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![] })
+            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![] })
         })?;
         Ok(track)
     }
@@ -309,7 +309,7 @@ impl ControlPlane {
                 .ok_or_else(|| format!("unknown track: {id}"))?
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![] })
+            tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
         })?;
         // Slot free is the sanctioned effect-layer carve-out (RT bookkeeping,
         // not document state) — runs ONLY after the commit above succeeded,
@@ -320,9 +320,10 @@ impl ControlPlane {
 
     /// Batched mix changes through the transaction channel: one `Op::Set`
     /// per present field, applied atomically (an unknown track id fails —
-    /// and rolls back — the whole batch, same as the pre-Task-7
-    /// `ops::apply_track_mix`). Param-table writes only, no graph rebuild
-    /// (§10.2) — `Op::Set`'s effect never sets `rebuild`.
+    /// and rolls back — the whole batch, same as the retired
+    /// `ops::apply_track_mix` (deleted in Plan B, behavior preserved here)).
+    /// Param-table writes only, no graph rebuild (§10.2) — `Op::Set`'s
+    /// effect never sets `rebuild`.
     ///
     /// `commit` emits `project://changed` on success. The Tauri command path
     /// doesn't strictly need it (the frontend patches its store optimistically
@@ -339,9 +340,9 @@ impl ControlPlane {
         // already rolls back a failed batch, but a change with every field
         // `None` never calls `tx.apply`, so an unknown id in an all-None
         // change would otherwise slip past a rollback that only guards
-        // ops that were actually applied. Pre-checking (as
-        // `ops::apply_track_mix` did) keeps ALL bad ids failing the batch
-        // atomically, before any commit.
+        // ops that were actually applied. Pre-checking (as the retired
+        // `ops::apply_track_mix`, deleted in Plan B, did) keeps ALL bad ids
+        // failing the batch atomically, before any commit.
         {
             let session = self.session.lock();
             for c in &changes {
@@ -446,8 +447,9 @@ impl ControlPlane {
                 op::PropPath::Pan => self.params.set_pan(slot, value),
                 op::PropPath::Muted => self.params.set_flag(slot, FLAG_MUTE, value != 0.0),
                 op::PropPath::Soloed => self.params.set_flag(slot, FLAG_SOLO, value != 0.0),
-                // No ParamTable counterpart for Armed (apply_track_mix
-                // doesn't write one either).
+                // No ParamTable counterpart for Armed (the retired
+                // apply_track_mix, deleted in Plan B, didn't write one
+                // either).
                 op::PropPath::Armed => {}
             }
         }
@@ -1072,8 +1074,8 @@ mod tests {
         let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
         plane
             .commit(user_meta("batch"), |tx| {
-                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![] })?;
-                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![], clip_indices: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![], clip_indices: vec![] })?;
                 tx.apply(set_gain("t-1", 0.5))?;
                 Ok(())
             })
@@ -1156,7 +1158,7 @@ mod tests {
 
         let committed = plane
             .commit(user_meta("remove"), |tx| {
-                tx.apply(Op::TrackRemove { track, index: 0, clips: vec![] })
+                tx.apply(Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
             })
             .unwrap();
         {

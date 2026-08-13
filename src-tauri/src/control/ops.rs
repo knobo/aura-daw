@@ -11,9 +11,8 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::rt::{ParamTable, SharedRt, FLAG_MUTE, FLAG_SOLO};
+use crate::audio::rt::{ParamTable, SharedRt};
 use crate::audio::types::{Store, TrackState, TransportState, MAX_TRACKS};
-use crate::audio::mixer;
 
 /// One batched mix change (op-log-shaped per debt D-03: a UI gesture or MCP
 /// tool call carries MANY of these in one request). `None` = leave unchanged.
@@ -39,55 +38,6 @@ impl TrackMixChange {
             armed: None,
         }
     }
-}
-
-/// Apply a batch of mix changes atomically: all track ids are validated
-/// before anything is written (a bad id fails the whole batch). Values are
-/// clamped to the schema ranges. Returns the updated tracks in batch order.
-pub fn apply_track_mix(
-    store: &mut Store,
-    params: &ParamTable,
-    changes: &[TrackMixChange],
-) -> Result<Vec<TrackState>, String> {
-    for c in changes {
-        if !store.tracks.iter().any(|t| t.id == c.track_id) {
-            return Err(format!("unknown track: {}", c.track_id));
-        }
-    }
-    let mut updated = Vec::with_capacity(changes.len());
-    for c in changes {
-        let slot = store.slots.get(&c.track_id).copied();
-        let t = store
-            .tracks
-            .iter_mut()
-            .find(|t| t.id == c.track_id)
-            .expect("validated above");
-        if let Some(g) = c.gain_db {
-            t.gain_db = g.clamp(-160.0, 24.0);
-        }
-        if let Some(p) = c.pan {
-            t.pan = p.clamp(-1.0, 1.0);
-        }
-        if let Some(m) = c.muted {
-            t.muted = m;
-        }
-        if let Some(s) = c.soloed {
-            t.soloed = s;
-        }
-        if let Some(a) = c.armed {
-            t.armed = a;
-        }
-        let snapshot = t.clone();
-        if let Some(slot) = slot {
-            params.set_gain_linear(slot, mixer::db_to_linear(snapshot.gain_db));
-            params.set_pan(slot, snapshot.pan as f32);
-            params.set_flag(slot, FLAG_MUTE, snapshot.muted);
-            params.set_flag(slot, FLAG_SOLO, snapshot.soloed);
-        }
-        updated.push(snapshot);
-    }
-    params.any_solo.store(store.any_solo(), Relaxed);
-    Ok(updated)
 }
 
 pub const TRACK_COLORS: [&str; 6] =
@@ -188,44 +138,6 @@ mod tests {
             add_track(&mut store, &params, Some(format!("T{i}")), None).unwrap();
         }
         (store, params)
-    }
-
-    #[test]
-    fn batched_mix_applies_all_and_clamps() {
-        let (mut store, params) = store_with_tracks(2);
-        let a = store.tracks[0].id.clone();
-        let b = store.tracks[1].id.clone();
-        let updated = apply_track_mix(
-            &mut store,
-            &params,
-            &[
-                TrackMixChange { gain_db: Some(100.0), pan: Some(-2.0), ..TrackMixChange::new(&a) },
-                TrackMixChange { muted: Some(true), soloed: Some(true), ..TrackMixChange::new(&b) },
-            ],
-        )
-        .unwrap();
-        assert_eq!(updated.len(), 2);
-        assert_eq!(updated[0].gain_db, 24.0, "gain clamped");
-        assert_eq!(updated[0].pan, -1.0, "pan clamped");
-        assert!(updated[1].muted && updated[1].soloed);
-        assert!(params.any_solo.load(Relaxed));
-    }
-
-    #[test]
-    fn batched_mix_is_atomic_on_unknown_track() {
-        let (mut store, params) = store_with_tracks(1);
-        let a = store.tracks[0].id.clone();
-        let err = apply_track_mix(
-            &mut store,
-            &params,
-            &[
-                TrackMixChange { gain_db: Some(-6.0), ..TrackMixChange::new(&a) },
-                TrackMixChange::new("nope"),
-            ],
-        )
-        .unwrap_err();
-        assert!(err.contains("unknown track"));
-        assert_eq!(store.tracks[0].gain_db, 0.0, "no partial application");
     }
 
     #[test]

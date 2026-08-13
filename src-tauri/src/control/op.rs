@@ -3,7 +3,7 @@
 pub const OP_FORMAT_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Op {
     /// Property-addressed change (round-2 §4: Set { object, path, from, to }).
     Set { object: ObjectRef, path: PropPath, from: serde_json::Value, to: serde_json::Value },
@@ -13,13 +13,33 @@ pub enum Op {
     /// `TrackRemove` carries back exactly the clips that were removed with
     /// it (clips are document state, not effect-layer bookkeeping — round-2
     /// fix, controller ruling: a track op must carry its own clips so an
-    /// undo never resurrects an empty track).
-    TrackAdd { track: crate::audio::types::TrackState, index: usize, clips: Vec<crate::audio::types::Clip> },
+    /// undo never resurrects an empty track). `clip_indices` are the
+    /// pre-removal positions the clips held in `store.clips`, in ascending
+    /// order — when its length matches `clips.len()`, `apply_raw` reinserts
+    /// each clip at its recorded index instead of appending, restoring the
+    /// original interleaving byte-identically (Plan A carry-forward).
+    /// `#[serde(default)]` so pre-Plan-B payloads without the field still
+    /// deserialize (OP_FORMAT_VERSION stays 1).
+    TrackAdd {
+        track: crate::audio::types::TrackState,
+        index: usize,
+        clips: Vec<crate::audio::types::Clip>,
+        #[serde(default)]
+        clip_indices: Vec<usize>,
+    },
     /// Structural: remove a track. Payload kept so the inverse can restore
     /// identity + row byte-identically (gate test 2 arrives in Plan B).
     /// `clips` is advisory (like `index`) — `apply_raw` collects the track's
     /// actual clips from store truth, ignoring the caller's value here.
-    TrackRemove { track: crate::audio::types::TrackState, index: usize, clips: Vec<crate::audio::types::Clip> },
+    /// `clip_indices` is likewise advisory — store truth (computed by
+    /// `apply_raw` from the removal) wins.
+    TrackRemove {
+        track: crate::audio::types::TrackState,
+        index: usize,
+        clips: Vec<crate::audio::types::Clip>,
+        #[serde(default)]
+        clip_indices: Vec<usize>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -117,7 +137,9 @@ mod tests {
             fade_in_samples: 0,
             fade_out_samples: 0,
         };
-        let track_add = Op::TrackAdd { track: track.clone(), index: 0, clips: vec![clip.clone()] };
+        let track_add = Op::TrackAdd {
+            track: track.clone(), index: 0, clips: vec![clip.clone()], clip_indices: vec![0],
+        };
         let s = serde_json::to_string(&track_add).unwrap();
         // Print once to verify camelCase tag form: should be "trackAdd", and
         // that `clips` is a true array on the wire (not dropped/renamed).
@@ -125,18 +147,28 @@ mod tests {
         assert!(s.contains("\"kind\":\"trackAdd\""), "wire form was: {s}");
         assert!(s.contains("\"clips\":[{"), "clips must serialize as an array of objects, was: {s}");
         assert!(s.contains("\"id\":\"c-1\""), "clip fields must be present, was: {s}");
+        assert!(s.contains("\"clipIndices\":[0]"), "clip_indices must serialize camelCase, was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, track_add);
 
         // TrackRemove with real TrackState: verify wire form and round-trip.
-        let track_remove = Op::TrackRemove { track, index: 0, clips: vec![clip] };
+        let track_remove = Op::TrackRemove {
+            track, index: 0, clips: vec![clip], clip_indices: vec![0],
+        };
         let s = serde_json::to_string(&track_remove).unwrap();
         // Print once to verify camelCase tag form: should be "trackRemove"
         eprintln!("TrackRemove wire form: {}", s);
         assert!(s.contains("\"kind\":\"trackRemove\""), "wire form was: {s}");
         assert!(s.contains("\"clips\":[{"), "clips must serialize as an array of objects, was: {s}");
+        assert!(s.contains("\"clipIndices\":[0]"), "clip_indices must serialize camelCase, was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, track_remove);
+
+        // Compat: a legacy payload without `clipIndices` still deserializes
+        // (additive field, `#[serde(default)]`, OP_FORMAT_VERSION stays 1).
+        let legacy = r##"{"kind":"trackRemove","track":{"id":"t-2","name":"Audio Track","kind":"audio","gainDb":0.0,"pan":0.0,"muted":false,"soloed":false,"armed":false,"color":"#7c9cff"},"index":0,"clips":[]}"##;
+        let parsed: Op = serde_json::from_str(legacy).expect("legacy payload without clipIndices parses");
+        assert!(matches!(parsed, Op::TrackRemove { ref clip_indices, .. } if clip_indices.is_empty()));
     }
 
     #[test]

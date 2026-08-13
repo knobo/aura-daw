@@ -15,18 +15,7 @@
 //! and unreachable from an integration test) — this file defines its own,
 //! parallel but independent.
 //!
-//! STRATEGY EXCLUSION (carried requirement, binding): `arb_op_batches` never
-//! generates ops carrying clips. The seeded 3-track session starts with zero
-//! clips, `TrackAdd`s here always pass `clips: vec![]`, and `TrackRemove`s
-//! always resolve against ids that (by construction) never had clips. This
-//! is required because `Op::TrackAdd`'s clip restore (`session.rs`,
-//! `apply_raw`) APPENDS restored clips to `store.clips` rather than
-//! reinserting them at their original positions — so a history that
-//! interleaves clip-bearing removes and adds is not byte-stable under
-//! undo/redo (clip vec order can permute). That's a real, ledgered, deferred
-//! design point (round-2 fix notes on `Op::TrackRemove`), not a bug this
-//! suite should trip over. A clip-carrying structural property test is out
-//! of scope for Task 8 / Plan A.
+//! Clip-carrying structural ops are exercised by Gate B (tests/identity_properties.rs).
 
 use std::collections::BTreeMap;
 
@@ -218,7 +207,9 @@ fn resolve_one(action: RawAction, alive: &mut Vec<String>, counter: &mut u32) ->
             *counter += 1;
             alive.push(id.clone());
             // Clip-free by design — see the module doc comment.
-            Some(Op::TrackAdd { track: test_track(&id), index: alive.len() - 1, clips: vec![] })
+            Some(Op::TrackAdd {
+                track: test_track(&id), index: alive.len() - 1, clips: vec![], clip_indices: vec![],
+            })
         }
         RawAction::Remove(pick) => {
             if alive.is_empty() {
@@ -229,7 +220,9 @@ fn resolve_one(action: RawAction, alive: &mut Vec<String>, counter: &mut u32) ->
             // `track`'s non-id fields are advisory-ignored by `apply_raw`
             // (store truth wins for the removed row and its clips) — only
             // `.id` matters for finding the row to remove.
-            Some(Op::TrackRemove { track: test_track(&id), index: idx, clips: vec![] })
+            Some(Op::TrackRemove {
+                track: test_track(&id), index: idx, clips: vec![], clip_indices: vec![],
+            })
         }
     }
 }

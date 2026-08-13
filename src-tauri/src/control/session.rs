@@ -86,19 +86,21 @@ impl Tx<'_> {
 /// What `apply_raw` did that the engine/RT side must eventually see, folded
 /// across a whole transaction. The session only DESCRIBES the effect —
 /// `ControlPlane::commit` (control/mod.rs, Task 6) EXECUTES it after the
-/// session lock is released. Faithfully mirrors what `ops::apply_track_mix`
-/// (control/ops.rs:47-95) writes today:
+/// session lock is released. Faithfully mirrors what the retired
+/// `ops::apply_track_mix` (deleted in Plan B, behavior preserved here)
+/// used to write:
 /// * `param_writes`: `(slot, path, value)` — `Gain` as linear (via
 ///   `mixer::db_to_linear`), `Pan` as-is, `Muted`/`Soloed` as 0.0/1.0 gates
 ///   (`ControlPlane::commit` turns those back into the RT param store's
-///   `set_flag` calls). `apply_track_mix` rewrites ALL FOUR params from the
-///   post-write snapshot on every changed (slotted) track, regardless of
-///   which single field changed — so does this, per `Set`. `Armed` has no
-///   RT param counterpart and never appears as its own entry (matching
-///   `apply_track_mix`, which also has nothing to write for it).
+///   `set_flag` calls). The retired `apply_track_mix` rewrote ALL FOUR
+///   params from the post-write snapshot on every changed (slotted) track,
+///   regardless of which single field changed — so does this, per `Set`.
+///   `Armed` has no RT param counterpart and never appears as its own entry
+///   (matching the retired `apply_track_mix`, which also had nothing to
+///   write for it).
 /// * `any_solo`: `Store::any_solo()` is a store-wide flag (not per-slot),
-///   which `apply_track_mix` recomputes unconditionally once per BATCH. A
-///   plain `Vec<(slot, PropPath, f32)>` can't express a slot-less,
+///   which the retired `apply_track_mix` recomputed unconditionally once per
+///   BATCH. A plain `Vec<(slot, PropPath, f32)>` can't express a slot-less,
 ///   whole-store flag, so this is a minimal, justified extension beyond the
 ///   brief's tuple sketch: recomputed on every track `Set` in the
 ///   transaction (slot or not — `any_solo` doesn't require one); the last
@@ -150,11 +152,12 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 from: applied,   // the inverse's `from`: value we just wrote
                 to: from_now,    // the inverse's `to`: value to restore
             };
-            // Mirror `ops::apply_track_mix` (control/ops.rs:47-95): a
-            // changed track WITH a slot gets all four mix params rewritten
-            // from the current (post-write) snapshot, not just the touched
-            // path — that's what apply_track_mix does too (unconditional
-            // per changed-track write of gain/pan/mute/solo). A track
+            // Mirror the retired `ops::apply_track_mix` (deleted in Plan B,
+            // behavior preserved here): a changed track WITH a slot gets
+            // all four mix params rewritten from the current (post-write)
+            // snapshot, not just the touched path — that's what
+            // apply_track_mix did too (unconditional per changed-track
+            // write of gain/pan/mute/solo). A track
             // without a slot contributes no param_write (op::TrackAdd
             // leaves slot bookkeeping untouched, round-2 §2.4).
             if let Some(&slot) = session.store.slots.get(id) {
@@ -182,13 +185,17 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 ));
             }
             // any_solo is store-wide (Store::any_solo), independent of
-            // slot presence — apply_track_mix recomputes it unconditionally
-            // once per batch; here, per track Set (idempotent: the last
-            // recompute in the transaction is truth).
+            // slot presence — the retired apply_track_mix (deleted in
+            // Plan B) recomputed it unconditionally once per batch; here,
+            // per track Set (idempotent: the last recompute in the
+            // transaction is truth).
             effect.any_solo = Some(session.store.any_solo());
             Ok(inverse)
         }
-        Op::TrackAdd { track, index, clips } => {
+        Op::TrackAdd { track, index, clips, clip_indices } => {
+            if session.store.tracks.iter().any(|t| t.id == track.id) {
+                return Err(format!("duplicate track id: {}", track.id));
+            }
             let idx = (*index).min(session.store.tracks.len());
             crate::control::ops::insert_track(&mut session.store, track.clone(), idx);
             // Clips are document state (part of Project), not effect-layer
@@ -196,14 +203,26 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // (fix: a prior draft freed/dropped clips outside the channel;
             // the payload here is authoritative, not advisory, since these
             // are the clips being inserted, not pre-existing store truth).
-            session.store.clips.extend(clips.iter().cloned());
+            if clip_indices.len() == clips.len() && !clips.is_empty() {
+                // Indices are ascending pre-removal positions; inserting back in
+                // ascending order reconstructs the original interleaving exactly.
+                for (c, &at) in clips.iter().zip(clip_indices.iter()) {
+                    let at = at.min(session.store.clips.len());
+                    session.store.clips.insert(at, c.clone());
+                }
+            } else {
+                session.store.clips.extend(clips.iter().cloned());
+            }
             // Structural: at most one Rebuild per transaction, however many
             // structural ops it contains — a plain flag naturally folds.
             effect.rebuild = true;
             // Inverse: remove the same row (+ the clips just inserted with
             // it), same id, no slot bookkeeping here (round-2 §2.4 — slots
             // stay in the command's effect layer until Plan B).
-            Ok(Op::TrackRemove { track: track.clone(), index: idx, clips: clips.clone() })
+            Ok(Op::TrackRemove {
+                track: track.clone(), index: idx, clips: clips.clone(),
+                clip_indices: clip_indices.clone(),
+            })
         }
         Op::TrackRemove { track, .. } => {
             // Found by id, not blindly by the caller's recorded index —
@@ -221,15 +240,21 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // caller's `clips` field on `Op::TrackRemove` is advisory only,
             // same precedent as `index`), removed alongside the row so an
             // undo (`TrackAdd` inverse below) restores both, not just an
-            // empty track.
+            // empty track. Pre-removal indices are recorded too (retain
+            // visits in order) so the inverse can reinsert each clip at its
+            // original position instead of appending (Plan A carry-forward:
+            // positional restore keeps clip vec order byte-stable).
             let mut removed_clips = Vec::new();
+            let mut removed_indices = Vec::new();
+            let mut i = 0usize;
             session.store.clips.retain(|c| {
-                if c.track_id == track.id {
+                let keep = c.track_id != track.id;
+                if !keep {
                     removed_clips.push(c.clone());
-                    false
-                } else {
-                    true
+                    removed_indices.push(i);
                 }
+                i += 1;
+                keep
             });
             effect.rebuild = true;
             // Removing a track can flip the store-wide any_solo flag (the
@@ -238,7 +263,9 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // TrackAdd row is never soloed (ops::new_track_row), so adding
             // never changes any_solo and doesn't need this.
             effect.any_solo = Some(session.store.any_solo());
-            Ok(Op::TrackAdd { track: removed, index: pos, clips: removed_clips })
+            Ok(Op::TrackAdd {
+                track: removed, index: pos, clips: removed_clips, clip_indices: removed_indices,
+            })
         }
         _ => Err("op not yet supported".into()),
     }
@@ -256,9 +283,9 @@ fn read_prop(t: &TrackState, path: PropPath) -> serde_json::Value {
     }
 }
 
-/// Write a track property, clamping to the same schema ranges
-/// `ops::apply_track_mix` (control/ops.rs:47) uses, and returns the
-/// as-applied (post-clamp) value.
+/// Write a track property, clamping to the same schema ranges the retired
+/// `ops::apply_track_mix` (deleted in Plan B, behavior preserved here) used,
+/// and returns the as-applied (post-clamp) value.
 fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Result<serde_json::Value, String> {
     match path {
         PropPath::Gain => {
@@ -420,6 +447,24 @@ mod tests {
         }
     }
 
+    fn test_clip(id: &str, track_id: &str) -> crate::audio::types::Clip {
+        crate::audio::types::Clip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: "clip".into(),
+            source_path: "audio/x.wav".into(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
     /// `from` is intentionally `Null`: it's advisory only, apply_raw re-reads
     /// truth from the store and ignores the caller's `from`.
     fn set_gain(track_id: &str, to: f64) -> Op {
@@ -457,6 +502,30 @@ mod tests {
     }
 
     #[test]
+    fn clamped_write_round_trips_through_inverse() {
+        // 999 dB clamps to 24.0 on write; the recorded op must carry the
+        // POST-CLAMP value (store truth), and its inverse must restore the
+        // original exactly — the ledgered 999→24 case.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let c = Session::transact(&m, user_meta("clamp"), |tx| {
+            tx.apply(set_gain("t-1", 999.0))
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].gain_db, 24.0);
+        match &c.ops[0] {
+            Op::Set { to, .. } => assert_eq!(to, &serde_json::json!(24.0),
+                "recorded op must carry the as-applied (clamped) value"),
+            other => panic!("expected Set, got {other:?}"),
+        }
+        Session::transact(&m, user_meta("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].gain_db, 1.0, "back to the original");
+    }
+
+    #[test]
     fn move_and_move_back_elides_to_noop_history() {
         // §4: property-addressed ops coalesce; from==to after fold drops out.
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
@@ -467,6 +536,22 @@ mod tests {
         })
         .unwrap();
         assert!(c.ops.is_empty(), "net-noop batch must fold to zero ops, got {:?}", c.ops);
+    }
+
+    #[test]
+    fn track_add_with_duplicate_id_is_rejected() {
+        // Rollback removes-by-id: a duplicate id would make the inverse
+        // mis-target. Reject, don't clamp (ledgered Plan A carry-forward).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before = m.lock().store.tracks.clone();
+        let r = Session::transact(&m, user_meta("dup"), |tx| {
+            tx.apply(Op::TrackAdd {
+                track: test_track("t-1"), index: 1,
+                clips: vec![], clip_indices: vec![],
+            })
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().store.tracks, before, "store untouched");
     }
 
     #[test]
@@ -520,7 +605,7 @@ mod tests {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let row = m.lock().store.tracks[0].clone();
         let c = Session::transact(&m, user_meta("remove"), |tx| {
-            tx.apply(Op::TrackRemove { track: row.clone(), index: 0, clips: vec![] })
+            tx.apply(Op::TrackRemove { track: row.clone(), index: 0, clips: vec![], clip_indices: vec![] })
         }).unwrap();
         assert!(m.lock().store.tracks.is_empty());
         Session::transact(&m, user_meta("undo"), |tx| {
@@ -528,6 +613,32 @@ mod tests {
             Ok(())
         }).unwrap();
         assert_eq!(m.lock().store.tracks[0], row, "same id, same everything");
+    }
+
+    #[test]
+    fn remove_undo_restores_interleaved_clip_order_byte_identically() {
+        // store.clips = [a1, b1, a2] (a-clips on t-A, b1 on t-B). Removing t-A
+        // then undoing must yield EXACTLY [a1, b1, a2] — not [b1, a1, a2].
+        let m = parking_lot::Mutex::new(session_with_one_track("t-B"));
+        {
+            let mut g = m.lock();
+            g.store.tracks.push(test_track("t-A"));
+            g.store.clips.push(test_clip("a1", "t-A"));
+            g.store.clips.push(test_clip("b1", "t-B"));
+            g.store.clips.push(test_clip("a2", "t-A"));
+        }
+        let row = m.lock().store.tracks.iter().find(|t| t.id == "t-A").cloned().unwrap();
+        let before = m.lock().store.clips.clone();
+        let c = Session::transact(&m, user_meta("remove"), |tx| {
+            tx.apply(Op::TrackRemove { track: row, index: 0, clips: vec![], clip_indices: vec![] })
+        })
+        .unwrap();
+        Session::transact(&m, user_meta("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.clips, before, "same clips, same ORDER");
     }
 
     #[test]
@@ -540,7 +651,7 @@ mod tests {
         let snapshot = { let g = m.lock(); (g.store.tracks.clone(), g.store.clips.clone()) };
         let new_row = test_track("t-2");
         let r = Session::transact(&m, user_meta("mixed-fail"), |tx| {
-            tx.apply(Op::TrackAdd { track: new_row, index: 1, clips: vec![] })?;
+            tx.apply(Op::TrackAdd { track: new_row, index: 1, clips: vec![], clip_indices: vec![] })?;
             tx.apply(set_gain("t-2", 0.5))?;
             tx.apply(set_gain("ghost", 0.1))?;   // fails the batch
             Ok(())
