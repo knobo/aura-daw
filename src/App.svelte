@@ -14,7 +14,8 @@
   import { mcp } from "./lib/state/mcp.svelte";
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
   import { view } from "./lib/state/view.svelte";
-  import { ui } from "./lib/state/ui.svelte";
+  import { resetUiZoom, ui, zoomUiIn, zoomUiOut } from "./lib/state/ui.svelte";
+  import { applyUiZoom } from "./lib/utils/ui-zoom";
   import { exporter } from "./lib/state/exporter.svelte";
   import { loopjam } from "./lib/state/loopjam.svelte";
   import { generation } from "./lib/state/generation.svelte";
@@ -45,12 +46,35 @@
     };
   });
 
+  // Interface zoom on <body> (not .app) so fixed overlays — dialogs,
+  // toasts — scale along with the shell.
+  $effect(() => applyUiZoom(document.body, ui.zoom));
+
   /** Where the playhead is right now — interpolated while rolling. */
   function playhead(): number {
     return Math.round(transport.positionAt(performance.now()));
   }
 
   function onKeydown(e: KeyboardEvent) {
+    // Interface zoom first: like browser page zoom it must work everywhere,
+    // including inputs and the piano roll, so it runs before the guards.
+    if (e.ctrlKey || e.metaKey) {
+      if (e.key === "+" || e.key === "=") {
+        e.preventDefault();
+        zoomUiIn();
+        return;
+      }
+      if (e.key === "-") {
+        e.preventDefault();
+        zoomUiOut();
+        return;
+      }
+      if (e.key === "0") {
+        e.preventDefault();
+        resetUiZoom();
+        return;
+      }
+    }
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
     // piano roll owns its own keys while hovered/focused
@@ -120,7 +144,10 @@
 
 <style>
   .app {
-    height: 100vh;
+    /* % (not vh): under interface zoom, viewport units get multiplied by
+       the zoom factor and would overflow the window; percentages resolve
+       against the parent's real size (html/body are height: 100%). */
+    height: 100%;
     display: flex;
     flex-direction: column;
     /* clip (not hidden): focus moves must never scroll the app shell */

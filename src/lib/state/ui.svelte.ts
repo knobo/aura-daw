@@ -11,7 +11,32 @@ export const ui = $state({
   studioKind: "aceStepGenerate",
   /** Flash notes (piano roll, keys, clip bodies) as the playhead hits them. */
   noteFlash: true,
+  /** Interface zoom factor (CSS `zoom` on the shell) — session only. */
+  zoom: 1,
 });
+
+export const UI_ZOOM_MIN = 0.8;
+export const UI_ZOOM_MAX = 2.0;
+export const UI_ZOOM_STEP = 0.1;
+
+/** Clamp to [0.8, 2.0] and snap to the 0.1 grid so steps never drift. */
+export function setUiZoom(factor: number) {
+  if (!Number.isFinite(factor)) return;
+  const clamped = Math.min(UI_ZOOM_MAX, Math.max(UI_ZOOM_MIN, factor));
+  ui.zoom = Math.round(clamped * 10) / 10;
+}
+
+export function zoomUiIn() {
+  setUiZoom(ui.zoom + UI_ZOOM_STEP);
+}
+
+export function zoomUiOut() {
+  setUiZoom(ui.zoom - UI_ZOOM_STEP);
+}
+
+export function resetUiZoom() {
+  setUiZoom(1);
+}
 
 export function toggleDock(tab: Exclude<DockTab, "">) {
   ui.dock = ui.dock === tab ? "" : tab;
