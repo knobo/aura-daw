@@ -240,8 +240,12 @@ impl TrackId {
     pub fn as_str(&self) -> &str;
 }
 // Also: Display, From<&str>, From<String>, PartialEq<&str>, PartialEq<str>,
-// Borrow<str> (so HashMap<TrackId, _>::get("plain-str") works), Default,
-// Clone, Eq, Hash, PartialOrd, Ord.
+// PartialEq<String> (production sites compare `t.id == some_string_param` —
+// scout map §A.2 lists ~9 of them), Borrow<str> (so a map RE-KEYED to
+// HashMap<TrackId, _> can be queried by &str; NOTE it does NOT rescue
+// `.get(&t.id)` against a map still keyed by String — String: Borrow<TrackId>
+// cannot exist; those sites take `.as_str()`), Default, Clone, Eq, Hash,
+// PartialOrd, Ord.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct NoteId(pub u32);
@@ -313,6 +317,7 @@ macro_rules! string_id {
         impl From<String> for $name { fn from(s: String) -> Self { Self(s) } }
         impl PartialEq<&str> for $name { fn eq(&self, o: &&str) -> bool { self.0 == *o } }
         impl PartialEq<str> for $name { fn eq(&self, o: &str) -> bool { self.0 == o } }
+        impl PartialEq<String> for $name { fn eq(&self, o: &String) -> bool { &self.0 == o } }
         impl std::borrow::Borrow<str> for $name { fn borrow(&self) -> &str { &self.0 } }
     };
 }
@@ -350,11 +355,13 @@ Expected: PASS
 
 Change `TrackState.id` to `TrackId` (`audio/types.rs:104`), `Clip.track_id` to `TrackId`, `MidiClip.track_id` to `TrackId`, `Store.slots` to `HashMap<TrackId, usize>`, and `ObjectRef::Track(TrackId)` (`control/op.rs:27`). Let the compiler drive the rest of the crate. Migration rules:
 
-- Comparisons `t.id == some_str` keep working via `PartialEq<&str>`; `some_str == t.id` does NOT — flip operand order instead of adding more impls.
+- **Read the scout fallout map first:** `.superpowers/sdd/2026-08-13-plan-b-identity-groundwork/scout-fallout-map.md` §A — it lists every construction site, comparison shape, String-context move and container, verified against the tree. The compiler still drives; the map tells you what each break means.
+- Comparisons `t.id == some_str` / `t.id == some_string` keep working via `PartialEq<&str>`/`PartialEq<String>`; `some_str == t.id` does NOT — flip operand order instead of adding more impls (the scout found zero id-on-right sites, so this should not come up).
 - Functions taking `track_id: &str` at IPC/engine boundaries KEEP `&str`; convert at the document edge with `.into()` / compare via `PartialEq`.
-- `HashMap<TrackId, usize>::get(track_id_str)` works via `Borrow<str>`.
-- `format!("{}", t.id)` works via `Display`; `t.id.clone()` where a `String` is needed becomes `t.id.0.clone()` or `t.id.to_string()`.
-- Struct literals in tests: `id: "t-1".into()` already compiles unchanged.
+- `HashMap<TrackId, usize>::get(track_id_str)` works via `Borrow<str>` — but maps that STAY keyed by `String` (engine `cache` until Task 4, `LiveNodeRegistry`) need `.as_str()` at every `&t.id`/`&c.id` lookup (scout map §A.4; `String: Borrow<TrackId>` cannot exist).
+- `format!("{}", t.id)` works via `Display`; `t.id.clone()` where a `String` is needed becomes `t.id.0.clone()` or `t.id.to_string()`; `Path::join(&clip.id)` needs `.as_str()` (no `AsRef<Path>`).
+- `json!({... clip.id ...})` and all serde output stay byte-identical (transparent) — no change needed at those sites.
+- Struct literals in tests: `id: "t-1".into()` already compiles unchanged; production literals holding a `String` local (scout §A.1: `ops.rs:82`, `import.rs:275`, `recorder.rs:166`, `loopjam.rs:459`, `persist.rs:177`, plus `project.rs:271`'s `format!`) need `.into()`.
 - Do NOT touch `TrackState.instrument_id` (a `plugin:`-scheme ref string, not a plain family).
 
 Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml`
@@ -380,13 +387,17 @@ git commit -m "feat(ids): typed id families — TrackId/ClipId end-to-end, Conte
 
 Round-2 §2.1. The note address is `(content, NoteId)`; pre-split, the `MidiClip` **is** its content object, so the watermark lives on the clip and moves to the content object in Plan C/D unchanged. The AMEV chunk gains a self-describing appended-column mechanism; **both** readers (`midi/events.rs::decode_notes` AND `plugins/automation.rs::decode_points`) stop ignoring the mask.
 
+*Amended 2026-08-13 after the pre-implementation format attack (`.superpowers/sdd/2026-08-13-plan-b-identity-groundwork/format-attack-t3-4.md`, findings C-1, C-2, H-1, H-2, M-1..M-5, M-7..M-9) — amendments are folded into the steps below and marked per ADR 0007.*
+
 **Files:**
-- Modify: `src-tauri/src/midi/types.rs` (`MidiNote.note_id`, `MidiClip.next_note_id`, `mint_note_id`, `ensure_note_ids`)
+- Modify: `src-tauri/src/midi/types.rs` (`MidiNote.note_id`, `MidiClip.next_note_id`, `mint_note_id`, `ensure_note_ids`, `MidiStore.dirty`)
 - Modify: `src-tauri/src/midi/events.rs` (column framing, `COLUMNS_NOTE_ID`, encode/decode signatures)
-- Modify: `src-tauri/src/plugins/automation.rs` (`decode_points` honors the mask / skips appended blocks; `encode_points` unchanged semantics)
-- Modify: `src-tauri/src/midi/persist.rs` (write watermark, read watermark + ids)
-- Modify: minting call sites: `src-tauri/src/midi/mod.rs` (`midi_set_notes`, `midi_add_clip`), `src-tauri/src/control/hum.rs`, `src-tauri/src/midi/midifile.rs`, `src-tauri/src/midi/amt.rs`, `src-tauri/src/control/mod.rs` (`demo_seed_clips`, `demo_seed_clips_v2`)
-- Test: inline in `events.rs`, `types.rs`, `persist.rs`
+- Modify: `src-tauri/src/plugins/automation.rs` (`decode_points` walks/skips appended blocks; `encode_points` unchanged semantics)
+- Modify: `src-tauri/src/midi/persist.rs` (row-level `nextNoteId` [C-1], chunk watermark, read path, `.bin.bad` rename on unreadable chunks [C-2])
+- Modify: `src-tauri/src/midi/mod.rs` (`midi_set_notes` keep-rule + mutation order [H-1, M-9]; `sync_midi_store` failed-load fix [H-2]; failed-persist `dirty` flag [M-5]; `midi_add_clip`)
+- Modify: minting call sites: `src-tauri/src/control/hum.rs`, `src-tauri/src/midi/midifile.rs`, `src-tauri/src/midi/amt.rs` (`merge_infill` forces `NoteId(0)` on generated notes [M-8]), `src-tauri/src/control/mod.rs` (`demo_seed_clips`, `demo_seed_clips_v2`)
+- Modify: `docs/ipc-schemas/midi-clip.schema.json` (additive `$defs/note.noteId` u32 default 0, `$defs/persistedClip.nextNoteId` integer min 1 default 1 — not required) [M-7]
+- Test: inline in `events.rs`, `types.rs`, `persist.rs`, `mod.rs`
 
 **Interfaces:**
 - Produces:
@@ -423,8 +434,27 @@ Readers skip blocks whose colBit they do not know via byteLen — that is
 what makes future columns non-breaking (the D-06 rule, binary edition).
 COLUMNS_NOTE_ID (0x0002) payload:
   [next_note_id u32] [count x note_id u32]   (byteLen = 4 + 4*count)
+One note_id per RECORD, in record order — 0 for non-note (kind != 0)
+records. `count` is the record count, and records are kind-tagged; a
+mixed chunk must not misalign ids against the note subset. [M-1]
 AMEV_VERSION stays 1: v1 chunks without the column read tolerantly (note
-ids minted 1..=count on load, watermark count+1); every write includes it.
+ids minted 1..=count by record ordinal on load, watermark count+1); every
+write includes it.
+Reader rules (normative) [M-2, M-3, M-4]:
+* the columnMask is ADVISORY: unknown bits are ignored, unknown blocks
+  are skipped by byteLen, and no reader may error on an unrecognised bit.
+  The note-id column is "present" iff a 0x0002 block was CONSUMED; a mask
+  bit set with no matching block -> Err; a block whose bit is not in the
+  mask is read anyway (blocks are self-describing).
+* byteLen > bytes remaining -> Err (truncated chunk). Remaining bytes are
+  computed with saturating_sub — never a bare subtraction.
+* the same colBit twice, or a colBit <= the previous one -> Err.
+* expected sizes (4 + 4*count, count*16) are computed in u64, and
+  count*16 <= remaining bytes is required BEFORE allocating.
+* a watermark <= some present id is REPAIRED, not rejected:
+  next_note_id = max(next_note_id, max_present_id + 1) + log::warn!.
+  Err is reserved for structural corruption — a semantic Err would feed
+  persist.rs's degrade-to-empty path and destroy notes on the next save.
 ```
 
 - [ ] **Step 1: Add the fields + allocator with a failing test**
@@ -533,22 +563,31 @@ Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml amev_` — FAI
 
 `encode_notes(ppq, notes, next_note_id)`: mask = `COLUMNS_CORE | COLUMNS_NOTE_ID`; after the records, write `[0x0002 u16][ (4 + 4*count) u32 ][next_note_id u32][note ids u32...]`.
 
-`decode_notes`: parse mask honestly (delete the `let _columns =` line). After `count` records, loop while ≥ 6 bytes remain: read `colBit`/`byteLen`; `COLUMNS_NOTE_ID` → read watermark + ids (error if `byteLen != 4 + 4*count`); unknown → skip `byteLen`. If the note-id column is absent: assign `NoteId(i as u32 + 1)` per note in order, `next_note_id = count + 1`. Validate on read: watermark must be > every id present (`max(id) < next_note_id`), else `Err` — a corrupt watermark silently re-minting live ids is exactly the Blender-class corruption ADR 0001 exists to prevent.
+`decode_notes`: implement the **Reader rules** block above exactly — it is normative. Concretely: read the mask (delete the `let _columns =` line) but treat it as advisory; after `count` records, loop while ≥ 6 bytes remain (`saturating_sub`): read `colBit`/`byteLen`; Err on truncation, duplicate/non-ascending `colBit`; `COLUMNS_NOTE_ID` → read watermark + one id per RECORD ordinal (error if `byteLen as u64 != 4 + 4*count as u64`), then take `ids[record_index]` at the point a note is pushed; unknown block → skip `byteLen`. If no 0x0002 block was consumed: assign `NoteId(record_index + 1)` per note, `next_note_id = count + 1`. A watermark ≤ some present id is repaired upward with a `log::warn!`, never `Err` [C-2] — write a test for the repair (`chunk with ids [1,5] and watermark 3 loads with next_note_id 6`).
 
-Update existing callers/tests mechanically: `encode_notes(960, &notes)` → `encode_notes(960, &notes, n)`; destructure `DecodedNotes`. The 100k round-trip test asserts `bytes.len()`: update to `16 + 100_000*16 + 6 + 4 + 100_000*4`.
+Update existing callers/tests mechanically: `encode_notes(960, &notes)` → `encode_notes(960, &notes, n)`; destructure `DecodedNotes`. The 100k round-trip test asserts `bytes.len()`: update to `16 + 100_000*16 + 6 + 4 + 100_000*4` (= 2 000 010 — verified arithmetic).
 
-In `plugins/automation.rs::decode_points`: same block-walking (skip ALL appended blocks — points carry no ids yet), delete its `let _columns =` (line ~172). `encode_points` keeps mask `COLUMNS_CORE` (automation chunks carry no note-id column).
+In `plugins/automation.rs::decode_points`: same block-walking (skip ALL appended blocks — points carry no ids yet; a reader that errors on unknown mask bits would break on every note chunk [M-4]), delete its `let _columns =` (line ~172), apply the same truncation/allocation guards [M-3]. `encode_points` keeps mask `COLUMNS_CORE` (automation chunks carry no note-id column).
 
 Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml`
 Expected: all PASS.
 
 - [ ] **Step 4: Persist round-trip + minting at every production site**
 
-`midi/persist.rs`: write path (line ~87) becomes `encode_notes(midi.ppq, &clip.notes, clip.next_note_id)`; read path (`read_chunk`, ~line 206) returns ids + watermark to the caller, which sets both on the loaded clip (find the caller — it builds `MidiClip` rows from project.json v2 + chunks).
+`midi/persist.rs` — the watermark must survive **independently of the chunk** [C-1: an emptied clip writes no chunk and GCs the old one; the watermark must not die with it]:
+- Write path (line ~87): `encode_notes(midi.ppq, &clip.notes, clip.next_note_id)` inside the `!notes.is_empty()` guard, AND `row["nextNoteId"] = json!(clip.next_note_id)` **unconditionally, outside the guard** — the JSON row is the durable authority, the chunk copy keeps chunks self-describing.
+- Read path: the persisted-clip row struct gains `#[serde(default = "first_note_id")] next_note_id: u32`; the loaded clip's watermark is `max(row.next_note_id, chunk.next_note_id)`; `read_chunk` returns ids + watermark to the caller (find it — it builds `MidiClip` rows from project.json v2 + chunks).
+- `read_chunk`'s error path: rename the unreadable chunk to `<name>.bin.bad` before degrading to empty, so the GC cannot destroy the evidence [C-2].
+- Test: **save a clip with notes ids 1..5 (watermark 6), set its notes to `[]`, save again, reload → `next_note_id` is still 6**, and a new note gets id 6, never 1. This is C-1's exact corruption path, pinned.
+
+`midi/mod.rs` hardening (both are identity-bearing now):
+- `sync_midi_store` (~line 127–150): on the `Err` branch of `load_from_project`, **do not** set `midi.loaded_dir` — return before it. Today a failed load marks the store as synced with the new dir and the next mutation persists project A's clips (and watermarks) into project B [H-2].
+- A failed `save_into_project` in the auto-persist block (~line 182–188) sets `midi.dirty = true`; `sync_midi_store` refuses to replace clips while `dirty` (loud `log::warn!`, memory stays authoritative); a successful save clears it [M-5].
 
 Minting rule, applied at every site that puts notes into `session.midi` (all hold the session lock, so allocation is race-free — full *transaction* routing for midi is Plan E's job and is recorded as such in Task 9's handoff):
-- `midi/mod.rs::midi_set_notes` (~line 277): after validation, set each incoming note's `note_id` per this rule — an incoming id that is non-zero, unique in the payload, and `< clip.next_note_id` is KEPT; everything else is minted via `mint_note_id`. Then `ensure_note_ids()` as the belt-and-braces check. (The frontend sends 0 today, so ids churn per replace; the id-*preserving* gesture path is Plan E, ledgered.)
-- `midi_add_clip`, `hum.rs` (both `MidiClip` construction sites), `midifile.rs` import, `amt.rs`, `demo_seed_clips`/`demo_seed_clips_v2`: construct notes with `note_id: NoteId(0)`, then call `ensure_note_ids()` on the finished clip before it enters the store.
+- `midi/mod.rs::midi_set_notes` (~line 277): after validation, set each incoming note's `note_id` per this rule — an incoming id is KEPT iff it is non-zero, appears exactly once in the payload, **and is the id of a note currently in `clip.notes`**; everything else is minted via `mint_note_id`. (`< next_note_id` alone would let a stale client resurrect a deleted note's id [H-1].) **Order [M-9]:** build the id-assigned vector and advanced watermark in locals, run every fallible check on the locals, and only then assign `clip.notes = local; clip.next_note_id = local_watermark;` as the last statements — no partial state is observable on an error return. (The frontend sends 0 today, so ids churn per replace; the id-*preserving* gesture path is Plan E, ledgered.)
+- `midi_add_clip`, `hum.rs` (both `MidiClip` construction sites), `midifile.rs` import, `demo_seed_clips`/`demo_seed_clips_v2`: construct notes with `note_id: NoteId(0)`, then call `ensure_note_ids()` on the finished clip before it enters the store.
+- `amt.rs::merge_infill` (~line 109–122): surviving existing notes keep their ids; **generated notes are forced to `note_id: NoteId(0)` before being pushed** (copies always mint — round-2 §2.1), then `ensure_note_ids()` on the merged clip. Without the force, a sidecar echoing a live id would get an innocent existing note re-minted [M-8].
 
 Test in `persist.rs` (repo-style tempdir test):
 
@@ -583,11 +622,17 @@ git commit -m "feat(midi): persisted note identity — note_id + AMEV watermark 
 
 Round-2 §2.2, justified per O-12: deduplicated decode memory, sane asset GC, and staleness invalidation — NOT the falsified "wrong audio" claim. New assets are named `audio/<sourceId>.wav`; the engine cache re-keys by source; legacy files stay valid (`source_path` remains truth — the naming convention only applies to newly created assets).
 
+*Amended 2026-08-13 after the pre-implementation format attack (findings H-3, H-4, M-6, L-1) — folded into the steps below.*
+
+**Binding invariant [H-3]: one `SourceId` names exactly one `source_path`, and an empty (`Default`) `SourceId` must never reach the cache or the store.** The cache was clip-keyed (unique by construction); source-keying with a shared empty sentinel would collapse every unassigned clip into one bucket — silently wrong audio, the exact failure round-2 §2.2 calls falsified. Legacy ids are minted **deterministically** (UUIDv5 over the normalized `source_path`, fixed namespace) so they are stable across sessions without requiring a write on open [M-6]; add the `v5` feature to the `uuid` dependency in `src-tauri/Cargo.toml`.
+
 **Files:**
+- Modify: `src-tauri/Cargo.toml` (`uuid` features gain `"v5"`)
 - Modify: `src-tauri/src/audio/types.rs` (`Clip.source_id: SourceId`, `#[serde(default)]`)
 - Modify: `docs/ipc-schemas/clip.schema.json` (additive `sourceId` field, D-06)
-- Modify: `src-tauri/src/audio/project.rs` (post-load fixup: mint one `SourceId` per unique `source_path` for clips with an empty `source_id`)
+- Modify: `src-tauri/src/audio/project.rs` (post-load fixup: deterministic `SourceId` per unique **normalized** `source_path` — strip a `project_dir` prefix, reject `..` [L-1] — for clips with an empty `source_id`)
 - Modify: `src-tauri/src/control/import.rs` (mint `SourceId`, name the copy `audio/<sourceId>.wav`, set it on the clip — lines ~218/257/276)
+- Modify: `src-tauri/src/control/loopjam.rs` (~line 445–472: the loop-evolve path is a production asset-creating site — mint a `SourceId`, name the wav by it, set it on the `Clip` literal at ~459) [H-4]
 - Modify: `src-tauri/src/audio/recorder.rs` + `src-tauri/src/audio/engine.rs::start_recording` (`RecSpec` carries a `source_id`; the take's wav path uses it — line ~860)
 - Modify: `src-tauri/src/audio/engine.rs` (`Control.cache` re-keyed; `ensure_loaded`, `rebuild`)
 - Test: inline in `engine.rs`, `project.rs`, `import.rs`
@@ -622,13 +667,13 @@ fn legacy_clips_get_one_source_id_per_unique_path() {
 }
 ```
 
-Implement `pub(crate) fn assign_source_ids(clips: &mut [Clip])` (a `HashMap<String, SourceId>` over `source_path`), call it from `load` before returning, AND from `open_project` / anywhere else a legacy `Project` enters the store (grep `project::load(`). Also add `"sourceId": { "type": "string" }` to `docs/ipc-schemas/clip.schema.json` (additive, not required).
+Implement `pub(crate) fn assign_source_ids(clips: &mut [Clip])` — normalize each `source_path` (strip any absolute `project_dir`-style prefix down to the project-relative form, reject `..` [L-1]), then mint **deterministically**: `SourceId(uuid::Uuid::new_v5(&AURA_SOURCE_NS, normalized.as_bytes()).to_string())` with `const AURA_SOURCE_NS: uuid::Uuid = uuid::uuid!("6ba7b810-9dad-11d1-80b4-00c04fd430c8")`-style fixed namespace (mint a project-specific constant once, document it in the fn's doc comment). Deterministic minting means the same legacy project opens with the SAME ids every session, without requiring a save-on-open [M-6]. Call it from `load` before returning, AND from `open_project` / anywhere else a legacy `Project` enters the store (grep `project::load(`). Extend the test: two loads of the same clip list yield identical ids. Also add `"sourceId": { "type": "string" }` to `docs/ipc-schemas/clip.schema.json` (additive, not required).
 
 Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml legacy_clips_get_one` — FAIL then PASS; then full suite.
 
 - [ ] **Step 2: New assets are named by source**
 
-`import.rs`: `let source_id = SourceId::mint();` → `rel = format!("audio/{source_id}.wav")`, clip gets `source_id`. Update the import test asserting `audio/<clipId>.wav` (line ~671) to assert `audio/<sourceId>.wav` and `clip.source_id` set. `start_recording` (`engine.rs` ~860) + `RecSpec` (`recorder.rs`): same change — wav path and `rel_path` from a minted `SourceId`, `RecSpec` gains `source_id: SourceId`, and the `Clip` the recorder finalizes carries it (grep `RecSpec` and the `Clip {` literal in `recorder.rs`). Waveform pyramid cache dirs stay keyed by clip id (visual cache; dedup opportunity ledgered in Task 9, not taken here).
+`import.rs`: `let source_id = SourceId::mint();` → `rel = format!("audio/{source_id}.wav")`, clip gets `source_id`. Update the import test asserting `audio/<clipId>.wav` (line ~671) to assert `audio/<sourceId>.wav` and `clip.source_id` set. `start_recording` (`engine.rs` ~860) + `RecSpec` (`recorder.rs`): same change — wav path and `rel_path` from a minted `SourceId`, `RecSpec` gains `source_id: SourceId`, and the `Clip` the recorder finalizes carries it (grep `RecSpec` and the `Clip {` literal in `recorder.rs`). **`loopjam.rs` (~445–472) [H-4]:** same treatment — mint, name the evolved-loop wav `audio/<sourceId>.wav`, set `source_id` on the `Clip` literal (~459); this is the third production asset-creating site and skipping it would feed the empty-sentinel bucket. Waveform pyramid cache dirs stay keyed by clip id (visual cache; dedup opportunity ledgered in Task 9, not taken here).
 
 Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml`
 Expected: all PASS.
@@ -674,7 +719,13 @@ Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml cache_is_share
 
 - [ ] **Step 4: Re-key the cache**
 
-`Control.cache: HashMap<SourceId, CachedSource>`; comment becomes "source id -> decoded samples at `cache_rate`". `ensure_loaded` uses `stale_sources` for its todo list (decode once per source; pyramid build still per *clip* dir — iterate clips of that source for `waveform_cache_dir`), retains by live source ids. `rebuild`'s lookup (line ~567) becomes `self.cache.get(&c.source_id).map(|e| e.data.clone())`. GC comment: retention by source means an asset shared by two clips survives one clip's deletion (the "sane asset GC" half of the O-12 justification).
+`Control.cache: HashMap<SourceId, CachedSource>`; comment becomes "source id -> decoded samples at `cache_rate`". `ensure_loaded` uses `stale_sources` for its todo list (decode once per source; pyramid build still per *clip* dir — iterate clips of that source for `waveform_cache_dir`), retains by live source ids. `rebuild`'s lookup (line ~567) becomes `self.cache.get(&c.source_id).map(|e| e.data.clone())`.
+
+Two policy rules inside `stale_sources` [H-3], both tested:
+- A clip whose `source_id` is empty is **skipped with a `log::warn!`** (and a `debug_assert!` — the store boundary should make this unreachable): it renders silent rather than playing another clip's audio.
+- Two clips naming the SAME `source_id` but DIFFERENT `source_path`s violate the one-source-one-path invariant: `log::warn!` and treat the source as stale under the conflicting path (last conflicting path wins the re-decode) — never silently keep the first and report "nothing to do".
+
+GC comment: retention by source means an asset shared by two clips survives one clip's deletion (the "sane asset GC" half of the O-12 justification).
 
 Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml`
 Expected: all PASS.
@@ -692,6 +743,8 @@ git commit -m "feat(audio): source-keyed assets + decode cache with staleness in
 
 Round-2 §2.4 / O-13. The defect is slot **aliasing in the async rebuild window**: `remove_track` frees the slot, an `alloc_slot` in between reuses it while the old graph still plays the deleted track under it. The fix is structural: `Store` stops owning slots entirely; every rebuild derives slots from display order and builds **its own** `ParamTable`; a retired graph keeps reading its own table, so a "freed" slot cannot alias — there is nothing to free. This is the RT-heavy task: its review goes to the most capable model.
 
+*Amended 2026-08-13 after the pre-implementation RT design attack (`.superpowers/sdd/2026-08-13-plan-b-identity-groundwork/design-attack-t5-7.md`, findings C1, I1, I5, I6, M1, M2) — folded into the semantics rules, files and steps below.*
+
 **Files:**
 - Modify: `src-tauri/src/audio/types.rs` (DELETE `Store.slots`, `slot_used`, `alloc_slot`, `free_slot`, `track_slots` + their tests; ADD `derive_slots`)
 - Modify: `src-tauri/src/audio/rt.rs` (`RtGraph { generation, params }`, `GraphTables`)
@@ -701,7 +754,8 @@ Round-2 §2.4 / O-13. The defect is slot **aliasing in the async rebuild window*
 - Modify: `src-tauri/src/control/ops.rs` (`new_track_row` loses `params` arg + alloc + the `MAX_TRACKS` limit error)
 - Modify: `src-tauri/src/audio/mod.rs` (`open_project` drops the free/alloc/param-seeding block — lines ~586–612; `AudioState` field swap)
 - Modify: `src-tauri/src/midi/playback.rs` (`append_from` takes the derived slot map instead of reading `store.slots`)
-- Modify: `src-tauri/src/audio/offline.rs`, `src-tauri/src/control/export.rs` (derive slots instead of scratch-store alloc)
+- Modify: `src-tauri/src/audio/offline.rs`, `src-tauri/src/control/export.rs` (derive slots instead of scratch-store alloc; `OfflineGraph`'s parallel params field folds into the graph — see semantics rule 4)
+- Modify: `src-tauri/src/control/import.rs`, `src-tauri/src/control/hum.rs`, `src-tauri/src/midi/mod.rs` (~line 366), `src-tauri/src/control/mod.rs` (`seed_demo_project`), `src-tauri/src/control/loopjam.rs` (`RtGraph::new` at ~637) — `add_track`/`new_track_row` callers lose the `&params` argument [M1]. The two tests asserting the deleted slot side effect (`hum.rs:656`, `import.rs:702` — `assert!(store.slots.contains_key(...))`) must be REWRITTEN to assert the row exists, not just compile-fixed [M1].
 - Modify: `src-tauri/src/plugins/lv2_host.rs`, `src-tauri/src/plugins/clap_host.rs`, test fallout wherever `alloc_slot` was called
 - Test: inline in `types.rs`, `rt.rs`, `engine.rs`, `mod.rs`
 
@@ -750,11 +804,13 @@ pub struct EngineEffect {
 - `midi/playback.rs::append_from(midi, store, slots: &HashMap<TrackId, usize>, rate, bank, nodes, out)`.
 
 **Semantics that must hold (write these into code comments where they land):**
-1. `rebuild` (with the session lock held, per the standing deferral) derives `slots = derive_slots(&store.tracks)`, builds a fresh `ParamTable` populated from the rows (`gain/pan/mute/solo` + `any_solo`), bumps `self.generation`, publishes `GraphTables` — **always, even headless** (no output device ⇒ no graph queued, but tables still publish so knob writes and recording keep working).
-2. `ControlPlane::commit` executes `param_writes` by resolving `TrackId → slot` through the CURRENT `GraphTables`; a track without a slot yet (committed but not yet rebuilt — only possible for a `Set` racing a structural rebuild) is skipped: the in-flight rebuild populates its table from the document, which already carries the change. Same for `any_solo`.
-3. `remove_track` loses `free_slot` (nothing to free); `new_track_row` loses alloc + param reset (build-time population replaces it); `open_project` loses its whole slot/param-seeding block (lines ~586–612) — adoption + `Rebuild` is enough.
-4. A retired graph's audio is rendered against ITS `params` (the alias window is dead by construction). `OutputCb` drops its `params` field; `mixer::render(g, ...)` reads `&g.params` (change `render`'s signature or pass `&g.params` explicitly — keep `mixer::render`'s `&ParamTable` parameter and pass the graph's).
+1. `rebuild` derives `slots = derive_slots(&store.tracks)`, builds a fresh `ParamTable` populated from the rows (`gain/pan/mute/solo` + `any_solo`), bumps `self.generation`, and **publishes `GraphTables` INSIDE the session-lock scope** [C1 — this is load-bearing, not style: publishing after the lock is released opens a window where a commit transacts (rev r+1), resolves its param writes through the OLD tables, and the rebuild then publishes tables built from rev r — the knob write is silently lost forever, since `Op::Set` never schedules a rebuild. Publishing under the lock makes ⟨read doc, publish tables⟩ atomic against every commit's ⟨transact, execute writes⟩.] **Lock order: session before tables, never the reverse** — record it as a comment on `SharedGraphTables`. Publish **always, even headless** (no output device ⇒ no graph queued, but tables still publish so knob writes and recording keep working).
+2. `ControlPlane::commit` executes `param_writes` by resolving `TrackId → slot` through the CURRENT `GraphTables`; a track without a slot yet is skipped — sound ONLY given rule 1's under-lock publish (either the commit transacted before the rebuild read the doc, and the table bakes the value in, or after the publish, and the write executes against the new table). Same for `any_solo`.
+3. `remove_track` loses `free_slot` (nothing to free); `new_track_row` loses alloc + param reset (build-time population replaces it — fresh rows are unity/center/no-flags, an exact behavioral match); `open_project` loses its whole slot/param-seeding block (lines ~586–612) — adoption + `Rebuild` is enough.
+4. A retired graph's audio is rendered against ITS `params` (the alias window is dead by construction). `OutputCb` drops its `params` field. **`mixer::render` drops its `&ParamTable` parameter entirely and destructures the graph internally** (`let RtGraph { tracks, scratch, params, .. } = graph;` — split borrows are fine inside the fn; `render(g, &g.params, ...)` would be E0502) [I6]. `offline.rs`'s `OfflineGraph` parallel params field folds into the graph itself (`RtGraph::new(tracks, 0, Arc::new(params))`).
 5. Live-node state already moves across rebuilds via `LiveNodeRegistry` keyed by track id (the pattern round-2 §2.4 names); parameter smoothing does not exist yet — when it lands (engine round), it keys by `TrackId` like the registry. Record this as a comment on `GraphTables`.
+6. **Headless keeps its narrow scope** [I5]: without an output device, `rebuild` derives slots + builds/publishes `GraphTables` and returns BEFORE clip assembly, `append_from` (live/plugin node instantiation) and the `song_end` store — today's headless rebuild does none of those, and silently enabling headless auto-stop or spinning plugin hosts in CI is a behavior change this refactor must not smuggle in.
+7. **A full graph queue must not orphan knob traffic** [I1]: on `PushError::Full`, set `rebuild_pending: bool` on `Control` and retry in `run()`'s loop after `drain_retired` (which is what frees queue space). Without the retry, published tables point at a generation no graph ever adopts and every subsequent param write lands in a table nothing reads.
 
 - [ ] **Step 1: Write the failing `derive_slots` + `GraphTables` tests**
 
@@ -819,7 +875,8 @@ Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml` — compile-e
 fn rebuild(&mut self) {
     self.ensure_loaded();
     self.generation += 1;
-    let (graph, tables) = {
+    let headless = self.output.is_none();
+    let graph = {
         let session = self.session.lock();
         let store = &session.store;
         let slots = super::types::derive_slots(&store.tracks);
@@ -831,28 +888,44 @@ fn rebuild(&mut self) {
             params.set_flag(i, super::rt::FLAG_SOLO, t.soloed);
         }
         params.any_solo.store(store.any_solo(), Relaxed);
-        let mut tracks = Vec::with_capacity(store.tracks.len());
-        for t in &store.tracks {
-            let slot = slots[&t.id];
-            /* clip assembly exactly as today, but slot from `slots` */
+        // PUBLISH UNDER THE SESSION LOCK [C1]: atomic against every
+        // commit's <transact, execute-writes> sequence. Lock order:
+        // session before tables, never the reverse.
+        *self.tables.lock() = GraphTables {
+            generation: self.generation,
+            params: params.clone(),
+            slots: slots.clone(),
+        };
+        if headless {
+            // Headless: tables only [I5] — no clip assembly, no live/plugin
+            // node instantiation, no song_end write (headless transport
+            // policy is unchanged by this refactor).
+            None
+        } else {
+            let mut tracks = Vec::with_capacity(store.tracks.len());
+            for t in &store.tracks {
+                let slot = slots[&t.id];
+                /* clip assembly exactly as today (post-Task-4: cache lookup
+                   by c.source_id), slot from `slots` */
+            }
+            /* append_from(&session.midi, store, &slots, self.cache_rate, bank, &mut self.live_nodes, &mut tracks) */
+            /* song_end exactly as today */
+            Some(Box::new(RtGraph::new(tracks, self.generation, params)))
         }
-        /* append_from(&session.midi, store, &slots, self.cache_rate, bank, &mut self.live_nodes, &mut tracks) */
-        /* song_end exactly as today */
-        (
-            Box::new(RtGraph::new(tracks, self.generation, params.clone())),
-            GraphTables { generation: self.generation, params, slots },
-        )
     };
-    *self.tables.lock() = tables; // published even headless
+    let Some(graph) = graph else { return };
     let Some(out) = self.output.as_mut() else { return };
     while let Ok(gp) = out.retire_rx.pop() { drop(gp); }
     if let Err(rtrb::PushError::Full(_gp)) = out.graph_tx.push(GraphPtr::new(graph)) {
-        log::warn!("audio: graph queue full, rebuild dropped");
+        // [I1] tables already point at this generation; without a retry,
+        // knob traffic would write to a table no graph ever adopts.
+        self.rebuild_pending = true;
+        log::warn!("audio: graph queue full, rebuild retried next tick");
     }
 }
 ```
 
-(The early `return` for headless moves BELOW the table publish — that ordering is the point.) `OutputCb`: delete the `params` field; `mixer::render(g, &g.params, ...)` — wait, `render` receives the graph already; pass `&g.params` where `&self.params` went. `start_recording`'s slot resolution (line ~848) reads `self.tables.lock().slots`. `pump_meter_frames`' `track_slots()` call becomes: lock session for display order, lock tables for slots — `store.tracks.iter().filter_map(|t| tables.slots.get(&t.id).map(|&s| (s, t.id.0.clone())))` (interim until Task 6 re-does the fold). `append_from` signature per the interface; `open_project` block deleted; `ops::new_track_row` per the interface; `remove_track`'s `free_slot` line deleted; offline/export derive slots (`derive_slots(&store.tracks)` on the snapshot — delete the scratch alloc loops); delete `Store.slots`/`slot_used`/`alloc_slot`/`free_slot`/`track_slots` and their two unit tests; fix ALL remaining call sites (tests included — test graphs now construct `RtGraph::new(tracks, gen, params)` explicitly, which most already nearly do).
+`Control` gains `rebuild_pending: bool`; `run()`'s loop, after `drain_retired()`, does `if self.rebuild_pending { self.rebuild_pending = false; self.rebuild(); }` [I1]. `OutputCb`: delete the `params` field; `mixer::render` reads the graph's own params internally (semantics rule 4 — no `&ParamTable` parameter). `start_recording`'s slot resolution (line ~848) reads `self.tables.lock().slots`. `pump_meter_frames`' `track_slots()` call becomes: lock session for display order, THEN tables for slots (lock order!) — `store.tracks.iter().filter_map(|t| tables.slots.get(&t.id).map(|&s| (s, t.id.to_string())))` (interim until Task 6 re-does the fold). `append_from` signature per the interface; `open_project` block deleted; `ops::new_track_row` per the interface (callers in import.rs/hum.rs/midi/mod.rs/seed_demo lose the `&params` argument [M1]); `remove_track`'s `free_slot` line deleted; offline/export derive slots (`derive_slots(&store.tracks)` on the snapshot — delete the scratch alloc loops; `OfflineGraph` params fold into the graph per rule 4); delete `Store.slots`/`slot_used`/`alloc_slot`/`free_slot`/`track_slots` and their two unit tests; fix ALL remaining call sites (tests included — test graphs now construct `RtGraph::new(tracks, gen, params)` explicitly, which most already nearly do). In `control/mod.rs` tests, `test_plane_with_tracks` must publish `GraphTables { generation: 1, params: Arc::new(ParamTable::default()), slots: derive_slots(&tracks) }` at construction, or every param write in the harness silently skips [M2] — add a comment saying exactly that so the next test author isn't trapped.
 
 Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml`
 Expected: all PASS. Behavioral pins that must still hold: `engine_pumps_meter_frames_at_60hz` (its manual `alloc_slot` seeding is replaced by just pushing the track + sending `ControlMsg::Rebuild`), `remove_track_recomputes_any_solo` (now asserts through `tables.params.any_solo`), offline/export byte-stability tests.
@@ -918,11 +991,21 @@ impl RawMeterBlock { pub fn new(generation: u64, position: u64, frames: u32) -> 
 /// generation -> (slot -> track id), kept for the adoption window.
 /// Entries are pruned to the last KEPT_GENERATIONS (4) on insert — a block
 /// older than that is dropped by the fold (stale beyond the window).
-pub struct GenerationMaps { /* BTreeMap<u64, HashMap<usize, TrackId>> */ }
+/// KEPT_GENERATIONS = 4 deliberately tolerates a command-burst publishing
+/// several generations before the ring drains (one blank meter frame,
+/// self-healing) — do not "fix" it down [design-attack M3].
+/// PINNING [design-attack I2]: `pin(generation)` exempts a generation from
+/// pruning; `unpin()` releases it. `start_recording` pins the generation
+/// its InputCb slots were resolved against, `stop_recording` unpins —
+/// otherwise a take spanning >4 rebuilds (drop four clips mid-take) loses
+/// its input meters for the rest of the recording.
+pub struct GenerationMaps { /* BTreeMap<u64, HashMap<usize, TrackId>>, pinned: Option<u64> */ }
 impl GenerationMaps {
     pub const KEPT_GENERATIONS: usize = 4;
     pub fn publish(&mut self, generation: u64, slots: &HashMap<TrackId, usize>);
     pub fn resolve(&self, generation: u64, slot: usize) -> Option<&TrackId>;
+    pub fn pin(&mut self, generation: u64);
+    pub fn unpin(&mut self);
 }
 
 // MeterAccum: folds into per-TrackId lanes.
@@ -974,7 +1057,7 @@ Run: `timeout 600 cargo test --manifest-path src-tauri/Cargo.toml blocks_fold_un
 
 - [ ] **Step 2: Implement**
 
-`MeterAccum`'s fixed `[_; MAX_TRACKS]` lanes become `HashMap<TrackId, Lanes>` (`Lanes { peak: [f32; 2], sumsq: [f32; 2] }`) — this is control-side, allocation is fine. Master lanes unchanged. `fold` resolves `(b.generation, slot)` per set mask bit; unresolvable → skip. `is_empty` counts frames only from accepted blocks. `take_frame` maps `order` through the HashMap (silence for absent). `mixer::render` gains the generation from the graph it renders (it already receives `&RtGraph` — stamp `blk.generation = g.generation`). `InputCb` gains a `generation: u64` field set at `start_recording` from `tables.generation` (recording slots were resolved against that same table — the stamp says so). `Control` owns `gen_maps: GenerationMaps`; `rebuild` publishes; `pump_meter_frames` passes `&self.gen_maps` to folds... correction: `drain_meters` does the folding — thread it there. `pump_meter_frames` builds `order` from `session.store.tracks` ids.
+`MeterAccum`'s fixed `[_; MAX_TRACKS]` lanes become `HashMap<TrackId, Lanes>` (`Lanes { peak: [f32; 2], sumsq: [f32; 2] }`) — this is control-side, allocation is fine. Master lanes unchanged. `fold` resolves `(b.generation, slot)` per set mask bit; unresolvable → skip. `is_empty` counts frames only from accepted blocks. `take_frame` maps `order` through the HashMap (silence for absent). `mixer::render` gains the generation from the graph it renders (it already receives `&RtGraph` — stamp `blk.generation = g.generation`). `InputCb` gains a `generation: u64` field set at `start_recording` from `tables.generation` (recording slots were resolved against that same table — the stamp says so), and `start_recording` **pins** that generation in `GenerationMaps` (`stop_recording` unpins) so a take spanning many rebuilds keeps its input meters [I2] — add a test: publish 6 generations with generation 1 pinned, fold a gen-1 block, assert it still resolves. `Control` owns `gen_maps: GenerationMaps`; `rebuild` publishes (inside the same lock scope as the tables publish — same [C1] ordering); `drain_meters` does the folding — thread `&self.gen_maps` there. `pump_meter_frames` builds `order` from `session.store.tracks` ids.
 
 `RawMeterBlock` stays POD/`Copy` (one added `u64` — still memcpy-able through rtrb).
 
@@ -1037,8 +1120,12 @@ pub struct RawMeterBlock {
 }
 ```
 
-- `mixer::render` signature: instead of returning ONE `RawMeterBlock`, it pushes 1..=⌈slots/64⌉ chunks into the producer it is given: `render(..., meter_tx: &mut rtrb::Producer<RawMeterBlock>)`. Master lanes ride on the first chunk only (`base_slot == 0`); the fold takes master from chunks where `base_slot == 0`.
-- **RT discipline:** the chunk array lives on the render stack (fixed 64-lane POD, same as today's block); emitting N chunks is N pushes, no allocation. A full ring drops the remaining chunks and counts one xrun (today's policy, unchanged).
+- `mixer::render` signature [I6]: no `&ParamTable` parameter (reads `graph.params` internally, per Task 5 rule 4); takes `meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>` and pushes 1..=⌈slots/64⌉ chunks into it; **returns the number of dropped chunks** (u32) so the CALLER counts xruns (`render` has no `SharedRt`). `OutputCb` passes `Some(&mut self.meter_tx)` and adds the returned count to `xruns`; the other three callers — `offline.rs:~146`, `loopjam.rs:~643` (production loop-region render), `playback.rs:~275` (headless test harness) — pass `None`, no fake rings.
+- Master lanes ride on the first chunk only (`base_slot == 0`); the fold takes master from chunks where `base_slot == 0`.
+- **Frame accounting [I3]:** `MeterAccum` counts `frames` ONLY from accepted chunks with `base_slot == 0` — one per callback per generation. With a global per-block counter, N chunks per callback would inflate the RMS denominator by N (meters read ~29 % low at 128 tracks; peaks unaffected, so it hides). Add a test: fold two chunks (base 0 and base 64) from one callback, assert a track's RMS equals the single-chunk case. Input emission must therefore always include a `base_slot == 0` chunk when it carries frames.
+- **`InputCb` chunk emission [I4]:** `capture` is RT (no allocation) and has no graph to hang scratch on — at `start_recording` (control thread), group the resolved slots by `slot / 64` and give `InputCb` a preallocated `blocks: Vec<RawMeterBlock>` template (one per distinct chunk, plus the base-0 chunk for frame accounting if not already present) with per-chunk lane lists; `capture` fills and pushes them. Same pattern as `RtGraph.meter_scratch`.
+- **RT discipline:** output-path chunks live in `RtGraph.meter_scratch` (preallocated at build time, `⌈tracks/64⌉` entries); emitting N chunks is N pushes, no allocation. A full ring drops the remaining chunks; the dropped count is returned (see above) and the caller counts one xrun.
+- **Ring sizing [M4]:** grow the meter ring from 64 to `64 * 8` blocks (`engine.rs:~492` and the input ring at ~877) — chunking divides headroom by the chunk count, and the control thread is exactly the thread that stalls (`ensure_loaded` decodes under rebuild). Blocks are ~2 KiB; the memory is nothing control-side.
 
 - [ ] **Step 1: Write the failing over-64 tests**
 
