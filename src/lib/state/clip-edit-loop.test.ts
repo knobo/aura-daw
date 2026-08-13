@@ -24,6 +24,7 @@ const DEFAULTS: TransportState = {
 const engine: TransportState = { ...DEFAULTS };
 
 const setTrackSolo = vi.fn((_trackId: string, _soloed: boolean) => Promise.resolve());
+const setTrackMute = vi.fn((_trackId: string, _muted: boolean) => Promise.resolve());
 
 vi.mock("../tauri", () => ({
   backend: {
@@ -48,6 +49,7 @@ vi.mock("../tauri", () => ({
     }),
     getTransportState: () => Promise.resolve({ ...engine }),
     setTrackSolo: (trackId: string, soloed: boolean) => setTrackSolo(trackId, soloed),
+    setTrackMute: (trackId: string, muted: boolean) => setTrackMute(trackId, muted),
   },
 }));
 
@@ -64,14 +66,14 @@ const mocked = backend as unknown as {
   transportSetLoop: ReturnType<typeof vi.fn>;
 };
 
-function track(id: string, soloed = false) {
+function track(id: string, soloed = false, muted = false) {
   return {
     id,
     name: id,
     kind: "midi",
     gainDb: 0,
     pan: 0,
-    muted: false,
+    muted,
     soloed,
     armed: false,
     color: "#888888",
@@ -193,6 +195,66 @@ describe("closing the clip editor", () => {
     expect(mocked.transportSetLoop).not.toHaveBeenCalled();
     expect(mocked.transportStop).not.toHaveBeenCalled();
     expect(setTrackSolo).not.toHaveBeenCalled();
+  });
+});
+
+describe("clip track that was manually muted (mute wins over solo)", () => {
+  beforeEach(() => {
+    project.tracks = [track("A", false, true), track("B", true), track("C", false, true)];
+  });
+
+  it("unmutes the clip's track while solo is on and re-mutes it on exit", async () => {
+    clipEditLoop.solo = true;
+    await clipEditLoop.enter(CLIP);
+
+    expect(setTrackMute).toHaveBeenCalledWith("A", false);
+    expect(project.trackById("A")?.muted).toBe(false);
+    setTrackMute.mockClear();
+
+    await clipEditLoop.exit();
+
+    expect(setTrackMute).toHaveBeenCalledWith("A", true);
+    expect(project.trackById("A")?.muted).toBe(true);
+  });
+
+  it("re-mutes the clip's track when solo toggles off mid-edit", async () => {
+    clipEditLoop.solo = true;
+    await clipEditLoop.enter(CLIP);
+    setTrackMute.mockClear();
+
+    await clipEditLoop.setSolo(false);
+
+    expect(setTrackMute).toHaveBeenCalledWith("A", true);
+  });
+
+  it("never touches other manually muted tracks", async () => {
+    clipEditLoop.solo = true;
+    await clipEditLoop.enter(CLIP);
+    await clipEditLoop.setSolo(false);
+    await clipEditLoop.setSolo(true);
+    await clipEditLoop.exit();
+
+    expect(setTrackMute).not.toHaveBeenCalledWith("C", expect.anything());
+    expect(project.trackById("C")?.muted).toBe(true);
+  });
+
+  it("leaves mute alone when the solo choice is off", async () => {
+    clipEditLoop.solo = false;
+    await clipEditLoop.enter(CLIP);
+    await clipEditLoop.exit();
+
+    expect(setTrackMute).not.toHaveBeenCalled();
+  });
+
+  it("re-mutes the old track when retargeting to a clip on another track", async () => {
+    clipEditLoop.solo = true;
+    await clipEditLoop.enter(CLIP);
+    setTrackMute.mockClear();
+
+    await clipEditLoop.enter({ trackId: "C", startSamples: 8000, endSamples: 9000 });
+
+    expect(setTrackMute).toHaveBeenCalledWith("A", true);
+    expect(setTrackMute).toHaveBeenCalledWith("C", false);
   });
 });
 

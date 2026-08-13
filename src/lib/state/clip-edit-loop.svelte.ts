@@ -31,6 +31,8 @@ class ClipEditLoopStore {
 
   private snapshot: Snapshot | null = null;
   private trackId: string | null = null;
+  /** Track whose manual mute we lifted for solo mode (mute wins over solo). */
+  private unmutedId: string | null = null;
 
   get active(): boolean {
     return this.snapshot !== null;
@@ -74,6 +76,11 @@ class ClipEditLoopStore {
   }
 
   private async applyExclusiveSolo(trackId: string) {
+    await this.remute(trackId);
+    if (project.trackById(trackId)?.muted) {
+      await project.setMute(trackId, false);
+      this.unmutedId = trackId;
+    }
     for (const t of project.tracks) {
       await project.setSolo(t.id, t.id === trackId);
     }
@@ -81,9 +88,17 @@ class ClipEditLoopStore {
 
   private async restoreSolo(snap: Snapshot | null = this.snapshot) {
     if (!snap) return;
+    await this.remute();
     for (const [id, soloed] of snap.soloed) {
       await project.setSolo(id, soloed);
     }
+  }
+
+  /** Put back a mute we lifted, unless it was lifted for `keptTrackId`. */
+  private async remute(keptTrackId: string | null = null) {
+    if (!this.unmutedId || this.unmutedId === keptTrackId) return;
+    await project.setMute(this.unmutedId, true);
+    this.unmutedId = null;
   }
 }
 
