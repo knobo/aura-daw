@@ -545,6 +545,14 @@ impl ControlPlane {
             session.midi.tempo_events = d0.tempo_events;
             session.midi.clips = d0.clips;
             session.midi.loaded_dir = Some(dir.clone());
+            // Finding 2: a stale `dirty = true` left over from a prior
+            // auto-persist failure (M-5) must not survive into this fresh
+            // project — otherwise the first midi mutation here persists a
+            // BLANK store over this project's real midi (the guard added to
+            // `with_synced_store` for finding 1 would otherwise be fooled:
+            // `loaded_dir` is set correctly above, so it WOULD persist, and
+            // dirty=true is only meant to block resync-from-disk, not writes).
+            session.midi.dirty = false;
         }
         // App-global plugin/automation registries adopt the (empty) project.
         crate::plugins::state::adopt_open_project(&dir);
@@ -582,8 +590,18 @@ impl ControlPlane {
             // it now (normally that only happens on the next midi mutation).
             let mut session = self.session.lock();
             session.midi.loaded_dir = Some(dir.clone());
-            if let Err(e) = crate::midi::persist::save_into_project(&dir, &session.midi) {
-                log::warn!("save_project_as: persisting midi failed: {e}");
+            // Finding 2 (same gap as create_project): explicitly settle
+            // `dirty` on this persist rather than leaving whatever it was
+            // (e.g. a stale `true` from a prior failed auto-persist in the
+            // old session) — mirrors `with_synced_store`'s success/failure
+            // handling so the flag stays an accurate "memory has an
+            // unpersisted edit" signal for the freshly adopted dir.
+            match crate::midi::persist::save_into_project(&dir, &session.midi) {
+                Ok(()) => session.midi.dirty = false,
+                Err(e) => {
+                    session.midi.dirty = true;
+                    log::warn!("save_project_as: persisting midi failed: {e}");
+                }
             }
         }
         (self.emit)(
@@ -2177,6 +2195,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// Finding 2: a `dirty = true` left over from a PRIOR project's failed
+    /// auto-persist must not survive `create_project`'s reset. If it did,
+    /// the stale flag itself is harmless in isolation, but combined with
+    /// finding 1's `loaded_dir == dir` persist guard it would NOT block
+    /// anything here (loaded_dir is correctly set to the new dir) — the real
+    /// danger is a caller reading `dirty` as "this project has an
+    /// unpersisted edit" when it never did. Assert it comes back false.
+    #[test]
+    fn create_project_clears_a_stale_dirty_flag() {
+        let (cp, _events, _engine) = recording_control_plane();
+        cp.session().lock().midi.dirty = true; // simulate a prior failed auto-persist
+
+        let parent = cp_tmp_parent("blank-dirty");
+        cp.create_project(parent.to_str().unwrap(), "Fresh").unwrap();
+
+        assert!(!cp.session().lock().midi.dirty, "stale dirty flag must not survive a blank-slate reset");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
     /// First save of a session that never had a project: `save_project_as`
     /// creates the .aura dir and persists the CURRENT content (tracks + midi),
     /// unlike create_project which resets.
@@ -2207,6 +2244,7 @@ mod tests {
             events.lock().iter().any(|(n, _)| n == "project://changed"),
             "project://changed emitted"
         );
+        assert!(!cp.session().lock().midi.dirty, "finding 2: successful persist clears dirty");
         let _ = std::fs::remove_dir_all(&parent);
     }
 

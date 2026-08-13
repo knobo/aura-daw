@@ -217,6 +217,17 @@ fn normalize_source_path(source_path: &str) -> Result<String, String> {
     if slashed.starts_with('/') {
         return Err(format!("source_path is absolute, refusing to normalize: {source_path:?}"));
     }
+    // Finding 7: a Windows drive-absolute path (`C:\audio\x.wav` ->
+    // `C:/audio/x.wav` after the backslash swap above) doesn't start with
+    // `/`, so it slipped past the check above — its first segment is a
+    // drive letter ending in `:` (e.g. "C:"). Reject those exactly like a
+    // POSIX-absolute path: minting a SourceId or joining a project dir with
+    // a drive-absolute path escapes the project the same way `/...` does.
+    if slashed.split('/').next().is_some_and(|first| first.ends_with(':')) {
+        return Err(format!(
+            "source_path is drive-absolute, refusing to normalize: {source_path:?}"
+        ));
+    }
     let mut out: Vec<&str> = Vec::new();
     for seg in slashed.split('/') {
         match seg {
@@ -528,6 +539,30 @@ mod tests {
         assert_ne!(
             clips[0].source_id, clips[1].source_id,
             "an absolute path must NEVER merge with its relative-looking twin"
+        );
+    }
+
+    /// Finding 7: a Windows drive-absolute path (`C:\...`) doesn't start
+    /// with `/`, so the POSIX-absolute check above alone let it through —
+    /// after the `\` -> `/` swap it becomes `C:/audio/x.wav`, which minted a
+    /// SourceId and, on the caller's `project_dir.join(...)` side, escapes
+    /// the project (a Windows-absolute join discards the join base just
+    /// like a POSIX-absolute one). Must be rejected the same way.
+    #[test]
+    fn windows_drive_absolute_source_path_is_rejected() {
+        let mut clips = vec![
+            clip_n("c0", "C:\\audio\\x.wav", ""),
+            clip_n("c1", "audio/x.wav", ""),
+        ];
+        assign_source_ids(&mut clips);
+        assert!(
+            clips[0].source_id.as_str().is_empty(),
+            "Windows drive-absolute path left unassigned, not minted over"
+        );
+        assert!(!clips[1].source_id.as_str().is_empty(), "the relative sibling still mints normally");
+        assert_ne!(
+            clips[0].source_id, clips[1].source_id,
+            "a drive-absolute path must NEVER merge with its relative-looking twin"
         );
     }
 

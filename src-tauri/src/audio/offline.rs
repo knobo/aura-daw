@@ -57,7 +57,12 @@ pub fn build_graph(
     rate: u32,
 ) -> OfflineGraph {
     let slots = derive_slots(&store.tracks);
-    let params = Arc::new(ParamTable::default());
+    // Finding 4: `ParamTable::default()` is a fixed 64-slot table (kept only
+    // for tests that poke slots without sizing explicitly). Production
+    // graphs must size PER-GRAPH to the actual track count (round-2 §2.4) —
+    // using the default here silently dropped every track at slot >= 64 from
+    // offline export.
+    let params = Arc::new(ParamTable::with_slots(store.tracks.len()));
     let mut tracks: Vec<RtTrack> = Vec::with_capacity(store.tracks.len());
     for t in &store.tracks {
         let slot = slots[&t.id];
@@ -346,5 +351,36 @@ mod tests {
         assert!((out[150 * 2 + 1] - center).abs() < 1e-6);
         assert_eq!(out[650 * 2], 0.0, "silent past the clip");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Finding 4: `build_graph` used to allocate a fixed 64-slot
+    /// `ParamTable::default()` regardless of track count — a project with
+    /// more than 64 tracks silently lost every track at slot >= 64 from
+    /// offline export (writes to out-of-range slots are dropped, and
+    /// `og.graph.tracks` still has an `RtTrack` per store track, but its
+    /// params would be UNSET past slot 63). Assert the param table is sized
+    /// to the ACTUAL track count, not the historical cap.
+    #[test]
+    fn build_graph_sizes_params_for_more_than_sixty_four_tracks() {
+        const RATE: u32 = 48_000;
+        const N: usize = 80; // > the old fixed 64-slot default
+        let mut store = Store::default();
+        for i in 0..N {
+            store.tracks.push(track(&format!("t{i}"), "audio"));
+        }
+        let midi = MidiStore::default();
+        let og = build_graph(&store, &midi, None, RATE);
+        assert_eq!(og.graph.tracks.len(), N, "one RtTrack per store track");
+        assert_eq!(
+            og.graph.params.len(),
+            N,
+            "param table must be sized for every track, not capped at the old 64-slot default"
+        );
+        // The last track's slot (79, unreachable under the old fixed-64
+        // table) must actually take a param write — proof the table isn't
+        // silently dropping it.
+        let last_slot = derive_slots(&store.tracks)[&store.tracks[N - 1].id];
+        og.graph.params.set_gain_linear(last_slot, 0.25);
+        assert_eq!(og.graph.params.gain[last_slot].load(std::sync::atomic::Ordering::Relaxed), 0.25f32.to_bits());
     }
 }

@@ -184,6 +184,18 @@ pub fn notify_project_opened(dir: Option<PathBuf>, fallback_bpm: f64) {
     }
 }
 
+/// Finding 1: an auto-persist into `dir` is safe only when the store is
+/// actually synced to it — i.e. `sync_midi_store` adopted this exact dir
+/// last, not a stale one left over after it REFUSED to resync (dirty flag,
+/// or a failed load; see [`sync_midi_store`]). Persisting when the two
+/// disagree would write one project's in-memory clips into another
+/// project's dir and GC that project's chunks. A plain equality check, but
+/// pulled out as a pure fn so the guard is unit-testable without a full
+/// session/State harness.
+fn synced_to_dir(loaded_dir: &Option<PathBuf>, dir: &Option<PathBuf>) -> bool {
+    loaded_dir == dir
+}
+
 /// Run `f` against the midi store, synced with the open project (see
 /// [`sync_midi_store`]). After a mutating `f`, persist into the project
 /// (when one is open) and ask the engine for a graph rebuild (STRUCTURAL
@@ -204,12 +216,24 @@ fn with_synced_store<R>(
 
     if mutating {
         if let Some(d) = &dir {
-            match persist::save_into_project(d, &session.midi) {
-                Ok(()) => session.midi.dirty = false,
-                Err(e) => {
-                    session.midi.dirty = true;
-                    log::warn!("midi: persisting to {} failed: {e}", d.display());
+            if synced_to_dir(&session.midi.loaded_dir, &dir) {
+                match persist::save_into_project(d, &session.midi) {
+                    Ok(()) => session.midi.dirty = false,
+                    Err(e) => {
+                        session.midi.dirty = true;
+                        log::warn!("midi: persisting to {} failed: {e}", d.display());
+                    }
                 }
+            } else {
+                // sync_midi_store refused to adopt `dir` above — persisting
+                // regardless would cross-contaminate project B's files with
+                // project A's in-memory clips (see `synced_to_dir`'s doc).
+                log::warn!(
+                    "midi: skipping persist to {} — store not synced to it (loaded_dir={:?}); \
+                     edit stays in memory only",
+                    d.display(),
+                    session.midi.loaded_dir
+                );
             }
         }
     }
@@ -581,6 +605,51 @@ mod tests {
             midi.loaded_dir,
             Some(std::path::PathBuf::from("/old/project")),
             "refuses to adopt the new dir while dirty"
+        );
+    }
+
+    // ---- Finding 1: with_synced_store's persist guard ----
+
+    #[test]
+    fn synced_to_dir_only_true_when_loaded_dir_matches() {
+        let a = Some(std::path::PathBuf::from("/project/a"));
+        let b = Some(std::path::PathBuf::from("/project/b"));
+        assert!(synced_to_dir(&a, &a), "same dir -> safe to persist");
+        assert!(!synced_to_dir(&a, &b), "stale loaded_dir (still A) must not persist into B");
+        assert!(!synced_to_dir(&None, &b), "never synced (None) must not persist into B");
+        assert!(synced_to_dir(&None, &None), "in-memory-only store, no project open: trivially synced");
+    }
+
+    #[test]
+    fn synced_to_dir_matches_the_failed_resync_scenarios() {
+        // Exercise the exact two `sync_midi_store` failure paths from H-2/M-5
+        // and confirm the persist guard correctly refuses both — this is the
+        // end-to-end shape of finding 1's bug: sync refuses to adopt `dir`,
+        // and the caller must not persist into it regardless.
+
+        // Failed load: loaded_dir stays None, dir is Some -> refuse.
+        let parent = std::env::temp_dir().join(format!(
+            "aura-midi-mod-f1-load-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let mut midi = MidiStore::default();
+        let dir = Some(parent.clone());
+        sync_midi_store(&mut midi, &dir, 120.0);
+        assert!(!synced_to_dir(&midi.loaded_dir, &dir), "failed load must not enable persist");
+        let _ = std::fs::remove_dir_all(&parent);
+
+        // Dirty refusal: loaded_dir stays at the OLD dir, dir is the NEW one
+        // -> refuse (this is the exact cross-project-write scenario).
+        let mut midi = MidiStore::default();
+        midi.dirty = true;
+        midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));
+        let new_dir = Some(std::path::PathBuf::from("/new/project"));
+        sync_midi_store(&mut midi, &new_dir, 120.0);
+        assert!(
+            !synced_to_dir(&midi.loaded_dir, &new_dir),
+            "dirty refusal must not enable persist into the new project"
         );
     }
 }

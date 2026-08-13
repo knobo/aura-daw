@@ -292,6 +292,41 @@ describe("piano roll wiring (midi store)", () => {
   });
 });
 
+describe("reset (finding 8: adopting a different project)", () => {
+  it("drops the snapshot without replaying any transport or solo writes", async () => {
+    setEngine({ positionSamples: 777, loopStartSamples: 10, loopEndSamples: 20 });
+    clipEditLoop.solo = true;
+    await clipEditLoop.enter(CLIP);
+    expect(clipEditLoop.active).toBe(true);
+    vi.clearAllMocks();
+
+    clipEditLoop.reset();
+
+    expect(clipEditLoop.active).toBe(false);
+    expect(mocked.transportSetLoop).not.toHaveBeenCalled();
+    expect(mocked.transportStop).not.toHaveBeenCalled();
+    expect(mocked.transportSeek).not.toHaveBeenCalled();
+    expect(setTrackSolo).not.toHaveBeenCalled();
+    expect(setTrackMute).not.toHaveBeenCalled();
+  });
+
+  it("a later exit() (e.g. a stray close from the old editor) is a no-op after reset", async () => {
+    await clipEditLoop.enter(CLIP);
+    clipEditLoop.reset();
+    vi.clearAllMocks();
+
+    await clipEditLoop.exit();
+
+    expect(mocked.transportSetLoop).not.toHaveBeenCalled();
+    expect(setTrackSolo).not.toHaveBeenCalled();
+  });
+
+  it("is a no-op when the editor was never entered", () => {
+    clipEditLoop.reset();
+    expect(clipEditLoop.active).toBe(false);
+  });
+});
+
 describe("switching clips while the editor is open", () => {
   it("retargets the loop but restores the original snapshot on exit", async () => {
     setEngine({ positionSamples: 42 });

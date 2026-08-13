@@ -412,11 +412,15 @@ struct CachedSource {
 /// source, in first-seen order.
 ///
 /// Two hardening rules [H-3]:
-/// * a clip whose `source_id` is EMPTY is skipped (with a loud warning and a
-///   debug-build assertion — the store boundary, `assign_source_ids` /
-///   the production minting sites, should make this unreachable): it
+/// * a clip whose `source_id` is EMPTY is skipped (with a loud warning): it
 ///   renders silent rather than risk playing another clip's audio through
-///   a shared empty-sentinel bucket.
+///   a shared empty-sentinel bucket. Finding 5: this IS reachable in
+///   production, not just a store-boundary bug — `assign_source_ids`
+///   (audio/project.rs) deliberately leaves legacy absolute / `..`-escaping
+///   `source_path`s unassigned (empty id) on every load of an old project,
+///   so opening such a project used to panic the engine control thread in
+///   debug builds via a `debug_assert!(false)` here. Warn+skip (silent mute
+///   for that one clip) is the documented degradation — no assertion.
 /// * two clips naming the SAME `source_id` but DIFFERENT `source_path`s
 ///   violate the one-source-one-path invariant: warned loudly, and the
 ///   source is treated as stale under the LAST conflicting path seen — never
@@ -429,12 +433,6 @@ fn stale_sources(clips: &[Clip], cache: &HashMap<SourceId, CachedSource>) -> Vec
         if clip.source_id.as_str().is_empty() {
             log::warn!(
                 "audio: clip {} has no source id; skipping (renders silent, never another clip's audio)",
-                clip.id
-            );
-            debug_assert!(
-                false,
-                "clip {} reached the engine cache with an empty source_id — \
-                 the store boundary (assign_source_ids / minting sites) should make this unreachable",
                 clip.id
             );
             continue;
@@ -855,11 +853,20 @@ impl Control {
         // loop above — a clip whose source was already cached (shared with
         // an earlier clip, so it never appeared in `todo`) still needs its
         // OWN waveform pyramid dir checked/built. Walk every LIVE clip
-        // (grouped by source), building from the cached (resampled) source
-        // data — the pyramid is a peak/RMS visual overview, not
-        // audio-critical, so reusing the already-decoded cache entry here
-        // (rather than re-reading the file) is exact enough and avoids a
-        // second decode of every source on every call.
+        // (grouped by source).
+        //
+        // Finding 6: pyramids MUST be built from the source file's RAW
+        // samples, not `cached.data` — that cache entry is resampled to the
+        // engine rate (round-2 §2.2's decode step above), while the AWTF
+        // tile protocol defines LOD bins in SOURCE samples
+        // (waveform.rs: "LOD n bins cover 2^(8+n) SOURCE samples"). Building
+        // from the resampled buffer time-stretches the waveform whenever the
+        // file's rate != the engine rate. Re-reading the file here (control
+        // thread — allowed, see `load_wav`'s callers elsewhere in this
+        // module) costs one extra decode per source per `ensure_loaded` call
+        // that actually has missing pyramids, which is rare (first open /
+        // new clip) — the hot decode loop above, which builds the
+        // play-critical `RtClipData`, is untouched.
         for (source_id, clip_ids) in &clips_by_source {
             let Some(cached) = self.cache.get(source_id) else { continue };
             let missing: Vec<&String> = clip_ids
@@ -869,7 +876,19 @@ impl Control {
             if missing.is_empty() {
                 continue;
             }
-            let pyr = Pyramid::from_interleaved(&cached.data.data, cached.data.channels as usize);
+            let source_path = project_dir.join(&cached.source_path);
+            let pyr = match load_wav(&source_path) {
+                Ok((channels, _file_rate, samples)) => {
+                    Pyramid::from_interleaved(&samples, channels as usize)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "waveform cache: cannot re-read {} for pyramid build: {e}",
+                        source_path.display()
+                    );
+                    continue;
+                }
+            };
             for clip_id in missing {
                 let cache_dir = Store::cache_dir_for(&project_dir, clip_id);
                 if let Err(e) = pyr.write_dir(&cache_dir) {
@@ -1774,23 +1793,19 @@ mod tests {
     #[test]
     fn stale_sources_skips_empty_source_id_clips() {
         let cache: HashMap<SourceId, CachedSource> = HashMap::new();
-        // Default SourceId is the empty-string sentinel — must never reach
-        // the cache (H-3). `stale_sources` both warns AND `debug_assert!`s on
-        // this (the store boundary should make it unreachable), so a debug
-        // build panics here — verify the assertion fires rather than calling
-        // straight through (which would abort this test binary).
+        // Default SourceId is the empty-string sentinel. Finding 5: this IS
+        // reachable in production (legacy absolute/`..` source_paths that
+        // `assign_source_ids` deliberately leaves unassigned on load) — the
+        // old `debug_assert!(false)` here used to panic the engine control
+        // thread on opening such a project. The fix is warn+skip only: the
+        // clip is silently muted (never crosses into `stale_sources`'
+        // output), everything else proceeds normally.
         let c = test_clip("c-1", "t-1");
+        let other = { let mut o = test_clip("c-2", "t-1"); o.source_id = SourceId::from("s-2"); o };
         assert!(c.source_id.as_str().is_empty());
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {})); // silence the expected panic's default print
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            stale_sources(std::slice::from_ref(&c), &cache)
-        }));
-        std::panic::set_hook(hook);
-        assert!(
-            result.is_err(),
-            "debug_assert! catches an empty source_id reaching the cache boundary (H-3)"
-        );
+        let todo = stale_sources(&[c, other], &cache);
+        assert_eq!(todo.len(), 1, "the empty-source-id clip is skipped, not panicked on");
+        assert_eq!(todo[0].0, SourceId::from("s-2"), "the other clip is still processed normally");
     }
 
     #[test]
@@ -1896,6 +1911,82 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+
+        handle.send(ControlMsg::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 6: the missing-pyramid path must build from the source
+    /// file's RAW samples, not the engine-rate-RESAMPLED decode cache — the
+    /// AWTF/pyramid protocol bins in SOURCE samples (waveform.rs doc: "LOD n
+    /// bins cover 2^(8+n) SOURCE samples"). This project's source file is
+    /// 24 kHz while `spin_up`'s engine defaults to 48 kHz (`SharedRt`'s
+    /// default `sample_rate`), i.e. exactly a 2x resample ratio: 2560 raw
+    /// source samples make exactly 10 lod-0 bins (2560 / 256); the same
+    /// audio resampled to 48 kHz would be ~5120 samples -> 20 bins. Reading
+    /// back the written pyramid and asserting 10 (not 20) bins pins the fix.
+    #[test]
+    fn ensure_loaded_builds_pyramids_from_source_rate_not_resampled_cache() {
+        const FILE_RATE: u32 = 24_000; // != the engine's default 48 kHz
+        const N_SAMPLES: usize = 2_560; // exactly 10 lod-0 bins (2560 / 256)
+        let dir = std::env::temp_dir().join(format!(
+            "aura-eng-pyramid-rate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: FILE_RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("audio/x.wav"), spec).unwrap();
+        for i in 0..N_SAMPLES {
+            w.write_sample(((i as f32) * 0.01).sin()).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let (handle, _shared, _tables, session) = spin_up();
+        let sid = SourceId::mint();
+        {
+            let mut session = session.lock();
+            let s = &mut session.store;
+            s.project_dir = Some(dir.clone());
+            s.tracks.push(super::super::types::TrackState {
+                id: "t1".into(),
+                name: "T1".into(),
+                kind: "audio".into(),
+                gain_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                soloed: false,
+                armed: false,
+                color: "#7c9cff".into(),
+                instrument_id: None,
+            });
+            let mut c1 = test_clip("c1", "t1");
+            c1.source_id = sid.clone();
+            s.clips.push(c1);
+        }
+        handle.send(ControlMsg::Rebuild);
+
+        let cdir1 = Store::cache_dir_for(&dir, "c1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pyramid_exists(&cdir1) {
+            assert!(std::time::Instant::now() < deadline, "clip c1's pyramid never built");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (_channels, bins) = crate::audio::waveform::read_tile(&cdir1, 0, 0)
+            .unwrap()
+            .expect("lod0 tile must exist");
+        assert_eq!(
+            bins.len(),
+            10,
+            "pyramid must be built from the 2560 SOURCE samples (10 bins), not the \
+             engine-rate-resampled ~5120 samples (which would give 20)"
+        );
 
         handle.send(ControlMsg::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);

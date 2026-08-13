@@ -41,6 +41,7 @@ vi.mock("../tauri", () => ({ backend: mockBackend }));
 const { project } = await import("./project.svelte");
 const { midi } = await import("./midi.svelte");
 const { toasts } = await import("./toasts.svelte");
+const { clipEditLoop } = await import("./clip-edit-loop.svelte");
 const { projectops } = await import("./projectops.svelte");
 
 function lastToast() {
@@ -60,6 +61,7 @@ beforeEach(() => {
   projectops.confirm = null;
   projectops.pickDirectory = async () => null;
   projectops.defaultParentDir = async () => "/home/u/Music/AURA";
+  clipEditLoop.reset();
 });
 
 describe("save", () => {
@@ -158,6 +160,40 @@ describe("save as (unsaved session)", () => {
   });
 });
 
+// Finding 8: adopt() (the re-pull that runs after create/save-as/open) used
+// to leave the piano roll's loop-while-editing snapshot (loop region, solo
+// map) pointed at the OLD project. A non-replaying reset() must run before
+// every adopt so a switch never replays a stale snapshot onto the newly
+// opened project.
+describe("adopting a project resets the clip-edit loop (finding 8)", () => {
+  it("submitDialog (new project) resets the clip-edit loop before re-pulling", async () => {
+    const resetSpy = vi.spyOn(clipEditLoop, "reset");
+    projectops.dialog = { mode: "new", name: "Fresh", parentDir: "/home/u/Music/AURA" };
+
+    await projectops.submitDialog();
+
+    expect(resetSpy).toHaveBeenCalled();
+  });
+
+  it("submitDialog (save as) resets the clip-edit loop before re-pulling", async () => {
+    const resetSpy = vi.spyOn(clipEditLoop, "reset");
+    projectops.dialog = { mode: "saveAs", name: "First", parentDir: "/p" };
+
+    await projectops.submitDialog();
+
+    expect(resetSpy).toHaveBeenCalled();
+  });
+
+  it("openViaPicker resets the clip-edit loop before re-pulling", async () => {
+    const resetSpy = vi.spyOn(clipEditLoop, "reset");
+    projectops.pickDirectory = async () => "/p/Other.aura";
+
+    await projectops.openViaPicker();
+
+    expect(resetSpy).toHaveBeenCalled();
+  });
+});
+
 describe("open project", () => {
   it("uses the directory picker and adopts the opened project", async () => {
     projectops.pickDirectory = async () => "/p/Other.aura";
@@ -216,5 +252,24 @@ describe("the unsaved-changes confirmation", () => {
     projectops.cancelConfirm();
 
     expect(projectops.confirm).toBeNull();
+  });
+
+  // Finding 3: save() used to swallow a failed pre-save into a toast and
+  // return void, so proceedConfirmed(true) had no way to tell the save
+  // failed — it proceeded to New/Open anyway and destroyed the session that
+  // failed to save. save() now reports success/failure and proceedConfirmed
+  // must stop on failure.
+  it("does not proceed with the pending action when the pre-save fails", async () => {
+    project.tracks = [{ id: "t1" } as (typeof project.tracks)[number]];
+    project.projectDir = "/p/Song.aura";
+    invokes.saveProject.mockRejectedValueOnce(new Error("disk full"));
+    projectops.requestNew();
+
+    await projectops.proceedConfirmed(true);
+
+    expect(invokes.saveProject).toHaveBeenCalled();
+    expect(lastToast().kind).toBe("error");
+    expect(invokes.createProject).not.toHaveBeenCalled();
+    expect(projectops.dialog).toBeNull();
   });
 });
