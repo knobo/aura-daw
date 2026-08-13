@@ -1,7 +1,13 @@
 # AURA — Core redesign, design analysis round 1
 
-**Status: DRAFT. Not authoritative, and nothing here binds code yet.**
-A second review round over this analysis is planned before any
+**Status: SUPERSEDED by [`CORE-REDESIGN-ROUND-2.md`](CORE-REDESIGN-ROUND-2.md)
+(2026-08-13).** The planned adversarial review ran the same day — six attack
+agents plus a naive-questions pass — and overturned or corrected fourteen
+positions in this document; round 2's §0.1 lists every reversal explicitly.
+This file is kept for the record. Do not build from it.
+
+**Original status: DRAFT. Not authoritative, and nothing here binds code
+yet.** A second review round over this analysis is planned before any
 implementation begins. Treat this document as a proposal to be argued with,
 not as a decision that has been taken.
 

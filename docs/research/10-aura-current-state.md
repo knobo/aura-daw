@@ -514,7 +514,12 @@ envelope, to `midi_set_notes`, `set_tempo_map`, `plugin_set_param` and
 
 ### 2.3 What bypasses the control plane
 
-`lib.rs` registers 57 commands; MCP exposes 10 tools. Transport, mix, add-track,
+`lib.rs` registers **66** commands *(CORRECTED 2026-08-13: this line
+originally said 57, which matches no commit; a fact-check against HEAD
+counted 66 `#[tauri::command]` functions, all registered. Note also that a
+naive grep for the attribute string returns 74 because 8 hits are
+doc-comment mentions — both wrong numbers have now appeared in project
+documents; the true count is 66)*; MCP exposes 10 tools. Transport, mix, add-track,
 create-project, import, recording and jobs are fully funnelled and have MCP
 parity. Everything else grew around the seam:
 
@@ -764,9 +769,13 @@ declaration.
 | Plugin instance rows + APST blobs | `src-tauri/src/plugins/state.rs` |
 | Automation lanes + point chunks | `src-tauri/src/plugins/automation.rs` |
 
-**There are five independent writers into one `project.json`**, each with its
-own atomic tmp+fsync+rename and its own directory GC. That is the single most
-important architectural fact about the format.
+**There are five independent writers into one `project.json`** *(CORRECTED
+2026-08-13: five writing subsystems, but only **two** distinct atomic
+tmp+fsync+rename implementations for project.json — `audio/project.rs:110`
+and `midi/persist.rs:258`; plugins and automation both route through
+`midi::persist::update_project_v2`. The consequence — fields added outside
+`update_project_v2`'s awareness are silently dropped — stands unchanged)*.
+That is the single most important architectural fact about the format.
 
 ### 3.2 The schema
 
@@ -1082,7 +1091,9 @@ half-instance (the velocity lane inside PianoRoll).
 
 ### 4.1 State modules
 
-Fifteen modules under `src/lib/state/`. **All are process-wide singletons** —
+Sixteen modules under `src/lib/state/` *(CORRECTED 2026-08-13: prose said
+fifteen; the table below and the directory both count 16)*. **All are
+process-wide singletons** —
 a class with `$state` fields instantiated once at module scope
 (`export const project = new ProjectStore()`). No context, no provider, no
 factory, so a second timeline or piano roll is structurally impossible.
@@ -1506,7 +1517,10 @@ prototype milestone (frozen surface, as-is)
 
 The green test count is a doc-level invariant: each plan opens by quoting it
 ("**78 passing**", "**180 lib tests passing**") and makes it every zone's
-definition of done. Today `README.md` and `CONTRIBUTING.md` say **259**.
+definition of done. Today `README.md` and `CONTRIBUTING.md` say **259**
+*(CORRECTED 2026-08-13: they disagree — `CONTRIBUTING.md:28` says 259 but
+`README.md:388` says 277 backend + 17 frontend; the drift is itself an
+instance of the doc-sync failure this section catalogues)*.
 
 The verification gate is a fenced shell block, identical in shape per phase:
 
@@ -1587,7 +1601,7 @@ consolidated. Ordered by how expensive it is to leave in place.
 | 1 | **`MidiNote` has no id** — identity is the index in a sorted array | `midi/types.rs:31`, AMEV record `midi/events.rs` | Positional addressing. Delete a note, undo, and a *different* note moves. Also blocks per-note expression, MPE and any per-voice modulation. Adding a `note_id` column costs one `columnMask` bit now and a migration of every event chunk ever written later. |
 | 2 | **RT slots are reused after free** — with a test asserting it | `audio/types.rs:237`, `Store::free_slot` | Delete track A (frees slot 3) → add track C (takes slot 3) → undo the delete → A cannot have its slot back. Slots must be derived state reassigned wholesale on rebuild, not identity. |
 | 3 | **`timeSignature` is silently clobbered to `[4,4]` on every save** | `audio/project.rs:47`, `:189`, save overlay `:67` | A `[3,4]` project becomes `[4,4]` on the next autosave. `Store` has no field to hold it. Silent user-data loss, today. |
-| 4 | **Audio assets are named by clip id, and the decode cache is keyed by clip id** | `audio/<clipId>.wav`; `Control::cache` in `audio/engine.rs` | Couples asset naming to *instance* identity. The moment two clips share a source, either the audio is orphaned or it must be copied — and the clip-id-keyed cache would serve the **wrong audio** with no diagnostic. |
+| 4 | **Audio assets are named by clip id, and the decode cache is keyed by clip id** | `audio/<clipId>.wav`; `Control::cache` in `audio/engine.rs` | Couples asset naming to *instance* identity. *(CORRECTED 2026-08-13: the original "would serve the wrong audio" consequence was wrong — each cache entry decodes from its own clip's `source_path`, so two clips sharing a source get duplicate **correct** decodes. The real defects: 2× decode memory per shared source; asset-GC coupling — deleting one clip can orphan or delete a file another clip references; and **staleness** — the cache never invalidates when a clip's `source_path` changes under an unchanged clip id, `engine.rs:599-623`. Source-keying remains the right fix, for these reasons.)* |
 | 5 | **`remove_track` bypasses the control plane** while `add_track` does not | `audio/mod.rs:369` vs `control/ops.rs:99` | The mirror-image asymmetry. No `ops::remove_track`, no MCP tool, no event, no validation, no possibility of an inverse. |
 | 6 | **Deleting a track leaks its automation lanes and plugin instances** | `audio/mod.rs:369`; `plugins/automation.rs` lanes are project-global | Lanes have no track association, so nothing collects them. Orphaned rows accumulate in `project.json` forever. |
 | 7 | **Five uncoordinated locks; no single project-state lock** | `Store`, `MidiStore`, `PluginRegistry`, `AutomationStore`, `SamplerBank` | A batch spanning tracks + midi + plugins cannot be made atomic. Lock ordering (store → midi) is a comment, enforced by nothing. |

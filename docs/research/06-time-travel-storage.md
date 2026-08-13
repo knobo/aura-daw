@@ -6,6 +6,35 @@
 machine described in the Measurement Appendix. Every number in this document
 was measured, not cited, unless it carries an external attribution.
 
+> **CORRECTIONS (2026-08-13, adversarial review round).** A verification
+> agent re-ran the benchmark crate and measured the bulk-op cases this
+> dossier had only estimated. The memory numbers reproduced **byte-exact**
+> (4 114 B/version tree, 23 969 B flat-rope optimum). Five claims needed
+> correction; each is marked **[CORRECTED]** inline at the spot it occurs:
+>
+> 1. **The quantize-100k estimate was right and passes the falsifier**:
+>    measured 1 661 344 B retained (418.7×) — *under* the 2 MB p99 line.
+> 2. **The real worst case is selection *locality*, not note count.**
+>    Scattered selections cost ~1.5–2.3 KB/note vs ~17 B/note contiguous:
+>    transposing 1 000 notes scattered over 10⁶ retains 2.30 MB (579×);
+>    humanize of 10 000 scattered retains 15.3 MB (3 857×). Falsifier 1
+>    does not model this shape.
+> 3. **"Delete 5 000 clips: same shape" was wrong** — deletes are nearly
+>    free (contiguous 50k-event delete retains 4 424 B, 1.1×), because
+>    fully-covered subtrees are dropped, not copied.
+> 4. **Falsifier 1's mean threshold is undecidable as written** (no op
+>    frequency weights given), and the 16-byte record it assumes becomes
+>    20 bytes once `note_id` lands, scaling leaf-dominated numbers ×1.25
+>    (quantize-100k → ~2.07 MB, *over* the p99 line).
+> 5. **Timing numbers are noisier than stated**: a re-run on the same
+>    machine drifted +20–40 % (single-shot `Instant::now`, no warmup, P/E
+>    hybrid part). Trust the byte counts; treat µs figures as ±40 %.
+>
+> The benchmark crates now live **in the repository** under
+> `benches/pdsbench/` (original) and `benches/bulkbench/` (exact
+> retained-bytes bulk-op variant added by the review), no longer only in a
+> wipeable scratchpad.
+
 ---
 
 ## Why this document exists
@@ -380,10 +409,17 @@ gestures are not all point edits.
 > **A quantize over 100 000 notes rewrites ~780 leaves ≈ 1.6 MB in a single
 > history node — roughly 400× the 4.1 KB mean.**
 
-Transpose a pattern, humanize a track, delete 5 000 clips: same shape. If bulk
-ops are common in real use, the budget arithmetic collapses — 512 MB buys
-hundreds of steps rather than 85 000 — and the whole "retain everything,
-materialize in nanoseconds" bet fails.
+Transpose a pattern, humanize a track, delete 5 000 clips: same shape.
+**[CORRECTED 2026-08-13: this sentence was wrong twice.** Deletes are *not*
+the same shape — a contiguous 50k-event delete retains 4 424 B (1.1×),
+because covered subtrees are dropped, not copied. And the shape that
+actually dominates is **scattered selections**, which this falsifier never
+modelled: transpose of 1 000 notes scattered across 10⁶ retains 2.30 MB
+(579×), humanize of 10 000 scattered retains 15.3 MB (3 857×) — each
+touched note drags its whole leaf. Measured with `benches/bulkbench`.]
+If bulk ops are common in real use, the budget arithmetic collapses —
+512 MB buys hundreds of steps rather than 85 000 — and the whole "retain
+everything, materialize in nanoseconds" bet fails.
 
 **The measurement.** On a 10⁷-event / 500-track session, execute a realistic
 gesture mix — single-note edit, note insert, note delete, quantize 10 000 notes,
@@ -392,6 +428,21 @@ plugin param gesture, plugin state change — and record bytes retained and µs 
 op for each.
 
 **Threshold: mean ≤ 8 KB/node, p99 ≤ 2 MB/node.**
+
+**[CORRECTED 2026-08-13: this threshold is undecidable as written** — the
+mean depends entirely on op frequency weights the dossier never gives
+(one-of-each over the listed ops yields a mean of ~150 KB, failing by 19×;
+weighted so quantize-100k is rarer than ~1/415 gestures, it passes). It
+also assumes the 16-byte record; with the `note_id` the redesign mandates,
+records are 20 bytes and quantize-100k measures ~2.07 MB — over the p99
+line. Restate as absolute per-op-class caps, include scattered-selection
+cases, and weight the mix for agent-driven editing (bulk-heavy), before
+treating this falsifier as decisive. Measured status: quantize-100k
+contiguous at 16 B/record = 1 661 344 B (418.7×), *passing*; the replay-only
+fallback below is therefore likely needed for scattered/bulk ops
+regardless, and its inverse payloads are cheap (quantize ≈ 4 B/note raw,
+transpose O(1)+selection, humanize O(1) **iff the PRNG seed is stored** —
+an implementation constraint recorded nowhere else).]
 
 **If falsified:** bulk ops stop retaining a materialized snapshot and become
 replay-only nodes (store the op plus its inverse; materialize on demand). That
@@ -453,9 +504,21 @@ All measured first-hand.
 **Record shape:** 16 bytes — `tick: u32`, `kind/key/vel/pad: u8×4`, `dur: u32`,
 `val: f32`.
 
-**Reproducible crate:**
-`/tmp/claude-1000/-home-knobo-prog-dav/aa81f388-79df-4119-9ec0-23203677c063/scratchpad/pdsbench/`
-(binaries: `pdsbench`, `hist`, `btree`, `insert`, `session`).
+**Reproducible crate:** `benches/pdsbench/` in this repository (binaries:
+`pdsbench`, `hist`, `btree`, `insert`, `session`, `arc`). The bulk-op
+variant added by the 2026-08-13 review, which measures retained bytes
+exactly by pointer-diffing Arc node graphs instead of RSS deltas, is
+`benches/bulkbench/`. *(Originally these lived in a session scratchpad
+under `/tmp`; they were moved into the repo so the evidence outlives the
+session.)*
+
+**[CORRECTED 2026-08-13: timing methodology.** Numbers below are
+single-shot `Instant::now` measurements without warmup or CPU pinning on a
+hybrid P/E-core part; a same-machine re-run reproduced every *byte* count
+exactly but drifted +20–40 % on µs figures (scan 537 µs vs 442, range query
+11.6 µs vs 8.8, random reads 91.2 ms vs 65.5). Precision-sensitive claims
+like "1.12× vs Vec" are inside the noise band. Note also the measurements
+were taken on `imbl` 6.1.0 while §5.2 recommends 7.0.1.]
 
 ### 4.1 Read cost, 10⁶ events — the constant-factor penalty, honestly
 
