@@ -16,6 +16,8 @@
   import { instruments } from "../../state/instruments.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { openStudio, ui } from "../../state/ui.svelte";
+  import { ROLL_RESIZE } from "../../utils/panel-resize";
+  import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import type { MidiNote } from "../../types/ipc";
 
   const KEY_H = 14; // CSS px per pitch row
@@ -718,8 +720,16 @@
     role="application"
     aria-label="Piano roll — {clip.name}"
     tabindex="-1"
+    style:height="{ui.rollHeight}px"
     onkeydown={onKeydown}
   >
+    <PanelResizeHandle
+      axis="y"
+      size={ui.rollHeight}
+      spec={ROLL_RESIZE}
+      label="Resize piano roll"
+      onresize={(px) => (ui.rollHeight = px)}
+    />
     <header class="head">
       <span class="dot" style:background={color}></span>
       <span class="title mono">{clip.name}</span>

@@ -11,6 +11,10 @@ export const ui = $state({
   studioKind: "aceStepGenerate",
   /** Flash notes (piano roll, keys, clip bodies) as the playhead hits them. */
   noteFlash: true,
+  /** Piano roll panel height, CSS px. User-dragged (top edge); session only. */
+  rollHeight: 340,
+  /** Right dock width, CSS px. User-dragged (left edge); session only. */
+  dockWidth: 340,
   /** Interface zoom factor (CSS `zoom` on the shell) — session only. */
   zoom: 1,
 });

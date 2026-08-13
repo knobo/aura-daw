@@ -51,6 +51,13 @@ body {
   -webkit-user-select: none;
 }
 
+/* The Svelte mount point sits between body and .app; without a height the
+   percentage chain breaks and the app shell collapses to content height
+   (.app moved from 100vh to % for the interface zoom). */
+#app {
+  height: 100%;
+}
+
 body {
   background:
     radial-gradient(1200px 500px at 75% -10%, rgba(82, 229, 255, 0.05), transparent 60%),
