@@ -98,7 +98,7 @@ pub struct TrackMeter {
 // ---------------------------------------------------------------------------
 
 /// Mirrors docs/ipc-schemas/track-state.schema.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackState {
     pub id: String,

@@ -17,6 +17,7 @@
 pub mod import;
 pub mod hum;
 pub mod export;
+pub mod op;
 pub mod ops;
 pub mod loopjam;
 pub mod session;
