@@ -7,7 +7,7 @@
   import { transport } from "../state/transport.svelte";
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
-  import { ui, toggleDock } from "../state/ui.svelte";
+  import { resetUiZoom, ui, toggleDock, zoomUiIn, zoomUiOut } from "../state/ui.svelte";
   import { mcp } from "../state/mcp.svelte";
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
@@ -189,6 +189,12 @@
       title="Export — offline bounce to wav/mp3/flac/ogg/m4a"
       onclick={() => exporter.openDialog()}>⤓ EXPORT</button
     >
+    <span class="divider"></span>
+    <button class="chip" title="Interface zoom out — smaller UI (Ctrl/Cmd −)" onclick={zoomUiOut}>A−</button>
+    <button class="chip" title="Reset interface zoom (Ctrl/Cmd 0)" onclick={resetUiZoom}
+      >{Math.round(ui.zoom * 100)}%</button
+    >
+    <button class="chip" title="Interface zoom in — bigger UI (Ctrl/Cmd +)" onclick={zoomUiIn}>A+</button>
     <span class="badge mono" title="Waveform renderer in use">{ui.rendererKind || "· · ·"}</span>
     <span class="badge mode mono" title={backend.mode === "demo" ? "Engine offline — synthetic data" : "Rust engine connected"}>
       {backend.mode === "demo" ? "DEMO" : "ENGINE"}
