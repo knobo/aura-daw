@@ -61,6 +61,7 @@ carry punch-in/out and markers too:
 | `,` / `.` | Jump to the previous / next **clip edge**, across all tracks |
 | `+` / `-` | Zoom the timeline |
 | `S` | Toggle grid snap · `G` toggles AI Studio |
+| `Ctrl/Cmd` + `+` / `-` / `0` | Interface zoom in / out / reset (whole UI, 80–200%) |
 
 The ⏮ button jumps to the start without stopping; ■ stops and returns there.
 Drag the ruler to seek, shift+wheel (or a horizontal wheel) to pan.
