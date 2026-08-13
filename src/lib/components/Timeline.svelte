@@ -11,6 +11,7 @@
   import { view } from "../state/view.svelte";
   import { midi } from "../state/midi.svelte";
   import { loopjam } from "../state/loopjam.svelte";
+  import { toasts } from "../state/toasts.svelte";
   import TrackHeader from "./TrackHeader.svelte";
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
@@ -329,15 +330,30 @@
     await project.addTrack({ name: `MIDI ${project.tracks.length + 1}`, color, kind: "midi" });
   }
 
-  /** Seed the empty session with the built-in demo song (control plane). */
+  /**
+   * Seed the empty session with the built-in demo song (control plane).
+   *
+   * This takes a visible moment — it binds three synth instruments (Zyn
+   * patches when they are installed) and rebuilds the graph — so the button
+   * has to say so. A control that looks inert gets hammered, and every extra
+   * click is another seed attempt racing the first.
+   */
+  let seeding = $state(false);
+
   async function loadDemoSong() {
-    if (!backend.seedDemoProject) return;
+    if (!backend.seedDemoProject || seeding) return;
+    seeding = true;
     try {
       const snap = await backend.seedDemoProject();
       project.applySnapshot(snap);
       midi.applySnapshot(snap);
     } catch (err) {
+      // Was console-only: a silent failure is indistinguishable from a
+      // slow one, which is exactly the confusion this flow had.
       console.warn("[aura] seed_demo_project failed:", err);
+      toasts.error("DEMO SONG FAILED", String(err));
+    } finally {
+      seeding = false;
     }
   }
 
@@ -447,11 +463,22 @@
         <div class="empty silk">
           <div>no tracks — add one to begin</div>
           {#if backend.seedDemoProject}
-            <button class="seedbtn mono" onclick={loadDemoSong}>
-              ✦ LOAD DEMO SONG
+            <button
+              class="seedbtn mono"
+              class:seeding
+              disabled={seeding}
+              aria-busy={seeding}
+              onclick={loadDemoSong}
+            >
+              {#if seeding}<span class="seedscan" aria-hidden="true"></span>{/if}
+              <span class="seedlabel"
+                >{seeding ? "BUILDING DEMO SONG…" : "✦ LOAD DEMO SONG"}</span
+              >
             </button>
             <div class="seedhint">
-              two synth tracks of demo content — press play to hear AURA
+              {seeding
+                ? "binding synths, laying down clips — a moment"
+                : "two synth tracks of demo content — press play to hear AURA"}
             </div>
           {/if}
         </div>
@@ -730,8 +757,65 @@
     color: var(--cyan);
     cursor: pointer;
   }
-  .seedbtn:hover {
+  .seedbtn:hover:not(:disabled) {
     box-shadow: 0 0 12px rgba(82, 229, 255, 0.25);
+  }
+  /* Busy: the same scanning cyan→magenta sweep clips wear while a job works
+     on them, so "something is happening" reads the same everywhere. */
+  .seedbtn.seeding {
+    position: relative;
+    overflow: hidden;
+    cursor: progress;
+    border-color: color-mix(in srgb, var(--cyan) 60%, var(--magenta) 40%);
+    animation: seed-glow 1.6s ease-in-out infinite;
+  }
+  .seedbtn:disabled {
+    /* Busy is not "unavailable": keep it legible rather than greyed out. */
+    opacity: 1;
+  }
+  .seedlabel {
+    position: relative;
+    z-index: 1;
+  }
+  .seedscan {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 40%;
+    background: linear-gradient(
+      90deg,
+      transparent,
+      rgba(82, 229, 255, 0.35) 45%,
+      rgba(255, 79, 216, 0.3) 65%,
+      transparent
+    );
+    mix-blend-mode: screen;
+    animation: seed-sweep 1.4s linear infinite;
+  }
+  @keyframes seed-glow {
+    0%,
+    100% {
+      box-shadow: 0 0 10px rgba(82, 229, 255, 0.25);
+    }
+    50% {
+      box-shadow: 0 0 18px rgba(255, 79, 216, 0.35);
+    }
+  }
+  @keyframes seed-sweep {
+    from {
+      transform: translateX(-110%);
+      left: 0;
+    }
+    to {
+      transform: translateX(110%);
+      left: 100%;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .seedbtn.seeding,
+    .seedscan {
+      animation: none;
+    }
   }
   .seedhint {
     margin-top: 8px;
