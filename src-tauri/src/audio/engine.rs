@@ -23,7 +23,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 
 use super::dsp::linear_resample;
-use super::meters::{MeterAccum, RawMeterBlock};
+use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock};
 use super::mixer;
 use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
@@ -156,6 +156,7 @@ pub fn start(
                 cache_rate: 0,
                 live_nodes: Default::default(),
                 accum: MeterAccum::default(),
+                gen_maps: GenerationMaps::default(),
                 sinks: Vec::new(),
                 last_frame: Instant::now(),
                 last_tick: Instant::now(),
@@ -306,6 +307,10 @@ struct InputCb {
     in_ch: usize,
     rec_ch: usize,
     shared: Arc<SharedRt>,
+    /// The `RtGraph` generation these `slots` were resolved against
+    /// (round-2 §2.4 / Task 6) — stamped on every emitted block so the fold
+    /// resolves it under the matching slot map, never the current one.
+    generation: u64,
 }
 
 impl InputCb {
@@ -328,7 +333,7 @@ impl InputCb {
             ss_r += r * r;
         }
         let mut blk =
-            RawMeterBlock::new(self.shared.position.load(Relaxed), frames as u32);
+            RawMeterBlock::new(self.generation, self.shared.position.load(Relaxed), frames as u32);
         for &slot in &self.slots {
             blk.set_slot(slot, pk_l, pk_r, ss_l, ss_r);
         }
@@ -493,6 +498,10 @@ struct Control {
     /// on the control thread and freed here when the last snapshot retires.
     live_nodes: crate::midi::playback::LiveNodeRegistry,
     accum: MeterAccum,
+    /// generation -> slot map window for the meter fold (Task 6); published
+    /// alongside `tables` on every rebuild, pinned across a recording so a
+    /// take spanning many rebuilds keeps its input meters [I2].
+    gen_maps: GenerationMaps,
     sinks: Vec<(Box<dyn MeterSink>, u64)>,
     last_frame: Instant,
     last_tick: Instant,
@@ -689,6 +698,10 @@ impl Control {
                 params: params.clone(),
                 slots: slots.clone(),
             };
+            // Same generation, same slot map, published alongside the
+            // tables (Task 6) — the meter fold resolves blocks under
+            // whichever generation produced them, not the current tables.
+            self.gen_maps.publish(self.generation, &slots);
             if headless {
                 // Headless keeps its narrow scope [I5]: tables are enough
                 // to serve knob writes and recording resolution with no
@@ -862,12 +875,12 @@ impl Control {
     fn drain_meters(&mut self) {
         if let Some(out) = self.output.as_mut() {
             while let Ok(blk) = out.meter_rx.pop() {
-                self.accum.fold(&blk);
+                self.accum.fold(&blk, &self.gen_maps);
             }
         }
         if let Some(inp) = self.input.as_mut() {
             while let Ok(blk) = inp.meter_rx.pop() {
-                self.accum.fold(&blk);
+                self.accum.fold(&blk, &self.gen_maps);
             }
         }
     }
@@ -877,21 +890,15 @@ impl Control {
             return;
         }
         self.last_frame = Instant::now();
-        // Interim (until Task 6 re-does the fold): display order comes from
-        // the session, slots come from the CURRENT graph's tables — lock
-        // order matters here too [C1], session before tables.
-        let tracks: Vec<(usize, String)> = {
+        // Display order comes from the session (Task 6: the fold itself now
+        // resolves generation -> slot -> track, so this is just display
+        // order, no slots needed here).
+        let order: Vec<crate::ids::TrackId> = {
             let session = self.session.lock();
-            let tables = self.tables.lock();
-            session
-                .store
-                .tracks
-                .iter()
-                .filter_map(|t| tables.slots.get(&t.id).map(|&s| (s, t.id.to_string())))
-                .collect()
+            session.store.tracks.iter().map(|t| t.id.clone()).collect()
         };
         let position = self.shared.position.load(Relaxed);
-        let frame = self.accum.take_frame(0, &tracks, position);
+        let frame = self.accum.take_frame(0, &order, position);
         self.sinks.retain_mut(|(sink, seq)| {
             let mut f = frame.clone();
             f.seq = *seq;
@@ -1040,7 +1047,7 @@ impl Control {
         // Rings + writer specs. Slot resolution reads the CURRENT graph's
         // tables, not the store — round-2 §2.4; lock order: session before
         // tables [C1].
-        let (project_dir, take_no, slots) = {
+        let (project_dir, take_no, slots, rec_generation) = {
             let session = self.session.lock();
             let store = &session.store;
             let dir = store.project_dir.clone().ok_or("no project open")?;
@@ -1050,8 +1057,12 @@ impl Control {
                 .iter()
                 .filter_map(|id| tables.slots.get(id.as_str()).copied())
                 .collect();
-            (dir, take_no, slots)
+            (dir, take_no, slots, tables.generation)
         };
+        // Pin the generation the slots above were resolved against (Task 6
+        // [I2]): a take spanning more rebuilds than `GenerationMaps` keeps
+        // in its plain window must not lose its input meters.
+        self.gen_maps.pin(rec_generation);
         let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
         let mut producers = Vec::with_capacity(targets.len());
         let mut consumers = Vec::with_capacity(targets.len());
@@ -1090,6 +1101,7 @@ impl Control {
             in_ch,
             rec_ch,
             shared: self.shared.clone(),
+            generation: rec_generation,
         };
         let stream = device
             .build_input_stream(
@@ -1133,6 +1145,9 @@ impl Control {
         // Drop the input stream FIRST so the ring producers close and the
         // writer can drain to empty.
         self.input = None;
+        // Release the pin (Task 6 [I2]) — recording is over, so its
+        // generation no longer needs exemption from the plain window.
+        self.gen_maps.unpin();
         let clips = writer.finish(Duration::from_secs(15))?;
 
         self.shared.recording.store(false, Relaxed);
@@ -1501,6 +1516,7 @@ mod tests {
             in_ch: 1,
             rec_ch: 1,
             shared: shared.clone(),
+            generation: 1,
         };
 
         // 1st buffer: 6 frames fit entirely.

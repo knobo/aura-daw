@@ -219,7 +219,7 @@ pub fn render(
     let out_ch = out_ch.max(1);
     let frames = out.len() / out_ch;
     out.fill(0.0);
-    let mut blk = RawMeterBlock::new(base_pos, frames as u32);
+    let mut blk = RawMeterBlock::new(graph.generation, base_pos, frames as u32);
     // Round-2 §2.4 / [I6]: the graph's OWN params, not a passed-in
     // reference — `render(g, &g.params, ...)` doesn't borrow-check
     // (mutable borrow of `*g` + shared borrow of `g.params`), so this reads
