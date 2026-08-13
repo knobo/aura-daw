@@ -43,6 +43,28 @@ mix bus:
 
 ![Master bus meters](docs/screenshots/master-meters.png)
 
+Playback **stops when the material ends** (STOP@END chip; ignored while
+looping or recording). The boundary is detected in the audio callback, which
+reports it and takes no action — the control plane decides what to do and
+parks the playhead exactly on the boundary sample. That seam is meant to
+carry punch-in/out and markers too:
+[ARCHITECTURE §2.6](docs/ARCHITECTURE.md).
+
+### Transport and timeline shortcuts
+
+| Key | Does |
+|---|---|
+| `Space` | Play / pause |
+| `Home` / `End` | Jump to start / to the end of the material |
+| `←` / `→` | Move the playhead one **bar**, landing on the grid line |
+| `Shift` + `←` / `→` | Same, one **beat** |
+| `,` / `.` | Jump to the previous / next **clip edge**, across all tracks |
+| `+` / `-` | Zoom the timeline |
+| `S` | Toggle grid snap · `G` toggles AI Studio |
+
+The ⏮ button jumps to the start without stopping; ■ stops and returns there.
+Drag the ruler to seek, shift+wheel (or a horizontal wheel) to pan.
+
 ### MIDI, piano roll and tick-based musical time
 
 A tick timeline with a tempo map (tick↔sample bijection), MIDI clips audible
@@ -363,7 +385,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 259 tests: engine, MIDI, sampler, plugins, MCP, sidecars, control plane
+cd src-tauri && cargo test    # 277 tests: engine, MIDI, sampler, plugins, MCP, sidecars, control plane
+npm test                      # 17 frontend unit tests (vitest): stores + timeline math
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```
