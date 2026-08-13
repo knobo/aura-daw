@@ -27,6 +27,7 @@ use super::policy::Decision;
 use super::tools;
 use super::{McpShared, PendingConfirmation};
 use crate::control::{ControlPlane, ImportClipRequest, TransportAction};
+use crate::control::op::TxMeta;
 use crate::control::ops::TrackMixChange;
 
 // ---------------------------------------------------------------------------
@@ -353,7 +354,8 @@ impl AuraMcpHandler {
         let label = p.name.clone().unwrap_or_else(|| "(auto-named)".into());
         let kind = p.kind.clone().unwrap_or_else(|| "audio".into());
         self.gate(tools::ADD_TRACK, format!("Add {kind} track {label}")).await?;
-        let res = self.blocking(move |c| c.add_track(p.name, p.kind)).await?;
+        let meta = TxMeta::agent(tools::ADD_TRACK, format!("Add {kind} track {label}"));
+        let res = self.blocking(move |c| c.add_track(p.name, p.kind, meta)).await?;
         from_control(res)
     }
 
@@ -386,7 +388,11 @@ impl AuraMcpHandler {
                 armed: c.armed,
             })
             .collect();
-        let res = self.blocking(move |c| c.set_track_mix(changes)).await?;
+        let meta = TxMeta::agent(
+            tools::SET_TRACK_MIX,
+            format!("Change mix on {} track(s)", changes.len()),
+        );
+        let res = self.blocking(move |c| c.set_track_mix(changes, meta)).await?;
         from_control(res.map(|tracks| json!({ "tracks": tracks })))
     }
 

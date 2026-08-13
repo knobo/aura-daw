@@ -1,0 +1,152 @@
+== verification against the previous round (16 B record, single tree) ==
+
+== single tree, Ev16 (16 B) ==
+base: 1000000 events, 8067 nodes, 16.6 MB (7813 leaves of 128)
+
+op                                             retained B      µs/op    amp vs pt     B/note
+point edit                                           3968        4.4         1.0x     3968.0
+quantize 100k contiguous                          1661344      881.0       418.7x       16.6
+quantize 10k contiguous                            169904       37.6        42.8x       17.0
+transpose 1k contiguous                             21552       11.0         5.4x       21.6
+transpose 1k scattered over 1M                    2298344      430.8       579.2x     2298.3
+humanize 10k scattered in 20k window               335024       77.2        84.4x       48.7
+humanize 10k scattered over 1M                   15303264     4958.8      3856.7x     1530.3
+delete 50k contiguous                                4424        4.7         1.1x        0.1
+paste 20k notes                                    335704       46.4        84.6x       16.8
+
+point edit      =      3968 B  (expected 3 968)      PASS
+quantize 100k   =   1661344 B  (expected 1 661 344)  PASS
+
+== single tree, Ev20 (20 B, canonical: +note_id u32) ==
+base: 1000000 events, 8067 nodes, 20.6 MB (7813 leaves of 128)
+
+op                                             retained B      µs/op    amp vs pt     B/note
+point edit                                           4480        3.8         1.0x     4480.0
+quantize 100k contiguous                          2061728      587.1       460.2x       20.6
+quantize 10k contiguous                            210352       59.1        47.0x       21.0
+transpose 1k contiguous                             26160       15.7         5.8x       26.2
+transpose 1k scattered over 1M                    2810344      956.9       627.3x     2810.3
+humanize 10k scattered in 20k window               415408       97.0        92.7x       60.4
+humanize 10k scattered over 1M                   18991200     5953.0      4239.1x     1899.1
+delete 50k contiguous                                5128        6.8         1.1x        0.1
+paste 20k notes                                    416216      117.4        92.9x       20.8
+
+== per-pattern session, Ev20 (20 B) == 200 patterns x 5000 events = 1000000 total, base 20.6 MB
+
+op                                               retained B      µs/op    amp vs pt     B/note
+point edit (1 note, 1 pattern)                         4552        1.9         1.0x     4552.0
+quantize 100k contiguous (20 whole patterns)        2062472      515.6       453.1x       20.6
+quantize 10k contiguous (2 whole patterns)           207176       52.5        45.5x       20.7
+transpose 1k contiguous (within 1 pattern)            25416        6.4         5.6x       25.4
+transpose 1k scattered over session (5/pat)         2699944      669.5       593.1x     2699.9
+humanize 10k scattered in 4-pattern window           413320      218.9        90.8x       41.3
+humanize 10k scattered over session (50/pat)       14969848     3185.1      3288.6x     1497.0
+delete 50k contiguous (drop 10 whole patterns)         1512        1.4         0.3x        0.0
+paste 20k as NEW content (4 patterns)                413320       75.8        90.8x       20.7
+paste 20k as COW duplicate (linked content)            1032        0.3         0.2x        0.1
+
+(HUMAN simulated in 1.8 s)
+
+== profile HUMAN — 10 000 gestures, per-pattern session, Ev20 ==
+
+per-op-class created bytes (evidence for the caps):
+  gesture               n         mean B          p99 B          max B
+  SongWide             21       21391270       22092908       22095396
+  HumanizeClip         82         108603         122264         125424
+  ScatteredSel        362          91626         114580         122372
+  QuantizeClip         54         107360         115328         121380
+  QuantizeSel         607          10164          15264          15740
+  PasteBar            453           7494           9984          10084
+  SmallDrag           987           4862           7420           7572
+  DrawNote           2151           4583           5028           5196
+  PointEdit          4282           4465           4888           5056
+  DeleteNote         1001           4444           4868           4988
+
+  retention         mean B/node   p99 B/node    max B/node   snapshots B     op-log B       total B   steps@512M replay%  chain  forced
+  no replay-only          55036       113240      22095532     544880976      5486480     550367456         9754    0.0%      0       0
+  A class>  64K           54683       111248      22090752     541352120      5486480     546838600         9817    4.7%      2       0
+  A class> 256K           55016       113240      22090752     544674932      5486480     550161412         9758    0.2%      1       0
+  A class>1024K           55016       113240      22090752     544674932      5486480     550161412         9758    0.2%      1       0
+  B charge>  64K          50009       276072      22090752     494607248      5486480     500093728        10735   61.8%     32     193
+  B charge> 256K          52240       111512      22097516     516918004      5486480     522404484        10276    6.4%     32      20
+  B charge>1024K          52240       111512      22097516     516918004      5486480     522404484        10276    6.4%     32      20
+
+(AGENT simulated in 2.4 s)
+
+== profile AGENT — 10 000 gestures, per-pattern session, Ev20 ==
+
+per-op-class created bytes (evidence for the caps):
+  gesture               n         mean B          p99 B          max B
+  MultiClip           808        1042345        1664064        1693616
+  QuantizeClip       1458         103319         114636         131524
+  TransposeClip       789         103085         115764         126380
+  ScatteredCond      1179         103587         114820         126380
+  HumanizeClip        803         104016         114820         125704
+  Regen              1759         104104         104104         104104
+  InsertPhrase       1193           8049          10800          10864
+  DeleteRangeOp       495           4442           6664           6876
+  PointEdit           816           4421           4624           4672
+  PastePattern        700           1032           1032           1032
+
+  retention         mean B/node   p99 B/node    max B/node   snapshots B     op-log B       total B   steps@512M replay%  chain  forced
+  no replay-only         153592      1541260       1693872    1479095916     56832316    1535928232         3495    0.0%      0       0
+  A class>  64K          121921      1939124       5517660    1162377728     56832316    1219210044         4403   67.9%     23       0
+  A class> 256K          152560      1644504       4206996    1468770172     56832316    1525602488         3519    8.1%      3       0
+  A class>1024K          153088      1601092       4206996    1474056564     56832316    1530888880         3506    4.0%      3       0
+  B charge>  64K         108685      4024840       7610716    1030025384     56832316    1086857700         4939   95.3%     32     296
+  B charge> 256K         117518      4239580       8253952    1118355924     56832316    1175188240         4568   71.3%     32     222
+  B charge>1024K         123088      4031244       9258952    1174057348     56832316    1230889664         4361   56.9%     32     177
+
+(HUMAN_V simulated in 0.5 s)
+
+== profile HUMAN + placement-offset transpose (round 2 §5 field) — 10 000 gestures, per-pattern session, Ev20 ==
+
+per-op-class created bytes (evidence for the caps):
+  gesture               n         mean B          p99 B          max B
+  HumanizeClip         82         108603         122264         125424
+  ScatteredSel        362          91626         114580         122372
+  QuantizeClip         54         107360         115328         121380
+  QuantizeSel         607          10164          15264          15740
+  PasteBar            453           7494           9984          10084
+  SmallDrag           987           4862           7420           7572
+  SongWideView         21           5928           5928           5928
+  DrawNote           2151           4583           5028           5196
+  PointEdit          4282           4465           4888           5056
+  DeleteNote         1001           4444           4868           4988
+
+  retention         mean B/node   p99 B/node    max B/node   snapshots B     op-log B       total B   steps@512M replay%  chain  forced
+  no replay-only          10127       110688        144632      95788792      5486648     101275440        53010    0.0%      0       0
+  A class>  64K            9813       109788        211792      92651384      5486648      98138032        54705    4.5%      2       0
+  A class> 256K           10127       110688        144632      95788792      5486648     101275440        53010    0.0%      0       0
+  A class>1024K           10127       110688        144632      95788792      5486648     101275440        53010    0.0%      0       0
+  B charge>  64K           7748       271048        515108      71994436      5486648      77481084        69290   60.2%     32     188
+  B charge> 256K          10127       110688        144632      95788792      5486648     101275440        53010    0.0%      0       0
+  B charge>1024K          10127       110688        144632      95788792      5486648     101275440        53010    0.0%      0       0
+
+(AGENT_V simulated in 1.5 s)
+
+== profile AGENT + placement-offset transpose (round 2 §5 field) — 10 000 gestures, per-pattern session, Ev20 ==
+
+per-op-class created bytes (evidence for the caps):
+  gesture               n         mean B          p99 B          max B
+  MultiClip           415        1044290        1659616        1680576
+  QuantizeClip       1458         103319         114636         131524
+  ScatteredCond      1179         103587         114820         126380
+  HumanizeClip        803         104016         114820         125704
+  Regen              1759         104104         104104         104104
+  InsertPhrase       1193           8049          10800          10864
+  DeleteRangeOp       495           4442           6664           6876
+  PointEdit           816           4421           4624           4672
+  MultiClipView       393           1270           1848           1848
+  TransposeClipView    789           1032           1032           1032
+  PastePattern        700           1032           1032           1032
+
+  retention         mean B/node   p99 B/node    max B/node   snapshots B     op-log B       total B   steps@512M replay%  chain  forced
+  no replay-only         104707      1369624       1680832     990240632     56832316    1047072948         5127    0.0%      0       0
+  A class>  64K           81918      1546636       4139120     762351472     56832316     819183788         6553   56.1%     15       0
+  A class> 256K          104322      1456168       3187788     986393628     56832316    1043225944         5146    4.2%      2       0
+  A class>1024K          104521      1445816       3187788     988387248     56832316    1045219564         5136    2.1%      2       0
+  B charge>  64K          71635      2661716       5813196     659520728     56832316     716353044         7494   94.1%     32     292
+  B charge> 256K          84396      2788992       6059952     787137040     56832316     843969356         6361   56.6%     32     176
+  B charge>1024K          90300      2286804       6228212     846175216     56832316     903007532         5945   39.7%     32     123
+

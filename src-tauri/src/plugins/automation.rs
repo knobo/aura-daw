@@ -156,7 +156,11 @@ pub fn encode_points(ppq: u32, points: &[AutomationPoint]) -> Vec<u8> {
 }
 
 /// Decode an AMEV chunk's automation records -> `(ppq, points)`. Note
-/// records are skipped (mirror of `events::decode_notes`).
+/// records are skipped (mirror of `events::decode_notes`). Appended column
+/// blocks (e.g. `events::COLUMNS_NOTE_ID` on a note chunk) are walked and
+/// skipped wholesale — automation points carry no per-point ids yet, and a
+/// reader that errored on an unrecognised mask bit would break on every
+/// note chunk it was (incorrectly) asked to read [M-4].
 pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String> {
     let mut r = std::io::Cursor::new(bytes);
     let magic = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -169,9 +173,20 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
             "AMEV version {version} is newer than supported {AMEV_VERSION}"
         ));
     }
-    let _columns = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
+    // Advisory for bits automation doesn't interpret — but a mask bit with
+    // no matching block consumed is still structural corruption (checked
+    // generically below, same rule as `events::decode_notes`).
+    let mask = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
     let ppq = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
     let count = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+
+    let core_bytes = (count as u64).saturating_mul(16);
+    if core_bytes > bytes.len() as u64 {
+        return Err(format!(
+            "AMEV chunk truncated: {count} records need {core_bytes} bytes, chunk has {}",
+            bytes.len()
+        ));
+    }
     let mut points = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let tick = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
@@ -183,6 +198,27 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
             points.push(AutomationPoint { tick, value });
         }
     }
+
+    // Walk and skip every appended column block (self-describing, D-06);
+    // automation never interprets any of them today — the shared walker
+    // (mirrors decode_notes) owns the truncation/ordering/duplicate-bit
+    // checks, this callback just discards the payload.
+    let bits_consumed = crate::midi::events::walk_column_blocks(bytes, &mut r, |_col_bit, byte_len, r| {
+        let mut buf = vec![0u8; byte_len as usize];
+        std::io::Read::read_exact(r, &mut buf).map_err(|e| e.to_string())
+    })?;
+
+    // Reviewer finding 1 (CRITICAL): a mask bit set with no matching block
+    // consumed is structural corruption, never silently tolerated — the
+    // general form of the rule (mirrors decode_notes), even though
+    // automation doesn't interpret any column's content.
+    let missing_blocks = mask & !COLUMNS_CORE & !bits_consumed;
+    if missing_blocks != 0 {
+        return Err(format!(
+            "AMEV mask 0x{mask:04x} claims column(s) 0x{missing_blocks:04x} but no matching block was found"
+        ));
+    }
+
     Ok((ppq, points))
 }
 
@@ -521,8 +557,8 @@ fn with_synced<R>(
     f: impl FnOnce(&mut AutomationStore) -> Result<R, String>,
 ) -> Result<R, String> {
     let dir = {
-        let (store, _, _) = audio.control_parts();
-        let d = store.lock().project_dir.clone();
+        let (session, _, _) = audio.control_parts();
+        let d = session.lock().store.project_dir.clone();
         d
     };
     let mut auto = state.automation.lock();
@@ -627,13 +663,35 @@ mod tests {
                 key: 60,
                 velocity: 100,
                 channel: 0,
+                note_id: crate::ids::NoteId(1),
             }],
+            2,
         );
         assert!(decode_points(&notes).unwrap().1.is_empty());
-        let (_, no_notes) = crate::midi::events::decode_notes(&bytes).unwrap();
-        assert!(no_notes.is_empty());
+        let decoded = crate::midi::events::decode_notes(&bytes).unwrap();
+        assert!(decoded.notes.is_empty());
 
         assert!(decode_points(&[0u8; 8]).is_err(), "garbage rejected");
+    }
+
+    /// Reviewer finding 1 (CRITICAL): a mask claiming a column is present
+    /// with its block missing (truncated away) must Err, mirroring
+    /// `events::decode_notes` — even though automation doesn't interpret
+    /// the column's content, the mask/block mismatch is structural
+    /// corruption on its own.
+    #[test]
+    fn decode_points_rejects_mask_claiming_a_column_whose_block_is_missing() {
+        let notes = vec![crate::midi::types::MidiNote {
+            tick: 0, length_ticks: 480, key: 60, velocity: 100, channel: 0,
+            note_id: crate::ids::NoteId(1),
+        }];
+        let mut bytes = crate::midi::events::encode_notes(960, &notes, 2);
+        // Truncate away the appended note-id block WITHOUT clearing the
+        // mask bit — the mask still claims 0x0002 is present.
+        bytes.truncate(16 + 1 * 16);
+        let mask = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert_eq!(mask & crate::midi::events::COLUMNS_NOTE_ID, crate::midi::events::COLUMNS_NOTE_ID);
+        assert!(decode_points(&bytes).is_err());
     }
 
     // ---- persistence -------------------------------------------------------
@@ -857,12 +915,11 @@ mod tests {
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(events) }),
         };
-        let mut g = RtGraph::new(vec![track]);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(vec![track], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; BAR * 2];
         let mut pos = 0u64;
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(&mut g, &params, pos, &LoopSpec::OFF, chunk, 2, RATE, false);
+            mixer::render(&mut g, pos, &LoopSpec::OFF, chunk, 2, RATE, false, None);
             pos += (chunk.len() / 2) as u64;
         }
         mono_of(&out)
@@ -941,8 +998,7 @@ mod tests {
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(vec![]) }),
         };
-        let mut g = RtGraph::new(vec![track]);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(vec![track], 1, Arc::new(ParamTable::default()));
 
         let expect = |buf: &[f32], base: u64, msg: &str| {
             for (i, frame) in buf.chunks_exact(2).enumerate() {
@@ -957,11 +1013,11 @@ mod tests {
 
         // Continuous render from 0.
         let mut buf = vec![0.0f32; 512 * 2];
-        mixer::render(&mut g, &params, 0, &LoopSpec::OFF, &mut buf, 2, RATE, false);
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut buf, 2, RATE, false, None);
         expect(&buf, 0, "from start");
 
         // SEEK to 72000 (gain 0.25 there): discontinuity block.
-        mixer::render(&mut g, &params, 72_000, &LoopSpec::OFF, &mut buf, 2, RATE, true);
+        mixer::render(&mut g, 72_000, &LoopSpec::OFF, &mut buf, 2, RATE, true, None);
         expect(&buf, 72_000, "after seek mid-ramp");
 
         // LOOP [24000, 96000): one block crossing the wrap. First 256
@@ -969,7 +1025,7 @@ mod tests {
         // loop start (gain 0.75) mid-block.
         let lp = LoopSpec { enabled: true, start: 24_000, end: 96_000 };
         let mut wrap_buf = vec![0.0f32; 1024 * 2];
-        mixer::render(&mut g, &params, 95_744, &lp, &mut wrap_buf, 2, RATE, true);
+        mixer::render(&mut g, 95_744, &lp, &mut wrap_buf, 2, RATE, true, None);
         expect(&wrap_buf[..256 * 2], 95_744, "pre-wrap tail");
         expect(&wrap_buf[256 * 2..], 24_000, "post-wrap re-seeded at loop start");
     }

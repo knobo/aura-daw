@@ -15,18 +15,23 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use crate::ids::SourceId;
+
 use super::types::Clip;
 use super::waveform::PyramidBuilder;
 
 /// Everything the writer needs to finalize one recorded track.
 pub struct RecSpec {
     pub track_id: String,
-    /// Pre-assigned clip UUID (also the WAV file stem).
+    /// Pre-assigned clip UUID (also the WAV file stem for cache/pyramid dirs).
     pub clip_id: String,
+    /// Pre-minted source identity (round-2 §2.2) — the take's wav is named
+    /// by this, not by `clip_id` (the decode cache is source-keyed).
+    pub source_id: SourceId,
     pub take_name: String,
-    /// Absolute WAV destination (`<proj>/audio/<clipId>.wav`).
+    /// Absolute WAV destination (`<proj>/audio/<sourceId>.wav`).
     pub wav_path: PathBuf,
-    /// Project-relative source path stored in the clip ("audio/<clipId>.wav").
+    /// Project-relative source path stored in the clip ("audio/<sourceId>.wav").
     pub rel_path: String,
     /// Waveform cache dir (`<proj>/cache/waveforms/<clipId>`).
     pub cache_dir: PathBuf,
@@ -164,10 +169,11 @@ fn run_writer(
             .write_dir(&w.spec.cache_dir)
             .map_err(|e| format!("waveform cache: {e}"))?;
         clips.push(Clip {
-            id: w.spec.clip_id,
-            track_id: w.spec.track_id,
+            id: w.spec.clip_id.into(),
+            track_id: w.spec.track_id.into(),
             name: w.spec.take_name,
             source_path: w.spec.rel_path,
+            source_id: w.spec.source_id,
             source_channels: channels,
             source_sample_rate: sample_rate,
             source_length_samples: frames,
@@ -195,12 +201,14 @@ mod tests {
     }
 
     fn spec(dir: &PathBuf, clip_id: &str, start_pos: u64) -> RecSpec {
+        let source_id = SourceId::mint();
         RecSpec {
             track_id: "track-1".into(),
             clip_id: clip_id.into(),
+            wav_path: dir.join(format!("audio/{source_id}.wav")),
+            rel_path: format!("audio/{source_id}.wav"),
+            source_id,
             take_name: "Take 1".into(),
-            wav_path: dir.join(format!("audio/{clip_id}.wav")),
-            rel_path: format!("audio/{clip_id}.wav"),
             cache_dir: dir.join(format!("cache/waveforms/{clip_id}")),
             start_pos,
         }
@@ -228,10 +236,11 @@ mod tests {
         assert_eq!(c.timeline_start_samples, 1234);
         assert_eq!(c.source_channels, 1);
         assert_eq!(c.source_sample_rate, 48_000);
-        assert_eq!(c.source_path, "audio/clipA.wav");
+        assert!(!c.source_id.as_str().is_empty(), "a source id was minted");
+        assert_eq!(c.source_path, format!("audio/{}.wav", c.source_id), "asset named by source, not clip");
 
         // Read back and compare bit-exact.
-        let mut r = hound::WavReader::open(dir.join("audio/clipA.wav")).unwrap();
+        let mut r = hound::WavReader::open(dir.join(&c.source_path)).unwrap();
         assert_eq!(r.spec().sample_format, hound::SampleFormat::Float);
         assert_eq!(r.spec().sample_rate, 48_000);
         let back: Vec<f32> = r.samples::<f32>().map(|s| s.unwrap()).collect();
@@ -278,7 +287,8 @@ mod tests {
         assert!(clips.iter().all(|c| c.source_length_samples == 100));
         assert!(clips.iter().all(|c| c.source_channels == 2));
 
-        let mut r = hound::WavReader::open(dir.join("audio/c2.wav")).unwrap();
+        let c2 = clips.iter().find(|c| c.id == "c2").unwrap();
+        let mut r = hound::WavReader::open(dir.join(&c2.source_path)).unwrap();
         let back: Vec<f32> = r.samples::<f32>().map(|s| s.unwrap()).collect();
         assert_eq!(back.len(), 200);
         assert_eq!(back[0], 0.5);

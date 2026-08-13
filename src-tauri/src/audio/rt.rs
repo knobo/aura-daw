@@ -7,12 +7,14 @@
 //! deallocation of retired graphs happens on the control thread).
 
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::dsp::LiveInstrument;
+use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::transport::LoopSpec;
-use super::types::MAX_TRACKS;
+use crate::ids::TrackId;
 use crate::midi::schedule::AbsNoteEvent;
 
 pub const FLAG_MUTE: u32 = 1 << 0;
@@ -91,39 +93,63 @@ impl SharedRt {
 /// Per-slot mixer parameters as atomics (f32 stored as bits). The callback
 /// reads these Relaxed every buffer; commands write them directly — no queue
 /// round-trip needed for continuous controls.
+///
+/// Round-2 §2.4: sized PER-GRAPH (`with_slots`), not by a fixed cap — a
+/// retired graph keeps reading the table it was built with (Task 5's O-13
+/// argument), and a rebuild always sizes the fresh table to the CURRENT
+/// track count, however wide that gets.
 pub struct ParamTable {
-    pub gain: [AtomicU32; MAX_TRACKS],
-    pub pan: [AtomicU32; MAX_TRACKS],
-    pub flags: [AtomicU32; MAX_TRACKS],
+    pub gain: Vec<AtomicU32>,
+    pub pan: Vec<AtomicU32>,
+    pub flags: Vec<AtomicU32>,
     pub any_solo: AtomicBool,
 }
 
+/// `ParamTable::default() == with_slots(0)` would be wrong for tests that
+/// poke arbitrary small slots without sizing the table explicitly first —
+/// keep the historical 64-slot default so those stay valid. Production code
+/// always goes through `with_slots(store.tracks.len())` at rebuild.
 impl Default for ParamTable {
     fn default() -> Self {
-        Self {
-            gain: std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())),
-            pan: std::array::from_fn(|_| AtomicU32::new(0.0f32.to_bits())),
-            flags: std::array::from_fn(|_| AtomicU32::new(0)),
-            any_solo: AtomicBool::new(false),
-        }
+        Self::with_slots(64)
     }
 }
 
 impl ParamTable {
+    /// A table sized for `n` slots (per-graph — round-2 §2.4). All setters
+    /// bounds-check against the actual size (out-of-range writes are
+    /// dropped, matching the old `MAX_TRACKS` guards).
+    pub fn with_slots(n: usize) -> Self {
+        Self {
+            gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            pan: (0..n).map(|_| AtomicU32::new(0.0f32.to_bits())).collect(),
+            flags: (0..n).map(|_| AtomicU32::new(0)).collect(),
+            any_solo: AtomicBool::new(false),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.gain.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.gain.is_empty()
+    }
+
     pub fn set_gain_linear(&self, slot: usize, gain: f32) {
-        if slot < MAX_TRACKS {
+        if slot < self.len() {
             self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
         }
     }
 
     pub fn set_pan(&self, slot: usize, pan: f32) {
-        if slot < MAX_TRACKS {
+        if slot < self.len() {
             self.pan[slot].store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
         }
     }
 
     pub fn set_flag(&self, slot: usize, flag: u32, on: bool) {
-        if slot < MAX_TRACKS {
+        if slot < self.len() {
             if on {
                 self.flags[slot].fetch_or(flag, Ordering::Relaxed);
             } else {
@@ -134,7 +160,7 @@ impl ParamTable {
 
     /// Reset a slot to unity/center/no-flags (used when a slot is reassigned).
     pub fn reset_slot(&self, slot: usize) {
-        if slot < MAX_TRACKS {
+        if slot < self.len() {
             self.gain[slot].store(1.0f32.to_bits(), Ordering::Relaxed);
             self.pan[slot].store(0.0f32.to_bits(), Ordering::Relaxed);
             self.flags[slot].store(0, Ordering::Relaxed);
@@ -245,24 +271,51 @@ impl RtTrack {
     }
 }
 
-#[derive(Default)]
 pub struct RtGraph {
     pub tracks: Vec<RtTrack>,
     /// Preallocated stereo scratch for live-node rendering
     /// (`MAX_LIVE_BLOCK * 2` once any track is live; empty otherwise).
     /// Allocated at BUILD time on the control thread — never on the RT path.
     pub scratch: Vec<f32>,
+    /// Monotonic graph generation; meter blocks echo it (Task 6).
+    pub generation: u64,
+    /// THIS graph's parameters — round-2 §2.4: the param table versions
+    /// with the graph snapshot. A retired graph keeps reading its own
+    /// table (the `Arc` it holds), so the O-13 alias window (a freed slot
+    /// reused by a newer graph while an old graph still renders under it)
+    /// cannot happen — there is nothing to free; every rebuild derives
+    /// fresh slots and builds its own table. Knob traffic always targets
+    /// the NEWEST table via `GraphTables`/`SharedGraphTables`, never this
+    /// field directly.
+    pub params: Arc<ParamTable>,
+    /// Preallocated meter-block chunk templates for THIS graph's slot count
+    /// (`⌈params.len() / METER_CHUNK_SLOTS⌉`, at least one so master meters
+    /// and frame accounting keep flowing with zero tracks) — Task 7:
+    /// chunking replaces the single `MAX_TRACKS`-wide block. Allocated at
+    /// BUILD time on the control thread; `mixer::render` only mutates
+    /// entries in place and pushes copies, so a wide graph's meter output
+    /// costs N pushes per callback, never an RT allocation.
+    pub meter_scratch: Vec<RawMeterBlock>,
 }
 
 impl RtGraph {
     /// Build a snapshot, allocating live-node scratch when needed.
-    pub fn new(tracks: Vec<RtTrack>) -> Self {
+    pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
         let scratch = if tracks.iter().any(|t| t.live.is_some()) {
             vec![0.0; MAX_LIVE_BLOCK * 2]
         } else {
             Vec::new()
         };
-        Self { tracks, scratch }
+        let n_chunks = (params.len() + METER_CHUNK_SLOTS - 1) / METER_CHUNK_SLOTS;
+        let n_chunks = n_chunks.max(1);
+        let meter_scratch = (0..n_chunks)
+            .map(|i| {
+                let mut b = RawMeterBlock::new(generation, 0, 0);
+                b.base_slot = (i * METER_CHUNK_SLOTS) as u32;
+                b
+            })
+            .collect();
+        Self { tracks, scratch, generation, params, meter_scratch }
     }
 }
 
@@ -299,3 +352,113 @@ impl Drop for GraphPtr {
 // SAFETY: the pointee is only ever owned by exactly one side at a time; the
 // queue transfers ownership. RtGraph contains no thread-affine state.
 unsafe impl Send for GraphPtr {}
+
+// ---------------------------------------------------------------------------
+// Control-side view of the current graph's tables (round-2 §2.4)
+// ---------------------------------------------------------------------------
+
+/// Control-side view of the CURRENT graph's tables, published by the engine
+/// control thread on every rebuild (also headless — tables exist without an
+/// output device, so knob writes and recording keep working with no device
+/// open). Readers: `ControlPlane::commit` (knob writes), recording slot
+/// resolution, the meter fold (Task 6).
+///
+/// Live-node state already moves across rebuilds via `LiveNodeRegistry`
+/// keyed by track id (the pattern round-2 §2.4 names); parameter smoothing
+/// does not exist yet — when it lands (engine round), it keys by `TrackId`
+/// like the registry, not by slot (slots are per-generation and therefore
+/// not a stable key across rebuilds).
+pub struct GraphTables {
+    pub generation: u64,
+    pub params: Arc<ParamTable>,
+    pub slots: HashMap<TrackId, usize>,
+}
+
+/// `Mutex` (not `RwLock`): writes are rare (once per rebuild) and reads are
+/// short (a slot lookup + a handful of atomic stores), so a plain mutex is
+/// simplest and cheap enough — this is control-side only, never touched by
+/// an RT thread.
+///
+/// LOCK ORDER: session before tables, never the reverse [C1]. `rebuild`
+/// publishes a fresh `GraphTables` INSIDE the session-lock scope it already
+/// holds while reading the store — that is load-bearing, not style:
+/// publishing after the lock is released opens a window where a commit
+/// transacts against a newer document revision, resolves its param writes
+/// through the OLD tables (because the new ones aren't published yet), and
+/// the rebuild then publishes tables built from the OLDER revision it read
+/// before that commit — the knob write is silently lost forever, since a
+/// plain `Set` never schedules a rebuild. Publishing under the lock makes
+/// <read doc, publish tables> atomic against every commit's
+/// <transact, execute writes> sequence. `ControlPlane::commit` (tables
+/// only, after transact), `start_recording` (session then tables), and
+/// `pump_meter_frames` (session then tables) all conform to this order.
+pub type SharedGraphTables = Arc<parking_lot::Mutex<GraphTables>>;
+
+impl GraphTables {
+    /// A fresh gen-0 table with no params and no slots — the shape every
+    /// `AudioState::default()` and every control-module test fixture wants
+    /// before the first real rebuild publishes something. Single source of
+    /// truth for "what does an empty `GraphTables` look like".
+    pub fn empty() -> SharedGraphTables {
+        Arc::new(parking_lot::Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: HashMap::new(),
+        }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::GraphTables;
+    use super::SharedGraphTables;
+
+    /// Test-only alias for [`GraphTables::empty`] — kept as a separate name
+    /// so test modules read `testutil::empty_tables()` like the other
+    /// fixture helpers, without duplicating the literal.
+    pub fn empty_tables() -> SharedGraphTables {
+        GraphTables::empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn param_table_sizes_beyond_sixty_four() {
+        let p = ParamTable::with_slots(100);
+        p.set_gain_linear(99, 0.5);
+        assert_eq!(f32::from_bits(p.gain[99].load(Ordering::Relaxed)), 0.5);
+        p.set_gain_linear(100, 0.5); // out of range: dropped, no panic
+        assert_eq!(p.len(), 100);
+    }
+
+    #[test]
+    fn default_table_keeps_the_historical_sixty_four_slots() {
+        // Tests that poke arbitrary small slots without sizing explicitly
+        // first must keep working.
+        let p = ParamTable::default();
+        assert_eq!(p.len(), 64);
+        p.set_pan(63, 1.0);
+        assert_eq!(f32::from_bits(p.pan[63].load(Ordering::Relaxed)), 1.0);
+    }
+
+    #[test]
+    fn wide_graph_gets_multiple_meter_chunks() {
+        let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(200)));
+        // ceil(200/64) = 4 chunks.
+        assert_eq!(g.meter_scratch.len(), 4);
+        assert_eq!(g.meter_scratch[0].base_slot, 0);
+        assert_eq!(g.meter_scratch[3].base_slot, 192);
+    }
+
+    #[test]
+    fn zero_slot_table_still_gets_one_meter_chunk() {
+        // Master meters + frame accounting must keep flowing even with no
+        // tracks (an empty project, still playing) — the chunk count floors
+        // at 1, it never goes to 0.
+        let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(0)));
+        assert_eq!(g.meter_scratch.len(), 1);
+    }
+}

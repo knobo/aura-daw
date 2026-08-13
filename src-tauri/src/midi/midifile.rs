@@ -210,14 +210,17 @@ pub fn import_smf(bytes: &[u8], target_ppq: u32) -> Result<ImportedMidi, String>
             .max()
             .unwrap_or(1)
             .max(1);
-        clips.push(MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
-            track_id: String::new(),
+        let mut clip = MidiClip {
+            id: crate::ids::ClipId::mint(),
+            track_id: String::new().into(),
             name: name.unwrap_or_else(|| format!("Imported track {}", ti + 1)),
             timeline_start_ticks: 0,
             length_ticks: length,
             notes,
-        });
+            next_note_id: 1,
+        };
+        clip.ensure_note_ids().expect("freshly imported notes never collide");
+        clips.push(clip);
     }
 
     // Merge/normalize the tempo map: sorted, unique ticks (last wins),
@@ -261,6 +264,7 @@ fn push_note(
         key,
         velocity: vel.max(1),
         channel: ch,
+        note_id: crate::ids::NoteId(0),
     });
 }
 
@@ -269,7 +273,13 @@ mod tests {
     use super::*;
 
     fn note(tick: u32, len: u32, key: u8, vel: u8, ch: u8) -> MidiNote {
-        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: ch }
+        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: ch, note_id: crate::ids::NoteId(0) }
+    }
+
+    /// Import mints fresh note ids (`ensure_note_ids`), so equality checks
+    /// against hand-built expectations compare everything BUT identity.
+    fn without_ids(notes: &[MidiNote]) -> Vec<MidiNote> {
+        notes.iter().map(|n| MidiNote { note_id: crate::ids::NoteId(0), ..*n }).collect()
     }
 
     #[test]
@@ -290,12 +300,13 @@ mod tests {
                 note(480, 960, 67, 80, 0), // overlapping
                 note(4000, 100, 72, 127, 15),
             ],
+            next_note_id: 1,
         };
         let bytes = export_smf(960, &tempo, &[clip.clone()]).unwrap();
         let imp = import_smf(&bytes, 960).unwrap();
         assert_eq!(imp.clips.len(), 1);
         assert_eq!(imp.clips[0].name, "Lead");
-        assert_eq!(imp.clips[0].notes, clip.notes);
+        assert_eq!(without_ids(&imp.clips[0].notes), clip.notes, "content survives (ids are freshly minted on import)");
         assert_eq!(imp.tempo_events.len(), 2);
         assert_eq!(imp.tempo_events[0].tick, 0);
         assert!((imp.tempo_events[0].bpm - 120.0).abs() < 0.01);
@@ -313,6 +324,7 @@ mod tests {
             timeline_start_ticks: 960,
             length_ticks: 960,
             notes: vec![note(0, 480, 60, 100, 0)],
+            next_note_id: 1,
         };
         let bytes =
             export_smf(960, &[TempoEvent { tick: 0, bpm: 120.0 }], &[clip]).unwrap();
@@ -329,6 +341,7 @@ mod tests {
             timeline_start_ticks: 0,
             length_ticks: 960,
             notes: vec![note(240, 480, 60, 100, 0)],
+            next_note_id: 1,
         };
         // Export at 480 ppq, import at 960 -> ticks double.
         let bytes = export_smf(480, &[TempoEvent { tick: 0, bpm: 120.0 }], &[clip]).unwrap();
@@ -347,17 +360,21 @@ mod tests {
             timeline_start_ticks: 0,
             length_ticks: 1920,
             notes: vec![note(0, 960, 60, 100, 0), note(480, 960, 60, 90, 0)],
+            next_note_id: 1,
         };
         // No tempo events at all -> import synthesizes 120 bpm at tick 0.
         let bytes = export_smf(960, &[], &[clip]).unwrap();
         let imp = import_smf(&bytes, 960).unwrap();
         assert_eq!(imp.tempo_events, vec![TempoEvent { tick: 0, bpm: 120.0 }]);
         assert!(!imp.explicit_tempo, "synthesized default is flagged as such");
-        let notes = &imp.clips[0].notes;
+        let notes = without_ids(&imp.clips[0].notes);
         assert_eq!(notes.len(), 2);
         // FIFO: first-on pairs with first-off -> lengths 960 each preserved.
         assert_eq!(notes[0], note(0, 960, 60, 100, 0));
         assert_eq!(notes[1], note(480, 960, 60, 90, 0));
+        // And ids were actually minted (1, 2 by import order), never left 0.
+        assert_eq!(imp.clips[0].notes[0].note_id.0, 1);
+        assert_eq!(imp.clips[0].notes[1].note_id.0, 2);
     }
 
     #[test]

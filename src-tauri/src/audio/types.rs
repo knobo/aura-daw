@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Hard cap on mixer tracks; slot indices and meter blocks are sized by this.
-/// 64 conveniently matches a `u64` presence mask.
-pub const MAX_TRACKS: usize = 64;
+use crate::ids::{ClipId, SourceId, TrackId};
 
 // ---------------------------------------------------------------------------
 // Transport
@@ -98,10 +96,10 @@ pub struct TrackMeter {
 // ---------------------------------------------------------------------------
 
 /// Mirrors docs/ipc-schemas/track-state.schema.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackState {
-    pub id: String,
+    pub id: TrackId,
     pub name: String,
     /// "audio" (future: "midi", "bus")
     pub kind: String,
@@ -143,14 +141,21 @@ pub struct AudioDevice {
 // ---------------------------------------------------------------------------
 
 /// Mirrors docs/ipc-schemas/clip.schema.json
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Clip {
-    pub id: String,
-    pub track_id: String,
+    pub id: ClipId,
+    pub track_id: TrackId,
     pub name: String,
     /// Relative to the .aura project dir, POSIX separators.
     pub source_path: String,
+    /// Decode-cache/asset identity (round-2 §2.2). Empty (`Default`) means
+    /// "unassigned" — a legacy clip before `assign_source_ids` runs, or a
+    /// construction site that hasn't minted one yet. One `SourceId` names
+    /// exactly one `source_path`; the empty sentinel must never reach the
+    /// engine cache ([`crate::audio::engine`]'s `stale_sources`).
+    #[serde(default)]
+    pub source_id: SourceId,
     pub source_channels: u16,
     pub source_sample_rate: u32,
     /// Length of the source file in SOURCE samples.
@@ -194,6 +199,7 @@ pub struct Project {
 // thread behind a parking_lot::Mutex; never touched by the RT threads).
 // ---------------------------------------------------------------------------
 
+#[derive(Default)]
 pub struct Store {
     pub transport: TransportState,
     pub tracks: Vec<TrackState>,
@@ -202,54 +208,27 @@ pub struct Store {
     pub project_dir: Option<PathBuf>,
     pub project_name: Option<String>,
     pub created_at: Option<String>,
-    /// track id -> RT parameter slot (0..MAX_TRACKS).
-    pub slots: HashMap<String, usize>,
-    slot_used: [bool; MAX_TRACKS],
 }
 
-impl Default for Store {
-    fn default() -> Self {
-        Self {
-            transport: TransportState::default(),
-            tracks: Vec::new(),
-            clips: Vec::new(),
-            project_dir: None,
-            project_name: None,
-            created_at: None,
-            slots: HashMap::new(),
-            slot_used: [false; MAX_TRACKS],
-        }
-    }
+/// Derive RT parameter slots from display order (round-2 §2.4). Pure: no
+/// stored allocation state, so there is nothing to free and therefore
+/// nothing that can be reused while a stale graph still reads it — the
+/// O-13 alias window this replaces is dead by construction. Every rebuild
+/// calls this fresh against the CURRENT track list and builds its OWN
+/// `ParamTable`/`GraphTables` from the result; a retired graph keeps
+/// reading the table it was built with, so a later renumbering (tracks
+/// added/removed) can never bleed into it.
+pub fn derive_slots(tracks: &[TrackState]) -> HashMap<TrackId, usize> {
+    tracks
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.id.clone(), i))
+        .collect()
 }
 
 impl Store {
-    /// Allocate a free RT slot for a track id. Returns None when full.
-    pub fn alloc_slot(&mut self, track_id: &str) -> Option<usize> {
-        if let Some(&s) = self.slots.get(track_id) {
-            return Some(s);
-        }
-        let slot = self.slot_used.iter().position(|u| !u)?;
-        self.slot_used[slot] = true;
-        self.slots.insert(track_id.to_string(), slot);
-        Some(slot)
-    }
-
-    pub fn free_slot(&mut self, track_id: &str) {
-        if let Some(slot) = self.slots.remove(track_id) {
-            self.slot_used[slot] = false;
-        }
-    }
-
     pub fn any_solo(&self) -> bool {
         self.tracks.iter().any(|t| t.soloed)
-    }
-
-    /// (slot, track_id) pairs in display order.
-    pub fn track_slots(&self) -> Vec<(usize, String)> {
-        self.tracks
-            .iter()
-            .filter_map(|t| self.slots.get(&t.id).map(|&s| (s, t.id.clone())))
-            .collect()
     }
 
     /// Absolute path for a project-relative source path.
@@ -265,7 +244,7 @@ impl Store {
     }
 
     pub fn armed_track_ids(&self) -> Vec<String> {
-        self.tracks.iter().filter(|t| t.armed).map(|t| t.id.clone()).collect()
+        self.tracks.iter().filter(|t| t.armed).map(|t| t.id.to_string()).collect()
     }
 
     pub fn cache_dir_for(dir: &Path, clip_id: &str) -> PathBuf {
@@ -273,30 +252,67 @@ impl Store {
     }
 }
 
+/// Shared test fixtures for `TrackState`/`Clip` — the id/track_id are the
+/// only fields callers vary; every other field is a fixed, arbitrary-but-
+/// valid default. Used by this module's own tests plus `control::mod`,
+/// `control::session`, and `audio::engine`'s test modules (one definition
+/// instead of four hand-kept copies).
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::{Clip, TrackState};
+    use crate::ids::SourceId;
+
+    pub fn test_track(id: &str) -> TrackState {
+        TrackState {
+            id: id.into(),
+            name: "New Track".into(),
+            kind: "audio".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        }
+    }
+
+    pub fn test_clip(id: &str, track_id: &str) -> Clip {
+        Clip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: "clip".into(),
+            source_path: "audio/x.wav".into(),
+            source_id: SourceId::default(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::testutil::test_track;
 
     #[test]
-    fn slot_allocation_reuses_freed_slots() {
-        let mut s = Store::default();
-        let a = s.alloc_slot("a").unwrap();
-        let b = s.alloc_slot("b").unwrap();
-        assert_ne!(a, b);
-        // idempotent
-        assert_eq!(s.alloc_slot("a").unwrap(), a);
-        s.free_slot("a");
-        let c = s.alloc_slot("c").unwrap();
-        assert_eq!(c, a, "freed slot is reused");
-    }
-
-    #[test]
-    fn slot_allocation_exhausts_at_max() {
-        let mut s = Store::default();
-        for i in 0..MAX_TRACKS {
-            assert!(s.alloc_slot(&format!("t{i}")).is_some());
-        }
-        assert!(s.alloc_slot("overflow").is_none());
+    fn slots_are_display_order_and_never_reused_across_generations() {
+        let tracks = vec![test_track("a"), test_track("b"), test_track("c")];
+        let s = derive_slots(&tracks);
+        assert_eq!((s["a"], s["b"], s["c"]), (0, 1, 2));
+        // Remove "a": the NEXT derivation renumbers — that is fine, because
+        // the numbering is scoped to one graph (each graph has its own table);
+        // cross-generation aliasing is impossible by construction, which the
+        // engine-level test (Task 8) proves end to end.
+        let s2 = derive_slots(&tracks[1..]);
+        assert_eq!((s2["b"], s2["c"]), (0, 1));
     }
 
     #[test]

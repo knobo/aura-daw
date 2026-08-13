@@ -30,13 +30,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::audio::engine::ControlMsg;
-use crate::audio::rt::ParamTable;
-use crate::audio::types::{Store, TrackState};
-use crate::midi::{MidiClip, MidiNote, MidiStore};
+use crate::audio::types::TrackState;
+use crate::midi::{MidiClip, MidiNote};
 use crate::sidecars::jobs::{self, EventSink, JobSpec};
 use crate::sidecars::{JobKind, SidecarEvent};
 
 use super::ops;
+use super::session::Session;
 use super::ControlPlane;
 
 /// SIGTERM → SIGKILL grace on cancel (same value as the other sidecar jobs).
@@ -148,12 +148,10 @@ pub(crate) fn parse_hum_result(
 /// Land validated notes as a new MIDI clip: resolve the target track (must be
 /// `kind: "midi"`) or auto-create one named after the clip, then register the
 /// clip in the midi store. STRUCTURAL — the caller persists and sends
-/// `ControlMsg::Rebuild` afterwards. Lock order: store first, then midi,
-/// never both at once (same convention as `seed_demo_project`).
+/// `ControlMsg::Rebuild` afterwards. One guard covers the whole block (store
+/// + midi live behind the same lock).
 pub(crate) fn apply_hum_notes(
-    store: &Mutex<Store>,
-    params: &ParamTable,
-    midi: &Mutex<MidiStore>,
+    session: &Mutex<Session>,
     mut notes: Vec<MidiNote>,
     length_ticks: u64,
     track_id: Option<String>,
@@ -166,28 +164,30 @@ pub(crate) fn apply_hum_notes(
     for n in &notes {
         n.validate()?;
     }
-    let (target, created_track) = {
-        let mut s = store.lock();
-        match track_id {
-            Some(id) => {
-                let track = s
-                    .tracks
-                    .iter()
-                    .find(|t| t.id == id)
-                    .ok_or_else(|| format!("unknown track: {id}"))?;
-                if track.kind != "midi" {
-                    return Err(format!(
-                        "track {id} is kind \"{}\" (hummed melodies need a midi track)",
-                        track.kind
-                    ));
-                }
-                (id, None)
+    let mut session = session.lock();
+    let (target, created_track) = match track_id {
+        Some(id) => {
+            let track = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id == id)
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            if track.kind != "midi" {
+                return Err(format!(
+                    "track {id} is kind \"{}\" (hummed melodies need a midi track)",
+                    track.kind
+                ));
             }
-            None => {
-                let track =
-                    ops::add_track(&mut s, params, Some(name.to_string()), Some("midi".into()))?;
-                (track.id.clone(), Some(track))
-            }
+            (crate::ids::TrackId::from(id), None)
+        }
+        None => {
+            let track = ops::add_track(
+                &mut session.store,
+                Some(name.to_string()),
+                Some("midi".into()),
+            )?;
+            (track.id.clone(), Some(track))
         }
     };
     notes.sort_by_key(|n| (n.tick, n.key));
@@ -196,15 +196,20 @@ pub(crate) fn apply_hum_notes(
         .map(|n| n.tick as u64 + n.length_ticks as u64)
         .max()
         .unwrap_or(0);
-    let clip = MidiClip {
-        id: uuid::Uuid::new_v4().to_string(),
+    for n in &mut notes {
+        n.note_id = crate::ids::NoteId(0);
+    }
+    let mut clip = MidiClip {
+        id: crate::ids::ClipId::mint(),
         track_id: target,
         name: name.to_string(),
         timeline_start_ticks: at_ticks,
         length_ticks: length_ticks.max(end).max(1),
         notes,
+        next_note_id: 1,
     };
-    midi.lock().clips.push(clip.clone());
+    clip.ensure_note_ids()?;
+    session.midi.clips.push(clip.clone());
     Ok((clip, created_track))
 }
 
@@ -263,7 +268,8 @@ impl ControlPlane {
             }
             (None, None) => Err("pass clipId (a recorded clip) or path (a WAV file)".into()),
             (Some(id), None) => {
-                let s = self.store.lock();
+                let session = self.session.lock();
+                let s = &session.store;
                 let clip = s
                     .clips
                     .iter()
@@ -301,14 +307,13 @@ impl ControlPlane {
         sink: EventSink,
     ) -> Result<String, String> {
         let input = self.resolve_hum_input(&req)?;
-        // Sync the midi store with the open project (same store->midi
-        // ordering as the midi commands) so ppq/tempo are fresh.
+        // Sync the midi store with the open project so ppq/tempo are fresh.
         let (dir, project_bpm) = {
-            let s = self.store.lock();
-            (s.project_dir.clone(), s.transport.tempo_bpm)
+            let session = self.session.lock();
+            (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
         };
         crate::midi::notify_project_opened(dir, project_bpm);
-        let ppq = self.midi.lock().ppq;
+        let ppq = self.session.lock().midi.ppq;
         let bpm = req.bpm.unwrap_or(project_bpm);
         if !(bpm > 0.0) {
             return Err(format!("bpm out of range: {bpm}"));
@@ -352,19 +357,17 @@ impl ControlPlane {
         name: &str,
     ) -> Result<(MidiClip, Option<TrackState>), String> {
         let out = apply_hum_notes(
-            &self.store,
-            &self.params,
-            &self.midi,
+            &self.session,
             notes,
             length_ticks,
             track_id,
             at_ticks,
             name,
         )?;
-        let dir = self.store.lock().project_dir.clone();
+        let dir = self.session.lock().store.project_dir.clone();
         if let Some(d) = &dir {
-            let m = self.midi.lock();
-            if let Err(e) = crate::midi::persist::save_into_project(d, &m) {
+            let session = self.session.lock();
+            if let Err(e) = crate::midi::persist::save_into_project(d, &session.midi) {
                 log::warn!("hum-to-song: persisting midi failed: {e}");
             }
         }
@@ -557,11 +560,21 @@ pub async fn hum_to_song(
 mod tests {
     use super::*;
     use crate::audio::project;
+    use crate::audio::rt::testutil::empty_tables;
+    use crate::audio::types::Store;
+    use crate::midi::MidiStore;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
     fn note(tick: u32, len: u32, key: u8, vel: u8) -> MidiNote {
-        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0 }
+        MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: crate::ids::NoteId(0) }
+    }
+
+    /// `apply_hum_notes` mints fresh ids (`ensure_note_ids`), so equality
+    /// checks against hand-built expectations compare everything BUT
+    /// identity.
+    fn without_ids(notes: &[MidiNote]) -> Vec<MidiNote> {
+        notes.iter().map(|n| MidiNote { note_id: crate::ids::NoteId(0), ..*n }).collect()
     }
 
     // ---- parse_hum_result -------------------------------------------------
@@ -608,28 +621,24 @@ mod tests {
 
     // ---- apply core -------------------------------------------------------
 
-    fn plain_store(n_midi: usize, n_audio: usize) -> (Mutex<Store>, ParamTable) {
+    fn plain_session(n_midi: usize, n_audio: usize) -> Mutex<Session> {
         let mut store = Store::default();
-        let params = ParamTable::default();
         for i in 0..n_midi {
-            ops::add_track(&mut store, &params, Some(format!("M{i}")), Some("midi".into()))
+            ops::add_track(&mut store, Some(format!("M{i}")), Some("midi".into()))
                 .unwrap();
         }
         for i in 0..n_audio {
-            ops::add_track(&mut store, &params, Some(format!("A{i}")), Some("audio".into()))
+            ops::add_track(&mut store, Some(format!("A{i}")), Some("audio".into()))
                 .unwrap();
         }
-        (Mutex::new(store), params)
+        Mutex::new(Session::new(store, MidiStore::default()))
     }
 
     #[test]
     fn apply_auto_creates_midi_track_and_places_clip() {
-        let (store, params) = plain_store(0, 0);
-        let midi = Mutex::new(MidiStore::default());
+        let session = plain_session(0, 0);
         let (clip, created) = apply_hum_notes(
-            &store,
-            &params,
-            &midi,
+            &session,
             vec![note(480, 240, 72, 90), note(0, 480, 69, 100)],
             3840,
             None,
@@ -644,27 +653,34 @@ mod tests {
         assert_eq!(clip.timeline_start_ticks, 960);
         assert_eq!(clip.length_ticks, 3840);
         assert_eq!(
-            clip.notes,
+            without_ids(&clip.notes),
             vec![note(0, 480, 69, 100), note(480, 240, 72, 90)],
             "sorted by (tick, key)"
         );
-        let m = midi.lock();
-        assert_eq!(m.clips.len(), 1);
-        let s = store.lock();
-        assert_eq!(s.tracks.len(), 1);
-        assert!(s.slots.contains_key(&t.id), "RT slot allocated");
+        assert_eq!(
+            clip.notes.iter().map(|n| n.note_id.0).collect::<Vec<_>>(),
+            vec![1, 2],
+            "ids minted in the sorted order, watermark advanced"
+        );
+        let g = session.lock();
+        assert_eq!(g.midi.clips.len(), 1);
+        assert_eq!(g.store.tracks.len(), 1);
+        // Round-2 §2.4: slots are derived state, not a store side effect —
+        // assert the row itself landed (a later Rebuild derives its slot).
+        assert!(g.store.tracks.iter().any(|tr| tr.id == t.id), "track row exists");
     }
 
     #[test]
     fn apply_targets_existing_midi_track_and_rejects_bad_targets() {
-        let (store, params) = plain_store(1, 1);
-        let midi_id = store.lock().tracks[0].id.clone();
-        let audio_id = store.lock().tracks[1].id.clone();
-        let midi = Mutex::new(MidiStore::default());
+        let session = plain_session(1, 1);
+        let (midi_id, audio_id) = {
+            let g = session.lock();
+            (g.store.tracks[0].id.clone(), g.store.tracks[1].id.clone())
+        };
 
         let (clip, created) = apply_hum_notes(
-            &store, &params, &midi,
-            vec![note(0, 100, 60, 90)], 0, Some(midi_id.clone()), 0, "m",
+            &session,
+            vec![note(0, 100, 60, 90)], 0, Some(midi_id.to_string()), 0, "m",
         )
         .unwrap();
         assert!(created.is_none());
@@ -674,20 +690,21 @@ mod tests {
         // Audio track target / unknown track / empty notes: structured errors,
         // no mutation.
         let e = apply_hum_notes(
-            &store, &params, &midi,
-            vec![note(0, 100, 60, 90)], 0, Some(audio_id), 0, "m",
+            &session,
+            vec![note(0, 100, 60, 90)], 0, Some(audio_id.to_string()), 0, "m",
         )
         .unwrap_err();
         assert!(e.contains("midi track"), "{e}");
         let e = apply_hum_notes(
-            &store, &params, &midi,
+            &session,
             vec![note(0, 100, 60, 90)], 0, Some("ghost".into()), 0, "m",
         )
         .unwrap_err();
         assert!(e.contains("unknown track"), "{e}");
-        assert!(apply_hum_notes(&store, &params, &midi, vec![], 0, None, 0, "m").is_err());
-        assert_eq!(midi.lock().clips.len(), 1, "no clip from failed attempts");
-        assert_eq!(store.lock().tracks.len(), 2, "no track from failed attempts");
+        assert!(apply_hum_notes(&session, vec![], 0, None, 0, "m").is_err());
+        let g = session.lock();
+        assert_eq!(g.midi.clips.len(), 1, "no clip from failed attempts");
+        assert_eq!(g.store.tracks.len(), 2, "no track from failed attempts");
     }
 
     // ---- fake-sidecar end-to-end (job manager + wrapped sink) -------------
@@ -707,23 +724,23 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
         let (_p, dir) = project::create(&parent, "Hum", 48_000, 120.0).unwrap();
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
-        store.lock().project_dir = Some(dir);
-        store.lock().project_name = Some("Hum".into());
+        let tables = empty_tables();
+        let mut store = Store::default();
+        store.project_dir = Some(dir);
+        store.project_name = Some("Hum".into());
+        let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
-            store.clone(),
+            tables.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
         let cp = Arc::new(ControlPlane::new(
-            store,
+            session,
             shared,
-            params,
+            tables,
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
-            Arc::new(Mutex::new(MidiStore::default())),
             Box::new(|_, _| {}),
         ));
         (cp, parent)
@@ -793,24 +810,23 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         // …then the async apply lands the clip (poll).
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if !cp.midi.lock().clips.is_empty() {
+            if !cp.session.lock().midi.clips.is_empty() {
                 break;
             }
             assert!(Instant::now() < deadline, "melody clip never applied");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let (clip, track) = {
-            let m = cp.midi.lock();
-            let clip = m.clips[0].clone();
-            let s = cp.store.lock();
-            let track = s.tracks.iter().find(|t| t.id == clip.track_id).cloned();
+            let session = cp.session.lock();
+            let clip = session.midi.clips[0].clone();
+            let track = session.store.tracks.iter().find(|t| t.id == clip.track_id).cloned();
             (clip, track)
         };
         assert_eq!(clip.name, "take melody");
         assert_eq!(clip.timeline_start_ticks, 1920);
         assert_eq!(clip.length_ticks, 3840);
         assert_eq!(
-            clip.notes,
+            without_ids(&clip.notes),
             vec![note(0, 480, 69, 100), note(480, 480, 72, 90)],
             "pitchHz diagnostic field ignored, notes decoded"
         );
@@ -819,7 +835,7 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         assert_eq!(track.name, "take melody");
 
         // Persistence: the midi state is on disk in the temp project.
-        let dir = cp.store.lock().project_dir.clone().unwrap();
+        let dir = cp.session.lock().store.project_dir.clone().unwrap();
         let v2 = crate::midi::persist::load_from_project(&dir)
             .unwrap()
             .expect("project persisted as v2");
@@ -876,18 +892,18 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         });
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if !cp.midi.lock().clips.is_empty() {
+            if !cp.session.lock().midi.clips.is_empty() {
                 break;
             }
             assert!(Instant::now() < deadline, "accompaniment clip never applied");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let clip = cp.midi.lock().clips[0].clone();
+        let clip = cp.session.lock().midi.clips[0].clone();
         assert_eq!(clip.name, "Hum Accompaniment");
         assert_eq!(clip.length_ticks, 3840);
         assert_eq!(clip.notes.len(), 2);
-        let s = cp.store.lock();
-        let t = s.tracks.iter().find(|t| t.id == clip.track_id).unwrap();
+        let s = cp.session.lock();
+        let t = s.store.tracks.iter().find(|t| t.id == clip.track_id).unwrap();
         assert_eq!(t.kind, "midi");
         drop(s);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1093,11 +1109,9 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         assert_eq!(length % (4 * 960), 0, "clip length is whole bars");
 
         // Store-level apply of the real result.
-        let (store, tparams) = plain_store(0, 0);
-        let midi = Mutex::new(MidiStore::default());
+        let session = plain_session(0, 0);
         let (clip, created) =
-            apply_hum_notes(&store, &tparams, &midi, notes, length, None, 0, "hum melody")
-                .unwrap();
+            apply_hum_notes(&session, notes, length, None, 0, "hum melody").unwrap();
         assert_eq!(clip.notes.len(), 2);
         assert_eq!(created.unwrap().kind, "midi");
         let _ = std::fs::remove_dir_all(dir);

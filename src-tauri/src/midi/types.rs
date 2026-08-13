@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ids::{ClipId, NoteId, TrackId};
+
 /// Default ticks-per-quarter-note for new (v2) projects.
 /// 960 divides cleanly by 2..=10 dotted/triplet grids and matches common DAWs.
 pub const DEFAULT_PPQ: u32 = 960;
@@ -40,6 +42,12 @@ pub struct MidiNote {
     /// MIDI channel 0..=15 (informational for the internal synth).
     #[serde(default)]
     pub channel: u8,
+    /// Stable per-clip note identity (round-2 §2.1). `0` is the wire
+    /// sentinel for "not yet assigned" — every note inside the document has
+    /// id >= 1, minted from its clip's persisted watermark
+    /// ([`MidiClip::mint_note_id`]) and NEVER reused (ADR 0001).
+    #[serde(default)]
+    pub note_id: NoteId,
 }
 
 /// A MIDI clip: a placement of note data on a `kind: "midi"` track.
@@ -51,8 +59,8 @@ pub struct MidiNote {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MidiClip {
-    pub id: String,
-    pub track_id: String,
+    pub id: ClipId,
+    pub track_id: TrackId,
     pub name: String,
     /// Placement on the timeline, in ticks.
     pub timeline_start_ticks: u64,
@@ -61,6 +69,53 @@ pub struct MidiClip {
     /// Note events, sorted by (tick, key). In-memory / IPC representation;
     /// persisted as an AMEV chunk (`eventsRef` in project.json v2).
     pub notes: Vec<MidiNote>,
+    /// Persisted note-id watermark (round-2 §2.1): the next id
+    /// [`MidiClip::mint_note_id`] hands out. Ids are NEVER reused —
+    /// recomputing `max(notes) + 1` on load is forbidden (ADR 0001), which is
+    /// why this rides along as its own durable field (both in the JSON row
+    /// and the AMEV chunk header) rather than being derived.
+    #[serde(default = "first_note_id")]
+    pub next_note_id: u32,
+}
+
+/// Serde default for [`MidiClip::next_note_id`] (and, imported,
+/// `persist::PersistedClip::next_note_id` — same sentinel invariant, one
+/// definition): id 0 is the wire sentinel for "unassigned", so real ids
+/// start at 1.
+pub(crate) fn first_note_id() -> u32 {
+    1
+}
+
+impl MidiClip {
+    /// Hand out the next id and advance the persisted watermark. Ids start
+    /// at 1 (0 is the "unassigned" wire sentinel) and are NEVER reused —
+    /// recomputing max+1 on load is forbidden (ADR 0001).
+    pub fn mint_note_id(&mut self) -> NoteId {
+        let id = NoteId(self.next_note_id);
+        self.next_note_id += 1;
+        id
+    }
+
+    /// Mint ids for any note still carrying `NoteId(0)` (unassigned); error
+    /// on duplicate non-zero ids already present (a caller bug or a corrupt
+    /// merge, never silently resolved).
+    pub fn ensure_note_ids(&mut self) -> Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for n in &self.notes {
+            if n.note_id.0 != 0 && !seen.insert(n.note_id.0) {
+                return Err(format!("duplicate note id {}", n.note_id.0));
+            }
+        }
+        let mut next = self.next_note_id;
+        for n in &mut self.notes {
+            if n.note_id.0 == 0 {
+                n.note_id = NoteId(next);
+                next += 1;
+            }
+        }
+        self.next_note_id = next;
+        Ok(())
+    }
 }
 
 impl MidiNote {
@@ -79,5 +134,44 @@ impl MidiNote {
             return Err("note lengthTicks must be > 0".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watermark_never_reuses_ids() {
+        let mut clip = MidiClip {
+            id: "c-1".into(), track_id: "t-1".into(), name: "c".into(),
+            timeline_start_ticks: 0, length_ticks: 3840,
+            notes: vec![], next_note_id: 1,
+        };
+        let a = clip.mint_note_id();
+        let b = clip.mint_note_id();
+        assert_eq!((a.0, b.0), (1, 2));
+        // Deleting the highest note and minting again must NOT reuse 2 —
+        // the watermark only ever advances (ADR 0001 never-reuse).
+        assert_eq!(clip.mint_note_id().0, 3);
+        assert_eq!(clip.next_note_id, 4);
+    }
+
+    #[test]
+    fn ensure_note_ids_mints_only_unassigned_and_rejects_duplicates() {
+        let mut clip = MidiClip {
+            id: "c-1".into(), track_id: "t-1".into(), name: "c".into(),
+            timeline_start_ticks: 0, length_ticks: 3840,
+            notes: vec![
+                MidiNote { tick: 0, length_ticks: 1, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) },
+                MidiNote { tick: 1, length_ticks: 1, key: 61, velocity: 100, channel: 0, note_id: NoteId(5) },
+            ],
+            next_note_id: 6,
+        };
+        clip.ensure_note_ids().unwrap();
+        assert_eq!(clip.notes[0].note_id.0, 6, "unassigned got minted");
+        assert_eq!(clip.notes[1].note_id.0, 5, "existing id preserved");
+        clip.notes.push(MidiNote { tick: 2, length_ticks: 1, key: 62, velocity: 100, channel: 0, note_id: NoteId(5) });
+        assert!(clip.ensure_note_ids().is_err(), "duplicate real ids rejected");
     }
 }

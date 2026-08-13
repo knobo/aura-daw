@@ -1,0 +1,15 @@
+[package]
+name = "ui-probe"
+version = "0.1.0"
+edition = "2021"
+description = "WebKitGTK measurement harness for AURA render-architecture gating (CORE-REDESIGN-ROUND-2 §10.1)"
+
+[dependencies]
+# Pinned to the EXACT versions resolved by the product's src-tauri/Cargo.lock
+# (tauri 2 -> wry 0.55.1, tao 0.35.3) so measurements are representative of
+# what Tauri v2 actually ships on this machine.
+wry = "=0.55.1"
+tao = "=0.35.3"
+
+[profile.release]
+debug = false

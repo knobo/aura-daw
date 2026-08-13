@@ -35,7 +35,7 @@ If you need a new crate, npm package, Tauri permission, or a new command
 registered in `lib.rs`: **state the request in your final report** and Agent 1
 (or the orchestrator) applies it. Do not edit frozen files "just this once".
 
-The command names registered in `lib.rs` and the event names in §5.4 are the
+The command names registered in `lib.rs` and the event names in §3.4 are the
 **frozen API surface**. Signatures/bodies of commands may evolve inside the
 owning module; names may not.
 
@@ -70,7 +70,7 @@ owning module; names may not.
     │ WebView IPC (invoke / Channel / events)
 ┌───▼──────────────────────────────────────────────┐
 │  SVELTE 5 UI (WebView)                           │
-│  WebGPU/Canvas waveforms & meters · Tailwind UI  │
+│  Canvas/WebGL2 waveforms & meters · Tailwind UI  │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -81,9 +81,14 @@ Three planes:
 * **Control plane** — engine control thread + Tauri commands + tokio tasks.
   Owns all mutable project/engine state, performs allocation and I/O.
 * **Presentation plane** — Svelte 5 in the WebView. Renders meters and
-  waveforms on Canvas2D first, WebGPU as the upgrade path for the arrangement
-  view. Never blocks on the backend; everything is push (channels/events) or
-  cheap request/response.
+  waveforms on Canvas2D first. *(updated 2026-08-13, see CORE-REDESIGN-ROUND-2
+  §9)* WebGPU is **not** the upgrade path on Linux: it is not coming to
+  WebKitGTK (verified absent from the roadmap, 2026-08), so **WebGL2 is the
+  ceiling** in our webview. Hot rendering (arranger, piano roll, meters) goes
+  behind **one texture-targeting renderer interface** — WebGL2 today,
+  WebGPU-capable by design for other platforms/futures — and Svelte keeps
+  chrome only (menus, inspectors, dialogs). Never blocks on the backend;
+  everything is push (channels/events) or cheap request/response.
 
 ## 2. Real-time rules and lock-free ringbuffers
 
@@ -323,7 +328,7 @@ here — use the channels.
 | disk writer | std thread, owned by `audio` | drain `rec_*` queues, encode WAV (hound) / FLAC (flacenc), fsync takes, fold hot waveform tiles | no |
 | tokio runtime | Tauri's async runtime | sidecar process supervision, waveform LOD builds, project file I/O, anything `await` | no |
 | Tauri main | main thread | window/event loop, command dispatch (commands are cheap or `async`) | no |
-| WebView | UI | Svelte 5, canvas/WebGPU painting | n/a |
+| WebView | UI | Svelte 5, canvas/WebGL2 painting (updated 2026-08-13, see CORE-REDESIGN-ROUND-2 §9) | n/a |
 
 Rules: commands never block the main thread on the engine — they enqueue and
 return, or are `async` and await the control thread over a oneshot. The RT
@@ -491,9 +496,12 @@ contradict — the sections above.
     rewrite.
 12. UI lists that scale with project size (tracks, mixer strips, clips) are
     virtualized from the start; no component iterates all tracks per frame.
-    Per-pixel surfaces (meters, waveforms) are canvas/WebGPU, fed from one
-    rAF-driven commit point. High-rate data never travels as app events
-    (§3.4 rule restated).
+    Per-pixel surfaces (meters, waveforms) are canvas-painted behind the one
+    texture-targeting renderer interface — WebGL2 today; WebGPU is not coming
+    to WebKitGTK, so it is a per-platform backend option, never the assumed
+    upgrade path *(updated 2026-08-13, see CORE-REDESIGN-ROUND-2 §9)* — fed
+    from one rAF-driven commit point. High-rate data never travels as app
+    events (§3.4 rule restated).
 13. Meter internals should not hard-cap track count beyond the single POD
     queue element (debt D-05 documents the planned chunked meter blocks);
     everything downstream of the queue sizes dynamically.

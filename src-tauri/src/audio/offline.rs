@@ -23,7 +23,7 @@ use super::mixer;
 use super::rt::{ParamTable, RtClip, RtClipData, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO};
 use super::sampler::SamplerBank;
 use super::transport::LoopSpec;
-use super::types::Store;
+use super::types::{derive_slots, Store};
 use crate::midi::playback::{append_from, LiveNodeRegistry};
 use crate::midi::MidiStore;
 
@@ -32,11 +32,11 @@ use crate::midi::MidiStore;
 /// regardless of the device's callback size.
 pub const OFFLINE_BLOCK: usize = super::rt::MAX_LIVE_BLOCK;
 
-/// A freshly built, exclusively owned render graph plus its parameter table
-/// (mirroring the store's gain/pan/mute/solo) and the song end.
+/// A freshly built, exclusively owned render graph (its parameter table
+/// mirroring the store's gain/pan/mute/solo lives ON the graph — round-2
+/// §2.4, semantics rule 4 — not as a parallel field) plus the song end.
 pub struct OfflineGraph {
     pub graph: RtGraph,
-    pub params: ParamTable,
     /// Last audible sample: max of clip ends and the last live note edge
     /// (note-offs included). 0 for an empty song. The release tail is the
     /// caller's business.
@@ -47,17 +47,25 @@ pub struct OfflineGraph {
 /// mirror of `engine::Control::rebuild` + `ensure_loaded`, but with a private
 /// sample cache and FRESH live nodes (never the engine's shared cells).
 /// Unreadable clip sources are skipped with a warning, matching playback
-/// (what you hear is what you export).
+/// (what you hear is what you export). Slots are derived fresh from display
+/// order (round-2 §2.4) — this graph is exclusively owned, so there is no
+/// cross-generation aliasing concern to begin with.
 pub fn build_graph(
     store: &Store,
     midi: &MidiStore,
     bank: Option<&SamplerBank>,
     rate: u32,
 ) -> OfflineGraph {
-    let params = ParamTable::default();
+    let slots = derive_slots(&store.tracks);
+    // Finding 4: `ParamTable::default()` is a fixed 64-slot table (kept only
+    // for tests that poke slots without sizing explicitly). Production
+    // graphs must size PER-GRAPH to the actual track count (round-2 §2.4) —
+    // using the default here silently dropped every track at slot >= 64 from
+    // offline export.
+    let params = Arc::new(ParamTable::with_slots(store.tracks.len()));
     let mut tracks: Vec<RtTrack> = Vec::with_capacity(store.tracks.len());
     for t in &store.tracks {
-        let Some(&slot) = store.slots.get(&t.id) else { continue };
+        let slot = slots[&t.id];
         params.set_gain_linear(slot, mixer::db_to_linear(t.gain_db));
         params.set_pan(slot, t.pan as f32);
         params.set_flag(slot, FLAG_MUTE, t.muted);
@@ -96,10 +104,10 @@ pub fn build_graph(
     // Midi tracks as LIVE instrument nodes — a private registry, so the
     // cells are fresh (deterministic voice state) and exclusively ours.
     let mut nodes = LiveNodeRegistry::default();
-    append_from(midi, store, rate, bank, &mut nodes, &mut tracks);
+    append_from(midi, store, &slots, rate, bank, &mut nodes, &mut tracks);
 
     let end_samples = song_end(&tracks);
-    OfflineGraph { graph: RtGraph::new(tracks), params, end_samples }
+    OfflineGraph { graph: RtGraph::new(tracks, 0, params), end_samples }
 }
 
 /// Last audible sample of a track set: clip `start + len` and the last
@@ -131,7 +139,6 @@ pub fn song_end(tracks: &[RtTrack]) -> u64 {
 /// `on_progress(done_frames, total_frames)` fires after every block.
 pub fn render(
     graph: &mut RtGraph,
-    params: &ParamTable,
     start: u64,
     frames: u64,
     rate: u32,
@@ -143,7 +150,7 @@ pub fn render(
     let mut done = 0u64;
     let mut discontinuity = true;
     for chunk in out.chunks_mut(OFFLINE_BLOCK * 2) {
-        mixer::render(graph, params, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity);
+        mixer::render(graph, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity, None);
         discontinuity = false;
         let n = (chunk.len() / 2) as u64;
         pos += n;
@@ -162,6 +169,7 @@ pub fn render(
 mod tests {
     use super::*;
     use crate::audio::types::TrackState;
+    use crate::ids::NoteId;
     use crate::midi::types::TempoEvent;
     use crate::midi::{MidiClip, MidiNote};
 
@@ -185,7 +193,6 @@ mod tests {
     fn demo_project() -> (Store, MidiStore) {
         let mut store = Store::default();
         for id in ["keys", "bass"] {
-            store.alloc_slot(id);
             store.tracks.push(track(id, "midi"));
         }
         let (arp, groove) = crate::control::demo_seed_clips("keys", "bass", 960);
@@ -194,6 +201,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             clips: vec![arp, groove],
             loaded_dir: None,
+            dirty: false,
         };
         (store, midi)
     }
@@ -222,7 +230,6 @@ mod tests {
             let mut blocks = 0u64;
             let out = render(
                 &mut og.graph,
-                &og.params,
                 0,
                 frames,
                 RATE,
@@ -251,13 +258,12 @@ mod tests {
     fn region_render_has_exact_length_and_skips_earlier_note_ons() {
         const RATE: u32 = 48_000;
         let mut store = Store::default();
-        store.alloc_slot("m1");
         store.tracks.push(track("m1", "midi"));
         // ppq 960 @120bpm -> 25 samples/tick. Note A: on at tick 0 (sample 0),
         // long. Note B: on at tick 1200 (sample 30000).
         let notes = vec![
-            MidiNote { tick: 0, length_ticks: 800, key: 60, velocity: 100, channel: 0 },
-            MidiNote { tick: 1200, length_ticks: 400, key: 72, velocity: 100, channel: 0 },
+            MidiNote { tick: 0, length_ticks: 800, key: 60, velocity: 100, channel: 0, note_id: NoteId(1) },
+            MidiNote { tick: 1200, length_ticks: 400, key: 72, velocity: 100, channel: 0, note_id: NoteId(2) },
         ];
         let midi = MidiStore {
             ppq: 960,
@@ -269,8 +275,10 @@ mod tests {
                 timeline_start_ticks: 0,
                 length_ticks: 1920,
                 notes,
+                next_note_id: 3,
             }],
             loaded_dir: None,
+            dirty: false,
         };
         let mut og = build_graph(&store, &midi, None, RATE);
         // Region [24000, 44000): starts after note A's on (skipped) and
@@ -278,7 +286,6 @@ mod tests {
         let (start, end) = (24_000u64, 44_000u64);
         let out = render(
             &mut og.graph,
-            &og.params,
             start,
             end - start,
             RATE,
@@ -317,13 +324,13 @@ mod tests {
 
         let mut store = Store::default();
         store.project_dir = Some(dir.clone());
-        store.alloc_slot("a1");
         store.tracks.push(track("a1", "audio"));
         store.clips.push(crate::audio::types::Clip {
             id: "c1".into(),
             track_id: "a1".into(),
             name: "c1".into(),
             source_path: "audio/c1.wav".into(),
+            source_id: crate::ids::SourceId::default(),
             source_channels: 1,
             source_sample_rate: RATE,
             source_length_samples: 1_000,
@@ -337,12 +344,43 @@ mod tests {
         let midi = MidiStore { clips: vec![], ..MidiStore::default() };
         let mut og = build_graph(&store, &midi, None, RATE);
         assert_eq!(og.end_samples, 600, "clip end = start + len");
-        let out = render(&mut og.graph, &og.params, 0, 700, RATE, 0.5, &mut |_, _| {});
+        let out = render(&mut og.graph, 0, 700, RATE, 0.5, &mut |_, _| {});
         let center = 0.5 * std::f32::consts::FRAC_1_SQRT_2 * 0.5; // sample * pan * master
         assert_eq!(out[0], 0.0, "silent before the clip");
         assert!((out[150 * 2] - center).abs() < 1e-6, "clip audible, panned, master-scaled");
         assert!((out[150 * 2 + 1] - center).abs() < 1e-6);
         assert_eq!(out[650 * 2], 0.0, "silent past the clip");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Finding 4: `build_graph` used to allocate a fixed 64-slot
+    /// `ParamTable::default()` regardless of track count — a project with
+    /// more than 64 tracks silently lost every track at slot >= 64 from
+    /// offline export (writes to out-of-range slots are dropped, and
+    /// `og.graph.tracks` still has an `RtTrack` per store track, but its
+    /// params would be UNSET past slot 63). Assert the param table is sized
+    /// to the ACTUAL track count, not the historical cap.
+    #[test]
+    fn build_graph_sizes_params_for_more_than_sixty_four_tracks() {
+        const RATE: u32 = 48_000;
+        const N: usize = 80; // > the old fixed 64-slot default
+        let mut store = Store::default();
+        for i in 0..N {
+            store.tracks.push(track(&format!("t{i}"), "audio"));
+        }
+        let midi = MidiStore::default();
+        let og = build_graph(&store, &midi, None, RATE);
+        assert_eq!(og.graph.tracks.len(), N, "one RtTrack per store track");
+        assert_eq!(
+            og.graph.params.len(),
+            N,
+            "param table must be sized for every track, not capped at the old 64-slot default"
+        );
+        // The last track's slot (79, unreachable under the old fixed-64
+        // table) must actually take a param write — proof the table isn't
+        // silently dropping it.
+        let last_slot = derive_slots(&store.tracks)[&store.tracks[N - 1].id];
+        og.graph.params.set_gain_linear(last_slot, 0.25);
+        assert_eq!(og.graph.params.gain[last_slot].load(std::sync::atomic::Ordering::Relaxed), 0.25f32.to_bits());
     }
 }

@@ -75,6 +75,21 @@ class ClipEditLoopStore {
     }
   }
 
+  /**
+   * Drop any active loop-while-editing state WITHOUT replaying transport or
+   * solo writes (finding 8). `exit()` restores the snapshot it holds — that
+   * is right when the SAME project's piano roll closes, but wrong when the
+   * project itself is being swapped out (`projectops.adopt()`): the
+   * snapshot's loop region and solo map describe the OLD project's tracks,
+   * and replaying them (or leaving them to be replayed later by a stray
+   * `exit()`) would apply stale writes onto the NEW one. Just forget it.
+   */
+  reset() {
+    this.snapshot = null;
+    this.trackId = null;
+    this.unmutedId = null;
+  }
+
   private async applyExclusiveSolo(trackId: string) {
     await this.remute(trackId);
     if (project.trackById(trackId)?.muted) {

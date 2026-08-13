@@ -14,9 +14,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::types::{Project, Store, TransportState};
+use super::types::{Clip, Project, Store, TransportState};
+use crate::ids::SourceId;
 
 pub const PROJECT_FILE: &str = "project.json";
+
+/// Fixed namespace for deterministic legacy `SourceId` minting
+/// ([`assign_source_ids`]). A project-specific constant, minted once and
+/// frozen forever — changing it would re-mint every legacy project's source
+/// ids on next open, breaking the decode-cache's stability guarantee.
+const AURA_SOURCE_NS: uuid::Uuid = uuid::uuid!("da93d478-7f57-41f5-a1a2-ffc2d1fc6c12");
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -123,13 +130,6 @@ pub fn save(dir: &Path, project: &Project) -> Result<(), String> {
 /// then fail slot allocation, leaving inconsistent state). All conditions
 /// that could make adoption fail midway are checked here, up front.
 pub fn validate(project: &Project) -> Result<(), String> {
-    if project.tracks.len() > super::types::MAX_TRACKS {
-        return Err(format!(
-            "project has {} tracks; this build supports at most {}",
-            project.tracks.len(),
-            super::types::MAX_TRACKS
-        ));
-    }
     let mut seen = std::collections::HashSet::new();
     for t in &project.tracks {
         if !seen.insert(&t.id) {
@@ -162,7 +162,84 @@ pub fn load(path: &Path) -> Result<(Project, PathBuf), String> {
         return Err(format!("unsupported project schemaVersion {}", project.schema_version));
     }
     project.path = Some(dir.to_string_lossy().into_owned());
+    // Round-2 §2.2: legacy clips (no sourceId on disk) get one deterministically
+    // minted per unique source_path, so every clip entering the store from this
+    // point on carries a real identity for the decode cache.
+    assign_source_ids(&mut project.clips);
     Ok((project, dir))
+}
+
+/// Mint one `SourceId` per unique (normalized) `source_path` for every clip
+/// that doesn't already carry one (round-2 §2.2, H-3/M-6). Minting is
+/// DETERMINISTIC (UUIDv5 over the normalized path under [`AURA_SOURCE_NS`]),
+/// so the same legacy project opens with the SAME ids every session without
+/// requiring a save-on-open — two clips sharing a `source_path` end up
+/// sharing an id "for free" (same hash input), no bookkeeping map needed.
+/// Clips whose `source_path` cannot be normalized (path-traversal, L-1) are
+/// left unassigned with a loud warning rather than minting over a
+/// potentially-wrong path.
+pub(crate) fn assign_source_ids(clips: &mut [Clip]) {
+    for clip in clips.iter_mut() {
+        if !clip.source_id.as_str().is_empty() {
+            continue; // already assigned — never re-minted
+        }
+        match normalize_source_path(&clip.source_path) {
+            Ok(normalized) => clip.source_id = mint_deterministic_source_id(&normalized),
+            Err(e) => log::warn!(
+                "assign_source_ids: clip {} left unassigned: {e}",
+                clip.id
+            ),
+        }
+    }
+}
+
+/// Deterministic legacy-id mint: `SourceId(UuidV5(AURA_SOURCE_NS, normalized_path))`.
+fn mint_deterministic_source_id(normalized_path: &str) -> SourceId {
+    SourceId(uuid::Uuid::new_v5(&AURA_SOURCE_NS, normalized_path.as_bytes()).to_string())
+}
+
+/// Normalize a clip's `source_path` into a stable, project-relative POSIX
+/// form for deterministic id minting (L-1): collapses `.` segments and
+/// REJECTS any `..` component or a leading absolute-path anchor outright —
+/// a normalized path must never escape the project, and an absolute path is
+/// left unassigned rather than salvaged.
+///
+/// Reviewer finding 3: an earlier version stripped a leading `/` down to its
+/// relative tail, which was wrong in two ways — `/audio/x.wav` and
+/// `audio/x.wav` would normalize to the SAME string and mint the SAME
+/// `SourceId` for two potentially DIFFERENT files (the one-source-one-path
+/// invariant broken in the forbidden direction), and `project_dir.join(rel)`
+/// on the caller side discards the join base for an absolute `rel`, which
+/// can point straight out of the project. Absolute paths are now rejected
+/// exactly like `..`, never salvaged.
+fn normalize_source_path(source_path: &str) -> Result<String, String> {
+    let slashed = source_path.replace('\\', "/");
+    if slashed.starts_with('/') {
+        return Err(format!("source_path is absolute, refusing to normalize: {source_path:?}"));
+    }
+    // Finding 7: a Windows drive-absolute path (`C:\audio\x.wav` ->
+    // `C:/audio/x.wav` after the backslash swap above) doesn't start with
+    // `/`, so it slipped past the check above — its first segment is a
+    // drive letter ending in `:` (e.g. "C:"). Reject those exactly like a
+    // POSIX-absolute path: minting a SourceId or joining a project dir with
+    // a drive-absolute path escapes the project the same way `/...` does.
+    if slashed.split('/').next().is_some_and(|first| first.ends_with(':')) {
+        return Err(format!(
+            "source_path is drive-absolute, refusing to normalize: {source_path:?}"
+        ));
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for seg in slashed.split('/') {
+        match seg {
+            "" | "." => continue, // collapse repeated separators / current-dir segments
+            ".." => return Err(format!("source_path escapes the project: {source_path:?}")),
+            s => out.push(s),
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("source_path is empty after normalization: {source_path:?}"));
+    }
+    Ok(out.join("/"))
 }
 
 /// Snapshot the control-plane store into a serializable Project.
@@ -270,7 +347,7 @@ mod tests {
 
     fn track_n(i: usize) -> TrackState {
         TrackState {
-            id: format!("t{i}"),
+            id: format!("t{i}").into(),
             name: format!("T{i}"),
             kind: "audio".into(),
             gain_db: 0.0,
@@ -283,23 +360,29 @@ mod tests {
         }
     }
 
-    /// Review fix: a project exceeding MAX_TRACKS (or with duplicate track
-    /// ids) is rejected UP FRONT by `validate`, before `open_project`
-    /// mutates any in-memory state.
+    /// MAX_TRACKS removed in Plan B (round-2 §2.4): slot assignment is
+    /// per-graph now (`ParamTable::with_slots`), so `validate` no longer
+    /// caps track count — a 64-track ceiling would be a miss against the
+    /// product's own scale ambition.
     #[test]
-    fn validate_rejects_overfull_and_duplicate_projects() {
-        let parent = tmp_parent("validate");
+    fn projects_larger_than_sixty_four_tracks_validate() {
+        let parent = tmp_parent("wide-project");
         let (mut project, _) = create(&parent, "V", 48_000, 120.0).unwrap();
-        project.tracks = (0..super::super::types::MAX_TRACKS).map(track_n).collect();
-        assert!(validate(&project).is_ok(), "exactly MAX_TRACKS is fine");
-        project.tracks.push(track_n(usize::MAX - 1)); // 65th track
-        let err = validate(&project).unwrap_err();
-        assert!(err.contains("65 tracks"), "clear message: {err}");
+        project.tracks = (0..200).map(track_n).collect();
+        assert!(validate(&project).is_ok());
+        let _ = fs::remove_dir_all(&parent);
+    }
 
-        let mut dup = project.clone();
-        dup.tracks.truncate(2);
-        dup.tracks[1].id = dup.tracks[0].id.clone();
-        assert!(validate(&dup).is_err(), "duplicate ids rejected");
+    /// Review fix: a project with duplicate track ids is rejected UP FRONT
+    /// by `validate`, before `open_project` mutates any in-memory state.
+    /// The cap is gone; this half of the guard stays.
+    #[test]
+    fn validate_rejects_duplicate_track_ids() {
+        let parent = tmp_parent("validate-dup");
+        let (mut project, _) = create(&parent, "V", 48_000, 120.0).unwrap();
+        project.tracks = (0..2).map(track_n).collect();
+        project.tracks[1].id = project.tracks[0].id.clone();
+        assert!(validate(&project).is_err(), "duplicate ids rejected");
         let _ = fs::remove_dir_all(&parent);
     }
 
@@ -366,6 +449,135 @@ mod tests {
         assert!(v.get("tempoBpm").is_some());
         assert!(v.get("timeSignature").is_some());
         assert_eq!(v["timeSignature"], serde_json::json!([4, 4]));
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    // ---- source-id assignment (round-2 §2.2) -------------------------------
+
+    fn clip_n(id: &str, source_path: &str, source_id: &str) -> Clip {
+        Clip {
+            id: id.into(),
+            track_id: "t0".into(),
+            name: id.into(),
+            source_path: source_path.into(),
+            source_id: source_id.into(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_clips_get_one_source_id_per_unique_path() {
+        // Two clips sharing audio/x.wav and one on audio/y.wav, none with a
+        // sourceId (legacy file): after load-fixup the two sharers have the
+        // SAME minted id, the third a different one; a clip that already has
+        // an id keeps it.
+        let mut p = Project {
+            schema_version: 1,
+            name: "legacy".into(),
+            path: None,
+            created_at: None,
+            modified_at: None,
+            sample_rate: 48_000,
+            tempo_bpm: 120.0,
+            time_signature: Some((4, 4)),
+            tracks: Vec::new(),
+            clips: vec![
+                clip_n("c0", "audio/x.wav", ""),
+                clip_n("c1", "audio/x.wav", ""),
+                clip_n("c2", "audio/y.wav", ""),
+                clip_n("c3", "audio/z.wav", "pre-existing"),
+            ],
+            transport: None,
+        };
+        assign_source_ids(&mut p.clips);
+        assert_eq!(p.clips[0].source_id, p.clips[1].source_id, "same path -> same id");
+        assert_ne!(p.clips[0].source_id, p.clips[2].source_id, "different path -> different id");
+        assert!(!p.clips[0].source_id.as_str().is_empty());
+        assert_eq!(p.clips[3].source_id.as_str(), "pre-existing", "already-assigned id kept");
+
+        // Deterministic minting (M-6): two independent runs over an
+        // identically-shaped clip list yield IDENTICAL ids — no save-on-open
+        // required for a legacy project to open with stable ids every time.
+        let mut p2_clips = vec![clip_n("c0", "audio/x.wav", ""), clip_n("c2", "audio/y.wav", "")];
+        assign_source_ids(&mut p2_clips);
+        assert_eq!(p2_clips[0].source_id, p.clips[0].source_id, "deterministic across runs");
+        assert_eq!(p2_clips[1].source_id, p.clips[2].source_id, "deterministic across runs");
+    }
+
+    #[test]
+    fn source_path_traversal_is_rejected_not_minted_over() {
+        let mut clips = vec![clip_n("c0", "../../etc/passwd", ""), clip_n("c1", "audio/ok.wav", "")];
+        assign_source_ids(&mut clips);
+        assert!(clips[0].source_id.as_str().is_empty(), "traversal path left unassigned");
+        assert!(!clips[1].source_id.as_str().is_empty());
+    }
+
+    /// Reviewer finding 3: an absolute `source_path` must be REJECTED, not
+    /// salvaged by stripping the leading `/` — otherwise `/audio/x.wav` and
+    /// `audio/x.wav` (two potentially DIFFERENT files) would normalize to
+    /// the same string and mint the SAME SourceId (the one-source-one-path
+    /// invariant broken in the forbidden direction), and the caller's
+    /// `project_dir.join(source_path)` on an absolute path discards the
+    /// project dir entirely (escapes the project).
+    #[test]
+    fn absolute_source_path_is_rejected_and_does_not_merge_with_the_relative_form() {
+        let mut clips = vec![
+            clip_n("c0", "/audio/x.wav", ""),
+            clip_n("c1", "audio/x.wav", ""),
+        ];
+        assign_source_ids(&mut clips);
+        assert!(clips[0].source_id.as_str().is_empty(), "absolute path left unassigned, not minted over");
+        assert!(!clips[1].source_id.as_str().is_empty(), "the relative sibling still mints normally");
+        assert_ne!(
+            clips[0].source_id, clips[1].source_id,
+            "an absolute path must NEVER merge with its relative-looking twin"
+        );
+    }
+
+    /// Finding 7: a Windows drive-absolute path (`C:\...`) doesn't start
+    /// with `/`, so the POSIX-absolute check above alone let it through —
+    /// after the `\` -> `/` swap it becomes `C:/audio/x.wav`, which minted a
+    /// SourceId and, on the caller's `project_dir.join(...)` side, escapes
+    /// the project (a Windows-absolute join discards the join base just
+    /// like a POSIX-absolute one). Must be rejected the same way.
+    #[test]
+    fn windows_drive_absolute_source_path_is_rejected() {
+        let mut clips = vec![
+            clip_n("c0", "C:\\audio\\x.wav", ""),
+            clip_n("c1", "audio/x.wav", ""),
+        ];
+        assign_source_ids(&mut clips);
+        assert!(
+            clips[0].source_id.as_str().is_empty(),
+            "Windows drive-absolute path left unassigned, not minted over"
+        );
+        assert!(!clips[1].source_id.as_str().is_empty(), "the relative sibling still mints normally");
+        assert_ne!(
+            clips[0].source_id, clips[1].source_id,
+            "a drive-absolute path must NEVER merge with its relative-looking twin"
+        );
+    }
+
+    #[test]
+    fn load_fixup_assigns_source_ids_from_disk() {
+        let parent = tmp_parent("source-ids");
+        let (mut project, dir) = create(&parent, "Legacy", 48_000, 120.0).unwrap();
+        project.clips = vec![clip_n("c0", "audio/a.wav", ""), clip_n("c1", "audio/a.wav", "")];
+        save(&dir, &project).unwrap();
+        // The file on disk has no sourceId field at all (pre-existing
+        // project) — the wire type's #[serde(default)] covers the absence,
+        // and `load`'s fixup mints deterministically on the way in.
+        let (loaded, _) = load(&dir).unwrap();
+        assert!(!loaded.clips[0].source_id.as_str().is_empty());
+        assert_eq!(loaded.clips[0].source_id, loaded.clips[1].source_id);
         let _ = fs::remove_dir_all(&parent);
     }
 }

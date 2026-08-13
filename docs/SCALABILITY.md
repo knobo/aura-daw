@@ -103,6 +103,12 @@ Scale targets used throughout ("FL-class" numbers):
   the final outputs. This is the standard JUCE/Bitwig-style graph player.
   Prerequisites: the compiled-schedule model above, and per-node buffer
   ownership so no two workers write one buffer.
+  > **Constraint (2026-08-13, CORE-REDESIGN-ROUND-2 §8):** buffer lifetime
+  > under nondeterministic multicore completion order will be solved by
+  > **per-node buffer ownership or a wait-free arena pool with control-side
+  > release** — decided when the schedule compiler is actually designed, not
+  > before. Whatever wins, the RT thread never runs a nontrivial destructor
+  > (dossier 07).
 * Stage 3: latency-aware partitioning — heavy lookahead plugins moved onto
   double-buffer-ahead partitions (FL's "smart disable"/async analog).
 
@@ -301,6 +307,13 @@ Key decisions:
 
 ### In-memory event structures (millions of events)
 
+> **Note (2026-08-13):** the in-memory structure specified below is
+> **superseded by the summarising COW B-tree** per CORE-REDESIGN-ROUND-2 §6
+> (measured Θ(log N) vs Θ(√N) retained bytes per point-edit version;
+> benchmark crates live in-repo under `benches/`). The AMEV binary chunk
+> **file format is unaffected** — file format and in-memory tree are
+> separable. The paragraphs below are kept for the reasoning record.
+
 * Per pattern: a **sorted struct-of-arrays chunk list** (columns: tick, kind,
   key/param, value, duration), immutable chunks of ~4k events with a small
   mutable tail — i.e. a persistent/copy-on-write rope of event chunks.
@@ -393,6 +406,13 @@ Key decisions:
 
 ### Undo/redo architecture
 
+> **Note (2026-08-13):** retention mechanics are now specified in
+> CORE-REDESIGN-ROUND-2 §2.3/§6 — deleted objects stay alive through
+> **version-graph retention** (history versions keep them reachable; no
+> limbo registry, no per-object refcounts), and bulk/scattered ops store
+> op + inverse payload as **replay-only history nodes** instead of
+> materialized snapshots.
+
 * **Command pattern at the op level** (the same ops as the journal and the
   IPC op-log): each op carries its inverse or enough state to derive it
   (`SetTrackGain{track, old, new}`); undo stack = list of op batches
@@ -442,6 +462,13 @@ three axes: **rate** (knob drag = 200 invokes/s), **atomicity** (multi-object
 edits: "delete 50 clips" must be one undo entry and one engine swap), and
 **sync** (two windows / script API / collaborative future need a single
 ordered mutation stream).
+
+> **Note (2026-08-13):** the op log is now designed — CORE-REDESIGN-ROUND-2
+> §4 specifies it as closure transactions over one `Session`, a **persisted,
+> versioned op format** from day one, and gesture `begin`/`end` IPC with
+> transient (coalesced, non-journaled) ops in between. This section's
+> envelope draft machinery (`rev`/`baseRev`/`transient`/`origin`,
+> `op-envelope.schema.json`) is **inherited by that design**, not replaced.
 
 Target: a **versioned, batched op-log protocol** — additive, standing beside
 the frozen commands (which become thin wrappers emitting single-op batches):
@@ -635,7 +662,7 @@ this becomes if unaddressed by the time its feature area ships.
 |----|---|---|---|---|---|
 | D-01 | `audio-device.schema.json` (`id` = "currently the cpal device name") | Device identity = display name | Names collide (two identical interfaces), change with hotplug order/locale ⇒ persisted device prefs break, ASIO/PipeWire backends can't be addressed reliably | **High** (before device-preference persistence) | Keep field, change *contents* to backend-qualified stable id (`"wasapi:{gu id}"`, `"pipewire:node.name"`); schema already calls it opaque, so this is semantics-compatible. Add optional `backend` field. |
 | D-02 | `project.schema.json`, `clip/transport` schemas | All timeline positions in samples; single global `tempoBpm`/`timeSignature` | No tempo/signature changes; MIDI patterns need musical time; sample-locked clips can't follow tempo | **High** (blocks MIDI/patterns) | **PAID DOWN (phase 2, zone C + architect merge)**: `midi::TempoMap` (tick↔sample bijection), `project-v2.schema.json` (`ppq`, `tempoMap`, tick-based `midiClips`, AMEV event chunks), v1→v2 migration (`project.json.v1.bak`), and the engine integration are all live — midi clips render into the RCU graph via control-thread pre-roll (PolySynth fallback / sampler when `instrumentId` is bound), plus `.mid` import/export. Audio clips stay sample-anchored by design. **Phase 3: live instrument nodes SHIPPED (ARCHITECTURE §15.1) — the control-side pre-render is retired; PolySynth/SamplerNode render block-live inside the RCU graph.** Remaining (tracked, not debt): time-signature map. |
-| D-03 | Frozen command list (§3.3) | One invoke per mutation, full-object responses, no batch/atomicity/revision | Knob-drag rates, multi-object gestures, multi-window sync, undo journaling all need atomic ordered batches | **High** (before undo & plugin params) | Additive `ops_apply`/`ops_subscribe` + `op-envelope.schema.json` (DRAFT included); frozen setters become single-op wrappers. **Partial (phase 2): `set_track_mix` ships batch-shaped and the frozen `set_track_*` setters are now single-change wrappers over it (control::ops); the full op-log protocol remains future work.** |
+| D-03 | Frozen command list (§3.3) | One invoke per mutation, full-object responses, no batch/atomicity/revision | Knob-drag rates, multi-object gestures, multi-window sync, undo journaling all need atomic ordered batches | **High** (before undo & plugin params) | Additive `ops_apply`/`ops_subscribe` + `op-envelope.schema.json` (DRAFT included); frozen setters become single-op wrappers. **Partial (phase 2): `set_track_mix` ships batch-shaped and the frozen `set_track_*` setters are now single-change wrappers over it (control::ops); the remaining half — the full op-log protocol — has its design settled in CORE-REDESIGN-ROUND-2 §4 (ACCEPTED 2026-08-13, ADR 0003); implementation remains future work.** |
 | D-04 | `meter-frame.schema.json` + `subscribe_meters` | JSON meter frames, always all tracks, fixed ~60 Hz | 500 tracks ⇒ MB/s JSON + UI parse/GC in the frame path | Medium (survivable to ~100 tracks) | Additive optional args `{trackIds, maxHz}` on subscribe; later binary frame variant negotiated via a `format` arg — same command name, same Channel. |
 | D-05 | ARCHITECTURE §2.3 `RawMeterBlock { [f32; MAX_TRACKS*2] }` | Compile-time track cap in the RT meter element | Hard ceiling on track count; big constant wastes queue space | Medium | Chunked meter blocks (fixed-size element carrying `{firstSlot, count, values[N]}`), multiple pushes per callback; internal only, no IPC change. |
 | D-06 | All `*.schema.json` | `additionalProperties: false` everywhere | Older readers hard-reject files/payloads with newer additive fields ⇒ every addition is de facto breaking | Medium (must be settled before v2 fields ship) | Declare schemas as *emitter* contracts; readers (serde) ignore unknown fields. **SETTLED (phase 2): all new schemas (`project-v2`, `midi-clip`, `sidecar-job-v2`, `mcp-policy`, `sampler-instrument`) ship WITHOUT `additionalProperties:false`; v1 schemas unchanged (frozen).** |

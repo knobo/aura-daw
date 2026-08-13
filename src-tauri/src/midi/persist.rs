@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::events;
-use super::types::{MidiClip, TempoEvent, DEFAULT_PPQ};
+use super::types::{first_note_id, MidiClip, TempoEvent, DEFAULT_PPQ};
 use super::MidiStore;
 
 const PROJECT_FILE: &str = "project.json";
@@ -50,6 +50,12 @@ struct PersistedClip {
     length_ticks: u64,
     #[serde(default)]
     events_ref: Option<String>,
+    /// Note-id watermark row copy (C-1): the JSON row is the DURABLE
+    /// authority — it survives independently of the AMEV chunk, so an
+    /// emptied clip (no chunk written, old chunk GC'd) does not lose its
+    /// watermark. The loaded clip's watermark is `max(row, chunk)`.
+    #[serde(default = "first_note_id")]
+    next_note_id: u32,
 }
 
 /// Write the midi store's state into `<dir>/project.json` (upgrading it to
@@ -82,9 +88,15 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
             "timelineStartTicks": clip.timeline_start_ticks,
             "lengthTicks": clip.length_ticks,
         });
+        // C-1: the watermark is written to the JSON row UNCONDITIONALLY,
+        // outside the "has notes" guard — an emptied clip writes no chunk
+        // (and its old chunk gets GC'd below), so the row is the only place
+        // the watermark can survive. The chunk copy (when written) keeps
+        // chunks self-describing for readers that only ever see the chunk.
+        row["nextNoteId"] = json!(clip.next_note_id);
         if !clip.notes.is_empty() {
             let chunk_name = format!("{}.bin", uuid::Uuid::new_v4());
-            let chunk = events::encode_notes(midi.ppq, &clip.notes);
+            let chunk = events::encode_notes(midi.ppq, &clip.notes, clip.next_note_id);
             fs::write(events_dir.join(&chunk_name), chunk)
                 .map_err(|e| format!("write events chunk: {e}"))?;
             row["eventsRef"] = json!(format!("{EVENTS_DIR}/{chunk_name}"));
@@ -164,23 +176,31 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V2Data>, String> {
     };
     let mut clips = Vec::with_capacity(rows.len());
     for row in rows {
-        let notes = match &row.events_ref {
+        // C-1: the row's watermark is the durable authority; the chunk's own
+        // copy (when a chunk exists and reads cleanly) can only push it
+        // forward, never override a higher row value.
+        let (notes, chunk_watermark) = match &row.events_ref {
             Some(rel) => match read_chunk(dir, rel, ppq) {
-                Ok(notes) => notes,
+                Ok((notes, watermark)) => (notes, Some(watermark)),
                 Err(e) => {
                     log::warn!("midi clip {}: {e}; loading without notes", row.id);
-                    Vec::new()
+                    (Vec::new(), None)
                 }
             },
-            None => Vec::new(),
+            None => (Vec::new(), None),
+        };
+        let next_note_id = match chunk_watermark {
+            Some(w) => row.next_note_id.max(w),
+            None => row.next_note_id,
         };
         clips.push(MidiClip {
-            id: row.id,
-            track_id: row.track_id,
+            id: row.id.into(),
+            track_id: row.track_id.into(),
             name: row.name,
             timeline_start_ticks: row.timeline_start_ticks,
             length_ticks: row.length_ticks.max(1),
             notes,
+            next_note_id,
         });
     }
     Ok(Some(V2Data { ppq, tempo_events, clips }))
@@ -195,7 +215,9 @@ pub fn v1_migration_defaults(tempo_bpm: f64) -> V2Data {
     }
 }
 
-fn read_chunk(dir: &Path, rel: &str, project_ppq: u32) -> Result<Vec<super::MidiNote>, String> {
+/// Returns the decoded notes AND the chunk's own note-id watermark (C-1:
+/// `load_from_project` combines it with the row's watermark via `max`).
+fn read_chunk(dir: &Path, rel: &str, project_ppq: u32) -> Result<(Vec<super::MidiNote>, u32), String> {
     // eventsRef must stay inside the project (schema: "events/<name>.bin").
     let name = rel
         .strip_prefix("events/")
@@ -203,16 +225,37 @@ fn read_chunk(dir: &Path, rel: &str, project_ppq: u32) -> Result<Vec<super::Midi
         .ok_or_else(|| format!("invalid eventsRef {rel:?}"))?;
     let path = dir.join(EVENTS_DIR).join(name);
     let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let (chunk_ppq, mut notes) = events::decode_notes(&bytes)?;
-    if chunk_ppq != project_ppq && chunk_ppq > 0 {
+    let decoded = match events::decode_notes(&bytes) {
+        Ok(d) => d,
+        Err(e) => {
+            // C-2: preserve the evidence. The GC in `save_into_project` only
+            // deletes chunk names it currently considers live; renaming away
+            // from `.bin` takes this chunk out of that consideration so a
+            // corrupt-but-recoverable file is never silently destroyed by
+            // the very next save.
+            let bad = path.with_extension("bin.bad");
+            if let Err(re) = fs::rename(&path, &bad) {
+                log::warn!(
+                    "midi: could not rename corrupt chunk {} to {}: {re}",
+                    path.display(),
+                    bad.display()
+                );
+            } else {
+                log::warn!("midi: corrupt chunk {} renamed to {}", path.display(), bad.display());
+            }
+            return Err(e);
+        }
+    };
+    let mut notes = decoded.notes;
+    if decoded.ppq != project_ppq && decoded.ppq > 0 {
         // Rescale ticks to the project ppq (chunks written before a ppq
         // change stay valid).
         for n in notes.iter_mut() {
-            n.tick = rescale(n.tick, chunk_ppq, project_ppq);
-            n.length_ticks = rescale(n.length_ticks, chunk_ppq, project_ppq).max(1);
+            n.tick = rescale(n.tick, decoded.ppq, project_ppq);
+            n.length_ticks = rescale(n.length_ticks, decoded.ppq, project_ppq).max(1);
         }
     }
-    Ok(notes)
+    Ok((notes, decoded.next_note_id))
 }
 
 #[inline]
@@ -294,17 +337,20 @@ mod tests {
             ],
             clips,
             loaded_dir: None,
+            dirty: false,
         }
     }
 
     fn clip(track: &str, notes: Vec<MidiNote>) -> MidiClip {
+        let next_note_id = notes.iter().map(|n| n.note_id.0).max().unwrap_or(0) + 1;
         MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: crate::ids::ClipId::mint(),
             track_id: track.into(),
             name: "Clip".into(),
             timeline_start_ticks: 960,
             length_ticks: 3840,
             notes,
+            next_note_id,
         }
     }
 
@@ -316,6 +362,7 @@ mod tests {
                 key: (24 + (i % 64)) as u8,
                 velocity: (1 + (i % 127)) as u8,
                 channel: (i % 16) as u8,
+                note_id: crate::ids::NoteId((i + 1) as u32),
             })
             .collect()
     }
@@ -341,16 +388,78 @@ mod tests {
             raw["midiClips"][0].get("notes").is_none(),
             "notes NEVER inline in project.json"
         );
-        // Empty clip has no chunk.
+        // Empty clip has no chunk...
         assert!(raw["midiClips"][1].get("eventsRef").is_none());
+        // ...but BOTH rows carry the watermark unconditionally (C-1).
+        assert_eq!(raw["midiClips"][0]["nextNoteId"], midi.clips[0].next_note_id);
+        assert_eq!(raw["midiClips"][1]["nextNoteId"], midi.clips[1].next_note_id);
 
         let v2 = load_from_project(&dir).unwrap().expect("v2 present");
         assert_eq!(v2.ppq, midi.ppq);
         assert_eq!(v2.tempo_events, midi.tempo_events);
         assert_eq!(v2.clips.len(), 2);
         assert_eq!(v2.clips[0].notes, midi.clips[0].notes);
+        assert_eq!(v2.clips[0].next_note_id, midi.clips[0].next_note_id);
+        assert_eq!(v2.clips[1].next_note_id, midi.clips[1].next_note_id);
         assert_eq!(v2.clips[0].timeline_start_ticks, 960);
         assert!(v2.clips[1].notes.is_empty());
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Step 4 / brief-pinned test: sparse ids (a deleted-note gap) round-trip
+    /// exactly, and the watermark never resurrects the gap.
+    #[test]
+    fn note_ids_and_watermark_survive_save_load() {
+        let parent = tmp_parent("ids-watermark");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let sparse_notes = vec![
+            MidiNote { tick: 0, length_ticks: 100, key: 60, velocity: 100, channel: 0, note_id: crate::ids::NoteId(1) },
+            MidiNote { tick: 200, length_ticks: 100, key: 64, velocity: 100, channel: 0, note_id: crate::ids::NoteId(3) },
+        ];
+        let mut c = clip("t1", sparse_notes);
+        c.next_note_id = 4; // note 2 was deleted — the gap must not be reused
+        let midi = store_with(vec![c]);
+
+        save_into_project(&dir, &midi).unwrap();
+        let mut loaded = load_from_project(&dir).unwrap().unwrap();
+        let ids: Vec<u32> = loaded.clips[0].notes.iter().map(|n| n.note_id.0).collect();
+        assert_eq!(ids, vec![1, 3], "sparse ids preserved exactly");
+        assert_eq!(loaded.clips[0].next_note_id, 4, "watermark preserved exactly");
+        assert_eq!(loaded.clips[0].mint_note_id().0, 4, "never resurrects the gap (2)");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// C-1's exact corruption path, pinned: emptying a clip's notes deletes
+    /// its chunk (via GC) on the NEXT save, but the watermark — living in
+    /// the JSON row unconditionally — must survive independently.
+    #[test]
+    fn watermark_survives_emptying_a_clips_notes() {
+        let parent = tmp_parent("watermark-survives-empty");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let notes: Vec<MidiNote> = (1..=5u32)
+            .map(|id| MidiNote {
+                tick: id * 100, length_ticks: 50, key: 60, velocity: 100, channel: 0,
+                note_id: crate::ids::NoteId(id),
+            })
+            .collect();
+        let mut c = clip("t1", notes);
+        c.next_note_id = 6;
+        let mut midi = store_with(vec![c]);
+        save_into_project(&dir, &midi).unwrap();
+
+        // Empty the clip and save again: no chunk is written this time, and
+        // the old one gets GC'd — the row must still carry nextNoteId: 6.
+        midi.clips[0].notes.clear();
+        save_into_project(&dir, &midi).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        assert!(raw["midiClips"][0].get("eventsRef").is_none(), "emptied clip writes no chunk");
+        assert_eq!(raw["midiClips"][0]["nextNoteId"], 6, "watermark survives the emptied chunk");
+
+        let mut loaded = load_from_project(&dir).unwrap().unwrap();
+        assert_eq!(loaded.clips[0].next_note_id, 6, "reload sees the row watermark");
+        assert!(loaded.clips[0].notes.is_empty());
+        assert_eq!(loaded.clips[0].mint_note_id().0, 6, "new note gets 6, never 1");
         let _ = fs::remove_dir_all(&parent);
     }
 
@@ -435,6 +544,57 @@ mod tests {
         fs::write(dir.join(PROJECT_FILE), serde_json::to_vec(&raw).unwrap()).unwrap();
         let v2 = load_from_project(&dir).unwrap().unwrap();
         assert!(v2.clips[0].notes.is_empty(), "traversal ref ignored");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Reviewer finding 4: the `.bin.bad` rename path (C-2) had no test
+    /// coverage. A chunk that decodes to structural corruption (not just a
+    /// missing file) must be renamed out of GC's consideration — evidence
+    /// preserved — while the project still loads with that clip empty.
+    #[test]
+    fn corrupt_chunk_is_renamed_to_bin_bad_and_clip_loads_empty() {
+        let parent = tmp_parent("bin-bad");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let midi = store_with(vec![clip("t1", some_notes(3))]);
+        save_into_project(&dir, &midi).unwrap();
+
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        let ev_ref = raw["midiClips"][0]["eventsRef"].as_str().unwrap().to_string();
+        let chunk_path = dir.join(&ev_ref);
+        let bad_path = chunk_path.with_extension("bin.bad");
+        assert!(chunk_path.is_file(), "chunk exists before corruption");
+        assert!(!bad_path.exists());
+
+        // Corrupt the chunk in place: valid magic/version/header so it parses
+        // past the header, but claims 5 records with zero record bytes
+        // following — a structural (truncation) failure in `decode_notes`,
+        // not just an I/O error or a magic mismatch.
+        let mut corrupt = Vec::new();
+        corrupt.extend_from_slice(&events::AMEV_MAGIC.to_le_bytes());
+        corrupt.extend_from_slice(&events::AMEV_VERSION.to_le_bytes());
+        corrupt.extend_from_slice(&0u16.to_le_bytes()); // columnMask
+        corrupt.extend_from_slice(&960u32.to_le_bytes()); // ppq
+        corrupt.extend_from_slice(&5u32.to_le_bytes()); // count = 5, but NO record bytes follow
+        fs::write(&chunk_path, &corrupt).unwrap();
+        assert!(events::decode_notes(&corrupt).is_err(), "the corrupted bytes really are structurally invalid");
+
+        let v2 = load_from_project(&dir).unwrap().unwrap();
+        assert!(v2.clips[0].notes.is_empty(), "corrupt chunk degrades to an empty clip, not a failed open");
+        assert!(!chunk_path.exists(), "the original .bin is gone (renamed away, not deleted)");
+        assert!(bad_path.is_file(), "the evidence survives at .bin.bad");
+        assert_eq!(
+            fs::read(&bad_path).unwrap(),
+            corrupt,
+            "renamed file's bytes are exactly the corrupt original"
+        );
+
+        // GC on the NEXT save must not have anything to do with the .bad
+        // file (it's not a `.bin`), and must not resurrect the clip's notes
+        // from thin air — the watermark row is still authoritative (C-1),
+        // notes stay empty.
+        save_into_project(&dir, &midi).unwrap();
+        assert!(bad_path.is_file(), "GC does not touch .bin.bad (only *.bin names it tracks as live)");
         let _ = fs::remove_dir_all(&parent);
     }
 

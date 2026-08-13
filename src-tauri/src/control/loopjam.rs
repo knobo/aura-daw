@@ -225,7 +225,8 @@ impl LoopJam {
         // Resolve target track + the region's clips under the store lock;
         // decode/render after it is dropped.
         let (project_dir, track_id, clip_sources) = {
-            let s = self.control.store.lock();
+            let session = self.control.session.lock();
+            let s = &session.store;
             let dir = s
                 .project_dir
                 .clone()
@@ -243,7 +244,7 @@ impl LoopJam {
                             t.kind
                         ));
                     }
-                    id.clone()
+                    crate::ids::TrackId::from(id.clone())
                 }
                 None => s
                     .tracks
@@ -321,7 +322,7 @@ impl LoopJam {
                 let jam = Arc::clone(&jam);
                 let track_id = track_for_sink.clone();
                 std::thread::spawn(move || {
-                    jam.on_job_done(epoch, out, track_id, region);
+                    jam.on_job_done(epoch, out, track_id.to_string(), region);
                 });
             }
             SidecarEvent::Error { message, .. } => {
@@ -334,7 +335,7 @@ impl LoopJam {
             let mut i = self.inner.lock();
             i.phase = Phase::Generating;
             i.job_id = Some(job_id);
-            i.track_id = Some(track_id);
+            i.track_id = Some(track_id.to_string());
             i.region = region;
             i.pending = None;
             i.last_error = None;
@@ -413,7 +414,7 @@ impl LoopJam {
     }
 
     /// Decode the worker's output and stage a fully-prepared clip: file in
-    /// `<project>/audio/<clipId>.wav`, waveform pyramid built. Pure
+    /// `<project>/audio/<sourceId>.wav`, waveform pyramid built. Pure
     /// preparation — the store is not touched yet.
     fn prepare_swap(
         &self,
@@ -435,13 +436,20 @@ impl LoopJam {
         };
         let project_dir = self
             .control
-            .store
+            .session
             .lock()
+            .store
             .project_dir
             .clone()
             .ok_or("project closed while evolving")?;
         let clip_id = uuid::Uuid::new_v4().to_string();
-        let rel = format!("audio/{clip_id}.wav");
+        // H-4: the loop-evolve path is a production asset-creating site — the
+        // evolved-loop wav is named by a freshly-minted SourceId, same as
+        // import.rs and start_recording, so it enters the source-keyed
+        // decode cache correctly (skipping this site would feed the
+        // empty-sentinel bucket).
+        let source_id = crate::ids::SourceId::mint();
+        let rel = format!("audio/{source_id}.wav");
         let dst = project_dir.join(&rel);
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -455,10 +463,11 @@ impl LoopJam {
         }
         let generation = self.inner.lock().generation;
         let clip = Clip {
-            id: clip_id,
-            track_id: track_id.to_string(),
+            id: clip_id.into(),
+            track_id: track_id.into(),
             name: format!("evolve {}", generation + 1),
             source_path: rel,
+            source_id,
             source_channels: channels,
             source_sample_rate: rate,
             source_length_samples: frames,
@@ -514,14 +523,14 @@ impl LoopJam {
             return;
         };
         {
-            let mut s = self.control.store.lock();
+            let mut session = self.control.session.lock();
             replace_region_clips(
-                &mut s.clips,
+                &mut session.store.clips,
                 &pending.track_id,
                 pending.region.0,
                 pending.region.1,
             );
-            s.clips.push(pending.clip.clone());
+            session.store.clips.push(pending.clip.clone());
         }
         self.control.engine.send(ControlMsg::Rebuild);
         {
@@ -536,10 +545,10 @@ impl LoopJam {
         }
         // Persist + announce, same convention as import (auto-save).
         let snapshot = {
-            let s = self.control.store.lock();
-            let dir = s.project_dir.clone();
+            let session = self.control.session.lock();
+            let dir = session.store.project_dir.clone();
             project::from_store(
-                &s,
+                &session.store,
                 self.control.shared.position.load(Relaxed),
                 self.control.shared.sample_rate.load(Relaxed),
             )
@@ -597,7 +606,7 @@ pub(crate) fn replace_region_clips(
         if ce > end {
             // Right remainder: fresh id, offset advanced past the cut.
             let mut right = c.clone();
-            right.id = uuid::Uuid::new_v4().to_string();
+            right.id = crate::ids::ClipId::mint();
             right.timeline_start_samples = end;
             right.offset_samples = c.offset_samples + (end - cs);
             right.length_samples = ce - end;
@@ -632,21 +641,24 @@ fn render_region_stereo(
             samples: Arc::new(RtClipData { channels, data }),
         });
     }
-    let mut graph = RtGraph::new(vec![RtTrack::clips(0, rt_clips)]);
-    let params = ParamTable::default();
+    let mut graph = RtGraph::new(
+        vec![RtTrack::clips(0, rt_clips)],
+        0,
+        Arc::new(ParamTable::default()),
+    );
     let frames = (end - start) as usize;
     let mut buf = vec![0.0f32; frames * 2];
     let mut pos = start;
     for chunk in buf.chunks_mut(1024 * 2) {
         mixer::render(
             &mut graph,
-            &params,
             pos,
             &LoopSpec::OFF,
             chunk,
             2,
             engine_rate,
             false,
+            None,
         );
         pos += (chunk.len() / 2) as u64;
     }
@@ -715,6 +727,7 @@ pub fn loopjam_status(jam: tauri::State<'_, Arc<LoopJam>>) -> Result<LoopJamStat
 mod tests {
     use super::*;
     use crate::audio::engine::load_wav;
+    use crate::audio::rt::testutil::empty_tables;
     use crate::control::{ImportClipRequest, TransportAction};
     use crate::midi::MidiStore;
     use crate::sidecars::jobs::JobManager;
@@ -738,12 +751,15 @@ mod tests {
         (u64, u64),
     ) {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let tables = empty_tables();
+        let session = Arc::new(Mutex::new(crate::control::Session::new(
+            Store::default(),
+            MidiStore::default(),
+        )));
         let engine = crate::audio::engine::start(
             shared.clone(),
-            params.clone(),
-            store.clone(),
+            tables.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
         // Event-driven readiness: the control thread opens (or fails to
@@ -761,12 +777,11 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         let ev2 = Arc::clone(&events);
         let cp = Arc::new(ControlPlane::new(
-            store,
+            session,
             shared.clone(),
-            params,
+            tables,
             engine,
             Arc::new(JobManager::new(2, Duration::ZERO)),
-            Arc::new(Mutex::new(MidiStore::default())),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
         ));
         // (Sample rate settled by the round-trip above — no sleep needed.)
@@ -901,6 +916,7 @@ mod tests {
             track_id: track.into(),
             name: id.into(),
             source_path: format!("audio/{id}.wav"),
+            source_id: crate::ids::SourceId::default(),
             source_channels: 2,
             source_sample_rate: 48_000,
             source_length_samples: len,

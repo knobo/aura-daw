@@ -1,0 +1,177 @@
+{
+  "test": "gfx",
+  "userAgent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/60.5 Safari/605.1.15",
+  "devicePixelRatio": 1,
+  "canvasSize": {
+    "w": 1280,
+    "h": 720
+  },
+  "webgl2": {
+    "contextCreated": true,
+    "maskedRenderer": "WebKit WebGL",
+    "maskedVendor": "WebKit",
+    "version": "WebGL 2.0",
+    "shadingLanguageVersion": "WebGL GLSL ES 3.00",
+    "maxTextureSize": 16384,
+    "unmaskedRenderer": "Apple GPU",
+    "unmaskedVendor": "Apple Inc."
+  },
+  "benchA_webgl2_instanced": [
+    {
+      "instances": 10000,
+      "framesMeasured": 120,
+      "achievedFps": 40.2,
+      "rafFrameMs": {
+        "n": 120,
+        "min": 9,
+        "p50": 24,
+        "p90": 40,
+        "p95": 48,
+        "max": 54,
+        "mean": 24.88
+      },
+      "jsSubmitMs": {
+        "n": 120,
+        "min": 0,
+        "p50": 0,
+        "p90": 0,
+        "p95": 0,
+        "max": 1,
+        "mean": 0.04
+      },
+      "syncedFrameWorkMs": {
+        "n": 30,
+        "min": 0,
+        "p50": 2,
+        "p90": 4,
+        "p95": 4,
+        "max": 4,
+        "mean": 1.97
+      },
+      "note": "rafFrameMs is vsync-capped (~16.7ms floor @60Hz); syncedFrameWorkMs = draw+readPixels(1px) full pipeline flush"
+    },
+    {
+      "instances": 50000,
+      "framesMeasured": 120,
+      "achievedFps": 46.7,
+      "rafFrameMs": {
+        "n": 120,
+        "min": 11,
+        "p50": 17,
+        "p90": 40,
+        "p95": 49,
+        "max": 57,
+        "mean": 21.42
+      },
+      "jsSubmitMs": {
+        "n": 120,
+        "min": 0,
+        "p50": 0,
+        "p90": 0,
+        "p95": 1,
+        "max": 1,
+        "mean": 0.07
+      },
+      "syncedFrameWorkMs": {
+        "n": 30,
+        "min": 1,
+        "p50": 7,
+        "p90": 15,
+        "p95": 16,
+        "max": 21,
+        "mean": 7.43
+      },
+      "note": "rafFrameMs is vsync-capped (~16.7ms floor @60Hz); syncedFrameWorkMs = draw+readPixels(1px) full pipeline flush"
+    },
+    {
+      "instances": 200000,
+      "framesMeasured": 120,
+      "achievedFps": 35.8,
+      "rafFrameMs": {
+        "n": 120,
+        "min": 7,
+        "p50": 26,
+        "p90": 44,
+        "p95": 47,
+        "max": 58,
+        "mean": 27.94
+      },
+      "jsSubmitMs": {
+        "n": 120,
+        "min": 0,
+        "p50": 0,
+        "p90": 0,
+        "p95": 1,
+        "max": 1,
+        "mean": 0.08
+      },
+      "syncedFrameWorkMs": {
+        "n": 30,
+        "min": 3,
+        "p50": 10,
+        "p90": 20,
+        "p95": 24,
+        "max": 35,
+        "mean": 11.47
+      },
+      "note": "rafFrameMs is vsync-capped (~16.7ms floor @60Hz); syncedFrameWorkMs = draw+readPixels(1px) full pipeline flush"
+    }
+  ],
+  "benchB_canvas2d": [
+    {
+      "fillRects": 5000,
+      "framesMeasured": 120,
+      "achievedFps": 31.4,
+      "rafFrameMs": {
+        "n": 120,
+        "min": 11,
+        "p50": 29,
+        "p90": 56,
+        "p95": 58,
+        "max": 69,
+        "mean": 31.82
+      },
+      "jsDrawMs": {
+        "n": 120,
+        "min": 1,
+        "p50": 2,
+        "p90": 5,
+        "p95": 5,
+        "max": 6,
+        "mean": 2.75
+      }
+    },
+    {
+      "fillRects": 20000,
+      "framesMeasured": 120,
+      "achievedFps": 37,
+      "rafFrameMs": {
+        "n": 120,
+        "min": 15,
+        "p50": 22,
+        "p90": 47,
+        "p95": 53,
+        "max": 65,
+        "mean": 27.05
+      },
+      "jsDrawMs": {
+        "n": 120,
+        "min": 8,
+        "p50": 9,
+        "p90": 9,
+        "p95": 10,
+        "max": 13,
+        "mean": 8.79
+      }
+    }
+  ],
+  "errors": [],
+  "canvas2dCreated": true,
+  "benchC_softwareTell": {
+    "criterion": "synced frame work for 10k instanced quads > 8 ms => PROBABLE-SOFTWARE",
+    "syncedP50Ms_10k": 2,
+    "verdict": "LIKELY-HARDWARE",
+    "rendererStringMentionsLlvmpipe": false
+  },
+  "finishedBecause": "complete"
+}

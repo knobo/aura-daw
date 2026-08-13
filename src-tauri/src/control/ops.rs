@@ -11,9 +11,8 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use serde::{Deserialize, Serialize};
 
-use crate::audio::rt::{ParamTable, SharedRt, FLAG_MUTE, FLAG_SOLO};
-use crate::audio::types::{Store, TrackState, TransportState, MAX_TRACKS};
-use crate::audio::mixer;
+use crate::audio::rt::SharedRt;
+use crate::audio::types::{Store, TrackState, TransportState};
 
 /// One batched mix change (op-log-shaped per debt D-03: a UI gesture or MCP
 /// tool call carries MANY of these in one request). `None` = leave unchanged.
@@ -41,79 +40,47 @@ impl TrackMixChange {
     }
 }
 
-/// Apply a batch of mix changes atomically: all track ids are validated
-/// before anything is written (a bad id fails the whole batch). Values are
-/// clamped to the schema ranges. Returns the updated tracks in batch order.
-pub fn apply_track_mix(
-    store: &mut Store,
-    params: &ParamTable,
-    changes: &[TrackMixChange],
-) -> Result<Vec<TrackState>, String> {
-    for c in changes {
-        if !store.tracks.iter().any(|t| t.id == c.track_id) {
-            return Err(format!("unknown track: {}", c.track_id));
-        }
-    }
-    let mut updated = Vec::with_capacity(changes.len());
-    for c in changes {
-        let slot = store.slots.get(&c.track_id).copied();
-        let t = store
-            .tracks
-            .iter_mut()
-            .find(|t| t.id == c.track_id)
-            .expect("validated above");
-        if let Some(g) = c.gain_db {
-            t.gain_db = g.clamp(-160.0, 24.0);
-        }
-        if let Some(p) = c.pan {
-            t.pan = p.clamp(-1.0, 1.0);
-        }
-        if let Some(m) = c.muted {
-            t.muted = m;
-        }
-        if let Some(s) = c.soloed {
-            t.soloed = s;
-        }
-        if let Some(a) = c.armed {
-            t.armed = a;
-        }
-        let snapshot = t.clone();
-        if let Some(slot) = slot {
-            params.set_gain_linear(slot, mixer::db_to_linear(snapshot.gain_db));
-            params.set_pan(slot, snapshot.pan as f32);
-            params.set_flag(slot, FLAG_MUTE, snapshot.muted);
-            params.set_flag(slot, FLAG_SOLO, snapshot.soloed);
-        }
-        updated.push(snapshot);
-    }
-    params.any_solo.store(store.any_solo(), Relaxed);
-    Ok(updated)
-}
-
 pub const TRACK_COLORS: [&str; 6] =
     ["#7c9cff", "#ff9c7c", "#7cffb0", "#e07cff", "#ffe07c", "#7cd8ff"];
 
-/// Create a track in the store and reset its RT param slot. STRUCTURAL —
-/// the caller must send `ControlMsg::Rebuild` afterwards.
-/// `kind`: "audio" (default) or "midi" (phase 2; "bus" reserved).
-pub fn add_track(
+/// Structural core: insert `track` into the store at `index` (clamped to
+/// the current length, so an out-of-range index appends). No slot
+/// allocation, no param reset — those stay in the `add_track` wrapper below
+/// until Plan B moves slot bookkeeping to the command's effect layer
+/// (round-2 §2.4). This is the part `control::session::apply_raw` reuses
+/// for `Op::TrackAdd`, so both paths insert a row the same way.
+pub(crate) fn insert_track(store: &mut Store, track: TrackState, index: usize) {
+    let index = index.min(store.tracks.len());
+    store.tracks.insert(index, track);
+}
+
+/// Build a fresh track row — everything `add_track` does EXCEPT inserting
+/// it into `store.tracks`. Split out (Task 7) so `ControlPlane::add_track`
+/// can insert the row through the transaction channel (`Op::TrackAdd`, via
+/// `Session::transact`) instead of a direct `Vec::insert`.
+///
+/// Round-2 §2.4: slot allocation and the RT param reset are GONE — slots
+/// are derived fresh from display order on every rebuild
+/// (`types::derive_slots`) and a fresh row's params come from that same
+/// rebuild's build-time population (unity gain / center pan / no flags),
+/// an exact behavioral match for what the deleted `params.reset_slot` used
+/// to write. There is therefore no `MAX_TRACKS` limit here either — the
+/// const itself is gone (Task 7: `ParamTable` is sized per-graph). Returns
+/// `(track, index)`; `index` is the row's intended position (end of the
+/// current list).
+pub(crate) fn new_track_row(
     store: &mut Store,
-    params: &ParamTable,
     name: Option<String>,
     kind: Option<String>,
-) -> Result<TrackState, String> {
+) -> Result<(TrackState, usize), String> {
     let kind = kind.unwrap_or_else(|| "audio".into());
     if !matches!(kind.as_str(), "audio" | "midi") {
         return Err(format!("unsupported track kind: {kind}"));
     }
     let n = store.tracks.len();
     let id = uuid::Uuid::new_v4().to_string();
-    let slot = store
-        .alloc_slot(&id)
-        .ok_or_else(|| format!("track limit reached ({MAX_TRACKS})"))?;
-    params.reset_slot(slot);
     let track = TrackState {
-        id,
+        id: id.into(),
         name: name.unwrap_or_else(|| format!("Track {}", n + 1)),
         kind,
         gain_db: 0.0,
@@ -124,7 +91,24 @@ pub fn add_track(
         color: TRACK_COLORS[n % TRACK_COLORS.len()].into(),
         instrument_id: None,
     };
-    store.tracks.push(track.clone());
+    Ok((track, n))
+}
+
+/// Create a track in the store. STRUCTURAL — the caller must send
+/// `ControlMsg::Rebuild` afterwards (the next rebuild derives the row's
+/// slot and populates its params — round-2 §2.4). `kind`: "audio" (default)
+/// or "midi" (phase 2; "bus" reserved). Used directly by callers that
+/// mutate the store outside the transaction channel (currently only
+/// `seed_demo_project`, which builds several tracks under one lock before
+/// any engine/event side effect); the frozen `add_track` COMMAND goes
+/// through `ControlPlane::add_track` -> `commit` -> `new_track_row` instead.
+pub fn add_track(
+    store: &mut Store,
+    name: Option<String>,
+    kind: Option<String>,
+) -> Result<TrackState, String> {
+    let (track, index) = new_track_row(store, name, kind)?;
+    insert_track(store, track.clone(), index);
     Ok(track)
 }
 
@@ -147,58 +131,19 @@ pub fn transport_snapshot(store: &Store, shared: &SharedRt) -> TransportState {
 mod tests {
     use super::*;
 
-    fn store_with_tracks(n: usize) -> (Store, ParamTable) {
+    fn store_with_tracks(n: usize) -> Store {
         let mut store = Store::default();
-        let params = ParamTable::default();
         for i in 0..n {
-            add_track(&mut store, &params, Some(format!("T{i}")), None).unwrap();
+            add_track(&mut store, Some(format!("T{i}")), None).unwrap();
         }
-        (store, params)
-    }
-
-    #[test]
-    fn batched_mix_applies_all_and_clamps() {
-        let (mut store, params) = store_with_tracks(2);
-        let a = store.tracks[0].id.clone();
-        let b = store.tracks[1].id.clone();
-        let updated = apply_track_mix(
-            &mut store,
-            &params,
-            &[
-                TrackMixChange { gain_db: Some(100.0), pan: Some(-2.0), ..TrackMixChange::new(&a) },
-                TrackMixChange { muted: Some(true), soloed: Some(true), ..TrackMixChange::new(&b) },
-            ],
-        )
-        .unwrap();
-        assert_eq!(updated.len(), 2);
-        assert_eq!(updated[0].gain_db, 24.0, "gain clamped");
-        assert_eq!(updated[0].pan, -1.0, "pan clamped");
-        assert!(updated[1].muted && updated[1].soloed);
-        assert!(params.any_solo.load(Relaxed));
-    }
-
-    #[test]
-    fn batched_mix_is_atomic_on_unknown_track() {
-        let (mut store, params) = store_with_tracks(1);
-        let a = store.tracks[0].id.clone();
-        let err = apply_track_mix(
-            &mut store,
-            &params,
-            &[
-                TrackMixChange { gain_db: Some(-6.0), ..TrackMixChange::new(&a) },
-                TrackMixChange::new("nope"),
-            ],
-        )
-        .unwrap_err();
-        assert!(err.contains("unknown track"));
-        assert_eq!(store.tracks[0].gain_db, 0.0, "no partial application");
+        store
     }
 
     #[test]
     fn add_track_rejects_unknown_kind_and_accepts_midi() {
-        let (mut store, params) = store_with_tracks(0);
-        assert!(add_track(&mut store, &params, None, Some("bus".into())).is_err());
-        let t = add_track(&mut store, &params, None, Some("midi".into())).unwrap();
+        let mut store = store_with_tracks(0);
+        assert!(add_track(&mut store, None, Some("bus".into())).is_err());
+        let t = add_track(&mut store, None, Some("midi".into())).unwrap();
         assert_eq!(t.kind, "midi");
     }
 }

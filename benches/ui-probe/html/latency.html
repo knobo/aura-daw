@@ -1,0 +1,111 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ui-probe-latency</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+<canvas id="c"></canvas>
+<script>
+(() => {
+  // Mode injected by the Rust harness via initialization script:
+  const MODE = (window.PROBE_CONFIG && window.PROBE_CONFIG.mode) || 'simple';
+  const TARGET_SAMPLES = 100;
+
+  const canvas = document.getElementById('c');
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(window.innerWidth * dpr);
+  canvas.height = Math.round(window.innerHeight * dpr);
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  const samples = [];      // { queueMs, drawMs, toPaintMs }
+  let n = 0;
+  let sent = false;
+  let lastKeyAt = 0;
+
+  function paint(step) {
+    if (MODE === 'heavy') {
+      // Full-canvas gradient redraw: several layered gradients over every pixel.
+      for (let layer = 0; layer < 3; layer++) {
+        const g = ctx.createLinearGradient(0, layer * 40 + (step % 60), W, H - layer * 40);
+        g.addColorStop(0, `hsl(${(step * 13 + layer * 120) % 360}, 70%, ${20 + layer * 12}%)`);
+        g.addColorStop(0.5, `hsl(${(step * 29 + layer * 40) % 360}, 60%, ${35 + layer * 8}%)`);
+        g.addColorStop(1, `hsl(${(step * 7 + layer * 200) % 360}, 80%, ${15 + layer * 10}%)`);
+        ctx.globalAlpha = layer === 0 ? 1 : 0.5;
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, W, H);
+      }
+      ctx.globalAlpha = 1;
+    } else {
+      // Large color region + moving bar (like a playhead over an arranger).
+      ctx.fillStyle = `hsl(${(step * 47) % 360}, 55%, 30%)`;
+      ctx.fillRect(0, 0, W, H);
+    }
+    // moving bar in both modes
+    ctx.fillStyle = '#fff';
+    ctx.fillRect((step * 24) % (W - 8), 0, 8, H);
+    ctx.fillStyle = '#000';
+    ctx.font = `${Math.round(20 * dpr)}px monospace`;
+    ctx.fillText(`${MODE} #${step}`, 20, 40 * dpr);
+  }
+
+  function send(why) {
+    if (sent) return; sent = true;
+    const sortBy = k => samples.map(s => s[k]).sort((a, b) => a - b);
+    const pct = (s, p) => s.length ? +s[Math.min(s.length - 1, Math.floor(p / 100 * s.length))].toFixed(2) : null;
+    const dist = k => {
+      const s = sortBy(k);
+      return s.length ? { n: s.length, min: pct(s, 0), p50: pct(s, 50), p95: pct(s, 95),
+                          max: +s[s.length - 1].toFixed(2),
+                          mean: +(s.reduce((a, b) => a + b, 0) / s.length).toFixed(2) } : null;
+    };
+    window.ipc.postMessage(JSON.stringify({
+      test: 'keydown-to-paint-latency',
+      mode: MODE,
+      finishedBecause: why,
+      canvasPx: { w: W, h: H }, devicePixelRatio: dpr,
+      methodology: 'keydown handler: record (performance.now() - event.timeStamp) as queueMs, ' +
+        'draw synchronously (drawMs), then double-rAF; timestamp taken in the SECOND rAF callback ' +
+        'minus event.timeStamp = toPaintMs (event delivery to first frame presented after the paint commit). ' +
+        'LIMITATION: this measures in-page event-to-paint-commit, NOT photon latency; ' +
+        'OS/X11/WebKitGTK input-delivery latency before event.timeStamp is NOT captured.',
+      distributionsMs: {
+        eventToHandlerEntry: dist('queueMs'),
+        synchronousDraw: dist('drawMs'),
+        eventToPaintCommit: dist('toPaintMs')
+      },
+      rawToPaintMs: samples.map(s => +s.toPaintMs.toFixed(2))
+    }, null, 2));
+  }
+
+  window.addEventListener('keydown', e => {
+    if (sent) return;
+    if (e.repeat) return;                 // ignore auto-repeat; xdotool sends discrete presses
+    const handlerEntry = performance.now();
+    const evT = e.timeStamp;
+    lastKeyAt = handlerEntry;
+    const step = ++n;
+    paint(step);
+    const drawDone = performance.now();
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const t2 = performance.now();
+      samples.push({
+        queueMs: handlerEntry - evT,
+        drawMs: drawDone - handlerEntry,
+        toPaintMs: t2 - evT
+      });
+      if (samples.length >= TARGET_SAMPLES) send('target-samples-reached');
+    }));
+  });
+
+  // finish if keys stop coming
+  setInterval(() => {
+    if (!sent && samples.length > 10 && lastKeyAt && performance.now() - lastKeyAt > 8000)
+      send('keys-stopped');
+  }, 1000);
+  setTimeout(() => send('global-timeout'), 120000);
+
+  paint(0);
+})();
+</script>

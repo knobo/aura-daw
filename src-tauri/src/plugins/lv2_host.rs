@@ -735,20 +735,21 @@ mod tests {
         clip_len_ticks: u64,
     ) -> (Store, MidiStore) {
         let mut store = Store::default();
-        store.alloc_slot(track_id);
         store.tracks.push(midi_track(track_id, Some(instrument_id.into())));
         let midi = MidiStore {
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             clips: vec![MidiClip {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: crate::ids::ClipId::mint(),
                 track_id: track_id.into(),
                 name: "c".into(),
                 timeline_start_ticks: 0,
                 length_ticks: clip_len_ticks,
                 notes: vec![note],
+                next_note_id: 1,
             }],
             loaded_dir: None,
+            dirty: false,
         };
         (store, midi)
     }
@@ -762,10 +763,9 @@ mod tests {
         rate: u32,
         mut discontinuity: bool,
     ) -> Vec<f32> {
-        let params = ParamTable::default();
         let mut out = vec![0.0f32; frames * 2];
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(g, &params, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity);
+            mixer::render(g, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity, None);
             discontinuity = false;
             pos += (chunk.len() / 2) as u64;
         }
@@ -824,12 +824,13 @@ mod tests {
         let Some(instance_id) = activate_zyn(&reg) else { return };
 
         // A4 for one beat (0.5 s @ 120 bpm): on at sample 0, off at 24000.
-        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0 };
+        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0, note_id: crate::ids::NoteId(0) };
         let (store, midi) = store_with_clip("zyn-track", &format!("plugin:{instance_id}"), note, 1920);
 
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
-        append_from(&midi, &store, RATE, None, &mut nodes, &mut tracks);
+        let slots = crate::audio::types::derive_slots(&store.tracks);
+        append_from(&midi, &store, &slots, RATE, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         // The registry key proves the PLUGIN node resolved (a PolySynth
         // fallback would be keyed "synth@48000" — and would fake the pitch).
@@ -840,7 +841,7 @@ mod tests {
         );
 
         // 3 s render: sustain [0, 24000), release tail afterwards.
-        let mut g = RtGraph::new(tracks);
+        let mut g = RtGraph::new(tracks, 1, Arc::new(ParamTable::default()));
         let audio = mono_of(&render_from(&mut g, 0, 3 * RATE as usize, RATE, false));
         let sustain = &audio[4_000..22_000];
         let sustain_peak = peak(sustain);
@@ -870,14 +871,15 @@ mod tests {
         let Some(instance_id) = activate_zyn(&reg) else { return };
 
         // Note held far beyond what we render: the off never arrives.
-        let note = MidiNote { tick: 0, length_ticks: 96_000, key: 64, velocity: 110, channel: 0 };
+        let note = MidiNote { tick: 0, length_ticks: 96_000, key: 64, velocity: 110, channel: 0, note_id: crate::ids::NoteId(0) };
         let (store, midi) = store_with_clip("zyn-hold", &format!("plugin:{instance_id}"), note, 96_000);
 
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
-        append_from(&midi, &store, RATE, None, &mut nodes, &mut tracks);
+        let slots = crate::audio::types::derive_slots(&store.tracks);
+        append_from(&midi, &store, &slots, RATE, None, &mut nodes, &mut tracks);
         assert_eq!(nodes.key_of("zyn-hold"), Some(format!("plugin:{instance_id}@{RATE}").as_str()));
-        let mut g = RtGraph::new(tracks);
+        let mut g = RtGraph::new(tracks, 2, Arc::new(ParamTable::default()));
 
         let sounding = mono_of(&render_from(&mut g, 0, RATE as usize / 2, RATE, false));
         let held_peak = peak(&sounding[4_000..]);

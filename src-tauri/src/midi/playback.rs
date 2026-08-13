@@ -14,10 +14,12 @@
 //! STATE (voices, plugin instances) survives graph swaps because successive
 //! snapshots share the node cell through [`LiveNodeRegistry`].
 //!
-//! `engine.rs::rebuild` calls [`append_midi_tracks`]; everything else lives
-//! here. The engine reaches the midi store through a process-global
-//! registered by `MidiState::shared()` during app setup (lib.rs) so no
-//! frozen signatures change.
+//! `engine.rs::rebuild` holds the session lock directly (store + midi behind
+//! one guard) and calls [`append_from`] with both fields; everything else
+//! lives here. Cross-cutting callers that don't already hold a session
+//! handle (e.g. [`super::notify_project_opened`]) reach it through a
+//! process-global registered by `MidiState::shared()` during app setup
+//! (lib.rs) so no frozen signatures change.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +31,7 @@ use crate::audio::rt::{LiveNodeCell, LiveSource, RtTrack, MAX_LIVE_BLOCK};
 use crate::audio::sampler::SamplerBank;
 use crate::audio::sampler_engine::SamplerNode;
 use crate::audio::types::{Store, TrackState};
+use crate::control::Session;
 
 use super::schedule::{self, AbsNoteEvent};
 use super::synth::PolySynth;
@@ -37,18 +40,20 @@ use super::MidiStore;
 
 use crate::audio::dsp::AudioProcessor;
 
-static PLAYBACK_STORE: OnceLock<Arc<Mutex<MidiStore>>> = OnceLock::new();
+static PLAYBACK_SESSION: OnceLock<Arc<Mutex<Session>>> = OnceLock::new();
 
-/// Register the app's midi store for engine rebuilds. Called (indirectly)
-/// once from lib.rs setup via `MidiState::shared()`. First registration wins;
-/// tests use [`append_from`] directly and never touch the global.
-pub fn register_store(store: Arc<Mutex<MidiStore>>) {
-    let _ = PLAYBACK_STORE.set(store);
+/// Register the app's session for cross-cutting reaches (e.g. midi resync
+/// on project open) that run outside the engine's own held lock. Called
+/// (indirectly) once from lib.rs setup via `MidiState::shared()`. First
+/// registration wins; tests use [`append_from`] directly and never touch
+/// the global.
+pub fn register_store(session: Arc<Mutex<Session>>) {
+    let _ = PLAYBACK_SESSION.set(session);
 }
 
-/// The registered app-wide midi store, if any (None in unit tests).
-pub fn registered_store() -> Option<&'static Arc<Mutex<MidiStore>>> {
-    PLAYBACK_STORE.get()
+/// The registered app-wide session, if any (None in unit tests).
+pub fn registered_store() -> Option<&'static Arc<Mutex<Session>>> {
+    PLAYBACK_SESSION.get()
 }
 
 // ---------------------------------------------------------------------------
@@ -111,27 +116,19 @@ impl LiveNodeRegistry {
 // Engine hook
 // ---------------------------------------------------------------------------
 
-/// ENGINE HOOK (called from `audio::engine::Control::rebuild` with the store
-/// lock held, on the engine control thread — never the RT thread). Appends
-/// one live `RtTrack` per audible midi track. No-op until the store is
-/// registered.
-pub fn append_midi_tracks(
-    store: &Store,
-    rate: u32,
-    nodes: &mut LiveNodeRegistry,
-    out: &mut Vec<RtTrack>,
-) {
-    let Some(midi) = PLAYBACK_STORE.get() else { return };
-    let midi = midi.lock();
-    let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-    append_from(&midi, store, rate, bank.as_deref(), nodes, out);
-}
-
-/// Testable core of [`append_midi_tracks`]. `bank` = None means "no sampler
-/// instruments available" (instrument-bound tracks fall back to PolySynth).
+/// Core of the engine's `rebuild` live-track step (called from
+/// `audio::engine::Control::rebuild` with the session lock held, on the
+/// engine control thread — never the RT thread). Appends one live `RtTrack`
+/// per audible midi track. `bank` = None means "no sampler instruments
+/// available" (instrument-bound tracks fall back to PolySynth). `slots` is
+/// the CURRENT rebuild's derived slot map (round-2 §2.4,
+/// `types::derive_slots`) — every store track has an entry, so lookups here
+/// are infallible by construction (a track absent from `slots` would be a
+/// caller bug, not a runtime case to skip).
 pub fn append_from(
     midi: &MidiStore,
     store: &Store,
+    slots: &HashMap<crate::ids::TrackId, usize>,
     rate: u32,
     bank: Option<&SamplerBank>,
     nodes: &mut LiveNodeRegistry,
@@ -142,13 +139,13 @@ pub fn append_from(
         match TempoMap::new(midi.ppq, midi.tempo_events.clone(), rate) {
             Ok(map) => {
                 for t in store.tracks.iter().filter(|t| t.kind == "midi") {
-                    let Some(&slot) = store.slots.get(&t.id) else { continue };
-                    let events = track_events(midi, &t.id, &map);
+                    let Some(&slot) = slots.get(&t.id) else { continue };
+                    let events = track_events(midi, t.id.as_str(), &map);
                     if events.is_empty() {
                         continue;
                     }
                     let node = node_for_track(t, bank, rate, nodes);
-                    live_ids.insert(t.id.clone());
+                    live_ids.insert(t.id.to_string());
                     out.push(RtTrack {
                         slot,
                         clips: Vec::new(),
@@ -193,7 +190,7 @@ fn node_for_track(
         if let Some(pid) = id.strip_prefix("plugin:") {
             let key = format!("plugin:{pid}@{rate}");
             if let Some(cell) =
-                nodes.resolve_with(&t.id, &key, || crate::plugins::live_node_for(pid, rate))
+                nodes.resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(pid, rate))
             {
                 return cell;
             }
@@ -203,7 +200,7 @@ fn node_for_track(
             );
         } else if let Some(compiled) = bank.and_then(|b| b.compiled(id)) {
             let key = format!("sampler:{id}@{rate}");
-            if let Some(cell) = nodes.resolve_with(&t.id, &key, move || {
+            if let Some(cell) = nodes.resolve_with(t.id.as_str(), &key, move || {
                 let mut node = SamplerNode::new((*compiled).clone());
                 node.prepare(rate, MAX_LIVE_BLOCK);
                 Some(Box::new(node))
@@ -219,7 +216,7 @@ fn node_for_track(
     }
     let key = format!("synth@{rate}");
     nodes
-        .resolve_with(&t.id, &key, || {
+        .resolve_with(t.id.as_str(), &key, || {
             let mut synth = PolySynth::new();
             synth.prepare(rate, MAX_LIVE_BLOCK);
             Some(Box::new(synth))
@@ -234,6 +231,7 @@ mod tests {
     use crate::audio::rt::{ParamTable, RtGraph};
     use crate::audio::transport::LoopSpec;
     use crate::audio::types::TrackState;
+    use crate::ids::NoteId;
     use crate::midi::types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
 
     fn midi_store_with(clips: Vec<MidiClip>) -> MidiStore {
@@ -242,6 +240,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             clips,
             loaded_dir: None,
+            dirty: false,
         }
     }
 
@@ -262,12 +261,13 @@ mod tests {
 
     fn clip(track_id: &str, start_ticks: u64, len_ticks: u64, notes: Vec<MidiNote>) -> MidiClip {
         MidiClip {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: uuid::Uuid::new_v4().to_string().into(),
             track_id: track_id.into(),
             name: "c".into(),
             timeline_start_ticks: start_ticks,
             length_ticks: len_ticks,
             notes,
+            next_note_id: 1,
         }
     }
 
@@ -275,12 +275,11 @@ mod tests {
     /// (`mixer::render`, block-sized chunks) and return the interleaved
     /// stereo output.
     fn render_graph(tracks: Vec<RtTrack>, frames: usize, rate: u32) -> Vec<f32> {
-        let mut g = RtGraph::new(tracks);
-        let params = ParamTable::default();
+        let mut g = RtGraph::new(tracks, 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; frames * 2];
         let mut pos = 0u64;
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(&mut g, &params, pos, &LoopSpec::OFF, chunk, 2, rate, false);
+            mixer::render(&mut g, pos, &LoopSpec::OFF, chunk, 2, rate, false, None);
             pos += (chunk.len() / 2) as u64;
         }
         out
@@ -300,23 +299,22 @@ mod tests {
     #[test]
     fn midi_tracks_become_live_rt_tracks_with_audible_render() {
         let mut store = Store::default();
-        store.alloc_slot("m1");
         store.tracks.push(track("m1", "midi"));
-        store.alloc_slot("a1");
         store.tracks.push(track("a1", "audio"));
+        let slots = crate::audio::types::derive_slots(&store.tracks);
 
         let midi = midi_store_with(vec![clip(
             "m1",
             960, // one beat in @120bpm/48k = sample 24000
             960,
-            vec![MidiNote { tick: 0, length_ticks: 480, key: 69, velocity: 100, channel: 0 }],
+            vec![MidiNote { tick: 0, length_ticks: 480, key: 69, velocity: 100, channel: 0, note_id: NoteId(0) }],
         )]);
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, 48_000, None, &mut nodes, &mut out);
+        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 1, "only the midi track renders");
-        assert_eq!(out[0].slot, *store.slots.get("m1").unwrap());
+        assert_eq!(out[0].slot, slots["m1"]);
         let live = out[0].live.as_ref().expect("live source attached");
         // Events converted tick->sample on the control side.
         assert_eq!(live.events[0].sample, 24_000);
@@ -334,17 +332,16 @@ mod tests {
     #[test]
     fn audio_tracks_and_empty_clips_are_skipped() {
         let mut store = Store::default();
-        store.alloc_slot("a1");
         store.tracks.push(track("a1", "audio"));
-        store.alloc_slot("m1");
         store.tracks.push(track("m1", "midi"));
+        let slots = crate::audio::types::derive_slots(&store.tracks);
         let midi = midi_store_with(vec![
-            clip("a1", 0, 960, vec![MidiNote { tick: 0, length_ticks: 10, key: 60, velocity: 100, channel: 0 }]),
+            clip("a1", 0, 960, vec![MidiNote { tick: 0, length_ticks: 10, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) }]),
             clip("m1", 0, 960, vec![]), // no notes
         ]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, 48_000, None, &mut nodes, &mut out);
+        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
         assert!(out.is_empty());
         assert!(nodes.is_empty(), "no nodes retained for non-live tracks");
     }
@@ -354,33 +351,33 @@ mod tests {
     #[test]
     fn registry_reuses_and_prunes_nodes_across_rebuilds() {
         let mut store = Store::default();
-        store.alloc_slot("m1");
         store.tracks.push(track("m1", "midi"));
+        let slots = crate::audio::types::derive_slots(&store.tracks);
         let midi = midi_store_with(vec![clip(
             "m1",
             0,
             960,
-            vec![MidiNote { tick: 0, length_ticks: 480, key: 60, velocity: 90, channel: 0 }],
+            vec![MidiNote { tick: 0, length_ticks: 480, key: 60, velocity: 90, channel: 0, note_id: NoteId(0) }],
         )]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out1 = Vec::new();
-        append_from(&midi, &store, 48_000, None, &mut nodes, &mut out1);
+        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out1);
         let cell1 = out1[0].live.as_ref().unwrap().node.clone();
         let mut out2 = Vec::new();
-        append_from(&midi, &store, 48_000, None, &mut nodes, &mut out2);
+        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out2);
         let cell2 = out2[0].live.as_ref().unwrap().node.clone();
         assert!(Arc::ptr_eq(&cell1, &cell2), "rebuild reuses the same node");
 
         // Rate change -> new key -> new node.
         let mut out3 = Vec::new();
-        append_from(&midi, &store, 44_100, None, &mut nodes, &mut out3);
+        append_from(&midi, &store, &slots, 44_100, None, &mut nodes, &mut out3);
         let cell3 = out3[0].live.as_ref().unwrap().node.clone();
         assert!(!Arc::ptr_eq(&cell1, &cell3), "rate change replaces the node");
 
         // Track gone -> registry pruned.
         let empty = midi_store_with(vec![]);
         let mut out4 = Vec::new();
-        append_from(&empty, &store, 48_000, None, &mut nodes, &mut out4);
+        append_from(&empty, &store, &slots, 48_000, None, &mut nodes, &mut out4);
         assert!(out4.is_empty());
         assert!(nodes.is_empty(), "stale nodes pruned");
     }
@@ -413,15 +410,14 @@ mod tests {
     fn instrument_tracks_use_sampler_and_unbound_tracks_use_polysynth() {
         const RATE: u32 = 48_000;
         let mut store = Store::default();
-        store.alloc_slot("sampled");
         let mut t_sampled = track("sampled", "midi");
         t_sampled.instrument_id = Some("inst-330".into());
         store.tracks.push(t_sampled);
-        store.alloc_slot("fallback");
         store.tracks.push(track("fallback", "midi"));
+        let slots = crate::audio::types::derive_slots(&store.tracks);
 
         // A4 (key 69) for half a second on both tracks.
-        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0 };
+        let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0, note_id: NoteId(0) };
         let midi = midi_store_with(vec![
             clip("sampled", 0, 960, vec![note.clone()]),
             clip("fallback", 0, 960, vec![note]),
@@ -430,7 +426,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, RATE, Some(&bank), &mut nodes, &mut out);
+        append_from(&midi, &store, &slots, RATE, Some(&bank), &mut nodes, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(nodes.key_of("sampled"), Some("sampler:inst-330@48000"));
         assert_eq!(nodes.key_of("fallback"), Some("synth@48000"));
@@ -464,20 +460,20 @@ mod tests {
         const RATE: u32 = 48_000;
         for id in ["ghost-instrument", "plugin:00000000-0000-4000-8000-000000000000"] {
             let mut store = Store::default();
-            store.alloc_slot("m1");
             let mut t = track("m1", "midi");
             t.instrument_id = Some(id.into());
             store.tracks.push(t);
+            let slots = crate::audio::types::derive_slots(&store.tracks);
             let midi = midi_store_with(vec![clip(
                 "m1",
                 0,
                 960,
-                vec![MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 100, channel: 0 }],
+                vec![MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 100, channel: 0, note_id: NoteId(0) }],
             )]);
             let bank = SamplerBank::default();
             let mut nodes = LiveNodeRegistry::default();
             let mut out = Vec::new();
-            append_from(&midi, &store, RATE, Some(&bank), &mut nodes, &mut out);
+            append_from(&midi, &store, &slots, RATE, Some(&bank), &mut nodes, &mut out);
             assert_eq!(out.len(), 1, "track still renders ({id})");
             let mono = mono_of(&render_graph(out, 24_000, RATE));
             let f = estimate_freq(&mono[1000..20_000], RATE, 100.0, 800.0);
@@ -550,20 +546,20 @@ mod tests {
 
         // Midi track bound to the generated instrument, playing C4.
         let mut store = Store::default();
-        store.alloc_slot("m1");
         let mut t = track("m1", "midi");
         t.instrument_id = Some("gen-1".into());
         store.tracks.push(t);
+        let slots = crate::audio::types::derive_slots(&store.tracks);
         let midi = midi_store_with(vec![clip(
             "m1",
             960,
             1920,
-            vec![MidiNote { tick: 0, length_ticks: 1920, key: 60, velocity: 100, channel: 0 }],
+            vec![MidiNote { tick: 0, length_ticks: 1920, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) }],
         )]);
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, RATE, Some(&bank), &mut nodes, &mut out);
+        append_from(&midi, &store, &slots, RATE, Some(&bank), &mut nodes, &mut out);
         assert_eq!(out.len(), 1);
         let live = out[0].live.as_ref().unwrap();
         assert_eq!(live.events[0].sample, 24_000, "tick placement preserved");

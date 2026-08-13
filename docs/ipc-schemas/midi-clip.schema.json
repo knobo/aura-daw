@@ -19,7 +19,11 @@
         "lengthTicks": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
         "key": { "description": "MIDI key, 60 = C4.", "type": "integer", "minimum": 0, "maximum": 127 },
         "velocity": { "type": "integer", "minimum": 1, "maximum": 127 },
-        "channel": { "type": "integer", "minimum": 0, "maximum": 15, "default": 0 }
+        "channel": { "type": "integer", "minimum": 0, "maximum": 15, "default": 0 },
+        "noteId": {
+          "description": "Stable per-clip note identity (round-2 §2.1). 0 = unassigned (wire sentinel); every note inside the document has id >= 1, minted from its clip's persisted watermark and never reused (ADR 0001). Additive (D-06).",
+          "type": "integer", "minimum": 0, "maximum": 4294967295, "default": 0
+        }
       },
       "required": ["tick", "lengthTicks", "key", "velocity"]
     },
@@ -55,6 +59,10 @@
         "patternId": {
           "description": "RESERVED for the pattern/playlist milestone (SCALABILITY §3): when set, this clip is an instance of a shared pattern and eventsRef is absent.",
           "type": "string"
+        },
+        "nextNoteId": {
+          "description": "Persisted note-id watermark (round-2 §2.1, C-1): the durable authority for the clip's next-minted note id — written unconditionally (even for an emptied clip, which writes no eventsRef) so the watermark survives independently of the AMEV chunk. Loaded as max(row, chunk). Additive (D-06).",
+          "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 1
         }
       },
       "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks"]

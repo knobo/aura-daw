@@ -12,8 +12,8 @@
 //!   (deallocation happens here, never on the RT thread), meter blocks out,
 //!   and recorded samples out to the disk-writer thread.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,20 +23,31 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 
 use super::dsp::linear_resample;
-use super::meters::{MeterAccum, RawMeterBlock};
+use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock, METER_CHUNK_SLOTS};
 use super::mixer;
 use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
-use super::rt::{GraphPtr, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedRt, NO_PARK};
+use super::rt::{
+    GraphPtr, GraphTables, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedGraphTables,
+    SharedRt, NO_PARK,
+};
 use super::transport;
-use super::types::{Clip, MeterFrame, Store};
+use super::types::{derive_slots, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use super::project;
+use crate::control::Session;
+use crate::ids::SourceId;
 
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
 /// Recording ring headroom, seconds of audio per track.
 const REC_RING_SECS: usize = 2;
+/// [M4] Meter ring slot count, both output and input/recording streams.
+/// Chunking (Task 7) divides headroom by the chunk count, and the control
+/// thread is exactly the thread that stalls (`ensure_loaded` decodes under
+/// rebuild) — grown from 64 to 64*8. Blocks are ~2 KiB; the memory is
+/// nothing control-side.
+const METER_RING_SLOTS: usize = 64 * 8;
 
 // ---------------------------------------------------------------------------
 // IPC-facing traits (implemented over Tauri types in mod.rs)
@@ -106,13 +117,27 @@ impl EngineHandle {
     }
 }
 
+#[cfg(test)]
+impl EngineHandle {
+    /// Test double: an `EngineHandle` with no control thread behind it — a
+    /// bare channel that just records every `ControlMsg` sent through it.
+    /// The receiver is `crossbeam_channel::Receiver` (the same channel type
+    /// `EngineHandle` already wraps internally), which offers the same
+    /// `try_iter()` a `std::sync::mpsc::Receiver` would for draining and
+    /// counting messages in a test.
+    pub fn for_tests() -> (EngineHandle, Receiver<ControlMsg>) {
+        let (tx, rx) = unbounded();
+        (EngineHandle { tx }, rx)
+    }
+}
+
 /// Spawn the engine control thread. Opens the default output device if one is
 /// available; without a device the engine still runs (headless transport +
 /// silent 60 Hz meter frames) so the UI and tests stay functional.
 pub fn start(
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
-    store: Arc<Mutex<Store>>,
+    tables: SharedGraphTables,
+    session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
 ) -> EngineHandle {
     let (tx, rx) = unbounded();
@@ -121,8 +146,10 @@ pub fn start(
         .spawn(move || {
             let mut ctl = Control {
                 shared,
-                params,
-                store,
+                tables,
+                generation: 0,
+                rebuild_pending: false,
+                session,
                 events,
                 rx,
                 output: None,
@@ -135,6 +162,7 @@ pub fn start(
                 cache_rate: 0,
                 live_nodes: Default::default(),
                 accum: MeterAccum::default(),
+                gen_maps: GenerationMaps::default(),
                 sinks: Vec::new(),
                 last_frame: Instant::now(),
                 last_tick: Instant::now(),
@@ -187,7 +215,6 @@ struct OutputCb {
     meter_tx: rtrb::Producer<RawMeterBlock>,
     evt_tx: rtrb::Producer<RtEvent>,
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
     /// Current graph snapshot (RCU: replaced whole; only live-node internals
     /// mutate, and only on this thread — see `LiveNodeCell`).
     graph: Option<Box<RtGraph>>,
@@ -236,19 +263,22 @@ impl OutputCb {
 
         match (&mut self.graph, playing) {
             (Some(g), true) => {
-                let blk = mixer::render(
+                // Task 7: `render` pushes the graph's meter chunks itself
+                // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
+                // ring couldn't take — telemetry, not data, so a dropped
+                // chunk is one xrun, not lost audio.
+                let dropped = mixer::render(
                     g,
-                    &self.params,
                     base,
                     &lp,
                     out,
                     self.channels,
                     self.rate,
                     discontinuity,
+                    Some(&mut self.meter_tx),
                 );
-                if self.meter_tx.push(blk).is_err() {
-                    // Meter queue overflow: telemetry, not data — drop it.
-                    self.shared.xruns.fetch_add(1, Relaxed);
+                if dropped > 0 {
+                    self.shared.xruns.fetch_add(dropped as u64, Relaxed);
                 }
             }
             _ => out.fill(0.0),
@@ -282,8 +312,17 @@ struct InputCb {
     /// across xruns (each track has its own ring).
     owed: Vec<usize>,
     meter_tx: rtrb::Producer<RawMeterBlock>,
-    /// RT param slots of the recorded tracks (same input feeds all of them).
-    slots: Vec<usize>,
+    /// Preallocated per-chunk meter templates for the recorded slots (Task 7
+    /// [I4]): one entry per distinct `slot / METER_CHUNK_SLOTS` touched by
+    /// the recording, plus the base-0 chunk (for frame accounting) if none
+    /// of the slots land there. Built ONCE at `start_recording` (control
+    /// thread) — `capture` (RT) only mutates these in place and pushes
+    /// copies, never allocates. Each entry pairs a chunk's template with the
+    /// LOCAL lanes in it to stamp with this input's level every buffer
+    /// (same input feeds every recorded track, so they all get the
+    /// identical peak/RMS this buffer) — paired in one `Vec` rather than two
+    /// parallel ones so the two halves can't drift out of lockstep.
+    blocks: Vec<(RawMeterBlock, Vec<usize>)>,
     in_ch: usize,
     rec_ch: usize,
     shared: Arc<SharedRt>,
@@ -308,12 +347,15 @@ impl InputCb {
             ss_l += l * l;
             ss_r += r * r;
         }
-        let mut blk =
-            RawMeterBlock::new(self.shared.position.load(Relaxed), frames as u32);
-        for &slot in &self.slots {
-            blk.set_slot(slot, pk_l, pk_r, ss_l, ss_r);
+        let pos = self.shared.position.load(Relaxed);
+        for (block, lanes) in self.blocks.iter_mut() {
+            block.position = pos;
+            block.frames = frames as u32;
+            for &lane in lanes.iter() {
+                block.set_slot_local(lane, pk_l, pk_r, ss_l, ss_r);
+            }
+            let _ = self.meter_tx.push(*block);
         }
-        let _ = self.meter_tx.push(blk);
 
         // Fan the first `rec_ch` input channels out to every armed ring.
         // Overflow policy: NEVER shrink a take. Whatever cannot be written
@@ -359,13 +401,99 @@ impl InputCb {
 }
 
 // ---------------------------------------------------------------------------
+// Source-keyed decode cache (round-2 §2.2)
+// ---------------------------------------------------------------------------
+
+/// One decoded source's cache entry: the samples, plus the `source_path`
+/// they were decoded FROM (so a path change under the same id is detected as
+/// staleness rather than silently serving stale/wrong audio).
+struct CachedSource {
+    source_path: String,
+    data: Arc<RtClipData>,
+}
+
+/// Which sources need (re)decoding: absent from the cache, or cached from a
+/// different path than the clip now names (staleness — round-2 §2.2). Pure
+/// and unit-testable (the policy that `ensure_loaded` drives); deduped by
+/// source, in first-seen order.
+///
+/// Two hardening rules [H-3]:
+/// * a clip whose `source_id` is EMPTY is skipped (with a loud warning): it
+///   renders silent rather than risk playing another clip's audio through
+///   a shared empty-sentinel bucket. Finding 5: this IS reachable in
+///   production, not just a store-boundary bug — `assign_source_ids`
+///   (audio/project.rs) deliberately leaves legacy absolute / `..`-escaping
+///   `source_path`s unassigned (empty id) on every load of an old project,
+///   so opening such a project used to panic the engine control thread in
+///   debug builds via a `debug_assert!(false)` here. Warn+skip (silent mute
+///   for that one clip) is the documented degradation — no assertion.
+/// * two clips naming the SAME `source_id` but DIFFERENT `source_path`s
+///   violate the one-source-one-path invariant: warned loudly, and the
+///   source is treated as stale under the LAST conflicting path seen — never
+///   silently kept at the first path while reporting "nothing to do".
+fn stale_sources(clips: &[Clip], cache: &HashMap<SourceId, CachedSource>) -> Vec<(SourceId, String)> {
+    let mut wanted_path: HashMap<SourceId, String> = HashMap::new();
+    let mut order: Vec<SourceId> = Vec::new();
+
+    for clip in clips {
+        if clip.source_id.as_str().is_empty() {
+            log::warn!(
+                "audio: clip {} has no source id; skipping (renders silent, never another clip's audio)",
+                clip.id
+            );
+            continue;
+        }
+        match wanted_path.get(&clip.source_id) {
+            None => {
+                wanted_path.insert(clip.source_id.clone(), clip.source_path.clone());
+                order.push(clip.source_id.clone());
+            }
+            Some(existing) if existing != &clip.source_path => {
+                log::warn!(
+                    "audio: source {} named by conflicting paths ({existing:?} vs {:?}) — \
+                     one SourceId must name one source_path; re-decoding under the latest path",
+                    clip.source_id, clip.source_path
+                );
+                wanted_path.insert(clip.source_id.clone(), clip.source_path.clone());
+            }
+            Some(_) => {} // same path already recorded — nothing to do
+        }
+    }
+
+    order
+        .into_iter()
+        .filter_map(|sid| {
+            let path = wanted_path.remove(&sid)?;
+            let stale = match cache.get(&sid) {
+                Some(cached) => cached.source_path != path,
+                None => true,
+            };
+            stale.then_some((sid, path))
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Control thread
 // ---------------------------------------------------------------------------
 
 struct Control {
     shared: Arc<SharedRt>,
-    params: Arc<ParamTable>,
-    store: Arc<Mutex<Store>>,
+    /// Control-side view of the CURRENT graph's tables (round-2 §2.4) — see
+    /// `SharedGraphTables`'s doc for the lock-order rule [C1]: session
+    /// before tables, never the reverse.
+    tables: SharedGraphTables,
+    /// Monotonic graph generation, bumped once per `rebuild` call (even
+    /// headless, even when the graph queue is full) — echoed on every
+    /// `RtGraph`/`GraphTables` built from that rebuild.
+    generation: u64,
+    /// Set on `PushError::Full` [I1]: the tables already point at this
+    /// generation, but no graph was queued to serve it, so a retry is
+    /// scheduled for the next `run()` tick (after `drain_retired`, which is
+    /// what frees queue space) — otherwise every subsequent param write
+    /// would resolve into a table nothing reads.
+    rebuild_pending: bool,
+    session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
     rx: Receiver<ControlMsg>,
     output: Option<OutputBundle>,
@@ -374,8 +502,11 @@ struct Control {
     rec_track_ids: Vec<String>,
     sel_output: Option<String>,
     sel_input: Option<String>,
-    /// clip id -> decoded samples at `cache_rate`.
-    cache: HashMap<String, Arc<RtClipData>>,
+    /// source id -> decoded samples at `cache_rate` (round-2 §2.2: keyed by
+    /// SOURCE, not clip — two clips naming the same source share one decode,
+    /// and the cache survives one clip's deletion as long as another clip
+    /// still names the source ("sane asset GC", the other half of O-12).
+    cache: HashMap<SourceId, CachedSource>,
     cache_rate: u32,
     /// Live instrument nodes keyed by track id (phase 3, ARCHITECTURE §15).
     /// Nodes are SHARED between successive graph snapshots (voice state and
@@ -383,6 +514,10 @@ struct Control {
     /// on the control thread and freed here when the last snapshot retires.
     live_nodes: crate::midi::playback::LiveNodeRegistry,
     accum: MeterAccum,
+    /// generation -> slot map window for the meter fold (Task 6); published
+    /// alongside `tables` on every rebuild, pinned across a recording so a
+    /// take spanning many rebuilds keeps its input meters [I2].
+    gen_maps: GenerationMaps,
     sinks: Vec<(Box<dyn MeterSink>, u64)>,
     last_frame: Instant,
     last_tick: Instant,
@@ -407,6 +542,15 @@ impl Control {
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             }
             self.drain_retired();
+            if self.rebuild_pending {
+                // [I1] the previous rebuild's tables already point at a
+                // generation no graph was queued for (the queue was full) —
+                // retry now that `drain_retired` has freed space, so knob
+                // traffic converges instead of writing into a table nothing
+                // reads forever.
+                self.rebuild_pending = false;
+                self.rebuild();
+            }
             self.drain_meters();
             self.drain_rt_events();
             self.headless_advance();
@@ -474,7 +618,7 @@ impl Control {
 
         let (graph_tx, graph_rx) = rtrb::RingBuffer::new(8);
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         // Boundary crossings are rare (one per playthrough), but the ring is
         // sized for a burst of them so a stalled control thread never makes
         // the callback drop one.
@@ -485,7 +629,6 @@ impl Control {
             meter_tx,
             evt_tx,
             shared: self.shared.clone(),
-            params: self.params.clone(),
             graph: None,
             channels,
             rate,
@@ -513,8 +656,8 @@ impl Control {
         });
         self.shared.sample_rate.store(rate, Relaxed);
         {
-            let mut store = self.store.lock();
-            store.transport.sample_rate = rate;
+            let mut session = self.session.lock();
+            session.store.transport.sample_rate = rate;
         }
         if self.cache_rate != rate {
             self.cache.clear();
@@ -531,113 +674,228 @@ impl Control {
 
     // -- graph lifecycle (prepare on control thread, swap by pointer) -------
 
+    /// Rewrite for round-2 §2.4: slots are derived fresh from display order
+    /// every rebuild (nothing is ever "freed" for a later rebuild to
+    /// alias — see `types::derive_slots`), and this rebuild's `ParamTable`
+    /// is built fresh and travels WITH the graph it belongs to
+    /// (`RtGraph::params`) — a retired graph keeps reading its own table,
+    /// so the O-13 alias window is dead by construction (Step 5's test
+    /// pins this).
     fn rebuild(&mut self) {
         self.ensure_loaded();
+        self.generation += 1;
+        let headless = self.output.is_none();
+        let graph = {
+            let session = self.session.lock();
+            let store = &session.store;
+            let slots = derive_slots(&store.tracks);
+            // Task 7: sized to THIS rebuild's track count, not a fixed cap.
+            let params = Arc::new(ParamTable::with_slots(store.tracks.len()));
+            for (i, t) in store.tracks.iter().enumerate() {
+                params.set_gain_linear(i, mixer::db_to_linear(t.gain_db));
+                params.set_pan(i, t.pan as f32);
+                params.set_flag(i, super::rt::FLAG_MUTE, t.muted);
+                params.set_flag(i, super::rt::FLAG_SOLO, t.soloed);
+            }
+            params.any_solo.store(store.any_solo(), Relaxed);
+            // PUBLISH UNDER THE SESSION LOCK [C1]: this is load-bearing, not
+            // style. Publishing after the lock is released would open a
+            // window where a commit transacts against a NEWER document
+            // revision than the one this rebuild read, resolves its param
+            // writes through the STILL-OLD tables (because these fresher
+            // ones aren't published yet), and then this rebuild publishes
+            // tables built from the OLDER revision — silently losing the
+            // commit's write forever (a plain `Set` never schedules a
+            // rebuild). Publishing here, still holding `session`, makes
+            // <read doc, publish tables> atomic against every commit's
+            // <transact, execute writes> sequence (see `SharedGraphTables`'s
+            // doc for the full argument and the lock-order rule).
+            *self.tables.lock() = GraphTables {
+                generation: self.generation,
+                params: params.clone(),
+                slots: slots.clone(),
+            };
+            // Same generation, same slot map, published alongside the
+            // tables (Task 6) — the meter fold resolves blocks under
+            // whichever generation produced them, not the current tables.
+            self.gen_maps.publish(self.generation, &slots);
+            if headless {
+                // Headless keeps its narrow scope [I5]: tables are enough
+                // to serve knob writes and recording resolution with no
+                // output device — no clip assembly, no live/plugin node
+                // instantiation, no `song_end` write. Enabling any of that
+                // headlessly (every structural commit in the whole backend
+                // test suite runs through here) would be a silent behavior
+                // change this refactor must not smuggle in.
+                None
+            } else {
+                let mut tracks = Vec::with_capacity(store.tracks.len());
+                for t in &store.tracks {
+                    let slot = slots[&t.id];
+                    let clips = store
+                        .clips
+                        .iter()
+                        .filter(|c| c.track_id == t.id)
+                        .filter_map(|c| {
+                            let samples = self.cache.get(&c.source_id).map(|e| e.data.clone())?;
+                            Some(RtClip {
+                                start: c.timeline_start_samples,
+                                offset: c.offset_samples,
+                                len: c.length_samples,
+                                gain: mixer::db_to_linear(c.gain_db),
+                                fade_in: c.fade_in_samples,
+                                fade_out: c.fade_out_samples,
+                                samples,
+                            })
+                        })
+                        .collect();
+                    tracks.push(RtTrack::clips(slot, clips));
+                }
+                // LIVE instrument tracks (phase 3, ARCHITECTURE §15): midi
+                // tracks become RtTracks carrying a live node (SamplerNode
+                // when the track's `instrument_id` resolves, plugin node
+                // for `plugin:` refs — stub until zones P1/P2 land —,
+                // PolySynth fallback) plus this snapshot's pre-scheduled
+                // events (ticks -> absolute samples via TempoMap, HERE on
+                // the control thread; the RT thread only slices
+                // sample-offset events). Nodes come from `live_nodes` so
+                // voice/plugin state SURVIVES rebuilds; brand-new nodes are
+                // prepared before the snapshot is published (RCU
+                // discipline). Store and midi share one guard now, so this
+                // reads `session.midi` directly instead of re-locking
+                // through the registered global.
+                let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
+                crate::midi::playback::append_from(
+                    &session.midi,
+                    store,
+                    &slots,
+                    self.cache_rate,
+                    bank.as_deref(),
+                    &mut self.live_nodes,
+                    &mut tracks,
+                );
+                // The timeline boundary belongs to the material, so it is
+                // derived exactly where the material is assembled — same
+                // helper the offline bounce uses, so live and export agree
+                // on where the song ends (clip ends AND the final scheduled
+                // note-off).
+                self.shared
+                    .song_end
+                    .store(offline::song_end(&tracks), Relaxed);
+                Some(Box::new(RtGraph::new(tracks, self.generation, params)))
+            }
+        };
+        let Some(graph) = graph else { return };
         let Some(out) = self.output.as_mut() else { return };
         // Free anything the callback already retired before queueing more.
         while let Ok(gp) = out.retire_rx.pop() {
             drop(gp);
         }
-        let graph = {
-            let store = self.store.lock();
-            let mut tracks = Vec::with_capacity(store.tracks.len());
-            for t in &store.tracks {
-                let Some(&slot) = store.slots.get(&t.id) else { continue };
-                let clips = store
-                    .clips
-                    .iter()
-                    .filter(|c| c.track_id == t.id)
-                    .filter_map(|c| {
-                        let samples = self.cache.get(&c.id)?.clone();
-                        Some(RtClip {
-                            start: c.timeline_start_samples,
-                            offset: c.offset_samples,
-                            len: c.length_samples,
-                            gain: mixer::db_to_linear(c.gain_db),
-                            fade_in: c.fade_in_samples,
-                            fade_out: c.fade_out_samples,
-                            samples,
-                        })
-                    })
-                    .collect();
-                tracks.push(RtTrack::clips(slot, clips));
-            }
-            // LIVE instrument tracks (phase 3, ARCHITECTURE §15): midi tracks
-            // become RtTracks carrying a live node (SamplerNode when the
-            // track's `instrument_id` resolves, plugin node for `plugin:`
-            // refs — stub until zones P1/P2 land —, PolySynth fallback) plus
-            // this snapshot's pre-scheduled events (ticks -> absolute samples
-            // via TempoMap, HERE on the control thread; the RT thread only
-            // slices sample-offset events). Nodes come from `live_nodes` so
-            // voice/plugin state SURVIVES rebuilds; brand-new nodes are
-            // prepared before the snapshot is published (RCU discipline).
-            crate::midi::playback::append_midi_tracks(
-                &store,
-                self.cache_rate,
-                &mut self.live_nodes,
-                &mut tracks,
-            );
-            // The timeline boundary belongs to the material, so it is derived
-            // exactly where the material is assembled — same helper the
-            // offline bounce uses, so live and export agree on where the song
-            // ends (clip ends AND the final scheduled note-off).
-            self.shared
-                .song_end
-                .store(offline::song_end(&tracks), Relaxed);
-            Box::new(RtGraph::new(tracks))
-        };
         if let Err(rtrb::PushError::Full(_gp)) = out.graph_tx.push(GraphPtr::new(graph)) {
-            // Queue full (callback stalled?) — the returned GraphPtr frees
-            // the fresh graph on drop, here on the control thread; the next
-            // Rebuild retries.
-            log::warn!("audio: graph queue full, rebuild dropped");
+            // [I1] Queue full (callback stalled?) — the returned GraphPtr
+            // frees the fresh graph on drop, here on the control thread.
+            // The tables above are ALREADY published at this generation, so
+            // without a retry every subsequent knob write would resolve
+            // into a table no graph ever reads: schedule one for `run()`'s
+            // next tick, after `drain_retired` has freed queue space.
+            self.rebuild_pending = true;
+            log::warn!("audio: graph queue full, rebuild retried next tick");
         }
     }
 
-    /// Decode any clip sources missing from the cache (at the engine rate)
-    /// and make sure their waveform pyramids exist.
+    /// Decode any clip sources missing from the cache (at the engine rate,
+    /// or stale under a changed `source_path` — round-2 §2.2) and make sure
+    /// every referencing clip's waveform pyramid exists.
     fn ensure_loaded(&mut self) {
         let rate = self.engine_rate();
         if self.cache_rate != rate {
             self.cache.clear();
             self.cache_rate = rate;
         }
-        let todo: Vec<(String, PathBuf, PathBuf)> = {
-            let store = self.store.lock();
-            store
-                .clips
-                .iter()
-                .filter(|c| !self.cache.contains_key(&c.id))
-                .filter_map(|c| {
-                    Some((
-                        c.id.clone(),
-                        store.abs_path(&c.source_path)?,
-                        store.waveform_cache_dir(&c.id)?,
-                    ))
-                })
-                .collect()
+        // `stale_sources` decides WHAT needs decoding (one entry per source,
+        // deduped); pyramid dirs are still resolved per clip below (the
+        // visual cache stays clip-id-keyed — dedup opportunity ledgered,
+        // not taken here).
+        let (project_dir, todo, live_sources, clips_by_source) = {
+            let session = self.session.lock();
+            let store = &session.store;
+            let todo = stale_sources(&store.clips, &self.cache);
+            let mut live_sources: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
+            let mut clips_by_source: HashMap<SourceId, Vec<String>> = HashMap::new();
+            for c in &store.clips {
+                if c.source_id.as_str().is_empty() {
+                    continue; // stale_sources already warned about this
+                }
+                live_sources.insert(c.source_id.clone());
+                clips_by_source.entry(c.source_id.clone()).or_default().push(c.id.to_string());
+            }
+            (store.project_dir.clone(), todo, live_sources, clips_by_source)
         };
-        // Retain only clips that still exist.
-        let live: std::collections::HashSet<String> =
-            self.store.lock().clips.iter().map(|c| c.id.clone()).collect();
-        self.cache.retain(|id, _| live.contains(id));
+        // GC by source (round-2 §2.2's "sane asset GC" half of O-12): an
+        // asset shared by two clips survives one clip's deletion, since the
+        // SOURCE stays live as long as any clip still names it.
+        self.cache.retain(|sid, _| live_sources.contains(sid));
 
-        for (clip_id, path, cache_dir) in todo {
+        let Some(project_dir) = project_dir else { return };
+        for (source_id, source_path) in todo {
+            let path = project_dir.join(&source_path);
             match load_wav(&path) {
                 Ok((channels, file_rate, samples)) => {
-                    if !pyramid_exists(&cache_dir) {
-                        let pyr = Pyramid::from_interleaved(&samples, channels as usize);
-                        if let Err(e) = pyr.write_dir(&cache_dir) {
-                            log::warn!("waveform cache for {clip_id}: {e}");
-                        }
-                    }
                     let data = linear_resample(&samples, channels as usize, file_rate, rate);
                     self.cache.insert(
-                        clip_id,
-                        Arc::new(RtClipData { channels, data }),
+                        source_id,
+                        CachedSource { source_path, data: Arc::new(RtClipData { channels, data }) },
                     );
                 }
                 Err(e) => log::warn!("audio: cannot load {}: {e}", path.display()),
+            }
+        }
+
+        // Reviewer finding 2: pyramid building is DECOUPLED from the decode
+        // loop above — a clip whose source was already cached (shared with
+        // an earlier clip, so it never appeared in `todo`) still needs its
+        // OWN waveform pyramid dir checked/built. Walk every LIVE clip
+        // (grouped by source).
+        //
+        // Finding 6: pyramids MUST be built from the source file's RAW
+        // samples, not `cached.data` — that cache entry is resampled to the
+        // engine rate (round-2 §2.2's decode step above), while the AWTF
+        // tile protocol defines LOD bins in SOURCE samples
+        // (waveform.rs: "LOD n bins cover 2^(8+n) SOURCE samples"). Building
+        // from the resampled buffer time-stretches the waveform whenever the
+        // file's rate != the engine rate. Re-reading the file here (control
+        // thread — allowed, see `load_wav`'s callers elsewhere in this
+        // module) costs one extra decode per source per `ensure_loaded` call
+        // that actually has missing pyramids, which is rare (first open /
+        // new clip) — the hot decode loop above, which builds the
+        // play-critical `RtClipData`, is untouched.
+        for (source_id, clip_ids) in &clips_by_source {
+            let Some(cached) = self.cache.get(source_id) else { continue };
+            let missing: Vec<&String> = clip_ids
+                .iter()
+                .filter(|clip_id| !pyramid_exists(&Store::cache_dir_for(&project_dir, clip_id)))
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            let source_path = project_dir.join(&cached.source_path);
+            let pyr = match load_wav(&source_path) {
+                Ok((channels, _file_rate, samples)) => {
+                    Pyramid::from_interleaved(&samples, channels as usize)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "waveform cache: cannot re-read {} for pyramid build: {e}",
+                        source_path.display()
+                    );
+                    continue;
+                }
+            };
+            for clip_id in missing {
+                let cache_dir = Store::cache_dir_for(&project_dir, clip_id);
+                if let Err(e) = pyr.write_dir(&cache_dir) {
+                    log::warn!("waveform cache for {clip_id}: {e}");
+                }
             }
         }
     }
@@ -655,12 +913,12 @@ impl Control {
     fn drain_meters(&mut self) {
         if let Some(out) = self.output.as_mut() {
             while let Ok(blk) = out.meter_rx.pop() {
-                self.accum.fold(&blk);
+                self.accum.fold(&blk, &self.gen_maps);
             }
         }
         if let Some(inp) = self.input.as_mut() {
             while let Ok(blk) = inp.meter_rx.pop() {
-                self.accum.fold(&blk);
+                self.accum.fold(&blk, &self.gen_maps);
             }
         }
     }
@@ -670,9 +928,15 @@ impl Control {
             return;
         }
         self.last_frame = Instant::now();
-        let tracks = self.store.lock().track_slots();
+        // Display order comes from the session (Task 6: the fold itself now
+        // resolves generation -> slot -> track, so this is just display
+        // order, no slots needed here).
+        let order: Vec<crate::ids::TrackId> = {
+            let session = self.session.lock();
+            session.store.tracks.iter().map(|t| t.id.clone()).collect()
+        };
         let position = self.shared.position.load(Relaxed);
-        let frame = self.accum.take_frame(0, &tracks, position);
+        let frame = self.accum.take_frame(0, &order, position);
         self.sinks.retain_mut(|(sink, seq)| {
             let mut f = frame.clone();
             f.seq = *seq;
@@ -755,10 +1019,10 @@ impl Control {
         self.shared.playing.store(false, Relaxed);
         self.shared.position.store(at, Relaxed);
         let snap = {
-            let mut store = self.store.lock();
-            store.transport.state = "stopped".into();
-            store.transport.position_samples = at;
-            crate::control::ops::transport_snapshot(&store, &self.shared)
+            let mut session = self.session.lock();
+            session.store.transport.state = "stopped".into();
+            session.store.transport.position_samples = at;
+            crate::control::ops::transport_snapshot(&session.store, &self.shared)
         };
         if let Ok(v) = serde_json::to_value(&snap) {
             self.events.emit("transport://state", v);
@@ -774,7 +1038,8 @@ impl Control {
 
         // Resolve target tracks (explicit list or armed flags).
         let targets: Vec<String> = {
-            let store = self.store.lock();
+            let session = self.session.lock();
+            let store = &session.store;
             match track_ids {
                 Some(ids) => {
                     for id in &ids {
@@ -817,23 +1082,51 @@ impl Control {
         let rate = cfg.sample_rate().0;
         let start_pos = self.shared.position.load(Relaxed);
 
-        // Rings + writer specs.
-        let (project_dir, take_no, slots) = {
-            let store = self.store.lock();
+        // Rings + writer specs. Slot resolution reads the CURRENT graph's
+        // tables, not the store — round-2 §2.4; lock order: session before
+        // tables [C1].
+        let (project_dir, take_no, slots, rec_generation) = {
+            let session = self.session.lock();
+            let store = &session.store;
             let dir = store.project_dir.clone().ok_or("no project open")?;
+            let take_no = store.clips.len() + 1;
+            let tables = self.tables.lock();
             let slots: Vec<usize> = targets
                 .iter()
-                .filter_map(|id| store.slots.get(id).copied())
+                .filter_map(|id| tables.slots.get(id.as_str()).copied())
                 .collect();
-            (dir, store.clips.len() + 1, slots)
+            (dir, take_no, slots, tables.generation)
         };
+        // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
+        // preallocated `RawMeterBlock` template per distinct chunk, plus the
+        // base-0 chunk (frame accounting [I3]) even if no recorded slot
+        // lands there. Built here (control thread) so `InputCb::capture`
+        // (RT) never allocates.
+        let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        chunk_lanes.entry(0).or_default();
+        for &slot in &slots {
+            let chunk_idx = slot / METER_CHUNK_SLOTS;
+            let lane = slot % METER_CHUNK_SLOTS;
+            chunk_lanes.entry(chunk_idx).or_default().push(lane);
+        }
+        let mut blocks = Vec::with_capacity(chunk_lanes.len());
+        for (chunk_idx, lanes) in chunk_lanes {
+            let mut b = RawMeterBlock::new(rec_generation, 0, 0);
+            b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
+            blocks.push((b, lanes));
+        }
+
         let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
         let mut producers = Vec::with_capacity(targets.len());
         let mut consumers = Vec::with_capacity(targets.len());
         let mut specs = Vec::with_capacity(targets.len());
         for (i, track_id) in targets.iter().enumerate() {
             let clip_id = uuid::Uuid::new_v4().to_string();
-            let rel = format!("audio/{clip_id}.wav");
+            // The take's wav is named by a freshly-minted SourceId (round-2
+            // §2.2) — the decode cache re-keys by source, not by clip.
+            // Waveform pyramid cache dirs stay keyed by clip id.
+            let source_id = crate::ids::SourceId::mint();
+            let rel = format!("audio/{source_id}.wav");
             let (p, c) = rtrb::RingBuffer::new(capacity);
             producers.push(p);
             consumers.push(c);
@@ -842,6 +1135,7 @@ impl Control {
                 take_name: format!("Take {}", take_no + i),
                 wav_path: project_dir.join(&rel),
                 rel_path: rel,
+                source_id,
                 cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
                 clip_id,
                 start_pos,
@@ -850,13 +1144,13 @@ impl Control {
 
         let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
 
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let n_producers = producers.len();
         let mut cb = InputCb {
             producers,
             owed: vec![0; n_producers],
             meter_tx,
-            slots,
+            blocks,
             in_ch,
             rec_ch,
             shared: self.shared.clone(),
@@ -871,14 +1165,27 @@ impl Control {
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
 
+        // Pin the generation the slots above were resolved against (Task 6
+        // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
+        // in its plain window must not lose its input meters. INVARIANT:
+        // pin only AFTER every fallible step above has succeeded (device
+        // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
+        // `stop_recording` is the only unpin, and it can only ever run once
+        // `self.writer`/`self.input` are actually populated. Pinning
+        // earlier and then returning `Err` from one of those `?`s would
+        // leak the pin: a generation stays exempt from pruning forever for
+        // a recording that never started (self-healing only on the NEXT
+        // successful recording, which is not good enough).
+        self.gen_maps.pin(rec_generation);
+
         self.input = Some(InputBundle { _stream: stream, meter_rx });
         self.writer = Some(writer);
         self.rec_track_ids = targets.clone();
         self.shared.recording.store(true, Relaxed);
         self.shared.playing.store(true, Relaxed);
         {
-            let mut store = self.store.lock();
-            store.transport.state = "recording".into();
+            let mut session = self.session.lock();
+            session.store.transport.state = "recording".into();
         }
         self.events.emit(
             "recording://state",
@@ -903,15 +1210,18 @@ impl Control {
         // Drop the input stream FIRST so the ring producers close and the
         // writer can drain to empty.
         self.input = None;
+        // Release the pin (Task 6 [I2]) — recording is over, so its
+        // generation no longer needs exemption from the plain window.
+        self.gen_maps.unpin();
         let clips = writer.finish(Duration::from_secs(15))?;
 
         self.shared.recording.store(false, Relaxed);
         self.shared.playing.store(false, Relaxed);
         let track_ids = std::mem::take(&mut self.rec_track_ids);
         {
-            let mut store = self.store.lock();
-            store.transport.state = "stopped".into();
-            store.clips.extend(clips.iter().cloned());
+            let mut session = self.session.lock();
+            session.store.transport.state = "stopped".into();
+            session.store.clips.extend(clips.iter().cloned());
         }
         self.rebuild();
         self.events.emit(
@@ -925,14 +1235,14 @@ impl Control {
         );
         // Persist the take into project.json right away.
         let snapshot = {
-            let store = self.store.lock();
+            let session = self.session.lock();
             project::from_store(
-                &store,
+                &session.store,
                 self.shared.position.load(Relaxed),
                 self.engine_rate(),
             )
             .ok()
-            .map(|p| (store.project_dir.clone().unwrap(), p))
+            .map(|p| (session.store.project_dir.clone().unwrap(), p))
         };
         if let Some((dir, p)) = snapshot {
             if let Err(e) = project::save(&dir, &p) {
@@ -944,7 +1254,7 @@ impl Control {
 
     /// Auto-create a default project when recording starts with none open.
     fn ensure_project(&mut self) -> Result<(), String> {
-        if self.store.lock().project_dir.is_some() {
+        if self.session.lock().store.project_dir.is_some() {
             return Ok(());
         }
         let parent = dirs::audio_dir()
@@ -961,10 +1271,10 @@ impl Control {
         let (project, dir) =
             project::create(&parent, &name, self.engine_rate(), 120.0)?;
         {
-            let mut store = self.store.lock();
-            store.project_dir = Some(dir);
-            store.project_name = Some(project.name.clone());
-            store.created_at = project.created_at.clone();
+            let mut session = self.session.lock();
+            session.store.project_dir = Some(dir);
+            session.store.project_name = Some(project.name.clone());
+            session.store.created_at = project.created_at.clone();
         }
         self.events.emit(
             "project://changed",
@@ -1039,7 +1349,6 @@ mod tests {
                 meter_tx,
                 evt_tx,
                 shared,
-                params: Arc::new(ParamTable::default()),
                 graph: None,
                 channels: 2,
                 rate: 48_000,
@@ -1114,28 +1423,33 @@ mod tests {
         assert_eq!(shared.position.load(Relaxed), 8 * 128);
     }
 
-    fn spin_up() -> (EngineHandle, Arc<SharedRt>, Arc<ParamTable>, Arc<Mutex<Store>>) {
+    fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
-        let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: HashMap::new(),
+        }));
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
         let handle = start(
             shared.clone(),
-            params.clone(),
-            store.clone(),
+            tables.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
-        (handle, shared, params, store)
+        (handle, shared, tables, session)
     }
 
     /// Runs with or without a real audio device: the engine falls back to
     /// headless mode, so meter frames must flow either way.
     #[test]
     fn engine_pumps_meter_frames_at_60hz() {
-        let (handle, _shared, _params, store) = spin_up();
+        let (handle, _shared, _tables, session) = spin_up();
         {
-            let mut s = store.lock();
-            let slot = s.alloc_slot("t1").unwrap();
-            assert_eq!(slot, 0);
+            let mut session = session.lock();
+            let s = &mut session.store;
+            // Slots are derived state now (round-2 §2.4) — pushing the row
+            // and sending Rebuild is what seeds slot 0, not a direct alloc.
             s.tracks.push(super::super::types::TrackState {
                 id: "t1".into(),
                 name: "Track 1".into(),
@@ -1149,6 +1463,13 @@ mod tests {
                 instrument_id: None,
             });
         }
+        // Rebuild derives slots + publishes tables (round-2 §2.4). The
+        // engine channel is FIFO and single-consumer, so this message is
+        // always HANDLED before the Subscribe sent below, however the two
+        // sends happen to interleave with the control thread's poll loop —
+        // deterministic: by the time any sink can capture a frame, the
+        // tables are already published.
+        handle.send(ControlMsg::Rebuild);
         let count = Arc::new(AtomicUsize::new(0));
         let frames = Arc::new(Mutex::new(Vec::new()));
         handle.send(ControlMsg::Subscribe(Box::new(CountingSink(
@@ -1182,7 +1503,7 @@ mod tests {
 
     #[test]
     fn transport_advances_headless_or_with_device() {
-        let (handle, shared, _params, _store) = spin_up();
+        let (handle, shared, _tables, _store) = spin_up();
         // Event-driven readiness: wait for the stream (or headless fallback)
         // to publish a sample rate instead of guessing with a fixed sleep.
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -1252,11 +1573,13 @@ mod tests {
         // Tiny mono ring: 8 samples capacity.
         let (producer, mut consumer) = rtrb::RingBuffer::new(8);
         let (meter_tx, _meter_rx) = rtrb::RingBuffer::new(8);
+        let mut b = RawMeterBlock::new(1, 0, 0);
+        b.base_slot = 0;
         let mut cb = InputCb {
             producers: vec![producer],
             owed: vec![0],
             meter_tx,
-            slots: vec![0],
+            blocks: vec![(b, vec![0])],
             in_ch: 1,
             rec_ch: 1,
             shared: shared.clone(),
@@ -1296,18 +1619,22 @@ mod tests {
     fn graph_ptr_frees_on_queue_teardown() {
         use super::super::rt::{GraphPtr, RtClip, RtClipData, RtGraph, RtTrack};
         let data = Arc::new(RtClipData { channels: 1, data: vec![0.0; 16] });
-        let graph = Box::new(RtGraph::new(vec![RtTrack::clips(
-            0,
-            vec![RtClip {
-                start: 0,
-                offset: 0,
-                len: 16,
-                gain: 1.0,
-                fade_in: 0,
-                fade_out: 0,
-                samples: data.clone(),
-            }],
-        )]));
+        let graph = Box::new(RtGraph::new(
+            vec![RtTrack::clips(
+                0,
+                vec![RtClip {
+                    start: 0,
+                    offset: 0,
+                    len: 16,
+                    gain: 1.0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    samples: data.clone(),
+                }],
+            )],
+            1,
+            Arc::new(ParamTable::default()),
+        ));
         assert_eq!(Arc::strong_count(&data), 2);
         let (mut tx, rx) = rtrb::RingBuffer::new(4);
         tx.push(GraphPtr::new(graph)).ok().unwrap();
@@ -1318,6 +1645,74 @@ mod tests {
             Arc::strong_count(&data),
             1,
             "graph queued at teardown was freed, not leaked"
+        );
+    }
+
+    /// Round-2 §2.4 / O-13 regression pin: a retired graph renders against
+    /// ITS OWN params, never a newer generation's — proving the alias
+    /// window is dead by construction. Written directly against the Step 4
+    /// implementation (there is no old "shared single ParamTable" code path
+    /// left in this tree to fail against; that design was deleted in this
+    /// same task), so this is a permanent pin rather than a red-then-green
+    /// TDD cycle — acceptable per the brief's note on Step 5.
+    ///
+    /// gen1 has one track on slot 0 with gain 0.5; gen2 has a DIFFERENT
+    /// track on the SAME slot 0 with gain 0.9. Both graphs carry a DC clip
+    /// (all samples 1.0) so gain is directly readable off the output peak.
+    /// `OutputCb::render` adopts a queued graph at the TOP of `render`, so
+    /// pushing gen2 only AFTER a render call means "the NEXT render adopts
+    /// it" — the test controls the queue, so the ordering is fully
+    /// deterministic, not a race.
+    #[test]
+    fn retired_graph_keeps_its_own_params_no_slot_aliasing() {
+        let dc = Arc::new(RtClipData { channels: 1, data: vec![1.0; 16] });
+        let dc_clip = || RtClip {
+            start: 0,
+            offset: 0,
+            len: 16,
+            gain: 1.0,
+            fade_in: 0,
+            fade_out: 0,
+            samples: dc.clone(),
+        };
+
+        let p1 = Arc::new(ParamTable::default());
+        p1.set_gain_linear(0, 0.5);
+        let g1 = Box::new(RtGraph::new(vec![RtTrack::clips(0, vec![dc_clip()])], 1, p1));
+
+        let p2 = Arc::new(ParamTable::default());
+        p2.set_gain_linear(0, 0.9);
+        let g2 = Box::new(RtGraph::new(vec![RtTrack::clips(0, vec![dc_clip()])], 2, p2));
+
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        shared.playing.store(true, Relaxed);
+
+        // Center pan (default) on both channels: peak = gain * 1/sqrt(2).
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2;
+        let mut out = vec![0.0f32; 4 * 2]; // 4 frames, stereo
+
+        // Adopt g1 (queued before this render).
+        graph_tx.push(GraphPtr::new(g1)).unwrap();
+        cb.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!((peak - 0.5 * K).abs() < 1e-5, "gen1's own gain (0.5), got {peak}");
+
+        // gen2 is NOT queued yet: this render must still read gen1's table.
+        cb.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - 0.5 * K).abs() < 1e-5,
+            "still gen1's gain while gen2 sits unqueued, got {peak}"
+        );
+
+        // Queue gen2 now: the NEXT render adopts it.
+        graph_tx.push(GraphPtr::new(g2)).unwrap();
+        cb.render(&mut out);
+        let peak = out.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(
+            (peak - 0.9 * K).abs() < 1e-5,
+            "gen2's own gain (0.9) after adoption — no aliasing, got {peak}"
         );
     }
 
@@ -1344,6 +1739,232 @@ mod tests {
         assert!((s[0] - (32767.0 / 32768.0)).abs() < 1e-4);
         assert!((s[1] + 1.0).abs() < 1e-6);
         assert_eq!(s[2], 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- source-keyed decode cache policy (round-2 §2.2) -------------------
+
+    use crate::audio::types::testutil::test_clip;
+
+    #[test]
+    fn cache_is_shared_per_source_and_invalidates_on_path_change() {
+        let mut cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        let sid = SourceId::from("s-1");
+        let c1 = { let mut c = test_clip("c-1", "t-1"); c.source_id = sid.clone(); c };
+        let c2 = { let mut c = test_clip("c-2", "t-1"); c.source_id = sid.clone(); c };
+        // Two clips, one source: exactly ONE decode wanted.
+        assert_eq!(stale_sources(&[c1.clone(), c2.clone()], &cache).len(), 1);
+        cache.insert(sid.clone(), CachedSource {
+            source_path: c1.source_path.clone(),
+            data: Arc::new(RtClipData { channels: 2, data: vec![0.0; 4] }),
+        });
+        // Cached and unchanged: nothing to do.
+        assert!(stale_sources(&[c1.clone(), c2.clone()], &cache).is_empty());
+        // source_path changes under the SAME source id: re-decode (staleness).
+        let mut c1b = c1.clone();
+        c1b.source_path = "audio/replaced.wav".into();
+        assert_eq!(stale_sources(&[c1b], &cache).len(), 1);
+    }
+
+    #[test]
+    fn stale_sources_skips_empty_source_id_clips() {
+        let cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        // Default SourceId is the empty-string sentinel. Finding 5: this IS
+        // reachable in production (legacy absolute/`..` source_paths that
+        // `assign_source_ids` deliberately leaves unassigned on load) — the
+        // old `debug_assert!(false)` here used to panic the engine control
+        // thread on opening such a project. The fix is warn+skip only: the
+        // clip is silently muted (never crosses into `stale_sources`'
+        // output), everything else proceeds normally.
+        let c = test_clip("c-1", "t-1");
+        let other = { let mut o = test_clip("c-2", "t-1"); o.source_id = SourceId::from("s-2"); o };
+        assert!(c.source_id.as_str().is_empty());
+        let todo = stale_sources(&[c, other], &cache);
+        assert_eq!(todo.len(), 1, "the empty-source-id clip is skipped, not panicked on");
+        assert_eq!(todo[0].0, SourceId::from("s-2"), "the other clip is still processed normally");
+    }
+
+    #[test]
+    fn stale_sources_conflicting_paths_warn_and_take_the_latest() {
+        let cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        let sid = SourceId::from("s-conflict");
+        let c1 = { let mut c = test_clip("c-1", "t-1"); c.source_id = sid.clone(); c.source_path = "audio/a.wav".into(); c };
+        let c2 = { let mut c = test_clip("c-2", "t-1"); c.source_id = sid.clone(); c.source_path = "audio/b.wav".into(); c };
+        let todo = stale_sources(&[c1, c2], &cache);
+        assert_eq!(todo.len(), 1, "one source, one decode — never two entries for the same id");
+        assert_eq!(todo[0].0, sid);
+        assert_eq!(todo[0].1, "audio/b.wav", "the LAST conflicting path wins the re-decode");
+    }
+
+    #[test]
+    fn stale_sources_dedupes_and_preserves_first_seen_order() {
+        let cache: HashMap<SourceId, CachedSource> = HashMap::new();
+        let s1 = SourceId::from("s-1");
+        let s2 = SourceId::from("s-2");
+        let c1 = { let mut c = test_clip("c-1", "t-1"); c.source_id = s1.clone(); c.source_path = "audio/1.wav".into(); c };
+        let c2 = { let mut c = test_clip("c-2", "t-1"); c.source_id = s2.clone(); c.source_path = "audio/2.wav".into(); c };
+        let c3 = { let mut c = test_clip("c-3", "t-1"); c.source_id = s1.clone(); c.source_path = "audio/1.wav".into(); c };
+        let todo = stale_sources(&[c1, c2, c3], &cache);
+        assert_eq!(todo.iter().map(|(sid, _)| sid.clone()).collect::<Vec<_>>(), vec![s1, s2]);
+    }
+
+    /// Reviewer finding 2 regression test, end-to-end through a real
+    /// control thread: a SECOND clip added later, sharing an
+    /// ALREADY-cached source with an earlier clip, must still get its own
+    /// waveform pyramid built. The bug was that pyramid-building lived
+    /// nested inside the decode loop, so it only ran for sources
+    /// `stale_sources` returned as needing a fresh decode — a clip whose
+    /// source was already cached never got its `waveform_cache_dir`
+    /// checked at all.
+    #[test]
+    fn ensure_loaded_builds_pyramids_for_clips_sharing_an_already_cached_source() {
+        let dir = std::env::temp_dir().join(format!(
+            "aura-eng-pyramid-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("audio/x.wav"), spec).unwrap();
+        for i in 0..480 {
+            w.write_sample((i as f32 / 48.0).sin()).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let (handle, _shared, _tables, session) = spin_up();
+        let sid = SourceId::mint();
+        {
+            let mut session = session.lock();
+            let s = &mut session.store;
+            s.project_dir = Some(dir.clone());
+            s.tracks.push(super::super::types::TrackState {
+                id: "t1".into(),
+                name: "T1".into(),
+                kind: "audio".into(),
+                gain_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                soloed: false,
+                armed: false,
+                color: "#7c9cff".into(),
+                instrument_id: None,
+            });
+            let mut c1 = test_clip("c1", "t1");
+            c1.source_id = sid.clone();
+            s.clips.push(c1);
+        }
+        handle.send(ControlMsg::Rebuild);
+
+        let cdir1 = Store::cache_dir_for(&dir, "c1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pyramid_exists(&cdir1) {
+            assert!(std::time::Instant::now() < deadline, "clip c1's pyramid never built");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // A SECOND clip, added AFTER the first rebuild, sharing the SAME
+        // (already-cached) source.
+        {
+            let mut session = session.lock();
+            let mut c2 = test_clip("c2", "t1");
+            c2.source_id = sid.clone();
+            session.store.clips.push(c2);
+        }
+        handle.send(ControlMsg::Rebuild);
+
+        let cdir2 = Store::cache_dir_for(&dir, "c2");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pyramid_exists(&cdir2) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "clip c2's pyramid never built (finding 2 regression: source already cached, so \
+                 the old nested pyramid-build loop never visited c2)"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        handle.send(ControlMsg::Shutdown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Finding 6: the missing-pyramid path must build from the source
+    /// file's RAW samples, not the engine-rate-RESAMPLED decode cache — the
+    /// AWTF/pyramid protocol bins in SOURCE samples (waveform.rs doc: "LOD n
+    /// bins cover 2^(8+n) SOURCE samples"). This project's source file is
+    /// 24 kHz while `spin_up`'s engine defaults to 48 kHz (`SharedRt`'s
+    /// default `sample_rate`), i.e. exactly a 2x resample ratio: 2560 raw
+    /// source samples make exactly 10 lod-0 bins (2560 / 256); the same
+    /// audio resampled to 48 kHz would be ~5120 samples -> 20 bins. Reading
+    /// back the written pyramid and asserting 10 (not 20) bins pins the fix.
+    #[test]
+    fn ensure_loaded_builds_pyramids_from_source_rate_not_resampled_cache() {
+        const FILE_RATE: u32 = 24_000; // != the engine's default 48 kHz
+        const N_SAMPLES: usize = 2_560; // exactly 10 lod-0 bins (2560 / 256)
+        let dir = std::env::temp_dir().join(format!(
+            "aura-eng-pyramid-rate-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: FILE_RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("audio/x.wav"), spec).unwrap();
+        for i in 0..N_SAMPLES {
+            w.write_sample(((i as f32) * 0.01).sin()).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let (handle, _shared, _tables, session) = spin_up();
+        let sid = SourceId::mint();
+        {
+            let mut session = session.lock();
+            let s = &mut session.store;
+            s.project_dir = Some(dir.clone());
+            s.tracks.push(super::super::types::TrackState {
+                id: "t1".into(),
+                name: "T1".into(),
+                kind: "audio".into(),
+                gain_db: 0.0,
+                pan: 0.0,
+                muted: false,
+                soloed: false,
+                armed: false,
+                color: "#7c9cff".into(),
+                instrument_id: None,
+            });
+            let mut c1 = test_clip("c1", "t1");
+            c1.source_id = sid.clone();
+            s.clips.push(c1);
+        }
+        handle.send(ControlMsg::Rebuild);
+
+        let cdir1 = Store::cache_dir_for(&dir, "c1");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !pyramid_exists(&cdir1) {
+            assert!(std::time::Instant::now() < deadline, "clip c1's pyramid never built");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let (_channels, bins) = crate::audio::waveform::read_tile(&cdir1, 0, 0)
+            .unwrap()
+            .expect("lod0 tile must exist");
+        assert_eq!(
+            bins.len(),
+            10,
+            "pyramid must be built from the 2560 SOURCE samples (10 bins), not the \
+             engine-rate-resampled ~5120 samples (which would give 20)"
+        );
+
+        handle.send(ControlMsg::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

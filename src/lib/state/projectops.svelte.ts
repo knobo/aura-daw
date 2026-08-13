@@ -8,6 +8,7 @@
  */
 
 import { backend } from "../tauri";
+import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { midi } from "./midi.svelte";
 import { project } from "./project.svelte";
 import { toasts } from "./toasts.svelte";
@@ -56,21 +57,30 @@ class ProjectOpsStore {
     return project.tracks.length > 0 || midi.clips.length > 0;
   }
 
-  async save() {
-    if (this.demoOnly()) return;
+  /**
+   * Returns true only on an actually-completed save — false both on
+   * failure and when there was no open project to save (diverted to the
+   * Save As dialog instead). Finding 3: `proceedConfirmed` needs this to
+   * tell a real save from a failed one before it lets a pending New/Open
+   * destroy the unsaved session.
+   */
+  async save(): Promise<boolean> {
+    if (this.demoOnly()) return false;
     if (!project.projectDir) {
       this.dialog = {
         mode: "saveAs",
         name: project.name,
         parentDir: await this.defaultParentDir(),
       };
-      return;
+      return false;
     }
     try {
       await backend.saveProject();
       toasts.success("PROJECT SAVED", project.projectDir);
+      return true;
     } catch (err) {
       toasts.error("SAVE FAILED", String(err));
+      return false;
     }
   }
 
@@ -91,10 +101,13 @@ class ProjectOpsStore {
     const action = this.confirm;
     this.confirm = null;
     if (saveFirst) {
-      await this.save();
-      // Unsaved session: save() turned into a Save As dialog instead —
-      // let the user finish that; they can redo the action afterwards.
-      if (!project.projectDir) return;
+      const saved = await this.save();
+      // Finding 3: save() may have FAILED (already toasted "SAVE FAILED"
+      // above) or diverted to the Save As dialog (unsaved session) — either
+      // way there is no guarantee the session is safely on disk, so the
+      // pending New/Open must not proceed and destroy it. Let the user
+      // retry the save (or finish the dialog) and redo the action after.
+      if (!saved) return;
     }
     if (action === "new") await this.openNewDialog();
     else if (action === "open") await this.openViaPicker();
@@ -147,6 +160,11 @@ class ProjectOpsStore {
 
   /** Re-pull the full snapshot; `project://changed` alone leaves projectDir stale. */
   private async adopt() {
+    // Finding 8: drop any loop-while-editing state from the OLD project
+    // BEFORE pulling the new one in — a non-replaying reset (never
+    // `exit()`, which would replay the old snapshot's loop/solo writes onto
+    // whatever project just got adopted).
+    clipEditLoop.reset();
     await project.reload();
     await midi.init();
   }

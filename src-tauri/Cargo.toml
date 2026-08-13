@@ -73,10 +73,14 @@ walkdir = "2"      # CLAP search-path scanning
 rand = "0.9"           # MCP session-token generation (crypto-seeded via OsRng/StdRng)
 thiserror = "2"
 log = "0.4"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 byteorder = "1"
+
+[dev-dependencies]
+# Property-test gate (round-2 §7 tests 1/3/5): src-tauri/tests/channel_properties.rs.
+proptest = "1"
 
 [profile.dev]
 # Audio DSP is unusable at opt-level 0; keep deps optimized even in dev.

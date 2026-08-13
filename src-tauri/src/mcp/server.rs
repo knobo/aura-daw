@@ -556,27 +556,31 @@ mod tests {
     }
 
     fn test_control() -> Arc<ControlPlane> {
-        let store = Arc::new(Mutex::new(crate::audio::types::Store::default()));
+        let session = Arc::new(Mutex::new(crate::control::Session::new(
+            crate::audio::types::Store::default(),
+            crate::midi::MidiStore::default(),
+        )));
         let shared_rt = Arc::new(crate::audio::rt::SharedRt::default());
-        let params = Arc::new(crate::audio::rt::ParamTable::default());
+        // A fresh, empty SharedGraphTables (gen 0, no tracks) — must be
+        // handed to BOTH `engine::start` and `ControlPlane::new` as the
+        // SAME `Arc` (round-2 §2.4).
+        let tables = crate::audio::rt::testutil::empty_tables();
         let engine = crate::audio::engine::start(
             shared_rt.clone(),
-            params.clone(),
-            store.clone(),
+            tables.clone(),
+            session.clone(),
             Box::new(NullSink),
         );
         let jobs = Arc::new(crate::sidecars::jobs::JobManager::new(
             2,
             Duration::from_millis(50),
         ));
-        let midi = Arc::new(Mutex::new(crate::midi::MidiStore::default()));
         Arc::new(ControlPlane::new(
-            store,
+            session,
             shared_rt,
-            params,
+            tables,
             engine,
             jobs,
-            midi,
             Box::new(|_, _| {}),
         ))
     }

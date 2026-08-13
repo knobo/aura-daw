@@ -24,6 +24,11 @@
       "description": "Audio file path RELATIVE to the .aura project directory, POSIX separators (e.g. \"audio/3f2a....wav\" or \"stems/<clipId>/vocals.wav\").",
       "type": "string"
     },
+    "sourceId": {
+      "description": "Decode-cache/asset identity (round-2 §2.2): one sourceId names exactly one sourcePath. Empty string = unassigned (a legacy clip before the load-time fixup mints one deterministically). Additive (D-06); not required so pre-existing writers/readers stay valid.",
+      "type": "string",
+      "default": ""
+    },
     "sourceChannels": {
       "description": "Channel count of the source file (1 = mono, 2 = stereo).",
       "type": "integer",
