@@ -316,10 +316,10 @@ pub async fn plugin_instantiate(
     audio: State<'_, crate::audio::AudioState>,
 ) -> Result<PluginInstanceInfo, String> {
     let registry = state.registry.clone();
-    let (store, _, _) = audio.control_parts();
+    let (session, _, _) = audio.control_parts();
     tauri::async_runtime::spawn_blocking(move || {
         let info = instantiate_and_activate(&registry, &uid)?;
-        state::persist_after_mutation(&store, &registry, true);
+        state::persist_after_mutation(&session, &registry, true);
         Ok(info)
     })
     .await
@@ -346,8 +346,8 @@ pub fn plugin_remove(
         }
     }
     // Auto-persist (zone P4): drops the row and GCs the instance's blob.
-    let (store, _, _) = audio.control_parts();
-    state::persist_after_mutation(&store, &state.registry, true);
+    let (session, _, _) = audio.control_parts();
+    state::persist_after_mutation(&session, &state.registry, true);
     Ok(info)
 }
 
@@ -422,8 +422,8 @@ pub fn plugin_set_param(
     let updated = set_params_and_forward(&state.registry, &instance_id, &changes)?;
     // Auto-persist the param snapshot (zone P4). `with_host_state: false` —
     // a knob drag must not round-trip the plugin main thread per rAF batch.
-    let (store, _, _) = audio.control_parts();
-    state::persist_after_mutation(&store, &state.registry, false);
+    let (session, _, _) = audio.control_parts();
+    state::persist_after_mutation(&session, &state.registry, false);
     Ok(updated)
 }
 

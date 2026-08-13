@@ -32,6 +32,7 @@ use super::transport;
 use super::types::{Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use super::project;
+use crate::control::Session;
 
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
@@ -112,7 +113,7 @@ impl EngineHandle {
 pub fn start(
     shared: Arc<SharedRt>,
     params: Arc<ParamTable>,
-    store: Arc<Mutex<Store>>,
+    session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
 ) -> EngineHandle {
     let (tx, rx) = unbounded();
@@ -122,7 +123,7 @@ pub fn start(
             let mut ctl = Control {
                 shared,
                 params,
-                store,
+                session,
                 events,
                 rx,
                 output: None,
@@ -365,7 +366,7 @@ impl InputCb {
 struct Control {
     shared: Arc<SharedRt>,
     params: Arc<ParamTable>,
-    store: Arc<Mutex<Store>>,
+    session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
     rx: Receiver<ControlMsg>,
     output: Option<OutputBundle>,
@@ -513,8 +514,8 @@ impl Control {
         });
         self.shared.sample_rate.store(rate, Relaxed);
         {
-            let mut store = self.store.lock();
-            store.transport.sample_rate = rate;
+            let mut session = self.session.lock();
+            session.store.transport.sample_rate = rate;
         }
         if self.cache_rate != rate {
             self.cache.clear();
@@ -539,7 +540,8 @@ impl Control {
             drop(gp);
         }
         let graph = {
-            let store = self.store.lock();
+            let session = self.session.lock();
+            let store = &session.store;
             let mut tracks = Vec::with_capacity(store.tracks.len());
             for t in &store.tracks {
                 let Some(&slot) = store.slots.get(&t.id) else { continue };
@@ -571,9 +573,14 @@ impl Control {
             // slices sample-offset events). Nodes come from `live_nodes` so
             // voice/plugin state SURVIVES rebuilds; brand-new nodes are
             // prepared before the snapshot is published (RCU discipline).
-            crate::midi::playback::append_midi_tracks(
-                &store,
+            // Store and midi share one guard now, so this reads `session.midi`
+            // directly instead of re-locking through the registered global.
+            let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
+            crate::midi::playback::append_from(
+                &session.midi,
+                store,
                 self.cache_rate,
+                bank.as_deref(),
                 &mut self.live_nodes,
                 &mut tracks,
             );
@@ -603,7 +610,8 @@ impl Control {
             self.cache_rate = rate;
         }
         let todo: Vec<(String, PathBuf, PathBuf)> = {
-            let store = self.store.lock();
+            let session = self.session.lock();
+            let store = &session.store;
             store
                 .clips
                 .iter()
@@ -619,7 +627,7 @@ impl Control {
         };
         // Retain only clips that still exist.
         let live: std::collections::HashSet<String> =
-            self.store.lock().clips.iter().map(|c| c.id.clone()).collect();
+            self.session.lock().store.clips.iter().map(|c| c.id.clone()).collect();
         self.cache.retain(|id, _| live.contains(id));
 
         for (clip_id, path, cache_dir) in todo {
@@ -670,7 +678,7 @@ impl Control {
             return;
         }
         self.last_frame = Instant::now();
-        let tracks = self.store.lock().track_slots();
+        let tracks = self.session.lock().store.track_slots();
         let position = self.shared.position.load(Relaxed);
         let frame = self.accum.take_frame(0, &tracks, position);
         self.sinks.retain_mut(|(sink, seq)| {
@@ -755,10 +763,10 @@ impl Control {
         self.shared.playing.store(false, Relaxed);
         self.shared.position.store(at, Relaxed);
         let snap = {
-            let mut store = self.store.lock();
-            store.transport.state = "stopped".into();
-            store.transport.position_samples = at;
-            crate::control::ops::transport_snapshot(&store, &self.shared)
+            let mut session = self.session.lock();
+            session.store.transport.state = "stopped".into();
+            session.store.transport.position_samples = at;
+            crate::control::ops::transport_snapshot(&session.store, &self.shared)
         };
         if let Ok(v) = serde_json::to_value(&snap) {
             self.events.emit("transport://state", v);
@@ -774,7 +782,8 @@ impl Control {
 
         // Resolve target tracks (explicit list or armed flags).
         let targets: Vec<String> = {
-            let store = self.store.lock();
+            let session = self.session.lock();
+            let store = &session.store;
             match track_ids {
                 Some(ids) => {
                     for id in &ids {
@@ -819,7 +828,8 @@ impl Control {
 
         // Rings + writer specs.
         let (project_dir, take_no, slots) = {
-            let store = self.store.lock();
+            let session = self.session.lock();
+            let store = &session.store;
             let dir = store.project_dir.clone().ok_or("no project open")?;
             let slots: Vec<usize> = targets
                 .iter()
@@ -877,8 +887,8 @@ impl Control {
         self.shared.recording.store(true, Relaxed);
         self.shared.playing.store(true, Relaxed);
         {
-            let mut store = self.store.lock();
-            store.transport.state = "recording".into();
+            let mut session = self.session.lock();
+            session.store.transport.state = "recording".into();
         }
         self.events.emit(
             "recording://state",
@@ -909,9 +919,9 @@ impl Control {
         self.shared.playing.store(false, Relaxed);
         let track_ids = std::mem::take(&mut self.rec_track_ids);
         {
-            let mut store = self.store.lock();
-            store.transport.state = "stopped".into();
-            store.clips.extend(clips.iter().cloned());
+            let mut session = self.session.lock();
+            session.store.transport.state = "stopped".into();
+            session.store.clips.extend(clips.iter().cloned());
         }
         self.rebuild();
         self.events.emit(
@@ -925,14 +935,14 @@ impl Control {
         );
         // Persist the take into project.json right away.
         let snapshot = {
-            let store = self.store.lock();
+            let session = self.session.lock();
             project::from_store(
-                &store,
+                &session.store,
                 self.shared.position.load(Relaxed),
                 self.engine_rate(),
             )
             .ok()
-            .map(|p| (store.project_dir.clone().unwrap(), p))
+            .map(|p| (session.store.project_dir.clone().unwrap(), p))
         };
         if let Some((dir, p)) = snapshot {
             if let Err(e) = project::save(&dir, &p) {
@@ -944,7 +954,7 @@ impl Control {
 
     /// Auto-create a default project when recording starts with none open.
     fn ensure_project(&mut self) -> Result<(), String> {
-        if self.store.lock().project_dir.is_some() {
+        if self.session.lock().store.project_dir.is_some() {
             return Ok(());
         }
         let parent = dirs::audio_dir()
@@ -961,10 +971,10 @@ impl Control {
         let (project, dir) =
             project::create(&parent, &name, self.engine_rate(), 120.0)?;
         {
-            let mut store = self.store.lock();
-            store.project_dir = Some(dir);
-            store.project_name = Some(project.name.clone());
-            store.created_at = project.created_at.clone();
+            let mut session = self.session.lock();
+            session.store.project_dir = Some(dir);
+            session.store.project_name = Some(project.name.clone());
+            session.store.created_at = project.created_at.clone();
         }
         self.events.emit(
             "project://changed",
@@ -1114,26 +1124,27 @@ mod tests {
         assert_eq!(shared.position.load(Relaxed), 8 * 128);
     }
 
-    fn spin_up() -> (EngineHandle, Arc<SharedRt>, Arc<ParamTable>, Arc<Mutex<Store>>) {
+    fn spin_up() -> (EngineHandle, Arc<SharedRt>, Arc<ParamTable>, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
         let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
         let handle = start(
             shared.clone(),
             params.clone(),
-            store.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
-        (handle, shared, params, store)
+        (handle, shared, params, session)
     }
 
     /// Runs with or without a real audio device: the engine falls back to
     /// headless mode, so meter frames must flow either way.
     #[test]
     fn engine_pumps_meter_frames_at_60hz() {
-        let (handle, _shared, _params, store) = spin_up();
+        let (handle, _shared, _params, session) = spin_up();
         {
-            let mut s = store.lock();
+            let mut session = session.lock();
+            let s = &mut session.store;
             let slot = s.alloc_slot("t1").unwrap();
             assert_eq!(slot, 0);
             s.tracks.push(super::super::types::TrackState {

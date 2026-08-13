@@ -14,10 +14,12 @@
 //! STATE (voices, plugin instances) survives graph swaps because successive
 //! snapshots share the node cell through [`LiveNodeRegistry`].
 //!
-//! `engine.rs::rebuild` calls [`append_midi_tracks`]; everything else lives
-//! here. The engine reaches the midi store through a process-global
-//! registered by `MidiState::shared()` during app setup (lib.rs) so no
-//! frozen signatures change.
+//! `engine.rs::rebuild` holds the session lock directly (store + midi behind
+//! one guard) and calls [`append_from`] with both fields; everything else
+//! lives here. Cross-cutting callers that don't already hold a session
+//! handle (e.g. [`super::notify_project_opened`]) reach it through a
+//! process-global registered by `MidiState::shared()` during app setup
+//! (lib.rs) so no frozen signatures change.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -29,6 +31,7 @@ use crate::audio::rt::{LiveNodeCell, LiveSource, RtTrack, MAX_LIVE_BLOCK};
 use crate::audio::sampler::SamplerBank;
 use crate::audio::sampler_engine::SamplerNode;
 use crate::audio::types::{Store, TrackState};
+use crate::control::Session;
 
 use super::schedule::{self, AbsNoteEvent};
 use super::synth::PolySynth;
@@ -37,18 +40,20 @@ use super::MidiStore;
 
 use crate::audio::dsp::AudioProcessor;
 
-static PLAYBACK_STORE: OnceLock<Arc<Mutex<MidiStore>>> = OnceLock::new();
+static PLAYBACK_SESSION: OnceLock<Arc<Mutex<Session>>> = OnceLock::new();
 
-/// Register the app's midi store for engine rebuilds. Called (indirectly)
-/// once from lib.rs setup via `MidiState::shared()`. First registration wins;
-/// tests use [`append_from`] directly and never touch the global.
-pub fn register_store(store: Arc<Mutex<MidiStore>>) {
-    let _ = PLAYBACK_STORE.set(store);
+/// Register the app's session for cross-cutting reaches (e.g. midi resync
+/// on project open) that run outside the engine's own held lock. Called
+/// (indirectly) once from lib.rs setup via `MidiState::shared()`. First
+/// registration wins; tests use [`append_from`] directly and never touch
+/// the global.
+pub fn register_store(session: Arc<Mutex<Session>>) {
+    let _ = PLAYBACK_SESSION.set(session);
 }
 
-/// The registered app-wide midi store, if any (None in unit tests).
-pub fn registered_store() -> Option<&'static Arc<Mutex<MidiStore>>> {
-    PLAYBACK_STORE.get()
+/// The registered app-wide session, if any (None in unit tests).
+pub fn registered_store() -> Option<&'static Arc<Mutex<Session>>> {
+    PLAYBACK_SESSION.get()
 }
 
 // ---------------------------------------------------------------------------
@@ -111,24 +116,11 @@ impl LiveNodeRegistry {
 // Engine hook
 // ---------------------------------------------------------------------------
 
-/// ENGINE HOOK (called from `audio::engine::Control::rebuild` with the store
-/// lock held, on the engine control thread — never the RT thread). Appends
-/// one live `RtTrack` per audible midi track. No-op until the store is
-/// registered.
-pub fn append_midi_tracks(
-    store: &Store,
-    rate: u32,
-    nodes: &mut LiveNodeRegistry,
-    out: &mut Vec<RtTrack>,
-) {
-    let Some(midi) = PLAYBACK_STORE.get() else { return };
-    let midi = midi.lock();
-    let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-    append_from(&midi, store, rate, bank.as_deref(), nodes, out);
-}
-
-/// Testable core of [`append_midi_tracks`]. `bank` = None means "no sampler
-/// instruments available" (instrument-bound tracks fall back to PolySynth).
+/// Core of the engine's `rebuild` live-track step (called from
+/// `audio::engine::Control::rebuild` with the session lock held, on the
+/// engine control thread — never the RT thread). Appends one live `RtTrack`
+/// per audible midi track. `bank` = None means "no sampler instruments
+/// available" (instrument-bound tracks fall back to PolySynth).
 pub fn append_from(
     midi: &MidiStore,
     store: &Store,

@@ -36,7 +36,7 @@ pub mod tempo;
 pub mod types;
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -44,6 +44,7 @@ use tauri::State;
 
 use crate::audio::engine::ControlMsg;
 use crate::audio::AudioState;
+use crate::control::Session;
 
 pub use tempo::TempoMap;
 pub use types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
@@ -52,9 +53,12 @@ pub use types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
 // Shared state (constructed with Default and `.manage()`d by lib.rs)
 // ---------------------------------------------------------------------------
 
-/// In-memory MIDI store. lib.rs relies only on the type name and `Default`.
+/// In-memory MIDI store handle. lib.rs relies only on the type name and
+/// `Default` construction; the session itself is wired in during setup (see
+/// [`MidiState::shared`]) once `AudioState` has built it — same pattern as
+/// `AudioState`'s own `OnceLock<EngineHandle>`.
 pub struct MidiState {
-    inner: Arc<Mutex<MidiStore>>,
+    session: OnceLock<Arc<Mutex<Session>>>,
 }
 
 #[derive(Debug)]
@@ -79,18 +83,26 @@ impl Default for MidiStore {
 
 impl Default for MidiState {
     fn default() -> Self {
-        Self { inner: Arc::new(Mutex::new(MidiStore::default())) }
+        Self { session: OnceLock::new() }
     }
 }
 
 impl MidiState {
-    /// Shared handle for the control plane (ARCHITECTURE §11): MCP's
-    /// `get_project_state` includes MIDI clips + tempo map. Also registers
-    /// the store with the engine-rebuild hook (playback integration) — lib.rs
-    /// calls this exactly once during setup.
-    pub fn shared(&self) -> Arc<Mutex<MidiStore>> {
-        playback::register_store(Arc::clone(&self.inner));
-        Arc::clone(&self.inner)
+    /// Wire the shared session (ARCHITECTURE §11 — store + midi behind one
+    /// lock) into this managed state and register it with the
+    /// engine-rebuild hook (playback integration) — lib.rs calls this
+    /// exactly once during setup, right after `AudioState` builds the
+    /// session.
+    pub fn shared(&self, session: Arc<Mutex<Session>>) -> Arc<Mutex<Session>> {
+        let _ = self.session.set(session.clone());
+        playback::register_store(session.clone());
+        session
+    }
+
+    fn session(&self) -> &Arc<Mutex<Session>> {
+        self.session
+            .get()
+            .expect("MidiState::shared must run during setup before any command")
     }
 }
 
@@ -144,40 +156,37 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
 /// lazily resyncs, so only `get_project_state` served BEFORE the first midi
 /// command can observe stale midi fields after an open.
 pub fn notify_project_opened(dir: Option<PathBuf>, fallback_bpm: f64) {
-    if let Some(store) = playback::registered_store() {
-        sync_midi_store(&mut store.lock(), &dir, fallback_bpm);
+    if let Some(session) = playback::registered_store() {
+        sync_midi_store(&mut session.lock().midi, &dir, fallback_bpm);
     }
 }
 
 /// Run `f` against the midi store, synced with the open project (see
 /// [`sync_midi_store`]). After a mutating `f`, persist into the project
 /// (when one is open) and ask the engine for a graph rebuild (STRUCTURAL
-/// change, §10.1).
+/// change, §10.1). One session guard covers the whole block — store and
+/// midi live behind the same lock.
 fn with_synced_store<R>(
     audio: &AudioState,
     state: &MidiState,
     mutating: bool,
     f: impl FnOnce(&mut MidiStore) -> Result<R, String>,
 ) -> Result<R, String> {
-    let (store, _shared, _params) = audio.control_parts();
-    let (dir, bpm) = {
-        let s = store.lock();
-        (s.project_dir.clone(), s.transport.tempo_bpm)
-    };
+    let mut session = state.session().lock();
+    let (dir, bpm) = (session.store.project_dir.clone(), session.store.transport.tempo_bpm);
 
-    let mut midi = state.inner.lock();
-    sync_midi_store(&mut midi, &dir, bpm);
+    sync_midi_store(&mut session.midi, &dir, bpm);
 
-    let result = f(&mut midi)?;
+    let result = f(&mut session.midi)?;
 
     if mutating {
         if let Some(d) = &dir {
-            if let Err(e) = persist::save_into_project(d, &midi) {
+            if let Err(e) = persist::save_into_project(d, &session.midi) {
                 log::warn!("midi: persisting to {} failed: {e}", d.display());
             }
         }
     }
-    drop(midi);
+    drop(session);
     if mutating {
         if let Some(engine) = audio.engine_handle() {
             engine.send(ControlMsg::Rebuild);
@@ -209,8 +218,8 @@ pub fn set_tempo_map(
         Ok(TempoMapState { ppq, events: events.clone() })
     })?;
     // Legacy single-tempo field follows the map (project-v2 invariant).
-    let (store, _, _) = audio.control_parts();
-    store.lock().transport.tempo_bpm = result.events[0].bpm;
+    let (session, _, _) = audio.control_parts();
+    session.lock().store.transport.tempo_bpm = result.events[0].bpm;
     Ok(result)
 }
 
@@ -230,9 +239,10 @@ pub fn midi_add_clip(
     }
     {
         // Validate against the control-plane store (ARCHITECTURE §11).
-        let (store, _, _) = audio.control_parts();
-        let store = store.lock();
-        let track = store
+        let (session, _, _) = audio.control_parts();
+        let session = session.lock();
+        let track = session
+            .store
             .tracks
             .iter()
             .find(|t| t.id == track_id)
@@ -314,30 +324,28 @@ pub fn midi_import_file(
     }
     let bytes = std::fs::read(p).map_err(|e| format!("read {path}: {e}"))?;
 
-    let (store, _shared, params) = audio.control_parts();
-    let (dir, bpm) = {
-        let s = store.lock();
-        (s.project_dir.clone(), s.transport.tempo_bpm)
-    };
+    let (session, _shared, params) = audio.control_parts();
     let ppq = {
-        let mut midi = state.inner.lock();
-        sync_midi_store(&mut midi, &dir, bpm);
-        midi.ppq
+        let mut s = session.lock();
+        let dir = s.store.project_dir.clone();
+        let bpm = s.store.transport.tempo_bpm;
+        sync_midi_store(&mut s.midi, &dir, bpm);
+        s.midi.ppq
     };
     let imported = midifile::import_smf(&bytes, ppq)?;
     if imported.clips.is_empty() {
         return Err("MIDI file contains no note-carrying tracks".into());
     }
 
-    // Resolve/assign target tracks (audio store lock; the midi lock is NOT
-    // held here — same store->midi ordering as everywhere else).
+    // Resolve/assign target tracks.
     let start = at_ticks.unwrap_or(0);
     let mut clips = imported.clips.clone();
     {
-        let mut s = store.lock();
+        let mut s = session.lock();
         match &track_id {
             Some(id) => {
                 let track = s
+                    .store
                     .tracks
                     .iter()
                     .find(|t| &t.id == id)
@@ -356,7 +364,7 @@ pub fn midi_import_file(
             None => {
                 for c in &mut clips {
                     let track = crate::control::ops::add_track(
-                        &mut s,
+                        &mut s.store,
                         &params,
                         Some(c.name.clone()),
                         Some("midi".into()),
@@ -381,7 +389,7 @@ pub fn midi_import_file(
     // Legacy single-tempo invariant (see set_tempo_map).
     if imported.explicit_tempo {
         if let Some(bpm0) = first_bpm {
-            store.lock().transport.tempo_bpm = bpm0;
+            session.lock().store.transport.tempo_bpm = bpm0;
         }
     }
     Ok(result)

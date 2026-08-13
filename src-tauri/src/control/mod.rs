@@ -19,6 +19,7 @@ pub mod hum;
 pub mod export;
 pub mod ops;
 pub mod loopjam;
+pub mod session;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -29,12 +30,12 @@ use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
 use crate::audio::rt::{ParamTable, SharedRt};
-use crate::audio::types::{Clip, MeterFrame, Project, Store, TrackState, TransportState};
+use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
-use crate::midi::MidiStore;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
 pub use ops::TrackMixChange;
+pub use session::Session;
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -94,12 +95,11 @@ pub type EventEmitter = Box<dyn Fn(&str, serde_json::Value) + Send + Sync>;
 /// The shared control-plane facade. Managed by Tauri (constructed in setup,
 /// after `audio::init`), and handed as an `Arc` to the MCP server.
 pub struct ControlPlane {
-    store: Arc<Mutex<Store>>,
+    session: Arc<Mutex<Session>>,
     shared: Arc<SharedRt>,
     params: Arc<ParamTable>,
     engine: EngineHandle,
     jobs: Arc<JobManager>,
-    midi: Arc<Mutex<MidiStore>>,
     latest_meters: Arc<Mutex<Option<MeterFrame>>>,
     emit: EventEmitter,
 }
@@ -116,21 +116,19 @@ impl MeterSink for LatestMeterCache {
 }
 
 impl ControlPlane {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        store: Arc<Mutex<Store>>,
+        session: Arc<Mutex<Session>>,
         shared: Arc<SharedRt>,
         params: Arc<ParamTable>,
         engine: EngineHandle,
         jobs: Arc<JobManager>,
-        midi: Arc<Mutex<MidiStore>>,
         emit: EventEmitter,
     ) -> Self {
         let latest_meters = Arc::new(Mutex::new(None));
         engine.send(ControlMsg::Subscribe(Box::new(LatestMeterCache(
             latest_meters.clone(),
         ))));
-        Self { store, shared, params, engine, jobs, midi, latest_meters, emit }
+        Self { session, shared, params, engine, jobs, latest_meters, emit }
     }
 
     fn emit_transport(&self, snap: &TransportState) {
@@ -142,12 +140,13 @@ impl ControlPlane {
     // ---- read side ------------------------------------------------------
 
     pub fn project_state(&self) -> ProjectSnapshot {
-        let store = self.store.lock();
-        let midi = self.midi.lock();
+        let session = self.session.lock();
+        let store = &session.store;
+        let midi = &session.midi;
         ProjectSnapshot {
             project_name: store.project_name.clone(),
             project_dir: store.project_dir.as_ref().map(|p| p.display().to_string()),
-            transport: ops::transport_snapshot(&store, &self.shared),
+            transport: ops::transport_snapshot(store, &self.shared),
             tracks: store.tracks.clone(),
             clips: store.clips.clone(),
             midi_clips: midi.clips.clone(),
@@ -157,7 +156,7 @@ impl ControlPlane {
     }
 
     pub fn transport_state(&self) -> TransportState {
-        ops::transport_snapshot(&self.store.lock(), &self.shared)
+        ops::transport_snapshot(&self.session.lock().store, &self.shared)
     }
 
     /// Latest 60 Hz meter frame (None until the engine has pumped one).
@@ -181,9 +180,9 @@ impl ControlPlane {
         match action {
             TransportAction::Play => {
                 {
-                    let mut s = self.store.lock();
-                    if s.transport.state != "recording" {
-                        s.transport.state = "playing".into();
+                    let mut session = self.session.lock();
+                    if session.store.transport.state != "recording" {
+                        session.store.transport.state = "playing".into();
                     }
                 }
                 self.shared.playing.store(true, Relaxed);
@@ -195,7 +194,7 @@ impl ControlPlane {
                         .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
                 }
                 self.shared.playing.store(false, Relaxed);
-                self.store.lock().transport.state = "stopped".into();
+                self.session.lock().store.transport.state = "stopped".into();
             }
             TransportAction::Seek { position_samples } => {
                 self.shared.position.store(position_samples, Relaxed);
@@ -212,14 +211,14 @@ impl ControlPlane {
                 self.shared.loop_enabled.store(enabled, Relaxed);
                 // ...and the store mirror, so project save persists the
                 // region (project::from_store serializes store.transport).
-                let mut s = self.store.lock();
-                s.transport.loop_enabled = enabled;
-                s.transport.loop_start_samples = start_samples;
-                s.transport.loop_end_samples = end_samples;
+                let mut session = self.session.lock();
+                session.store.transport.loop_enabled = enabled;
+                session.store.transport.loop_start_samples = start_samples;
+                session.store.transport.loop_end_samples = end_samples;
             }
             TransportAction::SetStopAtEnd { enabled } => {
                 self.shared.stop_at_end.store(enabled, Relaxed);
-                self.store.lock().transport.stop_at_end = enabled;
+                self.session.lock().store.transport.stop_at_end = enabled;
             }
         }
         let snap = self.transport_state();
@@ -255,8 +254,8 @@ impl ControlPlane {
         kind: Option<String>,
     ) -> Result<TrackState, String> {
         let track = {
-            let mut s = self.store.lock();
-            ops::add_track(&mut s, &self.params, name, kind)?
+            let mut session = self.session.lock();
+            ops::add_track(&mut session.store, &self.params, name, kind)?
         };
         self.engine.send(ControlMsg::Rebuild);
         Ok(track)
@@ -275,8 +274,8 @@ impl ControlPlane {
         changes: Vec<TrackMixChange>,
     ) -> Result<Vec<TrackState>, String> {
         let updated = {
-            let mut s = self.store.lock();
-            ops::apply_track_mix(&mut s, &self.params, &changes)?
+            let mut session = self.session.lock();
+            ops::apply_track_mix(&mut session.store, &self.params, &changes)?
         };
         self.emit_project_changed();
         Ok(updated)
@@ -287,7 +286,8 @@ impl ControlPlane {
     /// open project dir — mix changes are legal in an unsaved session).
     fn emit_project_changed(&self) {
         let payload = {
-            let s = self.store.lock();
+            let session = self.session.lock();
+            let s = &session.store;
             let sample_rate = self.shared.sample_rate.load(Relaxed);
             let mut transport = s.transport.clone();
             transport.position_samples = self.shared.position.load(Relaxed);
@@ -314,16 +314,16 @@ impl ControlPlane {
 
     pub fn create_project(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
-        let tempo = self.store.lock().transport.tempo_bpm;
+        let tempo = self.session.lock().store.transport.tempo_bpm;
         let (mut project, dir) =
             project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
         {
-            let mut s = self.store.lock();
-            s.clips.clear();
-            s.project_dir = Some(dir.clone());
-            s.project_name = Some(name.to_string());
-            s.created_at = project.created_at.clone();
-            project.tracks = s.tracks.clone();
+            let mut session = self.session.lock();
+            session.store.clips.clear();
+            session.store.project_dir = Some(dir.clone());
+            session.store.project_name = Some(name.to_string());
+            session.store.created_at = project.created_at.clone();
+            project.tracks = session.store.tracks.clone();
         }
         if !project.tracks.is_empty() {
             project::save(&dir, &project)?;
@@ -357,17 +357,18 @@ impl ControlPlane {
     /// the demo survives save/open.
     pub fn seed_demo_project(&self) -> Result<ProjectSnapshot, String> {
         {
-            let s = self.store.lock();
-            let m = self.midi.lock();
-            if !s.clips.is_empty() || m.clips.iter().any(|c| !c.notes.is_empty()) {
+            let session = self.session.lock();
+            if !session.store.clips.is_empty()
+                || session.midi.clips.iter().any(|c| !c.notes.is_empty())
+            {
                 return Err("project already has content".to_string());
             }
         }
-        // Sync the midi store with the open project first (same store->midi
-        // ordering as the midi commands), so we never clobber on-disk state.
+        // Sync the midi store with the open project first, so we never
+        // clobber on-disk state.
         let (dir, bpm) = {
-            let s = self.store.lock();
-            (s.project_dir.clone(), s.transport.tempo_bpm)
+            let session = self.session.lock();
+            (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
         };
         crate::midi::notify_project_opened(dir.clone(), bpm);
 
@@ -376,21 +377,21 @@ impl ControlPlane {
         let zyn = try_seed_zyn_demo_instruments();
 
         let (pad, lead, bass) = {
-            let mut s = self.store.lock();
+            let mut session = self.session.lock();
             let pad = ops::add_track(
-                &mut s,
+                &mut session.store,
                 &self.params,
                 Some("Demo Pad".into()),
                 Some("midi".into()),
             )?;
             let lead = ops::add_track(
-                &mut s,
+                &mut session.store,
                 &self.params,
                 Some("Demo Lead".into()),
                 Some("midi".into()),
             )?;
             let bass = ops::add_track(
-                &mut s,
+                &mut session.store,
                 &self.params,
                 Some("Demo Bass".into()),
                 Some("midi".into()),
@@ -399,7 +400,7 @@ impl ControlPlane {
                 for (track_id, instance_id) in
                     [(&pad.id, &ids[0]), (&lead.id, &ids[1]), (&bass.id, &ids[2])]
                 {
-                    if let Some(t) = s.tracks.iter_mut().find(|t| &t.id == track_id) {
+                    if let Some(t) = session.store.tracks.iter_mut().find(|t| &t.id == track_id) {
                         t.instrument_id = Some(format!("plugin:{instance_id}"));
                     }
                 }
@@ -407,15 +408,15 @@ impl ControlPlane {
             (pad, lead, bass)
         };
         {
-            let mut m = self.midi.lock();
-            let ppq = m.ppq;
+            let mut session = self.session.lock();
+            let ppq = session.midi.ppq;
             let (pad_clip, lead_clip, bass_clip) =
                 demo_seed_clips_v2(&pad.id, &lead.id, &bass.id, ppq);
-            m.clips.push(pad_clip);
-            m.clips.push(lead_clip);
-            m.clips.push(bass_clip);
+            session.midi.clips.push(pad_clip);
+            session.midi.clips.push(lead_clip);
+            session.midi.clips.push(bass_clip);
             if let Some(d) = &dir {
-                if let Err(e) = crate::midi::persist::save_into_project(d, &m) {
+                if let Err(e) = crate::midi::persist::save_into_project(d, &session.midi) {
                     log::warn!("seed demo: persisting midi failed: {e}");
                 }
             }
@@ -425,9 +426,9 @@ impl ControlPlane {
         // demo through the same patches (zone P4 restore path).
         if let (Some(d), Some(_)) = (&dir, &zyn) {
             let snapshot = {
-                let s = self.store.lock();
+                let session = self.session.lock();
                 project::from_store(
-                    &s,
+                    &session.store,
                     self.shared.position.load(Relaxed),
                     self.shared.sample_rate.load(Relaxed),
                 )
@@ -441,7 +442,7 @@ impl ControlPlane {
                 Err(e) => log::warn!("seed demo: project snapshot failed: {e}"),
             }
             if let Some(reg) = crate::plugins::registered_registry() {
-                crate::plugins::state::persist_after_mutation(&self.store, reg, true);
+                crate::plugins::state::persist_after_mutation(&self.session, reg, true);
             }
         }
         self.engine.send(ControlMsg::Rebuild);
@@ -817,6 +818,8 @@ pub fn seed_demo_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::Store;
+    use crate::midi::MidiStore;
     use crate::sidecars::SidecarEvent;
     use std::time::{Duration, Instant};
 
@@ -832,22 +835,21 @@ mod tests {
         }
         let shared = Arc::new(SharedRt::default());
         let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
             params.clone(),
-            store.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
         let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
         let cp = Arc::new(ControlPlane::new(
-            store,
+            session,
             shared,
             params,
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
-            Arc::new(Mutex::new(MidiStore::default())),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
         ));
         (cp, events, engine)
@@ -997,20 +999,19 @@ mod tests {
         let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
         let shared = Arc::new(SharedRt::default());
         let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
             params.clone(),
-            store.clone(),
+            session.clone(),
             Box::new(Recorder(Arc::clone(&events))),
         );
         let cp = ControlPlane::new(
-            store,
+            session,
             shared.clone(),
             params,
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::default()),
-            Arc::new(Mutex::new(MidiStore::default())),
             Box::new(|_, _| {}),
         );
         // Barrier: once the engine answers, its startup open_output is done.
@@ -1134,20 +1135,19 @@ mod tests {
         }
         let shared = Arc::new(SharedRt::default());
         let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
         let engine = crate::audio::engine::start(
             shared.clone(),
             params.clone(),
-            store.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
         let cp = ControlPlane::new(
-            store.clone(),
+            session.clone(),
             shared.clone(),
             params,
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::default()),
-            Arc::new(Mutex::new(MidiStore::default())),
             Box::new(|_, _| {}),
         );
         // Round-trip barrier: once the engine thread answers, its startup
@@ -1185,11 +1185,12 @@ mod tests {
         // The store mirror makes the region persistent: from_store (the
         // project.json serializer) carries it.
         {
-            let mut s = store.lock();
-            s.project_dir = Some(std::env::temp_dir().join("aura-loop-test.aura"));
-            s.project_name = Some("LoopTest".into());
+            let mut session = session.lock();
+            session.store.project_dir = Some(std::env::temp_dir().join("aura-loop-test.aura"));
+            session.store.project_name = Some("LoopTest".into());
         }
-        let p = crate::audio::project::from_store(&store.lock(), 0, rate as u32).unwrap();
+        let p =
+            crate::audio::project::from_store(&session.lock().store, 0, rate as u32).unwrap();
         let t = p.transport.expect("transport block");
         assert!(t.loop_enabled);
         assert_eq!((t.loop_start_samples, t.loop_end_samples), (start, end));

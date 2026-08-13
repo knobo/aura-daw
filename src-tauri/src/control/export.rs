@@ -516,9 +516,11 @@ impl ControlPlane {
         }
 
         // Snapshot the project: a private Store (own slot table, so the
-        // offline ParamTable is self-consistent) + a cloned MidiStore.
+        // offline ParamTable is self-consistent) + a cloned MidiStore. One
+        // guard covers both — store and midi live behind the same lock.
         let snapshot = {
-            let s = self.store.lock();
+            let session = self.session.lock();
+            let s = &session.store;
             let mut store = Store::default();
             store.transport = s.transport.clone();
             store.project_dir = s.project_dir.clone();
@@ -529,7 +531,7 @@ impl ControlPlane {
                     store.alloc_slot(&t.id);
                 }
             }
-            let m = self.midi.lock();
+            let m = &session.midi;
             ExportSnapshot {
                 store,
                 midi: MidiStore {
@@ -873,12 +875,14 @@ mod tests {
     fn control_plane_with_demo() -> (Arc<ControlPlane>, Arc<SharedRt>, Arc<Mutex<Vec<(String, Value)>>>) {
         let shared = Arc::new(SharedRt::default());
         let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
-        let midi = Arc::new(Mutex::new(MidiStore::default()));
+        let session = Arc::new(Mutex::new(crate::control::Session::new(
+            Store::default(),
+            MidiStore::default(),
+        )));
         let engine = crate::audio::engine::start(
             shared.clone(),
             params.clone(),
-            store.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
         // Round-trip barrier: once the engine thread answers, its startup
@@ -891,27 +895,26 @@ mod tests {
         let events: Arc<Mutex<Vec<(String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev = Arc::clone(&events);
         let cp = Arc::new(ControlPlane::new(
-            store.clone(),
+            session.clone(),
             shared.clone(),
             params.clone(),
             engine,
             Arc::new(JobManager::default()),
-            midi.clone(),
             Box::new(move |e, p| ev.lock().push((e.to_string(), p))),
         ));
         // Demo-song content, placed directly (no engine round-trip needed).
         let (keys, bass) = {
-            let mut s = store.lock();
-            let k = super::super::ops::add_track(&mut s, &params, Some("Keys".into()), Some("midi".into())).unwrap();
-            let b = super::super::ops::add_track(&mut s, &params, Some("Bass".into()), Some("midi".into())).unwrap();
+            let mut session = session.lock();
+            let k = super::super::ops::add_track(&mut session.store, &params, Some("Keys".into()), Some("midi".into())).unwrap();
+            let b = super::super::ops::add_track(&mut session.store, &params, Some("Bass".into()), Some("midi".into())).unwrap();
             (k, b)
         };
         {
-            let mut m = midi.lock();
-            let ppq = m.ppq;
+            let mut session = session.lock();
+            let ppq = session.midi.ppq;
             let (arp, groove) = crate::control::demo_seed_clips(&keys.id, &bass.id, ppq);
-            m.clips.push(arp);
-            m.clips.push(groove);
+            session.midi.clips.push(arp);
+            session.midi.clips.push(groove);
         }
         (cp, shared, events)
     }

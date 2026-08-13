@@ -225,7 +225,8 @@ impl LoopJam {
         // Resolve target track + the region's clips under the store lock;
         // decode/render after it is dropped.
         let (project_dir, track_id, clip_sources) = {
-            let s = self.control.store.lock();
+            let session = self.control.session.lock();
+            let s = &session.store;
             let dir = s
                 .project_dir
                 .clone()
@@ -435,8 +436,9 @@ impl LoopJam {
         };
         let project_dir = self
             .control
-            .store
+            .session
             .lock()
+            .store
             .project_dir
             .clone()
             .ok_or("project closed while evolving")?;
@@ -514,14 +516,14 @@ impl LoopJam {
             return;
         };
         {
-            let mut s = self.control.store.lock();
+            let mut session = self.control.session.lock();
             replace_region_clips(
-                &mut s.clips,
+                &mut session.store.clips,
                 &pending.track_id,
                 pending.region.0,
                 pending.region.1,
             );
-            s.clips.push(pending.clip.clone());
+            session.store.clips.push(pending.clip.clone());
         }
         self.control.engine.send(ControlMsg::Rebuild);
         {
@@ -536,10 +538,10 @@ impl LoopJam {
         }
         // Persist + announce, same convention as import (auto-save).
         let snapshot = {
-            let s = self.control.store.lock();
-            let dir = s.project_dir.clone();
+            let session = self.control.session.lock();
+            let dir = session.store.project_dir.clone();
             project::from_store(
-                &s,
+                &session.store,
                 self.control.shared.position.load(Relaxed),
                 self.control.shared.sample_rate.load(Relaxed),
             )
@@ -739,11 +741,14 @@ mod tests {
     ) {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
         let params = Arc::new(ParamTable::default());
-        let store = Arc::new(Mutex::new(Store::default()));
+        let session = Arc::new(Mutex::new(crate::control::Session::new(
+            Store::default(),
+            MidiStore::default(),
+        )));
         let engine = crate::audio::engine::start(
             shared.clone(),
             params.clone(),
-            store.clone(),
+            session.clone(),
             Box::new(NullEvents),
         );
         // Event-driven readiness: the control thread opens (or fails to
@@ -761,12 +766,11 @@ mod tests {
             Arc::new(Mutex::new(Vec::new()));
         let ev2 = Arc::clone(&events);
         let cp = Arc::new(ControlPlane::new(
-            store,
+            session,
             shared.clone(),
             params,
             engine,
             Arc::new(JobManager::new(2, Duration::ZERO)),
-            Arc::new(Mutex::new(MidiStore::default())),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
         ));
         // (Sample rate settled by the round-trip above — no sleep needed.)

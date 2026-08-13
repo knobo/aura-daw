@@ -46,6 +46,7 @@ use serde_json::Value;
 
 use super::descriptor::{ParamInfo, PluginInstanceInfo};
 use super::{ParamChange, PluginRegistry};
+use crate::control::Session;
 
 /// Project subdirectory holding the state blobs.
 pub const STATE_DIR: &str = "plugins";
@@ -638,11 +639,11 @@ pub fn adopt_open_project(dir: &Path) {
 /// `with_host_state` is false on the param path (a knob drag must not
 /// round-trip the plugin main thread per rAF batch).
 pub fn persist_after_mutation(
-    store: &Arc<Mutex<crate::audio::Store>>,
+    session: &Arc<Mutex<Session>>,
     registry: &Arc<Mutex<PluginRegistry>>,
     with_host_state: bool,
 ) {
-    let dir = store.lock().project_dir.clone();
+    let dir = session.lock().store.project_dir.clone();
     let Some(dir) = dir else { return };
     let reg = registry.lock();
     if let Err(e) = save_into_project(&dir, &reg, with_host_state) {

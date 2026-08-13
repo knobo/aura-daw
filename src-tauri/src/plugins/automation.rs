@@ -521,8 +521,8 @@ fn with_synced<R>(
     f: impl FnOnce(&mut AutomationStore) -> Result<R, String>,
 ) -> Result<R, String> {
     let dir = {
-        let (store, _, _) = audio.control_parts();
-        let d = store.lock().project_dir.clone();
+        let (session, _, _) = audio.control_parts();
+        let d = session.lock().store.project_dir.clone();
         d
     };
     let mut auto = state.automation.lock();

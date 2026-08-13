@@ -42,7 +42,8 @@ use parking_lot::Mutex;
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::control::{self, ControlPlane, TrackMixChange};
+use crate::control::{self, ControlPlane, Session, TrackMixChange};
+use crate::midi::MidiStore;
 use engine::{ControlMsg, EngineHandle};
 use rt::{ParamTable, SharedRt, FLAG_MUTE, FLAG_SOLO};
 use sampler::{InstrumentInfo, SamplerBank};
@@ -58,7 +59,7 @@ pub use types::{
 /// Engine-facing shared state. lib.rs relies only on the type name and
 /// `Default` construction.
 pub struct AudioState {
-    store: Arc<Mutex<Store>>,
+    session: Arc<Mutex<Session>>,
     shared: Arc<SharedRt>,
     params: Arc<ParamTable>,
     engine: OnceLock<EngineHandle>,
@@ -71,7 +72,7 @@ pub struct AudioState {
 impl Default for AudioState {
     fn default() -> Self {
         Self {
-            store: Arc::new(Mutex::new(Store::default())),
+            session: Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default()))),
             shared: Arc::new(SharedRt::default()),
             params: Arc::new(ParamTable::default()),
             engine: OnceLock::new(),
@@ -88,7 +89,7 @@ impl AudioState {
 
     /// Compose the live transport snapshot (atomics + store fields).
     fn transport_snapshot(&self) -> TransportState {
-        control::ops::transport_snapshot(&self.store.lock(), &self.shared)
+        control::ops::transport_snapshot(&self.session.lock().store, &self.shared)
     }
 
     // ---- control-plane wiring (ARCHITECTURE §11) ------------------------
@@ -97,8 +98,8 @@ impl AudioState {
 
     pub(crate) fn control_parts(
         &self,
-    ) -> (Arc<Mutex<Store>>, Arc<SharedRt>, Arc<ParamTable>) {
-        (self.store.clone(), self.shared.clone(), self.params.clone())
+    ) -> (Arc<Mutex<Session>>, Arc<SharedRt>, Arc<ParamTable>) {
+        (self.session.clone(), self.shared.clone(), self.params.clone())
     }
 
     pub(crate) fn engine_handle(&self) -> Option<EngineHandle> {
@@ -116,7 +117,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let handle = engine::start(
         state.shared.clone(),
         state.params.clone(),
-        state.store.clone(),
+        state.session.clone(),
         Box::new(TauriEvents(app.clone())),
     );
     let _ = state.engine.set(handle);
@@ -331,7 +332,8 @@ pub fn get_waveform_tile(
     state: State<'_, AudioState>,
 ) -> Result<Response, String> {
     let (cache_dir, channels) = {
-        let store = state.store.lock();
+        let session = state.session.lock();
+        let store = &session.store;
         let clip = store.clips.iter().find(|c| c.id == clip_id);
         (
             store.waveform_cache_dir(&clip_id),
@@ -368,7 +370,8 @@ pub fn add_track(
 #[tauri::command]
 pub fn remove_track(track_id: String, state: State<'_, AudioState>) -> Result<(), String> {
     {
-        let mut s = state.store.lock();
+        let mut session = state.session.lock();
+        let s = &mut session.store;
         s.tracks.retain(|t| t.id != track_id);
         s.clips.retain(|c| c.track_id != track_id);
         s.free_slot(&track_id);
@@ -380,7 +383,7 @@ pub fn remove_track(track_id: String, state: State<'_, AudioState>) -> Result<()
 
 #[tauri::command]
 pub fn get_tracks(state: State<'_, AudioState>) -> Result<Vec<TrackState>, String> {
-    Ok(state.store.lock().tracks.clone())
+    Ok(state.session.lock().store.tracks.clone())
 }
 
 /// Apply one mix change through the batched control-plane path (param-table
@@ -533,7 +536,8 @@ pub fn set_track_instrument(
         }
     }
     let track = {
-        let mut s = state.store.lock();
+        let mut session = state.session.lock();
+        let s = &mut session.store;
         let t = s
             .tracks
             .iter_mut()
@@ -580,7 +584,8 @@ pub fn open_project(
     // project must fail cleanly, not after tracks/clips were replaced).
     project::validate(&project)?;
     {
-        let mut s = state.store.lock();
+        let mut session = state.session.lock();
+        let s = &mut session.store;
         // Reset slots/params and adopt the loaded tracks.
         for t in s.tracks.clone() {
             s.free_slot(&t.id);
@@ -618,11 +623,11 @@ pub fn open_project(
     // Eager midi resync (zone C's requested seam): the midi store adopts the
     // opened project's v2 fields NOW, so the first `get_project_state` after
     // an open (and the rebuild below) already see fresh midi state.
-    {
-        let s = state.store.lock();
-        let t = &s.transport;
-        crate::midi::notify_project_opened(s.project_dir.clone(), t.tempo_bpm);
-    }
+    let (dir, bpm) = {
+        let session = state.session.lock();
+        (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
+    };
+    crate::midi::notify_project_opened(dir, bpm);
     // Load clip audio + (re)build waveform pyramids off the IPC path.
     state.engine()?.send(ControlMsg::Rebuild);
     let _ = app.emit("project://changed", serde_json::to_value(&project).unwrap_or_default());
@@ -632,10 +637,11 @@ pub fn open_project(
 #[tauri::command]
 pub fn save_project(app: AppHandle, state: State<'_, AudioState>) -> Result<(), String> {
     let (project, dir) = {
-        let s = state.store.lock();
+        let session = state.session.lock();
+        let s = &session.store;
         let dir = s.project_dir.clone().ok_or("no project open")?;
         let p = project::from_store(
-            &s,
+            s,
             state.shared.position.load(Relaxed),
             state.shared.sample_rate.load(Relaxed),
         )?;

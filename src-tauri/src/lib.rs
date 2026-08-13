@@ -56,22 +56,24 @@ pub fn run() {
 
             // Construct the shared control plane (ARCHITECTURE §11) from the
             // initialized modules and manage it: Tauri commands AND the MCP
-            // server drive AURA exclusively through this object.
+            // server drive AURA exclusively through this object. Store and
+            // midi live behind ONE lock (`Session`) — `AudioState` builds it;
+            // `MidiState::shared` wires the same Arc in and registers it with
+            // the engine-rebuild hook (playback integration).
             let audio_state = app.state::<audio::AudioState>();
-            let (store, shared, params) = audio_state.control_parts();
+            let (session, shared, params) = audio_state.control_parts();
             let engine = audio_state
                 .engine_handle()
                 .ok_or("audio engine failed to start")?;
             let jobs = app.state::<sidecars::SidecarState>().manager();
-            let midi_shared = app.state::<midi::MidiState>().shared();
+            let session = app.state::<midi::MidiState>().shared(session);
             let emitter = handle.clone();
             let control_plane = Arc::new(control::ControlPlane::new(
-                store,
+                session,
                 shared,
                 params,
                 engine,
                 jobs,
-                midi_shared,
                 Box::new(move |event, payload| {
                     if let Err(e) = emitter.emit(event, payload) {
                         log::warn!("emit {event}: {e}");
