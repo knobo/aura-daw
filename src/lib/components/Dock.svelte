@@ -5,6 +5,8 @@
    * the transport bar chips.
    */
   import { ui, type DockTab } from "../state/ui.svelte";
+  import { DOCK_RESIZE } from "../utils/panel-resize";
+  import PanelResizeHandle from "./PanelResizeHandle.svelte";
   import { mcp } from "../state/mcp.svelte";
   import { plugins } from "../state/plugins.svelte";
   import { zyn } from "../state/zynpatches.svelte";
@@ -26,7 +28,14 @@
 </script>
 
 {#if ui.dock}
-  <aside class="dock glass" aria-label="Side panel">
+  <aside class="dock glass" aria-label="Side panel" style:width="{ui.dockWidth}px">
+    <PanelResizeHandle
+      axis="x"
+      size={ui.dockWidth}
+      spec={DOCK_RESIZE}
+      label="Resize side panel"
+      onresize={(px) => (ui.dockWidth = px)}
+    />
     <div class="tabs" role="tablist">
       {#each TABS as t (t.id)}
         <button

@@ -107,6 +107,8 @@ export interface Backend {
   createProject(name: string, parentDir?: string | null): Promise<Project>;
   openProject(path: string): Promise<Project>;
   saveProject(): Promise<void>;
+  /** First save of an unsaved session: create `<parentDir>/<name>.aura` and persist current content. */
+  saveProjectAs(name: string, parentDir: string): Promise<Project>;
   /** Demo mode also serves the current project from here; live mode asks Tauri. */
   getProject(): Promise<Project>;
 
@@ -346,6 +348,9 @@ class TauriBackend implements Backend {
   }
   async saveProject() {
     await invoke("save_project");
+  }
+  saveProjectAs(name: string, parentDir: string) {
+    return invoke<Project>("save_project_as", { parentDir, name });
   }
   async getProject(): Promise<Project> {
     // No dedicated command in the frozen surface; assemble from parts.

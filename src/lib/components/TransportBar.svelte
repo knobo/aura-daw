@@ -7,11 +7,12 @@
   import { transport } from "../state/transport.svelte";
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
-  import { ui, toggleDock } from "../state/ui.svelte";
+  import { resetUiZoom, ui, toggleDock, zoomUiIn, zoomUiOut } from "../state/ui.svelte";
   import { mcp } from "../state/mcp.svelte";
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
   import { formatBarsBeats, formatClock } from "../utils/format";
+  import ProjectMenu from "./project/ProjectMenu.svelte";
 
   let clockEl: HTMLSpanElement | undefined = $state();
   let barsEl: HTMLSpanElement | undefined = $state();
@@ -51,10 +52,7 @@
 <header class="bar glass">
   <div class="left">
     <div class="wordmark mono">AURA</div>
-    <div class="project">
-      <span class="silk">project</span>
-      <span class="pname">{project.name}</span>
-    </div>
+    <ProjectMenu />
   </div>
 
   <div class="center">
@@ -189,6 +187,12 @@
       title="Export — offline bounce to wav/mp3/flac/ogg/m4a"
       onclick={() => exporter.openDialog()}>⤓ EXPORT</button
     >
+    <span class="divider"></span>
+    <button class="chip" title="Interface zoom out — smaller UI (Ctrl/Cmd −)" onclick={zoomUiOut}>A−</button>
+    <button class="chip" title="Reset interface zoom (Ctrl/Cmd 0)" onclick={resetUiZoom}
+      >{Math.round(ui.zoom * 100)}%</button
+    >
+    <button class="chip" title="Interface zoom in — bigger UI (Ctrl/Cmd +)" onclick={zoomUiIn}>A+</button>
     <span class="badge mono" title="Waveform renderer in use">{ui.rendererKind || "· · ·"}</span>
     <span class="badge mode mono" title={backend.mode === "demo" ? "Engine offline — synthetic data" : "Rust engine connected"}>
       {backend.mode === "demo" ? "DEMO" : "ENGINE"}
@@ -228,16 +232,6 @@
       0 0 14px var(--cyan-dim),
       1px 0 0 rgba(255, 79, 216, 0.55),
       -1px 0 0 rgba(82, 229, 255, 0.55);
-  }
-
-  .project {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-  }
-  .pname {
-    font-size: 12px;
-    color: var(--text-dim);
   }
 
   .center {

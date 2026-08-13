@@ -6,6 +6,7 @@
  */
 
 import { backend } from "../tauri";
+import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { project } from "./project.svelte";
 import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent } from "../types/ipc";
 
@@ -151,10 +152,19 @@ class MidiStore {
     this.openClipId = clipId;
     this.selectedClipId = clipId;
     if (this.region?.clipId !== clipId) this.region = null;
+    const clip = this.clipById(clipId);
+    if (clip) {
+      void clipEditLoop.enter({
+        trackId: clip.trackId,
+        startSamples: this.ticksToSamples(clip.timelineStartTicks),
+        endSamples: this.ticksToSamples(clip.timelineStartTicks + clip.lengthTicks),
+      });
+    }
   }
 
   closeEditor() {
     this.openClipId = null;
+    void clipEditLoop.exit();
   }
 
   select(clipId: string | null) {

@@ -1312,6 +1312,10 @@ export class DemoBackend implements Backend {
     return this.projectSnapshot();
   }
   async saveProject(): Promise<void> {}
+  async saveProjectAs(name: string, _parentDir: string): Promise<Project> {
+    // Demo mode has no filesystem; the UI guards on `mode` before calling.
+    return { ...this.projectSnapshot(), name };
+  }
   async getProject(): Promise<Project> {
     return this.projectSnapshot();
   }

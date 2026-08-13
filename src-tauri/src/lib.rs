@@ -123,6 +123,7 @@ pub fn run() {
             audio::create_project,
             audio::open_project,
             audio::save_project,
+            audio::save_project_as,
             // ---- audio: sampler (phase 2, zone D) ----
             audio::sampler_load_instrument,
             audio::sampler_list_instruments,

@@ -563,25 +563,51 @@ pub fn set_track_instrument(
 // Project commands (project.json format: docs/ipc-schemas/project.schema.json)
 // ---------------------------------------------------------------------------
 
+// All project commands are async: sync commands run on the MAIN thread, and
+// on Linux the WebKitGTK webview shares the GTK main loop — disk I/O plus
+// plugin/graph restore would freeze the UI mid-paint. `spawn_blocking` keeps
+// the (blocking) bodies off the async runtime's core threads as well.
+
 /// Creates `<parent_dir>/<name>.aura/` with project.json + audio/stems/cache
-/// subdirs and makes it the open project. Existing in-memory tracks are kept
-/// (and saved); clips are reset (they belonged to the previous project).
-/// Thin wrapper over the shared control plane (§11).
+/// subdirs and makes it the open project, resetting the session to a blank
+/// slate (tracks, clips, midi, transport). Materializing an unsaved session
+/// is `save_project_as`. Thin wrapper over the shared control plane (§11).
 #[tauri::command]
-pub fn create_project(
+pub async fn create_project(
     parent_dir: String,
     name: String,
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<Project, String> {
-    control.create_project(&parent_dir, &name)
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.create_project(&parent_dir, &name))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// First save of a session with no open project: creates the `.aura` dir and
+/// persists the current in-memory content into it. Fails when a project is
+/// already open. Thin wrapper over the shared control plane (§11).
+#[tauri::command]
+pub async fn save_project_as(
+    parent_dir: String,
+    name: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Project, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.save_project_as(&parent_dir, &name))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
-pub fn open_project(
-    path: String,
-    app: AppHandle,
-    state: State<'_, AudioState>,
-) -> Result<Project, String> {
+pub async fn open_project(path: String, app: AppHandle) -> Result<Project, String> {
+    tauri::async_runtime::spawn_blocking(move || open_project_impl(path, app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn open_project_impl(path: String, app: AppHandle) -> Result<Project, String> {
+    let state = app.state::<AudioState>();
     let (project, dir) = project::load(std::path::Path::new(&path))?;
     // Validate BEFORE mutating any in-memory state (review fix: a >MAX_TRACKS
     // project must fail cleanly, not after tracks/clips were replaced).
@@ -638,7 +664,14 @@ pub fn open_project(
 }
 
 #[tauri::command]
-pub fn save_project(app: AppHandle, state: State<'_, AudioState>) -> Result<(), String> {
+pub async fn save_project(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || save_project_impl(app))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn save_project_impl(app: AppHandle) -> Result<(), String> {
+    let state = app.state::<AudioState>();
     let (project, dir) = {
         let session = state.session.lock();
         let s = &session.store;

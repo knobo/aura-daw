@@ -137,14 +137,26 @@ class ProjectStore {
   async toggleMute(trackId: string) {
     const t = this.trackById(trackId);
     if (!t) return;
-    this.patchTrack(trackId, { muted: !t.muted });
-    await backend.setTrackMute(trackId, !t.muted);
+    await this.setMute(trackId, !t.muted);
+  }
+  /** Set mute to an absolute value; no-op (no invoke) when already there. */
+  async setMute(trackId: string, muted: boolean) {
+    const t = this.trackById(trackId);
+    if (!t || t.muted === muted) return;
+    this.patchTrack(trackId, { muted });
+    await backend.setTrackMute(trackId, muted);
   }
   async toggleSolo(trackId: string) {
     const t = this.trackById(trackId);
     if (!t) return;
-    this.patchTrack(trackId, { soloed: !t.soloed });
-    await backend.setTrackSolo(trackId, !t.soloed);
+    await this.setSolo(trackId, !t.soloed);
+  }
+  /** Set solo to an absolute value; no-op (no invoke) when already there. */
+  async setSolo(trackId: string, soloed: boolean) {
+    const t = this.trackById(trackId);
+    if (!t || t.soloed === soloed) return;
+    this.patchTrack(trackId, { soloed });
+    await backend.setTrackSolo(trackId, soloed);
   }
   async toggleArm(trackId: string) {
     const t = this.trackById(trackId);
