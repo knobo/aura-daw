@@ -9,6 +9,7 @@
    * Same discipline as the timeline: canvases repaint on state changes only,
    * the playhead is a rAF-transformed overlay outside Svelte reactivity.
    */
+  import { clipEditLoop } from "../../state/clip-edit-loop.svelte";
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
   import { transport } from "../../state/transport.svelte";
@@ -757,6 +758,15 @@
           </button>
         {/each}
       </div>
+
+      <button
+        class="chip mono"
+        class:on={clipEditLoop.solo}
+        title="Loop the clip solo (other tracks muted); off = loop with the full mix"
+        onclick={() => void clipEditLoop.setSolo(!clipEditLoop.solo)}
+      >
+        ◎ solo
+      </button>
 
       <button
         class="chip mono"
