@@ -48,8 +48,12 @@ impl Session {
                 // code path undo will use (round-2 §4, "inverse produced by
                 // apply, never guessed").
                 let inv: Vec<Op> = tx.inverses.drain(..).rev().collect();
+                // Rollback discards its effect: the transaction is about to
+                // return Err, so no `Committed` (and thus no effect) ever
+                // reaches `ControlPlane::commit`.
+                let mut discarded = EngineEffect::default();
                 for op in inv {
-                    apply_raw(tx.session, &op).expect("rollback must not fail");
+                    apply_raw(tx.session, &op, &mut discarded).expect("rollback must not fail");
                 }
                 Err(e)
             }
@@ -69,19 +73,44 @@ pub struct Tx<'s> {
 }
 
 impl Tx<'_> {
-    /// Applies `op`, recording it and its computed inverse.
+    /// Applies `op`, recording it, its computed inverse, and its effect
+    /// (folded into `self.effect` — see `EngineEffect`).
     pub fn apply(&mut self, op: Op) -> Result<(), String> {
-        let inverse = apply_raw(self.session, &op)?;
+        let inverse = apply_raw(self.session, &op, &mut self.effect)?;
         self.ops.push(op);
         self.inverses.push(inverse);
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What `apply_raw` did that the engine/RT side must eventually see, folded
+/// across a whole transaction. The session only DESCRIBES the effect —
+/// `ControlPlane::commit` (control/mod.rs, Task 6) EXECUTES it after the
+/// session lock is released. Faithfully mirrors what `ops::apply_track_mix`
+/// (control/ops.rs:47-95) writes today:
+/// * `param_writes`: `(slot, path, value)` — `Gain` as linear (via
+///   `mixer::db_to_linear`), `Pan` as-is, `Muted`/`Soloed` as 0.0/1.0 gates
+///   (`ControlPlane::commit` turns those back into the RT param store's
+///   `set_flag` calls). `apply_track_mix` rewrites ALL FOUR params from the
+///   post-write snapshot on every changed (slotted) track, regardless of
+///   which single field changed — so does this, per `Set`. `Armed` has no
+///   RT param counterpart and never appears as its own entry (matching
+///   `apply_track_mix`, which also has nothing to write for it).
+/// * `any_solo`: `Store::any_solo()` is a store-wide flag (not per-slot),
+///   which `apply_track_mix` recomputes unconditionally once per BATCH. A
+///   plain `Vec<(slot, PropPath, f32)>` can't express a slot-less,
+///   whole-store flag, so this is a minimal, justified extension beyond the
+///   brief's tuple sketch: recomputed on every track `Set` in the
+///   transaction (slot or not — `any_solo` doesn't require one); the last
+///   write is truth, so repeat recomputation is harmless.
+/// * `rebuild`: `TrackAdd`/`TrackRemove` set it; N structural ops still
+///   fold to a single flag, i.e. at most one `ControlMsg::Rebuild`.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct EngineEffect {
     pub rebuild: bool,
-} // grows in Task 6
+    pub param_writes: Vec<(usize, PropPath, f32)>,
+    pub any_solo: Option<bool>,
+}
 
 pub struct Committed {
     pub rev: u64,
@@ -91,15 +120,17 @@ pub struct Committed {
     pub meta: TxMeta,
 }
 
-/// Applies `op` to `session`, returning the computed inverse. The inverse's
-/// `from`/`to` are both derived from store truth (the value actually
-/// written, post-clamp, and the value that was there before) — never from
-/// the caller-supplied `op.from`, which is advisory only.
+/// Applies `op` to `session`, returning the computed inverse, and folds its
+/// effect into `effect` (see `EngineEffect`). The inverse's `from`/`to` are
+/// both derived from store truth (the value actually written, post-clamp,
+/// and the value that was there before) — never from the caller-supplied
+/// `op.from`, which is advisory only.
 ///
-/// Param-table/RT propagation is deliberately NOT touched here (Task 6's
-/// job): this only moves `Store` truth. The existing command still calls
-/// `ops::apply_track_mix` for the RT side until Task 7 rewires it.
-fn apply_raw(session: &mut Session, op: &Op) -> Result<Op, String> {
+/// This computes the effect DESCRIPTION only — plain data, no RT param
+/// store / engine handle / control-message reference anywhere in this
+/// module (grep-gated, see `ControlPlane::commit`). `ControlPlane::commit`
+/// EXECUTES the folded effect after the session lock is released.
+fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Result<Op, String> {
     match op {
         Op::Set { object: ObjectRef::Track(id), path, to, .. } => {
             let t = session
@@ -110,16 +141,56 @@ fn apply_raw(session: &mut Session, op: &Op) -> Result<Op, String> {
                 .ok_or_else(|| format!("unknown track: {id}"))?;
             let from_now = read_prop(t, *path); // truth, not caller's `from`
             let applied = write_prop(t, *path, to)?; // clamps like ops.rs does
-            Ok(Op::Set {
+            let inverse = Op::Set {
                 object: ObjectRef::Track(id.clone()),
                 path: *path,
                 from: applied,   // the inverse's `from`: value we just wrote
                 to: from_now,    // the inverse's `to`: value to restore
-            })
+            };
+            // Mirror `ops::apply_track_mix` (control/ops.rs:47-95): a
+            // changed track WITH a slot gets all four mix params rewritten
+            // from the current (post-write) snapshot, not just the touched
+            // path — that's what apply_track_mix does too (unconditional
+            // per changed-track write of gain/pan/mute/solo). A track
+            // without a slot contributes no param_write (op::TrackAdd
+            // leaves slot bookkeeping untouched, round-2 §2.4).
+            if let Some(&slot) = session.store.slots.get(id) {
+                let t = session
+                    .store
+                    .tracks
+                    .iter()
+                    .find(|t| &t.id == id)
+                    .expect("just wrote this track above");
+                effect.param_writes.push((
+                    slot,
+                    PropPath::Gain,
+                    crate::audio::mixer::db_to_linear(t.gain_db),
+                ));
+                effect.param_writes.push((slot, PropPath::Pan, t.pan as f32));
+                effect.param_writes.push((
+                    slot,
+                    PropPath::Muted,
+                    if t.muted { 1.0 } else { 0.0 },
+                ));
+                effect.param_writes.push((
+                    slot,
+                    PropPath::Soloed,
+                    if t.soloed { 1.0 } else { 0.0 },
+                ));
+            }
+            // any_solo is store-wide (Store::any_solo), independent of
+            // slot presence — apply_track_mix recomputes it unconditionally
+            // once per batch; here, per track Set (idempotent: the last
+            // recompute in the transaction is truth).
+            effect.any_solo = Some(session.store.any_solo());
+            Ok(inverse)
         }
         Op::TrackAdd { track, index } => {
             let idx = (*index).min(session.store.tracks.len());
             crate::control::ops::insert_track(&mut session.store, track.clone(), idx);
+            // Structural: at most one Rebuild per transaction, however many
+            // structural ops it contains — a plain flag naturally folds.
+            effect.rebuild = true;
             // Inverse: remove the same row, same id, no slot bookkeeping
             // here (round-2 §2.4 — slots stay in the command's effect
             // layer until Plan B).
@@ -137,6 +208,7 @@ fn apply_raw(session: &mut Session, op: &Op) -> Result<Op, String> {
                 .position(|t| t.id == track.id)
                 .ok_or_else(|| format!("unknown track: {}", track.id))?;
             let removed = session.store.tracks.remove(pos);
+            effect.rebuild = true;
             Ok(Op::TrackAdd { track: removed, index: pos })
         }
         _ => Err("op not yet supported".into()),

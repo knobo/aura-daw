@@ -107,6 +107,20 @@ impl EngineHandle {
     }
 }
 
+#[cfg(test)]
+impl EngineHandle {
+    /// Test double: an `EngineHandle` with no control thread behind it — a
+    /// bare channel that just records every `ControlMsg` sent through it.
+    /// The receiver is `crossbeam_channel::Receiver` (the same channel type
+    /// `EngineHandle` already wraps internally), which offers the same
+    /// `try_iter()` a `std::sync::mpsc::Receiver` would for draining and
+    /// counting messages in a test.
+    pub fn for_tests() -> (EngineHandle, Receiver<ControlMsg>) {
+        let (tx, rx) = unbounded();
+        (EngineHandle { tx }, rx)
+    }
+}
+
 /// Spawn the engine control thread. Opens the default output device if one is
 /// available; without a device the engine still runs (headless transport +
 /// silent 60 Hz meter frames) so the UI and tests stay functional.

@@ -30,13 +30,13 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
-use crate::audio::rt::{ParamTable, SharedRt};
+use crate::audio::rt::{ParamTable, SharedRt, FLAG_MUTE, FLAG_SOLO};
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
 pub use ops::TrackMixChange;
-pub use session::Session;
+pub use session::{Committed, EngineEffect, Session, Tx};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -311,6 +311,55 @@ impl ControlPlane {
             "project://changed",
             serde_json::to_value(&payload).unwrap_or_default(),
         );
+    }
+
+    /// Runs a `Session::transact` closure, then — with the session lock
+    /// RELEASED — executes the folded `EngineEffect`: param writes to
+    /// `self.params`, at most one `ControlMsg::Rebuild`, and exactly one
+    /// `project://changed` event carrying additive JSON `{rev, label,
+    /// actor}` (D-06: readers ignore fields they don't recognize).
+    ///
+    /// Zero engine/param-table/event calls happen while the lock is held —
+    /// `Session::transact` (session.rs) only ever computes the effect
+    /// DESCRIPTION; everything below this comment runs after it returns.
+    pub fn commit<F>(&self, meta: op::TxMeta, f: F) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+    {
+        let committed = Session::transact(&self.session, meta, f)?;
+        // ---- session lock is released here; everything below executes
+        // the effect the session merely described. ----
+        for &(slot, path, value) in &committed.effect.param_writes {
+            match path {
+                op::PropPath::Gain => self.params.set_gain_linear(slot, value),
+                op::PropPath::Pan => self.params.set_pan(slot, value),
+                op::PropPath::Muted => self.params.set_flag(slot, FLAG_MUTE, value != 0.0),
+                op::PropPath::Soloed => self.params.set_flag(slot, FLAG_SOLO, value != 0.0),
+                // No ParamTable counterpart for Armed (apply_track_mix
+                // doesn't write one either).
+                op::PropPath::Armed => {}
+            }
+        }
+        if let Some(any_solo) = committed.effect.any_solo {
+            self.params.any_solo.store(any_solo, Relaxed);
+        }
+        if committed.effect.rebuild {
+            self.engine.send(ControlMsg::Rebuild);
+        }
+        #[derive(Serialize)]
+        struct ChangeNotice<'a> {
+            rev: u64,
+            label: &'a str,
+            actor: &'a op::Actor,
+        }
+        let payload = serde_json::to_value(&ChangeNotice {
+            rev: committed.rev,
+            label: &committed.meta.label,
+            actor: &committed.meta.actor,
+        })
+        .unwrap_or_default();
+        (self.emit)("project://changed", payload);
+        Ok(committed)
     }
 
     pub fn create_project(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
@@ -828,6 +877,92 @@ mod tests {
     /// (real engine, headless-safe — the shared harness for the event-parity
     /// tests below).
     type RecordedEvents = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    // ---- Task 6 helpers: commit() folding (for_tests engine double) ----
+
+    use crate::control::op::{Actor, ObjectRef, Op, PropPath, TxMeta};
+
+    fn user_meta(label: &str) -> TxMeta {
+        TxMeta { actor: Actor::User, run: "r-1".into(), label: label.into() }
+    }
+
+    fn test_track(id: &str) -> TrackState {
+        TrackState {
+            id: id.into(),
+            name: "New Track".into(),
+            kind: "audio".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        }
+    }
+
+    fn set_gain(track_id: &str, to: f64) -> Op {
+        Op::Set {
+            object: ObjectRef::Track(track_id.into()),
+            path: PropPath::Gain,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(to),
+        }
+    }
+
+    /// A `ControlPlane` wired to `EngineHandle::for_tests()` (no real engine
+    /// thread — just a channel that records sent `ControlMsg`s) and a
+    /// Vec-capturing event emitter, seeded with one slotted track per given
+    /// id. Used by `commit()`'s folding tests.
+    fn test_plane_with_tracks(
+        ids: &[&str],
+    ) -> (ControlPlane, crossbeam_channel::Receiver<ControlMsg>, RecordedEvents) {
+        let mut store = Store::default();
+        for &id in ids {
+            store.alloc_slot(id);
+            store.tracks.push(test_track(id));
+        }
+        let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
+        let shared = Arc::new(SharedRt::default());
+        let params = Arc::new(ParamTable::default());
+        let (engine, engine_rx) = EngineHandle::for_tests();
+        let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let cp = ControlPlane::new(
+            session,
+            shared,
+            params,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+        );
+        (cp, engine_rx, events)
+    }
+
+    /// The gate test (task-6 brief): a batch with two structural ops
+    /// (`TrackAdd` x2) and one mix `Set` must fold to exactly one
+    /// `ControlMsg::Rebuild` and emit exactly one `project://changed`, and
+    /// both must land only AFTER the session lock is released (`commit`
+    /// itself proves this by construction: it can't touch `self.params` /
+    /// `self.engine` / `self.emit` until `Session::transact` returns).
+    #[test]
+    fn three_ops_one_rebuild_one_event() {
+        let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
+        plane
+            .commit(user_meta("batch"), |tx| {
+                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1 })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2 })?;
+                tx.apply(set_gain("t-1", 0.5))?;
+                Ok(())
+            })
+            .unwrap();
+        let rebuilds = engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count();
+        assert_eq!(rebuilds, 1, "two structural ops must fold to one Rebuild");
+        assert_eq!(
+            events.lock().iter().filter(|(n, _)| n == "project://changed").count(),
+            1
+        );
+    }
 
     fn recording_control_plane() -> (Arc<ControlPlane>, RecordedEvents, EngineHandle) {
         struct NullEvents;
