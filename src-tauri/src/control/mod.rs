@@ -868,11 +868,19 @@ pub fn import_audio_clip(
 
 /// Seed an empty session with the demo song (see
 /// [`ControlPlane::seed_demo_project`]). Returns the refreshed snapshot.
+///
+/// Async on purpose: sync commands run on the MAIN thread, and on Linux the
+/// WebKitGTK webview shares the GTK main loop — a seconds-long build (Zyn
+/// instantiation) would freeze the UI so the button's busy state never
+/// paints. `spawn_blocking` keeps the heavy work off the async runtime too.
 #[tauri::command]
-pub fn seed_demo_project(
+pub async fn seed_demo_project(
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<ProjectSnapshot, String> {
-    control.seed_demo_project()
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.seed_demo_project())
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 // ---------------------------------------------------------------------------
