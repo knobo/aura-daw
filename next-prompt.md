@@ -43,7 +43,7 @@ embedded MCP server so agents mutate the session alongside the user.
    `docs/PHASE4-PLAN.md`'s "Plan B handoff" section for its binding
    carry-forwards (id-preserving piano roll deferred to Plan E;
    `next_note_id`'s move to the content object and the split/merge/copy
-   rules bind Plan C/D directly). Suites: **340 backend + 73 frontend**,
+   rules bind Plan C/D directly). Suites: **346 backend + 80 frontend**,
    all green, counts dated in README/CONTRIBUTING.
 
 ## Your task

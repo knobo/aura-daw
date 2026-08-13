@@ -132,7 +132,7 @@ folded through `GenerationMaps`; `MAX_TRACKS` removed, chunked meter blocks
 replace the fixed-array/u64-mask assumption. Gate B green: delete-then-undo
 identity property, the slot-aliasing pin, and the meter-generation pin all
 pass (`src-tauri/tests/identity_properties.rs`). Suites:
-**340 backend + 73 frontend**, all green, counts dated in
+**346 backend + 80 frontend**, all green, counts dated in
 README/CONTRIBUTING.
 
 The following are binding carry-forwards for later plans, recorded here so
@@ -162,25 +162,20 @@ they aren't lost between sub-plan hand-offs:
 - **Ledgered, not taken:** the waveform pyramid cache is still keyed by
   clip id, not source id — a dedup-by-source opportunity Plan B's
   source-keyed decode cache (Task 4) does NOT extend to the pyramid cache;
-  left for whichever later round touches waveform rendering. Pyramids are
-  now built from resampled engine-rate source data
-  (`AudioEngine::ensure_loaded`, `src-tauri/src/audio/engine.rs`) rather
-  than a fresh file read — this is visual-only (peak/RMS overview, not
-  audio-critical) and intentional, not a latent bug.
+  left for whichever later round touches waveform rendering. The
+  missing-pyramid rebuild path re-reads the source file's raw samples
+  (fix commit `c0a2bfc`; see `AudioEngine::ensure_loaded`,
+  `src-tauri/src/audio/engine.rs` ~854-890) rather than building from the
+  engine-rate-resampled decode cache, so pyramids are always
+  source-rate-correct per the AWTF tile protocol.
   `GraphTables` under a `parking_lot::Mutex` is fine at today's track
   counts and rebuild rates — revisit only with a measurement (round-2
   §10.3's rule: no speculative lock-free rewrite without a bench showing
-  contention). `GenerationMaps::resolve` is unused API surface (no
-  production call site, only tests) — kept because Plan E's per-op
-  attribution will need to resolve `(generation, slot)` back to a
-  `TrackId`; deferred, not dead. `RtGraph`'s manual `impl Default` is
-  test/placeholder convenience only (documented as such in-tree);
-  production code always goes through `RtGraph::new` — deferred cleanup,
-  not a correctness gap. `create_project` and `save_project_as`
-  (`src-tauri/src/control/mod.rs`) do not reset `session.midi.dirty`;
-  deferred — does not affect correctness today since both paths persist
-  midi state as part of the same operation, but a future audit of dirty-
-  flag invariants should account for it.
+  contention). Plan E re-adds a `GenerationMaps` resolve accessor if/when
+  its per-op attribution needs one. `create_project` and
+  `save_project_as` (`src-tauri/src/control/mod.rs`) resetting
+  `session.midi.dirty` is RESOLVED via the shared `adopt_midi_dir` helper
+  (fix commit `c0a2bfc`; `src-tauri/src/control/mod.rs` ~145).
 - **Coverage note:** `channel_properties.rs`'s clip-extension property
   (Gate A) is a same-track-contiguous oracle; it cannot independently
   catch positional restore bugs across interleaved clip vecs. Dedicated
