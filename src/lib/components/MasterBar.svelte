@@ -85,6 +85,9 @@
       {/each}
       {#each activeGenJobs as job (job.jobId)}
         <div class="job mono" title="{job.label} — {job.stage}">
+          {#if job.origin === "agent"}
+            <span class="jagent" title="started by an agent over MCP">MCP</span>
+          {/if}
           <span class="jkind">{KIND_LABEL[job.kind] ?? job.kind}</span>
           <div class="jbar">
             <div class="jfill" style:width="{job.progress * 100}%"></div>
@@ -169,6 +172,14 @@
     font-size: 9px;
     letter-spacing: 0.15em;
     color: var(--magenta);
+  }
+  .jagent {
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    padding: 1px 3px;
+    border-radius: 2px;
+    color: var(--cyan);
+    border: 1px solid color-mix(in srgb, var(--cyan) 45%, transparent);
   }
   .jbar {
     width: 90px;

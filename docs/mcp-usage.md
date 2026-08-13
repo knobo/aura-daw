@@ -75,6 +75,15 @@ Destructive (policy-gated): `create_project`, `add_track`, `set_track_mix`
 * a finished `stableAudioSfz` job auto-loads its `sfzPath` into the sampler
   bank, ready for `sampler_preview_note` / `set_track_instrument`.
 
+Agent-launched jobs are visible to the human at the console: they reach the
+same `sidecar://*` app-event bus as UI-launched ones, and the frontend adopts
+any job id no UI flow owns — so the job shows up in the master bar's JOBS
+box (tagged `MCP`) and in the AI Studio list, with progress, cancel, and its
+landed result. `set_track_mix` likewise emits `project://changed`, so an
+agent's gain/pan moves are reflected in the mixer instead of only being
+audible. Agents themselves still poll `get_job_status` — there is no
+per-job channel for the MCP front door.
+
 ## Policy modes
 
 Wire shape: `docs/ipc-schemas/mcp-policy.schema.json`; change it with the

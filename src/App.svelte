@@ -17,6 +17,7 @@
   import { ui } from "./lib/state/ui.svelte";
   import { exporter } from "./lib/state/exporter.svelte";
   import { loopjam } from "./lib/state/loopjam.svelte";
+  import { generation } from "./lib/state/generation.svelte";
   import TransportBar from "./lib/components/TransportBar.svelte";
   import Timeline from "./lib/components/Timeline.svelte";
   import MasterBar from "./lib/components/MasterBar.svelte";
@@ -35,8 +36,12 @@
     void mcp.init();
     exporter.init();
     void loopjam.init();
+    generation.init(); // adopt jobs an agent starts over MCP
     void startMeterStream();
-    return () => stopMeterStream();
+    return () => {
+      stopMeterStream();
+      generation.dispose();
+    };
   });
 
   function onKeydown(e: KeyboardEvent) {

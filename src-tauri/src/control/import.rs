@@ -925,6 +925,108 @@ mod tests {
         (cp, parent)
     }
 
+    /// Same, but with an emitter that records the app events it is handed.
+    fn control_plane_recording(
+        name: &str,
+    ) -> (Arc<ControlPlane>, PathBuf, Arc<Mutex<Vec<(String, serde_json::Value)>>>) {
+        let shared = Arc::new(crate::audio::rt::SharedRt::default());
+        let params = Arc::new(ParamTable::default());
+        let store = Arc::new(Mutex::new(Store::default()));
+        let engine = crate::audio::engine::start(
+            shared.clone(),
+            params.clone(),
+            store.clone(),
+            Box::new(NullEvents),
+        );
+        let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let cp = Arc::new(ControlPlane::new(
+            store,
+            shared,
+            params,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Arc::new(Mutex::new(crate::midi::MidiStore::default())),
+            Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+        ));
+        let parent = tmp_parent(name);
+        cp.create_project(parent.to_str().unwrap(), "Announce").unwrap();
+        events.lock().clear(); // project creation is not what we're asserting
+        (cp, parent, events)
+    }
+
+    /// Pins the guarantee the MCP front door leans on. The auto-import runs
+    /// on its own thread AFTER `done` is delivered and reports itself as a
+    /// `log` line — and logs never reach the app-event bus, so a caller with
+    /// no per-job channel (the MCP `run_sidecar_job` tool) cannot learn that
+    /// way when the clip landed. What saves it is that `import_audio_clip_impl`
+    /// emits `project://changed` itself, with the clip already IN the payload;
+    /// the frontend's `project://changed` listener is what makes an agent's
+    /// generated clip appear. Whoever moves that emit breaks agent imports
+    /// silently — hence this test.
+    #[tokio::test]
+    async fn auto_import_announces_the_landed_clip_over_project_changed() {
+        let (cp, parent, events) = control_plane_recording("announce");
+        let src = parent.join("generated.wav");
+        write_wav(&src, 2, 44_100, 800);
+
+        let seen: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let inner: EventSink = Arc::new(move |ev| seen2.lock().push(ev));
+        let sink = wrap_sink_with_import(
+            &cp,
+            &serde_json::json!({"importToTrackId": null, "importAtSamples": 9_600}),
+            inner,
+        );
+
+        sink(SidecarEvent::Done {
+            job_id: "job-1".into(),
+            result: serde_json::json!({
+                "kind": "aceStepGenerate",
+                "outputPath": src.to_string_lossy(),
+            }),
+        });
+
+        // `done` is synchronous; the import lands on its own thread and
+        // finishes with the follow-up log line.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let landed = seen.lock().iter().any(
+                |e| matches!(e, SidecarEvent::Log { line, .. } if line.starts_with("auto-import:")),
+            );
+            if landed {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto-import never finished: {:?}",
+                seen.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let evs = events.lock();
+        let payload = evs
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "project://changed")
+            .map(|(_, p)| p)
+            .expect("auto-import announced itself");
+        let clips = payload["clips"].as_array().expect("clips array");
+        // The import copies the source into the project (`audio/<uuid>.wav`),
+        // so the clip's NAME is what carries the identity here.
+        assert!(
+            clips.iter().any(|c| c["name"] == "generated"
+                && c["timelineStartSamples"] == 9_600
+                && c["lengthSamples"] == 800),
+            "announcement carries the landed clip, not a pre-import snapshot: {clips:?}"
+        );
+        assert!(
+            payload["tracks"].as_array().is_some_and(|t| t.len() == 1),
+            "importToTrackId=null auto-created exactly one track"
+        );
+    }
+
     fn write_sh(dir: &Path, name: &str, body: &str) -> PathBuf {
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
