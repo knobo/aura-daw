@@ -279,7 +279,7 @@ mod tests {
         let mut out = vec![0.0f32; frames * 2];
         let mut pos = 0u64;
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(&mut g, pos, &LoopSpec::OFF, chunk, 2, rate, false);
+            mixer::render(&mut g, pos, &LoopSpec::OFF, chunk, 2, rate, false, None);
             pos += (chunk.len() / 2) as u64;
         }
         out

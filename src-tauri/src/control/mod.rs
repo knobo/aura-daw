@@ -1813,6 +1813,7 @@ mod tests {
                 2,
                 48_000,
                 false,
+                None,
             );
             pos += (chunk.len() / 2) as u64;
         }
@@ -1890,6 +1891,7 @@ mod tests {
                 2,
                 48_000,
                 false,
+                None,
             );
             pos += (chunk.len() / 2) as u64;
         }

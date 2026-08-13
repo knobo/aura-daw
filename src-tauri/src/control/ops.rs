@@ -64,10 +64,10 @@ pub(crate) fn insert_track(store: &mut Store, track: TrackState, index: usize) {
 /// (`types::derive_slots`) and a fresh row's params come from that same
 /// rebuild's build-time population (unity gain / center pan / no flags),
 /// an exact behavioral match for what the deleted `params.reset_slot` used
-/// to write. There is therefore no `MAX_TRACKS` limit here either — that
-/// error dies with the fixed arrays it used to guard (final removal of
-/// `MAX_TRACKS` itself is Task 7 territory). Returns `(track, index)`;
-/// `index` is the row's intended position (end of the current list).
+/// to write. There is therefore no `MAX_TRACKS` limit here either — the
+/// const itself is gone (Task 7: `ParamTable` is sized per-graph). Returns
+/// `(track, index)`; `index` is the row's intended position (end of the
+/// current list).
 pub(crate) fn new_track_row(
     store: &mut Store,
     name: Option<String>,

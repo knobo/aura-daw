@@ -765,7 +765,7 @@ mod tests {
     ) -> Vec<f32> {
         let mut out = vec![0.0f32; frames * 2];
         for chunk in out.chunks_mut(512 * 2) {
-            mixer::render(g, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity);
+            mixer::render(g, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity, None);
             discontinuity = false;
             pos += (chunk.len() / 2) as u64;
         }

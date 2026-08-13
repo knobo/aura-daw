@@ -3,28 +3,41 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use super::types::{MeterFrame, TrackMeter, MAX_TRACKS};
+use super::types::{MeterFrame, TrackMeter};
 use crate::ids::TrackId;
 
 /// Linear level at/above which a channel is reported as clipped.
 pub const CLIP_THRESHOLD: f32 = 0.999;
 
-/// One per-buffer meter block, POD, fixed size (~2 KiB) so pushing it through
-/// rtrb is a memcpy + two atomic ops. `mask` bit N marks slot N as present.
+/// Slots covered by one meter chunk — Task 7: replaces the old
+/// `MAX_TRACKS`-wide single block. A graph wider than this emits several
+/// chunks per callback (`⌈slots / METER_CHUNK_SLOTS⌉`), still fixed-size POD
+/// through rtrb; per-graph sizing (`ParamTable::with_slots`) has no cap, so
+/// the meter path can't have one either.
+pub const METER_CHUNK_SLOTS: usize = 64;
+
+/// One per-buffer meter CHUNK, POD, fixed size (~2 KiB) so pushing it
+/// through rtrb is a memcpy + two atomic ops. `mask` bit N marks LOCAL lane
+/// N (i.e. slot `base_slot + N`) as present within this chunk.
 #[derive(Clone, Copy)]
 pub struct RawMeterBlock {
-    /// The `RtGraph` generation this block's slots were resolved against
+    /// The `RtGraph` generation this chunk's slots were resolved against
     /// (round-2 §2.4 / Task 6) — the fold must resolve `(generation, slot)`
-    /// under the SAME slot map that produced the block, never the current
+    /// under the SAME slot map that produced the chunk, never the current
     /// one, or a per-rebuild renumbering shows one track's level on another.
     pub generation: u64,
     pub position: u64,
     pub frames: u32,
+    /// First slot this chunk covers; lane i = slot `base_slot + i`.
+    pub base_slot: u32,
+    /// Presence within THIS chunk (lane-relative, not slot-relative).
     pub mask: u64,
-    /// [slot][channel] max(|sample|) over the buffer.
-    pub peak: [[f32; 2]; MAX_TRACKS],
-    /// [slot][channel] sum of squared samples over the buffer.
-    pub sumsq: [[f32; 2]; MAX_TRACKS],
+    /// [lane][channel] max(|sample|) over the buffer.
+    pub peak: [[f32; 2]; METER_CHUNK_SLOTS],
+    /// [lane][channel] sum of squared samples over the buffer.
+    pub sumsq: [[f32; 2]; METER_CHUNK_SLOTS],
+    /// Master bus meters — carried ONLY on the chunk with `base_slot == 0`;
+    /// the fold reads master from there and ignores it on other chunks.
     pub master_peak: [f32; 2],
     pub master_sumsq: [f32; 2],
 }
@@ -35,20 +48,23 @@ impl RawMeterBlock {
             generation,
             position,
             frames,
+            base_slot: 0,
             mask: 0,
-            peak: [[0.0; 2]; MAX_TRACKS],
-            sumsq: [[0.0; 2]; MAX_TRACKS],
+            peak: [[0.0; 2]; METER_CHUNK_SLOTS],
+            sumsq: [[0.0; 2]; METER_CHUNK_SLOTS],
             master_peak: [0.0; 2],
             master_sumsq: [0.0; 2],
         }
     }
 
+    /// Set LANE `lane` (local to this chunk — the global slot is
+    /// `base_slot + lane`) to the given peak/sum-of-squares.
     #[inline]
-    pub fn set_slot(&mut self, slot: usize, peak_l: f32, peak_r: f32, ss_l: f32, ss_r: f32) {
-        if slot < MAX_TRACKS {
-            self.mask |= 1 << slot;
-            self.peak[slot] = [peak_l, peak_r];
-            self.sumsq[slot] = [ss_l, ss_r];
+    pub fn set_slot_local(&mut self, lane: usize, peak_l: f32, peak_r: f32, ss_l: f32, ss_r: f32) {
+        if lane < METER_CHUNK_SLOTS {
+            self.mask |= 1 << lane;
+            self.peak[lane] = [peak_l, peak_r];
+            self.sumsq[lane] = [ss_l, ss_r];
         }
     }
 }
@@ -133,31 +149,40 @@ pub struct MeterAccum {
 }
 
 impl MeterAccum {
-    /// Fold a block into the accumulator, resolving each set slot under the
-    /// slot map published for `b.generation` — NOT the current one. A block
+    /// Fold a chunk into the accumulator, resolving each set lane under the
+    /// slot map published for `b.generation` — NOT the current one. A chunk
     /// whose generation isn't in the window at all is dropped wholesale
     /// (stale beyond `GenerationMaps::KEPT_GENERATIONS`, or a pinned
-    /// recording generation that was never published); a slot that IS
+    /// recording generation that was never published); a lane that IS
     /// covered by a known generation but has no track (a mid-rebuild
     /// mismatch) is skipped individually.
+    ///
+    /// Frame/position/master accounting [I3] happens ONLY on the chunk with
+    /// `base_slot == 0` — one per callback per generation, regardless of how
+    /// many chunks a wide graph emits. Counting every chunk would inflate
+    /// the RMS denominator by the chunk count (a real bug this design
+    /// avoids: meters would read low, silently, the wider the graph gets).
     pub fn fold(&mut self, b: &RawMeterBlock, maps: &GenerationMaps) {
         let Some(slot_map) = maps.slot_map(b.generation) else { return };
-        self.frames += b.frames as u64;
-        self.position = b.position;
-        for slot in 0..MAX_TRACKS {
-            if b.mask & (1 << slot) != 0 {
-                if let Some(track_id) = slot_map.get(&slot) {
-                    let lanes = self.lanes.entry(track_id.clone()).or_default();
-                    lanes.peak[0] = lanes.peak[0].max(b.peak[slot][0]);
-                    lanes.peak[1] = lanes.peak[1].max(b.peak[slot][1]);
-                    lanes.sumsq[0] += b.sumsq[slot][0];
-                    lanes.sumsq[1] += b.sumsq[slot][1];
-                }
+        if b.base_slot == 0 {
+            self.frames += b.frames as u64;
+            self.position = b.position;
+            for c in 0..2 {
+                self.master_peak[c] = self.master_peak[c].max(b.master_peak[c]);
+                self.master_sumsq[c] += b.master_sumsq[c];
             }
         }
-        for c in 0..2 {
-            self.master_peak[c] = self.master_peak[c].max(b.master_peak[c]);
-            self.master_sumsq[c] += b.master_sumsq[c];
+        for lane in 0..METER_CHUNK_SLOTS {
+            if b.mask & (1 << lane) != 0 {
+                let slot = b.base_slot as usize + lane;
+                if let Some(track_id) = slot_map.get(&slot) {
+                    let lanes = self.lanes.entry(track_id.clone()).or_default();
+                    lanes.peak[0] = lanes.peak[0].max(b.peak[lane][0]);
+                    lanes.peak[1] = lanes.peak[1].max(b.peak[lane][1]);
+                    lanes.sumsq[0] += b.sumsq[lane][0];
+                    lanes.sumsq[1] += b.sumsq[lane][1];
+                }
+            }
         }
     }
 
@@ -227,7 +252,7 @@ mod tests {
 
     fn block(gen: u64, pos: u64, frames: u32, slot: usize, peak: f32, sumsq: f32) -> RawMeterBlock {
         let mut b = RawMeterBlock::new(gen, pos, frames);
-        b.set_slot(slot, peak, peak / 2.0, sumsq, sumsq / 4.0);
+        b.set_slot_local(slot, peak, peak / 2.0, sumsq, sumsq / 4.0);
         b.master_peak = [peak, peak];
         b.master_sumsq = [sumsq, sumsq];
         b
@@ -291,9 +316,9 @@ mod tests {
         maps.publish(2, &[("b".into(), 0)].into_iter().collect());
         let mut acc = MeterAccum::default();
         let mut b1 = RawMeterBlock::new(1, 0, 100);
-        b1.set_slot(0, 0.5, 0.5, 1.0, 1.0); // "a" under gen 1
+        b1.set_slot_local(0, 0.5, 0.5, 1.0, 1.0); // "a" under gen 1
         let mut b2 = RawMeterBlock::new(2, 100, 100);
-        b2.set_slot(0, 0.9, 0.9, 2.0, 2.0); // "b" under gen 2
+        b2.set_slot_local(0, 0.9, 0.9, 2.0, 2.0); // "b" under gen 2
         acc.fold(&b1, &maps);
         acc.fold(&b2, &maps);
         let f = acc.take_frame(0, &["a".into(), "b".into()], 0);
@@ -309,7 +334,7 @@ mod tests {
         }
         let mut acc = MeterAccum::default();
         let mut stale = RawMeterBlock::new(1, 0, 100); // pruned (only recent kept)
-        stale.set_slot(0, 1.0, 1.0, 1.0, 1.0);
+        stale.set_slot_local(0, 1.0, 1.0, 1.0, 1.0);
         acc.fold(&stale, &maps);
         assert!(acc.is_empty(), "stale-generation blocks contribute nothing");
     }
@@ -323,9 +348,53 @@ mod tests {
         }
         let mut acc = MeterAccum::default();
         let mut b = RawMeterBlock::new(1, 0, 100);
-        b.set_slot(0, 0.7, 0.7, 1.0, 1.0);
+        b.set_slot_local(0, 0.7, 0.7, 1.0, 1.0);
         acc.fold(&b, &maps);
         let f = acc.take_frame(0, &["t".into()], 0);
         assert!((f.tracks[0].peak_l - 0.7).abs() < 1e-6, "pinned gen-1 still resolves");
+    }
+
+    #[test]
+    fn chunked_blocks_cover_slots_past_sixty_four() {
+        let mut maps = GenerationMaps::default();
+        maps.publish(
+            1,
+            &(0..100)
+                .map(|i| (TrackId::from(format!("t{i}").as_str()), i))
+                .collect(),
+        );
+        let mut acc = MeterAccum::default();
+        let mut hi = RawMeterBlock::new(1, 0, 100);
+        hi.base_slot = 64;
+        hi.set_slot_local(99 - 64, 0.7, 0.7, 1.0, 1.0); // slot 99, lane 35
+        acc.fold(&hi, &maps);
+        let order: Vec<TrackId> = (0..100).map(|i| TrackId::from(format!("t{i}").as_str())).collect();
+        let f = acc.take_frame(0, &order, 0);
+        assert!((f.tracks[99].peak_l - 0.7).abs() < 1e-6);
+    }
+
+    /// [I3]: frame/RMS accounting must come ONLY from the `base_slot == 0`
+    /// chunk. Folding a second chunk (base 64) from the SAME callback must
+    /// not double the RMS denominator — the bug this design avoids reads
+    /// meters low, silently, the wider the graph gets.
+    #[test]
+    fn frame_accounting_ignores_non_base_chunks() {
+        let maps = maps_with(1, &[("t", 0)]);
+        // Single-chunk baseline: one block, 100 frames, sumsq 8.0 -> rms = sqrt(8/100).
+        let mut single = MeterAccum::default();
+        single.fold(&block(1, 0, 100, 0, 1.0, 8.0), &maps);
+        let f_single = single.take_frame(0, &["t".into()], 0);
+
+        // Two chunks from ONE callback: base 0 (frames=100) and base 64
+        // (also frames=100, as `render` stamps every chunk the same way) —
+        // the second must not add to the frame/RMS denominator.
+        let mut two = MeterAccum::default();
+        two.fold(&block(1, 0, 100, 0, 1.0, 8.0), &maps);
+        let mut extra = RawMeterBlock::new(1, 0, 100);
+        extra.base_slot = 64;
+        two.fold(&extra, &maps);
+        let f_two = two.take_frame(0, &["t".into()], 0);
+
+        assert!((f_two.tracks[0].rms_l - f_single.tracks[0].rms_l).abs() < 1e-6);
     }
 }

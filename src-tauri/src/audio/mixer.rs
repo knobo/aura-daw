@@ -16,10 +16,9 @@
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::dsp::ProcessBlock;
-use super::meters::RawMeterBlock;
+use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::rt::{RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
-use super::types::MAX_TRACKS;
 use crate::midi::synth::BlockNoteEvent;
 
 /// Fader dB to linear gain. -160 dB (and below) encodes -inf.
@@ -199,14 +198,23 @@ fn render_live(
 
 /// Render one output buffer: mixes all tracks into `out` (interleaved,
 /// `out_ch` channels) starting at timeline position `base_pos`, honoring the
-/// loop region per-frame. Returns the folded meter block (post-fader,
-/// post-mute). RT-safe: fixed-size stack state + the graph's preallocated
-/// scratch only.
+/// loop region per-frame. RT-safe: fixed-size stack state + the graph's
+/// preallocated scratch only — including the meter chunks (Task 7:
+/// `graph.meter_scratch`, sized `⌈slots / METER_CHUNK_SLOTS⌉` at BUILD time,
+/// so a wide graph's meter output is N in-place mutations + N pushes, never
+/// an RT allocation).
 ///
 /// `discontinuity` must be true when `base_pos` does not continue the
 /// previous render (seek, stop→play): live instrument nodes get
 /// `all_notes_off` so no voice hangs waiting for a note-off that will never
 /// be delivered.
+///
+/// `meter_tx` is `None` for offline/loopjam/headless-test callers that don't
+/// wire up a ring; `Some` (the cpal output callback) gets every chunk pushed
+/// into it. Returns the number of chunks DROPPED because the ring was full —
+/// `render` has no `SharedRt` to bump xruns itself, so the caller (which
+/// does) counts one xrun per dropped chunk.
+#[allow(clippy::too_many_arguments)]
 pub fn render(
     graph: &mut RtGraph,
     base_pos: u64,
@@ -215,11 +223,11 @@ pub fn render(
     out_ch: usize,
     sample_rate: u32,
     discontinuity: bool,
-) -> RawMeterBlock {
+    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
+) -> u32 {
     let out_ch = out_ch.max(1);
     let frames = out.len() / out_ch;
     out.fill(0.0);
-    let mut blk = RawMeterBlock::new(graph.generation, base_pos, frames as u32);
     // Round-2 §2.4 / [I6]: the graph's OWN params, not a passed-in
     // reference — `render(g, &g.params, ...)` doesn't borrow-check
     // (mutable borrow of `*g` + shared borrow of `g.params`), so this reads
@@ -228,10 +236,19 @@ pub fn render(
     // retired graph always renders against the table it was built with.
     let params = graph.params.clone();
     let any_solo = params.any_solo.load(Relaxed);
-    let RtGraph { tracks, scratch, .. } = graph;
+    let n_slots = params.len();
+    let generation = graph.generation;
+    let RtGraph { tracks, scratch, meter_scratch, .. } = graph;
+
+    // Reset this callback's chunk templates in place (Task 7: preallocated
+    // at BUILD time on the control thread; `render` never grows this Vec).
+    for (i, chunk) in meter_scratch.iter_mut().enumerate() {
+        *chunk = RawMeterBlock::new(generation, base_pos, frames as u32);
+        chunk.base_slot = (i * METER_CHUNK_SLOTS) as u32;
+    }
 
     for tr in tracks.iter() {
-        if tr.slot >= MAX_TRACKS {
+        if tr.slot >= n_slots {
             continue;
         }
         let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
@@ -276,20 +293,37 @@ pub fn render(
             &mut acc,
         );
 
-        blk.set_slot(tr.slot, acc.pk_l, acc.pk_r, acc.ss_l, acc.ss_r);
+        let chunk_idx = tr.slot / METER_CHUNK_SLOTS;
+        let lane = tr.slot % METER_CHUNK_SLOTS;
+        if let Some(chunk) = meter_scratch.get_mut(chunk_idx) {
+            chunk.set_slot_local(lane, acc.pk_l, acc.pk_r, acc.ss_l, acc.ss_r);
+        }
     }
 
-    // Master meters from the summed output.
-    for i in 0..frames {
-        let o = i * out_ch;
-        let l = out[o];
-        let r = if out_ch >= 2 { out[o + 1] } else { out[o] };
-        blk.master_peak[0] = blk.master_peak[0].max(l.abs());
-        blk.master_peak[1] = blk.master_peak[1].max(r.abs());
-        blk.master_sumsq[0] += l * l;
-        blk.master_sumsq[1] += r * r;
+    // Master meters from the summed output, on the first chunk only
+    // (base_slot == 0) — `meter_scratch` always has at least one entry
+    // (`RtGraph::new` floors the chunk count to 1), so this never misses.
+    if let Some(first) = meter_scratch.first_mut() {
+        for i in 0..frames {
+            let o = i * out_ch;
+            let l = out[o];
+            let r = if out_ch >= 2 { out[o + 1] } else { out[o] };
+            first.master_peak[0] = first.master_peak[0].max(l.abs());
+            first.master_peak[1] = first.master_peak[1].max(r.abs());
+            first.master_sumsq[0] += l * l;
+            first.master_sumsq[1] += r * r;
+        }
     }
-    blk
+
+    let mut dropped = 0u32;
+    if let Some(producer) = meter_tx {
+        for chunk in meter_scratch.iter() {
+            if producer.push(*chunk).is_err() {
+                dropped += 1;
+            }
+        }
+    }
+    dropped
 }
 
 #[cfg(test)]
@@ -390,17 +424,32 @@ mod tests {
         RtGraph::new(vec![RtTrack::clips(slot, vec![c])], 1, Arc::new(ParamTable::default()))
     }
 
-    /// Old-signature convenience: clip-only graphs, no discontinuity. Params
-    /// now live on the graph (`g.params`); callers mutate that Arc directly
-    /// before rendering.
-    fn render_simple(
+    /// Old-signature convenience: clip-only graphs, no discontinuity, no
+    /// meter ring (`None`) — for tests that only care about the mixed
+    /// audio. Params now live on the graph (`g.params`); callers mutate
+    /// that Arc directly before rendering.
+    fn render_simple(g: &mut RtGraph, base: u64, lp: &LoopSpec, out: &mut [f32], out_ch: usize) {
+        render(g, base, lp, out, out_ch, 48_000, false, None);
+    }
+
+    /// Render with a meter ring wired up, returning every chunk pushed by
+    /// this call (Task 7: `render` no longer returns a block directly — it
+    /// pushes `1..=⌈slots/64⌉` chunks into the ring).
+    fn render_with_meters(
         g: &mut RtGraph,
         base: u64,
         lp: &LoopSpec,
         out: &mut [f32],
         out_ch: usize,
-    ) -> RawMeterBlock {
-        render(g, base, lp, out, out_ch, 48_000, false)
+    ) -> Vec<RawMeterBlock> {
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(16);
+        let dropped = render(g, base, lp, out, out_ch, 48_000, false, Some(&mut tx));
+        assert_eq!(dropped, 0, "test ring is never full");
+        let mut blocks = Vec::new();
+        while let Ok(b) = rx.pop() {
+            blocks.push(b);
+        }
+        blocks
     }
 
     #[test]
@@ -409,7 +458,8 @@ mod tests {
         g.params.set_gain_linear(0, 0.5);
         g.params.set_pan(0, -1.0); // hard left
         let mut out = vec![0.0f32; 8]; // 4 frames stereo
-        let blk = render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let blocks = render_with_meters(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let blk = blocks[0];
         assert!((out[0] - 0.5).abs() < 1e-6, "left gets gain*1.0");
         assert!(out[1].abs() < 1e-6, "right silent at hard left");
         assert!((blk.peak[0][0] - 0.5).abs() < 1e-6);
@@ -427,7 +477,8 @@ mod tests {
         g.params.set_flag(1, FLAG_SOLO, true);
         g.params.any_solo.store(true, Relaxed);
         let mut out = vec![0.0f32; 8];
-        let blk = render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let blocks = render_with_meters(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let blk = blocks[0];
         assert_eq!(blk.peak[0][0], 0.0, "non-soloed track is silent");
         let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
         assert!((blk.peak[1][0] - expected).abs() < 1e-5, "soloed track plays center-panned");
@@ -521,10 +572,12 @@ mod tests {
         // Render 24000 frames in odd-sized callback blocks.
         let mut out = vec![0.0f32; 24_000 * 2];
         let mut pos = 0u64;
+        let (mut tx, mut rx) = rtrb::RingBuffer::new(8);
         for chunk in out.chunks_mut(700 * 2) {
-            let blk =
-                render(&mut g, pos, &LoopSpec::OFF, chunk, 2, RATE, false);
+            let dropped = render(&mut g, pos, &LoopSpec::OFF, chunk, 2, RATE, false, Some(&mut tx));
+            assert_eq!(dropped, 0);
             pos += (chunk.len() / 2) as u64;
+            let blk = rx.pop().expect("one base-0 meter chunk per callback");
             assert_eq!(blk.frames, (chunk.len() / 2) as u32);
         }
         let lefts: Vec<f32> = out.iter().step_by(2).copied().collect();
@@ -545,15 +598,15 @@ mod tests {
         ];
         let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; 512 * 2];
-        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
         assert!(peak(&out) > 0.01, "note started");
         // Seek far past the note-off; the off event will never be delivered.
         // First block after the jump carries discontinuity=true.
-        render(&mut g, 100_000, &LoopSpec::OFF, &mut out, 2, RATE, true);
+        render(&mut g, 100_000, &LoopSpec::OFF, &mut out, 2, RATE, true, None);
         // Render past the release tail: must decay to silence, not hang.
         let mut pos = 100_000 + 512;
         for _ in 0..20 {
-            render(&mut g, pos, &LoopSpec::OFF, &mut out, 2, RATE, false);
+            render(&mut g, pos, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
             pos += 512;
         }
         assert_eq!(peak(&out), 0.0, "no hung voice after discontinuity");
@@ -576,14 +629,14 @@ mod tests {
         // One callback block that crosses the wrap: frames [4096..8192) then
         // wraps to [0..4096).
         let mut out = vec![0.0f32; 8_192 * 2];
-        render(&mut g, 4_096, &lp, &mut out, 2, RATE, false);
+        render(&mut g, 4_096, &lp, &mut out, 2, RATE, false, None);
         assert!(peak(&out) > 0.01, "audible across the wrap");
         // After many looped blocks the voice count must not grow without
         // bound: each wrap releases before the retrigger.
         let node_voices = {
             let mut pos = 4_096u64;
             for _ in 0..50 {
-                render(&mut g, pos, &lp, &mut out, 2, RATE, false);
+                render(&mut g, pos, &lp, &mut out, 2, RATE, false, None);
                 pos = crate::audio::transport::advance(pos, 8_192, &lp);
             }
             let live = g.tracks[0].live.as_ref().unwrap();
@@ -599,6 +652,7 @@ mod tests {
                 2,
                 RATE,
                 false,
+                None,
             );
             peak(&tail[8_000..])
         };

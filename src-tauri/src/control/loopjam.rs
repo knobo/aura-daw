@@ -658,6 +658,7 @@ fn render_region_stereo(
             2,
             engine_rate,
             false,
+            None,
         );
         pos += (chunk.len() / 2) as u64;
     }

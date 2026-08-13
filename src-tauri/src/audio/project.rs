@@ -130,13 +130,6 @@ pub fn save(dir: &Path, project: &Project) -> Result<(), String> {
 /// then fail slot allocation, leaving inconsistent state). All conditions
 /// that could make adoption fail midway are checked here, up front.
 pub fn validate(project: &Project) -> Result<(), String> {
-    if project.tracks.len() > super::types::MAX_TRACKS {
-        return Err(format!(
-            "project has {} tracks; this build supports at most {}",
-            project.tracks.len(),
-            super::types::MAX_TRACKS
-        ));
-    }
     let mut seen = std::collections::HashSet::new();
     for t in &project.tracks {
         if !seen.insert(&t.id) {
@@ -356,23 +349,29 @@ mod tests {
         }
     }
 
-    /// Review fix: a project exceeding MAX_TRACKS (or with duplicate track
-    /// ids) is rejected UP FRONT by `validate`, before `open_project`
-    /// mutates any in-memory state.
+    /// MAX_TRACKS removed in Plan B (round-2 §2.4): slot assignment is
+    /// per-graph now (`ParamTable::with_slots`), so `validate` no longer
+    /// caps track count — a 64-track ceiling would be a miss against the
+    /// product's own scale ambition.
     #[test]
-    fn validate_rejects_overfull_and_duplicate_projects() {
-        let parent = tmp_parent("validate");
+    fn projects_larger_than_sixty_four_tracks_validate() {
+        let parent = tmp_parent("wide-project");
         let (mut project, _) = create(&parent, "V", 48_000, 120.0).unwrap();
-        project.tracks = (0..super::super::types::MAX_TRACKS).map(track_n).collect();
-        assert!(validate(&project).is_ok(), "exactly MAX_TRACKS is fine");
-        project.tracks.push(track_n(usize::MAX - 1)); // 65th track
-        let err = validate(&project).unwrap_err();
-        assert!(err.contains("65 tracks"), "clear message: {err}");
+        project.tracks = (0..200).map(track_n).collect();
+        assert!(validate(&project).is_ok());
+        let _ = fs::remove_dir_all(&parent);
+    }
 
-        let mut dup = project.clone();
-        dup.tracks.truncate(2);
-        dup.tracks[1].id = dup.tracks[0].id.clone();
-        assert!(validate(&dup).is_err(), "duplicate ids rejected");
+    /// Review fix: a project with duplicate track ids is rejected UP FRONT
+    /// by `validate`, before `open_project` mutates any in-memory state.
+    /// The cap is gone; this half of the guard stays.
+    #[test]
+    fn validate_rejects_duplicate_track_ids() {
+        let parent = tmp_parent("validate-dup");
+        let (mut project, _) = create(&parent, "V", 48_000, 120.0).unwrap();
+        project.tracks = (0..2).map(track_n).collect();
+        project.tracks[1].id = project.tracks[0].id.clone();
+        assert!(validate(&project).is_err(), "duplicate ids rejected");
         let _ = fs::remove_dir_all(&parent);
     }
 

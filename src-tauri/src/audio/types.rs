@@ -10,10 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{ClipId, SourceId, TrackId};
 
-/// Hard cap on mixer tracks; slot indices and meter blocks are sized by this.
-/// 64 conveniently matches a `u64` presence mask.
-pub const MAX_TRACKS: usize = 64;
-
 // ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------

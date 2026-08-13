@@ -12,7 +12,7 @@
 //!   (deallocation happens here, never on the RT thread), meter blocks out,
 //!   and recorded samples out to the disk-writer thread.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 
 use super::dsp::linear_resample;
-use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock};
+use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock, METER_CHUNK_SLOTS};
 use super::mixer;
 use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
@@ -257,7 +257,11 @@ impl OutputCb {
 
         match (&mut self.graph, playing) {
             (Some(g), true) => {
-                let blk = mixer::render(
+                // Task 7: `render` pushes the graph's meter chunks itself
+                // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
+                // ring couldn't take — telemetry, not data, so a dropped
+                // chunk is one xrun, not lost audio.
+                let dropped = mixer::render(
                     g,
                     base,
                     &lp,
@@ -265,10 +269,10 @@ impl OutputCb {
                     self.channels,
                     self.rate,
                     discontinuity,
+                    Some(&mut self.meter_tx),
                 );
-                if self.meter_tx.push(blk).is_err() {
-                    // Meter queue overflow: telemetry, not data — drop it.
-                    self.shared.xruns.fetch_add(1, Relaxed);
+                if dropped > 0 {
+                    self.shared.xruns.fetch_add(dropped as u64, Relaxed);
                 }
             }
             _ => out.fill(0.0),
@@ -302,15 +306,20 @@ struct InputCb {
     /// across xruns (each track has its own ring).
     owed: Vec<usize>,
     meter_tx: rtrb::Producer<RawMeterBlock>,
-    /// RT param slots of the recorded tracks (same input feeds all of them).
-    slots: Vec<usize>,
+    /// Preallocated per-chunk meter templates for the recorded slots (Task 7
+    /// [I4]): one entry per distinct `slot / METER_CHUNK_SLOTS` touched by
+    /// the recording, plus the base-0 chunk (for frame accounting) if none
+    /// of the slots land there. Built ONCE at `start_recording` (control
+    /// thread) — `capture` (RT) only mutates these in place and pushes
+    /// copies, never allocates.
+    blocks: Vec<RawMeterBlock>,
+    /// `block_lanes[i]` is the list of LOCAL lanes in `blocks[i]` to stamp
+    /// with this input's level every buffer (same input feeds every
+    /// recorded track, so they all get the identical peak/RMS this buffer).
+    block_lanes: Vec<Vec<usize>>,
     in_ch: usize,
     rec_ch: usize,
     shared: Arc<SharedRt>,
-    /// The `RtGraph` generation these `slots` were resolved against
-    /// (round-2 §2.4 / Task 6) — stamped on every emitted block so the fold
-    /// resolves it under the matching slot map, never the current one.
-    generation: u64,
 }
 
 impl InputCb {
@@ -332,12 +341,15 @@ impl InputCb {
             ss_l += l * l;
             ss_r += r * r;
         }
-        let mut blk =
-            RawMeterBlock::new(self.generation, self.shared.position.load(Relaxed), frames as u32);
-        for &slot in &self.slots {
-            blk.set_slot(slot, pk_l, pk_r, ss_l, ss_r);
+        let pos = self.shared.position.load(Relaxed);
+        for (block, lanes) in self.blocks.iter_mut().zip(self.block_lanes.iter()) {
+            block.position = pos;
+            block.frames = frames as u32;
+            for &lane in lanes {
+                block.set_slot_local(lane, pk_l, pk_r, ss_l, ss_r);
+            }
+            let _ = self.meter_tx.push(*block);
         }
-        let _ = self.meter_tx.push(blk);
 
         // Fan the first `rec_ch` input channels out to every armed ring.
         // Overflow policy: NEVER shrink a take. Whatever cannot be written
@@ -602,7 +614,11 @@ impl Control {
 
         let (graph_tx, graph_rx) = rtrb::RingBuffer::new(8);
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
+        // [M4] Chunking (Task 7) divides headroom by the chunk count, and
+        // the control thread is exactly the thread that stalls
+        // (`ensure_loaded` decodes under rebuild) — grow 64 -> 64*8. Blocks
+        // are ~2 KiB; the memory is nothing control-side.
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64 * 8);
         // Boundary crossings are rare (one per playthrough), but the ring is
         // sized for a burst of them so a stalled control thread never makes
         // the callback drop one.
@@ -673,7 +689,8 @@ impl Control {
             let session = self.session.lock();
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
-            let params = Arc::new(ParamTable::default());
+            // Task 7: sized to THIS rebuild's track count, not a fixed cap.
+            let params = Arc::new(ParamTable::with_slots(store.tracks.len()));
             for (i, t) in store.tracks.iter().enumerate() {
                 params.set_gain_linear(i, mixer::db_to_linear(t.gain_db));
                 params.set_pan(i, t.pan as f32);
@@ -1063,6 +1080,28 @@ impl Control {
         // [I2]): a take spanning more rebuilds than `GenerationMaps` keeps
         // in its plain window must not lose its input meters.
         self.gen_maps.pin(rec_generation);
+
+        // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
+        // preallocated `RawMeterBlock` template per distinct chunk, plus the
+        // base-0 chunk (frame accounting [I3]) even if no recorded slot
+        // lands there. Built here (control thread) so `InputCb::capture`
+        // (RT) never allocates.
+        let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        chunk_lanes.entry(0).or_default();
+        for &slot in &slots {
+            let chunk_idx = slot / METER_CHUNK_SLOTS;
+            let lane = slot % METER_CHUNK_SLOTS;
+            chunk_lanes.entry(chunk_idx).or_default().push(lane);
+        }
+        let mut blocks = Vec::with_capacity(chunk_lanes.len());
+        let mut block_lanes = Vec::with_capacity(chunk_lanes.len());
+        for (chunk_idx, lanes) in chunk_lanes {
+            let mut b = RawMeterBlock::new(rec_generation, 0, 0);
+            b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
+            blocks.push(b);
+            block_lanes.push(lanes);
+        }
+
         let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
         let mut producers = Vec::with_capacity(targets.len());
         let mut consumers = Vec::with_capacity(targets.len());
@@ -1091,17 +1130,21 @@ impl Control {
 
         let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
 
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
+        // [M4] Ring sizing: chunking divides headroom by the chunk count,
+        // and the control thread is exactly the thread that stalls
+        // (`ensure_loaded` decodes under rebuild) — grow 64 -> 64*8. Blocks
+        // are ~2 KiB; the memory is nothing control-side.
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64 * 8);
         let n_producers = producers.len();
         let mut cb = InputCb {
             producers,
             owed: vec![0; n_producers],
             meter_tx,
-            slots,
+            blocks,
+            block_lanes,
             in_ch,
             rec_ch,
             shared: self.shared.clone(),
-            generation: rec_generation,
         };
         let stream = device
             .build_input_stream(
@@ -1508,15 +1551,17 @@ mod tests {
         // Tiny mono ring: 8 samples capacity.
         let (producer, mut consumer) = rtrb::RingBuffer::new(8);
         let (meter_tx, _meter_rx) = rtrb::RingBuffer::new(8);
+        let mut b = RawMeterBlock::new(1, 0, 0);
+        b.base_slot = 0;
         let mut cb = InputCb {
             producers: vec![producer],
             owed: vec![0],
             meter_tx,
-            slots: vec![0],
+            blocks: vec![b],
+            block_lanes: vec![vec![0]],
             in_ch: 1,
             rec_ch: 1,
             shared: shared.clone(),
-            generation: 1,
         };
 
         // 1st buffer: 6 frames fit entirely.

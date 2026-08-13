@@ -145,7 +145,7 @@ pub fn render(
     let mut done = 0u64;
     let mut discontinuity = true;
     for chunk in out.chunks_mut(OFFLINE_BLOCK * 2) {
-        mixer::render(graph, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity);
+        mixer::render(graph, pos, &LoopSpec::OFF, chunk, 2, rate, discontinuity, None);
         discontinuity = false;
         let n = (chunk.len() / 2) as u64;
         pos += n;

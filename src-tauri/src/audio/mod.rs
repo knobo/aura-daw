@@ -615,8 +615,10 @@ pub async fn open_project(path: String, app: AppHandle) -> Result<Project, Strin
 fn open_project_impl(path: String, app: AppHandle) -> Result<Project, String> {
     let state = app.state::<AudioState>();
     let (project, dir) = project::load(std::path::Path::new(&path))?;
-    // Validate BEFORE mutating any in-memory state (review fix: a >MAX_TRACKS
-    // project must fail cleanly, not after tracks/clips were replaced).
+    // Validate BEFORE mutating any in-memory state (review fix: a project
+    // with duplicate track ids must fail cleanly, not after tracks/clips
+    // were replaced — the track-count cap this comment used to describe is
+    // gone, Task 7: slot assignment is per-graph now).
     project::validate(&project)?;
     {
         let mut session = state.session.lock();
