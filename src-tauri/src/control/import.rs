@@ -599,19 +599,8 @@ pub async fn import_audio_clip_split_stems(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::rt::{GraphTables, ParamTable, SharedGraphTables};
+    use crate::audio::rt::testutil::empty_tables;
     use std::path::PathBuf;
-
-    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) for real-engine
-    /// test harnesses — must be handed to BOTH `engine::start` and
-    /// `ControlPlane::new` as the SAME `Arc` (round-2 §2.4).
-    fn empty_tables() -> SharedGraphTables {
-        Arc::new(Mutex::new(GraphTables {
-            generation: 0,
-            params: Arc::new(ParamTable::default()),
-            slots: std::collections::HashMap::new(),
-        }))
-    }
 
     fn tmp_parent(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(

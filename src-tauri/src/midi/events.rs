@@ -99,6 +99,50 @@ pub struct DecodedNotes {
     pub next_note_id: u32,
 }
 
+/// Walk AMEV appended column blocks — shared by `decode_notes` and
+/// `automation::decode_points`, which otherwise hand-roll the identical
+/// truncation/ordering/duplicate-bit checks (module doc's reader rules,
+/// normative for both). Reads `[colBit u16][byteLen u32]` headers until
+/// fewer than 6 trailing bytes remain (not a block, deliberately tolerated
+/// slack — see the module doc); for each header, validates that `byteLen`
+/// bytes actually remain and that `colBit` is strictly greater than the
+/// previous one, THEN calls `on_block(col_bit, byte_len, r)` to consume
+/// (interpret or skip) exactly `byte_len` bytes from `r`. Returns the OR of
+/// every `colBit` seen as a block — callers use it for the "mask claims a
+/// column but no block was found" check, which stays theirs (notes treats
+/// COLUMNS_NOTE_ID specially there; automation never does).
+pub(crate) fn walk_column_blocks(
+    bytes: &[u8],
+    r: &mut std::io::Cursor<&[u8]>,
+    mut on_block: impl FnMut(u16, u32, &mut std::io::Cursor<&[u8]>) -> Result<(), String>,
+) -> Result<u16, String> {
+    let mut last_bit: i32 = -1;
+    let mut bits_consumed: u16 = 0;
+    loop {
+        let remaining = (bytes.len() as u64).saturating_sub(r.position());
+        if remaining < 6 {
+            break;
+        }
+        let col_bit = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
+        let byte_len = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
+        let remaining_after_header = (bytes.len() as u64).saturating_sub(r.position());
+        if byte_len as u64 > remaining_after_header {
+            return Err(format!(
+                "AMEV chunk truncated: column 0x{col_bit:04x} declares {byte_len} bytes, {remaining_after_header} remain"
+            ));
+        }
+        if col_bit as i32 <= last_bit {
+            return Err(format!(
+                "AMEV column blocks out of order or duplicated: 0x{col_bit:04x} after 0x{last_bit:04x}"
+            ));
+        }
+        last_bit = col_bit as i32;
+        bits_consumed |= col_bit;
+        on_block(col_bit, byte_len, r)?;
+    }
+    Ok(bits_consumed)
+}
+
 /// Decode an AMEV chunk. Automation records are skipped (they get their own
 /// accessor when automation lands). Implements the module doc's normative
 /// reader rules for the appended note-id column.
@@ -157,36 +201,12 @@ pub fn decode_notes(bytes: &[u8]) -> Result<DecodedNotes, String> {
         }
     }
 
-    // Appended column blocks: walk until fewer than 6 bytes remain
-    // (colBit u16 + byteLen u32 is the minimum header).
+    // Appended column blocks — truncation/ordering/duplicate-bit checks
+    // live in the shared walker; only COLUMNS_NOTE_ID interpretation is
+    // notes-specific.
     let mut note_ids: Option<Vec<u32>> = None; // one per note, in record order
     let mut next_note_id: Option<u32> = None;
-    let mut last_bit: i32 = -1;
-    let mut bits_consumed: u16 = 0; // every colBit actually seen as a block, known or not
-    loop {
-        let remaining = (bytes.len() as u64).saturating_sub(r.position());
-        if remaining < 6 {
-            // Fewer than 6 trailing bytes can't be a block header; ignoring
-            // this slack (rather than erroring on it) is intentional, not a
-            // gap — reviewed and accepted (Minor).
-            break;
-        }
-        let col_bit = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
-        let byte_len = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let remaining_after_header = (bytes.len() as u64).saturating_sub(r.position());
-        if byte_len as u64 > remaining_after_header {
-            return Err(format!(
-                "AMEV chunk truncated: column 0x{col_bit:04x} declares {byte_len} bytes, {remaining_after_header} remain"
-            ));
-        }
-        if col_bit as i32 <= last_bit {
-            return Err(format!(
-                "AMEV column blocks out of order or duplicated: 0x{col_bit:04x} after 0x{last_bit:04x}"
-            ));
-        }
-        last_bit = col_bit as i32;
-        bits_consumed |= col_bit;
-
+    let bits_consumed = walk_column_blocks(bytes, &mut r, |col_bit, byte_len, r| {
         if col_bit == COLUMNS_NOTE_ID {
             // Sized by the RECORD count, not the note count (M-1).
             let expected = 4u64 + 4 * count_u64;
@@ -205,9 +225,10 @@ pub fn decode_notes(bytes: &[u8]) -> Result<DecodedNotes, String> {
         } else {
             // Unknown column: skip by byteLen (self-describing, D-06).
             let mut buf = vec![0u8; byte_len as usize];
-            std::io::Read::read_exact(&mut r, &mut buf).map_err(|e| e.to_string())?;
+            std::io::Read::read_exact(r, &mut buf).map_err(|e| e.to_string())?;
         }
-    }
+        Ok(())
+    })?;
 
     // Reviewer finding 1 (CRITICAL): a mask bit set with no matching block
     // consumed is structural corruption (a truncated/stripped block with a

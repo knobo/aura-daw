@@ -42,6 +42,12 @@ use crate::ids::SourceId;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
 /// Recording ring headroom, seconds of audio per track.
 const REC_RING_SECS: usize = 2;
+/// [M4] Meter ring slot count, both output and input/recording streams.
+/// Chunking (Task 7) divides headroom by the chunk count, and the control
+/// thread is exactly the thread that stalls (`ensure_loaded` decodes under
+/// rebuild) — grown from 64 to 64*8. Blocks are ~2 KiB; the memory is
+/// nothing control-side.
+const METER_RING_SLOTS: usize = 64 * 8;
 
 // ---------------------------------------------------------------------------
 // IPC-facing traits (implemented over Tauri types in mod.rs)
@@ -311,12 +317,12 @@ struct InputCb {
     /// the recording, plus the base-0 chunk (for frame accounting) if none
     /// of the slots land there. Built ONCE at `start_recording` (control
     /// thread) — `capture` (RT) only mutates these in place and pushes
-    /// copies, never allocates.
-    blocks: Vec<RawMeterBlock>,
-    /// `block_lanes[i]` is the list of LOCAL lanes in `blocks[i]` to stamp
-    /// with this input's level every buffer (same input feeds every
-    /// recorded track, so they all get the identical peak/RMS this buffer).
-    block_lanes: Vec<Vec<usize>>,
+    /// copies, never allocates. Each entry pairs a chunk's template with the
+    /// LOCAL lanes in it to stamp with this input's level every buffer
+    /// (same input feeds every recorded track, so they all get the
+    /// identical peak/RMS this buffer) — paired in one `Vec` rather than two
+    /// parallel ones so the two halves can't drift out of lockstep.
+    blocks: Vec<(RawMeterBlock, Vec<usize>)>,
     in_ch: usize,
     rec_ch: usize,
     shared: Arc<SharedRt>,
@@ -342,10 +348,10 @@ impl InputCb {
             ss_r += r * r;
         }
         let pos = self.shared.position.load(Relaxed);
-        for (block, lanes) in self.blocks.iter_mut().zip(self.block_lanes.iter()) {
+        for (block, lanes) in self.blocks.iter_mut() {
             block.position = pos;
             block.frames = frames as u32;
-            for &lane in lanes {
+            for &lane in lanes.iter() {
                 block.set_slot_local(lane, pk_l, pk_r, ss_l, ss_r);
             }
             let _ = self.meter_tx.push(*block);
@@ -612,11 +618,7 @@ impl Control {
 
         let (graph_tx, graph_rx) = rtrb::RingBuffer::new(8);
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
-        // [M4] Chunking (Task 7) divides headroom by the chunk count, and
-        // the control thread is exactly the thread that stalls
-        // (`ensure_loaded` decodes under rebuild) — grow 64 -> 64*8. Blocks
-        // are ~2 KiB; the memory is nothing control-side.
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64 * 8);
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         // Boundary crossings are rare (one per playthrough), but the ring is
         // sized for a burst of them so a stalled control thread never makes
         // the callback drop one.
@@ -1108,12 +1110,10 @@ impl Control {
             chunk_lanes.entry(chunk_idx).or_default().push(lane);
         }
         let mut blocks = Vec::with_capacity(chunk_lanes.len());
-        let mut block_lanes = Vec::with_capacity(chunk_lanes.len());
         for (chunk_idx, lanes) in chunk_lanes {
             let mut b = RawMeterBlock::new(rec_generation, 0, 0);
             b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
-            blocks.push(b);
-            block_lanes.push(lanes);
+            blocks.push((b, lanes));
         }
 
         let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
@@ -1144,18 +1144,13 @@ impl Control {
 
         let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
 
-        // [M4] Ring sizing: chunking divides headroom by the chunk count,
-        // and the control thread is exactly the thread that stalls
-        // (`ensure_loaded` decodes under rebuild) — grow 64 -> 64*8. Blocks
-        // are ~2 KiB; the memory is nothing control-side.
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64 * 8);
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let n_producers = producers.len();
         let mut cb = InputCb {
             producers,
             owed: vec![0; n_producers],
             meter_tx,
             blocks,
-            block_lanes,
             in_ch,
             rec_ch,
             shared: self.shared.clone(),
@@ -1584,8 +1579,7 @@ mod tests {
             producers: vec![producer],
             owed: vec![0],
             meter_tx,
-            blocks: vec![b],
-            block_lanes: vec![vec![0]],
+            blocks: vec![(b, vec![0])],
             in_ch: 1,
             rec_ch: 1,
             shared: shared.clone(),
@@ -1750,25 +1744,7 @@ mod tests {
 
     // ---- source-keyed decode cache policy (round-2 §2.2) -------------------
 
-    /// Same shape as `control::mod`'s `test_clip` helper.
-    fn test_clip(id: &str, track_id: &str) -> Clip {
-        Clip {
-            id: id.into(),
-            track_id: track_id.into(),
-            name: "clip".into(),
-            source_path: "audio/x.wav".into(),
-            source_id: SourceId::default(),
-            source_channels: 2,
-            source_sample_rate: 48_000,
-            source_length_samples: 48_000,
-            timeline_start_samples: 0,
-            offset_samples: 0,
-            length_samples: 48_000,
-            gain_db: 0.0,
-            fade_in_samples: 0,
-            fade_out_samples: 0,
-        }
-    }
+    use crate::audio::types::testutil::test_clip;
 
     #[test]
     fn cache_is_shared_per_source_and_invalidates_on_path_change() {

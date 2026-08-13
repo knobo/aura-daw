@@ -78,9 +78,11 @@ pub struct MidiClip {
     pub next_note_id: u32,
 }
 
-/// Serde default for [`MidiClip::next_note_id`]: id 0 is the wire sentinel
-/// for "unassigned", so real ids start at 1.
-fn first_note_id() -> u32 {
+/// Serde default for [`MidiClip::next_note_id`] (and, imported,
+/// `persist::PersistedClip::next_note_id` — same sentinel invariant, one
+/// definition): id 0 is the wire sentinel for "unassigned", so real ids
+/// start at 1.
+pub(crate) fn first_note_id() -> u32 {
     1
 }
 

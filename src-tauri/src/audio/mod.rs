@@ -45,7 +45,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::control::{self, ControlPlane, Session, TrackMixChange};
 use crate::midi::MidiStore;
 use engine::{ControlMsg, EngineHandle};
-use rt::{GraphTables, ParamTable, SharedGraphTables, SharedRt};
+use rt::{GraphTables, SharedGraphTables, SharedRt};
 use sampler::{InstrumentInfo, SamplerBank};
 
 pub use types::{
@@ -76,11 +76,7 @@ impl Default for AudioState {
         Self {
             session: Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default()))),
             shared: Arc::new(SharedRt::default()),
-            tables: Arc::new(Mutex::new(GraphTables {
-                generation: 0,
-                params: Arc::new(ParamTable::default()),
-                slots: std::collections::HashMap::new(),
-            })),
+            tables: GraphTables::empty(),
             engine: OnceLock::new(),
             samplers: Arc::new(Mutex::new(SamplerBank::default())),
             preview: OnceLock::new(),

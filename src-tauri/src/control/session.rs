@@ -419,6 +419,8 @@ fn scopeguard<F: FnMut()>(f: F) -> impl Drop {
 mod tests {
     use super::*;
     use crate::audio::types::TrackState;
+    use crate::audio::types::testutil::{test_clip, test_track};
+    use crate::control::op::testutil::set_gain;
     use crate::control::op::{Actor, ObjectRef, PropPath, TxMeta};
 
     /// Store with one TrackState id `id`. Initial `gain_db` is 1.0 — a
@@ -441,61 +443,10 @@ mod tests {
         Session::new(store, MidiStore::default())
     }
 
-    fn user_meta(label: &str) -> TxMeta {
-        TxMeta { actor: Actor::User, run: "r-1".into(), label: label.into() }
-    }
-
-    /// A standalone `TrackState` row (not yet in any store), for structural
-    /// op tests (`TrackAdd`/`TrackRemove` payloads).
-    fn test_track(id: &str) -> TrackState {
-        TrackState {
-            id: id.into(),
-            name: "New Track".into(),
-            kind: "audio".into(),
-            gain_db: 0.0,
-            pan: 0.0,
-            muted: false,
-            soloed: false,
-            armed: false,
-            color: "#7c9cff".into(),
-            instrument_id: None,
-        }
-    }
-
-    fn test_clip(id: &str, track_id: &str) -> crate::audio::types::Clip {
-        crate::audio::types::Clip {
-            id: id.into(),
-            track_id: track_id.into(),
-            name: "clip".into(),
-            source_path: "audio/x.wav".into(),
-            source_id: crate::ids::SourceId::default(),
-            source_channels: 2,
-            source_sample_rate: 48_000,
-            source_length_samples: 48_000,
-            timeline_start_samples: 0,
-            offset_samples: 0,
-            length_samples: 48_000,
-            gain_db: 0.0,
-            fade_in_samples: 0,
-            fade_out_samples: 0,
-        }
-    }
-
-    /// `from` is intentionally `Null`: it's advisory only, apply_raw re-reads
-    /// truth from the store and ignores the caller's `from`.
-    fn set_gain(track_id: &str, to: f64) -> Op {
-        Op::Set {
-            object: ObjectRef::Track(track_id.into()),
-            path: PropPath::Gain,
-            from: serde_json::Value::Null,
-            to: serde_json::json!(to),
-        }
-    }
-
     #[test]
     fn set_gain_applies_and_inverse_restores() {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
-        let meta = user_meta("set gain");
+        let meta = TxMeta::user("set gain");
         let c = Session::transact(&m, meta.clone(), |tx| {
             tx.apply(Op::Set {
                 object: ObjectRef::Track("t-1".into()),
@@ -507,7 +458,7 @@ mod tests {
         .unwrap();
         assert_eq!(m.lock().store.tracks[0].gain_db, 0.25);
         // Undo = apply the recorded inverses through a new transaction.
-        Session::transact(&m, user_meta("undo"), |tx| {
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() {
                 tx.apply(op)?;
             }
@@ -523,7 +474,7 @@ mod tests {
         // POST-CLAMP value (store truth), and its inverse must restore the
         // original exactly — the ledgered 999→24 case.
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
-        let c = Session::transact(&m, user_meta("clamp"), |tx| {
+        let c = Session::transact(&m, TxMeta::user("clamp"), |tx| {
             tx.apply(set_gain("t-1", 999.0))
         })
         .unwrap();
@@ -533,7 +484,7 @@ mod tests {
                 "recorded op must carry the as-applied (clamped) value"),
             other => panic!("expected Set, got {other:?}"),
         }
-        Session::transact(&m, user_meta("undo"), |tx| {
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() { tx.apply(op)?; }
             Ok(())
         })
@@ -545,7 +496,7 @@ mod tests {
     fn move_and_move_back_elides_to_noop_history() {
         // §4: property-addressed ops coalesce; from==to after fold drops out.
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
-        let c = Session::transact(&m, user_meta("wiggle"), |tx| {
+        let c = Session::transact(&m, TxMeta::user("wiggle"), |tx| {
             tx.apply(set_gain("t-1", 0.5))?;
             tx.apply(set_gain("t-1", 1.0))?; // back to original
             Ok(())
@@ -560,7 +511,7 @@ mod tests {
         // mis-target. Reject, don't clamp (ledgered Plan A carry-forward).
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let before = m.lock().store.tracks.clone();
-        let r = Session::transact(&m, user_meta("dup"), |tx| {
+        let r = Session::transact(&m, TxMeta::user("dup"), |tx| {
             tx.apply(Op::TrackAdd {
                 track: test_track("t-1"), index: 1,
                 clips: vec![], clip_indices: vec![],
@@ -574,7 +525,7 @@ mod tests {
     fn unknown_track_fails_whole_batch_atomically() {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let before_gain = m.lock().store.tracks[0].gain_db;
-        let r = Session::transact(&m, user_meta("bad"), |tx| {
+        let r = Session::transact(&m, TxMeta::user("bad"), |tx| {
             tx.apply(set_gain("t-1", 0.1))?;
             tx.apply(set_gain("nope", 0.2))?; // fails → rollback
             Ok(())
@@ -620,11 +571,11 @@ mod tests {
     fn remove_then_inverse_restores_row_byte_identically() {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let row = m.lock().store.tracks[0].clone();
-        let c = Session::transact(&m, user_meta("remove"), |tx| {
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
             tx.apply(Op::TrackRemove { track: row.clone(), index: 0, clips: vec![], clip_indices: vec![] })
         }).unwrap();
         assert!(m.lock().store.tracks.is_empty());
-        Session::transact(&m, user_meta("undo"), |tx| {
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() { tx.apply(op)?; }
             Ok(())
         }).unwrap();
@@ -645,11 +596,11 @@ mod tests {
         }
         let row = m.lock().store.tracks.iter().find(|t| t.id == "t-A").cloned().unwrap();
         let before = m.lock().store.clips.clone();
-        let c = Session::transact(&m, user_meta("remove"), |tx| {
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
             tx.apply(Op::TrackRemove { track: row, index: 0, clips: vec![], clip_indices: vec![] })
         })
         .unwrap();
-        Session::transact(&m, user_meta("undo"), |tx| {
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() { tx.apply(op)?; }
             Ok(())
         })
@@ -666,7 +617,7 @@ mod tests {
         // statement and parking_lot's Mutex isn't reentrant.
         let snapshot = { let g = m.lock(); (g.store.tracks.clone(), g.store.clips.clone()) };
         let new_row = test_track("t-2");
-        let r = Session::transact(&m, user_meta("mixed-fail"), |tx| {
+        let r = Session::transact(&m, TxMeta::user("mixed-fail"), |tx| {
             tx.apply(Op::TrackAdd { track: new_row, index: 1, clips: vec![], clip_indices: vec![] })?;
             tx.apply(set_gain("t-2", 0.5))?;
             tx.apply(set_gain("ghost", 0.1))?;   // fails the batch

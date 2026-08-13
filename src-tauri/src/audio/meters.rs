@@ -118,10 +118,6 @@ impl GenerationMaps {
         self.maps.get(&generation)
     }
 
-    pub fn resolve(&self, generation: u64, slot: usize) -> Option<&TrackId> {
-        self.slot_map(generation)?.get(&slot)
-    }
-
     pub fn pin(&mut self, generation: u64) {
         self.pinned = Some(generation);
     }

@@ -90,6 +90,23 @@ impl TxMeta {
     }
 }
 
+/// Shared by `control::mod`'s and `control::session`'s test modules.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::{ObjectRef, Op, PropPath};
+
+    /// `from` is intentionally `Null`: it's advisory only, `apply_raw`
+    /// re-reads truth from the store and ignores the caller's `from`.
+    pub fn set_gain(track_id: &str, to: f64) -> Op {
+        Op::Set {
+            object: ObjectRef::Track(track_id.into()),
+            path: PropPath::Gain,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(to),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

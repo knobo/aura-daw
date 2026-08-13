@@ -200,35 +200,13 @@ pub fn decode_points(bytes: &[u8]) -> Result<(u32, Vec<AutomationPoint>), String
     }
 
     // Walk and skip every appended column block (self-describing, D-06);
-    // automation never interprets any of them today.
-    let mut last_bit: i32 = -1;
-    let mut bits_consumed: u16 = 0; // every colBit actually seen as a block
-    loop {
-        let remaining = (bytes.len() as u64).saturating_sub(r.position());
-        if remaining < 6 {
-            // Fewer than 6 trailing bytes can't be a block header; ignoring
-            // this slack (rather than erroring on it) is intentional, not a
-            // gap — reviewed and accepted (Minor), mirrors decode_notes.
-            break;
-        }
-        let col_bit = r.read_u16::<LittleEndian>().map_err(|e| e.to_string())?;
-        let byte_len = r.read_u32::<LittleEndian>().map_err(|e| e.to_string())?;
-        let remaining_after_header = (bytes.len() as u64).saturating_sub(r.position());
-        if byte_len as u64 > remaining_after_header {
-            return Err(format!(
-                "AMEV chunk truncated: column 0x{col_bit:04x} declares {byte_len} bytes, {remaining_after_header} remain"
-            ));
-        }
-        if col_bit as i32 <= last_bit {
-            return Err(format!(
-                "AMEV column blocks out of order or duplicated: 0x{col_bit:04x} after 0x{last_bit:04x}"
-            ));
-        }
-        last_bit = col_bit as i32;
-        bits_consumed |= col_bit;
+    // automation never interprets any of them today — the shared walker
+    // (mirrors decode_notes) owns the truncation/ordering/duplicate-bit
+    // checks, this callback just discards the payload.
+    let bits_consumed = crate::midi::events::walk_column_blocks(bytes, &mut r, |_col_bit, byte_len, r| {
         let mut buf = vec![0u8; byte_len as usize];
-        std::io::Read::read_exact(&mut r, &mut buf).map_err(|e| e.to_string())?;
-    }
+        std::io::Read::read_exact(r, &mut buf).map_err(|e| e.to_string())
+    })?;
 
     // Reviewer finding 1 (CRITICAL): a mask bit set with no matching block
     // consumed is structural corruption, never silently tolerated — the

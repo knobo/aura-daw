@@ -132,6 +132,31 @@ fn set_prop(track_id: &str, path: op::PropPath, to: serde_json::Value) -> op::Op
     }
 }
 
+/// Adopt `dir` as `midi.loaded_dir` and settle `midi.dirty` — the "gap"
+/// `create_project` and `save_project_as` each independently rediscovered
+/// and patched by hand (their own comments call out "Finding 2 (same gap as
+/// create_project)"), extracted here so a future call site can't reintroduce
+/// it. `persist: false` is `create_project`'s case (a fresh project already
+/// matches what `project::create` wrote to disk, so there is nothing to
+/// persist — just mark clean); `persist: true` runs
+/// `midi::persist::save_into_project` and settles `dirty` from the result,
+/// mirroring `with_synced_store`'s success/failure handling
+/// (`src/midi/mod.rs`) for the same reason.
+fn adopt_midi_dir(midi: &mut crate::midi::MidiStore, dir: &std::path::Path, persist: bool, context: &str) {
+    midi.loaded_dir = Some(dir.to_path_buf());
+    if !persist {
+        midi.dirty = false;
+        return;
+    }
+    match crate::midi::persist::save_into_project(dir, midi) {
+        Ok(()) => midi.dirty = false,
+        Err(e) => {
+            midi.dirty = true;
+            log::warn!("{context}: persisting midi failed: {e}");
+        }
+    }
+}
+
 impl ControlPlane {
     pub fn new(
         session: Arc<Mutex<Session>>,
@@ -512,6 +537,11 @@ impl ControlPlane {
         let (project, dir) =
             project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
         {
+            // One `session` guard for the store reset, the tables reset
+            // (session-before-tables is already the documented lock order
+            // [C1], so nesting `self.tables.lock()` here is sound), and the
+            // midi reset — all three touch state gated by the same lock and
+            // nothing in between needs it released.
             let mut session = self.session.lock();
             let s = &mut session.store;
             // Round-2 §2.4: nothing to free — slots are derived fresh from
@@ -527,24 +557,22 @@ impl ControlPlane {
             s.transport.loop_enabled = false;
             s.transport.loop_start_samples = 0;
             s.transport.loop_end_samples = 0;
-        }
-        // Immediate reset ahead of the async Rebuild below (which will
-        // publish fresh, empty tables anyway once processed) — keeps
-        // `any_solo` from reading stale-true between here and then.
-        self.tables.lock().params.any_solo.store(false, Relaxed);
-        self.shared.playing.store(false, Relaxed);
-        self.shared.position.store(0, Relaxed);
-        self.shared.loop_enabled.store(false, Relaxed);
-        {
+
+            // Immediate reset ahead of the async Rebuild below (which will
+            // publish fresh, empty tables anyway once processed) — keeps
+            // `any_solo` from reading stale-true between here and then.
+            self.tables.lock().params.any_solo.store(false, Relaxed);
+            self.shared.playing.store(false, Relaxed);
+            self.shared.position.store(0, Relaxed);
+            self.shared.loop_enabled.store(false, Relaxed);
+
             // Blank midi state bound to the new dir; `sync_midi_store` then
             // sees loaded_dir == dir and leaves it alone. Same lock as
             // `store` now (session merge) — no separate `self.midi` field.
-            let mut session = self.session.lock();
             let d0 = crate::midi::persist::v1_migration_defaults(tempo);
             session.midi.ppq = d0.ppq;
             session.midi.tempo_events = d0.tempo_events;
             session.midi.clips = d0.clips;
-            session.midi.loaded_dir = Some(dir.clone());
             // Finding 2: a stale `dirty = true` left over from a prior
             // auto-persist failure (M-5) must not survive into this fresh
             // project — otherwise the first midi mutation here persists a
@@ -552,7 +580,7 @@ impl ControlPlane {
             // `with_synced_store` for finding 1 would otherwise be fooled:
             // `loaded_dir` is set correctly above, so it WOULD persist, and
             // dirty=true is only meant to block resync-from-disk, not writes).
-            session.midi.dirty = false;
+            adopt_midi_dir(&mut session.midi, &dir, false, "create_project");
         }
         // App-global plugin/automation registries adopt the (empty) project.
         crate::plugins::state::adopt_open_project(&dir);
@@ -570,11 +598,14 @@ impl ControlPlane {
     /// into it. Refuses when a project is already open — that is plain
     /// `save_project` territory, not a fork.
     pub fn save_project_as(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
-        if self.session.lock().store.project_dir.is_some() {
-            return Err("a project is already open; use save_project".into());
-        }
+        let tempo = {
+            let session = self.session.lock();
+            if session.store.project_dir.is_some() {
+                return Err("a project is already open; use save_project".into());
+            }
+            session.store.transport.tempo_bpm
+        };
         let rate = self.shared.sample_rate.load(Relaxed);
-        let tempo = self.session.lock().store.transport.tempo_bpm;
         let (created, dir) = project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
         let project = {
             let mut session = self.session.lock();
@@ -589,20 +620,13 @@ impl ControlPlane {
             // Adopt the in-memory midi state into the new project and write
             // it now (normally that only happens on the next midi mutation).
             let mut session = self.session.lock();
-            session.midi.loaded_dir = Some(dir.clone());
             // Finding 2 (same gap as create_project): explicitly settle
             // `dirty` on this persist rather than leaving whatever it was
             // (e.g. a stale `true` from a prior failed auto-persist in the
             // old session) — mirrors `with_synced_store`'s success/failure
             // handling so the flag stays an accurate "memory has an
             // unpersisted edit" signal for the freshly adopted dir.
-            match crate::midi::persist::save_into_project(&dir, &session.midi) {
-                Ok(()) => session.midi.dirty = false,
-                Err(e) => {
-                    session.midi.dirty = true;
-                    log::warn!("save_project_as: persisting midi failed: {e}");
-                }
-            }
+            adopt_midi_dir(&mut session.midi, &dir, true, "save_project_as");
         }
         (self.emit)(
             "project://changed",
@@ -631,18 +655,15 @@ impl ControlPlane {
     /// project open, midi, track bindings AND plugin state are persisted so
     /// the demo survives save/open.
     pub fn seed_demo_project(&self) -> Result<ProjectSnapshot, String> {
-        {
+        // Sync the midi store with the open project first, so we never
+        // clobber on-disk state.
+        let (dir, bpm) = {
             let session = self.session.lock();
             if !session.store.clips.is_empty()
                 || session.midi.clips.iter().any(|c| !c.notes.is_empty())
             {
                 return Err("project already has content".to_string());
             }
-        }
-        // Sync the midi store with the open project first, so we never
-        // clobber on-disk state.
-        let (dir, bpm) = {
-            let session = self.session.lock();
             (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
         };
         crate::midi::notify_project_opened(dir.clone(), bpm);
@@ -902,7 +923,7 @@ pub fn demo_seed_clips(
     }
     let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| {
         let mut c = MidiClip {
-            id: uuid::Uuid::new_v4().to_string().into(),
+            id: crate::ids::ClipId::mint(),
             track_id: track_id.into(),
             name: name.to_string(),
             timeline_start_ticks: 0,
@@ -999,7 +1020,7 @@ pub fn demo_seed_clips_v2(
 
     let clip = |track_id: &str, name: &str, notes: Vec<MidiNote>| {
         let mut c = MidiClip {
-            id: uuid::Uuid::new_v4().to_string().into(),
+            id: crate::ids::ClipId::mint(),
             track_id: track_id.into(),
             name: name.to_string(),
             timeline_start_ticks: 0,
@@ -1115,7 +1136,7 @@ pub async fn seed_demo_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::rt::{GraphTables, ParamTable};
+    use crate::audio::rt::{testutil::empty_tables, GraphTables, ParamTable};
     use crate::audio::types::{derive_slots, Store};
     use crate::midi::MidiStore;
     use crate::sidecars::SidecarEvent;
@@ -1126,49 +1147,12 @@ mod tests {
     /// tests below).
     type RecordedEvents = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
 
-    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) — the shared
-    /// construction every real-engine test harness in this module needs to
-    /// hand BOTH `engine::start` and `ControlPlane::new` (they must share
-    /// the SAME `Arc`, round-2 §2.4).
-    fn empty_tables() -> SharedGraphTables {
-        Arc::new(Mutex::new(GraphTables {
-            generation: 0,
-            params: Arc::new(ParamTable::default()),
-            slots: std::collections::HashMap::new(),
-        }))
-    }
-
     // ---- Task 6 helpers: commit() folding (for_tests engine double) ----
 
-    use crate::control::op::{Actor, ObjectRef, Op, PropPath, TxMeta};
+    use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 
-    fn user_meta(label: &str) -> TxMeta {
-        TxMeta { actor: Actor::User, run: "r-1".into(), label: label.into() }
-    }
-
-    fn test_track(id: &str) -> TrackState {
-        TrackState {
-            id: id.into(),
-            name: "New Track".into(),
-            kind: "audio".into(),
-            gain_db: 0.0,
-            pan: 0.0,
-            muted: false,
-            soloed: false,
-            armed: false,
-            color: "#7c9cff".into(),
-            instrument_id: None,
-        }
-    }
-
-    fn set_gain(track_id: &str, to: f64) -> Op {
-        Op::Set {
-            object: ObjectRef::Track(track_id.into()),
-            path: PropPath::Gain,
-            from: serde_json::Value::Null,
-            to: serde_json::json!(to),
-        }
-    }
+    use crate::audio::types::testutil::{test_clip, test_track};
+    use crate::control::op::testutil::set_gain;
 
     /// A `ControlPlane` wired to `EngineHandle::for_tests()` (no real engine
     /// thread — just a channel that records sent `ControlMsg`s) and a
@@ -1267,9 +1251,9 @@ mod tests {
 
         // Real ops through the real channel — remove X, add Y — mirroring
         // round-2 O-13's actual sequence rather than manual store surgery.
-        plane.remove_track(track_x.as_str(), user_meta("remove x")).unwrap();
+        plane.remove_track(track_x.as_str(), TxMeta::user("remove x")).unwrap();
         let track_y_row =
-            plane.add_track(Some("Y".into()), Some("audio".into()), user_meta("add y")).unwrap();
+            plane.add_track(Some("Y".into()), Some("audio".into()), TxMeta::user("add y")).unwrap();
         let track_y = track_y_row.id.clone();
 
         // Simulate the control thread's rebuild WITHOUT adopting a new graph
@@ -1288,7 +1272,7 @@ mod tests {
         // through gen-2's CURRENT table.
         let y_gain_db = -12.0;
         plane
-            .commit(user_meta("mix y"), |tx| {
+            .commit(TxMeta::user("mix y"), |tx| {
                 tx.apply(Op::Set {
                     object: ObjectRef::Track(track_y.clone()),
                     path: PropPath::Gain,
@@ -1333,7 +1317,7 @@ mod tests {
     fn three_ops_one_rebuild_one_event() {
         let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
         plane
-            .commit(user_meta("batch"), |tx| {
+            .commit(TxMeta::user("batch"), |tx| {
                 tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![], clip_indices: vec![] })?;
                 tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![], clip_indices: vec![] })?;
                 tx.apply(set_gain("t-1", 0.5))?;
@@ -1355,7 +1339,7 @@ mod tests {
     #[test]
     fn remove_track_goes_through_the_channel_and_rebuilds_once() {
         let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
-        plane.remove_track("t-1", user_meta("remove track")).unwrap();
+        plane.remove_track("t-1", TxMeta::user("remove track")).unwrap();
         assert!(plane.session().lock().store.tracks.iter().all(|t| t.id != "t-1"));
         assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
     }
@@ -1371,30 +1355,11 @@ mod tests {
             session.store.tracks[0].soloed = true;
         }
         plane.tables.lock().params.any_solo.store(true, Relaxed);
-        plane.remove_track("t-1", user_meta("remove soloed track")).unwrap();
+        plane.remove_track("t-1", TxMeta::user("remove soloed track")).unwrap();
         assert!(
             !plane.tables.lock().params.any_solo.load(Relaxed),
             "any_solo must go false"
         );
-    }
-
-    fn test_clip(id: &str, track_id: &str) -> crate::audio::types::Clip {
-        crate::audio::types::Clip {
-            id: id.into(),
-            track_id: track_id.into(),
-            name: "clip".into(),
-            source_path: "audio/x.wav".into(),
-            source_id: crate::ids::SourceId::default(),
-            source_channels: 2,
-            source_sample_rate: 48_000,
-            source_length_samples: 48_000,
-            timeline_start_samples: 0,
-            offset_samples: 0,
-            length_samples: 48_000,
-            gain_db: 0.0,
-            fade_in_samples: 0,
-            fade_out_samples: 0,
-        }
     }
 
     /// Post-review fix: clips are document state, not effect-layer
@@ -1421,7 +1386,7 @@ mod tests {
             { plane.session().lock().store.tracks.iter().find(|t| t.id == "t-1").cloned().unwrap() };
 
         let committed = plane
-            .commit(user_meta("remove"), |tx| {
+            .commit(TxMeta::user("remove"), |tx| {
                 tx.apply(Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
             })
             .unwrap();
@@ -1435,7 +1400,7 @@ mod tests {
         }
 
         plane
-            .commit(user_meta("undo"), |tx| {
+            .commit(TxMeta::user("undo"), |tx| {
                 for op in committed.inverses.clone() {
                     tx.apply(op)?;
                 }
@@ -1559,20 +1524,20 @@ mod tests {
         plane
             .set_track_mix(
                 vec![TrackMixChange { gain_db: Some(-3.0), ..TrackMixChange::new("t-1") }],
-                user_meta("set mix"),
+                TxMeta::user("set mix"),
             )
             .unwrap();
 
         // Removed through the channel — the same path a concurrent
         // `remove_track` command takes.
-        plane.remove_track("t-1", user_meta("remove track")).unwrap();
+        plane.remove_track("t-1", TxMeta::user("remove track")).unwrap();
         assert!(plane.session().lock().store.tracks.iter().all(|t| t.id != "t-1"));
 
         // A second mix call naming the now-gone id must fail cleanly, not
         // panic.
         let result = plane.set_track_mix(
             vec![TrackMixChange { gain_db: Some(1.0), ..TrackMixChange::new("t-1") }],
-            user_meta("set mix on gone track"),
+            TxMeta::user("set mix on gone track"),
         );
         assert!(result.is_err(), "mix change on a removed track must error, not panic");
     }

@@ -24,7 +24,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::events;
-use super::types::{MidiClip, TempoEvent, DEFAULT_PPQ};
+use super::types::{first_note_id, MidiClip, TempoEvent, DEFAULT_PPQ};
 use super::MidiStore;
 
 const PROJECT_FILE: &str = "project.json";
@@ -56,12 +56,6 @@ struct PersistedClip {
     /// watermark. The loaded clip's watermark is `max(row, chunk)`.
     #[serde(default = "first_note_id")]
     next_note_id: u32,
-}
-
-/// Serde default for [`PersistedClip::next_note_id`] (mirrors
-/// `MidiClip::next_note_id`'s default — id 0 is the "unassigned" sentinel).
-fn first_note_id() -> u32 {
-    1
 }
 
 /// Write the midi store's state into `<dir>/project.json` (upgrading it to
@@ -350,7 +344,7 @@ mod tests {
     fn clip(track: &str, notes: Vec<MidiNote>) -> MidiClip {
         let next_note_id = notes.iter().map(|n| n.note_id.0).max().unwrap_or(0) + 1;
         MidiClip {
-            id: uuid::Uuid::new_v4().to_string().into(),
+            id: crate::ids::ClipId::mint(),
             track_id: track.into(),
             name: "Clip".into(),
             timeline_start_ticks: 960,

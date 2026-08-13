@@ -252,14 +252,20 @@ impl Store {
     }
 }
 
+/// Shared test fixtures for `TrackState`/`Clip` — the id/track_id are the
+/// only fields callers vary; every other field is a fixed, arbitrary-but-
+/// valid default. Used by this module's own tests plus `control::mod`,
+/// `control::session`, and `audio::engine`'s test modules (one definition
+/// instead of four hand-kept copies).
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod testutil {
+    use super::{Clip, TrackState};
+    use crate::ids::SourceId;
 
-    fn test_track(id: &str) -> TrackState {
+    pub fn test_track(id: &str) -> TrackState {
         TrackState {
             id: id.into(),
-            name: id.into(),
+            name: "New Track".into(),
             kind: "audio".into(),
             gain_db: 0.0,
             pan: 0.0,
@@ -270,6 +276,31 @@ mod tests {
             instrument_id: None,
         }
     }
+
+    pub fn test_clip(id: &str, track_id: &str) -> Clip {
+        Clip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: "clip".into(),
+            source_path: "audio/x.wav".into(),
+            source_id: SourceId::default(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::testutil::test_track;
 
     #[test]
     fn slots_are_display_order_and_never_reused_across_generations() {

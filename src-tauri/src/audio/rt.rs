@@ -298,14 +298,6 @@ pub struct RtGraph {
     pub meter_scratch: Vec<RawMeterBlock>,
 }
 
-impl Default for RtGraph {
-    /// Test/placeholder convenience only — production code always goes
-    /// through `RtGraph::new` with a real generation and param table.
-    fn default() -> Self {
-        Self::new(Vec::new(), 0, Arc::new(ParamTable::default()))
-    }
-}
-
 impl RtGraph {
     /// Build a snapshot, allocating live-node scratch when needed.
     pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
@@ -401,6 +393,33 @@ pub struct GraphTables {
 /// only, after transact), `start_recording` (session then tables), and
 /// `pump_meter_frames` (session then tables) all conform to this order.
 pub type SharedGraphTables = Arc<parking_lot::Mutex<GraphTables>>;
+
+impl GraphTables {
+    /// A fresh gen-0 table with no params and no slots — the shape every
+    /// `AudioState::default()` and every control-module test fixture wants
+    /// before the first real rebuild publishes something. Single source of
+    /// truth for "what does an empty `GraphTables` look like".
+    pub fn empty() -> SharedGraphTables {
+        Arc::new(parking_lot::Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: HashMap::new(),
+        }))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::GraphTables;
+    use super::SharedGraphTables;
+
+    /// Test-only alias for [`GraphTables::empty`] — kept as a separate name
+    /// so test modules read `testutil::empty_tables()` like the other
+    /// fixture helpers, without duplicating the literal.
+    pub fn empty_tables() -> SharedGraphTables {
+        GraphTables::empty()
+    }
+}
 
 #[cfg(test)]
 mod tests {

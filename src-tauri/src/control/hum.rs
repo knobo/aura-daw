@@ -200,7 +200,7 @@ pub(crate) fn apply_hum_notes(
         n.note_id = crate::ids::NoteId(0);
     }
     let mut clip = MidiClip {
-        id: uuid::Uuid::new_v4().to_string().into(),
+        id: crate::ids::ClipId::mint(),
         track_id: target,
         name: name.to_string(),
         timeline_start_ticks: at_ticks,
@@ -560,22 +560,11 @@ pub async fn hum_to_song(
 mod tests {
     use super::*;
     use crate::audio::project;
-    use crate::audio::rt::{GraphTables, ParamTable, SharedGraphTables};
+    use crate::audio::rt::testutil::empty_tables;
     use crate::audio::types::Store;
     use crate::midi::MidiStore;
     use std::path::Path;
     use std::time::{Duration, Instant};
-
-    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) for real-engine
-    /// test harnesses — must be handed to BOTH `engine::start` and
-    /// `ControlPlane::new` as the SAME `Arc` (round-2 §2.4).
-    fn empty_tables() -> SharedGraphTables {
-        Arc::new(Mutex::new(GraphTables {
-            generation: 0,
-            params: Arc::new(ParamTable::default()),
-            slots: std::collections::HashMap::new(),
-        }))
-    }
 
     fn note(tick: u32, len: u32, key: u8, vel: u8) -> MidiNote {
         MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: crate::ids::NoteId(0) }

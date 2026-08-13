@@ -606,7 +606,7 @@ pub(crate) fn replace_region_clips(
         if ce > end {
             // Right remainder: fresh id, offset advanced past the cut.
             let mut right = c.clone();
-            right.id = uuid::Uuid::new_v4().to_string().into();
+            right.id = crate::ids::ClipId::mint();
             right.timeline_start_samples = end;
             right.offset_samples = c.offset_samples + (end - cs);
             right.length_samples = ce - end;
@@ -727,7 +727,7 @@ pub fn loopjam_status(jam: tauri::State<'_, Arc<LoopJam>>) -> Result<LoopJamStat
 mod tests {
     use super::*;
     use crate::audio::engine::load_wav;
-    use crate::audio::rt::{GraphTables, SharedGraphTables};
+    use crate::audio::rt::testutil::empty_tables;
     use crate::control::{ImportClipRequest, TransportAction};
     use crate::midi::MidiStore;
     use crate::sidecars::jobs::JobManager;
@@ -736,17 +736,6 @@ mod tests {
     struct NullEvents;
     impl crate::audio::engine::EventSink for NullEvents {
         fn emit(&self, _e: &str, _p: serde_json::Value) {}
-    }
-
-    /// A fresh, empty `SharedGraphTables` (gen 0, no tracks) for real-engine
-    /// test harnesses — must be handed to BOTH `engine::start` and
-    /// `ControlPlane::new` as the SAME `Arc` (round-2 §2.4).
-    fn empty_tables() -> SharedGraphTables {
-        Arc::new(Mutex::new(GraphTables {
-            generation: 0,
-            params: Arc::new(ParamTable::default()),
-            slots: std::collections::HashMap::new(),
-        }))
     }
 
     /// Headless control plane + project + one audio track with a 1 s clip,

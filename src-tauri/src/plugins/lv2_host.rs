@@ -740,7 +740,7 @@ mod tests {
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             clips: vec![MidiClip {
-                id: uuid::Uuid::new_v4().to_string().into(),
+                id: crate::ids::ClipId::mint(),
                 track_id: track_id.into(),
                 name: "c".into(),
                 timeline_start_ticks: 0,

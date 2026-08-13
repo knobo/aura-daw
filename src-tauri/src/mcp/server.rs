@@ -564,13 +564,7 @@ mod tests {
         // A fresh, empty SharedGraphTables (gen 0, no tracks) — must be
         // handed to BOTH `engine::start` and `ControlPlane::new` as the
         // SAME `Arc` (round-2 §2.4).
-        let tables: crate::audio::rt::SharedGraphTables = Arc::new(Mutex::new(
-            crate::audio::rt::GraphTables {
-                generation: 0,
-                params: Arc::new(crate::audio::rt::ParamTable::default()),
-                slots: HashMap::new(),
-            },
-        ));
+        let tables = crate::audio::rt::testutil::empty_tables();
         let engine = crate::audio::engine::start(
             shared_rt.clone(),
             tables.clone(),
