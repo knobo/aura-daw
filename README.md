@@ -155,9 +155,14 @@ Prerequisites:
 - **Linux system packages** (for building Tauri):
 
   ```sh
-  sudo apt install libasound2-dev libwebkit2gtk-4.1-dev build-essential \
-    curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+  sudo apt install libasound2-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+    libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev \
+    libayatana-appindicator3-dev librsvg2-dev
   ```
+
+  (`libjavascriptcoregtk-4.1-dev` and `libsoup-3.0-dev` come in as dependencies
+  of `libwebkit2gtk-4.1-dev` on Ubuntu 24.04, but are listed explicitly — the
+  build needs their `.pc` files, and not every derivative pulls them in.)
 
 - **liblilv-dev** — required to build the LV2 plugin host (`livi` links system lilv):
 
@@ -206,6 +211,16 @@ npx tauri dev --config '{"build":{"devUrl":"http://localhost:1430","beforeDevCom
 (generation, infilling, instrument building included) produces deterministic
 placeholder output — the whole generate → import → hear-it loop works with zero
 model stacks.
+
+### Troubleshooting (Linux/GPU): white flash / webview reload under load
+
+When the GPU that drives your desktop is saturated (e.g. ACE-Step generating),
+WebKitGTK's DMA-BUF renderer can white-flash or reload the AURA webview
+mid-session. AURA works around this at startup by setting
+`WEBKIT_DISABLE_DMABUF_RENDERER=1` (the accepted Tauri workaround,
+[tauri#9304](https://github.com/tauri-apps/tauri/issues/9304)) — unless you
+have already set that variable yourself, which always wins. To opt back into
+WebKit's default renderer: `export WEBKIT_DISABLE_DMABUF_RENDERER=0`.
 
 ---
 

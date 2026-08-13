@@ -512,9 +512,11 @@ impl AuraMcpHandler {
         self.gate(tools::RUN_SIDECAR_JOB, format!("Run sidecar job '{}'", p.kind))
             .await?;
         let params = if p.params.is_null() { json!({}) } else { p.params };
-        // Sink feeds nothing extra: job events land in the registry and are
-        // polled via get_job_status (no channel fan-out for MCP callers).
-        let sink: crate::sidecars::jobs::EventSink = Arc::new(|_| {});
+        // No per-job Tauri channel for MCP callers (agents poll
+        // get_job_status), but the UI still needs to SEE agent-launched jobs:
+        // fan progress/done/error out as the standard `sidecar://*` app
+        // events, exactly like UI-launched jobs (JOBS indicator parity).
+        let sink: crate::sidecars::jobs::EventSink = self.control.app_event_sink();
         let res = self
             .blocking(move |c| c.run_sidecar_job(&p.kind, params, sink))
             .await?;

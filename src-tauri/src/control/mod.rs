@@ -247,12 +247,53 @@ impl ControlPlane {
     }
 
     /// Batched mix changes: param-table writes only, no graph rebuild (§10.2).
+    ///
+    /// Emits `project://changed` on success. The Tauri command path doesn't
+    /// need it (the frontend patches its store optimistically and gets the
+    /// updated `TrackState` back from the invoke), but non-webview front
+    /// doors — the MCP tools above all — have no return channel into the UI:
+    /// without this event an agent's gain/pan change is applied and audible
+    /// yet invisible in the mixer.
     pub fn set_track_mix(
         &self,
         changes: Vec<TrackMixChange>,
     ) -> Result<Vec<TrackState>, String> {
-        let mut s = self.store.lock();
-        ops::apply_track_mix(&mut s, &self.params, &changes)
+        let updated = {
+            let mut s = self.store.lock();
+            ops::apply_track_mix(&mut s, &self.params, &changes)?
+        };
+        self.emit_project_changed();
+        Ok(updated)
+    }
+
+    /// Emit `project://changed` with the full project payload (the same
+    /// shape `project::from_store` serializes, minus its requirement of an
+    /// open project dir — mix changes are legal in an unsaved session).
+    fn emit_project_changed(&self) {
+        let payload = {
+            let s = self.store.lock();
+            let sample_rate = self.shared.sample_rate.load(Relaxed);
+            let mut transport = s.transport.clone();
+            transport.position_samples = self.shared.position.load(Relaxed);
+            transport.sample_rate = sample_rate;
+            Project {
+                schema_version: 1,
+                name: s.project_name.clone().unwrap_or_else(|| "Untitled".into()),
+                path: s.project_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+                created_at: s.created_at.clone(),
+                modified_at: None,
+                sample_rate,
+                tempo_bpm: transport.tempo_bpm,
+                time_signature: Some((4, 4)),
+                tracks: s.tracks.clone(),
+                clips: s.clips.clone(),
+                transport: Some(transport),
+            }
+        };
+        (self.emit)(
+            "project://changed",
+            serde_json::to_value(&payload).unwrap_or_default(),
+        );
     }
 
     pub fn create_project(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
@@ -415,6 +456,29 @@ impl ControlPlane {
         let sink = import::wrap_sink_with_import(self, &params, sink);
         let sink = wrap_sink_with_instrument_register(&self.shared, kind, sink);
         crate::sidecars::run_generic_job(&self.jobs, kind, &params, sink)
+    }
+
+    /// EventSink that fans job events out as the standard
+    /// `sidecar://progress|done|error` app events (log lines stay off the
+    /// app-event bus, same as `sidecars::make_sink`). This is the sink for
+    /// front doors WITHOUT a per-job Tauri channel — the MCP `run_sidecar_job`
+    /// tool passes it so agent-launched jobs light up the UI JOBS indicator
+    /// exactly like UI-launched ones.
+    pub fn app_event_sink(self: &Arc<Self>) -> EventSink {
+        let cp = Arc::clone(self);
+        Arc::new(move |ev: crate::sidecars::SidecarEvent| {
+            use crate::sidecars::SidecarEvent;
+            let event_name = match &ev {
+                SidecarEvent::Progress { .. } => "sidecar://progress",
+                SidecarEvent::Done { .. } => "sidecar://done",
+                SidecarEvent::Error { .. } => "sidecar://error",
+                SidecarEvent::Log { .. } => return,
+            };
+            match serde_json::to_value(&ev) {
+                Ok(v) => (cp.emit)(event_name, v),
+                Err(e) => log::warn!("app_event_sink: serialize {event_name}: {e}"),
+            }
+        })
     }
 
     pub fn job_status(
@@ -739,6 +803,165 @@ mod tests {
     use super::*;
     use crate::sidecars::SidecarEvent;
     use std::time::{Duration, Instant};
+
+    /// Recorded app events + a ControlPlane whose emitter records into them
+    /// (real engine, headless-safe — the shared harness for the event-parity
+    /// tests below).
+    type RecordedEvents = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    fn recording_control_plane() -> (Arc<ControlPlane>, RecordedEvents, EngineHandle) {
+        struct NullEvents;
+        impl crate::audio::engine::EventSink for NullEvents {
+            fn emit(&self, _e: &str, _p: serde_json::Value) {}
+        }
+        let shared = Arc::new(SharedRt::default());
+        let params = Arc::new(ParamTable::default());
+        let store = Arc::new(Mutex::new(Store::default()));
+        let engine = crate::audio::engine::start(
+            shared.clone(),
+            params.clone(),
+            store.clone(),
+            Box::new(NullEvents),
+        );
+        let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let cp = Arc::new(ControlPlane::new(
+            store,
+            shared,
+            params,
+            engine.clone(),
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Arc::new(Mutex::new(MidiStore::default())),
+            Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+        ));
+        (cp, events, engine)
+    }
+
+    /// MCP-parity regression (found filming the MCP demo): a control-plane
+    /// `set_track_mix` — the path MCP tools drive, with NO webview return
+    /// channel — must emit `project://changed` carrying the updated track
+    /// state, or the UI mixer never reflects an agent's gain/pan change.
+    /// A failing batch must emit nothing.
+    #[test]
+    fn set_track_mix_emits_project_changed_with_updated_tracks() {
+        let (cp, events, engine) = recording_control_plane();
+        let track = cp.add_track(Some("Agent Mix".into()), None).unwrap();
+        events.lock().clear();
+
+        cp.set_track_mix(vec![TrackMixChange {
+            gain_db: Some(-6.0),
+            pan: Some(0.5),
+            muted: Some(true),
+            ..TrackMixChange::new(&track.id)
+        }])
+        .unwrap();
+
+        {
+            let evs = events.lock();
+            let payloads: Vec<&serde_json::Value> = evs
+                .iter()
+                .filter(|(name, _)| name == "project://changed")
+                .map(|(_, p)| p)
+                .collect();
+            assert_eq!(payloads.len(), 1, "exactly one project://changed per batch");
+            let t = payloads[0]["tracks"]
+                .as_array()
+                .expect("tracks array")
+                .iter()
+                .find(|t| t["id"] == track.id.as_str())
+                .expect("changed track in payload")
+                .clone();
+            assert_eq!(t["gainDb"], -6.0);
+            assert_eq!(t["pan"], 0.5);
+            assert_eq!(t["muted"], true);
+            // Works without an open project (unsaved session).
+            assert_eq!(payloads[0]["name"], "Untitled");
+        }
+
+        events.lock().clear();
+        assert!(cp.set_track_mix(vec![TrackMixChange::new("no-such-track")]).is_err());
+        assert!(
+            events.lock().iter().all(|(name, _)| name != "project://changed"),
+            "failed batch must not announce a change"
+        );
+        engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// MCP-parity regression (found filming the MCP demo): jobs submitted
+    /// through `ControlPlane::app_event_sink` — the sink the MCP
+    /// `run_sidecar_job` tool now passes — must fan progress/done out as the
+    /// standard `sidecar://*` app events so agent-launched jobs light up the
+    /// UI JOBS indicator. Driven by a fake sidecar (shell script speaking
+    /// the NDJSON protocol); log lines stay off the app-event bus.
+    #[tokio::test]
+    async fn app_event_sink_fans_fake_sidecar_job_out_as_app_events() {
+        let (cp, events, engine) = recording_control_plane();
+        let dir = std::env::temp_dir().join(format!(
+            "aura-mcp-sink-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake_sidecar.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             echo '{\"type\":\"progress\",\"progress\":0.5,\"stage\":\"halfway\"}'\n\
+             echo 'log noise stays off the app-event bus'\n\
+             echo '{\"type\":\"done\",\"result\":{\"kind\":\"fake\",\"outputPath\":\"/tmp/none.wav\"}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let spec = crate::sidecars::jobs::JobSpec {
+            kind: crate::sidecars::JobKind::StemSplit,
+            program: std::path::PathBuf::from("/bin/sh"),
+            args: vec![script.to_string_lossy().into_owned()],
+            grace: Duration::from_millis(500),
+            env: Vec::new(),
+        };
+        let job_id = cp.jobs.submit(spec, cp.app_event_sink());
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = cp.job_status(&job_id).unwrap();
+            if crate::sidecars::types::JobState::is_terminal(&st.state) {
+                assert_eq!(st.state, "done", "err: {:?}", st.error);
+                break;
+            }
+            assert!(Instant::now() < deadline, "fake sidecar did not finish: {st:?}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The sink is called synchronously by the supervisor before the job
+        // flips terminal, so all events are recorded by now.
+        let evs = events.lock();
+        let sidecar: Vec<&(String, serde_json::Value)> =
+            evs.iter().filter(|(n, _)| n.starts_with("sidecar://")).collect();
+        assert!(
+            sidecar.iter().any(|(n, p)| n == "sidecar://progress"
+                && p["jobId"] == job_id.as_str()
+                && p["stage"] == "halfway"),
+            "progress reached the app-event bus: {evs:?}"
+        );
+        let (last_name, last_payload) = sidecar.last().expect("sidecar events emitted");
+        assert_eq!(last_name, "sidecar://done");
+        assert_eq!(last_payload["jobId"], job_id.as_str());
+        assert_eq!(last_payload["result"]["kind"], "fake");
+        assert!(
+            !evs.iter().any(|(_, p)| p
+                .get("line")
+                .and_then(|l| l.as_str())
+                .is_some_and(|l| l.contains("log noise"))),
+            "log lines must not become app events"
+        );
+        drop(evs);
+        let _ = std::fs::remove_dir_all(&dir);
+        engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
 
     /// Loop region through the REAL transport path (phase-3 architect round):
     /// `TransportAction::SetLoop` validates the region, mirrors it into the
