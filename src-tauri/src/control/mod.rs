@@ -263,9 +263,11 @@ impl ControlPlane {
 
     /// Create a track and insert it through the transaction channel
     /// (`Op::TrackAdd`, `commit`). Slot allocation + the RT param reset stay
-    /// outside the op layer (`ops::new_track_row`, round-2 §2.4) — same
+    /// outside the op layer (`ops::new_track_row`, round-2 §2.4) — RT
+    /// bookkeeping, not document state, unlike clips (fix below) — same
     /// asymmetry `remove_track`'s slot free lives with, just on the other
-    /// side of the row's lifetime.
+    /// side of the row's lifetime. A fresh track never has clips yet, so
+    /// `Op::TrackAdd`'s `clips` payload is empty here.
     pub fn add_track(
         &self,
         name: Option<String>,
@@ -277,37 +279,42 @@ impl ControlPlane {
             ops::new_track_row(&mut session.store, &self.params, name, kind)?
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackAdd { track: track.clone(), index })
+            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![] })
         })?;
         Ok(track)
     }
 
     /// Remove a track through the transaction channel (`Op::TrackRemove`,
-    /// `commit`). The clip cleanup and slot free are effect-layer bookkeeping
-    /// (like `add_track`'s slot alloc) — outside the op vocabulary this plan
-    /// (round-2 §2.4) — so they run in a short PRE-transaction lock, in the
-    /// same order the old direct-mutation command used (audio/mod.rs:369-379,
-    /// pre-Task-7): clips retained, slot freed, THEN the row disappears and
-    /// `commit` sends the (single) `Rebuild`. `commit` also recomputes
-    /// `any_solo` on `Op::TrackRemove` (controller ruling 2) — the removed
-    /// row may have been the only soloed track.
+    /// `commit`). Fix (post-review): clips are DOCUMENT state, part of
+    /// `Project`, not effect-layer bookkeeping — `apply_raw`'s
+    /// `Op::TrackRemove` arm now collects and removes them from store truth
+    /// as part of the op itself, so the computed inverse (`Op::TrackAdd`)
+    /// carries them back too (an undo restores clips, not just an empty
+    /// track), and there is NO store write outside `commit` for them. Only
+    /// the slot free stays outside the op layer (round-2 §2.4: RT
+    /// bookkeeping, no document meaning) — and only AFTER `commit` succeeds,
+    /// so a failed commit never leaves an orphaned freed slot with the row
+    /// still present. `commit` sends the single `Rebuild` and recomputes
+    /// `any_solo` (controller ruling 2) — the removed row may have been the
+    /// only soloed track.
     pub fn remove_track(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
         let track = {
-            let mut session = self.session.lock();
-            let track = session
+            let session = self.session.lock();
+            session
                 .store
                 .tracks
                 .iter()
                 .find(|t| t.id == id)
                 .cloned()
-                .ok_or_else(|| format!("unknown track: {id}"))?;
-            session.store.clips.retain(|c| c.track_id != id);
-            session.store.free_slot(id);
-            track
+                .ok_or_else(|| format!("unknown track: {id}"))?
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackRemove { track, index: 0 })
+            tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![] })
         })?;
+        // Slot free is the sanctioned effect-layer carve-out (RT bookkeeping,
+        // not document state) — runs ONLY after the commit above succeeded,
+        // in its own short lock.
+        self.session.lock().store.free_slot(id);
         Ok(())
     }
 
@@ -1060,8 +1067,8 @@ mod tests {
         let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
         plane
             .commit(user_meta("batch"), |tx| {
-                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1 })?;
-                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2 })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![] })?;
                 tx.apply(set_gain("t-1", 0.5))?;
                 Ok(())
             })
@@ -1099,6 +1106,76 @@ mod tests {
         plane.params.any_solo.store(true, Relaxed);
         plane.remove_track("t-1", user_meta("remove soloed track")).unwrap();
         assert!(!plane.params.any_solo.load(Relaxed), "any_solo must go false");
+    }
+
+    fn test_clip(id: &str, track_id: &str) -> crate::audio::types::Clip {
+        crate::audio::types::Clip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: "clip".into(),
+            source_path: "audio/x.wav".into(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
+    /// Post-review fix: clips are document state, not effect-layer
+    /// bookkeeping — `Op::TrackRemove`'s effect must carry the removed
+    /// track's clips so its computed inverse (`Op::TrackAdd`) can restore
+    /// BOTH, not resurrect an empty track. Removes a track with two clips
+    /// through the channel, confirms the clips left with the row, then
+    /// replays the commit's own inverses through the SAME channel and
+    /// asserts the row AND its clips come back byte-identically.
+    #[test]
+    fn remove_track_inverse_restores_row_and_clips_byte_identically() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
+        let (c1, c2) = (test_clip("clip-a", "t-1"), test_clip("clip-b", "t-1"));
+        {
+            let mut session = plane.session().lock();
+            session.store.clips.push(c1.clone());
+            session.store.clips.push(c2.clone());
+        }
+        let before = {
+            let session = plane.session().lock();
+            (session.store.tracks.clone(), session.store.clips.clone())
+        };
+        let track =
+            { plane.session().lock().store.tracks.iter().find(|t| t.id == "t-1").cloned().unwrap() };
+
+        let committed = plane
+            .commit(user_meta("remove"), |tx| {
+                tx.apply(Op::TrackRemove { track, index: 0, clips: vec![] })
+            })
+            .unwrap();
+        {
+            let session = plane.session().lock();
+            assert!(session.store.tracks.iter().all(|t| t.id != "t-1"));
+            assert!(
+                session.store.clips.iter().all(|c| c.track_id != "t-1"),
+                "clips must leave the store WITH the track, not linger orphaned"
+            );
+        }
+
+        plane
+            .commit(user_meta("undo"), |tx| {
+                for op in committed.inverses.clone() {
+                    tx.apply(op)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let after = {
+            let session = plane.session().lock();
+            (session.store.tracks.clone(), session.store.clips.clone())
+        };
+        assert_eq!(after, before, "row AND clips restored byte-identically");
     }
 
     fn recording_control_plane() -> (Arc<ControlPlane>, RecordedEvents, EngineHandle) {

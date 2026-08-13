@@ -8,10 +8,18 @@ pub enum Op {
     /// Property-addressed change (round-2 §4: Set { object, path, from, to }).
     Set { object: ObjectRef, path: PropPath, from: serde_json::Value, to: serde_json::Value },
     /// Structural: create a track (payload = full row, so inverse is Remove).
-    TrackAdd { track: crate::audio::types::TrackState, index: usize },
+    /// `clips` are the track's clips to (re)insert alongside the row — a
+    /// fresh `add_track` call passes an empty vec; an undo of a
+    /// `TrackRemove` carries back exactly the clips that were removed with
+    /// it (clips are document state, not effect-layer bookkeeping — round-2
+    /// fix, controller ruling: a track op must carry its own clips so an
+    /// undo never resurrects an empty track).
+    TrackAdd { track: crate::audio::types::TrackState, index: usize, clips: Vec<crate::audio::types::Clip> },
     /// Structural: remove a track. Payload kept so the inverse can restore
     /// identity + row byte-identically (gate test 2 arrives in Plan B).
-    TrackRemove { track: crate::audio::types::TrackState, index: usize },
+    /// `clips` is advisory (like `index`) — `apply_raw` collects the track's
+    /// actual clips from store truth, ignoring the caller's value here.
+    TrackRemove { track: crate::audio::types::TrackState, index: usize, clips: Vec<crate::audio::types::Clip> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -94,20 +102,39 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
         };
-        let track_add = Op::TrackAdd { track: track.clone(), index: 0 };
+        let clip = crate::audio::types::Clip {
+            id: "c-1".into(),
+            track_id: "t-2".into(),
+            name: "clip".into(),
+            source_path: "audio/c-1.wav".into(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        };
+        let track_add = Op::TrackAdd { track: track.clone(), index: 0, clips: vec![clip.clone()] };
         let s = serde_json::to_string(&track_add).unwrap();
-        // Print once to verify camelCase tag form: should be "trackAdd"
+        // Print once to verify camelCase tag form: should be "trackAdd", and
+        // that `clips` is a true array on the wire (not dropped/renamed).
         eprintln!("TrackAdd wire form: {}", s);
         assert!(s.contains("\"kind\":\"trackAdd\""), "wire form was: {s}");
+        assert!(s.contains("\"clips\":[{"), "clips must serialize as an array of objects, was: {s}");
+        assert!(s.contains("\"id\":\"c-1\""), "clip fields must be present, was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, track_add);
 
         // TrackRemove with real TrackState: verify wire form and round-trip.
-        let track_remove = Op::TrackRemove { track, index: 0 };
+        let track_remove = Op::TrackRemove { track, index: 0, clips: vec![clip] };
         let s = serde_json::to_string(&track_remove).unwrap();
         // Print once to verify camelCase tag form: should be "trackRemove"
         eprintln!("TrackRemove wire form: {}", s);
         assert!(s.contains("\"kind\":\"trackRemove\""), "wire form was: {s}");
+        assert!(s.contains("\"clips\":[{"), "clips must serialize as an array of objects, was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, track_remove);
     }

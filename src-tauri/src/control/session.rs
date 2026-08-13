@@ -188,16 +188,22 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.any_solo = Some(session.store.any_solo());
             Ok(inverse)
         }
-        Op::TrackAdd { track, index } => {
+        Op::TrackAdd { track, index, clips } => {
             let idx = (*index).min(session.store.tracks.len());
             crate::control::ops::insert_track(&mut session.store, track.clone(), idx);
+            // Clips are document state (part of Project), not effect-layer
+            // bookkeeping — they travel WITH the row through the op itself
+            // (fix: a prior draft freed/dropped clips outside the channel;
+            // the payload here is authoritative, not advisory, since these
+            // are the clips being inserted, not pre-existing store truth).
+            session.store.clips.extend(clips.iter().cloned());
             // Structural: at most one Rebuild per transaction, however many
             // structural ops it contains — a plain flag naturally folds.
             effect.rebuild = true;
-            // Inverse: remove the same row, same id, no slot bookkeeping
-            // here (round-2 §2.4 — slots stay in the command's effect
-            // layer until Plan B).
-            Ok(Op::TrackRemove { track: track.clone(), index: idx })
+            // Inverse: remove the same row (+ the clips just inserted with
+            // it), same id, no slot bookkeeping here (round-2 §2.4 — slots
+            // stay in the command's effect layer until Plan B).
+            Ok(Op::TrackRemove { track: track.clone(), index: idx, clips: clips.clone() })
         }
         Op::TrackRemove { track, .. } => {
             // Found by id, not blindly by the caller's recorded index —
@@ -211,6 +217,20 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .position(|t| t.id == track.id)
                 .ok_or_else(|| format!("unknown track: {}", track.id))?;
             let removed = session.store.tracks.remove(pos);
+            // Clips are document state — collected from STORE TRUTH (the
+            // caller's `clips` field on `Op::TrackRemove` is advisory only,
+            // same precedent as `index`), removed alongside the row so an
+            // undo (`TrackAdd` inverse below) restores both, not just an
+            // empty track.
+            let mut removed_clips = Vec::new();
+            session.store.clips.retain(|c| {
+                if c.track_id == track.id {
+                    removed_clips.push(c.clone());
+                    false
+                } else {
+                    true
+                }
+            });
             effect.rebuild = true;
             // Removing a track can flip the store-wide any_solo flag (the
             // removed row may have been the only soloed track) — recompute
@@ -218,7 +238,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // TrackAdd row is never soloed (ops::new_track_row), so adding
             // never changes any_solo and doesn't need this.
             effect.any_solo = Some(session.store.any_solo());
-            Ok(Op::TrackAdd { track: removed, index: pos })
+            Ok(Op::TrackAdd { track: removed, index: pos, clips: removed_clips })
         }
         _ => Err("op not yet supported".into()),
     }
@@ -500,7 +520,7 @@ mod tests {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let row = m.lock().store.tracks[0].clone();
         let c = Session::transact(&m, user_meta("remove"), |tx| {
-            tx.apply(Op::TrackRemove { track: row.clone(), index: 0 })
+            tx.apply(Op::TrackRemove { track: row.clone(), index: 0, clips: vec![] })
         }).unwrap();
         assert!(m.lock().store.tracks.is_empty());
         Session::transact(&m, user_meta("undo"), |tx| {
@@ -520,7 +540,7 @@ mod tests {
         let snapshot = { let g = m.lock(); (g.store.tracks.clone(), g.store.clips.clone()) };
         let new_row = test_track("t-2");
         let r = Session::transact(&m, user_meta("mixed-fail"), |tx| {
-            tx.apply(Op::TrackAdd { track: new_row, index: 1 })?;
+            tx.apply(Op::TrackAdd { track: new_row, index: 1, clips: vec![] })?;
             tx.apply(set_gain("t-2", 0.5))?;
             tx.apply(set_gain("ghost", 0.1))?;   // fails the batch
             Ok(())
