@@ -1076,11 +1076,6 @@ impl Control {
                 .collect();
             (dir, take_no, slots, tables.generation)
         };
-        // Pin the generation the slots above were resolved against (Task 6
-        // [I2]): a take spanning more rebuilds than `GenerationMaps` keeps
-        // in its plain window must not lose its input meters.
-        self.gen_maps.pin(rec_generation);
-
         // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
         // preallocated `RawMeterBlock` template per distinct chunk, plus the
         // base-0 chunk (frame accounting [I3]) even if no recorded slot
@@ -1155,6 +1150,19 @@ impl Control {
             )
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
+
+        // Pin the generation the slots above were resolved against (Task 6
+        // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
+        // in its plain window must not lose its input meters. INVARIANT:
+        // pin only AFTER every fallible step above has succeeded (device
+        // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
+        // `stop_recording` is the only unpin, and it can only ever run once
+        // `self.writer`/`self.input` are actually populated. Pinning
+        // earlier and then returning `Err` from one of those `?`s would
+        // leak the pin: a generation stays exempt from pruning forever for
+        // a recording that never started (self-healing only on the NEXT
+        // successful recording, which is not good enough).
+        self.gen_maps.pin(rec_generation);
 
         self.input = Some(InputBundle { _stream: stream, meter_rx });
         self.writer = Some(writer);
