@@ -18,6 +18,15 @@ between "verified from a source" and "engineering judgment" are preserved
 throughout, because the value is in being able to check the reasoning
 rather than take it on trust.
 
+On 2026-08-13 the first redesign draft built on these dossiers was put
+through an adversarial review (six independent attack agents plus a
+naive-questions pass). The result:
+[`CORE-REDESIGN-ROUND-2.md`](../CORE-REDESIGN-ROUND-2.md) supersedes
+round 1, dossiers [06](06-time-travel-storage.md) and
+[10](10-aura-current-state.md) carry **marked corrections** (never silent
+edits), and the surviving decisions are distilled as ADRs — Status:
+Proposed — in [`docs/adr/`](../adr/README.md).
+
 **This directory is history, not law.** What binds code lives in
 `ARCHITECTURE.md` (as built), `SCALABILITY.md` (the debt register), and
 `docs/adr/` (the decisions and their consequences). Read a dossier when you

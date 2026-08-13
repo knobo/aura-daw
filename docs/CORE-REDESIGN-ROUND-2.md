@@ -84,13 +84,15 @@ that admits it:
    feature is deferred. **[F]**
 3. Time: `Ticks`/`Samples` newtypes **[E]**; integer-period tempo + minimal
    time-signature map as the v3 format **[F]**; section table, per-block
-   map, steady_time **[E]**.
+   map, steady_time **[E]** — except the section table's *subdivision
+   rule*, which is versioned format semantics and therefore **[F]**
+   (§3.4).
 4. The mutation channel **including the side-channel migration** (§4), with
    actor/run stamping **[A]** and the op log declared a persisted,
    versioned format from day one **[F]**.
 5. Storage: the summarising COW B-tree as the in-memory session structure,
    with replay-only nodes as a first-class mechanism **[E]** — explicitly
-  *not* justified by a file-format deadline (see O-9 note in §6).
+   *not* justified by a file-format deadline (§6 retires that argument).
 
 **Moved out, with the reason:**
 
@@ -136,8 +138,7 @@ the mapping — noted here so nobody discovers it as a surprise.
 `MidiNote` gains a `u32` id, unique within its **content object** — the
 address is `(ContentId, NoteId)`, *not* `(ClipId, NoteId)`: round 1's
 address was written against the pre-split model and was invalidated by its
-own §4 (O-8 in spirit; review finding). Requirements the review forced into
-the open:
+own §4 (review finding). Requirements the review forced into the open:
 
 - **The allocator is persisted.** A per-content `next_note_id` watermark
   lives in the AMEV chunk header (one u32). Recomputing `max+1` on load
@@ -179,8 +180,13 @@ in persistent structures (§6), a deleted object simply stops being
 referenced by the current version while history versions keep it alive —
 retention *is* the version graph, exactly as dossier 06 §1.1 states
 ("Undo never un-allocates an ID … No resurrection problem"). No separate
-limbo registry, no per-object refcount. Two scoping rules survive from the
-dossiers and are binding:
+limbo registry, no per-object refcount. Said plainly, because it must be
+checkable: **this sets aside dossier 04 §4.4's own verdict** (which
+crowned the entry-owned refcount, Solution B, "the correct answer") — that
+verdict was written before the storage dossier existed, and the refcount
+variant leaks under a forever-log (the round-1 review's blocker). The two
+dossiers disagreed; round 2 sides with 06 and says so. Two scoping rules
+survive from the dossiers and are binding:
 
 - **Plain model objects only.** Plugin instances are never kept alive or
   destroyed by history reachability: destruction follows the plugin
@@ -263,7 +269,7 @@ content of the decision:
 - **Sample-rate independent and persisted in the file.** Changing the
   project rate never rewrites tempo data.
 - **Round-trip guarantee, stated:** a user-typed BPM is quantized once, at
-  entry, to the nearest integer period (error ~1.4×10⁻⁷ BPM at 120.5 —
+  entry, to the nearest integer period (max error ~2.4×10⁻⁷ BPM at 120.5 —
   displays as 120.5 forever); storage and all derived math are exact
   thereafter. Round 1's unstated version (integer samples-per-beat) would
   have displayed 120.502 on day one.
@@ -320,9 +326,15 @@ than by accident.
 incremented by `frames` per callback, never reset on seek/loop/stop, and
 carried across graph adoption. Offline renders define origin 0 at bounce
 start so exports are deterministic. This replaces the current per-node
-counter that resets on rebuild — which violates CLAP's monotonicity
-contract for instances that survive swaps — and it is three sentences of
-spec that round 1 left out.
+counter, which survives ordinary rebuilds (the node cell is reused when
+its registry key is unchanged) but **resets to 0 whenever the node is
+re-created** — instrument rebind, sample-rate change, a track leaving and
+re-entering the live set — where a plugin *instance* that logically
+continues would see steady time jump backward, violating CLAP's
+monotonicity contract. One global counter removes the hazard class
+instead of enumerating its triggers, and it is three sentences of spec
+that round 1 left out. *(Corrected after the consistency read: the
+original text said the counter resets "on rebuild", which overstated it.)*
 
 ### 3.6 The wire and the frontend
 
@@ -374,8 +386,8 @@ not sit on the rebuild path.
 ### 4.2 The engine thread submits, it never holds (qualification 2)
 
 The engine control thread today writes the store directly from five sites
-(recording finalize, auto-stop, sample-rate writeback, auto-project) and
-one of them deadlocks the naive design: `Stop` blocks on an engine
+(recording start and finalize — two sites, auto-stop, sample-rate
+writeback, auto-project) and one of them deadlocks the naive design: `Stop` blocks on an engine
 round-trip while the engine's handler takes the store lock. The inversion
 is explicit:
 
@@ -403,7 +415,7 @@ single-reference case Rust can see.
 
 ### 4.4 Gestures, effects, and inverses — the dropped dossier machinery, restored
 
-- **Gestures get IPC primitives:** `begin_gesture(target)` /
+- **Gestures get IPC primitives (qualification 4):** `begin_gesture(target)` /
   `end_gesture()` from the frontend, CLAP-style, exactly as dossier 04
   prescribed and round 1 dropped. Between the two, updates flow as
   `transient` ops — RT-visible immediately, not journaled, not undoable,
@@ -517,12 +529,15 @@ schema-level decision. A **placement** (today's clip) references a
   `SourceId`), so the placement schema is uniform and SCALABILITY §3's
   `contentRef` union survives. Instancing arrives free for MIDI; for audio
   it is a byproduct, not a goal.
-- **The lane reference lands now** [F]: placements reference a `LaneId`;
-  every track gets one default lane created with it. This is the deferred
-  take feature's file-format hook — deferring the *reference shape* would
-  mean rewriting every placement in every saved file when takes ship,
-  which is exactly the class of mistake §1 exists to catch. Takes, lanes-UI
-  and comping stay deferred; only the indirection ships.
+- **The lane reference lands now** [F]: placements reference a `LaneId`
+  **and nothing else** — the placement carries no `track_id`; the track is
+  reached through the lane (`LaneId → TrackId`), and every track gets one
+  default lane created with it. This is the deferred take feature's
+  file-format hook — deferring the *reference shape* would mean rewriting
+  every placement in every saved file when takes ship, which is exactly
+  the class of mistake §1 exists to catch. Takes, lanes-UI and comping
+  stay deferred; only the indirection ships. (The "lane/track reference"
+  row in the table above means this single `LaneId` field.)
 - **The sounding-instance address** (what per-voice modulation will need)
   is recorded now: `(ClipId placement, ContentId, NoteId)` resolves the
   document note; the *voice* is Slot-tier per §2.1. Round 3 does not get to
@@ -573,14 +588,52 @@ reframed** — see the corrections block in
 - Therefore **replay-only history nodes are a first-class mechanism of the
   design, not a falsifier fallback**: ops classified bulk-or-scattered
   store op + inverse payload instead of a materialized snapshot
-  (measured replay: ~600 µs for the 100k quantize — hover-safe).
-  Inverse-payload rules: quantize ≈ 4 B/note (delta-codable), transpose
-  O(1)+selection, humanize O(1) **iff the PRNG seed is stored — random ops
-  must be seeded, which is hereby an implementation constraint.** Deletes
-  need no special case (measured ~1.1×: dropped subtrees are free).
-- Retention thresholds are restated as **absolute per-op-class caps** (a
-  point edit may retain ≤ 8 KB; a bulk op must go replay-only above
-  256 KB), replacing the undecidable weighted-mean falsifier.
+  (replay of the 100k quantize measured at ~600 µs with
+  `benches/bulkbench` — single-shot timing, ±40 % per dossier 06's
+  corrected methodology note; still two orders of magnitude inside a
+  hover budget). Inverse-payload rules: quantize ≈ 4 B/note
+  (delta-codable), transpose O(1)+selection, humanize O(1) **iff the PRNG
+  seed is stored — random ops must be seeded, which is hereby an
+  implementation constraint.** Deletes need no special case (measured
+  ~1.1×: dropped subtrees are free). One exclusion the mechanism needs
+  stated: **ops that mint non-deterministic ids** (paste, duplicate —
+  fresh `ClipId`/`ContentId` UUIDs) either carry their minted ids in the
+  op payload or are excluded from replay-only; re-minting on replay would
+  break every later log entry that addresses them. (`NoteId`s are safe —
+  the watermark makes them deterministic.)
+- Retention thresholds are restated as **absolute per-op-class caps**,
+  replacing the undecidable weighted-mean falsifier — and they are now
+  **measured, not estimated** (10 000-gesture weighted simulations, HUMAN
+  and AGENT profiles, per-pattern trees, 20-byte records;
+  `benches/bulkbench/RESULTS.md`): point class ≤ 8 KB/node (measured p99
+  4.9–5.1 KB — ~60 % headroom); bulk ≤ 256 KB/node (a whole 5 000-event
+  clip rewrite measures ≤ 132 KB under per-pattern granularity);
+  **replay-only kicks in class-based at 64 KB of own-created bytes** — at
+  the 256 KB this document originally proposed, the rule was a measured
+  no-op (0.04–0.7 % saving) because whole-clip ops sit below it; at 64 KB
+  it saves 21 % on the AGENT profile with a worst replay chain of 23
+  clip-sized transforms, sub-ms.
+- Two findings from the simulation that reshape the mechanism's role:
+  **(a) the capture effect** — a later materialized node re-captures a
+  replay-only op's surviving output via structural sharing, so in a mixed
+  stream the bytes are retained either way; replay-only *bounds node
+  charges* and saves consecutive-rewrite bursts (agent iteration), while
+  **the budget is defended by eviction** (the GIMP-style ceiling), not by
+  replay-only. **(b) The biggest lever is not storage at all:**
+  transpose/velocity-class gestures **MUST** route through §5's placement
+  offset fields (a map-row edit, no leaf rewrite) — measured 5.4× on the
+  HUMAN profile (550 → 101 MB per 10 k gestures; song-wide transposes
+  were 82 % of the bill) and 1 536 → 1 047 MB on AGENT.
+- What the budget actually buys, measured: HUMAN ~54 700 retained steps
+  in 512 MB with the settings above — a working day fits outright; AGENT
+  ~6 550 steps before coarsening begins. Dossier 06's "85 000 steps" was
+  point-edit arithmetic and overstates agent-driven capacity ~13×; the
+  budget *mechanism* holds.
+- Per-pattern granularity caps within-clip scatter (15.3 MB → ≤ 126 KB)
+  but not cross-clip scattered selections (~2.7 MB per 1 000 notes across
+  clips) — those stay in the replay-only class. Whole-pattern deletes
+  (1.5 KB) and COW duplicates (1.0 KB) are map-path-only, confirming §5's
+  linked-content economics.
 
 Delete-then-undo retention rides the version graph (§2.3), which is why
 the mechanism question and the storage question are one question, answered
@@ -656,8 +709,11 @@ would be first. Against that: Igalia's Skia rework delivered +91 % to
 as a first-class feature (so WebKitGTK pain now lands on a much larger
 constituency than ours), and the three decisive measurements
 (`setPointerCapture` past the window edge, WebGL2-with-microbenchmark on
-real hardware, keydown-to-paint) remain unrun — they are round-3 items and
-they gate the *render architecture*, not this round.
+real hardware, keydown-to-paint) **have now been run — all three pass; see
+§10.1 for the numbers and `benches/ui-probe/` for the harness.** The gate
+they guarded is open: the render architecture may assume a WebView-hosted
+arranger on this evidence, with the pacing self-check and DMA-BUF env-var
+mitigation shipped as §10.1 records.
 
 ### 9.2 The architectural answer: this round is the exit door
 
@@ -762,11 +818,34 @@ is one renderer backend and some chrome — not the product.
 
 ## 10. Open questions for round 3
 
-1. The three frontend measurements (§9.1) — unchanged from round 1, still
-   unrun, still cheap, still the gate for the render architecture.
-2. The weighted storage gesture mix with an *agent-editing profile*
-   (§6) — decides where the bulk/replay-only threshold sits; the crates in
-   `benches/` make this a day's work.
+1. ~~The three frontend measurements (§9.1)~~ **CLOSED (2026-08-13,
+   `benches/ui-probe/RESULTS.md` — wry 0.55.1 / WebKitGTK 2.52.3, the
+   exact versions in Cargo.lock):**
+   - **`setPointerCapture` past the window edge: PASS (3/3).** Moves
+     stream with coordinates up to 683 px beyond the window, ≤ 16 ms
+     gaps, `pointerup` delivered outside the window. Without capture:
+     clamped and lost. Drag-based arranger editing is safe; capture on
+     pointerdown is mandatory.
+   - **WebGL2: real hardware, order-of-magnitude throughput margin.**
+     10k instanced quads ≈ 2–5 ms; 200k ≈ 10 ms GPU-side. The renderer
+     string is a hardcoded lie ("Apple GPU") — software detection MUST be
+     timing-based. The one genuine risk found: default DMA-BUF frame
+     pacing jittered at 27–48 FPS *independent of load* on this dual-GPU
+     (reverse-PRIME) box, while `WEBKIT_DISABLE_DMABUF_RENDERER=1` locked
+     a flat 62 FPS — ship a runtime pacing self-check plus the env-var
+     mitigation; retest on single-GPU/Wayland.
+   - **keydown→paint-commit: p50 22 ms / p95 30 ms** (heavy full-canvas
+     repaint adds only ~3 ms — latency is frame-scheduling-bound,
+     ~1.3–2 frames). In-page commit, not photon latency.
+   **Gate verdict: nothing invalidates a WebView-hosted arranger.** §9.3's
+   posture stands on measurement now, not judgment.
+2. ~~The weighted storage gesture mix with an *agent-editing profile*~~
+   **CLOSED (2026-08-13, `benches/bulkbench/RESULTS.md`):** replay-only
+   threshold 64 KB own-created bytes (256 KB was a measured no-op);
+   point-cap 8 KB confirmed with headroom; transpose/velocity gestures
+   must route through placement offsets (the single biggest lever, 5.4×);
+   512 MB holds ~54 700 HUMAN steps / ~6 550 AGENT steps before
+   coarsening. Folded into §6.
 3. Session lock granularity: §4.1 merges five locks; if profiling shows
    contention (MCP agent + UI + engine submissions), the escape is
    persistent-structure snapshots for readers, not lock splitting —

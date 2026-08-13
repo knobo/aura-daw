@@ -1,0 +1,137 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ui-probe-pointer</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  #surface { width: 100vw; height: 100vh; background: #234; color: #cde;
+             font: 14px monospace; user-select: none; touch-action: none; }
+</style>
+<div id="surface">pointer-capture probe: waiting for drags…</div>
+<script>
+(() => {
+  const surface = document.getElementById('surface');
+  const CAPTURE_TRIALS = 3;   // trials 0..2 use setPointerCapture
+  const TOTAL_TRIALS   = 5;   // trials 3..4 are the no-capture contrast
+  const MAX_RAW_MOVES  = 500;
+
+  // Live-desktop guard: only drags travelling at least this far horizontally
+  // count as harness trials (synthetic drags travel >= window width + 300 px).
+  // Shorter interactions (stray real user clicks) are logged but ignored.
+  const MIN_TRAVEL_PX = 250;
+
+  const trials = [];
+  const ignored = [];
+  let trialIdx = 0;
+  let cur = null;
+  let idleTimer = null;
+  let sent = false;
+
+  function send(reason) {
+    if (sent) return;
+    sent = true;
+    window.ipc.postMessage(JSON.stringify({
+      test: 'pointer-capture',
+      finishedBecause: reason,
+      innerWidth: window.innerWidth,
+      innerHeight: window.innerHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      captureTrialsPlanned: CAPTURE_TRIALS,
+      totalTrialsPlanned: TOTAL_TRIALS,
+      minTravelPx: MIN_TRAVEL_PX,
+      ignoredShortInteractions: ignored,
+      trials
+    }, null, 2));
+  }
+
+  function arm() {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { if (cur) finishTrial('idle-timeout-no-pointerup'); }, 3000);
+  }
+
+  function finishTrial(reason) {
+    clearTimeout(idleTimer);
+    if (!cur) return;
+    const t = cur; cur = null;
+    const travel = t.moves.length ? Math.max(...t.moves.map(m => m.x)) - t.downX : 0;
+    if (travel < MIN_TRAVEL_PX) {
+      ignored.push({ downX: t.downX, downY: t.downY, travel: +travel.toFixed(1),
+                     moveCount: t.moves.length, endedBecause: reason,
+                     wouldHaveUsedCapture: t.capture });
+      surface.textContent = `ignored short interaction (travel ${travel.toFixed(0)}px); still at trial ${trialIdx}`;
+      return;
+    }
+    const beyond = t.moves.filter(m => m.x >= window.innerWidth);
+    const negative = t.moves.filter(m => m.x < 0 || m.y < 0);
+    trials.push({
+      trial: t.trial,
+      usedSetPointerCapture: t.capture,
+      setPointerCaptureResult: t.captureOk,
+      endedBecause: reason,
+      moveCount: t.moves.length,
+      maxX: t.moves.length ? Math.max(...t.moves.map(m => m.x)) : null,
+      minX: t.moves.length ? Math.min(...t.moves.map(m => m.x)) : null,
+      movesBeyondWindowWidth: beyond.length,
+      lastMoveBeyondWidth: beyond.length ? beyond[beyond.length - 1] : null,
+      movesWithNegativeCoords: negative.length,
+      gotPointerUp: t.gotPointerUp,
+      pointerUpAt: t.pointerUp || null,
+      lostPointerCapture: t.lostCapture || null,
+      gotPointerCancel: t.gotPointerCancel || false,
+      durationMs: t.lastEventT != null ? +(t.lastEventT - t.downAt).toFixed(1) : null,
+      rawMoves: t.moves.slice(0, MAX_RAW_MOVES)
+    });
+    surface.textContent = `trial ${t.trial} done (${reason}); ${trials.length}/${TOTAL_TRIALS}`;
+    trialIdx++;
+    if (trialIdx >= TOTAL_TRIALS) send('all-trials-complete');
+  }
+
+  surface.addEventListener('pointerdown', e => {
+    if (sent || cur) return;
+    cur = {
+      trial: trialIdx,
+      capture: trialIdx < CAPTURE_TRIALS,
+      captureOk: null,
+      downAt: e.timeStamp,
+      downX: e.clientX,
+      downY: e.clientY,
+      lastEventT: e.timeStamp,
+      moves: [],
+      gotPointerUp: false
+    };
+    if (cur.capture) {
+      try { surface.setPointerCapture(e.pointerId); cur.captureOk = 'ok'; }
+      catch (err) { cur.captureOk = 'threw: ' + err; }
+    } else {
+      cur.captureOk = 'not-requested';
+    }
+    surface.textContent = `trial ${trialIdx} down at ${e.clientX},${e.clientY} capture=${cur.capture}`;
+    arm();
+  });
+
+  surface.addEventListener('pointermove', e => {
+    if (!cur) return;
+    cur.lastEventT = e.timeStamp;
+    cur.moves.push({ x: e.clientX, y: e.clientY, t: +e.timeStamp.toFixed(1) });
+    arm();
+  });
+
+  surface.addEventListener('pointerup', e => {
+    if (!cur) return;
+    cur.gotPointerUp = true;
+    cur.lastEventT = e.timeStamp;
+    cur.pointerUp = { x: e.clientX, y: e.clientY, t: +e.timeStamp.toFixed(1) };
+    finishTrial('pointerup');
+  });
+
+  surface.addEventListener('lostpointercapture', e => {
+    if (!cur) return;
+    cur.lostCapture = { t: +e.timeStamp.toFixed(1), movesSoFar: cur.moves.length,
+                        beforePointerUp: !cur.gotPointerUp };
+  });
+
+  surface.addEventListener('pointercancel', () => { if (cur) cur.gotPointerCancel = true; });
+
+  // Safety net: report whatever we have.
+  setTimeout(() => send('global-timeout'), 90000);
+})();
+</script>

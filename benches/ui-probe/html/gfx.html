@@ -1,0 +1,227 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ui-probe-gfx</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #111; }
+  canvas { display: block; }
+  #status { position: fixed; top: 4px; left: 6px; color: #9fc; font: 12px monospace; }
+</style>
+<canvas id="glc" width="1280" height="720"></canvas>
+<canvas id="c2d" width="1280" height="720" style="display:none"></canvas>
+<div id="status">gfx probe starting…</div>
+<script>
+(async () => {
+  const status = document.getElementById('status');
+  const out = {
+    test: 'gfx',
+    userAgent: navigator.userAgent,
+    devicePixelRatio: window.devicePixelRatio,
+    canvasSize: { w: 1280, h: 720 },
+    webgl2: {},
+    benchA_webgl2_instanced: [],
+    benchB_canvas2d: [],
+    errors: []
+  };
+  let sent = false;
+  const send = (why) => {
+    if (sent) return; sent = true;
+    out.finishedBecause = why;
+    window.ipc.postMessage(JSON.stringify(out, null, 2));
+  };
+  setTimeout(() => send('global-timeout'), 170000);
+  const raf = () => new Promise(r => requestAnimationFrame(r));
+  const pct = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.floor(p / 100 * sorted.length))];
+  const stats = (arr) => {
+    if (!arr.length) return null;
+    const s = [...arr].sort((a, b) => a - b);
+    const round = v => +v.toFixed(2);
+    return { n: s.length, min: round(s[0]), p50: round(pct(s, 50)), p90: round(pct(s, 90)),
+             p95: round(pct(s, 95)), max: round(s[s.length - 1]),
+             mean: round(arr.reduce((a, b) => a + b, 0) / arr.length) };
+  };
+
+  try {
+    // ---------- WebGL2 context + info ----------
+    const glc = document.getElementById('glc');
+    const gl = glc.getContext('webgl2', { antialias: false, powerPreference: 'high-performance' });
+    out.webgl2.contextCreated = !!gl;
+    if (gl) {
+      out.webgl2.maskedRenderer = gl.getParameter(gl.RENDERER);
+      out.webgl2.maskedVendor = gl.getParameter(gl.VENDOR);
+      out.webgl2.version = gl.getParameter(gl.VERSION);
+      out.webgl2.shadingLanguageVersion = gl.getParameter(gl.SHADING_LANGUAGE_VERSION);
+      out.webgl2.maxTextureSize = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      out.webgl2.unmaskedRenderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : 'extension-unavailable';
+      out.webgl2.unmaskedVendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : 'extension-unavailable';
+    }
+
+    if (gl) {
+      // ---------- Bench A: instanced quads ----------
+      const vs = `#version 300 es
+        layout(location=0) in vec2 corner;      // unit quad corner
+        layout(location=1) in vec3 inst;        // per-instance x, y, hue
+        uniform float uT;
+        out vec3 vColor;
+        void main() {
+          vec2 p = inst.xy + corner * 0.006;    // small quads, like clip/note rects
+          p.x = mod(p.x + uT * 0.05, 2.0) - 1.0;
+          gl_Position = vec4(p, 0.0, 1.0);
+          vColor = vec3(fract(inst.z), fract(inst.z * 7.13), 0.8);
+        }`;
+      const fs = `#version 300 es
+        precision mediump float;
+        in vec3 vColor; out vec4 o;
+        void main() { o = vec4(vColor, 1.0); }`;
+      const sh = (type, src) => {
+        const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+          throw new Error('shader: ' + gl.getShaderInfoLog(s));
+        return s;
+      };
+      const prog = gl.createProgram();
+      gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+      gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS))
+        throw new Error('link: ' + gl.getProgramInfoLog(prog));
+      gl.useProgram(prog);
+      const uT = gl.getUniformLocation(prog, 'uT');
+
+      const quad = new Float32Array([0,0, 1,0, 0,1, 1,1]);
+      const qb = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, qb);
+      gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(0);
+      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+      const NMAX = 200000;
+      const inst = new Float32Array(NMAX * 3);
+      for (let i = 0; i < NMAX; i++) {
+        inst[i*3]   = Math.random() * 2 - 1;
+        inst[i*3+1] = Math.random() * 2 - 1;
+        inst[i*3+2] = Math.random();
+      }
+      const ib = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, ib);
+      gl.bufferData(gl.ARRAY_BUFFER, inst, gl.STATIC_DRAW);
+      gl.enableVertexAttribArray(1);
+      gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+      gl.vertexAttribDivisor(1, 1);
+
+      const drawFrame = (n, t) => {
+        gl.clearColor(0.05, 0.05, 0.08, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.uniform1f(uT, t);
+        gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, n);
+      };
+      const px = new Uint8Array(4);
+
+      for (const n of [10000, 50000, 200000]) {
+        status.textContent = `bench A: ${n} instanced quads…`;
+        // warmup
+        for (let i = 0; i < 10; i++) { drawFrame(n, i * 0.01); await raf(); }
+        // main pass: rAF frame deltas + JS submit time, 120 frames or 12 s
+        const rafDeltas = [], submitMs = [];
+        let prev = await raf();
+        const t0 = performance.now();
+        let frames = 0;
+        while (frames < 120 && performance.now() - t0 < 12000) {
+          const s0 = performance.now();
+          drawFrame(n, frames * 0.01);
+          submitMs.push(performance.now() - s0);
+          const now = await raf();
+          rafDeltas.push(now - prev);
+          prev = now;
+          frames++;
+        }
+        const elapsed = performance.now() - t0;
+        // sync pass: force completion each frame -> true per-frame work time
+        const syncMs = [];
+        for (let i = 0; i < 30; i++) {
+          const s0 = performance.now();
+          drawFrame(n, 1000 + i * 0.01);
+          gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px); // full sync
+          syncMs.push(performance.now() - s0);
+          await raf();
+        }
+        out.benchA_webgl2_instanced.push({
+          instances: n,
+          framesMeasured: frames,
+          achievedFps: +(frames / (elapsed / 1000)).toFixed(1),
+          rafFrameMs: stats(rafDeltas),
+          jsSubmitMs: stats(submitMs),
+          syncedFrameWorkMs: stats(syncMs),
+          note: 'rafFrameMs is vsync-capped (~16.7ms floor @60Hz); syncedFrameWorkMs = draw+readPixels(1px) full pipeline flush'
+        });
+      }
+    } else {
+      out.errors.push('WebGL2 context creation FAILED');
+    }
+
+    // ---------- Bench B: Canvas2D fillRect ----------
+    const c2d = document.getElementById('c2d');
+    document.getElementById('glc').style.display = 'none';
+    c2d.style.display = 'block';
+    const ctx = c2d.getContext('2d');
+    out.canvas2dCreated = !!ctx;
+    if (ctx) {
+      for (const n of [5000, 20000]) {
+        status.textContent = `bench B: ${n} fillRects…`;
+        const colors = [];
+        for (let i = 0; i < 64; i++) colors.push(`hsl(${i * 5.6}, 60%, 50%)`);
+        const draw = (f) => {
+          ctx.fillStyle = '#101018';
+          ctx.fillRect(0, 0, 1280, 720);
+          for (let i = 0; i < n; i++) {
+            ctx.fillStyle = colors[i & 63];
+            ctx.fillRect(((i * 37 + f * 3) % 1270), ((i * 91) % 710), 8, 6);
+          }
+        };
+        for (let i = 0; i < 10; i++) { draw(i); await raf(); }
+        const rafDeltas = [], jsMs = [];
+        let prev = await raf();
+        const t0 = performance.now();
+        let frames = 0;
+        while (frames < 120 && performance.now() - t0 < 12000) {
+          const s0 = performance.now();
+          draw(frames);
+          jsMs.push(performance.now() - s0);
+          const now = await raf();
+          rafDeltas.push(now - prev);
+          prev = now;
+          frames++;
+        }
+        const elapsed = performance.now() - t0;
+        out.benchB_canvas2d.push({
+          fillRects: n,
+          framesMeasured: frames,
+          achievedFps: +(frames / (elapsed / 1000)).toFixed(1),
+          rafFrameMs: stats(rafDeltas),
+          jsDrawMs: stats(jsMs)
+        });
+      }
+    }
+
+    // ---------- Bench C: llvmpipe tell ----------
+    const a10k = out.benchA_webgl2_instanced.find(b => b.instances === 10000);
+    if (a10k && a10k.syncedFrameWorkMs) {
+      out.benchC_softwareTell = {
+        criterion: 'synced frame work for 10k instanced quads > 8 ms => PROBABLE-SOFTWARE',
+        syncedP50Ms_10k: a10k.syncedFrameWorkMs.p50,
+        verdict: a10k.syncedFrameWorkMs.p50 > 8 ? 'PROBABLE-SOFTWARE' : 'LIKELY-HARDWARE',
+        rendererStringMentionsLlvmpipe:
+          /llvmpipe|softpipe|swiftshader|software/i.test(
+            (out.webgl2.maskedRenderer || '') + ' ' + (out.webgl2.unmaskedRenderer || ''))
+      };
+    } else {
+      out.benchC_softwareTell = { verdict: 'UNKNOWN - no WebGL2 data' };
+    }
+
+    send('complete');
+  } catch (err) {
+    out.errors.push(String(err && err.stack || err));
+    send('exception');
+  }
+})();
+</script>

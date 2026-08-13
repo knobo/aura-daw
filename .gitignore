@@ -1,5 +1,6 @@
 # Rust
 /src-tauri/target/
+/benches/*/target/
 
 # Node
 /node_modules/
