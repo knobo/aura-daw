@@ -78,6 +78,13 @@ describe("automation store", () => {
     b.automationGet = saved;
   });
 
+  it("automatePluginParam creates a flat lane, and toggling again deletes it", async () => {
+    await automation.automatePluginParam("inst-1", 7, 0.25);
+    expect(automation.pluginLaneFor("inst-1", 7)?.points).toEqual([{ tick: 0, value: 0.25 }]);
+    await automation.automatePluginParam("inst-1", 7, 0.25);
+    expect(automation.pluginLaneFor("inst-1", 7)).toBeUndefined();
+  });
+
   it("toggleVisible flips per-track overlay visibility", () => {
     expect(automation.isVisible("t-1")).toBe(false);
     automation.toggleVisible("t-1");

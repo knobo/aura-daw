@@ -48,6 +48,28 @@ class AutomationStore {
     return this.lanes.filter((l) => l.targetNode === instanceId);
   }
 
+  /** The lane automating one plugin instance's parameter, if any. */
+  pluginLaneFor(instanceId: string, paramId: number): AutomationLane | undefined {
+    return this.laneFor(instanceId, paramId);
+  }
+
+  /** Create (or clear) a flat lane at `value` for a plugin parameter — the
+   * "automate this knob" affordance's backing call. One point is enough to
+   * make the lane exist and visible; the user then draws on it. */
+  async automatePluginParam(instanceId: string, paramId: number, value: number) {
+    const existing = this.pluginLaneFor(instanceId, paramId);
+    if (existing) {
+      await this.commit({ ...existing, points: [] }); // toggle off = delete
+      return;
+    }
+    await this.commit({
+      id: "",
+      targetNode: instanceId,
+      paramId,
+      points: [{ tick: 0, value }],
+    });
+  }
+
   async reload(): Promise<void> {
     if (!backend.automationGet) return; // demo backend: no automation
     try {

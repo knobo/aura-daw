@@ -677,19 +677,8 @@ impl Committer {
                         let s = self.session.lock();
                         s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
                     };
-                    match format.as_deref() {
-                        Some("lv2") => {
-                            if let Some(host) = lv2_host::try_global() {
-                                host.set_params(instance, vec![(*index, *value)]);
-                            }
-                        }
-                        Some("clap") => {
-                            let change = crate::plugins::ParamChange { id: *index, value: *value as f64 };
-                            if let Err(e) = clap_host::set_params(instance, vec![change]) {
-                                log::warn!("plugins: clap param write for {instance}: {e}");
-                            }
-                        }
-                        _ => {}
+                    if let Some(format) = format {
+                        forward_param_to_host(instance, &format, *index, *value);
                     }
                 }
                 HostForward::Instantiate { instance } => {
@@ -1116,6 +1105,32 @@ impl MeterSink for LatestMeterCache {
     fn send_frame(&self, frame: &MeterFrame) -> bool {
         *self.0.lock() = Some(frame.clone());
         true
+    }
+}
+
+/// Forward one already-clamped param value to whichever host owns
+/// `instance`. Two callers: `Committer::execute_host_forward`'s `ParamWrite`
+/// arm (a document edit's host effect) and the engine control thread's
+/// automation driver (Track D — an RT-visible override that never touches
+/// the document; see `plugins::automation::ParamAutomationDriver`'s doc and
+/// `docs/SIDE-CHANNEL-INVENTORY.md`). Taking `format` as an argument, rather
+/// than looking it up, is what lets the driver run with zero session locks
+/// on its 2 ms tick.
+pub(crate) fn forward_param_to_host(instance: &str, format: &str, index: u32, value: f32) {
+    use crate::plugins::{clap_host, lv2_host};
+    match format {
+        "lv2" => {
+            if let Some(host) = lv2_host::try_global() {
+                host.set_params(instance, vec![(index, value)]);
+            }
+        }
+        "clap" => {
+            let change = crate::plugins::ParamChange { id: index, value: value as f64 };
+            if let Err(e) = clap_host::set_params(instance, vec![change]) {
+                log::warn!("plugins: clap param write for {instance}: {e}");
+            }
+        }
+        _ => {}
     }
 }
 
