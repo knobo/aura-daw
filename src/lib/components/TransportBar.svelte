@@ -96,6 +96,15 @@
       onClick: () => toggleDock("hum"),
     },
     {
+      id: "lib",
+      kind: "chip",
+      priority: 5,
+      label: "LIB",
+      title: "Library — samples, project clips, presets",
+      on: ui.dock === "library",
+      onClick: () => toggleDock("library"),
+    },
+    {
       id: "inst",
       kind: "chip",
       priority: 7,
