@@ -686,11 +686,11 @@ impl Committer {
                     // Clear `dirty_state` for whichever ids' pending bytes
                     // just landed on disk (Task 9 review round 1,
                     // Critical-2) — a short, separate re-lock, no disk I/O
-                    // under it.
-                    let mut s = self.session.lock();
-                    for id in cleared {
-                        s.plugins.dirty_state.remove(&id);
-                    }
+                    // under it. M-1 (Task 3, whole-branch review): guarded
+                    // against a `PluginSetState` landing between the
+                    // snapshot above and this re-lock — see
+                    // `clear_dirty_state_matching`'s doc.
+                    self.clear_dirty_state_matching(&cleared, &doc);
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("plugins persist failed: {e}"),
@@ -734,6 +734,28 @@ impl Committer {
         let entry = s.plugins.params.entry(instance.to_string()).or_default();
         if entry.is_empty() {
             *entry = params;
+        }
+    }
+
+    /// Clear `dirty_state` ONLY for ids whose live pending bytes still equal
+    /// the bytes this persist actually wrote (M-1, whole-branch review): a
+    /// concurrent `PluginSetState` landing between the snapshot (taken under
+    /// the FIRST session lock of the persist call this helper closes out)
+    /// and this re-lock must keep its dirty flag, or its bytes would
+    /// silently never persist — the same `PluginRemove`/`PluginSetState`
+    /// hazard Task 9's Critical-2 fixed one level down (a fresher write
+    /// beating a merely-existing file); this closes the analogous window
+    /// one level UP, between "bytes chosen to write" and "flag cleared".
+    /// Called from `execute_persist`, `save_project_mark`'s M-2 flush, and
+    /// `save_project_as_epoch`'s Save-As write — every site that calls
+    /// `plugins::state::save_snapshot_into_project` and then wants to clear
+    /// the ids it returned.
+    fn clear_dirty_state_matching(&self, written: &[String], snapshot: &session::PluginDoc) {
+        let mut s = self.session.lock();
+        for id in written {
+            if s.plugins.pending_state.get(id) == snapshot.pending_state.get(id) {
+                s.plugins.dirty_state.remove(id);
+            }
         }
     }
 
@@ -3360,12 +3382,10 @@ impl ControlPlane {
             Ok(cleared) if !cleared.is_empty() => {
                 // Mirrors execute_persist's post-write re-lock (:581-596):
                 // clear `dirty_state` for whichever ids' pending bytes just
-                // landed on disk. Plain remove — Task 3 tightens both call
-                // sites with a byte-compare guard once it lands.
-                let mut s = self.session.lock();
-                for id in cleared {
-                    s.plugins.dirty_state.remove(&id);
-                }
+                // landed on disk — now through `clear_dirty_state_matching`
+                // (M-1, Task 3), which keeps a concurrent `PluginSetState`'s
+                // dirty flag set if its bytes moved on since this snapshot.
+                self.committer.clear_dirty_state_matching(&cleared, &plugin_snapshot);
             }
             Ok(_) => {}
             Err(e) => log::warn!("save_project_as_epoch: persisting plugin state failed: {e}"),
@@ -3397,21 +3417,59 @@ impl ControlPlane {
     pub fn save_project_mark(&self) -> Result<Project, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
-        let (project, dir, epoch, modulation) = {
+        let (project, dir, epoch, midi_snapshot, plugin_snapshot, modulation) = {
             let session = self.session.lock();
             let dir = session.store.project_dir.clone().ok_or("no project open")?;
             let project = project::from_store(&session.store, position, rate)?;
-            (project, dir, session.epoch, session.modulation.clone())
+            // M-2 (Task 3, whole-branch review): a prior auto-persist
+            // (`execute_persist`) can fail and leave `midi.dirty`/
+            // `plugins.dirty_state` set with nothing actually written —
+            // Ctrl+S (this fn) is the user's explicit "save now" and, with
+            // the journal ON, the mark it records below claims durability
+            // for the whole document; it must recover any dirty stores
+            // first, not just write `project.json`. Snapshots taken under
+            // this SAME lock as the project snapshot above, written below
+            // after the lock drops (round-2 §4: no disk I/O under the
+            // session lock) — same helpers, same warn-not-fail policy, same
+            // `clear_dirty_state_matching` guard `execute_persist` uses.
+            // Automation is deliberately NOT covered here: lanes carry no
+            // dirty flag today (an automation persist is an all-or-nothing
+            // lane write, unlike midi/plugins' incremental dirty tracking),
+            // so there is nothing for a failed auto-persist to have left
+            // set — a future automation dirty flag would need the same
+            // treatment added here.
+            let midi_snapshot = session.midi.dirty.then(|| session.midi_snapshot());
+            let plugin_snapshot =
+                (!session.plugins.dirty_state.is_empty()).then(|| session.plugin_snapshot());
+            (project, dir, session.epoch, midi_snapshot, plugin_snapshot, session.modulation.clone())
         };
+        project::save(&dir, &project)?;
+        if let Some(m) = midi_snapshot {
+            if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
+                log::warn!("save_project_mark: midi persist failed: {e}");
+                self.session.lock().midi.dirty = true;
+            } else {
+                self.session.lock().midi.dirty = false;
+            }
+        }
+        if let Some(doc) = plugin_snapshot {
+            match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
+                Ok(cleared) if !cleared.is_empty() => {
+                    self.committer.clear_dirty_state_matching(&cleared, &doc);
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("save_project_mark: plugins persist failed: {e}"),
+            }
+        }
         // epoch boundary: no document swap here (same project, same
         // in-memory content) — so history is NOT cleared and the journal is
         // NOT rotated. Task 17 journals a "save" MARK record instead: it
         // tells a replay where the on-disk snapshot caught up with the log,
         // which is the whole difference between a snapshot mark and an
-        // epoch (ruling 4).
-        project::save(&dir, &project)?;
-        // Task 7: an explicit save is the one-way v4 upgrade. The file
-        // stays v3 `automation[]` until this write (or an edit persist).
+        // epoch (ruling 4). Position kept exactly here — after
+        // `project::save`, before the emit — even though the dirty-store
+        // flush above may now also have run: a save mark that also flushed
+        // dirty stores is still one mark.
         if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation) {
             log::warn!("save_project: modulation persist failed: {e}");
         }
@@ -7077,5 +7135,160 @@ mod tests {
         drop(s);
 
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// M-2 (Task 3, whole-branch review): before this fix, `save_project_
+    /// mark` (Ctrl+S) wrote ONLY `project.json` — a midi edit left dirty by
+    /// a prior FAILED auto-persist (mirrors M-5's own scenario: `midi.dirty`
+    /// stuck `true` with the edit never reaching disk) survived the save
+    /// untouched, so the journal's mark record then claimed durability the
+    /// snapshot didn't have. The edit here is added directly to
+    /// `session.midi.clips` (bypassing `commit`, same direct-drive sanction
+    /// `persist_effect_writes_midi_after_the_lock_and_before_the_emit` uses)
+    /// so nothing auto-persists it first; `midi.dirty` is forced `true` to
+    /// stand in for the failed auto-persist. `save_project_mark` must flush
+    /// it and clear the flag.
+    #[test]
+    fn save_project_mark_flushes_a_failed_midi_autopersist() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("save-mark-midi");
+        cp.create_project(parent.to_str().unwrap(), "SaveMarkMidi").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        {
+            let mut session = cp.session().lock();
+            let mut clip = dummy_midi_clip("t-1");
+            clip.notes.push(crate::midi::MidiNote {
+                tick: 0,
+                length_ticks: 480,
+                key: 60,
+                velocity: 100,
+                channel: 0,
+                note_id: crate::ids::NoteId(1),
+            });
+            session.midi.clips.push(clip);
+            // Stands in for a prior FAILED auto-persist (M-5's own
+            // scenario) — the edit is in memory, but nothing on disk
+            // reflects it yet.
+            session.midi.dirty = true;
+        }
+
+        cp.save_project_mark().unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert_eq!(
+            raw["content"].as_array().unwrap().len(),
+            1,
+            "M-2: Ctrl+S flushes the midi edit a failed auto-persist left behind"
+        );
+        let ev_ref = raw["content"][0]["eventsRef"]
+            .as_str()
+            .expect("events chunk ref written for a clip with notes");
+        assert!(dir.join(ev_ref).exists(), "AMEV chunk file exists on disk after save_project_mark");
+        assert!(!cp.session().lock().midi.dirty, "M-2: save_project_mark clears the recovered dirty flag");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// M-2 (Task 3): same recovery, for plugin state — a `dirty_state` id
+    /// left over from a failed auto-persist must flush on Ctrl+S, mirroring
+    /// `save_as_carries_plugin_rows_state_blobs_and_automation_into_the_new_dir`'s
+    /// setup but against an already-open project (`save_project_mark`, not
+    /// Save-As).
+    #[test]
+    fn save_project_mark_flushes_dirty_plugin_state() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("save-mark-plugins");
+        cp.create_project(parent.to_str().unwrap(), "SaveMarkPlugins").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![]);
+            s.plugins.pending_state.insert(
+                "inst-1".into(),
+                crate::plugins::state::encode_state(
+                    "lv2:urn:test:synth",
+                    &crate::plugins::state::StateBlob {
+                        kind: crate::plugins::state::KIND_OPAQUE,
+                        data: vec![7u8; 16],
+                    },
+                ),
+            );
+            // Stands in for a failed auto-persist: bytes are pending, the
+            // flag is set, nothing has landed on disk yet.
+            s.plugins.dirty_state.insert("inst-1".into());
+        }
+
+        cp.save_project_mark().unwrap();
+
+        assert!(
+            dir.join("plugins").join("inst-1.state").exists(),
+            "M-2: Ctrl+S flushes the pending plugin state blob"
+        );
+        assert!(
+            cp.session().lock().plugins.dirty_state.is_empty(),
+            "M-2: save_project_mark clears dirty_state once the bytes landed on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// M-1 (Task 3, whole-branch review): a `PluginSetState` landing between
+    /// the snapshot `execute_persist`/`save_project_mark`/`save_project_as_
+    /// epoch` take and their post-write re-lock must NOT have its dirty flag
+    /// cleared just because SOME earlier bytes for that id were written —
+    /// `clear_dirty_state_matching` must compare live pending bytes against
+    /// the snapshot's, not just check the id off a list.
+    #[test]
+    fn a_concurrent_set_state_between_snapshot_and_clear_stays_dirty() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let snapshot = {
+            let mut s = cp.session().lock();
+            s.plugins.pending_state.insert("inst-1".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.plugin_snapshot()
+        };
+        // The concurrent SetState: live pending bytes move on to something
+        // the snapshot above never saw — standing in for a `PluginSetState`
+        // landing in the window between the snapshot and this call.
+        cp.session().lock().plugins.pending_state.insert("inst-1".into(), vec![9, 9, 9]);
+
+        cp.committer().clear_dirty_state_matching(&["inst-1".to_string()], &snapshot);
+
+        assert!(
+            cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "M-1: a concurrent SetState after the snapshot keeps the id dirty"
+        );
+    }
+
+    /// M-1's complementary case: when nothing raced the snapshot, live
+    /// pending bytes still match what was written, and the helper clears
+    /// the flag exactly like the pre-M-1 unconditional `remove` did.
+    #[test]
+    fn matching_pending_bytes_clear_the_dirty_flag() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let snapshot = {
+            let mut s = cp.session().lock();
+            s.plugins.pending_state.insert("inst-1".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.plugin_snapshot()
+        };
+
+        cp.committer().clear_dirty_state_matching(&["inst-1".to_string()], &snapshot);
+
+        assert!(
+            !cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "M-1: matching pending bytes clear the dirty flag"
+        );
     }
 }
