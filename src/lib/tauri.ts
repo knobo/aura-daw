@@ -26,7 +26,9 @@ import type {
   McpStatus,
   MeterFrame,
   MidiClip,
+  MidiInputStatus,
   MidiNote,
+  MidiPortInfo,
   OpenSidecarEvent,
   PluginDescriptor,
   PluginInstanceInfo,
@@ -221,6 +223,14 @@ export interface Backend {
    * plain browser DnD instead and leaves this undefined.
    */
   onFileDrop?(cb: (e: FileDropEvent) => void): Unsubscribe;
+
+  // ── hardware MIDI input (midi-input-ports slice 1) ──
+  // Optional: real backend only (no hardware to simulate in demo mode),
+  // same carve-out as hintClipCharacter/registerClip above. UI callers must
+  // guard with `backend.midiListInputPorts?.(...)`.
+  midiListInputPorts?(): Promise<MidiPortInfo[]>;
+  midiSelectInputPort?(portId: string | null): Promise<void>;
+  midiInputStatus?(): Promise<MidiInputStatus>;
 
   // mcp
   mcpGetStatus(): Promise<McpStatus>;
@@ -562,6 +572,16 @@ class TauriBackend implements Backend {
     return () => {
       for (const p of subs) p.then((un) => un()).catch(() => {});
     };
+  }
+
+  midiListInputPorts() {
+    return invoke<MidiPortInfo[]>("midi_list_input_ports");
+  }
+  async midiSelectInputPort(portId: string | null) {
+    await invoke("midi_select_input_port", { portId });
+  }
+  midiInputStatus() {
+    return invoke<MidiInputStatus>("midi_input_status");
   }
 
   mcpGetStatus() {
