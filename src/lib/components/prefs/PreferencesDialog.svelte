@@ -8,6 +8,7 @@
    */
   import { prefs } from "../../prefs/prefs.svelte";
   import { PREF_CATEGORIES, PREF_SCHEMA, type PrefDef, type PrefId } from "../../prefs/schema";
+  import { directoryPicker } from "../../utils/pick-directory";
 
   const entries = Object.entries(PREF_SCHEMA) as [PrefId, PrefDef][];
 
@@ -36,6 +37,24 @@
   function numberLabel(def: PrefDef, value: number): string {
     if (def.kind !== "number") return String(value);
     return def.unit === "%" ? `${Math.round(value * 100)}%` : String(value);
+  }
+
+  /** Append a folder to a pathList preference (no-op when cancelled or a
+   * duplicate — `coercePref` de-dupes, but not adding is quieter). */
+  async function addPath(id: PrefId, def: PrefDef) {
+    if (def.kind !== "pathList") return;
+    const picked = await directoryPicker.pick(def.label);
+    if (!picked) return;
+    const current = prefs.values[id] as string[];
+    if (current.includes(picked)) return;
+    prefs.set(id, [...current, picked]);
+  }
+
+  function removePath(id: PrefId, path: string) {
+    prefs.set(
+      id,
+      (prefs.values[id] as string[]).filter((p) => p !== path),
+    );
   }
 
   function onOverlayKeydown(e: KeyboardEvent) {
@@ -109,6 +128,26 @@
                 {/if}
               </div>
               <p class="blurb silk">{def.blurb}</p>
+              {#if def.kind === "pathList"}
+                <div class="pathlist">
+                  {#each prefs.values[id] as string[] as p (p)}
+                    <div class="pathrow">
+                      <span class="pathtext silk" title={p}>{p}</span>
+                      <button
+                        class="pathx mono"
+                        title="Remove this folder"
+                        aria-label="Remove {p}"
+                        onclick={() => removePath(id, p)}>×</button
+                      >
+                    </div>
+                  {:else}
+                    <div class="pathempty silk">no extra folders — only the default library</div>
+                  {/each}
+                  <button class="pathadd mono" onclick={() => void addPath(id, def)}>
+                    + {def.addLabel}
+                  </button>
+                </div>
+              {/if}
             </div>
           {/each}
         </section>
@@ -266,6 +305,64 @@
     text-align: right;
     font-size: 10px;
     color: var(--text-dim);
+  }
+
+  .pathlist {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 2px;
+  }
+  .pathrow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 3px 6px;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    background: rgba(16, 20, 42, 0.4);
+  }
+  .pathtext {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9px;
+    color: var(--text-dim);
+  }
+  .pathx {
+    border: none;
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+  }
+  .pathx:hover {
+    color: var(--red);
+  }
+  .pathempty {
+    font-size: 9px;
+    color: var(--text-faint);
+    padding: 3px 6px;
+  }
+  .pathadd {
+    align-self: flex-start;
+    padding: 4px 8px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    border-radius: 4px;
+    border: 1px solid var(--glass-border);
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: border-color 120ms, color 120ms;
+  }
+  .pathadd:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
   }
 
   .foot {

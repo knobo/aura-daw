@@ -50,6 +50,16 @@ enum Msg {
         velocity: u8,
         reply: Sender<Result<(), String>>,
     },
+    /// Sustained audition with a reply channel: `note_on`'s hold semantics
+    /// (no auto-release — the voice ends itself at the end of the sample
+    /// data) with `play`'s error reporting, for user-initiated commands that
+    /// have a result to surface. Used by `library_audition`.
+    PlayHeld {
+        instrument: Arc<CompiledInstrument>,
+        key: u8,
+        velocity: u8,
+        reply: Sender<Result<(), String>>,
+    },
     /// Fire-and-forget sustained note-on (no auto-release hold; waits for an
     /// explicit `NoteOff`). No reply channel — the caller never blocks. Added
     /// for live-monitoring callers (e.g. `midi_input`) that manage their own
@@ -81,6 +91,25 @@ impl PreviewHandle {
         let (reply, rx) = bounded(1);
         self.tx
             .send(Msg::Play { instrument, key, velocity, reply })
+            .map_err(|_| "preview thread is gone".to_string())?;
+        rx.recv_timeout(Duration::from_secs(10))
+            .map_err(|_| "preview thread did not respond".to_string())?
+    }
+
+    /// Audition a whole sample: a sustained note that holds until the sample
+    /// data runs out (or an [`PreviewHandle::all_off`]). Blocks briefly for
+    /// the thread's reply, so stream-open and install errors reach the caller
+    /// — unlike [`PreviewHandle::note_on`], which is fire-and-forget for
+    /// non-RT callback threads.
+    pub fn play_held(
+        &self,
+        instrument: Arc<CompiledInstrument>,
+        key: u8,
+        velocity: u8,
+    ) -> Result<(), String> {
+        let (reply, rx) = bounded(1);
+        self.tx
+            .send(Msg::PlayHeld { instrument, key, velocity, reply })
             .map_err(|_| "preview thread is gone".to_string())?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|_| "preview thread did not respond".to_string())?
@@ -215,6 +244,9 @@ fn preview_thread(rx: Receiver<Msg>) {
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Msg::Play { instrument, key, velocity, reply }) => {
                 let _ = reply.send(handle_play(&mut bundle, instrument, key, velocity));
+            }
+            Ok(Msg::PlayHeld { instrument, key, velocity, reply }) => {
+                let _ = reply.send(handle_note_on(&mut bundle, instrument, key, velocity));
             }
             Ok(Msg::NoteOn { instrument, key, velocity }) => {
                 if let Err(e) = handle_note_on(&mut bundle, instrument, key, velocity) {
@@ -442,5 +474,38 @@ mod tests {
             }
         }
         let _ = handle.tx.send(Msg::Shutdown);
+    }
+
+    /// `play_held`'s wire behaviour at the callback: a note pushed with
+    /// `hold_frames: 0` (HOLD_MANUAL) is still sounding well past
+    /// PREVIEW_HOLD_SECS, and `NoteCmd::AllOff` releases it to silence.
+    #[test]
+    fn a_held_preview_note_outlives_the_auto_release_window_until_all_off() {
+        let (mut swap_tx, swap_rx) = rtrb::RingBuffer::new(4);
+        let (retire_tx, _retire_rx) = rtrb::RingBuffer::new(4);
+        let mut cb = PreviewCb { swap_rx, retire_tx, node: None, channels: 2, rate: RATE };
+
+        let mut node = Box::new(SamplerNode::new(compiled("held", 440.0)));
+        let mut note_tx = node.command_queue(8);
+        node.prepare(RATE, 512);
+        swap_tx.push(NodePtr(Box::into_raw(node))).unwrap();
+        note_tx.push(NoteCmd::On { key: 69, velocity: 110, hold_frames: 0 }).unwrap();
+
+        // Render past PREVIEW_HOLD_SECS (0.6 s) — `compiled()` is a 1 s sample.
+        let block = 512usize;
+        let blocks = ((RATE as f64 * 0.8) / block as f64) as usize;
+        let mut last = vec![0.0f32; block * 2];
+        for _ in 0..blocks {
+            last.fill(0.0);
+            cb.render(&mut last);
+        }
+        assert!(last.iter().any(|s| s.abs() > 0.01), "still sounding after 0.8 s");
+
+        note_tx.push(NoteCmd::AllOff).unwrap();
+        for _ in 0..20 {
+            last.fill(0.0);
+            cb.render(&mut last);
+        }
+        assert!(last.iter().all(|s| s.abs() < 1.0e-4), "AllOff released it to silence");
     }
 }

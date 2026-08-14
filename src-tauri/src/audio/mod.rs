@@ -550,6 +550,43 @@ pub fn sampler_preview_note(
     handle.play(compiled, key, velocity.clamp(1, 127))
 }
 
+/// Audition a LIBRARY FILE — no project, no clip, no document. The Gate-safe
+/// preview category (`sampler_preview_note`, `midi_input`'s live monitoring):
+/// no op, no document field, no dirty flag. Plays at most
+/// `library::AUDITION_MAX_SECS` of the file once through the shared "ui"
+/// preview stream; whatever was auditioning is released first, so a click
+/// cancels the previous one.
+///
+/// `async` + `spawn_blocking`: decoding is disk + CPU work and sync commands
+/// run on the MAIN thread (see `seed_demo_project`).
+#[tauri::command]
+pub async fn library_audition(
+    path: String,
+    max_seconds: Option<f32>,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    let handle = state.preview.get_or_init(|| sampler_preview::start("ui")).clone();
+    let secs = max_seconds.unwrap_or(crate::library::AUDITION_MAX_SECS);
+    tauri::async_runtime::spawn_blocking(move || {
+        let inst = crate::library::compile_audition(std::path::Path::new(&path), secs)?;
+        // Cancel whatever is sounding before installing the next sample.
+        handle.all_off()?;
+        handle.play_held(std::sync::Arc::new(inst), 60, 100)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Release whatever the audition path is sounding. A no-op (never an error)
+/// when nothing has ever been auditioned — the preview stream is lazy.
+#[tauri::command]
+pub fn library_audition_stop(state: State<'_, AudioState>) -> Result<(), String> {
+    match state.preview.get() {
+        Some(h) => h.all_off(),
+        None => Ok(()),
+    }
+}
+
 /// Bind (or unbind, with `instrument_id: null`) an instrument to a midi
 /// track. STRUCTURAL: triggers a graph rebuild so the track immediately
 /// renders through its LIVE instrument node (ARCHITECTURE §15).

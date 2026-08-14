@@ -341,25 +341,34 @@ the day this lands, `Op::AutomationSetLane`'s apply arm must flip
 run in parallel, sequence the engine-touching halves (see Track B's note;
 the same rule applies here).
 
-### Track E — Library & browser panel
+### Track E — Library & browser panel — LANDED 2026-08-14
 
-Backlog doc: `docs/backlog/library-and-browser.md`. Scope: a side panel
-with three roots — samples (user-configured folders + a default library
-dir, audition preview reusing the sampler-preview voice path), project
-clips (drag back onto tracks), presets/instruments (Zyn patches via
-`zyn_list_patches`, sampler instruments via `sampler_list_instruments`).
-Drag-out lands on the existing, already-channel-routed import/clip-add
-commands, so it's undoable for free.
+**Done, branch `library-browser` (9 tasks, plan doc
+`docs/superpowers/plans/2026-08-14-library-browser.md`).** The LIB dock tab
+browses three roots: SAMPLES (default library folder + user-configured
+folders, click-to-audition without touching the project), CLIPS (the open
+project's audio/MIDI clips, draggable back onto tracks), PRESETS (loaded
+sampler instruments + ZynAddSubFX bank patches). Four additive backend
+commands: `library_scan`, `library_default_root`, `library_audition`,
+`library_audition_stop`. Every drag-out lands through the existing,
+already-channel-routed import/clip-add commands, so it's undoable for
+free — no new document state, no engine.rs touch. The folder list is a
+frontend preference: the plan added a new `pathList` preference kind to
+`src/lib/prefs/schema.ts` (Preferences → LIBRARY), not a backend config
+file.
 
-**Prerequisites**: branch from `origin/main` — needs the channel-routed
-import/clip-add commands Plan E finished (PR #12 merged) so drag-to-track
-is undoable for free; no other dependency.
+Deferrals (recursive background scan, metadata probe, waveform
+thumbnails, on-disk `.sfz`/`.xiz` browsing, SMF drag-in, tagging/
+favourites/search, drag-out to the OS) are recorded explicitly, not
+silently, in `docs/backlog/library-and-browser.md`'s updated "Suggested
+cut" section — each one line, each dated. The plan doc's scope rulings
+1-11 are the reasoning behind each deferral; they still need to be copied
+into `docs/PHASE4-PLAN.md`'s Track E handoff section when one is written
+(not done as part of this track — `PHASE4-PLAN.md` wasn't touched here).
 
-**Footprint**: a new frontend panel component + a small store, new
-scanning backend commands (`library_scan(dir)` or similar — additive), the
-existing audition/preview path (no document coupling, Gate-safe category
-already established by MIDI slice 1's monitoring). **Conflict-light**: no
-`engine.rs`, no overlap with A/B/D.
+Baseline after this track: 538 backend + 234 frontend tests, all green
+(counted 2026-08-14 on `library-browser`, same day as the 506/206 baseline
+above — that baseline predates this track's merge).
 
 ## 4. Pointers (the master index and everything behind it)
 

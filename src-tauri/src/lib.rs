@@ -28,6 +28,11 @@
 pub mod audio;
 pub mod control;
 pub mod ids;
+// Library & browser panel backend (Track E: directory scan, default library
+// root, file audition). Self-contained; wired here purely additively, the
+// same carve-out `midi_input` takes. Not part of the frozen phase-2 command
+// surface described above.
+pub mod library;
 pub mod mcp;
 pub mod midi;
 // Hardware MIDI input (slice 1: enumerate/select/activity — see module doc).
@@ -184,6 +189,11 @@ pub fn run() {
             midi_input::midi_list_input_ports,
             midi_input::midi_select_input_port,
             midi_input::midi_input_status,
+            // ---- library & browser (Track E, additive) ----
+            library::library_scan,
+            library::library_default_root,
+            audio::library_audition,
+            audio::library_audition_stop,
             // ---- sidecars: jobs ----
             sidecars::sidecar_split_stems,
             sidecars::sidecar_transcribe,

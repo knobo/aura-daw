@@ -247,6 +247,20 @@ class MidiStore {
     return this.stamp(src, src.trackId, src.timelineStartTicks + src.lengthTicks);
   }
 
+  /** Public entry to the copy-stamp behind paste/duplicate: place an
+   * independent copy of `clipId` on `trackId` at `timelineStartTicks`. The
+   * library panel's project-clips drag lands here, so there is exactly ONE
+   * stamping path in the app. */
+  async stampClipTo(
+    clipId: string,
+    trackId: string,
+    timelineStartTicks: number,
+  ): Promise<MidiClip | null> {
+    const src = this.clipById(clipId);
+    if (!src) return null;
+    return this.stamp(src, trackId, Math.max(0, Math.round(timelineStartTicks)));
+  }
+
   private async stamp(
     src: MidiClip,
     trackId: string,

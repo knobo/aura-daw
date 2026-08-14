@@ -156,3 +156,53 @@ fn project_state_after_an_epoch_boundary_is_stable_across_repeated_reads() {
     eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);
 }
+
+/// The audition path is DOCUMENT-DECOUPLED (Track E, the Gate-safe preview
+/// category MIDI slice 1's monitoring established): compiling an audition
+/// decodes a file and touches nothing the document can see. This test pins the
+/// non-RT half — the whole half that could ever grow a `Session` reference.
+/// The command wrapper adds only `PreviewHandle` calls, and `PreviewHandle`
+/// takes no `Session`, no `ControlPlane` and no `Committer` by construction.
+#[test]
+fn library_audition_core_leaves_the_document_and_the_history_untouched() {
+    let (cp, eng) = fixture();
+    let parent = tmp_parent("library-audition");
+    // `create_project_epoch` resolves its OWN parent dir
+    // (`project::default_project_parent`, not this test's `parent`) — it has
+    // no dir parameter (unlike `create_project`). `name: None` mints a
+    // unique "Untitled-N" so repeated runs never collide with a leftover
+    // dir; the created project dir is removed at the end so the test leaves
+    // no trace in the real default project location.
+    let epoch_project = cp.create_project_epoch(None).unwrap();
+
+    let wav = parent.join("probe.wav");
+    {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for i in 0..48_000 {
+            w.write_sample((i as f32 / 48_000.0).sin() * 0.3).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    let before = serde_json::to_value(cp.project_state()).unwrap();
+    let depths_before = cp.history_depths();
+
+    let inst = aura_lib::library::compile_audition(&wav, 1.0).unwrap();
+    assert_eq!(inst.regions.len(), 1);
+
+    let after = serde_json::to_value(cp.project_state()).unwrap();
+    assert_eq!(before, after, "audition mutated the document");
+    assert_eq!(depths_before, cp.history_depths(), "audition created a history entry");
+
+    eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+    if let Some(dir) = epoch_project.path {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
