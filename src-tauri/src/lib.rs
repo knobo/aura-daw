@@ -34,6 +34,10 @@ pub mod midi;
 // Self-contained; wired here purely additively per the midi-input-ports
 // branch's task spec. Not part of the frozen phase-2 command surface above.
 pub mod midi_input;
+// MIDI output: transport sync (clock/Start/Stop/Continue/SPP) + note-out to
+// external gear (slice 2, Task 6). Engine-free per ruling 3 — pure state
+// machine; Task 7 wires the driving thread. No commands yet.
+pub mod midi_out;
 pub mod plugins;
 pub mod sidecars;
 pub mod time;
