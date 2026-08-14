@@ -354,13 +354,25 @@ fn transient_commits_reach_neither_history_nor_the_journal() {
     f.cp.transport(TransportAction::SetLoop { enabled: true, start_samples: 0, end_samples: 4800 })
         .unwrap();
     f.cp.transport(TransportAction::SetStopAtEnd { enabled: true }).unwrap();
-    // ...and an explicitly transient edit on a normal document path.
-    f.cp.commit(TxMeta::user("mid-drag").transient(), |tx| tx.apply(set_gain(&t, -12.0))).unwrap();
+    // ...and a transient edit on a normal (non-transport) document path:
+    // a MID-GESTURE fold, which is the only sanctioned shape for one (M-3,
+    // now enforced by `debug_assert_transient_invariant` — a bare transient
+    // `Set` against a track outside a gesture is the redo-corruption bug
+    // that assertion exists to catch, so it cannot be used as a stand-in
+    // here). Asserted while the gesture is still OPEN: the fold is
+    // committed, document-visible, and in neither stream.
+    f.cp.gesture_begin("mid-drag".into()).unwrap();
+    f.cp.set_track_mix(
+        vec![TrackMixChange { track_id: t.clone(), gain_db: Some(-12.0), ..TrackMixChange::new(t.clone()) }],
+        TxMeta::user("set track gain"),
+    )
+    .unwrap();
 
     assert_eq!(f.log.depths().0, depth_before, "no transient batch becomes an undo step");
     assert_eq!(journal_lines(&dir).len(), lines_before, "no transient batch reaches the journal");
     // The write itself DID happen — transient means "not logged", not "not applied".
     assert_eq!(gain_of(&f.cp, &t), -12.0);
+    f.cp.gesture_end().unwrap();
     assert!(f.cp.transport_state().stop_at_end);
 
     f.eng.send(ControlMsg::Shutdown);
@@ -488,7 +500,7 @@ fn an_epoch_boundary_clears_history_and_rotates_the_journal() {
     let b_lines = journal_lines(&dir_b);
     assert_eq!(b_lines.len(), 1, "the new journal starts with its boundary record");
     assert_eq!(b_lines[0]["epochEvent"], "create");
-    assert_eq!(b_lines[0]["v"], 1);
+    assert_eq!(b_lines[0]["v"], aura_lib::control::op::OP_FORMAT_VERSION);
     assert!(b_lines[0]["epoch"].as_u64().unwrap() >= 1);
     assert_eq!(
         f.log.journal_path().unwrap(),
@@ -513,6 +525,91 @@ fn an_epoch_boundary_clears_history_and_rotates_the_journal() {
     assert_eq!(after_save.last().unwrap()["epochEvent"], "save");
     assert_eq!(f.log.depths().0, 1, "a snapshot mark does NOT clear history");
     assert!(!t2.is_empty());
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// C-1 (whole-branch review): the epoch guard used to protect
+/// `execute_persist` ONLY. `record_commit`/`record_gesture` ran in the same
+/// post-lock window — after `execute_host_forward`'s blocking plugin
+/// round-trips and `execute_persist`'s disk I/O — with no epoch notion at
+/// all, so an epoch function landing in that window produced a journal line
+/// in the NEW project's file and a poppable undo entry describing a document
+/// that was no longer open.
+///
+/// The interleaving is staged the way `execute_persist`'s own guard test
+/// (`control/mod.rs`) stages its: run the commit, let the epoch function
+/// complete, THEN deliver the sink call the in-flight effect phase would
+/// have made, carrying the epoch it captured under `Session::transact`'s
+/// lock. RE-OPENING THE SAME PROJECT is the reachable case the review names
+/// — identical ids, so a stale inverse would apply cleanly against the
+/// wrong revision instead of failing loudly.
+#[test]
+fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream() {
+    let f = fixture();
+    let parent = tmp_parent("stale-epoch");
+    let p = f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let dir = std::path::PathBuf::from(p.path.unwrap());
+    let t = add_track(&f.cp, "Audio");
+
+    // The commit that is about to be overtaken. It records normally here;
+    // what matters is the (rev, epoch, ops) it captured under the lock.
+    let committed =
+        f.cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+    let stale_epoch = committed.epoch;
+
+    // The epoch function lands in the effect window: the SAME project is
+    // re-opened, so history is cleared and the journal rotates (onto the
+    // very same file, appending).
+    f.cp.open_project_epoch(&dir).unwrap();
+    assert_eq!(f.log.depths(), (0, 0), "the swap cleared history");
+    let after_swap = journal_lines(&dir).len();
+
+    // ...and only now does the overtaken commit reach the sink.
+    f.log.record_commit(
+        committed.rev,
+        stale_epoch,
+        &committed.meta,
+        &committed.ops,
+        &committed.inverses,
+        aura_lib::control::HistoryMode::Record,
+    );
+    assert_eq!(
+        f.log.depths(),
+        (0, 0),
+        "a stale-epoch commit must not push an undo entry onto the NEW document's stack"
+    );
+    assert_eq!(
+        journal_lines(&dir).len(),
+        after_swap,
+        "a stale-epoch commit must not write a line into the NEW document's journal"
+    );
+
+    // The gesture sink is the same sink and gets the same guard.
+    f.log.record_gesture(
+        committed.rev,
+        stale_epoch,
+        &committed.meta,
+        &committed.ops,
+        &committed.inverses,
+    );
+    assert_eq!(f.log.depths(), (0, 0), "same for a gesture batch");
+    assert_eq!(journal_lines(&dir).len(), after_swap, "same for a gesture batch");
+
+    // The guard is a stale-epoch guard, not a mute button: a commit at the
+    // LIVE epoch still records, in both streams.
+    // (`t` itself did not survive the reload — `Op::TrackAdd` sets no
+    // `persist.project`, so the re-opened document is the one on disk.)
+    let live = f
+        .cp
+        .commit(TxMeta::user("add after the swap"), |tx| {
+            ops::add_track_tx(tx, Some("After".into()), Some("audio".into())).map(|_| ())
+        })
+        .unwrap();
+    assert!(live.epoch > stale_epoch, "the swap really did move the epoch");
+    assert_eq!(f.log.depths(), (1, 0), "the live document still records normally");
+    assert_eq!(journal_lines(&dir).len(), after_swap + 1);
 
     f.eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);
@@ -587,7 +684,11 @@ fn every_journal_line_carries_a_resolvable_actor_and_run() {
     let lines = journal_lines(&dir);
     let mut seen: Vec<String> = Vec::new();
     for line in &lines {
-        assert_eq!(line["v"], 1, "every line carries the op-format version");
+        assert_eq!(
+            line["v"],
+            aura_lib::control::op::OP_FORMAT_VERSION,
+            "every line carries the op-format version"
+        );
         if line.get("epochEvent").is_some() {
             // An epoch record: no actor by design (ruling 4 — epochs are
             // not ops), but it must carry its epoch.
@@ -701,22 +802,46 @@ fn journal_op_kinds_match_the_corrected_envelope_schema_pattern() {
                 track_id: Some(t.clone()),
             },
             index: 0,
-        })
+        })?;
+        // I-5: a state-carrying op, so the base64 assertion below runs
+        // against a line a real session actually wrote.
+        tx.apply(Op::PluginSetState { instance: "p-1".into(), state: b"hello".to_vec() })
     })
     .unwrap();
     f.cp.undo().unwrap();
 
     let lines = journal_lines(&dir);
     let mut kinds = 0usize;
+    let mut state_blobs = 0usize;
     for line in &lines {
+        assert_eq!(
+            line["v"],
+            aura_lib::control::op::OP_FORMAT_VERSION,
+            "every line declares the format its ops are encoded in"
+        );
         let Some(ops) = line["ops"].as_array() else { continue };
         for op in ops {
             let k = op["kind"].as_str().unwrap_or_else(|| panic!("op without a kind: {op}"));
             assert!(matches_kind_pattern(k), "journaled op kind {k:?} violates the schema pattern");
             kinds += 1;
+            // I-5: a state blob is a base64 STRING on the wire. A JSON
+            // number array here is the ~4x blowup the format-2 bump exists
+            // to remove — and `additionalProperties: true` means the
+            // envelope schema would happily validate either, so the shape
+            // has to be asserted here or nowhere.
+            if let Some(state) = op.get("state") {
+                if !state.is_null() {
+                    assert!(
+                        state.is_string(),
+                        "journaled state blob must be base64, not a number array: {op}"
+                    );
+                    state_blobs += 1;
+                }
+            }
         }
     }
     assert!(kinds >= 8, "the session should have journaled a good spread of kinds, got {kinds}");
+    assert!(state_blobs >= 1, "the session should have journaled at least one state blob");
 
     f.eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);

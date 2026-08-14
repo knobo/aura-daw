@@ -156,33 +156,69 @@ The log the whole plan exists for, for completeness of this document:
   entry's `ops` can address, or a pending redo silently lands on a
   different state. Today's transient writers stay clear by construction
   (transport `Set`s address `ObjectRef::Transport` only; mid-gesture folds
-  are superseded by the gesture batch that closes over them). Nothing
-  checks this — it constrains what may be marked transient.
+  are superseded by the gesture batch that closes over them). **This is now
+  CHECKED** (Plan E follow-up, M-3): `debug_assert_transient_invariant`
+  runs in the commit path and fails a debug build on any transient batch
+  whose ops address something other than `ObjectRef::Transport`, unless it
+  is a mid-gesture fold (marked by a debug-only thread-local set across
+  `commit_transient_and_fold`). Still a rule about what may be MARKED
+  transient — but a rule with teeth in debug builds instead of a comment.
 * `undo`/`redo` (`ControlPlane::undo`/`redo`, Tauri commands `undo`/`redo`,
   Ctrl+Z / Ctrl+Shift+Z in `src/App.svelte` guarded against text entry)
   commit through the NORMAL path with `HistoryMode::Replay`: journaled
   (they are mutations), no new entry — the original entry migrates between
   the stacks.
-* `OP_FORMAT_VERSION` (`src-tauri/src/control/op.rs:3`) is LOAD-BEARING from
-  the first journal line. Additive `#[serde(default)]` fields stay
-  non-breaking and keep it at 1; anything else needs a bump plus a reader
-  that understands both shapes.
+* `OP_FORMAT_VERSION` is LOAD-BEARING from the first journal line. Additive
+  `#[serde(default)]` fields stay non-breaking and need no bump; anything
+  else needs a bump plus a reader that understands both shapes. It is at
+  **2** since the Plan E follow-up (I-5): plugin state blobs
+  (`PluginRemove.state`, `PluginSetState.state`) are base64 strings on the
+  wire, not JSON number arrays — the old encoding cost roughly 4x on blobs
+  that are routinely hundreds of kilobytes, written synchronously into the
+  journal and held in every `HistoryEntry`. That bump deliberately shipped
+  WITHOUT a dual-shape reader: the journal is still write-only, so every
+  version-1 line is data no code will ever parse. The same bump covers
+  L-1. This freedom ends the moment Plan F ships a replayer.
+* EPOCH GUARD AT BOTH SINKS (Plan E follow-up, C-1). `HistoryLog` owns the
+  epoch its two streams describe: advanced by `epoch_boundary`, left alone
+  by `snapshot_mark`, and CHECKED by
+  `record_commit`/`record_gesture`/`snapshot_mark`, which drop the record
+  with a warn when it has moved. Without it, an epoch function landing in
+  the effect window — which contains blocking plugin round-trips and disk
+  I/O — produced a journal line in the new project's file and a poppable
+  undo entry for a document that was no longer open. Same shape and same
+  justification as `execute_persist`'s long-standing guard; the epoch is a
+  mutex held across check AND write, because an atomic read would leave
+  exactly the window being closed.
+
+  ONE NARROW INVERSE WINDOW, RECORDED AS BENIGN: an epoch function bumps
+  `session.epoch` INSIDE its swap block but calls `epoch_boundary` only
+  after releasing the session lock (journal I/O may not run under it). A
+  commit whose `transact` lands in that gap captures the NEW epoch while
+  `HistoryLog` still holds the OLD one, so its batch is dropped rather
+  than recorded. That is the guard erring toward silence instead of
+  corruption — the commit wrote into a document the swap is in the middle
+  of replacing, and its `execute_persist` is dropped by the same reasoning
+  — so the log stays consistent with what survives. Recorded because it is
+  a real gap and a future reader of the guard will otherwise wonder: it
+  costs a dropped record, never a wrong one.
 
 ## Recorded replay limitations (known, not fixed here)
 
 Recorded so a future replay/collaboration round finds them stated rather
 than rediscovers them.
 
-**L-1 — `Op::PluginRemove.params` is captured but not used on undo.**
-The op carries the row's param mirror (`op.rs:118-124`, additive,
-`#[serde(default)]`) so a journaled op is self-describing. The UNDO path,
-however, restores the mirror from the PARKED in-memory copy in
-`session.plugins.params` (`session.rs:829-838`), not from the op field —
-`Op::PluginAdd`'s shape is fixed at `{row, index}` with no params slot. In
-process, both agree. On a COLD REPLAY of a journal (no parked mirror in
-memory), an undo-of-remove would restore the row without its params.
-Closing this needs either a params slot on `PluginAdd` or a replay-time
-read of `PluginRemove.params` — an op-format change, i.e. Plan F territory.
+**L-1 — CLOSED (Plan E follow-up).** `Op::PluginRemove.params` carries the
+row's param mirror so a journaled op is self-describing, but until the
+follow-up nothing read it: the undo path restored the mirror from the
+PARKED in-memory copy in `session.plugins.params`, which a COLD REPLAY
+(fresh process, journal only) does not have, so a replayed undo-of-remove
+restored the row without its params. `apply_raw`'s `PluginRemove` arm now
+SEEDS the mirror from the op's own field when the in-memory one is absent
+or empty. In-process behaviour is unchanged — a populated mirror still
+wins, so an undo restores the user's real values, not whatever the op
+recorded. Landed under the same `OP_FORMAT_VERSION` bump as the base64
+blob change, while the format was one day old and unread.
 
 **L-2 — `Op::MidiSetNotes` note ids are absolute in value but its
 `noteId: 0` entries are MINT SENTINELS.** A replay re-mints. Within a
@@ -200,6 +236,34 @@ on redo: `Op::TrackAdd` replays with its ORIGINAL (empty) `clips`, so a
 clip added later by an unlogged path never comes back. This is the reason
 `History::record` takes EVERY non-transient commit, with no exceptions
 beyond `TxMeta.transient`.
+
+**L-4 — journal FILE order is not `rev` order under concurrency; a reader
+must sort by `(epoch, rev)`.** Commits are serialized only for the
+duration of `Session::transact`. The effect phase — and therefore the
+`record_commit` call at the end of it — is not: the engine control
+thread's `Committer` and a command thread's are explicitly designed to run
+in parallel and share ONE `HistoryLog`, and the slower one's effect phase
+can include host round-trips and disk I/O. Two committers can therefore
+reach the sink in the opposite order to their `rev`s. Two consequences:
+the journal's line order is not `rev` order, so a replayer applying lines
+top-to-bottom (the obvious reader, and the only one the format documents)
+can diverge from the document the log describes; and the undo stack's
+order likewise need not be reverse-commit order, so a Ctrl+Z can apply an
+older batch's inverse on top of a newer batch's write. Every line carries
+both `epoch` and `rev`, so a reader has what it needs — it must USE them.
+The structural fix (serialize the record step under a commit-sequence
+lock, or buffer out-of-order revs in `record_commit`) is Plan F's.
+
+**L-5 — a PANICKING `transact` closure diverges the log from the document,
+permanently.** `record_commit` runs only on the `Ok` path and
+`Session::transact` has no panic rollback (a standing carry-forward), so a
+closure that panics mid-way leaves the document mutated with no op record
+at all — not a lost edit, a SILENT one. Nothing later reconciles it: the
+journal simply does not contain what happened, so any replay of that log
+produces a different document, and no `(epoch, rev)` gap marks the spot.
+This is the same class as L-3, arrived at from the other direction, and it
+is the reason the "no panic rollback in `transact`" item is worth more
+than its narrowness suggests now that the log is ON.
 
 ---
 

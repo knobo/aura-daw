@@ -816,7 +816,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 params: session.plugins.params.get(&row.id).cloned().unwrap_or_default(),
             })
         }
-        Op::PluginRemove { row, state, .. } => {
+        Op::PluginRemove { row, state, params, .. } => {
             // Found by id, not blindly by the caller's recorded index —
             // store truth wins (same rule as `ClipRemove`/`TrackRemove`).
             let pos = session
@@ -836,6 +836,21 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // orphaned entry, same trade-off `pending_state` already makes
             // below — both are GC'd wholesale on the next
             // `restore_into_session`/project open.
+            //
+            // L-1 CLOSED (whole-branch review): parking is an IN-MEMORY
+            // fact, and a COLD REPLAY has nothing parked — a fresh process
+            // applying journal lines would restore the row with an empty
+            // mirror, which is exactly the gap `Op::PluginRemove.params`
+            // was captured for and then never read. Seed from the op's own
+            // field when the in-memory mirror is absent or empty, so the op
+            // is self-describing in fact. In-process this changes nothing:
+            // the parked mirror is already populated and wins, so an undo
+            // still restores the REAL values rather than whatever the op
+            // recorded.
+            let mirror = session.plugins.params.entry(removed.id.clone()).or_default();
+            if mirror.is_empty() && !params.is_empty() {
+                *mirror = params.clone();
+            }
             effect.rebuild = true;
             effect.persist.plugins = true;
             // Park (or clear) the state blob: `state` is the caller-captured
@@ -2390,6 +2405,83 @@ mod tests {
             Some(&vec![tweaked]),
             "undo (PluginAdd replaying the parked id) leaves the real mirror untouched — \
              not reset to empty"
+        );
+    }
+
+    /// L-1 CLOSED (whole-branch review): the COLD-REPLAY half of the test
+    /// above. A fresh process replaying a journal has nothing parked in
+    /// `session.plugins.params`, so `Op::PluginRemove.params` — captured
+    /// since Task 9 and read by nothing — is now what seeds the mirror when
+    /// the in-memory one is absent. Without it, an undo-of-remove during a
+    /// replay restored the row with no params at all.
+    #[test]
+    fn plugin_remove_seeds_the_param_mirror_from_the_op_on_a_cold_replay() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        let journaled = ParamInfo {
+            id: 7,
+            name: "cutoff".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+            value: 0.9,
+            steps: 0,
+        };
+        // Cold: the row exists (an earlier replayed `PluginAdd` put it
+        // there) but NOTHING is parked in the params map.
+        m.lock().plugins.instances.push(row.clone());
+        assert!(m.lock().plugins.params.get("p-1").is_none());
+
+        let c = Session::transact(&m, TxMeta::user("replay remove"), |tx| {
+            tx.apply(Op::PluginRemove {
+                row: row.clone(),
+                index: 0,
+                state: None,
+                params: vec![journaled.clone()],
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![journaled.clone()]),
+            "the op's own params seed the mirror when there is nothing parked"
+        );
+
+        // ...so replaying the inverse restores a row WITH its params.
+        Session::transact(&m, TxMeta::user("replay undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.params.get("p-1"), Some(&vec![journaled]));
+
+        // And the seed NEVER clobbers a live mirror: with real values
+        // parked, the op's copy is ignored (in-process behaviour unchanged).
+        let live = ParamInfo {
+            id: 7,
+            name: "cutoff".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+            value: 0.1,
+            steps: 0,
+        };
+        m.lock().plugins.params.insert(row.id.clone(), vec![live.clone()]);
+        Session::transact(&m, TxMeta::user("remove again"), |tx| {
+            tx.apply(Op::PluginRemove {
+                row: row.clone(),
+                index: 0,
+                state: None,
+                params: vec![ParamInfo { value: 0.9, ..live.clone() }],
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![live]),
+            "a populated mirror wins over the op's recorded copy"
         );
     }
 
