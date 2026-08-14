@@ -35,6 +35,12 @@ class LibraryStore {
   error = $state<string | null>(null);
   /** Path of the file currently auditioning ("" = nothing). */
   auditioning = $state("");
+  /**
+   * Error from the last audition attempt. Kept separate from `error` — a
+   * failed audition must not blank the folder listing, which renders on
+   * `error` being null (see SamplesRoot.svelte).
+   */
+  auditionError = $state<string | null>(null);
 
   /** path → listing. In memory, per session; `refresh()` busts one entry. */
   private cache = new Map<string, LibraryEntry[]>();
@@ -113,15 +119,16 @@ class LibraryStore {
     this.auditioning = path;
     try {
       await backend.libraryAudition(path, null);
-      this.error = null;
+      this.auditionError = null;
     } catch (err) {
       this.auditioning = "";
-      this.error = String(err);
+      this.auditionError = String(err);
     }
   }
 
   async stopAudition(): Promise<void> {
     this.auditioning = "";
+    this.auditionError = null;
     try {
       await backend.libraryAuditionStop?.();
     } catch {
@@ -208,6 +215,14 @@ class LibraryStore {
       }
 
       case "zynPatch": {
+        // A patch needs a live Zyn instance, which only a MIDI track can
+        // host. Check the track kind first so an audio track gets the same
+        // "wrong kind" shape as every other branch, not a message that
+        // invites binding a Zyn to a track that can never host one.
+        if (track.kind !== "midi") {
+          toasts.info("NEEDS A MIDI TRACK", `${payload.patch.name} is a synth patch — drop it on a MIDI track`);
+          return;
+        }
         // A patch needs a live Zyn instance. Instantiating one behind the
         // user's back on a drop would be a surprise mutation — toast instead
         // (ruling 9).
@@ -233,6 +248,7 @@ class LibraryStore {
     this.loading = false;
     this.error = null;
     this.auditioning = "";
+    this.auditionError = null;
     this.cache.clear();
   }
 }

@@ -148,8 +148,12 @@ pub fn library_default_root() -> Result<String, String> {
     Ok(default_library_root()?.display().to_string())
 }
 
-/// How much of a file an audition decodes and plays, seconds. Bounded so a
-/// 20-minute stem does not decode into RAM on a click.
+/// How much of a file an audition KEEPS and plays, seconds, after
+/// `decode_audio` has already decoded the whole file into RAM. This bound
+/// does not save decode cost — a 20-minute stem is still fully decoded
+/// before being truncated — it only limits what gets held onto and played.
+/// A header-probe / partial-decode is the deferred fix for the decode-cost
+/// side of this (see roadmap).
 pub const AUDITION_MAX_SECS: f32 = 12.0;
 
 /// Build a one-shot audition instrument from the head of an audio file.

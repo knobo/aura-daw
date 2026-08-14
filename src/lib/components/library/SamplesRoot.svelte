@@ -50,6 +50,9 @@
   {:else if library.error}
     <div class="note err silk">{library.error}</div>
   {:else}
+    {#if library.auditionError}
+      <div class="note err silk">{library.auditionError}</div>
+    {/if}
     <div class="list">
       {#each library.entries as e (e.path)}
         <LibraryRow

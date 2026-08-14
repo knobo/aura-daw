@@ -199,11 +199,18 @@ describe("library store", () => {
     expect(library.auditioning).toBe("");
   });
 
-  it("clears the auditioning marker when the backend rejects", async () => {
+  it("clears the auditioning marker when the backend rejects, without touching the listing", async () => {
+    await library.init();
+    await library.open("/lib");
+    const before = library.entries;
+
     invokes.libraryAudition.mockRejectedValueOnce(new Error("no output device"));
     await library.audition("/lib/kick.wav");
     expect(library.auditioning).toBe("");
-    expect(library.error).toContain("no output device");
+    expect(library.auditionError).toContain("no output device");
+    expect(library.error).toBeNull();
+    expect(library.entries).toBe(before);
+    expect(library.entries.map((e) => e.name)).toEqual(["drums", "kick.wav"]);
   });
 });
 
@@ -291,6 +298,17 @@ describe("dropOnTrack — project clips", () => {
     ];
     await library.dropOnTrack({ kind: "projectMidiClip", clipId: "k1" }, "t1", 0);
     expect(invokes.midiAddClip).not.toHaveBeenCalled();
+
+    project.projectDir = "/home/u/Music/AURA/Song.aura";
+    project.clips = [
+      { id: "c1", trackId: "t1", name: "loop", sourcePath: "audio/abc.wav",
+        sourceChannels: 2, sourceSampleRate: 48000, sourceLengthSamples: 48000,
+        timelineStartSamples: 0, offsetSamples: 0, lengthSamples: 48000,
+        gainDb: 0, fadeInSamples: 0, fadeOutSamples: 0 },
+    ];
+    await library.dropOnTrack({ kind: "projectAudioClip", clipId: "c1" }, "m1", 0);
+    expect(invokes.importAudioClip).not.toHaveBeenCalled();
+    expect(lastToast().title).toContain("AUDIO TRACK");
   });
 });
 
