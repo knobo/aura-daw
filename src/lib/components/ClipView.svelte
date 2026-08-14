@@ -10,6 +10,8 @@
   import { view } from "../state/view.svelte";
   import { jobs } from "../state/jobs.svelte";
   import { ui } from "../state/ui.svelte";
+  import { clipSelection } from "../state/clip-selection.svelte";
+  import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildPeakColumns } from "../render/tiles";
   import { createPainter, hexToRgba, type WaveformPainter } from "../render/painter";
 
@@ -24,7 +26,7 @@
   const visL = $derived(Math.max(0, -leftPx));
   const visR = $derived(Math.min(widthPx, view.width - leftPx));
   const visW = $derived(Math.max(0, Math.floor(visR - visL)));
-  const selected = $derived(project.selectedClipId === clip.id);
+  const selected = $derived(clipSelection.has({ kind: "audio", id: clip.id }));
   const job = $derived(jobs.jobForClip(clip.id));
 
   // ── waveform painting ──
@@ -90,6 +92,17 @@
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest("button")) return;
+    const ref = { kind: "audio", id: clip.id } as const;
+    const mode = selectionModeFor(e);
+    // A plain click on an ALREADY-selected clip must not collapse the
+    // selection — that is what makes dragging a group possible at all.
+    if (!(mode === "replace" && clipSelection.has(ref))) {
+      clipSelection.apply([ref], mode);
+    } else {
+      clipSelection.anchor = ref;
+    }
+    // Focused clip (scope ruling F): SPLIT STEMS, the Dock and AI-Studio
+    // targeting still act on exactly one clip.
     project.select(clip.id);
     dragging = true;
     dragMoved = false;

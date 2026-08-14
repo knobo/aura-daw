@@ -12,6 +12,8 @@
   import { prefs } from "../prefs/prefs.svelte";
   import { midiPreviewLayout } from "../utils/midi-preview";
   import { view } from "../state/view.svelte";
+  import { clipSelection } from "../state/clip-selection.svelte";
+  import { selectionModeFor } from "../utils/selection-modifiers";
 
   let { clip, track }: { clip: MidiClip; track: TrackState } = $props();
 
@@ -70,7 +72,7 @@
   const widthPx = $derived(lengthSamples / view.spp);
   const visL = $derived(Math.max(0, -leftPx));
   const visR = $derived(Math.min(widthPx, view.width - leftPx));
-  const selected = $derived(midi.selectedClipId === clip.id);
+  const selected = $derived(clipSelection.has({ kind: "midi", id: clip.id }));
   const open = $derived(midi.openClipId === clip.id);
   // freshly landed (hum-to-song etc.) — transient glow set by midi.flash()
   const landed = $derived(midi.flashClipId === clip.id);
@@ -142,6 +144,13 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    const ref = { kind: "midi", id: clip.id } as const;
+    const mode = selectionModeFor(e);
+    if (!(mode === "replace" && clipSelection.has(ref))) {
+      clipSelection.apply([ref], mode);
+    } else {
+      clipSelection.anchor = ref;
+    }
     midi.select(clip.id);
     project.select(null);
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
