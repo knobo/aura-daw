@@ -518,6 +518,91 @@ fn an_epoch_boundary_clears_history_and_rotates_the_journal() {
     let _ = std::fs::remove_dir_all(&parent);
 }
 
+/// C-1 (whole-branch review): the epoch guard used to protect
+/// `execute_persist` ONLY. `record_commit`/`record_gesture` ran in the same
+/// post-lock window — after `execute_host_forward`'s blocking plugin
+/// round-trips and `execute_persist`'s disk I/O — with no epoch notion at
+/// all, so an epoch function landing in that window produced a journal line
+/// in the NEW project's file and a poppable undo entry describing a document
+/// that was no longer open.
+///
+/// The interleaving is staged the way `execute_persist`'s own guard test
+/// (`control/mod.rs`) stages its: run the commit, let the epoch function
+/// complete, THEN deliver the sink call the in-flight effect phase would
+/// have made, carrying the epoch it captured under `Session::transact`'s
+/// lock. RE-OPENING THE SAME PROJECT is the reachable case the review names
+/// — identical ids, so a stale inverse would apply cleanly against the
+/// wrong revision instead of failing loudly.
+#[test]
+fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream() {
+    let f = fixture();
+    let parent = tmp_parent("stale-epoch");
+    let p = f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let dir = std::path::PathBuf::from(p.path.unwrap());
+    let t = add_track(&f.cp, "Audio");
+
+    // The commit that is about to be overtaken. It records normally here;
+    // what matters is the (rev, epoch, ops) it captured under the lock.
+    let committed =
+        f.cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+    let stale_epoch = committed.epoch;
+
+    // The epoch function lands in the effect window: the SAME project is
+    // re-opened, so history is cleared and the journal rotates (onto the
+    // very same file, appending).
+    f.cp.open_project_epoch(&dir).unwrap();
+    assert_eq!(f.log.depths(), (0, 0), "the swap cleared history");
+    let after_swap = journal_lines(&dir).len();
+
+    // ...and only now does the overtaken commit reach the sink.
+    f.log.record_commit(
+        committed.rev,
+        stale_epoch,
+        &committed.meta,
+        &committed.ops,
+        &committed.inverses,
+        aura_lib::control::HistoryMode::Record,
+    );
+    assert_eq!(
+        f.log.depths(),
+        (0, 0),
+        "a stale-epoch commit must not push an undo entry onto the NEW document's stack"
+    );
+    assert_eq!(
+        journal_lines(&dir).len(),
+        after_swap,
+        "a stale-epoch commit must not write a line into the NEW document's journal"
+    );
+
+    // The gesture sink is the same sink and gets the same guard.
+    f.log.record_gesture(
+        committed.rev,
+        stale_epoch,
+        &committed.meta,
+        &committed.ops,
+        &committed.inverses,
+    );
+    assert_eq!(f.log.depths(), (0, 0), "same for a gesture batch");
+    assert_eq!(journal_lines(&dir).len(), after_swap, "same for a gesture batch");
+
+    // The guard is a stale-epoch guard, not a mute button: a commit at the
+    // LIVE epoch still records, in both streams.
+    // (`t` itself did not survive the reload — `Op::TrackAdd` sets no
+    // `persist.project`, so the re-opened document is the one on disk.)
+    let live = f
+        .cp
+        .commit(TxMeta::user("add after the swap"), |tx| {
+            ops::add_track_tx(tx, Some("After".into()), Some("audio".into())).map(|_| ())
+        })
+        .unwrap();
+    assert!(live.epoch > stale_epoch, "the swap really did move the epoch");
+    assert_eq!(f.log.depths(), (1, 0), "the live document still records normally");
+    assert_eq!(journal_lines(&dir).len(), after_swap + 1);
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
 #[test]
 fn an_unsaved_session_journals_nothing_but_undo_still_works() {
     let f = fixture();

@@ -22,10 +22,13 @@
 //! `audio::init` and handed to both.
 //!
 //! LOCK ORDER (binding, and it is the LEAF of the whole system):
-//! `gesture` -> `session` -> `history` / `journal`. Both mutexes here are
-//! acquired ONLY inside this module's own methods, are never held across
-//! any other lock acquisition, and no code path takes the session or
-//! gesture lock while holding one of them. Concretely: [`HistoryLog`]'s
+//! `gesture` -> `session` -> `epoch` -> `history` / `journal`. All three
+//! mutexes here are acquired ONLY inside this module's own methods, are
+//! never held across any other lock acquisition, and no code path takes the
+//! session or gesture lock while holding one of them. Within the module,
+//! [`HistoryLog::epoch`] is the outermost of the three (C-1's guard needs
+//! the check and the write to be one atomic step) and `history`/`journal`
+//! are never held at the same time. Concretely: [`HistoryLog`]'s
 //! methods are called from `commit_with_rebuild` AFTER the session lock is
 //! released, and from the epoch functions after their swap block ends. The
 //! journal's disk write happens under the journal mutex — which is legal
@@ -422,6 +425,26 @@ pub enum HistoryMode {
 
 /// History + journal behind one handle, shared by every `Committer`.
 pub struct HistoryLog {
+    /// The document epoch BOTH streams below currently describe (C-1,
+    /// whole-branch review). `execute_persist` has always re-checked the
+    /// committing epoch against the live one before writing a snapshot;
+    /// this is the same discipline at the other sink — see
+    /// [`Self::record_commit`].
+    ///
+    /// LOCK ORDER inside this module: `epoch` -> `history` / `journal`.
+    /// `epoch` is the OUTERMOST of the three and is acquired first by every
+    /// method that takes more than one of them; `history` and `journal` are
+    /// never held simultaneously, so no order between those two exists to
+    /// violate. All three remain leaf-most globally (the module doc's
+    /// `gesture -> session -> history/journal` is unchanged): nothing takes
+    /// the session or gesture lock while holding any of them.
+    ///
+    /// WHY A MUTEX AND NOT AN `AtomicU64`: the check and the write must be
+    /// ATOMIC with respect to [`Self::epoch_boundary`]. A plain atomic read
+    /// would leave exactly the window C-1 describes — read the (still old)
+    /// epoch, get overtaken by the whole boundary, then append into the NEW
+    /// journal and push onto the freshly CLEARED stack.
+    epoch: Mutex<u64>,
     history: Mutex<History>,
     journal: Mutex<JournalWriter>,
 }
@@ -434,7 +457,21 @@ impl Default for HistoryLog {
 
 impl HistoryLog {
     pub fn new() -> Self {
-        Self { history: Mutex::new(History::new()), journal: Mutex::new(JournalWriter::closed()) }
+        Self {
+            // `Session::epoch` also starts at 0, so a commit made before any
+            // epoch boundary (an unsaved session) matches and records — the
+            // guard is a staleness check, not a "needs a project" check.
+            epoch: Mutex::new(0),
+            history: Mutex::new(History::new()),
+            journal: Mutex::new(JournalWriter::closed()),
+        }
+    }
+
+    /// The epoch both streams currently describe. Test/diagnostic accessor;
+    /// the guard itself never reads through this (it holds the lock across
+    /// the check AND the write — see the field's doc).
+    pub fn current_epoch(&self) -> u64 {
+        *self.epoch.lock()
     }
 
     /// The one call `Committer::commit_with_rebuild` makes, after the
@@ -462,8 +499,41 @@ impl HistoryLog {
     /// emptiness check); this is the ordinary path catching up with it, and
     /// it lives HERE rather than at the call site so no future caller can
     /// route around it.
+    /// A STALE-EPOCH BATCH IS RECORDED NOWHERE (C-1, whole-branch review).
+    /// `epoch` is the `Committed.epoch` the batch captured under
+    /// `Session::transact`'s lock. The window between that lock being
+    /// released and this call is not microscopic — it contains
+    /// `execute_host_forward` (blocking plugin main-thread round-trips; a
+    /// CLAP instantiate/`load_state` runs for hundreds of ms) and
+    /// `execute_persist` (disk I/O). An epoch function landing inside it
+    /// swaps the document out from under this batch, and then:
+    /// * the journal line would go into the NEW project's `journal.ndjson`
+    ///   (already rotated by [`Self::epoch_boundary`]) carrying the OLD
+    ///   epoch number, describing ops `execute_persist` had already refused
+    ///   to write anywhere;
+    /// * the history entry would land on the undo stack AFTER
+    ///   [`History::clear`] ran — a live, poppable step describing a
+    ///   document that is no longer open. `History::clear`'s own doc calls
+    ///   that corruption, and re-opening the SAME project (routine) makes it
+    ///   reachable rather than theoretical: identical ids mean Ctrl+Z
+    ///   applies the inverse SUCCESSFULLY against the wrong revision instead
+    ///   of failing cleanly.
+    ///
+    /// So the batch is dropped, with a warn, in BOTH streams — the same
+    /// shape (and the same justification) `execute_persist`'s guard already
+    /// uses at the persist sink. The epoch mutex is held across the check
+    /// AND both writes, which is what makes the drop atomic with respect to
+    /// a concurrent boundary rather than merely likely.
     pub fn record_commit(&self, rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op], mode: HistoryMode) {
         if ops.is_empty() {
+            return;
+        }
+        let current = self.epoch.lock();
+        if epoch != *current {
+            log::warn!(
+                "history/journal: dropping batch rev {rev} — epoch changed between commit and \
+                 record ({epoch} -> {current}); it describes a document that is no longer open"
+            );
             return;
         }
         // Journal FIRST, unconditionally: an undo/redo is a mutation and
@@ -484,8 +554,21 @@ impl HistoryLog {
     /// `ops` (it returns early when the gesture folded nothing), so this is
     /// belt-and-braces — but the rule "an empty batch is recorded nowhere"
     /// belongs to the sink, not to one caller's discipline.
+    /// The same stale-epoch guard as [`Self::record_commit`], for the same
+    /// reasons (C-1). A gesture's window is if anything wider: `close_gesture`
+    /// reads `rev`/`epoch` under its own short session lock and then commits
+    /// the synthesized batch through the ordinary effect phase before
+    /// reaching here.
     pub fn record_gesture(&self, rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op]) {
         if ops.is_empty() {
+            return;
+        }
+        let current = self.epoch.lock();
+        if epoch != *current {
+            log::warn!(
+                "history/journal: dropping gesture batch rev {rev} — epoch changed between commit \
+                 and record ({epoch} -> {current})"
+            );
             return;
         }
         self.journal.lock().append_batch(rev, epoch, meta, ops);
@@ -496,7 +579,17 @@ impl HistoryLog {
     /// rotate the journal onto the new project dir, write the boundary
     /// record. Order matters — the record must land in the NEW journal,
     /// since it describes the document that journal belongs to.
+    ///
+    /// C-1: this is also where the sink's own notion of "which document am
+    /// I logging?" advances. The epoch mutex is taken FIRST and held across
+    /// the clear and the rotation, so a concurrent `record_commit` either
+    /// completes entirely before the swap (its line lands in the OLD
+    /// journal, its entry on the stack this call is about to clear — both
+    /// correct) or observes the new epoch and drops itself. There is no
+    /// interleaving in which it appends to the new journal.
     pub fn epoch_boundary(&self, dir: &Path, event: EpochEvent, epoch: u64) {
+        let mut current = self.epoch.lock();
+        *current = epoch;
         self.history.lock().clear();
         let mut j = self.journal.lock();
         j.open_in(dir);
@@ -507,7 +600,20 @@ impl HistoryLog {
     /// content, so history is NOT cleared and the journal is NOT rotated —
     /// only a mark is written, so a replay can tell where the on-disk
     /// snapshot caught up with the log.
+    ///
+    /// The epoch it is handed is NOT advanced (there was no swap) but it IS
+    /// checked, for C-1's reason one line down from the others: a mark whose
+    /// epoch has moved would claim, in the NEW project's journal, that a
+    /// DIFFERENT document's snapshot caught up with this log.
     pub fn snapshot_mark(&self, epoch: u64) {
+        let current = self.epoch.lock();
+        if epoch != *current {
+            log::warn!(
+                "journal: dropping snapshot mark — epoch changed between snapshot and mark \
+                 ({epoch} -> {current})"
+            );
+            return;
+        }
         self.journal.lock().append_epoch(EpochEvent::Save, epoch);
     }
 
@@ -780,6 +886,52 @@ mod tests {
 
         let text = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
         assert_eq!(text.lines().count(), 3, "epoch record + BOTH commits, replay included");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C-1 at the sink itself: a batch carrying an epoch the sink has moved
+    /// past is dropped from BOTH streams. The integration-level version of
+    /// this (a real `ControlPlane`, a real re-open of the same project) is
+    /// `tests/journal_and_history.rs::
+    /// a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream`.
+    #[test]
+    fn a_stale_epoch_batch_reaches_neither_the_journal_nor_history() {
+        let log = HistoryLog::new();
+        let dir = std::env::temp_dir().join(format!("aura-journal-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "mix".into(), transient: false };
+        let ops = [set_gain("t-1", -3.0)];
+
+        log.epoch_boundary(&dir, EpochEvent::Create, 1);
+        assert_eq!(log.current_epoch(), 1);
+        log.record_commit(1, 1, &meta, &ops, &ops, HistoryMode::Record);
+        assert_eq!(log.depths(), (1, 0));
+
+        // The document is swapped (re-opening the SAME dir, the reachable
+        // case): history clears, the journal rotates onto the same file.
+        log.epoch_boundary(&dir, EpochEvent::Open, 2);
+        assert_eq!(log.depths(), (0, 0));
+        let lines_after_swap = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap().lines().count();
+
+        // The overtaken commit's sink call finally lands, carrying epoch 1.
+        log.record_commit(2, 1, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_gesture(2, 1, &meta, &ops, &ops);
+        log.snapshot_mark(1);
+        assert_eq!(log.depths(), (0, 0), "no stale undo entry survives the swap");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap().lines().count(),
+            lines_after_swap,
+            "no stale line lands in the new document's journal"
+        );
+
+        // ...and the guard is not a mute button: the LIVE epoch still records.
+        log.record_commit(3, 2, &meta, &ops, &ops, HistoryMode::Record);
+        log.snapshot_mark(2);
+        assert_eq!(log.depths(), (1, 0));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap().lines().count(),
+            lines_after_swap + 2
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
