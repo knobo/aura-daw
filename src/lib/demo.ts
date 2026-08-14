@@ -52,6 +52,7 @@ import {
 } from "./types/ipc";
 import type { Backend, Unsubscribe } from "./tauri";
 import { sampleAtTick, tickAtSample, type SectionRow } from "./sectionTable";
+import { byTickKey } from "./utils/note-ops";
 
 const SR = 48000;
 const TEMPO = 120;
@@ -1558,7 +1559,7 @@ export class DemoBackend implements Backend {
   async midiSetNotes(clipId: string, notes: MidiNote[]): Promise<MidiClip> {
     const clip = this.midiClips.find((c) => c.id === clipId);
     if (!clip) throw new Error(`unknown MIDI clip: ${clipId}`);
-    clip.notes = [...notes].sort((a, b) => a.tick - b.tick || a.key - b.key);
+    clip.notes = [...notes].sort(byTickKey);
     this.resyncAudio();
     return { ...clip, notes: [...clip.notes] };
   }
@@ -2090,7 +2091,7 @@ export class DemoBackend implements Backend {
       name,
       timelineStartTicks: atTicks,
       lengthTicks,
-      notes: [...notes].sort((a, b) => a.tick - b.tick || a.key - b.key),
+      notes: [...notes].sort(byTickKey),
     };
     this.midiClips.push(clip);
     this.resyncAudio();
