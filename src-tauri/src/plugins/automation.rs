@@ -1042,10 +1042,12 @@ mod tests {
     /// PROJECT-ADOPTION SEAM: `adopt_open_project` now writes into
     /// `session.automation.lanes` (through the registered session global)
     /// instead of the retired standalone `AutomationStore`. Inert unless a
-    /// session is registered — this test registers a LOCAL one (never the
-    /// real app-wide `SESSION`, so it can't leak into other tests: first
-    /// registration in the process wins and nothing else in this test
-    /// binary ever calls `register_session`).
+    /// session is registered. NOTE (merge of Tasks 7+10): `register_session`
+    /// is first-registration-wins and `MidiState::shared` (midi/mod.rs) also
+    /// registers — other tests in this binary may win the race, so this test
+    /// asserts against WHOEVER is registered (via `registered_session()`)
+    /// and identifies its lane by its unique uuid id rather than assuming an
+    /// otherwise-empty session.
     #[test]
     fn adopt_open_project_writes_into_the_registered_session() {
         let parent = std::env::temp_dir().join(format!(
@@ -1064,10 +1066,17 @@ mod tests {
             crate::midi::MidiStore::default(),
         )));
         register_session(session.clone());
+        // First registration wins: use whichever session actually holds the
+        // global (ours, or one registered by another test in this binary).
+        let registered = registered_session().expect("a session is registered");
 
         adopt_open_project(&dir);
-        assert_eq!(session.lock().automation.lanes.len(), 1, "lanes adopted from disk");
-        assert_eq!(session.lock().automation.lanes[0].points, saved[0].points);
+        let lanes = registered.lock().automation.lanes.clone();
+        let adopted = lanes
+            .iter()
+            .find(|l| l.id == saved[0].id)
+            .expect("the saved lane (unique uuid id) was adopted from disk");
+        assert_eq!(adopted.points, saved[0].points);
 
         let _ = fs::remove_dir_all(&parent);
     }

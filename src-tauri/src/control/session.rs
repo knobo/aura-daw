@@ -559,6 +559,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 from: applied, // the inverse's `from`: value we just wrote
                 to: from_now,  // the inverse's `to`: value to restore
             })
+        }
         // §4.4 value-replacement wrapper (Plan E Task 10): one op replaces
         // (or deletes) ONE lane's full point set — an edit gesture is one
         // lane write, never one op per point (D-03), mirroring
@@ -1675,6 +1676,8 @@ mod tests {
         // which do set `effect.persist.project`/`.midi`.
         assert_eq!(c.effect.persist, PersistEffect::default(), "transport Sets set no persist flag");
         assert!(!c.effect.rebuild, "transport Sets don't need a graph rebuild");
+    }
+
     // ---- Plan E Task 10: automation lane op kind ----
 
     fn test_lane(id: &str, points: Vec<AutomationPoint>) -> AutomationLane {
