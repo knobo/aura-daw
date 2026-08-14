@@ -17,9 +17,19 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
+use super::midi_in::{LiveMidiEvent, EV_ALL_OFF, EV_NOTE_ON};
 use super::rt::{RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
+
+/// Hardware MIDI-in events for THIS block, already drained from the hub ring
+/// by the RT output callback. Delivered to the node at block offset 0
+/// (ruling 9: no sub-block placement in this slice).
+#[derive(Clone, Copy)]
+pub struct LiveInBlock<'a> {
+    pub slot: usize,
+    pub events: &'a [LiveMidiEvent],
+}
 
 /// Fader dB to linear gain. -160 dB (and below) encodes -inf.
 pub fn db_to_linear(db: f64) -> f32 {
@@ -130,6 +140,7 @@ fn render_live(
     steady_base: Option<u64>,
     mix: (f32, f32, f32, bool),
     acc: &mut TrackAccum,
+    live_in_events: &[LiveMidiEvent],
 ) {
     let Some(live) = &tr.live else { return };
     // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
@@ -138,6 +149,21 @@ fn render_live(
     let (gain, gl, gr, on) = mix;
     if discontinuity {
         node.all_notes_off();
+    }
+    // Hardware MIDI-in for this block, delivered at offset 0 (ruling 9: no
+    // sub-block placement in this slice). Velocity 0 IS the note-off
+    // convention on this path — see `AbsNoteEvent`'s use in
+    // `playback::track_events`.
+    for ev in live_in_events {
+        match ev.kind {
+            EV_ALL_OFF => node.all_notes_off(),
+            EV_NOTE_ON => {
+                node.queue_event(BlockNoteEvent { offset: 0, key: ev.key, velocity: ev.velocity });
+            }
+            _ => {
+                node.queue_event(BlockNoteEvent { offset: 0, key: ev.key, velocity: 0 });
+            }
+        }
     }
     // Per-run discontinuity for the automation seam: the caller's flag on
     // the first run, then true again after every loop wrap (the position
@@ -241,7 +267,7 @@ pub fn render(
     discontinuity: bool,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
-    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, None, meter_tx)
+    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, None, None, meter_tx)
 }
 
 /// Like [`render`], but carries the engine-global `steady_time` base for
@@ -273,6 +299,36 @@ pub fn render_rt(
         sample_rate,
         discontinuity,
         Some(steady_base),
+        None,
+        meter_tx,
+    )
+}
+
+/// `render_rt` plus hardware MIDI-in. `render_rt`'s own signature is
+/// UNCHANGED (it forwards `None`), so every existing caller keeps compiling.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rt_with_input(
+    graph: &mut RtGraph,
+    base_pos: u64,
+    lp: &LoopSpec,
+    out: &mut [f32],
+    out_ch: usize,
+    sample_rate: u32,
+    discontinuity: bool,
+    steady_base: u64,
+    live_in: Option<LiveInBlock<'_>>,
+    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
+) -> u32 {
+    render_impl(
+        graph,
+        base_pos,
+        lp,
+        out,
+        out_ch,
+        sample_rate,
+        discontinuity,
+        Some(steady_base),
+        live_in,
         meter_tx,
     )
 }
@@ -287,6 +343,7 @@ fn render_impl(
     sample_rate: u32,
     discontinuity: bool,
     steady_base: Option<u64>,
+    live_in: Option<LiveInBlock<'_>>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
     let out_ch = out_ch.max(1);
@@ -343,6 +400,7 @@ fn render_impl(
             }
         }
 
+        let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
         render_live(
             tr,
             scratch,
@@ -356,6 +414,7 @@ fn render_impl(
             steady_base,
             (gain, gl, gr, on),
             &mut acc,
+            live_in_events,
         );
 
         let chunk_idx = tr.slot / METER_CHUNK_SLOTS;
@@ -368,6 +427,123 @@ fn render_impl(
     // Master meters from the summed output, on the first chunk only
     // (base_slot == 0) — `meter_scratch` always has at least one entry
     // (`RtGraph::new` floors the chunk count to 1), so this never misses.
+    if let Some(first) = meter_scratch.first_mut() {
+        for i in 0..frames {
+            let o = i * out_ch;
+            let l = out[o];
+            let r = if out_ch >= 2 { out[o + 1] } else { out[o] };
+            first.master_peak[0] = first.master_peak[0].max(l.abs());
+            first.master_peak[1] = first.master_peak[1].max(r.abs());
+            first.master_sumsq[0] += l * l;
+            first.master_sumsq[1] += r * r;
+        }
+    }
+
+    let mut dropped = 0u32;
+    if let Some(producer) = meter_tx {
+        for chunk in meter_scratch.iter() {
+            if producer.push(*chunk).is_err() {
+                dropped += 1;
+            }
+        }
+    }
+    dropped
+}
+
+/// Render ONLY the live-in target track's instrument — no clips, no
+/// scheduled note events, no transport advance. This is what a STOPPED
+/// transport renders so monitoring is audible without playback: the
+/// scheduled-event slice would otherwise replay the clip's own notes.
+///
+/// Mirrors `render_impl`'s per-track prologue (gain/pan/mute/solo from
+/// `graph.params`, meter chunk reset + push) for the one matching slot. It
+/// never reads the track's own `live.events` (the pre-scheduled clip notes)
+/// and never advances a position — `base_pos` is handed to every run
+/// unchanged, because a stopped transport has nowhere to advance to.
+#[allow(clippy::too_many_arguments)]
+pub fn render_live_input_only(
+    graph: &mut RtGraph,
+    base_pos: u64,
+    out: &mut [f32],
+    out_ch: usize,
+    sample_rate: u32,
+    steady_base: u64,
+    live_in: LiveInBlock<'_>,
+    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
+) -> u32 {
+    let out_ch = out_ch.max(1);
+    let frames = out.len() / out_ch;
+    out.fill(0.0);
+    let params = graph.params.clone();
+    let any_solo = params.any_solo.load(Relaxed);
+    let n_slots = params.len();
+    let generation = graph.generation;
+    let RtGraph { tracks, scratch, meter_scratch, .. } = graph;
+
+    for (i, chunk) in meter_scratch.iter_mut().enumerate() {
+        *chunk = RawMeterBlock::new(generation, base_pos, frames as u32);
+        chunk.base_slot = (i * METER_CHUNK_SLOTS) as u32;
+    }
+
+    for tr in tracks.iter() {
+        if tr.slot != live_in.slot || tr.slot >= n_slots {
+            continue;
+        }
+        let Some(live) = &tr.live else { continue };
+        let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
+        let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
+        let flags = params.flags[tr.slot].load(Relaxed);
+        let on = audible(flags & FLAG_MUTE != 0, flags & FLAG_SOLO != 0, any_solo);
+        let (gl, gr) = pan_gains(pan);
+        let mut acc = TrackAccum::default();
+
+        // SAFETY: RCU discipline — exactly one graph snapshot is rendered at
+        // a time, on this (the only RT) thread; see `LiveNodeCell`.
+        let node = unsafe { live.node.rt_mut() };
+        for ev in live_in.events {
+            match ev.kind {
+                EV_ALL_OFF => node.all_notes_off(),
+                EV_NOTE_ON => {
+                    node.queue_event(BlockNoteEvent { offset: 0, key: ev.key, velocity: ev.velocity });
+                }
+                _ => {
+                    node.queue_event(BlockNoteEvent { offset: 0, key: ev.key, velocity: 0 });
+                }
+            }
+        }
+
+        let mut f = 0usize;
+        while f < frames {
+            let run = (frames - f).min(MAX_LIVE_BLOCK);
+            if run == 0 || scratch.len() < run * 2 {
+                // Defensive: never render live audio without prepared scratch.
+                break;
+            }
+            let sblock = &mut scratch[..run * 2];
+            sblock.fill(0.0);
+            node.set_block_context(base_pos, false);
+            let mut io = ProcessBlock { samples: sblock, channels: 2, sample_rate, steady: Some(steady_base) };
+            node.process(&mut io);
+            for i in 0..run {
+                let mut l = scratch[i * 2] * gain * gl;
+                let mut r = scratch[i * 2 + 1] * gain * gr;
+                if !on {
+                    l = 0.0;
+                    r = 0.0;
+                }
+                acc.fold(l, r);
+                mix_out(out, f + i, out_ch, l, r);
+            }
+            f += run;
+        }
+
+        let chunk_idx = tr.slot / METER_CHUNK_SLOTS;
+        let lane = tr.slot % METER_CHUNK_SLOTS;
+        if let Some(chunk) = meter_scratch.get_mut(chunk_idx) {
+            chunk.set_slot_local(lane, acc.pk_l, acc.pk_r, acc.ss_l, acc.ss_r);
+        }
+    }
+
     if let Some(first) = meter_scratch.first_mut() {
         for i in 0..frames {
             let o = i * out_ch;
@@ -794,5 +970,95 @@ mod tests {
         assert_eq!(seen.len(), 3, "one steady value observed per rendered block");
         assert!(seen[1] > seen[0], "monotonic across the loop wrap: {:?}", seen);
         assert!(seen[2] > seen[1], "still climbing after the wrap: {:?}", seen);
+    }
+
+    // ---- live MIDI-in routing (slice 2 audibility core) ------------------
+
+    use crate::audio::midi_in::LiveMidiEvent;
+
+    #[test]
+    fn live_in_note_on_is_audible_through_render_rt_with_input() {
+        const RATE: u32 = 48_000;
+        let mut g = RtGraph::new(vec![live_track(0, Vec::new(), RATE)], 1, Arc::new(ParamTable::default()));
+        let mut out = vec![0.0f32; 4_096 * 2];
+        // No events queued and no live-in: silence.
+        render_rt_with_input(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, 0, None, None);
+        assert_eq!(peak(&out), 0.0);
+        // A hardware note-on: audible from this block on.
+        let evs = [LiveMidiEvent::note_on(69, 110)];
+        let n = render_rt_with_input(
+            &mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, 0,
+            Some(LiveInBlock { slot: 0, events: &evs }), None,
+        );
+        assert_eq!(n, 0, "no meter chunks dropped without a ring");
+        assert!(peak(&out) > 0.02, "routed note is audible");
+    }
+
+    #[test]
+    fn live_in_all_off_releases_the_routed_voice() {
+        const RATE: u32 = 48_000;
+        let mut g = RtGraph::new(vec![live_track(0, Vec::new(), RATE)], 1, Arc::new(ParamTable::default()));
+        let mut out = vec![0.0f32; 4_096 * 2];
+        let on = [LiveMidiEvent::note_on(69, 110)];
+        render_rt_with_input(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, 0, Some(LiveInBlock { slot: 0, events: &on }), None);
+        let off = [LiveMidiEvent::all_off()];
+        render_rt_with_input(&mut g, 4_096, &LoopSpec::OFF, &mut out, 2, RATE, false, 4_096, Some(LiveInBlock { slot: 0, events: &off }), None);
+        // Render past the release tail (PolySynth releases in ~80 ms).
+        for i in 2..8u64 {
+            render_rt_with_input(&mut g, i * 4_096, &LoopSpec::OFF, &mut out, 2, RATE, false, i * 4_096, None, None);
+        }
+        assert_eq!(peak(&out), 0.0, "all-off released the voice");
+    }
+
+    #[test]
+    fn live_in_events_go_only_to_the_target_slot() {
+        const RATE: u32 = 48_000;
+        let mut g = RtGraph::new(
+            vec![live_track(0, Vec::new(), RATE), live_track(1, Vec::new(), RATE)],
+            1, Arc::new(ParamTable::with_slots(2)),
+        );
+        let mut out = vec![0.0f32; 4_096 * 2];
+        let evs = [LiveMidiEvent::note_on(69, 110)];
+        render_rt_with_input(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, 0, Some(LiveInBlock { slot: 1, events: &evs }), None);
+        // Mute slot 1 and re-render: if the note had gone to slot 0 it would
+        // still sound.
+        g.params.set_flag(1, crate::audio::rt::FLAG_MUTE, true);
+        let mut out2 = vec![0.0f32; 4_096 * 2];
+        render_rt_with_input(&mut g, 4_096, &LoopSpec::OFF, &mut out2, 2, RATE, false, 4_096, None, None);
+        assert_eq!(peak(&out2), 0.0, "the routed voice lives on slot 1 only");
+    }
+
+    #[test]
+    fn render_live_input_only_ignores_scheduled_clip_events() {
+        const RATE: u32 = 48_000;
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+            crate::midi::schedule::AbsNoteEvent { sample: 40_000, key: 60, velocity: 0 },
+        ];
+        let mut g = RtGraph::new(vec![live_track(0, scheduled, RATE)], 1, Arc::new(ParamTable::default()));
+        let mut out = vec![0.0f32; 4_096 * 2];
+        // Stopped-transport monitoring at position 0: the clip's own note at
+        // sample 0 must NOT sound.
+        render_live_input_only(&mut g, 0, &mut out, 2, RATE, 0, LiveInBlock { slot: 0, events: &[] }, None);
+        assert_eq!(peak(&out), 0.0, "scheduled events never play on the monitor path");
+        // A hardware note does sound.
+        let evs = [LiveMidiEvent::note_on(69, 110)];
+        render_live_input_only(&mut g, 0, &mut out, 2, RATE, 0, LiveInBlock { slot: 0, events: &evs }, None);
+        assert!(peak(&out) > 0.02);
+    }
+
+    #[test]
+    fn render_rt_without_live_in_is_unchanged() {
+        // Regression guard for every existing caller: the old entry point still
+        // renders scheduled events exactly as before.
+        const RATE: u32 = 48_000;
+        let events = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 1_000, key: 69, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 9_000, key: 69, velocity: 0 },
+        ];
+        let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
+        let mut out = vec![0.0f32; 4_096 * 2];
+        render_rt(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, 0, None);
+        assert!(peak(&out) > 0.02);
     }
 }
