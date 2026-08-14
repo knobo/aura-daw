@@ -2044,8 +2044,7 @@ mod tests {
         );
         assert!(driver.is_empty(), "no such plugin instance — the plugin lane resolves to nothing");
 
-        // No rate (headless before a device opens) yields a tempo map error:
-        // nothing is compiled rather than something compiled at rate 0.
+        // A failed tempo map compiles nothing, rather than something at rate 0.
         ctl.cache_rate = 0; // as if the tempo map failed to build
         let (ramps, driver) = {
             let s = session.lock();

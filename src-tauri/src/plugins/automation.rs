@@ -623,6 +623,11 @@ impl ParamAutomationDriver {
         Self { lanes: Vec::new() }
     }
 
+    /// Two lanes naming the SAME instance and the SAME param index both
+    /// compile, and the LAST one in `lanes` wins at every tick (the sort
+    /// below is stable, so the input order survives it) — no blend, no
+    /// error, exactly like `compile_gain_ramps`' track-gain equivalent.
+    /// Nothing produces that today: the UI keeps one lane per target.
     pub fn new(
         lanes: &[AutomationLane],
         plugins: &crate::control::session::PluginDoc,

@@ -326,7 +326,8 @@ auditable rather than asserted:
 * `sidecar_split_stems` / `sidecar_transcribe` — job submits only
   (`src-tauri/src/sidecars/mod.rs`).
 * the export thread — deep-copies the store under ONE lock and never writes
-  (`src-tauri/src/control/export.rs:528`).
+  (`src-tauri/src/control/export.rs:531` — store, midi, plugin rows and
+  (Track D) automation lanes).
 * MCP handlers — all mutations go through `ControlPlane`
   (`src-tauri/src/mcp/handler.rs`, `src-tauri/src/mcp/server.rs`).
 * the plugin scan worker (`src-tauri/src/plugins/scan_worker.rs`), the
@@ -337,6 +338,34 @@ auditable rather than asserted:
 * `hum.rs:314`/`:356`, `import.rs:237`, `loopjam.rs:230`/`:554`,
   `midi/mod.rs:248`, `audio/mod.rs:94`/`:353`/`:401`/`:568` — all
   read-only session locks (snapshot-then-drop), verified line by line.
+* **`engine::Control::drive_param_automation`** (Track D) — writes plugin
+  PARAMS ON THE HOST, at the engine control thread's ≤2 ms tick, and writes
+  NO document field. It is therefore not a residual, but it IS a host-write
+  site outside `execute_host_forward`, so the grep gate's readers need to
+  know it exists. Deliberate: automation overrides the stored knob value
+  during playback while the document keeps what the user set. Consequences,
+  recorded so they are not mistaken for bugs:
+  - After playing an automated section the plugin's live value can differ
+    from the document's stored value until the next project load or user
+    edit; the document is authoritative on save, and the param panel shows
+    the document. Making the panel follow automation live is deferred.
+  - A flat automated param is RE-ASSERTED every ~0.5 s
+    (`ParamAutomationDriver::REASSERT_TICKS`), because the host is not ours
+    alone — the plugin's own GUI, a patch load or a knob drag can move the
+    param behind our back and a flat lane would otherwise never correct it.
+    While the user HOLDS a knob on such a param during playback, the
+    plugin's GUI and the audio therefore snap back at 2 Hz (our own param
+    panel does not fight it). This is the gap write/touch/latch automation
+    modes fill; those are an explicit non-goal of the Track D plan.
+  - **Export does not evaluate plugin-param lanes at all**, and a bounce
+    captures whatever value the live host instance holds — most recently,
+    whatever the last playthrough left there. There is one copy of a plugin
+    instance in the process, so a bounce cannot drive it without writing the
+    export's automation into the user's live plugin. The fix needs private
+    per-render plugin instances (a `clap_host`/`lv2_host` API addition); see
+    the KNOWN DIVERGENCE note on `audio::offline::build_graph` and the Track
+    D handoff in `docs/PHASE4-PLAN.md`. TRACK-GAIN lanes, by contrast, ARE
+    compiled into the offline graph and a bounce follows them exactly.
 
 ## The grep gate
 
