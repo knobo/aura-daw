@@ -61,10 +61,13 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<LibraryEntry>, String> {
         if name.starts_with('.') {
             continue;
         }
-        // `metadata()` follows symlinks on purpose: a symlinked sample
-        // folder is a normal way to organise a library.
-        let Ok(meta) = entry.metadata() else { continue };
         let path = entry.path();
+        // `std::fs::metadata` (unlike `DirEntry::metadata`, which has lstat
+        // semantics and reports the *link's* own type/size) follows symlinks
+        // on purpose: a symlinked sample folder is a normal way to organise
+        // a library, and a symlinked audio file must report the target's
+        // size.
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
         let modified_ms = meta
             .modified()
             .ok()
@@ -196,6 +199,38 @@ mod tests {
 
         let names: Vec<String> = scan_dir(&d).unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(names, vec!["loop.flac".to_string()]);
+    }
+
+    /// `DirEntry::metadata()` has lstat semantics — it reports the *link's*
+    /// own type and size, not the target's. A symlinked sample folder is a
+    /// normal way to organise a library (the module doc's stated intent),
+    /// so `scan_dir` must resolve the link, not just see it exists.
+    #[cfg(unix)]
+    #[test]
+    fn scan_dir_follows_symlinks_to_real_folders_and_files() {
+        use std::os::unix::fs::symlink;
+
+        // Real folder + real audio file, living OUTSIDE the scanned dir.
+        let real_root = temp_dir("symlink-target");
+        let real_subdir = real_root.join("RealSamples");
+        std::fs::create_dir_all(&real_subdir).unwrap();
+        let real_file = real_root.join("real.wav");
+        std::fs::write(&real_file, b"0123456789").unwrap(); // 10 bytes, distinct from symlink's own size
+
+        // The scanned dir contains only symlinks to the above.
+        let d = temp_dir("symlink-scan");
+        symlink(&real_subdir, d.join("LinkedFolder")).unwrap();
+        symlink(&real_file, d.join("linked.wav")).unwrap();
+
+        let got = scan_dir(&d).unwrap();
+        let by_name = |n: &str| got.iter().find(|e| e.name == n).unwrap_or_else(|| panic!("missing {n}"));
+
+        let folder = by_name("LinkedFolder");
+        assert_eq!(folder.kind, LibraryEntryKind::Dir, "symlinked folder resolves as a Dir, not dropped");
+
+        let file = by_name("linked.wav");
+        assert_eq!(file.kind, LibraryEntryKind::Audio);
+        assert_eq!(file.size_bytes, 10, "reports the TARGET's size, not the symlink's own");
     }
 
     #[test]
