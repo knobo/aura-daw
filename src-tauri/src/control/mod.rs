@@ -115,7 +115,394 @@ pub struct ControlPlane {
     engine: EngineHandle,
     jobs: Arc<JobManager>,
     latest_meters: Arc<Mutex<Option<MeterFrame>>>,
-    emit: EventEmitter,
+    emit: Arc<EventEmitter>,
+    /// The commit core (Plan E Task 13) — `commit`/`commit_with` are thin
+    /// wrappers over this. A SECOND, independent `Committer` (same
+    /// `session`/`shared`/`tables` `Arc`s, its own `emit` closure instance)
+    /// is built in `audio::init` and carried by the engine control thread —
+    /// see `Committer`'s doc.
+    committer: Committer,
+}
+
+/// The commit core, shareable with the engine control thread (Plan E Task
+/// 13, round-2 inventory rows 21-24). Owns everything `commit_with`/`commit`
+/// need EXCEPT the `EngineHandle`: the engine executes a `rebuild` effect by
+/// calling its OWN `Control::rebuild` directly (it IS the engine control
+/// thread) instead of sending itself a `ControlMsg::Rebuild` — this is why
+/// `commit_with_rebuild` takes `do_rebuild` as a caller-supplied closure
+/// rather than hardcoding a `ControlMsg::Rebuild` send: it keeps "at most
+/// one `Rebuild` per transaction" (§4.4) a claim about ALL rebuilds, not
+/// just the ones a Tauri/MCP-driven `ControlPlane::commit` triggers.
+///
+/// `emit` is `Arc`-shared (not the plain `Box<dyn Fn>` `ControlPlane` alone
+/// used before this task) so a commit built through EITHER `Committer`
+/// instance — `ControlPlane`'s own, or the engine's — can call it without
+/// taking ownership of the underlying closure. `ControlPlane::new` wraps its
+/// caller-supplied `EventEmitter` in one `Arc` and clones it into both
+/// `self.emit` and `self.committer`'s copy; `audio::init` builds a SEPARATE
+/// `Arc<EventEmitter>` closure for the engine's own `Committer` — two
+/// closure instances, but both ultimately call the one live
+/// `AppHandle::emit`, so they're behaviorally one emitter.
+///
+/// DEADLOCK AUDIT — why the engine control thread calling
+/// `commit_with_rebuild` (i.e. `Session::transact`, under the session lock)
+/// from inside its own message loop is safe, traced against the actual
+/// code rather than just asserted:
+///
+/// (a) `Session::transact` never sends an engine message. `session.rs` has
+///     no `EngineHandle`/`ControlMsg` import at all — `Tx::apply`/
+///     `apply_raw` only ever touch `Session`/`Store`/`MidiStore` fields; the
+///     whole call is in-memory, no channel send, no lock other than the one
+///     `Session::transact` itself takes and releases before returning.
+///
+/// (b) The only blocking request-reply INTO the engine
+///     (`EngineHandle::request` — `ControlPlane::transport`'s Stop arm:
+///     `self.engine.request::<Vec<Clip>>(|reply| ControlMsg::StopRecording
+///     { reply })`, plus `start_recording`/`select_*_device`) is serviced by
+///     the SAME control loop that would run a commit: `Control::run` calls
+///     `Control::handle`, whose `StopRecording` arm is
+///     `let _ = reply.send(self.stop_recording());` — `self.stop_recording`
+///     is where the engine's own finalize commit runs, and it runs entirely
+///     BEFORE `reply.send(...)`. The reply sender is never held open DURING
+///     a commit; it's touched again only AFTER the site's commit (and the
+///     whole handler) returns. So the CALLER's `.recv_timeout` is what
+///     blocks — the engine thread itself never waits on its own reply, and
+///     `Control::handle` is never re-entered mid-commit (one `Control`
+///     value, one thread, one `handle` call in flight at a time, driven by
+///     that thread's own `rx.recv_timeout` loop).
+///
+/// (c) All five engine write sites (`open_output`, `apply_end_policy`,
+///     `start_recording`, `stop_recording`, `ensure_project`) commit
+///     synchronously on the control thread's own turn, fire-and-forget from
+///     the loop's perspective — none holds a `Reply<T>` sender across its
+///     `commit_with_rebuild` call (per (b), any sender for that turn's own
+///     message is sent only after the site's commit returns). Every site's
+///     `do_rebuild` closure calls `self.rebuild()` directly, never
+///     `self.engine.send(ControlMsg::Rebuild)` — sending to `self.engine`
+///     would round-trip through the very channel this thread is reading
+///     `ControlMsg`s from, and could queue behind whatever this turn is
+///     already doing (starvation, not deadlock, since nothing blocks on the
+///     reply — but still wrong: the whole point of "the engine IS the
+///     engine" is that it never needs to ask itself for anything).
+#[derive(Clone)]
+pub struct Committer {
+    session: Arc<Mutex<Session>>,
+    shared: Arc<SharedRt>,
+    tables: SharedGraphTables,
+    emit: Arc<EventEmitter>,
+}
+
+impl Committer {
+    pub fn new(
+        session: Arc<Mutex<Session>>,
+        shared: Arc<SharedRt>,
+        tables: SharedGraphTables,
+        emit: Arc<EventEmitter>,
+    ) -> Self {
+        Self { session, shared, tables, emit }
+    }
+
+    /// Compose the full-project payload `project://changed` carries — see
+    /// `ControlPlane::project_changed_payload`'s original doc (moved here
+    /// verbatim, Task 13): the same shape `project::from_store` serializes,
+    /// minus its requirement of an open project dir.
+    fn project_changed_payload(&self) -> Project {
+        let session = self.session.lock();
+        let s = &session.store;
+        let sample_rate = self.shared.sample_rate.load(Relaxed);
+        let mut transport = s.transport.clone();
+        transport.position_samples = self.shared.position.load(Relaxed);
+        transport.sample_rate = sample_rate;
+        Project {
+            schema_version: 1,
+            name: s.project_name.clone().unwrap_or_else(|| "Untitled".into()),
+            path: s.project_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
+            created_at: s.created_at.clone(),
+            modified_at: None,
+            sample_rate,
+            tempo_bpm: transport.tempo_bpm,
+            time_signature: Some((4, 4)),
+            tracks: s.tracks.clone(),
+            clips: s.clips.clone(),
+            transport: Some(transport),
+        }
+    }
+
+    /// Runs a `Session::transact` closure, then — with the session lock
+    /// RELEASED — executes the folded `EngineEffect`: param writes resolved
+    /// through `self.tables` (the CURRENT graph's tables — round-2 §2.4),
+    /// `do_rebuild()` called at most once (Task 13: the CALLER decides how
+    /// "one more rebuild" reaches its engine — see this struct's deadlock
+    /// audit), plugin host round-trips, persist, and — gated by
+    /// `emit_project_changed` — exactly one `project://changed` event.
+    ///
+    /// This is `ControlPlane::commit_with`'s pre-Task-13 body, unchanged
+    /// except that `if committed.effect.rebuild { self.engine.send(...) }`
+    /// became `if committed.effect.rebuild { do_rebuild(); }` — see
+    /// `ControlPlane::commit_with`'s doc for the fuller per-step rationale
+    /// (zero engine/param-table/event calls happen while the session lock
+    /// is held; `project://changed`'s frozen payload contract; etc.), which
+    /// still applies verbatim to this body.
+    pub fn commit_with_rebuild<F, R>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+        emit_project_changed: bool,
+        do_rebuild: R,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+        R: FnOnce(),
+    {
+        let committed = Session::transact(&self.session, meta, f)?;
+        // ---- session lock is released here; everything below executes
+        // the effect the session merely described. ----
+        {
+            let tables = self.tables.lock();
+            for (tid, path, value) in &committed.effect.param_writes {
+                let Some(&slot) = tables.slots.get(tid) else { continue };
+                match path {
+                    op::PropPath::Gain => tables.params.set_gain_linear(slot, *value),
+                    op::PropPath::Pan => tables.params.set_pan(slot, *value),
+                    op::PropPath::Muted => tables.params.set_flag(slot, FLAG_MUTE, *value != 0.0),
+                    op::PropPath::Soloed => tables.params.set_flag(slot, FLAG_SOLO, *value != 0.0),
+                    op::PropPath::Armed
+                    | op::PropPath::InstrumentId
+                    | op::PropPath::TimelineStartSamples
+                    | op::PropPath::LengthSamples
+                    | op::PropPath::OffsetSamples
+                    | op::PropPath::TimelineStartTicks
+                    | op::PropPath::LengthTicks
+                    | op::PropPath::ContentLengthTicks
+                    | op::PropPath::TransportState
+                    | op::PropPath::LoopEnabled
+                    | op::PropPath::LoopStartSamples
+                    | op::PropPath::LoopEndSamples
+                    | op::PropPath::StopAtEnd
+                    | op::PropPath::SampleRate
+                    | op::PropPath::Param { .. } => {}
+                }
+            }
+            if let Some(any_solo) = committed.effect.any_solo {
+                tables.params.any_solo.store(any_solo, Relaxed);
+            }
+        }
+        if !committed.effect.host_forward.is_empty() {
+            self.execute_host_forward(&committed.effect.host_forward);
+        }
+        if committed.effect.rebuild {
+            do_rebuild();
+        }
+        if committed.effect.persist != session::PersistEffect::default() {
+            self.execute_persist(&committed.effect.persist, committed.epoch);
+        }
+        if emit_project_changed {
+            let mut payload = serde_json::to_value(self.project_changed_payload())
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if let serde_json::Value::Object(map) = &mut payload {
+                map.insert("rev".into(), serde_json::json!(committed.rev));
+                map.insert("label".into(), serde_json::json!(committed.meta.label));
+                map.insert(
+                    "actor".into(),
+                    serde_json::to_value(&committed.meta.actor).unwrap_or_default(),
+                );
+            }
+            (self.emit)("project://changed", payload);
+        }
+        Ok(committed)
+    }
+
+    /// Executes a `PersistEffect` a commit merely described — see
+    /// `ControlPlane::execute_persist`'s original doc (moved here verbatim,
+    /// Task 13); `ControlPlane::execute_persist` is now a thin forwarding
+    /// wrapper kept for existing direct test callers.
+    pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
+        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot, plugin_snapshot) = {
+            let s = self.session.lock();
+            (
+                s.store.project_dir.clone(),
+                s.epoch,
+                p.midi.then(|| s.midi_snapshot()),
+                p.project.then(|| {
+                    project::from_store(
+                        &s.store,
+                        self.shared.position.load(Relaxed),
+                        self.shared.sample_rate.load(Relaxed),
+                    )
+                }),
+                p.automation.then(|| s.automation.lanes.clone()),
+                p.plugins.then(|| s.plugin_snapshot()),
+            )
+        };
+        if epoch_now != committed_epoch {
+            log::warn!(
+                "persist skipped: epoch changed between commit and persist ({committed_epoch} -> \
+                 {epoch_now}) — the epoch's own save owns durability now"
+            );
+            return;
+        }
+        let Some(dir) = dir else { return }; // unsaved in-memory project
+        if let Some(m) = midi_snapshot {
+            if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
+                log::warn!("midi persist failed: {e}");
+                self.session.lock().midi.dirty = true; // M-5 semantics preserved
+            } else {
+                self.session.lock().midi.dirty = false;
+            }
+        }
+        if let Some(pr) = project_snapshot {
+            match pr {
+                Ok(pr) => {
+                    if let Err(e) = project::save(&dir, &pr) {
+                        log::warn!("project save failed: {e}");
+                    }
+                }
+                Err(e) => log::warn!("project snapshot build failed: {e}"),
+            }
+        }
+        if let Some(lanes) = automation_snapshot {
+            if let Err(e) = crate::plugins::automation::save_into_project(&dir, &lanes) {
+                log::warn!("automation persist failed: {e}");
+            }
+        }
+        if let Some(doc) = plugin_snapshot {
+            match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
+                Ok(cleared) if !cleared.is_empty() => {
+                    let mut s = self.session.lock();
+                    for id in cleared {
+                        s.plugins.dirty_state.remove(&id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("plugins persist failed: {e}"),
+            }
+        }
+    }
+
+    /// Executes a `HostForward` list a commit merely described — calling
+    /// the SAME host entry points commands call today
+    /// (`plugins::clap_host`/`lv2_host`/`state`'s `HostStateBridge`), now
+    /// sequenced after the session lock is released ([C1]: hosts have their
+    /// own locks, never called while the session lock is held — this
+    /// method takes ONLY brief re-locks of `self.session` to read a row's
+    /// format/uid or to write back a post-host result, never spanning a
+    /// host call).
+    fn execute_host_forward(&self, forwards: &[session::HostForward]) {
+        use crate::plugins::{clap_host, lv2_host, state as pstate};
+        use session::HostForward;
+        for hf in forwards {
+            match hf {
+                HostForward::ParamWrite { instance, index, value } => {
+                    let format = {
+                        let s = self.session.lock();
+                        s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
+                    };
+                    match format.as_deref() {
+                        Some("lv2") => {
+                            if let Some(host) = lv2_host::try_global() {
+                                host.set_params(instance, vec![(*index, *value)]);
+                            }
+                        }
+                        Some("clap") => {
+                            let change = crate::plugins::ParamChange { id: *index, value: *value as f64 };
+                            if let Err(e) = clap_host::set_params(instance, vec![change]) {
+                                log::warn!("plugins: clap param write for {instance}: {e}");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                HostForward::Instantiate { instance } => {
+                    let row = {
+                        let s = self.session.lock();
+                        s.plugins.instances.iter().find(|r| &r.id == instance).cloned()
+                    };
+                    let Some(row) = row else { continue }; // row vanished meanwhile
+                    // Idempotent by construction (doc on `HostForward::
+                    // Instantiate`): if the host already has this id live
+                    // (the prepare-outside fresh-instantiate path), re-sync
+                    // params via a plain read instead of re-instantiating —
+                    // re-registering a live id would reset its voice state.
+                    let hosted = match row.format.as_str() {
+                        "clap" => match clap_host::has_instance(instance) {
+                            Ok(true) => clap_host::get_params(instance),
+                            Ok(false) => clap_host::instantiate(instance, &row.uid),
+                            Err(e) => Err(e),
+                        },
+                        "lv2" => {
+                            let host = lv2_host::global();
+                            match host.has_instance(instance) {
+                                Ok(true) => host.get_params(instance),
+                                Ok(false) => host.register_instance(instance, &row.uid),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        _ => continue, // non-hosted format: stays "stub", nothing to sync
+                    };
+                    match hosted {
+                        Ok(params) => {
+                            let mut s = self.session.lock();
+                            if let Some(r) = s.plugins.instances.iter_mut().find(|r| &r.id == instance) {
+                                r.status = "active".into();
+                            }
+                            // Fill only when absent (Task 9 review round 1,
+                            // Important-1): an undo-of-remove already
+                            // restored the REAL param mirror into
+                            // `session.plugins.params` (parked there by
+                            // `apply_raw`'s `PluginRemove` arm) — this must
+                            // not clobber it with the host's fresh-
+                            // reinstantiate DEFAULTS. A genuinely fresh
+                            // instantiate's mirror is still the empty seed
+                            // `Op::PluginAdd` left, so it gets filled here
+                            // exactly as before.
+                            let entry = s.plugins.params.entry(instance.clone()).or_default();
+                            if entry.is_empty() {
+                                *entry = params;
+                            }
+                        }
+                        Err(e) => log::warn!("plugins: instantiate forward for {instance} failed: {e}"),
+                    }
+                }
+                HostForward::Destroy { instance } => {
+                    let format = {
+                        let s = self.session.lock();
+                        s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
+                    };
+                    match format.as_deref() {
+                        Some("lv2") => {
+                            if let Some(host) = lv2_host::try_global() {
+                                host.unregister_instance(instance);
+                            }
+                        }
+                        Some("clap") => {
+                            if let Err(e) = clap_host::remove(instance) {
+                                log::warn!("plugins: clap destroy for {instance}: {e}");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                HostForward::LoadState { instance } => {
+                    let blob = {
+                        let s = self.session.lock();
+                        s.plugins.pending_state.get(instance).cloned()
+                    };
+                    let Some(bytes) = blob else { continue };
+                    let decoded = pstate::decode_state(&bytes);
+                    match decoded {
+                        Ok((_uid, blob)) => {
+                            if let Some(bridge) = pstate::registered_state_bridge() {
+                                if let Err(e) = bridge.load_state(instance, &blob) {
+                                    log::warn!("plugins: state load for {instance} failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!("plugins: pending state blob for {instance} unreadable: {e}"),
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// MeterSink that keeps only the latest frame so MCP's `read_meters` tool can
@@ -170,7 +557,12 @@ impl ControlPlane {
         engine.send(ControlMsg::Subscribe(Box::new(LatestMeterCache(
             latest_meters.clone(),
         ))));
-        Self { session, shared, tables, engine, jobs, latest_meters, emit }
+        // `emit` is promoted to `Arc` once here (Task 13) so both
+        // `ControlPlane` and its `committer` can hold a clone of the SAME
+        // closure instance — see `Committer`'s doc.
+        let emit: Arc<EventEmitter> = Arc::new(emit);
+        let committer = Committer::new(session.clone(), shared.clone(), tables.clone(), emit.clone());
+        Self { session, shared, tables, engine, jobs, latest_meters, emit, committer }
     }
 
     fn emit_transport(&self, snap: &TransportState) {
@@ -682,60 +1074,13 @@ impl ControlPlane {
         self.session.lock().plugins.pending_state.insert(instance_id.to_string(), bytes);
     }
 
-    /// Compose the full-project payload `project://changed` carries (the
-    /// same shape `project::from_store` serializes, minus its requirement of
-    /// an open project dir — mix/structural changes are legal in an unsaved
-    /// session). `commit`'s event emission (Task 7: every A-slice command
-    /// now goes live through it) is the sole caller; `create_project` builds
-    /// its own `Project` from `project::create`'s return instead, since that
-    /// one always has an open project dir.
-    fn project_changed_payload(&self) -> Project {
-        let session = self.session.lock();
-        let s = &session.store;
-        let sample_rate = self.shared.sample_rate.load(Relaxed);
-        let mut transport = s.transport.clone();
-        transport.position_samples = self.shared.position.load(Relaxed);
-        transport.sample_rate = sample_rate;
-        Project {
-            schema_version: 1,
-            name: s.project_name.clone().unwrap_or_else(|| "Untitled".into()),
-            path: s.project_dir.as_ref().map(|p| p.to_string_lossy().into_owned()),
-            created_at: s.created_at.clone(),
-            modified_at: None,
-            sample_rate,
-            tempo_bpm: transport.tempo_bpm,
-            time_signature: Some((4, 4)),
-            tracks: s.tracks.clone(),
-            clips: s.clips.clone(),
-            transport: Some(transport),
-        }
-    }
-
-    /// Runs a `Session::transact` closure, then — with the session lock
-    /// RELEASED — executes the folded `EngineEffect`: param writes resolved
-    /// through `self.tables` (the CURRENT graph's tables — round-2 §2.4),
-    /// at most one `ControlMsg::Rebuild`, and exactly one `project://changed`
-    /// event. `project://changed` is a FROZEN event whose payload contract
-    /// is the full `Project` shape (project.schema.json; ARCHITECTURE §3.4)
-    /// — this carries EXACTLY that (via `project_changed_payload`, the same
-    /// serialization `create_project` uses), with `rev`/`label`/`actor`
-    /// folded in as ADDITIVE top-level fields (D-06: readers ignore fields
-    /// they don't recognize).
-    ///
-    /// Zero engine/param-table/event calls happen while the SESSION lock is
-    /// held — `Session::transact` (session.rs) only ever computes the effect
-    /// DESCRIPTION; everything below this comment runs after it returns
-    /// (`project_changed_payload` takes its own fresh, separate lock).
-    ///
-    /// A track without a slot yet (`self.tables.lock().slots` doesn't have
-    /// it) is skipped — sound ONLY because `rebuild` publishes `GraphTables`
-    /// INSIDE the session lock it holds while reading the store [C1]:
-    /// either this commit's `Session::transact` above ran BEFORE that
-    /// rebuild read the document (so the fresh tables already bake this
-    /// write's value in), or it ran AFTER the rebuild published (so the
-    /// write below executes against the new table). There is no window
-    /// where a commit's own write can be silently lost. Same reasoning
-    /// covers `any_solo`.
+    /// Thin wrapper over `Committer::commit_with_rebuild` (Plan E Task 13
+    /// pulled `commit`/`commit_with`'s full body out into the `Committer`
+    /// so the engine control thread can share it — see `Committer`'s doc
+    /// for the moved implementation and the full per-step rationale).
+    /// `project://changed`'s frozen event contract, the `[C1]` lock-order
+    /// guarantee, and every other behavior below are unchanged — only
+    /// WHERE the code lives moved.
     pub fn commit<F>(&self, meta: op::TxMeta, f: F) -> Result<session::Committed, String>
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
@@ -746,13 +1091,11 @@ impl ControlPlane {
     /// Same as [`Self::commit`], but the caller controls whether the frozen
     /// `project://changed` event fires (Plan E Task 12). `commit` delegates
     /// here with `emit_project_changed: true`; `ControlPlane::transport`
-    /// passes `false` — `project://changed`'s payload contract is the full
-    /// `Project` shape (project.schema.json), and firing it once per
-    /// play/stop/loop-drag transport commit would be a behavior change
-    /// from today's `transport://state`-only contract. Transport commits
-    /// still bump `rev` and still run through the full effect pipeline
-    /// below (param writes / rebuild / persist) exactly like any other
-    /// commit — `emit_project_changed` only gates the LAST step.
+    /// passes `false`. `do_rebuild` here is `ControlPlane`'s half of Task
+    /// 13's split: a `ControlPlane`-driven commit reaches its engine by
+    /// sending `ControlMsg::Rebuild` over the channel (the engine control
+    /// thread's OWN commits instead call `Control::rebuild` directly — see
+    /// `Committer`'s deadlock audit for why that distinction matters).
     pub fn commit_with<F>(
         &self,
         meta: op::TxMeta,
@@ -762,333 +1105,16 @@ impl ControlPlane {
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
     {
-        let committed = Session::transact(&self.session, meta, f)?;
-        // ---- session lock is released here; everything below executes
-        // the effect the session merely described. ----
-        {
-            let tables = self.tables.lock();
-            for (tid, path, value) in &committed.effect.param_writes {
-                let Some(&slot) = tables.slots.get(tid) else { continue };
-                match path {
-                    op::PropPath::Gain => tables.params.set_gain_linear(slot, *value),
-                    op::PropPath::Pan => tables.params.set_pan(slot, *value),
-                    op::PropPath::Muted => tables.params.set_flag(slot, FLAG_MUTE, *value != 0.0),
-                    op::PropPath::Soloed => tables.params.set_flag(slot, FLAG_SOLO, *value != 0.0),
-                    // No ParamTable counterpart for Armed (the retired
-                    // apply_track_mix, deleted in Plan B, didn't write one
-                    // either), nor for InstrumentId/TimelineStartSamples
-                    // (Plan E Task 3): `apply_raw` never pushes those two
-                    // into `param_writes` in the first place (they're
-                    // structural — rebuild, not a param-table write), so
-                    // this arm is unreachable in practice; kept as an
-                    // honest no-op rather than a `todo!()` so a future path
-                    // added here without a `param_writes` producer doesn't
-                    // panic a live commit.
-                    // Plan E Task 5: same reasoning for the three MidiClip
-                    // paths — `apply_raw` never pushes them into
-                    // `param_writes` either (structural: rebuild only).
-                    // Plan E Task 12: same reasoning again for the six
-                    // Transport paths — the Transport `apply_raw` arm
-                    // (session.rs) never pushes anything into
-                    // `param_writes` (it isn't `TrackId`-keyed at all).
-                    // Plan E Task 8: same reasoning for LengthSamples/
-                    // OffsetSamples (LoopJam's in-place clip trims) —
-                    // structural (rebuild), no ParamTable counterpart.
-                    // Plan E Task 9: same reasoning for `Param` —
-                    // `apply_raw` never pushes plugin params into
-                    // `param_writes` either (they travel through
-                    // `host_forward::ParamWrite` instead, resolved by
-                    // instance id, not by a `GraphTables` slot).
-                    op::PropPath::Armed
-                    | op::PropPath::InstrumentId
-                    | op::PropPath::TimelineStartSamples
-                    | op::PropPath::LengthSamples
-                    | op::PropPath::OffsetSamples
-                    | op::PropPath::TimelineStartTicks
-                    | op::PropPath::LengthTicks
-                    | op::PropPath::ContentLengthTicks
-                    | op::PropPath::TransportState
-                    | op::PropPath::LoopEnabled
-                    | op::PropPath::LoopStartSamples
-                    | op::PropPath::LoopEndSamples
-                    | op::PropPath::StopAtEnd
-                    | op::PropPath::SampleRate
-                    | op::PropPath::Param { .. } => {}
-                }
-            }
-            if let Some(any_solo) = committed.effect.any_solo {
-                tables.params.any_solo.store(any_solo, Relaxed);
-            }
-        }
-        // Plugin host round-trips (Task 9): after the param-table writes,
-        // before persist — same "session lock is released" guarantee as
-        // everything else in `commit` ([C1]: hosts have their own locks,
-        // never called while the session lock is held).
-        if !committed.effect.host_forward.is_empty() {
-            self.execute_host_forward(&committed.effect.host_forward);
-        }
-        if committed.effect.rebuild {
-            self.engine.send(ControlMsg::Rebuild);
-        }
-        // Persist runs after the effect writes above and BEFORE the
-        // `project://changed` emit below — the event announces durable
-        // truth, so persistence must have already happened by the time it
-        // fires (round-2 §4: persistence is an effect, executed here, never
-        // I/O under the session lock).
-        if committed.effect.persist != session::PersistEffect::default() {
-            self.execute_persist(&committed.effect.persist, committed.epoch);
-        }
-        // Full-Project payload (the frozen contract) + rev/label/actor as
-        // additive fields (D-06). `project_changed_payload` serializes to a
-        // JSON object (all of `Project`'s fields are named), so inserting
-        // extra keys is safe; the `unwrap_or_default` fallback (an empty
-        // object) only matters if serialization itself somehow failed.
-        //
-        // Plan E Task 12: gated by `emit_project_changed` — transport
-        // commits pass `false` and rely on `ControlPlane::transport`'s own
-        // `transport://state` emit instead (see `commit_with`'s doc).
-        if emit_project_changed {
-            let mut payload = serde_json::to_value(self.project_changed_payload())
-                .unwrap_or_else(|_| serde_json::json!({}));
-            if let serde_json::Value::Object(map) = &mut payload {
-                map.insert("rev".into(), serde_json::json!(committed.rev));
-                map.insert("label".into(), serde_json::json!(committed.meta.label));
-                map.insert(
-                    "actor".into(),
-                    serde_json::to_value(&committed.meta.actor).unwrap_or_default(),
-                );
-            }
-            (self.emit)("project://changed", payload);
-        }
-        Ok(committed)
+        self.committer.commit_with_rebuild(meta, f, emit_project_changed, || {
+            self.engine.send(ControlMsg::Rebuild)
+        })
     }
 
-    /// Executes a `PersistEffect` `commit` merely described. Snapshots are
-    /// taken under a fresh, SHORT session lock; ALL disk I/O happens after
-    /// the guard drops — round-2 §4's whole point (persistence is an
-    /// effect, not I/O under the lock). No public trigger sets
-    /// `effect.persist` yet (that arrives with later tasks' apply_raw arms);
-    /// `pub(crate)` so tests can construct a `PersistEffect` and call this
-    /// directly in the meantime.
-    ///
-    /// `committed_epoch`: the `Committed.epoch` the triggering commit
-    /// captured under `Session::transact`'s lock (fix round 1, Task 7
-    /// review finding 2). Re-checked against the CURRENT `session.epoch`
-    /// under the fresh lock this fn takes below — a mismatch means an epoch
-    /// function (project open/create/save-as) swapped the document AFTER
-    /// this commit's `transact` returned but BEFORE this re-lock, so the
-    /// snapshot this fn would take belongs to a DIFFERENT document than the
-    /// one `p` describes; persisting it would be silent data loss either way
-    /// (corrupting the new document, or dropping this commit's edit — see
-    /// `Session::epoch`'s doc). Direct test callers of this fn (that don't
-    /// go through `commit`) should pass the session's current epoch.
+    /// Thin wrapper over `Committer::execute_persist` (Task 13), kept so
+    /// existing direct test callers (`cp.execute_persist(...)`) still work
+    /// unchanged.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
-        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot, plugin_snapshot) = {
-            let s = self.session.lock();
-            (
-                s.store.project_dir.clone(),
-                s.epoch,
-                p.midi.then(|| s.midi_snapshot()),
-                p.project.then(|| {
-                    project::from_store(
-                        &s.store,
-                        self.shared.position.load(Relaxed),
-                        self.shared.sample_rate.load(Relaxed),
-                    )
-                }),
-                // Plan E Task 10: snapshot taken under this SAME short lock
-                // as the midi/project snapshots above; the actual write
-                // (chunk files + `automation[]` RMW + chunk GC) happens
-                // below, after the guard drops — round-2 §4: no disk I/O
-                // under the session lock.
-                p.automation.then(|| s.automation.lanes.clone()),
-                // Plan E Task 9: plugin doc snapshot, taken under this SAME
-                // short lock — the actual write (state blobs + `plugins[]`
-                // dirty-ladder + clearing `dirty_state` for whichever ids
-                // were written) happens below, after the guard drops.
-                p.plugins.then(|| s.plugin_snapshot()),
-            )
-        };
-        if epoch_now != committed_epoch {
-            log::warn!(
-                "persist skipped: epoch changed between commit and persist ({committed_epoch} -> \
-                 {epoch_now}) — the epoch's own save owns durability now"
-            );
-            return;
-        }
-        let Some(dir) = dir else { return }; // unsaved in-memory project
-        if let Some(m) = midi_snapshot {
-            if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
-                log::warn!("midi persist failed: {e}");
-                self.session.lock().midi.dirty = true; // M-5 semantics preserved
-            } else {
-                self.session.lock().midi.dirty = false;
-            }
-        }
-        if let Some(pr) = project_snapshot {
-            match pr {
-                Ok(pr) => {
-                    if let Err(e) = project::save(&dir, &pr) {
-                        log::warn!("project save failed: {e}");
-                    }
-                }
-                Err(e) => log::warn!("project snapshot build failed: {e}"),
-            }
-        }
-        if let Some(lanes) = automation_snapshot {
-            if let Err(e) = crate::plugins::automation::save_into_project(&dir, &lanes) {
-                log::warn!("automation persist failed: {e}");
-            }
-        }
-        // `with_host_state: false` — a fresh host round-trip (state save)
-        // is never needed here: `PluginAdd`/`PluginRemove`/`PluginSetState`
-        // already keep `session.plugins.pending_state` current through
-        // `host_forward`'s `LoadState`/`Destroy` handling (executed before
-        // `execute_persist` runs, in `commit`), and a bare param write
-        // (`plugin_set_param`) must NOT round-trip the plugin main thread
-        // per rAF batch — same reasoning the retired `persist_after_
-        // mutation(..., with_host_state: false)` call site used.
-        if let Some(doc) = plugin_snapshot {
-            match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
-                Ok(cleared) if !cleared.is_empty() => {
-                    // Clear `dirty_state` for whichever ids' pending bytes
-                    // just landed on disk (Task 9 review round 1,
-                    // Critical-2) — a short, separate re-lock, no disk I/O
-                    // under it.
-                    let mut s = self.session.lock();
-                    for id in cleared {
-                        s.plugins.dirty_state.remove(&id);
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("plugins persist failed: {e}"),
-            }
-        }
-    }
-
-    /// Executes a `HostForward` list `commit` merely described — calling
-    /// the SAME host entry points commands call today
-    /// (`plugins::clap_host`/`lv2_host`/`state`'s `HostStateBridge`), now
-    /// sequenced after the session lock is released ([C1]: hosts have their
-    /// own locks, never called while the session lock is held — this
-    /// method takes ONLY brief re-locks of `self.session` to read a row's
-    /// format/uid or to write back a post-host result, never spanning a
-    /// host call).
-    fn execute_host_forward(&self, forwards: &[session::HostForward]) {
-        use crate::plugins::{clap_host, lv2_host, state as pstate};
-        use session::HostForward;
-        for hf in forwards {
-            match hf {
-                HostForward::ParamWrite { instance, index, value } => {
-                    let format = {
-                        let s = self.session.lock();
-                        s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
-                    };
-                    match format.as_deref() {
-                        Some("lv2") => {
-                            if let Some(host) = lv2_host::try_global() {
-                                host.set_params(instance, vec![(*index, *value)]);
-                            }
-                        }
-                        Some("clap") => {
-                            let change = crate::plugins::ParamChange { id: *index, value: *value as f64 };
-                            if let Err(e) = clap_host::set_params(instance, vec![change]) {
-                                log::warn!("plugins: clap param write for {instance}: {e}");
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                HostForward::Instantiate { instance } => {
-                    let row = {
-                        let s = self.session.lock();
-                        s.plugins.instances.iter().find(|r| &r.id == instance).cloned()
-                    };
-                    let Some(row) = row else { continue }; // row vanished meanwhile
-                    // Idempotent by construction (doc on `HostForward::
-                    // Instantiate`): if the host already has this id live
-                    // (the prepare-outside fresh-instantiate path), re-sync
-                    // params via a plain read instead of re-instantiating —
-                    // re-registering a live id would reset its voice state.
-                    let hosted = match row.format.as_str() {
-                        "clap" => match clap_host::has_instance(instance) {
-                            Ok(true) => clap_host::get_params(instance),
-                            Ok(false) => clap_host::instantiate(instance, &row.uid),
-                            Err(e) => Err(e),
-                        },
-                        "lv2" => {
-                            let host = lv2_host::global();
-                            match host.has_instance(instance) {
-                                Ok(true) => host.get_params(instance),
-                                Ok(false) => host.register_instance(instance, &row.uid),
-                                Err(e) => Err(e),
-                            }
-                        }
-                        _ => continue, // non-hosted format: stays "stub", nothing to sync
-                    };
-                    match hosted {
-                        Ok(params) => {
-                            let mut s = self.session.lock();
-                            if let Some(r) = s.plugins.instances.iter_mut().find(|r| &r.id == instance) {
-                                r.status = "active".into();
-                            }
-                            // Fill only when absent (Task 9 review round 1,
-                            // Important-1): an undo-of-remove already
-                            // restored the REAL param mirror into
-                            // `session.plugins.params` (parked there by
-                            // `apply_raw`'s `PluginRemove` arm) — this must
-                            // not clobber it with the host's fresh-
-                            // reinstantiate DEFAULTS. A genuinely fresh
-                            // instantiate's mirror is still the empty seed
-                            // `Op::PluginAdd` left, so it gets filled here
-                            // exactly as before.
-                            let entry = s.plugins.params.entry(instance.clone()).or_default();
-                            if entry.is_empty() {
-                                *entry = params;
-                            }
-                        }
-                        Err(e) => log::warn!("plugins: instantiate forward for {instance} failed: {e}"),
-                    }
-                }
-                HostForward::Destroy { instance } => {
-                    let format = {
-                        let s = self.session.lock();
-                        s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
-                    };
-                    match format.as_deref() {
-                        Some("lv2") => {
-                            if let Some(host) = lv2_host::try_global() {
-                                host.unregister_instance(instance);
-                            }
-                        }
-                        Some("clap") => {
-                            if let Err(e) = clap_host::remove(instance) {
-                                log::warn!("plugins: clap destroy for {instance}: {e}");
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                HostForward::LoadState { instance } => {
-                    let blob = {
-                        let s = self.session.lock();
-                        s.plugins.pending_state.get(instance).cloned()
-                    };
-                    let Some(bytes) = blob else { continue };
-                    let decoded = pstate::decode_state(&bytes);
-                    match decoded {
-                        Ok((_uid, blob)) => {
-                            if let Some(bridge) = pstate::registered_state_bridge() {
-                                if let Err(e) = bridge.load_state(instance, &blob) {
-                                    log::warn!("plugins: state load for {instance} failed: {e}");
-                                }
-                            }
-                        }
-                        Err(e) => log::warn!("plugins: pending state blob for {instance} unreadable: {e}"),
-                    }
-                }
-            }
-        }
+        self.committer.execute_persist(p, committed_epoch)
     }
 
     /// Test-only accessor to the shared session lock, for tests that need
