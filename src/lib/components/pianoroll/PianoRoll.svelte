@@ -11,6 +11,7 @@
    * Same discipline as the timeline: canvases repaint on state changes only,
    * the playhead is a rAF-transformed overlay outside Svelte reactivity.
    */
+  import { untrack } from "svelte";
   import { clipEditLoop } from "../../state/clip-edit-loop.svelte";
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
@@ -93,14 +94,19 @@
         // A commit echo has the same note count (and, via commit()'s
         // pre-sort, the same order), so the index selection stays valid; an
         // outside edit that grew/shrank the array would leave it pointing
-        // at the wrong notes — drop it instead of lying.
-        if (c.notes.length !== working.length) selection = new Set();
+        // at the wrong notes — drop it instead of lying. untrack: this
+        // effect WRITES working, so reading it tracked would loop it.
+        if (c.notes.length !== untrack(() => working.length)) selection = new Set();
         working = c.notes.map((n) => ({ ...n }));
       }
     }
   });
 
   function commit() {
+    if (commitTimer) {
+      clearTimeout(commitTimer);
+      commitTimer = null;
+    }
     if (!clip) return;
     // Pre-sort the way the store will (tick, key) and remap the selection
     // along — otherwise the sorted echo re-adopted by the $effect above
@@ -110,6 +116,32 @@
     selection = sorted.selection;
     void midi.setNotes(clip.id, working.map((n) => ({ ...n })));
   }
+
+  // Arrow-key nudges/transposes update `working` instantly but coalesce
+  // into ONE midi_set_notes trailing the last key repeat — a held key is
+  // one gesture, not thirty invokes a second (D-03).
+  let commitTimer: ReturnType<typeof setTimeout> | null = null;
+  function commitSoon() {
+    if (commitTimer) clearTimeout(commitTimer);
+    commitTimer = setTimeout(() => {
+      commitTimer = null;
+      // never re-sort/remap under a live pointer gesture (its indices are
+      // captured); the gesture's own pointerup commit picks the edit up
+      if (!gesture) commit();
+    }, 250);
+  }
+  function flushCommit() {
+    if (commitTimer) commit();
+  }
+
+  // Keyboard focus follows the editor: without this, the double-clicked
+  // timeline clip keeps DOM focus, and the first Ctrl+C/V or arrow key hits
+  // the TIMELINE handlers — stamping a clip or moving it by a beat while
+  // the user thinks they are operating on notes.
+  $effect(() => {
+    void midi.openClipId;
+    rollEl?.focus();
+  });
 
   // ── coordinate helpers ──
   const tickAtX = (x: number) => scrollTick + x * tpp;
@@ -156,6 +188,7 @@
     if (!clip || e.button === 2) return;
     const p = localPos(e);
     gestureMoved = false;
+    flushCommit(); // pending arrow edit lands (and remaps selection) BEFORE gesture indices are captured
     rollEl?.focus();
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
 
@@ -298,7 +331,10 @@
       // peel back one layer at a time: selection → region band → editor
       if (selection.size) selection = new Set();
       else if (midi.region && clip && midi.region.clipId === clip.id) midi.region = null;
-      else midi.closeEditor();
+      else {
+        flushCommit();
+        midi.closeEditor();
+      }
     } else if (mod && e.key.toLowerCase() === "a") {
       e.preventDefault();
       selection = new Set(working.map((_, i) => i));
@@ -328,7 +364,7 @@
       const next = nudgeSelection(working, selection, dTick);
       if (next) {
         working = next;
-        commit();
+        commitSoon();
       }
     } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
       if (selection.size === 0) return;
@@ -338,7 +374,7 @@
       const next = transposeSelection(working, selection, dKey);
       if (next) {
         working = next;
-        commit();
+        commitSoon();
       }
     }
   }
@@ -895,7 +931,14 @@
         </button>
       {/if}
 
-      <button class="close mono" title="Close (esc)" onclick={() => midi.closeEditor()}>×</button>
+      <button
+        class="close mono"
+        title="Close (esc)"
+        onclick={() => {
+          flushCommit();
+          midi.closeEditor();
+        }}>×</button
+      >
     </header>
 
     <div class="body">
