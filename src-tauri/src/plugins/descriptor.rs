@@ -49,7 +49,7 @@ pub struct PluginDescriptor {
 
 /// One plugin parameter (generic-UI + automation contract).
 /// Mirrors plugin-state.schema.json#/$defs/param.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ParamInfo {
     /// Stable per-plugin parameter id (CLAP param id / LV2 control-port index).
@@ -66,7 +66,7 @@ pub struct ParamInfo {
 
 /// A live plugin instance registered in the host.
 /// Mirrors plugin-state.schema.json#/$defs/instance.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginInstanceInfo {
     /// Instance uuid; a track binds it via `instrumentId = "plugin:<id>"`.

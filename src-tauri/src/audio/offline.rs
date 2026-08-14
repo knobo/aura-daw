@@ -53,6 +53,7 @@ pub struct OfflineGraph {
 pub fn build_graph(
     store: &Store,
     midi: &MidiStore,
+    plugins: &crate::control::session::PluginDoc,
     bank: Option<&SamplerBank>,
     rate: u32,
 ) -> OfflineGraph {
@@ -104,7 +105,7 @@ pub fn build_graph(
     // Midi tracks as LIVE instrument nodes — a private registry, so the
     // cells are fresh (deterministic voice state) and exclusively ours.
     let mut nodes = LiveNodeRegistry::default();
-    append_from(midi, store, &slots, rate, bank, &mut nodes, &mut tracks);
+    append_from(midi, store, plugins, &slots, rate, bank, &mut nodes, &mut tracks);
 
     let end_samples = song_end(&tracks);
     OfflineGraph { graph: RtGraph::new(tracks, 0, params), end_samples }
@@ -219,7 +220,7 @@ mod tests {
         const RATE: u32 = 48_000;
         let (store, midi) = demo_project();
         let render_once = || {
-            let mut og = build_graph(&store, &midi, None, RATE);
+            let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
             // Engine-rebuild parity: one (empty) clip track per store track
             // plus one LIVE track per audible midi track.
             let live = og.graph.tracks.iter().filter(|t| t.live.is_some()).count();
@@ -285,7 +286,7 @@ mod tests {
             loaded_dir: None,
             dirty: false,
         };
-        let mut og = build_graph(&store, &midi, None, RATE);
+        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
         // Region [24000, 44000): starts after note A's on (skipped) and
         // before note B's on at 30000 (audible).
         let (start, end) = (24_000u64, 44_000u64);
@@ -349,7 +350,7 @@ mod tests {
             lane_id: crate::ids::LaneId::default_for_track("a1"),
         });
         let midi = MidiStore { clips: vec![], ..MidiStore::default() };
-        let mut og = build_graph(&store, &midi, None, RATE);
+        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
         assert_eq!(og.end_samples, 600, "clip end = start + len");
         let out = render(&mut og.graph, 0, 700, RATE, 0.5, &mut |_, _| {});
         let center = 0.5 * std::f32::consts::FRAC_1_SQRT_2 * 0.5; // sample * pan * master
@@ -376,7 +377,7 @@ mod tests {
             store.tracks.push(track(&format!("t{i}"), "audio"));
         }
         let midi = MidiStore::default();
-        let og = build_graph(&store, &midi, None, RATE);
+        let og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
         assert_eq!(og.graph.tracks.len(), N, "one RtTrack per store track");
         assert_eq!(
             og.graph.params.len(),

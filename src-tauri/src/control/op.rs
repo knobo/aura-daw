@@ -72,11 +72,44 @@ pub enum Op {
     /// watermark advances monotonically and is NOT rewound by the inverse
     /// (scope ruling 3, ADR 0001).
     MidiSetNotes { clip: crate::ids::ClipId, notes: Vec<crate::midi::types::MidiNote> },
+    /// Plan E Task 9 (round-2 inventory rows 12-15): register a plugin
+    /// instance row in the document. Prepare-outside: the host instance
+    /// already exists (instantiation round-trip BEFORE the tx, so a plugin
+    /// the host rejects never reaches the document) — this op only
+    /// registers the row. Also used as `PluginRemove`'s computed inverse
+    /// (undo of a remove): in that case the host instance is gone (the
+    /// forward remove destroyed it), so `apply_raw` always folds in the
+    /// `host_forward` effect this case needs (`Instantiate` + `LoadState`
+    /// when a state blob is on file) — a redundant-but-safe re-derive for
+    /// the prepare-outside path too (`commit`'s executor skips the actual
+    /// host call when the id is already live, see its doc).
+    PluginAdd { row: crate::plugins::PluginInstanceInfo, index: usize },
+    /// Restore-from-blob (§4.4): `state` is the APST-encoded blob captured
+    /// via the host's `save_state` BEFORE teardown (the same self-describing
+    /// bytes `plugins::state` writes to `<project>/plugins/<id>.state` —
+    /// `None` when the instance had no host state to save, e.g. a stub or a
+    /// plugin without a state interface). The inverse is `PluginAdd` with
+    /// the row + this blob parked in `pending_state`; undo re-instantiates
+    /// through the host state machine (`host_forward`, executed after the
+    /// lock).
+    PluginRemove { row: crate::plugins::PluginInstanceInfo, index: usize, state: Option<Vec<u8>> },
+    /// Full-state write (zyn patch loads): `state` is the APST-encoded blob
+    /// AFTER the host load (the row's new pending_state truth); the inverse
+    /// carries the PREVIOUS blob (captured via host `save_state` before the
+    /// load) so the patch load is durable AND undoable (closes round-2
+    /// inventory row 14).
+    PluginSetState { instance: String, state: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "family", content = "id", rename_all = "camelCase")]
-pub enum ObjectRef { Track(crate::ids::TrackId), Clip(crate::ids::ClipId), MidiClip(crate::ids::ClipId) }
+pub enum ObjectRef {
+    Track(crate::ids::TrackId),
+    Clip(crate::ids::ClipId),
+    MidiClip(crate::ids::ClipId),
+    /// Plugin instance id (`plugins::PluginInstanceInfo::id`).
+    Plugin(String),
+}
 
 /// Property paths are a closed enum, not strings — renaming a variant is a
 /// compile error at every use site, which is the §4.6 anti-drift rule.
@@ -101,6 +134,12 @@ pub enum PropPath {
     /// `null` (mirrors `MidiClip::content_length_ticks: Option<u64>`);
     /// `null` clears back to "same as `LengthTicks`".
     ContentLengthTicks,
+    /// Plugin: one parameter, addressed by its stable per-plugin id (CLAP
+    /// param id / LV2 control-port index — the same id
+    /// `plugins::ParamChange::id` carries). Wire form: `to`/`from` are JSON
+    /// numbers (the param's value). Coalescable (§4.4): a knob drag folds
+    /// to net `Set`s per (instance, index), same as `Gain`.
+    Param { index: u32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

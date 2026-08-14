@@ -45,7 +45,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::descriptor::{ParamInfo, PluginInstanceInfo};
-use super::{ParamChange, PluginRegistry};
+use super::ParamChange;
+use crate::control::session::PluginDoc;
 use crate::control::Session;
 
 /// Project subdirectory holding the state blobs.
@@ -120,17 +121,23 @@ pub fn decode_state(bytes: &[u8]) -> Result<(String, StateBlob), String> {
     Ok((uid, StateBlob { kind, data }))
 }
 
-/// Atomic blob write (tmp + fsync + rename — the project.json discipline).
-fn write_state_file(path: &Path, uid: &str, blob: &StateBlob) -> Result<(), String> {
-    let bytes = encode_state(uid, blob);
+/// Atomic write of already-APST-ENCODED bytes (tmp + fsync + rename — the
+/// project.json discipline). Used both for a freshly encoded blob and for
+/// bytes that were ALREADY encoded elsewhere (`PluginDoc::pending_state` —
+/// Task 9 keeps that map self-describing so it never needs re-encoding).
+fn write_state_bytes(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("state.tmp");
     {
         let mut f = fs::File::create(&tmp).map_err(|e| e.to_string())?;
-        f.write_all(&bytes).map_err(|e| e.to_string())?;
+        f.write_all(bytes).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
     }
     fs::rename(&tmp, path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn write_state_file(path: &Path, uid: &str, blob: &StateBlob) -> Result<(), String> {
+    write_state_bytes(path, &encode_state(uid, blob))
 }
 
 fn read_state_file(path: &Path) -> Result<(String, StateBlob), String> {
@@ -265,40 +272,51 @@ pub struct PersistedPluginInstance {
     pub params: Vec<ParamChange>,
 }
 
-/// Persist every registered instance into `<dir>/project.json` `plugins[]`
-/// plus `<dir>/plugins/<id>.state` blobs, then GC orphaned blobs.
+/// Persist a `PluginDoc` snapshot into `<dir>/project.json` `plugins[]` plus
+/// `<dir>/plugins/<id>.state` blobs, then GC orphaned blobs. Task 9: takes a
+/// PLAIN SNAPSHOT (no lock, no `Session`/`PluginRegistry` reference) — the
+/// caller (`ControlPlane::execute_persist`) takes `Session::plugin_snapshot`
+/// under a short lock and calls this AFTER releasing it (round-2 §4: no
+/// disk I/O under the session lock).
 ///
 /// State source priority per instance (never lose data):
 /// 1. live host state via the registered [`HostStateBridge`] (only when
 ///    `with_host_state` — param-mirror updates skip the host round-trip),
 /// 2. the existing on-disk blob (kept verbatim),
-/// 3. the pending blob restored from disk earlier (host not yet available;
-///    written back only when the file vanished).
+/// 3. the pending blob captured earlier (`doc.pending_state` — host not yet
+///    available, or a restore-from-blob undo; written back only when the
+///    file vanished). These bytes are ALREADY APST-encoded (self-describing
+///    — see `PluginDoc`'s doc), so they're written verbatim, never
+///    re-encoded.
 ///
-/// The param snapshot from the registry mirror always persists in the row.
-pub fn save_into_project(
+/// The param snapshot from the document mirror always persists in the row.
+pub fn save_snapshot_into_project(
     dir: &Path,
-    reg: &PluginRegistry,
+    doc: &PluginDoc,
     with_host_state: bool,
 ) -> Result<(), String> {
-    save_into_project_with(
+    save_snapshot_into_project_with(
         dir,
-        reg,
+        doc,
         with_host_state,
         registered_state_bridge().map(|b| b.as_ref()),
     )
 }
 
-/// [`save_into_project`] with an explicit bridge (tests inject
+/// [`save_snapshot_into_project`] with an explicit bridge (tests inject
 /// [`FormatStateBridge`] or a fake without touching the process global).
-pub fn save_into_project_with(
+pub fn save_snapshot_into_project_with(
     dir: &Path,
-    reg: &PluginRegistry,
+    doc: &PluginDoc,
     with_host_state: bool,
     bridge: Option<&dyn HostStateBridge>,
 ) -> Result<(), String> {
     let sdir = state_dir(dir);
-    let mut instances: Vec<&PluginInstanceInfo> = reg.instances.values().collect();
+    // Deterministic on-disk ordering (matches the retired
+    // `save_into_project`'s `HashMap`-derived sort) — `doc.instances` itself
+    // stays insertion-ordered (Task 9: `Vec`, addressed by index like
+    // `TrackAdd`/`ClipAdd`), this sort is output-only.
+    let mut instances: Vec<&PluginInstanceInfo> = doc.instances.iter().collect();
     instances.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut rows = Vec::with_capacity(instances.len());
@@ -330,16 +348,16 @@ pub fn save_into_project_with(
             // Keep whatever is on disk (possibly written by an older or
             // newer session) — referenced files survive GC.
             state_ref = Some(blob_rel(&info.id));
-        } else if let Some(pending) = reg.pending_state.get(&info.id) {
+        } else if let Some(pending_bytes) = doc.pending_state.get(&info.id) {
             fs::create_dir_all(&sdir).map_err(|e| e.to_string())?;
-            write_state_file(&file, &info.uid, pending)?;
+            write_state_bytes(&file, pending_bytes)?;
             state_ref = Some(blob_rel(&info.id));
         }
         if let Some(r) = &state_ref {
             live_files.push(r.trim_start_matches("plugins/").to_string());
         }
 
-        let params = reg
+        let params = doc
             .params
             .get(&info.id)
             .map(|ps| {
@@ -378,7 +396,7 @@ pub fn save_into_project_with(
 
 /// Read the `plugins[]` rows of `<dir>/project.json`. `Ok(None)` when the
 /// project carries no plugins field at all (pre-persistence project — the
-/// caller must NOT clear the registry then).
+/// caller must NOT clear the document then).
 pub fn load_rows(dir: &Path) -> Result<Option<Vec<PersistedPluginInstance>>, String> {
     let file = dir.join("project.json");
     let bytes = fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
@@ -399,34 +417,38 @@ pub fn load_rows(dir: &Path) -> Result<Option<Vec<PersistedPluginInstance>>, Str
     Ok(Some(rows))
 }
 
-/// Adopt a project's persisted plugins into `reg`, REPLACING the current
-/// instance set (mirrors how `open_project` replaces tracks). Restored
-/// instances come back as `"stub"` (silent) with their param snapshot
-/// mirrored and their state blob parked in `reg.pending_state` until a host
-/// accepts it — [`reactivate_restored`] then flips available plugins to
-/// `"active"`; unavailable ones stay stub with everything preserved.
+/// Adopt a project's persisted plugins into `session.plugins`, REPLACING
+/// the current instance set (mirrors how `open_project` replaces tracks).
+/// Restored instances come back as `"stub"` (silent) with their param
+/// snapshot mirrored and their state blob parked in
+/// `session.plugins.pending_state` until a host accepts it —
+/// [`reactivate_restored`] then flips available plugins to `"active"`;
+/// unavailable ones stay stub with everything preserved.
 ///
 /// Returns `(restored_count, prior_hosted)` — `(format, id)` pairs of the
 /// PREVIOUS session's active instances; the caller unregisters them from
-/// their format hosts (without holding the registry lock). Projects WITHOUT
-/// a `plugins` field leave the registry untouched (`(0, vec![])`): the
-/// registry is app-level state until a project has actually persisted
+/// their format hosts (without holding the session lock — this function is
+/// called WITH the lock held, so all host bookkeeping is the CALLER's job,
+/// same contract the retired `restore_into_registry` had). Projects WITHOUT
+/// a `plugins` field leave the document untouched (`(0, vec![])`): the
+/// document is app-level state until a project has actually persisted
 /// plugin data.
-pub fn restore_into_registry(
+pub fn restore_into_session(
     dir: &Path,
-    reg: &mut PluginRegistry,
+    session: &mut Session,
 ) -> Result<(usize, Vec<(String, String)>), String> {
     let Some(rows) = load_rows(dir)? else { return Ok((0, Vec::new())) };
 
-    let prior_hosted: Vec<(String, String)> = reg
+    let prior_hosted: Vec<(String, String)> = session
+        .plugins
         .instances
-        .values()
+        .iter()
         .filter(|i| i.status == "active" && (i.format == "lv2" || i.format == "clap"))
         .map(|i| (i.format.clone(), i.id.clone()))
         .collect();
-    reg.instances.clear();
-    reg.params.clear();
-    reg.pending_state.clear();
+    session.plugins.instances.clear();
+    session.plugins.params.clear();
+    session.plugins.pending_state.clear();
 
     let mut restored = 0usize;
     for row in rows {
@@ -474,7 +496,13 @@ pub fn restore_into_registry(
                             row.uid
                         );
                     }
-                    reg.pending_state.insert(row.id.clone(), blob);
+                    // Re-encoded (self-describing) so `pending_state` stays
+                    // byte-identical to what a save would write — Task 9's
+                    // "same bytes on disk and in the document" invariant.
+                    session
+                        .plugins
+                        .pending_state
+                        .insert(row.id.clone(), encode_state(&row.uid, &blob));
                 }
                 Err(e) => log::warn!(
                     "plugin instance {}: state blob unavailable ({e}); restoring without state",
@@ -482,8 +510,8 @@ pub fn restore_into_registry(
                 ),
             }
         }
-        reg.params.insert(row.id.clone(), params);
-        reg.instances.insert(row.id.clone(), info);
+        session.plugins.params.insert(row.id.clone(), params);
+        session.plugins.instances.push(info);
         restored += 1;
     }
     Ok((restored, prior_hosted))
@@ -491,29 +519,31 @@ pub fn restore_into_registry(
 
 /// Re-activate restored `"stub"` instances through the format hosts (LV2 on
 /// the shared plugin main thread; CLAP likewise). Call WITHOUT holding the
-/// registry lock. Failures are graceful: the instance stays `"stub"`
+/// session lock. Failures are graceful: the instance stays `"stub"`
 /// (silent), its snapshot and pending blob remain — nothing lost.
 ///
 /// After activation the persisted param snapshot is re-applied (clamped
 /// against the REAL ranges) and forwarded to the host; a pending state blob
 /// is offered to the registered [`HostStateBridge`], which restores it on
 /// the plugin main thread.
-pub fn reactivate_restored(registry: &Arc<Mutex<PluginRegistry>>) {
-    reactivate_restored_with(registry, registered_state_bridge().map(|b| b.as_ref()))
+pub fn reactivate_restored(session: &Arc<Mutex<Session>>) {
+    reactivate_restored_with(session, registered_state_bridge().map(|b| b.as_ref()))
 }
 
 /// [`reactivate_restored`] with an explicit bridge (test injection point).
 pub fn reactivate_restored_with(
-    registry: &Arc<Mutex<PluginRegistry>>,
+    session: &Arc<Mutex<Session>>,
     bridge: Option<&dyn HostStateBridge>,
 ) {
     let stubs: Vec<(String, String, String, Vec<ParamChange>)> = {
-        let reg = registry.lock();
-        reg.instances
-            .values()
+        let s = session.lock();
+        s.plugins
+            .instances
+            .iter()
             .filter(|i| i.status == "stub" && (i.format == "lv2" || i.format == "clap"))
             .map(|i| {
-                let snapshot = reg
+                let snapshot = s
+                    .plugins
                     .params
                     .get(&i.id)
                     .map(|ps| {
@@ -534,25 +564,24 @@ pub fn reactivate_restored_with(
         match hosted {
             Ok(real_params) => {
                 let clamped: Vec<ParamChange> = {
-                    let mut reg = registry.lock();
-                    if reg.activate(&id, real_params).is_err() {
+                    let mut s = session.lock();
+                    let Some(r) = s.plugins.instances.iter_mut().find(|r| r.id == id) else {
                         continue; // instance vanished meanwhile
-                    }
+                    };
+                    r.status = "active".into();
+                    s.plugins.params.insert(id.clone(), real_params);
                     if snapshot.is_empty() {
                         Vec::new()
                     } else {
-                        match reg.set_params(&id, &snapshot) {
-                            Ok(updated) => snapshot
-                                .iter()
-                                .filter_map(|c| {
-                                    updated
-                                        .iter()
-                                        .find(|p| p.id == c.id)
-                                        .map(|p| ParamChange { id: p.id, value: p.value })
-                                })
-                                .collect(),
-                            Err(_) => Vec::new(),
+                        let params = s.plugins.params.get_mut(&id).expect("just inserted");
+                        let mut applied = Vec::with_capacity(snapshot.len());
+                        for c in &snapshot {
+                            if let Some(p) = params.iter_mut().find(|p| p.id == c.id) {
+                                p.value = c.value.clamp(p.min, p.max);
+                                applied.push(ParamChange { id: p.id, value: p.value });
+                            }
                         }
+                        applied
                     }
                 };
                 match format.as_str() {
@@ -570,14 +599,19 @@ pub fn reactivate_restored_with(
                         super::lv2_host::global().set_params(&id, vals);
                     }
                 }
-                let pending = registry.lock().pending_state.get(&id).cloned();
-                if let (Some(bridge), Some(blob)) = (bridge, pending) {
-                    match bridge.load_state(&id, &blob) {
-                        // Blob delivered; keep it pending too (save prefers
-                        // fresh host state once a bridge exists).
-                        Ok(()) => log::info!("plugins: state restored into instance {id}"),
+                let pending = session.lock().plugins.pending_state.get(&id).cloned();
+                if let (Some(bridge), Some(bytes)) = (bridge, pending) {
+                    match decode_state(&bytes) {
+                        Ok((_uid, blob)) => match bridge.load_state(&id, &blob) {
+                            // Blob delivered; keep it pending too (save prefers
+                            // fresh host state once a bridge exists).
+                            Ok(()) => log::info!("plugins: state restored into instance {id}"),
+                            Err(e) => log::warn!(
+                                "plugins: state restore for {id} failed ({e}); blob preserved"
+                            ),
+                        },
                         Err(e) => log::warn!(
-                            "plugins: state restore for {id} failed ({e}); blob preserved"
+                            "plugins: pending state blob for {id} unreadable ({e}); blob preserved"
                         ),
                     }
                 }
@@ -592,13 +626,14 @@ pub fn reactivate_restored_with(
 }
 
 /// PROJECT-OPEN SEAM (called by `midi::persist::load_from_project`): adopt
-/// the opened project's plugins into the app-global registry. Inert until
-/// the app registers the registry (unit tests use local registries).
+/// the opened project's plugins into the app-global session. Inert until
+/// the app registers the session (`midi::playback::register_store`; unit
+/// tests use local sessions directly via `restore_into_session`).
 pub fn adopt_open_project(dir: &Path) {
-    let Some(registry) = super::registered_registry() else { return };
+    let Some(session) = crate::midi::playback::registered_store() else { return };
     let (restored, prior_hosted) = {
-        let mut reg = registry.lock();
-        match restore_into_registry(dir, &mut reg) {
+        let mut s = session.lock();
+        match restore_into_session(dir, &mut s) {
             Ok(r) => r,
             Err(e) => {
                 log::warn!("plugins: cannot restore from {}: {e}", dir.display());
@@ -609,7 +644,7 @@ pub fn adopt_open_project(dir: &Path) {
     if restored == 0 && prior_hosted.is_empty() {
         return;
     }
-    // Host bookkeeping outside the registry lock: forget the previous
+    // Host bookkeeping outside the session lock: forget the previous
     // project's hosted registrations, then re-activate the restored set.
     for (format, id) in &prior_hosted {
         match format.as_str() {
@@ -625,30 +660,12 @@ pub fn adopt_open_project(dir: &Path) {
             }
         }
     }
-    reactivate_restored(registry);
+    reactivate_restored(session);
     log::info!(
         "plugins: adopted {} persisted instance(s) from {}",
         restored,
         dir.display()
     );
-}
-
-/// AUTO-PERSIST HOOK for plugin mutations (instantiate / remove / param
-/// changes): saves `plugins[]` + blobs into the open project, mirroring how
-/// midi edits persist on every mutation. No-op without an open project.
-/// `with_host_state` is false on the param path (a knob drag must not
-/// round-trip the plugin main thread per rAF batch).
-pub fn persist_after_mutation(
-    session: &Arc<Mutex<Session>>,
-    registry: &Arc<Mutex<PluginRegistry>>,
-    with_host_state: bool,
-) {
-    let dir = session.lock().store.project_dir.clone();
-    let Some(dir) = dir else { return };
-    let reg = registry.lock();
-    if let Err(e) = save_into_project(&dir, &reg, with_host_state) {
-        log::warn!("plugins: persisting to {} failed: {e}", dir.display());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -942,7 +959,9 @@ pub fn apply_lv2_state_blob(
 mod tests {
     use super::*;
     use crate::audio::project;
-    use crate::plugins::descriptor::PluginDescriptor;
+    use crate::audio::types::Store;
+    use crate::midi::MidiStore;
+    use crate::plugins::PluginRegistry;
 
     fn tmp_parent(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -954,22 +973,28 @@ mod tests {
         d
     }
 
-    fn scanned_registry() -> PluginRegistry {
-        let mut reg = PluginRegistry::default();
-        reg.scanned = Some(vec![PluginDescriptor {
-            uid: "lv2:urn:test:synth".into(),
-            format: "lv2".into(),
+    fn new_session() -> Session {
+        Session::new(Store::default(), MidiStore::default())
+    }
+
+    /// Test-only doc-level "instantiate": mints a `"stub"` row + an empty
+    /// param entry directly into `session.plugins`, mirroring the retired
+    /// `PluginRegistry::instantiate`'s pure (no host call) semantics — these
+    /// tests are about PERSISTENCE, not host activation (that's
+    /// `instantiate_and_activate`'s job, exercised where a real/fake host is
+    /// available, further down this module).
+    fn stub_instantiate(session: &mut Session, uid: &str) -> PluginInstanceInfo {
+        let info = PluginInstanceInfo {
+            id: uuid::Uuid::new_v4().to_string(),
+            uid: uid.into(),
             name: "TestSynth".into(),
-            vendor: None,
-            version: None,
-            path: None,
-            is_instrument: true,
-            audio_inputs: 0,
-            audio_outputs: 2,
-            has_note_input: true,
-            categories: vec![],
-        }]);
-        reg
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        session.plugins.instances.push(info.clone());
+        session.plugins.params.insert(info.id.clone(), Vec::new());
+        info
     }
 
     // ---- APST blob format --------------------------------------------------
@@ -1009,15 +1034,23 @@ mod tests {
         let parent = tmp_parent("roundtrip");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
 
-        let mut reg = scanned_registry();
-        let a = reg.instantiate("lv2:urn:test:synth").unwrap();
-        let b = reg.instantiate("lv2:urn:test:synth").unwrap();
-        reg.set_params(&a.id, &[ParamChange { id: 3, value: 0.75 }]).unwrap();
+        let mut session = new_session();
+        let a = stub_instantiate(&mut session, "lv2:urn:test:synth");
+        let b = stub_instantiate(&mut session, "lv2:urn:test:synth");
+        session.plugins.params.get_mut(&a.id).unwrap().push(ParamInfo {
+            id: 3,
+            name: "param 3".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.0,
+            value: 0.75,
+            steps: 0,
+        });
         // Instance b has a pending blob (as if restored for a missing host).
         let blob = StateBlob { kind: KIND_OPAQUE, data: vec![9; 100] };
-        reg.pending_state.insert(b.id.clone(), blob.clone());
+        session.plugins.pending_state.insert(b.id.clone(), encode_state("lv2:urn:test:synth", &blob));
 
-        save_into_project(&dir, &reg, true).unwrap();
+        save_snapshot_into_project(&dir, &session.plugins, true).unwrap();
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
         assert_eq!(raw["schemaVersion"], 2, "plugin save upgrades to v2");
@@ -1036,34 +1069,38 @@ mod tests {
         assert!(a_row.get("stateRef").is_none());
         assert_eq!(a_row["params"][0]["id"], 3);
 
-        // Restore into a fresh registry: everything comes back, stub status.
-        let mut fresh = PluginRegistry::default();
-        let (n, prior) = restore_into_registry(&dir, &mut fresh).unwrap();
+        // Restore into a fresh session: everything comes back, stub status.
+        let mut fresh = new_session();
+        let (n, prior) = restore_into_session(&dir, &mut fresh).unwrap();
         assert_eq!(n, 2);
         assert!(prior.is_empty());
-        let ra = fresh.instances.get(&a.id).expect("a restored");
+        let ra = fresh.plugins.instances.iter().find(|r| r.id == a.id).expect("a restored");
         assert_eq!(ra.status, "stub");
         assert_eq!(ra.uid, "lv2:urn:test:synth");
         assert_eq!(ra.name, "TestSynth");
-        assert_eq!(fresh.params.get(&a.id).unwrap()[0].value, 0.75);
-        assert_eq!(fresh.pending_state.get(&b.id), Some(&blob), "blob preserved");
+        assert_eq!(fresh.plugins.params.get(&a.id).unwrap()[0].value, 0.75);
+        let stored = fresh.plugins.pending_state.get(&b.id).expect("blob preserved");
+        assert_eq!(decode_state(stored).unwrap().1, blob);
 
-        // Re-saving from the restored registry keeps the blob (no host
+        // Re-saving from the restored session keeps the blob (no host
         // bridge registered): data survives a full open/save cycle.
-        save_into_project(&dir, &fresh, true).unwrap();
+        save_snapshot_into_project(&dir, &fresh.plugins, true).unwrap();
         assert_eq!(read_state_file(&dir.join(sref)).unwrap().1, blob);
         let _ = fs::remove_dir_all(&parent);
     }
 
     #[test]
-    fn projects_without_plugins_field_leave_registry_alone() {
+    fn projects_without_plugins_field_leave_document_alone() {
         let parent = tmp_parent("no-field");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
-        let mut reg = scanned_registry();
-        let inst = reg.instantiate("lv2:urn:test:synth").unwrap();
-        let (n, prior) = restore_into_registry(&dir, &mut reg).unwrap();
+        let mut session = new_session();
+        let inst = stub_instantiate(&mut session, "lv2:urn:test:synth");
+        let (n, prior) = restore_into_session(&dir, &mut session).unwrap();
         assert_eq!((n, prior.len()), (0, 0));
-        assert!(reg.instances.contains_key(&inst.id), "registry untouched");
+        assert!(
+            session.plugins.instances.iter().any(|r| r.id == inst.id),
+            "document untouched"
+        );
         let _ = fs::remove_dir_all(&parent);
     }
 
@@ -1071,8 +1108,8 @@ mod tests {
     fn malicious_state_ref_is_rejected_and_instance_still_restores() {
         let parent = tmp_parent("evil");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
-        let reg = PluginRegistry::default();
-        save_into_project(&dir, &reg, true).unwrap();
+        let doc = PluginDoc::default();
+        save_snapshot_into_project(&dir, &doc, true).unwrap();
         let mut raw: Value =
             serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
         raw["plugins"] = serde_json::json!([
@@ -1082,11 +1119,11 @@ mod tests {
         ]);
         fs::write(dir.join("project.json"), serde_json::to_vec(&raw).unwrap()).unwrap();
 
-        let mut fresh = PluginRegistry::default();
-        let (n, _) = restore_into_registry(&dir, &mut fresh).unwrap();
+        let mut fresh = new_session();
+        let (n, _) = restore_into_session(&dir, &mut fresh).unwrap();
         assert_eq!(n, 1, "unsafe id skipped, traversal ref tolerated");
-        assert!(fresh.instances.contains_key("inst-1"));
-        assert!(fresh.pending_state.is_empty(), "no blob read through traversal");
+        assert!(fresh.plugins.instances.iter().any(|r| r.id == "inst-1"));
+        assert!(fresh.plugins.pending_state.is_empty(), "no blob read through traversal");
         let _ = fs::remove_dir_all(&parent);
     }
 
@@ -1094,22 +1131,24 @@ mod tests {
     fn corrupt_blob_restores_instance_without_state_and_keeps_file() {
         let parent = tmp_parent("corrupt");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
-        let mut reg = scanned_registry();
-        let inst = reg.instantiate("lv2:urn:test:synth").unwrap();
-        reg.pending_state
-            .insert(inst.id.clone(), StateBlob { kind: KIND_OPAQUE, data: vec![7; 10] });
-        save_into_project(&dir, &reg, true).unwrap();
+        let mut session = new_session();
+        let inst = stub_instantiate(&mut session, "lv2:urn:test:synth");
+        session.plugins.pending_state.insert(
+            inst.id.clone(),
+            encode_state("lv2:urn:test:synth", &StateBlob { kind: KIND_OPAQUE, data: vec![7; 10] }),
+        );
+        save_snapshot_into_project(&dir, &session.plugins, true).unwrap();
         // Corrupt the blob on disk.
         let blob_file = state_dir(&dir).join(format!("{}.state", inst.id));
         fs::write(&blob_file, b"garbage").unwrap();
 
-        let mut fresh = PluginRegistry::default();
-        let (n, _) = restore_into_registry(&dir, &mut fresh).unwrap();
+        let mut fresh = new_session();
+        let (n, _) = restore_into_session(&dir, &mut fresh).unwrap();
         assert_eq!(n, 1, "instance restored despite corrupt blob");
-        assert!(fresh.pending_state.is_empty());
+        assert!(fresh.plugins.pending_state.is_empty());
         // The (still referenced) corrupt file survives the next save's GC —
         // a future version might read it.
-        save_into_project(&dir, &fresh, true).unwrap();
+        save_snapshot_into_project(&dir, &fresh.plugins, true).unwrap();
         assert!(blob_file.exists(), "referenced blob never GC'd");
         let _ = fs::remove_dir_all(&parent);
     }
@@ -1118,16 +1157,20 @@ mod tests {
     fn removed_instances_get_their_blobs_gcd_on_resave() {
         let parent = tmp_parent("gc");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
-        let mut reg = scanned_registry();
-        let inst = reg.instantiate("lv2:urn:test:synth").unwrap();
-        reg.pending_state
-            .insert(inst.id.clone(), StateBlob { kind: KIND_OPAQUE, data: vec![1] });
-        save_into_project(&dir, &reg, true).unwrap();
+        let mut session = new_session();
+        let inst = stub_instantiate(&mut session, "lv2:urn:test:synth");
+        session.plugins.pending_state.insert(
+            inst.id.clone(),
+            encode_state("lv2:urn:test:synth", &StateBlob { kind: KIND_OPAQUE, data: vec![1] }),
+        );
+        save_snapshot_into_project(&dir, &session.plugins, true).unwrap();
         let blob_file = state_dir(&dir).join(format!("{}.state", inst.id));
         assert!(blob_file.exists());
 
-        reg.remove(&inst.id).unwrap();
-        save_into_project(&dir, &reg, true).unwrap();
+        session.plugins.instances.retain(|r| r.id != inst.id);
+        session.plugins.params.remove(&inst.id);
+        session.plugins.pending_state.remove(&inst.id);
+        save_snapshot_into_project(&dir, &session.plugins, true).unwrap();
         assert!(!blob_file.exists(), "orphan blob GC'd");
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
@@ -1150,32 +1193,34 @@ mod tests {
             }
         }
 
-        let fresh = StateBlob { kind: KIND_LV2_PROPS, data: vec![42; 8] };
+        let fresh_blob = StateBlob { kind: KIND_LV2_PROPS, data: vec![42; 8] };
         let parent = tmp_parent("bridge");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
-        let mut reg = scanned_registry();
-        let inst = reg.instantiate("lv2:urn:test:synth").unwrap();
-        let bridge = OneBridge(inst.id.clone(), fresh.clone());
-        reg.pending_state
-            .insert(inst.id.clone(), StateBlob { kind: KIND_OPAQUE, data: vec![1] });
-        save_into_project_with(&dir, &reg, true, Some(&bridge)).unwrap();
+        let mut session = new_session();
+        let inst = stub_instantiate(&mut session, "lv2:urn:test:synth");
+        let bridge = OneBridge(inst.id.clone(), fresh_blob.clone());
+        session.plugins.pending_state.insert(
+            inst.id.clone(),
+            encode_state("lv2:urn:test:synth", &StateBlob { kind: KIND_OPAQUE, data: vec![1] }),
+        );
+        save_snapshot_into_project_with(&dir, &session.plugins, true, Some(&bridge)).unwrap();
         let (_uid, on_disk) =
             read_state_file(&state_dir(&dir).join(format!("{}.state", inst.id))).unwrap();
-        assert_eq!(on_disk, fresh, "bridge state written");
+        assert_eq!(on_disk, fresh_blob, "bridge state written");
 
         // Param-path saves (with_host_state=false) keep the existing file.
-        save_into_project_with(&dir, &reg, false, Some(&bridge)).unwrap();
+        save_snapshot_into_project_with(&dir, &session.plugins, false, Some(&bridge)).unwrap();
         let (_uid, still) =
             read_state_file(&state_dir(&dir).join(format!("{}.state", inst.id))).unwrap();
-        assert_eq!(still, fresh);
+        assert_eq!(still, fresh_blob);
         let _ = fs::remove_dir_all(&parent);
     }
 
     /// ARCHITECT-MERGE ACCEPTANCE (worklist item 2): opaque Zyn patches flow
-    /// through the REAL save/open path. Instantiate Zyn through the registry
-    /// + unified host thread, save the project with the production
+    /// through the REAL save/open path. Instantiate Zyn through the host +
+    /// unified plugin main thread, save the project with the production
     /// [`FormatStateBridge`] (serializes live state via `state:interface` on
-    /// the plugin main thread), then open into a fresh registry: the blob
+    /// the plugin main thread), then open into a fresh session: the blob
     /// restores, reactivation loads it back into the host, a SECOND save
     /// round-trips it, and a real RT node still builds (state applied).
     /// Skips cleanly when zynaddsubfx-lv2 is not installed.
@@ -1190,16 +1235,24 @@ mod tests {
         let parent = tmp_parent("zyn-roundtrip");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
 
-        // Registry + host activation (the plugin_instantiate path).
+        // Registry (scan cache only) + host activation (the
+        // plugin_instantiate path).
         let registry = Arc::new(Mutex::new(PluginRegistry::default()));
         registry.lock().scanned = Some(scanned);
-        let info = crate::plugins::instantiate_and_activate(&registry, ZYN_UID)
+        let (info, params) = crate::plugins::instantiate_and_activate(&registry, ZYN_UID)
             .expect("Zyn instantiates and activates");
         assert_eq!(info.status, "active");
 
+        let session = Arc::new(Mutex::new(new_session()));
+        {
+            let mut s = session.lock();
+            s.plugins.instances.push(info.clone());
+            s.plugins.params.insert(info.id.clone(), params);
+        }
+
         // SAVE through the real path with the production bridge.
         let bridge = FormatStateBridge;
-        save_into_project_with(&dir, &registry.lock(), true, Some(&bridge)).unwrap();
+        save_snapshot_into_project_with(&dir, &session.lock().plugins, true, Some(&bridge)).unwrap();
         let blob_file = state_dir(&dir).join(format!("{}.state", info.id));
         let (uid_on_disk, blob) = read_state_file(&blob_file).expect("Zyn blob written");
         assert_eq!(uid_on_disk, ZYN_UID);
@@ -1209,14 +1262,15 @@ mod tests {
             "Zyn state has properties"
         );
 
-        // OPEN into a fresh registry: restore + reactivate + state load.
-        let fresh = Arc::new(Mutex::new(PluginRegistry::default()));
-        let (n, _) = restore_into_registry(&dir, &mut fresh.lock()).unwrap();
+        // OPEN into a fresh session: restore + reactivate + state load.
+        let fresh = Arc::new(Mutex::new(new_session()));
+        let (n, _) = restore_into_session(&dir, &mut fresh.lock()).unwrap();
         assert_eq!(n, 1);
-        assert_eq!(fresh.lock().pending_state.get(&info.id), Some(&blob));
+        let stored = fresh.lock().plugins.pending_state.get(&info.id).cloned().unwrap();
+        assert_eq!(decode_state(&stored).unwrap().1, blob);
         reactivate_restored_with(&fresh, Some(&bridge));
         assert_eq!(
-            fresh.lock().instances.get(&info.id).unwrap().status,
+            fresh.lock().plugins.instances.iter().find(|r| r.id == info.id).unwrap().status,
             "active",
             "restored Zyn re-activates through the unified host thread"
         );
@@ -1228,7 +1282,7 @@ mod tests {
         }
 
         // A SECOND save from the restored session round-trips the state.
-        save_into_project_with(&dir, &fresh.lock(), true, Some(&bridge)).unwrap();
+        save_snapshot_into_project_with(&dir, &fresh.lock().plugins, true, Some(&bridge)).unwrap();
         let (_uid, again) = read_state_file(&blob_file).unwrap();
         assert_eq!(again.kind, KIND_LV2_PROPS);
         assert!(!decode_lv2_props(&again.data).unwrap().is_empty());
@@ -1271,12 +1325,19 @@ mod tests {
 
         let registry = Arc::new(Mutex::new(PluginRegistry::default()));
         registry.lock().scanned = Some(scanned);
-        let info = crate::plugins::instantiate_and_activate(&registry, &desc.uid)
+        let (info, params) = crate::plugins::instantiate_and_activate(&registry, &desc.uid)
             .expect("CLAP instrument instantiates");
         assert_eq!(info.status, "active");
 
+        let session = Arc::new(Mutex::new(new_session()));
+        {
+            let mut s = session.lock();
+            s.plugins.instances.push(info.clone());
+            s.plugins.params.insert(info.id.clone(), params);
+        }
+
         let bridge = FormatStateBridge;
-        save_into_project_with(&dir, &registry.lock(), true, Some(&bridge)).unwrap();
+        save_snapshot_into_project_with(&dir, &session.lock().plugins, true, Some(&bridge)).unwrap();
         let blob_file = state_dir(&dir).join(format!("{}.state", info.id));
         let has_state_ext = blob_file.exists();
         if has_state_ext {
@@ -1288,10 +1349,10 @@ mod tests {
             eprintln!("note: {} has no state extension; snapshot-only path", desc.name);
         }
 
-        // Open into a fresh registry: restore + re-activate through the
+        // Open into a fresh session: restore + re-activate through the
         // shared plugin main thread (state loaded when a blob exists).
-        let fresh = Arc::new(Mutex::new(PluginRegistry::default()));
-        let (n, _) = restore_into_registry(&dir, &mut fresh.lock()).unwrap();
+        let fresh = Arc::new(Mutex::new(new_session()));
+        let (n, _) = restore_into_session(&dir, &mut fresh.lock()).unwrap();
         assert_eq!(n, 1);
         // The first activation still owns the instance id on the host; drop
         // it (as `open_project` supersedes the old session) before
@@ -1299,13 +1360,13 @@ mod tests {
         let _ = crate::plugins::clap_host::remove(&info.id);
         reactivate_restored_with(&fresh, Some(&bridge));
         assert_eq!(
-            fresh.lock().instances.get(&info.id).unwrap().status,
+            fresh.lock().plugins.instances.iter().find(|r| r.id == info.id).unwrap().status,
             "active",
             "restored CLAP instance re-activates"
         );
         if has_state_ext {
             // Second save round-trips the opaque stream.
-            save_into_project_with(&dir, &fresh.lock(), true, Some(&bridge)).unwrap();
+            save_snapshot_into_project_with(&dir, &fresh.lock().plugins, true, Some(&bridge)).unwrap();
             let (_uid, again) = read_state_file(&blob_file).unwrap();
             assert_eq!(again.kind, KIND_OPAQUE);
             assert!(!again.data.is_empty());
@@ -1381,34 +1442,36 @@ mod tests {
         })
         .unwrap();
 
-        let registry = Arc::new(Mutex::new(PluginRegistry::default()));
-        let (n, _) = restore_into_registry(&dir, &mut registry.lock()).unwrap();
+        let session = Arc::new(Mutex::new(new_session()));
+        let (n, _) = restore_into_session(&dir, &mut session.lock()).unwrap();
         assert_eq!(n, 2);
-        reactivate_restored(&registry);
+        reactivate_restored(&session);
 
-        let reg = registry.lock();
+        let s = session.lock();
         // The missing plugin: graceful, nothing lost.
-        let ghost = reg.instances.get("ghost-1").expect("ghost kept");
+        let ghost = s.plugins.instances.iter().find(|r| r.id == "ghost-1").expect("ghost kept");
         assert_eq!(ghost.status, "stub", "missing plugin stays stub");
-        assert_eq!(reg.params.get("ghost-1").unwrap()[0].value, 42.0, "snapshot kept");
-        assert_eq!(reg.pending_state.get("ghost-1"), Some(&blob), "blob kept");
+        assert_eq!(s.plugins.params.get("ghost-1").unwrap()[0].value, 42.0, "snapshot kept");
+        let ghost_blob = s.plugins.pending_state.get("ghost-1").expect("blob kept");
+        assert_eq!(decode_state(ghost_blob).unwrap().1, blob);
 
-        let zyn = reg.instances.get("zyn-1").expect("zyn kept");
+        let zyn = s.plugins.instances.iter().find(|r| r.id == "zyn-1").expect("zyn kept");
         if zyn_installed {
             assert_eq!(zyn.status, "active", "installed plugin re-activated");
             assert!(
-                !reg.params.get("zyn-1").unwrap().is_empty(),
+                !s.plugins.params.get("zyn-1").unwrap().is_empty(),
                 "real control-port params installed"
             );
-            assert_eq!(reg.pending_state.get("zyn-1"), Some(&blob), "blob preserved");
+            let zyn_blob = s.plugins.pending_state.get("zyn-1").expect("blob preserved");
+            assert_eq!(decode_state(zyn_blob).unwrap().1, blob);
         } else {
             eprintln!("note: zynaddsubfx-lv2 not installed; missing-branch asserted");
             assert_eq!(zyn.status, "stub");
         }
-        drop(reg);
+        drop(s);
 
-        // A save from the restored registry keeps both blobs on disk.
-        save_into_project(&dir, &registry.lock(), false).unwrap();
+        // A save from the restored session keeps both blobs on disk.
+        save_snapshot_into_project(&dir, &session.lock().plugins, false).unwrap();
         assert!(state_dir(&dir).join("zyn-1.state").exists());
         assert!(state_dir(&dir).join("ghost-1.state").exists());
         if zyn_installed {

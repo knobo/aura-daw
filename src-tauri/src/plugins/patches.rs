@@ -308,9 +308,46 @@ pub fn zyn_list_patches() -> Result<Vec<ZynPatch>, String> {
 /// Load a `.xiz` bank patch into a registered Zyn LV2 instance. NOTE: an
 /// already-bound track keeps its live node across rebuilds; pair this with a
 /// rebind (`set_track_instrument`) until node invalidation ships (wave 2).
+///
+/// Task 9 (closes round-2 inventory row 14): the patch load itself still
+/// goes straight through the host (`load_zyn_patch`, prepare-outside — the
+/// SAME pattern `plugin_instantiate` uses), but is now WRAPPED in a
+/// `PluginSetState` commit, so it becomes durable (`persist.plugins`) AND
+/// undoable. The OLD blob is captured via a real host `save_state` call
+/// BEFORE the load and primed into the document's pending-state truth
+/// (`ControlPlane::set_plugin_pending_state`) so `apply_raw`'s computed
+/// inverse for `PluginSetState` is the REAL previous state, not a
+/// stale/absent one — `apply_raw` itself never touches the host ([C1]).
 #[tauri::command]
-pub fn zyn_load_patch(instance_id: String, path: String) -> Result<(), String> {
-    load_zyn_patch(&instance_id, Path::new(&path))
+pub fn zyn_load_patch(
+    instance_id: String,
+    path: String,
+    control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    let row = control
+        .plugin_row(&instance_id)
+        .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))?;
+    let host = lv2_host::global();
+    let old_blob = host
+        .save_state(&instance_id)?
+        .ok_or("instance exposes no state:interface — not the Zyn LV2 plugin?")?;
+    control.set_plugin_pending_state(&instance_id, super::state::encode_state(&row.uid, &old_blob));
+
+    load_zyn_patch(&instance_id, Path::new(&path))?;
+
+    let new_blob = host
+        .save_state(&instance_id)?
+        .ok_or("instance state:interface vanished after load — unexpected")?;
+    let new_bytes = super::state::encode_state(&row.uid, &new_blob);
+
+    let meta = crate::control::op::TxMeta::user("zyn load patch");
+    control.commit(meta, |tx| {
+        tx.apply(crate::control::op::Op::PluginSetState {
+            instance: instance_id.clone(),
+            state: new_bytes.clone(),
+        })
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
