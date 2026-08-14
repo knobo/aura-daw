@@ -12,7 +12,10 @@ This document is the landed form of the 34-row inventory in
 against dossier 10 §2.3 + review additions" clause audits.
 
 Verified at commit `73bb9a7` (Plan E Task 17, 2026-08-14). All `file:line`
-anchors below were grepped against that tree.
+anchors below were grepped against that tree; the anchors did not move when
+the op log landed in `f984ae2` (the log is additive to every path here) —
+`src-tauri/src/control/mod.rs` line numbers shifted by the insertions,
+so treat its anchors as "the named function", not a byte offset.
 
 The machine-checked half of this claim is
 `src-tauri/tests/figma_invariant.rs` (§7 test 4): a scripted mixed session
@@ -58,7 +61,7 @@ wrapper/op/epoch function.
 | 28 | transport family (`transport_play/stop/set_loop/set_stop_at_end`) — direct store writes | transient transport ops through `commit_with` (§4.2's "auto-stop produces a transport op") | `src-tauri/src/control/mod.rs:1042` (`ControlPlane::transport`) |
 | 29 | device selection — `EngineHandle` direct | **CARVE-OUT (app config, not document)**: behind a `ControlPlane` method for attribution, no op | `src-tauri/src/control/mod.rs:1229`, `:1240` |
 | 30 | frontend stems demo materialization + track reorder (webview-only clips) | DELETED; the frontend calls the real backend split-stems import | `src/lib/state/split-stems.test.ts`, `src/lib/state/jobs.svelte.ts` |
-| 31 | mix-fader drags: one `TxMeta::user` tx per `input` event, no boundaries | `gesture_begin`/`gesture_end` IPC + transient coalescing; ONE history-bound batch per drag | `src-tauri/src/control/mod.rs:1519`, `:1531`, `:1563` (`close_gesture`), `:804` (`commit_transient_and_fold`) |
+| 31 | mix-fader drags: one `TxMeta::user` tx per `input` event, no boundaries | `gesture_begin`/`gesture_end` IPC + transient coalescing; ONE history-bound batch per drag, recorded into `History` by `close_gesture` DIRECTLY (no drop-window) | `src-tauri/src/control/mod.rs:1519`, `:1531`, `:1563` (`close_gesture`), `:804` (`commit_transient_and_fold`) |
 | 32 | `fold_ops` merged `Set`s across intervening structural ops | structural barrier in the fold | `src-tauri/src/control/session.rs:1235` (see the `barrier` at `:1248`/`:1270`) |
 | 33 | piano-roll note-id churn (frontend `MidiNote` had no `noteId`) | `noteId` in the TS type + explicit mint sentinel (0) | `src/lib/types/ipc.ts:301`; keep-rule `src-tauri/src/midi/mod.rs:454` |
 | 34 | `steady_time` per-node counter reset on rebind | engine-global steady clock (`SharedRt::steady`, advanced once per block prologue) | `src-tauri/src/audio/engine.rs:294`; regression test `:1685` |
@@ -131,6 +134,27 @@ reads the document and writes a file OUTSIDE the project document. Writing
 an artifact is not a document mutation; the read half is pure (row 9).
 
 ---
+
+## The log itself (Task 17)
+
+The log the whole plan exists for, for completeness of this document:
+
+* `src-tauri/src/control/history.rs` — `History` (bounded undo/redo stacks,
+  the 350 ms boundary-less same-key merge, cleared at epochs) and
+  `JournalWriter` (append-only `<project dir>/journal.ndjson`, line-buffered,
+  no fsync), behind one `HistoryLog` shared by BOTH `Committer` instances.
+* The single write point: `Committer::commit_with_rebuild`, after the
+  effects, `if !committed.meta.transient`. That one condition IS ruling 2's
+  enforcement.
+* `undo`/`redo` (`ControlPlane::undo`/`redo`, Tauri commands `undo`/`redo`,
+  Ctrl+Z / Ctrl+Shift+Z in `src/App.svelte` guarded against text entry)
+  commit through the NORMAL path with `HistoryMode::Replay`: journaled
+  (they are mutations), no new entry — the original entry migrates between
+  the stacks.
+* `OP_FORMAT_VERSION` (`src-tauri/src/control/op.rs:3`) is LOAD-BEARING from
+  the first journal line. Additive `#[serde(default)]` fields stay
+  non-breaking and keep it at 1; anything else needs a bump plus a reader
+  that understands both shapes.
 
 ## Recorded replay limitations (known, not fixed here)
 

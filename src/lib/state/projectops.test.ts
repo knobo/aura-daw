@@ -16,6 +16,14 @@ const invokes = {
     Promise.resolve({ name: "x" }),
   ),
   openProject: vi.fn((_path: string) => Promise.resolve({ name: "x" })),
+  undo: vi.fn(
+    (): Promise<{ label: string | null; undoDepth: number; redoDepth: number }> =>
+      Promise.resolve({ label: "set gain", undoDepth: 0, redoDepth: 1 }),
+  ),
+  redo: vi.fn(
+    (): Promise<{ label: string | null; undoDepth: number; redoDepth: number }> =>
+      Promise.resolve({ label: "set gain", undoDepth: 1, redoDepth: 0 }),
+  ),
   getProjectState: vi.fn(() =>
     Promise.resolve({
       projectName: "Loaded",
@@ -271,5 +279,44 @@ describe("the unsaved-changes confirmation", () => {
     expect(lastToast().kind).toBe("error");
     expect(invokes.createProject).not.toHaveBeenCalled();
     expect(projectops.dialog).toBeNull();
+  });
+});
+
+describe("undo / redo (Plan E Task 17)", () => {
+  it("invokes undo, re-pulls the snapshot and reports the step's label", async () => {
+    await projectops.undo();
+    expect(invokes.undo).toHaveBeenCalledTimes(1);
+    expect(invokes.getProjectState).toHaveBeenCalled();
+    expect(lastToast().title).toBe("UNDO");
+    expect(lastToast().lines).toEqual(["set gain"]);
+  });
+
+  it("invokes redo the same way", async () => {
+    await projectops.redo();
+    expect(invokes.redo).toHaveBeenCalledTimes(1);
+    expect(lastToast().title).toBe("REDO");
+  });
+
+  it("is silent, and re-pulls nothing, when the stack is empty", async () => {
+    invokes.undo.mockResolvedValueOnce({ label: null, undoDepth: 0, redoDepth: 0 });
+    await projectops.undo();
+    expect(invokes.getProjectState).not.toHaveBeenCalled();
+    expect(toasts.list).toHaveLength(0);
+  });
+
+  it("surfaces a backend failure as an error toast", async () => {
+    invokes.undo.mockRejectedValueOnce("nope");
+    await projectops.undo();
+    expect(lastToast().title).toBe("UNDO FAILED");
+  });
+
+  it("does nothing when the backend has no op log (demo mode)", async () => {
+    const saved = mockBackend.undo;
+    // The optional-method pattern: the demo backend simply omits it.
+    // @ts-expect-error deliberately removing an optional method
+    delete mockBackend.undo;
+    await projectops.undo();
+    expect(toasts.list).toHaveLength(0);
+    mockBackend.undo = saved;
   });
 });

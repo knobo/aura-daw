@@ -17,6 +17,7 @@ import type {
   ExportCapabilities,
   ExportJobStatus,
   ExportRequest,
+  HistoryStep,
   HumToSongRequest,
   ImportClipRequest,
   ImportSplitReply,
@@ -154,6 +155,15 @@ export interface Backend {
    * play makes sound (real engine only — the demo backend ships with content).
    */
   seedDemoProject?(): Promise<ProjectSnapshot>;
+
+  /** Undo the most recent history step (Plan E Task 17). `label` is the
+   * undone step's own label, or `null` when there was nothing to undo (an
+   * empty history is not an error). Optional — real-engine only, same
+   * convention as `moveClip?`/`gestureBegin?`; the demo backend has no op
+   * log to walk back. */
+  undo?(): Promise<HistoryStep>;
+  /** Redo the most recently undone step (see `undo`). */
+  redo?(): Promise<HistoryStep>;
 
   // midi (all musical positions are integer ticks at the project ppq)
   setTempoMap(ppq: number | null, events: TempoEvent[]): Promise<TempoMapState>;
@@ -425,6 +435,12 @@ class TauriBackend implements Backend {
   }
   moveClip(clipId: string, timelineStartSamples: number) {
     return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  undo() {
+    return invoke<HistoryStep>("undo");
+  }
+  redo() {
+    return invoke<HistoryStep>("redo");
   }
   async gestureBegin(label: string) {
     await invoke("gesture_begin", { label });

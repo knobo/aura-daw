@@ -626,6 +626,19 @@ export interface ZynPatch {
   path: string;
 }
 
+/**
+ * Reply of the additive `undo` / `redo` commands (Plan E Task 17). `label`
+ * is the ORIGINAL label of the step that moved — what a UI shows in
+ * "Undo <label>" — or `null` when the stack was empty (not an error). The
+ * depths come back in the same round trip so menu items can be
+ * enabled/disabled without a second call.
+ */
+export interface HistoryStep {
+  label: string | null;
+  undoDepth: number;
+  redoDepth: number;
+}
+
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────
 
 export interface AuraEventMap {
