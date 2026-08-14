@@ -187,7 +187,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .iter_mut()
                 .find(|t| &t.id == id)
                 .ok_or_else(|| format!("unknown track: {id}"))?;
-            let from_now = read_prop(t, *path); // truth, not caller's `from`
+            let from_now = read_prop(t, *path)?; // truth, not caller's `from`
             let applied = write_prop(t, *path, to)?; // clamps like ops.rs does
             let inverse = Op::Set {
                 object: ObjectRef::Track(id.clone()),
@@ -384,19 +384,24 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
 }
 
 /// Read a track property as its JSON-wire representation (round-trippable
-/// through `write_prop`).
-fn read_prop(t: &TrackState, path: PropPath) -> serde_json::Value {
+/// through `write_prop`). Fallible: `PropPath` and `ObjectRef` are
+/// independent serde-derived enums, so a deserialized (e.g. replayed
+/// journal, or agent-authored) `Op::Set` can pair `ObjectRef::Track` with a
+/// Clip-only path like `TimelineStartSamples` — that must fail the
+/// transaction atomically (via `apply_raw`'s `?`), never panic a `transact`
+/// closure (round-2 §4's no-panic-in-transact invariant).
+fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String> {
     match path {
-        PropPath::Gain => serde_json::json!(t.gain_db),
-        PropPath::Pan => serde_json::json!(t.pan),
-        PropPath::Muted => serde_json::json!(t.muted),
-        PropPath::Soloed => serde_json::json!(t.soloed),
-        PropPath::Armed => serde_json::json!(t.armed),
+        PropPath::Gain => Ok(serde_json::json!(t.gain_db)),
+        PropPath::Pan => Ok(serde_json::json!(t.pan)),
+        PropPath::Muted => Ok(serde_json::json!(t.muted)),
+        PropPath::Soloed => Ok(serde_json::json!(t.soloed)),
+        PropPath::Armed => Ok(serde_json::json!(t.armed)),
         // Option<String> serializes as a JSON string or null, never a
         // wrapping object — same wire shape `write_prop` below accepts.
-        PropPath::InstrumentId => serde_json::json!(t.instrument_id),
+        PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
         PropPath::TimelineStartSamples => {
-            unreachable!("TimelineStartSamples is a Clip path, never dispatched to a Track")
+            Err(format!("path {path:?} is not a Track property (TimelineStartSamples is Clip-only)"))
         }
     }
 }
@@ -441,7 +446,7 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             Ok(serde_json::json!(t.instrument_id))
         }
         PropPath::TimelineStartSamples => {
-            unreachable!("TimelineStartSamples is a Clip path, never dispatched to a Track")
+            Err(format!("path {path:?} is not a Track property (TimelineStartSamples is Clip-only)"))
         }
     }
 }
@@ -865,5 +870,51 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.lock().store.tracks[0].instrument_id, None, "undo restores None");
+    }
+
+    #[test]
+    fn mismatched_track_timeline_start_samples_fails_cleanly_not_panics() {
+        // `PropPath` and `ObjectRef` are independent serde-derived enums, so
+        // a corrupted/replayed journal or a bad agent-authored op can pair
+        // `ObjectRef::Track` with the Clip-only `TimelineStartSamples` path
+        // — a value that deserializes cleanly. `apply_raw` must fail this
+        // transaction atomically, not panic (round-2 §4: transact closures
+        // must not panic).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before_gain = m.lock().store.tracks[0].gain_db;
+        let before_rev = m.lock().rev;
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::TimelineStartSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(42u64),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, before_gain, "store untouched");
+        assert_eq!(m.lock().rev, before_rev, "failed tx must not consume a revision");
+    }
+
+    #[test]
+    fn mismatched_clip_instrument_id_fails_cleanly_not_panics() {
+        // The mirror case: `Set{Clip, InstrumentId}` — a Track-only path
+        // paired with a Clip object. Already safe (falls to `apply_raw`'s
+        // catch-all `_ => Err(...)` arm) — pinned here so both mismatched
+        // directions have coverage, not just the one that used to panic.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let clip = test_clip("c-1", "t-1");
+        m.lock().store.clips.push(clip.clone());
+        let before = m.lock().store.clips.clone();
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Clip("c-1".into()),
+                path: PropPath::InstrumentId,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("plugin:x"),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.clips, before, "store untouched");
     }
 }
