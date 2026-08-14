@@ -2,6 +2,10 @@
   /**
    * Top transport bar: wordmark, transport buttons, rAF-driven timecode,
    * tempo block, snap/follow toggles and engine/renderer badges.
+   *
+   * The right-hand chip cluster is adaptive: a hidden copy of the row is
+   * measured, and chips that don't fit the window collapse into a ⋯ menu,
+   * lowest-priority first (see utils/toolbar-overflow).
    */
   import { backend } from "../tauri";
   import { transport } from "../state/transport.svelte";
@@ -13,6 +17,7 @@
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
   import { formatBarsBeats, formatClock } from "../utils/format";
+  import { computeVisible } from "../utils/toolbar-overflow";
   import ProjectMenu from "./project/ProjectMenu.svelte";
 
   let clockEl: HTMLSpanElement | undefined = $state();
@@ -48,7 +53,251 @@
       await transport.init(); // refresh snapshot (state -> recording)
     }
   }
+
+  // ---- adaptive right cluster ------------------------------------------
+
+  type RightItem = {
+    id: string;
+    kind: "chip" | "divider" | "badge";
+    /** Higher survives longer when space runs out. */
+    priority: number;
+    label?: string;
+    title?: string;
+    cls?: string;
+    on?: boolean;
+    busy?: boolean;
+    alert?: boolean;
+    led?: "ok" | "pending" | null;
+    onClick?: () => void;
+  };
+
+  const RIGHT_GAP = 8; // keep in sync with .right / .measure gap below
+
+  const items: RightItem[] = $derived([
+    {
+      id: "studio",
+      kind: "chip",
+      priority: 13,
+      cls: "studio",
+      label: "✦ AI STUDIO",
+      title: "AI Studio — prompt-driven generation (g)",
+      on: ui.dock === "generate",
+      onClick: () => toggleDock("generate"),
+    },
+    {
+      id: "hum",
+      kind: "chip",
+      priority: 10,
+      cls: "hum",
+      label: "🎤 HUM",
+      title: "Hum a melody — sing/hum into a mic, get a MIDI melody clip",
+      on: ui.dock === "hum",
+      busy: hum.busy,
+      onClick: () => toggleDock("hum"),
+    },
+    {
+      id: "inst",
+      kind: "chip",
+      priority: 7,
+      label: "INST",
+      title: "Sampler instrument browser",
+      on: ui.dock === "instruments",
+      onClick: () => toggleDock("instruments"),
+    },
+    {
+      id: "plug",
+      kind: "chip",
+      priority: 6,
+      label: "PLUG",
+      title: "Plugin browser — CLAP / LV2 instruments",
+      on: ui.dock === "plugins",
+      onClick: () => toggleDock("plugins"),
+    },
+    {
+      id: "mcp",
+      kind: "chip",
+      priority: 12,
+      cls: "mcpchip",
+      label: "MCP",
+      title: `MCP agent control${mcp.pending.length ? ` — ${mcp.pending.length} awaiting confirmation` : ""}`,
+      on: ui.dock === "mcp",
+      alert: mcp.pending.length > 0,
+      led: mcp.status?.running ? (mcp.pending.length > 0 ? "pending" : "ok") : null,
+      onClick: () => toggleDock("mcp"),
+    },
+    { id: "d1", kind: "divider", priority: 0 },
+    {
+      id: "snap",
+      kind: "chip",
+      priority: 5,
+      label: "SNAP",
+      title: "Snap clip drags to the grid",
+      on: view.snap,
+      onClick: () => (view.snap = !view.snap),
+    },
+    {
+      id: "follow",
+      kind: "chip",
+      priority: 4,
+      label: "FOLLOW",
+      title: "Follow the playhead",
+      on: view.follow,
+      onClick: () => (view.follow = !view.follow),
+    },
+    {
+      id: "loop",
+      kind: "chip",
+      priority: 9,
+      cls: "loopchip",
+      label: "LOOP",
+      title: "Loop the region between the loop pins (drag the top strip of the ruler to set it)",
+      on: transport.snap.loopEnabled,
+      onClick: () => transport.toggleLoop(0, 4 * project.samplesPerBar),
+    },
+    {
+      id: "stopend",
+      kind: "chip",
+      priority: 3,
+      label: "STOP@END",
+      title: "Stop when the playhead reaches the end of the material (ignored while looping or recording)",
+      on: transport.snap.stopAtEnd,
+      onClick: () => transport.setStopAtEnd(!transport.snap.stopAtEnd),
+    },
+    {
+      id: "flash",
+      kind: "chip",
+      priority: 2,
+      label: "FLASH",
+      title: "Flash notes at the moment they play",
+      on: prefs.values.noteFlash,
+      onClick: () => prefs.set("noteFlash", !prefs.values.noteFlash),
+    },
+    {
+      id: "export",
+      kind: "chip",
+      priority: 11,
+      cls: "exportchip",
+      label: "⤓ EXPORT",
+      title: "Export — offline bounce to wav/mp3/flac/ogg/m4a",
+      on: exporter.open,
+      busy: exporter.busy,
+      onClick: () => exporter.openDialog(),
+    },
+    { id: "d2", kind: "divider", priority: 0 },
+    {
+      id: "zoomout",
+      kind: "chip",
+      priority: 1,
+      label: "A−",
+      title: "Interface zoom out — smaller UI (Ctrl/Cmd −)",
+      onClick: zoomUiOut,
+    },
+    {
+      id: "zoomreset",
+      kind: "chip",
+      priority: 1,
+      label: `${Math.round(prefs.values.uiZoom * 100)}%`,
+      title: "Reset interface zoom (Ctrl/Cmd 0)",
+      onClick: resetUiZoom,
+    },
+    {
+      id: "zoomin",
+      kind: "chip",
+      priority: 1,
+      label: "A+",
+      title: "Interface zoom in — bigger UI (Ctrl/Cmd +)",
+      onClick: zoomUiIn,
+    },
+    {
+      id: "renderer",
+      kind: "badge",
+      priority: 0,
+      label: ui.rendererKind || "· · ·",
+      title: "Waveform renderer in use",
+    },
+    {
+      id: "mode",
+      kind: "badge",
+      priority: 0,
+      cls: "mode",
+      label: backend.mode === "demo" ? "DEMO" : "ENGINE",
+      title: backend.mode === "demo" ? "Engine offline — synthetic data" : "Rust engine connected",
+    },
+  ]);
+
+  let rightEl: HTMLDivElement | undefined = $state();
+  let measureEl: HTMLDivElement | undefined = $state();
+  // Start with everything collapsed; the first measurement fills the row
+  // before paint settles, so there is no flash of an overflowing bar.
+  let visibleIds: Set<string> = $state(new Set());
+  let overflowIds: string[] = $state([]);
+  let moreOpen = $state(false);
+
+  const overflowItems = $derived(
+    overflowIds
+      .map((id) => items.find((it) => it.id === id))
+      .filter((it): it is RightItem => it !== undefined),
+  );
+
+  function recompute() {
+    if (!rightEl || !measureEl) return;
+    const widths = new Map<string, number>();
+    for (const child of measureEl.children) {
+      const id = child.getAttribute("data-mid");
+      if (id) widths.set(id, (child as HTMLElement).offsetWidth);
+    }
+    const result = computeVisible(
+      items.map((it) => ({
+        id: it.id,
+        width: widths.get(it.id) ?? 0,
+        priority: it.priority,
+        divider: it.kind === "divider",
+      })),
+      rightEl.clientWidth,
+      widths.get("__more") ?? 0,
+      RIGHT_GAP,
+    );
+    visibleIds = result.visible;
+    overflowIds = result.overflow;
+    if (result.overflow.length === 0) moreOpen = false;
+  }
+
+  $effect(() => {
+    // Reading `items` here re-measures when any label / state changes;
+    // the observers catch window resizes and measure-row width changes.
+    void items;
+    const ro = new ResizeObserver(() => recompute());
+    if (rightEl) ro.observe(rightEl);
+    if (measureEl) ro.observe(measureEl);
+    recompute();
+    return () => ro.disconnect();
+  });
+
+  function runFromMenu(it: RightItem) {
+    moreOpen = false;
+    it.onClick?.();
+  }
 </script>
+
+{#snippet rowItem(it: RightItem)}
+  {#if it.kind === "divider"}
+    <span class="divider" data-mid={it.id}></span>
+  {:else if it.kind === "badge"}
+    <span class="badge mono {it.cls ?? ''}" data-mid={it.id} title={it.title}>{it.label}</span>
+  {:else}
+    <button
+      class="chip {it.cls ?? ''}"
+      class:on={it.on}
+      class:busychip={it.busy}
+      class:alert={it.alert}
+      data-mid={it.id}
+      title={it.title}
+      onclick={it.onClick}
+    >
+      {it.label}{#if it.led}<span class="mcpled" class:pending={it.led === "pending"}></span>{/if}
+    </button>
+  {/if}
+{/snippet}
 
 <header class="bar glass">
   <div class="left">
@@ -114,90 +363,61 @@
     </div>
   </div>
 
-  <div class="right">
-    <button
-      class="chip studio"
-      class:on={ui.dock === "generate"}
-      title="AI Studio — prompt-driven generation (g)"
-      onclick={() => toggleDock("generate")}>✦ AI STUDIO</button
-    >
-    <button
-      class="chip hum"
-      class:on={ui.dock === "hum"}
-      class:busychip={hum.busy}
-      title="Hum a melody — sing/hum into a mic, get a MIDI melody clip"
-      onclick={() => toggleDock("hum")}>🎤 HUM</button
-    >
-    <button
-      class="chip"
-      class:on={ui.dock === "instruments"}
-      title="Sampler instrument browser"
-      onclick={() => toggleDock("instruments")}>INST</button
-    >
-    <button
-      class="chip"
-      class:on={ui.dock === "plugins"}
-      title="Plugin browser — CLAP / LV2 instruments"
-      onclick={() => toggleDock("plugins")}>PLUG</button
-    >
-    <button
-      class="chip mcpchip"
-      class:on={ui.dock === "mcp"}
-      class:alert={mcp.pending.length > 0}
-      title="MCP agent control{mcp.pending.length ? ` — ${mcp.pending.length} awaiting confirmation` : ''}"
-      onclick={() => toggleDock("mcp")}
-    >
-      MCP
-      {#if mcp.status?.running}<span class="mcpled" class:pending={mcp.pending.length > 0}></span>{/if}
-    </button>
-    <span class="divider"></span>
-    <button
-      class="chip"
-      class:on={view.snap}
-      title="Snap clip drags to the grid"
-      onclick={() => (view.snap = !view.snap)}>SNAP</button
-    >
-    <button
-      class="chip"
-      class:on={view.follow}
-      title="Follow the playhead"
-      onclick={() => (view.follow = !view.follow)}>FOLLOW</button
-    >
-    <button
-      class="chip loopchip"
-      class:on={transport.snap.loopEnabled}
-      title="Loop the region between the loop pins (drag the top strip of the ruler to set it)"
-      onclick={() => transport.toggleLoop(0, 4 * project.samplesPerBar)}>LOOP</button
-    >
-    <button
-      class="chip"
-      class:on={transport.snap.stopAtEnd}
-      title="Stop when the playhead reaches the end of the material (ignored while looping or recording)"
-      onclick={() => transport.setStopAtEnd(!transport.snap.stopAtEnd)}>STOP@END</button
-    >
-    <button
-      class="chip"
-      class:on={prefs.values.noteFlash}
-      title="Flash notes at the moment they play"
-      onclick={() => prefs.set("noteFlash", !prefs.values.noteFlash)}>FLASH</button
-    >
-    <button
-      class="chip exportchip"
-      class:on={exporter.open}
-      class:busychip={exporter.busy}
-      title="Export — offline bounce to wav/mp3/flac/ogg/m4a"
-      onclick={() => exporter.openDialog()}>⤓ EXPORT</button
-    >
-    <span class="divider"></span>
-    <button class="chip" title="Interface zoom out — smaller UI (Ctrl/Cmd −)" onclick={zoomUiOut}>A−</button>
-    <button class="chip" title="Reset interface zoom (Ctrl/Cmd 0)" onclick={resetUiZoom}
-      >{Math.round(prefs.values.uiZoom * 100)}%</button
-    >
-    <button class="chip" title="Interface zoom in — bigger UI (Ctrl/Cmd +)" onclick={zoomUiIn}>A+</button>
-    <span class="badge mono" title="Waveform renderer in use">{ui.rendererKind || "· · ·"}</span>
-    <span class="badge mode mono" title={backend.mode === "demo" ? "Engine offline — synthetic data" : "Rust engine connected"}>
-      {backend.mode === "demo" ? "DEMO" : "ENGINE"}
-    </span>
+  <div class="right" bind:this={rightEl}>
+    <!-- hidden twin of the full row; only ever measured, never seen -->
+    <div class="measure" bind:this={measureEl} aria-hidden="true">
+      {#each items as it (it.id)}
+        {@render rowItem(it)}
+      {/each}
+      <button class="chip morebtn" data-mid="__more" tabindex="-1">⋯</button>
+    </div>
+
+    {#each items as it (it.id)}
+      {#if visibleIds.has(it.id)}
+        {@render rowItem(it)}
+      {/if}
+    {/each}
+
+    {#if overflowIds.length > 0}
+      <div class="morewrap">
+        <button
+          class="chip morebtn"
+          class:on={moreOpen}
+          class:alert={!moreOpen && overflowItems.some((it) => it.alert)}
+          title="More controls"
+          aria-label="More controls"
+          aria-haspopup="menu"
+          aria-expanded={moreOpen}
+          onclick={() => (moreOpen = !moreOpen)}>⋯</button
+        >
+        {#if moreOpen}
+          <div class="backdrop" role="presentation" onpointerdown={() => (moreOpen = false)}></div>
+          <div class="menu glass mono" role="menu" aria-label="More controls">
+            {#each overflowItems as it (it.id)}
+              {#if it.kind === "badge"}
+                <div class="mbadge {it.cls ?? ''}" title={it.title}>{it.label}</div>
+              {:else}
+                <button
+                  role="menuitem"
+                  class="mrow"
+                  class:on={it.on}
+                  class:alert={it.alert}
+                  title={it.title}
+                  onclick={() => runFromMenu(it)}
+                >
+                  <span>{it.label}</span>
+                  {#if it.led}
+                    <span class="mcpled" class:pending={it.led === "pending"}></span>
+                  {:else if it.on}
+                    <span class="mdot">●</span>
+                  {/if}
+                </button>
+              {/if}
+            {/each}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </div>
 </header>
 
@@ -221,6 +441,7 @@
     align-items: center;
     gap: 14px;
     min-width: var(--rail-width);
+    flex-shrink: 0;
   }
 
   .wordmark {
@@ -239,6 +460,7 @@
     display: flex;
     align-items: center;
     gap: 20px;
+    flex-shrink: 0;
   }
 
   .tbuttons {
@@ -322,8 +544,22 @@
   .right {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 8px; /* RIGHT_GAP */
     justify-content: flex-end;
+    flex: 1 1 auto;
+    min-width: 0;
+    position: relative;
+  }
+
+  .measure {
+    position: absolute;
+    top: -9999px;
+    left: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px; /* RIGHT_GAP */
+    visibility: hidden;
+    pointer-events: none;
   }
 
   .chip {
@@ -392,7 +628,8 @@
     align-items: center;
     gap: 5px;
   }
-  .mcpchip.alert {
+  .mcpchip.alert,
+  .morebtn.alert {
     color: var(--amber);
     border-color: rgba(255, 200, 87, 0.5);
     box-shadow: 0 0 10px rgba(255, 200, 87, 0.25);
@@ -419,6 +656,7 @@
     height: 16px;
     background: var(--glass-border);
     margin: 0 2px;
+    flex-shrink: 0;
   }
 
   .badge {
@@ -428,9 +666,87 @@
     border-radius: 4px;
     color: var(--text-faint);
     border: 1px dashed var(--glass-border);
+    white-space: nowrap;
   }
   .badge.mode {
     color: var(--magenta);
     border-color: var(--magenta-dim);
+  }
+
+  /* ---- overflow ⋯ menu ---- */
+  .morewrap {
+    position: relative;
+    display: flex;
+  }
+  .morebtn {
+    min-width: 26px;
+    font-size: 11px;
+    letter-spacing: 0;
+    line-height: 1;
+  }
+  .morebtn.on,
+  .morebtn:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+  }
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 89;
+  }
+  .menu {
+    position: absolute;
+    top: calc(100% + 10px);
+    right: 0;
+    z-index: 90;
+    min-width: 170px;
+    display: flex;
+    flex-direction: column;
+    padding: 5px;
+    border-radius: 7px;
+    background: rgba(8, 10, 19, 0.96);
+    max-height: calc(100vh - 90px);
+    overflow-y: auto;
+  }
+  .mrow {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 14px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 7px 9px;
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .mrow:hover {
+    background: rgba(82, 229, 255, 0.09);
+    color: var(--cyan);
+  }
+  .mrow.on {
+    color: var(--cyan);
+  }
+  .mrow.alert {
+    color: var(--amber);
+  }
+  .mdot {
+    font-size: 8px;
+    color: var(--cyan);
+  }
+  .mbadge {
+    padding: 6px 9px 4px;
+    border-top: 1px solid var(--glass-border);
+    margin-top: 4px;
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    color: var(--text-faint);
+    white-space: nowrap;
+  }
+  .mbadge.mode {
+    color: var(--magenta);
   }
 </style>
