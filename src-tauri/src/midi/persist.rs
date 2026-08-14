@@ -47,6 +47,18 @@ fn default_meter_events() -> Vec<MeterEvent> {
     vec![MeterEvent { tick: 0, num: 4, den: 4 }]
 }
 
+/// Fixed namespace for deterministic content-id minting on v2->v3
+/// migration (round-2 §5, ADR 0004) — same discipline as
+/// `audio::project::AURA_SOURCE_NS`: re-migrating the same un-resaved v2
+/// file twice must mint the SAME content id, or every re-open looks like a
+/// diff. Keyed by the clip's own id (content is 1:1 with its placement
+/// until a split/merge/copy content-op exists — none does yet).
+const CONTENT_NS: uuid::Uuid = uuid::uuid!("6f1a8b2e-8c4d-4a7a-9e1a-2c9f6b7d0a11");
+
+fn mint_content_id(clip_id: &str) -> crate::ids::ContentId {
+    crate::ids::ContentId(uuid::Uuid::new_v5(&CONTENT_NS, clip_id.as_bytes()).to_string())
+}
+
 /// v2/v3 midi fields loaded from a project. The name predates the v3 bump
 /// (Task 6 adds `meter_events`, keeps the rest) — `tempo_events` stays
 /// bpm-typed even for a v3 file: `TempoMap` (Task 3) is the actual period-
@@ -61,7 +73,8 @@ pub struct V3Data {
     pub clips: Vec<MidiClip>,
 }
 
-/// Persisted clip row (midi-clip.schema.json `$defs/persistedClip`).
+/// Persisted clip row (midi-clip.schema.json `$defs/persistedClip`) — the
+/// v2/legacy `midiClips` shape, read forever but never written from v3 on.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedClip {
@@ -78,6 +91,40 @@ struct PersistedClip {
     /// watermark. The loaded clip's watermark is `max(row, chunk)`.
     #[serde(default = "first_note_id")]
     next_note_id: u32,
+}
+
+/// v3 content row (round-2 §5, ADR 0004): the note payload half of the
+/// split. `kind` is read but not branched on yet — every content row this
+/// crate writes is `"midi"`; a future audio-content-array round (this
+/// plan's Task 8 keeps audio single-row) would add `"audio"` rows here.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedContent {
+    id: String,
+    #[serde(default)]
+    events_ref: Option<String>,
+    #[serde(default = "first_note_id")]
+    next_note_id: u32,
+}
+
+/// v3 placement row: the position/identity half of the split.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedPlacement {
+    id: String,
+    content_id: String,
+    lane_id: String,
+    name: String,
+    timeline_start_ticks: u64,
+    length_ticks: u64,
+}
+
+/// v3 lane row: resolves a `LaneId` to its `TrackId`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedLane {
+    id: String,
+    track_id: String,
 }
 
 /// Write the midi store's state into `<dir>/project.json` (upgrading it to
@@ -107,30 +154,50 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
     let events_dir = dir.join(EVENTS_DIR);
     fs::create_dir_all(&events_dir).map_err(|e| e.to_string())?;
     let mut live_chunks = Vec::with_capacity(midi.clips.len());
-    let mut clip_rows = Vec::with_capacity(midi.clips.len());
+    // v3 content/placement split (round-2 §5, ADR 0004): each clip becomes
+    // one content row (note payload: eventsRef + the watermark, which
+    // MOVES here from the placement — round-2 §5's table) and one
+    // placement row (position/length/lane/name). `midiClips` is retired as
+    // a WRITE target from v3 on (it stays readable forever for v2 files —
+    // see `load_from_project`).
+    let mut content_rows = Vec::with_capacity(midi.clips.len());
+    let mut placement_rows = Vec::with_capacity(midi.clips.len());
+    let mut lane_ids_seen = std::collections::HashSet::new();
+    let mut lane_rows = Vec::new();
     for clip in &midi.clips {
-        let mut row = json!({
-            "id": clip.id,
-            "trackId": clip.track_id,
-            "name": clip.name,
-            "timelineStartTicks": clip.timeline_start_ticks,
-            "lengthTicks": clip.length_ticks,
+        let mut content = json!({
+            "id": clip.content_id,
+            "kind": "midi",
+            "nextNoteId": clip.next_note_id,
         });
-        // C-1: the watermark is written to the JSON row UNCONDITIONALLY,
-        // outside the "has notes" guard — an emptied clip writes no chunk
-        // (and its old chunk gets GC'd below), so the row is the only place
-        // the watermark can survive. The chunk copy (when written) keeps
-        // chunks self-describing for readers that only ever see the chunk.
-        row["nextNoteId"] = json!(clip.next_note_id);
         if !clip.notes.is_empty() {
             let chunk_name = format!("{}.bin", uuid::Uuid::new_v4());
             let chunk = events::encode_notes(midi.ppq, &clip.notes, clip.next_note_id);
             fs::write(events_dir.join(&chunk_name), chunk)
                 .map_err(|e| format!("write events chunk: {e}"))?;
-            row["eventsRef"] = json!(format!("{EVENTS_DIR}/{chunk_name}"));
+            content["eventsRef"] = json!(format!("{EVENTS_DIR}/{chunk_name}"));
             live_chunks.push(chunk_name);
         }
-        clip_rows.push(row);
+        content_rows.push(content);
+        placement_rows.push(json!({
+            "id": clip.id,
+            "contentId": clip.content_id,
+            "laneId": clip.lane_id,
+            "name": clip.name,
+            "timelineStartTicks": clip.timeline_start_ticks,
+            "lengthTicks": clip.length_ticks,
+        }));
+        // One row per DISTINCT lane actually referenced — today that's one
+        // per track-with-a-clip (every clip on a track shares that
+        // track's default lane, by construction: `LaneId::default_for_
+        // track` is a pure function of track_id). A track with zero clips
+        // gets no lane row here; this function only ever sees clips, not
+        // the track list. Documented gap, not a silent one: a future round
+        // that needs "every track has a lane, even an empty one" should
+        // mint it at track-creation time, not derive it here at save time.
+        if lane_ids_seen.insert(clip.lane_id.0.clone()) {
+            lane_rows.push(json!({ "id": clip.lane_id, "trackId": clip.track_id }));
+        }
     }
 
     // v3 tempoMap (round-2 §3.3): each bpm event quantizes ONCE, here, into
@@ -161,7 +228,10 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
     if let Some(first) = midi.tempo_events.first() {
         obj.insert("tempoBpm".into(), json!(first.bpm));
     }
-    obj.insert("midiClips".into(), Value::Array(clip_rows));
+    obj.insert("content".into(), Value::Array(content_rows));
+    obj.insert("placements".into(), Value::Array(placement_rows));
+    obj.insert("lanes".into(), Value::Array(lane_rows));
+    obj.remove("midiClips"); // v3 stops writing the v2 key; still read forever (see load_from_project)
 
     atomic_write_json(dir, &root)?;
 
@@ -242,9 +312,21 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("meterMap: {e}"))?,
         None => default_meter_events(), // no meterMap in the file (v1/v2, or a v3 that omitted it)
     };
+    let clips = if root.get("content").is_some() && root.get("placements").is_some() {
+        parse_clips_v3_native(dir, &root, ppq)?
+    } else {
+        parse_clips_legacy(dir, &root, ppq)?
+    };
+    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips }))
+}
+
+/// The v2/legacy `midiClips` shape — one row IS the placement+content
+/// conflation §5 splits apart. Content/lane ids are minted deterministically
+/// (round-2 §2.2's precedent) so re-migrating the same un-resaved v2 file
+/// twice produces identical ids.
+fn parse_clips_legacy(dir: &Path, root: &Value, ppq: u32) -> Result<Vec<MidiClip>, String> {
     let rows: Vec<PersistedClip> = match root.get("midiClips") {
-        Some(v) => serde_json::from_value(v.clone())
-            .map_err(|e| format!("midiClips: {e}"))?,
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("midiClips: {e}"))?,
         None => Vec::new(),
     };
     let mut clips = Vec::with_capacity(rows.len());
@@ -266,6 +348,8 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
             Some(w) => row.next_note_id.max(w),
             None => row.next_note_id,
         };
+        let content_id = mint_content_id(&row.id);
+        let lane_id = crate::ids::LaneId::default_for_track(&row.track_id);
         clips.push(MidiClip {
             id: row.id.into(),
             track_id: row.track_id.into(),
@@ -274,9 +358,83 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
             length_ticks: row.length_ticks.max(1),
             notes,
             next_note_id,
+            content_id,
+            lane_id,
         });
     }
-    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips }))
+    Ok(clips)
+}
+
+/// The v3-native `content`/`placements`/`lanes` shape (round-2 §5, ADR
+/// 0004): join placements to content on `contentId`, resolve each
+/// placement's track through its `laneId` via the `lanes` index. A
+/// placement whose `contentId`/`laneId` has no matching row is a
+/// structurally corrupt v3 file — same policy as a missing `eventsRef`
+/// (C-2 precedent): log and skip that ONE placement, never fail the whole
+/// project load.
+fn parse_clips_v3_native(dir: &Path, root: &Value, ppq: u32) -> Result<Vec<MidiClip>, String> {
+    let content_rows: Vec<PersistedContent> = match root.get("content") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("content: {e}"))?,
+        None => Vec::new(),
+    };
+    let placement_rows: Vec<PersistedPlacement> = match root.get("placements") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("placements: {e}"))?,
+        None => Vec::new(),
+    };
+    let lane_rows: Vec<PersistedLane> = match root.get("lanes") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("lanes: {e}"))?,
+        None => Vec::new(),
+    };
+    let lane_track: std::collections::HashMap<String, String> =
+        lane_rows.into_iter().map(|l| (l.id, l.track_id)).collect();
+    let content_by_id: std::collections::HashMap<String, PersistedContent> =
+        content_rows.into_iter().map(|c| (c.id.clone(), c)).collect();
+
+    let mut clips = Vec::with_capacity(placement_rows.len());
+    for placement in placement_rows {
+        let Some(content) = content_by_id.get(&placement.content_id) else {
+            log::warn!(
+                "midi placement {}: no matching content row {} — skipping",
+                placement.id, placement.content_id
+            );
+            continue;
+        };
+        let Some(track_id) = lane_track.get(&placement.lane_id) else {
+            log::warn!(
+                "midi placement {}: no matching lane row {} — skipping",
+                placement.id, placement.lane_id
+            );
+            continue;
+        };
+        // C-1: the content row's watermark is the durable authority; the
+        // chunk's own copy (when readable) can only push it forward.
+        let (notes, chunk_watermark) = match &content.events_ref {
+            Some(rel) => match read_chunk(dir, rel, ppq) {
+                Ok((notes, watermark)) => (notes, Some(watermark)),
+                Err(e) => {
+                    log::warn!("midi content {}: {e}; loading without notes", content.id);
+                    (Vec::new(), None)
+                }
+            },
+            None => (Vec::new(), None),
+        };
+        let next_note_id = match chunk_watermark {
+            Some(w) => content.next_note_id.max(w),
+            None => content.next_note_id,
+        };
+        clips.push(MidiClip {
+            id: placement.id.into(),
+            track_id: track_id.clone().into(),
+            name: placement.name,
+            timeline_start_ticks: placement.timeline_start_ticks,
+            length_ticks: placement.length_ticks.max(1),
+            notes,
+            next_note_id,
+            content_id: placement.content_id.into(),
+            lane_id: placement.lane_id.into(),
+        });
+    }
+    Ok(clips)
 }
 
 /// The mechanical v1 migration: ppq 960, one-entry tempo map, default
@@ -427,6 +585,8 @@ mod tests {
             length_ticks: 3840,
             notes,
             next_note_id,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track),
         }
     }
 
@@ -463,19 +623,25 @@ mod tests {
         );
         assert_eq!(raw["meterMap"][0], serde_json::json!({"tick": 0, "num": 4, "den": 4}));
         assert_eq!(raw["sectionTableRuleVersion"], crate::midi::section_table::RULE_VERSION);
-        assert_eq!(raw["midiClips"].as_array().unwrap().len(), 2);
-        let ev_ref = raw["midiClips"][0]["eventsRef"].as_str().unwrap();
+        assert!(raw.get("midiClips").is_none(), "v3 writes content+placements, not midiClips");
+        assert_eq!(raw["content"].as_array().unwrap().len(), 2);
+        assert_eq!(raw["placements"].as_array().unwrap().len(), 2);
+        assert_eq!(raw["lanes"].as_array().unwrap().len(), 2, "one default lane per distinct track (t1, t2)");
+        let ev_ref = raw["content"][0]["eventsRef"].as_str().unwrap();
         assert!(ev_ref.starts_with("events/") && ev_ref.ends_with(".bin"));
         assert!(dir.join(ev_ref).exists());
         assert!(
-            raw["midiClips"][0].get("notes").is_none(),
+            raw["content"][0].get("notes").is_none(),
             "notes NEVER inline in project.json"
         );
         // Empty clip has no chunk...
-        assert!(raw["midiClips"][1].get("eventsRef").is_none());
-        // ...but BOTH rows carry the watermark unconditionally (C-1).
-        assert_eq!(raw["midiClips"][0]["nextNoteId"], midi.clips[0].next_note_id);
-        assert_eq!(raw["midiClips"][1]["nextNoteId"], midi.clips[1].next_note_id);
+        assert!(raw["content"][1].get("eventsRef").is_none());
+        // ...but BOTH content rows carry the watermark unconditionally (C-1;
+        // the watermark lives on content now, round-2 §5's table).
+        assert_eq!(raw["content"][0]["nextNoteId"], midi.clips[0].next_note_id);
+        assert_eq!(raw["content"][1]["nextNoteId"], midi.clips[1].next_note_id);
+        assert_eq!(raw["placements"][0]["contentId"], raw["content"][0]["id"]);
+        assert_eq!(raw["placements"][0]["laneId"], raw["lanes"][0]["id"]);
 
         let v2 = load_from_project(&dir).unwrap().expect("v2 present");
         assert_eq!(v2.ppq, midi.ppq);
@@ -485,6 +651,8 @@ mod tests {
         assert_eq!(v2.clips[0].next_note_id, midi.clips[0].next_note_id);
         assert_eq!(v2.clips[1].next_note_id, midi.clips[1].next_note_id);
         assert_eq!(v2.clips[0].timeline_start_ticks, 960);
+        assert_eq!(v2.clips[0].content_id, midi.clips[0].content_id, "round-trips through the split");
+        assert_eq!(v2.clips[0].lane_id, midi.clips[0].lane_id);
         assert!(v2.clips[1].notes.is_empty());
         let _ = fs::remove_dir_all(&parent);
     }
@@ -536,8 +704,8 @@ mod tests {
         save_into_project(&dir, &midi).unwrap();
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
-        assert!(raw["midiClips"][0].get("eventsRef").is_none(), "emptied clip writes no chunk");
-        assert_eq!(raw["midiClips"][0]["nextNoteId"], 6, "watermark survives the emptied chunk");
+        assert!(raw["content"][0].get("eventsRef").is_none(), "emptied clip writes no chunk");
+        assert_eq!(raw["content"][0]["nextNoteId"], 6, "watermark survives the emptied chunk");
 
         let mut loaded = load_from_project(&dir).unwrap().unwrap();
         assert_eq!(loaded.clips[0].next_note_id, 6, "reload sees the row watermark");
@@ -598,7 +766,7 @@ mod tests {
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
         assert_eq!(raw["schemaVersion"], 3, "stays v3");
-        assert_eq!(raw["midiClips"].as_array().unwrap().len(), 1);
+        assert_eq!(raw["placements"].as_array().unwrap().len(), 1);
         assert_eq!(raw["ppq"], 960);
         assert_eq!(raw["tempoBpm"], 87.0);
         assert_eq!(
@@ -622,14 +790,22 @@ mod tests {
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
         let midi = store_with(vec![]);
         save_into_project(&dir, &midi).unwrap();
-        // Inject a hostile ref.
+        // Inject a hostile ref into the v3-native content/placements/lanes
+        // shape (a real v3 file after this save has empty arrays for all
+        // three — the injected rows exercise the SAME traversal guard
+        // `parse_clips_v3_native` shares with the legacy path via
+        // `read_chunk`).
         let mut raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
-        raw["midiClips"] = serde_json::json!([{
-            "id": "x", "trackId": "t", "name": "n",
-            "timelineStartTicks": 0, "lengthTicks": 10,
+        raw["content"] = serde_json::json!([{
+            "id": "content-x",
             "eventsRef": "events/../../etc/passwd.bin"
         }]);
+        raw["placements"] = serde_json::json!([{
+            "id": "x", "contentId": "content-x", "laneId": "lane-x",
+            "name": "n", "timelineStartTicks": 0, "lengthTicks": 10
+        }]);
+        raw["lanes"] = serde_json::json!([{ "id": "lane-x", "trackId": "t" }]);
         fs::write(dir.join(PROJECT_FILE), serde_json::to_vec(&raw).unwrap()).unwrap();
         let v2 = load_from_project(&dir).unwrap().unwrap();
         assert!(v2.clips[0].notes.is_empty(), "traversal ref ignored");
@@ -649,7 +825,7 @@ mod tests {
 
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
-        let ev_ref = raw["midiClips"][0]["eventsRef"].as_str().unwrap().to_string();
+        let ev_ref = raw["content"][0]["eventsRef"].as_str().unwrap().to_string();
         let chunk_path = dir.join(&ev_ref);
         let bad_path = chunk_path.with_extension("bin.bad");
         assert!(chunk_path.is_file(), "chunk exists before corruption");
@@ -716,7 +892,7 @@ mod tests {
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
         assert_eq!(raw["plugins"][0]["uid"], "lv2:x");
-        assert_eq!(raw["midiClips"].as_array().unwrap().len(), 1);
+        assert_eq!(raw["placements"].as_array().unwrap().len(), 1);
         assert_eq!(raw["tempoBpm"], 99.0);
 
         // An apply error leaves the file untouched.

@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ClipId, NoteId, TrackId};
+use crate::ids::{ClipId, ContentId, LaneId, NoteId, TrackId};
 
 /// Default ticks-per-quarter-note for new (v2) projects.
 /// 960 divides cleanly by 2..=10 dotted/triplet grids and matches common DAWs.
@@ -102,6 +102,21 @@ pub struct MidiClip {
     /// and the AMEV chunk header) rather than being derived.
     #[serde(default = "first_note_id")]
     pub next_note_id: u32,
+    /// Content identity (round-2 §5, ADR 0004): first populated by the C/D
+    /// content/placement split (`midi::persist`'s v3 read path mints one
+    /// deterministically per clip on migration; every fresh clip mints its
+    /// own too). `#[serde(default)]` covers DESERIALIZATION of pre-v3 rows
+    /// only — a v3+ reader always sets this explicitly (see `persist.rs`),
+    /// so the empty-string default is never actually observed there; every
+    /// non-serde struct-literal constructor of `MidiClip` in this crate
+    /// must set it explicitly (Rust does not apply `#[serde(default)]` to
+    /// plain struct literals).
+    #[serde(default)]
+    pub content_id: ContentId,
+    /// Lane reference (round-2 §5): resolves to a track via a `lanes[]`
+    /// row in the v3 file. Same `#[serde(default)]` caveat as `content_id`.
+    #[serde(default)]
+    pub lane_id: LaneId,
 }
 
 /// Serde default for [`MidiClip::next_note_id`] (and, imported,
@@ -195,6 +210,7 @@ mod tests {
             id: "c-1".into(), track_id: "t-1".into(), name: "c".into(),
             timeline_start_ticks: 0, length_ticks: 3840,
             notes: vec![], next_note_id: 1,
+            content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
         };
         let a = clip.mint_note_id();
         let b = clip.mint_note_id();
@@ -215,6 +231,7 @@ mod tests {
                 MidiNote { tick: 1, length_ticks: 1, key: 61, velocity: 100, channel: 0, note_id: NoteId(5) },
             ],
             next_note_id: 6,
+            content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
         };
         clip.ensure_note_ids().unwrap();
         assert_eq!(clip.notes[0].note_id.0, 6, "unassigned got minted");

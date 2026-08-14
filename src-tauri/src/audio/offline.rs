@@ -278,6 +278,8 @@ mod tests {
                 length_ticks: 1920,
                 notes,
                 next_note_id: 3,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("m1"),
             }],
             loaded_dir: None,
             dirty: false,

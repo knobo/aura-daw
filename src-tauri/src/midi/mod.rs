@@ -315,6 +315,7 @@ pub fn midi_add_clip(
     }
     with_synced_store(&audio, &state, true, move |s| {
         let n = s.clips.len();
+        let lane_id = crate::ids::LaneId::default_for_track(&track_id);
         let clip = MidiClip {
             id: uuid::Uuid::new_v4().to_string().into(),
             track_id: track_id.into(),
@@ -323,6 +324,8 @@ pub fn midi_add_clip(
             length_ticks,
             notes: Vec::new(),
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id,
         };
         s.clips.push(clip.clone());
         Ok(clip)
@@ -461,6 +464,7 @@ pub fn midi_import_file(
                 }
                 for c in &mut clips {
                     c.track_id = id.clone().into();
+                    c.lane_id = crate::ids::LaneId::default_for_track(id);
                     c.timeline_start_ticks += start;
                 }
             }
@@ -471,6 +475,7 @@ pub fn midi_import_file(
                         Some(c.name.clone()),
                         Some("midi".into()),
                     )?;
+                    c.lane_id = crate::ids::LaneId::default_for_track(track.id.as_str());
                     c.track_id = track.id;
                     c.timeline_start_ticks += start;
                 }
@@ -601,6 +606,8 @@ mod tests {
             length_ticks: 960,
             notes: Vec::new(),
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
         });
         midi.dirty = true;
         midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));

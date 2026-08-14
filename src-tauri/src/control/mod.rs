@@ -930,6 +930,8 @@ pub fn demo_seed_clips(
             length_ticks: 4 * bar as u64,
             notes,
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
         };
         c.ensure_note_ids().expect("demo notes never collide");
         c
@@ -1027,6 +1029,8 @@ pub fn demo_seed_clips_v2(
             length_ticks: 4 * bar as u64,
             notes,
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
         };
         c.ensure_note_ids().expect("demo notes never collide");
         c
@@ -2130,6 +2134,8 @@ mod tests {
             length_ticks: 960,
             notes: Vec::new(),
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
         }
     }
 
@@ -2206,7 +2212,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(json["tracks"][0]["name"], "Keys", "tracks on disk");
-        assert_eq!(json["midiClips"][0]["id"], "mc1", "in-memory midi materialized");
+        assert_eq!(json["placements"][0]["id"], "mc1", "in-memory midi materialized");
         assert!(
             events.lock().iter().any(|(n, _)| n == "project://changed"),
             "project://changed emitted"

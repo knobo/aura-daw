@@ -89,6 +89,52 @@ fn v2_multi_tempo_project_migrates_and_resaves_as_v3() {
 }
 
 #[test]
+fn v2_project_with_clips_migrates_clips_into_content_and_placements() {
+    let dir = copy_fixture_to_tmp("with_clips");
+    let v3 = aura_lib::midi::persist::load_from_project(&dir).unwrap().expect("v2+ present");
+    assert_eq!(v3.clips.len(), 1);
+    let clip = &v3.clips[0];
+    assert!(!clip.content_id.as_str().is_empty(), "content id minted on migration");
+    assert!(!clip.lane_id.as_str().is_empty(), "lane id minted (default lane) on migration");
+
+    // Re-migrating the SAME v2 file twice mints the SAME content/lane ids
+    // (deterministic minting, same discipline as assign_source_ids —
+    // round-2 §2.2's precedent applied here).
+    let dir2 = copy_fixture_to_tmp("with_clips");
+    let v3b = aura_lib::midi::persist::load_from_project(&dir2).unwrap().unwrap();
+    assert_eq!(v3.clips[0].content_id, v3b.clips[0].content_id, "deterministic content id minting");
+    assert_eq!(v3.clips[0].lane_id, v3b.clips[0].lane_id, "deterministic lane id minting");
+
+    let store = aura_lib::midi::MidiStore {
+        ppq: v3.ppq,
+        tempo_events: v3.tempo_events.clone(),
+        meter_events: v3.meter_events.clone(),
+        clips: v3.clips.clone(),
+        loaded_dir: None,
+        dirty: false,
+    };
+    aura_lib::midi::persist::save_into_project(&dir, &store).unwrap();
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
+    assert!(raw.get("midiClips").is_none(), "v3 writes content+placements, not midiClips");
+    assert_eq!(raw["content"].as_array().unwrap().len(), 1);
+    assert_eq!(raw["placements"].as_array().unwrap().len(), 1);
+    assert_eq!(raw["lanes"].as_array().unwrap().len(), 1, "one default lane for the one track");
+    assert_eq!(raw["content"][0]["kind"], "midi");
+    assert_eq!(raw["content"][0]["nextNoteId"], 1);
+    assert_eq!(raw["placements"][0]["contentId"], raw["content"][0]["id"]);
+    assert_eq!(raw["placements"][0]["laneId"], raw["lanes"][0]["id"]);
+    assert_eq!(raw["lanes"][0]["trackId"], "t1");
+
+    let reloaded = aura_lib::midi::persist::load_from_project(&dir).unwrap().unwrap();
+    assert_eq!(reloaded.clips[0].content_id, clip.content_id, "round-trips through the split and back");
+    assert_eq!(reloaded.clips[0].lane_id, clip.lane_id);
+    assert_eq!(reloaded.clips[0].timeline_start_ticks, clip.timeline_start_ticks);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(&dir2);
+}
+
+#[test]
 fn project_rs_schema_gate_accepts_v3() {
     let dir = copy_fixture_to_tmp("single_tempo");
     let (project, _) = aura_lib::audio::project::load(&dir).unwrap();

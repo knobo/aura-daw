@@ -1033,6 +1033,8 @@ mod tests {
                     note_id: crate::ids::NoteId(0),
                 }],
                 next_note_id: 1,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("m1"),
             }],
             loaded_dir: None,
             dirty: false,

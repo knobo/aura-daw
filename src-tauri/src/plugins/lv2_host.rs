@@ -748,6 +748,8 @@ mod tests {
                 length_ticks: clip_len_ticks,
                 notes: vec![note],
                 next_note_id: 1,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track(track_id),
             }],
             loaded_dir: None,
             dirty: false,

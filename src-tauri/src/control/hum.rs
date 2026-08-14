@@ -199,6 +199,7 @@ pub(crate) fn apply_hum_notes(
     for n in &mut notes {
         n.note_id = crate::ids::NoteId(0);
     }
+    let lane_id = crate::ids::LaneId::default_for_track(target.as_str());
     let mut clip = MidiClip {
         id: crate::ids::ClipId::mint(),
         track_id: target,
@@ -207,6 +208,8 @@ pub(crate) fn apply_hum_notes(
         length_ticks: length_ticks.max(end).max(1),
         notes,
         next_note_id: 1,
+        content_id: crate::ids::ContentId::mint(),
+        lane_id,
     };
     clip.ensure_note_ids()?;
     session.midi.clips.push(clip.clone());

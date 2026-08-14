@@ -95,6 +95,8 @@ mod tests {
             length_ticks: len_ticks,
             notes,
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
         }
     }
 
