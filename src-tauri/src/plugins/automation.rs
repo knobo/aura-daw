@@ -73,7 +73,7 @@ pub struct AutomationPoint {
 }
 
 /// One parameter's automation curve.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AutomationLane {
     pub id: String,
@@ -87,24 +87,28 @@ pub struct AutomationLane {
     pub points: Vec<AutomationPoint>,
 }
 
-/// In-memory automation state, synced with the open project like the midi
-/// store (lazy reload when the project dir changes; auto-persist on edit).
-#[derive(Debug, Default)]
-pub struct AutomationStore {
-    pub lanes: Vec<AutomationLane>,
-    pub loaded_dir: Option<PathBuf>,
+/// PROJECT-ADOPTION SEAM cross-cutting reach (Plan E Task 10, mirrors
+/// `midi::playback`'s `PLAYBACK_SESSION`): `adopt_open_project` runs from
+/// call sites (`midi::persist::load_from_project`,
+/// `ControlPlane::create_project`/`save_project_as`) that have no session
+/// handle of their own to pass in, so the shared `Session` is reached
+/// through this process-global instead — registered once, from
+/// `MidiState::shared` (the same app-setup hook that wires
+/// `midi::playback::register_store`), never touched by unit tests (which
+/// construct `Session`s locally and call `adopt_open_project` only after
+/// registering their own — see this module's tests).
+static SESSION: OnceLock<Arc<Mutex<crate::control::Session>>> = OnceLock::new();
+
+/// Register the app-wide session for the project-adoption seam. First
+/// registration wins; tests register a local session instead of relying on
+/// this being set (unset = `adopt_open_project` is inert, same contract the
+/// retired `STORE` global had).
+pub fn register_session(session: Arc<Mutex<crate::control::Session>>) {
+    let _ = SESSION.set(session);
 }
 
-static STORE: OnceLock<Arc<Mutex<AutomationStore>>> = OnceLock::new();
-
-/// Register the app-wide automation store (first registration wins; called
-/// from `plugins::init`). Tests use local stores instead.
-pub fn register_store(store: Arc<Mutex<AutomationStore>>) {
-    let _ = STORE.set(store);
-}
-
-pub fn registered_store() -> Option<&'static Arc<Mutex<AutomationStore>>> {
-    STORE.get()
+pub fn registered_session() -> Option<&'static Arc<Mutex<crate::control::Session>>> {
+    SESSION.get()
 }
 
 /// Validate + normalize a lane in place: finite values, points sorted by
@@ -242,10 +246,15 @@ struct PersistedLane {
     points_ref: Option<String>,
 }
 
-/// Write the automation store into `<dir>/project.json` (`automation[]`) and
+/// Write a lane SNAPSHOT into `<dir>/project.json` (`automation[]`) and
 /// point chunks under `<dir>/automation/`, GC'ing stale chunks afterwards.
 /// Upgrades v1 files to schemaVersion 2 (same discipline as midi persist).
-pub fn save_into_project(dir: &Path, store: &AutomationStore) -> Result<(), String> {
+///
+/// Takes a plain snapshot (not the document itself, round-2 §4: no disk I/O
+/// under the session lock) — `ControlPlane::execute_persist` clones
+/// `session.automation.lanes` under a short lock and calls this AFTER the
+/// lock is released, same shape as `midi::persist::save_snapshot_into_project`.
+pub fn save_into_project(dir: &Path, lanes: &[AutomationLane]) -> Result<(), String> {
     // Chunk ppq: adopt the project's current ppq so ticks stay consistent
     // with midi clips (rescaled on load when it changed since).
     let ppq = fs::read(dir.join("project.json"))
@@ -256,9 +265,9 @@ pub fn save_into_project(dir: &Path, store: &AutomationStore) -> Result<(), Stri
         .unwrap_or(DEFAULT_PPQ);
 
     let adir = automation_dir(dir);
-    let mut rows = Vec::with_capacity(store.lanes.len());
+    let mut rows = Vec::with_capacity(lanes.len());
     let mut live_chunks: Vec<String> = Vec::new();
-    for lane in &store.lanes {
+    for lane in lanes {
         let mut row = PersistedLane {
             id: lane.id.clone(),
             target_node: lane.target_node.clone(),
@@ -369,30 +378,31 @@ fn rescale(t: u32, from_ppq: u32, to_ppq: u32) -> u32 {
     ((t as u64 * to_ppq as u64 + from_ppq as u64 / 2) / from_ppq as u64) as u32
 }
 
-/// PROJECT-OPEN SEAM (called by `midi::persist::load_from_project`): adopt
-/// the opened project's automation lanes into the app-global store. Inert
-/// until the app registers the store (unit tests use local stores).
+/// PROJECT-OPEN SEAM (called by `midi::persist::load_from_project`, and
+/// directly by `ControlPlane::create_project`/`save_project_as`): adopt the
+/// opened project's automation lanes into `session.automation.lanes`. Inert
+/// until the app registers the session (unit tests register a local one, or
+/// don't, and never observe this).
+///
+/// Unlike the retired lazily-resyncing `AutomationStore`, there is no
+/// `loaded_dir` special case here: this fn only ever runs at the exact
+/// moment a project is (re)adopted (open/create — never speculatively, on
+/// every command, the way the old lazy-sync `with_synced` used to check),
+/// so a project with no persisted `automation[]` field genuinely means
+/// "this (now open) project has none" — clearing unconditionally is correct.
 pub fn adopt_open_project(dir: &Path) {
-    let Some(store) = registered_store() else { return };
-    let mut s = store.lock();
+    let Some(session) = registered_session() else { return };
     match load_lanes(dir) {
         Ok(Some(lanes)) => {
             let n = lanes.len();
-            s.lanes = lanes;
+            session.lock().automation.lanes = lanes;
             if n > 0 {
                 log::info!("automation: adopted {n} lane(s) from {}", dir.display());
             }
         }
-        // No automation field: a project that never persisted automation
-        // starts (or stays) empty only if it is a DIFFERENT project.
-        Ok(None) => {
-            if s.loaded_dir.as_deref() != Some(dir) {
-                s.lanes.clear();
-            }
-        }
+        Ok(None) => session.lock().automation.lanes.clear(),
         Err(e) => log::warn!("automation: cannot restore from {}: {e}", dir.display()),
     }
-    s.loaded_dir = Some(dir.to_path_buf());
 }
 
 // ---------------------------------------------------------------------------
@@ -542,80 +552,44 @@ impl LiveInstrument for GainAutomatedNode {
 }
 
 // ---------------------------------------------------------------------------
-// Commands (bodies live here; NOT yet registered — lib.rs is frozen, the
-// registration of `automation_get` / `automation_set` is requested from the
-// architect in the zone report)
+// Commands (Plan E Task 10: lanes moved into `Session`; both commands go
+// through the transaction channel / a plain locked read, no more lazy
+// resync, no more auto-persist-inside-the-lock)
 // ---------------------------------------------------------------------------
 
-/// Run `f` against the automation store, synced with the open project (lazy
-/// reload on dir change — the midi `with_synced_store` pattern). Mutations
-/// auto-persist into the open project.
-fn with_synced<R>(
-    audio: &crate::audio::AudioState,
-    state: &super::PluginState,
-    mutating: bool,
-    f: impl FnOnce(&mut AutomationStore) -> Result<R, String>,
-) -> Result<R, String> {
-    let dir = {
-        let (session, _, _) = audio.control_parts();
-        let d = session.lock().store.project_dir.clone();
-        d
-    };
-    let mut auto = state.automation.lock();
-    if auto.loaded_dir != dir {
-        if let Some(d) = &dir {
-            match load_lanes(d) {
-                Ok(Some(lanes)) => auto.lanes = lanes,
-                Ok(None) => auto.lanes.clear(),
-                Err(e) => log::warn!("automation: cannot read project state: {e}"),
-            }
-        }
-        auto.loaded_dir = dir.clone();
-    }
-    let result = f(&mut auto)?;
-    if mutating {
-        if let Some(d) = &dir {
-            if let Err(e) = save_into_project(d, &auto) {
-                log::warn!("automation: persisting to {} failed: {e}", d.display());
-            }
-        }
-    }
-    Ok(result)
-}
-
-/// All automation lanes (points inline — GET is per-project, not per-frame).
+/// All automation lanes (points inline — GET is per-project, not
+/// per-frame). PURE read under the session lock: no sync, no `loaded_dir`,
+/// no disk I/O — epochs (project open/create) adopt lanes into
+/// `session.automation` eagerly (`adopt_open_project`), so by the time any
+/// command runs the session already reflects the open project.
 #[tauri::command]
 pub fn automation_get(
-    state: State<'_, super::PluginState>,
-    audio: State<'_, crate::audio::AudioState>,
+    control: State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<Vec<AutomationLane>, String> {
-    with_synced(&audio, &state, false, |s| Ok(s.lanes.clone()))
+    Ok(control.automation_lanes())
 }
 
 /// Upsert one lane (batch-shaped, D-03: one invoke carries the lane's FULL
 /// point set — an edit gesture, never one invoke per point). An empty
-/// `points` array deletes the lane. Returns the updated lane list.
+/// `points` array deletes the lane. Commits `Op::AutomationSetLane` through
+/// the transaction channel (undo/redo-eligible, `persist.automation`
+/// executed post-lock by `ControlPlane::execute_persist`). Returns the
+/// updated lane list.
 #[tauri::command]
 pub fn automation_set(
     mut lane: AutomationLane,
-    state: State<'_, super::PluginState>,
-    audio: State<'_, crate::audio::AudioState>,
+    control: State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<Vec<AutomationLane>, String> {
     if lane.id.is_empty() {
         lane.id = uuid::Uuid::new_v4().to_string();
     }
     normalize_lane(&mut lane)?;
-    with_synced(&audio, &state, true, move |s| {
-        if lane.points.is_empty() {
-            s.lanes.retain(|l| l.id != lane.id);
-        } else {
-            match s.lanes.iter_mut().find(|l| l.id == lane.id) {
-                Some(existing) => *existing = lane,
-                None => s.lanes.push(lane),
-            }
-        }
-        Ok(s.lanes.clone())
-    })
+    let key = lane.id.clone();
+    let to_apply = if lane.points.is_empty() { None } else { Some(lane) };
+    control.commit(crate::control::op::TxMeta::user("edit automation"), move |tx| {
+        tx.apply(crate::control::op::Op::AutomationSetLane { key, lane: to_apply })
+    })?;
+    Ok(control.automation_lanes())
 }
 
 #[cfg(test)]
@@ -706,13 +680,14 @@ mod tests {
         fs::create_dir_all(&parent).unwrap();
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
 
-        let mut store = AutomationStore::default();
-        store.lanes.push(lane(vec![
-            AutomationPoint { tick: 0, value: 1.0 },
-            AutomationPoint { tick: 3840, value: 0.0 },
-        ]));
-        store.lanes.push(lane(vec![])); // empty lane row, no chunk
-        save_into_project(&dir, &store).unwrap();
+        let mut lanes = vec![
+            lane(vec![
+                AutomationPoint { tick: 0, value: 1.0 },
+                AutomationPoint { tick: 3840, value: 0.0 },
+            ]),
+            lane(vec![]), // empty lane row, no chunk
+        ];
+        save_into_project(&dir, &lanes).unwrap();
 
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
@@ -734,15 +709,15 @@ mod tests {
         assert_eq!(raw["automation"].as_array().unwrap().len(), 2);
         assert!(dir.join(pref).exists(), "automation chunk untouched by midi GC");
 
-        let lanes = load_lanes(&dir).unwrap().expect("automation present");
-        assert_eq!(lanes.len(), 2);
-        assert_eq!(lanes[0].points, store.lanes[0].points);
-        assert_eq!(lanes[0].param_id, 0);
-        assert!(lanes[1].points.is_empty());
+        let loaded = load_lanes(&dir).unwrap().expect("automation present");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].points, lanes[0].points);
+        assert_eq!(loaded[0].param_id, 0);
+        assert!(loaded[1].points.is_empty());
 
         // Resave GCs the stale chunk.
-        store.lanes[0].points[1].value = 0.5;
-        save_into_project(&dir, &store).unwrap();
+        lanes[0].points[1].value = 0.5;
+        save_into_project(&dir, &lanes).unwrap();
         let chunks: Vec<_> = fs::read_dir(automation_dir(&dir))
             .unwrap()
             .flatten()
@@ -761,8 +736,7 @@ mod tests {
         ));
         fs::create_dir_all(&parent).unwrap();
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
-        let store = AutomationStore::default();
-        save_into_project(&dir, &store).unwrap();
+        save_into_project(&dir, &[]).unwrap();
         let mut raw: Value =
             serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
         raw["automation"] = serde_json::json!([
@@ -1051,5 +1025,67 @@ mod tests {
         let mut no_target = lane(vec![]);
         no_target.target_node.clear();
         assert!(normalize_lane(&mut no_target).is_err());
+    }
+
+    // ---- Plan E Task 10: session move ---------------------------------
+
+    /// `automation_get`'s ENTIRE body is now `session.lock().automation
+    /// .lanes.clone()` (`ControlPlane::automation_lanes`) — a pure,
+    /// side-effect-free session-lock read: no lazy resync, no `loaded_dir`
+    /// bookkeeping, no disk I/O, and (unlike the retired `with_synced`) no
+    /// requirement that a project even be open. `tests/pure_readers.rs`
+    /// does not exist at this task's base commit (checked: absent from
+    /// `src-tauri/tests/`), so this purity test lives here instead, per the
+    /// task brief's fallback instruction.
+    #[test]
+    fn automation_get_is_a_pure_session_read_no_disk_no_project_dir() {
+        let session = parking_lot::Mutex::new(crate::control::Session::new(
+            crate::audio::types::Store::default(),
+            crate::midi::MidiStore::default(),
+        ));
+        assert!(session.lock().store.project_dir.is_none(), "no project ever opened");
+        let l = lane(vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        session.lock().automation.lanes.push(l.clone());
+
+        // Exactly what the command reduces to: lock, clone, return.
+        let read = session.lock().automation.lanes.clone();
+        assert_eq!(read, vec![l]);
+        // Repeat reads are side-effect-free (no mutation of any kind —
+        // unlike the retired `with_synced`, which wrote `loaded_dir` on
+        // every single call, mutating reader included).
+        assert_eq!(session.lock().automation.lanes.clone(), read);
+    }
+
+    /// PROJECT-ADOPTION SEAM: `adopt_open_project` now writes into
+    /// `session.automation.lanes` (through the registered session global)
+    /// instead of the retired standalone `AutomationStore`. Inert unless a
+    /// session is registered — this test registers a LOCAL one (never the
+    /// real app-wide `SESSION`, so it can't leak into other tests: first
+    /// registration in the process wins and nothing else in this test
+    /// binary ever calls `register_session`).
+    #[test]
+    fn adopt_open_project_writes_into_the_registered_session() {
+        let parent = std::env::temp_dir().join(format!(
+            "aura-automation-adopt-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&parent).unwrap();
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+
+        let saved = vec![lane(vec![AutomationPoint { tick: 0, value: 1.0 }])];
+        save_into_project(&dir, &saved).unwrap();
+
+        let session = Arc::new(Mutex::new(crate::control::Session::new(
+            crate::audio::types::Store::default(),
+            crate::midi::MidiStore::default(),
+        )));
+        register_session(session.clone());
+
+        adopt_open_project(&dir);
+        assert_eq!(session.lock().automation.lanes.len(), 1, "lanes adopted from disk");
+        assert_eq!(session.lock().automation.lanes[0].points, saved[0].points);
+
+        let _ = fs::remove_dir_all(&parent);
     }
 }

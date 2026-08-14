@@ -105,10 +105,14 @@ impl MidiState {
     /// lock) into this managed state and register it with the
     /// engine-rebuild hook (playback integration) — lib.rs calls this
     /// exactly once during setup, right after `AudioState` builds the
-    /// session.
+    /// session. Also registers the same session for `plugins::automation`'s
+    /// project-adoption seam (Plan E Task 10 — mirrors `playback`'s
+    /// registration right above; both are app-setup-only, never touched by
+    /// unit tests, which construct `Session`s directly).
     pub fn shared(&self, session: Arc<Mutex<Session>>) -> Arc<Mutex<Session>> {
         let _ = self.session.set(session.clone());
         playback::register_store(session.clone());
+        crate::plugins::automation::register_session(session.clone());
         session
     }
 
