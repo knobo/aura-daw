@@ -38,6 +38,19 @@ pub struct PluginDoc {
     pub instances: Vec<PluginInstanceInfo>,
     pub params: HashMap<String, Vec<ParamInfo>>,
     pub pending_state: HashMap<String, Vec<u8>>,
+    /// Instance ids whose `pending_state` bytes are NEWER than whatever's
+    /// on disk (or nothing is on disk yet for them) — Task 9 review round 1
+    /// Critical-2: `save_snapshot_into_project`'s persist ladder previously
+    /// let a merely-EXISTING `.state` file win over fresher `pending_state`
+    /// bytes, so a second `PluginSetState` (e.g. a second zyn patch load
+    /// into the same instance) was silently dropped on disk. Set by every
+    /// `apply_raw` arm that writes `pending_state` with new authoritative
+    /// bytes (`PluginRemove`'s captured blob, `PluginSetState`); cleared by
+    /// `ControlPlane::execute_persist` for whichever ids
+    /// `save_snapshot_into_project` actually wrote. NOT set by
+    /// `restore_into_session` — a blob just read from that exact file is,
+    /// by definition, not ahead of it.
+    pub dirty_state: std::collections::HashSet<String>,
 }
 
 pub struct Session {
@@ -586,9 +599,17 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             }
             let idx = (*index).min(session.plugins.instances.len());
             session.plugins.instances.insert(idx, row.clone());
-            // Fresh params mirror (mirrors the retired
-            // `PluginRegistry::instantiate`'s empty seed) — `HostForward::
-            // Instantiate` below re-syncs it against the real host list.
+            // Seed an EMPTY params mirror only when nothing is parked there
+            // already (`.or_default()` is a no-op on an Occupied entry) —
+            // Task 9 review round 1, Important-1: undo-of-remove parks the
+            // removed row's real mirror in `session.plugins.params` (see
+            // `PluginRemove` below) instead of clearing it, specifically so
+            // THIS seed doesn't clobber it with an empty vec. A genuinely
+            // fresh instantiate's id has never been seen before, so this
+            // still seeds empty there; `HostForward::Instantiate` fills
+            // real values in — but ONLY when the mirror is still empty
+            // (same round-1 fix, control/mod.rs), so it never clobbers a
+            // restored mirror with the host's post-reinstantiate defaults.
             session.plugins.params.entry(row.id.clone()).or_default();
             effect.rebuild = true;
             effect.persist.plugins = true;
@@ -602,6 +623,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 row: row.clone(),
                 index: idx,
                 state: session.plugins.pending_state.get(&row.id).cloned(),
+                params: session.plugins.params.get(&row.id).cloned().unwrap_or_default(),
             })
         }
         Op::PluginRemove { row, state, .. } => {
@@ -614,7 +636,18 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .position(|r| r.id == row.id)
                 .ok_or_else(|| format!("unknown plugin instance: {}", row.id))?;
             let removed = session.plugins.instances.remove(pos);
-            session.plugins.params.remove(&removed.id);
+            // PARK the param mirror — do NOT clear it (Task 9 review round
+            // 1, Important-1). `Op::PluginAdd`'s fixed `{row, index}` shape
+            // has no field to carry the mirror back through on undo, so it
+            // travels via the document itself: a later `PluginAdd` for this
+            // SAME id (undo replaying THIS op's inverse) finds it already
+            // here and its `.or_default()` seed leaves it untouched. A
+            // permanent removal (never undone) leaves a small, bounded
+            // orphaned entry, same trade-off `pending_state` already makes
+            // below — both are GC'd wholesale on the next
+            // `restore_into_session`/project open.
+            effect.rebuild = true;
+            effect.persist.plugins = true;
             // Park (or clear) the state blob: `state` is the caller-captured
             // host blob (host `save_state`, taken outside the lock before
             // this op was applied) — `None` when the instance had nothing to
@@ -623,13 +656,18 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             match state {
                 Some(bytes) => {
                     session.plugins.pending_state.insert(removed.id.clone(), bytes.clone());
+                    // Dirty (Task 9 review round 1, Critical-2): these bytes
+                    // are NEWER than whatever `.state` file (if any) is on
+                    // disk for this id — `save_snapshot_into_project`'s
+                    // persist ladder must write them, not silently keep the
+                    // stale file just because it happens to exist.
+                    session.plugins.dirty_state.insert(removed.id.clone());
                 }
                 None => {
                     session.plugins.pending_state.remove(&removed.id);
+                    session.plugins.dirty_state.remove(&removed.id);
                 }
             }
-            effect.rebuild = true;
-            effect.persist.plugins = true;
             effect.host_forward.push(HostForward::Destroy { instance: removed.id.clone() });
             Ok(Op::PluginAdd { row: removed, index: pos })
         }
@@ -639,6 +677,10 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             }
             let previous = session.plugins.pending_state.get(instance).cloned();
             session.plugins.pending_state.insert(instance.clone(), state.clone());
+            // Dirty (Critical-2, same reasoning as `PluginRemove` above):
+            // these are new authoritative bytes, not necessarily reflected
+            // in whatever `.state` file already exists on disk.
+            session.plugins.dirty_state.insert(instance.clone());
             effect.persist.plugins = true;
             effect.host_forward.push(HostForward::LoadState { instance: instance.clone() });
             Ok(Op::PluginSetState {
@@ -1650,7 +1692,12 @@ mod tests {
         }
         let blob = vec![1u8, 2, 3, 4];
         let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
-            tx.apply(Op::PluginRemove { row: row.clone(), index: 0, state: Some(blob.clone()) })
+            tx.apply(Op::PluginRemove {
+                row: row.clone(),
+                index: 0,
+                state: Some(blob.clone()),
+                params: Vec::new(),
+            })
         })
         .unwrap();
         assert!(m.lock().plugins.instances.is_empty(), "row removed");
@@ -1684,6 +1731,56 @@ mod tests {
         assert!(
             c2.effect.host_forward.contains(&HostForward::LoadState { instance: "p-1".into() }),
             "undo re-emits LoadState (a blob is pending)"
+        );
+    }
+
+    /// Task 9 review round 1, Important-1: undo-of-remove must restore the
+    /// user's ACTUAL param mirror, not an empty seed later overwritten by
+    /// the host's post-reinstantiate DEFAULTS. `apply_raw`'s `PluginRemove`
+    /// arm parks the mirror instead of clearing it; `PluginAdd`'s
+    /// `.or_default()` seed must find it already there and leave it alone.
+    #[test]
+    fn plugin_remove_then_undo_restores_the_param_mirror_not_empty() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        let tweaked = ParamInfo {
+            id: 7,
+            name: "cutoff".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+            value: 0.9,
+            steps: 0,
+        };
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(row.id.clone(), vec![tweaked.clone()]);
+        }
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
+            tx.apply(Op::PluginRemove { row: row.clone(), index: 0, state: None, params: vec![] })
+        })
+        .unwrap();
+        // Document truth: the mirror is PARKED (still readable), not wiped,
+        // even though the row itself is gone.
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![tweaked.clone()]),
+            "param mirror survives removal, parked for a possible undo"
+        );
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![tweaked]),
+            "undo (PluginAdd replaying the parked id) leaves the real mirror untouched — \
+             not reset to empty"
         );
     }
 

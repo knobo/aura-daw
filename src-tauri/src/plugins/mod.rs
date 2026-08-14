@@ -76,13 +76,19 @@ pub fn registered_registry() -> Option<&'static Arc<Mutex<PluginRegistry>>> {
 /// AND for active instances whose host half cannot build a node — the
 /// caller falls back to PolySynth and logs (MIDI never goes silent).
 ///
-/// `doc` is `session.plugins`, read by the CALLER under the session lock it
-/// already holds (`engine::rebuild` — [C1]: session before tables) and
-/// passed in BY VALUE lookup here — this function itself never (re-)locks
-/// the session, only reads the slice it's handed, so the host calls below
-/// (both may block briefly — contract 3) never run while any session lock
-/// is held, exactly as the retired process-global registry lookup used to
-/// guarantee ("the registry lock is NOT held across the host call").
+/// `doc` is `session.plugins`, read by the CALLER under whatever lock it
+/// already holds and passed in BY VALUE lookup here — this function itself
+/// never (re-)locks the session, only reads the slice it's handed, so it
+/// never ADDS a new lock-then-host-call span beyond what the caller already
+/// has. HONEST NOTE (Task 9 review round 1, Important-3, correcting an
+/// earlier inaccurate claim here): `engine::rebuild` — the only production
+/// caller, via `midi::playback::node_for_track` — calls this WITH the
+/// session lock held for the whole rebuild (pre-existing, out of Task 9's
+/// scope; a Plan A handoff deferral awaiting Plan F's snapshot-based
+/// rebuild), so the host calls below (both may block briefly — contract 3)
+/// DO currently run while the session lock is held. New callers must not
+/// make this worse (no ADDITIONAL lock spans layered on top of this one);
+/// they must not assume "no session lock" as a hard guarantee either.
 ///
 /// Active LV2 instances resolve to a real [`lv2_host::Lv2Node`] through the
 /// LV2 host thread; active CLAP instances resolve to a real
@@ -310,12 +316,18 @@ pub fn plugin_remove(
     let blob = state::registered_state_bridge()
         .and_then(|b| b.save_state(&instance_id).ok().flatten())
         .map(|blob| state::encode_state(&row.uid, &blob));
+    // Current param mirror, for the recorded op's own completeness (Task 9
+    // review round 1, Important-1) — `apply_raw` parks the LIVE mirror
+    // itself regardless, so this doesn't change undo behavior, only makes
+    // the forward-recorded `Op::PluginRemove` self-describing.
+    let params = control.plugin_params(&instance_id).unwrap_or_default();
     let meta = crate::control::op::TxMeta::user("plugin remove");
     control.commit(meta, |tx| {
         tx.apply(crate::control::op::Op::PluginRemove {
             row: row.clone(),
             index: 0,
             state: blob.clone(),
+            params: params.clone(),
         })
     })?;
     // Host teardown happens as `commit`'s `HostForward::Destroy` effect

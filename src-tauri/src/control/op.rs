@@ -92,7 +92,26 @@ pub enum Op {
     /// the row + this blob parked in `pending_state`; undo re-instantiates
     /// through the host state machine (`host_forward`, executed after the
     /// lock).
-    PluginRemove { row: crate::plugins::PluginInstanceInfo, index: usize, state: Option<Vec<u8>> },
+    ///
+    /// `params` (additive, `#[serde(default)]`) is the row's param mirror
+    /// at removal time — self-describing for a journaled/replayed op the
+    /// same way `TrackRemove`'s `clips` is (Task 9 review round 1,
+    /// Important-1). `Op::PluginAdd`'s shape is fixed at `{row, index}` (no
+    /// params slot), so undo can't carry the mirror through the inverse op
+    /// itself; `apply_raw`'s `PluginRemove` arm instead PARKS the mirror in
+    /// `session.plugins.params` (never clearing it on removal, mirroring
+    /// `pending_state`'s same "survive the row's absence" treatment) so a
+    /// later `PluginAdd` for the SAME id (undo) finds it still there. A
+    /// genuinely permanent removal (never undone) leaves a small, bounded
+    /// orphaned entry — acceptable, GC'd wholesale on the next
+    /// `restore_into_session`/project open.
+    PluginRemove {
+        row: crate::plugins::PluginInstanceInfo,
+        index: usize,
+        state: Option<Vec<u8>>,
+        #[serde(default)]
+        params: Vec<crate::plugins::ParamInfo>,
+    },
     /// Full-state write (zyn patch loads): `state` is the APST-encoded blob
     /// AFTER the host load (the row's new pending_state truth); the inverse
     /// carries the PREVIOUS blob (captured via host `save_state` before the

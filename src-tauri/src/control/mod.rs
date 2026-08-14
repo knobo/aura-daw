@@ -722,8 +722,19 @@ impl ControlPlane {
         // per rAF batch — same reasoning the retired `persist_after_
         // mutation(..., with_host_state: false)` call site used.
         if let Some(doc) = plugin_snapshot {
-            if let Err(e) = crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
-                log::warn!("plugins persist failed: {e}");
+            match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
+                Ok(cleared) if !cleared.is_empty() => {
+                    // Clear `dirty_state` for whichever ids' pending bytes
+                    // just landed on disk (Task 9 review round 1,
+                    // Critical-2) — a short, separate re-lock, no disk I/O
+                    // under it.
+                    let mut s = self.session.lock();
+                    for id in cleared {
+                        s.plugins.dirty_state.remove(&id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("plugins persist failed: {e}"),
             }
         }
     }
@@ -794,7 +805,20 @@ impl ControlPlane {
                             if let Some(r) = s.plugins.instances.iter_mut().find(|r| &r.id == instance) {
                                 r.status = "active".into();
                             }
-                            s.plugins.params.insert(instance.clone(), params);
+                            // Fill only when absent (Task 9 review round 1,
+                            // Important-1): an undo-of-remove already
+                            // restored the REAL param mirror into
+                            // `session.plugins.params` (parked there by
+                            // `apply_raw`'s `PluginRemove` arm) — this must
+                            // not clobber it with the host's fresh-
+                            // reinstantiate DEFAULTS. A genuinely fresh
+                            // instantiate's mirror is still the empty seed
+                            // `Op::PluginAdd` left, so it gets filled here
+                            // exactly as before.
+                            let entry = s.plugins.params.entry(instance.clone()).or_default();
+                            if entry.is_empty() {
+                                *entry = params;
+                            }
                         }
                         Err(e) => log::warn!("plugins: instantiate forward for {instance} failed: {e}"),
                     }
@@ -1062,6 +1086,10 @@ impl ControlPlane {
             // path doesn't go through `commit`, same as the track/midi
             // writes above).
             let doc = self.session.lock().plugin_snapshot();
+            // `with_host_state: true` here always takes the `fresh` branch
+            // of the persist ladder for these brand-new instances, so
+            // there's nothing in `dirty_state` to clear (seed_demo writes
+            // rows directly, bypassing `apply_raw` entirely — see above).
             if let Err(e) = crate::plugins::state::save_snapshot_into_project(d, &doc, true) {
                 log::warn!("seed demo: persisting plugins failed: {e}");
             }
