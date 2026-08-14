@@ -26,6 +26,20 @@ pub struct TempoEvent {
     pub bpm: f64,
 }
 
+/// One tempo change in the v3 integer-period model (round-2 §3.3): period
+/// is the duration of one quarter note in superticks
+/// (`crate::time::SUPERTICKS_PER_SECOND`), sample-rate independent.
+/// `period_start == period_end` is constant tempo; otherwise a linear-in-
+/// period ramp across `[tick, next_event.tick)` (§3.3 "Ramps" — linear in
+/// seconds-per-beat, not in bpm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoPeriodEvent {
+    pub tick: u64,
+    pub period_start: u64,
+    pub period_end: u64,
+}
+
 /// One MIDI note. 16 bytes in the AMEV binary chunk encoding (see
 /// [`crate::midi::events`]); JSON on the IPC surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +154,17 @@ impl MidiNote {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tempo_period_event_serializes_camel_case_and_transparent_period_fields() {
+        let e = TempoPeriodEvent { tick: 3840, period_start: 4_233_600_000, period_end: 4_233_600_000 };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["tick"], 3840);
+        assert_eq!(v["periodStart"], 4_233_600_000u64);
+        assert_eq!(v["periodEnd"], 4_233_600_000u64);
+        let back: TempoPeriodEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+    }
 
     #[test]
     fn watermark_never_reuses_ids() {

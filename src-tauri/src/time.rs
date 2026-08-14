@@ -42,6 +42,26 @@ impl Samples {
 /// divisible by every common sample rate and PPQ (round-2 §3.3).
 pub const SUPERTICKS_PER_SECOND: u64 = 508_032_000;
 
+/// Quantize a user-typed BPM to the nearest integer period, ONCE, at entry
+/// (round-2 §3.3). Never call this on an already-stored period's displayed
+/// bpm in a loop — that's exactly the "re-quantize on every save" bug this
+/// guards against; storage keeps the integer period, not the bpm.
+pub fn period_from_bpm(bpm: f64) -> u64 {
+    let p = (SUPERTICKS_PER_SECOND as f64 * 60.0 / bpm).round();
+    if !p.is_finite() || p < 1.0 {
+        1
+    } else {
+        p as u64
+    }
+}
+
+/// Derive a display bpm from a stored period. Exact given the period;
+/// the only lossiness in the whole pipeline is the ONE quantization at
+/// `period_from_bpm` entry.
+pub fn bpm_from_period(period: u64) -> f64 {
+    SUPERTICKS_PER_SECOND as f64 * 60.0 / period.max(1) as f64
+}
+
 /// Cross-domain comparison, explicit and never `Ord` (round-2 §3.1):
 /// comparing a `Ticks` and a `Samples` value needs a tempo map to make
 /// them commensurable, so every call site names one. Implemented in this
@@ -72,5 +92,33 @@ mod tests {
         assert_eq!(serde_json::to_string(&a).unwrap(), "100");
         let back: Ticks = serde_json::from_str("100").unwrap();
         assert_eq!(back, a);
+    }
+
+    #[test]
+    fn bpm_quantizes_to_an_integer_period_and_back_within_spec_error() {
+        // Round-2 §3.3: max error ~2.4e-7 BPM at 120.5 (displays as 120.5
+        // forever); storage and derived math are exact thereafter.
+        let period = period_from_bpm(120.5);
+        let back = bpm_from_period(period);
+        assert!((back - 120.5).abs() < 3e-7, "round-trip error too large: {back}");
+
+        // Exact cases: bpm values whose period is an exact integer round-trip
+        // with zero error (60 bpm -> period == SUPERTICKS_PER_SECOND exactly).
+        assert_eq!(period_from_bpm(60.0), SUPERTICKS_PER_SECOND);
+        assert_eq!(bpm_from_period(SUPERTICKS_PER_SECOND), 60.0);
+
+        // Storage is exact thereafter: quantizing an ALREADY-quantized period's
+        // displayed bpm produces the SAME period (no drift on repeated saves).
+        let p1 = period_from_bpm(bpm_from_period(period));
+        assert_eq!(p1, period, "re-quantizing the displayed bpm must not drift");
+    }
+
+    #[test]
+    fn period_rejects_non_finite_or_non_positive_bpm_by_saturating_away_from_zero() {
+        // Defensive: a zero/negative/NaN bpm must not divide-by-zero or
+        // produce a period of 0 (which would make every later tick math
+        // divide by zero). Callers validate bpm > 0 before this point (as
+        // TempoMap::new already does); this is a belt-and-braces floor.
+        assert!(period_from_bpm(f64::MIN_POSITIVE) > 0, "never zero");
     }
 }
