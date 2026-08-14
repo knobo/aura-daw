@@ -13,6 +13,7 @@ import type {
   AuraEventMap,
   AuraEventName,
   Clip,
+  ClipPlacement,
   EvolveOptions,
   ExportCapabilities,
   ExportJobStatus,
@@ -138,6 +139,12 @@ export interface Backend {
    * Task 4). Optional — real-engine only, same convention as
    * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
   moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
+
+  /** Batch placement move — the group-drag counterpart of `moveClip`. Sent
+   * ONCE at gesture end, inside a `gestureBegin`/`gestureEnd` boundary, so
+   * the whole drag is one undo step. Optional — real-engine only, same
+   * convention as `moveClip?`. */
+  moveClips?(placements: ClipPlacement[]): Promise<void>;
 
   /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
    * primitive) — call on `pointerdown` of a fader/pan control. Matching
@@ -447,6 +454,9 @@ class TauriBackend implements Backend {
   }
   moveClip(clipId: string, timelineStartSamples: number) {
     return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  moveClips(placements: ClipPlacement[]) {
+    return invoke<void>("move_clips", { placements });
   }
   undo() {
     return invoke<HistoryStep>("undo");

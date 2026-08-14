@@ -340,6 +340,20 @@ export interface MidiClip {
   notes: MidiNote[];
 }
 
+/** One clip's new placement in a `move_clips` batch (Track C). Audio is
+ * placed in SAMPLES, MIDI in TICKS — two units that must never be
+ * confusable, hence the `kind` tag. `lengthTicks`/`contentLengthTicks` are
+ * additive and OPTIONAL: absent means "unchanged", never "clear". */
+export type ClipPlacement =
+  | { kind: "audio"; clipId: string; timelineStartSamples: number }
+  | {
+      kind: "midi";
+      clipId: string;
+      timelineStartTicks: number;
+      lengthTicks?: number;
+      contentLengthTicks?: number;
+    };
+
 /** Result of get_project_state (control plane cold-start snapshot). */
 export interface ProjectSnapshot {
   projectName?: string | null;

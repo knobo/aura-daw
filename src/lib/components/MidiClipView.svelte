@@ -13,6 +13,7 @@
   import { midiPreviewLayout } from "../utils/midi-preview";
   import { view } from "../state/view.svelte";
   import { clipSelection } from "../state/clip-selection.svelte";
+  import { clipDrag } from "../state/clip-drag.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
 
   let { clip, track }: { clip: MidiClip; track: TrackState } = $props();
@@ -125,13 +126,8 @@
   });
 
   // ── drag / select / edge-resize (mirrors ClipView + the ruler's loop pins) ──
-  let dragging = $state(false);
+  let dragging = $derived(clipDrag.active && selected);
   let dragMode: "move" | "resize" = $state("move");
-  let dragStartX = 0;
-  let dragOrigTicks = 0;
-  let dragOrigLengthTicks = 0;
-  let dragOrigContentTicks = 0; // pinned once, at drag start, for a resize gesture
-  let dragMoved = false;
 
   const EDGE_PX = 8;
 
@@ -156,47 +152,16 @@
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const nearRightEdge = rect.right - e.clientX <= EDGE_PX;
     dragMode = nearRightEdge ? "resize" : "move";
-    dragging = true;
-    dragMoved = false;
-    dragStartX = e.clientX;
-    dragOrigTicks = clip.timelineStartTicks;
-    dragOrigLengthTicks = clip.lengthTicks;
-    // Content length is pinned the moment a resize STARTS, not re-read every
-    // pointermove — the spec's "set the first time the right edge is
-    // dragged" rule: if the clip has no explicit content length yet, this
-    // drag's start-of-gesture placement length BECOMES the content length.
-    dragOrigContentTicks = midi.effectiveContentLengthTicks(clip);
+    clipDrag.begin(ref, e.clientX, dragMode);
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   }
   function onPointerMove(e: PointerEvent) {
     updateHoverEdge(e);
-    if (!dragging) return;
-    const dx = e.clientX - dragStartX;
-    if (Math.abs(dx) > 2) dragMoved = true;
-    if (!dragMoved) return;
-    if (dragMode === "resize") {
-      let targetSamples = midi.ticksToSamples(dragOrigTicks + dragOrigLengthTicks) + dx * view.spp;
-      if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
-      const newLengthTicks = Math.max(
-        1,
-        Math.round(midi.samplesToTicks(Math.max(0, targetSamples)) - dragOrigTicks),
-      );
-      midi.clips = midi.clips.map((c) =>
-        c.id === clip.id
-          ? { ...c, lengthTicks: newLengthTicks, contentLengthTicks: dragOrigContentTicks }
-          : c,
-      );
-    } else {
-      let targetSamples = midi.ticksToSamples(dragOrigTicks) + dx * view.spp;
-      if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
-      midi.moveClip(clip.id, midi.samplesToTicks(Math.max(0, targetSamples)));
-    }
+    clipDrag.move(e.clientX, e.altKey);
   }
   function onPointerUp(e: PointerEvent) {
-    const wasDragging = dragging && dragMoved;
-    dragging = false;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
-    if (wasDragging) void midi.commitBounds(clip.id);
+    void clipDrag.end();
   }
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
@@ -226,6 +191,7 @@
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
+    onpointercancel={() => clipDrag.cancel()}
     ondblclick={() => midi.open(clip.id)}
     onkeydown={onKeydown}
   >

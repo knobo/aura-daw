@@ -1,0 +1,159 @@
+/**
+ * Group drag: the delta comes from the ANCHOR (snapped once), every clip
+ * moves by it, and the whole drag is ONE gesture-wrapped move_clips call.
+ */
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Clip, MidiClip } from "../types/ipc";
+
+const calls: string[] = [];
+const gestureBegin = vi.fn(async () => {
+  calls.push("gestureBegin");
+});
+const gestureEnd = vi.fn(async () => {
+  calls.push("gestureEnd");
+});
+const moveClips = vi.fn(async (_placements: unknown) => {
+  calls.push("moveClips");
+});
+
+vi.mock("../tauri", () => ({
+  backend: {
+    on: () => () => {},
+    gestureBegin: (...a: unknown[]) => gestureBegin(...(a as [])),
+    gestureEnd: () => gestureEnd(),
+    moveClips: (p: unknown) => moveClips(p as never),
+    getProjectState: () =>
+      Promise.resolve({ ppq: 960, tempoEvents: [{ tick: 0, bpm: 120 }], midiClips: [] }),
+  },
+}));
+
+const { project } = await import("./project.svelte");
+const { midi } = await import("./midi.svelte");
+const { view } = await import("./view.svelte");
+const { clipSelection } = await import("./clip-selection.svelte");
+const { clipDrag } = await import("./clip-drag.svelte");
+
+beforeEach(() => {
+  calls.length = 0;
+  vi.clearAllMocks();
+  project.sampleRate = 48000;
+  project.tempoBpm = 120;
+  project.timeSignature = [4, 4];
+  // 1 sample per pixel keeps the pointer maths readable in the assertions
+  view.spp = 1;
+  view.snap = false;
+  project.clips = [
+    { id: "a1", trackId: "t1", timelineStartSamples: 1000, lengthSamples: 100 } as Clip,
+    { id: "a2", trackId: "t1", timelineStartSamples: 3000, lengthSamples: 100 } as Clip,
+  ];
+  // a flat 120bpm/960ppq map: 1 beat = 24000 samples = 960 ticks -> 25 samples/tick
+  // (period = 60/120 * 508_032_000 superticks/quarter, same construction as
+  // clip-edit-loop.test.ts's flat-tempo section row)
+  midi.ppq = 960;
+  midi.sectionTable = [
+    { startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 254_016_000 },
+  ];
+  midi.clips = [{ id: "m1", trackId: "t2", timelineStartTicks: 400, lengthTicks: 960 } as MidiClip];
+  clipSelection.clear();
+});
+
+describe("clipDrag group move", () => {
+  it("moves every selected clip by the anchor's delta, preserving offsets", () => {
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "audio", id: "a2" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(500, true); // alt = no snapping
+    expect(project.clips[0].timelineStartSamples).toBe(1500);
+    expect(project.clips[1].timelineStartSamples).toBe(3500);
+    // the gap between them is untouched — the offsets requirement
+    expect(project.clips[1].timelineStartSamples - project.clips[0].timelineStartSamples).toBe(2000);
+  });
+
+  it("clamps the DELTA at zero, so the group keeps its shape at the left edge", () => {
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "audio", id: "a2" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "audio", id: "a2" }, 0);
+    clipDrag.move(-9999, true);
+    expect(project.clips[0].timelineStartSamples).toBe(0);
+    // offsets survive the clamp
+    expect(project.clips[1].timelineStartSamples).toBe(2000);
+  });
+
+  it("snaps the anchor only — the other clips keep their off-grid offsets", () => {
+    view.snap = true; // beat grid = 24000 samples at 120bpm/48k
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "audio", id: "a2" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(23000, false);
+    // the anchor lands on the grid; a2 keeps its exact 2000-sample offset
+    expect(project.clips[0].timelineStartSamples % 24000).toBe(0);
+    expect(project.clips[1].timelineStartSamples - project.clips[0].timelineStartSamples).toBe(2000);
+  });
+
+  it("moves a mixed audio+MIDI selection by the same wall-clock delta", () => {
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "midi", id: "m1" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(2500, true); // +2500 samples = +100 ticks at 25 samples/tick
+    expect(project.clips[0].timelineStartSamples).toBe(3500);
+    expect(midi.clips[0].timelineStartTicks).toBe(500);
+  });
+
+  it("emits gestureBegin, then exactly one moveClips, then gestureEnd — in that order", async () => {
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "midi", id: "m1" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(100, true);
+    clipDrag.move(200, true);
+    clipDrag.move(300, true);
+    await clipDrag.end();
+    expect(calls).toEqual(["gestureBegin", "moveClips", "gestureEnd"]);
+    expect(moveClips).toHaveBeenCalledTimes(1);
+    expect(moveClips).toHaveBeenCalledWith([
+      { kind: "audio", clipId: "a1", timelineStartSamples: 1300 },
+      { kind: "midi", clipId: "m1", timelineStartTicks: 412 },
+    ]);
+  });
+
+  it("a drag that never moved sends no moveClips but still closes the gesture", async () => {
+    clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    await clipDrag.end();
+    expect(moveClips).not.toHaveBeenCalled();
+    expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
+  });
+
+  it("dragging an unselected clip drags only that clip", () => {
+    clipSelection.apply([{ kind: "audio", id: "a2" }], "replace");
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(500, true);
+    expect(project.clips[0].timelineStartSamples).toBe(1500);
+    // a2 was not part of this drag
+    expect(project.clips[1].timelineStartSamples).toBe(3000);
+  });
+});
