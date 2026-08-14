@@ -4,6 +4,7 @@
    * open project's path. Actions live in the projectops store; this is only
    * the affordance.
    */
+  import { prefs } from "../../prefs/prefs.svelte";
   import { project } from "../../state/project.svelte";
   import { projectops } from "../../state/projectops.svelte";
 
@@ -39,6 +40,9 @@
       </button>
       <button role="menuitem" onclick={() => run(() => void projectops.save())}>
         SAVE <span class="kbd">ctrl+s</span>
+      </button>
+      <button role="menuitem" onclick={() => run(() => (prefs.dialogOpen = true))}>
+        PREFERENCES… <span class="kbd">ctrl+,</span>
       </button>
       {#if project.projectDir}
         <div class="dir silk" title={project.projectDir}>{project.projectDir}</div>

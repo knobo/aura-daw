@@ -1,12 +1,14 @@
 /**
  * Loop-while-editing orchestration: when a MIDI clip opens in the piano roll,
- * loop its region on the transport — solo (exclusive on the clip's track) or
- * against the full mix — and put everything back on close. Owns one snapshot
+ * arm its region as the transport loop — solo (exclusive on the clip's track)
+ * or against the full mix — and put everything back on close. Playback itself
+ * only starts if the clipOpenAutoplay preference says so. Owns one snapshot
  * of the pre-edit transport/solo state; re-entering with another clip
  * retargets the loop without re-snapshotting, so exit always restores the
  * state from before the first open.
  */
 
+import { prefs } from "../prefs/prefs.svelte";
 import { project } from "./project.svelte";
 import { transport } from "./transport.svelte";
 
@@ -52,7 +54,9 @@ class ClipEditLoopStore {
     await transport.setLoop(true, target.startSamples, target.endSamples);
     await transport.seek(target.startSamples);
     if (this.solo) await this.applyExclusiveSolo(target.trackId);
-    if (!transport.isPlaying) await transport.play();
+    // Autoplay is opt-in (clipOpenAutoplay pref): by default opening a clip
+    // arms the loop and parks the playhead, but leaves the transport alone.
+    if (prefs.values.clipOpenAutoplay && !transport.isPlaying) await transport.play();
   }
 
   async setSolo(on: boolean) {

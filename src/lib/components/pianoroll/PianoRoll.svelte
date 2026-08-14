@@ -19,6 +19,7 @@
   import { instruments } from "../../state/instruments.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { openStudio, ui } from "../../state/ui.svelte";
+  import { prefs } from "../../prefs/prefs.svelte";
   import { toasts } from "../../state/toasts.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import HScrollbar from "../HScrollbar.svelte";
@@ -712,7 +713,7 @@
     // note body inverts to hot white inside a magenta bloom (the opposite
     // half of the duotone — nothing else in the roll is magenta), decaying
     // fast to a soft track-color sustain while the note is held.
-    if (!(ui.noteFlash && transport.isPlaying)) return;
+    if (!(prefs.values.noteFlash && transport.isPlaying)) return;
     // Visibility gate stays against the PLACEMENT (the flash must stop once
     // playback runs past the clip entirely), but note matching wraps modulo
     // the CONTENT length — the piano roll shows one repetition, so every
@@ -783,7 +784,7 @@
     // deps: clip presence, overlay mounts, selection, toggle, run state
     const c = clip;
     const hasSelection = selection.size > 0;
-    const flashing = ui.noteFlash && transport.isPlaying;
+    const flashing = prefs.values.noteFlash && transport.isPlaying;
     void flashCanvas, keysFlashCanvas;
     if (!c || (!hasSelection && !flashing)) {
       clearFlash();
@@ -914,9 +915,9 @@
 
       <button
         class="chip mono"
-        class:on={ui.noteFlash}
+        class:on={prefs.values.noteFlash}
         title="Flash notes at the moment they play"
-        onclick={() => (ui.noteFlash = !ui.noteFlash)}
+        onclick={() => prefs.set("noteFlash", !prefs.values.noteFlash)}
       >
         ⚡ flash
       </button>
