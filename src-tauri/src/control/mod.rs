@@ -3302,7 +3302,7 @@ impl ControlPlane {
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
         let new_epoch;
-        let (project, midi_snapshot) = {
+        let (project, midi_snapshot, plugin_snapshot, automation_snapshot) = {
             let mut session = self.session.lock();
             session.store.project_dir = Some(dir.to_path_buf());
             session.store.project_name = Some(name);
@@ -3320,7 +3320,20 @@ impl ControlPlane {
             session.midi.loaded_dir = Some(dir.to_path_buf());
             let project = project::from_store(&session.store, position, rate)?;
             let midi_snapshot = session.midi_snapshot();
-            (project, midi_snapshot)
+            // I-1 fix (ruling F-6): the plugin doc + automation lanes are
+            // snapshotted under this SAME short lock as the midi snapshot
+            // above — the actual writes happen below, after the guard
+            // drops (round-2 §4: no disk I/O under the session lock), using
+            // the SAME helpers `execute_persist` calls. Before this fix,
+            // Save-As wrote project.json + midi only: the new dir got no
+            // `plugins[]`/state blobs and no `automation[]`/chunks, so the
+            // next COLD OPEN of the Save-As'd project saw nothing on disk
+            // and (after Task 1's I-7 adopt-clear fix) actively cleared
+            // whatever plugins/automation the session had — a Save-As that
+            // silently destroyed both.
+            let plugin_snapshot = session.plugin_snapshot();
+            let automation_snapshot = session.automation.lanes.clone();
+            (project, midi_snapshot, plugin_snapshot, automation_snapshot)
         };
         // ---- session lock released; all disk I/O below ----
         // epoch boundary (Task 17): the session just acquired an identity.
@@ -3336,6 +3349,31 @@ impl ControlPlane {
                 self.session.lock().midi.dirty = true;
                 log::warn!("save_project_as_epoch: persisting midi failed: {e}");
             }
+        }
+        // I-1 fix: plugin state blobs + `plugins[]`, same helper and
+        // `with_host_state: false` reasoning `execute_persist` uses —
+        // `pending_state` is already kept current by the op arms that
+        // produced it, and Save-As must not round-trip live hosts. A failed
+        // write here is degraded, not aborted (project.json + midi already
+        // landed) — same `log::warn!`-not-fail policy as `execute_persist`.
+        match crate::plugins::state::save_snapshot_into_project(dir, &plugin_snapshot, false) {
+            Ok(cleared) if !cleared.is_empty() => {
+                // Mirrors execute_persist's post-write re-lock (:581-596):
+                // clear `dirty_state` for whichever ids' pending bytes just
+                // landed on disk. Plain remove — Task 3 tightens both call
+                // sites with a byte-compare guard once it lands.
+                let mut s = self.session.lock();
+                for id in cleared {
+                    s.plugins.dirty_state.remove(&id);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("save_project_as_epoch: persisting plugin state failed: {e}"),
+        }
+        // I-1 fix: automation lanes + AMEV point chunks, same helper
+        // `execute_persist` calls.
+        if let Err(e) = crate::plugins::automation::save_into_project(dir, &automation_snapshot) {
+            log::warn!("save_project_as_epoch: persisting automation failed: {e}");
         }
         let modulation = self.session.lock().modulation.clone();
         if let Err(e) = crate::modulation::persist::save_into_project(dir, &modulation) {
@@ -6856,6 +6894,188 @@ mod tests {
         let err = cp.save_project_as(parent.to_str().unwrap(), "Other").unwrap_err();
         assert!(err.contains("already open"), "clear message: {err}");
         assert!(!parent.join("Other.aura").exists(), "no dir left behind");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// I-1: before this fix, `save_project_as_epoch` wrote ONLY
+    /// project.json + the midi snapshot — plugin state blobs and automation
+    /// lanes were silently left behind. Combined with Task 1's I-7
+    /// adopt-clear fix, the very next COLD OPEN of the Save-As'd project
+    /// would see no `plugins`/`automation` fields on disk and actively
+    /// CLEAR whatever the session had — a Save-As that destroys plugin
+    /// state and automation. Ruling F-6: both are snapshotted under the
+    /// same short lock the midi snapshot already uses, and written after
+    /// the lock drops via the same helpers `execute_persist` calls.
+    #[test]
+    fn save_as_carries_plugin_rows_state_blobs_and_automation_into_the_new_dir() {
+        let (cp, _events, _engine) = recording_control_plane();
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![]);
+            s.plugins.pending_state.insert(
+                "inst-1".into(),
+                crate::plugins::state::encode_state(
+                    "lv2:urn:test:synth",
+                    &crate::plugins::state::StateBlob {
+                        kind: crate::plugins::state::KIND_OPAQUE,
+                        data: vec![7u8; 16],
+                    },
+                ),
+            );
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.automation.lanes.push(crate::plugins::automation::AutomationLane {
+                id: "track:t-1:gain".into(),
+                target_node: "track:t-1".into(),
+                param_id: 0,
+                points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+            });
+        }
+
+        let parent = cp_tmp_parent("saveas-plugins-automation");
+        cp.save_project_as(parent.to_str().unwrap(), "PluginsAuto").unwrap();
+        let dir = parent.join("PluginsAuto.aura");
+
+        let pj: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("project.json")).unwrap(),
+        )
+        .unwrap();
+        let rows = pj
+            .get("plugins")
+            .and_then(|v| v.as_array())
+            .expect("plugins[] must be written by Save-As (I-1)");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "inst-1");
+        assert!(dir.join("plugins").join("inst-1.state").exists(), "state blob must land");
+
+        let auto_rows = pj
+            .get("automation")
+            .and_then(|v| v.as_array())
+            .expect("automation[] must be written by Save-As (I-1)");
+        assert_eq!(auto_rows.len(), 1);
+        assert_eq!(auto_rows[0]["id"], "track:t-1:gain");
+        let pref = auto_rows[0]["pointsRef"].as_str().expect("chunk ref for a lane with points");
+        assert!(dir.join(pref).exists(), "automation point chunk must land");
+
+        assert!(
+            !cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "dirty_state cleared for the id whose pending bytes just landed on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// I-1 end-to-end: a Save-As'd project's plugins + automation survive a
+    /// COLD OPEN. `ControlPlane::open_project_epoch`'s own adopt step
+    /// (`plugins::state`/`plugins::automation::adopt_open_project`) reaches
+    /// its session through a process-global, first-registration-wins
+    /// `OnceLock` shared by the WHOLE test binary — `state.rs`'s and
+    /// `automation.rs`'s own registered-session tests already document that
+    /// as a "pre-existing, accepted risk" for tests WITHIN their own module
+    /// (each serializes against its own siblings via a private
+    /// `TEST_SESSION_LOCK`, but nothing stops a DIFFERENT module's
+    /// registered-session test from running concurrently against that same
+    /// global — confirmed here: an earlier version of this test that also
+    /// registered against the global flaked under the full parallel suite,
+    /// clobbered mid-test by one of those other modules' tests). So this
+    /// test instead drives the exact same UNDERLYING restore primitives
+    /// `adopt_open_project` calls — `plugins::state::restore_into_session`
+    /// (disk -> a session it's handed directly, no global) and
+    /// `plugins::automation::load_lanes` — against `cp.session()` itself,
+    /// with no process-global involved at all: a deterministic, race-free
+    /// exercise of the SAME disk-round-trip contract, without the
+    /// mid-air-shared-global hazard the plain `open_project_epoch` route
+    /// would reintroduce.
+    #[test]
+    fn save_as_then_cold_open_round_trips_plugins_and_automation() {
+        let (cp, _events, _engine) = recording_control_plane();
+
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![]);
+            s.plugins.pending_state.insert(
+                "inst-1".into(),
+                crate::plugins::state::encode_state(
+                    "lv2:urn:test:synth",
+                    &crate::plugins::state::StateBlob {
+                        kind: crate::plugins::state::KIND_OPAQUE,
+                        data: vec![7u8; 16],
+                    },
+                ),
+            );
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.automation.lanes.push(crate::plugins::automation::AutomationLane {
+                id: "track:t-1:gain".into(),
+                target_node: "track:t-1".into(),
+                param_id: 0,
+                points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+            });
+        }
+
+        let parent = cp_tmp_parent("saveas-cold-open-roundtrip");
+        cp.save_project_as(parent.to_str().unwrap(), "RoundTrip").unwrap();
+        let saved_dir = parent.join("RoundTrip.aura");
+
+        // "Cold open" — blank the in-memory session the way a fresh app
+        // process (nothing adopted yet) would look, WITHOUT going through
+        // `open_project_epoch`'s process-global-dependent adopt step (see
+        // this test's doc comment for why).
+        {
+            let mut s = cp.session().lock();
+            s.plugins = session::PluginDoc::default();
+            s.automation.lanes.clear();
+        }
+        assert!(cp.session().lock().plugins.instances.is_empty(), "sanity: session blanked");
+        assert!(cp.session().lock().automation.lanes.is_empty(), "sanity: session blanked");
+
+        // The actual restore under test: the SAME primitives
+        // `open_project_epoch`'s adopt step calls
+        // (`plugins::state::read_restored_rows`/`install_restored_rows` via
+        // `restore_into_session`, and `automation::load_lanes`), driven
+        // directly against `cp.session()` — reads back exactly what
+        // `save_project_as_epoch`'s I-1 fix just wrote.
+        {
+            let mut s = cp.session().lock();
+            crate::plugins::state::restore_into_session(&saved_dir, &mut s).unwrap();
+        }
+        let lanes = crate::plugins::automation::load_lanes(&saved_dir)
+            .unwrap()
+            .expect("automation[] present after Save-As (I-1)");
+        cp.session().lock().automation.lanes = lanes;
+
+        let s = cp.session().lock();
+        assert_eq!(
+            s.plugins.instances.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["inst-1"],
+            "plugin instance round-tripped through Save-As + cold open"
+        );
+        let pending = s.plugins.pending_state.get("inst-1").expect("pending_state present");
+        let (uid, blob) = crate::plugins::state::decode_state(pending).unwrap();
+        assert_eq!(uid, "lv2:urn:test:synth");
+        assert_eq!(blob.data, vec![7u8; 16], "state blob bytes round-tripped");
+        assert_eq!(s.automation.lanes.len(), 1, "automation lane round-tripped");
+        assert_eq!(s.automation.lanes[0].id, "track:t-1:gain");
+        assert_eq!(s.automation.lanes[0].points, vec![crate::plugins::automation::AutomationPoint {
+            tick: 0,
+            value: 1.0
+        }]);
+        drop(s);
+
         let _ = std::fs::remove_dir_all(&parent);
     }
 }
