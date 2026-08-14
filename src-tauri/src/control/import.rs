@@ -535,14 +535,58 @@ impl ControlPlane {
         sink: EventSink,
     ) -> Result<(Clip, String), String> {
         let clip = self.import_audio_clip_impl(req)?;
-        let (input, out_dir) = {
+        let project_dir = {
             let session = self.session.lock();
-            let dir = session.store.project_dir.clone().ok_or("no project open")?;
-            (dir.join(&clip.source_path), dir.join("stems").join(clip.id.as_str()))
+            session.store.project_dir.clone().ok_or("no project open")?
         };
-        let spec = demucs_split_spec(&input, &out_dir, simulate_mode())?;
-        let job_id = self.submit_split_job(&clip, spec, sink);
+        let job_id = self.submit_stem_split_for(&clip, &project_dir, sink)?;
         Ok((clip, job_id))
+    }
+
+    /// Split an EXISTING project clip into stems — no re-import, no new clip
+    /// row for the source; stems land aligned to `clip_id`'s current timeline
+    /// position (Task 11 addendum). Unlike [`Self::import_and_split_stems`]
+    /// (which is for freshly dropped files and always mints a new clip), this
+    /// is for the SPLIT STEMS gesture on a clip already on the timeline.
+    pub fn split_stems_for_clip(
+        self: &Arc<Self>,
+        clip_id: &str,
+        sink: EventSink,
+    ) -> Result<String, String> {
+        let (clip, project_dir) = {
+            let session = self.session.lock();
+            let clip = session
+                .store
+                .clips
+                .iter()
+                .find(|c| c.id == clip_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown clip: {clip_id}"))?;
+            let dir = session.store.project_dir.clone().ok_or("no project open")?;
+            (clip, dir)
+        };
+        let input = project_dir.join(&clip.source_path);
+        if !input.is_file() {
+            return Err(format!("source audio not found: {}", input.display()));
+        }
+        self.submit_stem_split_for(&clip, &project_dir, sink)
+    }
+
+    /// Shared by [`Self::import_and_split_stems`] (fresh import) and
+    /// [`Self::split_stems_for_clip`] (existing clip): build the Demucs spec
+    /// for `clip`'s already-in-project audio and submit through
+    /// [`Self::submit_split_job`], so both entry points get identical job
+    /// wiring and stem auto-import behavior.
+    fn submit_stem_split_for(
+        self: &Arc<Self>,
+        clip: &Clip,
+        project_dir: &Path,
+        sink: EventSink,
+    ) -> Result<String, String> {
+        let input = project_dir.join(&clip.source_path);
+        let out_dir = project_dir.join("stems").join(clip.id.as_str());
+        let spec = demucs_split_spec(&input, &out_dir, simulate_mode())?;
+        Ok(self.submit_split_job(clip, spec, sink))
     }
 
     /// Spec-injectable submission seam (tests drive it with a fake sidecar).
@@ -565,6 +609,30 @@ pub struct ImportSplitReply {
     pub job_id: String,
 }
 
+/// Shared by [`import_audio_clip_split_stems`] and [`split_stems_for_clip`]:
+/// same fan-out as `sidecars::make_sink` (private there) — every event to the
+/// per-job channel; progress/done/error also as `sidecar://*` app events.
+/// `log_tag` only labels the `emit` failure warning per call site.
+fn make_stem_sink(
+    app: tauri::AppHandle,
+    on_event: tauri::ipc::Channel<SidecarEvent>,
+    log_tag: &'static str,
+) -> EventSink {
+    use tauri::Emitter;
+    Arc::new(move |ev: SidecarEvent| {
+        let _ = on_event.send(ev.clone());
+        let name = match &ev {
+            SidecarEvent::Progress { .. } => "sidecar://progress",
+            SidecarEvent::Done { .. } => "sidecar://done",
+            SidecarEvent::Error { .. } => "sidecar://error",
+            SidecarEvent::Log { .. } => return,
+        };
+        if let Err(e) = app.emit(name, &ev) {
+            log::warn!("{log_tag}: failed to emit {name}: {e}");
+        }
+    })
+}
+
 /// Import + auto-stem-split front door (wave 1B; needs registration in the
 /// frozen lib.rs: `control::import::import_audio_clip_split_stems`). Job
 /// events stream over `on_event` and the `sidecar://*` app events, exactly
@@ -576,23 +644,25 @@ pub async fn import_audio_clip_split_stems(
     on_event: tauri::ipc::Channel<SidecarEvent>,
     control: tauri::State<'_, Arc<ControlPlane>>,
 ) -> Result<ImportSplitReply, String> {
-    use tauri::Emitter;
-    // Same fan-out as sidecars::make_sink (private there): every event to the
-    // per-job channel; progress/done/error also as `sidecar://*` app events.
-    let sink: EventSink = Arc::new(move |ev: SidecarEvent| {
-        let _ = on_event.send(ev.clone());
-        let name = match &ev {
-            SidecarEvent::Progress { .. } => "sidecar://progress",
-            SidecarEvent::Done { .. } => "sidecar://done",
-            SidecarEvent::Error { .. } => "sidecar://error",
-            SidecarEvent::Log { .. } => return,
-        };
-        if let Err(e) = app.emit(name, &ev) {
-            log::warn!("import-split: failed to emit {name}: {e}");
-        }
-    });
+    let sink = make_stem_sink(app, on_event, "import-split");
     let (clip, job_id) = control.import_and_split_stems(request, sink)?;
     Ok(ImportSplitReply { clip, job_id })
+}
+
+/// Stem-split front door for a clip ALREADY on the timeline (Task 11
+/// addendum, additive to the frozen surface): no re-import, no duplicate
+/// clip — stems land aligned to the existing clip's timeline position. Job
+/// events stream over `on_event` and the `sidecar://*` app events, exactly
+/// like `import_audio_clip_split_stems`/`sidecar_run_job`.
+#[tauri::command]
+pub async fn split_stems_for_clip(
+    app: tauri::AppHandle,
+    clip_id: String,
+    on_event: tauri::ipc::Channel<SidecarEvent>,
+    control: tauri::State<'_, Arc<ControlPlane>>,
+) -> Result<String, String> {
+    let sink = make_stem_sink(app, on_event, "split-stems-for-clip");
+    control.split_stems_for_clip(&clip_id, sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1263,169 @@ mod tests {
             .lock()
             .iter()
             .any(|e| matches!(e, SidecarEvent::Error { message, .. } if message.contains("demucs"))));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    // -- split_stems_for_clip (Task 11 addendum: existing-clip entry door) --
+
+    /// Unknown clip id errs cleanly, no job submitted.
+    #[test]
+    fn split_stems_for_clip_errs_on_unknown_id() {
+        let (cp, parent) = control_plane("split-unknown");
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let err = cp.split_stems_for_clip("does-not-exist", sink).unwrap_err();
+        assert!(err.contains("unknown clip"), "{err}");
+        assert!(events.lock().is_empty(), "no job/events for an unknown clip");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The resolve/validate/spec-build half of `split_stems_for_clip` for a
+    /// VALID existing clip, driven through the real public method end-to-end
+    /// (unlike the sibling test below, which injects a fake sidecar spec the
+    /// same way the rest of this file does). This exercises the actual
+    /// `demucs_split_spec` → `resolve_python`/`resolve_script` path this repo
+    /// ships with — python3 and `sidecars/demucs_split.py` are expected on
+    /// dev/CI machines the same way the sibling `hum.rs`/`loopjam.rs` sinks
+    /// assume it. Doesn't wait for job completion (that would need either a
+    /// real demucs install or `AURA_SIDECAR_SIMULATE=1`, a process-global env
+    /// var unsafe to mutate under parallel test threads) — just that
+    /// submission itself succeeds synchronously for a real clip.
+    #[tokio::test]
+    async fn split_stems_for_clip_valid_clip_submits_job() {
+        let (cp, parent) = control_plane("split-valid");
+        let src = parent.join("valid.wav");
+        write_wav(&src, 2, 44_100, 1000);
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: None,
+            })
+            .unwrap();
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let job_id = cp
+            .split_stems_for_clip(clip.id.as_str(), sink)
+            .expect("valid clip resolves + builds a spec + submits");
+        assert!(!job_id.is_empty());
+        assert!(cp.job_status(&job_id).is_ok(), "job is tracked");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The SPLIT STEMS gesture on a clip ALREADY on the timeline: no
+    /// re-import, no duplicate source clip — only the four stem tracks land,
+    /// aligned to the existing clip's timeline position. This is the
+    /// behavior `import_and_split_chain_lands_four_stem_tracks` above pins
+    /// for the fresh-import door; this test pins the same stem-import
+    /// mechanism for an EXISTING clip, and specifically that the source
+    /// clip/track count does not grow (the mismatch flagged in the Task 11
+    /// NEEDS_CONTEXT report). It drives the fake sidecar through
+    /// `submit_split_job` directly (the same injection seam
+    /// `split_stems_for_clip` itself calls after resolving the clip) so the
+    /// happy-path completion assertions don't depend on `demucs_split_spec`
+    /// resolving a real python/demucs install.
+    #[tokio::test]
+    async fn split_stems_for_clip_lands_four_stem_tracks_without_duplicating_source() {
+        let (cp, parent) = control_plane("split-existing");
+        let src = parent.join("take.wav");
+        write_wav(&src, 2, 44_100, 2000);
+
+        let stems_dir = parent.join("fake-stems");
+        std::fs::create_dir_all(&stems_dir).unwrap();
+        let mut stems_json = serde_json::Map::new();
+        for stem in ["vocals", "drums", "bass", "other"] {
+            let p = stems_dir.join(format!("{stem}.wav"));
+            write_wav(&p, 2, 44_100, 500);
+            stems_json.insert(
+                stem.to_string(),
+                serde_json::Value::String(p.to_string_lossy().into_owned()),
+            );
+        }
+        let done = serde_json::json!({
+            "type": "done",
+            "result": {"kind": "stemSplit", "stems": stems_json}
+        });
+        let script = write_sh(
+            &parent,
+            "fake_demucs.sh",
+            &format!(
+                "#!/bin/sh\necho '{{\"type\":\"progress\",\"progress\":0.5,\"stage\":\"separating\"}}'\necho '{}'\n",
+                done
+            ),
+        );
+
+        // Land the clip on the timeline first, exactly like a normal import —
+        // this is the clip SPLIT STEMS is invoked on, already placed.
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: Some(4_800),
+            })
+            .unwrap();
+        assert_eq!(cp.project_state().clips.len(), 1);
+
+        // Inject the fake sidecar via `submit_split_job` directly (see the
+        // doc comment above) instead of going through the real
+        // `demucs_split_spec`/python path, so completion doesn't depend on a
+        // real demucs install or the process-global simulate env var.
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let job_id = cp.submit_split_job(&clip, sh_spec(&script), sink);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            {
+                let evs = events.lock();
+                let done = evs.iter().any(|e| matches!(e, SidecarEvent::Done { .. }));
+                let stems_logged = evs
+                    .iter()
+                    .filter(|e| matches!(e, SidecarEvent::Log { line, .. } if line.contains("auto-import stem")))
+                    .count();
+                if done && stems_logged >= 4 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stem imports did not finish: {:?}",
+                events.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(cp.job_status(&job_id).unwrap().state, "done");
+
+        // 1 ORIGINAL source track/clip (untouched, not duplicated) + 4 stem
+        // tracks — this is the count that distinguishes this door from
+        // `import_and_split_stems`, which would have produced a SECOND
+        // source clip too.
+        let snap = cp.project_state();
+        assert_eq!(snap.tracks.len(), 5, "{:?}", snap.tracks);
+        assert_eq!(snap.clips.len(), 5, "no duplicate source clip");
+        assert!(
+            snap.clips.iter().any(|c| c.id == clip.id),
+            "the original clip is still there, untouched"
+        );
+        for stem in ["vocals", "drums", "bass", "other"] {
+            let t = snap
+                .tracks
+                .iter()
+                .find(|t| t.name == format!("take {stem}"))
+                .unwrap_or_else(|| panic!("missing stem track for {stem}"));
+            let c = snap
+                .clips
+                .iter()
+                .find(|c| c.track_id == t.id)
+                .unwrap_or_else(|| panic!("missing stem clip for {stem}"));
+            assert_eq!(
+                c.timeline_start_samples, 4_800,
+                "stem aligned with the EXISTING clip's position"
+            );
+        }
         let _ = std::fs::remove_dir_all(parent);
     }
 }

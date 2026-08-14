@@ -211,6 +211,14 @@ export interface Backend {
     onEvent: (e: SidecarEvent) => void,
   ): Promise<ImportSplitReply>;
 
+  /** SPLIT STEMS on a clip ALREADY on the timeline (Task 11 addendum): no
+   * re-import, no duplicate clip — the backend resolves `clipId`, submits the
+   * Demucs job on its existing project-copy audio, and auto-imports the four
+   * stems as new tracks aligned to the clip's current timeline position.
+   * Returns the job id; progress/done/error stream over `onEvent`, same
+   * envelope as the other sidecar jobs. */
+  splitStemsForClip(clipId: string, onEvent: (e: SidecarEvent) => void): Promise<string>;
+
   // loop-jam (ACE-Step repaint of the loop region, applied at wrap)
   loopjamEvolve(options?: EvolveOptions): Promise<LoopJamStatus>;
   loopjamCancel(): Promise<LoopJamStatus>;
@@ -237,18 +245,6 @@ export interface Backend {
     event: K,
     cb: (payload: AuraEventMap[K]) => void,
   ): Unsubscribe;
-
-  /**
-   * Demo-only hint so synthetic waveforms match a clip's musical role
-   * (drums look spiky, pads swell...). No-op against the real engine.
-   */
-  hintClipCharacter?(clipId: string, character: string): void;
-
-  /**
-   * Demo-only: register a frontend-created clip (stem results) with the
-   * synthetic engine so its meters play back. No-op against the real engine.
-   */
-  registerClip?(clip: Clip): void;
 }
 
 export const isTauri: boolean =
@@ -522,6 +518,11 @@ class TauriBackend implements Backend {
       request,
       onEvent: channel,
     });
+  }
+  splitStemsForClip(clipId: string, onEvent: (e: SidecarEvent) => void) {
+    const channel = new Channel<SidecarEvent>();
+    channel.onmessage = onEvent;
+    return invoke<string>("split_stems_for_clip", { clipId, onEvent: channel });
   }
 
   loopjamEvolve(options: EvolveOptions = {}) {

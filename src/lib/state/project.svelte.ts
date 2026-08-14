@@ -11,11 +11,6 @@
 import { backend } from "../tauri";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
-const uuid = () =>
-  typeof crypto !== "undefined" && crypto.randomUUID
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-
 class ProjectStore {
   name = $state("Untitled");
   sampleRate = $state(48000);
@@ -112,17 +107,6 @@ class ProjectStore {
     return merged;
   }
 
-  /** Insert (already-created) track right after another for stem grouping. */
-  placeTrackAfter(track: TrackState, afterTrackId: string) {
-    const rest = this.tracks.filter((t) => t.id !== track.id);
-    const at = rest.findIndex((t) => t.id === afterTrackId);
-    if (at === -1) {
-      this.tracks = [...rest, track];
-    } else {
-      this.tracks = [...rest.slice(0, at + 1), track, ...rest.slice(at + 1)];
-    }
-  }
-
   async removeTrack(trackId: string) {
     this.tracks = this.tracks.filter((t) => t.id !== trackId);
     this.clips = this.clips.filter((c) => c.trackId !== trackId);
@@ -210,13 +194,6 @@ class ProjectStore {
 
   select(clipId: string | null) {
     this.selectedClipId = clipId;
-  }
-
-  /** Create a frontend clip (stem results, demo takes). */
-  createClip(init: Omit<Clip, "id"> & { id?: string }): Clip {
-    const clip: Clip = { id: init.id ?? uuid(), ...init } as Clip;
-    this.clips = [...this.clips, clip];
-    return clip;
   }
 }
 
