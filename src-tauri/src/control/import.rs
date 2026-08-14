@@ -277,6 +277,7 @@ pub(crate) fn do_import(
             .map_err(|e| format!("waveform cache build failed: {e}"))?;
     }
 
+    let lane_id = crate::ids::LaneId::default_for_track(track_id.as_str());
     let clip = Clip {
         id: clip_id.into(),
         track_id,
@@ -292,6 +293,8 @@ pub(crate) fn do_import(
         gain_db: 0.0,
         fade_in_samples: 0,
         fade_out_samples: 0,
+        content_id: crate::ids::ContentId::mint(),
+        lane_id,
     };
     session.lock().store.clips.push(clip.clone());
     Ok(ImportOutcome { clip, created_track })

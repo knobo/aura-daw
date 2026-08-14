@@ -3,7 +3,7 @@
 //! serialize TRANSPARENTLY — the wire and every JSON schema see plain
 //! strings — which is what lets OP_FORMAT_VERSION stay 1 (gated by the
 //! exact-JSON tests in control/op.rs). Families are additive: TakeId,
-//! LaneId, PluginInstanceId, LineageId arrive with the rounds that use them.
+//! PluginInstanceId, LineageId arrive with the rounds that use them.
 
 macro_rules! string_id {
     ($(#[$m:meta])* $name:ident) => {
@@ -43,6 +43,30 @@ string_id!(/// A content object (round-2 §5). Declared now, first populated by
     ContentId);
 string_id!(/// An audio source asset (`audio/<sourceId>.wav`, round-2 §2.2).
     SourceId);
+string_id!(/// A lane within a track (round-2 §5, ADR 0004). Every track
+    /// gets one default lane at v3 migration/creation; placements
+    /// reference a lane, never a track directly — the lane resolves to
+    /// its track (`LaneId -> TrackId`). Multi-lane UI and takes stay
+    /// deferred; only the indirection ships.
+    LaneId);
+
+/// Fixed namespace for [`LaneId::default_for_track`]'s deterministic
+/// minting — a project-specific constant, minted once and frozen forever
+/// (same discipline as `audio::project`'s `AURA_SOURCE_NS`).
+const AURA_LANE_NS: uuid::Uuid = uuid::uuid!("9d2e5c14-6b3a-4f8e-b7d1-3a5c9e0f2b44");
+
+impl LaneId {
+    /// The one default lane every track has (round-2 §5). Deterministic
+    /// (UUIDv5 over the track id) so the SAME track always resolves to the
+    /// SAME default lane id regardless of path — a v2 project migrated to
+    /// v3, a fresh clip created live on an existing track, and a re-
+    /// migration of an un-resaved v2 file must all agree. Multi-lane UI
+    /// (minting additional, non-default lanes) is deferred; this is the
+    /// only lane-minting path that exists today.
+    pub fn default_for_track(track_id: &str) -> Self {
+        Self(uuid::Uuid::new_v5(&AURA_LANE_NS, track_id.as_bytes()).to_string())
+    }
+}
 
 /// Per-content sequential note id (round-2 §2.1). `0` is the wire sentinel
 /// for "not yet assigned" — every note inside the document has id >= 1,
@@ -72,5 +96,11 @@ mod tests {
         let mut m = std::collections::HashMap::new();
         m.insert(TrackId::from("a"), 1usize);
         assert_eq!(m.get("a"), Some(&1));
+    }
+
+    #[test]
+    fn default_lane_is_deterministic_per_track_and_differs_across_tracks() {
+        assert_eq!(LaneId::default_for_track("t1"), LaneId::default_for_track("t1"));
+        assert_ne!(LaneId::default_for_track("t1"), LaneId::default_for_track("t2"));
     }
 }

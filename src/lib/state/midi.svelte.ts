@@ -1,13 +1,16 @@
 /**
  * MIDI domain store: ppq + tempo map + midi clips (ticks everywhere musical —
- * D-02). The tick↔sample bijection lives HERE on the frontend side, mirroring
- * midi::TempoMap: piecewise over sorted {tick,bpm} events, first at tick 0.
+ * D-02). The tick↔sample bijection is the backend-shipped section table
+ * (round-2 §3.6): this store holds the table, `sectionTable.ts` does the
+ * (pure, tempo-knowledge-free) lookup — this is the ONE bijection
+ * implementation feeding every surface, not a frontend re-derivation.
  * Edits are batch-shaped: one midi_set_notes per edit gesture, never per note.
  */
 
 import { backend } from "../tauri";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { project } from "./project.svelte";
+import { sampleAtTick, tickAtSample, type SectionRow } from "../sectionTable";
 import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent } from "../types/ipc";
 
 export interface MidiRegion {
@@ -19,6 +22,9 @@ export interface MidiRegion {
 class MidiStore {
   ppq = $state(960);
   tempoEvents = $state<TempoEvent[]>([{ tick: 0, bpm: 120 }]);
+  /** The shipped section table (round-2 §3.6) — sectionTable.ts's ONLY input
+   * besides sampleRate/ppq. Populated from the cold-start snapshot. */
+  sectionTable = $state<SectionRow[]>([]);
   clips = $state<MidiClip[]>([]);
   /** Clip open in the piano roll (null = closed). */
   openClipId = $state<string | null>(null);
@@ -44,38 +50,14 @@ class MidiStore {
     return this.clips.find((c) => c.id === id);
   }
 
-  // ── tick ↔ sample (piecewise over the tempo map) ──
-
-  /** samples per tick while `bpm` rules. */
-  private spt(bpm: number): number {
-    return (project.sampleRate * 60) / (bpm * this.ppq);
-  }
+  // ── tick ↔ sample (the shipped section table, round-2 §3.6) ──
 
   ticksToSamples(ticks: number): number {
-    const ev = this.tempoEvents;
-    let samples = 0;
-    for (let i = 0; i < ev.length; i++) {
-      const end = i + 1 < ev.length ? ev[i + 1].tick : Infinity;
-      if (ticks <= end || i === ev.length - 1) {
-        return samples + (ticks - ev[i].tick) * this.spt(ev[i].bpm);
-      }
-      samples += (end - ev[i].tick) * this.spt(ev[i].bpm);
-    }
-    return samples;
+    return sampleAtTick(this.sectionTable, project.sampleRate, this.ppq, ticks);
   }
 
   samplesToTicks(samples: number): number {
-    const ev = this.tempoEvents;
-    let acc = 0;
-    for (let i = 0; i < ev.length; i++) {
-      const end = i + 1 < ev.length ? ev[i + 1].tick : Infinity;
-      const span = (end - ev[i].tick) * this.spt(ev[i].bpm);
-      if (samples <= acc + span || i === ev.length - 1) {
-        return ev[i].tick + (samples - acc) / this.spt(ev[i].bpm);
-      }
-      acc += span;
-    }
-    return 0;
+    return tickAtSample(this.sectionTable, project.sampleRate, this.ppq, samples);
   }
 
   /** Ticks per bar at the project time signature. */
@@ -86,6 +68,7 @@ class MidiStore {
   applySnapshot(snap: ProjectSnapshot) {
     this.ppq = snap.ppq || 960;
     if (snap.tempoEvents?.length) this.tempoEvents = snap.tempoEvents;
+    this.sectionTable = snap.sectionTable ?? [];
     this.clips = snap.midiClips ?? [];
   }
 

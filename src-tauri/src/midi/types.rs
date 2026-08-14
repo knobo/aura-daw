@@ -11,7 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ClipId, NoteId, TrackId};
+use crate::ids::{ClipId, ContentId, LaneId, NoteId, TrackId};
 
 /// Default ticks-per-quarter-note for new (v2) projects.
 /// 960 divides cleanly by 2..=10 dotted/triplet grids and matches common DAWs.
@@ -24,6 +24,32 @@ pub const DEFAULT_PPQ: u32 = 960;
 pub struct TempoEvent {
     pub tick: u64,
     pub bpm: f64,
+}
+
+/// One tempo change in the v3 integer-period model (round-2 §3.3): period
+/// is the duration of one quarter note in superticks
+/// (`crate::time::SUPERTICKS_PER_SECOND`), sample-rate independent.
+/// `period_start == period_end` is constant tempo; otherwise a linear-in-
+/// period ramp across `[tick, next_event.tick)` (§3.3 "Ramps" — linear in
+/// seconds-per-beat, not in bpm).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TempoPeriodEvent {
+    pub tick: u64,
+    pub period_start: u64,
+    pub period_end: u64,
+}
+
+/// One time-signature change (round-2 §3.3/O-10). Sorted list, first at
+/// tick 0; default is `[{0,4,4}]`. Persisting this is what fixes the
+/// active data-loss bug (dossier 10 trap 3): today's code silently
+/// clobbers the user's signature to 4/4 on every save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterEvent {
+    pub tick: u64,
+    pub num: u8,
+    pub den: u8,
 }
 
 /// One MIDI note. 16 bytes in the AMEV binary chunk encoding (see
@@ -76,6 +102,21 @@ pub struct MidiClip {
     /// and the AMEV chunk header) rather than being derived.
     #[serde(default = "first_note_id")]
     pub next_note_id: u32,
+    /// Content identity (round-2 §5, ADR 0004): first populated by the C/D
+    /// content/placement split (`midi::persist`'s v3 read path mints one
+    /// deterministically per clip on migration; every fresh clip mints its
+    /// own too). `#[serde(default)]` covers DESERIALIZATION of pre-v3 rows
+    /// only — a v3+ reader always sets this explicitly (see `persist.rs`),
+    /// so the empty-string default is never actually observed there; every
+    /// non-serde struct-literal constructor of `MidiClip` in this crate
+    /// must set it explicitly (Rust does not apply `#[serde(default)]` to
+    /// plain struct literals).
+    #[serde(default)]
+    pub content_id: ContentId,
+    /// Lane reference (round-2 §5): resolves to a track via a `lanes[]`
+    /// row in the v3 file. Same `#[serde(default)]` caveat as `content_id`.
+    #[serde(default)]
+    pub lane_id: LaneId,
 }
 
 /// Serde default for [`MidiClip::next_note_id`] (and, imported,
@@ -142,11 +183,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tempo_period_event_serializes_camel_case_and_transparent_period_fields() {
+        let e = TempoPeriodEvent { tick: 3840, period_start: 4_233_600_000, period_end: 4_233_600_000 };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["tick"], 3840);
+        assert_eq!(v["periodStart"], 4_233_600_000u64);
+        assert_eq!(v["periodEnd"], 4_233_600_000u64);
+        let back: TempoPeriodEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn meter_event_serializes_camel_case() {
+        let e = MeterEvent { tick: 7680, num: 3, den: 4 };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["tick"], 7680);
+        assert_eq!(v["num"], 3);
+        assert_eq!(v["den"], 4);
+        let back: MeterEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
     fn watermark_never_reuses_ids() {
         let mut clip = MidiClip {
             id: "c-1".into(), track_id: "t-1".into(), name: "c".into(),
             timeline_start_ticks: 0, length_ticks: 3840,
             notes: vec![], next_note_id: 1,
+            content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
         };
         let a = clip.mint_note_id();
         let b = clip.mint_note_id();
@@ -167,6 +231,7 @@ mod tests {
                 MidiNote { tick: 1, length_ticks: 1, key: 61, velocity: 100, channel: 0, note_id: NoteId(5) },
             ],
             next_note_id: 6,
+            content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
         };
         clip.ensure_note_ids().unwrap();
         assert_eq!(clip.notes[0].note_id.0, 6, "unassigned got minted");

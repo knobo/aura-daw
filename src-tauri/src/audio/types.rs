@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ClipId, SourceId, TrackId};
+use crate::ids::{ClipId, ContentId, LaneId, SourceId, TrackId};
 
 // ---------------------------------------------------------------------------
 // Transport
@@ -166,6 +166,21 @@ pub struct Clip {
     pub gain_db: f64,
     pub fade_in_samples: u64,
     pub fade_out_samples: u64,
+    /// Content identity (round-2 §5, ADR 0004): audio clips are content-
+    /// backed too — a thin content object wrapping the `SourceId` — so the
+    /// placement schema is uniform with MIDI's. Empty (`Default`) means
+    /// "unassigned"; `assign_content_and_lane_ids` (`audio/project.rs`)
+    /// mints one for every legacy clip on load, same discipline as
+    /// `source_id`. Scope ruling: addressing is real from this field on,
+    /// the JSON stays a single clip row (no content[]/placements[] array
+    /// split for audio yet — see the plan preamble).
+    #[serde(default)]
+    pub content_id: ContentId,
+    /// Lane reference (round-2 §5): resolves to a track via the SAME
+    /// `LaneId::default_for_track` function MIDI clips use, so a track's
+    /// default lane is one id regardless of domain.
+    #[serde(default)]
+    pub lane_id: LaneId,
 }
 
 // ---------------------------------------------------------------------------
@@ -260,7 +275,7 @@ impl Store {
 #[cfg(test)]
 pub(crate) mod testutil {
     use super::{Clip, TrackState};
-    use crate::ids::SourceId;
+    use crate::ids::{ContentId, LaneId, SourceId};
 
     pub fn test_track(id: &str) -> TrackState {
         TrackState {
@@ -293,6 +308,8 @@ pub(crate) mod testutil {
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: ContentId::mint(),
+            lane_id: LaneId::default_for_track(track_id),
         }
     }
 }

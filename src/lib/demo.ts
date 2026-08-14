@@ -51,10 +51,12 @@ import {
   type ZynPatch,
 } from "./types/ipc";
 import type { Backend, Unsubscribe } from "./tauri";
+import { sampleAtTick, tickAtSample, type SectionRow } from "./sectionTable";
 
 const SR = 48000;
 const TEMPO = 120;
 const BAR = (60 / TEMPO) * 4 * SR; // samples per bar (4/4)
+const SUPERTICKS_PER_SECOND = 508_032_000;
 
 const uuid = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
@@ -538,9 +540,13 @@ export class DemoBackend implements Backend {
     };
   }
 
-  /** samples → ticks with the demo's single-entry tempo map. */
+  /** samples -> ticks via the shipped section table (round-2 §3.6). This
+   * used to hardcode TEMPO (120bpm) regardless of `tempoEvents` — a real
+   * bug (a `setTempoMap` call would desync it from `ticksToSamples`, which
+   * DID read `tempoEvents`); fixed as part of consuming one shared
+   * bijection instead of two independently-wrong ones. */
   private samplesToTicks(samples: number): number {
-    return (samples / SR) * (TEMPO / 60) * this.ppq;
+    return tickAtSample(this.sectionTable, SR, this.ppq, samples);
   }
 
   private makeClip(trackId: string, name: string, start: number, length: number): Clip {
@@ -852,10 +858,38 @@ export class DemoBackend implements Backend {
     this.scheduleFrom(this.audioCtx, this.position());
   }
 
-  /** samples from ticks with the demo's single-entry tempo map. */
+  /** Constant-tempo segments derived from `tempoEvents` (round-2 §3.4):
+   * the demo backend has no ramp-editing feature, so a segment per
+   * TempoEvent is exact — no subdivision needed, unlike the real backend's
+   * `midi::section_table::SectionTable::build`, which also handles ramps.
+   * This IS the demo's simulation of what the real backend would ship; the
+   * frontend proper (`midi.svelte.ts`) never re-derives this itself. */
+  private get sectionTable(): SectionRow[] {
+    const sections: SectionRow[] = [];
+    let sample = 0;
+    for (let i = 0; i < this.tempoEvents.length; i++) {
+      const e = this.tempoEvents[i];
+      if (i > 0) {
+        const prev = this.tempoEvents[i - 1];
+        const prevPeriod = (60 / prev.bpm) * SUPERTICKS_PER_SECOND;
+        const samplesPerTick = (prevPeriod / SUPERTICKS_PER_SECOND) * (SR / this.ppq);
+        sample += (e.tick - prev.tick) * samplesPerTick;
+      }
+      sections.push({
+        startTick: e.tick,
+        startSample: Math.round(sample),
+        // Not consumed by sectionTable.ts's lookups; the demo doesn't
+        // model a meter map (round-2's meter work is UI-deferred).
+        startBeat: 0,
+        startBar: 0,
+        period: (60 / e.bpm) * SUPERTICKS_PER_SECOND,
+      });
+    }
+    return sections;
+  }
+
   private ticksToSamples(ticks: number): number {
-    const bpm = this.tempoEvents[0]?.bpm ?? TEMPO;
-    return (ticks / this.ppq) * (60 / bpm) * SR;
+    return sampleAtTick(this.sectionTable, SR, this.ppq, ticks);
   }
 
   private scheduleFrom(ctx: AudioContext, pos: number) {
@@ -1422,6 +1456,23 @@ export class DemoBackend implements Backend {
 
   // ── phase 2: control plane ──
 
+  /** Additive v3 fields shared by `getProjectState` and `setTempoMap`
+   * (round-2 §3.6) — one derivation, not two independently-drifting ones. */
+  private tempoMapAdditiveFields() {
+    return {
+      // The demo doesn't model a meter map (round-2's meter UI is
+      // deferred); the default is what a v3 project with no explicit
+      // signature change would carry.
+      meterMap: [{ tick: 0, num: 4, den: 4 }],
+      periodEvents: this.tempoEvents.map((e) => {
+        const period = Math.round((60 / e.bpm) * SUPERTICKS_PER_SECOND);
+        return { tick: e.tick, periodStart: period, periodEnd: period };
+      }),
+      sectionTable: this.sectionTable,
+      sectionTableRuleVersion: 1,
+    };
+  }
+
   async getProjectState(): Promise<ProjectSnapshot> {
     return {
       projectName: "Neon District",
@@ -1432,6 +1483,7 @@ export class DemoBackend implements Backend {
       midiClips: this.midiClips.map((c) => ({ ...c, notes: [...c.notes] })),
       ppq: this.ppq,
       tempoEvents: [...this.tempoEvents],
+      ...this.tempoMapAdditiveFields(),
     };
   }
 
@@ -1464,7 +1516,7 @@ export class DemoBackend implements Backend {
     if (ppq) this.ppq = ppq;
     this.tempoEvents = events.map((e) => ({ ...e }));
     this.resyncAudio();
-    return { ppq: this.ppq, events: [...this.tempoEvents] };
+    return { ppq: this.ppq, events: [...this.tempoEvents], ...this.tempoMapAdditiveFields() };
   }
 
   async midiAddClip(

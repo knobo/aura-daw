@@ -218,6 +218,13 @@ pub fn import_smf(bytes: &[u8], target_ppq: u32) -> Result<ImportedMidi, String>
             length_ticks: length,
             notes,
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            // track_id is a placeholder, fixed up by the caller
+            // (`midi::midi_import_file`) after import — that fixup MUST
+            // also re-derive lane_id from the real track_id, or the two
+            // fields go incoherent (lane_id pointing at "" instead of the
+            // clip's actual track). Placeholder value here on purpose.
+            lane_id: crate::ids::LaneId::default_for_track(""),
         };
         clip.ensure_note_ids().expect("freshly imported notes never collide");
         clips.push(clip);
@@ -301,6 +308,8 @@ mod tests {
                 note(4000, 100, 72, 127, 15),
             ],
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t"),
         };
         let bytes = export_smf(960, &tempo, &[clip.clone()]).unwrap();
         let imp = import_smf(&bytes, 960).unwrap();
@@ -325,6 +334,8 @@ mod tests {
             length_ticks: 960,
             notes: vec![note(0, 480, 60, 100, 0)],
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t"),
         };
         let bytes =
             export_smf(960, &[TempoEvent { tick: 0, bpm: 120.0 }], &[clip]).unwrap();
@@ -342,6 +353,8 @@ mod tests {
             length_ticks: 960,
             notes: vec![note(240, 480, 60, 100, 0)],
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t"),
         };
         // Export at 480 ppq, import at 960 -> ticks double.
         let bytes = export_smf(480, &[TempoEvent { tick: 0, bpm: 120.0 }], &[clip]).unwrap();
@@ -361,6 +374,8 @@ mod tests {
             length_ticks: 1920,
             notes: vec![note(0, 960, 60, 100, 0), note(480, 960, 60, 90, 0)],
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t"),
         };
         // No tempo events at all -> import synthesizes 120 bpm at tick 0.
         let bytes = export_smf(960, &[], &[clip]).unwrap();

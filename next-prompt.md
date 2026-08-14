@@ -1,4 +1,4 @@
-# Next: author and execute Plan C+D (time + project v3)
+# Next: author and execute Plan E (the side-channel totality)
 
 Read this file, then do the work described below. Reply to the user in
 Norwegian — they write Norwegian; the repo documentation is English.
@@ -7,8 +7,10 @@ Norwegian — they write Norwegian; the repo documentation is English.
 
 Working directory: `/home/knobo/prog/dav/.claude/worktrees/zrythm-arch`
 (a git worktree — run everything from here, do **not** `cd` to the main
-checkout, and never use bare `git stash`). Branch `worktree-zrythm-arch`,
-open as PR #1 on `knobo/aura-daw`.
+checkout, and never use bare `git stash`). Branch `plan-cd-time-v3`, open
+as PR #7 on `knobo/aura-daw` (merge it into `main` before starting Plan E,
+or branch Plan E's own work from wherever the merge lands — the previous
+session's own judgment call, not a rule this file dictates).
 
 The project is **AURA**, an AI-native DAW: Tauri v2 + Svelte 5 around a
 lock-free real-time Rust engine (`src-tauri/`), local AI sidecars, and an
@@ -41,105 +43,120 @@ embedded MCP server so agents mutate the session alongside the user.
    meter blocks carry the graph generation; `MAX_TRACKS` removed. Gate B
    green (`src-tauri/tests/identity_properties.rs`). See
    `docs/PHASE4-PLAN.md`'s "Plan B handoff" section for its binding
-   carry-forwards (id-preserving piano roll deferred to Plan E;
-   `next_note_id`'s move to the content object and the split/merge/copy
-   rules bind Plan C/D directly). Suites: **346 backend + 80 frontend**,
-   all green, counts dated in README/CONTRIBUTING.
+   carry-forwards.
+6. **Plan C+D is IMPLEMENTED** (`57acfa9..9aee08a`, 10 tasks, one v2→v3
+   format bump): `Ticks`/`Samples` newtypes; integer-period supertick
+   tempo (quantized once at entry, exact thereafter); a persisted meter
+   map (fixes the active 4/4-clobber data-loss bug); a section table with
+   a property-tested <64-sample ramp-subdivision bound (**Gate C/D test
+   6, green**); the v2→v3 migration with a fixture corpus (**Gate C/D
+   test 7, green for tempo/meter/MIDI content-placement**); the
+   content/placement identity split — full for MIDI, addressing-only for
+   audio (scope ruling); the frontend's shipped-section-table consumption
+   (`src/lib/sectionTable.ts` is the one bijection implementation left
+   client-side, TS `TempoMap` duplicate deleted). Suites: **372 backend +
+   85 frontend**, all green. See `docs/PHASE4-PLAN.md`'s "Plan C/D
+   handoff" section for its binding carry-forwards — **read it in full
+   before starting Plan E**; it names three scope rulings (audio
+   addressing-only, no runtime Content/Placement struct split,
+   `steady_time` out) that Plan E inherits, plus a stale-docs item
+   (`docs/ipc-schemas/midi-clip.schema.json`/`project-v2.schema.json` not
+   yet updated for v3) worth fixing while Plan E is already touching
+   this area.
 
 ## Your task
 
-**Author Plan C+D — time + project v3 — then execute it.** Scope was
-owner-approved in round 2. These two sub-plans ship as ONE format bump, not
-two (`docs/PHASE4-PLAN.md`'s sub-plan table: "D ships inside C's v3
-migration") — do not split them into separate schema versions. Do not start
-implementation before the plan document exists.
+**Author Plan E — the side-channel totality — then execute it.** This is
+round-2's own stated turning point: "E is last on purpose: it is the
+totality migration, and its exit gate is the one that turns the op log
+on" (PHASE4-PLAN's sub-plan table). Do not start implementation before
+the plan document exists.
 
 ### Step 1 — read, in this order
 
-1. `docs/PHASE4-PLAN.md` — sub-plan C and D rows, Gate C/D, the binding
-   rules, and **both** the "Plan A handoff" and "Plan B handoff" sections
-   (carry-forwards: snapshot-rebuild deferral; `fold_ops` coalescing
-   constraint before Gate E; `next_note_id`'s move to the content object;
-   split/merge/copy rules binding future content ops; the waveform pyramid
-   cache and `GraphTables`-under-Mutex items ledgered, not taken).
-2. `docs/CORE-REDESIGN-ROUND-2.md` §3 (time — supertick tempo, the section
-   table, `steady_time`, the v2→v3 migration) and §5 (content and
-   placement — `ContentId`, placements with `LaneId`, default lanes), plus
-   §0.1 rows O-4, O-5, O-9 (time) and whichever rows §5's own text points
-   at for the placement split. ADR 0002 (time model) and ADR 0004
-   (content/placement split), both in `docs/adr/`.
-3. The landed code (round-2 §3/§5 predate Plans A/B — the tree wins):
-   - Time: `src-tauri/src/midi/types.rs` (`TempoEvent { tick, bpm }`,
-     `MidiClip.next_note_id`), `src-tauri/src/audio/types.rs`
-     (`TransportState.tempo_bpm`, sample-based fields throughout —
-     `position_samples`/`loop_start_samples`/`loop_end_samples` etc.;
-     everything here is samples-or-bpm today, no `Ticks`/`Samples`
-     newtypes yet), the frontend tempo/tick math: `src/lib/tauri.ts`,
-     `src/lib/demo.ts`, `src/lib/types/ipc.ts` (`TempoMapState`,
-     `TempoEvent`), `src/lib/state/midi.svelte.ts` (its own header comment
-     says it mirrors `midi::TempoMap` — the piecewise tick<->sample math
-     (`ticksToSamples`/`samplesToTicks`) and `tempoEvents` state live here,
-     not behind any single named TS type; Gate C/D's frontend exit
-     condition is this piecewise math deleted, replaced by consuming the
-     shipped section table — read what it does today before deleting it).
-   - Project v3: `src-tauri/src/audio/project.rs` (`schema_version` field,
-     the `(1..=2).contains(&project.schema_version)` validation gate near
-     line 161 — this is what a v3 bump must extend, and what a fixture
-     corpus for lossless v2→v3 round-trip must exercise against).
-   - Content/placement: `src-tauri/src/ids.rs`'s `ContentId` (declared,
-     unpopulated — Plan B's handoff note); `src-tauri/src/audio/types.rs`'s
-     `Clip` (today IS the placement+content conflation §5 splits apart).
-4. Only if re-litigating a decision: dossier 02 (DAW engine architecture —
-   §5 on Ardour/Tracktion tempo maps and time representation), dossier
-   07's relevant rules, dossier 10's relevant sections, via
-   `docs/research/00-INDEX.md`.
-
-**Verified code anchors** — re-checked against the tree at Plan B's real
-closing commit (`a70bf67`) while writing this file. Symbols still drift
-over time; grep for the name, don't trust the line number.
+1. `docs/PHASE4-PLAN.md` — sub-plan E row, Gate E, the binding rules, and
+   **all three** of the "Plan A handoff", "Plan B handoff", and "Plan C/D
+   handoff" sections. Plan E's own row lists its scope: "all 14+ paths
+   through the channel, engine-thread inversion, gesture begin/end IPC,
+   `clip.move` op + command, id-preserving piano roll, mutating readers
+   become pure, remaining three stores into Session."
+2. `docs/CORE-REDESIGN-ROUND-2.md` §4.5 (the side-channel migration — was
+   §6 in round 1; O-1 folded it into THIS round, O-8's corrected ~14+-path
+   inventory) and §4.2-§4.4 (the engine thread submits/never holds; two
+   API tiers and anti-nesting; gestures/effects/inverses). §7 (testing)
+   for test 4 (the Figma invariant — reads mutate nothing) and Gate E's
+   exact exit condition.
+3. The landed code — grep for the actual side channels rather than
+   trusting the count above (dossier 10 §2.3 + the review's additions is
+   the inventory Gate E checks against; the previous sessions did NOT
+   re-verify it against current HEAD, so re-derive it): known items
+   already named across the three handoff sections —
+   `with_synced_store`/`apply_hum_clip` holding the document lock across
+   midi disk I/O (Plan A handoff), two *read* commands that mutate (lazy
+   disk resync, O-8), clip-move never reaching the backend (O-8, still
+   true — `midi.svelte.ts`'s `moveClip` is explicitly "frontend-only
+   placement move (no midi clip-move command in the surface)" per its own
+   doc comment, unchanged by Plan C+D), `midi_set_notes` still replacing
+   arrays wholesale so ids churn on every gesture even though the
+   allocator/keep-rule is correct (Plan B handoff — the frontend
+   `MidiNote` TS type still carries no `noteId` field, check whether that
+   changed), `fold_ops` coalescing Sets across intervening structural ops
+   (harmless dark, wrong for replay — must be constrained before
+   `Committed.ops` is ever persisted, i.e. before this gate turns the log
+   on).
+4. Only if re-litigating a decision: dossier 10 (side channels' original
+   home) via `docs/research/00-INDEX.md`.
 
 ### Step 2 — write the plan
 
 Load `superpowers:writing-plans`; save as
-`docs/superpowers/plans/<today>-plan-c-d-time-project-v3.md` with the
-standard header (Spec: round-2 §3 + §5, ADRs 0002 + 0004; orchestration
-PHASE4-PLAN). The plan author owns the task cut — Plan B's own plan
-document (`docs/superpowers/plans/2026-08-13-plan-b-identity-groundwork.md`)
-is a reasonable template for shape (files/interfaces/steps/gate per task),
-and its SDD ledger (`.superpowers/sdd/2026-08-13-plan-b-identity-groundwork/`)
-shows how a compressed, deadline-driven pipeline was actually run if that's
-useful precedent.
+`docs/superpowers/plans/<today>-plan-e-side-channel-totality.md` with the
+standard header (Spec: round-2 §4.5 + §4.2-§4.4, ADR 0003 (op log stays
+dark until this gate) + ADR 0006 (thin renderer); orchestration
+PHASE4-PLAN). Plan C+D's own document
+(`docs/superpowers/plans/2026-08-14-plan-c-d-time-project-v3.md`) is a
+reasonable template for shape (global constraints, scope rulings decided
+up front and documented rather than discovered mid-task, per-task
+Files/Interfaces/Steps/commit, a self-review section, an execution note).
 
-Gate C/D, verbatim from `docs/PHASE4-PLAN.md`: *test 6 (section-table bound
-< 64 samples), test 7 (tempo round-trip + lossless v2→v3 against a fixture
-corpus, including meterMap and the placement/content split); frontend
-consumes the shipped section table (TS TempoMap deleted).*
+Gate E, verbatim from `docs/PHASE4-PLAN.md`: *the side-channel inventory
+inside the channel is total (checked against dossier 10 §2.3 + review
+additions, all 14+ paths); test 4 (Figma invariant — reads mutate
+nothing) passes; only then does the op log/journal turn on. This gate is
+the round's whole point; it does not get negotiated down.*
 
 ### Step 3 — execute
 
-`superpowers:subagent-driven-development`: fresh implementer per task, task
-review after each, scoped re-review per fix round, final whole-branch
-review on the most capable model, ledger in the plan's own SDD workspace
-(`.superpowers/sdd/`). Model policy that worked for Plans A and B:
-implementers sonnet (haiku only for pure transcription), task reviewers
-sonnet, riskiest task(s) + the final review on the most capable model.
-**Foreground test runs only, with `timeout` guards.** Commit per task; push
-to PR #1 when the final review is clean (established flow). Update dated
-test counts when totals change.
+Ask the user (or check for a standing instruction like the one Plan C+D's
+session received) whether tonight's execution is solo or
+subagent-driven — Plan E's default per `docs/PHASE4-PLAN.md` line 120 is
+`superpowers:subagent-driven-development` (fresh implementer per task,
+task review after each, final whole-branch review on the most capable
+model), but the last two sessions both ran solo under a binding
+per-session constraint from the owner. Don't assume either way.
+
+**Foreground test runs only, with `timeout` guards.** Commit per task;
+push to a new PR when the first task lands green, then at every
+subsequent task boundary (same flow as Plan C+D). Update dated test
+counts when totals change. Current baseline: **372 backend + 85
+frontend**, both green — verify this before Task 1, the same way every
+prior session did.
 
 ## Ground rules (binding, from PHASE4-PLAN + ADRs)
 
-- **The op log stays dark until Gate E.** No journal writes, no undo UI.
+- **The op log stays dark until Gate E.** No journal writes, no undo UI —
+  until THIS gate closes, at which point it turns on. Read ADR 0003
+  before touching anything that looks like journal-adjacent code.
 - **Thin renderer** (ADR 0006, owner-accepted): no authoritative state,
-  business logic, or time math lands frontend-side.
+  business logic, or time math lands frontend-side. Plan E's own scope
+  includes "mutating readers become pure" and moving `clip.move` behind a
+  real op + command — both are thin-renderer compliance work, not
+  exceptions to it.
 - **Frozen command/event names stay frozen**; bodies become wrappers; new
   commands are additive.
 - **Prepare-outside/commit-inside** for I/O; no blocking engine
   round-trips inside a transaction; `transact` closures must not panic
   (no panic rollback until Plan F).
-- **One format bump, not two** — C and D ship inside the same v3
-  migration; do not stage a separate schema version for the placement
-  split.
 - Corrections to docs are marked, never silent (ADR 0007).
 - The user's standing instruction: *"ikke ver skjenert"* — use as many
   agents as the work needs, and say plainly when something is wrong.
@@ -147,5 +164,5 @@ test counts when totals change.
 ---
 
 *Working note, committed on the PR branch for session continuity. When
-Plan C+D lands: update this file for the next stage (Plan E — the
-side-channel totality) in the same commit that closes Plan C+D.*
+Plan E lands: update this file for the next stage (Plan F — history
+storage) in the same commit that closes Plan E.*

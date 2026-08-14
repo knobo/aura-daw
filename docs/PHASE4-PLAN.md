@@ -75,8 +75,10 @@ migration, and its exit gate is the one that turns the op log on.
 
 ## Written plans
 
-- **A:** [`docs/superpowers/plans/2026-08-13-plan-a-session-transaction-channel.md`](superpowers/plans/2026-08-13-plan-a-session-transaction-channel.md) — ready.
-- B–F: authored when their predecessor lands (just-in-time, against the
+- **A:** [`docs/superpowers/plans/2026-08-13-plan-a-session-transaction-channel.md`](superpowers/plans/2026-08-13-plan-a-session-transaction-channel.md) — executed.
+- **B:** [`docs/superpowers/plans/2026-08-13-plan-b-identity-groundwork.md`](superpowers/plans/2026-08-13-plan-b-identity-groundwork.md) — executed.
+- **C+D:** [`docs/superpowers/plans/2026-08-14-plan-c-d-time-project-v3.md`](superpowers/plans/2026-08-14-plan-c-d-time-project-v3.md) — executed.
+- E–F: authored when their predecessor lands (just-in-time, against the
   then-current tree). Each follows the same skill template as A.
 
 ## Plan A handoff (2026-08-13, post whole-branch review)
@@ -191,3 +193,106 @@ they aren't lost between sub-plan hand-offs:
   rules (round-2 §2.1) bind future content ops from the day they land —
   see the Plan C/D item above; repeated here because it binds Plan E's
   content-adjacent work too, not only C/D's.
+
+## Plan C/D handoff (2026-08-14, solo session, own-review)
+
+Plan C+D (time + project v3, round-2 §3 + §5, ADRs 0002 + 0004) is
+**IMPLEMENTED** (`57acfa9..9aee08a`, 10 tasks, one v2→v3 format bump):
+`Ticks`/`Samples` newtypes with no cross-domain `Ord` (§3.1); integer-
+period supertick tempo, quantized once at entry, exact thereafter (§3.3,
+O-9); a persisted meter map defaulting to `[{0,4,4}]`, fixing the active
+4/4-clobber data-loss bug (§3.3, O-10); a precomputed section table whose
+ramp subdivision is property-tested to a **<64-sample bound** against the
+exact closed-form bijection (§3.4 — **Gate C/D test 6, green**); the
+v2→v3 project migration (schema gate widened `1..=2` → `1..=3`,
+`project.json.v2.bak` mirroring the v1→v2 backup chain, a fixture corpus
+under `src-tauri/tests/fixtures/project_v2/`); the content/placement
+identity split (`ContentId`/`LaneId` populated, ADR 0004) — full for MIDI
+(`content[]`/`placements[]`/`lanes[]` JSON arrays), addressing-only for
+audio (scope ruling below); and the frontend's shipped-section-table
+consumption (`src/lib/sectionTable.ts` is now the one bijection
+implementation left client-side — the TS `TempoMap` duplicate and three
+independent piecewise re-derivations are gone). **Gate C/D test 7
+(lossless v2→v3, meterMap + placement/content split) is green for
+tempo/meter/MIDI; audio's split is addressing-only, per the scope ruling.**
+Suites: **372 backend + 85 frontend**, all green, counts dated in
+README/CONTRIBUTING.
+
+Executed solo (no subagent dispatch — token economy, the owner's binding
+session constraint for this run), TDD, one commit per task, foreground
+`timeout`-guarded test gates, self-review standing in for the missing
+external reviewer. Plan document:
+`docs/superpowers/plans/2026-08-14-plan-c-d-time-project-v3.md`; SDD
+ledger (gitignored, per the established convention): `.superpowers/sdd/
+plan-cd/progress.md`.
+
+Three scope rulings were made explicitly, before implementation, and are
+binding carry-forwards — recorded here so they aren't lost between
+sub-plan hand-offs, per ADR 0007 (corrections marked, never silent):
+
+- **Audio content/placement split is addressing-only.** MIDI clips get the
+  full round-2 §5 split (`content[]`/`placements[]`/`lanes[]` JSON arrays,
+  `ContentId`/`LaneId` populated, deterministic minting on migration).
+  Audio clips (`audio::types::Clip`) get real, populated `content_id`/
+  `lane_id` fields — addressing is genuine, `LaneId::default_for_track` is
+  the SAME function both domains use, so a track's default lane is one id
+  regardless of which domain's clip asks — but the JSON stays a single
+  clip row; no `content[]`/`placements[]` array split for audio. Audio's
+  higher consumer count (recorder, engine RT graph walk, waveform, offline
+  bounce) and MIDI's round-2-stated priority ("instancing arrives free for
+  MIDI; for audio it is a byproduct") made this the responsible cut for a
+  solo session with no reviewer backup. No format bump is needed to finish
+  the split later — the fields to key off already exist.
+- **No Rust-level `Content`/`Placement` struct replaces `MidiClip`/`Clip`
+  at runtime.** `Store`/`MidiStore` still hold `Clip`/`MidiClip`, now
+  carrying `content_id`/`lane_id`; the `content`/`placements` JSON shape is
+  assembled from and collapsed back into `MidiClip` at the `midi::persist`
+  boundary only (`parse_clips_v3_native`/`save_into_project`). Editing
+  shared content does not yet update every placement (ADR 0004's stated
+  consequence is not yet true) because nothing mints two placements
+  sharing one `ContentId` — no split/merge/copy content-op exists (same
+  observation the Plan B handoff already recorded; still true, and now
+  explicitly the thing round-2 §2.1's remint rules bind FROM, the day such
+  an op lands).
+- **`steady_time` (round-2 §3.5) and the per-block `Arc<TempoMap>` swap are
+  OUT of this plan.** `clap_host.rs`'s per-node `self.steady: u64` counter
+  is UNCHANGED — still resets to 0 whenever its node is re-created
+  (instrument rebind, sample-rate change, a track leaving and re-entering
+  the live set), the exact hazard round-2 §3.5 describes. This is RT
+  engine-thread wiring (replacing a per-node counter with one engine-
+  global, threaded through the `RtNode` trait used by 9+ node types) — a
+  different risk class from this plan's pure/compute and persistence work,
+  and not required by Gate C/D's own test list. Bound to Plan E, which
+  already inventories engine-thread work.
+
+Other carry-forwards, not new rulings but confirmed still true:
+
+- MIDI content/placement work is bound by round-2 §2.1's split/merge/copy
+  remint rules (split keeps both halves' ids and records the partition,
+  merge remints the absorbed side, copy mints fresh) from the day such an
+  op lands — the Plan B handoff named this bound for "C/D's content-op
+  work"; C/D itself minted `ContentId`/`LaneId` but never split/merged/
+  copied one, so the binding passes forward to Plan E (or whichever round
+  first adds a content-editing gesture) unconsumed.
+- `docs/ipc-schemas/midi-clip.schema.json` / `project-v2.schema.json` are
+  **not yet updated** for the v3 content/placement/lane shape. Checked: no
+  Rust test references `docs/ipc-schemas/` (grep, this session), so it's
+  non-blocking for Gate C/D — but the files are stale documentation now,
+  and should be brought current before anyone treats them as the wire
+  format's source of truth.
+- `project.svelte.ts`'s `samplesPerBeat`/`samplesPerBar` (used for grid
+  snapping in `App.svelte`/`ClipView.svelte`/`Timeline.svelte`/
+  `view.svelte.ts`) is round-2 §3.6's THIRD independent bijection, still
+  flat-tempo. The other two (`midi.svelte.ts`, `demo.ts`) now consume the
+  shipped section table; this one needs a position-aware refactor across
+  four call sites — out of Task 9's reach, flagged inline in
+  `project.svelte.ts` and here.
+- Standing from Plan A/B, unchanged: snapshot-rebuild deferral
+  (`engine::rebuild` still holds the session lock for the whole graph
+  build — needs Plan F); no panic rollback in `transact` (Plan F);
+  `fold_ops` coalescing constraint before `Committed.ops` is ever
+  persisted (Gate E); the op log stays dark — none of this plan's tempo/
+  meter/content work is `Session::transact`-routed, `set_tempo_map` and
+  the MIDI clip commands remain outside the A-slice channel exactly as
+  before this plan, binding for Plan E's side-channel inventory (§4.5) to
+  close.

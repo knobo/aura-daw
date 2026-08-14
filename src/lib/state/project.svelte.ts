@@ -25,7 +25,15 @@ class ProjectStore {
     return this.clips.find((c) => c.id === this.selectedClipId) ?? null;
   }
 
-  /** samples per beat at the project tempo */
+  /** samples per beat at the project's FLAT tempo. Deferred, not fixed, by
+   * Plan C+D's Task 9 (docs/superpowers/plans/2026-08-14-plan-c-d-time-
+   * project-v3.md): this is round-2 §3.6's third independent bijection
+   * (the other two — midi.svelte.ts's, demo.ts's — now consume the shipped
+   * section table). Grid-snapping call sites (App.svelte, ClipView.svelte,
+   * Timeline.svelte, view.svelte.ts) assume ONE scalar for the whole
+   * timeline; making this position-aware means passing a tick/sample
+   * argument through each of them, a UI-shaped refactor this task's own
+   * scope didn't reach. Recorded per ADR 0007 — not a silent gap. */
   get samplesPerBeat(): number {
     return (60 / this.tempoBpm) * this.sampleRate;
   }

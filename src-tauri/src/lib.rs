@@ -32,6 +32,7 @@ pub mod mcp;
 pub mod midi;
 pub mod plugins;
 pub mod sidecars;
+pub mod time;
 
 use std::sync::Arc;
 

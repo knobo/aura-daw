@@ -4,6 +4,8 @@
  * keep field names camelCase, exactly as on the wire.
  */
 
+import type { SectionRow } from "../sectionTable";
+
 // ── audio-device.schema.json ────────────────────────────────────────────────
 
 export interface AudioDevice {
@@ -240,9 +242,30 @@ export interface TempoEvent {
   bpm: number;
 }
 
+/** Persisted time signature (round-2 §3.3/O-10), v3+. */
+export interface MeterEvent {
+  tick: number;
+  num: number;
+  den: number;
+}
+
+/** v3 integer-period tempo event (round-2 §3.3) — the backend's real
+ * storage; `TempoEvent.bpm` above stays a derived display value. */
+export interface TempoPeriodEvent {
+  tick: number;
+  periodStart: number;
+  periodEnd: number;
+}
+
 export interface TempoMapState {
   ppq: number;
   events: TempoEvent[];
+  /** Additive v3 fields (round-2 §3.6) — see `../sectionTable.ts` for the
+   * ONE bijection implementation that consumes `sectionTable`. */
+  meterMap: MeterEvent[];
+  periodEvents: TempoPeriodEvent[];
+  sectionTable: SectionRow[];
+  sectionTableRuleVersion: number;
 }
 
 export interface MidiNote {
@@ -276,6 +299,12 @@ export interface ProjectSnapshot {
   midiClips: MidiClip[];
   ppq: number;
   tempoEvents: TempoEvent[];
+  /** Additive v3 fields (round-2 §3.6) — available from cold start, not
+   * just after a set_tempo_map edit. */
+  meterMap: MeterEvent[];
+  periodEvents: TempoPeriodEvent[];
+  sectionTable: SectionRow[];
+  sectionTableRuleVersion: number;
 }
 
 // ── sidecar-job-v2.schema.json (phase 2, open job kinds) ───────────────────

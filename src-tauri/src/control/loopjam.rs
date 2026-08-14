@@ -477,6 +477,8 @@ impl LoopJam {
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
         };
         Ok(PendingSwap { clip, track_id: track_id.to_string(), region })
     }
@@ -926,6 +928,8 @@ mod tests {
             gain_db: 0.0,
             fade_in_samples: 5,
             fade_out_samples: 7,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track),
         };
         let mut clips = vec![
             mk("straddle", "t", 0, 1000),   // spans the whole region

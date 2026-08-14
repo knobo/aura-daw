@@ -974,7 +974,7 @@ mod tests {
         use crate::audio::transport::LoopSpec;
         use crate::audio::types::{Store, TrackState};
         use crate::midi::playback::{append_from, LiveNodeRegistry};
-        use crate::midi::types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+        use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
         use crate::midi::MidiStore;
         use crate::plugins::{
             instantiate_and_activate, register_registry, registered_registry, PluginRegistry,
@@ -1017,6 +1017,7 @@ mod tests {
         let midi = MidiStore {
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![MidiClip {
                 id: crate::ids::ClipId::mint(),
                 track_id: "m1".into(),
@@ -1032,6 +1033,8 @@ mod tests {
                     note_id: crate::ids::NoteId(0),
                 }],
                 next_note_id: 1,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("m1"),
             }],
             loaded_dir: None,
             dirty: false,

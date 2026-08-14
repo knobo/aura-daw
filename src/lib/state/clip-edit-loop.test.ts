@@ -271,6 +271,10 @@ describe("piano roll wiring (midi store)", () => {
 
   it("opening a MIDI clip enters the loop with tick-converted bounds", async () => {
     midi.clips = [clip];
+    // 120bpm section, superticks/quarter = 60/120 * 508_032_000.
+    midi.sectionTable = [
+      { startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 254_016_000 },
+    ];
 
     midi.open("c1");
 
@@ -280,6 +284,9 @@ describe("piano roll wiring (midi store)", () => {
 
   it("closing the editor restores the pre-edit state", async () => {
     midi.clips = [clip];
+    midi.sectionTable = [
+      { startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 254_016_000 },
+    ];
     midi.open("c1");
     await vi.waitFor(() => expect(mocked.transportPlay).toHaveBeenCalled());
     vi.clearAllMocks();

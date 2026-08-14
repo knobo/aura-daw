@@ -11,7 +11,8 @@
 //! * [`schedule`] — ticks -> absolute-sample note edges -> per-block events.
 //! * [`playback`] — engine integration: control-side pre-render of midi
 //!                  clips into `RtTrack`s for the RCU graph snapshot.
-//! * [`persist`]  — project.json v2 fields + AMEV chunk save/load/migration.
+//! * [`section_table`] — precomputed constant-tempo segments (round-2 §3.4).
+//! * [`persist`]  — project.json v2/v3 fields + AMEV chunk save/load/migration.
 //! * [`midifile`] — .mid import/export (midly).
 //! * [`amt`]      — AMT infilling params/result/merge (job kind `amtInfill`).
 //! * this file    — `#[tauri::command]` glue + the managed [`MidiState`].
@@ -20,7 +21,7 @@
 //! `midi_add_clip`, `midi_set_notes`, `midi_get_clips`.
 //!
 //! Persistence model: midi edits auto-persist into the open project
-//! (`project.json` v2 + AMEV chunks) on every mutation; when the open
+//! (`project.json` v2/v3 + AMEV chunks) on every mutation; when the open
 //! project changes (open_project happened since the last midi command), the
 //! store lazily reloads from disk before serving. Every mutation triggers an
 //! engine graph rebuild so MIDI is immediately audible.
@@ -31,6 +32,7 @@ pub mod midifile;
 pub mod persist;
 pub mod playback;
 pub mod schedule;
+pub mod section_table;
 pub mod synth;
 pub mod tempo;
 pub mod types;
@@ -47,7 +49,7 @@ use crate::audio::AudioState;
 use crate::control::Session;
 
 pub use tempo::TempoMap;
-pub use types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+pub use types::{MeterEvent, MidiClip, MidiNote, TempoEvent, TempoPeriodEvent, DEFAULT_PPQ};
 
 // ---------------------------------------------------------------------------
 // Shared state (constructed with Default and `.manage()`d by lib.rs)
@@ -65,6 +67,9 @@ pub struct MidiState {
 pub struct MidiStore {
     pub ppq: u32,
     pub tempo_events: Vec<TempoEvent>,
+    /// Persisted time signature (round-2 §3.3/O-10), v3+. Defaults to
+    /// `[{tick:0,num:4,den:4}]` for stores that never loaded a v3 file.
+    pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
     /// Project dir this store was last synced with (None = in-memory only).
     pub loaded_dir: Option<PathBuf>,
@@ -81,6 +86,7 @@ impl Default for MidiStore {
         Self {
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: Vec::new(),
             loaded_dir: None,
             dirty: false,
@@ -114,11 +120,45 @@ impl MidiState {
 }
 
 /// Wire shape returned by `set_tempo_map` / embedded in project v2.
+/// `events` (bpm-projected) stays for wire compatibility — `set_tempo_map`'s
+/// SIGNATURE is frozen, so its body stays a wrapper (PHASE4-PLAN rule 3);
+/// the additive fields below are v3's real, shipped section-table contract
+/// (round-2 §3.6): the frontend consumes `section_table` instead of
+/// re-deriving a bijection from `events`/`meter_map` itself (Task 9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TempoMapState {
     pub ppq: u32,
     pub events: Vec<TempoEvent>,
+    pub meter_map: Vec<MeterEvent>,
+    pub period_events: Vec<TempoPeriodEvent>,
+    pub section_table: Vec<SectionRow>,
+    pub section_table_rule_version: u32,
+}
+
+/// Wire DTO mirroring [`section_table::Section`] field-for-field — the
+/// internal struct stays internal (this crate's established pattern: wire
+/// types are never the same struct as the internal representation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionRow {
+    pub start_tick: u64,
+    pub start_sample: u64,
+    pub start_beat: f64,
+    pub start_bar: u32,
+    pub period: u64,
+}
+
+impl From<&section_table::Section> for SectionRow {
+    fn from(s: &section_table::Section) -> Self {
+        Self {
+            start_tick: s.start_tick,
+            start_sample: s.start_sample,
+            start_beat: s.start_beat,
+            start_bar: s.start_bar,
+            period: s.period,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +190,7 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
             Ok(Some(v2)) => {
                 midi.ppq = v2.ppq;
                 midi.tempo_events = v2.tempo_events;
+                midi.meter_events = v2.meter_events;
                 midi.clips = v2.clips;
             }
             Ok(None) => {
@@ -157,6 +198,7 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
                     let d0 = persist::v1_migration_defaults(fallback_bpm);
                     midi.ppq = d0.ppq;
                     midi.tempo_events = d0.tempo_events;
+                    midi.meter_events = d0.meter_events;
                     midi.clips = d0.clips;
                 }
             }
@@ -250,6 +292,35 @@ fn with_synced_store<R>(
 // Commands (names frozen; bodies/signatures evolve inside this module)
 // ---------------------------------------------------------------------------
 
+/// Pure core of `set_tempo_map` (round-2 §3.6, Gate C/D frontend exit
+/// condition): validates `events` against a nominal rate, builds the v3
+/// section table from the just-set tempo events + the store's CURRENT
+/// meter map (this command doesn't touch meter — no `set_meter_map`
+/// command exists yet, round-2's own text: "meter UI can wait"), and
+/// returns the full additive wire shape. Split out from the
+/// `#[tauri::command]` wrapper so it's testable without a `tauri::State`
+/// harness — the same pattern `sync_midi_store`/`assign_incoming_note_ids`
+/// already use in this file.
+pub(crate) fn build_tempo_map_state(
+    ppq: u32,
+    events: &[TempoEvent],
+    meter_events: &[MeterEvent],
+) -> Result<TempoMapState, String> {
+    // Validate against a nominal rate; the map is rebuilt per engine rate.
+    let tempo_map = TempoMap::new(ppq, events.to_vec(), 48_000)?;
+    let meter_map = tempo::MeterMap::new(meter_events.to_vec())
+        .unwrap_or_else(|_| tempo::MeterMap::default_map());
+    let table = section_table::SectionTable::build(&tempo_map, &meter_map);
+    Ok(TempoMapState {
+        ppq,
+        events: tempo_map.events(),
+        meter_map: meter_map.events().to_vec(),
+        period_events: tempo_map.period_events().to_vec(),
+        section_table: table.sections().iter().map(SectionRow::from).collect(),
+        section_table_rule_version: section_table::RULE_VERSION,
+    })
+}
+
 /// Replace the project tempo map. `events` must be sorted, start at tick 0,
 /// bpm > 0 (validated via `TempoMap::new`). Batch-shaped by design (D-03).
 /// Also keeps the legacy `transport.tempoBpm` == `tempoMap[0].bpm` invariant.
@@ -262,11 +333,10 @@ pub fn set_tempo_map(
 ) -> Result<TempoMapState, String> {
     let result = with_synced_store(&audio, &state, true, |s| {
         let ppq = ppq.unwrap_or(s.ppq);
-        // Validate against a nominal rate; the map is rebuilt per engine rate.
-        TempoMap::new(ppq, events.clone(), 48_000)?;
+        let result = build_tempo_map_state(ppq, &events, &s.meter_events)?;
         s.ppq = ppq;
         s.tempo_events = events.clone();
-        Ok(TempoMapState { ppq, events: events.clone() })
+        Ok(result)
     })?;
     // Legacy single-tempo field follows the map (project-v2 invariant).
     let (session, _, _) = audio.control_parts();
@@ -307,6 +377,7 @@ pub fn midi_add_clip(
     }
     with_synced_store(&audio, &state, true, move |s| {
         let n = s.clips.len();
+        let lane_id = crate::ids::LaneId::default_for_track(&track_id);
         let clip = MidiClip {
             id: uuid::Uuid::new_v4().to_string().into(),
             track_id: track_id.into(),
@@ -315,6 +386,8 @@ pub fn midi_add_clip(
             length_ticks,
             notes: Vec::new(),
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id,
         };
         s.clips.push(clip.clone());
         Ok(clip)
@@ -453,6 +526,7 @@ pub fn midi_import_file(
                 }
                 for c in &mut clips {
                     c.track_id = id.clone().into();
+                    c.lane_id = crate::ids::LaneId::default_for_track(id);
                     c.timeline_start_ticks += start;
                 }
             }
@@ -463,6 +537,7 @@ pub fn midi_import_file(
                         Some(c.name.clone()),
                         Some("midi".into()),
                     )?;
+                    c.lane_id = crate::ids::LaneId::default_for_track(track.id.as_str());
                     c.track_id = track.id;
                     c.timeline_start_ticks += start;
                 }
@@ -538,6 +613,35 @@ mod tests {
         MidiNote { tick, length_ticks: 10, key, velocity: 100, channel: 0, note_id: NoteId(id) }
     }
 
+    // ---- build_tempo_map_state (Task 9: the shipped section table) --------
+
+    #[test]
+    fn build_tempo_map_state_carries_a_nonempty_section_table_at_the_shipped_rule_version() {
+        let events = vec![TempoEvent { tick: 0, bpm: 120.0 }];
+        let meter = vec![MeterEvent { tick: 0, num: 4, den: 4 }];
+        let state = build_tempo_map_state(960, &events, &meter).unwrap();
+        assert_eq!(state.ppq, 960);
+        assert_eq!(state.events.len(), 1);
+        assert!((state.events[0].bpm - 120.0).abs() < 1e-6);
+        assert_eq!(state.meter_map, meter);
+        assert_eq!(state.period_events.len(), 1);
+        assert_eq!(state.period_events[0].period_start, crate::time::period_from_bpm(120.0));
+        assert!(!state.section_table.is_empty(), "the shipped section table is never empty for a valid map");
+        assert_eq!(state.section_table[0].start_tick, 0);
+        assert_eq!(state.section_table[0].start_sample, 0);
+        assert_eq!(state.section_table_rule_version, section_table::RULE_VERSION);
+    }
+
+    #[test]
+    fn build_tempo_map_state_defaults_the_meter_map_when_the_store_has_a_malformed_one() {
+        // Defensive: an empty meter_events slice (shouldn't happen — every
+        // MidiStore constructor sets a default — but this function must not
+        // panic if it ever does) falls back to [{0,4,4}].
+        let events = vec![TempoEvent { tick: 0, bpm: 120.0 }];
+        let state = build_tempo_map_state(960, &events, &[]).unwrap();
+        assert_eq!(state.meter_map, vec![MeterEvent { tick: 0, num: 4, den: 4 }]);
+    }
+
     // ---- midi_set_notes's keep-rule (H-1/M-9), pure and directly testable ----
 
     #[test]
@@ -593,6 +697,8 @@ mod tests {
             length_ticks: 960,
             notes: Vec::new(),
             next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
         });
         midi.dirty = true;
         midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));

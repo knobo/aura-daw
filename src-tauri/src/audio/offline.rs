@@ -170,7 +170,7 @@ mod tests {
     use super::*;
     use crate::audio::types::TrackState;
     use crate::ids::NoteId;
-    use crate::midi::types::TempoEvent;
+    use crate::midi::types::{MeterEvent, TempoEvent};
     use crate::midi::{MidiClip, MidiNote};
 
     fn track(id: &str, kind: &str) -> TrackState {
@@ -199,6 +199,7 @@ mod tests {
         let midi = MidiStore {
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![arp, groove],
             loaded_dir: None,
             dirty: false,
@@ -268,6 +269,7 @@ mod tests {
         let midi = MidiStore {
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![MidiClip {
                 id: "c1".into(),
                 track_id: "m1".into(),
@@ -276,6 +278,8 @@ mod tests {
                 length_ticks: 1920,
                 notes,
                 next_note_id: 3,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("m1"),
             }],
             loaded_dir: None,
             dirty: false,
@@ -340,6 +344,8 @@ mod tests {
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("a1"),
         });
         let midi = MidiStore { clips: vec![], ..MidiStore::default() };
         let mut og = build_graph(&store, &midi, None, RATE);
