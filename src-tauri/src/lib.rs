@@ -142,6 +142,7 @@ pub fn run() {
             control::export::export_job_status,
             control::export::export_capabilities,
             control::import::import_audio_clip_split_stems,
+            control::import::split_stems_for_clip,
             control::loopjam::loopjam_evolve,
             control::loopjam::loopjam_cancel,
             control::loopjam::loopjam_status,
