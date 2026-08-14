@@ -191,6 +191,18 @@ The log the whole plan exists for, for completeness of this document:
   mutex held across check AND write, because an atomic read would leave
   exactly the window being closed.
 
+  ONE NARROW INVERSE WINDOW, RECORDED AS BENIGN: an epoch function bumps
+  `session.epoch` INSIDE its swap block but calls `epoch_boundary` only
+  after releasing the session lock (journal I/O may not run under it). A
+  commit whose `transact` lands in that gap captures the NEW epoch while
+  `HistoryLog` still holds the OLD one, so its batch is dropped rather
+  than recorded. That is the guard erring toward silence instead of
+  corruption — the commit wrote into a document the swap is in the middle
+  of replacing, and its `execute_persist` is dropped by the same reasoning
+  — so the log stays consistent with what survives. Recorded because it is
+  a real gap and a future reader of the guard will otherwise wonder: it
+  costs a dropped record, never a wrong one.
+
 ## Recorded replay limitations (known, not fixed here)
 
 Recorded so a future replay/collaboration round finds them stated rather

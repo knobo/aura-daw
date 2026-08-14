@@ -121,11 +121,13 @@ independently of Plan E, before or around the same time as PR #12. Nothing
 further to do about any of them; they're why the frontend baseline moved
 past Plan E's own count (see below).
 
-**Baseline to verify at the start of any track**: **501 backend + 206
-frontend tests, all green** on `origin/main` (the frontend count grew from
-Plan E's own 174 because PRs #14/#15/#16 added tests independently; the
-backend count is unchanged at 501). Run both suites before writing the
-first line of a track:
+**Baseline to verify at the start of any track**: **506 backend + 206
+frontend tests, all green** (the frontend count grew from Plan E's own 174
+because PRs #14/#15/#16 added tests independently; the backend count grew
+from 501 by the five regression tests the post-merge follow-up PR #18
+added). `origin/main` is still at 501 backend until #18 lands — if you
+branch before it merges, expect 501 and re-baseline afterwards. Run both
+suites before writing the first line of a track:
 
 ```
 timeout 900 cargo test --manifest-path src-tauri/Cargo.toml

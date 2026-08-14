@@ -556,9 +556,12 @@ plan document:
   lands on a different state than the entry recorded. Today's transient
   writers stay clear by construction (transport `Set`s address
   `ObjectRef::Transport` only; mid-gesture folds are superseded by the
-  gesture batch that closes over them) — nothing CHECKS this; it
-  constrains what may ever be marked transient. Binding on any future
-  transient-tx addition.
+  gesture batch that closes over them). **→ now CHECKED in PR #18**
+  (whole-branch review M-3): `debug_assert_transient_invariant` in the
+  commit path fails a debug build on any transient batch addressing
+  something other than `ObjectRef::Transport`, unless it is a mid-gesture
+  fold. Still a rule about what may ever be marked transient — but one
+  with teeth in debug builds. Binding on any future transient-tx addition.
 - **`fold_ops` never folds away non-`Set` ops.** A no-op lane delete (or
   any structural op with no net effect) still produces a journal line —
   noted near `fold_ops` during Task 10's review as future noise once
@@ -593,17 +596,29 @@ collected here so a future round doesn't have to re-mine the ledger:
   write pass; see the `fold_ops` non-`Set` note above (Task 10).
 - Dirty-but-nothing-pending branch never clears the dirty flag (redundant
   no-op persists); `Op::PluginRemove.params` captured-but-unread on
-  undo — see L-1 above (Task 9).
+  undo — see L-1 above (Task 9). **→ the `params` half is CLOSED in
+  PR #18**: `apply_raw` now seeds the mirror from the op's own field when
+  the in-memory one is absent, so a cold replay restores a plugin row with
+  its params (L-1 closed). The dirty-flag half is still open.
 - `plan_region_replacement`'s doc cites `replace_region_clips` but
   diverges on right-only-trim (`TrimRight` in place); the LoopJam mid-air
-  race is code-inspected, not test-forced (Task 8).
+  race is code-inspected, not test-forced (Task 8). **→ the race is now
+  TEST-FORCED in PR #18** (whole-branch review I-2, which found a real
+  100 % CPU spin in exactly that code): a pending swap whose commit fails
+  on every attempt, from a stopped transport, asserting both the bounded
+  retries and the back-off. The doc divergence is still open.
 - Deadlock-audit comment's five call-site line citations went stale by
   +129 lines after later edits — sites and the invariant itself stayed
-  correct (Task 13).
+  correct (Task 13). **→ CORRECTED in PR #18**, with a note that the
+  audit's value is its navigability, so the numbers are re-checked
+  whenever the file moves.
 - `midi/synth.rs` test-literal compile fixup, touched despite the
   `midi/*` scope note — mechanical, zero behavior (Task 16).
 - `ClapNode::reset()` not re-verified to leave `steady_fallback` alone —
   consistent with pre-change semantics, not re-audited (Task 16).
+  **→ RESOLVED**: the final whole-branch review re-verified it (M-9) —
+  `plugins/clap_host.rs`'s `reset` sets only `pending_all_off`, the
+  fallback counter is untouched. Ledger item closed.
 - A stale line-number citation in a doc comment (516 vs. 508);
   `tempoBpm` required-vs-conditional tension pre-existing in the v2
   schema (Task 15).
