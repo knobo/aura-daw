@@ -591,21 +591,29 @@ fn run_thread(
 
 /// The per-tick body, extracted so it is testable with an injected sink and
 /// injected time — no thread, no `SharedRt`, no `Session`.
-/// `clock_enabled == false` suppresses clock/transport bytes entirely (the
-/// engine is not even stepped, so its internal Start/Stop/pulse state stays
-/// frozen exactly as it was), leaving the caller free to keep the thread and
-/// the port alive for Task 8's note-out.
+/// `clock_enabled == false` suppresses clock/transport BYTES only — the
+/// engine still steps every tick, so its anchor/`estimated_sample()` keeps
+/// advancing in lockstep with real time (fix round 1: Task 8's note
+/// scheduler advances over that SAME window, so the anchor must stay live
+/// even with clock output off), leaving the caller free to keep the thread
+/// and the port alive for Task 8's note-out.
 pub(crate) fn out_tick(
     engine: &mut ClockEngine,
     sink: &mut dyn ClockSink,
     input: ClockInput<'_>,
     clock_enabled: bool,
 ) -> Result<(), String> {
+    // The engine steps UNCONDITIONALLY every tick — its anchor/
+    // `estimated_sample()` is the SAME window Task 8's note scheduler
+    // advances over, so it must keep living even while clock output is
+    // disabled (fix round 1: it previously froze here, which would have
+    // frozen note-out in lockstep). `clock_enabled` gates ONLY the byte
+    // emission below, not whether the transport state advances.
+    let mut out = Vec::new();
+    engine.step(input, &mut out);
     if !clock_enabled {
         return Ok(());
     }
-    let mut out = Vec::new();
-    engine.step(input, &mut out);
     for msg in out {
         sink.send(msg.to_out().as_slice())?;
     }
@@ -813,6 +821,23 @@ mod tests {
             out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
         }
         assert!(sink.0.is_empty(), "clock disabled means no bytes");
+    }
+
+    /// Fix round 1: `clock_enabled == false` must suppress bytes only, NOT
+    /// freeze the engine — Task 8's note scheduler advances over the SAME
+    /// anchor/`estimated_sample()` window `step()` maintains, so the anchor
+    /// has to keep living while clock output happens to be off.
+    #[test]
+    fn out_tick_still_steps_the_engine_while_the_clock_is_disabled() {
+        let map = map120();
+        let mut engine = ClockEngine::new();
+        let mut sink = RecordingSink::default();
+        for ms in 0..=25u64 {
+            out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
+        }
+        assert!(sink.0.is_empty(), "clock disabled means no bytes");
+        assert!(engine.running(), "the transport still registers as running");
+        assert_eq!(engine.estimated_sample(), 25 * 48, "the anchor kept advancing with real time");
     }
 
     /// Real `midir` loopback: a virtual INPUT port receives what a real
