@@ -379,6 +379,127 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.persist.project = true;
             Ok(Op::ClipAdd { clip: removed, index: pos })
         }
+        // Plan E Task 5: the MIDI half of the op vocabulary — tempo/meter,
+        // MIDI clip structural add/remove, MIDI clip bounds, and note
+        // replacement, all through the same session lock as `store` (round-2
+        // §4.1's cross-store atomicity).
+        Op::TempoSet { ppq, events, meter } => {
+            // Validate BEFORE any mutation — atomic (round-2 §4: a failed
+            // apply must leave the session untouched).
+            if events.is_empty() {
+                return Err("tempoSet: events must not be empty".into());
+            }
+            if !events.windows(2).all(|w| w[0].tick <= w[1].tick) {
+                return Err("tempoSet: events must be sorted by tick".into());
+            }
+            if !meter.windows(2).all(|w| w[0].tick <= w[1].tick) {
+                return Err("tempoSet: meter must be sorted by tick".into());
+            }
+            let inverse = Op::TempoSet {
+                ppq: session.midi.ppq,
+                events: session.midi.tempo_events.clone(),
+                meter: session.midi.meter_events.clone(),
+            };
+            // Cross-store atomicity (§4.1, this task's reason to exist): the
+            // three midi fields AND the store.transport.tempo_bpm mirror
+            // write together, under the one session lock — today's
+            // `set_tempo_map` command does this as two separate,
+            // non-atomic phases (round-2 inventory row 4).
+            session.midi.ppq = *ppq;
+            session.midi.tempo_events = events.clone();
+            session.midi.meter_events = meter.clone();
+            session.store.transport.tempo_bpm = events[0].bpm;
+            // A new tempo map changes every tick->sample conversion, which
+            // `engine::rebuild`'s `midi::playback::append_from` bakes into
+            // the RT track's pre-rendered note events — only invoked from
+            // `rebuild`, never at render time — so this needs a rebuild.
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            effect.persist.project = true; // the transport.tempo_bpm mirror lives in project.json
+            Ok(inverse)
+        }
+        Op::MidiClipAdd { clip, index } => {
+            if session.midi.clips.iter().any(|c| c.id == clip.id) {
+                return Err(format!("duplicate midi clip id: {}", clip.id));
+            }
+            let idx = (*index).min(session.midi.clips.len());
+            session.midi.clips.insert(idx, clip.clone());
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::MidiClipRemove { clip: clip.clone(), index: idx })
+        }
+        Op::MidiClipRemove { clip, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `ClipRemove`).
+            let pos = session
+                .midi
+                .clips
+                .iter()
+                .position(|c| c.id == clip.id)
+                .ok_or_else(|| format!("unknown midi clip: {}", clip.id))?;
+            let removed = session.midi.clips.remove(pos);
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::MidiClipAdd { clip: removed, index: pos })
+        }
+        // MIDI clip bounds: property-addressed, but structural in effect
+        // (rebuild + persist) for the same reason `Set{Clip,
+        // TimelineStartSamples}` is (Task 3) — `engine::rebuild`'s
+        // `midi::playback::append_from` reads `session.midi.clips`'
+        // placement/content-length fields to pre-render the RT track's note
+        // events, and is only ever invoked from `rebuild`, never at render
+        // time via a live table read — so any bounds edit needs a rebuild
+        // to become audible.
+        Op::Set { object: ObjectRef::MidiClip(id), path, to, .. } => {
+            let c = session
+                .midi
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown midi clip: {id}"))?;
+            let from_now = read_midi_prop(c, *path)?; // truth, not caller's `from`
+            let applied = write_midi_prop(c, *path, to)?; // clamps LengthTicks like write_prop clamps Gain
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::Set {
+                object: ObjectRef::MidiClip(id.clone()),
+                path: *path,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        // §4.4 value-replacement wrapper: whole-notes replace, diffed
+        // against store truth via `assign_incoming_note_ids`'s keep-rule
+        // (midi/mod.rs) — same rebuild reasoning as the bounds arm above
+        // (a note edit changes what `append_from` pre-renders).
+        Op::MidiSetNotes { clip: clip_id, notes } => {
+            let c = session
+                .midi
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == clip_id)
+                .ok_or_else(|| format!("unknown midi clip: {clip_id}"))?;
+            // `from` inverse = current notes (already live-id-resolved from
+            // whatever produced them), captured before this write.
+            let previous_notes = c.notes.clone();
+            // Everything computed on LOCALS first (assign_incoming_note_ids
+            // is pure); `c.notes`/`c.next_note_id` are assigned only as the
+            // last statements, mirroring `midi_set_notes`'s own discipline
+            // (midi/mod.rs) so no partial state is observable on early
+            // return.
+            let (local_notes, next_watermark) =
+                crate::midi::assign_incoming_note_ids(&c.notes, c.next_note_id, notes.clone());
+            c.notes = local_notes;
+            // Watermark rule (scope ruling 3, ADR 0001): advances
+            // monotonically, NEVER rewound by the inverse — the inverse
+            // below restores `previous_notes`' VALUES, but going through
+            // this same arm again means it too only ever advances
+            // `next_note_id`, never resets it.
+            c.next_note_id = next_watermark;
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::MidiSetNotes { clip: clip_id.clone(), notes: previous_notes })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
@@ -400,8 +521,11 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         // Option<String> serializes as a JSON string or null, never a
         // wrapping object — same wire shape `write_prop` below accepts.
         PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
-        PropPath::TimelineStartSamples => {
-            Err(format!("path {path:?} is not a Track property (TimelineStartSamples is Clip-only)"))
+        PropPath::TimelineStartSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip path)"))
         }
     }
 }
@@ -445,8 +569,79 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             t.instrument_id = v;
             Ok(serde_json::json!(t.instrument_id))
         }
-        PropPath::TimelineStartSamples => {
-            Err(format!("path {path:?} is not a Track property (TimelineStartSamples is Clip-only)"))
+        PropPath::TimelineStartSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip path)"))
+        }
+    }
+}
+
+/// Read a MIDI clip property as its JSON-wire representation (mirrors
+/// `read_prop` for `TrackState`, scoped to `MidiClip`'s three
+/// placement/content-length paths). Fallible for the same reason:
+/// `PropPath` and `ObjectRef` are independent serde-derived enums, so a
+/// `Set{MidiClip, Gain}` (a Track-only path) must fail the transaction
+/// atomically, never panic.
+fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TimelineStartTicks => Ok(serde_json::json!(c.timeline_start_ticks)),
+        PropPath::LengthTicks => Ok(serde_json::json!(c.length_ticks)),
+        PropPath::ContentLengthTicks => Ok(serde_json::json!(c.content_length_ticks)),
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples => {
+            Err(format!("path {path:?} is not a MidiClip property"))
+        }
+    }
+}
+
+/// Write a MIDI clip property, mirroring `write_prop`'s clamp discipline:
+/// `LengthTicks` clamps to >= 1 on write (the write side is the clamp
+/// authority, mirroring the gain-clamp round-trip rule — Plan A) so the
+/// inverse observes the post-clamp value, never the caller's raw (possibly
+/// zero) `to`. Returns the as-applied (post-clamp) value.
+fn write_midi_prop(
+    c: &mut crate::midi::types::MidiClip,
+    path: PropPath,
+    to: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TimelineStartTicks => {
+            let v = to.as_u64().ok_or("timelineStartTicks: expected a non-negative integer")?;
+            c.timeline_start_ticks = v;
+            Ok(serde_json::json!(c.timeline_start_ticks))
+        }
+        PropPath::LengthTicks => {
+            let v = to.as_u64().ok_or("lengthTicks: expected a non-negative integer")?;
+            c.length_ticks = v.max(1); // clamp, never Err — mirrors the gain clamp
+            Ok(serde_json::json!(c.length_ticks))
+        }
+        PropPath::ContentLengthTicks => {
+            let v = match to {
+                serde_json::Value::Null => None,
+                serde_json::Value::Number(n) => Some(
+                    n.as_u64()
+                        .ok_or("contentLengthTicks: expected a non-negative integer or null")?,
+                ),
+                _ => return Err("contentLengthTicks: expected a non-negative integer or null".into()),
+            };
+            c.content_length_ticks = v;
+            Ok(serde_json::json!(c.content_length_ticks))
+        }
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples => {
+            Err(format!("path {path:?} is not a MidiClip property"))
         }
     }
 }
@@ -916,5 +1111,275 @@ mod tests {
         });
         assert!(r.is_err(), "mismatched object/path must error, not panic");
         assert_eq!(m.lock().store.clips, before, "store untouched");
+    }
+
+    // ---- Plan E Task 5: MIDI + tempo op kinds ----
+
+    use crate::ids::{ContentId, LaneId, NoteId};
+    use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent};
+
+    fn test_midi_clip(id: &str, track_id: &str) -> MidiClip {
+        MidiClip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: format!("MIDI {id}"),
+            timeline_start_ticks: 0,
+            length_ticks: 3840,
+            notes: vec![],
+            next_note_id: 1,
+            content_id: ContentId::mint(),
+            lane_id: LaneId::default_for_track(track_id),
+            content_length_ticks: None,
+        }
+    }
+
+    fn note(tick: u32, key: u8, id: u32) -> MidiNote {
+        MidiNote { tick, length_ticks: 480, key, velocity: 100, channel: 0, note_id: NoteId(id) }
+    }
+
+    #[test]
+    fn tempo_set_is_atomic_including_the_bpm_mirror() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let c = Session::transact(&m, TxMeta::user("set tempo"), |tx| {
+            tx.apply(Op::TempoSet {
+                ppq: 960,
+                events: vec![TempoEvent { tick: 0, bpm: 140.0 }],
+                meter: vec![MeterEvent { tick: 0, num: 3, den: 4 }],
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert_eq!(g.midi.ppq, 960);
+            assert_eq!(g.midi.tempo_events, vec![TempoEvent { tick: 0, bpm: 140.0 }]);
+            assert_eq!(g.midi.meter_events, vec![MeterEvent { tick: 0, num: 3, den: 4 }]);
+            // The cross-store atomicity this task exists for: the bpm
+            // mirror lands in the SAME commit, not a second phase.
+            assert_eq!(g.store.transport.tempo_bpm, 140.0);
+        }
+        assert!(c.effect.rebuild, "tempo change must request a rebuild");
+        assert!(c.effect.persist.midi, "tempo change must persist midi");
+        assert!(c.effect.persist.project, "tempo change must persist the project (bpm mirror)");
+
+        // Inverse restores all four fields in one commit.
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let g = m.lock();
+        assert_eq!(g.midi.ppq, MidiStore::default().ppq);
+        assert_eq!(g.midi.tempo_events, MidiStore::default().tempo_events);
+        assert_eq!(g.midi.meter_events, MidiStore::default().meter_events);
+        assert_eq!(g.store.transport.tempo_bpm, Store::default().transport.tempo_bpm);
+    }
+
+    #[test]
+    fn tempo_set_rejects_empty_or_unsorted_events_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let before = { let g = m.lock(); (g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()) };
+
+        let r = Session::transact(&m, TxMeta::user("empty"), |tx| {
+            tx.apply(Op::TempoSet { ppq: 960, events: vec![], meter: vec![MeterEvent { tick: 0, num: 4, den: 4 }] })
+        });
+        assert!(r.is_err(), "empty events must be rejected");
+
+        let r = Session::transact(&m, TxMeta::user("unsorted"), |tx| {
+            tx.apply(Op::TempoSet {
+                ppq: 960,
+                events: vec![TempoEvent { tick: 100, bpm: 140.0 }, TempoEvent { tick: 0, bpm: 120.0 }],
+                meter: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            })
+        });
+        assert!(r.is_err(), "unsorted events must be rejected");
+
+        let g = m.lock();
+        assert_eq!((g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()), before, "store untouched");
+    }
+
+    #[test]
+    fn midi_set_notes_inverse_restores_notes_but_never_rewinds_watermark() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let mut clip = test_midi_clip("mc-1", "t-1");
+        clip.notes = vec![note(0, 60, 1), note(480, 62, 2)];
+        clip.next_note_id = 3;
+        m.lock().midi.clips.push(clip.clone());
+
+        let c = Session::transact(&m, TxMeta::user("set notes"), |tx| {
+            // Re-send the two existing notes with their live ids (kept) plus
+            // a brand-new note carrying id 0 (minted -> 3, watermark -> 4).
+            tx.apply(Op::MidiSetNotes {
+                clip: "mc-1".into(),
+                notes: vec![note(0, 60, 1), note(480, 62, 2), note(960, 64, 0)],
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            let c = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+            assert_eq!(c.notes.len(), 3);
+            assert_eq!(c.notes[2].note_id.0, 3, "id 0 minted from the watermark");
+            assert_eq!(c.next_note_id, 4);
+        }
+        assert!(c.effect.rebuild, "note replacement must request a rebuild");
+        assert!(c.effect.persist.midi, "note replacement must persist midi");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let g = m.lock();
+        let restored = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+        assert_eq!(restored.notes, clip.notes, "undo restores the original notes exactly");
+        assert_eq!(restored.next_note_id, 4, "watermark is NEVER rewound by the inverse (ADR 0001)");
+    }
+
+    #[test]
+    fn midi_clip_add_then_inverse_removes_byte_identically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        let c = Session::transact(&m, TxMeta::user("add midi clip"), |tx| {
+            tx.apply(Op::MidiClipAdd { clip: clip.clone(), index: 0 })
+        })
+        .unwrap();
+        assert_eq!(m.lock().midi.clips, vec![clip.clone()]);
+        assert!(c.effect.rebuild, "midi clip add must request a rebuild");
+        assert!(c.effect.persist.midi, "midi clip add must persist midi");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert!(m.lock().midi.clips.is_empty(), "inverse removes the row byte-identically (full round trip)");
+    }
+
+    #[test]
+    fn midi_clip_add_duplicate_id_is_rejected_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        m.lock().midi.clips.push(clip.clone());
+        let before = m.lock().midi.clips.clone();
+        let r = Session::transact(&m, TxMeta::user("dup"), |tx| {
+            tx.apply(Op::MidiClipAdd { clip: clip.clone(), index: 1 })
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().midi.clips, before, "store untouched");
+    }
+
+    #[test]
+    fn midi_bounds_set_clamps_and_round_trips() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let mut clip = test_midi_clip("mc-1", "t-1");
+        clip.length_ticks = 1920;
+        m.lock().midi.clips.push(clip.clone());
+
+        let c = Session::transact(&m, TxMeta::user("resize to zero"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip("mc-1".into()),
+                path: PropPath::LengthTicks,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0u64),
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            let c = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+            assert_eq!(c.length_ticks, 1, "clamps to >= 1, does not error");
+        }
+        match &c.ops[0] {
+            Op::Set { to, .. } => assert_eq!(to, &serde_json::json!(1u64), "recorded op carries the as-applied (clamped) value"),
+            other => panic!("expected Set, got {other:?}"),
+        }
+        assert!(c.effect.rebuild, "bounds change must request a rebuild");
+        assert!(c.effect.persist.midi, "bounds change must persist midi");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let g = m.lock();
+        let restored = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+        assert_eq!(restored.length_ticks, 1920, "inverse restores the pre-clamp truth");
+    }
+
+    #[test]
+    fn midi_bounds_content_length_ticks_round_trips_including_null() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        m.lock().midi.clips.push(clip.clone());
+
+        let c = Session::transact(&m, TxMeta::user("set content length"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip("mc-1".into()),
+                path: PropPath::ContentLengthTicks,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(1920u64),
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().midi.clips.iter().find(|c| c.id == "mc-1").unwrap().content_length_ticks,
+            Some(1920)
+        );
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().midi.clips.iter().find(|c| c.id == "mc-1").unwrap().content_length_ticks,
+            None,
+            "undo restores the absent (null) content length"
+        );
+    }
+
+    #[test]
+    fn mismatched_track_length_ticks_fails_cleanly_not_panics() {
+        // `Set{Track, LengthTicks}` — a MidiClip-only path paired with a
+        // Track object — must error, never panic.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before_gain = m.lock().store.tracks[0].gain_db;
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::LengthTicks,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(42u64),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, before_gain, "store untouched");
+    }
+
+    #[test]
+    fn mismatched_midi_clip_gain_fails_cleanly_not_panics() {
+        // The mirror case: `Set{MidiClip, Gain}` — a Track-only path paired
+        // with a MidiClip object.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        m.lock().midi.clips.push(clip.clone());
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip("mc-1".into()),
+                path: PropPath::Gain,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0.5),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().midi.clips, vec![clip], "store untouched");
+    }
+
+    #[test]
+    fn unknown_midi_clip_fails_whole_batch_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let r = Session::transact(&m, TxMeta::user("bad"), |tx| {
+            tx.apply(Op::MidiSetNotes { clip: "no-such-clip".into(), notes: vec![] })
+        });
+        assert!(r.is_err());
     }
 }

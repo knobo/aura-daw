@@ -24,13 +24,15 @@
 //! in `tests/identity_properties.rs`; this file's coverage is the general
 //! Gate A op-batch fuzzer, now clip-aware.)
 
+use std::collections::HashMap;
+
 use proptest::prelude::*;
 
 use aura_lib::audio::types::{Clip, Store, TrackState};
 use aura_lib::control::op::{Actor, ObjectRef, Op, PropPath, TxMeta};
 use aura_lib::control::Session;
-use aura_lib::ids::{ContentId, LaneId, SourceId};
-use aura_lib::midi::MidiStore;
+use aura_lib::ids::{ContentId, LaneId, NoteId, SourceId};
+use aura_lib::midi::{MeterEvent, MidiClip, MidiNote, MidiStore, TempoEvent};
 
 // ---------------------------------------------------------------------------
 // Local test helpers (independent of session.rs's private #[cfg(test)] ones)
@@ -96,6 +98,23 @@ fn test_clip(id: &str, track_id: &str) -> Clip {
     }
 }
 
+/// A standalone `MidiClip` row for `MidiClipAdd`/`MidiClipRemove` op
+/// payloads (Plan E Task 5), mirroring `test_clip`'s role for audio clips.
+fn test_midi_clip(id: &str, track_id: &str) -> MidiClip {
+    MidiClip {
+        id: id.into(),
+        track_id: track_id.into(),
+        name: format!("MIDI {id}"),
+        timeline_start_ticks: 0,
+        length_ticks: 3840,
+        notes: vec![],
+        next_note_id: 1,
+        content_id: ContentId::mint(),
+        lane_id: LaneId::default_for_track(track_id),
+        content_length_ticks: None,
+    }
+}
+
 /// `from` is intentionally `Null`: it's advisory only — `apply_raw` re-reads
 /// truth from the store and ignores the caller's `from`.
 fn set_gain(track_id: &str, to: f64) -> Op {
@@ -131,6 +150,9 @@ fn snapshot(m: &parking_lot::Mutex<Session>) -> String {
     struct MidiSnap<'a> {
         ppq: u32,
         tempo_events: &'a Vec<aura_lib::midi::TempoEvent>,
+        // Plan E Task 5: TempoSet mutates the meter map too — must be part
+        // of the snapshot or a meter round-trip bug would slip past Gate 1.
+        meter_events: &'a Vec<aura_lib::midi::MeterEvent>,
         clips: &'a Vec<aura_lib::midi::MidiClip>,
         loaded_dir: &'a Option<std::path::PathBuf>,
     }
@@ -153,11 +175,45 @@ fn snapshot(m: &parking_lot::Mutex<Session>) -> String {
         midi: MidiSnap {
             ppq: g.midi.ppq,
             tempo_events: &g.midi.tempo_events,
+            meter_events: &g.midi.meter_events,
             clips: &g.midi.clips,
             loaded_dir: &g.midi.loaded_dir,
         },
     };
     serde_json::to_string(&snap).expect("snapshot fields are all plain-data Serialize")
+}
+
+/// Map of `midi clip id -> next_note_id`, read off store truth (Plan E Task
+/// 5 / scope ruling 3's "assert monotonicity separately" half).
+fn watermarks(m: &parking_lot::Mutex<Session>) -> HashMap<String, u32> {
+    m.lock().midi.clips.iter().map(|c| (c.id.to_string(), c.next_note_id)).collect()
+}
+
+/// THE ORACLE CHANGE (binding scope ruling 3): re-parse a `snapshot()`
+/// string and zero every midi clip's `nextNoteId` field before the
+/// byte-identical comparison. Rationale: `MidiSetNotes`'s inverse NEVER
+/// rewinds the watermark (ADR 0001 — ids are never reused, so an undo
+/// cannot "give back" an id it already handed out), so `next_note_id` is
+/// the one field a round trip (undo, OR a same-transaction rollback that
+/// replays inverses immediately) is NOT expected to restore — unlike every
+/// other field, which IS. Masking it here (rather than excluding clips from
+/// the snapshot entirely) keeps every OTHER clip field — notes (incl. their
+/// individual `noteId`s, which the "keep-rule-safe" property strategy below
+/// guarantees ARE restored byte-identically), bounds, name, ids — under the
+/// same strict byte-identical scrutiny it always had. The asymmetry this
+/// masks is checked separately, not silently ignored — see `watermarks`
+/// and its call site in `undo_round_trip`.
+fn mask_watermarks(snapshot_json: &str) -> String {
+    let mut v: serde_json::Value =
+        serde_json::from_str(snapshot_json).expect("snapshot() always emits valid JSON");
+    if let Some(clips) = v.pointer_mut("/midi/clips").and_then(|c| c.as_array_mut()) {
+        for clip in clips {
+            if let Some(obj) = clip.as_object_mut() {
+                obj.insert("nextNoteId".to_string(), serde_json::json!(0));
+            }
+        }
+    }
+    serde_json::to_string(&v).expect("re-serializing a parsed Value never fails")
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +234,14 @@ enum SetKind {
     Muted(bool),
     Soloed(bool),
     Armed(bool),
+}
+
+#[derive(Debug, Clone)]
+enum MidiBoundsKind {
+    TimelineStartTicks(u64),
+    /// Includes 0 so the strategy exercises `write_midi_prop`'s clamp.
+    LengthTicks(u64),
+    ContentLengthTicks(Option<u64>),
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +266,35 @@ enum RawAction {
     /// Plan E Task 3: `pick` selects an alive CLIP by
     /// `pick % alive_clips.len()` to remove.
     ClipRemove(usize),
+    /// Plan E Task 5: mint a fresh MIDI clip on an alive TRACK, `track_pick`
+    /// selects it by `track_pick % alive.len()`.
+    MidiClipAdd(usize),
+    /// Plan E Task 5: `pick` selects an alive MIDI clip by
+    /// `pick % alive_midi_clips.len()` to remove.
+    MidiClipRemove(usize),
+    /// Plan E Task 5: `pick` selects an alive MIDI clip; `kind` is the new
+    /// bounds value.
+    MidiBoundsSet(usize, MidiBoundsKind),
+    /// Plan E Task 5: `pick` selects an alive MIDI clip; `n_new` (0..=2)
+    /// brand-new notes are APPENDED to whatever notes the clip already has
+    /// — deliberately never removed. This keeps every generated payload
+    /// "keep-rule-safe": it always re-sends every currently-live note id
+    /// unchanged, so `assign_incoming_note_ids`'s keep-rule (midi/mod.rs)
+    /// always recognizes them and `undo_round_trip`'s byte-identical oracle
+    /// holds on full note CONTENT, including individual `noteId`s — not
+    /// just the watermark (scope ruling 3 masks ONLY `next_note_id`, which
+    /// implies note ids themselves ARE expected to round-trip exactly).
+    /// Deleting notes here would sometimes force a mint-fresh-identity
+    /// round trip that is byte-identical in content but not in `noteId` (by
+    /// design — ADR 0001: a dropped id is never resurrected) — that path is
+    /// exercised directly by the dedicated `session.rs` unit tests instead
+    /// of here.
+    MidiSetNotes(usize, usize),
+    /// Plan E Task 5: replace the tempo/meter map wholesale. Not
+    /// model-threaded against `alive`/`alive_clips` — `TempoSet` doesn't
+    /// touch tracks or clips, only `midi.{ppq,tempo_events,meter_events}` +
+    /// the `transport.tempo_bpm` mirror.
+    TempoSet(f64),
 }
 
 fn set_kind_strategy() -> impl Strategy<Value = SetKind> {
@@ -214,12 +307,23 @@ fn set_kind_strategy() -> impl Strategy<Value = SetKind> {
     ]
 }
 
+fn midi_bounds_kind_strategy() -> impl Strategy<Value = MidiBoundsKind> {
+    prop_oneof![
+        (0u64..=20_000).prop_map(MidiBoundsKind::TimelineStartTicks),
+        (0u64..=5_000).prop_map(MidiBoundsKind::LengthTicks),
+        proptest::option::of(1u64..=5_000).prop_map(MidiBoundsKind::ContentLengthTicks),
+    ]
+}
+
 /// Weighted so removes land often enough (against a growing/shrinking model,
 /// starting from 3 seeded tracks) to exercise restore-at-varied-index, while
 /// Adds keep replenishing the pool so batches don't degenerate into
 /// all-no-op Sets/Removes against an empty track list. Plan E Task 3 adds
 /// ClipMove/ClipAdd/ClipRemove at weights 2/1/1 alongside the existing
-/// 4 Set / 2 Add / 3 Remove track actions.
+/// 4 Set / 2 Add / 3 Remove track actions. Plan E Task 5 adds the MIDI half
+/// the same way: MidiClipAdd/Remove at 1/1 (structural, mirrors ClipAdd/
+/// Remove's weight), MidiBoundsSet at 2 (mirrors ClipMove), MidiSetNotes at
+/// 1, TempoSet at 1 (store-wide, not model-threaded).
 fn raw_action_strategy() -> impl Strategy<Value = RawAction> {
     prop_oneof![
         4 => (any::<usize>(), set_kind_strategy()).prop_map(|(p, k)| RawAction::Set(p, k)),
@@ -228,6 +332,11 @@ fn raw_action_strategy() -> impl Strategy<Value = RawAction> {
         2 => (any::<usize>(), 0u64..=10_000_000u64).prop_map(|(p, to)| RawAction::ClipMove(p, to)),
         1 => any::<usize>().prop_map(RawAction::ClipAdd),
         1 => any::<usize>().prop_map(RawAction::ClipRemove),
+        1 => any::<usize>().prop_map(RawAction::MidiClipAdd),
+        1 => any::<usize>().prop_map(RawAction::MidiClipRemove),
+        2 => (any::<usize>(), midi_bounds_kind_strategy()).prop_map(|(p, k)| RawAction::MidiBoundsSet(p, k)),
+        1 => (any::<usize>(), 0usize..=2).prop_map(|(p, n)| RawAction::MidiSetNotes(p, n)),
+        1 => (40.0f64..=300.0f64).prop_map(RawAction::TempoSet),
     ]
 }
 
@@ -244,17 +353,35 @@ fn mint_clips(track_id: &str, n: usize, clip_counter: &mut u32) -> Vec<Clip> {
         .collect()
 }
 
+/// Plan E Task 5's threaded model for an alive MIDI clip: `note_ids` and
+/// `next_note_id` are kept in exact lockstep with real store truth (never
+/// approximated) because `MidiSetNotes`'s "keep-rule-safe" generation
+/// (`RawAction::MidiSetNotes`'s doc comment) depends on knowing the EXACT
+/// live ids to re-send, and the exact next id(s) `assign_incoming_note_ids`
+/// will mint for brand-new notes appended after them (see `resolve_one`'s
+/// `MidiSetNotes` arm for how that determinism is arranged: kept notes
+/// always sort before new notes by `tick`, so mint order == append order).
+#[derive(Debug, Clone)]
+struct MidiClipModel {
+    id: String,
+    note_ids: Vec<u32>,
+    next_note_id: u32,
+}
+
 /// Resolves one `RawAction` against the threaded model, mutating `alive`
 /// (track ids), `alive_clips` (`(clip_id, track_id)` pairs — Plan E Task 3,
-/// threaded the same way `alive` is), `counter` (fresh, distinct
-/// generated-track ids) and `clip_counter` (fresh, distinct generated-clip
-/// ids). Returns `None` when the action is a no-op given current model state
-/// (e.g. a Set/Remove drawn while `alive`/`alive_clips` is empty) — the
-/// caller filters those out, so a batch may end up shorter than requested
-/// (never invalid).
+/// threaded the same way `alive` is), `alive_midi_clips` (Plan E Task 5,
+/// same idea for MIDI clips), `counter` (fresh, distinct generated-track
+/// ids), `clip_counter` (fresh, distinct generated-clip ids) and
+/// `midi_clip_counter` (fresh, distinct generated-midi-clip ids). Returns
+/// `None` when the action is a no-op given current model state (e.g. a
+/// Set/Remove drawn while `alive`/`alive_clips`/`alive_midi_clips` is empty)
+/// — the caller filters those out, so a batch may end up shorter than
+/// requested (never invalid).
 fn resolve_one(
     action: RawAction, alive: &mut Vec<String>, alive_clips: &mut Vec<(String, String)>,
-    counter: &mut u32, clip_counter: &mut u32,
+    alive_midi_clips: &mut Vec<MidiClipModel>,
+    counter: &mut u32, clip_counter: &mut u32, midi_clip_counter: &mut u32,
 ) -> Option<Op> {
     match action {
         RawAction::Set(pick, kind) => {
@@ -342,6 +469,95 @@ fn resolve_one(
             // `TrackRemove` above.
             Some(Op::ClipRemove { clip: test_clip(&clip_id, &track_id), index: idx })
         }
+        RawAction::MidiClipAdd(track_pick) => {
+            if alive.is_empty() {
+                return None;
+            }
+            let track_id = alive[track_pick % alive.len()].clone();
+            let cid = format!("gen-midi-{}", *midi_clip_counter);
+            *midi_clip_counter += 1;
+            let clip = test_midi_clip(&cid, &track_id);
+            let index = alive_midi_clips.len();
+            alive_midi_clips.push(MidiClipModel { id: cid, note_ids: vec![], next_note_id: 1 });
+            Some(Op::MidiClipAdd { clip, index })
+        }
+        RawAction::MidiClipRemove(pick) => {
+            if alive_midi_clips.is_empty() {
+                return None;
+            }
+            let idx = pick % alive_midi_clips.len();
+            let model = alive_midi_clips.remove(idx);
+            // `clip`/`index` beyond `.id` are advisory-ignored by
+            // `apply_raw` (store truth wins), same precedent as
+            // `ClipRemove` above — `track_id` here is never read.
+            Some(Op::MidiClipRemove { clip: test_midi_clip(&model.id, "unused"), index: idx })
+        }
+        RawAction::MidiBoundsSet(pick, kind) => {
+            if alive_midi_clips.is_empty() {
+                return None;
+            }
+            let id = alive_midi_clips[pick % alive_midi_clips.len()].id.clone();
+            let (path, to) = match kind {
+                MidiBoundsKind::TimelineStartTicks(v) => (PropPath::TimelineStartTicks, serde_json::json!(v)),
+                MidiBoundsKind::LengthTicks(v) => (PropPath::LengthTicks, serde_json::json!(v)),
+                MidiBoundsKind::ContentLengthTicks(v) => (
+                    PropPath::ContentLengthTicks,
+                    match v {
+                        Some(v) => serde_json::json!(v),
+                        None => serde_json::Value::Null,
+                    },
+                ),
+            };
+            Some(Op::Set { object: ObjectRef::MidiClip(id.into()), path, from: serde_json::Value::Null, to })
+        }
+        RawAction::MidiSetNotes(pick, n_new) => {
+            if alive_midi_clips.is_empty() {
+                return None;
+            }
+            let idx = pick % alive_midi_clips.len();
+            let model = &mut alive_midi_clips[idx];
+            // Kept notes: re-send EVERY currently-live id unchanged (content
+            // varies only in `tick`, kept low) — "keep-rule-safe" by
+            // construction (see `RawAction::MidiSetNotes`'s doc comment).
+            let mut notes: Vec<MidiNote> = model
+                .note_ids
+                .iter()
+                .enumerate()
+                .map(|(i, &id)| MidiNote {
+                    tick: (i as u32) * 40,
+                    length_ticks: 480,
+                    key: 60,
+                    velocity: 100,
+                    channel: 0,
+                    note_id: NoteId(id),
+                })
+                .collect();
+            // New notes: id 0 (mint), `tick` deliberately far past any kept
+            // note's tick so `assign_incoming_note_ids`'s sort-by-(tick,key)
+            // places them AFTER every kept note — the mint order then
+            // exactly matches `j`'s order, so the model can predict the
+            // exact ids that will be minted without observing the result.
+            for j in 0..n_new {
+                notes.push(MidiNote {
+                    tick: 100_000 + (j as u32) * 40,
+                    length_ticks: 480,
+                    key: 61,
+                    velocity: 100,
+                    channel: 0,
+                    note_id: NoteId(0),
+                });
+            }
+            let n_new = n_new as u32;
+            let new_ids: Vec<u32> = (model.next_note_id..model.next_note_id + n_new).collect();
+            model.note_ids.extend(new_ids);
+            model.next_note_id += n_new;
+            Some(Op::MidiSetNotes { clip: model.id.clone().into(), notes })
+        }
+        RawAction::TempoSet(bpm) => Some(Op::TempoSet {
+            ppq: 960,
+            events: vec![TempoEvent { tick: 0, bpm }],
+            meter: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+        }),
     }
 }
 
@@ -350,15 +566,20 @@ fn arb_op_batches(num_batches: std::ops::Range<usize>) -> impl Strategy<Value = 
         .prop_map(|raw_batches| {
             let mut alive: Vec<String> = SEED_IDS.iter().map(|s| s.to_string()).collect();
             let mut alive_clips: Vec<(String, String)> = Vec::new();
+            let mut alive_midi_clips: Vec<MidiClipModel> = Vec::new();
             let mut counter: u32 = 0;
             let mut clip_counter: u32 = 0;
+            let mut midi_clip_counter: u32 = 0;
             raw_batches
                 .into_iter()
                 .map(|batch| {
                     batch
                         .into_iter()
                         .filter_map(|a| {
-                            resolve_one(a, &mut alive, &mut alive_clips, &mut counter, &mut clip_counter)
+                            resolve_one(
+                                a, &mut alive, &mut alive_clips, &mut alive_midi_clips,
+                                &mut counter, &mut clip_counter, &mut midi_clip_counter,
+                            )
                         })
                         .collect::<Vec<Op>>()
                 })
@@ -389,6 +610,14 @@ proptest! {
                 undo_stack.push(c.inverses);
             } // Err = rolled back = state unchanged; nothing pushed.
         }
+        // Scope ruling 3's monotonicity half: capture the peak (post-apply,
+        // pre-undo) watermark per alive midi clip. Any clip still alive
+        // AFTER the full undo below (uncommon — most midi clips added
+        // during the run get removed again by their own `MidiClipAdd`'s
+        // inverse, so this is frequently a vacuous check, but it's a real
+        // guard against a future regression that rewinds a survivor's
+        // watermark) must never show a SMALLER `next_note_id` than its peak.
+        let wm_peak = watermarks(&m);
         for inv in undo_stack.into_iter().rev() {
             Session::transact(&m, user_meta("undo"), |tx| {
                 for op in inv {
@@ -398,7 +627,20 @@ proptest! {
             })
             .unwrap();
         }
-        prop_assert_eq!(snapshot(&m), before);
+        let after = snapshot(&m);
+        // THE ORACLE CHANGE (binding scope ruling 3) — see `mask_watermarks`'
+        // doc for the full rationale: `next_note_id` is expected to differ
+        // (only ever upward) after a round trip; every other field is not.
+        prop_assert_eq!(mask_watermarks(&after), mask_watermarks(&before));
+        let wm_final = watermarks(&m);
+        for (id, peak) in &wm_peak {
+            if let Some(final_wm) = wm_final.get(id) {
+                prop_assert!(
+                    final_wm >= peak,
+                    "clip {id}: watermark rewound {peak} -> {final_wm} across undo"
+                );
+            }
+        }
     }
 
     /// Gate test 3: a failing batch leaves the session exactly as it was.
@@ -414,7 +656,13 @@ proptest! {
             }
             tx.apply(set_gain("no-such-track", 0.5)) // guaranteed failure
         });
-        prop_assert_eq!(snapshot(&m), before);
+        // Same masking as `undo_round_trip`: this transaction's OWN
+        // rollback replays inverses immediately (Session::transact's Err
+        // path), which hits the identical watermark asymmetry — a
+        // `MidiSetNotes` that minted new ids before the guaranteed failure
+        // has its notes fully restored by the rollback, but not its
+        // `next_note_id` (ADR 0001, never rewound).
+        prop_assert_eq!(mask_watermarks(&snapshot(&m)), mask_watermarks(&before));
     }
 }
 

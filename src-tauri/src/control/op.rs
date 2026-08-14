@@ -47,6 +47,31 @@ pub enum Op {
     /// Structural: remove an audio clip; `clip`/`index` advisory beyond
     /// `clip.id` — store truth wins, mirroring `TrackRemove`.
     ClipRemove { clip: crate::audio::types::Clip, index: usize },
+    /// Plan E Task 5: atomic tempo/meter replacement, including the
+    /// `transport.tempo_bpm` mirror (= first event's bpm), which today is a
+    /// second non-atomic phase (round-2 inventory row 4). Inverse carries
+    /// the previous triple.
+    TempoSet {
+        ppq: u32,
+        events: Vec<crate::midi::types::TempoEvent>,
+        meter: Vec<crate::midi::types::MeterEvent>,
+    },
+    /// Structural: insert a MIDI clip (payload = full row incl. content_id/
+    /// lane_id/next_note_id; inverse = MidiClipRemove). Duplicate-id guard
+    /// like ClipAdd. Restoring a removed clip's row restores its watermark
+    /// — correct: that watermark was the clip's own (ADR 0001).
+    MidiClipAdd { clip: crate::midi::types::MidiClip, index: usize },
+    /// Structural: remove a MIDI clip; `clip`/`index` advisory beyond
+    /// `clip.id` — store truth wins, mirroring `ClipRemove`.
+    MidiClipRemove { clip: crate::midi::types::MidiClip, index: usize },
+    /// §4.4 value-replacement wrapper form: whole-notes replace, diffed
+    /// against store truth server-side, coalescable by (kind, object,
+    /// actor). `notes` may carry noteId 0 (mint) or live ids (keep) —
+    /// `assign_incoming_note_ids`'s keep-rule applies inside `apply_raw`.
+    /// Inverse = MidiSetNotes with the previous notes (all live ids). The
+    /// watermark advances monotonically and is NOT rewound by the inverse
+    /// (scope ruling 3, ADR 0001).
+    MidiSetNotes { clip: crate::ids::ClipId, notes: Vec<crate::midi::types::MidiNote> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -64,6 +89,18 @@ pub enum PropPath {
     InstrumentId,
     /// Clip: timeline placement position, in samples.
     TimelineStartSamples,
+    /// MidiClip: timeline placement position, in ticks.
+    TimelineStartTicks,
+    /// MidiClip: placement length, in ticks. Clamped to >= 1 on write (the
+    /// write side is the clamp authority, mirroring the gain-clamp
+    /// round-trip rule — Plan A) so the inverse observes the post-clamp
+    /// value, never the caller's raw (possibly zero) `to`.
+    LengthTicks,
+    /// MidiClip: content (loop/native) length in ticks — ADR 0004's content
+    /// half of the content/placement split. Wire form is a JSON number or
+    /// `null` (mirrors `MidiClip::content_length_ticks: Option<u64>`);
+    /// `null` clears back to "same as `LengthTicks`".
+    ContentLengthTicks,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -272,6 +309,73 @@ mod tests {
         assert!(s.contains("\"path\":\"timelineStartSamples\""), "wire form was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, move_op);
+
+        // Plan E Task 5: TempoSet, MidiClipAdd/MidiSetNotes wire form, and
+        // the new ContentLengthTicks path on a Set.
+        let tempo_set = Op::TempoSet {
+            ppq: 960,
+            events: vec![crate::midi::types::TempoEvent { tick: 0, bpm: 140.0 }],
+            meter: vec![crate::midi::types::MeterEvent { tick: 0, num: 3, den: 4 }],
+        };
+        let s = serde_json::to_string(&tempo_set).unwrap();
+        eprintln!("TempoSet wire form: {}", s);
+        assert!(s.contains("\"kind\":\"tempoSet\""), "wire form was: {s}");
+        assert!(s.contains("\"bpm\":140.0"), "tempo events must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, tempo_set);
+
+        let midi_clip = crate::midi::types::MidiClip {
+            id: "mc-1".into(),
+            track_id: "t-2".into(),
+            name: "midi clip".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 3840,
+            notes: vec![],
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-2"),
+            content_length_ticks: None,
+        };
+        let midi_clip_add = Op::MidiClipAdd { clip: midi_clip.clone(), index: 0 };
+        let s = serde_json::to_string(&midi_clip_add).unwrap();
+        eprintln!("MidiClipAdd wire form: {}", s);
+        assert!(s.contains("\"kind\":\"midiClipAdd\""), "wire form was: {s}");
+        assert!(s.contains("\"id\":\"mc-1\""), "clip fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, midi_clip_add);
+
+        let midi_clip_remove = Op::MidiClipRemove { clip: midi_clip, index: 0 };
+        let s = serde_json::to_string(&midi_clip_remove).unwrap();
+        eprintln!("MidiClipRemove wire form: {}", s);
+        assert!(s.contains("\"kind\":\"midiClipRemove\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, midi_clip_remove);
+
+        let midi_set_notes = Op::MidiSetNotes {
+            clip: "mc-1".into(),
+            notes: vec![crate::midi::types::MidiNote {
+                tick: 0, length_ticks: 480, key: 60, velocity: 100, channel: 0,
+                note_id: crate::ids::NoteId(1),
+            }],
+        };
+        let s = serde_json::to_string(&midi_set_notes).unwrap();
+        eprintln!("MidiSetNotes wire form: {}", s);
+        assert!(s.contains("\"kind\":\"midiSetNotes\""), "wire form was: {s}");
+        assert!(s.contains("\"noteId\":1"), "note fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, midi_set_notes);
+
+        let content_length_op = Op::Set {
+            object: ObjectRef::MidiClip("mc-1".into()),
+            path: PropPath::ContentLengthTicks,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(1920u64),
+        };
+        let s = serde_json::to_string(&content_length_op).unwrap();
+        eprintln!("Set{{MidiClip,ContentLengthTicks}} wire form: {}", s);
+        assert!(s.contains("\"path\":\"contentLengthTicks\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, content_length_op);
     }
 
     #[test]

@@ -578,9 +578,15 @@ impl ControlPlane {
                     // honest no-op rather than a `todo!()` so a future path
                     // added here without a `param_writes` producer doesn't
                     // panic a live commit.
+                    // Plan E Task 5: same reasoning for the three MidiClip
+                    // paths — `apply_raw` never pushes them into
+                    // `param_writes` either (structural: rebuild only).
                     op::PropPath::Armed
                     | op::PropPath::InstrumentId
-                    | op::PropPath::TimelineStartSamples => {}
+                    | op::PropPath::TimelineStartSamples
+                    | op::PropPath::TimelineStartTicks
+                    | op::PropPath::LengthTicks
+                    | op::PropPath::ContentLengthTicks => {}
                 }
             }
             if let Some(any_solo) = committed.effect.any_solo {

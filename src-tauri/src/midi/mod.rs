@@ -433,8 +433,12 @@ pub fn midi_set_notes(
 /// `existing` — a stale/duplicated/foreign id is always minted fresh, never
 /// resurrects a deleted note's identity. Returns the sorted, id-resolved
 /// note list and the advanced watermark; extracted as a pure function so the
-/// keep-rule is unit-testable without a tauri State harness.
-fn assign_incoming_note_ids(
+/// keep-rule is unit-testable without a tauri State harness. `pub(crate)`
+/// (Plan E Task 5) so `control::session::apply_raw`'s `Op::MidiSetNotes` arm
+/// can call it directly — it's already pure (`&mut MidiClip` + payload, no
+/// midi-lock machinery), so no move/adapt was needed, only a visibility
+/// widening.
+pub(crate) fn assign_incoming_note_ids(
     existing: &[MidiNote],
     next_note_id: u32,
     mut incoming: Vec<MidiNote>,
