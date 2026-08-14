@@ -145,7 +145,19 @@ The log the whole plan exists for, for completeness of this document:
   no fsync), behind one `HistoryLog` shared by BOTH `Committer` instances.
 * The single write point: `Committer::commit_with_rebuild`, after the
   effects, `if !committed.meta.transient`. That one condition IS ruling 2's
-  enforcement.
+  enforcement. A batch that folded to ZERO ops is dropped inside
+  `HistoryLog::record_commit` itself (fix round 1): `fold_ops` elides a
+  net-no-op `Set` group, so an empty `Committed` is an ordinary outcome
+  (`move_clip` to the sample a clip already sits on, a gain write of the
+  current value) — it must produce neither a phantom undo step nor an
+  `"ops":[]` journal line.
+* REDO SOUNDNESS RESTS ON A RULE ABOUT `transient` (fix round 1, recorded
+  on `HistoryMode`): transient writes must never touch document fields an
+  entry's `ops` can address, or a pending redo silently lands on a
+  different state. Today's transient writers stay clear by construction
+  (transport `Set`s address `ObjectRef::Transport` only; mid-gesture folds
+  are superseded by the gesture batch that closes over them). Nothing
+  checks this — it constrains what may be marked transient.
 * `undo`/`redo` (`ControlPlane::undo`/`redo`, Tauri commands `undo`/`redo`,
   Ctrl+Z / Ctrl+Shift+Z in `src/App.svelte` guarded against text entry)
   commit through the NORMAL path with `HistoryMode::Replay`: journaled
@@ -214,12 +226,13 @@ boundary. Sanctioned by ruling 4 — an epoch is where the document is
 replaced wholesale, and nothing about that replacement is an op.
 
 **R-3 — `try_seed_zyn_demo_instruments`**
-(`src-tauri/src/control/mod.rs:2165`/`:2178`). `seed_demo_project`'s
-best-effort Zyn bootstrap pushes three instance rows into
-`session.plugins.instances` directly, before the demo's single channel
-transaction runs; the rationale is stated at the function
-(`src-tauri/src/control/mod.rs:2121-2126`): no track references those ids
-until the caller binds them, so there is nothing user-visible to undo yet.
+(`src-tauri/src/control/mod.rs:2430`; the direct row push at `:2469`, its
+rollback at `:2483`). `seed_demo_project`'s best-effort Zyn bootstrap
+pushes three instance rows into `session.plugins.instances` directly,
+before the demo's single channel transaction runs; the rationale is stated
+on the function itself (`src-tauri/src/control/mod.rs:2424-2429`): no track
+references those ids until the caller binds them, so there is nothing
+user-visible to undo yet.
 Recommended for Plan F: fold this into the seed transaction as
 `Op::PluginAdd`s so the demo's plugin rows are undoable like everything
 else.

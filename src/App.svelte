@@ -58,9 +58,11 @@
     return Math.round(transport.positionAt(performance.now()));
   }
 
-  /** True when the event targets somewhere the user is typing — a text
-   * input, a textarea, or any contenteditable host. Such a target owns its
-   * own editing keys (Ctrl+Z included). */
+  /** True when the event targets somewhere the user is typing or picking —
+   * an `<input>`, a `<textarea>`, a `<select>`, or any contenteditable
+   * host. Such a target owns its own editing keys (Ctrl+Z included). The
+   * list matches the guard the rest of `onKeydown` already applies below;
+   * keep the two in step. */
   function isTextEntry(target: EventTarget | null): boolean {
     const el = target as HTMLElement | null;
     if (!el) return false;

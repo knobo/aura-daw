@@ -396,6 +396,19 @@ impl JournalWriter {
 /// a thread-local: an undo runs on whatever thread invoked it, and a
 /// thread-local would silently mis-classify a commit that a wrapper made on
 /// its behalf.
+///
+/// THE INVARIANT REDO-SOUNDNESS RESTS ON (fix round 1, M-3): transient
+/// writes must never touch document fields an entry's `ops` can address, or
+/// a pending redo silently lands on a different state. Redo replays an
+/// entry's stored `ops` against whatever the document is NOW, so anything
+/// that mutates those same fields WITHOUT leaving a history entry — which
+/// is precisely what `TxMeta::transient` means — moves the ground under a
+/// redo without invalidating it. Today the transient writers stay clear by
+/// construction: transport `Op::Set`s address `ObjectRef::Transport` only,
+/// and mid-gesture folds are themselves superseded by the gesture batch
+/// that closes over them. A future transient writer touching a track,
+/// clip, midi or plugin field would break this silently — it is a rule
+/// about what may be marked transient, not a property the code checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryMode {
     /// A fresh edit: record it (clearing redo, applying the 350 ms merge).
@@ -430,7 +443,29 @@ impl HistoryLog {
     /// — the caller checks `meta.transient` — which is scope ruling 2's
     /// "through the channel, never journaled, never undoable", enforced at
     /// exactly one place.
+    ///
+    /// AN EMPTY BATCH IS RECORDED NOWHERE (fix round 1, I-1). `fold_ops`
+    /// DROPS a `Set` group whose net `from == to` (session.rs), so an empty
+    /// `Committed` is a live, ordinary outcome — not a defensive
+    /// impossibility: `move_clip` back to the sample it already sits on, or
+    /// a `set_track_mix` writing a track's current gain, both produce one.
+    /// Such a batch must leave no trace in EITHER stream:
+    /// * no history entry — otherwise Ctrl+Z consumes a step, bumps `rev`,
+    ///   emits `project://changed` and toasts a label, while changing
+    ///   nothing the user can see. A phantom undo step is worse than a
+    ///   missing one: it makes the whole stack feel untrustworthy.
+    /// * no journal line — `"ops":[]` documents nothing; a replay applying
+    ///   it is a guaranteed no-op, so the line is pure noise in a log whose
+    ///   entire value is that every line means something.
+    ///
+    /// `close_gesture` has always had the equivalent guard (its `last`
+    /// emptiness check); this is the ordinary path catching up with it, and
+    /// it lives HERE rather than at the call site so no future caller can
+    /// route around it.
     pub fn record_commit(&self, rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op], mode: HistoryMode) {
+        if ops.is_empty() {
+            return;
+        }
         // Journal FIRST, unconditionally: an undo/redo is a mutation and
         // replay must see it, even though it creates no new history entry.
         self.journal.lock().append_batch(rev, epoch, meta, ops);
@@ -443,7 +478,16 @@ impl HistoryLog {
     /// other non-transient batch — its `rev`/`epoch` are the session's
     /// current values, read by `close_gesture` — and recorded PRE-FOLDED
     /// (never 350 ms-merged, see [`HistoryEntry::from_gesture`]).
+    ///
+    /// The same empty-batch guard as [`Self::record_commit`], for the same
+    /// reasons. `close_gesture` cannot currently reach here with an empty
+    /// `ops` (it returns early when the gesture folded nothing), so this is
+    /// belt-and-braces — but the rule "an empty batch is recorded nowhere"
+    /// belongs to the sink, not to one caller's discipline.
     pub fn record_gesture(&self, rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op]) {
+        if ops.is_empty() {
+            return;
+        }
         self.journal.lock().append_batch(rev, epoch, meta, ops);
         self.history.lock().record(HistoryEntry::from_gesture(meta, ops, inverses));
     }

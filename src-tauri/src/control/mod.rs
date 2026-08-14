@@ -440,6 +440,12 @@ impl Committer {
         // Before the `project://changed` emit below, for the same reason
         // persist runs before it: the event announces durable truth, and by
         // the time a listener reacts the log must already agree.
+        //
+        // A batch that folded to ZERO ops is dropped by `record_commit`
+        // itself (fix round 1, I-1 — see its doc): `fold_ops` elides a
+        // net-no-op `Set` group, so an empty `Committed` is an ordinary
+        // outcome, and it must produce neither a phantom undo step nor an
+        // empty journal line.
         if !committed.meta.transient {
             self.log.record_commit(
                 committed.rev,

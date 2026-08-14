@@ -94,11 +94,12 @@ pub(crate) fn unique_untitled_name(parent: &Path) -> String {
 }
 
 /// Auto-create a default project when the session has none open yet (round-2
-/// §4.5 carve-out: an epoch boundary, "document birth"). Shared by the
-/// engine control thread's own `ensure_project` (auto-project on recording
-/// start, engine.rs; NOT rewired by Task 6 — still calls this directly) and
-/// `ControlPlane::ensure_project_epoch` (Task 6's sanctioned front door,
-/// wired to the engine by Task 13). Returns `Ok(None)` when a project is
+/// §4.5 carve-out: an epoch boundary, "document birth"). The ONE swap site,
+/// reached through exactly one front door: `ControlPlane::ensure_project_epoch`
+/// (Task 6's sanctioned epoch fn). The engine control thread's own
+/// `ensure_project` (auto-project on recording start, engine.rs) no longer
+/// calls this directly — Task 13 rewired it through the closure lib.rs
+/// installs, which invokes that same front door. Returns `Ok(None)` when a project is
 /// ALREADY open (no-op — the caller decides what "no work to do" means for
 /// its own return type); `Ok(Some(project))` when one was minted, with
 /// `project_dir`/`project_name`/`created_at` swapped into the store under
@@ -116,11 +117,15 @@ pub fn ensure_default_project(
     let (project, dir) = create(&parent, &name, sample_rate, 120.0)?;
     {
         let mut session = session.lock();
-        // epoch boundary: Task 17 hooks history-clear + journal rotation
-        // here — this is the actual swap site for the "ensure" epoch (both
-        // the engine's own `ensure_project` and `ControlPlane::
-        // ensure_project_epoch` call through here; neither does its own
-        // separate store write). Fix round 1 (Task 7 review finding 2):
+        // epoch boundary: the store swap for the "ensure" epoch happens
+        // HERE, but Task 17's history-clear + journal rotation does NOT —
+        // it lives in `ControlPlane::ensure_project_epoch`, the single
+        // front door every caller of this fn goes through (this module has
+        // no `ControlPlane` and must not grow one; the journal also writes
+        // to disk, which may never happen under the session lock this
+        // block holds). A `Some(project)` return there means this swap
+        // actually ran, so the hook fires exactly as often as the epoch
+        // counter below bumps. Fix round 1 (Task 7 review finding 2):
         // bump `session.epoch` here too — `ControlPlane::execute_persist`
         // uses it to detect a commit's persist racing this document swap.
         session.epoch += 1;

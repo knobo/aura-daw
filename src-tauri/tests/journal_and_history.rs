@@ -111,6 +111,31 @@ fn gain_of(cp: &ControlPlane, id: &str) -> f64 {
     cp.project_state().tracks.iter().find(|t| t.id == id).expect("track").gain_db
 }
 
+fn clip_start(cp: &ControlPlane, id: &str) -> u64 {
+    cp.project_state().clips.iter().find(|c| c.id == id).expect("clip").timeline_start_samples
+}
+
+fn test_clip(id: &str, track_id: &str) -> aura_lib::audio::types::Clip {
+    aura_lib::audio::types::Clip {
+        id: id.into(),
+        track_id: track_id.into(),
+        name: format!("Clip {id}"),
+        source_path: "audio/x.wav".into(),
+        source_id: aura_lib::ids::SourceId::default(),
+        source_channels: 2,
+        source_sample_rate: 48_000,
+        source_length_samples: 48_000,
+        timeline_start_samples: 24_000,
+        offset_samples: 0,
+        length_samples: 48_000,
+        gain_db: 0.0,
+        fade_in_samples: 0,
+        fade_out_samples: 0,
+        content_id: aura_lib::ids::ContentId::mint(),
+        lane_id: aura_lib::ids::LaneId::default_for_track(track_id),
+    }
+}
+
 /// Every line of `<dir>/journal.ndjson`, parsed. Fails loudly if any line is
 /// not valid JSON — "every line parses" is part of the contract.
 fn journal_lines(dir: &Path) -> Vec<serde_json::Value> {
@@ -337,6 +362,102 @@ fn transient_commits_reach_neither_history_nor_the_journal() {
     // The write itself DID happen — transient means "not logged", not "not applied".
     assert_eq!(gain_of(&f.cp, &t), -12.0);
     assert!(f.cp.transport_state().stop_at_end);
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+// ---------------------------------------------------------------------------
+// net-no-op batches (fix round 1, I-1)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_net_noop_batch_produces_no_history_entry_and_no_journal_line() {
+    let f = fixture();
+    let parent = tmp_parent("noop");
+    let project = f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let dir = std::path::PathBuf::from(project.path.unwrap());
+    let t = add_track(&f.cp, "Audio");
+    f.cp.commit(TxMeta::user("add clip"), |tx| {
+        tx.apply(Op::ClipAdd { clip: test_clip("c-1", &t), index: 0 })
+    })
+    .unwrap();
+
+    let depth_before = f.log.depths().0;
+    let lines_before = batches(&journal_lines(&dir)).len();
+    let start_before = clip_start(&f.cp, "c-1");
+
+    // (a) A move to the sample the clip ALREADY sits on. `fold_ops` elides
+    // the net-zero `Set` group, so the commit succeeds with zero ops —
+    // an ordinary outcome, not an error.
+    f.cp.move_clip("c-1", start_before, TxMeta::user("move clip")).unwrap();
+    // ...and a move away and straight back, folded inside ONE transaction.
+    f.cp.commit(TxMeta::user("wiggle"), |tx| {
+        tx.apply(Op::Set {
+            object: ObjectRef::Clip("c-1".into()),
+            path: PropPath::TimelineStartSamples,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(48_000u64),
+        })?;
+        tx.apply(Op::Set {
+            object: ObjectRef::Clip("c-1".into()),
+            path: PropPath::TimelineStartSamples,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(start_before),
+        })
+    })
+    .unwrap();
+    // ...and a gain write to the value the track already has. NB: the
+    // current value is read BEFORE the closure — `gain_of` takes the
+    // session lock, and the closure body runs while `Session::transact`
+    // already holds it (`parking_lot::Mutex` is not reentrant).
+    let current_gain = gain_of(&f.cp, &t);
+    f.cp.commit(TxMeta::user("same gain"), |tx| tx.apply(set_gain(&t, current_gain))).unwrap();
+
+    assert_eq!(clip_start(&f.cp, "c-1"), start_before, "nothing actually moved");
+    assert_eq!(
+        f.log.depths().0,
+        depth_before,
+        "a net-no-op batch must not become a phantom undo step"
+    );
+    assert_eq!(
+        batches(&journal_lines(&dir)).len(),
+        lines_before,
+        "a net-no-op batch must not write an empty ops[] journal line"
+    );
+    // Ctrl+Z therefore still undoes the last REAL edit — the clip add.
+    assert_eq!(f.cp.undo().unwrap().as_deref(), Some("add clip"));
+    assert!(f.cp.project_state().clips.is_empty(), "undo hit the real edit, not a phantom");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+#[test]
+fn a_real_edit_after_a_net_noop_records_normally() {
+    let f = fixture();
+    let parent = tmp_parent("noop-then-real");
+    let project = f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let dir = std::path::PathBuf::from(project.path.unwrap());
+    let t = add_track(&f.cp, "Audio");
+
+    let depth_before = f.log.depths().0;
+    let lines_before = batches(&journal_lines(&dir)).len();
+
+    // A no-op...
+    f.cp.commit(TxMeta::user("same gain"), |tx| tx.apply(set_gain(&t, 0.0))).unwrap();
+    assert_eq!(f.log.depths().0, depth_before, "the no-op recorded nothing");
+
+    // ...then a genuine edit, which must record and journal as usual — the
+    // guard skips empty batches, it does not wedge the log.
+    f.cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+    assert_eq!(f.log.depths().0, depth_before + 1, "the real edit still records");
+    assert_eq!(batches(&journal_lines(&dir)).len(), lines_before + 1);
+    assert_eq!(gain_of(&f.cp, &t), -6.0);
+
+    // And it undoes to the value the no-op left untouched.
+    assert_eq!(f.cp.undo().unwrap().as_deref(), Some("gain"));
+    assert_eq!(gain_of(&f.cp, &t), 0.0);
 
     f.eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);
