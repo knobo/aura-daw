@@ -206,10 +206,16 @@ M-6, M-7, M-8, and the frontend M-3. None turned out to be entangled with
 C-1's fix; the only adjacency found is the undo/redo entry-migration
 residual above, which is recorded, not fixed.
 
-`next-prompt.md` in this worktree is an OLDER revision than the reviewer's
-copy in the `zrythm-arch` worktree (it still says PR #12 is open, and cites
-174 frontend tests). I edited only what this fix wave is responsible for —
-the review-findings section, the `OP_FORMAT_VERSION` and M-3 constraint
-bullets, and the `L-1..L-3` range — and deliberately did not try to
-reconcile the rest, since the newer text is the controller's uncommitted
-work, not mine to merge.
+`next-prompt.md` — RECONCILED after the coordinator pointed out that my
+"older revision" observation was sharper than I knew: the post-merge
+rewrite exists as `001a241` on `plan-e-side-channels`, committed AFTER
+PR #12's squash, so it never reached `main` and this PR had been editing
+the pre-merge file. `001a241` is now cherry-picked onto this branch
+(`517b420`) with its rewrite as the BASE and this PR's edits merged on
+top; only the "R-1..R-3 / L-1..L-3" line genuinely conflicted. The
+cherry-pick touched the two docs files and nothing else — code and both
+suites are unmoved (506 / 206). Two things it forced, both done: Track
+A's "Consumes" block still called the journal v1 and listed L-1 as open
+(now v2, L-1 closed, L-4/L-5 added with the note that L-4's structural
+fix and L-5's panic rollback are both Track A's), and the HOLD list now
+carries the C-1 residual above, tagged to bundle with I-6.
