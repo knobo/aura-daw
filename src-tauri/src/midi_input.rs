@@ -589,20 +589,41 @@ pub fn midi_list_input_ports() -> Result<Vec<MidiPortInfo>, String> {
     list_ports()
 }
 
+/// Task 5 (MIDI slice 2, §4.5 config carve-out): the body is now a thin
+/// wrapper over `ControlPlane::select_midi_input_port` — the front door
+/// both Tauri and MCP call through, so actor/label attribution is
+/// captured. Default ON when a port is selected (slice 1b requirement);
+/// the value is irrelevant when `port_id` is `None` (closing the
+/// connection).
 #[tauri::command]
 pub fn midi_select_input_port(
     port_id: Option<String>,
     monitor: Option<bool>,
-    state: tauri::State<'_, MidiInputManager>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
 ) -> Result<(), String> {
-    // Default ON when a port is selected (slice 1b requirement); the value
-    // is irrelevant when `port_id` is `None` (closing the connection).
-    state.select_port(port_id, monitor.unwrap_or(true))
+    control.select_midi_input_port(
+        port_id,
+        monitor.unwrap_or(true),
+        crate::control::op::TxMeta::user("select midi input port"),
+    )
+}
+
+/// NEW, additive (Task 5): routes hardware MIDI-in to a track's instrument.
+/// `None` clears the routing (back to the slice-1b preview tone).
+#[tauri::command]
+pub fn midi_select_input_track(
+    track_id: Option<String>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.select_midi_input_track(
+        track_id,
+        crate::control::op::TxMeta::user("select midi input track"),
+    )
 }
 
 #[tauri::command]
 pub fn midi_input_status(
-    state: tauri::State<'_, MidiInputManager>,
+    state: tauri::State<'_, Arc<MidiInputManager>>,
 ) -> Result<MidiInputStatus, String> {
     state.status()
 }

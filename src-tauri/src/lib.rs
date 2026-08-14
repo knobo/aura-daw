@@ -52,7 +52,7 @@ pub fn run() {
         .manage(audio::AudioState::default())
         .manage(sidecars::SidecarState::default())
         .manage(midi::MidiState::default())
-        .manage(midi_input::MidiInputManager::default())
+        .manage(Arc::new(midi_input::MidiInputManager::default()))
         .manage(mcp::McpState::default())
         .manage(plugins::PluginState::default())
         .setup(|app| {
@@ -93,6 +93,12 @@ pub fn run() {
                 history_log,
             ));
             app.manage(control_plane.clone());
+            // MIDI slice 2, Task 5: attach the already-`.manage`d MIDI-input
+            // manager so `ControlPlane::select_midi_input_port` can reach it
+            // (unit tests' `ControlPlane`s never attach one — see the field's
+            // doc for why the port method errors instead of panicking there).
+            control_plane
+                .attach_midi_input(app.state::<Arc<midi_input::MidiInputManager>>().inner().clone());
 
             // Plan E Task 13: the engine's narrow "document birth" closure,
             // installable only now that `ControlPlane` exists — bound over
@@ -183,6 +189,7 @@ pub fn run() {
             // ---- midi input: hardware ports (slice 1, midi-input-ports) ----
             midi_input::midi_list_input_ports,
             midi_input::midi_select_input_port,
+            midi_input::midi_select_input_track,
             midi_input::midi_input_status,
             // ---- sidecars: jobs ----
             sidecars::sidecar_split_stems,
