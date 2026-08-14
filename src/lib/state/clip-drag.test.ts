@@ -156,4 +156,42 @@ describe("clipDrag group move", () => {
     // a2 was not part of this drag
     expect(project.clips[1].timelineStartSamples).toBe(3000);
   });
+
+  it("resize snaps the clip's END, not its start — parity with the pre-refactor drag", () => {
+    view.snap = true; // beat/4 grid = 6000 samples = 240 ticks at spp=1
+    // length (500 ticks) is deliberately NOT a multiple of the 240-tick
+    // grid, so start-anchored vs end-anchored snapping disagree.
+    midi.clips = [{ id: "m2", trackId: "t2", timelineStartTicks: 0, lengthTicks: 500 } as MidiClip];
+    clipSelection.apply([{ kind: "midi", id: "m2" }], "replace");
+    clipDrag.begin({ kind: "midi", id: "m2" }, 0, "resize");
+    // tiny nudge (dx=3 samples raw) — the snap does the real work: raw end
+    // 12500+3=12503 samples snaps to the nearest 6000-multiple, 12000.
+    clipDrag.move(3, false);
+    // end lands at 12000 samples = 480 ticks, a multiple of the 240-tick
+    // grid; length equals endTicks since the clip starts at 0. Anchoring
+    // the START instead (the bug) would leave the length at 500 unchanged
+    // for this same input.
+    expect(midi.clips[0].lengthTicks).toBe(480);
+    expect(midi.clips[0].lengthTicks % 240).toBe(0);
+  });
+
+  it("cancel restores every previewed position and sends no moveClips", () => {
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "midi", id: "m1" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(500, true);
+    // preview applied — confirms there is something to undo
+    expect(project.clips[0].timelineStartSamples).toBe(1500);
+    expect(midi.clips[0].timelineStartTicks).toBe(420);
+    clipDrag.cancel();
+    expect(project.clips[0].timelineStartSamples).toBe(1000);
+    expect(midi.clips[0].timelineStartTicks).toBe(400);
+    expect(moveClips).not.toHaveBeenCalled();
+    expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
+  });
 });

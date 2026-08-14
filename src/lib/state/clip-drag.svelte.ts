@@ -79,15 +79,32 @@ class ClipDragController {
           });
       }
     }
-    this.anchorOrigSamples =
-      anchor.kind === "audio"
-        ? (project.clips.find((c) => c.id === anchor.id)?.timelineStartSamples ?? 0)
-        : midi.ticksToSamples(midi.clipById(anchor.id)?.timelineStartTicks ?? 0);
+    // The reference point the pointer's dx targets, then (re)snaps: MOVE
+    // snaps the clip's START (unchanged single-clip behavior). RESIZE snaps
+    // the clip's END — the pre-refactor MidiClipView code snapped
+    // `dragOrigTicks + dragOrigLengthTicks` (converted through the section
+    // table) and derived the new length from the snapped end. Anchoring the
+    // START for resize too, as an earlier version of this controller did,
+    // gives a DIFFERENT snapped length whenever the length isn't a grid
+    // multiple — ruling D's "a one-clip selection behaves bit-for-bit as it
+    // does today" makes this a correctness bug, not a style choice.
+    if (mode === "resize") {
+      const c = anchor.kind === "midi" ? midi.clipById(anchor.id) : undefined;
+      this.anchorOrigSamples = c ? midi.ticksToSamples(c.timelineStartTicks + c.lengthTicks) : 0;
+    } else {
+      this.anchorOrigSamples =
+        anchor.kind === "audio"
+          ? (project.clips.find((c) => c.id === anchor.id)?.timelineStartSamples ?? 0)
+          : midi.ticksToSamples(midi.clipById(anchor.id)?.timelineStartTicks ?? 0);
+    }
     this.minStartSamples = Math.min(
       ...this.origins.map((o) =>
         o.kind === "audio" ? o.startSamples : midi.ticksToSamples(o.startTicks),
       ),
-      this.anchorOrigSamples,
+      // Only a MOVE anchor is a "start" in the same unit as the rest of this
+      // min — a RESIZE anchor is the clip's END and must not pull the floor
+      // in (the position clamp below is move-only regardless).
+      mode === "move" ? this.anchorOrigSamples : Number.MAX_SAFE_INTEGER,
     );
     this.minStartTicks = Math.min(
       ...this.origins.filter((o): o is MidiOrigin => o.kind === "midi").map((o) => o.startTicks),
@@ -106,11 +123,21 @@ class ClipDragController {
     let target = this.anchorOrigSamples + dx;
     if (!altKey) target = view.snapSamples(target);
     let deltaSamples = Math.round(target - this.anchorOrigSamples);
-    if (this.minStartSamples + deltaSamples < 0) deltaSamples = -this.minStartSamples;
+    // The timeline-origin position clamp is MOVE-only: for RESIZE the
+    // anchor is the clip's END, not a start position, so "keep it >= 0"
+    // is meaningless here — the new length gets its own >= 1 clamp in
+    // previewResize/end() instead.
+    if (this.mode === "move" && this.minStartSamples + deltaSamples < 0) {
+      deltaSamples = -this.minStartSamples;
+    }
     let deltaTicks =
       midi.samplesToTicks(this.anchorOrigSamples + deltaSamples) -
       midi.samplesToTicks(this.anchorOrigSamples);
-    if (this.minStartTicks !== Number.MAX_SAFE_INTEGER && this.minStartTicks + deltaTicks < 0) {
+    if (
+      this.mode === "move" &&
+      this.minStartTicks !== Number.MAX_SAFE_INTEGER &&
+      this.minStartTicks + deltaTicks < 0
+    ) {
       deltaTicks = -this.minStartTicks;
     }
     return { deltaSamples, deltaTicks: Math.round(deltaTicks) };
@@ -194,10 +221,19 @@ class ClipDragController {
     await backend.gestureEnd?.();
   }
 
-  /** pointercancel / Escape: close the gesture without sending anything. The
-   * local preview stays where it is; the next commit or a project reload
-   * reconciles it — the same forgiveness `gestureEnd` itself has. */
+  /** pointercancel / Escape: undo the local preview back to each origin's
+   * exact pre-drag position — the same `moveClip`/`project.moveClip` calls
+   * `move()` used to apply it — THEN close the gesture. Leaving the preview
+   * in place (the earlier behavior) is a phantom uncommitted edit: nothing
+   * was ever sent to the backend, so the store silently disagrees with the
+   * document until an unrelated reload happens to paper over it. */
   cancel() {
+    if (this.moved) {
+      for (const o of this.origins) {
+        if (o.kind === "audio") project.moveClip(o.id, o.startSamples);
+        else midi.moveClip(o.id, o.startTicks);
+      }
+    }
     this.active = false;
     this.moved = false;
     this.origins = [];
