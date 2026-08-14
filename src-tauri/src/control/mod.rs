@@ -1626,6 +1626,56 @@ impl ControlPlane {
         Ok(updated)
     }
 
+    /// Batched plugin-param writes through the transaction channel — one
+    /// `Op::Set{Plugin, Param}` per change, applied atomically. Gesture-aware
+    /// in exactly the shape `set_track_mix` uses (I-8: plugin knobs are the
+    /// canonical CLAP gesture, round-2 §4.4, and until now they were the one
+    /// drag surface that never consulted `GestureState` — so every rAF batch
+    /// was its own undo entry AND its own `project.json` rewrite).
+    ///
+    /// LOCK ORDER: `commit_transient_and_fold` holds the gesture mutex
+    /// across the nested session-lock acquisition; that direction (gesture,
+    /// then session) is the only safe one and is the one used here.
+    pub fn set_plugin_params(
+        &self,
+        instance_id: &str,
+        changes: &[crate::plugins::ParamChange],
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        // Validate before any commit (the `transact` closure must not panic,
+        // and an unknown instance must fail the whole batch atomically).
+        {
+            let s = self.session.lock();
+            if !s.plugins.instances.iter().any(|r| r.id == instance_id) {
+                return Err(format!("unknown plugin instance: {instance_id}"));
+            }
+        }
+        let apply = |changes: &[crate::plugins::ParamChange], tx: &mut session::Tx<'_>| {
+            for c in changes {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Plugin(instance_id.to_string()),
+                    path: op::PropPath::Param { index: c.id },
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(c.value),
+                })?;
+            }
+            Ok(())
+        };
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| apply(changes, tx))
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| apply(changes, tx))?;
+            }
+        }
+        Ok(())
+    }
+
     /// Move a clip on the timeline through the transaction channel
     /// (`Op::Set`, `PropPath::TimelineStartSamples`) — Plan E Task 3
     /// (round-2 inventory row 3). A thin `commit` wrapper mirroring
@@ -3832,6 +3882,77 @@ mod tests {
         let (undo_depth, _redo) = cp.history_depths();
         assert_eq!(undo_depth, 0, "a net no-op gesture creates no history entry");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// I-8: a knob drag inside a gesture is ONE undo entry — the per-(instance,
+    /// param) `CoalesceKey` already exists for `Op::Set{Plugin, Param}`; what
+    /// was missing is that `plugin_set_param` never consulted the gesture at
+    /// all (`commit_transient_and_fold` was wired only into `set_track_mix`).
+    #[test]
+    fn plugin_param_writes_fold_into_an_open_gesture() {
+        let (cp, _events, _engine) = recording_control_plane();
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        cp.gesture_begin("plugin param drag".into()).unwrap();
+        for v in [0.25f64, 0.5, 0.75] {
+            cp.set_plugin_params(
+                "inst-1",
+                &[crate::plugins::ParamChange { id: 7, value: v }],
+                op::TxMeta::user("plugin set param"),
+            )
+            .unwrap();
+        }
+        assert_eq!(cp.history_depths().0, 0, "nothing reaches history while the gesture is open");
+        cp.gesture_end().unwrap();
+        assert_eq!(cp.history_depths().0, 1, "the whole drag is one undo entry");
+
+        let batch = cp.take_last_gesture_batch().expect("gesture_end must produce a batch");
+        assert_eq!(batch.ops.len(), 1, "coalesced to the LAST write per (instance, param)");
+        assert!(matches!(
+            &batch.ops[0],
+            op::Op::Set { object: op::ObjectRef::Plugin(id), path: op::PropPath::Param { index: 7 }, to, .. }
+                if id == "inst-1" && to.as_f64() == Some(0.75)
+        ), "{:?}", batch.ops[0]);
+        // and the baseline is the value BEFORE the drag, not the previous move
+        assert!(matches!(
+            &batch.inverses[0],
+            op::Op::Set { to, .. } if to.as_f64() == Some(0.0)
+        ), "{:?}", batch.inverses[0]);
+    }
+
+    /// Outside a gesture, nothing changes: one invoke, one history entry.
+    #[test]
+    fn plugin_param_writes_outside_a_gesture_stay_one_entry_each() {
+        let (cp, _events, _engine) = recording_control_plane();
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        cp.set_plugin_params(
+            "inst-1",
+            &[crate::plugins::ParamChange { id: 7, value: 0.4 }],
+            op::TxMeta::user("plugin set param"),
+        )
+        .unwrap();
+        assert_eq!(cp.history_depths().0, 1);
     }
 
     /// `gesture_begin` while one is already open auto-closes the stale

@@ -170,6 +170,9 @@
                     aria-label="{p.name} ({fmt(p)}{unitOf(p)})"
                     title="{p.name} — double-click resets to {fmt(p, p.default)}"
                     oninput={(e) => onSlide(p, e)}
+                    onpointerdown={() => plugins.beginParamGesture()}
+                    onpointerup={() => void plugins.endParamGesture()}
+                    onpointercancel={() => void plugins.endParamGesture()}
                     ondblclick={() => plugins.resetParam(p)}
                   />
                 {/if}
