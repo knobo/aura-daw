@@ -56,6 +56,14 @@ pub struct ProjectSnapshot {
     pub midi_clips: Vec<crate::midi::MidiClip>,
     pub ppq: u32,
     pub tempo_events: Vec<crate::midi::TempoEvent>,
+    /// Additive v3 fields (round-2 §3.6, Task 9): the shipped section-table
+    /// contract available from cold start, not just after a `set_tempo_map`
+    /// edit — a renderer opening a project needs tick<->sample lookups
+    /// before it ever calls that command.
+    pub meter_map: Vec<crate::midi::MeterEvent>,
+    pub period_events: Vec<crate::midi::TempoPeriodEvent>,
+    pub section_table: Vec<crate::midi::SectionRow>,
+    pub section_table_rule_version: u32,
 }
 
 /// Argument of `import_audio_clip` (and the MCP tool of the same name).
@@ -185,6 +193,24 @@ impl ControlPlane {
         let session = self.session.lock();
         let store = &session.store;
         let midi = &session.midi;
+        // The store's own tempo_events always passed TempoMap::new's
+        // validation when they were set (set_tempo_map, migration
+        // defaults, ...) — a build failure here means that invariant broke
+        // elsewhere; degrade to an empty section table rather than fail
+        // the whole snapshot read (reads must never panic — the session
+        // lock is held).
+        let tms = crate::midi::build_tempo_map_state(midi.ppq, &midi.tempo_events, &midi.meter_events)
+            .unwrap_or_else(|e| {
+                log::warn!("project_state: tempo map state build failed ({e}); serving an empty section table");
+                crate::midi::TempoMapState {
+                    ppq: midi.ppq,
+                    events: midi.tempo_events.clone(),
+                    meter_map: midi.meter_events.clone(),
+                    period_events: Vec::new(),
+                    section_table: Vec::new(),
+                    section_table_rule_version: crate::midi::section_table::RULE_VERSION,
+                }
+            });
         ProjectSnapshot {
             project_name: store.project_name.clone(),
             project_dir: store.project_dir.as_ref().map(|p| p.display().to_string()),
@@ -194,6 +220,10 @@ impl ControlPlane {
             midi_clips: midi.clips.clone(),
             ppq: midi.ppq,
             tempo_events: midi.tempo_events.clone(),
+            meter_map: tms.meter_map,
+            period_events: tms.period_events,
+            section_table: tms.section_table,
+            section_table_rule_version: tms.section_table_rule_version,
         }
     }
 
