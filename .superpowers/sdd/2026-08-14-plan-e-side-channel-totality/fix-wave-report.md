@@ -1,6 +1,6 @@
 # Plan E post-merge follow-up — fix wave report
 
-Branch: `fix/plan-e-followup`, cut from `origin/main` (`27911d8`).
+Branch: `fix/plan-e-followup`, cut from `origin/main` (`27911d8`). PR **#18**.
 Scope: exactly the final whole-branch review's **FIX NOW** triage list.
 Nothing HOLD-triaged was touched.
 

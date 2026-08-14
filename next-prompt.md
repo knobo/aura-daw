@@ -8,29 +8,29 @@ Norwegian — they write Norwegian; the repo documentation is English.
 The final whole-branch review of Plan E (`15c9909..27911d8`) is at
 `.superpowers/sdd/2026-08-14-plan-e-side-channel-totality/final-review-report.md`
 (verdict: NEEDS FOLLOW-UP PR). Its **FIX NOW** triage list is done —
-follow-up PR #PR_NUMBER, `fix/plan-e-followup`:
+follow-up PR #18, `fix/plan-e-followup`:
 
 - **C-1 (Critical)** — no epoch guard on `HistoryLog::record_commit`/
   `record_gesture`; a commit racing an epoch boundary journaled into the
   NEW project's file and pushed a live undo entry for the OLD document.
-  → fixed in PR #PR_NUMBER (the urgent item; the other four were bundled
+  → fixed in PR #18 (the urgent item; the other four were bundled
   behind it).
 - **I-2** — LoopJam `watch_and_apply` busy-spun at 100 % CPU when a
   retryable `apply` kept failing with the transport stopped.
-  → fixed in PR #PR_NUMBER (back-off + bounded retries + the mid-air-race
+  → fixed in PR #18 (back-off + bounded retries + the mid-air-race
   test the Task 8 ledger asked for).
 - **Task 13 deferral** — the deadlock audit's five stale `request`
-  call-site line citations. → fixed in PR #PR_NUMBER.
+  call-site line citations. → fixed in PR #18.
 - **I-5 + L-1** — plugin state blobs serialized as JSON number arrays
   (~4x); `Op::PluginRemove.params` was captured but never read.
-  → fixed in PR #PR_NUMBER (`OP_FORMAT_VERSION` 2, base64 blobs, apply
+  → fixed in PR #18 (`OP_FORMAT_VERSION` 2, base64 blobs, apply
   seeds the mirror from the op on cold replay).
 - **I-4's two caveats** — journal line order vs `rev` order under
   concurrency, and a panicking `transact` diverging log from document.
   → recorded as L-4/L-5 in `docs/SIDE-CHANNEL-INVENTORY.md` in PR
-  #PR_NUMBER (records, not fixes — the structural fix is Track A's).
+  #18 (records, not fixes — the structural fix is Track A's).
 - **M-3** — the transient/redo invariant was a comment checked by nothing.
-  → fixed in PR #PR_NUMBER (a `debug_assert!` in the commit path).
+  → fixed in PR #18 (a `debug_assert!` in the commit path).
 
 **Still open, deliberately HELD for the owner with the context** (do NOT
 fix these blind — read the report's entry first):
