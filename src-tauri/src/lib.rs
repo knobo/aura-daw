@@ -192,6 +192,8 @@ pub fn run() {
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,
+            audio::library_audition,
+            audio::library_audition_stop,
             // ---- sidecars: jobs ----
             sidecars::sidecar_split_stems,
             sidecars::sidecar_transcribe,

@@ -148,6 +148,75 @@ pub fn library_default_root() -> Result<String, String> {
     Ok(default_library_root()?.display().to_string())
 }
 
+/// How much of a file an audition decodes and plays, seconds. Bounded so a
+/// 20-minute stem does not decode into RAM on a click.
+pub const AUDITION_MAX_SECS: f32 = 12.0;
+
+/// Build a one-shot audition instrument from the head of an audio file.
+///
+/// RULING 8: the samples keep the FILE's rate — nothing is resampled.
+/// `sampler_voice::pitch_ratio` folds `sample.rate / out_rate` in, so the
+/// audition plays at the right pitch on any output stream. (The
+/// `CompiledInstrument::rate` doc's "resampled at load time" describes the
+/// SFZ loader, not this path.) Do not "fix" this by resampling.
+///
+/// Takes no `Session`, no `ControlPlane`, no `Committer` — the audition path
+/// is document-decoupled by construction (pinned by
+/// `library_audition_core_leaves_the_document_and_the_history_untouched`).
+pub fn compile_audition(
+    path: &Path,
+    max_seconds: f32,
+) -> Result<crate::audio::sampler_engine::CompiledInstrument, String> {
+    use std::sync::Arc;
+
+    use crate::audio::sampler_engine::CompiledInstrument;
+    use crate::audio::sampler_voice::{CompiledRegion, SampleData};
+
+    let (channels, rate, mut data) = crate::control::import::decode_audio(path)?;
+    let ch = channels.max(1) as usize;
+    let secs = if max_seconds.is_finite() { max_seconds.clamp(0.1, 60.0) } else { AUDITION_MAX_SECS };
+    let max_frames = (rate as f64 * secs as f64) as usize;
+    data.truncate(max_frames.saturating_mul(ch));
+    if data.is_empty() {
+        return Err(format!("{} decoded to no audio", path.display()));
+    }
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let sample = Arc::new(SampleData { channels, rate, data });
+
+    Ok(CompiledInstrument {
+        // The path IS the identity: the preview thread reinstalls the node
+        // only when the id changes, so re-auditioning the same file reuses
+        // the loaded node instead of churning an RCU swap.
+        id: format!("library-audition:{}", path.display()),
+        name,
+        rate,
+        regions: Arc::new(vec![CompiledRegion {
+            lokey: 0,
+            hikey: 127,
+            lovel: 1,
+            hivel: 127,
+            pitch_keycenter: 60,
+            tune: 0,
+            transpose: 0,
+            gain_l: 1.0,
+            gain_r: 1.0,
+            offset: 0,
+            looped: false,
+            loop_start: 0,
+            loop_end: 0,
+            // A short attack de-clicks the head; a short release de-clicks
+            // the cancel. Neither shapes the sound.
+            ampeg_attack: 0.002,
+            ampeg_release: 0.05,
+            sample,
+        }]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +348,59 @@ mod tests {
         assert!(root.is_dir(), "created on demand");
         assert_eq!(root.file_name().unwrap(), "Library");
         assert_eq!(root.parent().unwrap().file_name().unwrap(), "AURA");
+    }
+
+    /// Write a mono 48 kHz WAV of `secs` seconds so the decode path is real.
+    fn write_wav(path: &std::path::Path, secs: f64) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 48_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        let n = (48_000.0 * secs) as usize;
+        for i in 0..n {
+            let t = i as f64 / 48_000.0;
+            w.write_sample((2.0 * std::f64::consts::PI * 440.0 * t).sin() as f32 * 0.5).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn compile_audition_truncates_to_max_seconds_and_keeps_the_native_rate() {
+        let d = temp_dir("audition");
+        let p = d.join("long.wav");
+        write_wav(&p, 3.0);
+
+        let inst = compile_audition(&p, 1.0).unwrap();
+        assert_eq!(inst.rate, 48_000, "native file rate, never resampled (ruling 8)");
+        assert_eq!(inst.regions.len(), 1, "one region covers the whole keyboard");
+        let r = &inst.regions[0];
+        assert_eq!((r.lokey, r.hikey), (0, 127));
+        assert_eq!(r.pitch_keycenter, 60);
+        assert!(!r.looped, "an audition is a one-shot");
+        assert_eq!(r.sample.rate, 48_000);
+        assert_eq!(r.sample.frames(), 48_000, "1 s of a 3 s file");
+        assert!(inst.name.contains("long.wav"), "name is the file name: {}", inst.name);
+
+        // A file SHORTER than the bound is kept whole.
+        let short = d.join("short.wav");
+        write_wav(&short, 0.25);
+        assert_eq!(compile_audition(&short, 1.0).unwrap().regions[0].sample.frames(), 12_000);
+    }
+
+    #[test]
+    fn compile_audition_rejects_what_the_decoder_rejects() {
+        let d = temp_dir("audition-bad");
+        touch(&d, "notes.txt");
+        // `.unwrap_err()` would need `CompiledInstrument: Debug`, which it
+        // deliberately does not derive (out of scope for this task to add) —
+        // match instead.
+        let err = match compile_audition(&d.join("notes.txt"), 1.0) {
+            Err(e) => e,
+            Ok(_) => panic!("expected notes.txt to be rejected by the decoder"),
+        };
+        assert!(!err.is_empty(), "the failure is reported, never a panic");
     }
 }
