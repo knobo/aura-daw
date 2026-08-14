@@ -4,6 +4,14 @@ AURA runs a Model Context Protocol (MCP) **streamable-HTTP** server inside the
 app so agents (Claude Code, Claude Desktop via `mcp-remote`, any MCP SDK) can
 inspect, edit, mix, record and generate in the open session.
 
+**Prerequisite: the app has to be running.** The MCP server is embedded in
+the AURA process, not a standalone service — see
+[CONTRIBUTING.md § Dev setup](../CONTRIBUTING.md#dev-setup) to build and
+launch it (and § Sidecar Python on PATH if you want `run_sidecar_job`'s
+generation kinds — `amtInfill`, `aceStepGenerate`, etc. — to find the real
+model stack instead of erroring). Each launch generates a fresh token, so
+connect (or reconnect) *after* the app is up.
+
 * **Endpoint:** `http://127.0.0.1:41717/mcp` (loopback only — never a LAN
   interface). The port is configurable via policy (below).
 * **Lifecycle:** starts with the app (`mcp::init`); a bind failure disables
