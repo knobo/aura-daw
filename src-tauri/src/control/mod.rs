@@ -231,6 +231,39 @@ impl ControlPlane {
 
     // ---- transport / recording -----------------------------------------
 
+    /// Plan E Task 12 (inventory rows 28-29): the transport's four direct
+    /// `session.store.transport.*` writes (state="playing", state=
+    /// "stopped", the loop mirror, stop_at_end) now go through the op
+    /// system as one transient `commit_with` per action — transient
+    /// because a play/stop/loop-drag is mid-gesture, RT/document-visible
+    /// state, not a document edit a user would expect in undo history
+    /// (round-2 §4.4; Task 2's `TxMeta::transient`). `emit_project_changed:
+    /// false` — `project://changed`'s payload contract is the full
+    /// `Project` shape; firing it once per transport action would be a
+    /// behavior change from today's `transport://state`-only contract.
+    ///
+    /// RT atomics (the output callback reads these per buffer) are
+    /// deliberately kept HERE, in `ControlPlane::transport`, executed AFTER
+    /// `commit_with` returns — never folded into `EngineEffect` as a
+    /// `param_writes`-style entry. They are engine-visible state, not
+    /// document state: the document mirror (project.json's transport
+    /// block) is what the `Op::Set` above covers, and lock order [C1]
+    /// (session lock released before anything engine/RT-visible happens)
+    /// is preserved exactly as `commit`'s own doc describes for param
+    /// writes.
+    ///
+    /// `Play`/`Stop` are special-cased below, each for its own reason —
+    /// worth being precise about which property survives:
+    /// * `Play`'s recording guard preserves both the VALUE (state stays
+    ///   "recording") AND atomicity (the check-and-set runs under one
+    ///   session lock, via `tx.store()` inside the transaction closure —
+    ///   fix round 1; a `self.session.lock()` taken and dropped BEFORE the
+    ///   transaction would only preserve the value in the race-free case).
+    /// * `Stop` preserves ordering, not atomicity: `StopRecording`'s engine
+    ///   round-trip is sent BEFORE the "stopped" Set commits (restored,
+    ///   fix round 1) so a reader can't observe "stopped" while the take
+    ///   is still finalizing — but the round-trip itself is a separate,
+    ///   non-transactional engine call (§4.2), not part of this commit.
     pub fn transport(&self, action: TransportAction) -> Result<TransportState, String> {
         // An explicit transport command supersedes any parking position the
         // engine still owes (`SharedRt::park`) — otherwise a stop that is
@@ -243,24 +276,76 @@ impl ControlPlane {
         }
         match action {
             TransportAction::Play => {
-                {
-                    let mut session = self.session.lock();
-                    if session.store.transport.state != "recording" {
-                        session.store.transport.state = "playing".into();
-                    }
-                }
+                let meta = op::TxMeta::user("transport play").transient();
+                self.commit_with(
+                    meta,
+                    |tx| {
+                        // Recording owns the state label while a take is
+                        // running — Play must never downgrade "recording"
+                        // back to "playing". Checked-and-set ATOMICALLY:
+                        // the check reads `tx.store()` (the SAME session
+                        // lock `apply` writes through, held for the whole
+                        // closure), not a separate `self.session.lock()`
+                        // taken and dropped before the transaction — that
+                        // earlier shape was a TOCTOU (fix round 1): the
+                        // engine control thread's own recording-start
+                        // write could land in the gap between the read and
+                        // the commit, and this Set would then stomp
+                        // "recording" back to "playing". Applying nothing
+                        // and returning `Ok(())` is a legal empty
+                        // transient commit — it preserves the pre-Task-12
+                        // VALUE semantics (state stays "recording") without
+                        // reproducing the old code's non-atomic check.
+                        if tx.store().transport.state == "recording" {
+                            return Ok(());
+                        }
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::TransportState,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!("playing"),
+                        })
+                    },
+                    false,
+                )?;
                 self.shared.playing.store(true, Relaxed);
             }
             TransportAction::Stop => {
-                // Stopping while recording finalizes the take (DAW convention).
+                // Stopping while recording finalizes the take (DAW
+                // convention) — sent BEFORE the state Set commits below,
+                // restoring the pre-Task-12 ordering (fix round 1): the
+                // old code sent this first and only wrote "stopped"
+                // afterward, so any reader mid-finalize (which can take up
+                // to 15s — `writer.finish`'s timeout, audio/engine.rs) saw
+                // "recording", never a premature "stopped" while the take
+                // is still draining to disk. Kept OUTSIDE this transaction
+                // either way (§4.2) — `StopRecording`'s own finalize write
+                // to `store.transport.state` (audio/engine.rs's
+                // `stop_recording`) races harmlessly with the Set below
+                // (both converge on "stopped"); Task 13 revisits this once
+                // that finalize becomes its own `Actor::Engine` tx.
                 if self.shared.recording.load(Relaxed) {
                     self.engine
                         .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
                 }
+                let meta = op::TxMeta::user("transport stop").transient();
+                self.commit_with(
+                    meta,
+                    |tx| {
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::TransportState,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!("stopped"),
+                        })
+                    },
+                    false,
+                )?;
                 self.shared.playing.store(false, Relaxed);
-                self.session.lock().store.transport.state = "stopped".into();
             }
             TransportAction::Seek { position_samples } => {
+                // Pure RT atomic — position is engine state, not document
+                // state, so this is (still) not an op.
                 self.shared.position.store(position_samples, Relaxed);
             }
             TransportAction::SetLoop { enabled, start_samples, end_samples } => {
@@ -269,20 +354,53 @@ impl ControlPlane {
                         "loop region is empty (start {start_samples} >= end {end_samples})"
                     ));
                 }
-                // RT atomics (the output callback reads these per buffer)...
+                let meta = op::TxMeta::user("transport set loop").transient();
+                self.commit_with(
+                    meta,
+                    |tx| {
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::LoopEnabled,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!(enabled),
+                        })?;
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::LoopStartSamples,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!(start_samples),
+                        })?;
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::LoopEndSamples,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!(end_samples),
+                        })
+                    },
+                    false,
+                )?;
+                // RT atomics (the output callback reads these per buffer),
+                // AFTER the document commit [C1] — see this method's doc.
                 self.shared.loop_start.store(start_samples, Relaxed);
                 self.shared.loop_end.store(end_samples, Relaxed);
                 self.shared.loop_enabled.store(enabled, Relaxed);
-                // ...and the store mirror, so project save persists the
-                // region (project::from_store serializes store.transport).
-                let mut session = self.session.lock();
-                session.store.transport.loop_enabled = enabled;
-                session.store.transport.loop_start_samples = start_samples;
-                session.store.transport.loop_end_samples = end_samples;
             }
             TransportAction::SetStopAtEnd { enabled } => {
+                let meta = op::TxMeta::user("transport set stop at end").transient();
+                self.commit_with(
+                    meta,
+                    |tx| {
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::StopAtEnd,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!(enabled),
+                        })
+                    },
+                    false,
+                )?;
+                // RT atomic after the document commit [C1] — see above.
                 self.shared.stop_at_end.store(enabled, Relaxed);
-                self.session.lock().store.transport.stop_at_end = enabled;
             }
         }
         let snap = self.transport_state();
@@ -308,6 +426,39 @@ impl ControlPlane {
         let snap = self.transport_state();
         self.emit_transport(&snap);
         Ok(clips)
+    }
+
+    // ---- device selection -------------------------------------------------
+    // Plan E Task 12 (§4.5 "moves behind the ControlPlane for attribution"):
+    // the input/output device is app config, not document state — no `Op`,
+    // no `commit`. Moving the Tauri commands' direct `ControlMsg` sends
+    // behind these two methods is purely so the ACTOR/LABEL attribution is
+    // captured (logged) at the one front door both Tauri and MCP call
+    // through, instead of only at the (Tauri-only, MCP-unreachable)
+    // `#[tauri::command]` body.
+
+    /// Select the input device, logging the attribution before sending the
+    /// existing `ControlMsg::SelectInput`. Restarting the input stream is
+    /// refused (by the engine) while a recording is running — unchanged.
+    pub fn select_input_device(&self, device_id: String, meta: op::TxMeta) -> Result<(), String> {
+        log::info!(
+            "select_input_device: actor={:?} label={:?} device={device_id:?}",
+            meta.actor,
+            meta.label
+        );
+        self.engine
+            .request(|reply| ControlMsg::SelectInput { device_id: Some(device_id), reply })
+    }
+
+    /// Select the output device — same shape as `select_input_device`.
+    pub fn select_output_device(&self, device_id: String, meta: op::TxMeta) -> Result<(), String> {
+        log::info!(
+            "select_output_device: actor={:?} label={:?} device={device_id:?}",
+            meta.actor,
+            meta.label
+        );
+        self.engine
+            .request(|reply| ControlMsg::SelectOutput { device_id: Some(device_id), reply })
     }
 
     // ---- structure ------------------------------------------------------
@@ -548,6 +699,28 @@ impl ControlPlane {
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
     {
+        self.commit_with(meta, f, true)
+    }
+
+    /// Same as [`Self::commit`], but the caller controls whether the frozen
+    /// `project://changed` event fires (Plan E Task 12). `commit` delegates
+    /// here with `emit_project_changed: true`; `ControlPlane::transport`
+    /// passes `false` — `project://changed`'s payload contract is the full
+    /// `Project` shape (project.schema.json), and firing it once per
+    /// play/stop/loop-drag transport commit would be a behavior change
+    /// from today's `transport://state`-only contract. Transport commits
+    /// still bump `rev` and still run through the full effect pipeline
+    /// below (param writes / rebuild / persist) exactly like any other
+    /// commit — `emit_project_changed` only gates the LAST step.
+    pub fn commit_with<F>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+        emit_project_changed: bool,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+    {
         let committed = Session::transact(&self.session, meta, f)?;
         // ---- session lock is released here; everything below executes
         // the effect the session merely described. ----
@@ -573,12 +746,22 @@ impl ControlPlane {
                     // Plan E Task 5: same reasoning for the three MidiClip
                     // paths — `apply_raw` never pushes them into
                     // `param_writes` either (structural: rebuild only).
+                    // Plan E Task 12: same reasoning again for the six
+                    // Transport paths — the Transport `apply_raw` arm
+                    // (session.rs) never pushes anything into
+                    // `param_writes` (it isn't `TrackId`-keyed at all).
                     op::PropPath::Armed
                     | op::PropPath::InstrumentId
                     | op::PropPath::TimelineStartSamples
                     | op::PropPath::TimelineStartTicks
                     | op::PropPath::LengthTicks
-                    | op::PropPath::ContentLengthTicks => {}
+                    | op::PropPath::ContentLengthTicks
+                    | op::PropPath::TransportState
+                    | op::PropPath::LoopEnabled
+                    | op::PropPath::LoopStartSamples
+                    | op::PropPath::LoopEndSamples
+                    | op::PropPath::StopAtEnd
+                    | op::PropPath::SampleRate => {}
                 }
             }
             if let Some(any_solo) = committed.effect.any_solo {
@@ -601,17 +784,23 @@ impl ControlPlane {
         // JSON object (all of `Project`'s fields are named), so inserting
         // extra keys is safe; the `unwrap_or_default` fallback (an empty
         // object) only matters if serialization itself somehow failed.
-        let mut payload = serde_json::to_value(self.project_changed_payload())
-            .unwrap_or_else(|_| serde_json::json!({}));
-        if let serde_json::Value::Object(map) = &mut payload {
-            map.insert("rev".into(), serde_json::json!(committed.rev));
-            map.insert("label".into(), serde_json::json!(committed.meta.label));
-            map.insert(
-                "actor".into(),
-                serde_json::to_value(&committed.meta.actor).unwrap_or_default(),
-            );
+        //
+        // Plan E Task 12: gated by `emit_project_changed` — transport
+        // commits pass `false` and rely on `ControlPlane::transport`'s own
+        // `transport://state` emit instead (see `commit_with`'s doc).
+        if emit_project_changed {
+            let mut payload = serde_json::to_value(self.project_changed_payload())
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if let serde_json::Value::Object(map) = &mut payload {
+                map.insert("rev".into(), serde_json::json!(committed.rev));
+                map.insert("label".into(), serde_json::json!(committed.meta.label));
+                map.insert(
+                    "actor".into(),
+                    serde_json::to_value(&committed.meta.actor).unwrap_or_default(),
+                );
+            }
+            (self.emit)("project://changed", payload);
         }
-        (self.emit)("project://changed", payload);
         Ok(committed)
     }
 
@@ -1945,6 +2134,184 @@ mod tests {
             TxMeta::user("set mix on gone track"),
         );
         assert!(result.is_err(), "mix change on a removed track must error, not panic");
+    }
+
+    // ---- Plan E Task 12: transport family + commit_with -------------------
+
+    /// `commit_with(meta, f, false)` is the primitive `ControlPlane::transport`
+    /// builds on: bumps `rev`, threads the caller's `meta` through (transient
+    /// included) unchanged, and — the whole point of the new parameter —
+    /// never fires `project://changed`, unlike plain `commit`.
+    #[test]
+    fn commit_with_false_bumps_rev_and_meta_but_skips_project_changed() {
+        let (plane, _engine_rx, events) = test_plane_with_tracks(&[]);
+        let rev_before = plane.session().lock().rev;
+        let committed = plane
+            .commit_with(
+                TxMeta::user("test transport set").transient(),
+                |tx| {
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Transport,
+                        path: PropPath::TransportState,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!("playing"),
+                    })
+                },
+                false,
+            )
+            .unwrap();
+        assert!(committed.meta.transient, "meta.transient must survive the round trip");
+        assert_eq!(committed.rev, rev_before + 1, "commit_with still bumps rev");
+        assert_eq!(plane.session().lock().store.transport.state, "playing");
+        assert!(
+            events.lock().iter().all(|(name, _)| name != "project://changed"),
+            "commit_with(..., false) must never fire project://changed"
+        );
+    }
+
+    /// `commit` (unchanged public signature) still fires `project://changed`
+    /// — it now merely delegates to `commit_with(meta, f, true)`.
+    #[test]
+    fn commit_still_fires_project_changed_via_commit_with_delegation() {
+        let (plane, _engine_rx, events) = test_plane_with_tracks(&["t-1"]);
+        plane.commit(TxMeta::user("set gain"), |tx| tx.apply(set_gain("t-1", -6.0))).unwrap();
+        assert!(
+            events.lock().iter().any(|(name, _)| name == "project://changed"),
+            "commit must still announce project://changed"
+        );
+    }
+
+    /// The Task 12 brief's TDD step: transport play->stop leaves `rev`
+    /// bumped twice, each commit transient (asserted at the `commit_with`
+    /// level above and at the session.rs level), `transport://state`
+    /// emitted once per call, and NO `project://changed` fires — the fake
+    /// emitter is what makes that last assertion possible.
+    #[test]
+    fn transport_play_then_stop_bumps_rev_twice_and_never_emits_project_changed() {
+        let (plane, _engine_rx, events) = test_plane_with_tracks(&[]);
+        let rev_before = plane.session().lock().rev;
+
+        plane.transport(TransportAction::Play).unwrap();
+        plane.transport(TransportAction::Stop).unwrap();
+
+        assert_eq!(
+            plane.session().lock().rev,
+            rev_before + 2,
+            "play + stop each commit exactly once"
+        );
+        let evs = events.lock();
+        let transport_events =
+            evs.iter().filter(|(name, _)| name == "transport://state").count();
+        assert_eq!(transport_events, 2, "transport://state emitted exactly once per call");
+        assert!(
+            evs.iter().all(|(name, _)| name != "project://changed"),
+            "transport commits must never announce project://changed"
+        );
+    }
+
+    /// Play never downgrades an in-progress "recording" take back to
+    /// "playing" — preserved exactly as the pre-Task-12 direct write did.
+    /// No commit happens in that branch, so `rev` doesn't move either.
+    #[test]
+    fn transport_play_does_not_downgrade_recording_state() {
+        // Sets `state = "recording"` via a direct store write (as the
+        // engine control thread's own recording-start write would), THEN
+        // calls Play — exercising the guard through the SAME path a racing
+        // recording-start would use, not just as a pre-existing fixture
+        // value. Fix round 1: the guard lives inside the commit closure
+        // (`tx.store()`), checked-and-set under the one session lock —
+        // there is no window between the check and the write for a
+        // concurrent recording-start to land in.
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        plane.session().lock().store.transport.state = "recording".into();
+        let rev_before = plane.session().lock().rev;
+
+        let snap = plane.transport(TransportAction::Play).unwrap();
+
+        assert_eq!(snap.state, "recording", "play must not overwrite an active recording");
+        // The guard's `Ok(())` with no `tx.apply` is a legal EMPTY
+        // transient commit — `Session::transact` still bumps `rev`
+        // unconditionally (it doesn't inspect whether the closure applied
+        // any ops), so `rev` moves by exactly one even though the document
+        // itself is untouched. That's the VALUE guarantee ("recording"
+        // survives); it is a distinct claim from atomicity (checked above).
+        assert_eq!(plane.session().lock().rev, rev_before + 1, "an empty transient commit still bumps rev");
+    }
+
+    /// `TransportAction::SetLoop`'s three Sets (`LoopEnabled`,
+    /// `LoopStartSamples`, `LoopEndSamples`) fold into ONE commit (one `rev`
+    /// bump), and the RT atomics land — this is the headless-safe half of
+    /// `set_loop_validates_persists_and_wraps_playback` below, which needs a
+    /// real engine only for the wrap-around playback assertion.
+    #[test]
+    fn transport_set_loop_is_one_commit_and_writes_rt_atomics() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        let rev_before = plane.session().lock().rev;
+        let snap = plane
+            .transport(TransportAction::SetLoop { enabled: true, start_samples: 100, end_samples: 200 })
+            .unwrap();
+        assert_eq!(plane.session().lock().rev, rev_before + 1, "the three loop Sets fold into one commit");
+        assert!(snap.loop_enabled);
+        assert_eq!((snap.loop_start_samples, snap.loop_end_samples), (100, 200));
+    }
+
+    /// Mismatch combos err atomically at the `ControlPlane` level too:
+    /// `TransportAction::SetLoop` with an empty region is rejected BEFORE
+    /// any commit runs (unchanged validation, now guarding the op path).
+    #[test]
+    fn transport_set_loop_empty_region_rejected_without_committing() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        let rev_before = plane.session().lock().rev;
+        let r = plane.transport(TransportAction::SetLoop {
+            enabled: true,
+            start_samples: 100,
+            end_samples: 100,
+        });
+        assert!(r.is_err());
+        assert_eq!(plane.session().lock().rev, rev_before, "a rejected loop region must not commit");
+    }
+
+    /// Device selection has no `Op` (§4.5 config carve-out) — this pins the
+    /// one observable contract `select_input_device`/`select_output_device`
+    /// DO have: the existing `ControlMsg` still goes out, carrying the
+    /// caller's device id, same as the pre-Task-12 direct Tauri command did.
+    /// (The attribution log line itself isn't asserted here — `log`'s
+    /// output isn't a `RecordedEvents`-style seam — but the method takes a
+    /// `TxMeta` specifically so a caller's actor/label reaches that line.)
+    #[test]
+    fn select_input_and_output_device_send_the_existing_control_msg() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&[]);
+        // No real engine thread behind `for_tests()` — reply immediately so
+        // `request` (which blocks up to 30s) doesn't stall the test.
+        // `ControlPlane::new` itself already sent a `Subscribe` — skip
+        // anything that isn't the two device-select messages this test
+        // cares about.
+        let responder = std::thread::spawn(move || {
+            let mut answered = 0;
+            for msg in engine_rx.iter() {
+                match msg {
+                    ControlMsg::SelectInput { reply, .. } => {
+                        reply.send(Ok(())).unwrap();
+                        answered += 1;
+                    }
+                    ControlMsg::SelectOutput { reply, .. } => {
+                        reply.send(Ok(())).unwrap();
+                        answered += 1;
+                    }
+                    _ => {}
+                }
+                if answered == 2 {
+                    break;
+                }
+            }
+        });
+        plane
+            .select_input_device("mic-1".into(), TxMeta::user("select input device"))
+            .unwrap();
+        plane
+            .select_output_device("speakers-1".into(), TxMeta::user("select output device"))
+            .unwrap();
+        responder.join().unwrap();
     }
 
     /// MCP-parity regression (found filming the MCP demo): jobs submitted

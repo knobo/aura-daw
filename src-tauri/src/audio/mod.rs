@@ -258,27 +258,23 @@ pub fn list_output_devices() -> Result<Vec<AudioDevice>, String> {
 }
 
 /// Selecting a device restarts the corresponding stream (input restarts are
-/// refused while a recording is running).
+/// refused while a recording is running). Delegates to `ControlPlane` (Plan
+/// E Task 12, §4.5) so the selection is attributed at the one front door
+/// both this command and the MCP surface call through.
 #[tauri::command]
 pub fn select_input_device(
     device_id: String,
-    state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
 ) -> Result<(), String> {
-    state.engine()?.request(|reply| ControlMsg::SelectInput {
-        device_id: Some(device_id),
-        reply,
-    })
+    control.select_input_device(device_id, control::op::TxMeta::user("select input device"))
 }
 
 #[tauri::command]
 pub fn select_output_device(
     device_id: String,
-    state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
 ) -> Result<(), String> {
-    state.engine()?.request(|reply| ControlMsg::SelectOutput {
-        device_id: Some(device_id),
-        reply,
-    })
+    control.select_output_device(device_id, control::op::TxMeta::user("select output device"))
 }
 
 // ---------------------------------------------------------------------------

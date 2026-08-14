@@ -76,7 +76,16 @@ pub enum Op {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "family", content = "id", rename_all = "camelCase")]
-pub enum ObjectRef { Track(crate::ids::TrackId), Clip(crate::ids::ClipId), MidiClip(crate::ids::ClipId) }
+pub enum ObjectRef {
+    Track(crate::ids::TrackId),
+    Clip(crate::ids::ClipId),
+    MidiClip(crate::ids::ClipId),
+    /// Plan E Task 12: the transport is a singleton, not an id-addressed
+    /// row — a unit variant. Adjacently-tagged serde omits the `id` field
+    /// entirely for a unit variant, so the wire form is exactly
+    /// `{"family":"transport"}` (no stray `"id":null`).
+    Transport,
+}
 
 /// Property paths are a closed enum, not strings — renaming a variant is a
 /// compile error at every use site, which is the §4.6 anti-drift rule.
@@ -101,6 +110,24 @@ pub enum PropPath {
     /// `null` (mirrors `MidiClip::content_length_ticks: Option<u64>`);
     /// `null` clears back to "same as `LengthTicks`".
     ContentLengthTicks,
+    /// Transport: `"playing"|"stopped"|"recording"` (wire: JSON string).
+    /// Plan E Task 12 (inventory rows 28-29): the property-addressed mirror
+    /// of `ControlPlane::transport`'s direct `session.store.transport.state`
+    /// writes.
+    TransportState,
+    /// Transport: loop-region enabled flag (wire: JSON bool).
+    LoopEnabled,
+    /// Transport: loop-region start, in samples (wire: JSON non-negative
+    /// integer).
+    LoopStartSamples,
+    /// Transport: loop-region end, in samples (wire: JSON non-negative
+    /// integer).
+    LoopEndSamples,
+    /// Transport: stop-at-end policy flag (wire: JSON bool).
+    StopAtEnd,
+    /// Transport: engine sample rate (wire: JSON non-negative integer,
+    /// `u32`).
+    SampleRate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -376,6 +403,44 @@ mod tests {
         assert!(s.contains("\"path\":\"contentLengthTicks\""), "wire form was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, content_length_op);
+
+        // Plan E Task 12: ObjectRef::Transport is a unit variant — the
+        // adjacently-tagged wire form must be exactly `{"family":"transport"}`,
+        // with no stray `"id"` key (unlike Track/Clip/MidiClip, which carry one).
+        let s = serde_json::to_string(&ObjectRef::Transport).unwrap();
+        eprintln!("ObjectRef::Transport wire form: {}", s);
+        assert_eq!(s, r#"{"family":"transport"}"#, "wire form was: {s}");
+        let back: ObjectRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ObjectRef::Transport);
+
+        // Set{Transport, TransportState} round-trips, including the new
+        // transport PropPath variants' camelCase wire names.
+        let transport_state_op = Op::Set {
+            object: ObjectRef::Transport,
+            path: PropPath::TransportState,
+            from: serde_json::json!("stopped"),
+            to: serde_json::json!("playing"),
+        };
+        let s = serde_json::to_string(&transport_state_op).unwrap();
+        eprintln!("Set{{Transport,TransportState}} wire form: {}", s);
+        assert!(s.contains("\"family\":\"transport\""), "wire form was: {s}");
+        assert!(s.contains("\"path\":\"transportState\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, transport_state_op);
+
+        // The remaining transport paths' camelCase wire names.
+        for (path, expected) in [
+            (PropPath::LoopEnabled, "loopEnabled"),
+            (PropPath::LoopStartSamples, "loopStartSamples"),
+            (PropPath::LoopEndSamples, "loopEndSamples"),
+            (PropPath::StopAtEnd, "stopAtEnd"),
+            (PropPath::SampleRate, "sampleRate"),
+        ] {
+            let s = serde_json::to_string(&path).unwrap();
+            assert_eq!(s, format!("\"{expected}\""), "wire form was: {s}");
+            let back: PropPath = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, path);
+        }
     }
 
     #[test]

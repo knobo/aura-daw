@@ -1,7 +1,7 @@
 //! The document. `&mut` access is (after Task 3) only reachable through
 //! `Session::transact`. Round-2 §4.1: the remaining three stores
 //! (automation, plugin rows, sampler bank) move in during Plan E.
-use crate::audio::types::{Store, TrackState};
+use crate::audio::types::{Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use crate::ids::TrackId;
 use crate::midi::MidiStore;
@@ -100,9 +100,14 @@ impl Tx<'_> {
     /// Read-only view of the document store, for validating/deriving inside
     /// a transaction closure without a second lock (Plan E Task 7, §4.3) —
     /// e.g. `ops::add_track_tx` reading track count/color, or a wrapper
-    /// validating a track's kind before applying a structural op. Never
-    /// `&mut`: the only way to mutate is [`Tx::apply`], so this can't be
-    /// used to bypass the op/inverse/effect bookkeeping.
+    /// validating a track's kind before applying a structural op, or a
+    /// closure branching on current truth (e.g. "don't downgrade an
+    /// in-flight recording", Task 12) under the SAME lock `apply` writes
+    /// through — reading via a separate `self.session.lock()` outside the
+    /// closure is a TOCTOU: another thread can write between that read and
+    /// this transaction's commit. Never `&mut`: the only way to mutate is
+    /// [`Tx::apply`], so this can't be used to bypass the op/inverse/effect
+    /// bookkeeping.
     pub fn store(&self) -> &Store {
         &self.session.store
     }
@@ -515,6 +520,31 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.persist.midi = true;
             Ok(Op::MidiSetNotes { clip: clip_id.clone(), notes: previous_notes })
         }
+        // Plan E Task 12 (inventory rows 28-29): the transport family — a
+        // property-addressed mirror of what `ControlPlane::transport` used
+        // to write directly into `session.store.transport.*` in four
+        // places. Deliberately sets NO `effect` flags:
+        // * no `rebuild` — the transport isn't baked into the RT graph by
+        //   `engine::rebuild` the way clip/track structure is; the RT side
+        //   reads its own atomics (`SharedRt`), not this document mirror.
+        // * no `persist.project` — RULING (Task 12 brief, binding),
+        //   diverging from the generic "structural/property Set persists"
+        //   pattern the Clip/MidiClip arms above follow: these fields DO
+        //   live in project.json, but setting `persist.project` on every
+        //   transport commit would write project.json once per
+        //   play/stop/loop-drag gesture. Persistence for transport fields
+        //   rides explicit saves only, exactly as before this task.
+        Op::Set { object: ObjectRef::Transport, path, to, .. } => {
+            let t = &mut session.store.transport;
+            let from_now = read_transport_prop(t, *path)?; // truth, not caller's `from`
+            let applied = write_transport_prop(t, *path, to)?;
+            Ok(Op::Set {
+                object: ObjectRef::Transport,
+                path: *path,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
@@ -539,8 +569,14 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         PropPath::TimelineStartSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
-        | PropPath::ContentLengthTicks => {
-            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip path)"))
+        | PropPath::ContentLengthTicks
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport path)"))
         }
     }
 }
@@ -587,8 +623,14 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
         PropPath::TimelineStartSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
-        | PropPath::ContentLengthTicks => {
-            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip path)"))
+        | PropPath::ContentLengthTicks
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport path)"))
         }
     }
 }
@@ -610,7 +652,13 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
-        | PropPath::TimelineStartSamples => {
+        | PropPath::TimelineStartSamples
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
     }
@@ -655,8 +703,110 @@ fn write_midi_prop(
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
-        | PropPath::TimelineStartSamples => {
+        | PropPath::TimelineStartSamples
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate => {
             Err(format!("path {path:?} is not a MidiClip property"))
+        }
+    }
+}
+
+/// Read/write a transport property as its JSON-wire representation —
+/// mirrors `read_prop`/`write_prop` (`TrackState`) and
+/// `read_midi_prop`/`write_midi_prop` (`MidiClip`), scoped to the six
+/// `Transport` paths. Fallible for the same reason: `PropPath` and
+/// `ObjectRef` are independent serde-derived enums, so e.g.
+/// `Set{Transport, Gain}` (a Track-only path) must fail the transaction
+/// atomically, never panic.
+fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TransportState => Ok(serde_json::json!(t.state)),
+        PropPath::LoopEnabled => Ok(serde_json::json!(t.loop_enabled)),
+        PropPath::LoopStartSamples => Ok(serde_json::json!(t.loop_start_samples)),
+        PropPath::LoopEndSamples => Ok(serde_json::json!(t.loop_end_samples)),
+        PropPath::StopAtEnd => Ok(serde_json::json!(t.stop_at_end)),
+        PropPath::SampleRate => Ok(serde_json::json!(t.sample_rate)),
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks => {
+            Err(format!("path {path:?} is not a Transport property"))
+        }
+    }
+}
+
+/// Write a transport property. `TransportState`'s wire form is validated
+/// against the closed `"playing"|"stopped"|"recording"` set (the same set
+/// `audio/engine.rs` writes directly); the numeric fields are u64/u32
+/// wire-checked like their Clip/MidiClip counterparts, with no clamping
+/// (unlike `Gain`/`LengthTicks`) since a transport commit's caller —
+/// `ControlPlane::transport` — already validates the loop region before
+/// ever building the op.
+fn write_transport_prop(
+    t: &mut TransportState,
+    path: PropPath,
+    to: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TransportState => {
+            let v = to.as_str().ok_or("transportState: expected a string")?;
+            if !matches!(v, "playing" | "stopped" | "recording") {
+                return Err(format!(
+                    "transportState: expected \"playing\"|\"stopped\"|\"recording\", got {v:?}"
+                ));
+            }
+            t.state = v.to_string();
+            Ok(serde_json::json!(t.state))
+        }
+        PropPath::LoopEnabled => {
+            let v = to.as_bool().ok_or("loopEnabled: expected a bool")?;
+            t.loop_enabled = v;
+            Ok(serde_json::json!(t.loop_enabled))
+        }
+        PropPath::LoopStartSamples => {
+            let v = to.as_u64().ok_or("loopStartSamples: expected a non-negative integer")?;
+            t.loop_start_samples = v;
+            Ok(serde_json::json!(t.loop_start_samples))
+        }
+        PropPath::LoopEndSamples => {
+            let v = to.as_u64().ok_or("loopEndSamples: expected a non-negative integer")?;
+            t.loop_end_samples = v;
+            Ok(serde_json::json!(t.loop_end_samples))
+        }
+        PropPath::StopAtEnd => {
+            let v = to.as_bool().ok_or("stopAtEnd: expected a bool")?;
+            t.stop_at_end = v;
+            Ok(serde_json::json!(t.stop_at_end))
+        }
+        PropPath::SampleRate => {
+            let v = to
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or("sampleRate: expected a non-negative 32-bit integer")?;
+            t.sample_rate = v;
+            Ok(serde_json::json!(t.sample_rate))
+        }
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks => {
+            Err(format!("path {path:?} is not a Transport property"))
         }
     }
 }
@@ -1396,5 +1546,154 @@ mod tests {
             tx.apply(Op::MidiSetNotes { clip: "no-such-clip".into(), notes: vec![] })
         });
         assert!(r.is_err());
+    }
+
+    // ---- Plan E Task 12: transport family --------------------------------
+
+    #[test]
+    fn transport_state_set_round_trips_through_inverse() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        assert_eq!(m.lock().store.transport.state, "stopped");
+        let c = Session::transact(&m, TxMeta::user("transport play").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::TransportState,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("playing"),
+            })
+        })
+        .unwrap();
+        assert!(c.meta.transient, "transport commits are transient");
+        assert_eq!(m.lock().store.transport.state, "playing");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.transport.state, "stopped", "undo restores the original state");
+    }
+
+    #[test]
+    fn transport_loop_set_round_trips_through_inverse() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let c = Session::transact(&m, TxMeta::user("transport set loop").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEnabled,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(true),
+            })?;
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopStartSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(1_000u64),
+            })?;
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEndSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(2_000u64),
+            })
+        })
+        .unwrap();
+        assert!(c.meta.transient);
+        {
+            let s = m.lock();
+            assert!(s.store.transport.loop_enabled);
+            assert_eq!(s.store.transport.loop_start_samples, 1_000);
+            assert_eq!(s.store.transport.loop_end_samples, 2_000);
+        }
+        // Sets on transport paths carry NO persist flag (RULING, Task 12
+        // brief) — a divergence from the Clip/MidiClip Set arms above,
+        // which do set `effect.persist.project`/`.midi`.
+        assert_eq!(c.effect.persist, PersistEffect::default(), "transport Sets set no persist flag");
+        assert!(!c.effect.rebuild, "transport Sets don't need a graph rebuild");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let s = m.lock();
+        assert!(!s.store.transport.loop_enabled, "undo restores loop_enabled");
+        assert_eq!(s.store.transport.loop_start_samples, 0, "undo restores loop_start_samples");
+        assert_eq!(s.store.transport.loop_end_samples, 0, "undo restores loop_end_samples");
+    }
+
+    #[test]
+    fn transport_stop_at_end_and_sample_rate_round_trip() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        assert!(m.lock().store.transport.stop_at_end); // default true
+        Session::transact(&m, TxMeta::user("stop at end").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::StopAtEnd,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(false),
+            })
+        })
+        .unwrap();
+        assert!(!m.lock().store.transport.stop_at_end);
+
+        Session::transact(&m, TxMeta::user("sample rate").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::SampleRate,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(96_000u32),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.transport.sample_rate, 96_000);
+    }
+
+    #[test]
+    fn mismatched_transport_gain_fails_cleanly_not_panics() {
+        // `Set{Transport, Gain}` — a Track-only path paired with the
+        // Transport object.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let before = m.lock().store.transport.state.clone();
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::Gain,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0.5),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.transport.state, before, "store untouched");
+    }
+
+    #[test]
+    fn mismatched_track_loop_enabled_fails_cleanly_not_panics() {
+        // The mirror case: `Set{Track, LoopEnabled}` — a Transport-only
+        // path paired with a Track object.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before_gain = m.lock().store.tracks[0].gain_db;
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::LoopEnabled,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(true),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, before_gain, "store untouched");
+    }
+
+    #[test]
+    fn transport_state_rejects_unknown_string() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let r = Session::transact(&m, TxMeta::user("bad state"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::TransportState,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("paused"), // not one of playing/stopped/recording
+            })
+        });
+        assert!(r.is_err(), "an unrecognized transport state must error, not silently write garbage");
     }
 }
