@@ -3,7 +3,9 @@
    * Canvas piano roll for one MIDI clip. Pitch rows × tick columns, notes as
    * glowing bars in the track color (velocity → luminance). Draw on empty,
    * drag to move, edge-drag to resize, double-click / Delete to remove;
-   * shift-drag marquees a tick region (feeds AMT infill) and selects notes.
+   * shift-drag marquees a tick region (feeds AMT infill) and selects notes
+   * (ctrl = add, alt = subtract, shift-click toggles one). Ctrl+C/X/V work
+   * on the note selection; arrows nudge in time / transpose in pitch.
    * Velocity lane below; piano keys at left audition through
    * sampler_preview_note when the track carries an instrument.
    * Same discipline as the timeline: canvases repaint on state changes only,
@@ -18,6 +20,18 @@
   import { openStudio, ui } from "../../state/ui.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import HScrollbar from "../HScrollbar.svelte";
+  import { canvasPos } from "../../utils/canvas-pos";
+  import {
+    applyMarquee,
+    copySelection,
+    marqueeHits,
+    nudgeSelection,
+    pasteNotes,
+    sortWithSelection,
+    toggleIndex,
+    transposeSelection,
+    type MarqueeMode,
+  } from "../../utils/note-ops";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import type { MidiNote } from "../../types/ipc";
 
@@ -50,6 +64,7 @@
   let keysCanvas: HTMLCanvasElement | undefined = $state();
   let velCanvas: HTMLCanvasElement | undefined = $state();
   let gridWrap: HTMLDivElement | undefined = $state();
+  let rollEl: HTMLDivElement | undefined = $state();
   let playheadEl: HTMLDivElement | undefined = $state();
   let flashCanvas: HTMLCanvasElement | undefined = $state();
   let keysFlashCanvas: HTMLCanvasElement | undefined = $state();
@@ -79,6 +94,12 @@
 
   function commit() {
     if (!clip) return;
+    // Pre-sort the way the store will (tick, key) and remap the selection
+    // along — otherwise the sorted echo re-adopted by the $effect above
+    // leaves the index-based selection pointing at the wrong notes.
+    const sorted = sortWithSelection(working, selection);
+    working = sorted.notes;
+    selection = sorted.selection;
     void midi.setNotes(clip.id, working.map((n) => ({ ...n })));
   }
 
@@ -113,25 +134,27 @@
   type Gesture =
     | { mode: "move"; start: { x: number; y: number }; orig: MidiNote[]; indices: number[] }
     | { mode: "resize"; start: { x: number; y: number }; orig: MidiNote[]; indices: number[] }
-    | { mode: "marquee"; start: { x: number; y: number }; toX: number; toY: number }
+    | { mode: "marquee"; start: { x: number; y: number }; select: MarqueeMode }
     | null;
   let gesture: Gesture = null;
   let marquee = $state<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
   let gestureMoved = false;
 
   function localPos(e: PointerEvent): { x: number; y: number } {
-    const rect = gridCanvas!.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    return canvasPos(gridCanvas!, e.clientX, e.clientY);
   }
 
   function onGridDown(e: PointerEvent) {
     if (!clip || e.button === 2) return;
     const p = localPos(e);
     gestureMoved = false;
+    rollEl?.focus();
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
 
     if (e.shiftKey) {
-      gesture = { mode: "marquee", start: p, toX: p.x, toY: p.y };
+      // shift-drag marquee; ctrl adds to the selection, alt subtracts
+      const select: MarqueeMode = e.ctrlKey || e.metaKey ? "add" : e.altKey ? "subtract" : "replace";
+      gesture = { mode: "marquee", start: p, select };
       marquee = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
       return;
     }
@@ -207,15 +230,23 @@
     if (!gesture) return;
     if (gesture.mode === "marquee") {
       const m = marquee!;
+      if (!gestureMoved) {
+        // shift-CLICK, not a drag: toggle the note under the pointer in and
+        // out of the selection; on empty space a plain shift-click clears it
+        // (the zero-area "replace" marquee), ctrl/alt-variants leave it be.
+        const hit = noteAt(gesture.start.x, gesture.start.y);
+        selection = hit
+          ? toggleIndex(selection, hit.index)
+          : applyMarquee(selection, [], gesture.select);
+        marquee = null;
+        gesture = null;
+        return;
+      }
       const t0 = tickAtX(Math.min(m.x0, m.x1));
       const t1 = tickAtX(Math.max(m.x0, m.x1));
       const kLo = keyAtY(Math.max(m.y0, m.y1));
       const kHi = keyAtY(Math.min(m.y0, m.y1));
-      const sel = new Set<number>();
-      working.forEach((n, i) => {
-        if (n.tick + n.lengthTicks > t0 && n.tick < t1 && n.key >= kLo && n.key <= kHi) sel.add(i);
-      });
-      selection = sel;
+      selection = applyMarquee(selection, marqueeHits(working, t0, t1, kLo, kHi), gesture.select);
       if (clip && Math.abs(m.x1 - m.x0) > 4) {
         midi.region = {
           clipId: clip.id,
@@ -234,8 +265,8 @@
   }
 
   function onGridDblClick(e: MouseEvent) {
-    const rect = gridCanvas!.getBoundingClientRect();
-    const hit = noteAt(e.clientX - rect.left, e.clientY - rect.top);
+    const p = canvasPos(gridCanvas!, e.clientX, e.clientY);
+    const hit = noteAt(p.x, p.y);
     if (hit) {
       working = working.filter((_, i) => i !== hit.index);
       selection = new Set();
@@ -251,23 +282,58 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
+    const mod = e.ctrlKey || e.metaKey;
     if (e.key === "Delete" || e.key === "Backspace") {
       e.preventDefault();
       deleteSelection();
     } else if (e.key === "Escape") {
+      // peel back one layer at a time: selection → region band → editor
       if (selection.size) selection = new Set();
+      else if (midi.region && clip && midi.region.clipId === clip.id) midi.region = null;
       else midi.closeEditor();
-    } else if (e.key === "a" && (e.ctrlKey || e.metaKey)) {
+    } else if (mod && e.key.toLowerCase() === "a") {
       e.preventDefault();
       selection = new Set(working.map((_, i) => i));
+    } else if (mod && (e.key.toLowerCase() === "c" || e.key.toLowerCase() === "x")) {
+      if (selection.size === 0) return;
+      e.preventDefault();
+      midi.noteClipboard = copySelection(working, selection);
+      if (e.key.toLowerCase() === "x") deleteSelection();
+    } else if (mod && e.key.toLowerCase() === "v") {
+      if (!clip || !midi.noteClipboard?.length) return;
+      e.preventDefault();
+      // paste in place; the pasted notes become the selection so they can be
+      // nudged/transposed (arrows) straight away
+      const pasted = pasteNotes(working, midi.noteClipboard, midi.effectiveContentLengthTicks(clip));
+      working = pasted.notes;
+      selection = pasted.selection;
+      commit();
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+      if (selection.size === 0) return;
+      e.preventDefault();
+      const dTick = (e.key === "ArrowRight" ? 1 : -1) * gridTicks;
+      const next = nudgeSelection(working, selection, dTick);
+      if (next) {
+        working = next;
+        commit();
+      }
+    } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+      if (selection.size === 0) return;
+      e.preventDefault();
+      // semitone; octave with shift
+      const dKey = (e.key === "ArrowUp" ? 1 : -1) * (e.shiftKey ? 12 : 1);
+      const next = transposeSelection(working, selection, dKey);
+      if (next) {
+        working = next;
+        commit();
+      }
     }
   }
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
     if (e.ctrlKey || e.metaKey) {
-      const rect = gridCanvas!.getBoundingClientRect();
-      const x = e.clientX - rect.left;
+      const x = canvasPos(gridCanvas!, e.clientX, e.clientY).x;
       const anchor = tickAtX(x);
       tpp = Math.min(120, Math.max(0.5, tpp * Math.exp(e.deltaY * 0.002)));
       scrollTick = Math.max(0, anchor - x * tpp);
@@ -282,10 +348,9 @@
   // ── velocity lane ──
   let velDragging = false;
   function velApply(e: PointerEvent) {
-    const rect = velCanvas!.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const v = Math.min(127, Math.max(1, Math.round((1 - (e.clientY - rect.top) / rect.height) * 127)));
-    const t = tickAtX(x);
+    const p = canvasPos(velCanvas!, e.clientX, e.clientY);
+    const v = Math.min(127, Math.max(1, Math.round((1 - p.y / VEL_H) * 127)));
+    const t = tickAtX(p.x);
     // nearest note onset within 0.6 grid cells
     let best = -1;
     let bestDist = gridTicks * 0.6;
@@ -320,8 +385,7 @@
   // ── piano keys (audition) ──
   let heldKey = $state(-1);
   function keyFromEvent(e: PointerEvent): number {
-    const rect = keysCanvas!.getBoundingClientRect();
-    return keyAtY(e.clientY - rect.top);
+    return keyAtY(canvasPos(keysCanvas!, e.clientX, e.clientY).y);
   }
   function onKeysDown(e: PointerEvent) {
     const k = keyFromEvent(e);
@@ -736,6 +800,7 @@
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <!-- role="application": the editor is one composite widget; keyboard is handled at the container -->
   <div
+    bind:this={rollEl}
     class="roll glass"
     role="application"
     aria-label="Piano roll — {clip.name}"
@@ -873,7 +938,9 @@
     </div>
 
     <footer class="hints silk">
-      draw · drag to move · edge-drag to resize · dbl-click delete · shift-drag region · ctrl+wheel zoom
+      draw · drag to move · edge-drag resize · dbl-click delete · shift-drag select (+ctrl add, +alt
+      remove) · shift-click toggle · ctrl+a all · esc none · ctrl+c/x/v copy/cut/paste · arrows
+      nudge, ±pitch (shift = octave) · ctrl+wheel zoom
     </footer>
   </div>
 {/if}
