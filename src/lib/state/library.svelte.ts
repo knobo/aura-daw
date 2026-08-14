@@ -14,6 +14,7 @@
 import { backend } from "../tauri";
 import { prefs } from "../prefs/prefs.svelte";
 import { project } from "./project.svelte";
+import { midi } from "./midi.svelte";
 import { toasts } from "./toasts.svelte";
 import { parentDir, type LibraryDragPayload } from "../utils/library";
 import type { LibraryEntry } from "../types/ipc";
@@ -153,8 +154,45 @@ class LibraryStore {
         }
         return;
       }
+      case "projectAudioClip": {
+        if (track.kind !== "audio") {
+          toasts.info("NEEDS AN AUDIO TRACK", "audio clips drop on audio tracks");
+          return;
+        }
+        const clip = project.clips.find((c) => c.id === payload.clipId);
+        if (!clip || !project.projectDir) return;
+        try {
+          // `sourcePath` is relative to the .aura dir; join it with the
+          // platform separator rather than string-concatenating.
+          const { join } = await import("@tauri-apps/api/path");
+          const abs = await join(project.projectDir, clip.sourcePath);
+          await backend.importAudioClip({ path: abs, trackId, atSamples });
+          await project.reload();
+        } catch (err) {
+          toasts.error("CLIP COPY FAILED", String(err));
+        }
+        return;
+      }
+
+      case "projectMidiClip": {
+        if (track.kind !== "midi") {
+          toasts.info("NEEDS A MIDI TRACK", "MIDI clips drop on MIDI tracks");
+          return;
+        }
+        // One gesture = one undo entry, even though the stamp is up to three
+        // commands (add + bounds + notes). `fold_ops` keeps non-Set ops in
+        // the same batch, and a closed gesture becomes one HistoryEntry.
+        project.beginGesture("drag midi clip");
+        try {
+          await midi.stampClipTo(payload.clipId, trackId, midi.samplesToTicks(atSamples));
+        } finally {
+          project.endGesture();
+        }
+        return;
+      }
+
       default:
-        return; // remaining kinds land in Tasks 7 and 8
+        return; // remaining kinds land in Task 8
     }
   }
 

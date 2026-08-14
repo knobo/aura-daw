@@ -22,6 +22,29 @@ const fileEntry = (name: string, path: string): LibraryEntry => ({
   modifiedMs: 0,
 });
 
+const audioTrack = (id: string) => ({
+  id,
+  name: "Audio",
+  kind: "audio" as const,
+  gainDb: 0,
+  pan: 0,
+  muted: false,
+  soloed: false,
+  armed: false,
+  color: "#888888",
+});
+const midiTrack = (id: string) => ({
+  id,
+  name: "Synth",
+  kind: "midi" as const,
+  gainDb: 0,
+  pan: 0,
+  muted: false,
+  soloed: false,
+  armed: false,
+  color: "#888888",
+});
+
 const invokes = {
   libraryScan: vi.fn(async (dir: string): Promise<LibraryEntry[]> =>
     dir === "/lib" ? [dirEntry("drums", "/lib/drums"), fileEntry("kick.wav", "/lib/kick.wav")] : [],
@@ -32,6 +55,35 @@ const invokes = {
   importAudioClip: vi.fn(async (_req: { path: string; trackId?: string | null; atSamples?: number | null }) => ({
     id: "c1",
   })),
+  midiAddClip: vi.fn(async (trackId: string, name: string | null, timelineStartTicks: number, lengthTicks: number) => ({
+    id: "k1-copy",
+    trackId,
+    name: name ?? "riff",
+    timelineStartTicks,
+    lengthTicks,
+    notes: [],
+  })),
+  midiSetNotes: vi.fn(async (clipId: string, notes: unknown[]) => ({
+    id: clipId,
+    trackId: "m1",
+    name: "riff",
+    timelineStartTicks: 0,
+    lengthTicks: 1920,
+    notes,
+  })),
+  midiSetClipBounds: vi.fn(
+    async (clipId: string, timelineStartTicks: number, lengthTicks: number, contentLengthTicks: number | null) => ({
+      id: clipId,
+      trackId: "m1",
+      name: "riff",
+      timelineStartTicks,
+      lengthTicks,
+      contentLengthTicks: contentLengthTicks ?? undefined,
+      notes: [],
+    }),
+  ),
+  gestureBegin: vi.fn(async (_label: string) => {}),
+  gestureEnd: vi.fn(async () => {}),
   getProjectState: vi.fn(() =>
     Promise.resolve({
       projectName: "Untitled",
@@ -48,10 +100,14 @@ const invokes = {
 
 const mockBackend = { mode: "tauri" as const, on: () => () => {}, ...invokes };
 vi.mock("../tauri", () => ({ backend: mockBackend }));
+vi.mock("@tauri-apps/api/path", () => ({
+  join: async (...parts: string[]) => parts.join("/"),
+}));
 
 const { prefs } = await import("../prefs/prefs.svelte");
 const { library } = await import("./library.svelte");
 const { project } = await import("./project.svelte");
+const { midi } = await import("./midi.svelte");
 const { toasts } = await import("./toasts.svelte");
 
 function lastToast() {
@@ -160,5 +216,61 @@ describe("dropOnTrack — sample file", () => {
     );
     expect(invokes.importAudioClip).not.toHaveBeenCalled();
     expect(lastToast().title).toContain("AUDIO TRACK");
+  });
+});
+
+describe("dropOnTrack — project clips", () => {
+  it("re-imports an audio project clip from its absolute source path", async () => {
+    project.projectDir = "/home/u/Music/AURA/Song.aura";
+    project.tracks = [audioTrack("t1")];
+    project.clips = [
+      { id: "c1", trackId: "t1", name: "loop", sourcePath: "audio/abc.wav",
+        sourceChannels: 2, sourceSampleRate: 48000, sourceLengthSamples: 48000,
+        timelineStartSamples: 0, offsetSamples: 0, lengthSamples: 48000,
+        gainDb: 0, fadeInSamples: 0, fadeOutSamples: 0 },
+    ];
+
+    await library.dropOnTrack({ kind: "projectAudioClip", clipId: "c1" }, "t1", 24000);
+
+    expect(invokes.importAudioClip).toHaveBeenCalledWith({
+      path: "/home/u/Music/AURA/Song.aura/audio/abc.wav",
+      trackId: "t1",
+      atSamples: 24000,
+    });
+  });
+
+  it("stamps a MIDI project clip inside ONE gesture, so it is one undo step", async () => {
+    project.tracks = [midiTrack("m1")];
+    midi.clips = [
+      { id: "k1", trackId: "m1", name: "riff", timelineStartTicks: 0, lengthTicks: 1920,
+        notes: [{ tick: 0, key: 60, velocity: 100, lengthTicks: 480 }] },
+    ];
+
+    await library.dropOnTrack({ kind: "projectMidiClip", clipId: "k1" }, "m1", 0);
+
+    expect(invokes.gestureBegin).toHaveBeenCalledTimes(1);
+    expect(invokes.midiAddClip).toHaveBeenCalledTimes(1);
+    expect(invokes.midiSetNotes).toHaveBeenCalledTimes(1);
+    expect(invokes.gestureEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the gesture even when the stamp fails", async () => {
+    project.tracks = [midiTrack("m1")];
+    midi.clips = [
+      { id: "k1", trackId: "m1", name: "riff", timelineStartTicks: 0, lengthTicks: 1920, notes: [] },
+    ];
+    invokes.midiAddClip.mockRejectedValueOnce(new Error("boom"));
+
+    await library.dropOnTrack({ kind: "projectMidiClip", clipId: "k1" }, "m1", 0);
+    expect(invokes.gestureEnd).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a MIDI clip on an audio track and an audio clip on a MIDI track", async () => {
+    project.tracks = [audioTrack("t1"), midiTrack("m1")];
+    midi.clips = [
+      { id: "k1", trackId: "m1", name: "riff", timelineStartTicks: 0, lengthTicks: 1920, notes: [] },
+    ];
+    await library.dropOnTrack({ kind: "projectMidiClip", clipId: "k1" }, "t1", 0);
+    expect(invokes.midiAddClip).not.toHaveBeenCalled();
   });
 });
