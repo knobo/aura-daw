@@ -127,6 +127,7 @@ fn render_live(
     frames: usize,
     sample_rate: u32,
     discontinuity: bool,
+    steady_base: u64,
     mix: (f32, f32, f32, bool),
     acc: &mut TrackAccum,
 ) {
@@ -174,7 +175,11 @@ fn render_live(
         // position + discontinuity reach the node BEFORE it processes, so
         // ramp cursors survive seeks and loop wraps.
         node.set_block_context(pos, run_discontinuity);
-        let mut io = ProcessBlock { samples: sblock, channels: 2, sample_rate };
+        // Round-2 §3.5: the same engine-global steady_time base for every
+        // run in this block (a loop wrap can split one callback block into
+        // several runs) — non-decreasing is the CLAP contract, not
+        // strictly-increasing every call.
+        let mut io = ProcessBlock { samples: sblock, channels: 2, sample_rate, steady: steady_base };
         node.process(&mut io);
         if wraps {
             node.all_notes_off();
@@ -214,6 +219,13 @@ fn render_live(
 /// into it. Returns the number of chunks DROPPED because the ring was full —
 /// `render` has no `SharedRt` to bump xruns itself, so the caller (which
 /// does) counts one xrun per dropped chunk.
+///
+/// This entry point has no engine-global `steady_time` to hand live nodes
+/// (round-2 §3.5) — only the real RT output callback owns one (`SharedRt`;
+/// see `render_rt`). Every other caller (offline bounce, loopjam, preview,
+/// tests) falls back to `base_pos` here, which is numerically identical to
+/// the old per-node self-counter for the straight-through, no-rebuild
+/// renders these callers do.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     graph: &mut RtGraph,
@@ -223,6 +235,44 @@ pub fn render(
     out_ch: usize,
     sample_rate: u32,
     discontinuity: bool,
+    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
+) -> u32 {
+    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, base_pos, meter_tx)
+}
+
+/// Like [`render`], but carries the engine-global `steady_time` base for
+/// this block (round-2 §3.5) explicitly — used ONLY by the real RT output
+/// callback (`engine::OutputCb::render`), which advances `SharedRt::steady`
+/// once per block and passes the pre-advance value here. Live nodes
+/// (`ProcessBlock::steady`) see this instead of self-counting, so the value
+/// they observe survives node re-creation (instrument rebind, sample-rate
+/// change, a track leaving and re-entering the live set) — the counter
+/// lives on the engine, not the node.
+#[allow(clippy::too_many_arguments)]
+pub fn render_rt(
+    graph: &mut RtGraph,
+    base_pos: u64,
+    lp: &LoopSpec,
+    out: &mut [f32],
+    out_ch: usize,
+    sample_rate: u32,
+    discontinuity: bool,
+    steady_base: u64,
+    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
+) -> u32 {
+    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, steady_base, meter_tx)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_impl(
+    graph: &mut RtGraph,
+    base_pos: u64,
+    lp: &LoopSpec,
+    out: &mut [f32],
+    out_ch: usize,
+    sample_rate: u32,
+    discontinuity: bool,
+    steady_base: u64,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
     let out_ch = out_ch.max(1);
@@ -289,6 +339,7 @@ pub fn render(
             frames,
             sample_rate,
             discontinuity,
+            steady_base,
             (gain, gl, gr, on),
             &mut acc,
         );

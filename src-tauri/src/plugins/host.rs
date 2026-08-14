@@ -221,7 +221,7 @@ mod tests {
         }
         assert_eq!(node.events_seen(), 600);
         let mut buf = vec![0.0f32; 512 * 2];
-        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000 };
+        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: 0 };
         node.process(&mut io);
         node.all_notes_off();
         assert!(buf.iter().all(|s| *s == 0.0), "stub renders silence");

@@ -12,6 +12,16 @@ pub struct ProcessBlock<'a> {
     pub samples: &'a mut [f32],
     pub channels: usize,
     pub sample_rate: u32,
+    /// Engine-global CLAP `steady_time` base for this block (round-2 §3.5):
+    /// the RT output callback's running sample counter, advanced once per
+    /// block from `rt::SharedRt::steady` — never a per-node count, so it
+    /// survives a live node's re-creation (instrument rebind, sample-rate
+    /// change, a track leaving and re-entering the live set). Callers with
+    /// no `SharedRt` of their own (offline bounce, preview, tests) fall
+    /// back to the block's absolute timeline position, which is
+    /// numerically identical to the old per-node counter for a
+    /// straight-through render — see `mixer::render` vs `mixer::render_rt`.
+    pub steady: u64,
 }
 
 impl<'a> ProcessBlock<'a> {
@@ -203,7 +213,7 @@ mod tests {
 
         let mut buf = vec![0.1f32, -0.2, 0.3, -0.4];
         let orig = buf.clone();
-        let mut blk = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000 };
+        let mut blk = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: 0 };
         assert_eq!(blk.frames(), 2);
         st.process(&mut blk);
         assert_eq!(buf, orig);

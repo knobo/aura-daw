@@ -258,7 +258,6 @@ impl ClapWorld {
             n_notes: 0,
             param_rx,
             pending_all_off: false,
-            steady: 0,
             errors: 0,
             layout,
             instance_id: instance_id.to_string(),
@@ -586,7 +585,6 @@ pub struct ClapNode {
     n_notes: usize,
     param_rx: rtrb::Consumer<ParamCmd>,
     pending_all_off: bool,
-    steady: u64,
     /// Process-error count (RT-safe diagnostics; logged on drop).
     errors: u64,
     layout: PortLayout,
@@ -699,12 +697,16 @@ impl AuraAudioProcessor for ClapNode {
         };
         let input_events = InputEvents::from_buffer(&self.ev_in);
         let mut output_events = OutputEvents::from_buffer(&mut self.ev_out);
+        // Round-2 §3.5: steady_time comes from the engine-global counter
+        // (`SharedRt::steady`, threaded through `ProcessBlock::steady`), not
+        // a per-node count — a rebuild that re-creates this node no longer
+        // resets the clock the host sees.
         match started.process(
             &in_audio,
             &mut out_audio,
             &input_events,
             &mut output_events,
-            Some(self.steady),
+            Some(io.steady),
             None,
         ) {
             Ok(_status) => {
@@ -727,7 +729,6 @@ impl AuraAudioProcessor for ClapNode {
             }
             Err(_) => self.errors += 1,
         }
-        self.steady = self.steady.wrapping_add(frames as u64);
     }
 
     fn reset(&mut self) {
@@ -815,7 +816,7 @@ mod tests {
         let mut out = Vec::with_capacity(blocks * frames * 2);
         for _ in 0..blocks {
             let mut buf = vec![0.0f32; frames * 2];
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: 0 };
             node.process(&mut io);
             out.extend_from_slice(&buf);
         }

@@ -394,7 +394,7 @@ mod tests {
         let mut buf = vec![0.0f32; 24_000 * 2];
         // Render in engine-sized blocks to exercise block boundaries.
         for chunk in buf.chunks_mut(512 * 2) {
-            let mut io = ProcessBlock { samples: chunk, channels: 2, sample_rate: RATE };
+            let mut io = ProcessBlock { samples: chunk, channels: 2, sample_rate: RATE, steady: 0 };
             node.process(&mut io);
         }
         let mono: Vec<f32> = buf.iter().step_by(2).copied().collect();
@@ -425,7 +425,7 @@ mod tests {
         // Note starts at offset 100 within a 256-frame block.
         node.set_block_events(&[BlockNoteEvent { offset: 100, key: 69, velocity: 127 }]);
         let mut buf = vec![0.0f32; 256 * 2];
-        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: RATE };
+        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: RATE, steady: 0 };
         node.process(&mut io);
         assert!(
             buf[..100 * 2].iter().all(|s| *s == 0.0),
@@ -439,7 +439,7 @@ mod tests {
         // velocity 0 == note off (frozen contract) -> voice releases + dies.
         node.set_block_events(&[BlockNoteEvent { offset: 0, key: 69, velocity: 0 }]);
         let mut buf2 = vec![0.0f32; 512 * 2];
-        let mut io2 = ProcessBlock { samples: &mut buf2, channels: 2, sample_rate: RATE };
+        let mut io2 = ProcessBlock { samples: &mut buf2, channels: 2, sample_rate: RATE, steady: 0 };
         node.process(&mut io2);
         assert_eq!(node.active_voices(), 0, "released after vel-0 event");
         let _ = std::fs::remove_dir_all(&dir);
@@ -457,14 +457,14 @@ mod tests {
         node.prepare(RATE, 512);
         tx.push(NoteCmd::On { key: 60, velocity: 100, hold_frames: 256 }).unwrap();
         let mut buf = vec![0.0f32; 512 * 2];
-        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: RATE };
+        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: RATE, steady: 0 };
         node.process(&mut io);
         assert!(buf.iter().any(|s| s.abs() > 0.01), "preview note audible");
         assert_eq!(node.active_voices(), 1);
         // Auto-release after 256 frames + 10 ms release: silent well within
         // the next 1024 frames.
         let mut buf2 = vec![0.0f32; 1024 * 2];
-        let mut io2 = ProcessBlock { samples: &mut buf2, channels: 2, sample_rate: RATE };
+        let mut io2 = ProcessBlock { samples: &mut buf2, channels: 2, sample_rate: RATE, steady: 0 };
         node.process(&mut io2);
         assert_eq!(node.active_voices(), 0, "hold expired, voice released");
         let _ = std::fs::remove_dir_all(&dir);
@@ -568,7 +568,7 @@ mod tests {
         node.set_block_events(&[BlockNoteEvent { offset: 0, key: 60, velocity: 100 }]);
         let mut buf = vec![0.0f32; 24_000 * 2];
         for chunk in buf.chunks_mut(512 * 2) {
-            let mut io = ProcessBlock { samples: chunk, channels: 2, sample_rate: RATE };
+            let mut io = ProcessBlock { samples: chunk, channels: 2, sample_rate: RATE, steady: 0 };
             node.process(&mut io);
         }
         let mono: Vec<f32> = buf.iter().step_by(2).copied().collect();
