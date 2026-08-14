@@ -1456,7 +1456,10 @@ mod tests {
     impl crate::audio::dsp::AudioProcessor for RecordingNode {
         fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
         fn process(&mut self, io: &mut crate::audio::dsp::ProcessBlock<'_>) {
-            self.0.lock().push(io.steady);
+            // The real RT path (`render_rt`) always carries an
+            // engine-global value — `None` here would mean this test
+            // somehow went through the non-RT `render` entry point instead.
+            self.0.lock().push(io.steady.expect("RT block always carries a steady value"));
         }
         fn reset(&mut self) {}
     }

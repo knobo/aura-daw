@@ -125,7 +125,7 @@ impl PreviewCb {
                 // Sample preview, not the live engine graph — no CLAP node
                 // ever sits behind this seam, so there is no steady_time to
                 // carry.
-                steady: 0,
+                steady: None,
             };
             node.process(&mut io);
         }

@@ -406,7 +406,7 @@ mod tests {
             while std::time::Instant::now() < deadline {
                 warm.fill(0.0);
                 let mut io =
-                    ProcessBlock { samples: &mut warm, channels: 2, sample_rate: RATE, steady: 0 };
+                    ProcessBlock { samples: &mut warm, channels: 2, sample_rate: RATE, steady: None };
                 node.process(&mut io);
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -418,7 +418,7 @@ mod tests {
         let mut rendered = 0usize;
         while rendered < frames {
             buf.fill(0.0);
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: RATE, steady: 0 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: RATE, steady: None };
             node.process(&mut io);
             out.extend(buf.iter().step_by(2));
             rendered += 512;

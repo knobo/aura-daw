@@ -858,7 +858,7 @@ mod tests {
         let mut rendered = Vec::new();
         for frames in [128usize, 128, 512] {
             let mut buf = vec![0.0f32; frames * 2];
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: 0 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
             node.process(&mut io);
             rendered.extend_from_slice(&buf);
         }

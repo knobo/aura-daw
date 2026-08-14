@@ -127,7 +127,7 @@ fn render_live(
     frames: usize,
     sample_rate: u32,
     discontinuity: bool,
-    steady_base: u64,
+    steady_base: Option<u64>,
     mix: (f32, f32, f32, bool),
     acc: &mut TrackAccum,
 ) {
@@ -223,9 +223,13 @@ fn render_live(
 /// This entry point has no engine-global `steady_time` to hand live nodes
 /// (round-2 §3.5) — only the real RT output callback owns one (`SharedRt`;
 /// see `render_rt`). Every other caller (offline bounce, loopjam, preview,
-/// tests) falls back to `base_pos` here, which is numerically identical to
-/// the old per-node self-counter for the straight-through, no-rebuild
-/// renders these callers do.
+/// tests) hands live nodes `ProcessBlock::steady == None` (fix-round-1):
+/// `base_pos` can move BACKWARD here (a loop wrap), so it must never be
+/// used to derive a steady value — a persistent live node (e.g. `ClapNode`)
+/// falls back to its OWN per-instance monotonic counter when told `None`,
+/// exactly the pre-round-2 behavior for these paths, which is immune to
+/// `base_pos` direction because it only counts frames it actually
+/// processed.
 #[allow(clippy::too_many_arguments)]
 pub fn render(
     graph: &mut RtGraph,
@@ -237,7 +241,7 @@ pub fn render(
     discontinuity: bool,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
-    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, base_pos, meter_tx)
+    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, None, meter_tx)
 }
 
 /// Like [`render`], but carries the engine-global `steady_time` base for
@@ -260,7 +264,17 @@ pub fn render_rt(
     steady_base: u64,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
-    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, steady_base, meter_tx)
+    render_impl(
+        graph,
+        base_pos,
+        lp,
+        out,
+        out_ch,
+        sample_rate,
+        discontinuity,
+        Some(steady_base),
+        meter_tx,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -272,7 +286,7 @@ fn render_impl(
     out_ch: usize,
     sample_rate: u32,
     discontinuity: bool,
-    steady_base: u64,
+    steady_base: Option<u64>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
     let out_ch = out_ch.max(1);
@@ -708,5 +722,77 @@ mod tests {
             peak(&tail[8_000..])
         };
         assert!(node_voices < 0.05, "voices do not accumulate across wraps");
+    }
+
+    // ---- fix-round-1: non-RT steady_time must never decrease ----
+
+    use super::super::dsp::LiveInstrument;
+
+    /// Mirrors `plugins::clap_host::ClapNode`'s fix-round-1 fallback exactly
+    /// (see that module): when handed `ProcessBlock::steady == None` (every
+    /// non-RT caller — offline bounce, loopjam, preview), fall back to a
+    /// per-instance accumulator that only counts frames THIS node actually
+    /// processed, so the caller's `base_pos` direction (which CAN move
+    /// backward on a loop wrap) never enters into it.
+    #[derive(Default)]
+    struct FallbackState {
+        fallback: u64,
+        log: Vec<u64>,
+    }
+    struct FallbackNode(Arc<parking_lot::Mutex<FallbackState>>);
+    impl AudioProcessor for FallbackNode {
+        fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+        fn process(&mut self, io: &mut ProcessBlock<'_>) {
+            let frames = io.frames() as u64;
+            let mut st = self.0.lock();
+            let steady = match io.steady {
+                Some(s) => s,
+                None => {
+                    let s = st.fallback;
+                    st.fallback = st.fallback.wrapping_add(frames);
+                    s
+                }
+            };
+            st.log.push(steady);
+        }
+        fn reset(&mut self) {}
+    }
+    impl LiveInstrument for FallbackNode {
+        fn queue_event(&mut self, _ev: BlockNoteEvent) -> bool {
+            true
+        }
+        fn all_notes_off(&mut self) {}
+    }
+
+    /// Round-2 §3.5 fix-round-1: the non-RT `render` entry point (offline
+    /// bounce, loopjam, preview) must never hand a PERSISTENT live node a
+    /// decreasing steady_time, even though its own `base_pos` moves
+    /// backward on a loop wrap. Two `render` calls on the SAME graph/SAME
+    /// node (no rebuild between them) — the second call's `base_pos` is
+    /// LOWER than the first's, simulating exactly that wrap — must still
+    /// produce a strictly-increasing steady sequence.
+    #[test]
+    fn non_rt_render_never_hands_a_decreasing_steady_across_a_loop_wrap() {
+        let state = Arc::new(parking_lot::Mutex::new(FallbackState::default()));
+        let tr = RtTrack {
+            slot: 0,
+            clips: Vec::new(),
+            live: Some(LiveSource {
+                node: LiveNodeCell::new(Box::new(FallbackNode(state.clone()))),
+                events: Arc::new(Vec::new()),
+            }),
+        };
+        let mut g = RtGraph::new(vec![tr], 1, Arc::new(ParamTable::with_slots(1)));
+        let mut out = vec![0.0f32; 128 * 2];
+
+        render(&mut g, 5_000, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        // base_pos DROPS here — a loop wrap on the same persistent node.
+        render(&mut g, 100, &LoopSpec::OFF, &mut out, 2, 48_000, true, None);
+        render(&mut g, 228, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+
+        let seen = state.lock().log.clone();
+        assert_eq!(seen.len(), 3, "one steady value observed per rendered block");
+        assert!(seen[1] > seen[0], "monotonic across the loop wrap: {:?}", seen);
+        assert!(seen[2] > seen[1], "still climbing after the wrap: {:?}", seen);
     }
 }

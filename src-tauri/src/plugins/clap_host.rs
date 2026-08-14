@@ -258,6 +258,7 @@ impl ClapWorld {
             n_notes: 0,
             param_rx,
             pending_all_off: false,
+            steady_fallback: 0,
             errors: 0,
             layout,
             instance_id: instance_id.to_string(),
@@ -585,6 +586,16 @@ pub struct ClapNode {
     n_notes: usize,
     param_rx: rtrb::Consumer<ParamCmd>,
     pending_all_off: bool,
+    /// Fix-round-1 (§3.5 adjacent hazard): per-instance fallback steady
+    /// counter, used ONLY when the caller has no engine-global clock
+    /// (`ProcessBlock::steady == None` — every non-RT caller: offline
+    /// bounce, loopjam, preview, tests; see `mixer::render` vs
+    /// `mixer::render_rt`). Exactly the pre-round-2 behavior for those
+    /// paths: a pure per-instance accumulator that only counts frames THIS
+    /// node actually processed, so it can never be handed a decreasing
+    /// steady_time even when the caller's own timeline position moves
+    /// backward (a loop wrap).
+    steady_fallback: u64,
     /// Process-error count (RT-safe diagnostics; logged on drop).
     errors: u64,
     layout: PortLayout,
@@ -616,6 +627,13 @@ impl ClapNode {
 
     pub fn process_errors(&self) -> u64 {
         self.errors
+    }
+
+    /// Test-only introspection of the fix-round-1 fallback accumulator
+    /// (compiled out of every non-test build — zero RT-path cost).
+    #[cfg(test)]
+    pub(crate) fn steady_fallback_for_test(&self) -> u64 {
+        self.steady_fallback
     }
 }
 
@@ -697,16 +715,30 @@ impl AuraAudioProcessor for ClapNode {
         };
         let input_events = InputEvents::from_buffer(&self.ev_in);
         let mut output_events = OutputEvents::from_buffer(&mut self.ev_out);
-        // Round-2 §3.5: steady_time comes from the engine-global counter
-        // (`SharedRt::steady`, threaded through `ProcessBlock::steady`), not
-        // a per-node count — a rebuild that re-creates this node no longer
-        // resets the clock the host sees.
+        // Round-2 §3.5 + fix-round-1: steady_time comes from the
+        // engine-global counter (`SharedRt::steady`, threaded through
+        // `ProcessBlock::steady`) when the RT engine hands us one — a
+        // rebuild that re-creates this node no longer resets the clock the
+        // host sees. Non-RT callers (offline bounce, loopjam, preview) pass
+        // `None` instead of a `base_pos`-derived value, because their
+        // `base_pos` can move backward on a loop wrap; falling back to our
+        // OWN per-instance accumulator here (pre-round-2 behavior for these
+        // paths) keeps steady_time monotonic regardless — it only counts
+        // frames THIS node actually processed.
+        let steady = match io.steady {
+            Some(s) => s,
+            None => {
+                let s = self.steady_fallback;
+                self.steady_fallback = self.steady_fallback.wrapping_add(frames as u64);
+                s
+            }
+        };
         match started.process(
             &in_audio,
             &mut out_audio,
             &input_events,
             &mut output_events,
-            Some(io.steady),
+            Some(steady),
             None,
         ) {
             Ok(_status) => {
@@ -816,7 +848,7 @@ mod tests {
         let mut out = Vec::with_capacity(blocks * frames * 2);
         for _ in 0..blocks {
             let mut buf = vec![0.0f32; frames * 2];
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: 0 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
             node.process(&mut io);
             out.extend_from_slice(&buf);
         }
@@ -825,6 +857,44 @@ mod tests {
 
     fn peak(buf: &[f32]) -> f32 {
         buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Fix-round-1 (§3.5 adjacent hazard): a non-RT caller (offline bounce,
+    /// loopjam, preview) hands `ProcessBlock::steady == None` — `ClapNode`
+    /// must fall back to its OWN per-instance accumulator rather than ever
+    /// seeing (or deriving from) a caller-side position that could move
+    /// backward. Exercises a REAL installed CLAP instrument, not a stub, so
+    /// this pins the concrete fallback field directly. Skips cleanly when
+    /// no CLAP instrument is installed.
+    #[test]
+    fn non_rt_process_keeps_a_monotonic_per_instance_fallback() {
+        let Some(uid) = instrument_uid() else {
+            eprintln!("skipping: no CLAP instrument installed");
+            return;
+        };
+        let id = format!("t-{}", uuid::Uuid::new_v4());
+        instantiate(&id, &uid).expect("instantiate");
+        let id2 = id.clone();
+        let mut node = plugin_main()
+            .run(move |ctx| world(ctx).activate_node(&id2, 48_000))
+            .expect("main thread responded")
+            .expect("activate");
+
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
+        node.process(&mut io);
+        let first = node.steady_fallback_for_test();
+        node.process(&mut io);
+        let second = node.steady_fallback_for_test();
+        node.process(&mut io);
+        let third = node.steady_fallback_for_test();
+
+        assert!(second > first, "monotonic within the same instance: {first} -> {second}");
+        assert!(third > second, "still climbing on a third call: {second} -> {third}");
+
+        drop(node);
+        plugin_main().run(|_| ()).unwrap();
+        let _ = remove(&id);
     }
 
     /// Full CLAP lifecycle against a real installed instrument: instantiate
