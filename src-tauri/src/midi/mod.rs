@@ -63,7 +63,7 @@ use crate::audio::AudioState;
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use crate::control::{ops as control_ops, ControlPlane, Session};
 
-pub use tempo::TempoMap;
+pub use tempo::{TempoMap, NOMINAL_SAMPLE_RATE};
 pub use types::{MeterEvent, MidiClip, MidiNote, TempoEvent, TempoPeriodEvent, DEFAULT_PPQ};
 
 // ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ pub(crate) fn build_tempo_map_state(
     meter_events: &[MeterEvent],
 ) -> Result<TempoMapState, String> {
     // Validate against a nominal rate; the map is rebuilt per engine rate.
-    let tempo_map = TempoMap::new(ppq, events.to_vec(), 48_000)?;
+    let tempo_map = TempoMap::new(ppq, events.to_vec(), NOMINAL_SAMPLE_RATE)?;
     let meter_map = tempo::MeterMap::new(meter_events.to_vec())
         .unwrap_or_else(|_| tempo::MeterMap::default_map());
     let table = section_table::SectionTable::build(&tempo_map, &meter_map);

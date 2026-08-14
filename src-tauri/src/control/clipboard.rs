@@ -7,15 +7,26 @@
 //! three-step asset resolution a paste performs, and scope ruling C for why
 //! the MIME name rides inside the envelope instead of being an OS clipboard
 //! flavor.
+//!
+//! WIRE DOMAIN (fix round 1, Critical-1): every tick<->sample number in
+//! [`AuraClipsPayload`] — `anchor_samples`/`anchor_ticks` and each clip's
+//! `offset_from_anchor_*` — is computed against
+//! [`crate::midi::NOMINAL_SAMPLE_RATE`] (48kHz), the SAME nominal map
+//! `ProjectSnapshot`'s section table is built from
+//! (`midi::build_tempo_map_state`), never the live device rate
+//! (`SharedRt::sample_rate`). The document must convert identically
+//! regardless of which output device happens to be open — a copy made
+//! while a 96kHz interface is attached must produce the exact same anchor
+//! math as one made at 44.1kHz. Task 9's paste MUST resolve this payload's
+//! ticks/samples through the same nominal map, not the engine rate.
 
-use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use super::ControlPlane;
-use crate::midi::TempoMap;
+use crate::midi::{TempoMap, NOMINAL_SAMPLE_RATE};
 
 pub const AURA_CLIPS_MIME: &str = "application/x-aura-clips";
 pub const AURA_CLIPS_SCHEMA_VERSION: u32 = 1;
@@ -124,9 +135,12 @@ impl ControlPlane {
 
         // Same tick<->sample bijection `ProjectSnapshot`'s section table is
         // built from (round-2 §3.3) — ADR 0006: the frontend does no time
-        // math, so the anchor's cross-unit resolution happens here.
-        let rate = self.shared.sample_rate.load(Relaxed);
-        let tempo = TempoMap::new(midi.ppq, midi.tempo_events.clone(), rate)
+        // math, so the anchor's cross-unit resolution happens here. Fixed
+        // (nominal) rate, NOT the live device rate (fix round 1,
+        // Critical-1): a copy's anchor/offset numbers must not depend on
+        // which audio interface happens to be attached — see this module's
+        // WIRE DOMAIN doc above.
+        let tempo = TempoMap::new(midi.ppq, midi.tempo_events.clone(), NOMINAL_SAMPLE_RATE)
             .map_err(|e| format!("clips_copy: tempo map: {e}"))?;
 
         let midi_starts_samples: Vec<u64> =
@@ -305,6 +319,53 @@ mod tests {
             _ => None,
         });
         assert_eq!(audio_off, Some(96_000));
+    }
+
+    /// Fix round 1, Critical-1 regression: the anchor/offset math must be
+    /// computed against the NOMINAL 48kHz wire domain (`NOMINAL_SAMPLE_RATE`,
+    /// same as `ProjectSnapshot`'s section table), never the live device
+    /// rate. A prior version built the conversion `TempoMap` from
+    /// `self.shared.sample_rate` — invisible with the test harness's default
+    /// 48kHz rate, so this test deliberately overrides it to something else
+    /// (96kHz) to unmask the bug class: at 96kHz, ticks convert to DOUBLE
+    /// the nominal sample count, which would skew a mixed audio+MIDI
+    /// selection's anchor by the rate ratio. The expected numbers below are
+    /// the nominal-domain ones (tick 960 @ 120bpm/960ppq/48kHz = 24_000
+    /// samples, matching `tempo::tests::v1_equivalent_single_entry_map`) —
+    /// they must hold regardless of the device rate override.
+    #[test]
+    fn copy_anchor_math_is_independent_of_the_live_device_rate() {
+        let cp = plane();
+        // Override the live device rate AFTER construction — same private
+        // field `self.shared` access `control::clipboard` already relies on
+        // for production code (this test module is a descendant of
+        // `control`, same as the impl above).
+        cp.shared.sample_rate.store(96_000, std::sync::atomic::Ordering::Relaxed);
+
+        cp.commit(TxMeta::user("seed"), |tx| {
+            let mut a = crate::audio::types::testutil::test_clip("a-1", "t-1");
+            a.timeline_start_samples = 96_000;
+            let mut m = crate::control::tests::dummy_midi_clip("t-2");
+            m.timeline_start_ticks = 960; // nominal: 24_000 samples @120bpm/960ppq/48kHz
+            tx.apply(Op::ClipAdd { clip: a, index: 0 })?;
+            tx.apply(Op::MidiClipAdd { clip: m, index: 0 })
+        })
+        .unwrap();
+        let mid = cp.session().lock().midi.clips[0].id.to_string();
+
+        let p = cp.clips_copy(vec!["a-1".into()], vec![mid]).unwrap();
+        assert_eq!(p.anchor_samples, 24_000, "nominal-rate conversion of tick 960, not the 96kHz device rate's 48_000");
+        assert_eq!(p.anchor_ticks, 960);
+        let audio_off = p.clips.iter().find_map(|c| match c {
+            ClipboardClip::Audio { offset_from_anchor_samples, .. } => Some(*offset_from_anchor_samples),
+            _ => None,
+        });
+        assert_eq!(audio_off, Some(72_000), "96_000 - the nominal 24_000 anchor, never negative/skewed");
+        let midi_off = p.clips.iter().find_map(|c| match c {
+            ClipboardClip::Midi { offset_from_anchor_ticks, .. } => Some(*offset_from_anchor_ticks),
+            _ => None,
+        });
+        assert_eq!(midi_off, Some(0));
     }
 
     #[test]

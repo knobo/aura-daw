@@ -9,6 +9,21 @@
 use super::types::{MeterEvent, TempoEvent, TempoPeriodEvent, DEFAULT_PPQ};
 use crate::time::{Samples, Ticks, SUPERTICKS_PER_SECOND};
 
+/// The WIRE domain's sample rate — the one every tick<->sample number in
+/// `ProjectSnapshot`'s section table (`build_tempo_map_state`, hardcoded
+/// `TempoMap::new(ppq, events, 48_000)`) and the `application/x-aura-clips`
+/// clipboard payload (`control::clipboard`) is expressed in. This is
+/// deliberately NOT the live device rate (`SharedRt::sample_rate`, which
+/// varies with the audio interface — 44100/96000 in the wild): document
+/// state (and anything derived from it that crosses a copy/paste or
+/// section-table boundary) must be independent of which output device
+/// happens to be open, so every such conversion is nominal-rate, always.
+/// The engine's OWN live map (`midi::playback`, `midi::append_from`) is the
+/// one deliberate exception — it converts ticks to REAL sample positions
+/// for scheduling against the actual RT callback, at the actual device
+/// rate — and must never be confused with this one.
+pub const NOMINAL_SAMPLE_RATE: u32 = 48_000;
+
 /// Piecewise tick<->sample mapping over integer-period tempo events
 /// (round-2 §3.3). Immutable once built; rebuild on any tempo-map edit
 /// (tempo edits are structural, i.e. rebuild-and-swap tier, not param
