@@ -1,168 +1,291 @@
-# Next: author and execute Plan E (the side-channel totality)
+# Next: Plan F (history storage) — and four parallel-safe post-Plan-E tracks
 
-Read this file, then do the work described below. Reply to the user in
+Read this file, then pick a track and do the work. Reply to the user in
 Norwegian — they write Norwegian; the repo documentation is English.
 
-## Where you are
+This file is written for a **fresh session after `/clear`**: it assumes no
+memory of the Plan E conversation. Everything it asserts is checked against
+git/README at write time (2026-08-14) — trust files over this file if they
+disagree, and update this file (marked correction, ADR 0007) if they do.
 
-Working directory: `/home/knobo/prog/dav/.claude/worktrees/zrythm-arch`
-(a git worktree — run everything from here, do **not** `cd` to the main
-checkout, and never use bare `git stash`). Branch `plan-cd-time-v3`, open
-as PR #7 on `knobo/aura-daw` (merge it into `main` before starting Plan E,
-or branch Plan E's own work from wherever the merge lands — the previous
-session's own judgment call, not a rule this file dictates).
+## 1. State of the world
 
 The project is **AURA**, an AI-native DAW: Tauri v2 + Svelte 5 around a
 lock-free real-time Rust engine (`src-tauri/`), local AI sidecars, and an
 embedded MCP server so agents mutate the session alongside the user.
 
-## What has happened (all of it is in git — trust files over memory)
+**Plan E (the side-channel totality) is IMPLEMENTED and Gate E is CLOSED.**
+Commit range `ac65b76..531d790` on branch `plan-e-side-channels`, open as
+**PR #12** on `knobo/aura-daw` — **still OPEN, pending final whole-branch
+review, then merge.** Verify its merge status before picking a track that
+touches files it changed (`gh pr view 12`). Once merged, `main` carries
+Plan A + B + C+D + Plan E's full channel rewrite. Full handoff (every scope
+ruling, every mid-flight ruling, every carry-forward, the deferred-minors
+roll-up): `docs/PHASE4-PLAN.md`'s **"Plan E handoff"** section, appended
+after the "Plan C/D handoff" section, same conventions. The landed
+side-channel inventory (34 rows, all closed, plus residual carve-outs
+R-1..R-3 and recorded replay limitations L-1..L-3): `docs/SIDE-CHANNEL-INVENTORY.md`.
 
-1. **Research round** (14 agents): `docs/research/` — eleven dossiers,
-   start at `00-INDEX.md`. Dossiers 06/10 carry marked `[CORRECTED]`
-   blocks from the later review. History, not law.
-2. **Adversarial review**: `docs/CORE-REDESIGN-ROUND-2.md` is **ACCEPTED**
-   and binding; it supersedes round 1 and lists all fourteen overturned
-   positions in its §0.1. ADRs 0001-0007 in `docs/adr/` are all Accepted.
-3. **Measurements**: `benches/ui-probe/RESULTS.md` (three WebKitGTK
-   render-gate measurements — all PASS) and `benches/bulkbench/RESULTS.md`
-   (storage gesture mix — replay-only threshold 64 KB). Evidence policy
-   (ADR 0007): measured claims cite `benches/`.
-4. **Plan A is IMPLEMENTED** (`ded3670..405af0b`, 12 commits): `Session`
-   over Store+MidiStore behind one lock; `Session::transact` as the only
-   mutation door for the A-slice (mix/add/remove track); `control::op`
-   vocabulary v1 with actor/run meta; inverses derived from store truth;
-   effects executed strictly after the lock. See `docs/PHASE4-PLAN.md`'s
-   "Plan A handoff" section for its binding carry-forwards (snapshot-
-   rebuild deferral chief among them).
-5. **Plan B is IMPLEMENTED** (`a31104f..a70bf67`): identity groundwork
-   — typed id families end to end through the op wire form; persisted note
-   identity (AMEV columnMask-honest); source-keyed assets + decode cache;
-   `Store`-owned slots deleted, replaced by per-graph `derive_slots` +
-   `GraphTables` (round-2 O-13's aliasing window closed by construction);
-   meter blocks carry the graph generation; `MAX_TRACKS` removed. Gate B
-   green (`src-tauri/tests/identity_properties.rs`). See
-   `docs/PHASE4-PLAN.md`'s "Plan B handoff" section for its binding
-   carry-forwards.
-6. **Plan C+D is IMPLEMENTED** (`57acfa9..9aee08a`, 10 tasks, one v2→v3
-   format bump): `Ticks`/`Samples` newtypes; integer-period supertick
-   tempo (quantized once at entry, exact thereafter); a persisted meter
-   map (fixes the active 4/4-clobber data-loss bug); a section table with
-   a property-tested <64-sample ramp-subdivision bound (**Gate C/D test
-   6, green**); the v2→v3 migration with a fixture corpus (**Gate C/D
-   test 7, green for tempo/meter/MIDI content-placement**); the
-   content/placement identity split — full for MIDI, addressing-only for
-   audio (scope ruling); the frontend's shipped-section-table consumption
-   (`src/lib/sectionTable.ts` is the one bijection implementation left
-   client-side, TS `TempoMap` duplicate deleted). Suites: **372 backend +
-   85 frontend**, all green. See `docs/PHASE4-PLAN.md`'s "Plan C/D
-   handoff" section for its binding carry-forwards — **read it in full
-   before starting Plan E**; it names three scope rulings (audio
-   addressing-only, no runtime Content/Placement struct split,
-   `steady_time` out) that Plan E inherits, plus a stale-docs item
-   (`docs/ipc-schemas/midi-clip.schema.json`/`project-v2.schema.json` not
-   yet updated for v3) worth fixing while Plan E is already touching
-   this area.
+**Also open: PR #17**, `midi-input-ports` — hardware MIDI input slice 1
+(port list/select + activity indicator + live monitoring, `midir`,
+owner-verified end-to-end with an LPK25). This is **independent of PR #12**
+(cut from `origin/main`, no document coupling — live monitoring is
+engine-state-only, the same non-writer category as `sampler_preview_note`)
+and is **mergeable now**, on its own timeline. Verify with `gh pr view 17`.
 
-## Your task
+Main also carries **PR #9** (timeline/piano-roll horizontal scrollbars),
+**PR #10** (interface-zoom preference), **PR #11** (piano-roll note
+selection + copy/paste ops) — all merged before Plan E's branch did its
+own mid-flight merge of `origin/main` (commit `f886306`), so they are
+already folded into PR #12's diff. Nothing further to do about them.
 
-**Author Plan E — the side-channel totality — then execute it.** This is
-round-2's own stated turning point: "E is last on purpose: it is the
-totality migration, and its exit gate is the one that turns the op log
-on" (PHASE4-PLAN's sub-plan table). Do not start implementation before
-the plan document exists.
+**Baseline to verify at the start of any track**: **501 backend + 174
+frontend tests, all green** (dated 2026-08-14 in README/CONTRIBUTING),
+either on `plan-e-side-channels` before merge or on `main` after. Run both
+suites before writing the first line of a track:
 
-### Step 1 — read, in this order
+```
+timeout 900 cargo test --manifest-path src-tauri/Cargo.toml
+timeout 300 npx vitest run
+```
 
-1. `docs/PHASE4-PLAN.md` — sub-plan E row, Gate E, the binding rules, and
-   **all three** of the "Plan A handoff", "Plan B handoff", and "Plan C/D
-   handoff" sections. Plan E's own row lists its scope: "all 14+ paths
-   through the channel, engine-thread inversion, gesture begin/end IPC,
-   `clip.move` op + command, id-preserving piano roll, mutating readers
-   become pure, remaining three stores into Session."
-2. `docs/CORE-REDESIGN-ROUND-2.md` §4.5 (the side-channel migration — was
-   §6 in round 1; O-1 folded it into THIS round, O-8's corrected ~14+-path
-   inventory) and §4.2-§4.4 (the engine thread submits/never holds; two
-   API tiers and anti-nesting; gestures/effects/inverses). §7 (testing)
-   for test 4 (the Figma invariant — reads mutate nothing) and Gate E's
-   exact exit condition.
-3. The landed code — grep for the actual side channels rather than
-   trusting the count above (dossier 10 §2.3 + the review's additions is
-   the inventory Gate E checks against; the previous sessions did NOT
-   re-verify it against current HEAD, so re-derive it): known items
-   already named across the three handoff sections —
-   `with_synced_store`/`apply_hum_clip` holding the document lock across
-   midi disk I/O (Plan A handoff), two *read* commands that mutate (lazy
-   disk resync, O-8), clip-move never reaching the backend (O-8, still
-   true — `midi.svelte.ts`'s `moveClip` is explicitly "frontend-only
-   placement move (no midi clip-move command in the surface)" per its own
-   doc comment, unchanged by Plan C+D), `midi_set_notes` still replacing
-   arrays wholesale so ids churn on every gesture even though the
-   allocator/keep-rule is correct (Plan B handoff — the frontend
-   `MidiNote` TS type still carries no `noteId` field, check whether that
-   changed), `fold_ops` coalescing Sets across intervening structural ops
-   (harmless dark, wrong for replay — must be constrained before
-   `Committed.ops` is ever persisted, i.e. before this gate turns the log
-   on).
-4. Only if re-litigating a decision: dossier 10 (side channels' original
-   home) via `docs/research/00-INDEX.md`.
+If the counts don't match, something changed underneath you — stop and
+find out what before proceeding, don't just update the number.
 
-### Step 2 — write the plan
+### Branch and worktree rules (verbatim, binding for every track)
 
-Load `superpowers:writing-plans`; save as
-`docs/superpowers/plans/<today>-plan-e-side-channel-totality.md` with the
-standard header (Spec: round-2 §4.5 + §4.2-§4.4, ADR 0003 (op log stays
-dark until this gate) + ADR 0006 (thin renderer); orchestration
-PHASE4-PLAN). Plan C+D's own document
-(`docs/superpowers/plans/2026-08-14-plan-c-d-time-project-v3.md`) is a
-reasonable template for shape (global constraints, scope rulings decided
-up front and documented rather than discovered mid-task, per-task
-Files/Interfaces/Steps/commit, a self-review section, an execution note).
+- **New branches start from `origin/main`.** Never branch from a stale
+  local main or from another track's branch.
+- **Continuing branches merge `origin/main` in** whenever it has advanced,
+  at a task boundary — don't let a long-running branch drift.
+- **Never use bare `git stash`.** If you need to shelve work, commit it or
+  use a named stash; bare `stash` has bitten prior sessions when a worktree
+  switch lost track of it.
+- **Use a dedicated git worktree per track** (this file's own worktree is
+  `/home/knobo/prog/dav/.claude/worktrees/zrythm-arch` — that pattern:
+  `git worktree add <path> -b <branch> origin/main`, one path per track, so
+  the tracks below can genuinely run in parallel without stepping on each
+  other's working tree).
+- **Foreground test runs only, `timeout`-guarded.** No backgrounding a test
+  run and moving on — every gate in this project has been foreground since
+  Plan A.
 
-Gate E, verbatim from `docs/PHASE4-PLAN.md`: *the side-channel inventory
-inside the channel is total (checked against dossier 10 §2.3 + review
-additions, all 14+ paths); test 4 (Figma invariant — reads mutate
-nothing) passes; only then does the op log/journal turn on. This gate is
-the round's whole point; it does not get negotiated down.*
+## 2. Standing constraints now in force (all tracks)
 
-### Step 3 — execute
+These are new or newly load-bearing as of Gate E closing — read them even
+if you worked on this repo before Plan E:
 
-Ask the user (or check for a standing instruction like the one Plan C+D's
-session received) whether tonight's execution is solo or
-subagent-driven — Plan E's default per `docs/PHASE4-PLAN.md` line 120 is
-`superpowers:subagent-driven-development` (fresh implementer per task,
-task review after each, final whole-branch review on the most capable
-model), but the last two sessions both ran solo under a binding
-per-session constraint from the owner. Don't assume either way.
-
-**Foreground test runs only, with `timeout` guards.** Commit per task;
-push to a new PR when the first task lands green, then at every
-subsequent task boundary (same flow as Plan C+D). Update dated test
-counts when totals change. Current baseline: **372 backend + 85
-frontend**, both green — verify this before Task 1, the same way every
-prior session did.
-
-## Ground rules (binding, from PHASE4-PLAN + ADRs)
-
-- **The op log stays dark until Gate E.** No journal writes, no undo UI —
-  until THIS gate closes, at which point it turns on. Read ADR 0003
-  before touching anything that looks like journal-adjacent code.
-- **Thin renderer** (ADR 0006, owner-accepted): no authoritative state,
-  business logic, or time math lands frontend-side. Plan E's own scope
-  includes "mutating readers become pure" and moving `clip.move` behind a
-  real op + command — both are thin-renderer compliance work, not
-  exceptions to it.
+- **The op log is ON.** `journal.ndjson` is a **persisted format** from
+  now on: `OP_FORMAT_VERSION` (currently 1) is load-bearing the moment any
+  project has a journal file. Additive `#[serde(default)]` fields on an op
+  or on `TxMeta` stay non-breaking; anything else (renaming a field,
+  changing a variant's shape, removing a path) needs a version bump AND a
+  reader that understands both shapes. This did not matter before Task 17;
+  it matters on every op-touching change from here on.
+- **Thin renderer** (ADR 0006) still holds: no new authoritative state,
+  business logic, or time math lands frontend-side. Every frontend change
+  is op emission, gesture emission, or UI/chrome.
 - **Frozen command/event names stay frozen**; bodies become wrappers; new
-  commands are additive.
-- **Prepare-outside/commit-inside** for I/O; no blocking engine
-  round-trips inside a transaction; `transact` closures must not panic
-  (no panic rollback until Plan F).
-- Corrections to docs are marked, never silent (ADR 0007).
-- The user's standing instruction: *"ikke ver skjenert"* — use as many
-  agents as the work needs, and say plainly when something is wrong.
+  commands are additive (the same rule that shaped every Plan E task).
+- **`transact` closures must not panic** — no panic rollback until Plan F.
+  Validate before mutating, every time, exactly as every landed op arm
+  does.
+- **The M-3 redo invariant**: a transient write must never touch a
+  document field an entry's `ops` can address, or a pending redo silently
+  lands on a different state than the entry recorded. If you add a new
+  transient transaction (transport-like, engine-thread, or gesture
+  mid-flight), this is the check to run before shipping it — nothing in
+  the code enforces it, it's a discipline.
+- **Undo is bounded**: 200 entries, in-memory, bottom-eviction, cleared at
+  epochs (project open/create/save-as). The journal itself is unbounded
+  and append-only but currently has no reader (see Track A).
+- **Foreground timeout-guarded test runs** and the **dated-count
+  convention**: any task that changes test counts updates README.md +
+  CONTRIBUTING.md in the same commit, with the date.
+- **Gesture lock order is gesture-before-session, everywhere** (Task 14's
+  fix) — if a track adds a new gesture-shaped commit path, follow this
+  order or reintroduce the TOCTOU that fix closed.
+
+## 3. The five parallel-safe tracks
+
+All five are independently startable in separate worktrees right now
+(subject to each track's own prerequisites, noted below). Cross-track
+conflicts are called out explicitly — read the conflict notes for any pair
+you plan to run truly concurrently.
+
+### Track A — Plan F: history storage (round-2 §6, ADR 0005)
+
+**The backend-core track.** Round-2 §6: copy-on-write B-tree session
+store, version-graph retention, replay-only nodes at a 64 KB threshold
+(per `benches/bulkbench/RESULTS.md`), placement-offset routing, a janitor
+thread for off-RT eviction. This is what finally lifts the snapshot-rebuild
+deferral that's been a carry-forward since the Plan A handoff
+(`engine::rebuild` still holds the session lock across the whole graph
+build) and gives the journal (write-only since Task 17) an actual reader.
+
+**Convention**: author the plan doc FIRST, just-in-time, per
+`docs/PHASE4-PLAN.md`'s stated convention ("Detailed, bite-sized task plans
+live in `docs/superpowers/plans/` and are written just-in-time — each
+sub-plan is authored when its predecessor lands, against the tree as it
+then exists, not speculatively"). Do not start implementation before the
+plan document exists. Use `superpowers:writing-plans`; Plan E's own
+document
+(`docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md`) is
+the template for shape (global constraints, scope rulings decided and
+recorded up front, per-task Files/Interfaces/Steps/commit, self-review,
+execution note).
+
+**Footprint**: `src-tauri/src/control/history.rs`'s successor (today's
+`History` — bounded `Vec` undo/redo, the 350ms same-key merge — becomes
+the exposure layer over the new store), a new COW session store module,
+`src-tauri/src/audio/engine.rs`'s `rebuild` (reads an immutable snapshot
+instead of holding the session lock — this is the payoff).
+
+**Consumes**: the journal format (v1, `OP_FORMAT_VERSION` load-bearing —
+see §2 above), the undo bound (200 entries — Plan F may change the
+retention policy but must not silently change user-visible undo depth
+without a ruling), and the three recorded replay limitations R-3/L-1/L-2
+from `docs/SIDE-CHANNEL-INVENTORY.md` (R-3: `seed_demo`'s Zyn bootstrap
+rows outside an op — fold into Plan F's seed transaction; L-1:
+`PluginRemove.params` unused on cold replay — needs an op-format decision;
+L-2: `MidiSetNotes` mint sentinels re-mint on replay — same class).
+
+**Prerequisites**: none blocking (Plan A landed the transaction channel
+this builds under). PR #12 does not need to be merged first, but the plan
+doc should be authored against whichever tree (branch or post-merge main)
+you're actually implementing on, since Session's shape changed materially
+across Plan E's tasks (plugins/automation moved in).
+
+**Conflicts**: with Track B and Track D in `engine.rs` — see their
+sections. Track A's `engine.rs` touch is the `rebuild` function
+specifically; sequence with B/D if running genuinely concurrently
+(smallest safe unit: land A's `rebuild` change first, since B and D both
+build on top of "how does the engine read the document" more than they
+change it).
+
+### Track B — MIDI slice 2+: routing, recording, clock/sync out
+
+Backlog doc: `docs/backlog/hardware-midi-io.md` (also read for slice 1's
+already-landed shape and the design notes that led to this slice's cut).
+Scope: MIDI-in routing to a track's instrument (live monitoring beyond
+slice 1's preview-only tone), MIDI-in recording registered as ONE
+`Actor::Engine` take transaction (`MidiClipAdd` with the captured notes —
+"the op is the registration, never the recording itself," same pattern as
+audio-recording finalize from Plan E Task 13), and MIDI clock + Start/Stop
+output on transport changes (Hydrogen sync) driven by the engine-global
+steady clock (Plan E Task 16) + the section table.
+
+**REQUIRES both PR #12 AND PR #17 merged first** — this slice extends
+slice 1's branch and needs the full post-Gate-E channel (take registration
+as an op needs `Actor::Engine` transactions, which is Plan E's Task 13
+machinery).
+
+**Footprint**: `src-tauri/src/audio/engine.rs` (routing + recording +
+clock-out on the engine's own turn), `src-tauri/src/midi_input.rs` (slice
+1's module — port handling grows here), control-layer seams
+(`ControlPlane` methods for attribution, mirroring the device-selection
+carve-out pattern).
+
+**Conflicts**: with Track A (`engine.rs`'s `rebuild`/session-read path)
+and with Track D (`engine.rs`'s RT-attach work) — all three touch
+`engine.rs`. Sequence the engine-touching halves: land whichever of A's
+`rebuild` change or D's RT-attach lands first, then rebase the other two.
+Do not run B, D, and A's `rebuild` work concurrently in the same file
+without a merge plan.
+
+### Track C — Multi-clip selection, group-drag, cross-track paste + cross-instance clipboard
+
+Backlog doc: `docs/backlog/multi-clip-selection-and-paste.md`. Scope:
+timeline multi-select (`Set<ClipId>` viewer state, mirrors PR #11's
+note-level selection model), group drag as one `gesture_begin`/
+`gesture_end`-wrapped multi-op transaction (audio and MIDI clips mix
+freely in one tx — the channel is cross-store atomic), copy/paste at the
+playhead with per-clip offsets preserved, paste-to-new-tracks, and a
+cross-instance/OS-clipboard extension (an `application/x-aura-clips` JSON
+payload + SMF fallback on the OS clipboard).
+
+**Mostly frontend + a thin command layer** — the backend primitives this
+needs (gesture IPC, `move_clip`, MIDI bounds ops, `ClipAdd`/`MidiClipAdd`,
+undo) all landed in Plan E. **Conflict-light**: touches timeline
+components + a view-state store + the clipboard glue; no `engine.rs`, no
+overlap with A/B/D's backend footprint. The one shared surface is the
+gesture IPC commands themselves (already frozen/additive, so no real
+contention).
+
+### Track D — Automation audible + lane UI
+
+Backlog doc: `docs/backlog/automation-audible-and-ui.md`. Scope: RT attach
+(the data layer landed in Plan E Task 10 — `AutomationLane` persists,
+`Op::AutomationSetLane` is atomic/attributed/undoable — but
+`engine::rebuild` never reads `session.automation`; compiled ramps and
+`GainAutomatedNode` exist but aren't wired into the production graph),
+then a timeline lane UI (draw/drag points, gesture-wrapped edits through
+`automation_set`), then plugin-parameter targets.
+
+**Start AFTER PR #12 (Plan E) lands** — the RT-attach half edits
+`engine.rs`, which Plan E's Task 13 rewrote (`Committer`, `steady_time`).
+
+**Footprint**: `src-tauri/src/audio/engine.rs` (attach at rebuild time —
+the day this lands, `Op::AutomationSetLane`'s apply arm must flip
+`effect.rebuild = true`; the arm's own comment already says this, marked
+"REBUILD PIN" in `control/session.rs`), `src-tauri/src/plugins/automation.rs`
+(the attach path), timeline components + a small store (UI).
+
+**Conflicts**: with Track B (MIDI slice 2) and Track A in `engine.rs` — if
+run in parallel, sequence the engine-touching halves (see Track B's note;
+the same rule applies here).
+
+### Track E — Library & browser panel
+
+Backlog doc: `docs/backlog/library-and-browser.md`. Scope: a side panel
+with three roots — samples (user-configured folders + a default library
+dir, audition preview reusing the sampler-preview voice path), project
+clips (drag back onto tracks), presets/instruments (Zyn patches via
+`zyn_list_patches`, sampler instruments via `sampler_list_instruments`).
+Drag-out lands on the existing, already-channel-routed import/clip-add
+commands, so it's undoable for free.
+
+**Footprint**: a new frontend panel component + a small store, new
+scanning backend commands (`library_scan(dir)` or similar — additive), the
+existing audition/preview path (no document coupling, Gate-safe category
+already established by MIDI slice 1's monitoring). **Conflict-light**: no
+`engine.rs`, no overlap with A/B/D.
+
+## 4. Pointers (the master index and everything behind it)
+
+- **`docs/backlog/00-ROADMAP-real-alternative.md`** — the master tiered
+  index the owner asked for ("hva mangler for å være et reelt alternativ
+  og faktisk brukandes til å lage gode ting?"). Lists what's already
+  differentiating (landed), Tier 1 (weeks — includes Tracks B/C/D/E plus
+  smaller **inline** items: metronome/click+count-in, piano-roll quantize,
+  and the biggest single Tier-1 architecture item — **insert FX chains +
+  sends/busses, candidate "Plan G"**, which needs its own research → plan
+  → gates round because it touches the RT graph invariants round-2 §8
+  reserves for the node-graph round, and is bound by the standing "PDC
+  before sends ship" rule), and Tier 2 (months — time-stretch, pattern
+  instancing, takes/comping, stems export, freeze/bounce, external
+  instrument tracks, two-instance coexistence). **Start here** for
+  anything not already one of the five tracks above.
+- `docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md` —
+  Plan E's own plan doc (scope rulings, non-goals, all 18 tasks).
+- `docs/SIDE-CHANNEL-INVENTORY.md` — the landed inventory, carve-outs, and
+  recorded replay limitations (L-1/L-2/L-3) that Track A consumes.
+- `docs/PHASE4-PLAN.md` — orchestration; "Plan E handoff" section has
+  every scope ruling, mid-flight ruling, and deferred-minor from the
+  ledger, verbatim.
+- `.superpowers/sdd/2026-08-14-plan-e-side-channel-totality/progress.md` —
+  the full SDD ledger (gitignored) if you need more detail than the
+  handoff section carries — every `Ruling:` and `minor (deferred):` line
+  is there with full context.
+- `docs/backlog/hardware-midi-io.md`, `docs/backlog/multi-clip-selection-and-paste.md`,
+  `docs/backlog/automation-audible-and-ui.md`, `docs/backlog/library-and-browser.md`
+  — Tracks B/C/D/E's own docs, read in full before starting that track.
+- `docs/CORE-REDESIGN-ROUND-2.md` (ACCEPTED) §6 for Plan F's spec; ADR
+  0005 for the history-storage decision it implements.
 
 ---
 
-*Working note, committed on the PR branch for session continuity. When
-Plan E lands: update this file for the next stage (Plan F — history
-storage) in the same commit that closes Plan E.*
+*Working note, committed on the PR branch for session continuity. When any
+track lands, update the relevant section of this file (or, once a track's
+own follow-on work is substantial, split it into its own next-prompt-style
+pointer) so the next fresh session isn't reading stale status.*

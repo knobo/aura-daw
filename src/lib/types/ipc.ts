@@ -126,6 +126,25 @@ export interface RecordingState {
 
 // ── project.schema.json ─────────────────────────────────────────────────────
 
+/** Who committed a transaction (control::op::Actor, externally-tagged serde
+ * enum with rename_all="camelCase"): a unit variant serializes as a bare
+ * string, the struct variant as `{ agent: { tool } }`. */
+export type Actor = "user" | "engine" | "system" | { agent: { tool: string } };
+
+/**
+ * `create_project`/`open_project`/`save_project_as`'s return value AND the
+ * `project://changed` app-event payload — both are `audio::types::Project`
+ * (src-tauri/src/audio/types.rs), which the backend has NOT bumped past
+ * schemaVersion 1 despite the MIDI side landing schemaVersion 3 in
+ * project.json (see project-v3.schema.json): `tracks`/`clips` stay flat and
+ * audio-only here — MIDI clips are a separate surface (`MidiClip`,
+ * `ProjectSnapshot.midiClips`), never folded into this type. `rev`/`label`/
+ * `actor` are additive fields control::mod's `execute()` inserts into the
+ * `project://changed` payload only (control/mod.rs:611-622) — every OTHER
+ * emit site (audio::mod, control::import, control::loopjam) sends the bare
+ * v1 struct without them, so treat all three as optional even on that
+ * event.
+ */
 export interface Project {
   schemaVersion: 1;
   name: string;
@@ -138,6 +157,13 @@ export interface Project {
   tracks: TrackState[];
   clips: Clip[];
   transport?: TransportState;
+  /** `project://changed` only (control::mod's execute() path): the
+   * committed transaction's revision counter (control/session.rs). */
+  rev?: number;
+  /** `project://changed` only: the committed transaction's human label. */
+  label?: string;
+  /** `project://changed` only: who committed the transaction. */
+  actor?: Actor;
 }
 
 // ── waveform-tile.schema.json ───────────────────────────────────────────────
@@ -617,6 +643,19 @@ export interface ZynPatch {
   program: number;
   /** Absolute path of the .xiz file. */
   path: string;
+}
+
+/**
+ * Reply of the additive `undo` / `redo` commands (Plan E Task 17). `label`
+ * is the ORIGINAL label of the step that moved — what a UI shows in
+ * "Undo <label>" — or `null` when the stack was empty (not an error). The
+ * depths come back in the same round trip so menu items can be
+ * enabled/disabled without a second call.
+ */
+export interface HistoryStep {
+  label: string | null;
+  undoDepth: number;
+  redoDepth: number;
 }
 
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────

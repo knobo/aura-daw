@@ -13,7 +13,7 @@
 //!   and recorded samples out to the disk-writer thread.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,8 +34,7 @@ use super::rt::{
 use super::transport;
 use super::types::{derive_slots, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
-use super::project;
-use crate::control::Session;
+use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
 
 /// Meter frame cadence (~60 Hz).
@@ -93,6 +92,15 @@ pub enum ControlMsg {
     SelectInput { device_id: Option<String>, reply: Reply<()> },
     StartRecording { track_ids: Option<Vec<String>>, reply: Reply<Vec<String>> },
     StopRecording { reply: Reply<Vec<Clip>> },
+    /// Installs the narrow "document birth" closure `ensure_project` calls
+    /// (Plan E Task 13, round-2 §4.5 carve-out) — bound over the
+    /// `ControlPlane` `Arc`, so it can only be built AFTER `ControlPlane`
+    /// exists, which is AFTER the engine control thread is already
+    /// running (`audio::init` -> `engine::start` -> later, `lib.rs`
+    /// constructs `ControlPlane` and sends this). Fire-and-forget, sent
+    /// exactly once at startup; the engine thread never touches project
+    /// fields itself, only calls this closure.
+    SetEnsureProject(Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>),
     Shutdown,
 }
 
@@ -104,6 +112,17 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub fn send(&self, msg: ControlMsg) {
         let _ = self.tx.send(msg);
+    }
+
+    /// Installs the engine's `ensure_project` closure — `lib.rs` calls this
+    /// once, right after constructing the shared `ControlPlane` (Plan E
+    /// Task 13; see `ControlMsg::SetEnsureProject`'s doc for why this can't
+    /// happen any earlier).
+    pub fn install_ensure_project(
+        &self,
+        f: Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>,
+    ) {
+        self.send(ControlMsg::SetEnsureProject(f));
     }
 
     /// Send a request-style message and await the control thread's reply.
@@ -139,6 +158,7 @@ pub fn start(
     tables: SharedGraphTables,
     session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
+    committer: Committer,
 ) -> EngineHandle {
     let (tx, rx) = unbounded();
     std::thread::Builder::new()
@@ -166,6 +186,8 @@ pub fn start(
                 sinks: Vec::new(),
                 last_frame: Instant::now(),
                 last_tick: Instant::now(),
+                committer,
+                ensure_project_fn: None,
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -261,13 +283,23 @@ impl OutputCb {
         let lp = self.shared.loop_spec();
         let discontinuity = playing && (!self.was_playing || base != self.next_pos);
 
+        // Block prologue (round-2 §3.5): advance the engine-global steady
+        // sample counter ONCE per block, unconditionally — CLAP hosts need
+        // a clock that never resets, not even across a live node's
+        // re-creation (instrument rebind, sample-rate change, a track
+        // leaving and re-entering the live set). `steady_base` is the value
+        // THIS block's nodes see; Relaxed suffices (a free-running counter,
+        // no other state is synchronized against it).
+        let frames = (out.len() / self.channels.max(1)) as u64;
+        let steady_base = self.shared.steady.fetch_add(frames, Relaxed);
+
         match (&mut self.graph, playing) {
             (Some(g), true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                let dropped = mixer::render(
+                let dropped = mixer::render_rt(
                     g,
                     base,
                     &lp,
@@ -275,6 +307,7 @@ impl OutputCb {
                     self.channels,
                     self.rate,
                     discontinuity,
+                    steady_base,
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -285,7 +318,6 @@ impl OutputCb {
         }
 
         if playing {
-            let frames = (out.len() / self.channels.max(1)) as u64;
             // Report boundary crossings, never act on them (§2.1): the ring
             // push is wait-free, and a full ring is dropped rather than
             // waited on. `crossing` is edge-triggered by construction — once
@@ -521,6 +553,19 @@ struct Control {
     sinks: Vec<(Box<dyn MeterSink>, u64)>,
     last_frame: Instant,
     last_tick: Instant,
+    /// The engine's own commit core (Plan E Task 13) — same
+    /// `session`/`shared`/`tables` `Arc`s as everything else in `Control`,
+    /// its own `emit` closure instance. Every engine-side document write
+    /// goes through this now; see `Committer`'s doc for the deadlock audit
+    /// covering the engine control thread committing from inside its own
+    /// message loop.
+    committer: Committer,
+    /// "Document birth" closure, installed post-construction by `lib.rs`
+    /// once `ControlPlane` exists (`ControlMsg::SetEnsureProject`'s doc) —
+    /// `None` until then. Bound over the `ControlPlane` `Arc`; calling it
+    /// is the ONLY way `ensure_project` touches project fields — this
+    /// thread never swaps `store.project_dir` itself.
+    ensure_project_fn: Option<Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>>,
 }
 
 impl Control {
@@ -582,6 +627,9 @@ impl Control {
             }
             ControlMsg::StopRecording { reply } => {
                 let _ = reply.send(self.stop_recording());
+            }
+            ControlMsg::SetEnsureProject(f) => {
+                self.ensure_project_fn = Some(f);
             }
             ControlMsg::Shutdown => return false,
         }
@@ -655,9 +703,16 @@ impl Control {
             evt_rx,
         });
         self.shared.sample_rate.store(rate, Relaxed);
-        {
-            let mut session = self.session.lock();
-            session.store.transport.sample_rate = rate;
+        // Site 1 (Plan E Task 13): a transient `Actor::Engine` tx — the
+        // document mirror of the RT atomic just above. `Op::Set{Transport,
+        // SampleRate}` never sets `effect.rebuild` (Task 12's transport
+        // family deliberately sets no engine-effect flags — session.rs's
+        // `ObjectRef::Transport` arm doc), so this commit's `do_rebuild`
+        // closure is a no-op; the unconditional `self.rebuild()` below
+        // (unchanged from before this task) is what actually rebuilds,
+        // exactly as it always has.
+        if let Err(e) = self.commit_output_sample_rate(rate) {
+            log::warn!("open_output: sample-rate commit failed: {e}");
         }
         if self.cache_rate != rate {
             self.cache.clear();
@@ -670,6 +725,31 @@ impl Control {
         );
         self.rebuild();
         Ok(())
+    }
+
+    /// The commit `open_output` submits when the engine (re)opens its
+    /// output stream at a new sample rate — split out so it's independently
+    /// testable. Transient, `emit_project_changed: false` (matches every
+    /// other transport-family commit: `ControlPlane::transport`'s four
+    /// actions all pass `false` too — `project://changed`'s payload
+    /// contract is the full `Project` shape, and firing it once per
+    /// device-open would be a behavior change from today's silent
+    /// writeback).
+    fn commit_output_sample_rate(&mut self, rate: u32) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("sample rate").transient(),
+            |tx| {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Transport,
+                    path: op::PropPath::SampleRate,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(rate),
+                })
+            },
+            false,
+            || {},
+        )
     }
 
     // -- graph lifecycle (prepare on control thread, swap by pointer) -------
@@ -686,7 +766,7 @@ impl Control {
         self.generation += 1;
         let headless = self.output.is_none();
         let graph = {
-            let session = self.session.lock();
+            let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
             // Task 7: sized to THIS rebuild's track count, not a fixed cap.
@@ -768,6 +848,7 @@ impl Control {
                 crate::midi::playback::append_from(
                     &session.midi,
                     store,
+                    &session.plugins,
                     &slots,
                     self.cache_rate,
                     bank.as_deref(),
@@ -817,7 +898,7 @@ impl Control {
         // visual cache stays clip-id-keyed — dedup opportunity ledgered,
         // not taken here).
         let (project_dir, todo, live_sources, clips_by_source) = {
-            let session = self.session.lock();
+            let session = self.session.lock(); // read-only: stale-source scan (import cache maintenance) — no writes
             let store = &session.store;
             let todo = stale_sources(&store.clips, &self.cache);
             let mut live_sources: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
@@ -932,7 +1013,7 @@ impl Control {
         // resolves generation -> slot -> track, so this is just display
         // order, no slots needed here).
         let order: Vec<crate::ids::TrackId> = {
-            let session = self.session.lock();
+            let session = self.session.lock(); // read-only: display order for the meter fold
             session.store.tracks.iter().map(|t| t.id.clone()).collect()
         };
         let position = self.shared.position.load(Relaxed);
@@ -1018,15 +1099,47 @@ impl Control {
         }
         self.shared.playing.store(false, Relaxed);
         self.shared.position.store(at, Relaxed);
-        let snap = {
-            let mut session = self.session.lock();
-            session.store.transport.state = "stopped".into();
-            session.store.transport.position_samples = at;
-            crate::control::ops::transport_snapshot(&session.store, &self.shared)
-        };
+        // `position_samples` stays a bare RT atomic, never an op — there is
+        // no `PropPath` for it (the six Transport paths are TransportState/
+        // LoopEnabled/LoopStartSamples/LoopEndSamples/StopAtEnd/SampleRate,
+        // session.rs's `write_transport_prop`); every read of the document's
+        // `position_samples` (`project_changed_payload`, `execute_persist`'s
+        // `project::from_store`) already overrides it from this SAME atomic,
+        // so a store-field mirror here would be dead weight.
+        if let Err(e) = self.commit_auto_stop() {
+            log::warn!("apply_end_policy: auto-stop commit failed: {e}");
+        }
+        // read-only: transport_snapshot only reads store.transport; the
+        // document write above already went through commit_auto_stop.
+        let snap = crate::control::ops::transport_snapshot(&self.session.lock().store, &self.shared);
         if let Ok(v) = serde_json::to_value(&snap) {
             self.events.emit("transport://state", v);
         }
+    }
+
+    /// The commit `apply_end_policy` submits when the transport auto-stops
+    /// at the end of the material — split out so it's independently
+    /// testable. Transient (a policy-driven stop is RT/document-visible
+    /// state, not a document edit a user would expect in undo history —
+    /// same reasoning as `ControlPlane::transport`'s Play/Stop/SetLoop/
+    /// SetStopAtEnd), `emit_project_changed: false` (this site's own
+    /// `transport://state` emit, right after this call, is what today's
+    /// callers actually observe — unchanged by this task).
+    fn commit_auto_stop(&mut self) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("auto-stop at end").transient(),
+            |tx| {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Transport,
+                    path: op::PropPath::TransportState,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!("stopped"),
+                })
+            },
+            false,
+            || {},
+        )
     }
 
     // -- recording ----------------------------------------------------------
@@ -1038,7 +1151,7 @@ impl Control {
 
         // Resolve target tracks (explicit list or armed flags).
         let targets: Vec<String> = {
-            let session = self.session.lock();
+            let session = self.session.lock(); // read-only: resolve/validate target track ids before recording starts
             let store = &session.store;
             match track_ids {
                 Some(ids) => {
@@ -1086,7 +1199,7 @@ impl Control {
         // tables, not the store — round-2 §2.4; lock order: session before
         // tables [C1].
         let (project_dir, take_no, slots, rec_generation) = {
-            let session = self.session.lock();
+            let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
             let store = &session.store;
             let dir = store.project_dir.clone().ok_or("no project open")?;
             let take_no = store.clips.len() + 1;
@@ -1183,9 +1296,8 @@ impl Control {
         self.rec_track_ids = targets.clone();
         self.shared.recording.store(true, Relaxed);
         self.shared.playing.store(true, Relaxed);
-        {
-            let mut session = self.session.lock();
-            session.store.transport.state = "recording".into();
+        if let Err(e) = self.commit_start_recording_state() {
+            log::warn!("start_recording: transport-state commit failed: {e}");
         }
         self.events.emit(
             "recording://state",
@@ -1205,6 +1317,29 @@ impl Control {
         Ok(targets)
     }
 
+    /// The commit `start_recording` submits for the "recording" transport
+    /// state — split out so it's independently testable. Transient (same
+    /// reasoning as `commit_auto_stop`/`commit_output_sample_rate`),
+    /// `emit_project_changed: false` — `recording://state`, emitted right
+    /// after this call in `start_recording`, is what today's callers
+    /// actually observe.
+    fn commit_start_recording_state(&mut self) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("start recording").transient(),
+            |tx| {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Transport,
+                    path: op::PropPath::TransportState,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!("recording"),
+                })
+            },
+            false,
+            || {},
+        )
+    }
+
     fn stop_recording(&mut self) -> Result<Vec<Clip>, String> {
         let writer = self.writer.take().ok_or("not recording")?;
         // Drop the input stream FIRST so the ring producers close and the
@@ -1218,12 +1353,48 @@ impl Control {
         self.shared.recording.store(false, Relaxed);
         self.shared.playing.store(false, Relaxed);
         let track_ids = std::mem::take(&mut self.rec_track_ids);
-        {
-            let mut session = self.session.lock();
-            session.store.transport.state = "stopped".into();
-            session.store.clips.extend(clips.iter().cloned());
+
+        // §4.4: "the op is the registration, never the recording itself" —
+        // the ops are built AFTER `writer.finish` above (the wav I/O has
+        // ALREADY completed by this point), never before. ONE non-transient
+        // Actor::Engine tx: ClipAdd x n (appended in `clips`' order, mirroring
+        // the pre-Task-13 `store.clips.extend`). `ClipAdd`'s `apply_raw` arm
+        // sets BOTH `effect.rebuild` and `effect.persist.project`
+        // (session.rs) — so `self.rebuild()` (via `do_rebuild` below) and
+        // the project.json write (via `execute_persist`, replacing the
+        // manual `project::save` this used to do) both come from the SAME
+        // commit's folded effect, not two separate steps racing each other.
+        //
+        // Review round 1 (Important-1): the `TransportState="stopped"` Set
+        // does NOT ride in this tx — it's a SEPARATE, transient commit right
+        // below. Bundling it into the ClipAdd tx would make it part of that
+        // tx's inverse: once Task 17 lands history, undoing "stop recording"
+        // would restore `state = "recording"` alongside removing the clips —
+        // a document state that CLAIMS a take is running when nothing is
+        // recording. `ClipAdd`'s inverse (removing the clips) must never
+        // carry transport-state baggage with it.
+        //
+        // Near-unreachable edge case (deferred-minor, review round 1):
+        // when `clips` is empty (only possible if `start_recording`'s own
+        // "no armed tracks to record" guard somehow let a take start with
+        // no targets — it can't today), this commit applies zero `ClipAdd`
+        // ops, so `effect.rebuild`/`effect.persist.project` are never set —
+        // no rebuild, no project.json write. The pre-Task-13 code rebuilt
+        // and saved unconditionally, even for zero clips; this is an
+        // intentional narrowing (a commit that materially changes nothing
+        // now does nothing), not an oversight.
+        if let Err(e) = self.commit_recording_finalize(&clips) {
+            log::warn!("stop_recording: finalize commit failed: {e}");
         }
-        self.rebuild();
+        // Own, transient commit — same reasoning as `commit_auto_stop`/
+        // `commit_start_recording_state`: transport state is RT/document-
+        // visible but not itself a document edit a user would expect
+        // separately in undo history, and keeping it OUT of the ClipAdd tx
+        // above is exactly what review round 1 asked for (see the comment
+        // above `commit_recording_finalize`'s call).
+        if let Err(e) = self.commit_recording_stopped_state() {
+            log::warn!("stop_recording: transport-state commit failed: {e}");
+        }
         self.events.emit(
             "recording://state",
             serde_json::json!({
@@ -1233,54 +1404,90 @@ impl Control {
                 "clips": clips,
             }),
         );
-        // Persist the take into project.json right away.
-        let snapshot = {
-            let session = self.session.lock();
-            project::from_store(
-                &session.store,
-                self.shared.position.load(Relaxed),
-                self.engine_rate(),
-            )
-            .ok()
-            .map(|p| (session.store.project_dir.clone().unwrap(), p))
-        };
-        if let Some((dir, p)) = snapshot {
-            if let Err(e) = project::save(&dir, &p) {
-                log::warn!("auto-save after recording failed: {e}");
-            }
-        }
         Ok(clips)
     }
 
+    /// The ONE non-transient `Actor::Engine` tx `stop_recording` submits to
+    /// register the take's clips — split out so it's independently testable
+    /// without a live input stream/disk writer (`clips` is exactly what
+    /// `writer.finish` returned; this fn does no I/O of its own).
+    /// `emit_project_changed: true` — unlike the transient sites,
+    /// registering new clips IS a document edit (mirrors the `set_track_
+    /// instrument` precedent: routing a previously-raw write through
+    /// `commit` legitimately starts firing `project://changed` where it
+    /// didn't before; `recording://state` remains the dedicated
+    /// "recording finished" signal for the trackIds/xruns/clips shape).
+    ///
+    /// Review round 1 (Important-1): ONLY `ClipAdd`s live here now —
+    /// `TransportState="stopped"` moved to its own transient commit
+    /// (`commit_recording_stopped_state`, called right after this one in
+    /// `stop_recording`). Bundling both into one tx would make the state
+    /// flip part of THIS tx's inverse: once Task 17 lands undo history,
+    /// undoing "stop recording" would restore `state = "recording"` in the
+    /// SAME step that removes the clips — claiming a take is running while
+    /// nothing records. Splitting them means undoing the ClipAdd tx only
+    /// ever un-registers clips; the state mirror is a separate, transient
+    /// fact that was never meant to be undo-tracked in the first place
+    /// (same reasoning as every other transport-family commit — Task 12).
+    fn commit_recording_finalize(&mut self, clips: &[Clip]) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("stop recording"),
+            |tx| {
+                for clip in clips {
+                    let idx = tx.store().clips.len();
+                    tx.apply(op::Op::ClipAdd { clip: clip.clone(), index: idx })?;
+                }
+                Ok(())
+            },
+            true,
+            || self.rebuild(),
+        )
+    }
+
+    /// The transient commit `stop_recording` submits, immediately after
+    /// `commit_recording_finalize`, for the "stopped" transport-state
+    /// mirror — split out of the finalize tx (review round 1, Important-1;
+    /// see that method's doc for why). Same shape as `commit_auto_stop`/
+    /// `commit_start_recording_state`: transient, `emit_project_changed:
+    /// false` (`recording://state`, emitted by `stop_recording` right after
+    /// both commits, is what today's callers actually observe), `do_rebuild:
+    /// || {}` (`Op::Set{Transport, ...}` never sets `effect.rebuild` —
+    /// Task 12's transport family).
+    fn commit_recording_stopped_state(&mut self) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("stop recording").transient(),
+            |tx| {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Transport,
+                    path: op::PropPath::TransportState,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!("stopped"),
+                })
+            },
+            false,
+            || {},
+        )
+    }
+
     /// Auto-create a default project when recording starts with none open.
+    /// Round-2 §4.5 carve-out (epoch boundary, "document birth"): the
+    /// dir-resolution/store-swap logic is shared with `ControlPlane::
+    /// ensure_project_epoch` (Task 6) via `project::ensure_default_project`.
+    /// Task 13: this call site now goes through the closure `lib.rs`
+    /// installs (`ensure_project_fn`, `ControlMsg::SetEnsureProject`) —
+    /// bound over `ControlPlane::ensure_project_epoch`, which already does
+    /// the store swap AND its own `project://changed` emit — so this
+    /// thread never touches `project_dir`/`project_name`/`created_at`
+    /// itself and never emits that event directly either; both moved
+    /// behind the one sanctioned epoch fn.
     fn ensure_project(&mut self) -> Result<(), String> {
-        if self.session.lock().store.project_dir.is_some() {
-            return Ok(());
-        }
-        let parent = dirs::audio_dir()
-            .or_else(dirs::home_dir)
-            .ok_or("cannot determine a directory for the default project")?
-            .join("AURA");
-        std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
-        let mut name = "Untitled".to_string();
-        let mut n = 1;
-        while parent.join(format!("{name}.aura")).exists() {
-            n += 1;
-            name = format!("Untitled-{n}");
-        }
-        let (project, dir) =
-            project::create(&parent, &name, self.engine_rate(), 120.0)?;
-        {
-            let mut session = self.session.lock();
-            session.store.project_dir = Some(dir);
-            session.store.project_name = Some(project.name.clone());
-            session.store.created_at = project.created_at.clone();
-        }
-        self.events.emit(
-            "project://changed",
-            serde_json::to_value(&project).unwrap_or_default(),
-        );
-        log::info!("audio: auto-created project {name}");
+        let f = self
+            .ensure_project_fn
+            .clone()
+            .ok_or_else(|| "ensure_project: no project-birth closure installed yet".to_string())?;
+        f()?;
         Ok(())
     }
 }
@@ -1423,6 +1630,91 @@ mod tests {
         assert_eq!(shared.position.load(Relaxed), 8 * 128);
     }
 
+    /// Round-2 §3.5 (deferred from Plan C+D): CLAP hosts require
+    /// `steady_time` to only ever climb — it must NOT reset when a live
+    /// node is re-created (instrument rebind, sample-rate change, a track
+    /// leaving and re-entering the live set). The old design counted
+    /// samples on the node itself (`ClapNode::steady`), so a rebuild that
+    /// built a fresh node handed the host a fresh zero. The fix moves the
+    /// counter onto `SharedRt`, advanced once per block by `OutputCb`.
+    ///
+    /// This exercises the REAL RT path end to end: `OutputCb::render`'s
+    /// block prologue, the real `SharedRt::steady` atomic, the real
+    /// `mixer::render_rt` / `render_live` plumbing, and a REAL graph
+    /// rebuild — a brand-new `RtGraph` with a brand-new `LiveNodeCell`
+    /// swapped in mid-stream via the same graph_tx/retire_tx ring the
+    /// engine control thread uses for every rebuild. Only the leaf
+    /// "plugin" is a test double (any `LiveInstrument` stands in for
+    /// `ClapNode`, which is opaque from the outside): it just records the
+    /// `ProcessBlock::steady` value each block hands it.
+    #[derive(Clone)]
+    struct RecordingNode(Arc<Mutex<Vec<u64>>>);
+
+    impl crate::audio::dsp::AudioProcessor for RecordingNode {
+        fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+        fn process(&mut self, io: &mut crate::audio::dsp::ProcessBlock<'_>) {
+            // The real RT path (`render_rt`) always carries an
+            // engine-global value — `None` here would mean this test
+            // somehow went through the non-RT `render` entry point instead.
+            self.0.lock().push(io.steady.expect("RT block always carries a steady value"));
+        }
+        fn reset(&mut self) {}
+    }
+
+    impl crate::audio::dsp::LiveInstrument for RecordingNode {
+        fn queue_event(&mut self, _ev: crate::midi::synth::BlockNoteEvent) -> bool {
+            true
+        }
+        fn all_notes_off(&mut self) {}
+    }
+
+    /// A one-track live graph wrapping a fresh `LiveNodeCell` around `node`
+    /// — the same shape a control-thread rebuild publishes for an
+    /// instrument rebind (Task 16 brief's exact §3.5 hazard).
+    fn live_graph(node: RecordingNode, generation: u64) -> RtGraph {
+        let cell = crate::audio::rt::LiveNodeCell::new(Box::new(node));
+        let tr = RtTrack {
+            slot: 0,
+            clips: Vec::new(),
+            live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(Vec::new()) }),
+        };
+        RtGraph::new(vec![tr], generation, Arc::new(ParamTable::with_slots(1)))
+    }
+
+    #[test]
+    fn steady_time_survives_live_node_recreation() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut out = vec![0.0f32; 128 * 2];
+        shared.playing.store(true, Relaxed);
+
+        // Node A's graph — adopted and rendered for two blocks.
+        graph_tx
+            .push(GraphPtr::new(Box::new(live_graph(RecordingNode(log.clone()), 1))))
+            .expect("ring has room");
+        cb.render(&mut out);
+        cb.render(&mut out);
+
+        // Simulate the rebind/rebuild hazard: a FRESH `RtGraph` with a
+        // BRAND-NEW `LiveNodeCell` (never the same node object as A) lands
+        // mid-stream, exactly like a real instrument rebind, sample-rate
+        // change, or a track re-entering the live set.
+        graph_tx
+            .push(GraphPtr::new(Box::new(live_graph(RecordingNode(log.clone()), 2))))
+            .expect("ring has room");
+        cb.render(&mut out);
+
+        let seen = log.lock().clone();
+        assert_eq!(seen.len(), 3, "one steady value observed per rendered block");
+        assert!(seen[1] > seen[0], "monotonic within the same node: {:?}", seen);
+        assert!(
+            seen[2] > seen[1],
+            "steady_time must NOT reset when the live node is re-created (round-2 §3.5): {:?}",
+            seen
+        );
+    }
+
     fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
@@ -1436,8 +1728,194 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         (handle, shared, tables, session)
+    }
+
+    /// Headless `Control` fixture (Plan E Task 13): the struct literal
+    /// `start()` builds, minus the thread spawn AND `open_output` — no
+    /// output/input stream, no disk writer. Lets `commit_recording_finalize`/
+    /// `commit_auto_stop` be driven directly, synchronously, on the test
+    /// thread, without a real cpal device or real WAV I/O — same headless
+    /// mode `start()`'s own doc describes ("without a device the engine
+    /// still runs... so the UI and tests stay functional"), just without
+    /// even the control-thread machinery around it.
+    fn bare_control() -> (Control, Arc<Mutex<Session>>) {
+        let shared = Arc::new(SharedRt::default());
+        let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            generation: 0,
+            params: Arc::new(ParamTable::default()),
+            slots: HashMap::new(),
+        }));
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
+        let (_tx, rx) = unbounded();
+        let committer = crate::control::testutil::test_committer(&session, &shared, &tables);
+        let ctl = Control {
+            shared,
+            tables,
+            generation: 0,
+            rebuild_pending: false,
+            session: session.clone(),
+            events: Box::new(NullEvents),
+            rx,
+            output: None,
+            input: None,
+            writer: None,
+            rec_track_ids: Vec::new(),
+            sel_output: None,
+            sel_input: None,
+            cache: HashMap::new(),
+            cache_rate: 0,
+            live_nodes: Default::default(),
+            accum: MeterAccum::default(),
+            gen_maps: GenerationMaps::default(),
+            sinks: Vec::new(),
+            last_frame: Instant::now(),
+            last_tick: Instant::now(),
+            committer,
+            ensure_project_fn: None,
+        };
+        (ctl, session)
+    }
+
+    /// Plan E Task 13's TDD step 1, at the real `Control` methods (not just
+    /// the `Committer` primitive they call — `control::mod`'s own
+    /// `recording_finalize_commits_as_actor_engine_with_clip_add_ops_and_
+    /// one_rebuild` pins the primitive; this pins `stop_recording`'s ACTUAL
+    /// call sites). Corrected by review round 1 (Important-1): finalize is
+    /// TWO commits, not one — `commit_recording_finalize` (ClipAdd ops
+    /// only, built AFTER `clips` is already in hand, exactly as
+    /// `stop_recording` does — §4.4 "the op is the registration, never the
+    /// recording itself"; exactly one rebuild, `self.generation` moves by
+    /// exactly 1) followed by `commit_recording_stopped_state` (the
+    /// transport-state Set, transient, its OWN commit, no further
+    /// rebuild — `self.generation` unchanged by it). Splitting them keeps
+    /// the state flip OUT of the ClipAdd tx's inverse: once Task 17 lands
+    /// undo history, undoing "stop recording" must only ever un-register
+    /// clips, never also claim a take is running again.
+    #[test]
+    fn commit_recording_finalize_is_actor_engine_with_clip_adds_and_one_rebuild() {
+        let (mut ctl, session) = bare_control();
+        // Seed a non-default state so the state-commit assertion below is
+        // load-bearing (`TransportState::default()`'s `state` is already
+        // "stopped", which would make that assertion trivially true even
+        // if `commit_recording_stopped_state` did nothing).
+        session.lock().store.transport.state = "recording".into();
+        let gen_before = ctl.generation;
+        let clips = vec![
+            crate::audio::types::testutil::test_clip("c-1", "t-1"),
+            crate::audio::types::testutil::test_clip("c-2", "t-1"),
+        ];
+
+        let clip_committed = ctl.commit_recording_finalize(&clips).unwrap();
+        assert!(
+            matches!(clip_committed.meta.actor, crate::control::op::Actor::Engine),
+            "got {:?}",
+            clip_committed.meta.actor
+        );
+        assert!(!clip_committed.meta.transient, "clip registration is a real document edit");
+        assert!(
+            clip_committed.ops.iter().all(|op| matches!(op, crate::control::op::Op::ClipAdd { .. })),
+            "must carry ONLY ClipAdd ops, got {:?}",
+            clip_committed.ops
+        );
+        let n_clip_adds = clip_committed
+            .ops
+            .iter()
+            .filter(|op| matches!(op, crate::control::op::Op::ClipAdd { .. }))
+            .count();
+        assert_eq!(n_clip_adds, 2);
+        assert_eq!(ctl.generation, gen_before + 1, "exactly one rebuild");
+        assert_eq!(session.lock().store.clips.len(), 2);
+        assert_eq!(session.lock().store.transport.state, "recording", "unchanged by the ClipAdd-only commit");
+
+        let state_committed = ctl.commit_recording_stopped_state().unwrap();
+        assert!(
+            matches!(state_committed.meta.actor, crate::control::op::Actor::Engine),
+            "got {:?}",
+            state_committed.meta.actor
+        );
+        assert!(state_committed.meta.transient, "the state mirror is transient");
+        assert!(
+            state_committed.ops.iter().all(|op| matches!(
+                op,
+                crate::control::op::Op::Set { path: crate::control::op::PropPath::TransportState, .. }
+            )),
+            "must carry ONLY the TransportState Set, got {:?}",
+            state_committed.ops
+        );
+        assert_eq!(ctl.generation, gen_before + 1, "no further rebuild from the state commit");
+        assert_eq!(session.lock().store.transport.state, "stopped");
+    }
+
+    /// Plan E Task 13's TDD step 1, at the real `Control` method:
+    /// `commit_auto_stop` produces a TRANSIENT `Actor::Engine` tx and never
+    /// rebuilds (`Op::Set{Transport, ...}` sets no `effect.rebuild` —
+    /// Task 12's transport family) — `self.generation` is unchanged.
+    #[test]
+    fn commit_auto_stop_is_a_transient_actor_engine_tx_with_no_rebuild() {
+        let (mut ctl, session) = bare_control();
+        let gen_before = ctl.generation;
+        let committed = ctl.commit_auto_stop().unwrap();
+        assert!(
+            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            "got {:?}",
+            committed.meta.actor
+        );
+        assert!(committed.meta.transient, "auto-stop is transient");
+        assert_eq!(ctl.generation, gen_before, "Transport Set never rebuilds");
+        assert_eq!(session.lock().store.transport.state, "stopped");
+    }
+
+    /// Review round 1 (Important-3): site 5 (`ensure_project`) had no
+    /// fixture exercising it at all, so its new failure mode — erroring
+    /// when no closure is installed, where the pre-Task-13 code silently
+    /// auto-created a project itself — was unreachable in the test suite.
+    /// `bare_control()` never calls `install_ensure_project` (no
+    /// `ControlMsg::SetEnsureProject` is ever sent to a `Control` built
+    /// this way — it isn't running a message loop at all), so
+    /// `ensure_project_fn` stays `None`, exactly as it would for a real
+    /// engine thread the moment after `engine::start` returns, before
+    /// `lib.rs`'s post-`ControlPlane` `install_ensure_project` call lands.
+    #[test]
+    fn ensure_project_errs_when_no_closure_installed() {
+        let (mut ctl, _session) = bare_control();
+        assert!(ctl.ensure_project_fn.is_none(), "bare_control installs no closure");
+        let err = ctl.ensure_project().unwrap_err();
+        assert!(
+            err.contains("no project-birth closure installed"),
+            "got {err:?}"
+        );
+    }
+
+    /// The installed-closure half of the same review point: once a closure
+    /// is installed (`lib.rs`'s real call: `engine.install_ensure_project
+    /// (Arc::new(move || cp.ensure_project_epoch()))`), `ensure_project`
+    /// calls it EXACTLY once, and its result propagates through unchanged
+    /// in BOTH directions (`Ok` and `Err`) rather than being swallowed or
+    /// mapped to something else — pinned here with a counting stand-in
+    /// closure rather than a real `ControlPlane::ensure_project_epoch`
+    /// (which needs a `JobManager` + a real `.aura` dir to construct; the
+    /// delegation contract under test is "the engine calls the installed
+    /// closure and does nothing else", not `ensure_project_epoch`'s own
+    /// behavior, which has its own coverage in control/mod.rs).
+    #[test]
+    fn ensure_project_invokes_the_installed_closure_exactly_once_and_propagates_its_result() {
+        let (mut ctl, _session) = bare_control();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let calls2 = calls.clone();
+        ctl.ensure_project_fn = Some(Arc::new(move || {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(std::path::PathBuf::from("/tmp/aura-test-project"))
+        }));
+        ctl.ensure_project().expect("an Ok(PathBuf) from the closure propagates as Ok");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "invoked exactly once");
+
+        ctl.ensure_project_fn = Some(Arc::new(|| Err("boom".to_string())));
+        let err = ctl.ensure_project().unwrap_err();
+        assert_eq!(err, "boom", "an Err from the closure propagates through ensure_project unchanged, not swallowed");
     }
 
     /// Runs with or without a real audio device: the engine falls back to

@@ -581,19 +581,6 @@ export class DemoBackend implements Backend {
     return this.characters.get(clipId) ?? "other";
   }
 
-  hintClipCharacter(clipId: string, character: string) {
-    this.characters.set(clipId, character as ClipCharacter);
-    this.clipBuffers.delete(clipId); // re-synthesize with the new character
-    this.resyncAudio();
-  }
-
-  registerClip(clip: Clip) {
-    if (!this.clips.some((c) => c.id === clip.id)) {
-      this.clips.push({ ...clip });
-      this.resyncAudio();
-    }
-  }
-
   private now(): number {
     return performance.now();
   }
@@ -2290,6 +2277,27 @@ export class DemoBackend implements Backend {
       }
     });
     return { clip, jobId };
+  }
+
+  /** SPLIT STEMS on a clip ALREADY on the timeline (Task 11 addendum): no
+   * re-import, no duplicate clip — mirrors the real backend's
+   * `split_stems_for_clip`, reusing the same demo stem-materialization as
+   * `importAudioClipSplitStems` above, just without the leading import. */
+  async splitStemsForClip(clipId: string, onEvent: (e: SidecarEvent) => void): Promise<string> {
+    const source = this.clips.find((c) => c.id === clipId);
+    if (!source) throw new Error(`unknown clip: ${clipId}`);
+    return this.runFakeJob("stemSplit", { inputPath: source.sourcePath }, (e) => {
+      onEvent(e);
+      if (e.type === "done") {
+        // Real-backend protocol: `done` first, then the stems land one by
+        // one, each announced by a follow-up `log` line.
+        setTimeout(() => {
+          for (const line of this.materializeDemoStems(source)) {
+            onEvent({ type: "log", jobId: e.jobId, line });
+          }
+        }, 250);
+      }
+    });
   }
 
   private materializeDemoStems(source: Clip): string[] {

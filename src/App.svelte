@@ -60,6 +60,19 @@
     return Math.round(transport.positionAt(performance.now()));
   }
 
+  /** True when the event targets somewhere the user is typing or picking —
+   * an `<input>`, a `<textarea>`, a `<select>`, or any contenteditable
+   * host. Such a target owns its own editing keys (Ctrl+Z included). The
+   * list matches the guard the rest of `onKeydown` already applies below;
+   * keep the two in step. */
+  function isTextEntry(target: EventTarget | null): boolean {
+    const el = target as HTMLElement | null;
+    if (!el) return false;
+    const tag = el.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
+    return el.isContentEditable === true;
+  }
+
   function onKeydown(e: KeyboardEvent) {
     // Interface zoom first: like browser page zoom it must work everywhere,
     // including inputs and the piano roll, so it runs before the guards.
@@ -104,6 +117,16 @@
         projectops.requestNew();
         return;
       }
+    }
+    // Undo / redo (Plan E Task 17). GUARDED, unlike Ctrl+S/O/N above: a
+    // focused text field owns its own undo stack, and hijacking Ctrl+Z
+    // while someone renames a track would feel broken. The piano roll is
+    // NOT excluded — note edits are ordinary history steps, so Ctrl+Z must
+    // work with the roll focused.
+    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "z" && !isTextEntry(e.target)) {
+      e.preventDefault();
+      void (e.shiftKey ? projectops.redo() : projectops.undo());
+      return;
     }
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;

@@ -17,6 +17,7 @@ import type {
   ExportCapabilities,
   ExportJobStatus,
   ExportRequest,
+  HistoryStep,
   HumToSongRequest,
   ImportClipRequest,
   ImportSplitReply,
@@ -133,11 +134,38 @@ export interface Backend {
   getProjectState(): Promise<ProjectSnapshot>;
   importAudioClip(request: ImportClipRequest): Promise<Clip>;
 
+  /** Persist an audio clip's timeline position through the channel (Plan E
+   * Task 4). Optional — real-engine only, same convention as
+   * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
+  moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
+
+  /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
+   * primitive) — call on `pointerdown` of a fader/pan control. Matching
+   * mid-gesture commits (e.g. `setTrackGain`/`setTrackPan`) coalesce
+   * backend-side into one history-bound batch; `gestureEnd` closes the
+   * boundary. Optional — real-engine only, same convention as `moveClip?`;
+   * the demo backend has no history to fold into. */
+  gestureBegin?(label: string): Promise<void>;
+  /** Close the open gesture boundary (see `gestureBegin`) — call on
+   * `pointerup`/`pointercancel`. Safe to call even when nothing is open
+   * (a stray event without a matching `gestureBegin`); the backend treats
+   * it as a no-op. */
+  gestureEnd?(): Promise<void>;
+
   /**
    * Seed an empty session with the built-in demo song so the first press of
    * play makes sound (real engine only — the demo backend ships with content).
    */
   seedDemoProject?(): Promise<ProjectSnapshot>;
+
+  /** Undo the most recent history step (Plan E Task 17). `label` is the
+   * undone step's own label, or `null` when there was nothing to undo (an
+   * empty history is not an error). Optional — real-engine only, same
+   * convention as `moveClip?`/`gestureBegin?`; the demo backend has no op
+   * log to walk back. */
+  undo?(): Promise<HistoryStep>;
+  /** Redo the most recently undone step (see `undo`). */
+  redo?(): Promise<HistoryStep>;
 
   // midi (all musical positions are integer ticks at the project ppq)
   setTempoMap(ppq: number | null, events: TempoEvent[]): Promise<TempoMapState>;
@@ -208,6 +236,14 @@ export interface Backend {
     onEvent: (e: SidecarEvent) => void,
   ): Promise<ImportSplitReply>;
 
+  /** SPLIT STEMS on a clip ALREADY on the timeline (Task 11 addendum): no
+   * re-import, no duplicate clip — the backend resolves `clipId`, submits the
+   * Demucs job on its existing project-copy audio, and auto-imports the four
+   * stems as new tracks aligned to the clip's current timeline position.
+   * Returns the job id; progress/done/error stream over `onEvent`, same
+   * envelope as the other sidecar jobs. */
+  splitStemsForClip(clipId: string, onEvent: (e: SidecarEvent) => void): Promise<string>;
+
   // loop-jam (ACE-Step repaint of the loop region, applied at wrap)
   loopjamEvolve(options?: EvolveOptions): Promise<LoopJamStatus>;
   loopjamCancel(): Promise<LoopJamStatus>;
@@ -244,18 +280,6 @@ export interface Backend {
     event: K,
     cb: (payload: AuraEventMap[K]) => void,
   ): Unsubscribe;
-
-  /**
-   * Demo-only hint so synthetic waveforms match a clip's musical role
-   * (drums look spiky, pads swell...). No-op against the real engine.
-   */
-  hintClipCharacter?(clipId: string, character: string): void;
-
-  /**
-   * Demo-only: register a frontend-created clip (stem results) with the
-   * synthetic engine so its meters play back. No-op against the real engine.
-   */
-  registerClip?(clip: Clip): void;
 }
 
 export const isTauri: boolean =
@@ -421,6 +445,21 @@ class TauriBackend implements Backend {
   importAudioClip(request: ImportClipRequest) {
     return invoke<Clip>("import_audio_clip", { request });
   }
+  moveClip(clipId: string, timelineStartSamples: number) {
+    return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  undo() {
+    return invoke<HistoryStep>("undo");
+  }
+  redo() {
+    return invoke<HistoryStep>("redo");
+  }
+  async gestureBegin(label: string) {
+    await invoke("gesture_begin", { label });
+  }
+  async gestureEnd() {
+    await invoke("gesture_end");
+  }
   seedDemoProject() {
     return invoke<ProjectSnapshot>("seed_demo_project");
   }
@@ -526,6 +565,11 @@ class TauriBackend implements Backend {
       request,
       onEvent: channel,
     });
+  }
+  splitStemsForClip(clipId: string, onEvent: (e: SidecarEvent) => void) {
+    const channel = new Channel<SidecarEvent>();
+    channel.onmessage = onEvent;
+    return invoke<string>("split_stems_for_clip", { clipId, onEvent: channel });
   }
 
   loopjamEvolve(options: EvolveOptions = {}) {

@@ -69,6 +69,10 @@ pub fn run() {
             // the engine-rebuild hook (playback integration).
             let audio_state = app.state::<audio::AudioState>();
             let (session, shared, tables) = audio_state.control_parts();
+            // Plan E Task 17: the ONE history + journal, already held by the
+            // engine's own `Committer` (audio::init) — shared, not a second
+            // instance, so the engine's non-transient commits are undoable.
+            let history_log = audio_state.history_log();
             let engine = audio_state
                 .engine_handle()
                 .ok_or("audio engine failed to start")?;
@@ -79,15 +83,27 @@ pub fn run() {
                 session,
                 shared,
                 tables,
-                engine,
+                engine.clone(),
                 jobs,
                 Box::new(move |event, payload| {
                     if let Err(e) = emitter.emit(event, payload) {
                         log::warn!("emit {event}: {e}");
                     }
                 }),
+                history_log,
             ));
-            app.manage(control_plane);
+            app.manage(control_plane.clone());
+
+            // Plan E Task 13: the engine's narrow "document birth" closure,
+            // installable only now that `ControlPlane` exists — bound over
+            // this SAME `Arc<ControlPlane>`, so `start_recording`'s
+            // auto-project (audio/engine.rs's `ensure_project`) shares the
+            // ONE sanctioned epoch fn instead of duplicating the store-swap
+            // + `project://changed` emit engine-side.
+            {
+                let cp = control_plane.clone();
+                engine.install_ensure_project(std::sync::Arc::new(move || cp.ensure_project_epoch()));
+            }
 
             // Loop-jam session driver rides on the shared control plane.
             app.manage(std::sync::Arc::new(control::loopjam::LoopJam::new(
@@ -138,6 +154,12 @@ pub fn run() {
             // ---- control plane (phase 2) ----
             control::get_project_state,
             control::set_track_mix,
+            control::move_clip,
+            control::gesture_begin,
+            control::gesture_end,
+            // ---- control plane: undo/redo (Plan E Task 17, additive) ----
+            control::undo,
+            control::redo,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----
@@ -146,6 +168,7 @@ pub fn run() {
             control::export::export_job_status,
             control::export::export_capabilities,
             control::import::import_audio_clip_split_stems,
+            control::import::split_stems_for_clip,
             control::loopjam::loopjam_evolve,
             control::loopjam::loopjam_cancel,
             control::loopjam::loopjam_status,

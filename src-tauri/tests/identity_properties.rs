@@ -70,7 +70,7 @@ fn test_clip(id: &ClipId, track_id: &TrackId) -> Clip {
 }
 
 fn user_meta(label: &str) -> TxMeta {
-    TxMeta { actor: Actor::User, run: "identity-prop-run".into(), label: label.into() }
+    TxMeta { actor: Actor::User, run: "identity-prop-run".into(), label: label.into(), transient: false }
 }
 
 /// Byte-identical snapshot of session STATE, canonical JSON — the same

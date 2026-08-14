@@ -40,6 +40,21 @@ use super::MidiStore;
 
 use crate::audio::dsp::AudioProcessor;
 
+/// READ-ONLY document view (Plan E Task 7 fix round 1 — binding requirement).
+/// This global exists purely so a cross-cutting reach with no session handle
+/// of its own (`register_store`'s doc) can still LOOK at the current
+/// document; no code may lock it in order to WRITE. The only door for
+/// mutation is `Session::transact` (via `ControlPlane::commit`), which is
+/// always reached through the `Arc<Mutex<Session>>` the app hands to
+/// `ControlPlane`/`MidiState`/`AudioState` at setup — never through this
+/// static. As of this fix round, `registered_store()` (this file's only
+/// accessor) has ZERO callers anywhere in the crate (`grep -rn
+/// registered_store src/` outside this file matches nothing but a doc
+/// comment in `plugins/automation.rs` describing its own, separate
+/// process-global by analogy) — so today this is write-once
+/// (`register_store`, called exactly once from `lib.rs` setup) and
+/// read-never; the doc exists so the FIRST future reader doesn't reach for
+/// `.lock()`'s mutable API out of habit.
 static PLAYBACK_SESSION: OnceLock<Arc<Mutex<Session>>> = OnceLock::new();
 
 /// Register the app's session for cross-cutting reaches (e.g. midi resync
@@ -128,6 +143,7 @@ impl LiveNodeRegistry {
 pub fn append_from(
     midi: &MidiStore,
     store: &Store,
+    plugins: &crate::control::session::PluginDoc,
     slots: &HashMap<crate::ids::TrackId, usize>,
     rate: u32,
     bank: Option<&SamplerBank>,
@@ -144,7 +160,7 @@ pub fn append_from(
                     if events.is_empty() {
                         continue;
                     }
-                    let node = node_for_track(t, bank, rate, nodes);
+                    let node = node_for_track(t, plugins, bank, rate, nodes);
                     live_ids.insert(t.id.to_string());
                     out.push(RtTrack {
                         slot,
@@ -182,6 +198,7 @@ fn track_events(midi: &MidiStore, track_id: &str, map: &TempoMap) -> Vec<AbsNote
 /// stays audible exactly as in phase 2.
 fn node_for_track(
     t: &TrackState,
+    plugins: &crate::control::session::PluginDoc,
     bank: Option<&SamplerBank>,
     rate: u32,
     nodes: &mut LiveNodeRegistry,
@@ -189,8 +206,8 @@ fn node_for_track(
     if let Some(id) = t.instrument_id.as_deref() {
         if let Some(pid) = id.strip_prefix("plugin:") {
             let key = format!("plugin:{pid}@{rate}");
-            if let Some(cell) =
-                nodes.resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(pid, rate))
+            if let Some(cell) = nodes
+                .resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(plugins, pid, rate))
             {
                 return cell;
             }
@@ -316,7 +333,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 1, "only the midi track renders");
         assert_eq!(out[0].slot, slots["m1"]);
         let live = out[0].live.as_ref().expect("live source attached");
@@ -345,7 +362,7 @@ mod tests {
         ]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert!(out.is_empty());
         assert!(nodes.is_empty(), "no nodes retained for non-live tracks");
     }
@@ -365,23 +382,23 @@ mod tests {
         )]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out1 = Vec::new();
-        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out1);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out1);
         let cell1 = out1[0].live.as_ref().unwrap().node.clone();
         let mut out2 = Vec::new();
-        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out2);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out2);
         let cell2 = out2[0].live.as_ref().unwrap().node.clone();
         assert!(Arc::ptr_eq(&cell1, &cell2), "rebuild reuses the same node");
 
         // Rate change -> new key -> new node.
         let mut out3 = Vec::new();
-        append_from(&midi, &store, &slots, 44_100, None, &mut nodes, &mut out3);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 44_100, None, &mut nodes, &mut out3);
         let cell3 = out3[0].live.as_ref().unwrap().node.clone();
         assert!(!Arc::ptr_eq(&cell1, &cell3), "rate change replaces the node");
 
         // Track gone -> registry pruned.
         let empty = midi_store_with(vec![]);
         let mut out4 = Vec::new();
-        append_from(&empty, &store, &slots, 48_000, None, &mut nodes, &mut out4);
+        append_from(&empty, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out4);
         assert!(out4.is_empty());
         assert!(nodes.is_empty(), "stale nodes pruned");
     }
@@ -430,7 +447,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &slots, RATE, Some(&bank), &mut nodes, &mut out);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(nodes.key_of("sampled"), Some("sampler:inst-330@48000"));
         assert_eq!(nodes.key_of("fallback"), Some("synth@48000"));
@@ -477,7 +494,7 @@ mod tests {
             let bank = SamplerBank::default();
             let mut nodes = LiveNodeRegistry::default();
             let mut out = Vec::new();
-            append_from(&midi, &store, &slots, RATE, Some(&bank), &mut nodes, &mut out);
+            append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
             assert_eq!(out.len(), 1, "track still renders ({id})");
             let mono = mono_of(&render_graph(out, 24_000, RATE));
             let f = estimate_freq(&mono[1000..20_000], RATE, 100.0, 800.0);
@@ -563,7 +580,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &slots, RATE, Some(&bank), &mut nodes, &mut out);
+        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
         assert_eq!(out.len(), 1);
         let live = out[0].live.as_ref().unwrap();
         assert_eq!(live.events[0].sample, 24_000, "tick placement preserved");

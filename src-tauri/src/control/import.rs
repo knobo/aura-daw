@@ -31,15 +31,17 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::audio::engine::{load_wav, ControlMsg};
+use crate::audio::engine::load_wav;
+#[cfg(test)]
 use crate::audio::project;
 use crate::audio::types::{Clip, Store, TrackState};
 use crate::audio::waveform::{pyramid_exists, Pyramid};
 use crate::sidecars::jobs::{self, EventSink, JobSpec};
 use crate::sidecars::{JobKind, SidecarEvent};
 
+use super::op::{Op, TxMeta};
 use super::ops;
-use super::session::Session;
+use super::session::{Session, Tx};
 use super::{ControlPlane, ImportClipRequest};
 
 /// Formats decoded through symphonia (everything except the WAV fast path).
@@ -182,12 +184,27 @@ pub(crate) struct ImportOutcome {
     pub created_track: Option<TrackState>,
 }
 
-/// Tauri-free import core: validate + decode + copy + pyramid + register.
-/// STRUCTURAL — the caller must send `ControlMsg::Rebuild` afterwards.
-pub(crate) fn do_import(
-    session: &Mutex<Session>,
-    req: &ImportClipRequest,
-) -> Result<ImportOutcome, String> {
+/// Everything `do_import`/`ControlPlane::import_audio_clip_impl` must do
+/// BEFORE touching the document: validate the path, decode, resolve+
+/// validate the project dir and (if given) the target track, copy the
+/// source into the project, build the waveform pyramid. No lock is held
+/// across any of the decode/copy/pyramid disk I/O — only one SHORT,
+/// READ-ONLY lock acquisition (the project-dir + track precheck) brackets
+/// it. The precheck is advisory: [`commit_import_clip`] re-validates the
+/// same facts against transaction-time store truth right before writing,
+/// so a race between this prepare step and that commit just surfaces as a
+/// clean error from the commit (never an orphaned track or a lost clip).
+struct PreparedImport {
+    clip_id: String,
+    stem: String,
+    rel: String,
+    source_id: crate::ids::SourceId,
+    channels: u16,
+    sample_rate: u32,
+    frames: u64,
+}
+
+fn prepare_import(session: &Mutex<Session>, req: &ImportClipRequest) -> Result<PreparedImport, String> {
     let src = Path::new(&req.path);
     if !src.is_absolute() {
         return Err(format!("path must be absolute: {}", req.path));
@@ -213,41 +230,31 @@ pub(crate) fn do_import(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Imported".into());
 
-    // Resolve the project + target track under the lock (auto-create when
-    // no track was named); file I/O happens after the lock is dropped.
-    let clip_id = uuid::Uuid::new_v4().to_string();
-    let (project_dir, track_id, created_track) = {
-        let mut session = session.lock();
+    // Read-only precheck: project dir + (if given) the target track's
+    // existence/kind. No mutation — `commit_import_clip` re-checks the same
+    // facts against store truth at commit time.
+    let project_dir = {
+        let session = session.lock();
         let dir = session
             .store
             .project_dir
             .clone()
             .ok_or("no project open — create or open a project before importing audio")?;
-        match &req.track_id {
-            Some(id) => {
-                let track = session
-                    .store
-                    .tracks
-                    .iter()
-                    .find(|t| &t.id == id)
-                    .ok_or_else(|| format!("unknown track: {id}"))?;
-                if track.kind != "audio" {
-                    return Err(format!(
-                        "track {id} is a {} track — audio clips need an audio track",
-                        track.kind
-                    ));
-                }
-                (dir, crate::ids::TrackId::from(id.clone()), None)
-            }
-            None => {
-                let track = ops::add_track(
-                    &mut session.store,
-                    Some(stem.clone()),
-                    Some("audio".into()),
-                )?;
-                (dir, track.id.clone(), Some(track))
+        if let Some(id) = &req.track_id {
+            let track = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| &t.id == id)
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            if track.kind != "audio" {
+                return Err(format!(
+                    "track {id} is a {} track — audio clips need an audio track",
+                    track.kind
+                ));
             }
         }
+        dir
     };
 
     // Land the audio in the project layout and build the waveform pyramid
@@ -258,6 +265,7 @@ pub(crate) fn do_import(
     // is required at the point of creation. Waveform pyramid cache dirs stay
     // keyed by clip id (visual cache; dedup opportunity ledgered, not taken
     // here).
+    let clip_id = uuid::Uuid::new_v4().to_string();
     let source_id = crate::ids::SourceId::mint();
     let rel = format!("audio/{source_id}.wav");
     let dst = project_dir.join(&rel);
@@ -277,60 +285,109 @@ pub(crate) fn do_import(
             .map_err(|e| format!("waveform cache build failed: {e}"))?;
     }
 
+    Ok(PreparedImport { clip_id, stem, rel, source_id, channels, sample_rate, frames })
+}
+
+/// The document-mutation half: resolve (or `add_track_tx`-create) the
+/// target track and insert the clip, both through the ONE transaction `tx`
+/// — Plan E Task 8 (round-2 inventory rows 16/17). Shared by [`do_import`]
+/// (direct `Session::transact`, no engine/persist/emit — the free-function
+/// tests exercise only the document mutation) and
+/// [`ControlPlane::import_audio_clip_impl`] (`ControlPlane::commit`, the
+/// production path with the full rebuild/persist/emit effect pipeline).
+fn commit_import_clip(
+    tx: &mut Tx<'_>,
+    req: &ImportClipRequest,
+    prepared: &PreparedImport,
+    track_name: &str,
+) -> Result<ImportOutcome, String> {
+    let (track_id, created_track) = match &req.track_id {
+        Some(id) => {
+            let track = tx
+                .store()
+                .tracks
+                .iter()
+                .find(|t| &t.id == id)
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            if track.kind != "audio" {
+                return Err(format!(
+                    "track {id} is a {} track — audio clips need an audio track",
+                    track.kind
+                ));
+            }
+            (crate::ids::TrackId::from(id.clone()), None)
+        }
+        None => {
+            let track = ops::add_track_tx(tx, Some(track_name.to_string()), Some("audio".into()))?;
+            (track.id.clone(), Some(track))
+        }
+    };
     let lane_id = crate::ids::LaneId::default_for_track(track_id.as_str());
     let clip = Clip {
-        id: clip_id.into(),
+        id: prepared.clip_id.clone().into(),
         track_id,
-        name: stem,
-        source_path: rel,
-        source_id,
-        source_channels: channels,
-        source_sample_rate: sample_rate,
-        source_length_samples: frames,
+        name: prepared.stem.clone(),
+        source_path: prepared.rel.clone(),
+        source_id: prepared.source_id.clone(),
+        source_channels: prepared.channels,
+        source_sample_rate: prepared.sample_rate,
+        source_length_samples: prepared.frames,
         timeline_start_samples: req.at_samples.unwrap_or(0),
         offset_samples: 0,
-        length_samples: frames,
+        length_samples: prepared.frames,
         gain_db: 0.0,
         fade_in_samples: 0,
         fade_out_samples: 0,
         content_id: crate::ids::ContentId::mint(),
         lane_id,
     };
-    session.lock().store.clips.push(clip.clone());
+    let index = tx.store().clips.len();
+    tx.apply(Op::ClipAdd { clip: clip.clone(), index })?;
     Ok(ImportOutcome { clip, created_track })
+}
+
+/// Tauri-free import core: validate + decode + copy + pyramid + register,
+/// the document mutation going through ONE `Session::transact` (no engine/
+/// persist/emit — this fn has no `ControlPlane` to execute those effects
+/// with; that's `ControlPlane::import_audio_clip_impl`'s job). STRUCTURAL —
+/// the caller must send `ControlMsg::Rebuild` afterwards. `#[cfg(test)]`:
+/// since Plan E Task 8, the production path (`import_audio_clip_impl`)
+/// calls `prepare_import`/`commit_import_clip` directly (through
+/// `ControlPlane::commit`, for the full rebuild/persist/emit pipeline) —
+/// this fn's only remaining callers are its own tests below, which want a
+/// `Session::transact`-only entry point with no engine/webview required.
+#[cfg(test)]
+pub(crate) fn do_import(
+    session: &Mutex<Session>,
+    req: &ImportClipRequest,
+) -> Result<ImportOutcome, String> {
+    let prepared = prepare_import(session, req)?;
+    let mut outcome = None;
+    Session::transact(session, TxMeta::system("import audio clip"), |tx| {
+        outcome = Some(commit_import_clip(tx, req, &prepared, &prepared.stem)?);
+        Ok(())
+    })?;
+    Ok(outcome.expect("commit_import_clip sets outcome on every Ok(())"))
 }
 
 impl ControlPlane {
     /// Real body of the frozen `import_audio_clip` surface (control/mod.rs
-    /// delegates here). Registers the clip, rebuilds the graph, auto-saves
-    /// project.json and re-emits `project://changed`.
+    /// delegates here). Plan E Task 8: decode/copy/pyramid ([`prepare_import`])
+    /// stay outside any lock, then the document mutation — optional
+    /// `add_track_tx` + `Op::ClipAdd` — is ONE `commit` ([`commit_import_clip`]):
+    /// `ClipAdd`'s `effect.persist.project`/`effect.rebuild` replace the old
+    /// manual `project::save`/`ControlMsg::Rebuild`, and `commit`'s own
+    /// `project://changed` emit replaces the old raw emit. There is no
+    /// longer a two-lock window between resolving the track and registering
+    /// the clip — both land in the same transaction.
     pub(crate) fn import_audio_clip_impl(&self, req: ImportClipRequest) -> Result<Clip, String> {
-        let outcome = do_import(&self.session, &req)?;
-        self.engine.send(ControlMsg::Rebuild);
-
-        // Persist the import right away (same convention as record-stop) and
-        // tell every front door the project changed.
-        let snapshot = {
-            use std::sync::atomic::Ordering::Relaxed;
-            let session = self.session.lock();
-            let dir = session.store.project_dir.clone();
-            project::from_store(
-                &session.store,
-                self.shared.position.load(Relaxed),
-                self.shared.sample_rate.load(Relaxed),
-            )
-            .ok()
-            .zip(dir)
-        };
-        if let Some((p, dir)) = snapshot {
-            if let Err(e) = project::save(&dir, &p) {
-                log::warn!("auto-save after import failed: {e}");
-            }
-            (self.emit)(
-                "project://changed",
-                serde_json::to_value(&p).unwrap_or_default(),
-            );
-        }
+        let prepared = prepare_import(&self.session, &req)?;
+        let mut outcome = None;
+        self.commit(TxMeta::system("import audio clip"), |tx| {
+            outcome = Some(commit_import_clip(tx, &req, &prepared, &prepared.stem)?);
+            Ok(())
+        })?;
+        let outcome = outcome.expect("commit_import_clip sets outcome on every Ok(())");
         if let Some(t) = &outcome.created_track {
             log::info!("import: auto-created audio track {} ({})", t.name, t.id);
         }
@@ -494,23 +551,38 @@ pub(crate) fn wrap_sink_with_stem_import(
                 let clip_name = clip_name.clone();
                 inner(ev.clone()); // deliver `done` first, imports are extra
                 std::thread::spawn(move || {
+                    // Plan E Task 8 (round-2 §4.6): `run` correlates every
+                    // commit this ONE stem-split job produces into a single
+                    // group — minted ONCE for the whole batch, not per stem,
+                    // so an agent/UI can see "these 4 tracks came from one
+                    // gesture" even though each stem lands in its own commit
+                    // (a track + a clip, atomically, per stem).
+                    let run_id = uuid::Uuid::new_v4().to_string();
                     for (stem, path) in ordered {
                         let line = (|| -> Result<String, String> {
-                            let track = control.add_track(
-                                Some(format!("{clip_name} {stem}")),
-                                Some("audio".into()),
-                                crate::control::op::TxMeta::system(format!(
-                                    "auto-import stem: {stem}"
-                                )),
-                            )?;
-                            let clip = control.import_audio_clip_impl(ImportClipRequest {
+                            let req = ImportClipRequest {
                                 path,
-                                track_id: Some(track.id.to_string()),
+                                track_id: None,
                                 at_samples: Some(at_samples),
+                            };
+                            let prepared = prepare_import(&control.session, &req)?;
+                            let track_name = format!("{clip_name} {stem}");
+                            let mut meta = TxMeta::system(format!("auto-import stem: {stem}"));
+                            meta.run = run_id.clone();
+                            let mut outcome = None;
+                            control.commit(meta, |tx| {
+                                outcome =
+                                    Some(commit_import_clip(tx, &req, &prepared, &track_name)?);
+                                Ok(())
                             })?;
+                            let outcome =
+                                outcome.expect("commit_import_clip sets outcome on every Ok(())");
+                            let track = outcome
+                                .created_track
+                                .expect("stem import always auto-creates its track");
                             Ok(format!(
                                 "auto-import stem `{stem}`: clip {} on track {} ({})",
-                                clip.id, track.name, track.id
+                                outcome.clip.id, track.name, track.id
                             ))
                         })()
                         .unwrap_or_else(|e| format!("auto-import stem `{stem}` failed: {e}"));
@@ -535,14 +607,58 @@ impl ControlPlane {
         sink: EventSink,
     ) -> Result<(Clip, String), String> {
         let clip = self.import_audio_clip_impl(req)?;
-        let (input, out_dir) = {
+        let project_dir = {
             let session = self.session.lock();
-            let dir = session.store.project_dir.clone().ok_or("no project open")?;
-            (dir.join(&clip.source_path), dir.join("stems").join(clip.id.as_str()))
+            session.store.project_dir.clone().ok_or("no project open")?
         };
-        let spec = demucs_split_spec(&input, &out_dir, simulate_mode())?;
-        let job_id = self.submit_split_job(&clip, spec, sink);
+        let job_id = self.submit_stem_split_for(&clip, &project_dir, sink)?;
         Ok((clip, job_id))
+    }
+
+    /// Split an EXISTING project clip into stems — no re-import, no new clip
+    /// row for the source; stems land aligned to `clip_id`'s current timeline
+    /// position (Task 11 addendum). Unlike [`Self::import_and_split_stems`]
+    /// (which is for freshly dropped files and always mints a new clip), this
+    /// is for the SPLIT STEMS gesture on a clip already on the timeline.
+    pub fn split_stems_for_clip(
+        self: &Arc<Self>,
+        clip_id: &str,
+        sink: EventSink,
+    ) -> Result<String, String> {
+        let (clip, project_dir) = {
+            let session = self.session.lock();
+            let clip = session
+                .store
+                .clips
+                .iter()
+                .find(|c| c.id == clip_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown clip: {clip_id}"))?;
+            let dir = session.store.project_dir.clone().ok_or("no project open")?;
+            (clip, dir)
+        };
+        let input = project_dir.join(&clip.source_path);
+        if !input.is_file() {
+            return Err(format!("source audio not found: {}", input.display()));
+        }
+        self.submit_stem_split_for(&clip, &project_dir, sink)
+    }
+
+    /// Shared by [`Self::import_and_split_stems`] (fresh import) and
+    /// [`Self::split_stems_for_clip`] (existing clip): build the Demucs spec
+    /// for `clip`'s already-in-project audio and submit through
+    /// [`Self::submit_split_job`], so both entry points get identical job
+    /// wiring and stem auto-import behavior.
+    fn submit_stem_split_for(
+        self: &Arc<Self>,
+        clip: &Clip,
+        project_dir: &Path,
+        sink: EventSink,
+    ) -> Result<String, String> {
+        let input = project_dir.join(&clip.source_path);
+        let out_dir = project_dir.join("stems").join(clip.id.as_str());
+        let spec = demucs_split_spec(&input, &out_dir, simulate_mode())?;
+        Ok(self.submit_split_job(clip, spec, sink))
     }
 
     /// Spec-injectable submission seam (tests drive it with a fake sidecar).
@@ -565,6 +681,30 @@ pub struct ImportSplitReply {
     pub job_id: String,
 }
 
+/// Shared by [`import_audio_clip_split_stems`] and [`split_stems_for_clip`]:
+/// same fan-out as `sidecars::make_sink` (private there) — every event to the
+/// per-job channel; progress/done/error also as `sidecar://*` app events.
+/// `log_tag` only labels the `emit` failure warning per call site.
+fn make_stem_sink(
+    app: tauri::AppHandle,
+    on_event: tauri::ipc::Channel<SidecarEvent>,
+    log_tag: &'static str,
+) -> EventSink {
+    use tauri::Emitter;
+    Arc::new(move |ev: SidecarEvent| {
+        let _ = on_event.send(ev.clone());
+        let name = match &ev {
+            SidecarEvent::Progress { .. } => "sidecar://progress",
+            SidecarEvent::Done { .. } => "sidecar://done",
+            SidecarEvent::Error { .. } => "sidecar://error",
+            SidecarEvent::Log { .. } => return,
+        };
+        if let Err(e) = app.emit(name, &ev) {
+            log::warn!("{log_tag}: failed to emit {name}: {e}");
+        }
+    })
+}
+
 /// Import + auto-stem-split front door (wave 1B; needs registration in the
 /// frozen lib.rs: `control::import::import_audio_clip_split_stems`). Job
 /// events stream over `on_event` and the `sidecar://*` app events, exactly
@@ -576,23 +716,25 @@ pub async fn import_audio_clip_split_stems(
     on_event: tauri::ipc::Channel<SidecarEvent>,
     control: tauri::State<'_, Arc<ControlPlane>>,
 ) -> Result<ImportSplitReply, String> {
-    use tauri::Emitter;
-    // Same fan-out as sidecars::make_sink (private there): every event to the
-    // per-job channel; progress/done/error also as `sidecar://*` app events.
-    let sink: EventSink = Arc::new(move |ev: SidecarEvent| {
-        let _ = on_event.send(ev.clone());
-        let name = match &ev {
-            SidecarEvent::Progress { .. } => "sidecar://progress",
-            SidecarEvent::Done { .. } => "sidecar://done",
-            SidecarEvent::Error { .. } => "sidecar://error",
-            SidecarEvent::Log { .. } => return,
-        };
-        if let Err(e) = app.emit(name, &ev) {
-            log::warn!("import-split: failed to emit {name}: {e}");
-        }
-    });
+    let sink = make_stem_sink(app, on_event, "import-split");
     let (clip, job_id) = control.import_and_split_stems(request, sink)?;
     Ok(ImportSplitReply { clip, job_id })
+}
+
+/// Stem-split front door for a clip ALREADY on the timeline (Task 11
+/// addendum, additive to the frozen surface): no re-import, no duplicate
+/// clip — stems land aligned to the existing clip's timeline position. Job
+/// events stream over `on_event` and the `sidecar://*` app events, exactly
+/// like `import_audio_clip_split_stems`/`sidecar_run_job`.
+#[tauri::command]
+pub async fn split_stems_for_clip(
+    app: tauri::AppHandle,
+    clip_id: String,
+    on_event: tauri::ipc::Channel<SidecarEvent>,
+    control: tauri::State<'_, Arc<ControlPlane>>,
+) -> Result<String, String> {
+    let sink = make_stem_sink(app, on_event, "split-stems-for-clip");
+    control.split_stems_for_clip(&clip_id, sink)
 }
 
 // ---------------------------------------------------------------------------
@@ -933,6 +1075,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let cp = Arc::new(ControlPlane::new(
             session,
@@ -941,6 +1084,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(|_, _| {}),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         let parent = tmp_parent(name);
         cp.create_project(parent.to_str().unwrap(), "Split").unwrap();
@@ -959,6 +1103,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -969,6 +1114,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         let parent = tmp_parent(name);
         cp.create_project(parent.to_str().unwrap(), "Announce").unwrap();
@@ -1046,6 +1192,45 @@ mod tests {
             payload["tracks"].as_array().is_some_and(|t| t.len() == 1),
             "importToTrackId=null auto-created exactly one track"
         );
+    }
+
+    /// Plan E Task 8 (brief-mandated behavioral test): the clip row lands
+    /// in project.json only AFTER `import_audio_clip_impl` RETURNS —
+    /// persistence is `commit`'s `persist.project` effect now (executed
+    /// synchronously, session lock released, before `commit`'s own
+    /// `project://changed` emit), not a manual `project::save` call
+    /// reachable independently of the transaction. Behavioral, not a grep
+    /// gate: read the file.
+    #[test]
+    fn import_persists_the_clip_row_synchronously_when_commit_returns() {
+        let (cp, parent) = control_plane("persist-sync");
+        let src = parent.join("take.wav");
+        write_wav(&src, 2, 44_100, 480);
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert!(
+            before["clips"].as_array().map(|c| c.is_empty()).unwrap_or(true),
+            "no clip persisted before import: {before}"
+        );
+
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: Some(240),
+            })
+            .unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        let clips = after["clips"].as_array().expect("clips array");
+        assert!(
+            clips.iter().any(|c| c["id"] == clip.id.as_str()),
+            "clip row persisted synchronously by the time commit returned: {clips:?}"
+        );
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     fn write_sh(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -1193,6 +1378,169 @@ mod tests {
             .lock()
             .iter()
             .any(|e| matches!(e, SidecarEvent::Error { message, .. } if message.contains("demucs"))));
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    // -- split_stems_for_clip (Task 11 addendum: existing-clip entry door) --
+
+    /// Unknown clip id errs cleanly, no job submitted.
+    #[test]
+    fn split_stems_for_clip_errs_on_unknown_id() {
+        let (cp, parent) = control_plane("split-unknown");
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let err = cp.split_stems_for_clip("does-not-exist", sink).unwrap_err();
+        assert!(err.contains("unknown clip"), "{err}");
+        assert!(events.lock().is_empty(), "no job/events for an unknown clip");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The resolve/validate/spec-build half of `split_stems_for_clip` for a
+    /// VALID existing clip, driven through the real public method end-to-end
+    /// (unlike the sibling test below, which injects a fake sidecar spec the
+    /// same way the rest of this file does). This exercises the actual
+    /// `demucs_split_spec` → `resolve_python`/`resolve_script` path this repo
+    /// ships with — python3 and `sidecars/demucs_split.py` are expected on
+    /// dev/CI machines the same way the sibling `hum.rs`/`loopjam.rs` sinks
+    /// assume it. Doesn't wait for job completion (that would need either a
+    /// real demucs install or `AURA_SIDECAR_SIMULATE=1`, a process-global env
+    /// var unsafe to mutate under parallel test threads) — just that
+    /// submission itself succeeds synchronously for a real clip.
+    #[tokio::test]
+    async fn split_stems_for_clip_valid_clip_submits_job() {
+        let (cp, parent) = control_plane("split-valid");
+        let src = parent.join("valid.wav");
+        write_wav(&src, 2, 44_100, 1000);
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: None,
+            })
+            .unwrap();
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let job_id = cp
+            .split_stems_for_clip(clip.id.as_str(), sink)
+            .expect("valid clip resolves + builds a spec + submits");
+        assert!(!job_id.is_empty());
+        assert!(cp.job_status(&job_id).is_ok(), "job is tracked");
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// The SPLIT STEMS gesture on a clip ALREADY on the timeline: no
+    /// re-import, no duplicate source clip — only the four stem tracks land,
+    /// aligned to the existing clip's timeline position. This is the
+    /// behavior `import_and_split_chain_lands_four_stem_tracks` above pins
+    /// for the fresh-import door; this test pins the same stem-import
+    /// mechanism for an EXISTING clip, and specifically that the source
+    /// clip/track count does not grow (the mismatch flagged in the Task 11
+    /// NEEDS_CONTEXT report). It drives the fake sidecar through
+    /// `submit_split_job` directly (the same injection seam
+    /// `split_stems_for_clip` itself calls after resolving the clip) so the
+    /// happy-path completion assertions don't depend on `demucs_split_spec`
+    /// resolving a real python/demucs install.
+    #[tokio::test]
+    async fn split_stems_for_clip_lands_four_stem_tracks_without_duplicating_source() {
+        let (cp, parent) = control_plane("split-existing");
+        let src = parent.join("take.wav");
+        write_wav(&src, 2, 44_100, 2000);
+
+        let stems_dir = parent.join("fake-stems");
+        std::fs::create_dir_all(&stems_dir).unwrap();
+        let mut stems_json = serde_json::Map::new();
+        for stem in ["vocals", "drums", "bass", "other"] {
+            let p = stems_dir.join(format!("{stem}.wav"));
+            write_wav(&p, 2, 44_100, 500);
+            stems_json.insert(
+                stem.to_string(),
+                serde_json::Value::String(p.to_string_lossy().into_owned()),
+            );
+        }
+        let done = serde_json::json!({
+            "type": "done",
+            "result": {"kind": "stemSplit", "stems": stems_json}
+        });
+        let script = write_sh(
+            &parent,
+            "fake_demucs.sh",
+            &format!(
+                "#!/bin/sh\necho '{{\"type\":\"progress\",\"progress\":0.5,\"stage\":\"separating\"}}'\necho '{}'\n",
+                done
+            ),
+        );
+
+        // Land the clip on the timeline first, exactly like a normal import —
+        // this is the clip SPLIT STEMS is invoked on, already placed.
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: Some(4_800),
+            })
+            .unwrap();
+        assert_eq!(cp.project_state().clips.len(), 1);
+
+        // Inject the fake sidecar via `submit_split_job` directly (see the
+        // doc comment above) instead of going through the real
+        // `demucs_split_spec`/python path, so completion doesn't depend on a
+        // real demucs install or the process-global simulate env var.
+        let events: Arc<Mutex<Vec<SidecarEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let sink: EventSink = Arc::new(move |ev| ev2.lock().push(ev));
+        let job_id = cp.submit_split_job(&clip, sh_spec(&script), sink);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            {
+                let evs = events.lock();
+                let done = evs.iter().any(|e| matches!(e, SidecarEvent::Done { .. }));
+                let stems_logged = evs
+                    .iter()
+                    .filter(|e| matches!(e, SidecarEvent::Log { line, .. } if line.contains("auto-import stem")))
+                    .count();
+                if done && stems_logged >= 4 {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stem imports did not finish: {:?}",
+                events.lock()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(cp.job_status(&job_id).unwrap().state, "done");
+
+        // 1 ORIGINAL source track/clip (untouched, not duplicated) + 4 stem
+        // tracks — this is the count that distinguishes this door from
+        // `import_and_split_stems`, which would have produced a SECOND
+        // source clip too.
+        let snap = cp.project_state();
+        assert_eq!(snap.tracks.len(), 5, "{:?}", snap.tracks);
+        assert_eq!(snap.clips.len(), 5, "no duplicate source clip");
+        assert!(
+            snap.clips.iter().any(|c| c.id == clip.id),
+            "the original clip is still there, untouched"
+        );
+        for stem in ["vocals", "drums", "bass", "other"] {
+            let t = snap
+                .tracks
+                .iter()
+                .find(|t| t.name == format!("take {stem}"))
+                .unwrap_or_else(|| panic!("missing stem track for {stem}"));
+            let c = snap
+                .clips
+                .iter()
+                .find(|c| c.track_id == t.id)
+                .unwrap_or_else(|| panic!("missing stem clip for {stem}"));
+            assert_eq!(
+                c.timeline_start_samples, 4_800,
+                "stem aligned with the EXISTING clip's position"
+            );
+        }
         let _ = std::fs::remove_dir_all(parent);
     }
 }

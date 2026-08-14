@@ -158,6 +158,39 @@ class ProjectOpsStore {
     }
   }
 
+  /**
+   * Undo / redo the last history step (Plan E Task 17). Thin: the backend
+   * owns the stacks — this store only invokes and reports. The optional-
+   * method pattern (Task 4's precedent) keeps the demo backend, which has
+   * no op log, out of it entirely.
+   *
+   * After the commit lands the backend emits `project://changed`, but that
+   * payload does not carry midi — and an undo can restore a MIDI clip — so
+   * this re-pulls the same way `adopt` does, minus the loop-edit reset
+   * (no project swap happened here).
+   */
+  async undo() {
+    await this.step("undo");
+  }
+
+  async redo() {
+    await this.step("redo");
+  }
+
+  private async step(dir: "undo" | "redo") {
+    const call = dir === "undo" ? backend.undo : backend.redo;
+    if (!call) return; // demo backend: no op log to walk
+    try {
+      const step = await call.call(backend);
+      if (!step?.label) return; // nothing to undo/redo — silent, not an error
+      await project.reload();
+      await midi.init();
+      toasts.info(dir === "undo" ? "UNDO" : "REDO", step.label);
+    } catch (err) {
+      toasts.error(dir === "undo" ? "UNDO FAILED" : "REDO FAILED", String(err));
+    }
+  }
+
   /** Re-pull the full snapshot; `project://changed` alone leaves projectDir stale. */
   private async adopt() {
     // Finding 8: drop any loop-while-editing state from the OLD project

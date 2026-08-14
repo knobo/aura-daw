@@ -59,6 +59,17 @@ pub struct SharedRt {
     pub park: AtomicU64,
     /// Ring-buffer over/underrun count since engine start.
     pub xruns: AtomicU64,
+    /// Engine-global CLAP `steady_time` base, in samples — advanced ONCE
+    /// per RT output block by the callback (round-2 §3.5). Unlike
+    /// `position`, this never resets: not on stop/play, not on a seek, and
+    /// not when a live node is re-created (instrument rebind, sample-rate
+    /// change, a track leaving and re-entering the live set). CLAP hosts
+    /// require a steady_time that only ever climbs; per-node self-counting
+    /// broke that guarantee the instant a node was rebuilt, because the
+    /// counter lived on the node and a rebuild makes a new one. Nodes read
+    /// this shared value instead — see `dsp::ProcessBlock::steady` and
+    /// `plugins::clap_host::ClapNode::process`.
+    pub steady: AtomicU64,
 }
 
 impl Default for SharedRt {
@@ -75,6 +86,7 @@ impl Default for SharedRt {
             stop_at_end: AtomicBool::new(true),
             park: AtomicU64::new(NO_PARK),
             xruns: AtomicU64::new(0),
+            steady: AtomicU64::new(0),
         }
     }
 }

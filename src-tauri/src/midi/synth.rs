@@ -303,7 +303,7 @@ mod tests {
 
     fn render(synth: &mut PolySynth, frames: usize, rate: u32) -> Vec<f32> {
         let mut buf = vec![0.0f32; frames * 2];
-        let mut blk = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: rate };
+        let mut blk = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: rate, steady: None };
         synth.process(&mut blk);
         buf
     }

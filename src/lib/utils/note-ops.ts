@@ -19,8 +19,10 @@ export const byTickKey = (a: MidiNote, b: MidiNote) => a.tick - b.tick || a.key 
 
 /** Deep-copy a note WITHOUT its backend-minted id: a copy is a new note,
  * and resending an existing id makes the backend's keep-rule re-mint both
- * the copy and the original (id stability lost). */
-function copyNote(n: MidiNote): MidiNote {
+ * the copy and the original (id stability lost). Exported so any call site
+ * that materializes "new" notes from someone else's ids (paste, AMT infill
+ * fills) can strip them the same way instead of re-deriving the rule. */
+export function copyNote(n: MidiNote): MidiNote {
   const { noteId: _dropId, ...copy } = n;
   return copy;
 }

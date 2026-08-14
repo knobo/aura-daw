@@ -166,6 +166,10 @@ impl PreviewCb {
                 samples: out,
                 channels: self.channels,
                 sample_rate: self.rate,
+                // Sample preview, not the live engine graph — no CLAP node
+                // ever sits behind this seam, so there is no steady_time to
+                // carry.
+                steady: None,
             };
             node.process(&mut io);
         }

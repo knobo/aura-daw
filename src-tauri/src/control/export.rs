@@ -484,6 +484,10 @@ impl<'a> Progress<'a> {
 struct ExportSnapshot {
     store: Store,
     midi: MidiStore,
+    /// Plugin document rows (Task 9) — `offline::build_graph` needs these to
+    /// resolve `plugin:<id>` track bindings the same way live playback does
+    /// ("what you hear is what you export").
+    plugins: crate::control::session::PluginDoc,
     rate: u32,
     loop_region: (u64, u64),
 }
@@ -539,6 +543,7 @@ impl ControlPlane {
                     loaded_dir: None,
                     dirty: false,
                 },
+                plugins: session.plugins.clone(),
                 rate: self.shared.sample_rate.load(Relaxed),
                 loop_region: (
                     self.shared.loop_start.load(Relaxed),
@@ -622,7 +627,7 @@ fn do_export(
     // guard is held only while the graph is built, never during the render.
     let mut og = {
         let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-        offline::build_graph(&snap.store, &snap.midi, bank.as_deref(), snap.rate)
+        offline::build_graph(&snap.store, &snap.midi, &snap.plugins, bank.as_deref(), snap.rate)
     };
 
     let tail = (plan.tail_seconds * snap.rate as f64).round() as u64;
@@ -883,6 +888,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         // Round-trip barrier: once the engine thread answers, its startup
         // `open_output` has finished, so the engine rate is final (a mid-test
@@ -900,6 +906,7 @@ mod tests {
             engine,
             Arc::new(JobManager::default()),
             Box::new(move |e, p| ev.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         // Demo-song content, placed directly (no engine round-trip needed).
         let (keys, bass) = {

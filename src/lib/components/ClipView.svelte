@@ -113,12 +113,14 @@
   }
 
   function onPointerUp(e: PointerEvent) {
+    const wasDragging = dragging && dragMoved;
     dragging = false;
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {
       /* not captured */
     }
+    if (wasDragging) void project.commitClipMove(clip.id);
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -127,6 +129,7 @@
       e.preventDefault();
       const dir = e.key === "ArrowLeft" ? -1 : 1;
       project.moveClip(clip.id, clip.timelineStartSamples + dir * beat);
+      void project.commitClipMove(clip.id);
     }
   }
 </script>

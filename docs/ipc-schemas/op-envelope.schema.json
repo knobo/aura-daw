@@ -15,13 +15,14 @@
     },
     "op": {
       "title": "Op",
-      "description": "One mutation. `kind` is an open namespaced string (e.g. \"track.setGain\", \"clip.move\", \"param.set\"); unknown kinds must be rejected by the applier but tolerated by observers. Payload fields beyond these are kind-specific.",
+      "description": "One mutation. `kind` is an open camelCase token (e.g. \"set\", \"trackAdd\", \"tempoSet\", \"automationSetLane\", \"pluginAdd\"); unknown kinds must be rejected by the applier but tolerated by observers. Payload fields beyond these are kind-specific.",
       "type": "object",
       "properties": {
         "kind": {
-          "description": "Namespaced op kind, \"<area>.<verb>\".",
+          "description": "Op kind: a single camelCase token.",
+          "$comment": "2026-08: implementation kinds are single camelCase tokens; dotted form was D-03 draft, never shipped — corrected per ADR 0007, not silently. The landed vocabulary (src-tauri/src/control/op.rs, serde tag = \"kind\", rename_all = camelCase) is what journal.ndjson has written since Plan E Task 17, so this pattern now describes data on disk rather than a proposal. Checked by src-tauri/tests/journal_and_history.rs::journal_op_kinds_match_the_corrected_envelope_schema_pattern.",
           "type": "string",
-          "pattern": "^[a-z][a-zA-Z0-9]*\\.[a-z][a-zA-Z0-9]*$"
+          "pattern": "^[a-z][a-zA-Z0-9]*$"
         },
         "target": {
           "description": "Primary target entity UUID (track, clip, node, ...), when the kind has one.",

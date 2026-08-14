@@ -82,7 +82,7 @@ pub struct MidiNote {
 /// them to `events/<clipId>.bin` AMEV chunks referenced from project.json v2
 /// (`eventsRef`), never inline JSON (SCALABILITY §3). Pattern instancing
 /// (`patternId`) is reserved for the pattern/playlist milestone.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MidiClip {
     pub id: ClipId,
