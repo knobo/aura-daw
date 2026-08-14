@@ -295,20 +295,20 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
 ///   state (fresh session) or reset to the mechanical migration defaults,
 ///   which [`v1_migration_defaults`] provides.
 ///
-/// PROJECT-ADOPTION SEAM (zone P4): this loader runs exactly when a project
-/// is adopted (open_project eagerly via `notify_project_opened`, or the lazy
-/// midi resync), so it also restores the project's persisted PLUGIN
-/// instances and AUTOMATION lanes into the app-global registries. Both
-/// hooks are inert until the app registers those globals — unit tests use
-/// local registries/stores and never observe them.
+/// Task 6 (Plan E): this loader is PURE midi/v2+ parsing only — it used to
+/// also cascade into `plugins::state::adopt_open_project`/
+/// `plugins::automation::adopt_open_project` as a side effect (the
+/// "plugin-teardown-inside-a-read horror", round-2 inventory row 9: a
+/// supposedly pure `midi_get_clips` read could tear down live host state).
+/// The adopt-chain now runs explicitly, and ONLY, from `ControlPlane`'s
+/// sanctioned epoch functions (`open_project_epoch` et al.), after the
+/// session lock that calls this loader has already been dropped.
 pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
         fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
     let root: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse {}: {e}", file.display()))?;
-    crate::plugins::state::adopt_open_project(dir);
-    crate::plugins::automation::adopt_open_project(dir);
     let version = root.get("schemaVersion").and_then(Value::as_u64).unwrap_or(1);
     if version < 2 {
         return Ok(None);

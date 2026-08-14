@@ -369,9 +369,11 @@ fn rescale(t: u32, from_ppq: u32, to_ppq: u32) -> u32 {
     ((t as u64 * to_ppq as u64 + from_ppq as u64 / 2) / from_ppq as u64) as u32
 }
 
-/// PROJECT-OPEN SEAM (called by `midi::persist::load_from_project`): adopt
-/// the opened project's automation lanes into the app-global store. Inert
-/// until the app registers the store (unit tests use local stores).
+/// PROJECT-OPEN SEAM (Task 6: called explicitly from `ControlPlane`'s
+/// sanctioned epoch functions, e.g. `open_project_epoch`/`create_project_at`
+/// — AFTER the session lock drops, never from a read path): adopt the
+/// opened project's automation lanes into the app-global store. Inert until
+/// the app registers the store (unit tests use local stores).
 pub fn adopt_open_project(dir: &Path) {
     let Some(store) = registered_store() else { return };
     let mut s = store.lock();

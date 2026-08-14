@@ -22,6 +22,7 @@ pub mod ops;
 pub mod loopjam;
 pub mod session;
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 
@@ -140,29 +141,20 @@ fn set_prop(track_id: &str, path: op::PropPath, to: serde_json::Value) -> op::Op
     }
 }
 
-/// Adopt `dir` as `midi.loaded_dir` and settle `midi.dirty` — the "gap"
-/// `create_project` and `save_project_as` each independently rediscovered
-/// and patched by hand (their own comments call out "Finding 2 (same gap as
-/// create_project)"), extracted here so a future call site can't reintroduce
-/// it. `persist: false` is `create_project`'s case (a fresh project already
-/// matches what `project::create` wrote to disk, so there is nothing to
-/// persist — just mark clean); `persist: true` runs
-/// `midi::persist::save_into_project` and settles `dirty` from the result,
-/// mirroring `with_synced_store`'s success/failure handling
-/// (`src/midi/mod.rs`) for the same reason.
-fn adopt_midi_dir(midi: &mut crate::midi::MidiStore, dir: &std::path::Path, persist: bool, context: &str) {
+/// Mark `midi` as belonging to freshly-`project::create`d `dir` and settle
+/// `midi.dirty` — `create_project`/`create_project_epoch`'s case: a fresh
+/// project's on-disk state already matches this blank in-memory reset (both
+/// came from `v1_migration_defaults`/nothing), so there is nothing to
+/// persist, just mark clean. Finding 2: a stale `dirty = true` left over
+/// from a PRIOR project's failed auto-persist (M-5) must not survive into
+/// the new one. (`save_project_as_epoch` has its own, DIFFERENT case —
+/// adopting a dir with REAL content to persist — handled inline there via
+/// `Session::midi_snapshot` + `save_snapshot_into_project`, Task 6's
+/// lock-free-I/O fix; this helper's one remaining caller never needs to
+/// write, so the old `persist: bool` fork was dropped.)
+fn adopt_midi_dir(midi: &mut crate::midi::MidiStore, dir: &std::path::Path) {
     midi.loaded_dir = Some(dir.to_path_buf());
-    if !persist {
-        midi.dirty = false;
-        return;
-    }
-    match crate::midi::persist::save_into_project(dir, midi) {
-        Ok(()) => midi.dirty = false,
-        Err(e) => {
-            midi.dirty = true;
-            log::warn!("{context}: persisting midi failed: {e}");
-        }
-    }
+    midi.dirty = false;
 }
 
 impl ControlPlane {
@@ -680,11 +672,38 @@ impl ControlPlane {
     /// 2026-08 this kept the session's tracks; the UI "New Project" flow
     /// wants a true blank, and materializing an unsaved session is
     /// [`Self::save_project_as`]'s job.)
+    ///
+    /// Kept at this 2-arg shape (frontend's file-dialog-picked `parent_dir`
+    /// + `name`, MCP tool `create_project`'s params, and this crate's own
+    /// tests all call it this way) — [`Self::create_project_epoch`] is the
+    /// Task 6-literal, dir-free additive sibling for a caller with no folder
+    /// to hand it; both share [`Self::create_project_at`]'s body.
     pub fn create_project(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
+        self.create_project_at(Path::new(parent_dir), name)
+    }
+
+    /// Epoch boundary (round-2 §4.5 carve-out, "document birth"): same
+    /// blank-slate reset as [`Self::create_project`], for a caller with no
+    /// user-picked folder — resolves the same default location
+    /// `ensure_project_epoch`/the engine's auto-project use
+    /// (`project::default_project_parent`), and mints an "Untitled"/
+    /// "Untitled-N" name when `name` is `None`.
+    pub fn create_project_epoch(&self, name: Option<String>) -> Result<Project, String> {
+        let parent = project::default_project_parent()?;
+        let name = name.unwrap_or_else(|| project::unique_untitled_name(&parent));
+        self.create_project_at(&parent, &name)
+    }
+
+    /// Shared body: `create_project`/`create_project_epoch`'s only
+    /// difference is where `dir` comes from. Sequencing matches the epoch
+    /// contract: (1) short lock — swap store fields + reset midi to blank
+    /// defaults; (2) drop lock; (3) adopt plugins + automation from `dir`
+    /// (host round-trips OUTSIDE the session lock); (4) Rebuild; (5) emit
+    /// `project://changed`.
+    fn create_project_at(&self, parent_dir: &Path, name: &str) -> Result<Project, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
         let tempo = self.session.lock().store.transport.tempo_bpm;
-        let (project, dir) =
-            project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
+        let (project, dir) = project::create(parent_dir, name, rate, tempo)?;
         {
             // One `session` guard for the store reset, the tables reset
             // (session-before-tables is already the documented lock order
@@ -715,7 +734,9 @@ impl ControlPlane {
             self.shared.position.store(0, Relaxed);
             self.shared.loop_enabled.store(false, Relaxed);
 
-            // Blank midi state bound to the new dir; `sync_midi_store` then
+            // epoch boundary: Task 17 hooks history-clear + journal rotation here
+
+            // Blank midi state bound to the new dir; `adopt_midi_dir` then
             // sees loaded_dir == dir and leaves it alone. Same lock as
             // `store` now (session merge) — no separate `self.midi` field.
             let d0 = crate::midi::persist::v1_migration_defaults(tempo);
@@ -729,8 +750,9 @@ impl ControlPlane {
             // `with_synced_store` for finding 1 would otherwise be fooled:
             // `loaded_dir` is set correctly above, so it WOULD persist, and
             // dirty=true is only meant to block resync-from-disk, not writes).
-            adopt_midi_dir(&mut session.midi, &dir, false, "create_project");
+            adopt_midi_dir(&mut session.midi, &dir);
         }
+        // ---- session lock released; host round-trips + rebuild + emit below ----
         // App-global plugin/automation registries adopt the (empty) project.
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
@@ -742,10 +764,65 @@ impl ControlPlane {
         Ok(project)
     }
 
+    /// Open an existing `.aura` project (or a direct `project.json` path) —
+    /// epoch boundary (round-2 §4.5 carve-out, "document swap, history
+    /// root"). Sequencing: (1) short lock — swap store fields + midi from
+    /// the parsed project; (2) drop lock; (3) adopt plugins + automation
+    /// from `dir` (host round-trips OUTSIDE the session lock); (4) Rebuild;
+    /// (5) emit `project://changed`. Absorbs `audio::open_project_impl`'s
+    /// former body; the Tauri `open_project` command is now a one-line
+    /// delegate.
+    pub fn open_project_epoch(&self, dir: &Path) -> Result<Project, String> {
+        let (project, dir) = project::load(dir)?;
+        // Validate BEFORE mutating any in-memory state (review fix carried
+        // over: a project with duplicate track ids must fail cleanly, not
+        // after tracks/clips were replaced).
+        project::validate(&project)?;
+        {
+            let mut session = self.session.lock();
+            session.store.tracks = project.tracks.clone();
+            session.store.clips = project.clips.clone();
+            session.store.project_dir = Some(dir.clone());
+            session.store.project_name = Some(project.name.clone());
+            session.store.created_at = project.created_at.clone();
+            if let Some(t) = &project.transport {
+                session.store.transport.tempo_bpm = t.tempo_bpm;
+                session.store.transport.state = "stopped".into();
+                // Store mirror AND RT atomics for the loop region, so the
+                // next save round-trips it (from_store serializes
+                // store.transport).
+                session.store.transport.loop_enabled = t.loop_enabled;
+                session.store.transport.loop_start_samples = t.loop_start_samples;
+                session.store.transport.loop_end_samples = t.loop_end_samples;
+                self.shared.playing.store(false, Relaxed);
+                self.shared.position.store(t.position_samples, Relaxed);
+                self.shared.loop_enabled.store(t.loop_enabled, Relaxed);
+                self.shared.loop_start.store(t.loop_start_samples, Relaxed);
+                self.shared.loop_end.store(t.loop_end_samples, Relaxed);
+            }
+            // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // Eager midi adopt (Task 6: no more lazy resync on the first
+            // midi command after an open) — same lock as the store swap
+            // above, no separate re-acquisition.
+            let bpm = session.store.transport.tempo_bpm;
+            crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+        }
+        // ---- session lock released; host round-trips + rebuild + emit below ----
+        crate::plugins::state::adopt_open_project(&dir);
+        crate::plugins::automation::adopt_open_project(&dir);
+        self.engine.send(ControlMsg::Rebuild);
+        (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
+        Ok(project)
+    }
+
     /// First save of a session that never had a project: create the `.aura`
     /// dir and persist the CURRENT in-memory content (tracks, clips, midi)
     /// into it. Refuses when a project is already open — that is plain
-    /// `save_project` territory, not a fork.
+    /// `save_project` territory, not a fork. Kept at this 2-arg shape (no
+    /// other caller besides the frozen `save_project_as` command exists);
+    /// [`Self::save_project_as_epoch`] does the actual swap + I/O once
+    /// `dir` is minted, fixing the lock-then-write bug this method used to
+    /// have (the midi write ran under the session lock).
     pub fn save_project_as(&self, parent_dir: &str, name: &str) -> Result<Project, String> {
         let tempo = {
             let session = self.session.lock();
@@ -755,33 +832,111 @@ impl ControlPlane {
             session.store.transport.tempo_bpm
         };
         let rate = self.shared.sample_rate.load(Relaxed);
-        let (created, dir) = project::create(std::path::Path::new(parent_dir), name, rate, tempo)?;
-        let project = {
+        let (_created, dir) = project::create(Path::new(parent_dir), name, rate, tempo)?;
+        self.save_project_as_epoch(&dir)
+    }
+
+    /// Epoch boundary: materialize the CURRENT in-memory session (tracks,
+    /// clips, midi) into `dir`, an ALREADY-CREATED `.aura` directory (minted
+    /// by [`Self::save_project_as`] via `project::create`, which also wrote
+    /// its own initial `project.json` — read back here for `created_at`).
+    /// Fixes control/mod.rs:659 (round-2 inventory row 26): the midi
+    /// snapshot is taken under a short lock and WRITTEN to disk only after
+    /// the lock drops — no disk I/O ever runs while the session lock is
+    /// held.
+    pub fn save_project_as_epoch(&self, dir: &Path) -> Result<Project, String> {
+        let name = dir
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Untitled")
+            .to_string();
+        let created_at = project::load(dir).ok().and_then(|(p, _)| p.created_at);
+        let rate = self.shared.sample_rate.load(Relaxed);
+        let position = self.shared.position.load(Relaxed);
+        let (project, midi_snapshot) = {
             let mut session = self.session.lock();
-            session.store.project_dir = Some(dir.clone());
-            session.store.project_name = Some(name.to_string());
-            session.store.created_at = created.created_at.clone();
-            let position = self.shared.position.load(Relaxed);
-            project::from_store(&session.store, position, rate)?
+            session.store.project_dir = Some(dir.to_path_buf());
+            session.store.project_name = Some(name);
+            session.store.created_at = created_at;
+            // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // Mark the midi store as belonging to `dir` NOW (under the same
+            // lock as the store swap); the snapshot taken alongside it is
+            // written to disk below, AFTER the lock drops.
+            session.midi.loaded_dir = Some(dir.to_path_buf());
+            let project = project::from_store(&session.store, position, rate)?;
+            let midi_snapshot = session.midi_snapshot();
+            (project, midi_snapshot)
         };
-        project::save(&dir, &project)?;
-        {
-            // Adopt the in-memory midi state into the new project and write
-            // it now (normally that only happens on the next midi mutation).
-            let mut session = self.session.lock();
-            // Finding 2 (same gap as create_project): explicitly settle
-            // `dirty` on this persist rather than leaving whatever it was
-            // (e.g. a stale `true` from a prior failed auto-persist in the
-            // old session) — mirrors `with_synced_store`'s success/failure
-            // handling so the flag stays an accurate "memory has an
-            // unpersisted edit" signal for the freshly adopted dir.
-            adopt_midi_dir(&mut session.midi, &dir, true, "save_project_as");
+        // ---- session lock released; all disk I/O below ----
+        project::save(dir, &project)?;
+        match crate::midi::persist::save_snapshot_into_project(dir, &midi_snapshot) {
+            Ok(()) => self.session.lock().midi.dirty = false,
+            Err(e) => {
+                self.session.lock().midi.dirty = true;
+                log::warn!("save_project_as_epoch: persisting midi failed: {e}");
+            }
         }
         (self.emit)(
             "project://changed",
             serde_json::to_value(&project).unwrap_or_default(),
         );
         Ok(project)
+    }
+
+    /// Snapshot mark (today's `save_project`, sanctioned): persist the
+    /// CURRENT in-memory document to its already-open project dir. Not a
+    /// document swap (no dir change, nothing to adopt from disk — the
+    /// project already open is exactly the one being written), so there is
+    /// no plugin/automation adopt step here, only the write. Absorbs
+    /// `audio::save_project_impl`'s former body; the Tauri `save_project`
+    /// command is now a one-line delegate (its frozen `Result<(), String>`
+    /// shape discards the returned `Project`).
+    pub fn save_project_mark(&self) -> Result<Project, String> {
+        let rate = self.shared.sample_rate.load(Relaxed);
+        let position = self.shared.position.load(Relaxed);
+        let (project, dir) = {
+            let session = self.session.lock();
+            let dir = session.store.project_dir.clone().ok_or("no project open")?;
+            let project = project::from_store(&session.store, position, rate)?;
+            (project, dir)
+        };
+        // epoch boundary: no document swap here (same project, same
+        // in-memory content) — Task 17 still journals a "save" mark record.
+        project::save(&dir, &project)?;
+        (self.emit)(
+            "project://changed",
+            serde_json::to_value(&project).unwrap_or_default(),
+        );
+        Ok(project)
+    }
+
+    /// Engine auto-project, as a sanctioned `ControlPlane` epoch fn (round-2
+    /// §4.5 carve-out, "document birth") — same behavior as the engine
+    /// control thread's own `ensure_project` (engine.rs), sharing its core
+    /// via `project::ensure_default_project`; NOT yet wired to the engine
+    /// (Task 13 switches that call site over). No-op (just returns the
+    /// already-open dir) when a project is already open.
+    pub fn ensure_project_epoch(&self) -> Result<PathBuf, String> {
+        let rate = self.shared.sample_rate.load(Relaxed);
+        match project::ensure_default_project(&self.session, rate)? {
+            Some(project) => {
+                // epoch boundary: Task 17 hooks history-clear + journal rotation here
+                (self.emit)(
+                    "project://changed",
+                    serde_json::to_value(&project).unwrap_or_default(),
+                );
+                Ok(PathBuf::from(
+                    project.path.clone().expect("just-created project has a path"),
+                ))
+            }
+            None => Ok(self
+                .session
+                .lock()
+                .store
+                .project_dir
+                .clone()
+                .expect("ensure_default_project returns None only when a project is already open")),
+        }
     }
 
     /// Copy the file into `<project>/audio/`, probe channels/rate/length,
@@ -804,18 +959,20 @@ impl ControlPlane {
     /// project open, midi, track bindings AND plugin state are persisted so
     /// the demo survives save/open.
     pub fn seed_demo_project(&self) -> Result<ProjectSnapshot, String> {
-        // Sync the midi store with the open project first, so we never
-        // clobber on-disk state.
-        let (dir, bpm) = {
+        // Task 6: no lazy resync needed here — eager epoch adoption
+        // (open/create/save-as/ensure-project) keeps the midi store synced
+        // to `project_dir` at all times, so the open project's on-disk
+        // state is never at risk of being clobbered by a stale in-memory
+        // copy the way a lazy resync used to guard against.
+        let dir = {
             let session = self.session.lock();
             if !session.store.clips.is_empty()
                 || session.midi.clips.iter().any(|c| !c.notes.is_empty())
             {
                 return Err("project already has content".to_string());
             }
-            (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
+            session.store.project_dir.clone()
         };
-        crate::midi::notify_project_opened(dir.clone(), bpm);
 
         // Zyn upgrade path: build the three patched instances BEFORE the
         // tracks so a failure leaves no half-bound state (None = PolySynth).

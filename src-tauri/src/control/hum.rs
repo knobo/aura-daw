@@ -311,13 +311,12 @@ impl ControlPlane {
         sink: EventSink,
     ) -> Result<String, String> {
         let input = self.resolve_hum_input(&req)?;
-        // Sync the midi store with the open project so ppq/tempo are fresh.
-        let (dir, project_bpm) = {
+        // Task 6: no lazy resync — eager epoch adoption keeps ppq/tempo
+        // current at all times, so a plain read under one lock is enough.
+        let (project_bpm, ppq) = {
             let session = self.session.lock();
-            (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
+            (session.store.transport.tempo_bpm, session.midi.ppq)
         };
-        crate::midi::notify_project_opened(dir, project_bpm);
-        let ppq = self.session.lock().midi.ppq;
         let bpm = req.bpm.unwrap_or(project_bpm);
         if !(bpm > 0.0) {
             return Err(format!("bpm out of range: {bpm}"));

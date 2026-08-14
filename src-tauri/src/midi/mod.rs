@@ -21,10 +21,13 @@
 //! `midi_add_clip`, `midi_set_notes`, `midi_get_clips`.
 //!
 //! Persistence model: midi edits auto-persist into the open project
-//! (`project.json` v2/v3 + AMEV chunks) on every mutation; when the open
-//! project changes (open_project happened since the last midi command), the
-//! store lazily reloads from disk before serving. Every mutation triggers an
-//! engine graph rebuild so MIDI is immediately audible.
+//! (`project.json` v2/v3 + AMEV chunks) on every mutation. Task 6 (Plan E):
+//! the store no longer lazily resyncs from disk on a command call — every
+//! adopt-chain run (midi + plugins + automation) happens exactly at a
+//! `ControlPlane` epoch boundary (open/create/save-as/ensure-project), so
+//! `midi.loaded_dir` is always current by the time any command runs. Every
+//! mutation still triggers an engine graph rebuild so MIDI is immediately
+//! audible.
 
 pub mod amt;
 pub mod events;
@@ -37,7 +40,7 @@ pub mod synth;
 pub mod tempo;
 pub mod types;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::Mutex;
@@ -73,11 +76,11 @@ pub struct MidiStore {
     pub clips: Vec<MidiClip>,
     /// Project dir this store was last synced with (None = in-memory only).
     pub loaded_dir: Option<PathBuf>,
-    /// Set when the last auto-persist ([`with_synced_store`]'s mutating
-    /// path) failed to write to disk (M-5). While set, memory is the ONLY
-    /// authoritative copy — [`sync_midi_store`] refuses to overwrite it from
-    /// disk (which could otherwise silently discard the unpersisted edit on
-    /// the next project-dir change). Cleared by the next successful save.
+    /// Set when the last auto-persist ([`with_synced_store`]'s path) failed
+    /// to write to disk (M-5). While set, memory is the ONLY authoritative
+    /// copy — [`adopt_midi_from_dir`] refuses to overwrite it from disk
+    /// (which could otherwise silently discard the unpersisted edit on the
+    /// next epoch boundary). Cleared by the next successful save.
     pub dirty: bool,
 }
 
@@ -165,127 +168,129 @@ impl From<&section_table::Section> for SectionRow {
 // Command plumbing
 // ---------------------------------------------------------------------------
 
-/// Sync the midi store with the (possibly changed) open project dir:
-/// * v2 project -> load its midi fields (AMEV chunks decoded),
-/// * v1 project -> reset to the mechanical migration defaults, EXCEPT when
-///   this session had no project yet (fresh in-memory edits are adopted into
-///   the project and persisted on the next mutation),
-/// * no project -> keep in-memory state.
-fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f64) {
-    if midi.loaded_dir == *dir {
+/// Adopt `dir`'s midi/v2+ fields into `midi`, replacing memory wholesale —
+/// the ONE place midi state resyncs from disk (Task 6: called ONLY from
+/// `ControlPlane`'s sanctioned epoch functions — `open_project_epoch` is the
+/// only caller that actually needs the disk read; `create_project_epoch`/
+/// `save_project_as_epoch` mark `loaded_dir` directly, they don't read).
+/// Never called from a read path anymore (that was the "plugin-teardown-
+/// inside-a-read horror", round-2 inventory row 9 — `load_from_project`
+/// used to cascade into `plugins::state::adopt_open_project`, tearing down
+/// live host state as a side effect of what looked like a pure `get_clips`).
+///
+/// Same M-5 dirty-guard semantics as the retired `sync_midi_store` this
+/// replaces: a previous auto-persist failure leaves memory as the ONLY
+/// authoritative copy, so this refuses to overwrite it from disk.
+pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm: f64) {
+    if midi.loaded_dir.as_deref() == Some(dir) {
         return;
     }
     if midi.dirty {
-        // M-5: a previous auto-persist failed — memory holds the only copy
-        // of that edit. Reloading now (from the old dir's disk state, or
-        // adopting a newly-opened project) would silently destroy it.
         log::warn!(
             "midi: refusing to resync ({:?} -> {dir:?}) — memory has unpersisted edits from a failed save",
             midi.loaded_dir
         );
         return;
     }
-    if let Some(d) = dir {
-        match persist::load_from_project(d) {
-            Ok(Some(v2)) => {
-                midi.ppq = v2.ppq;
-                midi.tempo_events = v2.tempo_events;
-                midi.meter_events = v2.meter_events;
-                midi.clips = v2.clips;
-            }
-            Ok(None) => {
-                if midi.loaded_dir.is_some() {
-                    let d0 = persist::v1_migration_defaults(fallback_bpm);
-                    midi.ppq = d0.ppq;
-                    midi.tempo_events = d0.tempo_events;
-                    midi.meter_events = d0.meter_events;
-                    midi.clips = d0.clips;
-                }
-            }
-            Err(e) => {
-                log::warn!("midi: cannot read project midi state: {e}");
-                // H-2: do NOT mark synced on a failed load — otherwise the
-                // next mutation persists the OLD project's clips (and
-                // watermarks) into the new dir.
-                return;
+    match persist::load_from_project(dir) {
+        Ok(Some(v2)) => {
+            midi.ppq = v2.ppq;
+            midi.tempo_events = v2.tempo_events;
+            midi.meter_events = v2.meter_events;
+            midi.clips = v2.clips;
+        }
+        Ok(None) => {
+            if midi.loaded_dir.is_some() {
+                let d0 = persist::v1_migration_defaults(fallback_bpm);
+                midi.ppq = d0.ppq;
+                midi.tempo_events = d0.tempo_events;
+                midi.meter_events = d0.meter_events;
+                midi.clips = d0.clips;
             }
         }
+        Err(e) => {
+            log::warn!("midi: cannot read project midi state: {e}");
+            // H-2: do NOT mark synced on a failed load — otherwise the
+            // next mutation persists the OLD project's clips (and
+            // watermarks) into the new dir.
+            return;
+        }
     }
-    midi.loaded_dir = dir.clone();
-}
-
-/// REQUESTED ARCHITECT SEAM: one-line eager-resync hook for
-/// `audio::open_project` (frozen for zone C) — call as
-/// `crate::midi::notify_project_opened(dir.clone(), tempo_bpm);` after the
-/// store adopts the loaded project. Until that lands, every `midi_*` command
-/// lazily resyncs, so only `get_project_state` served BEFORE the first midi
-/// command can observe stale midi fields after an open.
-pub fn notify_project_opened(dir: Option<PathBuf>, fallback_bpm: f64) {
-    if let Some(session) = playback::registered_store() {
-        sync_midi_store(&mut session.lock().midi, &dir, fallback_bpm);
-    }
+    midi.loaded_dir = Some(dir.to_path_buf());
 }
 
 /// Finding 1: an auto-persist into `dir` is safe only when the store is
-/// actually synced to it — i.e. `sync_midi_store` adopted this exact dir
-/// last, not a stale one left over after it REFUSED to resync (dirty flag,
-/// or a failed load; see [`sync_midi_store`]). Persisting when the two
-/// disagree would write one project's in-memory clips into another
-/// project's dir and GC that project's chunks. A plain equality check, but
-/// pulled out as a pure fn so the guard is unit-testable without a full
-/// session/State harness.
+/// actually synced to it — i.e. an epoch function adopted this exact dir
+/// last, not a stale one left over after `adopt_midi_from_dir` REFUSED to
+/// resync (dirty flag, or a failed load). Persisting when the two disagree
+/// would write one project's in-memory clips into another project's dir and
+/// GC that project's chunks. A plain equality check, but pulled out as a
+/// pure fn so the guard is unit-testable without a full session/State
+/// harness.
 fn synced_to_dir(loaded_dir: &Option<PathBuf>, dir: &Option<PathBuf>) -> bool {
     loaded_dir == dir
 }
 
-/// Run `f` against the midi store, synced with the open project (see
-/// [`sync_midi_store`]). After a mutating `f`, persist into the project
-/// (when one is open) and ask the engine for a graph rebuild (STRUCTURAL
-/// change, §10.1). One session guard covers the whole block — store and
-/// midi live behind the same lock.
+/// Run `f` against the midi store for a MUTATION: after `f`, persist into
+/// the project (when one is open) and ask the engine for a graph rebuild
+/// (STRUCTURAL change, §10.1). One session guard covers the whole block —
+/// store and midi live behind the same lock.
+///
+/// Task 6: no longer resyncs from disk first — eager epoch adoption
+/// (`ControlPlane::open_project_epoch`/`create_project_epoch`/
+/// `save_project_as_epoch`/`ensure_project_epoch`) keeps `midi.loaded_dir`
+/// current at every document-swap boundary, so a mutating command never
+/// needs to catch up; `dirty` still guards the write-failure case via
+/// `synced_to_dir` below.
 fn with_synced_store<R>(
     audio: &AudioState,
     state: &MidiState,
-    mutating: bool,
     f: impl FnOnce(&mut MidiStore) -> Result<R, String>,
 ) -> Result<R, String> {
     let mut session = state.session().lock();
-    let (dir, bpm) = (session.store.project_dir.clone(), session.store.transport.tempo_bpm);
-
-    sync_midi_store(&mut session.midi, &dir, bpm);
+    let dir = session.store.project_dir.clone();
 
     let result = f(&mut session.midi)?;
 
-    if mutating {
-        if let Some(d) = &dir {
-            if synced_to_dir(&session.midi.loaded_dir, &dir) {
-                match persist::save_into_project(d, &session.midi) {
-                    Ok(()) => session.midi.dirty = false,
-                    Err(e) => {
-                        session.midi.dirty = true;
-                        log::warn!("midi: persisting to {} failed: {e}", d.display());
-                    }
+    if let Some(d) = &dir {
+        if synced_to_dir(&session.midi.loaded_dir, &dir) {
+            match persist::save_into_project(d, &session.midi) {
+                Ok(()) => session.midi.dirty = false,
+                Err(e) => {
+                    session.midi.dirty = true;
+                    log::warn!("midi: persisting to {} failed: {e}", d.display());
                 }
-            } else {
-                // sync_midi_store refused to adopt `dir` above — persisting
-                // regardless would cross-contaminate project B's files with
-                // project A's in-memory clips (see `synced_to_dir`'s doc).
-                log::warn!(
-                    "midi: skipping persist to {} — store not synced to it (loaded_dir={:?}); \
-                     edit stays in memory only",
-                    d.display(),
-                    session.midi.loaded_dir
-                );
             }
+        } else {
+            // The store isn't synced to `dir` — persisting regardless would
+            // cross-contaminate project B's files with project A's
+            // in-memory clips (see `synced_to_dir`'s doc).
+            log::warn!(
+                "midi: skipping persist to {} — store not synced to it (loaded_dir={:?}); \
+                 edit stays in memory only",
+                d.display(),
+                session.midi.loaded_dir
+            );
         }
     }
     drop(session);
-    if mutating {
-        if let Some(engine) = audio.engine_handle() {
-            engine.send(ControlMsg::Rebuild);
-        }
+    if let Some(engine) = audio.engine_handle() {
+        engine.send(ControlMsg::Rebuild);
     }
     Ok(result)
+}
+
+/// Run `f` against the midi store as a PURE READ: lock, read, drop — no
+/// resync, no persist, no engine rebuild. Task 6: the only midi read paths
+/// left (`midi_get_clips`, `midi_export_file`) go through this; staleness
+/// is impossible because eager epoch adoption keeps `loaded_dir` current at
+/// every document swap, so there is nothing left for a read to "catch up".
+fn read_midi<R>(
+    state: &MidiState,
+    f: impl FnOnce(&MidiStore) -> Result<R, String>,
+) -> Result<R, String> {
+    let session = state.session().lock();
+    f(&session.midi)
 }
 
 // ---------------------------------------------------------------------------
@@ -331,7 +336,7 @@ pub fn set_tempo_map(
     state: State<'_, MidiState>,
     audio: State<'_, AudioState>,
 ) -> Result<TempoMapState, String> {
-    let result = with_synced_store(&audio, &state, true, |s| {
+    let result = with_synced_store(&audio, &state, |s| {
         let ppq = ppq.unwrap_or(s.ppq);
         let result = build_tempo_map_state(ppq, &events, &s.meter_events)?;
         s.ppq = ppq;
@@ -375,7 +380,7 @@ pub fn midi_add_clip(
             ));
         }
     }
-    with_synced_store(&audio, &state, true, move |s| {
+    with_synced_store(&audio, &state, move |s| {
         let n = s.clips.len();
         let lane_id = crate::ids::LaneId::default_for_track(&track_id);
         let clip = MidiClip {
@@ -409,7 +414,7 @@ pub fn midi_set_notes(
     for n in &notes {
         n.validate()?;
     }
-    with_synced_store(&audio, &state, true, move |s| {
+    with_synced_store(&audio, &state, move |s| {
         let clip = s
             .clips
             .iter_mut()
@@ -514,17 +519,14 @@ pub fn midi_set_clip_bounds(
     state: State<'_, MidiState>,
     audio: State<'_, AudioState>,
 ) -> Result<MidiClip, String> {
-    with_synced_store(&audio, &state, true, move |s| {
+    with_synced_store(&audio, &state, move |s| {
         apply_clip_bounds(&mut s.clips, &clip_id, timeline_start_ticks, length_ticks, content_length_ticks)
     })
 }
 
 #[tauri::command]
-pub fn midi_get_clips(
-    state: State<'_, MidiState>,
-    audio: State<'_, AudioState>,
-) -> Result<Vec<MidiClip>, String> {
-    with_synced_store(&audio, &state, false, |s| Ok(s.clips.clone()))
+pub fn midi_get_clips(state: State<'_, MidiState>) -> Result<Vec<MidiClip>, String> {
+    read_midi(&state, |s| Ok(s.clips.clone()))
 }
 
 /// Import a standard MIDI file (.mid) onto the tick timeline (architect
@@ -547,14 +549,9 @@ pub fn midi_import_file(
     }
     let bytes = std::fs::read(p).map_err(|e| format!("read {path}: {e}"))?;
 
+    // Task 6: no lazy resync — eager epoch adoption keeps the store current.
     let (session, _shared, _tables) = audio.control_parts();
-    let ppq = {
-        let mut s = session.lock();
-        let dir = s.store.project_dir.clone();
-        let bpm = s.store.transport.tempo_bpm;
-        sync_midi_store(&mut s.midi, &dir, bpm);
-        s.midi.ppq
-    };
+    let ppq = session.lock().midi.ppq;
     let imported = midifile::import_smf(&bytes, ppq)?;
     if imported.clips.is_empty() {
         return Err("MIDI file contains no note-carrying tracks".into());
@@ -603,7 +600,7 @@ pub fn midi_import_file(
     let adopt_tempo = imported.explicit_tempo.then(|| imported.tempo_events.clone());
     let first_bpm = imported.tempo_events.first().map(|e| e.bpm);
     let result_clips = clips.clone();
-    let result = with_synced_store(&audio, &state, true, move |s| {
+    let result = with_synced_store(&audio, &state, move |s| {
         if let Some(events) = adopt_tempo {
             s.tempo_events = events;
         }
@@ -627,13 +624,12 @@ pub fn midi_export_file(
     path: String,
     clip_ids: Option<Vec<String>>,
     state: State<'_, MidiState>,
-    audio: State<'_, AudioState>,
 ) -> Result<String, String> {
     let p = std::path::PathBuf::from(&path);
     if !p.is_absolute() {
         return Err(format!("path must be absolute: {path}"));
     }
-    let bytes = with_synced_store(&audio, &state, false, |s| {
+    let bytes = read_midi(&state, |s| {
         let clips: Vec<MidiClip> = match &clip_ids {
             None => s.clips.clone(),
             Some(ids) => ids
@@ -773,10 +769,11 @@ mod tests {
         assert_eq!(watermark, 13);
     }
 
-    // ---- sync_midi_store (H-2, M-5) — plain fns, no tauri State needed ----
+    // ---- adopt_midi_from_dir (H-2, M-5; renamed from sync_midi_store,
+    // Task 6) — plain fns, no tauri State needed ----
 
     #[test]
-    fn sync_midi_store_failed_load_does_not_mark_synced() {
+    fn adopt_midi_from_dir_failed_load_does_not_mark_synced() {
         // A directory that looks like a project dir but has no readable
         // project.json — load_from_project errors.
         let parent = std::env::temp_dir()
@@ -784,15 +781,14 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
 
         let mut midi = MidiStore::default();
-        let dir = Some(parent.clone());
-        sync_midi_store(&mut midi, &dir, 120.0);
+        adopt_midi_from_dir(&mut midi, &parent, 120.0);
         assert_eq!(midi.loaded_dir, None, "H-2: a failed load must not mark the store synced");
 
         let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
-    fn sync_midi_store_refuses_to_resync_while_dirty() {
+    fn adopt_midi_from_dir_refuses_to_resync_while_dirty() {
         let mut midi = MidiStore::default();
         midi.clips.push(crate::midi::MidiClip {
             id: "c1".into(),
@@ -809,8 +805,8 @@ mod tests {
         midi.dirty = true;
         midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));
 
-        let new_dir = Some(std::path::PathBuf::from("/new/project"));
-        sync_midi_store(&mut midi, &new_dir, 120.0);
+        let new_dir = std::path::PathBuf::from("/new/project");
+        adopt_midi_from_dir(&mut midi, &new_dir, 120.0);
 
         assert_eq!(midi.clips.len(), 1, "M-5: dirty memory is not silently discarded");
         assert_eq!(
@@ -834,10 +830,10 @@ mod tests {
 
     #[test]
     fn synced_to_dir_matches_the_failed_resync_scenarios() {
-        // Exercise the exact two `sync_midi_store` failure paths from H-2/M-5
-        // and confirm the persist guard correctly refuses both — this is the
-        // end-to-end shape of finding 1's bug: sync refuses to adopt `dir`,
-        // and the caller must not persist into it regardless.
+        // Exercise the exact two `adopt_midi_from_dir` failure paths from
+        // H-2/M-5 and confirm the persist guard correctly refuses both —
+        // this is the end-to-end shape of finding 1's bug: adopt refuses
+        // `dir`, and the caller must not persist into it regardless.
 
         // Failed load: loaded_dir stays None, dir is Some -> refuse.
         let parent = std::env::temp_dir().join(format!(
@@ -847,9 +843,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&parent).unwrap();
         let mut midi = MidiStore::default();
-        let dir = Some(parent.clone());
-        sync_midi_store(&mut midi, &dir, 120.0);
-        assert!(!synced_to_dir(&midi.loaded_dir, &dir), "failed load must not enable persist");
+        adopt_midi_from_dir(&mut midi, &parent, 120.0);
+        assert!(
+            !synced_to_dir(&midi.loaded_dir, &Some(parent.clone())),
+            "failed load must not enable persist"
+        );
         let _ = std::fs::remove_dir_all(&parent);
 
         // Dirty refusal: loaded_dir stays at the OLD dir, dir is the NEW one
@@ -857,11 +855,119 @@ mod tests {
         let mut midi = MidiStore::default();
         midi.dirty = true;
         midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));
-        let new_dir = Some(std::path::PathBuf::from("/new/project"));
-        sync_midi_store(&mut midi, &new_dir, 120.0);
+        let new_dir = std::path::PathBuf::from("/new/project");
+        adopt_midi_from_dir(&mut midi, &new_dir, 120.0);
         assert!(
-            !synced_to_dir(&midi.loaded_dir, &new_dir),
+            !synced_to_dir(&midi.loaded_dir, &Some(new_dir)),
             "dirty refusal must not enable persist into the new project"
         );
+    }
+
+    // ---- Task 6 (Gate E test-4 precursor): declared MIDI read paths are
+    // pure — the "plugin-teardown-inside-a-read horror" (round-2 inventory
+    // row 9) is gone because no read path calls a resync anymore. This is
+    // the RED/GREEN evidence `tests/pure_readers.rs` can't reach directly:
+    // `with_synced_store`/`read_midi` are crate-private (same constraint
+    // `EngineHandle::for_tests` hits in control/mod.rs — that test's own
+    // comment documents the ruling this follows), so the genuinely
+    // behavioral proof lives here, in-crate.
+
+    /// Builds an `AudioState` + `MidiState` pair sharing one session (same
+    /// wiring `MidiState::shared` performs during real app setup), seeded
+    /// with a store already "adopted" from `dir_a` (a real on-disk project
+    /// with one clip). Returns the pair plus `dir_a`/`dir_b`, where `dir_b`
+    /// is a SECOND real project with a DIFFERENT clip — never adopted.
+    fn midi_purity_fixture() -> (AudioState, MidiState, std::path::PathBuf, std::path::PathBuf) {
+        use crate::audio::project;
+
+        let parent = std::env::temp_dir().join(format!(
+            "aura-midi-mod-purity-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&parent).unwrap();
+        let (_, dir_a) = project::create(&parent, "A", 48_000, 120.0).unwrap();
+        let (_, dir_b) = project::create(&parent, "B", 48_000, 120.0).unwrap();
+
+        let mut store_a = MidiStore::default();
+        store_a.clips.push(dummy_clip("from-a"));
+        persist::save_into_project(&dir_a, &store_a).unwrap();
+        let mut store_b = MidiStore::default();
+        store_b.clips.push(dummy_clip("from-b"));
+        persist::save_into_project(&dir_b, &store_b).unwrap();
+
+        let audio = AudioState::default();
+        let midi_state = MidiState::default();
+        let (session, _shared, _tables) = audio.control_parts();
+        midi_state.shared(session.clone());
+        {
+            let mut s = session.lock();
+            s.store.project_dir = Some(dir_a.clone());
+            adopt_midi_from_dir(&mut s.midi, &dir_a, 120.0);
+        }
+        (audio, midi_state, dir_a, dir_b)
+    }
+
+    fn dummy_clip(id: &str) -> MidiClip {
+        MidiClip {
+            id: id.into(),
+            track_id: "t1".into(),
+            name: id.into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
+        }
+    }
+
+    /// THE red/green case: `store.project_dir` moves to `dir_b` WITHOUT
+    /// going through a `ControlPlane` epoch function (simulating "the old
+    /// lazy-resync trigger" — a document swap the eager-adopt invariant is
+    /// supposed to make impossible in practice, forced here by hand). A
+    /// read through `read_midi` (Task 6's replacement for
+    /// `with_synced_store(mutating=false)`) must NOT touch the midi store:
+    /// still A's clip, `loaded_dir` still `dir_a`. Before Task 6,
+    /// `with_synced_store`'s read path called `sync_midi_store` first,
+    /// which WOULD have swapped in B's clip here — this is the exact
+    /// behavior this test pins as gone.
+    #[test]
+    fn read_midi_never_resyncs_even_when_project_dir_moved_underneath_it() {
+        let (audio, midi_state, dir_a, dir_b) = midi_purity_fixture();
+        let (session, _, _) = audio.control_parts();
+        session.lock().store.project_dir = Some(dir_b.clone());
+
+        let before = read_midi(&midi_state, |s| Ok(s.clips.clone())).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].id.as_str(), "from-a", "a read must never resync from disk");
+
+        let after = read_midi(&midi_state, |s| Ok(s.clips.clone())).unwrap();
+        assert_eq!(before, after, "two reads back to back must be byte-identical (idempotent)");
+        assert_eq!(
+            session.lock().midi.loaded_dir,
+            Some(dir_a.clone()),
+            "loaded_dir must not move just from reading — only an epoch function adopts"
+        );
+
+        let _ = std::fs::remove_dir_all(dir_a.parent().unwrap());
+    }
+
+    /// Same fixture, but exercising `with_synced_store`'s mutating path
+    /// (the surviving Task 7 callers): it must NOT resync from disk before
+    /// running `f` either — `f` sees A's pre-existing clip untouched by any
+    /// eager reload, only its own edit is added.
+    #[test]
+    fn with_synced_store_mutating_path_does_not_resync_before_running_f() {
+        let (audio, midi_state, dir_a, dir_b) = midi_purity_fixture();
+        let (session, _, _) = audio.control_parts();
+        session.lock().store.project_dir = Some(dir_b.clone());
+
+        let seen = with_synced_store(&audio, &midi_state, |s| Ok(s.clips.clone())).unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].id.as_str(), "from-a", "no lazy resync before running the mutating closure");
+
+        let _ = std::fs::remove_dir_all(dir_a.parent().unwrap());
     }
 }

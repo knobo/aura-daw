@@ -606,83 +606,30 @@ pub async fn save_project_as(
         .map_err(|e| e.to_string())?
 }
 
+/// Open an existing `.aura` project (or a direct `project.json` path).
+/// One-line delegate over the sanctioned epoch fn (Task 6, round-2
+/// inventory row 25): [`ControlPlane::open_project_epoch`] absorbs what
+/// used to be this file's own `open_project_impl` body.
 #[tauri::command]
-pub async fn open_project(path: String, app: AppHandle) -> Result<Project, String> {
-    tauri::async_runtime::spawn_blocking(move || open_project_impl(path, app))
+pub async fn open_project(
+    path: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Project, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.open_project_epoch(std::path::Path::new(&path)))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn open_project_impl(path: String, app: AppHandle) -> Result<Project, String> {
-    let state = app.state::<AudioState>();
-    let (project, dir) = project::load(std::path::Path::new(&path))?;
-    // Validate BEFORE mutating any in-memory state (review fix: a project
-    // with duplicate track ids must fail cleanly, not after tracks/clips
-    // were replaced — the track-count cap this comment used to describe is
-    // gone, Task 7: slot assignment is per-graph now).
-    project::validate(&project)?;
-    {
-        let mut session = state.session.lock();
-        let s = &mut session.store;
-        // Round-2 §2.4: no slot/param seeding here anymore — adoption
-        // (below) + the `Rebuild` sent after this block is enough; the
-        // next rebuild derives slots from display order and populates a
-        // fresh `ParamTable` from the adopted rows.
-        s.tracks = project.tracks.clone();
-        s.clips = project.clips.clone();
-        s.project_dir = Some(dir);
-        s.project_name = Some(project.name.clone());
-        s.created_at = project.created_at.clone();
-        if let Some(t) = &project.transport {
-            s.transport.tempo_bpm = t.tempo_bpm;
-            s.transport.state = "stopped".into();
-            // Store mirror AND RT atomics for the loop region, so the next
-            // save round-trips it (from_store serializes store.transport).
-            s.transport.loop_enabled = t.loop_enabled;
-            s.transport.loop_start_samples = t.loop_start_samples;
-            s.transport.loop_end_samples = t.loop_end_samples;
-            state.shared.playing.store(false, Relaxed);
-            state.shared.position.store(t.position_samples, Relaxed);
-            state.shared.loop_enabled.store(t.loop_enabled, Relaxed);
-            state.shared.loop_start.store(t.loop_start_samples, Relaxed);
-            state.shared.loop_end.store(t.loop_end_samples, Relaxed);
-        }
-    }
-    // Eager midi resync (zone C's requested seam): the midi store adopts the
-    // opened project's v2 fields NOW, so the first `get_project_state` after
-    // an open (and the rebuild below) already see fresh midi state.
-    let (dir, bpm) = {
-        let session = state.session.lock();
-        (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
-    };
-    crate::midi::notify_project_opened(dir, bpm);
-    // Load clip audio + (re)build waveform pyramids off the IPC path.
-    state.engine()?.send(ControlMsg::Rebuild);
-    let _ = app.emit("project://changed", serde_json::to_value(&project).unwrap_or_default());
-    Ok(project)
-}
-
+/// Persist the CURRENT in-memory document to its already-open project dir.
+/// One-line delegate over the sanctioned snapshot-mark fn (Task 6, round-2
+/// inventory row 26): [`ControlPlane::save_project_mark`] absorbs what used
+/// to be this file's own `save_project_impl` body. The frozen command
+/// return shape (`Result<(), String>`) discards the returned `Project`.
 #[tauri::command]
-pub async fn save_project(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || save_project_impl(app))
+pub async fn save_project(control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.save_project_mark().map(|_| ()))
         .await
         .map_err(|e| e.to_string())?
-}
-
-fn save_project_impl(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AudioState>();
-    let (project, dir) = {
-        let session = state.session.lock();
-        let s = &session.store;
-        let dir = s.project_dir.clone().ok_or("no project open")?;
-        let p = project::from_store(
-            s,
-            state.shared.position.load(Relaxed),
-            state.shared.sample_rate.load(Relaxed),
-        )?;
-        (p, dir)
-    };
-    project::save(&dir, &project)?;
-    let _ = app.emit("project://changed", serde_json::to_value(&project).unwrap_or_default());
-    Ok(())
 }

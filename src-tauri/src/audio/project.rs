@@ -14,7 +14,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use parking_lot::Mutex;
+
 use super::types::{Clip, Project, Store, TransportState};
+use crate::control::Session;
 use crate::ids::SourceId;
 
 pub const PROJECT_FILE: &str = "project.json";
@@ -62,6 +65,62 @@ pub fn create(parent: &Path, name: &str, sample_rate: u32, tempo_bpm: f64) -> Re
     };
     save(&dir, &project)?;
     Ok((project, dir))
+}
+
+/// A writable default parent for projects nobody picked a folder for
+/// (the engine's auto-project, and `ControlPlane::create_project_epoch`
+/// when called with no explicit location) — `~/Music/AURA` or
+/// `$HOME/AURA` as a fallback.
+pub(crate) fn default_project_parent() -> Result<PathBuf, String> {
+    let parent = dirs::audio_dir()
+        .or_else(dirs::home_dir)
+        .ok_or("cannot determine a directory for the default project")?
+        .join("AURA");
+    fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
+    Ok(parent)
+}
+
+/// Mint an "Untitled"/"Untitled-N" name that doesn't collide with an
+/// existing `<parent>/<name>.aura` — shared by [`ensure_default_project`]
+/// and `ControlPlane::create_project_epoch`.
+pub(crate) fn unique_untitled_name(parent: &Path) -> String {
+    let mut name = "Untitled".to_string();
+    let mut n = 1;
+    while parent.join(format!("{name}.aura")).exists() {
+        n += 1;
+        name = format!("Untitled-{n}");
+    }
+    name
+}
+
+/// Auto-create a default project when the session has none open yet (round-2
+/// §4.5 carve-out: an epoch boundary, "document birth"). Shared by the
+/// engine control thread's own `ensure_project` (auto-project on recording
+/// start, engine.rs; NOT rewired by Task 6 — still calls this directly) and
+/// `ControlPlane::ensure_project_epoch` (Task 6's sanctioned front door,
+/// wired to the engine by Task 13). Returns `Ok(None)` when a project is
+/// ALREADY open (no-op — the caller decides what "no work to do" means for
+/// its own return type); `Ok(Some(project))` when one was minted, with
+/// `project_dir`/`project_name`/`created_at` swapped into the store under
+/// one short lock (no disk I/O held under it beyond `create`'s own, which
+/// runs BEFORE the lock is taken).
+pub fn ensure_default_project(
+    session: &Mutex<Session>,
+    sample_rate: u32,
+) -> Result<Option<Project>, String> {
+    if session.lock().store.project_dir.is_some() {
+        return Ok(None);
+    }
+    let parent = default_project_parent()?;
+    let name = unique_untitled_name(&parent);
+    let (project, dir) = create(&parent, &name, sample_rate, 120.0)?;
+    {
+        let mut session = session.lock();
+        session.store.project_dir = Some(dir);
+        session.store.project_name = Some(project.name.clone());
+        session.store.created_at = project.created_at.clone();
+    }
+    Ok(Some(project))
 }
 
 /// Atomically write project.json into `dir`.

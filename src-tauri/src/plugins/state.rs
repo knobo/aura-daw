@@ -591,9 +591,11 @@ pub fn reactivate_restored_with(
     }
 }
 
-/// PROJECT-OPEN SEAM (called by `midi::persist::load_from_project`): adopt
-/// the opened project's plugins into the app-global registry. Inert until
-/// the app registers the registry (unit tests use local registries).
+/// PROJECT-OPEN SEAM (Task 6: called explicitly from `ControlPlane`'s
+/// sanctioned epoch functions, e.g. `open_project_epoch`/`create_project_at`
+/// — AFTER the session lock drops, never from a read path): adopt the
+/// opened project's plugins into the app-global registry. Inert until the
+/// app registers the registry (unit tests use local registries).
 pub fn adopt_open_project(dir: &Path) {
     let Some(registry) = super::registered_registry() else { return };
     let (restored, prior_hosted) = {

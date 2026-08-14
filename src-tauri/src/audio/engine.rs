@@ -1253,34 +1253,20 @@ impl Control {
     }
 
     /// Auto-create a default project when recording starts with none open.
+    /// Round-2 §4.5 carve-out (epoch boundary, "document birth"): the
+    /// dir-resolution/store-swap logic is shared with `ControlPlane::
+    /// ensure_project_epoch` (Task 6) via `project::ensure_default_project`
+    /// — this call site is NOT rewired to go through `ControlPlane` (Task
+    /// 13's job); only the shared core moved.
     fn ensure_project(&mut self) -> Result<(), String> {
-        if self.session.lock().store.project_dir.is_some() {
-            return Ok(());
+        let rate = self.engine_rate();
+        if let Some(project) = project::ensure_default_project(&self.session, rate)? {
+            self.events.emit(
+                "project://changed",
+                serde_json::to_value(&project).unwrap_or_default(),
+            );
+            log::info!("audio: auto-created project {}", project.name);
         }
-        let parent = dirs::audio_dir()
-            .or_else(dirs::home_dir)
-            .ok_or("cannot determine a directory for the default project")?
-            .join("AURA");
-        std::fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
-        let mut name = "Untitled".to_string();
-        let mut n = 1;
-        while parent.join(format!("{name}.aura")).exists() {
-            n += 1;
-            name = format!("Untitled-{n}");
-        }
-        let (project, dir) =
-            project::create(&parent, &name, self.engine_rate(), 120.0)?;
-        {
-            let mut session = self.session.lock();
-            session.store.project_dir = Some(dir);
-            session.store.project_name = Some(project.name.clone());
-            session.store.created_at = project.created_at.clone();
-        }
-        self.events.emit(
-            "project://changed",
-            serde_json::to_value(&project).unwrap_or_default(),
-        );
-        log::info!("audio: auto-created project {name}");
         Ok(())
     }
 }
