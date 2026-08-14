@@ -300,7 +300,12 @@ Other carry-forwards, not new rulings but confirmed still true:
 ## Plan E handoff (2026-08-14, subagent-driven session, external review layer)
 
 Plan E (the side-channel totality, round-2 §4.5, ADRs 0003 + 0006) is
-**IMPLEMENTED** (commit range `ac65b76..531d790`, 51 commits, including 7
+**IMPLEMENTED and MERGED to `main`** — the owner ordered the merge; `main`
+carries squash commit `27911d8` ("Plan E — the side-channel totality; Gate
+E closed, op log ON"). Branch `plan-e-side-channels` is kept (not deleted)
+so every commit SHA cited below still resolves. A post-merge whole-branch
+review is running as a follow-up; this handoff is not gated on its
+outcome. (commit range `ac65b76..531d790`, 51 commits, including 7
 merges — 6 side-branch task merges (`task-9-plugin-doc`,
 `task-10-automation-doc`, `task-11-frontend-stems`, `task-12-transport`,
 `task-15-noteid-schemas`, `task-16-steady-time`) plus one `origin/main`
