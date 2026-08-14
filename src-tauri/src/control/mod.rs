@@ -142,6 +142,12 @@ pub struct ControlPlane {
     /// `EngineHandle::for_tests()` "not really wired" shape, just for a
     /// seam this task adds rather than one already threaded through `new`.
     midi_input: std::sync::OnceLock<Arc<crate::midi_input::MidiInputManager>>,
+    /// The `aura-midi-out` driver (Task 7), same carve-out shape as
+    /// `midi_input` above: attached once by lib.rs setup AFTER `.manage`,
+    /// so unit-test `ControlPlane`s (never routed through `lib.rs::run`)
+    /// have this unset and `select_midi_output_port`/
+    /// `set_midi_clock_enabled` error rather than panic.
+    midi_out: std::sync::OnceLock<Arc<crate::midi_out::MidiOut>>,
 }
 
 /// The commit core, shareable with the engine control thread (Plan E Task
@@ -1133,6 +1139,7 @@ impl ControlPlane {
             gesture: GestureState::new(),
             last_gesture_batch: Mutex::new(None),
             midi_input: std::sync::OnceLock::new(),
+            midi_out: std::sync::OnceLock::new(),
         }
     }
 
@@ -1513,6 +1520,59 @@ impl ControlPlane {
             meta.label
         );
         crate::audio::midi_in::hub().set_target_track(track_id);
+        Ok(())
+    }
+
+    // ---- MIDI-out selection / clock -----------------------------------
+    // MIDI slice 2, Task 7 (§4.5 config carve-out, same shape as the pair
+    // above): the selected output port and whether clock/transport bytes
+    // are sent are both app config, not document state — no `Op`, no
+    // `commit`. Moving them behind `ControlPlane` methods is purely so the
+    // ACTOR/LABEL attribution is captured at the one front door both Tauri
+    // and MCP call through.
+
+    /// lib.rs setup calls this once, after `.manage` — before that, every
+    /// unit test's `ControlPlane` has an unattached `midi_out`, and
+    /// `select_midi_output_port`/`set_midi_clock_enabled` error instead of
+    /// panicking.
+    pub fn attach_midi_out(&self, out: Arc<crate::midi_out::MidiOut>) {
+        // `OnceLock::set` returning `Err` (already attached) is silently
+        // ignored — lib.rs calls this exactly once in `setup`, and a
+        // hypothetical second call losing is harmless (first attach wins).
+        let _ = self.midi_out.set(out);
+    }
+
+    /// Select the hardware MIDI-out port, logging the attribution before
+    /// delegating to the attached `MidiOut` — same shape as
+    /// `select_midi_input_port`; the driver owns the connection/thread
+    /// directly (Task 7).
+    pub fn select_midi_output_port(&self, port_id: Option<String>, meta: op::TxMeta) -> Result<(), String> {
+        log::info!(
+            "select_midi_output_port: actor={:?} label={:?} port={port_id:?}",
+            meta.actor,
+            meta.label
+        );
+        let out = self
+            .midi_out
+            .get()
+            .ok_or_else(|| "midi output driver not attached".to_string())?;
+        out.select_port(port_id)
+    }
+
+    /// Toggle whether the `aura-midi-out` thread emits clock/transport
+    /// bytes. Leaves the thread and the open port alive either way (Task
+    /// 8's note-out keeps working).
+    pub fn set_midi_clock_enabled(&self, enabled: bool, meta: op::TxMeta) -> Result<(), String> {
+        log::info!(
+            "set_midi_clock_enabled: actor={:?} label={:?} enabled={enabled}",
+            meta.actor,
+            meta.label
+        );
+        let out = self
+            .midi_out
+            .get()
+            .ok_or_else(|| "midi output driver not attached".to_string())?;
+        out.set_clock_enabled(enabled);
         Ok(())
     }
 
@@ -4145,6 +4205,20 @@ mod tests {
         let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
         let err = cp.select_midi_input_port(Some("nope#0".into()), true, TxMeta::user("x")).unwrap_err();
         assert!(err.contains("midi input"), "got {err}");
+    }
+
+    /// MIDI-out selection is a config carve-out (ruling 1, same shape as
+    /// MIDI-in): unattached (every unit test's `ControlPlane`), both seams
+    /// must return an honest error, never panic and never write to the
+    /// document.
+    #[test]
+    fn midi_output_selection_has_no_op() {
+        let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        let rev_before = cp.session().lock().rev;
+        // Unattached: an honest error, never a panic and never a document write.
+        assert!(cp.select_midi_output_port(Some("x#0".into()), TxMeta::user("x")).is_err());
+        assert!(cp.set_midi_clock_enabled(true, TxMeta::user("x")).is_err());
+        assert_eq!(cp.session().lock().rev, rev_before);
     }
 
     /// MCP-parity regression (found filming the MCP demo): jobs submitted

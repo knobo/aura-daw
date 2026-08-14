@@ -2,8 +2,67 @@
 //! to external gear. Runs entirely off `SharedRt` atomics + a document
 //! snapshot on its own non-RT thread — see ruling 3: NOTHING here touches
 //! `audio/engine.rs`.
+//!
+//! ## The `aura-midi-out` thread (Task 7)
+//!
+//! Named `aura-midi-out`, spawned on the first `MidiOut::select_port(Some
+//! (..))` and stopped by an `Arc<AtomicBool>` flag on close/re-select/
+//! `Drop`. **Not an RT thread**: unlike the audio callback it is free to
+//! allocate and take locks — it is driven by `std::thread::sleep`, not the
+//! audio device.
+//!
+//! Loop body: `std::thread::sleep(Duration::from_micros(500))`, then one
+//! `out_tick(now_micros, shared.playing, shared.position, shared.
+//! sample_rate)`. 500 µs gives sub-millisecond clock jitter at any musical
+//! tempo — at 120 bpm a single 24-PPQN pulse is 20.8 ms apart, so the loop
+//! is roughly 40× oversampled relative to the fastest thing it needs to
+//! emit on time.
+//!
+//! Tempo snapshot: at most every **250 ms** the thread attempts
+//! `session.try_lock()` — **never** a blocking lock, because
+//! `engine::rebuild` holds the session lock across a full graph build and a
+//! blocking lock here would stall clock output for that whole window. On a
+//! successful try_lock the thread rebuilds its `TempoMap` from
+//! `session.midi.ppq` + `session.midi.tempo_events` + the engine's current
+//! sample rate, but ONLY if that triple changed since the last snapshot —
+//! otherwise the existing `TempoMap` (and its internal caches) is reused
+//! as-is. A contended try_lock is not an error: the thread simply keeps
+//! whatever `TempoMap` it already has and tries again on the next 250 ms
+//! boundary. Documented consequence: a tempo edit made in the UI can take
+//! up to ~250 ms to reach external gear.
+//!
+//! Lock order: this thread takes the session lock and NOTHING else — it
+//! never calls `EngineHandle::request`. So the Committer deadlock invariant
+//! ("no thread may hold the session lock across a `request`") holds here
+//! trivially, by construction, with no cross-thread ordering argument
+//! needed.
+//!
+//! On stop (close, re-select to a different port, or `Drop`): the thread
+//! sends an explicit `ClockMsg::Stop` to its sink before the sink (and the
+//! underlying `midir` connection) is dropped, so a hardware slave synced to
+//! MIDI clock does not keep running forever after AURA lets go of the port.
+//!
+//! `MidiOut::set_clock_enabled(false)` suppresses clock/transport bytes
+//! (the thread stops emitting `ClockMsg`s to the sink) but leaves the
+//! thread — and the open port — alive; Task 8's note-out keeps working
+//! through the very same connection.
+//!
+//! The per-tick body is pulled out as the free function [`out_tick`] so it
+//! is testable with an injected [`ClockSink`] and injected time, with no
+//! thread, no `SharedRt`, and no `Session` involved.
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use parking_lot::Mutex as PlMutex;
+use serde::Serialize;
+
+use crate::audio::rt::SharedRt;
+use crate::control::Session;
 use crate::midi::tempo::TempoMap;
+use crate::midi::{TempoEvent, DEFAULT_PPQ};
+use crate::midi_input::MidiPortInfo;
 
 /// One outbound MIDI message. POD so the clock and the note scheduler share
 /// one output buffer.
@@ -190,6 +249,402 @@ impl ClockEngine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 7: the sink abstraction, port enumeration, the `aura-midi-out`
+// thread, and the four Tauri commands.
+// ---------------------------------------------------------------------------
+
+/// Anything that can accept outbound MIDI bytes. `MidiOutSink` wraps a real
+/// port; tests inject [`RecordingSink`].
+pub trait ClockSink: Send {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), String>;
+}
+
+/// A real `midir` output connection.
+pub struct MidiOutSink(midir::MidiOutputConnection);
+
+impl ClockSink for MidiOutSink {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.0.send(bytes).map_err(|e| e.to_string())
+    }
+}
+
+/// Recording sink for tests (and, in spirit, for the status readout's byte
+/// counter — Task 8 wires notes through the same trait).
+#[derive(Default)]
+pub struct RecordingSink(pub Vec<Vec<u8>>);
+
+impl ClockSink for RecordingSink {
+    fn send(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.0.push(bytes.to_vec());
+        Ok(())
+    }
+}
+
+/// Enumerate MIDI OUTPUT ports currently visible to the platform backend
+/// (ALSA-seq on Linux). Mirrors `midi_input::list_ports`: same `"<name>#
+/// <index>"` id scheme, same skip-on-vanish rule (a port that disappears
+/// between `.ports()` and `.port_name()` is silently dropped rather than
+/// failing the whole call), and creates/drops a throwaway `midir::
+/// MidiOutput` client — no connection is held.
+pub fn list_output_ports() -> Result<Vec<MidiPortInfo>, String> {
+    let midi_out = midir::MidiOutput::new("aura-midi-output-enum").map_err(|e| e.to_string())?;
+    let ports = midi_out.ports();
+    let mut out = Vec::with_capacity(ports.len());
+    for (i, p) in ports.iter().enumerate() {
+        if let Ok(name) = midi_out.port_name(p) {
+            out.push(MidiPortInfo { id: format!("{name}#{i}"), name });
+        }
+    }
+    Ok(out)
+}
+
+/// Live status snapshot returned by [`MidiOut::status`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MidiOutputStatus {
+    pub selected: Option<MidiPortInfo>,
+    pub clock_enabled: bool,
+    /// The clock engine currently considers the transport running.
+    pub running: bool,
+    pub pulses_sent: u64,
+    pub resyncs: u64,
+    /// Task 8 fills these; declared here so the wire shape is final.
+    pub note_track_id: Option<String>,
+    pub notes_sent: u64,
+}
+
+/// State the `aura-midi-out` thread updates every tick and `MidiOut::status`
+/// reads back — no lock needed since it's all atomics.
+#[derive(Default)]
+struct ThreadShared {
+    stop: AtomicBool,
+    pulses_sent: AtomicU64,
+    resyncs: AtomicU64,
+    running: AtomicBool,
+}
+
+struct ActiveOutput {
+    port: MidiPortInfo,
+    thread_shared: Arc<ThreadShared>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct Inner {
+    active: Option<ActiveOutput>,
+}
+
+/// Owns the (at most one) open MIDI output connection and the `aura-midi-out`
+/// thread driving it. See the module doc for the full thread contract.
+pub struct MidiOut {
+    /// Set once by lib.rs setup via [`MidiOut::attach`]. `None` in every
+    /// unit test that builds a bare `MidiOut::default()` — the thread then
+    /// falls back to "transport never plays" (see `run_thread`), which is
+    /// exactly what the port-enumeration/error-path tests below need and
+    /// nothing more.
+    session: OnceLock<Arc<PlMutex<Session>>>,
+    shared: OnceLock<Arc<SharedRt>>,
+    /// Live flag the thread reads every tick; flipping it never tears down
+    /// or restarts the thread/connection (Task 7 contract: "leaves the
+    /// thread and port alive"). Defaults to enabled so plugging a device in
+    /// and pressing play "just works" without an extra step, mirroring
+    /// `midi_input`'s "default ON when a port is selected" precedent.
+    clock_enabled: Arc<AtomicBool>,
+    inner: PlMutex<Inner>,
+}
+
+impl Default for MidiOut {
+    fn default() -> Self {
+        Self {
+            session: OnceLock::new(),
+            shared: OnceLock::new(),
+            clock_enabled: Arc::new(AtomicBool::new(true)),
+            inner: PlMutex::new(Inner::default()),
+        }
+    }
+}
+
+impl MidiOut {
+    /// lib.rs setup, once: the thread needs the transport atomics and a way
+    /// to snapshot tempo. A second call is silently ignored (first attach
+    /// wins) — lib.rs calls this exactly once, same shape as `midi_input`'s
+    /// `attach_midi_input`.
+    pub fn attach(&self, session: Arc<PlMutex<Session>>, shared: Arc<SharedRt>) {
+        let _ = self.session.set(session);
+        let _ = self.shared.set(shared);
+    }
+
+    /// Open (or close, on `None`) the output port. Starts the
+    /// `aura-midi-out` thread on first open; stops it (Stop-then-drop, see
+    /// module doc) on close. Re-selecting the SAME port is a no-op —
+    /// mirrors `MidiInputManager::select_port`'s fast path: no teardown, no
+    /// counter reset.
+    pub fn select_port(&self, port_id: Option<String>) -> Result<(), String> {
+        let mut inner = self.inner.lock();
+
+        if let Some(active) = inner.active.as_ref() {
+            if port_id.as_deref() == Some(active.port.id.as_str()) {
+                return Ok(()); // fast path: same port, nothing to do.
+            }
+        }
+
+        // Slow path: an actual port change (including closing to `None`).
+        // Tear down whatever is currently open first.
+        if let Some(mut active) = inner.active.take() {
+            active.thread_shared.stop.store(true, Relaxed);
+            if let Some(handle) = active.handle.take() {
+                let _ = handle.join();
+            }
+        }
+
+        let Some(id) = port_id else {
+            return Ok(());
+        };
+
+        let midi_out = midir::MidiOutput::new("aura-midi-output").map_err(|e| e.to_string())?;
+        let ports = midi_out.ports();
+        let mut found = None;
+        for (i, p) in ports.iter().enumerate() {
+            let name = match midi_out.port_name(p) {
+                Ok(n) => n,
+                Err(_) => continue, // vanished mid-enumeration; skip
+            };
+            if format!("{name}#{i}") == id {
+                found = Some((p.clone(), MidiPortInfo { id: id.clone(), name }));
+                break;
+            }
+        }
+        let (port, info) = found.ok_or_else(|| format!("MIDI output port not found: {id}"))?;
+
+        let conn = midi_out
+            .connect(&port, "aura-midi-output")
+            .map_err(|e| e.to_string())?;
+        let sink = MidiOutSink(conn);
+
+        let thread_shared = Arc::new(ThreadShared::default());
+        let ts_for_thread = thread_shared.clone();
+        let session_for_thread = self.session.get().cloned();
+        let shared_for_thread = self.shared.get().cloned();
+        let clock_enabled = self.clock_enabled.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("aura-midi-out".to_string())
+            .spawn(move || {
+                run_thread(sink, ts_for_thread, session_for_thread, shared_for_thread, clock_enabled)
+            })
+            .map_err(|e| e.to_string())?;
+
+        inner.active = Some(ActiveOutput { port: info, thread_shared, handle: Some(handle) });
+        Ok(())
+    }
+
+    /// Flip the live clock-enable flag. Never touches the thread/connection
+    /// — safe to call whether or not a port is currently open.
+    pub fn set_clock_enabled(&self, enabled: bool) {
+        self.clock_enabled.store(enabled, Relaxed);
+    }
+
+    /// Cheap live snapshot for polling.
+    pub fn status(&self) -> MidiOutputStatus {
+        let inner = self.inner.lock();
+        let clock_enabled = self.clock_enabled.load(Relaxed);
+        match inner.active.as_ref() {
+            Some(active) => MidiOutputStatus {
+                selected: Some(active.port.clone()),
+                clock_enabled,
+                running: active.thread_shared.running.load(Relaxed),
+                pulses_sent: active.thread_shared.pulses_sent.load(Relaxed),
+                resyncs: active.thread_shared.resyncs.load(Relaxed),
+                note_track_id: None,
+                notes_sent: 0,
+            },
+            None => MidiOutputStatus {
+                selected: None,
+                clock_enabled,
+                running: false,
+                pulses_sent: 0,
+                resyncs: 0,
+                note_track_id: None,
+                notes_sent: 0,
+            },
+        }
+    }
+}
+
+impl Drop for MidiOut {
+    /// Belt and suspenders: normal teardown already happens in
+    /// `select_port`'s slow path (re-select to `None`/a different port), but
+    /// if a `MidiOut` is simply dropped with a connection open (e.g. process
+    /// exit), stop the thread rather than leaking it — the thread itself
+    /// still performs the Stop-then-drop sequence before it returns.
+    fn drop(&mut self) {
+        let mut inner = self.inner.lock();
+        if let Some(mut active) = inner.active.take() {
+            active.thread_shared.stop.store(true, Relaxed);
+            if let Some(handle) = active.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
+/// A 120 bpm, one-event tempo map at the given rate — the fallback used
+/// before the first successful tempo snapshot (or permanently, in tests
+/// that never call `attach`).
+fn default_tempo_map(rate: u32) -> TempoMap {
+    TempoMap::new(DEFAULT_PPQ, vec![TempoEvent { tick: 0, bpm: 120.0 }], rate)
+        .expect("a single tick-0 tempo event is always a valid TempoMap")
+}
+
+/// The `aura-midi-out` thread body — see the module doc for the full
+/// contract (500 µs loop, 250 ms try_lock tempo snapshot, Stop-on-exit,
+/// session-lock-only, no `EngineHandle::request`).
+fn run_thread(
+    mut sink: MidiOutSink,
+    thread_shared: Arc<ThreadShared>,
+    session: Option<Arc<PlMutex<Session>>>,
+    shared_rt: Option<Arc<SharedRt>>,
+    clock_enabled: Arc<AtomicBool>,
+) {
+    let mut engine = ClockEngine::new();
+    let fallback_rate = shared_rt
+        .as_ref()
+        .map(|s| s.sample_rate.load(Relaxed))
+        .filter(|&r| r > 0)
+        .unwrap_or(48_000);
+    let mut map = default_tempo_map(fallback_rate);
+    // The last (ppq, tempo_events, rate) triple the map was built from —
+    // rebuilding is skipped when nothing in this triple changed.
+    let mut snapshot_key: Option<(u32, Vec<TempoEvent>, u32)> = None;
+    // Backdated so the very first loop iteration attempts a snapshot
+    // immediately, rather than waiting a full 250 ms to see a project's
+    // real tempo for the first time.
+    let mut last_snapshot = Instant::now() - Duration::from_millis(250);
+    let start = Instant::now();
+
+    loop {
+        if thread_shared.stop.load(Relaxed) {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(500));
+
+        if last_snapshot.elapsed() >= Duration::from_millis(250) {
+            if let Some(session) = &session {
+                // NEVER a blocking lock — `engine::rebuild` holds the
+                // session across a graph build, and this thread must never
+                // stall waiting for it out.
+                if let Some(guard) = session.try_lock() {
+                    let rate = shared_rt
+                        .as_ref()
+                        .map(|s| s.sample_rate.load(Relaxed))
+                        .filter(|&r| r > 0)
+                        .unwrap_or(fallback_rate);
+                    let key = (guard.midi.ppq, guard.midi.tempo_events.clone(), rate);
+                    drop(guard);
+                    if snapshot_key.as_ref() != Some(&key) {
+                        if let Ok(new_map) = TempoMap::new(key.0, key.1.clone(), key.2) {
+                            map = new_map;
+                            snapshot_key = Some(key);
+                        }
+                    }
+                    last_snapshot = Instant::now();
+                }
+                // Contended try_lock: keep the previous snapshot and simply
+                // try again on the next iteration where the 250ms window has
+                // reopened (last_snapshot is left untouched).
+            } else {
+                // Unattached (every unit test, and the ALSA loopback test):
+                // nothing to snapshot from, so there is nothing to retry —
+                // avoid re-checking on every single tick.
+                last_snapshot = Instant::now();
+            }
+        }
+
+        let (playing, position, rate) = match &shared_rt {
+            Some(s) => (
+                s.playing.load(Relaxed),
+                s.position.load(Relaxed),
+                s.sample_rate.load(Relaxed),
+            ),
+            None => (false, 0, fallback_rate),
+        };
+        let rate = if rate > 0 { rate } else { fallback_rate };
+        let now_micros = start.elapsed().as_micros() as u64;
+        let enabled = clock_enabled.load(Relaxed);
+
+        let input = ClockInput { now_micros, playing, position, rate, map: &map };
+        if let Err(e) = out_tick(&mut engine, &mut sink, input, enabled) {
+            log::warn!("aura-midi-out: send failed: {e}");
+        }
+
+        thread_shared.running.store(engine.running(), Relaxed);
+        thread_shared.pulses_sent.store(engine.pulses_sent(), Relaxed);
+        thread_shared.resyncs.store(engine.resyncs(), Relaxed);
+    }
+
+    // Stop-on-close: an explicit Stop reaches the sink before the
+    // connection is dropped, so a hardware slave synced to MIDI clock does
+    // not keep running forever after AURA lets go of the port.
+    let _ = sink.send(ClockMsg::Stop.to_out().as_slice());
+}
+
+/// The per-tick body, extracted so it is testable with an injected sink and
+/// injected time — no thread, no `SharedRt`, no `Session`.
+/// `clock_enabled == false` suppresses clock/transport bytes entirely (the
+/// engine is not even stepped, so its internal Start/Stop/pulse state stays
+/// frozen exactly as it was), leaving the caller free to keep the thread and
+/// the port alive for Task 8's note-out.
+pub(crate) fn out_tick(
+    engine: &mut ClockEngine,
+    sink: &mut dyn ClockSink,
+    input: ClockInput<'_>,
+    clock_enabled: bool,
+) -> Result<(), String> {
+    if !clock_enabled {
+        return Ok(());
+    }
+    let mut out = Vec::new();
+    engine.step(input, &mut out);
+    for msg in out {
+        sink.send(msg.to_out().as_slice())?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tauri commands — thin wrappers, additive only (registered from lib.rs).
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn midi_list_output_ports() -> Result<Vec<MidiPortInfo>, String> {
+    list_output_ports()
+}
+
+#[tauri::command]
+pub fn midi_select_output_port(
+    port_id: Option<String>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.select_midi_output_port(
+        port_id,
+        crate::control::op::TxMeta::user("select midi output port"),
+    )
+}
+
+#[tauri::command]
+pub fn midi_set_clock_enabled(
+    enabled: bool,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.set_midi_clock_enabled(enabled, crate::control::op::TxMeta::user("set midi clock enabled"))
+}
+
+#[tauri::command]
+pub fn midi_output_status(state: tauri::State<'_, Arc<MidiOut>>) -> Result<MidiOutputStatus, String> {
+    Ok(state.status())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +769,78 @@ mod tests {
         let out = step(&mut e, 2_000_000, true, 96_000, &m);
         let clocks = out.iter().filter(|m| **m == ClockMsg::Clock).count();
         assert!(clocks <= MAX_PULSE_BURST as usize, "burst clamped, got {clocks}");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 7: sink/port enumeration, `MidiOut`, and `out_tick`.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn list_output_ports_never_panics() {
+        match list_output_ports() {
+            Ok(ports) => for p in &ports { assert!(!p.id.is_empty()); },
+            Err(e) => assert!(!e.is_empty()),
+        }
+    }
+
+    #[test]
+    fn selecting_a_nonexistent_output_port_is_a_graceful_error() {
+        let out = MidiOut::default();
+        let err = out.select_port(Some("definitely-not-a-port#99".into())).unwrap_err();
+        assert!(err.contains("not found"), "got {err}");
+        assert!(out.status().selected.is_none(), "a failed open leaves nothing half-open");
+    }
+
+    #[test]
+    fn out_tick_writes_start_then_clocks_to_the_sink() {
+        let map = map120();
+        let mut engine = ClockEngine::new();
+        let mut sink = RecordingSink::default();
+        out_tick(&mut engine, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true).unwrap();
+        assert_eq!(sink.0, vec![vec![0xFA]]);
+        for ms in 1..=25u64 {
+            out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, true).unwrap();
+        }
+        assert!(sink.0.iter().any(|b| b == &vec![0xF8]), "clock bytes reached the sink");
+    }
+
+    #[test]
+    fn out_tick_writes_nothing_while_the_clock_is_disabled() {
+        let map = map120();
+        let mut engine = ClockEngine::new();
+        let mut sink = RecordingSink::default();
+        for ms in 0..=25u64 {
+            out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
+        }
+        assert!(sink.0.is_empty(), "clock disabled means no bytes");
+    }
+
+    /// Real `midir` loopback: a virtual INPUT port receives what a real
+    /// `MidiOutSink` sends. Skips cleanly where ALSA seq is unavailable — the
+    /// same pattern slice 1's `monitor_toggle_via_manager_does_not_reset_
+    /// activity_counters` uses.
+    #[test]
+    fn a_real_output_connection_delivers_bytes_to_a_virtual_port() {
+        use midir::os::unix::VirtualInput;
+        let Ok(midi_in) = midir::MidiInput::new("aura-midi-out-test-in") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink_seen = seen.clone();
+        let Ok(_conn) = midi_in.create_virtual("aura-out-loopback", move |_, msg, _: &mut ()| {
+            sink_seen.lock().push(msg.to_vec());
+        }, ()) else { eprintln!("skipping: virtual port unavailable"); return; };
+
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no output enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-out-loopback")) else {
+            eprintln!("skipping: loopback port not visible"); return;
+        };
+        let out = MidiOut::default();
+        out.select_port(Some(target.id)).expect("open the loopback port");
+        // Give the ALSA delivery a moment, then assert SOMETHING arrived once a
+        // Stop is sent on close.
+        out.select_port(None).expect("close sends Stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(seen.lock().iter().any(|m| m.as_slice() == [0xFC]), "Stop reached the port: {:?}", seen.lock());
     }
 }
