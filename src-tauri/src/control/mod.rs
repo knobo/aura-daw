@@ -198,9 +198,12 @@ pub struct ControlPlane {
 /// `request`'s own 30s timeout rather than hanging forever. All five
 /// current production `request` call sites comply — none holds `self.
 /// session.lock()` (or any session guard) across the call:
-/// `ControlPlane::transport`'s Stop arm (control/mod.rs:769),
-/// `start_recording` (:856), `stop_recording` (:865), `select_input_device`
-/// (:890), `select_output_device` (:901).
+/// `ControlPlane::transport`'s Stop arm (control/mod.rs:1301),
+/// `start_recording` (:1388), `stop_recording` (:1397),
+/// `select_input_device` (:1422), `select_output_device` (:1433).
+/// (Those five numbers were stale by the end of Plan E — the audit is only
+/// as good as its navigability, so they are re-checked whenever this file
+/// moves; the INVARIANT above, not the line numbers, is what binds.)
 ///
 /// (c) All five engine write sites (`open_output`, `apply_end_policy`,
 ///     `start_recording`, `stop_recording`, `ensure_project`) commit
@@ -357,6 +360,7 @@ impl Committer {
         let committed = Session::transact(&self.session, meta, f)?;
         // ---- session lock is released here; everything below executes
         // the effect the session merely described. ----
+        debug_assert_transient_invariant(&committed);
         {
             let tables = self.tables.lock();
             for (tid, path, value) in &committed.effect.param_writes {
@@ -819,6 +823,64 @@ impl CoalesceKey {
     }
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    /// Debug-only marker: set for the duration of the commit
+    /// [`GestureState::commit_transient_and_fold`] runs, so
+    /// [`debug_assert_transient_invariant`] can tell a MID-GESTURE transient
+    /// fold (sanctioned — the gesture batch that closes over it supersedes
+    /// it) from any other transient write. A thread-local rather than a flag
+    /// on the call path for the same reason `session.rs`'s `IN_TX` is one:
+    /// the commit reaches `Committer` through `ControlPlane::commit_with`,
+    /// several frames and one closure away, and threading a debug-only
+    /// parameter through the public commit API to serve an assertion would
+    /// be worse than the assertion is good. Correct because the marker's
+    /// whole lifetime is inside one `f()` call on one thread.
+    static IN_GESTURE_FOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// THE `transient` INVARIANT, CHECKED (whole-branch review, M-3 —
+/// previously a comment on `HistoryMode` and a bullet in
+/// `docs/SIDE-CHANNEL-INVENTORY.md`, and nothing else).
+///
+/// Redo replays a `HistoryEntry`'s stored `ops` against whatever the
+/// document is NOW, so any write that mutates the fields those ops address
+/// WITHOUT leaving a history entry — which is exactly what
+/// `TxMeta::transient` means — moves the ground under a pending redo
+/// without invalidating it. The rule is therefore about what may be MARKED
+/// transient, and the two sanctioned classes are:
+///
+/// * transport writes — `Op::Set` against `ObjectRef::Transport`, the only
+///   object no history entry can ever address (transport ops are transient
+///   by construction, everywhere: `ControlPlane::transport`, and the
+///   engine's sample-rate / auto-stop / recording-state mirrors);
+/// * mid-gesture folds — superseded by the gesture batch that closes over
+///   them, and recognizable here by [`IN_GESTURE_FOLD`].
+///
+/// Anything else marked transient is the silent-redo-corruption bug this
+/// catches. Debug-only: the check walks a batch that is already in hand and
+/// is a no-op in release, so it costs nothing where it would matter.
+fn debug_assert_transient_invariant(committed: &session::Committed) {
+    #[cfg(debug_assertions)]
+    {
+        if !committed.meta.transient || IN_GESTURE_FOLD.with(|f| f.get()) {
+            return;
+        }
+        for op in &committed.ops {
+            debug_assert!(
+                matches!(op, op::Op::Set { object: op::ObjectRef::Transport, .. }),
+                "transient batch {:?} writes {op:?}, which addresses a document field a \
+                 history entry's ops can also address — a pending redo would silently land on \
+                 a different state (see HistoryMode's doc). Either drop `.transient()` or \
+                 fold this write into an explicit gesture.",
+                committed.meta.label,
+            );
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = committed;
+}
+
 /// A gesture in progress: one explicit `gesture_begin`..`gesture_end` span
 /// (round-2 §4.4's CLAP-style primitive; ADR 0003). `baselines`/`last` are
 /// `Vec`s, not `HashMap`s — `PropPath` isn't `Hash` (op.rs's closed enum,
@@ -923,7 +985,16 @@ impl GestureState {
             Some(g) if &g.actor == actor => {}
             _ => return None,
         }
+        // M-3: mark the fold so `debug_assert_transient_invariant` can tell
+        // this sanctioned transient write from an unsanctioned one. Reset
+        // unconditionally afterwards — `f` returns a `Result`, it does not
+        // unwind on a rejected commit, and a panicking `f` takes the whole
+        // commit path down anyway.
+        #[cfg(debug_assertions)]
+        IN_GESTURE_FOLD.with(|g| g.set(true));
         let result = f();
+        #[cfg(debug_assertions)]
+        IN_GESTURE_FOLD.with(|g| g.set(false));
         if let Ok(committed) = &result {
             let g = guard
                 .as_mut()

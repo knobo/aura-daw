@@ -53,6 +53,20 @@ use super::{session, ControlPlane};
 /// 48 kHz — comfortably inside one UI frame, far coarser than a buffer.
 const WATCH_INTERVAL: Duration = Duration::from_millis(5);
 
+/// How many times [`LoopJam::watch_and_apply`] retries a swap whose commit
+/// lost its race with a concurrent store change before giving up and
+/// reporting it (whole-branch review, I-2).
+///
+/// The retry exists for a NARROW race — the store moved between the read
+/// snapshot and the commit — which a re-plan against fresh truth normally
+/// wins on the next attempt. A failure that survives 20 attempts is not that
+/// race; it is a standing condition (the target track is gone, the pending
+/// clip's id already exists), and no number of further attempts will change
+/// it. 20 is generous for the transient case while keeping the give-up
+/// latency ≈ 100 ms with the transport stopped, and ≈ 20 loop passes while
+/// it is playing (the wrap wait dominates there).
+const MAX_APPLY_ATTEMPTS: u32 = 20;
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -497,11 +511,25 @@ impl LoopJam {
     /// loops back to wait for the NEXT wrap and try again, same liveness as
     /// the old lock-then-apply had, just without the lost-update window a
     /// direct mutation used to risk. The inner wait loop's epoch/phase guard
-    /// is what actually stops the loop (on either a successful apply, which
-    /// flips `phase` to `Applied`, or a cancel, which bumps `epoch`).
+    /// is what actually stops the loop on a cancel; a successful apply
+    /// returns straight out of it.
+    ///
+    /// BOUNDED AND BACKED OFF (whole-branch review, I-2). The inner loop's
+    /// FIRST exit — `if !shared.playing { break }` — is taken WITHOUT
+    /// sleeping, because with the transport stopped there is nothing to wait
+    /// for. So a commit that fails repeatedly (the target track removed
+    /// between the snapshot and the commit — precisely the race this retry
+    /// exists for) used to run `break -> apply -> Err -> loop -> break ->
+    /// apply -> …` with no sleep anywhere on the path: the watcher thread
+    /// pinned a core indefinitely, bounded by nothing but a user cancel.
+    /// Two changes close it: a `WATCH_INTERVAL` back-off after every FAILED
+    /// apply (the wait loop's own sleep only covers the playing case), and
+    /// [`MAX_APPLY_ATTEMPTS`] — a swap that has lost the same race that many
+    /// times is not going to win it, and belongs in `last_error` where the
+    /// UI can show it, not in a spin.
     fn watch_and_apply(&self, epoch: u64, region: (u64, u64)) {
         let shared = &self.control.shared;
-        loop {
+        for _attempt in 0..MAX_APPLY_ATTEMPTS {
             let mut last = shared.position.load(Relaxed);
             loop {
                 {
@@ -520,8 +548,29 @@ impl LoopJam {
                 last = pos;
                 std::thread::sleep(WATCH_INTERVAL);
             }
-            self.apply(epoch);
+            if self.apply(epoch) {
+                return; // applied, or the state machine moved on under us
+            }
+            // The commit lost its race. Back off before trying again — with
+            // the transport stopped this is the ONLY sleep on the path.
+            std::thread::sleep(WATCH_INTERVAL);
         }
+        // Out of attempts: surface it as a job error rather than keep a
+        // thread alive retrying something that keeps failing the same way.
+        {
+            let mut i = self.inner.lock();
+            if i.epoch != epoch {
+                return; // cancelled/superseded meanwhile — not our state to touch
+            }
+            i.phase = Phase::Idle;
+            i.pending = None;
+            i.job_id = None;
+            i.last_error = Some(format!(
+                "evolve swap failed {MAX_APPLY_ATTEMPTS} times (the store kept changing \
+                 under it); the generated loop was not applied"
+            ));
+        } // guard dropped BEFORE emit_state() re-locks `inner`
+        self.emit_state();
     }
 
     /// The hot-swap: replace the region's clips on the target track with the
@@ -539,15 +588,21 @@ impl LoopJam {
     /// `effect.rebuild`/`effect.persist.project`/`project://changed` emit
     /// replace the old direct mutation + manual `Rebuild` send + manual
     /// `project::save` + manual emit.
-    fn apply(&self, epoch: u64) {
+    ///
+    /// Returns `true` when the watcher is DONE — the swap landed, or the
+    /// state machine moved on underneath it (cancelled/superseded/nothing
+    /// pending) — and `false` only for the retryable case: a clean `Err`
+    /// from the commit, with `pending` left intact (I-2: the caller is what
+    /// bounds and paces those retries; this fn does not sleep).
+    fn apply(&self, epoch: u64) -> bool {
         let pending = {
             let i = self.inner.lock();
             if i.epoch != epoch || i.phase != Phase::Ready {
-                return; // cancelled/superseded meanwhile — nothing to do
+                return true; // cancelled/superseded meanwhile — nothing to do
             }
             match &i.pending {
                 Some(p) => p.clone(),
-                None => return,
+                None => return true,
             }
         };
 
@@ -578,13 +633,16 @@ impl LoopJam {
                     // state machine belongs to the new epoch now.
                 } // guard dropped BEFORE emit_state() re-locks `inner` below
                 self.emit_state();
+                true
             }
             Err(e) => {
                 // Race: the store moved between the snapshot and the commit.
                 // `pending` is untouched, `phase` is still `Ready` — the
-                // caller's outer retry loop (`watch_and_apply`) waits for
-                // the next wrap and tries again.
+                // caller's outer retry loop (`watch_and_apply`) backs off,
+                // waits for the next wrap and tries again, a bounded number
+                // of times (I-2).
                 log::warn!("loopjam apply: commit failed, will retry at the next wrap: {e}");
+                false
             }
         }
     }
@@ -1265,6 +1323,72 @@ mod tests {
         // No fresh-id split needed — just the new (evolved) clip.
         assert_eq!(adds.len(), 1, "{adds:?}");
         assert_eq!(adds[0].id, new_clip.id);
+    }
+
+    /// I-2 (whole-branch review), and the mid-air race the Task 8 ledger
+    /// flagged as "code-inspected, not test-forced". With the transport
+    /// STOPPED the wrap-watcher's wait loop exits immediately and without
+    /// sleeping, so a swap whose commit fails every time used to run
+    /// `break -> apply -> Err -> loop` at 100 % CPU forever. This drives
+    /// exactly that: a pending swap whose clip id already exists in the
+    /// store, so `commit_region_replacement`'s `Op::ClipAdd` fails cleanly
+    /// on EVERY attempt, from a stopped transport.
+    ///
+    /// The assertions are the two halves of the fix: it TERMINATES (bounded
+    /// attempts, reported as a job error), and it SLEEPS between attempts
+    /// (elapsed time is at least the back-off the attempts imply — a spin
+    /// would finish in microseconds).
+    #[test]
+    fn a_swap_that_keeps_failing_backs_off_and_gives_up_instead_of_spinning() {
+        let (jam, cp, parent, _events, _region) = jam_fixture("retry-bound");
+
+        let existing = cp.project_state().clips[0].clone();
+        // A region far from the existing clip: the plan produces no edits,
+        // just the add — which collides with `existing.id` every time.
+        let region = (existing.length_samples * 10, existing.length_samples * 11);
+        let mut doomed = existing.clone();
+        doomed.timeline_start_samples = region.0;
+        assert!(
+            !cp.shared.playing.load(Relaxed),
+            "the fixture's transport is stopped — this is the no-sleep path"
+        );
+
+        let epoch = {
+            let mut i = jam.inner.lock();
+            i.phase = Phase::Ready;
+            i.pending = Some(PendingSwap {
+                clip: doomed,
+                track_id: existing.track_id.to_string(),
+                region,
+            });
+            i.epoch
+        };
+
+        let t0 = Instant::now();
+        jam.watch_and_apply(epoch, region);
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed >= WATCH_INTERVAL * (MAX_APPLY_ATTEMPTS - 1),
+            "every failed attempt must back off — a spin would return in ~0 ns, got {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "...and the retries must be BOUNDED, got {elapsed:?}"
+        );
+        let i = jam.inner.lock();
+        assert_eq!(i.phase, Phase::Idle, "giving up leaves the machine idle, not stuck Ready");
+        assert!(i.pending.is_none(), "the undeliverable swap is dropped");
+        assert!(
+            i.last_error.as_deref().unwrap_or_default().contains("failed"),
+            "the give-up is reported, not silent: {:?}",
+            i.last_error
+        );
+        drop(i);
+
+        // Nothing was applied: the store still holds exactly the fixture clip.
+        assert_eq!(cp.project_state().clips.len(), 1);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// Plan E Task 8, written for real (brief-mandated): `commit_region_

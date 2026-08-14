@@ -354,13 +354,25 @@ fn transient_commits_reach_neither_history_nor_the_journal() {
     f.cp.transport(TransportAction::SetLoop { enabled: true, start_samples: 0, end_samples: 4800 })
         .unwrap();
     f.cp.transport(TransportAction::SetStopAtEnd { enabled: true }).unwrap();
-    // ...and an explicitly transient edit on a normal document path.
-    f.cp.commit(TxMeta::user("mid-drag").transient(), |tx| tx.apply(set_gain(&t, -12.0))).unwrap();
+    // ...and a transient edit on a normal (non-transport) document path:
+    // a MID-GESTURE fold, which is the only sanctioned shape for one (M-3,
+    // now enforced by `debug_assert_transient_invariant` — a bare transient
+    // `Set` against a track outside a gesture is the redo-corruption bug
+    // that assertion exists to catch, so it cannot be used as a stand-in
+    // here). Asserted while the gesture is still OPEN: the fold is
+    // committed, document-visible, and in neither stream.
+    f.cp.gesture_begin("mid-drag".into()).unwrap();
+    f.cp.set_track_mix(
+        vec![TrackMixChange { track_id: t.clone(), gain_db: Some(-12.0), ..TrackMixChange::new(t.clone()) }],
+        TxMeta::user("set track gain"),
+    )
+    .unwrap();
 
     assert_eq!(f.log.depths().0, depth_before, "no transient batch becomes an undo step");
     assert_eq!(journal_lines(&dir).len(), lines_before, "no transient batch reaches the journal");
     // The write itself DID happen — transient means "not logged", not "not applied".
     assert_eq!(gain_of(&f.cp, &t), -12.0);
+    f.cp.gesture_end().unwrap();
     assert!(f.cp.transport_state().stop_at_end);
 
     f.eng.send(ControlMsg::Shutdown);
