@@ -45,7 +45,7 @@ use super::session::{Session, Tx};
 use super::{ControlPlane, ImportClipRequest};
 
 /// Formats decoded through symphonia (everything except the WAV fast path).
-const SYMPHONIA_EXTS: [&str; 6] = ["mp3", "flac", "ogg", "aac", "m4a", "mp4"];
+pub(crate) const SYMPHONIA_EXTS: [&str; 6] = ["mp3", "flac", "ogg", "aac", "m4a", "mp4"];
 
 /// Decode any supported audio file to interleaved f32 at its NATIVE rate:
 /// `(channels, sample_rate, samples)`. WAV goes through hound (fast path,

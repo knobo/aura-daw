@@ -12,6 +12,7 @@
   import { zyn } from "../state/zynpatches.svelte";
   import AiStudio from "./generate/AiStudio.svelte";
   import HumPanel from "./hum/HumPanel.svelte";
+  import LibraryPanel from "./library/LibraryPanel.svelte";
   import InstrumentBrowser from "./instruments/InstrumentBrowser.svelte";
   import PluginBrowser from "./plugins/PluginBrowser.svelte";
   import PluginParamPanel from "./plugins/PluginParamPanel.svelte";
@@ -21,6 +22,7 @@
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
     { id: "generate", label: "AI STUDIO" },
     { id: "hum", label: "🎤 HUM" },
+    { id: "library", label: "LIBRARY" },
     { id: "instruments", label: "INSTRUMENTS" },
     { id: "plugins", label: "PLUGINS" },
     { id: "mcp", label: "MCP" },
@@ -59,6 +61,8 @@
         <AiStudio />
       {:else if ui.dock === "hum"}
         <HumPanel />
+      {:else if ui.dock === "library"}
+        <LibraryPanel />
       {:else if ui.dock === "instruments"}
         <InstrumentBrowser />
       {:else if ui.dock === "plugins"}

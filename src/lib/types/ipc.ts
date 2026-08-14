@@ -413,6 +413,25 @@ export interface InstrumentInfo {
   keyHigh?: number;
 }
 
+// ── library & browser (Track E, src-tauri/src/library.rs) ──────────────────
+
+export type LibraryEntryKind = "dir" | "audio";
+
+/** One row of a `library_scan` listing. Filesystem metadata only — duration
+ * and format are NOT probed during a scan (plan ruling 2). */
+export interface LibraryEntry {
+  /** File or directory name (no path). */
+  name: string;
+  /** Absolute path. */
+  path: string;
+  kind: LibraryEntryKind;
+  /** Lowercased extension without the dot; empty for directories. */
+  ext: string;
+  sizeBytes: number;
+  /** Modification time, ms since the Unix epoch (0 when unknown). */
+  modifiedMs: number;
+}
+
 // ── plugin-descriptor.schema.json + plugin-state.schema.json (phase 3) ─────
 
 export type PluginFormat = "clap" | "lv2";
