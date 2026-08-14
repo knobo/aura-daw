@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/project-v3.schema.json",
+  "title": "Project (v3)",
+  "description": "project.json format version 3 — transcribed from what src-tauri/src/midi/persist.rs::save_snapshot_into_project actually writes (persist.rs:161-282, round-2 §3.3/§5, O-9/O-10, ADR 0002/0004), layered on the v1 typed fields (src-tauri/src/audio/types.rs Project, still written by audio::project::save) and v2's `ppq` (project-v2.schema.json). v2 -> v3 changes TWO things: (1) `tempoMap` rows go from {tick,bpm} to integer-superticks {tick,periodStart,periodEnd} (quantized ONCE via crate::time::period_from_bpm; `tempoBpm` stays a display mirror of tempoMap[0]'s period, never the source of truth) and adds a persisted `meterMap` (default [{tick:0,num:4,den:4}] when absent) plus `sectionTableRuleVersion`; (2) the v2 `midiClips` conflated row is split (ADR 0004) into three new top-level arrays — `content[]` (note-payload half: eventsRef + the nextNoteId watermark, which MOVES here from the placement row), `placements[]` (position/identity half: id/name/timelineStartTicks/lengthTicks/contentId/laneId), and `lanes[]` (resolves a laneId to its trackId, one row per lane actually referenced by a clip). `midiClips` is retired as a WRITE target from v3 on but stays readable forever (src-tauri/src/midi/persist.rs::parse_clips_legacy) — old v2 files upgrade to the split shape in memory on the next save, not on load. `save` is a read-modify-write over the existing JSON (audio::project::save's v2/v3 seam, project.rs:69-111): the v1 typed fields overlay onto whatever v2/v3 keys already exist in the file, so both writers preserve each other's fields; a v1-path save on an existing v3 file re-quantizes `tempoMap[0]` from the typed `tempoBpm` the same way persist.rs does, so the two paths never disagree. `instruments` (sampler-instrument.schema.json refs, named in the v2 doc) is preserved passively by that same merge seam if already present in the file, but no code in this tree currently writes it — reserved, not actively emitted; noted here rather than silently promised. Per debt D-06, v3 (like v2) is an emitter contract WITHOUT additionalProperties:false — readers ignore unknown fields.",
+  "type": "object",
+  "properties": {
+    "schemaVersion": {
+      "description": "project.json format version; this document describes version 3.",
+      "type": "integer",
+      "const": 3
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 256 },
+    "path": { "type": "string" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "modifiedAt": { "type": "string", "format": "date-time" },
+    "sampleRate": { "type": "integer", "minimum": 8000, "maximum": 384000, "default": 48000 },
+    "tempoBpm": {
+      "description": "Display-value mirror of tempoMap[0]'s period (crate::time::bpm_from_period) — written by persist.rs only when at least one tempo event exists; NEVER re-quantized on its own and never the source of truth (tempoMap's integer period is). Kept for older tooling.",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "timeSignature": {
+      "description": "Legacy v1 global time signature; still written by the v1 typed path. meterMap is the v3+ authority for time-signature changes over the timeline.",
+      "type": "array",
+      "prefixItems": [
+        { "type": "integer", "minimum": 1, "maximum": 32 },
+        { "type": "integer", "enum": [1, 2, 4, 8, 16, 32] }
+      ],
+      "items": false
+    },
+    "ppq": {
+      "description": "Ticks per quarter note for ALL tick-valued fields in this file (unchanged from v2).",
+      "type": "integer",
+      "minimum": 24,
+      "maximum": 15360,
+      "default": 960
+    },
+    "tempoMap": {
+      "description": "Sorted tempo changes as integer superticks-per-quarter periods (round-2 §3.3) — NOT bpm from v3 on. Each entry's periodStart == periodEnd today (no ramp-editing command exists yet to produce anything else). First entry MUST be at tick 0.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/tempoPeriodEvent" }
+    },
+    "meterMap": {
+      "description": "Persisted time signature changes (round-2 §3.3/O-10). Defaults to [{tick:0,num:4,den:4}] on read when absent (v1/v2 files, or a v3 file that omitted it) — never actually absent in a v3 file this code writes.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/meterEvent" }
+    },
+    "sectionTableRuleVersion": {
+      "description": "Version of the tempoMap/meterMap -> sectionTable bijection rule (src-tauri/src/midi/section_table.rs::RULE_VERSION, currently 1). The section table itself is DERIVED at read time from tempoMap+meterMap (see ../../src/lib/sectionTable.ts for the one bijection implementation) and is never written to project.json.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "tracks": {
+      "description": "Mixer tracks in display order (track-state.schema.json; v2+ midi tracks add instrumentId).",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/track-state.schema.json" }
+    },
+    "clips": {
+      "description": "Audio clips, unchanged shape from v1 (clip.schema.json, sample-based). MIDI clips live in content[]/placements[]/lanes[] below, never here.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/clip.schema.json" }
+    },
+    "content": {
+      "description": "v3 MIDI content rows (ADR 0004 content half) — one per MIDI clip, written by persist.rs::save_snapshot_into_project. Replaces v2's midiClips as the write target; midiClips stays readable forever for un-resaved v2 files.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedContentRow" }
+    },
+    "placements": {
+      "description": "v3 MIDI placement rows (ADR 0004 position/identity half) — one per MIDI clip, joined to its content row via contentId and to its track via laneId -> lanes[].",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedPlacementRow" }
+    },
+    "lanes": {
+      "description": "v3 lane rows resolving a laneId to its trackId — one row per DISTINCT lane actually referenced by a placement (not one per track; a track with zero clips gets no lane row here).",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedLaneRow" }
+    },
+    "midiClips": {
+      "description": "v2 legacy conflated MIDI clip rows (midi-clip.schema.json #/$defs/persistedClipLegacy). Present only on a file that has never been re-saved since its v2->v3 upgrade; persist.rs removes this key unconditionally on every v3 save (`obj.remove(\"midiClips\")`) and never writes it again.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedClipLegacy" }
+    },
+    "instruments": {
+      "description": "Sampler instruments used by midi tracks (sampler-instrument.schema.json). Named in the v2 doc and passively preserved by audio::project::save's merge seam if already present in the file, but no writer in this tree currently populates it — reserved, not actively emitted.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/sampler-instrument.schema.json#/$defs/projectRef" }
+    },
+    "transport": { "description": "transport-state.schema.json object.", "type": "object" }
+  },
+  "required": [
+    "schemaVersion", "name", "sampleRate", "tempoBpm", "ppq", "tempoMap", "meterMap",
+    "sectionTableRuleVersion", "tracks", "clips"
+  ],
+  "$defs": {
+    "tempoPeriodEvent": {
+      "title": "TempoPeriodEvent",
+      "description": "Integer-period tempo event (superticks per quarter note, round-2 §3.3) — mirrors src-tauri/src/midi/types.rs TempoPeriodEvent.",
+      "type": "object",
+      "properties": {
+        "tick": { "type": "integer", "minimum": 0 },
+        "periodStart": { "type": "integer", "minimum": 1 },
+        "periodEnd": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["tick", "periodStart", "periodEnd"]
+    },
+    "meterEvent": {
+      "title": "MeterEvent",
+      "description": "Persisted time-signature change — mirrors src-tauri/src/midi/types.rs MeterEvent.",
+      "type": "object",
+      "properties": {
+        "tick": { "type": "integer", "minimum": 0 },
+        "num": { "type": "integer", "minimum": 1, "maximum": 32 },
+        "den": { "type": "integer", "enum": [1, 2, 4, 8, 16, 32] }
+      },
+      "required": ["tick", "num", "den"]
+    }
+  }
+}

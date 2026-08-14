@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "aura:ipc/project-v2.schema.json",
-  "title": "Project (v2)",
-  "description": "project.json format version 2 — v1 (project.schema.json) plus musical time (debt D-02 paydown): ppq + tempoMap in ticks, MIDI clips with binary AMEV event chunks, and sampler instrument references. ADDITIVE evolution: every v1 field keeps its exact v1 meaning; audio clip positions stay sample-based. Migration v1->v2 is mechanical: set schemaVersion=2, ppq=960, tempoMap=[{tick:0,bpm:<tempoBpm>}], midiClips=[], instruments=[]. tempoBpm is retained and MUST equal tempoMap[0].bpm (older tooling reads it). Per debt D-06, v2 schemas are emitter contracts WITHOUT additionalProperties:false — readers ignore unknown fields.",
+  "title": "Project (v2, superseded — migration source only, see project-v3.schema.json)",
+  "description": "SUPERSEDED by project-v3.schema.json (schemaVersion 3, round-2 §3.3/§5) — kept here as the MIGRATION SOURCE format, not deleted: src-tauri/src/midi/persist.rs::parse_clips_legacy reads this shape forever (an un-resaved v2 project must keep loading), and v2->v3 is a mechanical in-memory upgrade on first save (period-quantize tempoMap once, default meterMap to [{0,4,4}], split each midiClips row into a content[]+placements[]+lanes[] triple). Do not describe NEW writes against this document — see project-v3.schema.json for what persist.rs actually writes today. // Original v2 description follows — project.json format version 2 — v1 (project.schema.json) plus musical time (debt D-02 paydown): ppq + tempoMap in ticks, MIDI clips with binary AMEV event chunks, and sampler instrument references. ADDITIVE evolution: every v1 field keeps its exact v1 meaning; audio clip positions stay sample-based. Migration v1->v2 is mechanical: set schemaVersion=2, ppq=960, tempoMap=[{tick:0,bpm:<tempoBpm>}], midiClips=[], instruments=[]. tempoBpm is retained and MUST equal tempoMap[0].bpm (older tooling reads it). Per debt D-06, v2 schemas are emitter contracts WITHOUT additionalProperties:false — readers ignore unknown fields.",
   "type": "object",
   "properties": {
     "schemaVersion": {
@@ -54,7 +54,7 @@
     "midiClips": {
       "description": "MIDI clip placements (ticks). Note payloads live in AMEV chunk files referenced by eventsRef — NEVER inline in project.json (SCALABILITY §3).",
       "type": "array",
-      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedClip" }
+      "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedClipLegacy" }
     },
     "instruments": {
       "description": "Sampler instruments used by midi tracks.",
