@@ -1358,15 +1358,42 @@ impl Control {
         // the ops are built AFTER `writer.finish` above (the wav I/O has
         // ALREADY completed by this point), never before. ONE non-transient
         // Actor::Engine tx: ClipAdd x n (appended in `clips`' order, mirroring
-        // the pre-Task-13 `store.clips.extend`) + Set{Transport,
-        // TransportState="stopped"}. `ClipAdd`'s `apply_raw` arm sets BOTH
-        // `effect.rebuild` and `effect.persist.project` (session.rs) — so
-        // `self.rebuild()` (via `do_rebuild` below) and the project.json
-        // write (via `execute_persist`, replacing the manual
-        // `project::save` this used to do) both come from the SAME commit's
-        // folded effect, not two separate steps racing each other.
+        // the pre-Task-13 `store.clips.extend`). `ClipAdd`'s `apply_raw` arm
+        // sets BOTH `effect.rebuild` and `effect.persist.project`
+        // (session.rs) — so `self.rebuild()` (via `do_rebuild` below) and
+        // the project.json write (via `execute_persist`, replacing the
+        // manual `project::save` this used to do) both come from the SAME
+        // commit's folded effect, not two separate steps racing each other.
+        //
+        // Review round 1 (Important-1): the `TransportState="stopped"` Set
+        // does NOT ride in this tx — it's a SEPARATE, transient commit right
+        // below. Bundling it into the ClipAdd tx would make it part of that
+        // tx's inverse: once Task 17 lands history, undoing "stop recording"
+        // would restore `state = "recording"` alongside removing the clips —
+        // a document state that CLAIMS a take is running when nothing is
+        // recording. `ClipAdd`'s inverse (removing the clips) must never
+        // carry transport-state baggage with it.
+        //
+        // Near-unreachable edge case (deferred-minor, review round 1):
+        // when `clips` is empty (only possible if `start_recording`'s own
+        // "no armed tracks to record" guard somehow let a take start with
+        // no targets — it can't today), this commit applies zero `ClipAdd`
+        // ops, so `effect.rebuild`/`effect.persist.project` are never set —
+        // no rebuild, no project.json write. The pre-Task-13 code rebuilt
+        // and saved unconditionally, even for zero clips; this is an
+        // intentional narrowing (a commit that materially changes nothing
+        // now does nothing), not an oversight.
         if let Err(e) = self.commit_recording_finalize(&clips) {
             log::warn!("stop_recording: finalize commit failed: {e}");
+        }
+        // Own, transient commit — same reasoning as `commit_auto_stop`/
+        // `commit_start_recording_state`: transport state is RT/document-
+        // visible but not itself a document edit a user would expect
+        // separately in undo history, and keeping it OUT of the ClipAdd tx
+        // above is exactly what review round 1 asked for (see the comment
+        // above `commit_recording_finalize`'s call).
+        if let Err(e) = self.commit_recording_stopped_state() {
+            log::warn!("stop_recording: transport-state commit failed: {e}");
         }
         self.events.emit(
             "recording://state",
@@ -1381,8 +1408,8 @@ impl Control {
     }
 
     /// The ONE non-transient `Actor::Engine` tx `stop_recording` submits to
-    /// finalize a take — split out so it's independently testable without a
-    /// live input stream/disk writer (`clips` is exactly what
+    /// register the take's clips — split out so it's independently testable
+    /// without a live input stream/disk writer (`clips` is exactly what
     /// `writer.finish` returned; this fn does no I/O of its own).
     /// `emit_project_changed: true` — unlike the transient sites,
     /// registering new clips IS a document edit (mirrors the `set_track_
@@ -1390,6 +1417,18 @@ impl Control {
     /// `commit` legitimately starts firing `project://changed` where it
     /// didn't before; `recording://state` remains the dedicated
     /// "recording finished" signal for the trackIds/xruns/clips shape).
+    ///
+    /// Review round 1 (Important-1): ONLY `ClipAdd`s live here now —
+    /// `TransportState="stopped"` moved to its own transient commit
+    /// (`commit_recording_stopped_state`, called right after this one in
+    /// `stop_recording`). Bundling both into one tx would make the state
+    /// flip part of THIS tx's inverse: once Task 17 lands undo history,
+    /// undoing "stop recording" would restore `state = "recording"` in the
+    /// SAME step that removes the clips — claiming a take is running while
+    /// nothing records. Splitting them means undoing the ClipAdd tx only
+    /// ever un-registers clips; the state mirror is a separate, transient
+    /// fact that was never meant to be undo-tracked in the first place
+    /// (same reasoning as every other transport-family commit — Task 12).
     fn commit_recording_finalize(&mut self, clips: &[Clip]) -> Result<Committed, String> {
         let committer = self.committer.clone();
         committer.commit_with_rebuild(
@@ -1399,6 +1438,27 @@ impl Control {
                     let idx = tx.store().clips.len();
                     tx.apply(op::Op::ClipAdd { clip: clip.clone(), index: idx })?;
                 }
+                Ok(())
+            },
+            true,
+            || self.rebuild(),
+        )
+    }
+
+    /// The transient commit `stop_recording` submits, immediately after
+    /// `commit_recording_finalize`, for the "stopped" transport-state
+    /// mirror — split out of the finalize tx (review round 1, Important-1;
+    /// see that method's doc for why). Same shape as `commit_auto_stop`/
+    /// `commit_start_recording_state`: transient, `emit_project_changed:
+    /// false` (`recording://state`, emitted by `stop_recording` right after
+    /// both commits, is what today's callers actually observe), `do_rebuild:
+    /// || {}` (`Op::Set{Transport, ...}` never sets `effect.rebuild` —
+    /// Task 12's transport family).
+    fn commit_recording_stopped_state(&mut self) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("stop recording").transient(),
+            |tx| {
                 tx.apply(op::Op::Set {
                     object: op::ObjectRef::Transport,
                     path: op::PropPath::TransportState,
@@ -1406,8 +1466,8 @@ impl Control {
                     to: serde_json::json!("stopped"),
                 })
             },
-            true,
-            || self.rebuild(),
+            false,
+            || {},
         )
     }
 
@@ -1719,32 +1779,48 @@ mod tests {
         (ctl, session)
     }
 
-    /// Plan E Task 13's TDD step 1, at the real `Control` method (not just
-    /// the `Committer` primitive it calls — `control::mod`'s own
+    /// Plan E Task 13's TDD step 1, at the real `Control` methods (not just
+    /// the `Committer` primitive they call — `control::mod`'s own
     /// `recording_finalize_commits_as_actor_engine_with_clip_add_ops_and_
     /// one_rebuild` pins the primitive; this pins `stop_recording`'s ACTUAL
-    /// call site): `commit_recording_finalize` produces a `Committed`
-    /// attributed to `Actor::Engine`, carrying the `ClipAdd` ops (built
-    /// AFTER `clips` is already in hand, exactly as `stop_recording` does —
-    /// §4.4 "the op is the registration, never the recording itself"), and
-    /// exactly one rebuild (`self.generation` — bumped once per `rebuild()`
-    /// call, even headless — moves by exactly 1).
+    /// call sites). Corrected by review round 1 (Important-1): finalize is
+    /// TWO commits, not one — `commit_recording_finalize` (ClipAdd ops
+    /// only, built AFTER `clips` is already in hand, exactly as
+    /// `stop_recording` does — §4.4 "the op is the registration, never the
+    /// recording itself"; exactly one rebuild, `self.generation` moves by
+    /// exactly 1) followed by `commit_recording_stopped_state` (the
+    /// transport-state Set, transient, its OWN commit, no further
+    /// rebuild — `self.generation` unchanged by it). Splitting them keeps
+    /// the state flip OUT of the ClipAdd tx's inverse: once Task 17 lands
+    /// undo history, undoing "stop recording" must only ever un-register
+    /// clips, never also claim a take is running again.
     #[test]
     fn commit_recording_finalize_is_actor_engine_with_clip_adds_and_one_rebuild() {
         let (mut ctl, session) = bare_control();
+        // Seed a non-default state so the state-commit assertion below is
+        // load-bearing (`TransportState::default()`'s `state` is already
+        // "stopped", which would make that assertion trivially true even
+        // if `commit_recording_stopped_state` did nothing).
+        session.lock().store.transport.state = "recording".into();
         let gen_before = ctl.generation;
         let clips = vec![
             crate::audio::types::testutil::test_clip("c-1", "t-1"),
             crate::audio::types::testutil::test_clip("c-2", "t-1"),
         ];
-        let committed = ctl.commit_recording_finalize(&clips).unwrap();
+
+        let clip_committed = ctl.commit_recording_finalize(&clips).unwrap();
         assert!(
-            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            matches!(clip_committed.meta.actor, crate::control::op::Actor::Engine),
             "got {:?}",
-            committed.meta.actor
+            clip_committed.meta.actor
         );
-        assert!(!committed.meta.transient, "finalize is a real document edit");
-        let n_clip_adds = committed
+        assert!(!clip_committed.meta.transient, "clip registration is a real document edit");
+        assert!(
+            clip_committed.ops.iter().all(|op| matches!(op, crate::control::op::Op::ClipAdd { .. })),
+            "must carry ONLY ClipAdd ops, got {:?}",
+            clip_committed.ops
+        );
+        let n_clip_adds = clip_committed
             .ops
             .iter()
             .filter(|op| matches!(op, crate::control::op::Op::ClipAdd { .. }))
@@ -1752,6 +1828,24 @@ mod tests {
         assert_eq!(n_clip_adds, 2);
         assert_eq!(ctl.generation, gen_before + 1, "exactly one rebuild");
         assert_eq!(session.lock().store.clips.len(), 2);
+        assert_eq!(session.lock().store.transport.state, "recording", "unchanged by the ClipAdd-only commit");
+
+        let state_committed = ctl.commit_recording_stopped_state().unwrap();
+        assert!(
+            matches!(state_committed.meta.actor, crate::control::op::Actor::Engine),
+            "got {:?}",
+            state_committed.meta.actor
+        );
+        assert!(state_committed.meta.transient, "the state mirror is transient");
+        assert!(
+            state_committed.ops.iter().all(|op| matches!(
+                op,
+                crate::control::op::Op::Set { path: crate::control::op::PropPath::TransportState, .. }
+            )),
+            "must carry ONLY the TransportState Set, got {:?}",
+            state_committed.ops
+        );
+        assert_eq!(ctl.generation, gen_before + 1, "no further rebuild from the state commit");
         assert_eq!(session.lock().store.transport.state, "stopped");
     }
 
@@ -1772,6 +1866,56 @@ mod tests {
         assert!(committed.meta.transient, "auto-stop is transient");
         assert_eq!(ctl.generation, gen_before, "Transport Set never rebuilds");
         assert_eq!(session.lock().store.transport.state, "stopped");
+    }
+
+    /// Review round 1 (Important-3): site 5 (`ensure_project`) had no
+    /// fixture exercising it at all, so its new failure mode — erroring
+    /// when no closure is installed, where the pre-Task-13 code silently
+    /// auto-created a project itself — was unreachable in the test suite.
+    /// `bare_control()` never calls `install_ensure_project` (no
+    /// `ControlMsg::SetEnsureProject` is ever sent to a `Control` built
+    /// this way — it isn't running a message loop at all), so
+    /// `ensure_project_fn` stays `None`, exactly as it would for a real
+    /// engine thread the moment after `engine::start` returns, before
+    /// `lib.rs`'s post-`ControlPlane` `install_ensure_project` call lands.
+    #[test]
+    fn ensure_project_errs_when_no_closure_installed() {
+        let (mut ctl, _session) = bare_control();
+        assert!(ctl.ensure_project_fn.is_none(), "bare_control installs no closure");
+        let err = ctl.ensure_project().unwrap_err();
+        assert!(
+            err.contains("no project-birth closure installed"),
+            "got {err:?}"
+        );
+    }
+
+    /// The installed-closure half of the same review point: once a closure
+    /// is installed (`lib.rs`'s real call: `engine.install_ensure_project
+    /// (Arc::new(move || cp.ensure_project_epoch()))`), `ensure_project`
+    /// calls it EXACTLY once, and its result propagates through unchanged
+    /// in BOTH directions (`Ok` and `Err`) rather than being swallowed or
+    /// mapped to something else — pinned here with a counting stand-in
+    /// closure rather than a real `ControlPlane::ensure_project_epoch`
+    /// (which needs a `JobManager` + a real `.aura` dir to construct; the
+    /// delegation contract under test is "the engine calls the installed
+    /// closure and does nothing else", not `ensure_project_epoch`'s own
+    /// behavior, which has its own coverage in control/mod.rs).
+    #[test]
+    fn ensure_project_invokes_the_installed_closure_exactly_once_and_propagates_its_result() {
+        let (mut ctl, _session) = bare_control();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let calls2 = calls.clone();
+        ctl.ensure_project_fn = Some(Arc::new(move || {
+            calls2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(std::path::PathBuf::from("/tmp/aura-test-project"))
+        }));
+        ctl.ensure_project().expect("an Ok(PathBuf) from the closure propagates as Ok");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1, "invoked exactly once");
+
+        ctl.ensure_project_fn = Some(Arc::new(|| Err("boom".to_string())));
+        let err = ctl.ensure_project().unwrap_err();
+        assert_eq!(err, "boom", "an Err from the closure propagates through ensure_project unchanged, not swallowed");
     }
 
     /// Runs with or without a real audio device: the engine falls back to

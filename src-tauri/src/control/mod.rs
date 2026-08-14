@@ -171,6 +171,24 @@ pub struct ControlPlane {
 ///     value, one thread, one `handle` call in flight at a time, driven by
 ///     that thread's own `rx.recv_timeout` loop).
 ///
+/// The rule THIS actually rests on (review round 1, Important-4 — (b)
+/// shows the engine thread is safe; this is what keeps every OTHER caller
+/// safe too, including future ones): no thread may hold the session lock
+/// across an `EngineHandle::request` — the engine takes that SAME lock
+/// inside `handle()` (every write site, and most of the read-only ones —
+/// see the `// read-only:` sites in engine.rs), so a `request` issued while
+/// the calling thread is still holding a session guard would deadlock the
+/// instant the engine's own `handle()` tries to lock it: the engine can't
+/// finish the request (so never sends the reply), and the caller can't
+/// drop its guard (it's blocked inside `request`'s `recv_timeout`) — a real
+/// deadlock, not just the starvation (c) describes, though bounded by
+/// `request`'s own 30s timeout rather than hanging forever. All five
+/// current production `request` call sites comply — none holds `self.
+/// session.lock()` (or any session guard) across the call:
+/// `ControlPlane::transport`'s Stop arm (control/mod.rs:769),
+/// `start_recording` (:856), `stop_recording` (:865), `select_input_device`
+/// (:890), `select_output_device` (:901).
+///
 /// (c) All five engine write sites (`open_output`, `apply_end_policy`,
 ///     `start_recording`, `stop_recording`, `ensure_project`) commit
 ///     synchronously on the control thread's own turn, fire-and-forget from
@@ -202,10 +220,14 @@ impl Committer {
         Self { session, shared, tables, emit }
     }
 
-    /// Compose the full-project payload `project://changed` carries — see
-    /// `ControlPlane::project_changed_payload`'s original doc (moved here
-    /// verbatim, Task 13): the same shape `project::from_store` serializes,
-    /// minus its requirement of an open project dir.
+    /// Compose the full-project payload `project://changed` carries (the
+    /// same shape `project::from_store` serializes, minus its requirement of
+    /// an open project dir — mix/structural changes are legal in an unsaved
+    /// session). `commit_with_rebuild`'s event emission (Task 7: every
+    /// A-slice command now goes live through it) is the sole caller;
+    /// `ControlPlane::create_project`/`create_project_at` builds its own
+    /// `Project` from `project::create`'s return instead, since that one
+    /// always has an open project dir.
     fn project_changed_payload(&self) -> Project {
         let session = self.session.lock();
         let s = &session.store;
@@ -231,18 +253,38 @@ impl Committer {
     /// Runs a `Session::transact` closure, then — with the session lock
     /// RELEASED — executes the folded `EngineEffect`: param writes resolved
     /// through `self.tables` (the CURRENT graph's tables — round-2 §2.4),
-    /// `do_rebuild()` called at most once (Task 13: the CALLER decides how
-    /// "one more rebuild" reaches its engine — see this struct's deadlock
-    /// audit), plugin host round-trips, persist, and — gated by
-    /// `emit_project_changed` — exactly one `project://changed` event.
+    /// `do_rebuild()` called at most once, plugin host round-trips, persist,
+    /// and — gated by `emit_project_changed` — exactly one
+    /// `project://changed` event. `project://changed` is a FROZEN event
+    /// whose payload contract is the full `Project` shape
+    /// (project.schema.json; ARCHITECTURE §3.4) — this carries EXACTLY that
+    /// (via `project_changed_payload`, the same serialization
+    /// `ControlPlane::create_project` uses), with `rev`/`label`/`actor`
+    /// folded in as ADDITIVE top-level fields (D-06: readers ignore fields
+    /// they don't recognize).
     ///
-    /// This is `ControlPlane::commit_with`'s pre-Task-13 body, unchanged
-    /// except that `if committed.effect.rebuild { self.engine.send(...) }`
-    /// became `if committed.effect.rebuild { do_rebuild(); }` — see
-    /// `ControlPlane::commit_with`'s doc for the fuller per-step rationale
-    /// (zero engine/param-table/event calls happen while the session lock
-    /// is held; `project://changed`'s frozen payload contract; etc.), which
-    /// still applies verbatim to this body.
+    /// Zero engine/param-table/event calls happen while the SESSION lock is
+    /// held — `Session::transact` (session.rs) only ever computes the effect
+    /// DESCRIPTION; everything below this comment runs after it returns
+    /// (`project_changed_payload` takes its own fresh, separate lock).
+    ///
+    /// A track without a slot yet (`self.tables.lock().slots` doesn't have
+    /// it) is skipped — sound ONLY because `rebuild` publishes `GraphTables`
+    /// INSIDE the session lock it holds while reading the store [C1]:
+    /// either this commit's `Session::transact` above ran BEFORE that
+    /// rebuild read the document (so the fresh tables already bake this
+    /// write's value in), or it ran AFTER the rebuild published (so the
+    /// write below executes against the new table). There is no window
+    /// where a commit's own write can be silently lost. Same reasoning
+    /// covers `any_solo`.
+    ///
+    /// Task 13: `do_rebuild()` replaces what used to be a hardcoded
+    /// `self.engine.send(ControlMsg::Rebuild)` here — the CALLER now
+    /// decides how "one more rebuild" reaches its engine: a
+    /// `ControlPlane`-driven commit sends `ControlMsg::Rebuild` over the
+    /// channel; the engine control thread's OWN commits call `Control::
+    /// rebuild` directly instead (see this struct's deadlock audit for why
+    /// that distinction is load-bearing, not stylistic).
     pub fn commit_with_rebuild<F, R>(
         &self,
         meta: op::TxMeta,
@@ -266,6 +308,31 @@ impl Committer {
                     op::PropPath::Pan => tables.params.set_pan(slot, *value),
                     op::PropPath::Muted => tables.params.set_flag(slot, FLAG_MUTE, *value != 0.0),
                     op::PropPath::Soloed => tables.params.set_flag(slot, FLAG_SOLO, *value != 0.0),
+                    // No ParamTable counterpart for Armed (the retired
+                    // apply_track_mix, deleted in Plan B, didn't write one
+                    // either), nor for InstrumentId/TimelineStartSamples
+                    // (Plan E Task 3): `apply_raw` never pushes those two
+                    // into `param_writes` in the first place (they're
+                    // structural — rebuild, not a param-table write), so
+                    // this arm is unreachable in practice; kept as an
+                    // honest no-op rather than a `todo!()` so a future path
+                    // added here without a `param_writes` producer doesn't
+                    // panic a live commit.
+                    // Plan E Task 5: same reasoning for the three MidiClip
+                    // paths — `apply_raw` never pushes them into
+                    // `param_writes` either (structural: rebuild only).
+                    // Plan E Task 12: same reasoning again for the six
+                    // Transport paths — the Transport `apply_raw` arm
+                    // (session.rs) never pushes anything into
+                    // `param_writes` (it isn't `TrackId`-keyed at all).
+                    // Plan E Task 8: same reasoning for LengthSamples/
+                    // OffsetSamples (LoopJam's in-place clip trims) —
+                    // structural (rebuild), no ParamTable counterpart.
+                    // Plan E Task 9: same reasoning for `Param` —
+                    // `apply_raw` never pushes plugin params into
+                    // `param_writes` either (they travel through
+                    // `host_forward::ParamWrite` instead, resolved by
+                    // instance id, not by a `GraphTables` slot).
                     op::PropPath::Armed
                     | op::PropPath::InstrumentId
                     | op::PropPath::TimelineStartSamples
@@ -287,15 +354,37 @@ impl Committer {
                 tables.params.any_solo.store(any_solo, Relaxed);
             }
         }
+        // Plugin host round-trips (Task 9): after the param-table writes,
+        // before persist — same "session lock is released" guarantee as
+        // everything else in `commit_with_rebuild` ([C1]: hosts have their
+        // own locks, never called while the session lock is held).
         if !committed.effect.host_forward.is_empty() {
             self.execute_host_forward(&committed.effect.host_forward);
         }
         if committed.effect.rebuild {
             do_rebuild();
         }
+        // Persist runs after the effect writes above and BEFORE the
+        // `project://changed` emit below — the event announces durable
+        // truth, so persistence must have already happened by the time it
+        // fires (round-2 §4: persistence is an effect, executed here, never
+        // I/O under the session lock).
         if committed.effect.persist != session::PersistEffect::default() {
             self.execute_persist(&committed.effect.persist, committed.epoch);
         }
+        // Full-Project payload (the frozen contract) + rev/label/actor as
+        // additive fields (D-06). `project_changed_payload` serializes to a
+        // JSON object (all of `Project`'s fields are named), so inserting
+        // extra keys is safe; the `unwrap_or_default` fallback (an empty
+        // object) only matters if serialization itself somehow failed.
+        //
+        // Plan E Task 12: gated by `emit_project_changed` — transport
+        // commits (`ControlPlane::transport`, and Task 13's engine-side
+        // transient sites) pass `false` and rely on their own
+        // `transport://state`/`recording://state` emit instead;
+        // `project://changed`'s payload contract is the full `Project`
+        // shape, and firing it once per play/stop/loop-drag gesture would
+        // be a behavior change from today's narrower event contract.
         if emit_project_changed {
             let mut payload = serde_json::to_value(self.project_changed_payload())
                 .unwrap_or_else(|_| serde_json::json!({}));
@@ -312,10 +401,28 @@ impl Committer {
         Ok(committed)
     }
 
-    /// Executes a `PersistEffect` a commit merely described — see
-    /// `ControlPlane::execute_persist`'s original doc (moved here verbatim,
-    /// Task 13); `ControlPlane::execute_persist` is now a thin forwarding
-    /// wrapper kept for existing direct test callers.
+    /// Executes a `PersistEffect` a commit merely described. Snapshots are
+    /// taken under a fresh, SHORT session lock; ALL disk I/O happens after
+    /// the guard drops — round-2 §4's whole point (persistence is an
+    /// effect, not I/O under the lock). `pub(crate)` so tests can construct
+    /// a `PersistEffect` and call this directly (`ControlPlane::committer()`
+    /// is a `#[cfg(test)]`-only accessor for exactly that — Task 13; there
+    /// is no non-test caller left on `ControlPlane` itself, only
+    /// `commit_with_rebuild` above, which is why this moved here instead of
+    /// staying a `ControlPlane` method with a forwarding wrapper).
+    ///
+    /// `committed_epoch`: the `Committed.epoch` the triggering commit
+    /// captured under `Session::transact`'s lock (fix round 1, Task 7
+    /// review finding 2). Re-checked against the CURRENT `session.epoch`
+    /// under the fresh lock this fn takes below — a mismatch means an epoch
+    /// function (project open/create/save-as) swapped the document AFTER
+    /// this commit's `transact` returned but BEFORE this re-lock, so the
+    /// snapshot this fn would take belongs to a DIFFERENT document than the
+    /// one `p` describes; persisting it would be silent data loss either way
+    /// (corrupting the new document, or dropping this commit's edit — see
+    /// `Session::epoch`'s doc). Direct test callers of this fn (that don't
+    /// go through `commit_with_rebuild`) should pass the session's current
+    /// epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
         let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot, plugin_snapshot) = {
             let s = self.session.lock();
@@ -330,7 +437,16 @@ impl Committer {
                         self.shared.sample_rate.load(Relaxed),
                     )
                 }),
+                // Plan E Task 10: snapshot taken under this SAME short lock
+                // as the midi/project snapshots above; the actual write
+                // (chunk files + `automation[]` RMW + chunk GC) happens
+                // below, after the guard drops — round-2 §4: no disk I/O
+                // under the session lock.
                 p.automation.then(|| s.automation.lanes.clone()),
+                // Plan E Task 9: plugin doc snapshot, taken under this SAME
+                // short lock — the actual write (state blobs + `plugins[]`
+                // dirty-ladder + clearing `dirty_state` for whichever ids
+                // were written) happens below, after the guard drops.
                 p.plugins.then(|| s.plugin_snapshot()),
             )
         };
@@ -365,9 +481,22 @@ impl Committer {
                 log::warn!("automation persist failed: {e}");
             }
         }
+        // `with_host_state: false` — a fresh host round-trip (state save)
+        // is never needed here: `PluginAdd`/`PluginRemove`/`PluginSetState`
+        // already keep `session.plugins.pending_state` current through
+        // `host_forward`'s `LoadState`/`Destroy` handling (executed before
+        // `execute_persist` runs, in `commit_with_rebuild`), and a bare
+        // param write (`plugin_set_param`) must NOT round-trip the plugin
+        // main thread per rAF batch — same reasoning the retired
+        // `persist_after_mutation(..., with_host_state: false)` call site
+        // used.
         if let Some(doc) = plugin_snapshot {
             match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
                 Ok(cleared) if !cleared.is_empty() => {
+                    // Clear `dirty_state` for whichever ids' pending bytes
+                    // just landed on disk (Task 9 review round 1,
+                    // Critical-2) — a short, separate re-lock, no disk I/O
+                    // under it.
                     let mut s = self.session.lock();
                     for id in cleared {
                         s.plugins.dirty_state.remove(&id);
@@ -1152,19 +1281,26 @@ impl ControlPlane {
         })
     }
 
-    /// Thin wrapper over `Committer::execute_persist` (Task 13), kept so
-    /// existing direct test callers (`cp.execute_persist(...)`) still work
-    /// unchanged.
-    pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
-        self.committer.execute_persist(p, committed_epoch)
-    }
-
     /// Test-only accessor to the shared session lock, for tests that need
     /// to assert on/mutate store state directly around a `commit`-driven
     /// call (Task 7 brief).
     #[cfg(test)]
     pub fn session(&self) -> &Arc<Mutex<Session>> {
         &self.session
+    }
+
+    /// Test-only accessor to the `Committer` (review round 1, Important-2):
+    /// `ControlPlane` no longer has its own `execute_persist` — the only
+    /// production caller is `Committer::commit_with_rebuild` itself, calling
+    /// `self.execute_persist` where `self: &Committer`. Direct test callers
+    /// that used to write `cp.execute_persist(...)` now write
+    /// `cp.committer().execute_persist(...)` — a real accessor instead of a
+    /// forwarding method that existed for tests alone (which is exactly the
+    /// shape that reads as dead code to the compiler once nothing in
+    /// production calls it).
+    #[cfg(test)]
+    pub(crate) fn committer(&self) -> &Committer {
+        &self.committer
     }
 
     /// New Project = blank slate: the previous session's tracks, clips, midi
@@ -2542,13 +2678,23 @@ mod tests {
         (committer, session)
     }
 
-    /// Plan E Task 13's TDD step 1: recording finalize (`Control::
-    /// commit_recording_finalize`'s exact shape) produces a `Committed`
-    /// attributed to `Actor::Engine`, carrying the `ClipAdd` ops in order,
-    /// with exactly one rebuild — even though TWO `ClipAdd`s are applied in
-    /// the same transaction (`EngineEffect::rebuild` folds to one flag;
-    /// "at most one `Rebuild` per transaction" is a claim about ALL
-    /// rebuilds, engine-originated ones included — this is what pins that).
+    /// Plan E Task 13's TDD step 1, corrected by review round 1
+    /// (Important-1): recording finalize is now TWO commits, not one —
+    /// `Control::commit_recording_finalize`'s exact shape (ClipAdd x n
+    /// only) followed by `Control::commit_recording_stopped_state`'s
+    /// (the transport-state Set, transient, separate). Bundling the state
+    /// flip into the ClipAdd tx would make it part of THAT tx's inverse:
+    /// once Task 17 lands undo history, undoing "stop recording" would
+    /// restore `state = "recording"` in the same step that un-registers the
+    /// clips — a document claiming a take is running while nothing
+    /// records. This test pins both commits and their independent shapes:
+    /// the non-transient one carries ONLY `ClipAdd`s (with exactly one
+    /// rebuild — `EngineEffect::rebuild` folds to one flag even though TWO
+    /// `ClipAdd`s are applied in the same transaction; "at most one
+    /// `Rebuild` per transaction" is a claim about ALL rebuilds,
+    /// engine-originated ones included), the transient one carries ONLY the
+    /// state `Set` (no rebuild — `Op::Set{Transport, ...}` never sets
+    /// `effect.rebuild`, Task 12's transport family).
     #[test]
     fn recording_finalize_commits_as_actor_engine_with_clip_add_ops_and_one_rebuild() {
         let (committer, session) = test_committer();
@@ -2556,8 +2702,10 @@ mod tests {
         let clip_b = crate::audio::types::testutil::test_clip("c-2", "t-1");
         let clips = vec![clip_a.clone(), clip_b.clone()];
         let rebuilds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        // Commit 1: ClipAdd x n only, non-transient.
         let rebuilds2 = rebuilds.clone();
-        let committed = committer
+        let clip_committed = committer
             .commit_with_rebuild(
                 TxMeta::engine("stop recording"),
                 |tx| {
@@ -2565,12 +2713,7 @@ mod tests {
                         let idx = tx.store().clips.len();
                         tx.apply(Op::ClipAdd { clip: clip.clone(), index: idx })?;
                     }
-                    tx.apply(Op::Set {
-                        object: ObjectRef::Transport,
-                        path: PropPath::TransportState,
-                        from: serde_json::Value::Null,
-                        to: serde_json::json!("stopped"),
-                    })
+                    Ok(())
                 },
                 true,
                 move || {
@@ -2579,12 +2722,17 @@ mod tests {
             )
             .unwrap();
         assert!(
-            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            matches!(clip_committed.meta.actor, crate::control::op::Actor::Engine),
             "finalize must be attributed to Actor::Engine, got {:?}",
-            committed.meta.actor
+            clip_committed.meta.actor
         );
-        assert!(!committed.meta.transient, "finalize is a real document edit, not transient");
-        let clip_ids: Vec<&str> = committed
+        assert!(!clip_committed.meta.transient, "clip registration is a real document edit, not transient");
+        assert!(
+            clip_committed.ops.iter().all(|op| matches!(op, Op::ClipAdd { .. })),
+            "the clip-registration commit must carry ONLY ClipAdd ops, got {:?}",
+            clip_committed.ops
+        );
+        let clip_ids: Vec<&str> = clip_committed
             .ops
             .iter()
             .filter_map(|op| match op {
@@ -2595,6 +2743,44 @@ mod tests {
         assert_eq!(clip_ids, vec!["c-1", "c-2"], "both clips registered, in order");
         assert_eq!(rebuilds.load(std::sync::atomic::Ordering::Relaxed), 1, "exactly one rebuild");
         assert_eq!(session.lock().store.clips.len(), 2, "clips landed in the store");
+
+        // Commit 2: the transport-state Set, its OWN transient commit,
+        // submitted immediately after (mirroring `stop_recording`'s call
+        // order).
+        let rebuilds3 = rebuilds.clone();
+        let state_committed = committer
+            .commit_with_rebuild(
+                TxMeta::engine("stop recording").transient(),
+                |tx| {
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Transport,
+                        path: PropPath::TransportState,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!("stopped"),
+                    })
+                },
+                false,
+                move || {
+                    rebuilds3.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(state_committed.meta.actor, crate::control::op::Actor::Engine),
+            "state flip must also be attributed to Actor::Engine, got {:?}",
+            state_committed.meta.actor
+        );
+        assert!(state_committed.meta.transient, "the state mirror is transient, like the rest of the transport family");
+        assert!(
+            state_committed.ops.iter().all(|op| matches!(op, Op::Set { path: PropPath::TransportState, .. })),
+            "the state commit must carry ONLY the TransportState Set, got {:?}",
+            state_committed.ops
+        );
+        assert_eq!(
+            rebuilds.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the state commit adds no further rebuild (Transport Set never sets effect.rebuild)"
+        );
         assert_eq!(session.lock().store.transport.state, "stopped");
     }
 
@@ -3424,7 +3610,7 @@ mod tests {
         }
 
         let epoch = cp.session().lock().epoch;
-        cp.execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() }, epoch);
+        cp.committer().execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() }, epoch);
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
@@ -3495,7 +3681,7 @@ mod tests {
             cp.session().lock().midi.clips.push(clip2);
         }
 
-        cp.execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() }, committed.epoch);
+        cp.committer().execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() }, committed.epoch);
 
         let after: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&project_json).unwrap()).unwrap();
@@ -3529,7 +3715,7 @@ mod tests {
         cp.session().lock().automation.lanes.push(lane.clone());
 
         let epoch = cp.session().lock().epoch;
-        cp.execute_persist(&PersistEffect { automation: true, ..PersistEffect::default() }, epoch);
+        cp.committer().execute_persist(&PersistEffect { automation: true, ..PersistEffect::default() }, epoch);
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
