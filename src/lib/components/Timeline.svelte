@@ -13,6 +13,7 @@
   import { loopjam } from "../state/loopjam.svelte";
   import { toasts } from "../state/toasts.svelte";
   import TrackHeader from "./TrackHeader.svelte";
+  import HScrollbar from "./HScrollbar.svelte";
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
   import ImportDropZone from "./ImportDropZone.svelte";
@@ -357,6 +358,16 @@
     }
   }
 
+  /** End of the arrangement's content: the furthest clip edge (audio or
+   *  MIDI), so the scrollbar spans exactly what there is to reach. */
+  const contentEndSamples = $derived.by(() => {
+    let end = 0;
+    for (const c of project.clips) end = Math.max(end, c.timelineStartSamples + c.lengthSamples);
+    for (const c of midi.clips)
+      end = Math.max(end, midi.ticksToSamples(c.timelineStartTicks + c.lengthTicks));
+    return end;
+  });
+
   /** Double-click an empty span of a midi lane → create a 2-bar clip there. */
   function onLaneDblClick(track: TrackState, e: MouseEvent) {
     if (track.kind !== "midi") return;
@@ -441,7 +452,7 @@
       </div>
     </div>
 
-    <div class="lanes" bind:this={lanesEl}>
+    <div class="lanes" id="timeline-lanes" bind:this={lanesEl}>
       <canvas bind:this={gridCanvas} class="grid"></canvas>
       {#each project.tracks as track (track.id)}
         <div
@@ -498,6 +509,19 @@
       <ImportDropZone />
       <div bind:this={playheadEl} class="playhead"></div>
     </div>
+  </div>
+
+  <!-- horizontal time scroll -->
+  <div class="scrollrow">
+    <div class="scrollcorner"></div>
+    <HScrollbar
+      start={view.viewStart}
+      viewSpan={view.width * view.spp}
+      contentEnd={contentEndSamples}
+      label="Scroll timeline"
+      controls="timeline-lanes"
+      onscroll={(s) => view.scrollToSamples(s)}
+    />
   </div>
 </div>
 
@@ -672,6 +696,18 @@
     display: flex;
     overflow-y: auto;
     overflow-x: hidden;
+  }
+
+  .scrollrow {
+    flex: none;
+    display: flex;
+    border-top: 1px solid var(--glass-border);
+    background: rgba(10, 13, 23, 0.85);
+  }
+  .scrollcorner {
+    width: var(--rail-width);
+    flex: none;
+    border-right: 1px solid var(--glass-border);
   }
 
   .rail {

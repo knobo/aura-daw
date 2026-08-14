@@ -17,6 +17,7 @@
   import { plugins } from "../../state/plugins.svelte";
   import { openStudio, ui } from "../../state/ui.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
+  import HScrollbar from "../HScrollbar.svelte";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import type { MidiNote } from "../../types/ipc";
 
@@ -718,6 +719,11 @@
     return `rgba(${r},${g},${b},${a})`;
   }
 
+  // scrollbar reach: one repetition of content plus a bar of headroom
+  const contentEndTicks = $derived(
+    clip ? midi.effectiveContentLengthTicks(clip) + midi.ticksPerBar : 0,
+  );
+
   const GRID_CHOICES = [
     { label: "1/4", div: 1 },
     { label: "1/8", div: 2 },
@@ -827,7 +833,7 @@
         <canvas bind:this={keysFlashCanvas} class="overlay" style:width="{KEYS_W}px"></canvas>
       </div>
 
-      <div class="gridwrap" bind:this={gridWrap} onwheel={onWheel}>
+      <div class="gridwrap" id="pianoroll-grid" bind:this={gridWrap} onwheel={onWheel}>
         <canvas
           bind:this={gridCanvas}
           class="grid"
@@ -839,6 +845,18 @@
         <canvas bind:this={flashCanvas} class="overlay"></canvas>
         <div bind:this={playheadEl} class="playhead"></div>
       </div>
+    </div>
+
+    <div class="scrollrow">
+      <div class="scrollcorner" style:width="{KEYS_W}px"></div>
+      <HScrollbar
+        start={scrollTick}
+        viewSpan={gridW * tpp}
+        contentEnd={contentEndTicks}
+        label="Scroll piano roll"
+        controls="pianoroll-grid"
+        onscroll={(t) => (scrollTick = t)}
+      />
     </div>
 
     <div class="velrow">
@@ -1012,6 +1030,16 @@
     box-shadow: 0 0 6px var(--cyan-dim);
     pointer-events: none;
     will-change: transform;
+  }
+
+  .scrollrow {
+    flex: none;
+    display: flex;
+    border-top: 1px solid rgba(96, 130, 190, 0.12);
+  }
+  .scrollcorner {
+    flex: none;
+    border-right: 1px solid rgba(96, 130, 190, 0.25);
   }
 
   .velrow {
