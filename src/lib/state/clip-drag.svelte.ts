@@ -48,6 +48,10 @@ class ClipDragController {
   /** True once the pointer has travelled far enough to count as a drag. */
   moved = $state(false);
   mode = $state<"move" | "resize">("move");
+  /** Set by MidiClipView while a right-edge hover is live, so sibling
+   * selected clips can show the same affordance. Pure chrome — no document
+   * meaning. */
+  edgeHoverActive = $state(false);
 
   private origins: Origin[] = [];
   private anchorOrigSamples = 0;
@@ -226,12 +230,29 @@ class ClipDragController {
    * `move()` used to apply it — THEN close the gesture. Leaving the preview
    * in place (the earlier behavior) is a phantom uncommitted edit: nothing
    * was ever sent to the backend, so the store silently disagrees with the
-   * document until an unrelated reload happens to paper over it. */
+   * document until an unrelated reload happens to paper over it.
+   *
+   * In resize mode the preview also touched `lengthTicks`/
+   * `contentLengthTicks` (never `timelineStartTicks` — resize doesn't move
+   * the clip), so those need restoring too, or a cancelled resize leaves a
+   * phantom length behind exactly like the phantom position the move-mode
+   * fix above closed. */
   cancel() {
     if (this.moved) {
-      for (const o of this.origins) {
-        if (o.kind === "audio") project.moveClip(o.id, o.startSamples);
-        else midi.moveClip(o.id, o.startTicks);
+      if (this.mode === "resize") {
+        const byId = new Map(
+          this.origins.filter((o): o is MidiOrigin => o.kind === "midi").map((o) => [o.id, o]),
+        );
+        midi.clips = midi.clips.map((c) => {
+          const o = byId.get(c.id);
+          if (!o) return c;
+          return { ...c, lengthTicks: o.lengthTicks, contentLengthTicks: o.contentLengthTicks };
+        });
+      } else {
+        for (const o of this.origins) {
+          if (o.kind === "audio") project.moveClip(o.id, o.startSamples);
+          else midi.moveClip(o.id, o.startTicks);
+        }
       }
     }
     this.active = false;

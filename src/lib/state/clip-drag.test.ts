@@ -194,4 +194,82 @@ describe("clipDrag group move", () => {
     expect(moveClips).not.toHaveBeenCalled();
     expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
   });
+
+  it("cancel restores a resize's length preview too, not just position", () => {
+    clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
+    clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
+    clipDrag.move(2500, true); // +2500 samples = +100 ticks
+    // preview applied — confirms there is something to undo
+    expect(midi.clips[0].lengthTicks).toBe(1060);
+    expect(midi.clips[0].contentLengthTicks).toBe(960);
+    clipDrag.cancel();
+    expect(midi.clips[0].lengthTicks).toBe(960);
+    expect(midi.clips[0].timelineStartTicks).toBe(400);
+    expect(moveClips).not.toHaveBeenCalled();
+    expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
+  });
+});
+
+describe("clipDrag group resize (loop length)", () => {
+  beforeEach(() => {
+    midi.clips = [
+      { id: "m1", trackId: "t2", timelineStartTicks: 0, lengthTicks: 960 } as MidiClip,
+      { id: "m2", trackId: "t2", timelineStartTicks: 4800, lengthTicks: 1920 } as MidiClip,
+    ];
+  });
+
+  it("adds the same tick delta to every selected MIDI clip's length", () => {
+    clipSelection.apply(
+      [
+        { kind: "midi", id: "m1" },
+        { kind: "midi", id: "m2" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
+    clipDrag.move(2500, true); // +2500 samples = +100 ticks
+    expect(midi.clips[0].lengthTicks).toBe(1060);
+    expect(midi.clips[1].lengthTicks).toBe(2020);
+  });
+
+  it("never shrinks a clip below one tick", () => {
+    clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
+    clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
+    clipDrag.move(-999999, true);
+    expect(midi.clips[0].lengthTicks).toBe(1);
+  });
+
+  it("pins each clip's content length at drag start, so a first resize establishes it", () => {
+    clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
+    clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
+    clipDrag.move(2500, true);
+    // m1 had no explicit content length; its start-of-gesture placement
+    // length (960) becomes the content length, as MidiClipView's rule says
+    expect(midi.clips[0].contentLengthTicks).toBe(960);
+  });
+
+  it("sends one move_clips carrying bounds, and leaves audio clips out", async () => {
+    project.clips = [
+      { id: "a1", trackId: "t1", timelineStartSamples: 0, lengthSamples: 100 } as Clip,
+    ];
+    clipSelection.apply(
+      [
+        { kind: "midi", id: "m1" },
+        { kind: "audio", id: "a1" },
+      ],
+      "replace",
+    );
+    clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
+    clipDrag.move(2500, true);
+    await clipDrag.end();
+    expect(moveClips).toHaveBeenCalledWith([
+      {
+        kind: "midi",
+        clipId: "m1",
+        timelineStartTicks: 0,
+        lengthTicks: 1060,
+        contentLengthTicks: 960,
+      },
+    ]);
+  });
 });

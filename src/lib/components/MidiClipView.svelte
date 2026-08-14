@@ -74,6 +74,10 @@
   const visL = $derived(Math.max(0, -leftPx));
   const visR = $derived(Math.min(widthPx, view.width - leftPx));
   const selected = $derived(clipSelection.has({ kind: "midi", id: clip.id }));
+  /** True while the pointer hovers ANY selected MIDI clip's right edge —
+   * so a group resize announces itself on every clip it will affect, not
+   * just the one under the pointer. */
+  const groupEdgeHover = $derived(clipDrag.edgeHoverActive && clipSelection.count() > 1);
   const open = $derived(midi.openClipId === clip.id);
   // freshly landed (hum-to-song etc.) — transient glow set by midi.flash()
   const landed = $derived(midi.flashClipId === clip.id);
@@ -136,6 +140,7 @@
     if (dragging) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     hoverEdge = rect.right - e.clientX <= EDGE_PX;
+    clipDrag.edgeHoverActive = hoverEdge;
   }
 
   function onPointerDown(e: PointerEvent) {
@@ -181,7 +186,7 @@
     class:selected
     class:open
     class:landed
-    class:edge={hoverEdge || (dragging && dragMode === "resize")}
+    class:edge={hoverEdge || (dragging && dragMode === "resize") || (selected && groupEdgeHover)}
     style:left="{leftPx}px"
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
@@ -192,6 +197,10 @@
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
     onpointercancel={() => clipDrag.cancel()}
+    onpointerleave={() => {
+      hoverEdge = false;
+      clipDrag.edgeHoverActive = false;
+    }}
     ondblclick={() => midi.open(clip.id)}
     onkeydown={onKeydown}
   >
