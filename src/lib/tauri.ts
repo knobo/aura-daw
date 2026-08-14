@@ -146,6 +146,12 @@ export interface Backend {
     lengthTicks: number,
   ): Promise<MidiClip>;
   midiSetNotes(clipId: string, notes: MidiNote[]): Promise<MidiClip>;
+  midiSetClipBounds(
+    clipId: string,
+    timelineStartTicks: number,
+    lengthTicks: number,
+    contentLengthTicks: number | null,
+  ): Promise<MidiClip>;
   midiGetClips(): Promise<MidiClip[]>;
   midiImportFile(path: string, trackId?: string | null, atTicks?: number | null): Promise<MidiClip[]>;
   midiExportFile(path: string, clipIds?: string[] | null): Promise<string>;
@@ -415,6 +421,19 @@ class TauriBackend implements Backend {
   }
   midiSetNotes(clipId: string, notes: MidiNote[]) {
     return invoke<MidiClip>("midi_set_notes", { clipId, notes });
+  }
+  midiSetClipBounds(
+    clipId: string,
+    timelineStartTicks: number,
+    lengthTicks: number,
+    contentLengthTicks: number | null,
+  ) {
+    return invoke<MidiClip>("midi_set_clip_bounds", {
+      clipId,
+      timelineStartTicks,
+      lengthTicks,
+      contentLengthTicks,
+    });
   }
   midiGetClips() {
     return invoke<MidiClip[]>("midi_get_clips");

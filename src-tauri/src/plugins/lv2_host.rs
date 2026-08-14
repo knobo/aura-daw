@@ -750,6 +750,7 @@ mod tests {
                 next_note_id: 1,
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track(track_id),
+                content_length_ticks: None,
             }],
             loaded_dir: None,
             dirty: false,

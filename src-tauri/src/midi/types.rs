@@ -117,6 +117,14 @@ pub struct MidiClip {
     /// row in the v3 file. Same `#[serde(default)]` caveat as `content_id`.
     #[serde(default)]
     pub lane_id: LaneId,
+    /// Content (loop/native) length in ticks — ADR 0004's content half of
+    /// the content/placement split; `length_ticks` stays the placement
+    /// length. Absent (the wire default) means "same as `length_ticks`"
+    /// (today's pre-looping semantics, byte-identical). Set the first time
+    /// a clip's right edge is dragged past its content: content length is
+    /// pinned to whatever `length_ticks` was at that moment.
+    #[serde(default)]
+    pub content_length_ticks: Option<u64>,
 }
 
 /// Serde default for [`MidiClip::next_note_id`] (and, imported,
@@ -156,6 +164,17 @@ impl MidiClip {
         }
         self.next_note_id = next;
         Ok(())
+    }
+
+    /// The length `clip_events()` repeats content over: the explicit
+    /// content length when set, else the placement length (today's
+    /// semantics). Never 0 (a defensive floor — a 0 period would make the
+    /// scheduler's repeat loop divide by zero; `content_length_ticks:
+    /// Some(0)` should never be constructed, but this accessor is the one
+    /// seam every reader goes through, so it's the one place worth
+    /// guarding).
+    pub fn effective_content_length_ticks(&self) -> u64 {
+        self.content_length_ticks.unwrap_or(self.length_ticks).max(1)
     }
 }
 
@@ -211,6 +230,7 @@ mod tests {
             timeline_start_ticks: 0, length_ticks: 3840,
             notes: vec![], next_note_id: 1,
             content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
+            content_length_ticks: None,
         };
         let a = clip.mint_note_id();
         let b = clip.mint_note_id();
@@ -232,11 +252,31 @@ mod tests {
             ],
             next_note_id: 6,
             content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
+            content_length_ticks: None,
         };
         clip.ensure_note_ids().unwrap();
         assert_eq!(clip.notes[0].note_id.0, 6, "unassigned got minted");
         assert_eq!(clip.notes[1].note_id.0, 5, "existing id preserved");
         clip.notes.push(MidiNote { tick: 2, length_ticks: 1, key: 62, velocity: 100, channel: 0, note_id: NoteId(5) });
         assert!(clip.ensure_note_ids().is_err(), "duplicate real ids rejected");
+    }
+
+    #[test]
+    fn effective_content_length_defaults_to_placement_length() {
+        let mut clip = MidiClip {
+            id: "c-1".into(), track_id: "t-1".into(), name: "c".into(),
+            timeline_start_ticks: 0, length_ticks: 3840,
+            notes: vec![], next_note_id: 1,
+            content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
+            content_length_ticks: None,
+        };
+        assert_eq!(clip.effective_content_length_ticks(), 3840, "absent -> placement length");
+        clip.content_length_ticks = Some(960);
+        assert_eq!(clip.effective_content_length_ticks(), 960, "explicit value wins");
+        // Defensive floor: a stray 0 (should never be constructed, but the
+        // accessor must never hand back 0 — a zero-length repeat period
+        // would divide-by-zero in the scheduler).
+        clip.content_length_ticks = Some(0);
+        assert_eq!(clip.effective_content_length_ticks(), 1, "floors at 1");
     }
 }

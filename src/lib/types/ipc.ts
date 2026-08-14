@@ -285,6 +285,8 @@ export interface MidiClip {
   name: string;
   timelineStartTicks: number;
   lengthTicks: number;
+  /** Content (loop/native) length in ticks; absent = same as lengthTicks. */
+  contentLengthTicks?: number;
   /** Sorted by (tick, key). */
   notes: MidiNote[];
 }

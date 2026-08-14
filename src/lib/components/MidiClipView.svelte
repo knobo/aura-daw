@@ -33,21 +33,24 @@
       raf = requestAnimationFrame(loop);
       const posTicks =
         midi.samplesToTicks(transport.positionAt(now)) - clip.timelineStartTicks;
+      const contentTicks = midi.effectiveContentLengthTicks(clip);
+      const posInContent = posTicks % contentTicks;
       if (posTicks < 0 || posTicks > clip.lengthTicks || clip.notes.length === 0) {
         el.style.opacity = "0";
         return;
       }
-      // latest onset at/before the playhead (notes are tick-sorted)
+      // latest onset at/before the playhead within the CURRENT repeat
+      // (notes are tick-sorted, content-relative)
       let last = -1;
       for (const n of clip.notes) {
-        if (n.tick > posTicks) break;
+        if (n.tick > posInContent) break;
         if (n.tick > last) last = n.tick;
       }
       if (last < 0) {
         el.style.opacity = "0";
         return;
       }
-      const ageSec = ((posTicks - last) / midi.ppq) * (60 / project.tempoBpm);
+      const ageSec = ((posInContent - last) / midi.ppq) * (60 / project.tempoBpm);
       const glow = Math.exp(-ageSec * 9);
       el.style.opacity = glow > 0.02 ? (0.6 * glow).toFixed(3) : "0";
     };
@@ -77,7 +80,12 @@
     if (!c) return;
     const notes = clip.notes;
     const w = Math.max(1, Math.floor(visR - visL));
-    void view.spp, view.viewStart, clip.timelineStartTicks, clip.lengthTicks, track.color;
+    void view.spp,
+      view.viewStart,
+      clip.timelineStartTicks,
+      clip.lengthTicks,
+      clip.contentLengthTicks,
+      track.color;
 
     const h = c.clientHeight || 60;
     const dpr = Math.min(3, window.devicePixelRatio || 1);
@@ -98,50 +106,104 @@
     lo -= 2;
     hi += 2;
     const rowH = Math.min(4, h / (hi - lo + 1));
-    const pxPerTick = widthPx / clip.lengthTicks;
+    const contentTicks = midi.effectiveContentLengthTicks(clip);
+    const pxPerTick = widthPx / contentTicks;
     const offset = visL; // clip-local css px of canvas origin
+    const repeats = Math.max(1, Math.ceil(clip.lengthTicks / contentTicks));
 
     const r = parseInt(track.color.slice(1, 3), 16);
     const g = parseInt(track.color.slice(3, 5), 16);
     const b = parseInt(track.color.slice(5, 7), 16);
-    for (const n of notes) {
-      const x = n.tick * pxPerTick - offset;
-      const nw = Math.max(1.5, n.lengthTicks * pxPerTick);
-      if (x + nw < 0 || x > w) continue;
-      const y = h - ((n.key - lo + 1) / (hi - lo + 1)) * h;
-      ctx.fillStyle = `rgba(${r},${g},${b},${0.4 + 0.6 * (n.velocity / 127)})`;
-      ctx.fillRect(x, y, nw, Math.max(1.5, rowH - 1));
+    for (let rep = 0; rep < repeats; rep++) {
+      const repOffsetTicks = rep * contentTicks;
+      if (repOffsetTicks >= clip.lengthTicks) break;
+      for (const n of notes) {
+        const tick = repOffsetTicks + n.tick;
+        if (tick >= clip.lengthTicks) continue; // cropped by the placement end
+        const x = tick * pxPerTick - offset;
+        const nw = Math.max(1.5, n.lengthTicks * pxPerTick);
+        if (x + nw < 0 || x > w) continue;
+        const y = h - ((n.key - lo + 1) / (hi - lo + 1)) * h;
+        ctx.fillStyle = `rgba(${r},${g},${b},${0.4 + 0.6 * (n.velocity / 127)})`;
+        ctx.fillRect(x, y, nw, Math.max(1.5, rowH - 1));
+      }
+      // Separator line at every content boundary (skip rep 0's leading edge).
+      if (rep > 0) {
+        const sepX = repOffsetTicks * pxPerTick - offset;
+        if (sepX >= 0 && sepX <= w) {
+          ctx.fillStyle = `rgba(${r},${g},${b},0.35)`;
+          ctx.fillRect(sepX, 0, 1, h);
+        }
+      }
     }
   });
 
-  // ── drag / select (mirrors ClipView) ──
+  // ── drag / select / edge-resize (mirrors ClipView + the ruler's loop pins) ──
   let dragging = $state(false);
+  let dragMode: "move" | "resize" = $state("move");
   let dragStartX = 0;
   let dragOrigTicks = 0;
+  let dragOrigLengthTicks = 0;
+  let dragOrigContentTicks = 0; // pinned once, at drag start, for a resize gesture
   let dragMoved = false;
+
+  const EDGE_PX = 8;
+
+  let hoverEdge = $state(false);
+  function updateHoverEdge(e: PointerEvent) {
+    if (dragging) return;
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    hoverEdge = rect.right - e.clientX <= EDGE_PX;
+  }
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     midi.select(clip.id);
     project.select(null);
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const nearRightEdge = rect.right - e.clientX <= EDGE_PX;
+    dragMode = nearRightEdge ? "resize" : "move";
     dragging = true;
     dragMoved = false;
     dragStartX = e.clientX;
     dragOrigTicks = clip.timelineStartTicks;
+    dragOrigLengthTicks = clip.lengthTicks;
+    // Content length is pinned the moment a resize STARTS, not re-read every
+    // pointermove — the spec's "set the first time the right edge is
+    // dragged" rule: if the clip has no explicit content length yet, this
+    // drag's start-of-gesture placement length BECOMES the content length.
+    dragOrigContentTicks = midi.effectiveContentLengthTicks(clip);
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   }
   function onPointerMove(e: PointerEvent) {
+    updateHoverEdge(e);
     if (!dragging) return;
     const dx = e.clientX - dragStartX;
     if (Math.abs(dx) > 2) dragMoved = true;
     if (!dragMoved) return;
-    let targetSamples = midi.ticksToSamples(dragOrigTicks) + dx * view.spp;
-    if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
-    midi.moveClip(clip.id, midi.samplesToTicks(Math.max(0, targetSamples)));
+    if (dragMode === "resize") {
+      let targetSamples = midi.ticksToSamples(dragOrigTicks + dragOrigLengthTicks) + dx * view.spp;
+      if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
+      const newLengthTicks = Math.max(
+        1,
+        Math.round(midi.samplesToTicks(Math.max(0, targetSamples)) - dragOrigTicks),
+      );
+      midi.clips = midi.clips.map((c) =>
+        c.id === clip.id
+          ? { ...c, lengthTicks: newLengthTicks, contentLengthTicks: dragOrigContentTicks }
+          : c,
+      );
+    } else {
+      let targetSamples = midi.ticksToSamples(dragOrigTicks) + dx * view.spp;
+      if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
+      midi.moveClip(clip.id, midi.samplesToTicks(Math.max(0, targetSamples)));
+    }
   }
   function onPointerUp(e: PointerEvent) {
+    const wasDragging = dragging && dragMoved;
     dragging = false;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+    if (wasDragging) void midi.commitBounds(clip.id);
   }
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
@@ -150,6 +212,7 @@
       e.preventDefault();
       const dir = e.key === "ArrowLeft" ? -1 : 1;
       midi.moveClip(clip.id, clip.timelineStartTicks + dir * midi.ppq);
+      void midi.commitBounds(clip.id);
     }
   }
 </script>
@@ -160,11 +223,12 @@
     class:selected
     class:open
     class:landed
+    class:edge={hoverEdge || (dragging && dragMode === "resize")}
     style:left="{leftPx}px"
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
     role="button"
-    aria-label="MIDI clip {clip.name} — double-click to edit"
+    aria-label="MIDI clip {clip.name} — double-click to edit, drag the right edge to loop"
     tabindex="0"
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
@@ -210,6 +274,10 @@
     box-shadow:
       inset 0 0 0 1px color-mix(in srgb, var(--clip-color) 45%, transparent),
       0 0 14px color-mix(in srgb, var(--clip-color) 30%, transparent);
+  }
+  /* right-edge drag-to-loop zone — same idiom as the ruler's loop pins */
+  .mclip.edge {
+    cursor: ew-resize;
   }
   /* a clip a job just landed (hum-to-song melody/accompaniment) */
   .mclip.landed {

@@ -282,6 +282,17 @@ describe("piano roll wiring (midi store)", () => {
     expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 24000, 48000);
   });
 
+  it("a looped clip (placement longer than content) loops the CONTENT, not the placement", async () => {
+    // Placement is 4 beats (3840 ticks), content is 1 beat (960 ticks) —
+    // the clip-edit loop must span only the content, per spec §6.
+    midi.clips = [{ ...clip, lengthTicks: 3840, contentLengthTicks: 960 }];
+
+    midi.open("c1");
+
+    await vi.waitFor(() => expect(mocked.transportPlay).toHaveBeenCalled());
+    expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 24000, 24000 + 960 * 25);
+  });
+
   it("closing the editor restores the pre-edit state", async () => {
     midi.clips = [clip];
     midi.sectionTable = [

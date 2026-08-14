@@ -35,6 +35,10 @@ class MidiStore {
   /** Clip glowing from a just-landed result (hum-to-song etc.); transient. */
   flashClipId = $state<string | null>(null);
   private flashTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Clipboard for Ctrl+C/V/D clip stamping (spec §6) — a snapshot, not a
+   * live reference, so later edits to the source clip don't leak into a
+   * clip already copied. */
+  clipboard = $state<MidiClip | null>(null);
 
   get openClip(): MidiClip | null {
     return this.clips.find((c) => c.id === this.openClipId) ?? null;
@@ -63,6 +67,13 @@ class MidiStore {
   /** Ticks per bar at the project time signature. */
   get ticksPerBar(): number {
     return this.ppq * project.timeSignature[0];
+  }
+
+  /** Effective content (loop) length: explicit, else the placement length —
+   * the single accessor every content-relative reader (piano roll bounds,
+   * repeat rendering, the clip-edit loop) goes through. */
+  effectiveContentLengthTicks(clip: MidiClip): number {
+    return Math.max(1, clip.contentLengthTicks ?? clip.lengthTicks);
   }
 
   applySnapshot(snap: ProjectSnapshot) {
@@ -125,10 +136,47 @@ class MidiStore {
     }
   }
 
-  /** Frontend-only placement move (no midi clip-move command in the surface). */
+  /** Frontend-only placement move (used DURING a drag; see commitBounds for
+   * the persisted end of the gesture — D-03: one invoke per gesture, not
+   * one per pointermove). */
   moveClip(clipId: string, timelineStartTicks: number) {
     const t = Math.max(0, Math.round(timelineStartTicks));
     this.clips = this.clips.map((c) => (c.id === clipId ? { ...c, timelineStartTicks: t } : c));
+  }
+
+  /** Persist a clip's current placement/content bounds — called once at the
+   * END of a move or edge-drag gesture (pointerup), never per pointermove.
+   * Closes the pre-existing hole where moveClip() never reached the
+   * scheduler or the project file. */
+  async setClipBounds(
+    clipId: string,
+    timelineStartTicks: number,
+    lengthTicks: number,
+    contentLengthTicks?: number,
+  ): Promise<void> {
+    const t = Math.max(0, Math.round(timelineStartTicks));
+    const len = Math.max(1, Math.round(lengthTicks));
+    const cl = contentLengthTicks === undefined ? undefined : Math.max(1, Math.round(contentLengthTicks));
+    this.clips = this.clips.map((c) =>
+      c.id === clipId
+        ? { ...c, timelineStartTicks: t, lengthTicks: len, contentLengthTicks: cl }
+        : c,
+    );
+    try {
+      const clip = await backend.midiSetClipBounds(clipId, t, len, cl ?? null);
+      this.upsert(clip);
+    } catch (err) {
+      console.error("[aura] midi_set_clip_bounds failed:", err);
+    }
+  }
+
+  /** Commit a clip's CURRENT in-store bounds to the backend — the pointerup
+   * end of a move/edge-drag gesture that used moveClip()/local mutation
+   * during the drag. */
+  async commitBounds(clipId: string): Promise<void> {
+    const c = this.clipById(clipId);
+    if (!c) return;
+    await this.setClipBounds(clipId, c.timelineStartTicks, c.lengthTicks, c.contentLengthTicks);
   }
 
   open(clipId: string) {
@@ -140,7 +188,9 @@ class MidiStore {
       void clipEditLoop.enter({
         trackId: clip.trackId,
         startSamples: this.ticksToSamples(clip.timelineStartTicks),
-        endSamples: this.ticksToSamples(clip.timelineStartTicks + clip.lengthTicks),
+        endSamples: this.ticksToSamples(
+          clip.timelineStartTicks + this.effectiveContentLengthTicks(clip),
+        ),
       });
     }
   }
@@ -162,6 +212,62 @@ class MidiStore {
       if (this.flashClipId === clipId) this.flashClipId = null;
       this.flashTimer = null;
     }, ms);
+  }
+
+  // ── clip stamping (Ctrl+C/V/D, spec §6) ──
+
+  copySelected() {
+    const c = this.selectedClip;
+    this.clipboard = c ? { ...c, notes: c.notes.map((n) => ({ ...n })) } : null;
+  }
+
+  /** Independent copy at `timelineStartTicks` on the target track — the
+   * SELECTED clip's track when one is selected, else the copied clip's own
+   * original track. Fresh backend id + fresh note ids (midi_set_notes's
+   * keep-rule mints fresh ids whenever the target clip starts with no
+   * notes, which a brand-new clip always does — see progress.md). */
+  async pasteAtPlayhead(timelineStartTicks: number): Promise<MidiClip | null> {
+    const src = this.clipboard;
+    if (!src) return null;
+    const targetTrackId = this.selectedClip?.trackId ?? src.trackId;
+    return this.stamp(src, targetTrackId, Math.max(0, Math.round(timelineStartTicks)));
+  }
+
+  /** Independent copy immediately after the currently selected clip, on the
+   * same track. */
+  async duplicateSelected(): Promise<MidiClip | null> {
+    const src = this.selectedClip;
+    if (!src) return null;
+    return this.stamp(src, src.trackId, src.timelineStartTicks + src.lengthTicks);
+  }
+
+  private async stamp(
+    src: MidiClip,
+    trackId: string,
+    timelineStartTicks: number,
+  ): Promise<MidiClip | null> {
+    try {
+      let created = await backend.midiAddClip(trackId, src.name, timelineStartTicks, src.lengthTicks);
+      this.upsert(created);
+      if (src.contentLengthTicks !== undefined) {
+        created = await backend.midiSetClipBounds(
+          created.id,
+          timelineStartTicks,
+          src.lengthTicks,
+          src.contentLengthTicks,
+        );
+        this.upsert(created);
+      }
+      if (src.notes.length > 0) {
+        const copiedNotes = src.notes.map((n) => ({ ...n }));
+        created = await backend.midiSetNotes(created.id, copiedNotes);
+        this.upsert(created);
+      }
+      return created;
+    } catch (err) {
+      console.error("[aura] clip stamp failed:", err);
+      return null;
+    }
   }
 }
 
