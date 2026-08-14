@@ -338,7 +338,9 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
 /// store truth, never the caller's advisory `op.from`); entries whose net
 /// `from == to` are dropped from both `ops` and `inverses`. Non-`Set` ops
 /// (future op kinds) pass through untouched, each still paired with its own
-/// inverse, in original relative order.
+/// inverse, in original relative order. Structural (non-Set) ops act as a
+/// barrier: grouping never reaches back across a structural op boundary to
+/// merge with earlier Set groups, preserving replay order once ops persist.
 ///
 /// A linear scan (not a `HashMap`) is used deliberately: `PropPath` isn't
 /// `Hash` (op.rs's closed enum, Task 2 territory, left untouched), and
@@ -356,11 +358,12 @@ fn fold_ops(ops: Vec<Op>, inverses: Vec<Op>) -> (Vec<Op>, Vec<Op>) {
     }
 
     let mut slots: Vec<Slot> = Vec::new();
+    let mut barrier = 0usize; // grouping never reaches below this index
 
     for (op, inv) in ops.into_iter().zip(inverses.into_iter()) {
         match (&op, &inv) {
             (Op::Set { object, path, .. }, Op::Set { from: true_to, to: true_from, .. }) => {
-                let existing = slots.iter_mut().find_map(|s| match s {
+                let existing = slots[barrier..].iter_mut().find_map(|s| match s {
                     Slot::Grouped(g) if g.object == *object && g.path == *path => Some(g),
                     _ => None,
                 });
@@ -375,7 +378,10 @@ fn fold_ops(ops: Vec<Op>, inverses: Vec<Op>) -> (Vec<Op>, Vec<Op>) {
                     }));
                 }
             }
-            _ => slots.push(Slot::Passthrough(op, inv)),
+            _ => {
+                slots.push(Slot::Passthrough(op, inv));
+                barrier = slots.len(); // structural op: nothing before it may absorb later Sets
+            }
         }
     }
 
@@ -637,5 +643,43 @@ mod tests {
             let _ = Session::transact(&m, meta.clone(), |_| Ok(()));
             Ok(())
         });
+    }
+
+    #[test]
+    fn fold_never_merges_sets_across_a_structural_op() {
+        // gain 0→3, then a structural TrackAdd, then gain 3→6: the two Sets
+        // must NOT merge into one 0→6 emitted before the TrackAdd.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let t2 = test_track("t-2");
+        let c = Session::transact(&m, TxMeta::user("fold-barrier"), |tx| {
+            tx.apply(set_gain("t-1", 3.0))?;
+            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(set_gain("t-1", 6.0))
+        })
+        .unwrap();
+        assert_eq!(c.ops.len(), 3, "no cross-barrier merge: {:?}", c.ops);
+        assert!(matches!(&c.ops[0], Op::Set { .. }));
+        assert!(matches!(&c.ops[1], Op::TrackAdd { .. }));
+        assert!(matches!(&c.ops[2], Op::Set { .. }));
+        // Verify the gained value is correct
+        assert_eq!(m.lock().store.tracks[0].gain_db, 6.0);
+    }
+
+    #[test]
+    fn wiggle_back_across_a_structural_op_is_not_elided() {
+        // gain 0→3, TrackAdd, gain 3→0: net-noop for the gain, but the two Sets
+        // sit in different barrier regions — BOTH survive (replay order truth
+        // beats history minimalism once ops persist).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let t2 = test_track("t-2");
+        let c = Session::transact(&m, TxMeta::user("wiggle-barrier"), |tx| {
+            tx.apply(set_gain("t-1", 3.0))?;
+            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(set_gain("t-1", 1.0)) // back to original
+        })
+        .unwrap();
+        assert_eq!(c.ops.len(), 3, "cross-barrier wiggle must not elide: {:?}", c.ops);
+        // Even though we're back to the original value, the two Sets are in
+        // different barrier regions so neither can cancel out
     }
 }
