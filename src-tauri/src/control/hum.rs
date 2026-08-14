@@ -25,18 +25,21 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(test)]
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::audio::engine::ControlMsg;
 use crate::audio::types::TrackState;
 use crate::midi::{MidiClip, MidiNote};
 use crate::sidecars::jobs::{self, EventSink, JobSpec};
 use crate::sidecars::{JobKind, SidecarEvent};
 
+use super::op::{Op, TxMeta};
 use super::ops;
+#[cfg(test)]
 use super::session::Session;
+use super::session::Tx;
 use super::ControlPlane;
 
 /// SIGTERM → SIGKILL grace on cancel (same value as the other sidecar jobs).
@@ -145,30 +148,52 @@ pub(crate) fn parse_hum_result(
 // Apply core (tauri-free: Store + ParamTable + MidiStore)
 // ---------------------------------------------------------------------------
 
-/// Land validated notes as a new MIDI clip: resolve the target track (must be
-/// `kind: "midi"`) or auto-create one named after the clip, then register the
-/// clip in the midi store. STRUCTURAL — the caller persists and sends
-/// `ControlMsg::Rebuild` afterwards. One guard covers the whole block (store
-/// + midi live behind the same lock).
-pub(crate) fn apply_hum_notes(
-    session: &Mutex<Session>,
+/// Validate + sort + zero-out note ids and settle the clip's length, all
+/// pure (no lock, no store access) — the prepare-outside-the-transaction
+/// half of [`apply_hum_notes`]/[`ControlPlane::apply_hum_clip`] (Plan E
+/// Task 8).
+fn prepare_hum_notes(
     mut notes: Vec<MidiNote>,
     length_ticks: u64,
-    track_id: Option<String>,
-    at_ticks: u64,
-    name: &str,
-) -> Result<(MidiClip, Option<TrackState>), String> {
+) -> Result<(Vec<MidiNote>, u64), String> {
     if notes.is_empty() {
         return Err("no notes to place".into());
     }
     for n in &notes {
         n.validate()?;
     }
-    let mut session = session.lock();
+    notes.sort_by_key(|n| (n.tick, n.key));
+    let end = notes
+        .iter()
+        .map(|n| n.tick as u64 + n.length_ticks as u64)
+        .max()
+        .unwrap_or(0);
+    for n in &mut notes {
+        n.note_id = crate::ids::NoteId(0);
+    }
+    Ok((notes, length_ticks.max(end).max(1)))
+}
+
+/// The document-mutation half: resolve (or `add_track_tx`-create) the
+/// target midi track and insert the melody clip, both through the ONE
+/// transaction `tx` — Plan E Task 8 (round-2 inventory row 18). Shared by
+/// [`apply_hum_notes`] (direct `Session::transact`, the free-function tests'
+/// entry point) and [`ControlPlane::apply_hum_clip`] (`ControlPlane::commit`,
+/// the production path with the full rebuild/persist/emit effect pipeline —
+/// this is what turns hum's old under-lock disk write and missing
+/// `project://changed` emit into effects executed AFTER the lock drops).
+fn commit_hum_clip(
+    tx: &mut Tx<'_>,
+    notes: Vec<MidiNote>,
+    length_ticks: u64,
+    track_id: Option<String>,
+    at_ticks: u64,
+    name: &str,
+) -> Result<(MidiClip, Option<TrackState>), String> {
     let (target, created_track) = match track_id {
         Some(id) => {
-            let track = session
-                .store
+            let track = tx
+                .store()
                 .tracks
                 .iter()
                 .find(|t| t.id == id)
@@ -182,30 +207,17 @@ pub(crate) fn apply_hum_notes(
             (crate::ids::TrackId::from(id), None)
         }
         None => {
-            let track = ops::add_track(
-                &mut session.store,
-                Some(name.to_string()),
-                Some("midi".into()),
-            )?;
+            let track = ops::add_track_tx(tx, Some(name.to_string()), Some("midi".into()))?;
             (track.id.clone(), Some(track))
         }
     };
-    notes.sort_by_key(|n| (n.tick, n.key));
-    let end = notes
-        .iter()
-        .map(|n| n.tick as u64 + n.length_ticks as u64)
-        .max()
-        .unwrap_or(0);
-    for n in &mut notes {
-        n.note_id = crate::ids::NoteId(0);
-    }
     let lane_id = crate::ids::LaneId::default_for_track(target.as_str());
     let mut clip = MidiClip {
         id: crate::ids::ClipId::mint(),
         track_id: target,
         name: name.to_string(),
         timeline_start_ticks: at_ticks,
-        length_ticks: length_ticks.max(end).max(1),
+        length_ticks,
         notes,
         next_note_id: 1,
         content_id: crate::ids::ContentId::mint(),
@@ -213,8 +225,35 @@ pub(crate) fn apply_hum_notes(
         content_length_ticks: None,
     };
     clip.ensure_note_ids()?;
-    session.midi.clips.push(clip.clone());
+    let index = tx.midi().clips.len();
+    tx.apply(Op::MidiClipAdd { clip: clip.clone(), index })?;
     Ok((clip, created_track))
+}
+
+/// Land validated notes as a new MIDI clip: resolve the target track (must be
+/// `kind: "midi"`) or auto-create one named after the clip, then register the
+/// clip in the midi store — ONE `Session::transact` (no engine/persist/emit;
+/// this fn has no `ControlPlane` to execute those effects with — that's
+/// [`ControlPlane::apply_hum_clip`]'s job). `#[cfg(test)]`: since Plan E
+/// Task 8, `apply_hum_clip` calls `prepare_hum_notes`/`commit_hum_clip`
+/// directly (through `ControlPlane::commit`) — this fn's only remaining
+/// callers are its own tests below.
+#[cfg(test)]
+pub(crate) fn apply_hum_notes(
+    session: &Mutex<Session>,
+    notes: Vec<MidiNote>,
+    length_ticks: u64,
+    track_id: Option<String>,
+    at_ticks: u64,
+    name: &str,
+) -> Result<(MidiClip, Option<TrackState>), String> {
+    let (notes, length_ticks) = prepare_hum_notes(notes, length_ticks)?;
+    let mut outcome = None;
+    Session::transact(session, TxMeta::system("hum-to-song apply"), |tx| {
+        outcome = Some(commit_hum_clip(tx, notes.clone(), length_ticks, track_id.clone(), at_ticks, name)?);
+        Ok(())
+    })?;
+    Ok(outcome.expect("commit_hum_clip sets outcome on every Ok(())"))
 }
 
 // ---------------------------------------------------------------------------
@@ -349,8 +388,17 @@ impl ControlPlane {
         Ok(self.jobs.submit(spec, sink))
     }
 
-    /// Apply-side helper: land notes as a clip, persist the midi store into
-    /// the open project (when there is one), and rebuild the graph.
+    /// Apply-side helper: land notes as a clip through ONE `commit` — Plan E
+    /// Task 8 (round-2 inventory row 18). Notes are validated/prepared
+    /// OUTSIDE any lock ([`prepare_hum_notes`]); the mutation itself
+    /// (optional `add_track_tx` + `Op::MidiClipAdd`, [`commit_hum_clip`])
+    /// is the ONE transaction. `MidiClipAdd`'s `effect.persist.midi`/
+    /// `effect.rebuild` replace the old manual
+    /// `midi::persist::save_into_project` call (which used to run WHILE the
+    /// session lock was held — the Plan A handoff defect this task fixes by
+    /// construction) and the old manual `ControlMsg::Rebuild` send; `commit`'s
+    /// own `project://changed` emit is new here — the previous version never
+    /// announced a hummed clip to the frontend at all (silent-UI defect).
     pub(crate) fn apply_hum_clip(
         &self,
         notes: Vec<MidiNote>,
@@ -359,23 +407,20 @@ impl ControlPlane {
         at_ticks: u64,
         name: &str,
     ) -> Result<(MidiClip, Option<TrackState>), String> {
-        let out = apply_hum_notes(
-            &self.session,
-            notes,
-            length_ticks,
-            track_id,
-            at_ticks,
-            name,
-        )?;
-        let dir = self.session.lock().store.project_dir.clone();
-        if let Some(d) = &dir {
-            let session = self.session.lock();
-            if let Err(e) = crate::midi::persist::save_into_project(d, &session.midi) {
-                log::warn!("hum-to-song: persisting midi failed: {e}");
-            }
-        }
-        self.engine.send(ControlMsg::Rebuild);
-        Ok(out)
+        let (notes, length_ticks) = prepare_hum_notes(notes, length_ticks)?;
+        let mut outcome = None;
+        self.commit(TxMeta::system("hum-to-song apply"), |tx| {
+            outcome = Some(commit_hum_clip(
+                tx,
+                notes.clone(),
+                length_ticks,
+                track_id.clone(),
+                at_ticks,
+                name,
+            )?);
+            Ok(())
+        })?;
+        Ok(outcome.expect("commit_hum_clip sets outcome on every Ok(())"))
     }
 }
 
@@ -837,11 +882,24 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         assert_eq!(track.kind, "midi");
         assert_eq!(track.name, "take melody");
 
-        // Persistence: the midi state is on disk in the temp project.
+        // Persistence: the midi state is on disk in the temp project. The
+        // poll above only proves the MUTATION landed (the store became
+        // visible the instant `Session::transact` returned, inside
+        // `apply_hum_clip`'s `commit` call); `commit`'s `persist.midi`
+        // effect executes a moment later, still inside that same `commit`
+        // call but AFTER the session lock (and thus this test's poll) can
+        // already observe the mutated store — so the disk write itself
+        // needs its own short poll too, not a single-shot read right after
+        // the in-memory check above.
         let dir = cp.session.lock().store.project_dir.clone().unwrap();
-        let v2 = crate::midi::persist::load_from_project(&dir)
-            .unwrap()
-            .expect("project persisted as v2");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let v2 = loop {
+            if let Some(v2) = crate::midi::persist::load_from_project(&dir).unwrap() {
+                break v2;
+            }
+            assert!(Instant::now() < deadline, "midi never persisted to disk");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
         assert_eq!(v2.clips.len(), 1);
         assert_eq!(v2.clips[0].notes.len(), 2);
 
@@ -863,6 +921,79 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
             assert!(Instant::now() < deadline, "apply log line never arrived");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        cp.engine.send(crate::audio::engine::ControlMsg::Shutdown);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// Plan E Task 8 (brief-mandated behavioral test): `apply_hum_clip` used
+    /// to persist midi WHILE the session lock was held (the Plan A handoff
+    /// defect this task fixes by construction — persistence is a `commit`
+    /// effect now) and never emitted `project://changed` at all (a silent
+    /// UI: a hummed clip landed in the store with nothing telling the
+    /// frontend to redraw). Behavioral, not a grep gate: read the file, and
+    /// check the emitted event, right after `apply_hum_clip` returns — one
+    /// rev bump for the whole commit, the midi store already on disk, and
+    /// the new track/clip present in the `project://changed` payload.
+    #[test]
+    fn apply_hum_clip_commits_synchronously_and_announces_project_changed() {
+        let parent = std::env::temp_dir()
+            .join(format!("aura-hum-commit-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let (_p, dir) = project::create(&parent, "HumCommit", 48_000, 120.0).unwrap();
+        let shared = Arc::new(crate::audio::rt::SharedRt::default());
+        let tables = empty_tables();
+        let mut store = Store::default();
+        store.project_dir = Some(dir.clone());
+        store.project_name = Some("HumCommit".into());
+        let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
+        let engine = crate::audio::engine::start(
+            shared.clone(),
+            tables.clone(),
+            session.clone(),
+            Box::new(NullEvents),
+        );
+        let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev2 = Arc::clone(&events);
+        let cp = Arc::new(ControlPlane::new(
+            session,
+            shared,
+            tables,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
+        ));
+
+        let before_rev = cp.session.lock().rev;
+
+        let (clip, _created) = cp
+            .apply_hum_clip(vec![note(0, 480, 69, 100)], 960, None, 0, "commit test melody")
+            .unwrap();
+
+        assert_eq!(cp.session.lock().rev, before_rev + 1, "one commit, one rev bump");
+
+        // Synchronous persistence: read the file right after
+        // `apply_hum_clip` RETURNED — no separate flush step to remember.
+        let v2 = crate::midi::persist::load_from_project(&dir)
+            .unwrap()
+            .expect("midi persisted synchronously by the time commit returned");
+        assert!(v2.clips.iter().any(|c| c.id == clip.id), "{v2:?}");
+
+        // `project://changed` was emitted — fixes the previous silent-UI
+        // defect (the pre-Task-8 code never emitted this at all).
+        let evs = events.lock();
+        let payload = evs
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "project://changed")
+            .map(|(_, p)| p)
+            .expect("apply_hum_clip announces itself over project://changed");
+        assert!(
+            payload["tracks"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|tr| tr["id"] == clip.track_id.as_str())),
+            "{payload:?}"
+        );
+        drop(evs);
         cp.engine.send(crate::audio::engine::ControlMsg::Shutdown);
         let _ = std::fs::remove_dir_all(parent);
     }

@@ -37,9 +37,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::audio::dsp::linear_resample;
-use crate::audio::engine::ControlMsg;
 use crate::audio::mixer;
-use crate::audio::project;
 use crate::audio::rt::{ParamTable, RtClip, RtClipData, RtGraph, RtTrack};
 use crate::audio::transport::LoopSpec;
 use crate::audio::types::{Clip, Store};
@@ -48,7 +46,8 @@ use crate::sidecars::jobs::{self, EventSink, JobSpec};
 use crate::sidecars::{JobKind, SidecarEvent};
 
 use super::import::{decode_audio, write_f32_wav};
-use super::ControlPlane;
+use super::op::{Op, ObjectRef, PropPath, TxMeta};
+use super::{session, ControlPlane};
 
 /// How often the wrap-watcher samples the playhead. 5 ms ≈ 240 samples at
 /// 48 kHz — comfortably inside one UI frame, far coarser than a buffer.
@@ -115,8 +114,11 @@ impl Phase {
 }
 
 /// A finished generation waiting for the next loop wrap: the clip is fully
-/// prepared (file in `audio/`, pyramid built) — applying is a pure store
-/// mutation + Rebuild.
+/// prepared (file in `audio/`, pyramid built) — applying is ONE commit
+/// (`Op::ClipRemove`/`Set`/`ClipAdd`, Plan E Task 8). `Clone`: `apply` reads
+/// this out of `Inner` and may need to retry it at the NEXT wrap if the
+/// commit races a concurrent store change (see `apply`'s doc).
+#[derive(Clone)]
 struct PendingSwap {
     clip: Clip,
     track_id: String,
@@ -488,85 +490,103 @@ impl LoopJam {
     ///   the region start (position decreases) — next-ready-wrap;
     /// * transport stopped: apply immediately (nothing is audible);
     /// * cancelled/superseded (epoch bump): exit without applying.
+    ///
+    /// Outer retry loop (Plan E Task 8): `apply` can fail cleanly if the
+    /// store changed between its read snapshot and its commit (a genuine
+    /// race, not a cancel) — `pending` stays intact in that case and this
+    /// loops back to wait for the NEXT wrap and try again, same liveness as
+    /// the old lock-then-apply had, just without the lost-update window a
+    /// direct mutation used to risk. The inner wait loop's epoch/phase guard
+    /// is what actually stops the loop (on either a successful apply, which
+    /// flips `phase` to `Applied`, or a cancel, which bumps `epoch`).
     fn watch_and_apply(&self, epoch: u64, region: (u64, u64)) {
         let shared = &self.control.shared;
-        let mut last = shared.position.load(Relaxed);
         loop {
-            {
-                let i = self.inner.lock();
-                if i.epoch != epoch || i.phase != Phase::Ready {
-                    return; // cancelled meanwhile
+            let mut last = shared.position.load(Relaxed);
+            loop {
+                {
+                    let i = self.inner.lock();
+                    if i.epoch != epoch || i.phase != Phase::Ready {
+                        return; // cancelled, or a previous iteration applied
+                    }
                 }
+                if !shared.playing.load(Relaxed) {
+                    break; // stopped: nothing audible, swap now
+                }
+                let pos = shared.position.load(Relaxed);
+                if pos < last && last >= region.0 {
+                    break; // wrapped (or seeked back — equally safe to apply)
+                }
+                last = pos;
+                std::thread::sleep(WATCH_INTERVAL);
             }
-            if !shared.playing.load(Relaxed) {
-                break; // stopped: nothing audible, swap now
-            }
-            let pos = shared.position.load(Relaxed);
-            if pos < last && last >= region.0 {
-                break; // wrapped (or seeked back — equally safe to apply)
-            }
-            last = pos;
-            std::thread::sleep(WATCH_INTERVAL);
+            self.apply(epoch);
         }
-        self.apply(epoch);
     }
 
     /// The hot-swap: replace the region's clips on the target track with the
-    /// prepared clip, rebuild the graph (RCU), persist, announce.
+    /// prepared clip, all through ONE `commit` (Plan E Task 8, round-2
+    /// inventory row 20) — `ClipRemove`×n + `Set{Clip,…}` trims +
+    /// `ClipAdd`, one atomic, undoable batch. The diff (which clips to
+    /// remove/trim/add) is computed from a READ snapshot taken here, with NO
+    /// lock held across the computation or the commit that follows —
+    /// [`plan_region_replacement`]'s output is plain data, and the commit
+    /// closure below re-validates every id against `tx.store()` truth right
+    /// before writing. A race — the store changed between the snapshot and
+    /// the commit — surfaces as a clean `Err` from the closure; `pending`
+    /// is left untouched (not consumed) so `watch_and_apply`'s outer loop
+    /// retries the whole thing at the next wrap. `commit`'s own
+    /// `effect.rebuild`/`effect.persist.project`/`project://changed` emit
+    /// replace the old direct mutation + manual `Rebuild` send + manual
+    /// `project::save` + manual emit.
     fn apply(&self, epoch: u64) {
-        let Some(pending) = ({
-            let mut i = self.inner.lock();
+        let pending = {
+            let i = self.inner.lock();
             if i.epoch != epoch || i.phase != Phase::Ready {
-                None
-            } else {
-                i.pending.take()
+                return; // cancelled/superseded meanwhile — nothing to do
             }
-        }) else {
-            return;
+            match &i.pending {
+                Some(p) => p.clone(),
+                None => return,
+            }
         };
-        {
-            let mut session = self.control.session.lock();
-            replace_region_clips(
-                &mut session.store.clips,
-                &pending.track_id,
-                pending.region.0,
-                pending.region.1,
-            );
-            session.store.clips.push(pending.clip.clone());
-        }
-        self.control.engine.send(ControlMsg::Rebuild);
-        {
-            let mut i = self.inner.lock();
-            if i.epoch != epoch {
-                return; // cancelled between take and finish — store already
-                        // swapped, but state machine belongs to the new epoch
+
+        let snapshot_clips = self.control.session.lock().store.clips.clone();
+        let (edits, adds) = plan_region_replacement(
+            &snapshot_clips,
+            &pending.track_id,
+            pending.region.0,
+            pending.region.1,
+            pending.clip.clone(),
+        );
+
+        let commit_result = commit_region_replacement(&self.control, &edits, &adds);
+
+        match commit_result {
+            Ok(_) => {
+                {
+                    let mut i = self.inner.lock();
+                    if i.epoch == epoch {
+                        i.pending = None;
+                        i.phase = Phase::Applied;
+                        i.job_id = None;
+                        i.generation += 1;
+                    }
+                    // else: cancelled between the commit and this re-lock —
+                    // the store swap already landed (undoable like any
+                    // other commit, this isn't a lost update), but the
+                    // state machine belongs to the new epoch now.
+                } // guard dropped BEFORE emit_state() re-locks `inner` below
+                self.emit_state();
             }
-            i.phase = Phase::Applied;
-            i.job_id = None;
-            i.generation += 1;
-        }
-        // Persist + announce, same convention as import (auto-save).
-        let snapshot = {
-            let session = self.control.session.lock();
-            let dir = session.store.project_dir.clone();
-            project::from_store(
-                &session.store,
-                self.control.shared.position.load(Relaxed),
-                self.control.shared.sample_rate.load(Relaxed),
-            )
-            .ok()
-            .zip(dir)
-        };
-        if let Some((p, dir)) = snapshot {
-            if let Err(e) = project::save(&dir, &p) {
-                log::warn!("auto-save after evolve apply failed: {e}");
+            Err(e) => {
+                // Race: the store moved between the snapshot and the commit.
+                // `pending` is untouched, `phase` is still `Ready` — the
+                // caller's outer retry loop (`watch_and_apply`) waits for
+                // the next wrap and tries again.
+                log::warn!("loopjam apply: commit failed, will retry at the next wrap: {e}");
             }
-            (self.control.emit)(
-                "project://changed",
-                serde_json::to_value(&p).unwrap_or_default(),
-            );
         }
-        self.emit_state();
     }
 }
 
@@ -581,9 +601,193 @@ fn clip_overlaps(c: &Clip, start: u64, end: u64) -> bool {
     cs < end && ce > start
 }
 
+/// One existing clip row's participation in a region replacement — the
+/// non-destructive, op-shaped counterpart of what [`replace_region_clips`]
+/// does with a direct `Vec` rewrite (Plan E Task 8). Computed from a READ
+/// snapshot by [`plan_region_replacement`]; turned into `Op::Set`/
+/// `Op::ClipRemove` calls by [`LoopJam::apply`]'s commit closure.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RegionEdit {
+    /// The row keeps its id, shrunk to the span BEFORE the cut
+    /// (`cs < start`, no material survives after `end`).
+    TrimLeft { id: crate::ids::ClipId, new_length_samples: u64 },
+    /// The row keeps its id, repositioned to the span AFTER the cut
+    /// (`cs >= start`, material survives past `end`, and there is no
+    /// separate `TrimLeft` for this same id claiming it — i.e. the clip
+    /// didn't ALSO have material before `start`).
+    TrimRight {
+        id: crate::ids::ClipId,
+        new_timeline_start: u64,
+        new_offset: u64,
+        new_length: u64,
+    },
+    /// The row disappears entirely: fully covered by the region, or its
+    /// only surviving remainder was claimed by a fresh-id `adds` entry (a
+    /// clip straddling BOTH edges — the left remainder keeps the id via
+    /// `TrimLeft`, so the right remainder must be a new row).
+    Remove(Clip),
+}
+
+/// Compute the region-replacement diff from a store SNAPSHOT — no lock held
+/// past this call (Plan E Task 8: the commit that applies the diff is the
+/// only place truth is re-checked). Mirrors [`replace_region_clips`]'s exact
+/// left/right classification for every clip on `track_id` overlapping
+/// `[start, end)`:
+/// * fully covered → `RegionEdit::Remove`;
+/// * material only before the cut (`cs < start`, nothing survives after
+///   `end`) → `RegionEdit::TrimLeft` (same id, shrunk);
+/// * material only after the cut (`cs >= start`, something survives past
+///   `end`) → `RegionEdit::TrimRight` (same id, repositioned) — UNLIKE
+///   `replace_region_clips`, which always mints a fresh id for the "right"
+///   piece: here, when there is no competing left remainder to also claim
+///   the id, keeping it gives a nicer undo (one row's bounds change, not a
+///   remove+add) with no observable difference in what plays;
+/// * straddles both edges → BOTH a `TrimLeft` (keeps the id) AND a fresh-id
+///   `adds` entry (the right piece) — a single id can't name two rows, so
+///   here the fresh-id split IS unavoidable, same as `replace_region_clips`.
+///
+/// `new_clip` (the evolved region's replacement audio) is appended to
+/// `adds` unconditionally.
+fn plan_region_replacement(
+    clips: &[Clip],
+    track_id: &str,
+    start: u64,
+    end: u64,
+    new_clip: Clip,
+) -> (Vec<RegionEdit>, Vec<Clip>) {
+    let mut edits = Vec::new();
+    let mut adds = Vec::new();
+    for c in clips {
+        if c.track_id != track_id || !clip_overlaps(c, start, end) {
+            continue;
+        }
+        let cs = c.timeline_start_samples;
+        let ce = cs + c.length_samples;
+        let left = cs < start;
+        let right = ce > end;
+        match (left, right) {
+            (true, true) => {
+                // Straddles both edges: left piece keeps the id (shrunk),
+                // right piece is a brand-new row (fresh id — matches
+                // `replace_region_clips`; a single id can't name two rows).
+                edits.push(RegionEdit::TrimLeft { id: c.id.clone(), new_length_samples: start - cs });
+                let mut right_clip = c.clone();
+                right_clip.id = crate::ids::ClipId::mint();
+                right_clip.timeline_start_samples = end;
+                right_clip.offset_samples = c.offset_samples + (end - cs);
+                right_clip.length_samples = ce - end;
+                adds.push(right_clip);
+            }
+            (true, false) => {
+                edits.push(RegionEdit::TrimLeft { id: c.id.clone(), new_length_samples: start - cs });
+            }
+            (false, true) => {
+                edits.push(RegionEdit::TrimRight {
+                    id: c.id.clone(),
+                    new_timeline_start: end,
+                    new_offset: c.offset_samples + (end - cs),
+                    new_length: ce - end,
+                });
+            }
+            (false, false) => {
+                // Fully covered — no remainder on either side.
+                edits.push(RegionEdit::Remove(c.clone()));
+            }
+        }
+    }
+    adds.push(new_clip);
+    (edits, adds)
+}
+
+/// Turn a computed diff ([`plan_region_replacement`]'s output) into ONE
+/// commit — `Op::ClipRemove`×n + `Op::Set{Clip,…}` trims + `Op::ClipAdd`,
+/// `TxMeta::system("loopjam apply")`, NOT transient (a user can undo a
+/// LoopJam replacement). Every edit re-validates its target id against
+/// `tx.store()` truth right before writing — the store may have moved since
+/// the caller's read snapshot — so a stale id fails the WHOLE commit
+/// cleanly (rolled back atomically by `Session::transact`) rather than
+/// applying a partial swap. Shared by [`LoopJam::apply`] (the production
+/// hot-swap) and this module's own tests (which call it directly to get the
+/// [`session::Committed`] back — ops for the "ops present" assertion,
+/// inverses for the real undo test).
+pub(crate) fn commit_region_replacement(
+    control: &Arc<ControlPlane>,
+    edits: &[RegionEdit],
+    adds: &[Clip],
+) -> Result<session::Committed, String> {
+    control.commit(TxMeta::system("loopjam apply"), |tx| {
+        for edit in edits {
+            match edit {
+                RegionEdit::TrimLeft { id, new_length_samples } => {
+                    if !tx.store().clips.iter().any(|c| &c.id == id) {
+                        return Err(format!(
+                            "loopjam apply: clip {id} no longer exists (store changed \
+                             since the region snapshot)"
+                        ));
+                    }
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Clip(id.clone()),
+                        path: PropPath::LengthSamples,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(new_length_samples),
+                    })?;
+                }
+                RegionEdit::TrimRight { id, new_timeline_start, new_offset, new_length } => {
+                    if !tx.store().clips.iter().any(|c| &c.id == id) {
+                        return Err(format!(
+                            "loopjam apply: clip {id} no longer exists (store changed \
+                             since the region snapshot)"
+                        ));
+                    }
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Clip(id.clone()),
+                        path: PropPath::TimelineStartSamples,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(new_timeline_start),
+                    })?;
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Clip(id.clone()),
+                        path: PropPath::OffsetSamples,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(new_offset),
+                    })?;
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Clip(id.clone()),
+                        path: PropPath::LengthSamples,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(new_length),
+                    })?;
+                }
+                RegionEdit::Remove(c) => {
+                    if !tx.store().clips.iter().any(|x| x.id == c.id) {
+                        return Err(format!(
+                            "loopjam apply: clip {} no longer exists (store changed \
+                             since the region snapshot)",
+                            c.id
+                        ));
+                    }
+                    tx.apply(Op::ClipRemove { clip: c.clone(), index: 0 })?;
+                }
+            }
+        }
+        for c in adds {
+            let index = tx.store().clips.len();
+            tx.apply(Op::ClipAdd { clip: c.clone(), index })?;
+        }
+        Ok(())
+    })
+}
+
 /// Remove the audible span `[start, end)` from every clip of `track_id`:
 /// fully-covered clips are dropped, straddling clips are trimmed (left piece
 /// keeps the id, a right piece gets a fresh id + shifted offset). Pure.
+///
+/// Kept as its own pure `Vec`-rewrite helper for [`plan_region_replacement`]'s
+/// doc comment to cite and this file's own unit test to pin the trim
+/// arithmetic against — [`LoopJam::apply`] itself now goes through
+/// `plan_region_replacement` + a commit instead of calling this directly
+/// (Plan E Task 8). `#[cfg(test)]`: its only remaining caller is that test.
+#[cfg(test)]
 pub(crate) fn replace_region_clips(
     clips: &mut Vec<Clip>,
     track_id: &str,
@@ -957,6 +1161,203 @@ mod tests {
         assert_eq!(right.length_samples, 400);
         assert_eq!(right.fade_in_samples, 0);
         assert_eq!(clips.len(), 4);
+    }
+
+    /// Shared builder for `plan_region_replacement`'s tests (mirrors
+    /// `replace_region_trims_splits_and_drops`'s local `mk`, factored out so
+    /// more than one test fn can use it).
+    fn clip_at(id: &str, track: &str, start: u64, len: u64) -> Clip {
+        Clip {
+            id: id.into(),
+            track_id: track.into(),
+            name: id.into(),
+            source_path: format!("audio/{id}.wav"),
+            source_id: crate::ids::SourceId::default(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: len,
+            timeline_start_samples: start,
+            offset_samples: 0,
+            length_samples: len,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track),
+        }
+    }
+
+    /// Plan E Task 8: `plan_region_replacement`'s own dedicated coverage —
+    /// the op-shaped counterpart of `replace_region_trims_splits_and_drops`
+    /// above. A clip straddling both edges keeps its id for the LEFT
+    /// remainder (`TrimLeft`) and gets a fresh-id `adds` entry for the
+    /// right one (a single id can't name two rows); a fully-covered clip is
+    /// `Remove`d; an untouched/different-track clip produces no edit at
+    /// all.
+    #[test]
+    fn plan_region_replacement_classifies_left_right_and_straddle() {
+        let clips = vec![
+            clip_at("straddle", "t", 0, 1000),     // spans the whole region
+            clip_at("inside", "t", 300, 100),      // fully covered -> Remove
+            clip_at("before", "t", 0, 200),        // ends at region start -> untouched
+            clip_at("other-track", "x", 300, 400), // different track -> untouched
+        ];
+        let new_clip = clip_at("new", "t", 200, 400);
+        let (edits, adds) = plan_region_replacement(&clips, "t", 200, 600, new_clip.clone());
+
+        assert!(
+            edits.iter().any(|e| matches!(
+                e, RegionEdit::TrimLeft { id, new_length_samples }
+                    if id == "straddle" && *new_length_samples == 200
+            )),
+            "{edits:?}"
+        );
+        assert!(
+            edits.iter().any(|e| matches!(e, RegionEdit::Remove(c) if c.id == "inside")),
+            "{edits:?}"
+        );
+        let touched: Vec<&str> = edits
+            .iter()
+            .map(|e| match e {
+                RegionEdit::TrimLeft { id, .. } | RegionEdit::TrimRight { id, .. } => id.as_str(),
+                RegionEdit::Remove(c) => c.id.as_str(),
+            })
+            .collect();
+        assert!(!touched.contains(&"before"), "{touched:?}");
+        assert!(!touched.contains(&"other-track"), "{touched:?}");
+        assert_eq!(edits.len(), 2, "{edits:?}"); // straddle's TrimLeft + inside's Remove
+
+        // adds: the straddler's fresh-id right remainder + `new_clip` itself.
+        assert_eq!(adds.len(), 2, "{adds:?}");
+        assert!(adds.iter().any(|c| c.id == new_clip.id));
+        let right = adds
+            .iter()
+            .find(|c| c.id != new_clip.id)
+            .expect("straddle's right remainder");
+        assert_ne!(right.id, "straddle", "fresh id, matching replace_region_clips");
+        assert_eq!(right.timeline_start_samples, 600);
+        assert_eq!(right.offset_samples, 600);
+        assert_eq!(right.length_samples, 400);
+    }
+
+    /// A clip with material ONLY after the cut (no competing left remainder
+    /// for the same id) is trimmed IN PLACE — `TrimRight`, same id — rather
+    /// than a remove-then-fresh-id-add, which is the whole point of adding
+    /// `PropPath::OffsetSamples`/`LengthSamples` (Task 8 brief).
+    #[test]
+    fn plan_region_replacement_trims_right_in_place_when_no_left_remainder() {
+        let clips = vec![clip_at("right-only", "t", 0, 1000)]; // cs == start
+        let new_clip = clip_at("new", "t", 0, 500);
+        let (edits, adds) = plan_region_replacement(&clips, "t", 0, 500, new_clip.clone());
+
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        match &edits[0] {
+            RegionEdit::TrimRight { id, new_timeline_start, new_offset, new_length } => {
+                assert_eq!(id, "right-only");
+                assert_eq!(*new_timeline_start, 500);
+                assert_eq!(*new_offset, 500);
+                assert_eq!(*new_length, 500);
+            }
+            other => panic!("expected TrimRight, got {other:?}"),
+        }
+        // No fresh-id split needed — just the new (evolved) clip.
+        assert_eq!(adds.len(), 1, "{adds:?}");
+        assert_eq!(adds[0].id, new_clip.id);
+    }
+
+    /// Plan E Task 8, written for real (brief-mandated): `commit_region_
+    /// replacement` — the transaction `LoopJam::apply` drives — is ONE
+    /// atomic commit (a single rev bump for the whole batch, every expected
+    /// op present in that ONE `Committed`), and undo is the real thing:
+    /// applying the `Committed`'s OWN inverses through a second commit (not
+    /// a hand-rolled revert) restores the pre-apply clip set byte-for-byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn commit_region_replacement_is_one_atomic_undoable_batch() {
+        let (_jam, cp, parent, _events, region) = jam_fixture("commit-atomic");
+
+        let mut before_clips = cp.project_state().clips;
+        before_clips.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        assert_eq!(before_clips.len(), 1, "fixture starts with exactly the imported clip");
+        let track_id = before_clips[0].track_id.clone();
+        let before_rev = cp.session().lock().rev;
+
+        // A plausible "evolved" replacement for the fixture's loop region,
+        // built the same way `LoopJam::prepare_swap` would.
+        let new_clip = Clip {
+            id: crate::ids::ClipId::mint(),
+            track_id: track_id.clone(),
+            name: "evolve 1".into(),
+            source_path: before_clips[0].source_path.clone(),
+            source_id: before_clips[0].source_id.clone(),
+            source_channels: before_clips[0].source_channels,
+            source_sample_rate: before_clips[0].source_sample_rate,
+            source_length_samples: before_clips[0].source_length_samples,
+            timeline_start_samples: region.0,
+            offset_samples: 0,
+            length_samples: region.1 - region.0,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: before_clips[0].lane_id.clone(),
+        };
+
+        let snapshot_clips = cp.session().lock().store.clips.clone();
+        let (edits, adds) = plan_region_replacement(
+            &snapshot_clips, track_id.as_str(), region.0, region.1, new_clip.clone(),
+        );
+        assert_eq!(edits.len(), 1, "the fixture clip starts exactly at the region: TrimRight only");
+        assert_eq!(adds.len(), 1, "no fresh-id split needed");
+
+        let committed =
+            commit_region_replacement(&cp, &edits, &adds).expect("commit succeeds");
+
+        // One atomic commit — exactly one rev bump for the WHOLE batch.
+        assert_eq!(cp.session().lock().rev, before_rev + 1, "one commit, one rev bump");
+
+        // Every expected op landed in this ONE Committed: the ClipAdd for
+        // the evolved clip, plus the three Sets that repositioned the
+        // original clip's surviving remainder in place.
+        assert_eq!(committed.ops.len(), 4, "{:?}", committed.ops);
+        assert!(
+            committed.ops.iter().any(|op| matches!(
+                op, Op::ClipAdd { clip, .. } if clip.id == new_clip.id
+            )),
+            "{:?}", committed.ops
+        );
+        for path in [PropPath::TimelineStartSamples, PropPath::OffsetSamples, PropPath::LengthSamples] {
+            assert!(
+                committed.ops.iter().any(|op| matches!(
+                    op, Op::Set { object: ObjectRef::Clip(id), path: p, .. }
+                        if id == &clip_id_of_original(&before_clips) && *p == path
+                )),
+                "missing Set{{Clip,{path:?}}}: {:?}", committed.ops
+            );
+        }
+
+        // Undo, FOR REAL: the Committed's OWN inverses, through a second
+        // commit — not a hand-rolled "restore the old Vec" revert.
+        let inverses = committed.inverses.clone();
+        cp.commit(TxMeta::system("undo loopjam apply (test)"), |tx| {
+            for inv in &inverses {
+                tx.apply(inv.clone())?;
+            }
+            Ok(())
+        })
+        .expect("undo commit succeeds");
+
+        let mut after_undo = cp.project_state().clips;
+        after_undo.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+        assert_eq!(after_undo, before_clips, "undo restores the pre-apply clip set exactly");
+
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    /// Helper for the test above: the ORIGINAL fixture clip's id (the one
+    /// `TrimRight` repositions in place) — named to keep the assertion loop
+    /// readable.
+    fn clip_id_of_original(before_clips: &[Clip]) -> crate::ids::ClipId {
+        before_clips[0].id.clone()
     }
 
     // -- state machine over fake sidecars ---------------------------------

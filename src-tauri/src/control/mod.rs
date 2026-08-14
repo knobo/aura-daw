@@ -756,9 +756,14 @@ impl ControlPlane {
                     // Transport paths — the Transport `apply_raw` arm
                     // (session.rs) never pushes anything into
                     // `param_writes` (it isn't `TrackId`-keyed at all).
+                    // Plan E Task 8: same reasoning for LengthSamples/
+                    // OffsetSamples (LoopJam's in-place clip trims) —
+                    // structural (rebuild), no ParamTable counterpart.
                     op::PropPath::Armed
                     | op::PropPath::InstrumentId
                     | op::PropPath::TimelineStartSamples
+                    | op::PropPath::LengthSamples
+                    | op::PropPath::OffsetSamples
                     | op::PropPath::TimelineStartTicks
                     | op::PropPath::LengthTicks
                     | op::PropPath::ContentLengthTicks

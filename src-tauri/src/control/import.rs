@@ -31,15 +31,17 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use crate::audio::engine::{load_wav, ControlMsg};
+use crate::audio::engine::load_wav;
+#[cfg(test)]
 use crate::audio::project;
 use crate::audio::types::{Clip, Store, TrackState};
 use crate::audio::waveform::{pyramid_exists, Pyramid};
 use crate::sidecars::jobs::{self, EventSink, JobSpec};
 use crate::sidecars::{JobKind, SidecarEvent};
 
+use super::op::{Op, TxMeta};
 use super::ops;
-use super::session::Session;
+use super::session::{Session, Tx};
 use super::{ControlPlane, ImportClipRequest};
 
 /// Formats decoded through symphonia (everything except the WAV fast path).
@@ -182,12 +184,27 @@ pub(crate) struct ImportOutcome {
     pub created_track: Option<TrackState>,
 }
 
-/// Tauri-free import core: validate + decode + copy + pyramid + register.
-/// STRUCTURAL — the caller must send `ControlMsg::Rebuild` afterwards.
-pub(crate) fn do_import(
-    session: &Mutex<Session>,
-    req: &ImportClipRequest,
-) -> Result<ImportOutcome, String> {
+/// Everything `do_import`/`ControlPlane::import_audio_clip_impl` must do
+/// BEFORE touching the document: validate the path, decode, resolve+
+/// validate the project dir and (if given) the target track, copy the
+/// source into the project, build the waveform pyramid. No lock is held
+/// across any of the decode/copy/pyramid disk I/O — only one SHORT,
+/// READ-ONLY lock acquisition (the project-dir + track precheck) brackets
+/// it. The precheck is advisory: [`commit_import_clip`] re-validates the
+/// same facts against transaction-time store truth right before writing,
+/// so a race between this prepare step and that commit just surfaces as a
+/// clean error from the commit (never an orphaned track or a lost clip).
+struct PreparedImport {
+    clip_id: String,
+    stem: String,
+    rel: String,
+    source_id: crate::ids::SourceId,
+    channels: u16,
+    sample_rate: u32,
+    frames: u64,
+}
+
+fn prepare_import(session: &Mutex<Session>, req: &ImportClipRequest) -> Result<PreparedImport, String> {
     let src = Path::new(&req.path);
     if !src.is_absolute() {
         return Err(format!("path must be absolute: {}", req.path));
@@ -213,41 +230,31 @@ pub(crate) fn do_import(
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Imported".into());
 
-    // Resolve the project + target track under the lock (auto-create when
-    // no track was named); file I/O happens after the lock is dropped.
-    let clip_id = uuid::Uuid::new_v4().to_string();
-    let (project_dir, track_id, created_track) = {
-        let mut session = session.lock();
+    // Read-only precheck: project dir + (if given) the target track's
+    // existence/kind. No mutation — `commit_import_clip` re-checks the same
+    // facts against store truth at commit time.
+    let project_dir = {
+        let session = session.lock();
         let dir = session
             .store
             .project_dir
             .clone()
             .ok_or("no project open — create or open a project before importing audio")?;
-        match &req.track_id {
-            Some(id) => {
-                let track = session
-                    .store
-                    .tracks
-                    .iter()
-                    .find(|t| &t.id == id)
-                    .ok_or_else(|| format!("unknown track: {id}"))?;
-                if track.kind != "audio" {
-                    return Err(format!(
-                        "track {id} is a {} track — audio clips need an audio track",
-                        track.kind
-                    ));
-                }
-                (dir, crate::ids::TrackId::from(id.clone()), None)
-            }
-            None => {
-                let track = ops::add_track(
-                    &mut session.store,
-                    Some(stem.clone()),
-                    Some("audio".into()),
-                )?;
-                (dir, track.id.clone(), Some(track))
+        if let Some(id) = &req.track_id {
+            let track = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| &t.id == id)
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            if track.kind != "audio" {
+                return Err(format!(
+                    "track {id} is a {} track — audio clips need an audio track",
+                    track.kind
+                ));
             }
         }
+        dir
     };
 
     // Land the audio in the project layout and build the waveform pyramid
@@ -258,6 +265,7 @@ pub(crate) fn do_import(
     // is required at the point of creation. Waveform pyramid cache dirs stay
     // keyed by clip id (visual cache; dedup opportunity ledgered, not taken
     // here).
+    let clip_id = uuid::Uuid::new_v4().to_string();
     let source_id = crate::ids::SourceId::mint();
     let rel = format!("audio/{source_id}.wav");
     let dst = project_dir.join(&rel);
@@ -277,60 +285,109 @@ pub(crate) fn do_import(
             .map_err(|e| format!("waveform cache build failed: {e}"))?;
     }
 
+    Ok(PreparedImport { clip_id, stem, rel, source_id, channels, sample_rate, frames })
+}
+
+/// The document-mutation half: resolve (or `add_track_tx`-create) the
+/// target track and insert the clip, both through the ONE transaction `tx`
+/// — Plan E Task 8 (round-2 inventory rows 16/17). Shared by [`do_import`]
+/// (direct `Session::transact`, no engine/persist/emit — the free-function
+/// tests exercise only the document mutation) and
+/// [`ControlPlane::import_audio_clip_impl`] (`ControlPlane::commit`, the
+/// production path with the full rebuild/persist/emit effect pipeline).
+fn commit_import_clip(
+    tx: &mut Tx<'_>,
+    req: &ImportClipRequest,
+    prepared: &PreparedImport,
+    track_name: &str,
+) -> Result<ImportOutcome, String> {
+    let (track_id, created_track) = match &req.track_id {
+        Some(id) => {
+            let track = tx
+                .store()
+                .tracks
+                .iter()
+                .find(|t| &t.id == id)
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            if track.kind != "audio" {
+                return Err(format!(
+                    "track {id} is a {} track — audio clips need an audio track",
+                    track.kind
+                ));
+            }
+            (crate::ids::TrackId::from(id.clone()), None)
+        }
+        None => {
+            let track = ops::add_track_tx(tx, Some(track_name.to_string()), Some("audio".into()))?;
+            (track.id.clone(), Some(track))
+        }
+    };
     let lane_id = crate::ids::LaneId::default_for_track(track_id.as_str());
     let clip = Clip {
-        id: clip_id.into(),
+        id: prepared.clip_id.clone().into(),
         track_id,
-        name: stem,
-        source_path: rel,
-        source_id,
-        source_channels: channels,
-        source_sample_rate: sample_rate,
-        source_length_samples: frames,
+        name: prepared.stem.clone(),
+        source_path: prepared.rel.clone(),
+        source_id: prepared.source_id.clone(),
+        source_channels: prepared.channels,
+        source_sample_rate: prepared.sample_rate,
+        source_length_samples: prepared.frames,
         timeline_start_samples: req.at_samples.unwrap_or(0),
         offset_samples: 0,
-        length_samples: frames,
+        length_samples: prepared.frames,
         gain_db: 0.0,
         fade_in_samples: 0,
         fade_out_samples: 0,
         content_id: crate::ids::ContentId::mint(),
         lane_id,
     };
-    session.lock().store.clips.push(clip.clone());
+    let index = tx.store().clips.len();
+    tx.apply(Op::ClipAdd { clip: clip.clone(), index })?;
     Ok(ImportOutcome { clip, created_track })
+}
+
+/// Tauri-free import core: validate + decode + copy + pyramid + register,
+/// the document mutation going through ONE `Session::transact` (no engine/
+/// persist/emit — this fn has no `ControlPlane` to execute those effects
+/// with; that's `ControlPlane::import_audio_clip_impl`'s job). STRUCTURAL —
+/// the caller must send `ControlMsg::Rebuild` afterwards. `#[cfg(test)]`:
+/// since Plan E Task 8, the production path (`import_audio_clip_impl`)
+/// calls `prepare_import`/`commit_import_clip` directly (through
+/// `ControlPlane::commit`, for the full rebuild/persist/emit pipeline) —
+/// this fn's only remaining callers are its own tests below, which want a
+/// `Session::transact`-only entry point with no engine/webview required.
+#[cfg(test)]
+pub(crate) fn do_import(
+    session: &Mutex<Session>,
+    req: &ImportClipRequest,
+) -> Result<ImportOutcome, String> {
+    let prepared = prepare_import(session, req)?;
+    let mut outcome = None;
+    Session::transact(session, TxMeta::system("import audio clip"), |tx| {
+        outcome = Some(commit_import_clip(tx, req, &prepared, &prepared.stem)?);
+        Ok(())
+    })?;
+    Ok(outcome.expect("commit_import_clip sets outcome on every Ok(())"))
 }
 
 impl ControlPlane {
     /// Real body of the frozen `import_audio_clip` surface (control/mod.rs
-    /// delegates here). Registers the clip, rebuilds the graph, auto-saves
-    /// project.json and re-emits `project://changed`.
+    /// delegates here). Plan E Task 8: decode/copy/pyramid ([`prepare_import`])
+    /// stay outside any lock, then the document mutation — optional
+    /// `add_track_tx` + `Op::ClipAdd` — is ONE `commit` ([`commit_import_clip`]):
+    /// `ClipAdd`'s `effect.persist.project`/`effect.rebuild` replace the old
+    /// manual `project::save`/`ControlMsg::Rebuild`, and `commit`'s own
+    /// `project://changed` emit replaces the old raw emit. There is no
+    /// longer a two-lock window between resolving the track and registering
+    /// the clip — both land in the same transaction.
     pub(crate) fn import_audio_clip_impl(&self, req: ImportClipRequest) -> Result<Clip, String> {
-        let outcome = do_import(&self.session, &req)?;
-        self.engine.send(ControlMsg::Rebuild);
-
-        // Persist the import right away (same convention as record-stop) and
-        // tell every front door the project changed.
-        let snapshot = {
-            use std::sync::atomic::Ordering::Relaxed;
-            let session = self.session.lock();
-            let dir = session.store.project_dir.clone();
-            project::from_store(
-                &session.store,
-                self.shared.position.load(Relaxed),
-                self.shared.sample_rate.load(Relaxed),
-            )
-            .ok()
-            .zip(dir)
-        };
-        if let Some((p, dir)) = snapshot {
-            if let Err(e) = project::save(&dir, &p) {
-                log::warn!("auto-save after import failed: {e}");
-            }
-            (self.emit)(
-                "project://changed",
-                serde_json::to_value(&p).unwrap_or_default(),
-            );
-        }
+        let prepared = prepare_import(&self.session, &req)?;
+        let mut outcome = None;
+        self.commit(TxMeta::system("import audio clip"), |tx| {
+            outcome = Some(commit_import_clip(tx, &req, &prepared, &prepared.stem)?);
+            Ok(())
+        })?;
+        let outcome = outcome.expect("commit_import_clip sets outcome on every Ok(())");
         if let Some(t) = &outcome.created_track {
             log::info!("import: auto-created audio track {} ({})", t.name, t.id);
         }
@@ -494,23 +551,38 @@ pub(crate) fn wrap_sink_with_stem_import(
                 let clip_name = clip_name.clone();
                 inner(ev.clone()); // deliver `done` first, imports are extra
                 std::thread::spawn(move || {
+                    // Plan E Task 8 (round-2 §4.6): `run` correlates every
+                    // commit this ONE stem-split job produces into a single
+                    // group — minted ONCE for the whole batch, not per stem,
+                    // so an agent/UI can see "these 4 tracks came from one
+                    // gesture" even though each stem lands in its own commit
+                    // (a track + a clip, atomically, per stem).
+                    let run_id = uuid::Uuid::new_v4().to_string();
                     for (stem, path) in ordered {
                         let line = (|| -> Result<String, String> {
-                            let track = control.add_track(
-                                Some(format!("{clip_name} {stem}")),
-                                Some("audio".into()),
-                                crate::control::op::TxMeta::system(format!(
-                                    "auto-import stem: {stem}"
-                                )),
-                            )?;
-                            let clip = control.import_audio_clip_impl(ImportClipRequest {
+                            let req = ImportClipRequest {
                                 path,
-                                track_id: Some(track.id.to_string()),
+                                track_id: None,
                                 at_samples: Some(at_samples),
+                            };
+                            let prepared = prepare_import(&control.session, &req)?;
+                            let track_name = format!("{clip_name} {stem}");
+                            let mut meta = TxMeta::system(format!("auto-import stem: {stem}"));
+                            meta.run = run_id.clone();
+                            let mut outcome = None;
+                            control.commit(meta, |tx| {
+                                outcome =
+                                    Some(commit_import_clip(tx, &req, &prepared, &track_name)?);
+                                Ok(())
                             })?;
+                            let outcome =
+                                outcome.expect("commit_import_clip sets outcome on every Ok(())");
+                            let track = outcome
+                                .created_track
+                                .expect("stem import always auto-creates its track");
                             Ok(format!(
                                 "auto-import stem `{stem}`: clip {} on track {} ({})",
-                                clip.id, track.name, track.id
+                                outcome.clip.id, track.name, track.id
                             ))
                         })()
                         .unwrap_or_else(|e| format!("auto-import stem `{stem}` failed: {e}"));
@@ -1116,6 +1188,45 @@ mod tests {
             payload["tracks"].as_array().is_some_and(|t| t.len() == 1),
             "importToTrackId=null auto-created exactly one track"
         );
+    }
+
+    /// Plan E Task 8 (brief-mandated behavioral test): the clip row lands
+    /// in project.json only AFTER `import_audio_clip_impl` RETURNS —
+    /// persistence is `commit`'s `persist.project` effect now (executed
+    /// synchronously, session lock released, before `commit`'s own
+    /// `project://changed` emit), not a manual `project::save` call
+    /// reachable independently of the transaction. Behavioral, not a grep
+    /// gate: read the file.
+    #[test]
+    fn import_persists_the_clip_row_synchronously_when_commit_returns() {
+        let (cp, parent) = control_plane("persist-sync");
+        let src = parent.join("take.wav");
+        write_wav(&src, 2, 44_100, 480);
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert!(
+            before["clips"].as_array().map(|c| c.is_empty()).unwrap_or(true),
+            "no clip persisted before import: {before}"
+        );
+
+        let clip = cp
+            .import_audio_clip_impl(ImportClipRequest {
+                path: src.to_string_lossy().into_owned(),
+                track_id: None,
+                at_samples: Some(240),
+            })
+            .unwrap();
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        let clips = after["clips"].as_array().expect("clips array");
+        assert!(
+            clips.iter().any(|c| c["id"] == clip.id.as_str()),
+            "clip row persisted synchronously by the time commit returned: {clips:?}"
+        );
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     fn write_sh(dir: &Path, name: &str, body: &str) -> PathBuf {

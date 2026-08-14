@@ -108,6 +108,16 @@ pub enum PropPath {
     InstrumentId,
     /// Clip: timeline placement position, in samples.
     TimelineStartSamples,
+    /// Clip: placement length, in samples (Plan E Task 8 — LoopJam's
+    /// region-replacement trims need to shrink/reposition an EXISTING
+    /// clip row in place, the audio counterpart of MidiClip's
+    /// `LengthTicks`).
+    LengthSamples,
+    /// Clip: offset into the source audio, in samples (Plan E Task 8 —
+    /// paired with `LengthSamples`/`TimelineStartSamples` so a clip whose
+    /// HEAD is cut can be repositioned in place instead of a
+    /// remove-then-fresh-id-add).
+    OffsetSamples,
     /// MidiClip: timeline placement position, in ticks.
     TimelineStartTicks,
     /// MidiClip: placement length, in ticks. Clamped to >= 1 on write (the
@@ -346,6 +356,17 @@ mod tests {
         assert!(s.contains("\"path\":\"timelineStartSamples\""), "wire form was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, move_op);
+
+        // Plan E Task 8: LengthSamples/OffsetSamples camelCase wire names
+        // (LoopJam's in-place region trims).
+        for (path, expected) in
+            [(PropPath::LengthSamples, "lengthSamples"), (PropPath::OffsetSamples, "offsetSamples")]
+        {
+            let s = serde_json::to_string(&path).unwrap();
+            assert_eq!(s, format!("\"{expected}\""), "wire form was: {s}");
+            let back: PropPath = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, path);
+        }
 
         // Plan E Task 5: TempoSet, MidiClipAdd/MidiSetNotes wire form, and
         // the new ContentLengthTicks path on a Set.

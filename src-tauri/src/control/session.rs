@@ -412,6 +412,52 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 to: from_now,  // the inverse's `to`: value to restore
             })
         }
+        // Plan E Task 8: LoopJam's region-replacement trims a clip IN PLACE
+        // (shrink its length, or — paired with `OffsetSamples` below —
+        // reposition its head) instead of a remove-then-fresh-id-add, so an
+        // undo restores the exact original row. Same structural-in-effect
+        // reasoning as `TimelineStartSamples` above (a trimmed clip changes
+        // what the RT graph renders).
+        Op::Set { object: ObjectRef::Clip(id), path: PropPath::LengthSamples, to, .. } => {
+            let c = session
+                .store
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown clip: {id}"))?;
+            let from_now = serde_json::json!(c.length_samples); // truth, not caller's `from`
+            let v = to.as_u64().ok_or("lengthSamples: expected a non-negative integer")?;
+            c.length_samples = v;
+            let applied = serde_json::json!(c.length_samples);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::Set {
+                object: ObjectRef::Clip(id.clone()),
+                path: PropPath::LengthSamples,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        Op::Set { object: ObjectRef::Clip(id), path: PropPath::OffsetSamples, to, .. } => {
+            let c = session
+                .store
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown clip: {id}"))?;
+            let from_now = serde_json::json!(c.offset_samples); // truth, not caller's `from`
+            let v = to.as_u64().ok_or("offsetSamples: expected a non-negative integer")?;
+            c.offset_samples = v;
+            let applied = serde_json::json!(c.offset_samples);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::Set {
+                object: ObjectRef::Clip(id.clone()),
+                path: PropPath::OffsetSamples,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
         // Plan E Task 3 (inventory rows 16/17/20/23): sinks/threads consume
         // clip add/remove — the same TrackAdd/TrackRemove pattern (store
         // truth wins over the caller's advisory payload beyond `.id`).
@@ -659,6 +705,8 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         // wrapping object — same wire shape `write_prop` below accepts.
         PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
         PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
@@ -713,6 +761,8 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             Ok(serde_json::json!(t.instrument_id))
         }
         PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
@@ -745,6 +795,8 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::Armed
         | PropPath::InstrumentId
         | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
         | PropPath::TransportState
         | PropPath::LoopEnabled
         | PropPath::LoopStartSamples
@@ -796,6 +848,8 @@ fn write_midi_prop(
         | PropPath::Armed
         | PropPath::InstrumentId
         | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
         | PropPath::TransportState
         | PropPath::LoopEnabled
         | PropPath::LoopStartSamples
@@ -829,6 +883,8 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::Armed
         | PropPath::InstrumentId
         | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks => {
@@ -895,6 +951,8 @@ fn write_transport_prop(
         | PropPath::Armed
         | PropPath::InstrumentId
         | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks => {
