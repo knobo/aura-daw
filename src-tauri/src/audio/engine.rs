@@ -914,9 +914,13 @@ impl Control {
     ///
     /// `n_slots` is the TRACK COUNT `ParamTable` was sized with, not
     /// `slots.len()`, so the ramp table and the param table index alike.
-    /// A tempo map needs a rate; before a device opens (`cache_rate` 0)
-    /// there is nothing to compile against, and both products come back
-    /// empty rather than compiled at a made-up rate.
+    ///
+    /// The `TempoMap` can fail to build — a zero `ppq`, an empty or
+    /// non-monotonic `tempo_events`, a zero rate — and then nothing is
+    /// compiled rather than something compiled against a guessed timeline.
+    /// (`rebuild` calls `ensure_loaded` first, which sets `cache_rate` from
+    /// `SharedRt::sample_rate`, so in practice a malformed tempo map is what
+    /// reaches this branch, not a missing device.)
     fn compile_automation(
         &self,
         session: &Session,
@@ -927,6 +931,12 @@ impl Control {
         crate::plugins::automation::ParamAutomationDriver,
     ) {
         use crate::plugins::automation as auto;
+        // The overwhelmingly common case, and every structural commit in the
+        // suite goes through here: no lanes, so no tempo-event clone and no
+        // TempoMap build.
+        if session.automation.lanes.is_empty() {
+            return ((0..n_slots).map(|_| None).collect(), auto::ParamAutomationDriver::empty());
+        }
         let map = crate::midi::TempoMap::new(
             session.midi.ppq,
             session.midi.tempo_events.clone(),
@@ -966,8 +976,13 @@ impl Control {
         let pos = self.shared.position.load(Relaxed);
         let mut writes = std::mem::take(&mut self.param_writes);
         self.param_automation.tick(pos, &mut writes);
-        for w in writes.iter() {
-            crate::control::forward_param_to_host(&w.instance, &w.format, w.index, w.value);
+        // ONE host call per instance per tick (review I-2): `tick` hands its
+        // writes out grouped by instance, so a contiguous run IS a plugin's
+        // whole batch. If that grouping ever regressed this would still be
+        // correct, just chattier — never wrong.
+        for batch in writes.chunk_by(|a, b| a.instance == b.instance) {
+            let changes: Vec<(u32, f32)> = batch.iter().map(|w| (w.index, w.value)).collect();
+            crate::control::forward_params_to_host(&batch[0].instance, &batch[0].format, &changes);
         }
         self.param_writes = writes;
     }
@@ -1830,6 +1845,17 @@ mod tests {
     /// still runs... so the UI and tests stay functional"), just without
     /// even the control-thread machinery around it.
     fn bare_control() -> (Control, Arc<Mutex<Session>>) {
+        let (ctl, session, _tx) = bare_control_with_tx();
+        (ctl, session)
+    }
+
+    /// `bare_control` keeping the message SENDER alive, so a test can drive
+    /// `Control::run`'s real loop: send one message, drop the sender, and
+    /// `run` executes exactly one full iteration (handle → drain → tick
+    /// work) before `recv_timeout` reports Disconnected and it returns.
+    /// That is the only way to cover the per-tick work `run` schedules,
+    /// call sites included.
+    fn bare_control_with_tx() -> (Control, Arc<Mutex<Session>>, Sender<ControlMsg>) {
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
             generation: 0,
@@ -1837,7 +1863,7 @@ mod tests {
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
-        let (_tx, rx) = unbounded();
+        let (tx, rx) = unbounded();
         let committer = crate::control::testutil::test_committer(&session, &shared, &tables);
         let ctl = Control {
             shared,
@@ -1866,7 +1892,7 @@ mod tests {
             param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
             param_writes: Vec::new(),
         };
-        (ctl, session)
+        (ctl, session, tx)
     }
 
     fn test_track(id: &str) -> super::super::types::TrackState {
@@ -1906,7 +1932,6 @@ mod tests {
     #[test]
     fn rebuild_compiles_plugin_param_lanes_into_the_driver() {
         let (mut ctl, session) = bare_control();
-        ctl.cache_rate = 48_000; // headless has no device; the tempo map needs a rate
         {
             let mut s = session.lock();
             s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
@@ -1930,6 +1955,61 @@ mod tests {
         assert!(ctl.param_automation.is_empty());
     }
 
+    /// Seed a hosted instance and a 0→1 lane on its param 7, spanning one
+    /// bar (3840 ticks = 96_000 samples at 120 bpm / 48 kHz).
+    fn seed_plugin_lane(session: &Arc<Mutex<Session>>) {
+        let mut s = session.lock();
+        s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        });
+        let mut l = test_lane("l1", "inst-1", 7);
+        l.points[0].value = 0.0;
+        l.points[1].value = 1.0;
+        s.automation.lanes.push(l);
+    }
+
+    /// Track D review I-4: `run` must actually DRIVE the compiled lanes —
+    /// deleting the `drive_param_automation()` call left every other test
+    /// green. One `run` iteration (see `bare_control_with_tx`) rebuilds and
+    /// then ticks, so the batch left in `param_writes` is the call site's
+    /// only in-process witness.
+    #[test]
+    fn run_drives_plugin_param_automation_at_the_transport_position() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(48_000, Relaxed); // halfway up the ramp
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+
+        assert_eq!(ctl.param_writes.len(), 1, "the tick produced one host write");
+        let w = &ctl.param_writes[0];
+        assert_eq!((w.instance.as_str(), w.format.as_str(), w.index), ("inst-1", "lv2", 7));
+        assert!((w.value - 0.5).abs() < 1e-3, "interpolated at the transport position: {}", w.value);
+    }
+
+    /// The other half of the same guard: a STOPPED transport writes nothing,
+    /// so the last automated value stays put instead of being re-driven from
+    /// a parked playhead.
+    #[test]
+    fn run_drives_no_param_automation_while_stopped() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.position.store(48_000, Relaxed);
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+
+        assert!(!ctl.param_automation.is_empty(), "the lane IS compiled");
+        assert!(ctl.param_writes.is_empty(), "…but a stopped transport drives nothing");
+    }
+
     /// Track D: the gain-ramp half of the same attach. `rebuild` builds no
     /// graph headlessly (no cpal stream is constructible in-process), so the
     /// compile step is exercised exactly as `rebuild` calls it — with the
@@ -1939,7 +2019,7 @@ mod tests {
     #[test]
     fn rebuild_compiles_track_gain_lanes_by_slot() {
         let (mut ctl, session) = bare_control();
-        ctl.cache_rate = 48_000;
+        ctl.cache_rate = 48_000; // no `rebuild` here, so nothing else sets it
         {
             let mut s = session.lock();
             s.store.tracks.push(test_track("t-1"));
@@ -1966,7 +2046,7 @@ mod tests {
 
         // No rate (headless before a device opens) yields a tempo map error:
         // nothing is compiled rather than something compiled at rate 0.
-        ctl.cache_rate = 0;
+        ctl.cache_rate = 0; // as if the tempo map failed to build
         let (ramps, driver) = {
             let s = session.lock();
             let slots = derive_slots(&s.store.tracks);

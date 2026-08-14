@@ -2246,6 +2246,11 @@ mod tests {
         })
         .unwrap();
         assert!(m.lock().automation.lanes.is_empty());
+        // Track D: the arm schedules a rebuild unconditionally, so even this
+        // no-op costs one. Cheaper than proving a delete changed nothing,
+        // and a rebuild of an unchanged session is inaudible — but it IS the
+        // behaviour, so it is asserted rather than left to be discovered.
+        assert!(c.effect.rebuild, "an absent-key delete still rebuilds");
         match &c.inverses[0] {
             Op::AutomationSetLane { key, lane } => {
                 assert_eq!(key, "ghost");

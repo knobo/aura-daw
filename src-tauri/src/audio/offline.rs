@@ -51,12 +51,22 @@ pub struct OfflineGraph {
 /// order (round-2 §2.4) — this graph is exclusively owned, so there is no
 /// cross-generation aliasing concern to begin with.
 ///
-/// ONE KNOWN DIVERGENCE (Track D, automation audible): `rebuild` now attaches
-/// compiled track-gain lanes to its graph (`RtGraph::set_gain_ramps`) and this
-/// does not — no `AutomationDoc` reaches here, so an export ignores automation
-/// that live playback obeys. Closing it needs the lanes in `ExportSnapshot`
-/// and one `compile_gain_ramps` call; deliberately not smuggled into the
-/// engine task's diff.
+/// KNOWN DIVERGENCE, BOTH HALVES (Track D, automation audible): no
+/// `AutomationDoc` reaches here, so an export ignores automation that live
+/// playback obeys.
+/// - Track-gain lanes: `rebuild` attaches compiled ramps to its graph
+///   (`RtGraph::set_gain_ramps`); this graph has none, so an exported track
+///   plays at its fader value throughout.
+/// - Plugin-param lanes: worse than absent. They are driven HOST-side by the
+///   engine's `ParamAutomationDriver`, and the offline nodes talk to those
+///   same host instances — so an export inherits whatever value the last live
+///   playthrough left in the plugin. Bouncing a project after playing it and
+///   bouncing it from a fresh launch can produce different WAVs.
+///
+/// Closing it needs the lanes in `ExportSnapshot`, one `compile_gain_ramps`
+/// call, and a decision about how a bounce evaluates plugin params (the live
+/// driver's ≤2 ms tick has no meaning offline). A Task 10 item, deliberately
+/// not smuggled into the engine task's diff.
 pub fn build_graph(
     store: &Store,
     midi: &MidiStore,

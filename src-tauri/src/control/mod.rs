@@ -1117,16 +1117,34 @@ impl MeterSink for LatestMeterCache {
 /// than looking it up, is what lets the driver run with zero session locks
 /// on its 2 ms tick.
 pub(crate) fn forward_param_to_host(instance: &str, format: &str, index: u32, value: f32) {
+    forward_params_to_host(instance, format, &[(index, value)]);
+}
+
+/// The same, for a whole BATCH of params on one instance — one host call
+/// instead of one per param (Task 9 review, I-2). This matters for CLAP:
+/// `clap_host::set_params` is a blocking `plugin_main().run(…)` round-trip on
+/// the thread that also serves the param panel, instantiate and `save_state`,
+/// so a handful of automated params on a 2 ms tick would otherwise be
+/// thousands of blocking hops a second. The engine's automation driver hands
+/// its writes out grouped by instance precisely so this is one call per
+/// plugin per tick.
+pub(crate) fn forward_params_to_host(instance: &str, format: &str, changes: &[(u32, f32)]) {
     use crate::plugins::{clap_host, lv2_host};
+    if changes.is_empty() {
+        return;
+    }
     match format {
         "lv2" => {
             if let Some(host) = lv2_host::try_global() {
-                host.set_params(instance, vec![(index, value)]);
+                host.set_params(instance, changes.to_vec());
             }
         }
         "clap" => {
-            let change = crate::plugins::ParamChange { id: index, value: value as f64 };
-            if let Err(e) = clap_host::set_params(instance, vec![change]) {
+            let changes = changes
+                .iter()
+                .map(|(id, v)| crate::plugins::ParamChange { id: *id, value: *v as f64 })
+                .collect();
+            if let Err(e) = clap_host::set_params(instance, changes) {
                 log::warn!("plugins: clap param write for {instance}: {e}");
             }
         }

@@ -552,6 +552,11 @@ impl RampCursor {
 /// rebuild. CONTROL THREAD ONLY — this is where ticks become absolute
 /// samples; nothing tick-shaped crosses onto the RT thread
 /// (ARCHITECTURE §13/§15.1).
+///
+/// One slot holds ONE ramp: if two lanes name the same track's gain, the
+/// LAST one in `lanes` wins and the earlier is silently dropped (no blend,
+/// no error). Nothing produces that today — the UI keeps one gain lane per
+/// track — so it is documented rather than rejected.
 pub fn compile_gain_ramps(
     lanes: &[AutomationLane],
     map: &TempoMap,
@@ -591,6 +596,8 @@ struct CompiledParamLane {
     events: Vec<AbsParamEvent>,
     cursor: RampCursor,
     last_emitted: Option<f32>,
+    /// Consecutive ticks whose value was suppressed as unchanged.
+    ticks_held: u32,
 }
 
 /// Control-thread evaluator for plugin-parameter lanes. See scope ruling 2
@@ -608,6 +615,9 @@ pub struct ParamAutomationDriver {
 impl ParamAutomationDriver {
     /// Values closer than this to the last emitted one are not re-sent.
     pub const EPSILON: f32 = 1e-4;
+    /// …but a value held for this many consecutive ticks is re-asserted
+    /// anyway. At the engine control loop's ≤2 ms tick that is ~0.5 s.
+    pub const REASSERT_TICKS: u32 = 250;
 
     pub fn empty() -> Self {
         Self { lanes: Vec::new() }
@@ -637,8 +647,14 @@ impl ParamAutomationDriver {
                 events,
                 cursor: RampCursor::new(),
                 last_emitted: None,
+                ticks_held: 0,
             });
         }
+        // Group by instance (review I-2) so `tick`'s output arrives in
+        // contiguous per-instance runs and the caller can collapse a tick
+        // into ONE host round-trip per plugin. Sorting is a per-rebuild
+        // cost on the control thread; the tick stays a linear walk.
+        compiled.sort_by(|a, b| a.instance.cmp(&b.instance));
         Self { lanes: compiled }
     }
 
@@ -655,9 +671,20 @@ impl ParamAutomationDriver {
             };
             if let Some(prev) = l.last_emitted {
                 if (v - prev).abs() <= Self::EPSILON {
-                    continue;
+                    // Suppress — but only for a bounded stretch (review
+                    // I-3). The host is not ours alone: a knob drag
+                    // (`execute_host_forward`) or the plugin's own GUI can
+                    // move this param behind our back, and a flat lane
+                    // would then never correct it. Re-asserting a held
+                    // value keeps "automation overrides the knob during
+                    // playback" true without spamming the host.
+                    l.ticks_held += 1;
+                    if l.ticks_held < Self::REASSERT_TICKS {
+                        continue;
+                    }
                 }
             }
+            l.ticks_held = 0;
             l.last_emitted = Some(v);
             out.push(ParamWrite {
                 instance: l.instance.clone(),
@@ -1072,6 +1099,105 @@ mod tests {
         d.tick(48_000, &mut out);
         assert_eq!(out.len(), 1);
         assert!((out[0].value - 0.5).abs() < 1e-3, "halfway up the ramp: {}", out[0].value);
+    }
+
+    /// Task 9 review, I-3: the epsilon suppression above must not let a
+    /// knob grab win the rest of the pass. Anything else that writes the
+    /// same param behind the driver's back — the user dragging the knob
+    /// (`execute_host_forward`), or the plugin's OWN GUI, which never
+    /// touches our channel at all — leaves the host holding a value the
+    /// driver thinks it already emitted. A HELD lane value must therefore
+    /// be re-asserted periodically, or `drive_param_automation`'s
+    /// "automation OVERRIDES the stored knob value during playback" is
+    /// false whenever the curve is flat.
+    #[test]
+    fn param_driver_reasserts_a_held_value_so_a_knob_grab_cannot_win_the_pass() {
+        use crate::control::session::PluginDoc;
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut l = lane(vec![
+            AutomationPoint { tick: 0, value: 0.5 },
+            AutomationPoint { tick: 3840, value: 0.5 }, // dead flat
+        ]);
+        l.target_node = "inst-1".into();
+        l.param_id = 7;
+        let mut doc = PluginDoc::default();
+        doc.instances.push(crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        });
+
+        let mut d = ParamAutomationDriver::new(&[l], &doc, &map);
+        let mut out = Vec::new();
+        d.tick(0, &mut out);
+        assert_eq!(out.len(), 1, "the first tick asserts the value");
+
+        // The knob grab happens HERE, host-side, invisible to the driver.
+        let mut emitted = 0usize;
+        for i in 1..=ParamAutomationDriver::REASSERT_TICKS {
+            d.tick(i as u64, &mut out);
+            emitted += out.len();
+        }
+        assert_eq!(
+            emitted, 1,
+            "exactly one re-assert within REASSERT_TICKS ticks — not silence, not every tick"
+        );
+        assert!((out[0].value - 0.5).abs() < 1e-6, "and it re-asserts the LANE's value");
+
+        // …and then it goes quiet again: the hold counter restarts, so a
+        // held value costs one host round-trip per REASSERT_TICKS, not one
+        // per tick from here on.
+        let n = ParamAutomationDriver::REASSERT_TICKS as u64;
+        let mut emitted = 0usize;
+        for i in n + 1..2 * n {
+            d.tick(i, &mut out);
+            emitted += out.len();
+        }
+        assert_eq!(emitted, 0, "the hold counter restarts after a re-assert");
+    }
+
+    /// Task 9 review, I-2: a tick's writes come out GROUPED by instance, so
+    /// the caller can issue one host call per plugin per tick instead of one
+    /// per param — a CLAP param write is a blocking round-trip on the shared
+    /// plugin-main thread. Lanes are authored in any order; the grouping is
+    /// the driver's job, once per rebuild, not the tick's.
+    #[test]
+    fn param_driver_groups_its_writes_by_instance() {
+        use crate::control::session::PluginDoc;
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut doc = PluginDoc::default();
+        let mut lanes = Vec::new();
+        // Interleaved on purpose: a, b, a, b.
+        for (i, inst) in ["inst-a", "inst-b", "inst-a", "inst-b"].iter().enumerate() {
+            let mut l = lane(vec![
+                AutomationPoint { tick: 0, value: 0.0 },
+                AutomationPoint { tick: 3840, value: 1.0 },
+            ]);
+            l.id = format!("l{i}");
+            l.target_node = (*inst).into();
+            l.param_id = i as u32;
+            lanes.push(l);
+        }
+        for inst in ["inst-a", "inst-b"] {
+            doc.instances.push(crate::plugins::PluginInstanceInfo {
+                id: inst.into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: None,
+            });
+        }
+
+        let mut d = ParamAutomationDriver::new(&lanes, &doc, &map);
+        let mut out = Vec::new();
+        d.tick(48_000, &mut out);
+        assert_eq!(out.len(), 4, "all four lanes are due");
+        let runs = out.chunk_by(|a, b| a.instance == b.instance).count();
+        assert_eq!(runs, 2, "one contiguous run per instance, not {runs} — got {out:?}");
     }
 
     #[test]
