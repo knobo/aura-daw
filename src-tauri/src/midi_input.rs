@@ -15,17 +15,22 @@
 //! track's instrument" lives in this module (the hub owns target
 //! resolution and the RT-side plumbing). This module never touches
 //! `crate::control` or `crate::midi` (the tick-timeline/clip/synth document
-//! module) directly, but — unlike slice 1 — it now DOES reach the engine's
-//! real-time audio graph indirectly, through the wait-free ring installed
-//! on `crate::audio::midi_in::MidiInHub`: exactly one monitoring path is
-//! ever live (ruling 2) — either slice 1b's preview tone (no target set) or
-//! a target track's real instrument (target set), never both, never
-//! neither. Its live-resource dependencies are `crate::audio::sampler_preview`
-//! (the same "no project needed" audition path `sampler_preview_note`
-//! already uses) for the preview path, and `crate::audio::midi_in::hub()`
-//! for the routed/captured path. It is wired into `lib.rs` purely
-//! additively (new `pub mod`, a new managed state, three new commands
-//! appended to `generate_handler!`).
+//! module) directly, and — unlike slice 1 — it no longer sits fully outside
+//! the engine's real-time audio graph either, but only as a FEEDER: the
+//! callback pushes routed notes into `crate::audio::midi_in::MidiInHub`'s
+//! wait-free ring (ruling 2: exactly one monitoring path is ever live —
+//! either slice 1b's preview tone with no target set, or the hub push with
+//! a target set, never both, never neither), and the hub is the wiring
+//! point the engine's RT output callback will *drain* — that consumer side
+//! is a separate, not-yet-landed task (Task 10). Until Task 10 installs a
+//! producer there, every hub push in this slice counts as a drop
+//! (`MidiInputStatus::dropped_events`) rather than reaching any audio graph
+//! node; nothing in *this* module claims otherwise. Its live-resource
+//! dependencies are `crate::audio::sampler_preview` (the same "no project
+//! needed" audition path `sampler_preview_note` already uses) for the
+//! preview path, and `crate::audio::midi_in::hub()` for the routed/captured
+//! path. It is wired into `lib.rs` purely additively (new `pub mod`, a new
+//! managed state, three new commands appended to `generate_handler!`).
 //!
 //! Backend: [`midir`], which gets the ALSA-seq backend on Linux for free.
 //!
@@ -69,17 +74,25 @@
 //! ## Callback discipline
 //!
 //! midir invokes the input callback on its own backend thread (not the
-//! audio RT thread). The callback does two small things: (1) bump the
-//! activity atomics / status-byte ring (slice 1), and (2) parse a
-//! NoteOn/NoteOff out of the raw bytes and, if monitoring is enabled,
-//! forward it with a **non-blocking** channel send to the preview control
-//! thread (slice 1b) — see [`crate::audio::sampler_preview::PreviewHandle`]
-//! doc: `note_on`/`note_off`/`all_off` never wait for a reply, so this
-//! callback never blocks on an audio lock or on the preview thread's own
-//! work (stream open, node swap, etc. all happen asynchronously over
-//! there). The whole body is wrapped in `catch_unwind` so a bug in it can
-//! never unwind across the FFI/thread boundary into a panic that takes
-//! down the MIDI backend thread.
+//! audio RT thread). The callback does three small things, all inside
+//! [`handle_incoming`]: (1) bump the activity atomics / status-byte ring
+//! (slice 1) — done just before, in the caller; (2) capture the parsed
+//! NoteOn/NoteOff into the hub's take buffer via `MidiInHub::capture_event`
+//! **unconditionally whenever a take is armed** (slice 2) — this does NOT
+//! depend on the monitor toggle, so recording never silently drops notes
+//! just because monitoring happens to be off; and (3) route the same event
+//! per [`monitor_route`] to exactly one of: nowhere (monitor off), the
+//! preview control thread with a **non-blocking** channel send (slice 1b,
+//! no target track set) — see
+//! [`crate::audio::sampler_preview::PreviewHandle`] doc: `note_on`/
+//! `note_off`/`all_off` never wait for a reply — or `MidiInHub::push`
+//! (slice 2, a target track is set), which is likewise non-blocking (an
+//! rtrb push, never a wait). So this callback never blocks on an audio
+//! lock, on the preview thread's own work (stream open, node swap, etc.
+//! all happen asynchronously over there), or on the RT audio callback. The
+//! whole body is wrapped in `catch_unwind` so a bug in it can never unwind
+//! across the FFI/thread boundary into a panic that takes down the MIDI
+//! backend thread.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
