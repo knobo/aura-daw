@@ -120,7 +120,10 @@ pub fn ensure_default_project(
         // here — this is the actual swap site for the "ensure" epoch (both
         // the engine's own `ensure_project` and `ControlPlane::
         // ensure_project_epoch` call through here; neither does its own
-        // separate store write).
+        // separate store write). Fix round 1 (Task 7 review finding 2):
+        // bump `session.epoch` here too — `ControlPlane::execute_persist`
+        // uses it to detect a commit's persist racing this document swap.
+        session.epoch += 1;
         session.store.project_dir = Some(dir);
         session.store.project_name = Some(project.name.clone());
         session.store.created_at = project.created_at.clone();

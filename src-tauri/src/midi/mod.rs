@@ -284,9 +284,20 @@ pub(crate) fn build_tempo_map_state(
 
 /// Replace the project tempo map. `events` must be sorted, start at tick 0,
 /// bpm > 0 (validated via `TempoMap::new`). Batch-shaped by design (D-03).
-/// Also keeps the legacy `transport.tempoBpm` == `tempoMap[0].bpm` invariant
+/// Also keeps the legacy `transport.tempoBpm` in sync with the new map
 /// (owned by `Op::TempoSet`'s apply arm now — no separate writeback here,
-/// Plan E Task 7).
+/// Plan E Task 7). Honest correction (fix round 1): this is NOT an exact
+/// `transport.tempoBpm == tempoMap[0].bpm` invariant — the apply arm mirrors
+/// the RAW `events[0].bpm` this fn passes it (the caller's literal input),
+/// while the `TempoMapState` returned to the caller (`built`, below) carries
+/// `build_tempo_map_state`'s PERIOD-QUANTIZED bpm
+/// (`bpm_from_period(period_from_bpm(bpm))`) — the two can differ by up to
+/// the quantization's own error bound (<1e-6 bpm, pinned in
+/// `time::tests::bpm_quantizes_to_an_integer_period_and_back_within_spec_error`).
+/// This is not a regression: it's the SAME raw-bpm behavior
+/// `midi_import_file_core` already relies on (its `Op::TempoSet` also
+/// carries the file's literal parsed bpm, never a quantized round-trip) —
+/// this fn now unifies with that rather than diverging from it.
 ///
 /// Split from the `#[tauri::command]` wrapper (same pattern
 /// `build_tempo_map_state`/`assign_incoming_note_ids` already use in this

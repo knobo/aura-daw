@@ -25,11 +25,30 @@ pub struct Session {
     pub midi: MidiStore,
     pub automation: AutomationDoc,
     pub(crate) rev: u64,
+    /// Document-identity counter (fix round 1, Task 7 review finding 2):
+    /// bumped exactly once, under the session lock, at every DOCUMENT-SWAP
+    /// epoch boundary — `audio::project::ensure_default_project`,
+    /// `ControlPlane::create_project_at`, `ControlPlane::open_project_epoch`,
+    /// `ControlPlane::save_project_as_epoch` (their own `// epoch boundary:`
+    /// markers are the bump sites; `save_project_mark`'s marker explicitly
+    /// says "no document swap here" and does NOT bump). `Committed` captures
+    /// this under the SAME `transact` lock that captures `rev`;
+    /// `ControlPlane::execute_persist` re-locks afterward (persistence runs
+    /// with the session lock released — round-2 §4) and refuses to persist
+    /// if `session.epoch` has moved past what the commit captured: an epoch
+    /// function interleaved between `transact` returning and `execute_persist`
+    /// re-locking, so the document `execute_persist` would snapshot is no
+    /// longer the one this commit's `PersistEffect` describes — silently
+    /// writing it would either corrupt the NEW document (e.g. persist a
+    /// stale in-memory edit into a project just opened) or silently drop the
+    /// commit's own edit (its target document already moved on). The new
+    /// epoch's own swap/save owns durability from that point forward.
+    pub(crate) epoch: u64,
 }
 
 impl Session {
     pub fn new(store: Store, midi: MidiStore) -> Self {
-        Self { store, midi, automation: AutomationDoc::default(), rev: 0 }
+        Self { store, midi, automation: AutomationDoc::default(), rev: 0, epoch: 0 }
     }
 
     /// Clone of the midi fields `midi::persist` persists — `ppq`,
@@ -71,7 +90,10 @@ impl Session {
                 let (ops, mut inverses) = fold_ops(ops, inverses);
                 inverses.reverse();
                 guard.rev += 1;
-                Ok(Committed { rev: guard.rev, ops, inverses, effect, meta })
+                // `epoch` is captured under this SAME lock, alongside `rev`
+                // — see `Session::epoch`'s doc for why `execute_persist`
+                // needs this to detect an interleaved document swap.
+                Ok(Committed { rev: guard.rev, epoch: guard.epoch, ops, inverses, effect, meta })
             }
             Err(e) => {
                 // Rollback: run collected inverses in reverse — the same
@@ -197,6 +219,10 @@ pub struct PersistEffect {
 
 pub struct Committed {
     pub rev: u64,
+    /// `Session::epoch` as observed under the SAME lock as `rev` — see that
+    /// field's doc. `ControlPlane::execute_persist` compares this against
+    /// the CURRENT `session.epoch` after re-locking, post-`transact`.
+    pub epoch: u64,
     pub ops: Vec<Op>,
     pub inverses: Vec<Op>, // reverse order, ready to apply
     pub effect: EngineEffect,

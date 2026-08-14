@@ -783,7 +783,7 @@ impl ControlPlane {
         // fires (round-2 §4: persistence is an effect, executed here, never
         // I/O under the session lock).
         if committed.effect.persist != session::PersistEffect::default() {
-            self.execute_persist(&committed.effect.persist);
+            self.execute_persist(&committed.effect.persist, committed.epoch);
         }
         // Full-Project payload (the frozen contract) + rev/label/actor as
         // additive fields (D-06). `project_changed_payload` serializes to a
@@ -817,11 +817,24 @@ impl ControlPlane {
     /// `effect.persist` yet (that arrives with later tasks' apply_raw arms);
     /// `pub(crate)` so tests can construct a `PersistEffect` and call this
     /// directly in the meantime.
-    pub(crate) fn execute_persist(&self, p: &session::PersistEffect) {
-        let (dir, midi_snapshot, project_snapshot, automation_snapshot) = {
+    ///
+    /// `committed_epoch`: the `Committed.epoch` the triggering commit
+    /// captured under `Session::transact`'s lock (fix round 1, Task 7
+    /// review finding 2). Re-checked against the CURRENT `session.epoch`
+    /// under the fresh lock this fn takes below — a mismatch means an epoch
+    /// function (project open/create/save-as) swapped the document AFTER
+    /// this commit's `transact` returned but BEFORE this re-lock, so the
+    /// snapshot this fn would take belongs to a DIFFERENT document than the
+    /// one `p` describes; persisting it would be silent data loss either way
+    /// (corrupting the new document, or dropping this commit's edit — see
+    /// `Session::epoch`'s doc). Direct test callers of this fn (that don't
+    /// go through `commit`) should pass the session's current epoch.
+    pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
+        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot) = {
             let s = self.session.lock();
             (
                 s.store.project_dir.clone(),
+                s.epoch,
                 p.midi.then(|| s.midi_snapshot()),
                 p.project.then(|| {
                     project::from_store(
@@ -838,6 +851,13 @@ impl ControlPlane {
                 p.automation.then(|| s.automation.lanes.clone()),
             )
         };
+        if epoch_now != committed_epoch {
+            log::warn!(
+                "persist skipped: epoch changed between commit and persist ({committed_epoch} -> \
+                 {epoch_now}) — the epoch's own save owns durability now"
+            );
+            return;
+        }
         let Some(dir) = dir else { return }; // unsaved in-memory project
         if let Some(m) = midi_snapshot {
             if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
@@ -941,6 +961,9 @@ impl ControlPlane {
             self.shared.loop_enabled.store(false, Relaxed);
 
             // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // Fix round 1 (Task 7 review finding 2): bump the document-swap
+            // epoch counter here — see `Session::epoch`'s doc.
+            session.epoch += 1;
 
             // Blank midi state bound to the new dir; `adopt_midi_dir` then
             // sees loaded_dir == dir and leaves it alone. Same lock as
@@ -1007,6 +1030,9 @@ impl ControlPlane {
                 self.shared.loop_end.store(t.loop_end_samples, Relaxed);
             }
             // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // Fix round 1 (Task 7 review finding 2): bump the document-swap
+            // epoch counter here — see `Session::epoch`'s doc.
+            session.epoch += 1;
             // Eager midi adopt (Task 6: no more lazy resync on the first
             // midi command after an open) — same lock as the store swap
             // above, no separate re-acquisition.
@@ -1065,6 +1091,9 @@ impl ControlPlane {
             session.store.project_name = Some(name);
             session.store.created_at = created_at;
             // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // Fix round 1 (Task 7 review finding 2): bump the document-swap
+            // epoch counter here — see `Session::epoch`'s doc.
+            session.epoch += 1;
             // Mark the midi store as belonging to `dir` NOW (under the same
             // lock as the store swap); the snapshot taken alongside it is
             // written to disk below, AFTER the lock drops.
@@ -2958,7 +2987,8 @@ mod tests {
             session.midi.dirty = true;
         }
 
-        cp.execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() });
+        let epoch = cp.session().lock().epoch;
+        cp.execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() }, epoch);
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
@@ -2971,6 +3001,75 @@ mod tests {
             !cp.session().lock().midi.dirty,
             "successful persist clears the M-5 dirty flag"
         );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Fix round 1 (Task 7 review finding 2): `execute_persist` must SKIP —
+    /// not write — when the session's document epoch has moved past the
+    /// epoch the triggering commit captured. Simulates the exact race:
+    /// commit a real midi op through the channel (capturing its genuine
+    /// `Committed.epoch`), then manually bump `session.epoch` (standing in
+    /// for an epoch function — project open/create/save-as — interleaving
+    /// between `transact` returning and `execute_persist`'s re-lock), then
+    /// drive `execute_persist` directly with the now-STALE captured epoch
+    /// (same "Task 2 brief" direct-drive sanction the sibling test above
+    /// uses) against NEW midi content. Evidence the skip fired: the new
+    /// content never reaches disk (file content unchanged) and
+    /// `project.json`'s mtime never moves (proving no write ran at all, not
+    /// just a write that happened not to change the clip count).
+    #[test]
+    fn execute_persist_skips_when_the_session_epoch_moved_past_the_committed_one() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("persist-epoch-skip");
+        cp.create_project(parent.to_str().unwrap(), "EpochSkip").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        // A real commit through the channel — this one's OWN internal
+        // execute_persist runs normally (no race here) and persists clip 1.
+        let committed = cp
+            .commit(TxMeta::user("add clip"), |tx| {
+                tx.apply(crate::control::op::Op::MidiClipAdd {
+                    clip: dummy_midi_clip("t-1"),
+                    index: 0,
+                })
+            })
+            .unwrap();
+        assert!(committed.effect.persist.midi, "MidiClipAdd sets persist.midi");
+
+        let project_json = dir.join("project.json");
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&project_json).unwrap()).unwrap();
+        assert_eq!(before["content"].as_array().unwrap().len(), 1, "clip 1 landed on disk");
+        let mtime_before = std::fs::metadata(&project_json).unwrap().modified().unwrap();
+
+        // Simulate an epoch function racing in between `transact` and a
+        // (would-be) `execute_persist` re-lock: the document identity moves
+        // on from under `committed.epoch`.
+        cp.session().lock().epoch += 1;
+
+        // New content that a persist call WOULD write if it ran — added
+        // directly (not through `commit`, which would capture the NEW
+        // epoch and persist successfully; this simulates the stale
+        // in-flight commit's own deferred `execute_persist` call still
+        // carrying the OLD, now-mismatched epoch).
+        {
+            let mut clip2 = dummy_midi_clip("t-1");
+            clip2.id = "mc2".into();
+            cp.session().lock().midi.clips.push(clip2);
+        }
+
+        cp.execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() }, committed.epoch);
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&project_json).unwrap()).unwrap();
+        assert_eq!(
+            after["content"].as_array().unwrap().len(),
+            1,
+            "the second clip must NOT reach disk — the skip fired, not a write"
+        );
+        let mtime_after = std::fs::metadata(&project_json).unwrap().modified().unwrap();
+        assert_eq!(mtime_before, mtime_after, "project.json was never touched by the skipped persist");
 
         let _ = std::fs::remove_dir_all(&parent);
     }
@@ -2993,7 +3092,8 @@ mod tests {
         };
         cp.session().lock().automation.lanes.push(lane.clone());
 
-        cp.execute_persist(&PersistEffect { automation: true, ..PersistEffect::default() });
+        let epoch = cp.session().lock().epoch;
+        cp.execute_persist(&PersistEffect { automation: true, ..PersistEffect::default() }, epoch);
 
         let raw: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();

@@ -40,6 +40,21 @@ use super::MidiStore;
 
 use crate::audio::dsp::AudioProcessor;
 
+/// READ-ONLY document view (Plan E Task 7 fix round 1 — binding requirement).
+/// This global exists purely so a cross-cutting reach with no session handle
+/// of its own (`register_store`'s doc) can still LOOK at the current
+/// document; no code may lock it in order to WRITE. The only door for
+/// mutation is `Session::transact` (via `ControlPlane::commit`), which is
+/// always reached through the `Arc<Mutex<Session>>` the app hands to
+/// `ControlPlane`/`MidiState`/`AudioState` at setup — never through this
+/// static. As of this fix round, `registered_store()` (this file's only
+/// accessor) has ZERO callers anywhere in the crate (`grep -rn
+/// registered_store src/` outside this file matches nothing but a doc
+/// comment in `plugins/automation.rs` describing its own, separate
+/// process-global by analogy) — so today this is write-once
+/// (`register_store`, called exactly once from `lib.rs` setup) and
+/// read-never; the doc exists so the FIRST future reader doesn't reach for
+/// `.lock()`'s mutable API out of habit.
 static PLAYBACK_SESSION: OnceLock<Arc<Mutex<Session>>> = OnceLock::new();
 
 /// Register the app's session for cross-cutting reaches (e.g. midi resync
