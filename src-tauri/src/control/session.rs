@@ -96,6 +96,21 @@ impl Tx<'_> {
         self.inverses.push(inverse);
         Ok(())
     }
+
+    /// Read-only view of the document store, for validating/deriving inside
+    /// a transaction closure without a second lock (Plan E Task 7, §4.3) —
+    /// e.g. `ops::add_track_tx` reading track count/color, or a wrapper
+    /// validating a track's kind before applying a structural op. Never
+    /// `&mut`: the only way to mutate is [`Tx::apply`], so this can't be
+    /// used to bypass the op/inverse/effect bookkeeping.
+    pub fn store(&self) -> &Store {
+        &self.session.store
+    }
+
+    /// Same as [`Tx::store`], for the MIDI store.
+    pub fn midi(&self) -> &MidiStore {
+        &self.session.midi
+    }
 }
 
 /// What `apply_raw` did that the engine/RT side must eventually see, folded

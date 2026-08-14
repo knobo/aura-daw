@@ -69,7 +69,7 @@ pub(crate) fn insert_track(store: &mut Store, track: TrackState, index: usize) {
 /// `(track, index)`; `index` is the row's intended position (end of the
 /// current list).
 pub(crate) fn new_track_row(
-    store: &mut Store,
+    store: &Store,
     name: Option<String>,
     kind: Option<String>,
 ) -> Result<(TrackState, usize), String> {
@@ -109,6 +109,30 @@ pub fn add_track(
 ) -> Result<TrackState, String> {
     let (track, index) = new_track_row(store, name, kind)?;
     insert_track(store, track.clone(), index);
+    Ok(track)
+}
+
+/// The §4.3 Tx-tier sibling of [`add_track`]: builds the row (against the
+/// transaction's read-only store view, `Tx::store`) and inserts it through
+/// the transaction channel (`Op::TrackAdd`, via [`crate::control::session::Tx::apply`])
+/// instead of a direct `Vec::insert` — so a caller composing several
+/// mutations into ONE commit (e.g. `midi_import_file`'s per-clip
+/// auto-created tracks, `seed_demo_project`'s three demo tracks) can create
+/// tracks without a second lock or a second `project://changed`/rebuild.
+/// Undo-able like any other op: `apply`'s computed inverse is a
+/// `TrackRemove` for this exact row.
+pub fn add_track_tx(
+    tx: &mut crate::control::session::Tx<'_>,
+    name: Option<String>,
+    kind: Option<String>,
+) -> Result<TrackState, String> {
+    let (track, index) = new_track_row(tx.store(), name, kind)?;
+    tx.apply(crate::control::op::Op::TrackAdd {
+        track: track.clone(),
+        index,
+        clips: Vec::new(),
+        clip_indices: Vec::new(),
+    })?;
     Ok(track)
 }
 

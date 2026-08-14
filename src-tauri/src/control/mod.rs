@@ -325,8 +325,8 @@ impl ControlPlane {
         meta: op::TxMeta,
     ) -> Result<TrackState, String> {
         let (track, index) = {
-            let mut session = self.session.lock();
-            ops::new_track_row(&mut session.store, name, kind)?
+            let session = self.session.lock();
+            ops::new_track_row(&session.store, name, kind)?
         };
         self.commit(meta, |tx| {
             tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![] })
@@ -987,89 +987,66 @@ impl ControlPlane {
         // to `project_dir` at all times, so the open project's on-disk
         // state is never at risk of being clobbered by a stale in-memory
         // copy the way a lazy resync used to guard against.
-        let dir = {
+        {
             let session = self.session.lock();
             if !session.store.clips.is_empty()
                 || session.midi.clips.iter().any(|c| !c.notes.is_empty())
             {
                 return Err("project already has content".to_string());
             }
-            session.store.project_dir.clone()
-        };
+        }
 
         // Zyn upgrade path: build the three patched instances BEFORE the
-        // tracks so a failure leaves no half-bound state (None = PolySynth).
+        // transaction so a failure leaves no half-bound state (None =
+        // PolySynth).
         let zyn = try_seed_zyn_demo_instruments();
 
-        let (pad, lead, bass) = {
-            let mut session = self.session.lock();
-            let pad = ops::add_track(
-                &mut session.store,
-                Some("Demo Pad".into()),
-                Some("midi".into()),
-            )?;
-            let lead = ops::add_track(
-                &mut session.store,
-                Some("Demo Lead".into()),
-                Some("midi".into()),
-            )?;
-            let bass = ops::add_track(
-                &mut session.store,
-                Some("Demo Bass".into()),
-                Some("midi".into()),
-            )?;
+        // Task 7: one commit — 3x add_track_tx, the instrument bindings (if
+        // Zyn is available), and the 3 demo clips, all through the channel.
+        // `persist.project` (set only by the InstrumentId `Set`s below, same
+        // as the pre-Task-7 code's zyn-gated project::save) and
+        // `persist.midi` (set unconditionally by `MidiClipAdd`, same as the
+        // pre-Task-7 code's unconditional `save_into_project`) replace the
+        // manual saves; `commit` also emits `project://changed`, fixing this
+        // command's previously missing event.
+        self.commit(op::TxMeta::system("seed demo project"), |tx| {
+            let pad = ops::add_track_tx(tx, Some("Demo Pad".into()), Some("midi".into()))?;
+            let lead = ops::add_track_tx(tx, Some("Demo Lead".into()), Some("midi".into()))?;
+            let bass = ops::add_track_tx(tx, Some("Demo Bass".into()), Some("midi".into()))?;
+
             if let Some(ids) = &zyn {
                 for (track_id, instance_id) in
                     [(&pad.id, &ids[0]), (&lead.id, &ids[1]), (&bass.id, &ids[2])]
                 {
-                    if let Some(t) = session.store.tracks.iter_mut().find(|t| &t.id == track_id) {
-                        t.instrument_id = Some(format!("plugin:{instance_id}"));
-                    }
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::Track(track_id.clone()),
+                        path: op::PropPath::InstrumentId,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(format!("plugin:{instance_id}")),
+                    })?;
                 }
             }
-            (pad, lead, bass)
-        };
-        {
-            let mut session = self.session.lock();
-            let ppq = session.midi.ppq;
+
+            let ppq = tx.midi().ppq;
             let (pad_clip, lead_clip, bass_clip) =
                 demo_seed_clips_v2(pad.id.as_str(), lead.id.as_str(), bass.id.as_str(), ppq);
-            session.midi.clips.push(pad_clip);
-            session.midi.clips.push(lead_clip);
-            session.midi.clips.push(bass_clip);
-            if let Some(d) = &dir {
-                if let Err(e) = crate::midi::persist::save_into_project(d, &session.midi) {
-                    log::warn!("seed demo: persisting midi failed: {e}");
-                }
+            for clip in [pad_clip, lead_clip, bass_clip] {
+                let index = tx.midi().clips.len();
+                tx.apply(op::Op::MidiClipAdd { clip, index })?;
             }
-        }
-        // Persist the track bindings (project.json tracks) and the plugin
-        // instances + state blobs, so a save/open cycle replays the same
-        // demo through the same patches (zone P4 restore path).
-        if let (Some(d), Some(_)) = (&dir, &zyn) {
-            let snapshot = {
-                let session = self.session.lock();
-                project::from_store(
-                    &session.store,
-                    self.shared.position.load(Relaxed),
-                    self.shared.sample_rate.load(Relaxed),
-                )
-            };
-            match snapshot {
-                Ok(p) => {
-                    if let Err(e) = project::save(d, &p) {
-                        log::warn!("seed demo: persisting tracks failed: {e}");
-                    }
-                }
-                Err(e) => log::warn!("seed demo: project snapshot failed: {e}"),
-            }
+            Ok(())
+        })?;
+
+        // Plugin instance + state blobs (not the `PersistEffect` machinery's
+        // job yet — Tasks 9/10), so a save/open cycle replays the same demo
+        // through the same patches (zone P4 restore path). Unchanged from
+        // pre-Task-7: a no-op when there's no open project dir
+        // (`persist_after_mutation` checks internally) or no Zyn instances.
+        if zyn.is_some() {
             if let Some(reg) = crate::plugins::registered_registry() {
                 crate::plugins::state::persist_after_mutation(&self.session, reg, true);
             }
         }
-        self.engine.send(ControlMsg::Rebuild);
-        // No app event: the caller applies the returned snapshot (the frozen
-        // event-name surface stays untouched).
         Ok(self.project_state())
     }
 
