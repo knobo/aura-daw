@@ -261,13 +261,23 @@ impl OutputCb {
         let lp = self.shared.loop_spec();
         let discontinuity = playing && (!self.was_playing || base != self.next_pos);
 
+        // Block prologue (round-2 §3.5): advance the engine-global steady
+        // sample counter ONCE per block, unconditionally — CLAP hosts need
+        // a clock that never resets, not even across a live node's
+        // re-creation (instrument rebind, sample-rate change, a track
+        // leaving and re-entering the live set). `steady_base` is the value
+        // THIS block's nodes see; Relaxed suffices (a free-running counter,
+        // no other state is synchronized against it).
+        let frames = (out.len() / self.channels.max(1)) as u64;
+        let steady_base = self.shared.steady.fetch_add(frames, Relaxed);
+
         match (&mut self.graph, playing) {
             (Some(g), true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                let dropped = mixer::render(
+                let dropped = mixer::render_rt(
                     g,
                     base,
                     &lp,
@@ -275,6 +285,7 @@ impl OutputCb {
                     self.channels,
                     self.rate,
                     discontinuity,
+                    steady_base,
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -285,7 +296,6 @@ impl OutputCb {
         }
 
         if playing {
-            let frames = (out.len() / self.channels.max(1)) as u64;
             // Report boundary crossings, never act on them (§2.1): the ring
             // push is wait-free, and a full ring is dropped rather than
             // waited on. `crossing` is edge-triggered by construction — once
@@ -1407,6 +1417,91 @@ mod tests {
         }
         assert!(evt_rx.pop().is_err());
         assert_eq!(shared.position.load(Relaxed), 8 * 128);
+    }
+
+    /// Round-2 §3.5 (deferred from Plan C+D): CLAP hosts require
+    /// `steady_time` to only ever climb — it must NOT reset when a live
+    /// node is re-created (instrument rebind, sample-rate change, a track
+    /// leaving and re-entering the live set). The old design counted
+    /// samples on the node itself (`ClapNode::steady`), so a rebuild that
+    /// built a fresh node handed the host a fresh zero. The fix moves the
+    /// counter onto `SharedRt`, advanced once per block by `OutputCb`.
+    ///
+    /// This exercises the REAL RT path end to end: `OutputCb::render`'s
+    /// block prologue, the real `SharedRt::steady` atomic, the real
+    /// `mixer::render_rt` / `render_live` plumbing, and a REAL graph
+    /// rebuild — a brand-new `RtGraph` with a brand-new `LiveNodeCell`
+    /// swapped in mid-stream via the same graph_tx/retire_tx ring the
+    /// engine control thread uses for every rebuild. Only the leaf
+    /// "plugin" is a test double (any `LiveInstrument` stands in for
+    /// `ClapNode`, which is opaque from the outside): it just records the
+    /// `ProcessBlock::steady` value each block hands it.
+    #[derive(Clone)]
+    struct RecordingNode(Arc<Mutex<Vec<u64>>>);
+
+    impl crate::audio::dsp::AudioProcessor for RecordingNode {
+        fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+        fn process(&mut self, io: &mut crate::audio::dsp::ProcessBlock<'_>) {
+            // The real RT path (`render_rt`) always carries an
+            // engine-global value — `None` here would mean this test
+            // somehow went through the non-RT `render` entry point instead.
+            self.0.lock().push(io.steady.expect("RT block always carries a steady value"));
+        }
+        fn reset(&mut self) {}
+    }
+
+    impl crate::audio::dsp::LiveInstrument for RecordingNode {
+        fn queue_event(&mut self, _ev: crate::midi::synth::BlockNoteEvent) -> bool {
+            true
+        }
+        fn all_notes_off(&mut self) {}
+    }
+
+    /// A one-track live graph wrapping a fresh `LiveNodeCell` around `node`
+    /// — the same shape a control-thread rebuild publishes for an
+    /// instrument rebind (Task 16 brief's exact §3.5 hazard).
+    fn live_graph(node: RecordingNode, generation: u64) -> RtGraph {
+        let cell = crate::audio::rt::LiveNodeCell::new(Box::new(node));
+        let tr = RtTrack {
+            slot: 0,
+            clips: Vec::new(),
+            live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(Vec::new()) }),
+        };
+        RtGraph::new(vec![tr], generation, Arc::new(ParamTable::with_slots(1)))
+    }
+
+    #[test]
+    fn steady_time_survives_live_node_recreation() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut out = vec![0.0f32; 128 * 2];
+        shared.playing.store(true, Relaxed);
+
+        // Node A's graph — adopted and rendered for two blocks.
+        graph_tx
+            .push(GraphPtr::new(Box::new(live_graph(RecordingNode(log.clone()), 1))))
+            .expect("ring has room");
+        cb.render(&mut out);
+        cb.render(&mut out);
+
+        // Simulate the rebind/rebuild hazard: a FRESH `RtGraph` with a
+        // BRAND-NEW `LiveNodeCell` (never the same node object as A) lands
+        // mid-stream, exactly like a real instrument rebind, sample-rate
+        // change, or a track re-entering the live set.
+        graph_tx
+            .push(GraphPtr::new(Box::new(live_graph(RecordingNode(log.clone()), 2))))
+            .expect("ring has room");
+        cb.render(&mut out);
+
+        let seen = log.lock().clone();
+        assert_eq!(seen.len(), 3, "one steady value observed per rendered block");
+        assert!(seen[1] > seen[0], "monotonic within the same node: {:?}", seen);
+        assert!(
+            seen[2] > seen[1],
+            "steady_time must NOT reset when the live node is re-created (round-2 §3.5): {:?}",
+            seen
+        );
     }
 
     fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {

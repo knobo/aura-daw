@@ -676,7 +676,7 @@ mod tests {
         let mut energy = 0.0f32;
         for _ in 0..20 {
             buf.fill(0.0);
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
             node.process(&mut io);
             energy += buf.iter().map(|s| s.abs()).sum::<f32>();
         }
@@ -687,7 +687,7 @@ mod tests {
         host.set_params("epiano-test", vec![(params[0].id, 0.2)]);
         std::thread::sleep(std::time::Duration::from_millis(50)); // main-thread tick
         let mut tiny = vec![0.0f32; 2];
-        let mut io = ProcessBlock { samples: &mut tiny, channels: 2, sample_rate: 48_000 };
+        let mut io = ProcessBlock { samples: &mut tiny, channels: 2, sample_rate: 48_000, steady: None };
         node.process(&mut io);
         host.unregister_instance("epiano-test");
     }
