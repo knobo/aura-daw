@@ -11,6 +11,7 @@ import { project } from "./project.svelte";
 import { midi } from "./midi.svelte";
 import { instruments } from "./instruments.svelte";
 import { jobs } from "./jobs.svelte";
+import { copyNote } from "../utils/note-ops";
 import type {
   AmtInfillResult,
   MidiNote,
@@ -282,12 +283,17 @@ class GenerationStore {
       const r = result as unknown as AmtInfillResult;
       const clip = midi.clipById(amtTarget.clipId);
       if (clip && Array.isArray(r.notes)) {
+        // Context notes are the clip's own, round-tripped untouched — KEEP
+        // their ids (ADR 0001). Sidecar-filled notes are new material; strip
+        // any id the sidecar result might carry (same rule as note-ops'
+        // copyNote/paste) so an absent id lets the backend mint fresh ones
+        // instead of the keep-rule re-minting a colliding id from elsewhere.
         const context = clip.notes.filter(
           (n) => n.tick + n.lengthTicks <= amtTarget.startTicks || n.tick >= amtTarget.endTicks,
         );
-        const filled = (r.notes as MidiNote[]).filter(
-          (n) => n.tick >= amtTarget.startTicks && n.tick < amtTarget.endTicks,
-        );
+        const filled = (r.notes as MidiNote[])
+          .filter((n) => n.tick >= amtTarget.startTicks && n.tick < amtTarget.endTicks)
+          .map(copyNote);
         await midi.setNotes(clip.id, [...context, ...filled]);
         this.patch(jobId, { outcome: `${filled.length} notes → ${clip.name}` });
       }
