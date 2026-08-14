@@ -136,6 +136,19 @@ export interface Backend {
    * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
   moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
 
+  /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
+   * primitive) — call on `pointerdown` of a fader/pan control. Matching
+   * mid-gesture commits (e.g. `setTrackGain`/`setTrackPan`) coalesce
+   * backend-side into one history-bound batch; `gestureEnd` closes the
+   * boundary. Optional — real-engine only, same convention as `moveClip?`;
+   * the demo backend has no history to fold into. */
+  gestureBegin?(label: string): Promise<void>;
+  /** Close the open gesture boundary (see `gestureBegin`) — call on
+   * `pointerup`/`pointercancel`. Safe to call even when nothing is open
+   * (a stray event without a matching `gestureBegin`); the backend treats
+   * it as a no-op. */
+  gestureEnd?(): Promise<void>;
+
   /**
    * Seed an empty session with the built-in demo song so the first press of
    * play makes sound (real engine only — the demo backend ships with content).
@@ -412,6 +425,12 @@ class TauriBackend implements Backend {
   }
   moveClip(clipId: string, timelineStartSamples: number) {
     return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  async gestureBegin(label: string) {
+    await invoke("gesture_begin", { label });
+  }
+  async gestureEnd() {
+    await invoke("gesture_end");
   }
   seedDemoProject() {
     return invoke<ProjectSnapshot>("seed_demo_project");

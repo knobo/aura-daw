@@ -161,6 +161,22 @@ class ProjectStore {
     await backend.setTrackArm(trackId, !t.armed);
   }
 
+  /** Open a gesture boundary (Plan E Task 14) — call on `pointerdown` of a
+   * fader/pan control, before the first `setGain`/`setPan` of the drag.
+   * `label` is the gesture's history label (e.g. "gain drag"). No-op in
+   * demo mode (`gestureBegin?` is optional — no history to fold into). */
+  beginGesture(label: string) {
+    void backend.gestureBegin?.(label);
+  }
+
+  /** Close the gesture boundary opened by `beginGesture` — call on
+   * `pointerup`/`pointercancel`. Safe to call even without a matching
+   * `beginGesture` (mirrors `gestureEnd?`'s no-op-on-nothing-open
+   * contract). */
+  endGesture() {
+    void backend.gestureEnd?.();
+  }
+
   // ── clips ──
 
   upsertClip(clip: Clip) {

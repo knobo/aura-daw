@@ -39,6 +39,21 @@
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
     void project.setPan(track.id, v);
   }
+
+  /** Gesture boundaries (Plan E Task 14): explicit begin/end brackets a
+   * fader/pan drag so the backend coalesces the per-`input`-event commits
+   * into one history-bound batch instead of one per pointer move. `oninput`
+   * itself (`onGain`/`onPan` above) is unchanged — the coalescing happens
+   * backend-side, not by throttling these calls. */
+  function onGainPointerDown() {
+    project.beginGesture("gain drag");
+  }
+  function onPanPointerDown() {
+    project.beginGesture("pan drag");
+  }
+  function onGestureEnd() {
+    project.endGesture();
+  }
 </script>
 
 <div class="header" style:--track-color={track.color}>
@@ -113,6 +128,9 @@
           title="Gain"
           aria-label="Gain for {track.name}"
           oninput={onGain}
+          onpointerdown={onGainPointerDown}
+          onpointerup={onGestureEnd}
+          onpointercancel={onGestureEnd}
         />
         <span class="db mono">{formatDb(track.gainDb)}</span>
       </div>
@@ -130,6 +148,9 @@
           style:--fader-fill="var(--violet)"
           aria-label="Pan for {track.name}"
           oninput={onPan}
+          onpointerdown={onPanPointerDown}
+          onpointerup={onGestureEnd}
+          onpointercancel={onGestureEnd}
           ondblclick={() => project.setPan(track.id, 0)}
         />
       </div>

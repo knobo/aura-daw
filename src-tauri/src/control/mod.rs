@@ -122,6 +122,14 @@ pub struct ControlPlane {
     /// is built in `audio::init` and carried by the engine control thread —
     /// see `Committer`'s doc.
     committer: Committer,
+    /// The (at most one) open gesture boundary (Plan E Task 14) —
+    /// `gesture_begin`/`gesture_end` and `set_track_mix`'s transient-fold
+    /// check all go through it. See `GestureState`'s doc.
+    gesture: GestureState,
+    /// The last gesture batch `close_gesture` synthesized, parked here for
+    /// `take_last_gesture_batch` (Task 17's real consumer; this crate's own
+    /// tests until it lands).
+    last_gesture_batch: Mutex<Option<session::Committed>>,
 }
 
 /// The commit core, shareable with the engine control thread (Plan E Task
@@ -665,6 +673,132 @@ pub(crate) mod testutil {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gesture IPC (Plan E Task 14, round-2 inventory row 31, ADR 0003)
+// ---------------------------------------------------------------------------
+
+/// The coalescing key a gesture folds by: the op's discriminant + the
+/// `ObjectRef` it targets + the `PropPath` it targets (round-2 §4.4:
+/// "coalesced by (op_kind, target, actor)" — the (kind, target) half; the
+/// actor half is `OpenGesture::actor`/`GestureState::matches_actor`, checked
+/// separately since it gates whether a commit folds AT ALL, not which key it
+/// folds under). `path` is `Option` because a future non-`Set` op kind may
+/// have no property path; today `for_op` only ever returns `Some(path)`,
+/// since `Op::Set` is the only kind it builds a key for. Exported
+/// (`pub(crate)`) — Task 17 imports this exact type to key its own
+/// history-side merge; the name and the (kind, object, path) shape are
+/// load-bearing, not cosmetic.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CoalesceKey {
+    kind: &'static str,
+    object: op::ObjectRef,
+    path: Option<op::PropPath>,
+}
+
+impl CoalesceKey {
+    /// Builds the key for `op`, or `None` for an op kind gesture folding
+    /// doesn't (yet) handle. Only `Op::Set` today — the only op kind
+    /// `ControlPlane::set_track_mix` (gesture folding's one wired caller)
+    /// ever applies.
+    fn for_op(op: &op::Op) -> Option<Self> {
+        match op {
+            op::Op::Set { object, path, .. } => {
+                Some(Self { kind: "set", object: object.clone(), path: Some(*path) })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A gesture in progress: one explicit `gesture_begin`..`gesture_end` span
+/// (round-2 §4.4's CLAP-style primitive; ADR 0003). `baselines`/`last` are
+/// `Vec`s, not `HashMap`s — `PropPath` isn't `Hash` (op.rs's closed enum,
+/// left untouched — `fold_ops` makes the same call for the same reason), and
+/// a gesture's key count is small (a handful of track/property pairs at
+/// most), so a linear scan is a non-issue.
+struct OpenGesture {
+    actor: op::Actor,
+    /// One correlation id for the WHOLE gesture — each transient commit
+    /// folded into it keeps its own tx's `rev`, but the synthesized history
+    /// batch this gesture eventually produces carries this run id instead.
+    run: String,
+    /// First-seen inverse per coalesce key — the gesture's baseline (what
+    /// each key was BEFORE the gesture began; never overwritten once set).
+    baselines: Vec<(CoalesceKey, op::Op)>,
+    /// Last-seen forward op per key — what each key IS as of the most
+    /// recent fold (overwritten every time the key reappears).
+    last: Vec<(CoalesceKey, op::Op)>,
+    label: String,
+}
+
+/// Holds the (at most one) open gesture. `ControlPlane` owns one instance;
+/// `gesture_begin`/`gesture_end` and `set_track_mix`'s transient-fold check
+/// all go through it. One gesture at a time is the product reality: a
+/// second `gesture_begin` before the first one's `gesture_end` auto-closes
+/// the stale gesture first (its accumulated batch is still committed, via
+/// `begin`'s return value) — a missed pointerup (pointercancel not wired, a
+/// webview reload mid-drag, ...) can never wedge the channel shut for good.
+pub struct GestureState(Mutex<Option<OpenGesture>>);
+
+impl GestureState {
+    fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// True when a gesture is open for the SAME actor class `actor` names
+    /// (round-2 §4.4's "coalesced by (..., actor)" — the actor half of the
+    /// triple; see `CoalesceKey`'s doc for the other half). In practice
+    /// this is always `Actor::User` today (gestures are a frontend-only
+    /// concept; no MCP tool opens one), but the check is by actor value,
+    /// not a hardcoded `User` match, so a future agent-driven gesture can't
+    /// silently fold into a live user drag or vice versa.
+    fn matches_actor(&self, actor: &op::Actor) -> bool {
+        self.0.lock().as_ref().is_some_and(|g| &g.actor == actor)
+    }
+
+    /// Opens a new gesture. If one was already open, it's taken (closed)
+    /// and handed back to the caller to finish committing — `GestureState`
+    /// has no `ControlPlane` handle of its own to synthesize/emit the
+    /// auto-closed batch.
+    fn begin(&self, label: String, actor: op::Actor) -> Option<OpenGesture> {
+        let mut guard = self.0.lock();
+        let stale = guard.take();
+        *guard =
+            Some(OpenGesture { actor, run: uuid::Uuid::new_v4().to_string(), baselines: Vec::new(), last: Vec::new(), label });
+        stale
+    }
+
+    /// Closes the open gesture (if any), handing it back to the caller to
+    /// synthesize/commit. `None` if nothing was open.
+    fn end(&self) -> Option<OpenGesture> {
+        self.0.lock().take()
+    }
+
+    /// Folds one just-committed, already per-tx-folded batch (`committed.
+    /// ops`/`.inverses` — `fold_ops`'s output, round-2 §4's commit-time
+    /// fold) into the open gesture's accumulator: the LAST forward op per
+    /// key overwrites `last`; the FIRST-seen inverse per key is recorded
+    /// into `baselines` once and never overwritten again (it's what the
+    /// gesture restores on undo). A no-op if no gesture is open (a
+    /// caller-side race against a concurrent `gesture_end` — the fold is
+    /// simply lost, same fate as any transient commit landing after the
+    /// boundary already closed).
+    fn fold_in(&self, committed: &session::Committed) {
+        let mut guard = self.0.lock();
+        let Some(g) = guard.as_mut() else { return };
+        for (op, inv) in committed.ops.iter().zip(committed.inverses.iter()) {
+            let Some(key) = CoalesceKey::for_op(op) else { continue };
+            if !g.baselines.iter().any(|(k, _)| *k == key) {
+                g.baselines.push((key.clone(), inv.clone()));
+            }
+            match g.last.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1 = op.clone(),
+                None => g.last.push((key, op.clone())),
+            }
+        }
+    }
+}
+
 /// MeterSink that keeps only the latest frame so MCP's `read_meters` tool can
 /// "hear" current levels without a streaming subscription. Never unsubscribes.
 struct LatestMeterCache(Arc<Mutex<Option<MeterFrame>>>);
@@ -722,7 +856,18 @@ impl ControlPlane {
         // closure instance — see `Committer`'s doc.
         let emit: Arc<EventEmitter> = Arc::new(emit);
         let committer = Committer::new(session.clone(), shared.clone(), tables.clone(), emit.clone());
-        Self { session, shared, tables, engine, jobs, latest_meters, emit, committer }
+        Self {
+            session,
+            shared,
+            tables,
+            engine,
+            jobs,
+            latest_meters,
+            emit,
+            committer,
+            gesture: GestureState::new(),
+            last_gesture_batch: Mutex::new(None),
+        }
     }
 
     fn emit_transport(&self, snap: &TransportState) {
@@ -1118,7 +1263,15 @@ impl ControlPlane {
                 }
             }
         }
-        self.commit(meta, |tx| {
+        // Plan E Task 14: while a gesture is open for `meta`'s actor class,
+        // this batch runs TRANSIENT (document + RT effects immediate,
+        // `project://changed` suppressed via `commit_with(..., false)`) and
+        // folds into the gesture's accumulator instead of reaching history
+        // directly — `gesture_end` synthesizes the ONE history-bound batch
+        // the whole drag reduces to. Checked BEFORE `meta` is consumed
+        // below (either arm moves it).
+        let gesture_open = self.gesture.matches_actor(&meta.actor);
+        let apply = |tx: &mut session::Tx<'_>| {
             for c in &changes {
                 if let Some(g) = c.gain_db {
                     tx.apply(set_prop(&c.track_id, op::PropPath::Gain, serde_json::json!(g)))?;
@@ -1137,7 +1290,13 @@ impl ControlPlane {
                 }
             }
             Ok(())
-        })?;
+        };
+        if gesture_open {
+            let committed = self.commit_with(meta.transient(), apply, false)?;
+            self.gesture.fold_in(&committed);
+        } else {
+            self.commit(meta, apply)?;
+        }
         // Re-lock (a fresh acquisition, separate from the pre-check and the
         // commit above) to read back the post-commit state. A track that
         // existed at the pre-check can vanish here if a concurrent
@@ -1279,6 +1438,113 @@ impl ControlPlane {
         self.committer.commit_with_rebuild(meta, f, emit_project_changed, || {
             self.engine.send(ControlMsg::Rebuild)
         })
+    }
+
+    // ---- gestures (Plan E Task 14) ---------------------------------------
+
+    /// Opens a gesture boundary — the CLAP-style primitive round-2 §4.4 /
+    /// ADR 0003 describe. While open, matching commits (today: only
+    /// `set_track_mix` checks — same actor class as this gesture's) run
+    /// TRANSIENT and fold into this gesture's accumulator instead of
+    /// reaching history directly; `gesture_end` synthesizes the ONE
+    /// history-bound batch the whole drag reduces to. One gesture at a time
+    /// is the product reality: a second `gesture_begin` before the first
+    /// one's `gesture_end` auto-closes the stale gesture first (committing
+    /// whatever it had accumulated) — a missed pointerup (pointercancel not
+    /// wired, a webview reload mid-drag, ...) can never wedge the channel
+    /// shut for good. Always `Actor::User` — gestures are a frontend-only
+    /// concept today; no MCP tool opens one.
+    pub fn gesture_begin(&self, label: String) -> Result<(), String> {
+        if let Some(stale) = self.gesture.begin(label, op::Actor::User) {
+            self.close_gesture(stale);
+        }
+        Ok(())
+    }
+
+    /// Closes the open gesture, synthesizing and committing its one
+    /// history-bound batch (see `close_gesture`). A no-op — not an error —
+    /// when nothing is open: `pointerup`/`pointercancel` firing without a
+    /// matching `pointerdown`, or a double-fire, must never error the IPC
+    /// channel.
+    pub fn gesture_end(&self) -> Result<(), String> {
+        if let Some(g) = self.gesture.end() {
+            self.close_gesture(g);
+        }
+        Ok(())
+    }
+
+    /// Synthesizes and finalizes a closed gesture's ONE `Committed`-shaped
+    /// history entry: `ops` = last-forward op per key (first-seen order),
+    /// `inverses` = first-baseline op per key, REVERSED (ready to apply in
+    /// undo order — mirrors `Session::transact`'s own `inverses.reverse()`);
+    /// `meta` carries the gesture's own `run`/`label`, non-transient (this
+    /// IS the history-bound commit the whole gesture reduces to). `rev`/
+    /// `epoch` are read fresh off the session — this synthesized entry
+    /// isn't produced by `Session::transact` (its ops already landed, one
+    /// transient tx at a time, while the gesture was open), so there is no
+    /// single tx's `Committed` to borrow them from; the session's CURRENT
+    /// values are the correct ones to stamp a history entry describing
+    /// "the document as of gesture-close" with.
+    ///
+    /// Parks the batch for `take_last_gesture_batch` (Task 17's real
+    /// consumer; a test hook until then) and emits exactly ONE
+    /// `project://changed` — every transient commit folded into this
+    /// gesture emitted none of its own (`commit_with(..., false)`), so this
+    /// is the gesture's only announcement, keeping an "N invokes -> 1
+    /// event" contract even though N `set_track_mix` calls landed under the
+    /// hood.
+    ///
+    /// A gesture that never folded anything (`last` empty — e.g. a
+    /// `pointerdown`/`pointerup` with no drag in between) produces no batch
+    /// and no emit: nothing changed, so there is nothing for history or the
+    /// UI to hear about.
+    fn close_gesture(&self, gesture: OpenGesture) {
+        if gesture.last.is_empty() {
+            return;
+        }
+        let ops: Vec<op::Op> = gesture.last.into_iter().map(|(_, op)| op).collect();
+        let mut inverses: Vec<op::Op> = gesture.baselines.into_iter().map(|(_, op)| op).collect();
+        inverses.reverse();
+        let meta = op::TxMeta { actor: gesture.actor, run: gesture.run, label: gesture.label, transient: false };
+        let (rev, epoch) = {
+            let session = self.session.lock();
+            (session.rev, session.epoch)
+        };
+        let committed = session::Committed {
+            rev,
+            epoch,
+            ops,
+            inverses,
+            effect: session::EngineEffect::default(),
+            meta: meta.clone(),
+        };
+        *self.last_gesture_batch.lock() = Some(committed);
+
+        // Same payload shape `Committer::commit_with_rebuild` emits (Task
+        // 13's frozen `project://changed` contract) — the full `Project`
+        // shape plus rev/label/actor as additive top-level fields.
+        let mut payload = serde_json::to_value(self.committer.project_changed_payload())
+            .unwrap_or_else(|_| serde_json::json!({}));
+        if let serde_json::Value::Object(map) = &mut payload {
+            map.insert("rev".into(), serde_json::json!(rev));
+            map.insert("label".into(), serde_json::json!(meta.label));
+            map.insert("actor".into(), serde_json::to_value(&meta.actor).unwrap_or_default());
+        }
+        (self.emit)("project://changed", payload);
+    }
+
+    /// Test/Task-17 surface: takes (removes) the last gesture batch
+    /// `close_gesture` parked — either from an explicit `gesture_end` or an
+    /// auto-close inside `gesture_begin`. `pub(crate)`, not `#[cfg(test)]`:
+    /// Task 17's history sink is this fn's real production caller; until it
+    /// lands, this crate's own tests are the only caller. Draining promptly
+    /// matters: a second closing gesture overwrites this slot, so a caller
+    /// that wants BOTH an auto-closed batch and the one that follows it
+    /// must take the first before triggering the second (this crate's own
+    /// auto-close test does exactly that).
+    #[allow(dead_code)] // Task 17 is the real production caller; tests only until then.
+    pub(crate) fn take_last_gesture_batch(&self) -> Option<session::Committed> {
+        self.last_gesture_batch.lock().take()
     }
 
     /// Test-only accessor to the shared session lock, for tests that need
@@ -2110,6 +2376,24 @@ pub fn move_clip(
     control.move_clip(&clip_id, timeline_start_samples, op::TxMeta::user("move clip")).map(|_| ())
 }
 
+/// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
+/// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. The frontend
+/// calls this on `pointerdown` of a fader/pan control; matching mid-gesture
+/// `set_track_mix` calls fold backend-side until `gesture_end` closes the
+/// boundary.
+#[tauri::command]
+pub fn gesture_begin(label: String, control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    control.gesture_begin(label)
+}
+
+/// Close the open gesture boundary (Plan E Task 14) — thin delegate over
+/// [`ControlPlane::gesture_end`]. The frontend calls this on `pointerup`/
+/// `pointercancel`; a no-op (never an error) if nothing is open.
+#[tauri::command]
+pub fn gesture_end(control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    control.gesture_end()
+}
+
 /// Import an audio file as a clip (STUB until zone B lands).
 #[tauri::command]
 pub fn import_audio_clip(
@@ -2626,6 +2910,159 @@ mod tests {
             TxMeta::user("set mix on gone track"),
         );
         assert!(result.is_err(), "mix change on a removed track must error, not panic");
+    }
+
+    // ---- Plan E Task 14: gesture IPC ---------------------------------------
+
+    /// The brief's core TDD case: begin -> 5x `set_track_mix` gain on ONE
+    /// track -> end produces exactly ONE history-bound batch whose inverse
+    /// restores the pre-gesture gain, and the 5 mid-gesture commits' would-
+    /// be `project://changed` spam is reduced to ONE final emit.
+    #[test]
+    fn gesture_folds_five_gain_sets_into_one_batch_with_one_final_emit() {
+        let (plane, _engine_rx, events) = test_plane_with_tracks(&["t-1"]);
+        plane.gesture_begin("gain drag".into()).unwrap();
+
+        for i in 1..=5 {
+            plane
+                .set_track_mix(
+                    vec![TrackMixChange { gain_db: Some(-3.0 * i as f64), ..TrackMixChange::new("t-1") }],
+                    TxMeta::user("set gain"),
+                )
+                .unwrap();
+        }
+
+        assert!(
+            events.lock().iter().all(|(name, _)| name != "project://changed"),
+            "mid-gesture transient commits must not emit project://changed"
+        );
+
+        plane.gesture_end().unwrap();
+
+        let emits = events.lock().iter().filter(|(name, _)| name == "project://changed").count();
+        assert_eq!(emits, 1, "gesture_end must emit exactly one project://changed");
+
+        let batch = plane.take_last_gesture_batch().expect("gesture_end must produce a batch");
+        assert!(!batch.meta.transient, "the history-bound batch is non-transient");
+        assert_eq!(batch.ops.len(), 1, "one folded Set for the one (track, path) key touched");
+        assert_eq!(batch.inverses.len(), 1);
+
+        match &batch.ops[0] {
+            Op::Set { object: ObjectRef::Track(id), path: PropPath::Gain, to, .. } => {
+                assert_eq!(id, "t-1");
+                assert_eq!(*to, serde_json::json!(-15.0), "last-forward value wins");
+            }
+            other => panic!("expected a Track Gain Set, got {other:?}"),
+        }
+        match &batch.inverses[0] {
+            Op::Set { object: ObjectRef::Track(id), path: PropPath::Gain, to, .. } => {
+                assert_eq!(id, "t-1");
+                assert_eq!(*to, serde_json::json!(0.0), "inverse restores the pre-gesture (baseline) gain");
+            }
+            other => panic!("expected a Track Gain Set inverse, got {other:?}"),
+        }
+    }
+
+    /// Two tracks touched during one gesture: the batch carries ONE folded
+    /// Set per (track, path) key, not one per `set_track_mix` call.
+    #[test]
+    fn gesture_folds_one_set_per_track_path_key_across_two_tracks() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
+        plane.gesture_begin("gain drag".into()).unwrap();
+
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-3.0), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-4.0), ..TrackMixChange::new("t-2") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-6.0), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+
+        plane.gesture_end().unwrap();
+        let batch = plane.take_last_gesture_batch().expect("gesture_end must produce a batch");
+        assert_eq!(batch.ops.len(), 2, "one folded Set per (track, path) key, not one per call");
+
+        let mut finals: Vec<(String, f64)> = batch
+            .ops
+            .iter()
+            .map(|op| match op {
+                Op::Set { object: ObjectRef::Track(id), path: PropPath::Gain, to, .. } => {
+                    (id.to_string(), to.as_f64().unwrap())
+                }
+                other => panic!("expected a Track Gain Set, got {other:?}"),
+            })
+            .collect();
+        finals.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(finals, vec![("t-1".to_string(), -6.0), ("t-2".to_string(), -4.0)]);
+    }
+
+    /// `gesture_begin` while one is already open auto-closes the stale
+    /// gesture first (committing its batch) instead of discarding it — a
+    /// missed `pointerup` must not wedge the channel. Both batches are
+    /// retrievable, in order, by draining `take_last_gesture_batch` between
+    /// the auto-close and the second, explicit `gesture_end`.
+    #[test]
+    fn gesture_begin_while_open_auto_closes_the_stale_gesture_first() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+
+        plane.gesture_begin("gain drag".into()).unwrap();
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-3.0), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+
+        // No matching `gesture_end` — a second `begin` must auto-close it.
+        plane.gesture_begin("pan drag".into()).unwrap();
+        let first = plane.take_last_gesture_batch().expect("auto-close must commit a batch");
+        assert_eq!(first.meta.label, "gain drag");
+
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { pan: Some(0.5), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set pan"),
+            )
+            .unwrap();
+        plane.gesture_end().unwrap();
+        let second = plane.take_last_gesture_batch().expect("gesture_end must commit a batch");
+        assert_eq!(second.meta.label, "pan drag");
+
+        assert_ne!(first.meta.run, second.meta.run, "two independent batches, two independent run ids");
+    }
+
+    /// A gesture that never folds anything (begin immediately followed by
+    /// end, no `set_track_mix` in between — e.g. a click with no drag)
+    /// produces no batch and no emit.
+    #[test]
+    fn gesture_end_with_nothing_folded_produces_no_batch_and_no_emit() {
+        let (plane, _engine_rx, events) = test_plane_with_tracks(&["t-1"]);
+        plane.gesture_begin("gain drag".into()).unwrap();
+        plane.gesture_end().unwrap();
+
+        assert!(plane.take_last_gesture_batch().is_none());
+        assert!(events.lock().iter().all(|(name, _)| name != "project://changed"));
+    }
+
+    /// `gesture_end` without a matching `gesture_begin` (a stray
+    /// `pointerup`/`pointercancel`) is a safe no-op, never an error — the
+    /// IPC channel must not wedge on a mismatched event pair.
+    #[test]
+    fn gesture_end_without_a_matching_begin_is_a_safe_no_op() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        assert!(plane.gesture_end().is_ok());
+        assert!(plane.take_last_gesture_batch().is_none());
     }
 
     // ---- Plan E Task 12: transport family + commit_with -------------------

@@ -145,6 +145,8 @@ pub fn run() {
             control::get_project_state,
             control::set_track_mix,
             control::move_clip,
+            control::gesture_begin,
+            control::gesture_end,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----

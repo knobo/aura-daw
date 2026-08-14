@@ -10,12 +10,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Clip } from "../types/ipc";
 
 const moveClip = vi.fn(() => Promise.resolve());
+const gestureBegin = vi.fn(() => Promise.resolve());
+const gestureEnd = vi.fn(() => Promise.resolve());
 
 vi.mock("../tauri", () => ({
   backend: {
     mode: "tauri" as const,
     on: () => () => {},
     moveClip,
+    gestureBegin,
+    gestureEnd,
   },
 }));
 
@@ -61,5 +65,30 @@ describe("commitClipMove", () => {
     await project.commitClipMove("no-such-clip");
 
     expect(moveClip).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Gesture boundaries (Plan E Task 14): `TrackHeader`'s fader/pan
+ * `onpointerdown`/`onpointerup`/`onpointercancel` handlers call
+ * `project.beginGesture`/`endGesture`, which are thin wrappers over
+ * `backend.gestureBegin?`/`gestureEnd?` — the same optional-binding
+ * convention `moveClip?` established above. There is no component test
+ * harness for `TrackHeader.svelte` (or any `.svelte` file) in this suite
+ * today — every existing test in this file exercises the store/binding
+ * layer directly rather than mounting a component — so these tests do the
+ * same: they pin the store-level contract the pointer handlers rely on
+ * (label passed through on begin; end is a plain, argument-less close),
+ * not the DOM event wiring itself.
+ */
+describe("beginGesture / endGesture", () => {
+  it("beginGesture invokes backend.gestureBegin with the given label", () => {
+    project.beginGesture("gain drag");
+    expect(gestureBegin).toHaveBeenCalledWith("gain drag");
+  });
+
+  it("endGesture invokes backend.gestureEnd", () => {
+    project.endGesture();
+    expect(gestureEnd).toHaveBeenCalledWith();
   });
 });
