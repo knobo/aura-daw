@@ -931,13 +931,25 @@ export class DemoBackend implements Backend {
         if (!pinst || pinst.status !== "active") continue;
         shape = this.pluginVoiceShape(pinst.id);
       }
-      for (const n of mc.notes) {
-        const ns = clipStart + this.ticksToSamples(n.tick);
-        const ne = Math.min(ns + this.ticksToSamples(n.lengthTicks), clipEnd);
-        if (ne <= pos) continue;
-        const when = t0 + Math.max(0, ns - pos) / SR;
-        const dur = Math.max(0.05, (ne - Math.max(ns, pos)) / SR);
-        this.scheduleVoice(ctx, chain.gain, when, dur, n.key, n.velocity, bells, shape);
+      // Content repeats every contentLengthTicks until the placement
+      // (lengthTicks) ends — mirrors schedule.rs::clip_events()'s
+      // repetition loop. Absent contentLengthTicks (repeats === 1) is
+      // byte-identical to the pre-looping single pass.
+      const contentTicks = mc.contentLengthTicks ?? mc.lengthTicks;
+      const repeats = Math.max(1, Math.ceil(mc.lengthTicks / contentTicks));
+      for (let rep = 0; rep < repeats; rep++) {
+        const repOffsetTicks = rep * contentTicks;
+        if (repOffsetTicks >= mc.lengthTicks) break;
+        for (const n of mc.notes) {
+          const tick = repOffsetTicks + n.tick;
+          if (tick >= mc.lengthTicks) continue; // onset at/after placement end: dropped
+          const ns = clipStart + this.ticksToSamples(tick);
+          const ne = Math.min(ns + this.ticksToSamples(n.lengthTicks), clipEnd);
+          if (ne <= pos) continue;
+          const when = t0 + Math.max(0, ns - pos) / SR;
+          const dur = Math.max(0.05, (ne - Math.max(ns, pos)) / SR);
+          this.scheduleVoice(ctx, chain.gain, when, dur, n.key, n.velocity, bells, shape);
+        }
       }
     }
   }
@@ -1188,9 +1200,11 @@ export class DemoBackend implements Backend {
           if (mc.trackId !== track.id) continue;
           const local = posTicks - mc.timelineStartTicks;
           if (local < 0 || local >= mc.lengthTicks) continue;
+          const contentLen = mc.contentLengthTicks ?? mc.lengthTicks;
+          const localInContent = local % Math.max(1, contentLen);
           for (const n of mc.notes) {
-            if (local < n.tick || local >= n.tick + n.lengthTicks) continue;
-            const age = (local - n.tick) / this.ppq; // beats since onset
+            if (localInContent < n.tick || localInContent >= n.tick + n.lengthTicks) continue;
+            const age = (localInContent - n.tick) / this.ppq; // beats since onset
             const e = (n.velocity / 127) * (0.35 + 0.65 * Math.exp(-age * 2.2));
             if (e > env) env = e;
           }
@@ -1547,6 +1561,21 @@ export class DemoBackend implements Backend {
     clip.notes = [...notes].sort((a, b) => a.tick - b.tick || a.key - b.key);
     this.resyncAudio();
     return { ...clip, notes: [...clip.notes] };
+  }
+
+  async midiSetClipBounds(
+    clipId: string,
+    timelineStartTicks: number,
+    lengthTicks: number,
+    contentLengthTicks: number | null,
+  ): Promise<MidiClip> {
+    const clip = this.midiClips.find((c) => c.id === clipId);
+    if (!clip) throw new Error(`unknown MIDI clip: ${clipId}`);
+    clip.timelineStartTicks = timelineStartTicks;
+    clip.lengthTicks = lengthTicks;
+    clip.contentLengthTicks = contentLengthTicks ?? undefined;
+    this.resyncAudio();
+    return { ...clip };
   }
 
   async midiGetClips(): Promise<MidiClip[]> {

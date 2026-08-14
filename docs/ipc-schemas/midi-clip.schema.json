@@ -37,6 +37,10 @@
         "name": { "type": "string" },
         "timelineStartTicks": { "type": "integer", "minimum": 0 },
         "lengthTicks": { "type": "integer", "minimum": 1 },
+        "contentLengthTicks": {
+          "description": "Content (loop/native) length in ticks — ADR 0004's content half of the placement/content split; lengthTicks stays the placement length. Absent means \"same as lengthTicks\" (pre-looping semantics). When lengthTicks > contentLengthTicks the content repeats to fill the placement; when shorter, content is cropped. Additive (D-06).",
+          "type": "integer", "minimum": 1, "maximum": 18446744073709551615
+        },
         "notes": { "type": "array", "items": { "$ref": "#/$defs/note" } }
       },
       "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks", "notes"]
@@ -51,6 +55,10 @@
         "name": { "type": "string" },
         "timelineStartTicks": { "type": "integer", "minimum": 0 },
         "lengthTicks": { "type": "integer", "minimum": 1 },
+        "contentLengthTicks": {
+          "description": "Content (loop/native) length in ticks — ADR 0004's content half of the placement/content split; lengthTicks stays the placement length. Absent means \"same as lengthTicks\" (pre-looping semantics). When lengthTicks > contentLengthTicks the content repeats to fill the placement; when shorter, content is cropped. Additive (D-06).",
+          "type": "integer", "minimum": 1, "maximum": 18446744073709551615
+        },
         "eventsRef": {
           "description": "Relative path of the AMEV chunk, e.g. \"events/<clipId>.bin\". Chunks are immutable-once-written; edits write a new chunk under a new UUID (SCALABILITY §4).",
           "type": "string",

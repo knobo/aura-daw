@@ -148,6 +148,7 @@ pub fn run() {
             midi::set_tempo_map,
             midi::midi_add_clip,
             midi::midi_set_notes,
+            midi::midi_set_clip_bounds,
             midi::midi_get_clips,
             midi::midi_import_file,
             midi::midi_export_file,

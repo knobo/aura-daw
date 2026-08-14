@@ -962,6 +962,7 @@ pub fn demo_seed_clips(
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
+            content_length_ticks: None,
         };
         c.ensure_note_ids().expect("demo notes never collide");
         c
@@ -1061,6 +1062,7 @@ pub fn demo_seed_clips_v2(
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
+            content_length_ticks: None,
         };
         c.ensure_note_ids().expect("demo notes never collide");
         c
@@ -2168,6 +2170,7 @@ mod tests {
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
+            content_length_ticks: None,
         }
     }
 

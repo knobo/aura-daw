@@ -123,18 +123,37 @@
       const target = edgeJump(
         [
           ...clipEdges(project.clips),
-          // MIDI clips are musical time; the tempo map converts them.
+          // MIDI clips are musical time; the tempo map converts them. Length
+          // is the DIFFERENCE of two converted positions, not a direct
+          // conversion of the tick length — the latter drifts under a
+          // non-constant tempo map (pre-existing bug, fixed alongside the
+          // clip-looping work per spec §6).
           ...clipEdges(
-            midi.clips.map((c) => ({
-              timelineStartSamples: midi.ticksToSamples(c.timelineStartTicks),
-              lengthSamples: midi.ticksToSamples(c.lengthTicks),
-            })),
+            midi.clips.map((c) => {
+              const start = midi.ticksToSamples(c.timelineStartTicks);
+              return {
+                timelineStartSamples: start,
+                lengthSamples: midi.ticksToSamples(c.timelineStartTicks + c.lengthTicks) - start,
+              };
+            }),
           ),
         ],
         playhead(),
         dir,
       );
       if (target !== null) void transport.seek(target);
+    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "c") {
+      // Copy the selected timeline clip (spec §6 stamping).
+      e.preventDefault();
+      midi.copySelected();
+    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "v") {
+      // Paste at the playhead, on the selected clip's track.
+      e.preventDefault();
+      void midi.pasteAtPlayhead(midi.samplesToTicks(playhead()));
+    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "d") {
+      // Duplicate immediately after the selected clip.
+      e.preventDefault();
+      void midi.duplicateSelected();
     } else if (e.key === "+" || e.key === "=") {
       view.zoomAt(view.width / 2, 0.75);
     } else if (e.key === "-") {

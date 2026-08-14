@@ -210,6 +210,7 @@ pub(crate) fn apply_hum_notes(
         next_note_id: 1,
         content_id: crate::ids::ContentId::mint(),
         lane_id,
+        content_length_ticks: None,
     };
     clip.ensure_note_ids()?;
     session.midi.clips.push(clip.clone());

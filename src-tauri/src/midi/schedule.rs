@@ -23,32 +23,44 @@ pub struct AbsNoteEvent {
 /// Expand a clip's notes into absolute-sample note-on/off edges, sorted by
 /// (sample, offs-before-ons). Rules:
 ///
+/// * Content (one pass over `clip.notes`) repeats every
+///   `effective_content_length_ticks()` ticks until the placement
+///   (`length_ticks`) ends (spec: drag-to-loop). `content == placement` (the
+///   `None` default) is a single repeat — byte-identical to the pre-looping
+///   behavior.
 /// * Note onsets at/after the clip end are dropped (the clip window clips
-///   its content).
-/// * Note-offs are clamped to the clip end tick.
+///   its content), in every repeat.
+/// * Note-offs are clamped to the clip end tick — including the final
+///   partial repeat's tail.
 /// * Zero-length results (rounding) still get a 1-sample duration so every
 ///   on has its off strictly after it.
 pub fn clip_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
     let clip_end_tick = clip.timeline_start_ticks.saturating_add(clip.length_ticks);
-    let mut out = Vec::with_capacity(clip.notes.len() * 2);
-    for n in &clip.notes {
-        if n.velocity == 0 || n.length_ticks == 0 {
-            continue;
+    let content_len = clip.effective_content_length_ticks();
+    let repeats = clip.length_ticks.div_ceil(content_len).max(1);
+    let mut out = Vec::with_capacity(clip.notes.len() * 2 * repeats as usize);
+    for rep in 0..repeats {
+        let rep_start_tick =
+            clip.timeline_start_ticks.saturating_add(rep.saturating_mul(content_len));
+        for n in &clip.notes {
+            if n.velocity == 0 || n.length_ticks == 0 {
+                continue;
+            }
+            let on_tick = rep_start_tick.saturating_add(n.tick as u64);
+            if on_tick >= clip_end_tick {
+                continue;
+            }
+            let off_tick = on_tick
+                .saturating_add(n.length_ticks as u64)
+                .min(clip_end_tick);
+            let on_s = map.tick_to_samples(on_tick);
+            let mut off_s = map.tick_to_samples(off_tick);
+            if off_s <= on_s {
+                off_s = on_s + 1;
+            }
+            out.push(AbsNoteEvent { sample: on_s, key: n.key, velocity: n.velocity });
+            out.push(AbsNoteEvent { sample: off_s, key: n.key, velocity: 0 });
         }
-        let on_tick = clip.timeline_start_ticks.saturating_add(n.tick as u64);
-        if on_tick >= clip_end_tick {
-            continue;
-        }
-        let off_tick = on_tick
-            .saturating_add(n.length_ticks as u64)
-            .min(clip_end_tick);
-        let on_s = map.tick_to_samples(on_tick);
-        let mut off_s = map.tick_to_samples(off_tick);
-        if off_s <= on_s {
-            off_s = on_s + 1;
-        }
-        out.push(AbsNoteEvent { sample: on_s, key: n.key, velocity: n.velocity });
-        out.push(AbsNoteEvent { sample: off_s, key: n.key, velocity: 0 });
     }
     // Offs before ons at the same sample position so retriggers of the same
     // key release the previous voice first.
@@ -97,12 +109,82 @@ mod tests {
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
         }
     }
 
     /// 120 bpm @ 48 kHz, ppq 960: 1 tick = 25 samples exactly.
     fn map_120() -> TempoMap {
         TempoMap::from_v1(120.0, 48_000).unwrap()
+    }
+
+    #[test]
+    fn repeats_content_across_a_longer_placement() {
+        // Content is one beat (960 ticks) long, placement is 2 beats — the
+        // single note repeats once, at content-length offset.
+        let mut c = clip(0, 1920, vec![note(0, 480, 60, 100)]);
+        c.content_length_ticks = Some(960);
+        let ev = clip_events(&c, &map_120());
+        assert_eq!(
+            ev,
+            vec![
+                AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+                AbsNoteEvent { sample: 480 * 25, key: 60, velocity: 0 },
+                AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 100 },
+                AbsNoteEvent { sample: (960 + 480) * 25, key: 60, velocity: 0 },
+            ],
+            "note repeats once at the content-length offset"
+        );
+    }
+
+    #[test]
+    fn partial_final_repeat_clamps_the_note_tail() {
+        // Content is one beat (960 ticks); placement is 1.5 beats (1440) —
+        // the second repeat's note-on lands inside the placement, but its
+        // note-off must clamp to the placement end, not run past it.
+        let mut c = clip(0, 1440, vec![note(0, 960, 60, 100)]); // near-full-beat note
+        c.content_length_ticks = Some(960);
+        let ev = clip_events(&c, &map_120());
+        assert_eq!(ev.len(), 4, "both repeats' onsets are before placement end (1440)");
+        assert_eq!(ev[0], AbsNoteEvent { sample: 0, key: 60, velocity: 100 });
+        assert_eq!(ev[1], AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 0 });
+        assert_eq!(ev[2], AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 100 });
+        // Off would naturally land at (960+960)*25 = 1920*25, but placement
+        // ends at 1440*25 — clamp there.
+        assert_eq!(ev[3], AbsNoteEvent { sample: 1440 * 25, key: 60, velocity: 0 });
+    }
+
+    #[test]
+    fn content_equal_to_placement_is_a_no_op() {
+        // No content_length_ticks set (None) and an explicit Some equal to
+        // length_ticks must produce IDENTICAL output to today's behavior.
+        let c = clip(3840, 3840, vec![note(960, 960, 60, 100)]);
+        let mut c_explicit = c.clone();
+        c_explicit.content_length_ticks = Some(3840);
+        let baseline = clip_events(&c, &map_120());
+        assert_eq!(clip_events(&c_explicit, &map_120()), baseline, "explicit == placement matches absent");
+        assert_eq!(baseline.len(), 2, "single repeat, unchanged from the pre-looping behavior");
+    }
+
+    #[test]
+    fn tempo_change_mid_repetition_moves_the_later_repeat() {
+        // 120bpm for bar 1, 60bpm after. Content is one bar (3840 ticks);
+        // placement is two bars — repeat 2 starts exactly at the tempo
+        // change and must use the new tempo's sample rate.
+        let map = TempoMap::new(
+            960,
+            vec![TempoEvent { tick: 0, bpm: 120.0 }, TempoEvent { tick: 3840, bpm: 60.0 }],
+            48_000,
+        )
+        .unwrap();
+        let mut c = clip(0, 7680, vec![note(0, 480, 64, 90)]);
+        c.content_length_ticks = Some(3840);
+        let ev = clip_events(&c, &map);
+        // Repeat 0: on at tick 0 (120bpm) -> sample 0.
+        assert_eq!(ev[0], AbsNoteEvent { sample: 0, key: 64, velocity: 90 });
+        // Repeat 1: on at tick 3840 (exactly the tempo change) -> 3840*25 = 96000.
+        assert_eq!(ev[2].sample, 96_000);
+        assert_eq!(ev[2].velocity, 90);
     }
 
     #[test]

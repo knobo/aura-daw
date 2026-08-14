@@ -66,8 +66,10 @@
       const keys = c.notes.map((n) => n.key);
       const mid = keys.length ? Math.round((Math.min(...keys) + Math.max(...keys)) / 2) : 60;
       topKey = Math.min(126, Math.max(24, mid + Math.round(gridH / KEY_H / 2)));
-      // fit ~clip length + 1 bar into the view
-      tpp = Math.max(1, (c.lengthTicks + midi.ticksPerBar) / Math.max(320, gridW));
+      // fit ~content length + 1 bar into the view (the piano roll edits one
+      // repetition of content, not the — possibly looped/stretched —
+      // placement; spec §6)
+      tpp = Math.max(1, (midi.effectiveContentLengthTicks(c) + midi.ticksPerBar) / Math.max(320, gridW));
     } else {
       // outside edit (AMT merge, backend echo): adopt unless mid-gesture
       if (!gesture) working = c.notes.map((n) => ({ ...n }));
@@ -150,7 +152,7 @@
     const key = keyAtY(p.y);
     if (key < 0 || key > 127) return;
     const tick = snapTick(tickAtX(p.x), true);
-    if (tick >= clip.lengthTicks) return;
+    if (tick >= midi.effectiveContentLengthTicks(clip)) return;
     const note: MidiNote = { tick, lengthTicks: gridTicks, key, velocity: 100, channel: 0 };
     working = [...working, note];
     const idx = working.length - 1;
@@ -217,7 +219,7 @@
         midi.region = {
           clipId: clip.id,
           startTicks: snapTick(t0, true),
-          endTicks: Math.min(clip.lengthTicks, snapTick(t1)),
+          endTicks: Math.min(midi.effectiveContentLengthTicks(clip), snapTick(t1)),
         };
       }
       marquee = null;
@@ -389,8 +391,8 @@
       }
     }
 
-    // clip bounds shading (past clip end)
-    const endX = xOfTick(clip.lengthTicks);
+    // content bounds shading (past the content — one repetition — end)
+    const endX = xOfTick(midi.effectiveContentLengthTicks(clip));
     if (endX < w) {
       ctx.fillStyle = "rgba(5,7,13,0.5)";
       ctx.fillRect(Math.max(0, endX), 0, w - Math.max(0, endX), h);
@@ -597,15 +599,21 @@
     // half of the duotone — nothing else in the roll is magenta), decaying
     // fast to a soft track-color sustain while the note is held.
     if (!(ui.noteFlash && transport.isPlaying)) return;
+    // Visibility gate stays against the PLACEMENT (the flash must stop once
+    // playback runs past the clip entirely), but note matching wraps modulo
+    // the CONTENT length — the piano roll shows one repetition, so every
+    // repeat's playback flashes the same displayed notes.
     const posTicks = midi.samplesToTicks(transport.positionAt(nowMs)) - c.timelineStartTicks;
     if (posTicks < 0 || posTicks > c.lengthTicks) return;
+    const contentTicks = midi.effectiveContentLengthTicks(c);
+    const posInContent = ((posTicks % contentTicks) + contentTicks) % contentTicks;
     const secPerTick = 60 / (project.tempoBpm * midi.ppq);
     const MAG = "#ff4fd8";
     fctx.globalCompositeOperation = "lighter";
     const keySustain = new Map<number, number>();
     const keyFlare = new Map<number, number>();
     for (const n of working) {
-      const age = posTicks - n.tick;
+      const age = posInContent - n.tick;
       if (age < 0) continue;
       const held = age < n.lengthTicks;
       const flare = Math.exp(-age * secPerTick * FLASH_DECAY);
@@ -687,8 +695,14 @@
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick);
       if (!playheadEl) return;
+      // The overlay stays visible for the full PLACEMENT duration but wraps
+      // its X position modulo the CONTENT length, so it re-enters at the
+      // left edge on every repeat instead of running off the right side of
+      // the (one-repetition-wide) grid (spec §6).
       const posTicks = midi.samplesToTicks(transport.positionAt(now)) - c.timelineStartTicks;
-      const x = xOfTick(posTicks);
+      const contentTicks = midi.effectiveContentLengthTicks(c);
+      const posInContent = ((posTicks % contentTicks) + contentTicks) % contentTicks;
+      const x = xOfTick(posInContent);
       const visible = posTicks >= 0 && posTicks <= c.lengthTicks && x >= -1 && x <= gridW + 1;
       playheadEl.style.opacity = visible ? "1" : "0";
       if (visible) playheadEl.style.transform = `translateX(${x.toFixed(2)}px)`;

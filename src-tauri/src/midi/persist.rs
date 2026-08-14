@@ -91,6 +91,11 @@ struct PersistedClip {
     /// watermark. The loaded clip's watermark is `max(row, chunk)`.
     #[serde(default = "first_note_id")]
     next_note_id: u32,
+    /// ADR 0004's content half (spec §3): absent = same as `length_ticks`.
+    /// Only ever written to the row when `Some` (see `save_into_project`) so
+    /// an old project resaves byte-diff-free.
+    #[serde(default)]
+    content_length_ticks: Option<u64>,
 }
 
 /// v3 content row (round-2 §5, ADR 0004): the note payload half of the
@@ -105,6 +110,11 @@ struct PersistedContent {
     events_ref: Option<String>,
     #[serde(default = "first_note_id")]
     next_note_id: u32,
+    /// ADR 0004's content half (spec §3): absent = same as the placement's
+    /// `length_ticks`. Only ever written when `Some` (see
+    /// `save_into_project`) so an old project resaves byte-diff-free.
+    #[serde(default)]
+    content_length_ticks: Option<u64>,
 }
 
 /// v3 placement row: the position/identity half of the split.
@@ -170,6 +180,12 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
             "kind": "midi",
             "nextNoteId": clip.next_note_id,
         });
+        // ADR 0004 content/placement split: the loop length is the content
+        // half, so it lives on the content row. Only write the key when
+        // Some — a never-looped project resaves byte-diff-free (D-06).
+        if let Some(cl) = clip.content_length_ticks {
+            content["contentLengthTicks"] = json!(cl);
+        }
         if !clip.notes.is_empty() {
             let chunk_name = format!("{}.bin", uuid::Uuid::new_v4());
             let chunk = events::encode_notes(midi.ppq, &clip.notes, clip.next_note_id);
@@ -360,6 +376,7 @@ fn parse_clips_legacy(dir: &Path, root: &Value, ppq: u32) -> Result<Vec<MidiClip
             next_note_id,
             content_id,
             lane_id,
+            content_length_ticks: row.content_length_ticks,
         });
     }
     Ok(clips)
@@ -432,6 +449,7 @@ fn parse_clips_v3_native(dir: &Path, root: &Value, ppq: u32) -> Result<Vec<MidiC
             next_note_id,
             content_id: placement.content_id.into(),
             lane_id: placement.lane_id.into(),
+            content_length_ticks: content.content_length_ticks,
         });
     }
     Ok(clips)
@@ -587,6 +605,7 @@ mod tests {
             next_note_id,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track),
+            content_length_ticks: None,
         }
     }
 
@@ -654,6 +673,45 @@ mod tests {
         assert_eq!(v2.clips[0].content_id, midi.clips[0].content_id, "round-trips through the split");
         assert_eq!(v2.clips[0].lane_id, midi.clips[0].lane_id);
         assert!(v2.clips[1].notes.is_empty());
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn content_length_ticks_round_trips_when_present() {
+        let parent = tmp_parent("content-length-present");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let mut c = clip("t1", some_notes(2));
+        c.length_ticks = 7680;
+        c.content_length_ticks = Some(3840);
+        let midi = store_with(vec![c]);
+        save_into_project(&dir, &midi).unwrap();
+
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["content"][0]["contentLengthTicks"], 3840);
+
+        let v2 = load_from_project(&dir).unwrap().unwrap();
+        assert_eq!(v2.clips[0].content_length_ticks, Some(3840));
+        assert_eq!(v2.clips[0].length_ticks, 7680);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn content_length_ticks_absent_round_trips_as_none() {
+        let parent = tmp_parent("content-length-absent");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let midi = store_with(vec![clip("t1", some_notes(1))]); // content_length_ticks: None
+        save_into_project(&dir, &midi).unwrap();
+
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        assert!(
+            raw["content"][0].get("contentLengthTicks").is_none(),
+            "absent stays absent on disk — never writes null or the placement length"
+        );
+
+        let v2 = load_from_project(&dir).unwrap().unwrap();
+        assert_eq!(v2.clips[0].content_length_ticks, None);
         let _ = fs::remove_dir_all(&parent);
     }
 

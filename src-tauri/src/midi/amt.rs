@@ -32,10 +32,12 @@ pub fn infill_params(
     if region_end <= region_start {
         return Err("regionEndTicks must be > regionStartTicks".into());
     }
-    if region_end as u64 > clip.length_ticks {
+    // A looped clip's content repeats — infill always targets the ONE
+    // repeated bar of content, not the (possibly much longer) placement.
+    let content_len = clip.effective_content_length_ticks();
+    if region_end as u64 > content_len {
         return Err(format!(
-            "region end {region_end} exceeds clip length {}",
-            clip.length_ticks
+            "region end {region_end} exceeds content length {content_len}"
         ));
     }
     let context: Vec<&MidiNote> = clip
@@ -155,6 +157,7 @@ mod tests {
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t"),
+            content_length_ticks: None,
         }
     }
 
@@ -172,6 +175,28 @@ mod tests {
 
         assert!(infill_params(960, 120.0, &c, 1920, 960, None, None).is_err());
         assert!(infill_params(960, 120.0, &c, 0, 10_000, None, None).is_err());
+    }
+
+    #[test]
+    fn region_validates_against_content_length_not_placement_length() {
+        let mut clip = MidiClip {
+            id: "c1".into(), track_id: "t1".into(), name: "c".into(),
+            timeline_start_ticks: 0, length_ticks: 7680, // placement: 2 bars
+            notes: vec![], next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: Some(3840), // content: 1 bar
+        };
+        // A region inside the CONTENT (1 bar) succeeds even though the
+        // PLACEMENT is 2 bars.
+        assert!(infill_params(960, 120.0, &clip, 0, 3840, None, None).is_ok());
+        // A region past the content (but still inside the placement) is
+        // rejected — infill always targets the one repeated bar of content,
+        // never a placement-relative region.
+        let err = infill_params(960, 120.0, &clip, 0, 3841, None, None).unwrap_err();
+        assert!(err.contains("exceeds"), "got: {err}");
+        clip.content_length_ticks = None; // absent -> falls back to placement length, unchanged behavior
+        assert!(infill_params(960, 120.0, &clip, 0, 7680, None, None).is_ok());
     }
 
     #[test]

@@ -388,6 +388,7 @@ pub fn midi_add_clip(
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id,
+            content_length_ticks: None,
         };
         s.clips.push(clip.clone());
         Ok(clip)
@@ -462,6 +463,56 @@ fn assign_incoming_note_ids(
         local_notes.push(n);
     }
     (local_notes, next_watermark)
+}
+
+/// Pure core of `midi_set_clip_bounds`: validates and applies a clip's new
+/// placement (+ optional content length) against an owned clip slice —
+/// unit-testable without a tauri State harness (mirrors
+/// `assign_incoming_note_ids`'s split for `midi_set_notes`). `None` for
+/// `content_length_ticks` explicitly CLEARS a previously-set content length
+/// back to "same as placement" — the command always sends the caller's
+/// current intent, never merges partial updates.
+fn apply_clip_bounds(
+    clips: &mut [MidiClip],
+    clip_id: &crate::ids::ClipId,
+    timeline_start_ticks: u64,
+    length_ticks: u64,
+    content_length_ticks: Option<u64>,
+) -> Result<MidiClip, String> {
+    if length_ticks == 0 {
+        return Err("lengthTicks must be > 0".into());
+    }
+    if content_length_ticks == Some(0) {
+        return Err("contentLengthTicks must be > 0 when present".into());
+    }
+    let clip = clips
+        .iter_mut()
+        .find(|c| &c.id == clip_id)
+        .ok_or_else(|| format!("unknown MIDI clip: {clip_id}"))?;
+    clip.timeline_start_ticks = timeline_start_ticks;
+    clip.length_ticks = length_ticks;
+    clip.content_length_ticks = content_length_ticks;
+    Ok(clip.clone())
+}
+
+/// Move and/or resize a clip's placement (and optionally pin its content
+/// length) — one additive command serving both the edge-drag gesture (sets
+/// placement + content length atomically) and plain clip moves, which
+/// closes a pre-existing hole: `midi.svelte.ts::moveClip()` was
+/// frontend-only, so a dragged clip never reached the scheduler or the
+/// project file (spec §5).
+#[tauri::command]
+pub fn midi_set_clip_bounds(
+    clip_id: crate::ids::ClipId,
+    timeline_start_ticks: u64,
+    length_ticks: u64,
+    content_length_ticks: Option<u64>,
+    state: State<'_, MidiState>,
+    audio: State<'_, AudioState>,
+) -> Result<MidiClip, String> {
+    with_synced_store(&audio, &state, true, move |s| {
+        apply_clip_bounds(&mut s.clips, &clip_id, timeline_start_ticks, length_ticks, content_length_ticks)
+    })
 }
 
 #[tauri::command]
@@ -642,6 +693,56 @@ mod tests {
         assert_eq!(state.meter_map, vec![MeterEvent { tick: 0, num: 4, den: 4 }]);
     }
 
+    // ---- midi_set_clip_bounds's core (apply_clip_bounds), pure and directly testable ----
+
+    fn clip_for_bounds(id: &str, length_ticks: u64) -> MidiClip {
+        MidiClip {
+            id: id.into(), track_id: "t1".into(), name: "c".into(),
+            timeline_start_ticks: 0, length_ticks, notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
+        }
+    }
+
+    #[test]
+    fn apply_clip_bounds_moves_and_resizes() {
+        let mut clips = vec![clip_for_bounds("c1", 1920), clip_for_bounds("c2", 500)];
+        let updated = apply_clip_bounds(&mut clips, &"c1".into(), 960, 3840, Some(1920)).unwrap();
+        assert_eq!(updated.timeline_start_ticks, 960);
+        assert_eq!(updated.length_ticks, 3840);
+        assert_eq!(updated.content_length_ticks, Some(1920));
+        // Written into the slice, not just the return value.
+        assert_eq!(clips[0].timeline_start_ticks, 960);
+        assert_eq!(clips[0].content_length_ticks, Some(1920));
+        // The other clip is untouched.
+        assert_eq!(clips[1].timeline_start_ticks, 0);
+    }
+
+    #[test]
+    fn apply_clip_bounds_can_clear_content_length_back_to_absent() {
+        let mut clips = vec![clip_for_bounds("c1", 1920)];
+        clips[0].content_length_ticks = Some(480);
+        apply_clip_bounds(&mut clips, &"c1".into(), 0, 1920, None).unwrap();
+        assert_eq!(clips[0].content_length_ticks, None, "explicit None clears a previously-set content length");
+    }
+
+    #[test]
+    fn apply_clip_bounds_rejects_zero_length_and_zero_content_length() {
+        let mut clips = vec![clip_for_bounds("c1", 1920)];
+        assert!(apply_clip_bounds(&mut clips, &"c1".into(), 0, 0, None).is_err());
+        assert!(apply_clip_bounds(&mut clips, &"c1".into(), 0, 100, Some(0)).is_err());
+        // Rejected calls must not have mutated the clip.
+        assert_eq!(clips[0].length_ticks, 1920);
+    }
+
+    #[test]
+    fn apply_clip_bounds_rejects_unknown_clip() {
+        let mut clips = vec![clip_for_bounds("c1", 1920)];
+        assert!(apply_clip_bounds(&mut clips, &"no-such-clip".into(), 0, 100, None).is_err());
+    }
+
     // ---- midi_set_notes's keep-rule (H-1/M-9), pure and directly testable ----
 
     #[test]
@@ -699,6 +800,7 @@ mod tests {
             next_note_id: 1,
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
         });
         midi.dirty = true;
         midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));
