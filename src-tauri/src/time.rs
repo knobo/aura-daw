@@ -64,12 +64,20 @@ pub fn bpm_from_period(period: u64) -> f64 {
 
 /// Cross-domain comparison, explicit and never `Ord` (round-2 §3.1):
 /// comparing a `Ticks` and a `Samples` value needs a tempo map to make
-/// them commensurable, so every call site names one. Implemented in this
-/// module too (Task 3 needs `TempoMap::tick_to_samples_v3`, which doesn't
-/// exist yet — the trait is declared now, WITHOUT impls, so it compiles
-/// standalone; Task 3 adds the two impls once the bijection exists).
+/// them commensurable, so every call site names one.
 pub trait CmpIn<Other> {
     fn cmp_in(&self, other: &Other, map: &crate::midi::tempo::TempoMap) -> std::cmp::Ordering;
+}
+
+impl CmpIn<Samples> for Ticks {
+    fn cmp_in(&self, other: &Samples, map: &crate::midi::tempo::TempoMap) -> std::cmp::Ordering {
+        map.tick_to_samples_v3(*self).cmp(other)
+    }
+}
+impl CmpIn<Ticks> for Samples {
+    fn cmp_in(&self, other: &Ticks, map: &crate::midi::tempo::TempoMap) -> std::cmp::Ordering {
+        self.cmp(&map.tick_to_samples_v3(*other))
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +128,18 @@ mod tests {
         // divide by zero). Callers validate bpm > 0 before this point (as
         // TempoMap::new already does); this is a belt-and-braces floor.
         assert!(period_from_bpm(f64::MIN_POSITIVE) > 0, "never zero");
+    }
+}
+
+#[cfg(test)]
+mod cmp_in_tests {
+    use super::*;
+    use crate::midi::tempo::TempoMap;
+
+    #[test]
+    fn cmp_in_orders_across_domains_via_the_named_map() {
+        let m = TempoMap::from_v1(120.0, 48_000).unwrap();
+        assert_eq!(Ticks(960).cmp_in(&Samples(24_000), &m), std::cmp::Ordering::Equal);
+        assert_eq!(Ticks(960).cmp_in(&Samples(1), &m), std::cmp::Ordering::Greater);
     }
 }
