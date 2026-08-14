@@ -2,10 +2,10 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "aura:ipc/midi-clip.schema.json",
   "title": "MidiClip",
-  "description": "MIDI clip + note payloads: arguments/results of midi_add_clip, midi_set_notes, midi_get_clips (Rust mirror: src-tauri/src/midi/types.rs). ALL musical positions are integer ticks at the project PPQ (debt D-02: never seconds, never samples). On the IPC surface notes travel as JSON arrays on the clip; in project.json v2 they are persisted as AMEV binary chunks ($defs persistedClip). Emitter contract — no additionalProperties:false (D-06).",
+  "description": "MIDI clip + note payloads: arguments/results of midi_add_clip, midi_set_notes, midi_get_clips (Rust mirror: src-tauri/src/midi/types.rs). ALL musical positions are integer ticks at the project PPQ (debt D-02: never seconds, never samples). On the IPC surface notes travel as JSON arrays on the clip; in project.json notes are persisted as AMEV binary chunks. v2 persists one conflated row per clip ($defs/persistedClipLegacy); from schemaVersion 3 (ADR 0004, round-2 §5, transcribed from src-tauri/src/midi/persist.rs:178-233) that row is split across three project.json arrays — $defs/persistedContentRow (content[]), $defs/persistedPlacementRow (placements[]), $defs/persistedLaneRow (lanes[]) — see project-v3.schema.json. Emitter contract — no additionalProperties:false (D-06).",
   "oneOf": [
     { "$ref": "#/$defs/clip" },
-    { "$ref": "#/$defs/persistedClip" }
+    { "$ref": "#/$defs/persistedClipLegacy" }
   ],
   "$defs": {
     "note": {
@@ -45,9 +45,9 @@
       },
       "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks", "notes"]
     },
-    "persistedClip": {
-      "title": "MidiClip (project.json v2)",
-      "description": "Persisted form: notes live in an AMEV chunk file (16-byte records; layout in src-tauri/src/midi/events.rs), referenced relative to the .aura dir.",
+    "persistedClipLegacy": {
+      "title": "MidiClip (project.json v2, superseded)",
+      "description": "v2's single conflated row per clip: notes live in an AMEV chunk file (16-byte records; layout in src-tauri/src/midi/events.rs), referenced relative to the .aura dir. SUPERSEDED at schemaVersion 3 by the persistedContentRow/persistedPlacementRow/persistedLaneRow split below (ADR 0004) — persist.rs stops WRITING this shape from v3 on (`obj.remove(\"midiClips\")` on every v3 save) but still READS it forever (src-tauri/src/midi/persist.rs::parse_clips_legacy), so an un-resaved v2 project keeps loading correctly.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "format": "uuid" },
@@ -74,6 +74,57 @@
         }
       },
       "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks"]
+    },
+    "persistedContentRow": {
+      "title": "MidiClip content row (project.json v3, content[])",
+      "description": "ADR 0004 note-payload half of the v3 content/placement split (round-2 §5), transcribed from persist.rs:196-215 (`save_snapshot_into_project`). One row per MIDI clip; joined to its placement row via the placement's contentId.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "kind": {
+          "description": "Every content row this codebase writes today is \"midi\"; read but not yet branched on (a future audio-content-array round would add \"audio\" rows here).",
+          "type": "string",
+          "const": "midi"
+        },
+        "nextNoteId": {
+          "description": "Persisted note-id watermark (round-2 §2.1, C-1) — MOVED here from the v2 placement row: the durable authority for the clip's next-minted note id, written unconditionally even for an emptied clip. Loaded as max(row, chunk).",
+          "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 1
+        },
+        "contentLengthTicks": {
+          "description": "Content (loop/native) length in ticks (ADR 0004). Only written when Some, so a never-looped project resaves byte-diff-free. Absent means \"same as the placement's lengthTicks\".",
+          "type": "integer", "minimum": 1, "maximum": 18446744073709551615
+        },
+        "eventsRef": {
+          "description": "Relative path of the AMEV chunk, e.g. \"events/<uuid>.bin\". Only written when the clip has at least one note; absent for an empty clip. Chunks are immutable-once-written; edits write a new chunk under a new UUID (SCALABILITY §4).",
+          "type": "string",
+          "pattern": "^events/[^/]+\\.bin$"
+        }
+      },
+      "required": ["id", "kind", "nextNoteId"]
+    },
+    "persistedPlacementRow": {
+      "title": "MidiClip placement row (project.json v3, placements[])",
+      "description": "ADR 0004 position/identity half of the v3 content/placement split (round-2 §5), transcribed from persist.rs:216-223. One row per MIDI clip; resolves to a track through laneId -> lanes[] (persistedLaneRow), not directly.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "format": "uuid" },
+        "contentId": { "description": "Joins to a persistedContentRow's id.", "type": "string", "format": "uuid" },
+        "laneId": { "description": "Joins to a persistedLaneRow's id.", "type": "string" },
+        "name": { "type": "string" },
+        "timelineStartTicks": { "type": "integer", "minimum": 0 },
+        "lengthTicks": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["id", "contentId", "laneId", "name", "timelineStartTicks", "lengthTicks"]
+    },
+    "persistedLaneRow": {
+      "title": "MidiClip lane row (project.json v3, lanes[])",
+      "description": "Resolves a laneId to its trackId (persist.rs:224-234). One row per DISTINCT lane actually referenced by a placement — today that's one per track-with-a-clip (every clip on a track shares that track's default lane, `LaneId::default_for_track`). A track with zero clips gets no lane row.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "trackId": { "type": "string" }
+      },
+      "required": ["id", "trackId"]
     }
   }
 }

@@ -40,17 +40,169 @@ pub enum Op {
         #[serde(default)]
         clip_indices: Vec<usize>,
     },
+    /// Structural: insert an audio clip (payload = full row; inverse =
+    /// ClipRemove) — Plan E Task 3 (round-2 inventory row 3, "most common
+    /// editing gesture reaches no backend channel at all").
+    ClipAdd { clip: crate::audio::types::Clip, index: usize },
+    /// Structural: remove an audio clip; `clip`/`index` advisory beyond
+    /// `clip.id` — store truth wins, mirroring `TrackRemove`.
+    ClipRemove { clip: crate::audio::types::Clip, index: usize },
+    /// Plan E Task 5: atomic tempo/meter replacement, including the
+    /// `transport.tempo_bpm` mirror (= first event's bpm), which today is a
+    /// second non-atomic phase (round-2 inventory row 4). Inverse carries
+    /// the previous triple.
+    TempoSet {
+        ppq: u32,
+        events: Vec<crate::midi::types::TempoEvent>,
+        meter: Vec<crate::midi::types::MeterEvent>,
+    },
+    /// Structural: insert a MIDI clip (payload = full row incl. content_id/
+    /// lane_id/next_note_id; inverse = MidiClipRemove). Duplicate-id guard
+    /// like ClipAdd. Restoring a removed clip's row restores its watermark
+    /// — correct: that watermark was the clip's own (ADR 0001).
+    MidiClipAdd { clip: crate::midi::types::MidiClip, index: usize },
+    /// Structural: remove a MIDI clip; `clip`/`index` advisory beyond
+    /// `clip.id` — store truth wins, mirroring `ClipRemove`.
+    MidiClipRemove { clip: crate::midi::types::MidiClip, index: usize },
+    /// §4.4 value-replacement wrapper form: whole-notes replace, diffed
+    /// against store truth server-side, coalescable by (kind, object,
+    /// actor). `notes` may carry noteId 0 (mint) or live ids (keep) —
+    /// `assign_incoming_note_ids`'s keep-rule applies inside `apply_raw`.
+    /// Inverse = MidiSetNotes with the previous notes (all live ids). The
+    /// watermark advances monotonically and is NOT rewound by the inverse
+    /// (scope ruling 3, ADR 0001).
+    MidiSetNotes { clip: crate::ids::ClipId, notes: Vec<crate::midi::types::MidiNote> },
+    /// §4.4 value-replacement wrapper (Plan E Task 10): the automation lane
+    /// analogue of `MidiSetNotes` — one op replaces (or deletes) ONE lane's
+    /// full point set; an edit gesture is one lane write, never one op per
+    /// point (D-03). `key` addresses the lane by its `AutomationLane::id` —
+    /// a plain string, not a struct key, so no new `ObjectRef` variant is
+    /// needed. `lane: None` deletes the lane at `key` (a no-op, not an
+    /// error, if it doesn't exist); `Some` upserts (replaces in place if
+    /// `key` already names a lane, else inserts). Inverse carries the
+    /// previous lane at `key` (or `None` if it didn't exist before this op).
+    AutomationSetLane { key: String, lane: Option<crate::plugins::automation::AutomationLane> },
+    /// Plan E Task 9 (round-2 inventory rows 12-15): register a plugin
+    /// instance row in the document. Prepare-outside: the host instance
+    /// already exists (instantiation round-trip BEFORE the tx, so a plugin
+    /// the host rejects never reaches the document) — this op only
+    /// registers the row. Also used as `PluginRemove`'s computed inverse
+    /// (undo of a remove): in that case the host instance is gone (the
+    /// forward remove destroyed it), so `apply_raw` always folds in the
+    /// `host_forward` effect this case needs (`Instantiate` + `LoadState`
+    /// when a state blob is on file) — a redundant-but-safe re-derive for
+    /// the prepare-outside path too (`commit`'s executor skips the actual
+    /// host call when the id is already live, see its doc).
+    PluginAdd { row: crate::plugins::PluginInstanceInfo, index: usize },
+    /// Restore-from-blob (§4.4): `state` is the APST-encoded blob captured
+    /// via the host's `save_state` BEFORE teardown (the same self-describing
+    /// bytes `plugins::state` writes to `<project>/plugins/<id>.state` —
+    /// `None` when the instance had no host state to save, e.g. a stub or a
+    /// plugin without a state interface). The inverse is `PluginAdd` with
+    /// the row + this blob parked in `pending_state`; undo re-instantiates
+    /// through the host state machine (`host_forward`, executed after the
+    /// lock).
+    ///
+    /// `params` (additive, `#[serde(default)]`) is the row's param mirror
+    /// at removal time — self-describing for a journaled/replayed op the
+    /// same way `TrackRemove`'s `clips` is (Task 9 review round 1,
+    /// Important-1). `Op::PluginAdd`'s shape is fixed at `{row, index}` (no
+    /// params slot), so undo can't carry the mirror through the inverse op
+    /// itself; `apply_raw`'s `PluginRemove` arm instead PARKS the mirror in
+    /// `session.plugins.params` (never clearing it on removal, mirroring
+    /// `pending_state`'s same "survive the row's absence" treatment) so a
+    /// later `PluginAdd` for the SAME id (undo) finds it still there. A
+    /// genuinely permanent removal (never undone) leaves a small, bounded
+    /// orphaned entry — acceptable, GC'd wholesale on the next
+    /// `restore_into_session`/project open.
+    PluginRemove {
+        row: crate::plugins::PluginInstanceInfo,
+        index: usize,
+        state: Option<Vec<u8>>,
+        #[serde(default)]
+        params: Vec<crate::plugins::ParamInfo>,
+    },
+    /// Full-state write (zyn patch loads): `state` is the APST-encoded blob
+    /// AFTER the host load (the row's new pending_state truth); the inverse
+    /// carries the PREVIOUS blob (captured via host `save_state` before the
+    /// load) so the patch load is durable AND undoable (closes round-2
+    /// inventory row 14).
+    PluginSetState { instance: String, state: Vec<u8> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "family", content = "id", rename_all = "camelCase")]
-pub enum ObjectRef { Track(crate::ids::TrackId), Clip(crate::ids::ClipId), MidiClip(crate::ids::ClipId) }
+pub enum ObjectRef {
+    Track(crate::ids::TrackId),
+    Clip(crate::ids::ClipId),
+    MidiClip(crate::ids::ClipId),
+    /// Plan E Task 12: the transport is a singleton, not an id-addressed
+    /// row — a unit variant. Adjacently-tagged serde omits the `id` field
+    /// entirely for a unit variant, so the wire form is exactly
+    /// `{"family":"transport"}` (no stray `"id":null`).
+    Transport,
+    /// Plugin instance id (`plugins::PluginInstanceInfo::id`).
+    Plugin(String),
+}
 
 /// Property paths are a closed enum, not strings — renaming a variant is a
 /// compile error at every use site, which is the §4.6 anti-drift rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PropPath { Gain, Pan, Muted, Soloed, Armed }
+pub enum PropPath {
+    Gain, Pan, Muted, Soloed, Armed,
+    /// Track: sampler-bank id or `plugin:<instanceId>`, `None` = unbound.
+    /// Wire form: JSON string or `null` (not an `Option`-shaped object).
+    InstrumentId,
+    /// Clip: timeline placement position, in samples.
+    TimelineStartSamples,
+    /// Clip: placement length, in samples (Plan E Task 8 — LoopJam's
+    /// region-replacement trims need to shrink/reposition an EXISTING
+    /// clip row in place, the audio counterpart of MidiClip's
+    /// `LengthTicks`).
+    LengthSamples,
+    /// Clip: offset into the source audio, in samples (Plan E Task 8 —
+    /// paired with `LengthSamples`/`TimelineStartSamples` so a clip whose
+    /// HEAD is cut can be repositioned in place instead of a
+    /// remove-then-fresh-id-add).
+    OffsetSamples,
+    /// MidiClip: timeline placement position, in ticks.
+    TimelineStartTicks,
+    /// MidiClip: placement length, in ticks. Clamped to >= 1 on write (the
+    /// write side is the clamp authority, mirroring the gain-clamp
+    /// round-trip rule — Plan A) so the inverse observes the post-clamp
+    /// value, never the caller's raw (possibly zero) `to`.
+    LengthTicks,
+    /// MidiClip: content (loop/native) length in ticks — ADR 0004's content
+    /// half of the content/placement split. Wire form is a JSON number or
+    /// `null` (mirrors `MidiClip::content_length_ticks: Option<u64>`);
+    /// `null` clears back to "same as `LengthTicks`".
+    ContentLengthTicks,
+    /// Transport: `"playing"|"stopped"|"recording"` (wire: JSON string).
+    /// Plan E Task 12 (inventory rows 28-29): the property-addressed mirror
+    /// of `ControlPlane::transport`'s direct `session.store.transport.state`
+    /// writes.
+    TransportState,
+    /// Transport: loop-region enabled flag (wire: JSON bool).
+    LoopEnabled,
+    /// Transport: loop-region start, in samples (wire: JSON non-negative
+    /// integer).
+    LoopStartSamples,
+    /// Transport: loop-region end, in samples (wire: JSON non-negative
+    /// integer).
+    LoopEndSamples,
+    /// Transport: stop-at-end policy flag (wire: JSON bool).
+    StopAtEnd,
+    /// Transport: engine sample rate (wire: JSON non-negative integer,
+    /// `u32`).
+    SampleRate,
+    /// Plugin: one parameter, addressed by its stable per-plugin id (CLAP
+    /// param id / LV2 control-port index — the same id
+    /// `plugins::ParamChange::id` carries). Wire form: `to`/`from` are JSON
+    /// numbers (the param's value). Coalescable (§4.4): a knob drag folds
+    /// to net `Set`s per (instance, index), same as `Gain`.
+    Param { index: u32 },
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +215,12 @@ pub struct TxMeta {
     /// Correlation id for a multi-transaction run (an agent task, an import).
     pub run: String,
     pub label: String,
+    /// RT/document-visible, but excluded from history and journal (round-2
+    /// §4.4) — transport/gesture mid-flight commits. Additive field:
+    /// `#[serde(default)]` so pre-existing payloads without it still
+    /// deserialize, defaulting to `false`.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 impl TxMeta {
@@ -71,7 +229,7 @@ impl TxMeta {
     /// `TxMeta` at the call site (Task 7) rather than defaulting one deep
     /// inside `ControlPlane`, so the actor is always an explicit choice.
     pub fn user(label: impl Into<String>) -> Self {
-        Self { actor: Actor::User, run: uuid::Uuid::new_v4().to_string(), label: label.into() }
+        Self { actor: Actor::User, run: uuid::Uuid::new_v4().to_string(), label: label.into(), transient: false }
     }
 
     /// Same, attributed to the named MCP tool call.
@@ -80,13 +238,29 @@ impl TxMeta {
             actor: Actor::Agent { tool: tool.into() },
             run: uuid::Uuid::new_v4().to_string(),
             label: label.into(),
+            transient: false,
         }
     }
 
     /// Same, attributed to an automated system process (e.g. a sidecar
     /// job's post-processing hook, not a direct user/agent request).
     pub fn system(label: impl Into<String>) -> Self {
-        Self { actor: Actor::System, run: uuid::Uuid::new_v4().to_string(), label: label.into() }
+        Self { actor: Actor::System, run: uuid::Uuid::new_v4().to_string(), label: label.into(), transient: false }
+    }
+
+    /// Same, attributed to the engine/RT side itself (e.g. an auto-stop at
+    /// the end of material) — today this is only ever built as a literal
+    /// struct in tests; this constructor gives non-test callers the same
+    /// explicit-actor discipline `user`/`agent`/`system` already have.
+    pub fn engine(label: impl Into<String>) -> Self {
+        Self { actor: Actor::Engine, run: uuid::Uuid::new_v4().to_string(), label: label.into(), transient: false }
+    }
+
+    /// Builder: mark this transaction transient — RT/document-visible, but
+    /// excluded from history and journal (round-2 §4.4).
+    pub fn transient(mut self) -> Self {
+        self.transient = true;
+        self
     }
 }
 
@@ -189,6 +363,191 @@ mod tests {
         let legacy = r##"{"kind":"trackRemove","track":{"id":"t-2","name":"Audio Track","kind":"audio","gainDb":0.0,"pan":0.0,"muted":false,"soloed":false,"armed":false,"color":"#7c9cff"},"index":0,"clips":[]}"##;
         let parsed: Op = serde_json::from_str(legacy).expect("legacy payload without clipIndices parses");
         assert!(matches!(parsed, Op::TrackRemove { ref clip_indices, .. } if clip_indices.is_empty()));
+
+        // Plan E Task 3: ClipAdd/ClipRemove wire form, and the new
+        // TimelineStartSamples path on a Set.
+        let clip2 = crate::audio::types::Clip {
+            id: "c-2".into(),
+            track_id: "t-2".into(),
+            name: "clip2".into(),
+            source_path: "audio/c-2.wav".into(),
+            source_id: crate::ids::SourceId::default(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-2"),
+        };
+        let clip_add = Op::ClipAdd { clip: clip2.clone(), index: 0 };
+        let s = serde_json::to_string(&clip_add).unwrap();
+        eprintln!("ClipAdd wire form: {}", s);
+        assert!(s.contains("\"kind\":\"clipAdd\""), "wire form was: {s}");
+        assert!(s.contains("\"id\":\"c-2\""), "clip fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, clip_add);
+
+        let clip_remove = Op::ClipRemove { clip: clip2.clone(), index: 0 };
+        let s = serde_json::to_string(&clip_remove).unwrap();
+        eprintln!("ClipRemove wire form: {}", s);
+        assert!(s.contains("\"kind\":\"clipRemove\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, clip_remove);
+
+        let move_op = Op::Set {
+            object: ObjectRef::Clip("c-2".into()),
+            path: PropPath::TimelineStartSamples,
+            from: serde_json::json!(0u64),
+            to: serde_json::json!(48_000u64),
+        };
+        let s = serde_json::to_string(&move_op).unwrap();
+        eprintln!("Set{{Clip,TimelineStartSamples}} wire form: {}", s);
+        assert!(s.contains("\"path\":\"timelineStartSamples\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, move_op);
+
+        // Plan E Task 8: LengthSamples/OffsetSamples camelCase wire names
+        // (LoopJam's in-place region trims).
+        for (path, expected) in
+            [(PropPath::LengthSamples, "lengthSamples"), (PropPath::OffsetSamples, "offsetSamples")]
+        {
+            let s = serde_json::to_string(&path).unwrap();
+            assert_eq!(s, format!("\"{expected}\""), "wire form was: {s}");
+            let back: PropPath = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, path);
+        }
+
+        // Plan E Task 5: TempoSet, MidiClipAdd/MidiSetNotes wire form, and
+        // the new ContentLengthTicks path on a Set.
+        let tempo_set = Op::TempoSet {
+            ppq: 960,
+            events: vec![crate::midi::types::TempoEvent { tick: 0, bpm: 140.0 }],
+            meter: vec![crate::midi::types::MeterEvent { tick: 0, num: 3, den: 4 }],
+        };
+        let s = serde_json::to_string(&tempo_set).unwrap();
+        eprintln!("TempoSet wire form: {}", s);
+        assert!(s.contains("\"kind\":\"tempoSet\""), "wire form was: {s}");
+        assert!(s.contains("\"bpm\":140.0"), "tempo events must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, tempo_set);
+
+        let midi_clip = crate::midi::types::MidiClip {
+            id: "mc-1".into(),
+            track_id: "t-2".into(),
+            name: "midi clip".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 3840,
+            notes: vec![],
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-2"),
+            content_length_ticks: None,
+        };
+        let midi_clip_add = Op::MidiClipAdd { clip: midi_clip.clone(), index: 0 };
+        let s = serde_json::to_string(&midi_clip_add).unwrap();
+        eprintln!("MidiClipAdd wire form: {}", s);
+        assert!(s.contains("\"kind\":\"midiClipAdd\""), "wire form was: {s}");
+        assert!(s.contains("\"id\":\"mc-1\""), "clip fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, midi_clip_add);
+
+        let midi_clip_remove = Op::MidiClipRemove { clip: midi_clip, index: 0 };
+        let s = serde_json::to_string(&midi_clip_remove).unwrap();
+        eprintln!("MidiClipRemove wire form: {}", s);
+        assert!(s.contains("\"kind\":\"midiClipRemove\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, midi_clip_remove);
+
+        let midi_set_notes = Op::MidiSetNotes {
+            clip: "mc-1".into(),
+            notes: vec![crate::midi::types::MidiNote {
+                tick: 0, length_ticks: 480, key: 60, velocity: 100, channel: 0,
+                note_id: crate::ids::NoteId(1),
+            }],
+        };
+        let s = serde_json::to_string(&midi_set_notes).unwrap();
+        eprintln!("MidiSetNotes wire form: {}", s);
+        assert!(s.contains("\"kind\":\"midiSetNotes\""), "wire form was: {s}");
+        assert!(s.contains("\"noteId\":1"), "note fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, midi_set_notes);
+
+        let content_length_op = Op::Set {
+            object: ObjectRef::MidiClip("mc-1".into()),
+            path: PropPath::ContentLengthTicks,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(1920u64),
+        };
+        let s = serde_json::to_string(&content_length_op).unwrap();
+        eprintln!("Set{{MidiClip,ContentLengthTicks}} wire form: {}", s);
+        assert!(s.contains("\"path\":\"contentLengthTicks\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, content_length_op);
+
+        // Plan E Task 12: ObjectRef::Transport is a unit variant — the
+        // adjacently-tagged wire form must be exactly `{"family":"transport"}`,
+        // with no stray `"id"` key (unlike Track/Clip/MidiClip, which carry one).
+        let s = serde_json::to_string(&ObjectRef::Transport).unwrap();
+        eprintln!("ObjectRef::Transport wire form: {}", s);
+        assert_eq!(s, r#"{"family":"transport"}"#, "wire form was: {s}");
+        let back: ObjectRef = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, ObjectRef::Transport);
+
+        // Set{Transport, TransportState} round-trips, including the new
+        // transport PropPath variants' camelCase wire names.
+        let transport_state_op = Op::Set {
+            object: ObjectRef::Transport,
+            path: PropPath::TransportState,
+            from: serde_json::json!("stopped"),
+            to: serde_json::json!("playing"),
+        };
+        let s = serde_json::to_string(&transport_state_op).unwrap();
+        eprintln!("Set{{Transport,TransportState}} wire form: {}", s);
+        assert!(s.contains("\"family\":\"transport\""), "wire form was: {s}");
+        assert!(s.contains("\"path\":\"transportState\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, transport_state_op);
+
+        // The remaining transport paths' camelCase wire names.
+        for (path, expected) in [
+            (PropPath::LoopEnabled, "loopEnabled"),
+            (PropPath::LoopStartSamples, "loopStartSamples"),
+            (PropPath::LoopEndSamples, "loopEndSamples"),
+            (PropPath::StopAtEnd, "stopAtEnd"),
+            (PropPath::SampleRate, "sampleRate"),
+        ] {
+            let s = serde_json::to_string(&path).unwrap();
+            assert_eq!(s, format!("\"{expected}\""), "wire form was: {s}");
+            let back: PropPath = serde_json::from_str(&s).unwrap();
+            assert_eq!(back, path);
+        }
+        // Plan E Task 10: AutomationSetLane wire form, both a lane payload
+        // (upsert) and `lane: null` (delete).
+        let lane = crate::plugins::automation::AutomationLane {
+            id: "a-1".into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+        };
+        let automation_set = Op::AutomationSetLane { key: "a-1".into(), lane: Some(lane.clone()) };
+        let s = serde_json::to_string(&automation_set).unwrap();
+        eprintln!("AutomationSetLane wire form: {}", s);
+        assert!(s.contains("\"kind\":\"automationSetLane\""), "wire form was: {s}");
+        assert!(s.contains("\"targetNode\":\"track:t-1\""), "lane fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, automation_set);
+
+        let automation_delete = Op::AutomationSetLane { key: "a-1".into(), lane: None };
+        let s = serde_json::to_string(&automation_delete).unwrap();
+        eprintln!("AutomationSetLane (delete) wire form: {}", s);
+        assert!(s.contains("\"lane\":null"), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, automation_delete);
     }
 
     #[test]
@@ -196,7 +555,7 @@ mod tests {
         // actor/run are non-optional by construction: TxMeta has no Default
         // and no Option fields — this test locks the shape and verifies all
         // required fields serialize and deserialize correctly.
-        let m = TxMeta { actor: Actor::Engine, run: "r-1".into(), label: "auto-stop".into() };
+        let m = TxMeta { actor: Actor::Engine, run: "r-1".into(), label: "auto-stop".into(), transient: false };
         let s = serde_json::to_string(&m).unwrap();
         // Print once to verify actual wire form
         eprintln!("TxMeta wire form: {}", s);
@@ -204,8 +563,24 @@ mod tests {
         assert!(s.contains("\"actor\":\"engine\""), "actor field must serialize as key:value, was: {s}");
         assert!(s.contains("\"run\":\"r-1\""), "run field must serialize as key:value, was: {s}");
         assert!(s.contains("\"label\":\"auto-stop\""), "label field must serialize as key:value, was: {s}");
+        // transient defaults false and round-trips explicitly.
+        assert!(s.contains("\"transient\":false"), "transient field must serialize as key:value, was: {s}");
         // Round-trip and assert equality
         let back: TxMeta = serde_json::from_str(&s).unwrap();
         assert_eq!(back, m, "TxMeta must deserialize to the original value");
+
+        // Additive-field compat: a legacy payload without `transient` still
+        // deserializes (`#[serde(default)]`), defaulting to false.
+        let legacy = r#"{"actor":"engine","run":"r-1","label":"auto-stop"}"#;
+        let parsed: TxMeta = serde_json::from_str(legacy).expect("legacy payload without transient parses");
+        assert!(!parsed.transient, "missing transient defaults to false");
+    }
+
+    #[test]
+    fn engine_meta_constructor_stamps_actor_engine() {
+        let m = TxMeta::engine("auto-stop");
+        assert_eq!(m.actor, Actor::Engine);
+        assert!(!m.transient);
+        assert!(m.transient().transient);
     }
 }

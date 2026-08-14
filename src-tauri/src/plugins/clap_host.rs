@@ -258,7 +258,7 @@ impl ClapWorld {
             n_notes: 0,
             param_rx,
             pending_all_off: false,
-            steady: 0,
+            steady_fallback: 0,
             errors: 0,
             layout,
             instance_id: instance_id.to_string(),
@@ -586,7 +586,16 @@ pub struct ClapNode {
     n_notes: usize,
     param_rx: rtrb::Consumer<ParamCmd>,
     pending_all_off: bool,
-    steady: u64,
+    /// Fix-round-1 (§3.5 adjacent hazard): per-instance fallback steady
+    /// counter, used ONLY when the caller has no engine-global clock
+    /// (`ProcessBlock::steady == None` — every non-RT caller: offline
+    /// bounce, loopjam, preview, tests; see `mixer::render` vs
+    /// `mixer::render_rt`). Exactly the pre-round-2 behavior for those
+    /// paths: a pure per-instance accumulator that only counts frames THIS
+    /// node actually processed, so it can never be handed a decreasing
+    /// steady_time even when the caller's own timeline position moves
+    /// backward (a loop wrap).
+    steady_fallback: u64,
     /// Process-error count (RT-safe diagnostics; logged on drop).
     errors: u64,
     layout: PortLayout,
@@ -618,6 +627,13 @@ impl ClapNode {
 
     pub fn process_errors(&self) -> u64 {
         self.errors
+    }
+
+    /// Test-only introspection of the fix-round-1 fallback accumulator
+    /// (compiled out of every non-test build — zero RT-path cost).
+    #[cfg(test)]
+    pub(crate) fn steady_fallback_for_test(&self) -> u64 {
+        self.steady_fallback
     }
 }
 
@@ -699,12 +715,30 @@ impl AuraAudioProcessor for ClapNode {
         };
         let input_events = InputEvents::from_buffer(&self.ev_in);
         let mut output_events = OutputEvents::from_buffer(&mut self.ev_out);
+        // Round-2 §3.5 + fix-round-1: steady_time comes from the
+        // engine-global counter (`SharedRt::steady`, threaded through
+        // `ProcessBlock::steady`) when the RT engine hands us one — a
+        // rebuild that re-creates this node no longer resets the clock the
+        // host sees. Non-RT callers (offline bounce, loopjam, preview) pass
+        // `None` instead of a `base_pos`-derived value, because their
+        // `base_pos` can move backward on a loop wrap; falling back to our
+        // OWN per-instance accumulator here (pre-round-2 behavior for these
+        // paths) keeps steady_time monotonic regardless — it only counts
+        // frames THIS node actually processed.
+        let steady = match io.steady {
+            Some(s) => s,
+            None => {
+                let s = self.steady_fallback;
+                self.steady_fallback = self.steady_fallback.wrapping_add(frames as u64);
+                s
+            }
+        };
         match started.process(
             &in_audio,
             &mut out_audio,
             &input_events,
             &mut output_events,
-            Some(self.steady),
+            Some(steady),
             None,
         ) {
             Ok(_status) => {
@@ -727,7 +761,6 @@ impl AuraAudioProcessor for ClapNode {
             }
             Err(_) => self.errors += 1,
         }
-        self.steady = self.steady.wrapping_add(frames as u64);
     }
 
     fn reset(&mut self) {
@@ -815,7 +848,7 @@ mod tests {
         let mut out = Vec::with_capacity(blocks * frames * 2);
         for _ in 0..blocks {
             let mut buf = vec![0.0f32; frames * 2];
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
             node.process(&mut io);
             out.extend_from_slice(&buf);
         }
@@ -824,6 +857,44 @@ mod tests {
 
     fn peak(buf: &[f32]) -> f32 {
         buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Fix-round-1 (§3.5 adjacent hazard): a non-RT caller (offline bounce,
+    /// loopjam, preview) hands `ProcessBlock::steady == None` — `ClapNode`
+    /// must fall back to its OWN per-instance accumulator rather than ever
+    /// seeing (or deriving from) a caller-side position that could move
+    /// backward. Exercises a REAL installed CLAP instrument, not a stub, so
+    /// this pins the concrete fallback field directly. Skips cleanly when
+    /// no CLAP instrument is installed.
+    #[test]
+    fn non_rt_process_keeps_a_monotonic_per_instance_fallback() {
+        let Some(uid) = instrument_uid() else {
+            eprintln!("skipping: no CLAP instrument installed");
+            return;
+        };
+        let id = format!("t-{}", uuid::Uuid::new_v4());
+        instantiate(&id, &uid).expect("instantiate");
+        let id2 = id.clone();
+        let mut node = plugin_main()
+            .run(move |ctx| world(ctx).activate_node(&id2, 48_000))
+            .expect("main thread responded")
+            .expect("activate");
+
+        let mut buf = vec![0.0f32; 512 * 2];
+        let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
+        node.process(&mut io);
+        let first = node.steady_fallback_for_test();
+        node.process(&mut io);
+        let second = node.steady_fallback_for_test();
+        node.process(&mut io);
+        let third = node.steady_fallback_for_test();
+
+        assert!(second > first, "monotonic within the same instance: {first} -> {second}");
+        assert!(third > second, "still climbing on a third call: {second} -> {third}");
+
+        drop(node);
+        plugin_main().run(|_| ()).unwrap();
+        let _ = remove(&id);
     }
 
     /// Full CLAP lifecycle against a real installed instrument: instantiate
@@ -986,7 +1057,9 @@ mod tests {
             return;
         };
 
-        // Global registry (shared with other tests; first registration wins).
+        // Global registry (shared with other tests; first registration wins)
+        // — scan cache only (Task 9: instance rows live in the document, a
+        // local `PluginDoc` here, never the registry).
         register_registry(Arc::new(parking_lot::Mutex::new(PluginRegistry::default())));
         let registry = registered_registry().unwrap().clone();
         {
@@ -995,8 +1068,11 @@ mod tests {
             scanned.extend(installed());
             reg.scanned = Some(scanned);
         }
-        let info = instantiate_and_activate(&registry, &uid).expect("instantiate");
+        let (info, params) = instantiate_and_activate(&registry, &uid).expect("instantiate");
         assert_eq!(info.status, "active", "contract 4: stub -> active");
+        let mut doc = crate::control::session::PluginDoc::default();
+        doc.params.insert(info.id.clone(), params);
+        doc.instances.push(info.clone());
 
         // One midi track bound to the plugin instance, playing C3 for a beat.
         let mut store = Store::default();
@@ -1044,7 +1120,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut tracks);
+        append_from(&midi, &store, &doc, &slots, 48_000, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             nodes.key_of("m1"),
@@ -1069,7 +1145,6 @@ mod tests {
         // Retire the graph (returns the processor), then clean up.
         drop(g);
         plugin_main().run(|_| ()).unwrap();
-        let _ = registry.lock().remove(&info.id);
         let _ = remove(&info.id);
     }
 }

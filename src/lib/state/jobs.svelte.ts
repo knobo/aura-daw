@@ -1,11 +1,14 @@
 /**
  * Sidecar job tracking + the "AI Split Stems" flow: submit, stream progress
- * over the Channel, and on completion materialize four stem tracks/clips
- * under the source track.
+ * over the Channel. Stem tracks/clips are never built in the webview — the
+ * backend's `split_stems_for_clip` resolves the clip, runs Demucs, and
+ * auto-imports each stem as a real track+clip, announcing over
+ * `project://changed`; this store just mirrors job progress and re-pulls the
+ * project when the backend says a stem landed (Task 11).
  */
 
 import { backend } from "../tauri";
-import { IMPORT_AUDIO_EXTS, type Clip, type SidecarEvent, type StemName } from "../types/ipc";
+import { IMPORT_AUDIO_EXTS, type Clip, type SidecarEvent } from "../types/ipc";
 import { project } from "./project.svelte";
 import { toasts } from "./toasts.svelte";
 
@@ -19,20 +22,6 @@ export interface StemJob {
   state: "queued" | "running" | "done" | "error" | "cancelled";
   error?: string;
 }
-
-const STEM_ORDER: StemName[] = ["drums", "bass", "vocals", "other"];
-const STEM_LABEL: Record<StemName, string> = {
-  drums: "Drums",
-  bass: "Bass",
-  vocals: "Vocals",
-  other: "Other",
-};
-const STEM_COLOR: Record<StemName, string> = {
-  drums: "#ffc857",
-  bass: "#ff4fd8",
-  vocals: "#52e5ff",
-  other: "#9d7bff",
-};
 
 class JobsStore {
   jobs = $state<Record<string, StemJob>>({});
@@ -57,6 +46,15 @@ class JobsStore {
     this.jobs = { ...this.jobs, [jobId]: { ...job, ...patch } };
   }
 
+  /**
+   * SPLIT STEMS on a clip already on the timeline: one invoke to the real
+   * backend command (`split_stems_for_clip`), which resolves the clip,
+   * submits the Demucs job on its EXISTING project-copy audio (no re-import,
+   * no duplicate clip), and auto-imports the four stems as new tracks
+   * aligned to the clip's current position. Progress/completion mirror the
+   * drag-and-drop import+split flow's events (`onImportSplitEvent`) exactly
+   * — same envelope, same "stems land as follow-up log lines" protocol.
+   */
   async splitStems(clip: Clip): Promise<void> {
     if (this.jobForClip(clip.id)) return; // one job per clip at a time
 
@@ -67,13 +65,14 @@ class JobsStore {
         pending.push(e);
         return;
       }
-      this.onEvent(clip, e);
+      this.onImportSplitEvent(clip.name, e);
     };
 
     try {
-      jobId = await backend.sidecarSplitStems({ inputPath: clip.sourcePath }, handle);
+      jobId = await backend.splitStemsForClip(clip.id, handle);
     } catch (err) {
-      console.error("[aura] sidecar_split_stems failed:", err);
+      console.error("[aura] split_stems_for_clip failed:", err);
+      toasts.error("STEM SPLIT FAILED", clip.name, String(err));
       return;
     }
 
@@ -89,37 +88,12 @@ class JobsStore {
         state: "queued",
       },
     };
-    for (const e of pending) this.onEvent(clip, e);
+    for (const e of pending) this.onImportSplitEvent(clip.name, e);
   }
 
   async cancel(jobId: string) {
     await backend.sidecarCancelJob(jobId);
     this.patch(jobId, { state: "cancelled" });
-  }
-
-  private onEvent(sourceClip: Clip, e: SidecarEvent) {
-    switch (e.type) {
-      case "progress":
-        this.patch(e.jobId, { progress: e.progress, stage: e.stage, state: "running" });
-        break;
-      case "log":
-        break;
-      case "error": {
-        const wasCancelled = this.jobs[e.jobId]?.state === "cancelled";
-        this.patch(e.jobId, {
-          state: wasCancelled ? "cancelled" : "error",
-          error: e.message,
-        });
-        break;
-      }
-      case "done": {
-        this.patch(e.jobId, { state: "done", progress: 1, stage: "done" });
-        if (e.result.kind === "stemSplit") {
-          void this.materializeStems(sourceClip, e.result.stems);
-        }
-        break;
-      }
-    }
   }
 
   // ── drag-and-drop import (wave 1.5) ──
@@ -223,46 +197,6 @@ class JobsStore {
           }
         }
         break;
-    }
-  }
-
-  /** Turn a finished split into four stem tracks below the source track. */
-  private async materializeStems(
-    source: Clip,
-    stems: Partial<Record<StemName, string>>,
-  ) {
-    let after = source.trackId;
-    for (const stem of STEM_ORDER) {
-      const path = stems[stem];
-      if (!path) continue;
-      try {
-        const track = await project.addTrack({
-          name: `${STEM_LABEL[stem]} · ${source.name}`,
-          color: STEM_COLOR[stem],
-        });
-        project.placeTrackAfter(track, after);
-        after = track.id;
-        const clip = project.createClip({
-          trackId: track.id,
-          name: `${source.name} — ${stem}`,
-          sourcePath: path,
-          sourceChannels: source.sourceChannels,
-          sourceSampleRate: source.sourceSampleRate,
-          sourceLengthSamples: source.sourceLengthSamples,
-          timelineStartSamples: source.timelineStartSamples,
-          offsetSamples: source.offsetSamples,
-          lengthSamples: source.lengthSamples,
-          gainDb: 0,
-          fadeInSamples: 0,
-          fadeOutSamples: 0,
-        });
-        // demo engine: make the synthetic waveform match the stem's role
-        // and register the clip so its meters play back
-        backend.hintClipCharacter?.(clip.id, stem === "other" ? "pad" : stem);
-        backend.registerClip?.(clip);
-      } catch (err) {
-        console.error("[aura] failed to create stem track:", err);
-      }
     }
   }
 }

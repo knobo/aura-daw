@@ -1,16 +1,15 @@
 /**
  * Project store: tracks, clips, selection. Track mutations go through the
- * backend commands optimistically; clip placement is a frontend concern in
- * the prototype (no clip-move command exists in the frozen surface).
+ * backend commands optimistically. Clip placement mirrors midi.svelte.ts's
+ * moveClip/commitBounds split (Plan E Task 4): `moveClip` is a frontend-only
+ * preview applied per pointermove/arrow-keypress during a drag (D-03: one
+ * invoke per gesture, not one per event), and `commitClipMove` persists the
+ * store's CURRENT position through the `move_clip` channel once, at the end
+ * of the gesture.
  */
 
 import { backend } from "../tauri";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
-
-const uuid = () =>
-  typeof crypto !== "undefined" && crypto.randomUUID
-    ? crypto.randomUUID()
-    : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
 class ProjectStore {
   name = $state("Untitled");
@@ -108,17 +107,6 @@ class ProjectStore {
     return merged;
   }
 
-  /** Insert (already-created) track right after another for stem grouping. */
-  placeTrackAfter(track: TrackState, afterTrackId: string) {
-    const rest = this.tracks.filter((t) => t.id !== track.id);
-    const at = rest.findIndex((t) => t.id === afterTrackId);
-    if (at === -1) {
-      this.tracks = [...rest, track];
-    } else {
-      this.tracks = [...rest.slice(0, at + 1), track, ...rest.slice(at + 1)];
-    }
-  }
-
   async removeTrack(trackId: string) {
     this.tracks = this.tracks.filter((t) => t.id !== trackId);
     this.clips = this.clips.filter((c) => c.trackId !== trackId);
@@ -173,6 +161,22 @@ class ProjectStore {
     await backend.setTrackArm(trackId, !t.armed);
   }
 
+  /** Open a gesture boundary (Plan E Task 14) — call on `pointerdown` of a
+   * fader/pan control, before the first `setGain`/`setPan` of the drag.
+   * `label` is the gesture's history label (e.g. "gain drag"). No-op in
+   * demo mode (`gestureBegin?` is optional — no history to fold into). */
+  beginGesture(label: string) {
+    void backend.gestureBegin?.(label);
+  }
+
+  /** Close the gesture boundary opened by `beginGesture` — call on
+   * `pointerup`/`pointercancel`. Safe to call even without a matching
+   * `beginGesture` (mirrors `gestureEnd?`'s no-op-on-nothing-open
+   * contract). */
+  endGesture() {
+    void backend.gestureEnd?.();
+  }
+
   // ── clips ──
 
   upsertClip(clip: Clip) {
@@ -182,21 +186,30 @@ class ProjectStore {
       : [...this.clips, clip];
   }
 
+  /** Frontend-only placement move (used DURING a drag/arrow-keypress; see
+   * commitClipMove for the persisted end of the gesture). */
   moveClip(clipId: string, timelineStartSamples: number) {
     this.clips = this.clips.map((c) =>
       c.id === clipId ? { ...c, timelineStartSamples: Math.max(0, Math.round(timelineStartSamples)) } : c,
     );
   }
 
-  select(clipId: string | null) {
-    this.selectedClipId = clipId;
+  /** Persist a clip's CURRENT in-store position — the pointerup/arrow-commit
+   * end of a move gesture that used moveClip() for the live preview. No-op
+   * (no invoke) when the clip id is unknown, matching setMute/setSolo's
+   * no-op-on-nothing-to-do convention. */
+  async commitClipMove(clipId: string): Promise<void> {
+    const c = this.clips.find((c) => c.id === clipId);
+    if (!c) return;
+    try {
+      await backend.moveClip?.(clipId, c.timelineStartSamples);
+    } catch (err) {
+      console.error("[aura] move_clip failed:", err);
+    }
   }
 
-  /** Create a frontend clip (stem results, demo takes). */
-  createClip(init: Omit<Clip, "id"> & { id?: string }): Clip {
-    const clip: Clip = { id: init.id ?? uuid(), ...init } as Clip;
-    this.clips = [...this.clips, clip];
-    return clip;
+  select(clipId: string | null) {
+    this.selectedClipId = clipId;
   }
 }
 

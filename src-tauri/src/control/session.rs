@@ -1,20 +1,130 @@
 //! The document. `&mut` access is (after Task 3) only reachable through
 //! `Session::transact`. Round-2 §4.1: the remaining three stores
 //! (automation, plugin rows, sampler bank) move in during Plan E.
-use crate::audio::types::{Store, TrackState};
+use std::collections::HashMap;
+
+use crate::audio::types::{Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use crate::ids::TrackId;
 use crate::midi::MidiStore;
+use crate::plugins::automation::AutomationLane;
+use crate::plugins::{ParamInfo, PluginInstanceInfo};
+
+/// Automation lanes document (Plan E Task 10) — the in-memory half of the
+/// former standalone `plugins::automation::AutomationStore` +
+/// process-global `STORE`, moved under the Session lock (round-2 §4.1's
+/// cross-store atomicity: automation edits are now tx-atomic with every
+/// other document field, mirroring `MidiStore`'s earlier merge). No
+/// `loaded_dir` field — unlike the old lazily-resyncing store, epochs
+/// (project open/create) adopt eagerly (`plugins::automation::
+/// adopt_open_project`), so there is nothing left to lazily reconcile.
+#[derive(Debug, Default)]
+pub struct AutomationDoc {
+    pub lanes: Vec<AutomationLane>,
+}
+
+/// The registry's DOCUMENT half (Plan E Task 9, round-2 inventory rows
+/// 12-15 + 14): instance rows, the generic-UI param mirror, and state blobs
+/// parked for instances whose host half hasn't (yet) accepted them. The
+/// LIVE half — the plugin main thread, the format hosts' own instance
+/// tables, `PluginRegistry::scanned` — stays outside the session, reached
+/// by id through `plugins::clap_host`/`plugins::lv2_host` (their own locks,
+/// never the session's — [C1]).
+///
+/// `instances` is an ordered `Vec` (not a map), matching the
+/// `TrackAdd`/`MidiClipAdd` precedent: `Op::PluginAdd`/`PluginRemove`
+/// address a row by `index` (advisory) with store truth (by `id`) winning,
+/// exactly like `ClipRemove`/`MidiClipRemove`.
+///
+/// `params` keeps the FULL `ParamInfo` mirror (not just the raw values) —
+/// deliberately: ranges/names are synthesized PER INSTANCE for stub rows
+/// (restore-before-activation, `plugins::state::restore_into_registry`) and
+/// per real plugin once activated, so they are genuinely instance-scoped
+/// document state, not a separate lookup keyed by plugin uid.
+///
+/// `pending_state` holds APST-ENCODED bytes (`plugins::state::encode_state`
+/// — magic/version/kind/uid/data, self-describing) — the SAME bytes written
+/// to `<project>/plugins/<id>.state`, so a blob can move between disk,
+/// `PluginRemove.state`/`PluginSetState.state`, and this map without any
+/// re-encoding.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PluginDoc {
+    pub instances: Vec<PluginInstanceInfo>,
+    pub params: HashMap<String, Vec<ParamInfo>>,
+    pub pending_state: HashMap<String, Vec<u8>>,
+    /// Instance ids whose `pending_state` bytes are NEWER than whatever's
+    /// on disk (or nothing is on disk yet for them) — Task 9 review round 1
+    /// Critical-2: `save_snapshot_into_project`'s persist ladder previously
+    /// let a merely-EXISTING `.state` file win over fresher `pending_state`
+    /// bytes, so a second `PluginSetState` (e.g. a second zyn patch load
+    /// into the same instance) was silently dropped on disk. Set by every
+    /// `apply_raw` arm that writes `pending_state` with new authoritative
+    /// bytes (`PluginRemove`'s captured blob, `PluginSetState`); cleared by
+    /// `ControlPlane::execute_persist` for whichever ids
+    /// `save_snapshot_into_project` actually wrote. NOT set by
+    /// `restore_into_session` — a blob just read from that exact file is,
+    /// by definition, not ahead of it.
+    pub dirty_state: std::collections::HashSet<String>,
+}
 
 pub struct Session {
     pub store: Store,
     pub midi: MidiStore,
+    pub automation: AutomationDoc,
+    pub plugins: PluginDoc,
     pub(crate) rev: u64,
+    /// Document-identity counter (fix round 1, Task 7 review finding 2):
+    /// bumped exactly once, under the session lock, at every DOCUMENT-SWAP
+    /// epoch boundary — `audio::project::ensure_default_project`,
+    /// `ControlPlane::create_project_at`, `ControlPlane::open_project_epoch`,
+    /// `ControlPlane::save_project_as_epoch` (their own `// epoch boundary:`
+    /// markers are the bump sites; `save_project_mark`'s marker explicitly
+    /// says "no document swap here" and does NOT bump). `Committed` captures
+    /// this under the SAME `transact` lock that captures `rev`;
+    /// `ControlPlane::execute_persist` re-locks afterward (persistence runs
+    /// with the session lock released — round-2 §4) and refuses to persist
+    /// if `session.epoch` has moved past what the commit captured: an epoch
+    /// function interleaved between `transact` returning and `execute_persist`
+    /// re-locking, so the document `execute_persist` would snapshot is no
+    /// longer the one this commit's `PersistEffect` describes — silently
+    /// writing it would either corrupt the NEW document (e.g. persist a
+    /// stale in-memory edit into a project just opened) or silently drop the
+    /// commit's own edit (its target document already moved on). The new
+    /// epoch's own swap/save owns durability from that point forward.
+    pub(crate) epoch: u64,
 }
 
 impl Session {
     pub fn new(store: Store, midi: MidiStore) -> Self {
-        Self { store, midi, rev: 0 }
+        Self {
+            store,
+            midi,
+            automation: AutomationDoc::default(),
+            plugins: PluginDoc::default(),
+            rev: 0,
+            epoch: 0,
+        }
+    }
+
+    /// Clone of the midi fields `midi::persist` persists — `ppq`,
+    /// `tempo_events`, `meter_events`, `clips` — taken under the session
+    /// lock so `ControlPlane::execute_persist` can write it to disk AFTER
+    /// the lock is released (round-2 §4: no disk I/O under the session
+    /// lock). `midi::persist::V3Data` already has exactly this shape.
+    pub fn midi_snapshot(&self) -> crate::midi::persist::V3Data {
+        crate::midi::persist::V3Data {
+            ppq: self.midi.ppq,
+            tempo_events: self.midi.tempo_events.clone(),
+            meter_events: self.midi.meter_events.clone(),
+            clips: self.midi.clips.clone(),
+        }
+    }
+
+    /// Clone of the plugin document, taken under the session lock so
+    /// `ControlPlane::execute_persist` can write it to disk AFTER the lock
+    /// is released (Task 9, same discipline as `midi_snapshot`).
+    pub fn plugin_snapshot(&self) -> PluginDoc {
+        self.plugins.clone()
     }
 
     /// The ONLY way to mutate the document. Returns Err and leaves the
@@ -42,7 +152,10 @@ impl Session {
                 let (ops, mut inverses) = fold_ops(ops, inverses);
                 inverses.reverse();
                 guard.rev += 1;
-                Ok(Committed { rev: guard.rev, ops, inverses, effect, meta })
+                // `epoch` is captured under this SAME lock, alongside `rev`
+                // — see `Session::epoch`'s doc for why `execute_persist`
+                // needs this to detect an interleaved document swap.
+                Ok(Committed { rev: guard.rev, epoch: guard.epoch, ops, inverses, effect, meta })
             }
             Err(e) => {
                 // Rollback: run collected inverses in reverse — the same
@@ -81,6 +194,26 @@ impl Tx<'_> {
         self.ops.push(op);
         self.inverses.push(inverse);
         Ok(())
+    }
+
+    /// Read-only view of the document store, for validating/deriving inside
+    /// a transaction closure without a second lock (Plan E Task 7, §4.3) —
+    /// e.g. `ops::add_track_tx` reading track count/color, or a wrapper
+    /// validating a track's kind before applying a structural op, or a
+    /// closure branching on current truth (e.g. "don't downgrade an
+    /// in-flight recording", Task 12) under the SAME lock `apply` writes
+    /// through — reading via a separate `self.session.lock()` outside the
+    /// closure is a TOCTOU: another thread can write between that read and
+    /// this transaction's commit. Never `&mut`: the only way to mutate is
+    /// [`Tx::apply`], so this can't be used to bypass the op/inverse/effect
+    /// bookkeeping.
+    pub fn store(&self) -> &Store {
+        &self.session.store
+    }
+
+    /// Same as [`Tx::store`], for the MIDI store.
+    pub fn midi(&self) -> &MidiStore {
+        &self.session.midi
     }
 }
 
@@ -123,10 +256,70 @@ pub struct EngineEffect {
     pub rebuild: bool,
     pub param_writes: Vec<(TrackId, PropPath, f32)>,
     pub any_solo: Option<bool>,
+    /// Which stores to persist to disk, executed by `ControlPlane::commit`
+    /// (Task 6) AFTER the session lock is released — see `PersistEffect`.
+    pub persist: PersistEffect,
+    /// Plan E Task 9: plugin host round-trips a commit's plugin ops
+    /// describe, EXECUTED by `ControlPlane::commit` after the session lock
+    /// is released (§4.1/[C1]: hosts have their own locks, never called
+    /// while the session lock is held) — see `HostForward`.
+    pub host_forward: Vec<HostForward>,
+}
+
+/// A plugin-host round-trip `apply_raw` determined is needed, described
+/// here (plain data — id + numbers, no host handle anywhere in this
+/// module), EXECUTED by `ControlPlane::commit` by calling the SAME host
+/// entry points commands call today (`plugins::clap_host`/`lv2_host`/
+/// `state`'s `HostStateBridge`), now sequenced after the session lock.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostForward {
+    /// Forward a single (already-clamped) param value from `Op::Set{Plugin,
+    /// Param}` to the format host — mirrors `plugins::set_params_and_forward`.
+    ParamWrite { instance: String, index: u32, value: f32 },
+    /// Ensure `instance` is live on its format host, then mirror the real
+    /// param list + `"active"` status back into the document (short session
+    /// lock, post host call). Pushed by every `Op::PluginAdd` apply — the
+    /// executor is idempotent (checks `has_instance` first), so the
+    /// prepare-outside fresh-instantiate path (host already live) safely
+    /// no-ops the host call and just re-syncs params; the undo-of-remove
+    /// path (host gone, destroyed by the forward `Destroy`) actually
+    /// re-instantiates.
+    Instantiate { instance: String },
+    /// Destroy `instance` on its format host (`Op::PluginRemove`'s forward
+    /// direction).
+    Destroy { instance: String },
+    /// Offer `session.plugins.pending_state[instance]` to the registered
+    /// `HostStateBridge` (`Op::PluginAdd` when a blob is pending —
+    /// restore-from-blob undo — and `Op::PluginSetState`'s forward
+    /// direction — zyn patch loads).
+    LoadState { instance: String },
+}
+
+/// Which durable stores a transaction touched — described here (plain data,
+/// no I/O), EXECUTED by `ControlPlane::execute_persist` after the session
+/// lock is released (round-2 §4: persistence becomes an effect, not I/O
+/// under the lock). `plugins`/`automation` are fields only for now — no
+/// executor wires them until Tasks 9/10 (YAGNI: this task adds the
+/// machinery, not speculative plugin/automation persistence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PersistEffect {
+    /// `midi::persist::save_snapshot_into_project` from a `midi_snapshot()`.
+    pub midi: bool,
+    /// `audio::project::save` from `audio::project::from_store`.
+    pub project: bool,
+    /// `plugins::state::save_snapshot_into_project` from a `PluginDoc`
+    /// snapshot taken under a short session lock (Task 9).
+    pub plugins: bool,
+    /// Task 10 wires the executor; the field exists now.
+    pub automation: bool,
 }
 
 pub struct Committed {
     pub rev: u64,
+    /// `Session::epoch` as observed under the SAME lock as `rev` — see that
+    /// field's doc. `ControlPlane::execute_persist` compares this against
+    /// the CURRENT `session.epoch` after re-locking, post-`transact`.
+    pub epoch: u64,
     pub ops: Vec<Op>,
     pub inverses: Vec<Op>, // reverse order, ready to apply
     pub effect: EngineEffect,
@@ -152,7 +345,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .iter_mut()
                 .find(|t| &t.id == id)
                 .ok_or_else(|| format!("unknown track: {id}"))?;
-            let from_now = read_prop(t, *path); // truth, not caller's `from`
+            let from_now = read_prop(t, *path)?; // truth, not caller's `from`
             let applied = write_prop(t, *path, to)?; // clamps like ops.rs does
             let inverse = Op::Set {
                 object: ObjectRef::Track(id.clone()),
@@ -160,6 +353,16 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 from: applied,   // the inverse's `from`: value we just wrote
                 to: from_now,    // the inverse's `to`: value to restore
             };
+            if matches!(path, PropPath::InstrumentId) {
+                // Structural (Plan E Task 3, inventory row 2): rebinding a
+                // track's instrument changes the live graph node, so this
+                // triggers a rebuild + persists the project, instead of the
+                // mix-param-table writes below (InstrumentId has no RT
+                // param counterpart — nothing there to write).
+                effect.rebuild = true;
+                effect.persist.project = true;
+                return Ok(inverse);
+            }
             // Mirror the retired `ops::apply_track_mix` (deleted in Plan B,
             // behavior preserved here): a changed track gets all four mix
             // params rewritten from the current (post-write) snapshot, not
@@ -282,19 +485,491 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 track: removed, index: pos, clips: removed_clips, clip_indices: removed_indices,
             })
         }
+        // Plan E Task 3 (inventory row 3): clip placement — the round-2
+        // "most common editing gesture reaches no backend channel at all"
+        // gap. Property-addressed, but structural in effect (rebuild +
+        // persist) since a moved clip changes what the RT graph renders.
+        Op::Set { object: ObjectRef::Clip(id), path: PropPath::TimelineStartSamples, to, .. } => {
+            let c = session
+                .store
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown clip: {id}"))?;
+            let from_now = serde_json::json!(c.timeline_start_samples); // truth, not caller's `from`
+            let v = to.as_u64().ok_or("timelineStartSamples: expected a non-negative integer")?;
+            c.timeline_start_samples = v;
+            let applied = serde_json::json!(c.timeline_start_samples);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::Set {
+                object: ObjectRef::Clip(id.clone()),
+                path: PropPath::TimelineStartSamples,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        // Plan E Task 8: LoopJam's region-replacement trims a clip IN PLACE
+        // (shrink its length, or — paired with `OffsetSamples` below —
+        // reposition its head) instead of a remove-then-fresh-id-add, so an
+        // undo restores the exact original row. Same structural-in-effect
+        // reasoning as `TimelineStartSamples` above (a trimmed clip changes
+        // what the RT graph renders).
+        Op::Set { object: ObjectRef::Clip(id), path: PropPath::LengthSamples, to, .. } => {
+            let c = session
+                .store
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown clip: {id}"))?;
+            let from_now = serde_json::json!(c.length_samples); // truth, not caller's `from`
+            let v = to.as_u64().ok_or("lengthSamples: expected a non-negative integer")?;
+            c.length_samples = v;
+            let applied = serde_json::json!(c.length_samples);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::Set {
+                object: ObjectRef::Clip(id.clone()),
+                path: PropPath::LengthSamples,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        Op::Set { object: ObjectRef::Clip(id), path: PropPath::OffsetSamples, to, .. } => {
+            let c = session
+                .store
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown clip: {id}"))?;
+            let from_now = serde_json::json!(c.offset_samples); // truth, not caller's `from`
+            let v = to.as_u64().ok_or("offsetSamples: expected a non-negative integer")?;
+            c.offset_samples = v;
+            let applied = serde_json::json!(c.offset_samples);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::Set {
+                object: ObjectRef::Clip(id.clone()),
+                path: PropPath::OffsetSamples,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        // Plan E Task 3 (inventory rows 16/17/20/23): sinks/threads consume
+        // clip add/remove — the same TrackAdd/TrackRemove pattern (store
+        // truth wins over the caller's advisory payload beyond `.id`).
+        Op::ClipAdd { clip, index } => {
+            if session.store.clips.iter().any(|c| c.id == clip.id) {
+                return Err(format!("duplicate clip id: {}", clip.id));
+            }
+            let idx = (*index).min(session.store.clips.len());
+            session.store.clips.insert(idx, clip.clone());
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::ClipRemove { clip: clip.clone(), index: idx })
+        }
+        Op::ClipRemove { clip, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `Op::Set`'s from/to and
+            // `Op::TrackRemove`'s row lookup).
+            let pos = session
+                .store
+                .clips
+                .iter()
+                .position(|c| c.id == clip.id)
+                .ok_or_else(|| format!("unknown clip: {}", clip.id))?;
+            let removed = session.store.clips.remove(pos);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::ClipAdd { clip: removed, index: pos })
+        }
+        // Plan E Task 5: the MIDI half of the op vocabulary — tempo/meter,
+        // MIDI clip structural add/remove, MIDI clip bounds, and note
+        // replacement, all through the same session lock as `store` (round-2
+        // §4.1's cross-store atomicity).
+        Op::TempoSet { ppq, events, meter } => {
+            // Validate BEFORE any mutation — atomic (round-2 §4: a failed
+            // apply must leave the session untouched).
+            if events.is_empty() {
+                return Err("tempoSet: events must not be empty".into());
+            }
+            if !events.windows(2).all(|w| w[0].tick <= w[1].tick) {
+                return Err("tempoSet: events must be sorted by tick".into());
+            }
+            if !meter.windows(2).all(|w| w[0].tick <= w[1].tick) {
+                return Err("tempoSet: meter must be sorted by tick".into());
+            }
+            let inverse = Op::TempoSet {
+                ppq: session.midi.ppq,
+                events: session.midi.tempo_events.clone(),
+                meter: session.midi.meter_events.clone(),
+            };
+            // Cross-store atomicity (§4.1, this task's reason to exist): the
+            // three midi fields AND the store.transport.tempo_bpm mirror
+            // write together, under the one session lock — today's
+            // `set_tempo_map` command does this as two separate,
+            // non-atomic phases (round-2 inventory row 4).
+            session.midi.ppq = *ppq;
+            session.midi.tempo_events = events.clone();
+            session.midi.meter_events = meter.clone();
+            session.store.transport.tempo_bpm = events[0].bpm;
+            // A new tempo map changes every tick->sample conversion, which
+            // `engine::rebuild`'s `midi::playback::append_from` bakes into
+            // the RT track's pre-rendered note events — only invoked from
+            // `rebuild`, never at render time — so this needs a rebuild.
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            effect.persist.project = true; // the transport.tempo_bpm mirror lives in project.json
+            Ok(inverse)
+        }
+        Op::MidiClipAdd { clip, index } => {
+            if session.midi.clips.iter().any(|c| c.id == clip.id) {
+                return Err(format!("duplicate midi clip id: {}", clip.id));
+            }
+            let idx = (*index).min(session.midi.clips.len());
+            session.midi.clips.insert(idx, clip.clone());
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::MidiClipRemove { clip: clip.clone(), index: idx })
+        }
+        Op::MidiClipRemove { clip, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `ClipRemove`).
+            let pos = session
+                .midi
+                .clips
+                .iter()
+                .position(|c| c.id == clip.id)
+                .ok_or_else(|| format!("unknown midi clip: {}", clip.id))?;
+            let removed = session.midi.clips.remove(pos);
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::MidiClipAdd { clip: removed, index: pos })
+        }
+        // MIDI clip bounds: property-addressed, but structural in effect
+        // (rebuild + persist) for the same reason `Set{Clip,
+        // TimelineStartSamples}` is (Task 3) — `engine::rebuild`'s
+        // `midi::playback::append_from` reads `session.midi.clips`'
+        // placement/content-length fields to pre-render the RT track's note
+        // events, and is only ever invoked from `rebuild`, never at render
+        // time via a live table read — so any bounds edit needs a rebuild
+        // to become audible.
+        Op::Set { object: ObjectRef::MidiClip(id), path, to, .. } => {
+            let c = session
+                .midi
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown midi clip: {id}"))?;
+            let from_now = read_midi_prop(c, *path)?; // truth, not caller's `from`
+            let applied = write_midi_prop(c, *path, to)?; // clamps LengthTicks like write_prop clamps Gain
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::Set {
+                object: ObjectRef::MidiClip(id.clone()),
+                path: *path,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        // §4.4 value-replacement wrapper: whole-notes replace, diffed
+        // against store truth via `assign_incoming_note_ids`'s keep-rule
+        // (midi/mod.rs) — same rebuild reasoning as the bounds arm above
+        // (a note edit changes what `append_from` pre-renders).
+        Op::MidiSetNotes { clip: clip_id, notes } => {
+            let c = session
+                .midi
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == clip_id)
+                .ok_or_else(|| format!("unknown midi clip: {clip_id}"))?;
+            // `from` inverse = current notes (already live-id-resolved from
+            // whatever produced them), captured before this write.
+            let previous_notes = c.notes.clone();
+            // Everything computed on LOCALS first (assign_incoming_note_ids
+            // is pure); `c.notes`/`c.next_note_id` are assigned only as the
+            // last statements, mirroring `midi_set_notes`'s own discipline
+            // (midi/mod.rs) so no partial state is observable on early
+            // return.
+            let (local_notes, next_watermark) =
+                crate::midi::assign_incoming_note_ids(&c.notes, c.next_note_id, notes.clone());
+            c.notes = local_notes;
+            // Watermark rule (scope ruling 3, ADR 0001): advances
+            // monotonically, NEVER rewound by the inverse — the inverse
+            // below restores `previous_notes`' VALUES, but going through
+            // this same arm again means it too only ever advances
+            // `next_note_id`, never resets it.
+            c.next_note_id = next_watermark;
+            effect.rebuild = true;
+            effect.persist.midi = true;
+            Ok(Op::MidiSetNotes { clip: clip_id.clone(), notes: previous_notes })
+        }
+        // Plan E Task 12 (inventory rows 28-29): the transport family — a
+        // property-addressed mirror of what `ControlPlane::transport` used
+        // to write directly into `session.store.transport.*` in four
+        // places. Deliberately sets NO `effect` flags:
+        // * no `rebuild` — the transport isn't baked into the RT graph by
+        //   `engine::rebuild` the way clip/track structure is; the RT side
+        //   reads its own atomics (`SharedRt`), not this document mirror.
+        // * no `persist.project` — RULING (Task 12 brief, binding),
+        //   diverging from the generic "structural/property Set persists"
+        //   pattern the Clip/MidiClip arms above follow: these fields DO
+        //   live in project.json, but setting `persist.project` on every
+        //   transport commit would write project.json once per
+        //   play/stop/loop-drag gesture. Persistence for transport fields
+        //   rides explicit saves only, exactly as before this task.
+        Op::Set { object: ObjectRef::Transport, path, to, .. } => {
+            let t = &mut session.store.transport;
+            let from_now = read_transport_prop(t, *path)?; // truth, not caller's `from`
+            let applied = write_transport_prop(t, *path, to)?;
+            Ok(Op::Set {
+                object: ObjectRef::Transport,
+                path: *path,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        // §4.4 value-replacement wrapper (Plan E Task 10): one op replaces
+        // (or deletes) ONE lane's full point set — an edit gesture is one
+        // lane write, never one op per point (D-03), mirroring
+        // `MidiSetNotes`. Addressed by `key` (== `AutomationLane::id`, a
+        // plain string) rather than `ObjectRef` — automation lanes have no
+        // struct key, just a string id, so no new `ObjectRef` variant is
+        // needed (checked against the brief's NEEDS_CONTEXT trigger).
+        //
+        // REBUILD PIN (brief-mandated file:line cite): this op does NOT set
+        // `effect.rebuild`. `engine::rebuild` (src/audio/engine.rs:684) never
+        // reads `session.automation` — automation lanes are compiled to
+        // absolute-sample ramps and attached to a live node only through
+        // `GainAutomatedNode` (this file's module, `plugins/automation.rs`),
+        // and nothing in the production graph build wires that node in yet
+        // (see this crate's `plugins/automation.rs` module doc: "Production
+        // graph rebuilds do not yet attach lanes to nodes (roadmap:
+        // automation editing UI round)"). So today automation edits have no
+        // RT-visible effect to rebuild for; when a future round wires lanes
+        // into the graph, this arm needs `effect.rebuild = true` too.
+        Op::AutomationSetLane { key, lane } => {
+            let pos = session.automation.lanes.iter().position(|l| &l.id == key);
+            // Validate + normalize BEFORE any mutation (atomic — round-2 §4:
+            // a failed apply must leave the session untouched).
+            let mut new_lane = match lane {
+                Some(l) => {
+                    let mut nl = l.clone();
+                    nl.id = key.clone(); // the op's `key` is authoritative
+                    crate::plugins::automation::normalize_lane(&mut nl)?;
+                    Some(nl)
+                }
+                None => None,
+            };
+            // Upsert/remove, capturing whatever was there before (store
+            // truth) as the inverse's payload — `None` when the key didn't
+            // exist (mirrors `Op::Set`'s "inverse from store truth, never
+            // guessed" rule).
+            let previous = match pos {
+                Some(idx) => match new_lane.take() {
+                    Some(nl) => Some(std::mem::replace(&mut session.automation.lanes[idx], nl)),
+                    None => Some(session.automation.lanes.remove(idx)),
+                },
+                None => {
+                    if let Some(nl) = new_lane.take() {
+                        session.automation.lanes.push(nl);
+                    }
+                    None // deleting an already-absent lane is a no-op, not an error
+                }
+            };
+            effect.persist.automation = true;
+            Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
+        }
+        // Plan E Task 9 (round-2 inventory rows 12-15): plugin instance
+        // rows. Same store-truth-wins-by-id discipline as
+        // ClipAdd/ClipRemove/MidiClipAdd/MidiClipRemove.
+        Op::PluginAdd { row, index } => {
+            if session.plugins.instances.iter().any(|r| r.id == row.id) {
+                return Err(format!("duplicate plugin instance id: {}", row.id));
+            }
+            let idx = (*index).min(session.plugins.instances.len());
+            session.plugins.instances.insert(idx, row.clone());
+            // Seed an EMPTY params mirror only when nothing is parked there
+            // already (`.or_default()` is a no-op on an Occupied entry) —
+            // Task 9 review round 1, Important-1: undo-of-remove parks the
+            // removed row's real mirror in `session.plugins.params` (see
+            // `PluginRemove` below) instead of clearing it, specifically so
+            // THIS seed doesn't clobber it with an empty vec. A genuinely
+            // fresh instantiate's id has never been seen before, so this
+            // still seeds empty there; `HostForward::Instantiate` fills
+            // real values in — but ONLY when the mirror is still empty
+            // (same round-1 fix, control/mod.rs), so it never clobbers a
+            // restored mirror with the host's post-reinstantiate defaults.
+            session.plugins.params.entry(row.id.clone()).or_default();
+            effect.rebuild = true;
+            effect.persist.plugins = true;
+            // Always folded in (doc comment on the op): the executor is the
+            // one that knows whether the host call is actually needed.
+            effect.host_forward.push(HostForward::Instantiate { instance: row.id.clone() });
+            if session.plugins.pending_state.contains_key(&row.id) {
+                effect.host_forward.push(HostForward::LoadState { instance: row.id.clone() });
+            }
+            Ok(Op::PluginRemove {
+                row: row.clone(),
+                index: idx,
+                state: session.plugins.pending_state.get(&row.id).cloned(),
+                params: session.plugins.params.get(&row.id).cloned().unwrap_or_default(),
+            })
+        }
+        Op::PluginRemove { row, state, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `ClipRemove`/`TrackRemove`).
+            let pos = session
+                .plugins
+                .instances
+                .iter()
+                .position(|r| r.id == row.id)
+                .ok_or_else(|| format!("unknown plugin instance: {}", row.id))?;
+            let removed = session.plugins.instances.remove(pos);
+            // PARK the param mirror — do NOT clear it (Task 9 review round
+            // 1, Important-1). `Op::PluginAdd`'s fixed `{row, index}` shape
+            // has no field to carry the mirror back through on undo, so it
+            // travels via the document itself: a later `PluginAdd` for this
+            // SAME id (undo replaying THIS op's inverse) finds it already
+            // here and its `.or_default()` seed leaves it untouched. A
+            // permanent removal (never undone) leaves a small, bounded
+            // orphaned entry, same trade-off `pending_state` already makes
+            // below — both are GC'd wholesale on the next
+            // `restore_into_session`/project open.
+            effect.rebuild = true;
+            effect.persist.plugins = true;
+            // Park (or clear) the state blob: `state` is the caller-captured
+            // host blob (host `save_state`, taken outside the lock before
+            // this op was applied) — `None` when the instance had nothing to
+            // save. Preserved verbatim so a later undo (`PluginAdd`) can
+            // restore it via `HostForward::LoadState`.
+            match state {
+                Some(bytes) => {
+                    session.plugins.pending_state.insert(removed.id.clone(), bytes.clone());
+                    // Dirty (Task 9 review round 1, Critical-2): these bytes
+                    // are NEWER than whatever `.state` file (if any) is on
+                    // disk for this id — `save_snapshot_into_project`'s
+                    // persist ladder must write them, not silently keep the
+                    // stale file just because it happens to exist.
+                    session.plugins.dirty_state.insert(removed.id.clone());
+                }
+                None => {
+                    session.plugins.pending_state.remove(&removed.id);
+                    session.plugins.dirty_state.remove(&removed.id);
+                }
+            }
+            effect.host_forward.push(HostForward::Destroy { instance: removed.id.clone() });
+            Ok(Op::PluginAdd { row: removed, index: pos })
+        }
+        Op::PluginSetState { instance, state } => {
+            if !session.plugins.instances.iter().any(|r| r.id == *instance) {
+                return Err(format!("unknown plugin instance: {instance}"));
+            }
+            let previous = session.plugins.pending_state.get(instance).cloned();
+            session.plugins.pending_state.insert(instance.clone(), state.clone());
+            // Dirty (Critical-2, same reasoning as `PluginRemove` above):
+            // these are new authoritative bytes, not necessarily reflected
+            // in whatever `.state` file already exists on disk.
+            session.plugins.dirty_state.insert(instance.clone());
+            effect.persist.plugins = true;
+            effect.host_forward.push(HostForward::LoadState { instance: instance.clone() });
+            Ok(Op::PluginSetState {
+                instance: instance.clone(),
+                // Inverse restores whatever was there before (which may be
+                // "nothing" — an instance that never had a blob) by
+                // reapplying an EMPTY blob is wrong (that would forward-load
+                // zero bytes into the host); an absent previous blob simply
+                // means there is nothing meaningful to undo TO, so the
+                // instance's own current blob is kept as a harmless
+                // self-inverse in that corner case (no data loss either way
+                // — never observed by `zyn_load_patch`, which always saves a
+                // real prior blob first).
+                state: previous.unwrap_or_else(|| state.clone()),
+            })
+        }
+        // Plugin params: property-addressed, mirrors `Op::Set{Track, Gain}`
+        // — clamped write, inverse from store truth, folds like mix Sets
+        // (coalescable per (object, path) — a knob drag is Sets on one
+        // instance/param).
+        Op::Set { object: ObjectRef::Plugin(id), path: PropPath::Param { index }, to, .. } => {
+            if !session.plugins.instances.iter().any(|r| &r.id == id) {
+                return Err(format!("unknown plugin instance: {id}"));
+            }
+            let v = to.as_f64().ok_or("param: expected a number")?;
+            let params = session.plugins.params.entry(id.clone()).or_default();
+            let (from_now, applied) = match params.iter_mut().find(|p| p.id == *index) {
+                Some(p) => {
+                    let from_now = p.value;
+                    p.value = v.clamp(p.min, p.max);
+                    (from_now, p.value)
+                }
+                None => {
+                    // Unseen param id (mirrors the retired
+                    // `PluginRegistry::set_params`'s dynamic-entry path for
+                    // stub instances whose real ranges aren't known yet): a
+                    // fresh 0..1-spanning entry, clamped the same way.
+                    let clamped = v.clamp(0.0, 1.0);
+                    params.push(ParamInfo {
+                        id: *index,
+                        name: format!("param {index}"),
+                        min: 0.0,
+                        max: 1.0,
+                        default: 0.0,
+                        value: clamped,
+                        steps: 0,
+                    });
+                    (0.0, clamped)
+                }
+            };
+            effect.persist.plugins = true;
+            effect.host_forward.push(HostForward::ParamWrite {
+                instance: id.clone(),
+                index: *index,
+                value: applied as f32,
+            });
+            Ok(Op::Set {
+                object: ObjectRef::Plugin(id.clone()),
+                path: PropPath::Param { index: *index },
+                from: serde_json::json!(applied), // the inverse's `from`: value we just wrote
+                to: serde_json::json!(from_now),  // the inverse's `to`: value to restore
+            })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
 
 /// Read a track property as its JSON-wire representation (round-trippable
-/// through `write_prop`).
-fn read_prop(t: &TrackState, path: PropPath) -> serde_json::Value {
+/// through `write_prop`). Fallible: `PropPath` and `ObjectRef` are
+/// independent serde-derived enums, so a deserialized (e.g. replayed
+/// journal, or agent-authored) `Op::Set` can pair `ObjectRef::Track` with a
+/// Clip-only path like `TimelineStartSamples` — that must fail the
+/// transaction atomically (via `apply_raw`'s `?`), never panic a `transact`
+/// closure (round-2 §4's no-panic-in-transact invariant).
+fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String> {
     match path {
-        PropPath::Gain => serde_json::json!(t.gain_db),
-        PropPath::Pan => serde_json::json!(t.pan),
-        PropPath::Muted => serde_json::json!(t.muted),
-        PropPath::Soloed => serde_json::json!(t.soloed),
-        PropPath::Armed => serde_json::json!(t.armed),
+        PropPath::Gain => Ok(serde_json::json!(t.gain_db)),
+        PropPath::Pan => Ok(serde_json::json!(t.pan)),
+        PropPath::Muted => Ok(serde_json::json!(t.muted)),
+        PropPath::Soloed => Ok(serde_json::json!(t.soloed)),
+        PropPath::Armed => Ok(serde_json::json!(t.armed)),
+        // Option<String> serializes as a JSON string or null, never a
+        // wrapping object — same wire shape `write_prop` below accepts.
+        PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
+        PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin path)"))
+        }
     }
 }
 
@@ -328,6 +1003,218 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             t.armed = v;
             Ok(serde_json::json!(t.armed))
         }
+        PropPath::InstrumentId => {
+            let v = match to {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s.clone()),
+                _ => return Err("instrumentId: expected a string or null".into()),
+            };
+            t.instrument_id = v;
+            Ok(serde_json::json!(t.instrument_id))
+        }
+        PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin path)"))
+        }
+    }
+}
+
+/// Read a MIDI clip property as its JSON-wire representation (mirrors
+/// `read_prop` for `TrackState`, scoped to `MidiClip`'s three
+/// placement/content-length paths). Fallible for the same reason:
+/// `PropPath` and `ObjectRef` are independent serde-derived enums, so a
+/// `Set{MidiClip, Gain}` (a Track-only path) must fail the transaction
+/// atomically, never panic.
+fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TimelineStartTicks => Ok(serde_json::json!(c.timeline_start_ticks)),
+        PropPath::LengthTicks => Ok(serde_json::json!(c.length_ticks)),
+        PropPath::ContentLengthTicks => Ok(serde_json::json!(c.content_length_ticks)),
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a MidiClip property"))
+        }
+    }
+}
+
+/// Write a MIDI clip property, mirroring `write_prop`'s clamp discipline:
+/// `LengthTicks` clamps to >= 1 on write (the write side is the clamp
+/// authority, mirroring the gain-clamp round-trip rule — Plan A) so the
+/// inverse observes the post-clamp value, never the caller's raw (possibly
+/// zero) `to`. Returns the as-applied (post-clamp) value.
+fn write_midi_prop(
+    c: &mut crate::midi::types::MidiClip,
+    path: PropPath,
+    to: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TimelineStartTicks => {
+            let v = to.as_u64().ok_or("timelineStartTicks: expected a non-negative integer")?;
+            c.timeline_start_ticks = v;
+            Ok(serde_json::json!(c.timeline_start_ticks))
+        }
+        PropPath::LengthTicks => {
+            let v = to.as_u64().ok_or("lengthTicks: expected a non-negative integer")?;
+            c.length_ticks = v.max(1); // clamp, never Err — mirrors the gain clamp
+            Ok(serde_json::json!(c.length_ticks))
+        }
+        PropPath::ContentLengthTicks => {
+            let v = match to {
+                serde_json::Value::Null => None,
+                serde_json::Value::Number(n) => Some(
+                    n.as_u64()
+                        .ok_or("contentLengthTicks: expected a non-negative integer or null")?,
+                ),
+                _ => return Err("contentLengthTicks: expected a non-negative integer or null".into()),
+            };
+            c.content_length_ticks = v;
+            Ok(serde_json::json!(c.content_length_ticks))
+        }
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a MidiClip property"))
+        }
+    }
+}
+
+/// Read/write a transport property as its JSON-wire representation —
+/// mirrors `read_prop`/`write_prop` (`TrackState`) and
+/// `read_midi_prop`/`write_midi_prop` (`MidiClip`), scoped to the six
+/// `Transport` paths. Fallible for the same reason: `PropPath` and
+/// `ObjectRef` are independent serde-derived enums, so e.g.
+/// `Set{Transport, Gain}` (a Track-only path) must fail the transaction
+/// atomically, never panic.
+fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TransportState => Ok(serde_json::json!(t.state)),
+        PropPath::LoopEnabled => Ok(serde_json::json!(t.loop_enabled)),
+        PropPath::LoopStartSamples => Ok(serde_json::json!(t.loop_start_samples)),
+        PropPath::LoopEndSamples => Ok(serde_json::json!(t.loop_end_samples)),
+        PropPath::StopAtEnd => Ok(serde_json::json!(t.stop_at_end)),
+        PropPath::SampleRate => Ok(serde_json::json!(t.sample_rate)),
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Transport property"))
+        }
+    }
+}
+
+/// Write a transport property. `TransportState`'s wire form is validated
+/// against the closed `"playing"|"stopped"|"recording"` set (the same set
+/// `audio/engine.rs` writes directly); the numeric fields are u64/u32
+/// wire-checked like their Clip/MidiClip counterparts, with no clamping
+/// (unlike `Gain`/`LengthTicks`) since a transport commit's caller —
+/// `ControlPlane::transport` — already validates the loop region before
+/// ever building the op.
+fn write_transport_prop(
+    t: &mut TransportState,
+    path: PropPath,
+    to: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::TransportState => {
+            let v = to.as_str().ok_or("transportState: expected a string")?;
+            if !matches!(v, "playing" | "stopped" | "recording") {
+                return Err(format!(
+                    "transportState: expected \"playing\"|\"stopped\"|\"recording\", got {v:?}"
+                ));
+            }
+            t.state = v.to_string();
+            Ok(serde_json::json!(t.state))
+        }
+        PropPath::LoopEnabled => {
+            let v = to.as_bool().ok_or("loopEnabled: expected a bool")?;
+            t.loop_enabled = v;
+            Ok(serde_json::json!(t.loop_enabled))
+        }
+        PropPath::LoopStartSamples => {
+            let v = to.as_u64().ok_or("loopStartSamples: expected a non-negative integer")?;
+            t.loop_start_samples = v;
+            Ok(serde_json::json!(t.loop_start_samples))
+        }
+        PropPath::LoopEndSamples => {
+            let v = to.as_u64().ok_or("loopEndSamples: expected a non-negative integer")?;
+            t.loop_end_samples = v;
+            Ok(serde_json::json!(t.loop_end_samples))
+        }
+        PropPath::StopAtEnd => {
+            let v = to.as_bool().ok_or("stopAtEnd: expected a bool")?;
+            t.stop_at_end = v;
+            Ok(serde_json::json!(t.stop_at_end))
+        }
+        PropPath::SampleRate => {
+            let v = to
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or("sampleRate: expected a non-negative 32-bit integer")?;
+            t.sample_rate = v;
+            Ok(serde_json::json!(t.sample_rate))
+        }
+        PropPath::Gain
+        | PropPath::Pan
+        | PropPath::Muted
+        | PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::InstrumentId
+        | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Transport property"))
+        }
     }
 }
 
@@ -338,7 +1225,18 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
 /// store truth, never the caller's advisory `op.from`); entries whose net
 /// `from == to` are dropped from both `ops` and `inverses`. Non-`Set` ops
 /// (future op kinds) pass through untouched, each still paired with its own
-/// inverse, in original relative order.
+/// inverse, in original relative order. Structural (non-Set) ops act as a
+/// barrier: grouping never reaches back across a structural op boundary to
+/// merge with earlier Set groups, preserving replay order once ops persist.
+///
+/// NON-`Set` OPS NEVER FOLD AWAY (Plan E review ask, made explicit here so
+/// nobody "optimizes" it later): only the `Grouped` arm can drop an entry,
+/// and only when a group's net `from == to`. Every non-`Set` op takes the
+/// `Passthrough` arm, which always emits both the op and its inverse — so a
+/// structurally no-op mutation still reaches history and the journal. A
+/// `Op::AutomationSetLane { lane: None }` that deletes an already-absent
+/// lane changes nothing in the document, and it STILL journals: the log
+/// records what was attempted through the channel, not merely what moved.
 ///
 /// A linear scan (not a `HashMap`) is used deliberately: `PropPath` isn't
 /// `Hash` (op.rs's closed enum, Task 2 territory, left untouched), and
@@ -356,11 +1254,12 @@ fn fold_ops(ops: Vec<Op>, inverses: Vec<Op>) -> (Vec<Op>, Vec<Op>) {
     }
 
     let mut slots: Vec<Slot> = Vec::new();
+    let mut barrier = 0usize; // grouping never reaches below this index
 
     for (op, inv) in ops.into_iter().zip(inverses.into_iter()) {
         match (&op, &inv) {
             (Op::Set { object, path, .. }, Op::Set { from: true_to, to: true_from, .. }) => {
-                let existing = slots.iter_mut().find_map(|s| match s {
+                let existing = slots[barrier..].iter_mut().find_map(|s| match s {
                     Slot::Grouped(g) if g.object == *object && g.path == *path => Some(g),
                     _ => None,
                 });
@@ -375,7 +1274,10 @@ fn fold_ops(ops: Vec<Op>, inverses: Vec<Op>) -> (Vec<Op>, Vec<Op>) {
                     }));
                 }
             }
-            _ => slots.push(Slot::Passthrough(op, inv)),
+            _ => {
+                slots.push(Slot::Passthrough(op, inv));
+                barrier = slots.len(); // structural op: nothing before it may absorb later Sets
+            }
         }
     }
 
@@ -422,6 +1324,7 @@ mod tests {
     use crate::audio::types::testutil::{test_clip, test_track};
     use crate::control::op::testutil::set_gain;
     use crate::control::op::{Actor, ObjectRef, PropPath, TxMeta};
+    use crate::plugins::automation::AutomationPoint;
 
     /// Store with one TrackState id `id`. Initial `gain_db` is 1.0 — a
     /// deliberately odd-but-valid dB value inside ops.rs's -160..24 clamp
@@ -550,7 +1453,7 @@ mod tests {
     #[test]
     fn transact_commits_and_bumps_rev() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "noop".into() };
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "noop".into(), transient: false };
         let c1 = Session::transact(&m, meta.clone(), |_tx| Ok(())).unwrap();
         let c2 = Session::transact(&m, meta, |_tx| Ok(())).unwrap();
         assert_eq!(c2.rev, c1.rev + 1);
@@ -559,7 +1462,7 @@ mod tests {
     #[test]
     fn failing_closure_leaves_session_untouched_and_no_rev() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "fail".into() };
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "fail".into(), transient: false };
         let before = Session::transact(&m, meta.clone(), |_| Ok(())).unwrap().rev;
         let r = Session::transact(&m, meta.clone(), |_tx| Err("boom".into()));
         assert!(r.is_err());
@@ -632,10 +1535,972 @@ mod tests {
     #[should_panic(expected = "nested transact")]
     fn nested_transact_panics_not_deadlocks() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "outer".into() };
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "outer".into(), transient: false };
         let _ = Session::transact(&m, meta.clone(), |_tx| {
             let _ = Session::transact(&m, meta.clone(), |_| Ok(()));
             Ok(())
         });
+    }
+
+    #[test]
+    fn fold_never_merges_sets_across_a_structural_op() {
+        // gain 0→3, then a structural TrackAdd, then gain 3→6: the two Sets
+        // must NOT merge into one 0→6 emitted before the TrackAdd.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let t2 = test_track("t-2");
+        let c = Session::transact(&m, TxMeta::user("fold-barrier"), |tx| {
+            tx.apply(set_gain("t-1", 3.0))?;
+            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(set_gain("t-1", 6.0))
+        })
+        .unwrap();
+        assert_eq!(c.ops.len(), 3, "no cross-barrier merge: {:?}", c.ops);
+        assert!(matches!(&c.ops[0], Op::Set { .. }));
+        assert!(matches!(&c.ops[1], Op::TrackAdd { .. }));
+        assert!(matches!(&c.ops[2], Op::Set { .. }));
+        // Verify the gained value is correct
+        assert_eq!(m.lock().store.tracks[0].gain_db, 6.0);
+    }
+
+    #[test]
+    fn wiggle_back_across_a_structural_op_is_not_elided() {
+        // gain 0→3, TrackAdd, gain 3→0: net-noop for the gain, but the two Sets
+        // sit in different barrier regions — BOTH survive (replay order truth
+        // beats history minimalism once ops persist).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let t2 = test_track("t-2");
+        let c = Session::transact(&m, TxMeta::user("wiggle-barrier"), |tx| {
+            tx.apply(set_gain("t-1", 3.0))?;
+            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(set_gain("t-1", 1.0)) // back to original
+        })
+        .unwrap();
+        assert_eq!(c.ops.len(), 3, "cross-barrier wiggle must not elide: {:?}", c.ops);
+        // Even though we're back to the original value, the two Sets are in
+        // different barrier regions so neither can cancel out
+    }
+
+    // ---- Plan E Task 3: clip move / add / remove, track instrument ----
+
+    #[test]
+    fn clip_move_applies_and_inverse_restores() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let clip = test_clip("c-1", "t-1");
+        m.lock().store.clips.push(clip.clone());
+        let c = Session::transact(&m, TxMeta::user("move clip"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Clip("c-1".into()),
+                path: PropPath::TimelineStartSamples,
+                from: serde_json::Value::Null, // advisory; apply re-reads truth
+                to: serde_json::json!(48_000u64),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.clips[0].timeline_start_samples, 48_000);
+        assert!(c.effect.rebuild, "clip move must request a rebuild");
+        assert!(c.effect.persist.project, "clip move must persist the project");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().store.clips[0].timeline_start_samples,
+            clip.timeline_start_samples,
+            "undo restores the original position"
+        );
+    }
+
+    #[test]
+    fn clip_add_duplicate_id_is_rejected_atomically() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let clip = test_clip("c-1", "t-1");
+        m.lock().store.clips.push(clip.clone());
+        let before = m.lock().store.clips.clone();
+        let r = Session::transact(&m, TxMeta::user("dup clip"), |tx| {
+            tx.apply(Op::ClipAdd { clip: clip.clone(), index: 0 })?;
+            tx.apply(Op::ClipAdd { clip: clip.clone(), index: 1 }) // duplicate id, in-tx
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().store.clips, before, "store untouched, rev unchanged");
+    }
+
+    #[test]
+    fn instrument_set_round_trips_and_requests_rebuild() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        assert_eq!(m.lock().store.tracks[0].instrument_id, None);
+        let c = Session::transact(&m, TxMeta::user("set instrument"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::InstrumentId,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("plugin:x"),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].instrument_id, Some("plugin:x".to_string()));
+        assert!(c.effect.rebuild, "instrument change must request a rebuild");
+        assert!(c.effect.persist.project, "instrument change must persist the project");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].instrument_id, None, "undo restores None");
+    }
+
+    #[test]
+    fn mismatched_track_timeline_start_samples_fails_cleanly_not_panics() {
+        // `PropPath` and `ObjectRef` are independent serde-derived enums, so
+        // a corrupted/replayed journal or a bad agent-authored op can pair
+        // `ObjectRef::Track` with the Clip-only `TimelineStartSamples` path
+        // — a value that deserializes cleanly. `apply_raw` must fail this
+        // transaction atomically, not panic (round-2 §4: transact closures
+        // must not panic).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before_gain = m.lock().store.tracks[0].gain_db;
+        let before_rev = m.lock().rev;
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::TimelineStartSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(42u64),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, before_gain, "store untouched");
+        assert_eq!(m.lock().rev, before_rev, "failed tx must not consume a revision");
+    }
+
+    #[test]
+    fn mismatched_clip_instrument_id_fails_cleanly_not_panics() {
+        // The mirror case: `Set{Clip, InstrumentId}` — a Track-only path
+        // paired with a Clip object. Already safe (falls to `apply_raw`'s
+        // catch-all `_ => Err(...)` arm) — pinned here so both mismatched
+        // directions have coverage, not just the one that used to panic.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let clip = test_clip("c-1", "t-1");
+        m.lock().store.clips.push(clip.clone());
+        let before = m.lock().store.clips.clone();
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Clip("c-1".into()),
+                path: PropPath::InstrumentId,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("plugin:x"),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.clips, before, "store untouched");
+    }
+
+    // ---- Plan E Task 5: MIDI + tempo op kinds ----
+
+    use crate::ids::{ContentId, LaneId, NoteId};
+    use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent};
+
+    fn test_midi_clip(id: &str, track_id: &str) -> MidiClip {
+        MidiClip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: format!("MIDI {id}"),
+            timeline_start_ticks: 0,
+            length_ticks: 3840,
+            notes: vec![],
+            next_note_id: 1,
+            content_id: ContentId::mint(),
+            lane_id: LaneId::default_for_track(track_id),
+            content_length_ticks: None,
+        }
+    }
+
+    fn note(tick: u32, key: u8, id: u32) -> MidiNote {
+        MidiNote { tick, length_ticks: 480, key, velocity: 100, channel: 0, note_id: NoteId(id) }
+    }
+
+    #[test]
+    fn tempo_set_is_atomic_including_the_bpm_mirror() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let c = Session::transact(&m, TxMeta::user("set tempo"), |tx| {
+            tx.apply(Op::TempoSet {
+                ppq: 960,
+                events: vec![TempoEvent { tick: 0, bpm: 140.0 }],
+                meter: vec![MeterEvent { tick: 0, num: 3, den: 4 }],
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert_eq!(g.midi.ppq, 960);
+            assert_eq!(g.midi.tempo_events, vec![TempoEvent { tick: 0, bpm: 140.0 }]);
+            assert_eq!(g.midi.meter_events, vec![MeterEvent { tick: 0, num: 3, den: 4 }]);
+            // The cross-store atomicity this task exists for: the bpm
+            // mirror lands in the SAME commit, not a second phase.
+            assert_eq!(g.store.transport.tempo_bpm, 140.0);
+        }
+        assert!(c.effect.rebuild, "tempo change must request a rebuild");
+        assert!(c.effect.persist.midi, "tempo change must persist midi");
+        assert!(c.effect.persist.project, "tempo change must persist the project (bpm mirror)");
+
+        // Inverse restores all four fields in one commit.
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let g = m.lock();
+        assert_eq!(g.midi.ppq, MidiStore::default().ppq);
+        assert_eq!(g.midi.tempo_events, MidiStore::default().tempo_events);
+        assert_eq!(g.midi.meter_events, MidiStore::default().meter_events);
+        assert_eq!(g.store.transport.tempo_bpm, Store::default().transport.tempo_bpm);
+    }
+
+    #[test]
+    fn tempo_set_rejects_empty_or_unsorted_events_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let before = { let g = m.lock(); (g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()) };
+
+        let r = Session::transact(&m, TxMeta::user("empty"), |tx| {
+            tx.apply(Op::TempoSet { ppq: 960, events: vec![], meter: vec![MeterEvent { tick: 0, num: 4, den: 4 }] })
+        });
+        assert!(r.is_err(), "empty events must be rejected");
+
+        let r = Session::transact(&m, TxMeta::user("unsorted"), |tx| {
+            tx.apply(Op::TempoSet {
+                ppq: 960,
+                events: vec![TempoEvent { tick: 100, bpm: 140.0 }, TempoEvent { tick: 0, bpm: 120.0 }],
+                meter: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            })
+        });
+        assert!(r.is_err(), "unsorted events must be rejected");
+
+        let g = m.lock();
+        assert_eq!((g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()), before, "store untouched");
+    }
+
+    #[test]
+    fn midi_set_notes_inverse_restores_notes_but_never_rewinds_watermark() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let mut clip = test_midi_clip("mc-1", "t-1");
+        clip.notes = vec![note(0, 60, 1), note(480, 62, 2)];
+        clip.next_note_id = 3;
+        m.lock().midi.clips.push(clip.clone());
+
+        let c = Session::transact(&m, TxMeta::user("set notes"), |tx| {
+            // Re-send the two existing notes with their live ids (kept) plus
+            // a brand-new note carrying id 0 (minted -> 3, watermark -> 4).
+            tx.apply(Op::MidiSetNotes {
+                clip: "mc-1".into(),
+                notes: vec![note(0, 60, 1), note(480, 62, 2), note(960, 64, 0)],
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            let c = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+            assert_eq!(c.notes.len(), 3);
+            assert_eq!(c.notes[2].note_id.0, 3, "id 0 minted from the watermark");
+            assert_eq!(c.next_note_id, 4);
+        }
+        assert!(c.effect.rebuild, "note replacement must request a rebuild");
+        assert!(c.effect.persist.midi, "note replacement must persist midi");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let g = m.lock();
+        let restored = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+        assert_eq!(restored.notes, clip.notes, "undo restores the original notes exactly");
+        assert_eq!(restored.next_note_id, 4, "watermark is NEVER rewound by the inverse (ADR 0001)");
+    }
+
+    #[test]
+    fn midi_clip_add_then_inverse_removes_byte_identically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        let c = Session::transact(&m, TxMeta::user("add midi clip"), |tx| {
+            tx.apply(Op::MidiClipAdd { clip: clip.clone(), index: 0 })
+        })
+        .unwrap();
+        assert_eq!(m.lock().midi.clips, vec![clip.clone()]);
+        assert!(c.effect.rebuild, "midi clip add must request a rebuild");
+        assert!(c.effect.persist.midi, "midi clip add must persist midi");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert!(m.lock().midi.clips.is_empty(), "inverse removes the row byte-identically (full round trip)");
+    }
+
+    #[test]
+    fn midi_clip_add_duplicate_id_is_rejected_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        m.lock().midi.clips.push(clip.clone());
+        let before = m.lock().midi.clips.clone();
+        let r = Session::transact(&m, TxMeta::user("dup"), |tx| {
+            tx.apply(Op::MidiClipAdd { clip: clip.clone(), index: 1 })
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().midi.clips, before, "store untouched");
+    }
+
+    #[test]
+    fn midi_bounds_set_clamps_and_round_trips() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let mut clip = test_midi_clip("mc-1", "t-1");
+        clip.length_ticks = 1920;
+        m.lock().midi.clips.push(clip.clone());
+
+        let c = Session::transact(&m, TxMeta::user("resize to zero"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip("mc-1".into()),
+                path: PropPath::LengthTicks,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0u64),
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            let c = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+            assert_eq!(c.length_ticks, 1, "clamps to >= 1, does not error");
+        }
+        match &c.ops[0] {
+            Op::Set { to, .. } => assert_eq!(to, &serde_json::json!(1u64), "recorded op carries the as-applied (clamped) value"),
+            other => panic!("expected Set, got {other:?}"),
+        }
+        assert!(c.effect.rebuild, "bounds change must request a rebuild");
+        assert!(c.effect.persist.midi, "bounds change must persist midi");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let g = m.lock();
+        let restored = g.midi.clips.iter().find(|c| c.id == "mc-1").unwrap();
+        assert_eq!(restored.length_ticks, 1920, "inverse restores the pre-clamp truth");
+    }
+
+    #[test]
+    fn midi_bounds_content_length_ticks_round_trips_including_null() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        m.lock().midi.clips.push(clip.clone());
+
+        let c = Session::transact(&m, TxMeta::user("set content length"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip("mc-1".into()),
+                path: PropPath::ContentLengthTicks,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(1920u64),
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().midi.clips.iter().find(|c| c.id == "mc-1").unwrap().content_length_ticks,
+            Some(1920)
+        );
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().midi.clips.iter().find(|c| c.id == "mc-1").unwrap().content_length_ticks,
+            None,
+            "undo restores the absent (null) content length"
+        );
+    }
+
+    #[test]
+    fn mismatched_track_length_ticks_fails_cleanly_not_panics() {
+        // `Set{Track, LengthTicks}` — a MidiClip-only path paired with a
+        // Track object — must error, never panic.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before_gain = m.lock().store.tracks[0].gain_db;
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::LengthTicks,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(42u64),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, before_gain, "store untouched");
+    }
+
+    #[test]
+    fn mismatched_midi_clip_gain_fails_cleanly_not_panics() {
+        // The mirror case: `Set{MidiClip, Gain}` — a Track-only path paired
+        // with a MidiClip object.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let clip = test_midi_clip("mc-1", "t-1");
+        m.lock().midi.clips.push(clip.clone());
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip("mc-1".into()),
+                path: PropPath::Gain,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0.5),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().midi.clips, vec![clip], "store untouched");
+    }
+
+    #[test]
+    fn unknown_midi_clip_fails_whole_batch_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let r = Session::transact(&m, TxMeta::user("bad"), |tx| {
+            tx.apply(Op::MidiSetNotes { clip: "no-such-clip".into(), notes: vec![] })
+        });
+        assert!(r.is_err());
+    }
+
+    // ---- Plan E Task 12: transport family --------------------------------
+
+    #[test]
+    fn transport_state_set_round_trips_through_inverse() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        assert_eq!(m.lock().store.transport.state, "stopped");
+        let c = Session::transact(&m, TxMeta::user("transport play").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::TransportState,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("playing"),
+            })
+        })
+        .unwrap();
+        assert!(c.meta.transient, "transport commits are transient");
+        assert_eq!(m.lock().store.transport.state, "playing");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.transport.state, "stopped", "undo restores the original state");
+    }
+
+    #[test]
+    fn transport_loop_set_round_trips_through_inverse() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let c = Session::transact(&m, TxMeta::user("transport set loop").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEnabled,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(true),
+            })?;
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopStartSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(1_000u64),
+            })?;
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEndSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(2_000u64),
+            })
+        })
+        .unwrap();
+        assert!(c.meta.transient);
+        {
+            let s = m.lock();
+            assert!(s.store.transport.loop_enabled);
+            assert_eq!(s.store.transport.loop_start_samples, 1_000);
+            assert_eq!(s.store.transport.loop_end_samples, 2_000);
+        }
+        // Sets on transport paths carry NO persist flag (RULING, Task 12
+        // brief) — a divergence from the Clip/MidiClip Set arms above,
+        // which do set `effect.persist.project`/`.midi`.
+        assert_eq!(c.effect.persist, PersistEffect::default(), "transport Sets set no persist flag");
+        assert!(!c.effect.rebuild, "transport Sets don't need a graph rebuild");
+    }
+
+    // ---- Plan E Task 10: automation lane op kind ----
+
+    fn test_lane(id: &str, points: Vec<AutomationPoint>) -> AutomationLane {
+        AutomationLane { id: id.into(), target_node: "track:t-1".into(), param_id: 0, points }
+    }
+
+    #[test]
+    fn automation_set_lane_inserts_and_inverse_deletes() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let lane = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        let c = Session::transact(&m, TxMeta::user("set lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(lane.clone()) })
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![lane]);
+        assert!(c.effect.persist.automation, "lane write must persist automation");
+        assert!(
+            !c.effect.rebuild,
+            "automation lanes aren't read at graph-build time yet (audio/engine.rs:684) — no rebuild"
+        );
+        match &c.inverses[0] {
+            Op::AutomationSetLane { key, lane } => {
+                assert_eq!(key, "a-1");
+                assert!(lane.is_none(), "the lane didn't exist before — inverse deletes it");
+            }
+            other => panic!("expected AutomationSetLane, got {other:?}"),
+        }
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        let s = m.lock();
+        assert!(!s.store.transport.loop_enabled, "undo restores loop_enabled");
+        assert_eq!(s.store.transport.loop_start_samples, 0, "undo restores loop_start_samples");
+        assert_eq!(s.store.transport.loop_end_samples, 0, "undo restores loop_end_samples");
+    }
+
+    #[test]
+    fn transport_stop_at_end_and_sample_rate_round_trip() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        assert!(m.lock().store.transport.stop_at_end); // default true
+        Session::transact(&m, TxMeta::user("stop at end").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::StopAtEnd,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(false),
+            })
+        })
+        .unwrap();
+        assert!(!m.lock().store.transport.stop_at_end);
+
+        Session::transact(&m, TxMeta::user("sample rate").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::SampleRate,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(96_000u32),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.transport.sample_rate, 96_000);
+    }
+
+    #[test]
+    fn mismatched_transport_gain_fails_cleanly_not_panics() {
+        // `Set{Transport, Gain}` — a Track-only path paired with the
+        // Transport object.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let before = m.lock().store.transport.state.clone();
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::Gain,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0.5),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.transport.state, before, "store untouched");
+    }
+
+    #[test]
+    fn mismatched_track_loop_enabled_fails_cleanly_not_panics() {
+        // The mirror case: `Set{Track, LoopEnabled}` — a Transport-only
+        // path paired with a Track object.
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let before_gain = m.lock().store.tracks[0].gain_db;
+        let r = Session::transact(&m, TxMeta::user("mismatched"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::LoopEnabled,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(true),
+            })
+        });
+        assert!(r.is_err(), "mismatched object/path must error, not panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, before_gain, "store untouched");
+    }
+
+    #[test]
+    fn transport_state_rejects_unknown_string() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let r = Session::transact(&m, TxMeta::user("bad state"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::TransportState,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("paused"), // not one of playing/stopped/recording
+            })
+        });
+        assert!(r.is_err(), "an unrecognized transport state must error, not silently write garbage");
+        assert!(m.lock().automation.lanes.is_empty(), "undo removes the inserted lane");
+    }
+
+    #[test]
+    fn automation_set_lane_overwrites_and_inverse_restores_previous() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let original = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        m.lock().automation.lanes.push(original.clone());
+
+        let replacement = test_lane("a-1", vec![AutomationPoint { tick: 960, value: 0.5 }]);
+        let c = Session::transact(&m, TxMeta::user("overwrite lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(replacement.clone()) })
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![replacement]);
+        assert!(c.effect.persist.automation);
+        match &c.inverses[0] {
+            Op::AutomationSetLane { key, lane: Some(l) } => {
+                assert_eq!(key, "a-1");
+                assert_eq!(l.points, original.points, "inverse carries the PREVIOUS lane, from store truth");
+            }
+            other => panic!("expected AutomationSetLane{{..Some}}, got {other:?}"),
+        }
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![original], "undo restores the original lane exactly");
+    }
+
+    #[test]
+    fn automation_set_lane_deletes_and_inverse_reinserts() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let lane = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        m.lock().automation.lanes.push(lane.clone());
+
+        let c = Session::transact(&m, TxMeta::user("delete lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: None })
+        })
+        .unwrap();
+        assert!(m.lock().automation.lanes.is_empty(), "lane removed");
+        assert!(c.effect.persist.automation);
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![lane], "undo reinserts the deleted lane");
+    }
+
+    #[test]
+    fn automation_set_lane_deleting_an_unknown_key_is_a_harmless_noop() {
+        // Mirrors the retired command's leniency (`s.lanes.retain(...)`
+        // silently dropped nothing for an unknown id) — deleting a lane
+        // that was never there is not an error.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let c = Session::transact(&m, TxMeta::user("delete ghost"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "ghost".into(), lane: None })
+        })
+        .unwrap();
+        assert!(m.lock().automation.lanes.is_empty());
+        match &c.inverses[0] {
+            Op::AutomationSetLane { key, lane } => {
+                assert_eq!(key, "ghost");
+                assert!(lane.is_none());
+            }
+            other => panic!("expected AutomationSetLane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_set_lane_normalizes_and_rejects_invalid_points_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let bad = test_lane("a-1", vec![AutomationPoint { tick: 0, value: f32::NAN }]);
+        let r = Session::transact(&m, TxMeta::user("bad lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(bad) })
+        });
+        assert!(r.is_err(), "non-finite values must be rejected");
+        assert!(m.lock().automation.lanes.is_empty(), "rejected write leaves the session untouched");
+
+        // Unsorted points get normalized (sorted), not rejected.
+        let unsorted = test_lane(
+            "a-1",
+            vec![AutomationPoint { tick: 960, value: 0.5 }, AutomationPoint { tick: 0, value: 1.0 }],
+        );
+        Session::transact(&m, TxMeta::user("unsorted lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(unsorted) })
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().automation.lanes[0].points,
+            vec![AutomationPoint { tick: 0, value: 1.0 }, AutomationPoint { tick: 960, value: 0.5 }],
+            "apply normalizes (sorts) points before storing"
+        );
+    }
+    // ---- Plan E Task 9: plugin op kinds ----
+
+    fn test_plugin_row(id: &str) -> PluginInstanceInfo {
+        PluginInstanceInfo {
+            id: id.into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        }
+    }
+
+    /// Mirrors `session_owns_both_stores_under_one_lock`: the plugin
+    /// document is a THIRD field behind the SAME session guard, so a
+    /// caller can read/write tracks, midi and plugin rows under one lock —
+    /// impossible with the old (store, midi) + separate `PluginRegistry`
+    /// layout.
+    #[test]
+    fn session_owns_plugin_rows() {
+        let s = Session::new(Store::default(), MidiStore::default());
+        let m = parking_lot::Mutex::new(s);
+        let mut g = m.lock();
+        g.plugins.instances.push(test_plugin_row("p-1"));
+        g.plugins.params.insert("p-1".into(), Vec::new());
+        g.midi.ppq = 960;
+        assert_eq!(g.plugins.instances.len(), 1);
+        assert_eq!(g.midi.ppq, 960);
+    }
+
+    #[test]
+    fn plugin_add_duplicate_id_is_rejected_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        m.lock().plugins.instances.push(row.clone());
+        let before = m.lock().plugins.instances.clone();
+        let r = Session::transact(&m, TxMeta::user("dup"), |tx| {
+            tx.apply(Op::PluginAdd { row: row.clone(), index: 1 })
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().plugins.instances, before, "document untouched");
+    }
+
+    /// §4.4 restore-from-blob: `PluginRemove`'s `state` (captured via the
+    /// host's `save_state` BEFORE teardown, outside the lock — this test
+    /// hands it in directly, no real host needed) travels into
+    /// `pending_state`; the computed inverse is `PluginAdd`, and REPLAYING
+    /// that inverse (undo) re-emits `Instantiate` + `LoadState` — the
+    /// host-forward round trip a generic undo replay needs since there is
+    /// no "prepare" step for it (unlike the original forward instantiate).
+    #[test]
+    fn plugin_remove_then_undo_restores_state_blob() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(row.id.clone(), Vec::new());
+        }
+        let blob = vec![1u8, 2, 3, 4];
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
+            tx.apply(Op::PluginRemove {
+                row: row.clone(),
+                index: 0,
+                state: Some(blob.clone()),
+                params: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert!(m.lock().plugins.instances.is_empty(), "row removed");
+        assert_eq!(
+            m.lock().plugins.pending_state.get("p-1"),
+            Some(&blob),
+            "blob parked in pending_state"
+        );
+        assert!(
+            c.effect.host_forward.contains(&HostForward::Destroy { instance: "p-1".into() }),
+            "forward remove destroys the host instance post-lock"
+        );
+        assert!(c.effect.persist.plugins, "remove persists via effect");
+        match &c.inverses[0] {
+            Op::PluginAdd { row: r, .. } => assert_eq!(r.id, "p-1", "inverse carries the row"),
+            other => panic!("expected PluginAdd inverse, got {other:?}"),
+        }
+
+        let c2 = Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.instances.len(), 1, "undo restores the row");
+        assert!(
+            c2.effect.host_forward.contains(&HostForward::Instantiate { instance: "p-1".into() }),
+            "undo re-emits Instantiate"
+        );
+        assert!(
+            c2.effect.host_forward.contains(&HostForward::LoadState { instance: "p-1".into() }),
+            "undo re-emits LoadState (a blob is pending)"
+        );
+    }
+
+    /// Task 9 review round 1, Important-1: undo-of-remove must restore the
+    /// user's ACTUAL param mirror, not an empty seed later overwritten by
+    /// the host's post-reinstantiate DEFAULTS. `apply_raw`'s `PluginRemove`
+    /// arm parks the mirror instead of clearing it; `PluginAdd`'s
+    /// `.or_default()` seed must find it already there and leave it alone.
+    #[test]
+    fn plugin_remove_then_undo_restores_the_param_mirror_not_empty() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        let tweaked = ParamInfo {
+            id: 7,
+            name: "cutoff".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+            value: 0.9,
+            steps: 0,
+        };
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(row.id.clone(), vec![tweaked.clone()]);
+        }
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
+            tx.apply(Op::PluginRemove { row: row.clone(), index: 0, state: None, params: vec![] })
+        })
+        .unwrap();
+        // Document truth: the mirror is PARKED (still readable), not wiped,
+        // even though the row itself is gone.
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![tweaked.clone()]),
+            "param mirror survives removal, parked for a possible undo"
+        );
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![tweaked]),
+            "undo (PluginAdd replaying the parked id) leaves the real mirror untouched — \
+             not reset to empty"
+        );
+    }
+
+    /// A knob drag: several `Set{Plugin, Param}` writes on the SAME
+    /// (instance, index) within one transaction fold to their net change
+    /// (mirrors mix Sets), and the batch persists via `effect.persist.
+    /// plugins` + forwards the FINAL clamped value to the host
+    /// (`host_forward`) — never disk I/O or a host call inside `apply_raw`
+    /// itself.
+    #[test]
+    fn plugin_set_param_is_coalescable_and_persists_via_effect() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(
+                row.id.clone(),
+                vec![ParamInfo {
+                    id: 7,
+                    name: "cutoff".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    value: 0.5,
+                    steps: 0,
+                }],
+            );
+        }
+        let set_param = |v: f64| Op::Set {
+            object: ObjectRef::Plugin("p-1".into()),
+            path: PropPath::Param { index: 7 },
+            from: serde_json::Value::Null,
+            to: serde_json::json!(v),
+        };
+        let c = Session::transact(&m, TxMeta::user("knob drag"), |tx| {
+            tx.apply(set_param(0.2))?;
+            tx.apply(set_param(0.9))
+        })
+        .unwrap();
+        assert_eq!(c.ops.len(), 1, "same (instance, index) coalesces to one net Set");
+        match &c.ops[0] {
+            Op::Set { to, .. } => assert_eq!(to, &serde_json::json!(0.9)),
+            other => panic!("expected Set, got {other:?}"),
+        }
+        assert_eq!(m.lock().plugins.params.get("p-1").unwrap()[0].value, 0.9);
+        assert!(c.effect.persist.plugins, "param write persists via effect");
+        assert!(!c.effect.rebuild, "a param write is not structural");
+        let last = c.effect.host_forward.last().expect("at least one host forward");
+        assert!(
+            matches!(last, HostForward::ParamWrite { instance, index, value }
+                if instance == "p-1" && *index == 7 && (*value - 0.9).abs() < 1e-6),
+            "final host forward carries the net clamped value: {last:?}"
+        );
+
+        // Undo restores the original value.
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.params.get("p-1").unwrap()[0].value, 0.5);
+    }
+
+    #[test]
+    fn plugin_set_param_unknown_instance_fails_cleanly() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let r = Session::transact(&m, TxMeta::user("bad"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Plugin("nope".into()),
+                path: PropPath::Param { index: 0 },
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0.5),
+            })
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn plugin_set_state_inverse_carries_the_previous_blob() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.pending_state.insert("p-1".into(), vec![0u8, 0, 0]);
+        }
+        let new_blob = vec![9u8, 9, 9, 9];
+        let c = Session::transact(&m, TxMeta::user("zyn load patch"), |tx| {
+            tx.apply(Op::PluginSetState { instance: "p-1".into(), state: new_blob.clone() })
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.pending_state.get("p-1"), Some(&new_blob));
+        assert!(c.effect.persist.plugins);
+        assert!(c
+            .effect
+            .host_forward
+            .contains(&HostForward::LoadState { instance: "p-1".into() }));
+        match &c.inverses[0] {
+            Op::PluginSetState { state, .. } => assert_eq!(state, &vec![0u8, 0, 0], "old blob"),
+            other => panic!("expected PluginSetState inverse, got {other:?}"),
+        }
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
     }
 }

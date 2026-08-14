@@ -141,6 +141,24 @@ struct PersistedLane {
 /// schemaVersion 3 — round-2 §3.3/§0.1 O-9) and the AMEV chunks under
 /// `<dir>/events/`.
 pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
+    save_snapshot_into_project(
+        dir,
+        &V3Data {
+            ppq: midi.ppq,
+            tempo_events: midi.tempo_events.clone(),
+            meter_events: midi.meter_events.clone(),
+            clips: midi.clips.clone(),
+        },
+    )
+}
+
+/// Same as [`save_into_project`], taking a `V3Data` snapshot instead of a
+/// `&MidiStore` — the persist-as-effect seam (round-2 §4): `Session::
+/// midi_snapshot` clones exactly these fields under the session lock, and
+/// `ControlPlane::execute_persist` calls this AFTER the lock is released,
+/// so no disk I/O ever happens while the lock is held. Identical body to
+/// the retired direct-`MidiStore` version this now backs.
+pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
         fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
@@ -277,20 +295,20 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
 ///   state (fresh session) or reset to the mechanical migration defaults,
 ///   which [`v1_migration_defaults`] provides.
 ///
-/// PROJECT-ADOPTION SEAM (zone P4): this loader runs exactly when a project
-/// is adopted (open_project eagerly via `notify_project_opened`, or the lazy
-/// midi resync), so it also restores the project's persisted PLUGIN
-/// instances and AUTOMATION lanes into the app-global registries. Both
-/// hooks are inert until the app registers those globals — unit tests use
-/// local registries/stores and never observe them.
+/// Task 6 (Plan E): this loader is PURE midi/v2+ parsing only — it used to
+/// also cascade into `plugins::state::adopt_open_project`/
+/// `plugins::automation::adopt_open_project` as a side effect (the
+/// "plugin-teardown-inside-a-read horror", round-2 inventory row 9: a
+/// supposedly pure `midi_get_clips` read could tear down live host state).
+/// The adopt-chain now runs explicitly, and ONLY, from `ControlPlane`'s
+/// sanctioned epoch functions (`open_project_epoch` et al.), after the
+/// session lock that calls this loader has already been dropped.
 pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
         fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
     let root: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse {}: {e}", file.display()))?;
-    crate::plugins::state::adopt_open_project(dir);
-    crate::plugins::automation::adopt_open_project(dir);
     let version = root.get("schemaVersion").and_then(Value::as_u64).unwrap_or(1);
     if version < 2 {
         return Ok(None);

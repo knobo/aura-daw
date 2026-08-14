@@ -69,6 +69,13 @@ pub struct AudioState {
     samplers: Arc<Mutex<SamplerBank>>,
     /// Lazily started preview/audition player (phase 2, sampler zone).
     preview: OnceLock<sampler_preview::PreviewHandle>,
+    /// The ONE undo/redo history + op journal (Plan E Task 17), created
+    /// here because `init` builds the engine's `Committer` before
+    /// `ControlPlane` exists — both must share this exact `Arc`, or the
+    /// engine's non-transient commits (recording finalize) would land in a
+    /// second, invisible history. `lib.rs`'s setup passes it on via
+    /// [`AudioState::history_log`].
+    log: Arc<control::HistoryLog>,
 }
 
 impl Default for AudioState {
@@ -80,6 +87,7 @@ impl Default for AudioState {
             engine: OnceLock::new(),
             samplers: Arc::new(Mutex::new(SamplerBank::default())),
             preview: OnceLock::new(),
+            log: Arc::new(control::HistoryLog::new()),
         }
     }
 }
@@ -107,6 +115,13 @@ impl AudioState {
     pub(crate) fn engine_handle(&self) -> Option<EngineHandle> {
         self.engine.get().cloned()
     }
+
+    /// The shared history/journal handle (Plan E Task 17) — `lib.rs` hands
+    /// this to `ControlPlane::new` so the control plane and the engine
+    /// control thread commit into the SAME log.
+    pub(crate) fn history_log(&self) -> Arc<control::HistoryLog> {
+        self.log.clone()
+    }
 }
 
 /// Module init hook, called once from Tauri's `setup` (lib.rs, frozen).
@@ -116,11 +131,35 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // Make the sampler bank reachable from the engine graph rebuild
     // (midi-track instrument routing) and the post-job auto-register hook.
     sampler::register_bank(state.samplers.clone());
+    // The engine's own commit core (Plan E Task 13) — the SAME
+    // session/shared/tables `Arc`s `ControlPlane::new` gets a moment later
+    // (lib.rs's setup), with its own `emit` closure instance: two closure
+    // instances, both ultimately calling the one live `AppHandle::emit`, so
+    // they're behaviorally one emitter (see `control::Committer`'s doc).
+    let engine_emit: control::EventEmitter = {
+        let app = app.clone();
+        Box::new(move |event: &str, payload: serde_json::Value| {
+            if let Err(e) = app.emit(event, payload) {
+                log::warn!("emit {event}: {e}");
+            }
+        })
+    };
+    let committer = control::Committer::new(
+        state.session.clone(),
+        state.shared.clone(),
+        state.tables.clone(),
+        std::sync::Arc::new(engine_emit),
+        // The SAME log `ControlPlane` gets a moment later (lib.rs setup):
+        // the engine's `stop recording` finalize is NON-transient, so it
+        // must be an undo step in the user's one history (Task 17).
+        state.log.clone(),
+    );
     let handle = engine::start(
         state.shared.clone(),
         state.tables.clone(),
         state.session.clone(),
         Box::new(TauriEvents(app.clone())),
+        committer,
     );
     let _ = state.engine.set(handle);
     log::info!("audio::init — engine control thread started");
@@ -258,27 +297,23 @@ pub fn list_output_devices() -> Result<Vec<AudioDevice>, String> {
 }
 
 /// Selecting a device restarts the corresponding stream (input restarts are
-/// refused while a recording is running).
+/// refused while a recording is running). Delegates to `ControlPlane` (Plan
+/// E Task 12, §4.5) so the selection is attributed at the one front door
+/// both this command and the MCP surface call through.
 #[tauri::command]
 pub fn select_input_device(
     device_id: String,
-    state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
 ) -> Result<(), String> {
-    state.engine()?.request(|reply| ControlMsg::SelectInput {
-        device_id: Some(device_id),
-        reply,
-    })
+    control.select_input_device(device_id, control::op::TxMeta::user("select input device"))
 }
 
 #[tauri::command]
 pub fn select_output_device(
     device_id: String,
-    state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
 ) -> Result<(), String> {
-    state.engine()?.request(|reply| ControlMsg::SelectOutput {
-        device_id: Some(device_id),
-        reply,
-    })
+    control.select_output_device(device_id, control::op::TxMeta::user("select output device"))
 }
 
 // ---------------------------------------------------------------------------
@@ -523,15 +558,23 @@ pub fn sampler_preview_note(
 /// `plugin:<instanceId>` naming a registered plugin instance
 /// (`plugin_instantiate`). Plugin-backed tracks render silence while the
 /// instance status is `"stub"` (until zones P1/P2 land the real hosts).
+///
+/// Plan E Task 3: this command's own validation (plugin/sampler existence,
+/// track-kind gate) still runs here, ahead of the call — but the actual
+/// mutation is now `ControlPlane::set_track_instrument`, a thin wrapper
+/// over the transaction channel (`Op::Set`, `PropPath::InstrumentId`). Bug
+/// fix (dossier 10 §2.4): this now emits `project://changed` via `commit`,
+/// which it never did before — the rebuild used to run silently.
 #[tauri::command]
 pub fn set_track_instrument(
     track_id: String,
     instrument_id: Option<String>,
     state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
 ) -> Result<TrackState, String> {
     if let Some(id) = &instrument_id {
         if let Some(pid) = id.strip_prefix("plugin:") {
-            if !crate::plugins::instance_exists(pid) {
+            if !control.plugin_exists(pid) {
                 return Err(format!(
                     "unknown plugin instance: {pid} (plugin_instantiate first)"
                 ));
@@ -540,12 +583,12 @@ pub fn set_track_instrument(
             return Err(format!("unknown instrument: {id} (load it first)"));
         }
     }
-    let track = {
-        let mut session = state.session.lock();
-        let s = &mut session.store;
-        let t = s
+    {
+        let session = state.session.lock();
+        let t = session
+            .store
             .tracks
-            .iter_mut()
+            .iter()
             .find(|t| t.id == track_id)
             .ok_or_else(|| format!("unknown track: {track_id}"))?;
         if t.kind != "midi" {
@@ -554,11 +597,8 @@ pub fn set_track_instrument(
                 t.kind
             ));
         }
-        t.instrument_id = instrument_id;
-        t.clone()
-    };
-    state.engine()?.send(ControlMsg::Rebuild);
-    Ok(track)
+    }
+    control.set_track_instrument(&track_id, instrument_id, control::op::TxMeta::user("set instrument"))
 }
 
 // ---------------------------------------------------------------------------
@@ -601,83 +641,30 @@ pub async fn save_project_as(
         .map_err(|e| e.to_string())?
 }
 
+/// Open an existing `.aura` project (or a direct `project.json` path).
+/// One-line delegate over the sanctioned epoch fn (Task 6, round-2
+/// inventory row 25): [`ControlPlane::open_project_epoch`] absorbs what
+/// used to be this file's own `open_project_impl` body.
 #[tauri::command]
-pub async fn open_project(path: String, app: AppHandle) -> Result<Project, String> {
-    tauri::async_runtime::spawn_blocking(move || open_project_impl(path, app))
+pub async fn open_project(
+    path: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Project, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.open_project_epoch(std::path::Path::new(&path)))
         .await
         .map_err(|e| e.to_string())?
 }
 
-fn open_project_impl(path: String, app: AppHandle) -> Result<Project, String> {
-    let state = app.state::<AudioState>();
-    let (project, dir) = project::load(std::path::Path::new(&path))?;
-    // Validate BEFORE mutating any in-memory state (review fix: a project
-    // with duplicate track ids must fail cleanly, not after tracks/clips
-    // were replaced — the track-count cap this comment used to describe is
-    // gone, Task 7: slot assignment is per-graph now).
-    project::validate(&project)?;
-    {
-        let mut session = state.session.lock();
-        let s = &mut session.store;
-        // Round-2 §2.4: no slot/param seeding here anymore — adoption
-        // (below) + the `Rebuild` sent after this block is enough; the
-        // next rebuild derives slots from display order and populates a
-        // fresh `ParamTable` from the adopted rows.
-        s.tracks = project.tracks.clone();
-        s.clips = project.clips.clone();
-        s.project_dir = Some(dir);
-        s.project_name = Some(project.name.clone());
-        s.created_at = project.created_at.clone();
-        if let Some(t) = &project.transport {
-            s.transport.tempo_bpm = t.tempo_bpm;
-            s.transport.state = "stopped".into();
-            // Store mirror AND RT atomics for the loop region, so the next
-            // save round-trips it (from_store serializes store.transport).
-            s.transport.loop_enabled = t.loop_enabled;
-            s.transport.loop_start_samples = t.loop_start_samples;
-            s.transport.loop_end_samples = t.loop_end_samples;
-            state.shared.playing.store(false, Relaxed);
-            state.shared.position.store(t.position_samples, Relaxed);
-            state.shared.loop_enabled.store(t.loop_enabled, Relaxed);
-            state.shared.loop_start.store(t.loop_start_samples, Relaxed);
-            state.shared.loop_end.store(t.loop_end_samples, Relaxed);
-        }
-    }
-    // Eager midi resync (zone C's requested seam): the midi store adopts the
-    // opened project's v2 fields NOW, so the first `get_project_state` after
-    // an open (and the rebuild below) already see fresh midi state.
-    let (dir, bpm) = {
-        let session = state.session.lock();
-        (session.store.project_dir.clone(), session.store.transport.tempo_bpm)
-    };
-    crate::midi::notify_project_opened(dir, bpm);
-    // Load clip audio + (re)build waveform pyramids off the IPC path.
-    state.engine()?.send(ControlMsg::Rebuild);
-    let _ = app.emit("project://changed", serde_json::to_value(&project).unwrap_or_default());
-    Ok(project)
-}
-
+/// Persist the CURRENT in-memory document to its already-open project dir.
+/// One-line delegate over the sanctioned snapshot-mark fn (Task 6, round-2
+/// inventory row 26): [`ControlPlane::save_project_mark`] absorbs what used
+/// to be this file's own `save_project_impl` body. The frozen command
+/// return shape (`Result<(), String>`) discards the returned `Project`.
 #[tauri::command]
-pub async fn save_project(app: AppHandle) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || save_project_impl(app))
+pub async fn save_project(control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.save_project_mark().map(|_| ()))
         .await
         .map_err(|e| e.to_string())?
-}
-
-fn save_project_impl(app: AppHandle) -> Result<(), String> {
-    let state = app.state::<AudioState>();
-    let (project, dir) = {
-        let session = state.session.lock();
-        let s = &session.store;
-        let dir = s.project_dir.clone().ok_or("no project open")?;
-        let p = project::from_store(
-            s,
-            state.shared.position.load(Relaxed),
-            state.shared.sample_rate.load(Relaxed),
-        )?;
-        (p, dir)
-    };
-    project::save(&dir, &project)?;
-    let _ = app.emit("project://changed", serde_json::to_value(&project).unwrap_or_default());
-    Ok(())
 }

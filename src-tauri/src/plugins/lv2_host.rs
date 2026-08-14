@@ -232,6 +232,33 @@ impl Lv2Host {
         })
     }
 
+    /// Current param list (real ranges/names, values refreshed from the
+    /// host's mirror) for an already-registered instance — the LV2 sibling
+    /// of `clap_host::get_params`. Plan E Task 9: lets `ControlPlane`'s
+    /// `HostForward::Instantiate` executor re-sync the document's param
+    /// mirror WITHOUT re-registering an already-live instance (registering
+    /// twice would re-instantiate the plugin, resetting its voice state).
+    pub fn get_params(&self, instance_id: &str) -> Result<Vec<ParamInfo>, String> {
+        let instance_id = instance_id.to_string();
+        plugin_main().run(move |ctx| {
+            let inner = ctx
+                .slot_mut::<Lv2World>(SLOT)
+                .inner
+                .as_ref()
+                .ok_or_else(|| "lv2 world not initialized".to_string())?;
+            let inst = inner.instances.get(&instance_id).ok_or_else(|| {
+                format!("LV2 instance not registered with the host: {instance_id}")
+            })?;
+            let mut params = control_port_params(&inst.plugin);
+            for p in &mut params {
+                if let Some(v) = inst.values.get(&p.id) {
+                    p.value = *v as f64;
+                }
+            }
+            Ok(params)
+        })?
+    }
+
     /// Serialize the instance's `state:interface` state on the plugin main
     /// thread (zone P4's raw-lilv glue). `Ok(None)` = the plugin implements
     /// no state interface (callers fall back to the param snapshot).
@@ -676,7 +703,7 @@ mod tests {
         let mut energy = 0.0f32;
         for _ in 0..20 {
             buf.fill(0.0);
-            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000 };
+            let mut io = ProcessBlock { samples: &mut buf, channels: 2, sample_rate: 48_000, steady: None };
             node.process(&mut io);
             energy += buf.iter().map(|s| s.abs()).sum::<f32>();
         }
@@ -687,7 +714,7 @@ mod tests {
         host.set_params("epiano-test", vec![(params[0].id, 0.2)]);
         std::thread::sleep(std::time::Duration::from_millis(50)); // main-thread tick
         let mut tiny = vec![0.0f32; 2];
-        let mut io = ProcessBlock { samples: &mut tiny, channels: 2, sample_rate: 48_000 };
+        let mut io = ProcessBlock { samples: &mut tiny, channels: 2, sample_rate: 48_000, steady: None };
         node.process(&mut io);
         host.unregister_instance("epiano-test");
     }
@@ -785,15 +812,19 @@ mod tests {
     }
 
     /// Registry-side setup shared by the Zyn tests: real scan -> instantiate
-    /// -> host registration -> status "active". Returns the instance id, or
-    /// None (skip) when ZynAddSubFX is not installed.
-    fn activate_zyn(reg: &Arc<Mutex<PluginRegistry>>) -> Option<String> {
+    /// -> host registration -> status "active". Returns the instance id +
+    /// a `PluginDoc` carrying its row (Task 9: `live_node_for` reads the
+    /// document, not the registry), or None (skip) when ZynAddSubFX is not
+    /// installed.
+    fn activate_zyn(
+        reg: &Arc<Mutex<PluginRegistry>>,
+    ) -> Option<(String, crate::control::session::PluginDoc)> {
         let scanned = crate::plugins::scan::scan_lv2();
         if !scanned.iter().any(|d| d.uid == lv2_uid(ZYN_URI)) {
             eprintln!("skipping: zynaddsubfx-lv2 not installed");
             return None;
         }
-        let info = {
+        {
             let mut reg = reg.lock();
             // EXTEND the shared registry's scan results instead of replacing
             // them: this registry is process-global (OnceLock) and the CLAP
@@ -805,15 +836,15 @@ mod tests {
                     merged.push(d);
                 }
             }
-            reg.instantiate(&lv2_uid(ZYN_URI)).expect("Zyn instantiates in the registry")
-        };
-        assert_eq!(info.status, "stub");
-        let params = global()
-            .register_instance(&info.id, &info.uid)
-            .expect("Zyn registers with the LV2 host");
-        let activated = reg.lock().activate(&info.id, params).expect("activate");
-        assert_eq!(activated.status, "active", "contract 4: stub -> active");
-        Some(info.id)
+        }
+        let (info, params) = crate::plugins::instantiate_and_activate(reg, &lv2_uid(ZYN_URI))
+            .expect("Zyn instantiates and activates");
+        assert_eq!(info.status, "active", "contract 4: stub -> active");
+        let mut doc = crate::control::session::PluginDoc::default();
+        doc.params.insert(info.id.clone(), params);
+        let id = info.id.clone();
+        doc.instances.push(info);
+        Some((id, doc))
     }
 
     /// THE GATING ACCEPTANCE TEST (PHASE3-PLAN §2.7): headless, through the
@@ -825,7 +856,7 @@ mod tests {
     fn zyn_acceptance_midi_track_renders_pitched_audio_headlessly() {
         const RATE: u32 = 48_000;
         let reg = shared_registry();
-        let Some(instance_id) = activate_zyn(&reg) else { return };
+        let Some((instance_id, doc)) = activate_zyn(&reg) else { return };
 
         // A4 for one beat (0.5 s @ 120 bpm): on at sample 0, off at 24000.
         let note = MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 110, channel: 0, note_id: crate::ids::NoteId(0) };
@@ -834,7 +865,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &slots, RATE, None, &mut nodes, &mut tracks);
+        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         // The registry key proves the PLUGIN node resolved (a PolySynth
         // fallback would be keyed "synth@48000" — and would fake the pitch).
@@ -872,7 +903,7 @@ mod tests {
     fn zyn_all_notes_off_releases_held_voices() {
         const RATE: u32 = 48_000;
         let reg = shared_registry();
-        let Some(instance_id) = activate_zyn(&reg) else { return };
+        let Some((instance_id, doc)) = activate_zyn(&reg) else { return };
 
         // Note held far beyond what we render: the off never arrives.
         let note = MidiNote { tick: 0, length_ticks: 96_000, key: 64, velocity: 110, channel: 0, note_id: crate::ids::NoteId(0) };
@@ -881,7 +912,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &slots, RATE, None, &mut nodes, &mut tracks);
+        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
         assert_eq!(nodes.key_of("zyn-hold"), Some(format!("plugin:{instance_id}@{RATE}").as_str()));
         let mut g = RtGraph::new(tracks, 2, Arc::new(ParamTable::default()));
 
@@ -903,7 +934,6 @@ mod tests {
     /// `live_node_for` — the caller's PolySynth fallback keeps MIDI audible.
     #[test]
     fn live_node_for_falls_back_when_host_has_no_instance() {
-        let reg = shared_registry();
         let orphan = crate::plugins::PluginInstanceInfo {
             id: "orphan-lv2".into(),
             uid: "lv2:urn:aura-test:orphan".into(),
@@ -912,11 +942,11 @@ mod tests {
             status: "active".into(),
             track_id: None,
         };
-        reg.lock().instances.insert(orphan.id.clone(), orphan);
+        let mut doc = crate::control::session::PluginDoc::default();
+        doc.instances.push(orphan);
         assert!(
-            crate::plugins::live_node_for("orphan-lv2", 48_000).is_none(),
+            crate::plugins::live_node_for(&doc, "orphan-lv2", 48_000).is_none(),
             "unresolvable active LV2 instance -> None (PolySynth fallback upstream)"
         );
-        reg.lock().instances.remove("orphan-lv2");
     }
 }

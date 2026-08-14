@@ -296,3 +296,308 @@ Other carry-forwards, not new rulings but confirmed still true:
   the MIDI clip commands remain outside the A-slice channel exactly as
   before this plan, binding for Plan E's side-channel inventory (§4.5) to
   close.
+
+## Plan E handoff (2026-08-14, subagent-driven session, external review layer)
+
+Plan E (the side-channel totality, round-2 §4.5, ADRs 0003 + 0006) is
+**IMPLEMENTED** (commit range `ac65b76..531d790`, 51 commits, including 7
+merges — 6 side-branch task merges (`task-9-plugin-doc`,
+`task-10-automation-doc`, `task-11-frontend-stems`, `task-12-transport`,
+`task-15-noteid-schemas`, `task-16-steady-time`) plus one `origin/main`
+merge (`f886306`, pulling in PR #9 hscrollbars / #10 zoom-pref / #11
+note-ops mid-flight)). **Gate E is CLOSED**: the Figma invariant (§7 test 4
+— reads mutate nothing, a scripted mixed session over every op family, undo
+through new commits, a pure-reader sweep, redo, byte-identical canonical
+snapshot) is green against the code exactly as Tasks 1-16 left it —
+provably so, because the commit that adds the test, `73bb9a7`, touches
+**zero production files** (`src-tauri/tests/figma_invariant.rs` only, 748
+insertions). The 34-row side-channel inventory closes total, recorded in
+`docs/SIDE-CHANNEL-INVENTORY.md` (landed form of the plan doc's re-derived
+table, with three residual documented non-op writes R-1..R-3 and three
+recorded replay limitations L-1..L-3 — see that doc, not repeated here).
+The op log is now **ON**: `journal.ndjson` (append-only NDJSON, no fsync)
+plus in-memory undo/redo (bounded `Vec`, 200 entries, bottom-eviction),
+wired to Ctrl+Z / Ctrl+Shift+Z in `src/App.svelte`. Suites: **501 backend +
+174 frontend**, all green, counts dated in README/CONTRIBUTING
+(2026-08-14).
+
+**Execution note.** Subagent-driven (owner's explicit choice via
+AskUserQuestion), with parallel isolated worktrees for Tasks 9, 10, 11, 12,
+15, 16 once the mainline tasks (1-8, then 13-14, then 17) stopped
+contending for the same files — a fresh implementer per task, a task
+review after each, and scoped re-reviews on every fix round. Every one of
+the 18 tasks cleared review in **0 or 1 fix rounds** (no task needed a
+second round). Two **Critical** findings were caught by the review layer,
+both in Task 9 (plugin rows into Session, the widest diff in the plan — 55
+plugin tests churned): a reentrant session-lock deadlock in
+`adopt_open_project` (invisible to tests because the registered global was
+`None` there) and `PluginSetState` not actually durable (the persist
+ladder's `file.exists()` check beat the new authoritative `pending_state`,
+so a second patch load never persisted). Both were fixed in Task 9's one
+fix round. The review layer also caught real concurrency bugs outside
+Critical severity worth citing as evidence it earned its cost: Task 13's
+review (opus) found the deadlock-audit comment named the wrong invariant
+(the real rule is "no thread may hold the session lock across an
+`EngineHandle::request`") and that `finalize` bundled a `TransportState`
+`Set` into the non-transient tx, landing it in the undo surface; Task 14's
+review found a TOCTOU between a gesture-open check, a transient commit, and
+`fold_in` that could silently lose a fold under a concurrent `gesture_end`.
+Both are recorded as mid-flight rulings below. SDD ledger (gitignored, per
+the established convention): `.superpowers/sdd/2026-08-14-plan-e-side-channel-totality/progress.md`;
+plan document:
+`docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md`.
+
+### Scope rulings (carried verbatim from the plan doc, per ADR 0007)
+
+1. **Op kind naming keeps the landed style** (`"set"`, `"trackAdd"`, …).
+   D-03's draft envelope schema prescribed dotted kinds (`clip.move`); the
+   three landed kinds don't dot, no journal has ever been written, and
+   renaming landed kinds would churn Plan A/B tests for zero replay
+   benefit. The envelope schema's `kind` pattern is corrected to match the
+   implementation, as a marked correction. Round-2's "`clip.move` op"
+   therefore lands as `Op::Set{object: Clip, path: TimelineStartSamples}` +
+   the additive `move_clip` command — the capability round-2 demands,
+   under the house naming.
+2. **Transport ops are transient**: through the channel, never journaled,
+   never undoable. `transport.state`/loop window/stop-at-end writes become
+   `Op::Set` on `ObjectRef::Transport` paths so they are attributed,
+   atomic, and single-writer, but they carry `TxMeta.transient = true`: no
+   history entry, no journal line (no DAW undoes play/stop).
+   `transport_seek` stays a pure RT atomic (position is engine state, not
+   document state). `sample_rate` writeback is likewise transient (a
+   device property mirrored into the document for save).
+3. **Undo-round-trip oracle masks the note-id watermark.** ADR 0001 makes
+   `next_note_id` monotonic and never-rewinding; an undo of `MidiSetNotes`
+   restores the notes but NOT the watermark (ids are never reused). The
+   byte-identical snapshot oracle (Gate A test 1, and Gate E's Figma
+   invariant) normalizes `next_note_id` to 0 in both snapshots before
+   comparing, and separately asserts it never decreases. This is the test
+   honoring the ADR, not the test being weakened.
+4. **Epoch boundaries are not ops** (round-2 §4.5 carve-out, verbatim):
+   `open_project` is a log epoch boundary (document swap, history root);
+   `save_project`/`save_project_as` are snapshot marks; `create_project`
+   and the engine's `ensure_project` are epoch boundaries too (document
+   birth). They become *sanctioned* epoch functions: single-lock swap
+   discipline, eager adopt of midi/plugins/automation, history + redo
+   stack cleared, journal rotated — but they never appear as ops in the
+   log.
+5. **`SamplerBank` stays outside `Session`.** At HEAD the bank has no
+   document half: loaded instruments are never persisted
+   (`load_into_registered_bank` writes only the process-global bank;
+   nothing lands in project.json), and the bank is exactly the "live
+   plugin host handles / loaded voice data" class §4.1 keeps outside the
+   document. The document half of instrument assignment is
+   `TrackState.instrument_id`, which DOES become an op (Task 3). If a
+   later round persists bank contents, that round moves them into
+   Session.
+6. **No MCP MIDI tools in this plan.** The MCP tool roster is frozen
+   (ARCHITECTURE §12.2) and PHASE4-PLAN's E row doesn't include it. The
+   channel work makes future MIDI tools one-liners over ControlPlane, but
+   adding them is not Gate E material.
+7. **Track reorder gets no op.** The only caller of the frontend-only
+   `placeTrackAfter` is the demo stems path, which Task 11 deletes;
+   backend append order is the product's track order today. A
+   `track.move` op is deferred to whichever round adds a real reorder
+   gesture — recorded, not silent.
+8. **`midi_export_file` writes the exported `.mid` file but stays
+   classified a read**: it reads the document and writes *outside* it (an
+   export artifact, like `export_song`). What made it a §7-test-4
+   violation was the lazy resync, which Task 6 removes.
+9. **History is in-memory in this plan; Plan F owns persistence/retention.**
+   Task 17's undo/redo stack is a bounded `Vec` of committed batches
+   (cleared at epochs); the journal file is append-only NDJSON. Plan F
+   (history storage, §6) replaces the storage substrate; the *exposure*
+   (undo/redo commands, journal format) is Plan E's per PHASE4-PLAN ("F …
+   informs E's undo exposure").
+
+### Preflight conflict-scan rulings (decided before Task 1 started)
+
+- **`Op::MidiSetNotes` addresses by a `ClipId` field, not `ObjectRef`.**
+  `fold_ops` only groups `Op::Set`, so two `MidiSetNotes` in ONE tx do not
+  fold; coalescing for notes happens at the gesture (Task 14) and
+  history-350ms (Task 17) layers instead, as the plan's §4.4 note says.
+  Cost if wrong: an op-vocabulary asymmetry normalized in a later round;
+  replay unaffected.
+- **Task 9's `PluginInstanceRow` names whatever the existing registry row
+  struct is** (`plugins/mod.rs`) — the implementer reuses the landed type
+  rather than inventing a new one. Cost if wrong: a rename diff.
+- **Task 12's `commit_with(emit_project_changed=false)` is an accepted
+  wart**, noted before implementation: the frozen `project://changed`
+  contract must not start firing per play/stop, so transport commits
+  suppress the emit rather than the frozen event growing a new firing
+  condition.
+
+### Mid-flight rulings (from the SDD ledger, each with its one-line why)
+
+- **Task 12's Play/Stop fixed twice**: (1) `Play`'s check-then-act TOCTOU
+  (a recording-downgrade window across two lock acquisitions) is closed
+  by re-checking state INSIDE the commit closure via a `Tx` read accessor
+  (the same shape as Task 7's contract, so the later merge deduped it);
+  (2) `Stop`'s ordering is restored to send `StopRecording` FIRST, then
+  commit the `stopped` `Set` — the dispatch text had mandated the reverse
+  order while also saying "mirror today's ordering," a self-contradiction
+  the review caught; the fix preserves the old visibility window instead
+  of exposing "stopped" while finalize is still running.
+- **`ContentLengthTicks == 0` must be rejected on the command surface**
+  (Task 5 ruling, mandatory for Task 7's dispatch): Task 5's validation
+  was weaker than `apply_clip_bounds`'s reject; carried forward so the
+  rewired `midi_set_clip_bounds` closes the gap rather than shipping a
+  silent weakening.
+- **Multi-clip selection/paste is deliberately deferred until Gate E
+  closes** (owner feature request, captured mid-Plan-E into
+  `docs/backlog/multi-clip-selection-and-paste.md`): every gesture in
+  that request maps 1:1 onto the finished channel's primitives (gesture
+  batches, multi-op transactions, one undo entry per gesture); building
+  it pre-gate would have recreated the side-channels this plan removes.
+  This is why it ships as Track C in `next-prompt.md` rather than as a
+  Plan E task.
+- **Task 15 revised after PR #11** (noteId optional convention, not
+  required-0-sentinel): PR #11 landed mid-flight and already added an
+  optional `noteId` to the TS `MidiNote` type plus strip-on-copy in
+  `note-ops.ts` — Task 15 adopted that convention instead of inventing a
+  parallel one, shrinking its own scope to `generation.svelte.ts` infill
+  rules, the v3 schema, and the `ipc.ts` `Project` type refresh.
+- **`split_stems_for_clip` landed as an additive command** (Task 11
+  ruling): `import_audio_clip_split_stems` always re-imported (duplicate
+  clip/ghost track) with no existing-clip stem path; an additive command
+  resolving the existing clip + absolute source path and submitting the
+  demucs job anchored on that clip avoided a re-import while staying
+  inside binding rule 3 ("new commands are additive").
+- **`finalize` splits into a `ClipAdds` tx + a separate transient state
+  `Set`** (Task 13 ruling, overriding the task's own "one tx" wording):
+  bundling the `TransportState` `Set` into the non-transient clip
+  registration tx would have landed transport state in the undo surface;
+  atomicity between clip registration and the state mirror was judged not
+  load-bearing, so splitting them keeps the undo surface honest at the
+  cost of two revs per finalize instead of one.
+- **Gesture lock order: gesture before session, always** (Task 14
+  ruling): a TOCTOU between a gesture-open check, a transient commit, and
+  `fold_in` in `set_track_mix` could let a concurrent `gesture_end` (a
+  fire-and-forget frontend invoke) silently lose the fold; holding the
+  gesture lock across check+commit+fold, with lock order gesture-then-
+  session everywhere, closes the race by construction and is documented
+  at `GestureState`.
+- **`ensure_project_epoch` deliberately does NOT adopt+Rebuild** (Task 6
+  ruling): adding adopt/rebuild parity would have been the "obvious" fix
+  to the review's finding, but behavior parity with the engine's existing
+  `ensure_project` is load-bearing for Task 13; the fix was an explicit
+  justifying comment + a marker at the actual document-swap site instead
+  of a behavior change. Cost if wrong: Task 13 would discover a
+  standalone caller needing rebuild after all — cheap to add then, and it
+  didn't happen.
+- **`execute_persist` gained an epoch guard** (Task 7 fix round 1): the
+  original design re-locked the session after `commit` returned to do
+  disk I/O; an epoch swap (project open/save-as) landing in that window
+  would silently drop the edit being persisted — a pre-existing data-loss
+  class since Task 2. Fix: an epoch counter on `Session`, bumped by epoch
+  functions, captured inside the `transact` lock at commit time;
+  `execute_persist` skips and warns on a mismatch instead of writing
+  stale data over fresh.
+- **Net-noop batches record nothing** (Task 17 fix round 1, finding I-1):
+  `fold_ops` legitimately drops a net-noop `Set` group (a `move_clip` back
+  to the sample a clip already sits on, a gain write of the current
+  value), producing an empty `Committed`. Without a guard this created a
+  phantom undo step and an `"ops":[]` journal line; the fix drops the
+  record inside `HistoryLog::record_commit` itself when the ops list is
+  empty.
+
+### Standing carry-forwards for Plan F+
+
+- **R-3**: `try_seed_zyn_demo_instruments` pushes three plugin instance
+  rows into `session.plugins.instances` directly, outside any op, before
+  the demo's channel transaction runs (no track references those ids yet,
+  so nothing user-visible is undoable). Recommended for Plan F: fold this
+  into the seed transaction as `Op::PluginAdd`s.
+- **L-1**: `Op::PluginRemove.params` is captured on the op (self-
+  describing, additive field) but undo restores the param mirror from the
+  in-memory PARKED copy, not the op field, because `Op::PluginAdd` has no
+  params slot. Fine in-process; on a cold journal replay (no parked
+  mirror) an undo-of-remove would restore the row without its params.
+  Needs an op-format change — Plan F territory.
+- **L-2**: `Op::MidiSetNotes`'s `noteId: 0` entries are mint sentinels
+  that RE-MINT on replay. Invisible whenever a redo of `Op::MidiClipAdd`
+  restores the clip row (watermark included) before the notes op
+  replays — which is what the Figma invariant exercises. A redo that does
+  NOT re-create the clip re-mints from the current watermark, so re-added
+  notes get fresh ids: ADR 0001 behaving as designed, the same asymmetry
+  scope ruling 3 masks for the watermark itself.
+- **The journal is write-only until Plan F.** `JournalWriter` appends
+  `journal.ndjson`; nothing in the product reads it back. Plan F's
+  version-graph retention is what gives the journal a reader.
+- **Undo is bounded at 200 entries, bottom-eviction.** In-memory `Vec`,
+  cleared at epochs (scope ruling 9) — Plan F replaces the storage
+  substrate, not the exposure.
+- **Snapshot-rebuild deferral STILL standing** (from the Plan A handoff,
+  reconfirmed unchanged by every subsequent plan): `engine::rebuild`
+  still holds the session lock across the entire graph build. Plan E's
+  Task 13 gave the engine a `Committer` that submits instead of holding
+  the lock for writes, but rebuild-the-read-side is untouched — it needs
+  Plan F's copy-on-write session store to read an immutable view without
+  the live document lock.
+- **No panic rollback in `transact`** (Plan F). Every closure in this
+  plan validates before mutating, per the standing constraint; the
+  constraint itself does not lift until Plan F's snapshot rollback lands.
+- **Host-GUI plugin tweaks are uncaptured** until a host-state poll
+  lands: a user twiddling a plugin's own native GUI (not AURA's param
+  UI) produces no op today — `Op::Set{Plugin, Param}` only fires through
+  AURA's control surface. Recorded as a gap, not a defect of this plan.
+- **PDC (plugin delay compensation) before sends ship** — round-2's
+  standing rule, relevant to the FX/bus "Plan G" candidate
+  (`docs/backlog/00-ROADMAP-real-alternative.md`'s Tier-1 insert-FX item):
+  whichever round adds sends/busses must have PDC first.
+- **The M-3 redo invariant**: transient writes must never touch a
+  document field an entry's `ops` can address, or a pending redo silently
+  lands on a different state than the entry recorded. Today's transient
+  writers stay clear by construction (transport `Set`s address
+  `ObjectRef::Transport` only; mid-gesture folds are superseded by the
+  gesture batch that closes over them) — nothing CHECKS this; it
+  constrains what may ever be marked transient. Binding on any future
+  transient-tx addition.
+- **`fold_ops` never folds away non-`Set` ops.** A no-op lane delete (or
+  any structural op with no net effect) still produces a journal line —
+  noted near `fold_ops` during Task 10's review as future noise once
+  history persists; Plan F's retention design should account for it.
+
+### Deferred-minors roll-up
+
+Every `minor (deferred):` line the ledger recorded, triaged by the final
+whole-branch review (Task 17's gate review) and left open by design —
+collected here so a future round doesn't have to re-mine the ledger:
+
+- Report/test-count arithmetic presentation (Task 1, report-only).
+- `execute_persist` re-acquiring the session lock to flip `midi.dirty` — a
+  theoretical stomp window (Task 2).
+- `persist.project`'s branch lacked a dedicated unit test; covered
+  end-to-end by Task 7 instead (Task 2).
+- `set_track_instrument`'s validate-then-mutate is two lock acquisitions
+  (TOCTOU window, benign under serial command execution) (Task 3).
+- The frontend catch in `move_clip`'s commit path logs at `console.error`
+  vs. `reload()`'s `console.warn` — arguably the more correct level, left
+  as-is (Task 4).
+- No targeted meter-only sortedness test for `TempoSet`; the fuzzer's
+  meter generator is always single-entry (Task 5).
+- Deletion-then-undo note-identity is covered by one unit test, not the
+  fuzzer — correct per the oracle-masking ruling, not a coverage gap
+  (Task 5).
+- `file_stem` naming-coupling comment; `automation.rs` carried a sibling
+  lazy-resync until Task 10 deleted it (Task 6).
+- `sidecarSplitStems` is now dead from the UI (`tauri.ts:116/389` + the
+  backend impls) — cleanup ticket for a later round (Task 11).
+- No no-op-lane-delete short-circuit — still triggers a `persist.automation`
+  write pass; see the `fold_ops` non-`Set` note above (Task 10).
+- Dirty-but-nothing-pending branch never clears the dirty flag (redundant
+  no-op persists); `Op::PluginRemove.params` captured-but-unread on
+  undo — see L-1 above (Task 9).
+- `plan_region_replacement`'s doc cites `replace_region_clips` but
+  diverges on right-only-trim (`TrimRight` in place); the LoopJam mid-air
+  race is code-inspected, not test-forced (Task 8).
+- Deadlock-audit comment's five call-site line citations went stale by
+  +129 lines after later edits — sites and the invariant itself stayed
+  correct (Task 13).
+- `midi/synth.rs` test-literal compile fixup, touched despite the
+  `midi/*` scope note — mechanical, zero behavior (Task 16).
+- `ClapNode::reset()` not re-verified to leave `steady_fallback` alone —
+  consistent with pre-change semantics, not re-audited (Task 16).
+- A stale line-number citation in a doc comment (516 vs. 508);
+  `tempoBpm` required-vs-conditional tension pre-existing in the v2
+  schema (Task 15).
