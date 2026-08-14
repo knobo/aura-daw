@@ -131,6 +131,11 @@ export interface Backend {
   getProjectState(): Promise<ProjectSnapshot>;
   importAudioClip(request: ImportClipRequest): Promise<Clip>;
 
+  /** Persist an audio clip's timeline position through the channel (Plan E
+   * Task 4). Optional — real-engine only, same convention as
+   * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
+  moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
+
   /**
    * Seed an empty session with the built-in demo song so the first press of
    * play makes sound (real engine only — the demo backend ships with content).
@@ -408,6 +413,9 @@ class TauriBackend implements Backend {
   }
   importAudioClip(request: ImportClipRequest) {
     return invoke<Clip>("import_audio_clip", { request });
+  }
+  moveClip(clipId: string, timelineStartSamples: number) {
+    return invoke<void>("move_clip", { clipId, timelineStartSamples });
   }
   seedDemoProject() {
     return invoke<ProjectSnapshot>("seed_demo_project");

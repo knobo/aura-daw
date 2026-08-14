@@ -133,6 +133,7 @@ pub fn run() {
             // ---- control plane (phase 2) ----
             control::get_project_state,
             control::set_track_mix,
+            control::move_clip,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----

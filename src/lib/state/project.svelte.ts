@@ -1,7 +1,11 @@
 /**
  * Project store: tracks, clips, selection. Track mutations go through the
- * backend commands optimistically; clip placement is a frontend concern in
- * the prototype (no clip-move command exists in the frozen surface).
+ * backend commands optimistically. Clip placement mirrors midi.svelte.ts's
+ * moveClip/commitBounds split (Plan E Task 4): `moveClip` is a frontend-only
+ * preview applied per pointermove/arrow-keypress during a drag (D-03: one
+ * invoke per gesture, not one per event), and `commitClipMove` persists the
+ * store's CURRENT position through the `move_clip` channel once, at the end
+ * of the gesture.
  */
 
 import { backend } from "../tauri";
@@ -182,10 +186,26 @@ class ProjectStore {
       : [...this.clips, clip];
   }
 
+  /** Frontend-only placement move (used DURING a drag/arrow-keypress; see
+   * commitClipMove for the persisted end of the gesture). */
   moveClip(clipId: string, timelineStartSamples: number) {
     this.clips = this.clips.map((c) =>
       c.id === clipId ? { ...c, timelineStartSamples: Math.max(0, Math.round(timelineStartSamples)) } : c,
     );
+  }
+
+  /** Persist a clip's CURRENT in-store position — the pointerup/arrow-commit
+   * end of a move gesture that used moveClip() for the live preview. No-op
+   * (no invoke) when the clip id is unknown, matching setMute/setSolo's
+   * no-op-on-nothing-to-do convention. */
+  async commitClipMove(clipId: string): Promise<void> {
+    const c = this.clips.find((c) => c.id === clipId);
+    if (!c) return;
+    try {
+      await backend.moveClip?.(clipId, c.timelineStartSamples);
+    } catch (err) {
+      console.error("[aura] move_clip failed:", err);
+    }
   }
 
   select(clipId: string | null) {

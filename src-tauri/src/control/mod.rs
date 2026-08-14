@@ -1252,6 +1252,21 @@ pub fn set_track_mix(
     control.set_track_mix(changes, op::TxMeta::user("set track mix"))
 }
 
+/// Move a clip on the timeline — thin delegate over
+/// [`ControlPlane::move_clip`] (Plan E Task 3's channel path), mirroring
+/// `set_track_mix`'s State/ControlPlane access shape. The frontend drags a
+/// clip locally (`project.moveClip`, a live preview only) and calls this
+/// once at gesture end (`project.commitClipMove`), same split as the MIDI
+/// clip's `midi.moveClip`/`midi_set_clip_bounds` pair.
+#[tauri::command]
+pub fn move_clip(
+    clip_id: String,
+    timeline_start_samples: u64,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.move_clip(&clip_id, timeline_start_samples, op::TxMeta::user("move clip")).map(|_| ())
+}
+
 /// Import an audio file as a clip (STUB until zone B lands).
 #[tauri::command]
 pub fn import_audio_clip(
@@ -1507,6 +1522,54 @@ mod tests {
         assert!(committed.effect.rebuild);
         assert_eq!(plane.session().lock().store.clips[0].timeline_start_samples, 48_000);
         assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
+    }
+
+    /// Plan E Task 4 brief, step 1: `move_clip` emits `project://changed`
+    /// carrying the clip's NEW position (the MCP-parity shape
+    /// `set_track_mix_emits_project_changed_with_updated_tracks` already
+    /// pins for track mixes) — the same webview-return-channel gap would
+    /// otherwise leave an agent-driven clip move invisible in the UI. A
+    /// move naming an unknown clip id must error cleanly and emit nothing.
+    #[test]
+    fn move_clip_emits_project_changed_with_new_position_and_errs_on_unknown_id() {
+        let (cp, events, engine) = recording_control_plane();
+        let track = cp
+            .add_track(Some("Move Me".into()), None, TxMeta::user("add track"))
+            .unwrap();
+        {
+            let mut session = cp.session().lock();
+            session.store.clips.push(test_clip("c-1", track.id.as_str()));
+        }
+        events.lock().clear();
+
+        cp.move_clip("c-1", 48_000, TxMeta::user("move clip")).unwrap();
+
+        {
+            let evs = events.lock();
+            let payloads: Vec<&serde_json::Value> = evs
+                .iter()
+                .filter(|(name, _)| name == "project://changed")
+                .map(|(_, p)| p)
+                .collect();
+            assert_eq!(payloads.len(), 1, "exactly one project://changed per move");
+            let c = payloads[0]["clips"]
+                .as_array()
+                .expect("clips array")
+                .iter()
+                .find(|c| c["id"] == "c-1")
+                .expect("moved clip in payload")
+                .clone();
+            assert_eq!(c["timelineStartSamples"], 48_000);
+        }
+
+        events.lock().clear();
+        let result = cp.move_clip("no-such-clip", 1_000, TxMeta::user("move unknown"));
+        assert!(result.is_err(), "moving an unknown clip id must error, not panic");
+        assert!(
+            events.lock().iter().all(|(name, _)| name != "project://changed"),
+            "a failed move must not announce a change"
+        );
+        engine.send(crate::audio::engine::ControlMsg::Shutdown);
     }
 
     /// Plan E Task 3: `set_track_instrument` runs through the channel and
