@@ -74,7 +74,7 @@ pub fn run() {
                 session,
                 shared,
                 tables,
-                engine,
+                engine.clone(),
                 jobs,
                 Box::new(move |event, payload| {
                     if let Err(e) = emitter.emit(event, payload) {
@@ -82,7 +82,18 @@ pub fn run() {
                     }
                 }),
             ));
-            app.manage(control_plane);
+            app.manage(control_plane.clone());
+
+            // Plan E Task 13: the engine's narrow "document birth" closure,
+            // installable only now that `ControlPlane` exists — bound over
+            // this SAME `Arc<ControlPlane>`, so `start_recording`'s
+            // auto-project (audio/engine.rs's `ensure_project`) shares the
+            // ONE sanctioned epoch fn instead of duplicating the store-swap
+            // + `project://changed` emit engine-side.
+            {
+                let cp = control_plane.clone();
+                engine.install_ensure_project(std::sync::Arc::new(move || cp.ensure_project_epoch()));
+            }
 
             // Loop-jam session driver rides on the shared control plane.
             app.manage(std::sync::Arc::new(control::loopjam::LoopJam::new(

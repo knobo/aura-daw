@@ -748,11 +748,22 @@ impl ControlPlane {
                 // to 15s — `writer.finish`'s timeout, audio/engine.rs) saw
                 // "recording", never a premature "stopped" while the take
                 // is still draining to disk. Kept OUTSIDE this transaction
-                // either way (§4.2) — `StopRecording`'s own finalize write
-                // to `store.transport.state` (audio/engine.rs's
-                // `stop_recording`) races harmlessly with the Set below
-                // (both converge on "stopped"); Task 13 revisits this once
-                // that finalize becomes its own `Actor::Engine` tx.
+                // either way (§4.2) — `request` blocks THIS (calling)
+                // thread until the engine control thread's own `handle`
+                // call returns, and `stop_recording`'s finalize commit
+                // (`Control::commit_recording_finalize`, Task 13) runs
+                // entirely INSIDE that call, before its reply is sent — so
+                // by the time `request` returns here, "stopped" is already
+                // committed as an `Actor::Engine` tx. The Set below then
+                // commits "stopped" a SECOND time (this thread's own
+                // `Actor::User` tx) — harmless: the value is already
+                // "stopped", `write_transport_prop` accepts it idempotently,
+                // and the resulting extra `rev` bump/journal entry is the
+                // ordinary cost of two independent, correctly-ordered
+                // commits, not a race. (Committer's deadlock audit: this
+                // `request` is the "only blocking request-reply INTO the
+                // engine" case (b) describes — the reply is never held
+                // across the engine's own commit.)
                 if self.shared.recording.load(Relaxed) {
                     self.engine
                         .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
@@ -2512,6 +2523,117 @@ mod tests {
             events.lock().iter().all(|(name, _)| name != "project://changed"),
             "commit_with(..., false) must never fire project://changed"
         );
+    }
+
+    /// A bare `Committer` over a fresh session/shared/tables, plus an
+    /// `AtomicUsize` the caller passes as `do_rebuild` to count how many
+    /// times a commit's folded effect actually asked for a rebuild — the
+    /// engine's own sites 1-4 (Plan E Task 13) call `self.rebuild()`
+    /// directly from that closure instead of round-tripping through
+    /// `ControlMsg::Rebuild`; these tests exercise the SAME
+    /// `commit_with_rebuild` primitive engine.rs calls, just with a
+    /// counting closure standing in for `Control::rebuild`.
+    fn test_committer() -> (Committer, Arc<Mutex<Session>>) {
+        let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
+        let shared = Arc::new(SharedRt::default());
+        let tables = empty_tables();
+        let committer =
+            Committer::new(session.clone(), shared, tables, Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter));
+        (committer, session)
+    }
+
+    /// Plan E Task 13's TDD step 1: recording finalize (`Control::
+    /// commit_recording_finalize`'s exact shape) produces a `Committed`
+    /// attributed to `Actor::Engine`, carrying the `ClipAdd` ops in order,
+    /// with exactly one rebuild — even though TWO `ClipAdd`s are applied in
+    /// the same transaction (`EngineEffect::rebuild` folds to one flag;
+    /// "at most one `Rebuild` per transaction" is a claim about ALL
+    /// rebuilds, engine-originated ones included — this is what pins that).
+    #[test]
+    fn recording_finalize_commits_as_actor_engine_with_clip_add_ops_and_one_rebuild() {
+        let (committer, session) = test_committer();
+        let clip_a = crate::audio::types::testutil::test_clip("c-1", "t-1");
+        let clip_b = crate::audio::types::testutil::test_clip("c-2", "t-1");
+        let clips = vec![clip_a.clone(), clip_b.clone()];
+        let rebuilds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rebuilds2 = rebuilds.clone();
+        let committed = committer
+            .commit_with_rebuild(
+                TxMeta::engine("stop recording"),
+                |tx| {
+                    for clip in &clips {
+                        let idx = tx.store().clips.len();
+                        tx.apply(Op::ClipAdd { clip: clip.clone(), index: idx })?;
+                    }
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Transport,
+                        path: PropPath::TransportState,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!("stopped"),
+                    })
+                },
+                true,
+                move || {
+                    rebuilds2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            "finalize must be attributed to Actor::Engine, got {:?}",
+            committed.meta.actor
+        );
+        assert!(!committed.meta.transient, "finalize is a real document edit, not transient");
+        let clip_ids: Vec<&str> = committed
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Op::ClipAdd { clip, .. } => Some(clip.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clip_ids, vec!["c-1", "c-2"], "both clips registered, in order");
+        assert_eq!(rebuilds.load(std::sync::atomic::Ordering::Relaxed), 1, "exactly one rebuild");
+        assert_eq!(session.lock().store.clips.len(), 2, "clips landed in the store");
+        assert_eq!(session.lock().store.transport.state, "stopped");
+    }
+
+    /// Plan E Task 13's TDD step 1: auto-stop (`Control::commit_auto_stop`'s
+    /// exact shape) produces a TRANSIENT `Actor::Engine` tx, and — because
+    /// `Op::Set{Transport, ...}` never sets `effect.rebuild` (Task 12's
+    /// transport family, session.rs) — `do_rebuild` is never invoked; the
+    /// caller (the real `apply_end_policy`) relies on its own already-taken
+    /// RT-atomic path, not a rebuild, for this state change.
+    #[test]
+    fn auto_stop_commits_a_transient_actor_engine_tx_with_no_rebuild() {
+        let (committer, session) = test_committer();
+        let rebuilds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rebuilds2 = rebuilds.clone();
+        let committed = committer
+            .commit_with_rebuild(
+                TxMeta::engine("auto-stop at end").transient(),
+                |tx| {
+                    tx.apply(Op::Set {
+                        object: ObjectRef::Transport,
+                        path: PropPath::TransportState,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!("stopped"),
+                    })
+                },
+                false,
+                move || {
+                    rebuilds2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            "auto-stop must be attributed to Actor::Engine, got {:?}",
+            committed.meta.actor
+        );
+        assert!(committed.meta.transient, "auto-stop is transient, like the rest of the transport family");
+        assert_eq!(rebuilds.load(std::sync::atomic::Ordering::Relaxed), 0, "Transport Set never rebuilds");
+        assert_eq!(session.lock().store.transport.state, "stopped");
     }
 
     /// `commit` (unchanged public signature) still fires `project://changed`

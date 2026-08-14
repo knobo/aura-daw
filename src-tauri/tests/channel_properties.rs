@@ -678,4 +678,14 @@ fn attribution_survives_commit() {
     .unwrap();
     assert!(matches!(c.meta.actor, Actor::Agent { ref tool } if tool == "set_track_mix"));
     assert_eq!(c.meta.run, "run-42");
+
+    // Plan E Task 13 (§7 test 5's "Actor::Engine appears where expected"):
+    // the engine control thread's own commits (recording finalize,
+    // auto-stop, ...) carry `Actor::Engine`, resolvable through the exact
+    // same `Session::transact` path as every other actor — attribution
+    // isn't special-cased per actor kind.
+    let c2 = Session::transact(&m, TxMeta::engine("stop recording"), |tx| tx.apply(set_gain("t-2", 0.25)))
+        .unwrap();
+    assert!(matches!(c2.meta.actor, Actor::Engine), "engine-originated commits carry Actor::Engine");
+    assert!(!c2.meta.transient, "TxMeta::engine() defaults to non-transient (finalize is a real edit)");
 }
