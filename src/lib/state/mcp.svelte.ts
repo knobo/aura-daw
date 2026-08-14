@@ -6,6 +6,7 @@
  */
 
 import { backend } from "../tauri";
+import { prefs } from "../prefs/prefs.svelte";
 import { project } from "./project.svelte";
 import { midi } from "./midi.svelte";
 import type { McpPolicyMode, McpStatus, PendingConfirmation } from "../types/ipc";
@@ -33,6 +34,7 @@ class McpStore {
 
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private unlisten: (() => void) | null = null;
+  private unsubscribePref: (() => void) | null = null;
   /** Ids the user already resolved — an in-flight (stale) status poll must
    * not resurrect them as pending. */
   private resolved = new Set<string>();
@@ -80,6 +82,15 @@ class McpStore {
 
   async init() {
     await this.refresh();
+    // The mcpDefaultMode preference is the durable intent for how much the
+    // agent may do; the server only remembers its own session. Push the
+    // preference at boot when they disagree, and again whenever the user
+    // changes it in the preferences dialog. Panel-side setMode() calls are
+    // deliberately session-only — they never write back into the preference.
+    if (this.status && this.status.policy.mode !== prefs.values.mcpDefaultMode) {
+      await this.setMode(prefs.values.mcpDefaultMode);
+    }
+    this.unsubscribePref ??= prefs.onChange("mcpDefaultMode", (mode) => void this.setMode(mode));
     this.unlisten?.();
     this.unlisten = backend.on("mcp://confirm-requested", (p) => this.accept(p));
     // Slow poll keeps status honest (timeouts, out-of-band policy edits).

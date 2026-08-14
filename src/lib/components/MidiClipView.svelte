@@ -9,7 +9,7 @@
   import { midi } from "../state/midi.svelte";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
-  import { ui } from "../state/ui.svelte";
+  import { prefs } from "../prefs/prefs.svelte";
   import { midiPreviewLayout } from "../utils/midi-preview";
   import { view } from "../state/view.svelte";
 
@@ -20,10 +20,10 @@
 
   // ── note-trigger pulse — rAF-driven opacity, no reactivity in the loop ──
   // The clip body glows briefly whenever the playhead crosses a note onset
-  // (same interpolated clock as the playhead; toggled by ui.noteFlash).
+  // (same interpolated clock as the playhead; toggled by the noteFlash pref).
   $effect(() => {
     const el = pulseEl;
-    const enabled = ui.noteFlash && transport.isPlaying;
+    const enabled = prefs.values.noteFlash && transport.isPlaying;
     if (!el) return;
     if (!enabled) {
       el.style.opacity = "0";

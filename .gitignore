@@ -12,6 +12,9 @@
 # Tauri
 /src-tauri/gen/
 
+# Claude Code: agent worktree checkouts are local scratch state (skills are tracked)
+/.claude/worktrees/
+
 # Local project data / caches
 *.wav.tmp
 project.json.v1.bak

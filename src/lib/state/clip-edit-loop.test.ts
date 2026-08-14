@@ -58,6 +58,7 @@ const { transport } = await import("./transport.svelte");
 const { project } = await import("./project.svelte");
 const { clipEditLoop } = await import("./clip-edit-loop.svelte");
 const { midi } = await import("./midi.svelte");
+const { prefs } = await import("../prefs/prefs.svelte");
 
 const mocked = backend as unknown as {
   transportPlay: ReturnType<typeof vi.fn>;
@@ -93,12 +94,22 @@ beforeEach(async () => {
   setEngine();
   project.tracks = [track("A"), track("B", true), track("C")];
   clipEditLoop.solo = false;
+  prefs.restoreDefaults(); // autoplay pref back to its default (off)
 });
 
 const CLIP = { trackId: "A", startSamples: 1000, endSamples: 5000 };
 
 describe("entering the clip editor", () => {
-  it("loops the clip region and starts playback from its start", async () => {
+  it("loops the clip region and parks the playhead at its start — WITHOUT playing", async () => {
+    await clipEditLoop.enter(CLIP);
+
+    expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 1000, 5000);
+    expect(mocked.transportSeek).toHaveBeenCalledWith(1000);
+    expect(mocked.transportPlay).not.toHaveBeenCalled();
+  });
+
+  it("starts playback on open when the clipOpenAutoplay preference is on", async () => {
+    prefs.set("clipOpenAutoplay", true);
     await clipEditLoop.enter(CLIP);
 
     expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 1000, 5000);
@@ -128,11 +139,20 @@ describe("entering the clip editor", () => {
   });
 
   it("does not re-issue play when the transport is already rolling", async () => {
+    prefs.set("clipOpenAutoplay", true);
     setEngine({ state: "playing", positionSamples: 200 });
     await clipEditLoop.enter(CLIP);
 
     expect(mocked.transportPlay).not.toHaveBeenCalled();
     expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 1000, 5000);
+  });
+
+  it("keeps an already-rolling transport rolling even with autoplay off", async () => {
+    setEngine({ state: "playing", positionSamples: 200 });
+    await clipEditLoop.enter(CLIP);
+
+    expect(mocked.transportPlay).not.toHaveBeenCalled();
+    expect(mocked.transportStop).not.toHaveBeenCalled();
   });
 });
 
@@ -278,8 +298,7 @@ describe("piano roll wiring (midi store)", () => {
 
     midi.open("c1");
 
-    await vi.waitFor(() => expect(mocked.transportPlay).toHaveBeenCalled());
-    expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 24000, 48000);
+    await vi.waitFor(() => expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 24000, 48000));
   });
 
   it("a looped clip (placement longer than content) loops the CONTENT, not the placement", async () => {
@@ -289,8 +308,9 @@ describe("piano roll wiring (midi store)", () => {
 
     midi.open("c1");
 
-    await vi.waitFor(() => expect(mocked.transportPlay).toHaveBeenCalled());
-    expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 24000, 24000 + 960 * 25);
+    await vi.waitFor(() =>
+      expect(mocked.transportSetLoop).toHaveBeenCalledWith(true, 24000, 24000 + 960 * 25),
+    );
   });
 
   it("closing the editor restores the pre-edit state", async () => {
@@ -298,6 +318,7 @@ describe("piano roll wiring (midi store)", () => {
     midi.sectionTable = [
       { startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 254_016_000 },
     ];
+    prefs.set("clipOpenAutoplay", true); // playback must be restored (stopped) on close
     midi.open("c1");
     await vi.waitFor(() => expect(mocked.transportPlay).toHaveBeenCalled());
     vi.clearAllMocks();

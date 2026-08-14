@@ -22,6 +22,40 @@ npx vite                 # browser-only demo mode (mock engine, no Rust build)
 `AURA_SIDECAR_SIMULATE=1` makes every AI worker produce deterministic
 placeholder output — develop AI-adjacent features without any model stack.
 
+### Sidecar Python on PATH
+
+`sidecars_run_job` (and MCP's `run_sidecar_job`) spawns the **first
+`python3`/`python` found on `PATH`** — see `resolve_python()` in
+`src-tauri/src/sidecars/jobs.rs`. If you've set up `.venv-sidecars` (real
+model stack, [README](README.md#ai-features--real-model-setup)), launch with
+it prepended so sidecar jobs actually see `anticipation`/`torch`/
+`transformers`/`mido`/`demucs` instead of falling back to (or erroring on)
+whatever `python3` the system PATH resolves first:
+
+```sh
+PATH="$PWD/.venv-sidecars/bin:$PATH" npm run tauri dev
+```
+
+Without a real model stack, skip this and set `AURA_SIDECAR_SIMULATE=1`
+instead.
+
+### Restarting on a new `main`
+
+The dev binary does not hot-reload Rust changes, and the MCP bearer token
+rotates on every launch — so after pulling new commits, restart both:
+
+```sh
+git status                       # make sure nothing local would be discarded
+git pull --ff-only origin main   # fast-forward only; stop and ask if it can't be
+# stop the running `npm run tauri dev` (Ctrl-C, or kill the pid group)
+PATH="$PWD/.venv-sidecars/bin:$PATH" npm run tauri dev
+```
+
+If you're driving AURA over MCP, re-run `claude mcp add` (or update
+whichever client config holds the token) after the restart — the old token
+stops working the moment the new one is generated. Full client setup:
+[docs/mcp-usage.md](docs/mcp-usage.md).
+
 ## Running the tests
 
 ```sh
