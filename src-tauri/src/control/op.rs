@@ -40,6 +40,13 @@ pub enum Op {
         #[serde(default)]
         clip_indices: Vec<usize>,
     },
+    /// Structural: insert an audio clip (payload = full row; inverse =
+    /// ClipRemove) — Plan E Task 3 (round-2 inventory row 3, "most common
+    /// editing gesture reaches no backend channel at all").
+    ClipAdd { clip: crate::audio::types::Clip, index: usize },
+    /// Structural: remove an audio clip; `clip`/`index` advisory beyond
+    /// `clip.id` — store truth wins, mirroring `TrackRemove`.
+    ClipRemove { clip: crate::audio::types::Clip, index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -50,7 +57,14 @@ pub enum ObjectRef { Track(crate::ids::TrackId), Clip(crate::ids::ClipId), MidiC
 /// compile error at every use site, which is the §4.6 anti-drift rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub enum PropPath { Gain, Pan, Muted, Soloed, Armed }
+pub enum PropPath {
+    Gain, Pan, Muted, Soloed, Armed,
+    /// Track: sampler-bank id or `plugin:<instanceId>`, `None` = unbound.
+    /// Wire form: JSON string or `null` (not an `Option`-shaped object).
+    InstrumentId,
+    /// Clip: timeline placement position, in samples.
+    TimelineStartSamples,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -211,6 +225,53 @@ mod tests {
         let legacy = r##"{"kind":"trackRemove","track":{"id":"t-2","name":"Audio Track","kind":"audio","gainDb":0.0,"pan":0.0,"muted":false,"soloed":false,"armed":false,"color":"#7c9cff"},"index":0,"clips":[]}"##;
         let parsed: Op = serde_json::from_str(legacy).expect("legacy payload without clipIndices parses");
         assert!(matches!(parsed, Op::TrackRemove { ref clip_indices, .. } if clip_indices.is_empty()));
+
+        // Plan E Task 3: ClipAdd/ClipRemove wire form, and the new
+        // TimelineStartSamples path on a Set.
+        let clip2 = crate::audio::types::Clip {
+            id: "c-2".into(),
+            track_id: "t-2".into(),
+            name: "clip2".into(),
+            source_path: "audio/c-2.wav".into(),
+            source_id: crate::ids::SourceId::default(),
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 48_000,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: 48_000,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-2"),
+        };
+        let clip_add = Op::ClipAdd { clip: clip2.clone(), index: 0 };
+        let s = serde_json::to_string(&clip_add).unwrap();
+        eprintln!("ClipAdd wire form: {}", s);
+        assert!(s.contains("\"kind\":\"clipAdd\""), "wire form was: {s}");
+        assert!(s.contains("\"id\":\"c-2\""), "clip fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, clip_add);
+
+        let clip_remove = Op::ClipRemove { clip: clip2.clone(), index: 0 };
+        let s = serde_json::to_string(&clip_remove).unwrap();
+        eprintln!("ClipRemove wire form: {}", s);
+        assert!(s.contains("\"kind\":\"clipRemove\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, clip_remove);
+
+        let move_op = Op::Set {
+            object: ObjectRef::Clip("c-2".into()),
+            path: PropPath::TimelineStartSamples,
+            from: serde_json::json!(0u64),
+            to: serde_json::json!(48_000u64),
+        };
+        let s = serde_json::to_string(&move_op).unwrap();
+        eprintln!("Set{{Clip,TimelineStartSamples}} wire form: {}", s);
+        assert!(s.contains("\"path\":\"timelineStartSamples\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, move_op);
     }
 
     #[test]

@@ -445,6 +445,59 @@ impl ControlPlane {
         Ok(updated)
     }
 
+    /// Move a clip on the timeline through the transaction channel
+    /// (`Op::Set`, `PropPath::TimelineStartSamples`) — Plan E Task 3
+    /// (round-2 inventory row 3). A thin `commit` wrapper mirroring
+    /// `set_track_mix`'s shape. NOTE: the Tauri `move_clip` COMMAND is
+    /// Task 4's job, not this one — only this `ControlPlane` method lands
+    /// here.
+    pub fn move_clip(
+        &self,
+        clip_id: &str,
+        timeline_start_samples: u64,
+        meta: op::TxMeta,
+    ) -> Result<session::Committed, String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::Set {
+                object: op::ObjectRef::Clip(clip_id.into()),
+                path: op::PropPath::TimelineStartSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(timeline_start_samples),
+            })
+        })
+    }
+
+    /// Bind (or unbind, with `instrument_id: None`) a track's instrument
+    /// through the transaction channel (`Op::Set`, `PropPath::InstrumentId`)
+    /// — Plan E Task 3 (round-2 inventory row 2). `set_track_instrument`
+    /// (audio/mod.rs) is a thin wrapper over this, keeping its own
+    /// track-kind/plugin-existence validation ahead of the call.
+    pub fn set_track_instrument(
+        &self,
+        track_id: &str,
+        instrument_id: Option<String>,
+        meta: op::TxMeta,
+    ) -> Result<TrackState, String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::Set {
+                object: op::ObjectRef::Track(track_id.into()),
+                path: op::PropPath::InstrumentId,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(instrument_id),
+            })
+        })?;
+        // Re-lock (a fresh acquisition, separate from `commit`) to read
+        // back the post-commit row — same pattern `set_track_mix` uses.
+        let session = self.session.lock();
+        session
+            .store
+            .tracks
+            .iter()
+            .find(|t| t.id == track_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown track: {track_id}"))
+    }
+
     /// Compose the full-project payload `project://changed` carries (the
     /// same shape `project::from_store` serializes, minus its requirement of
     /// an open project dir — mix/structural changes are legal in an unsaved
@@ -517,8 +570,17 @@ impl ControlPlane {
                     op::PropPath::Soloed => tables.params.set_flag(slot, FLAG_SOLO, *value != 0.0),
                     // No ParamTable counterpart for Armed (the retired
                     // apply_track_mix, deleted in Plan B, didn't write one
-                    // either).
-                    op::PropPath::Armed => {}
+                    // either), nor for InstrumentId/TimelineStartSamples
+                    // (Plan E Task 3): `apply_raw` never pushes those two
+                    // into `param_writes` in the first place (they're
+                    // structural — rebuild, not a param-table write), so
+                    // this arm is unreachable in practice; kept as an
+                    // honest no-op rather than a `todo!()` so a future path
+                    // added here without a `param_writes` producer doesn't
+                    // panic a live commit.
+                    op::PropPath::Armed
+                    | op::PropPath::InstrumentId
+                    | op::PropPath::TimelineStartSamples => {}
                 }
             }
             if let Some(any_solo) = committed.effect.any_solo {
@@ -1428,6 +1490,36 @@ mod tests {
         let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
         plane.remove_track("t-1", TxMeta::user("remove track")).unwrap();
         assert!(plane.session().lock().store.tracks.iter().all(|t| t.id != "t-1"));
+        assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
+    }
+
+    /// Plan E Task 3: `move_clip` runs through the channel — the store row
+    /// updates and exactly one `Rebuild` is sent (structural, since a moved
+    /// clip changes what the RT graph renders).
+    #[test]
+    fn move_clip_goes_through_the_channel_and_rebuilds_once() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        {
+            let mut session = plane.session().lock();
+            session.store.clips.push(test_clip("c-1", "t-1"));
+        }
+        let committed = plane.move_clip("c-1", 48_000, TxMeta::user("move clip")).unwrap();
+        assert!(committed.effect.rebuild);
+        assert_eq!(plane.session().lock().store.clips[0].timeline_start_samples, 48_000);
+        assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
+    }
+
+    /// Plan E Task 3: `set_track_instrument` runs through the channel and
+    /// returns the updated row (mirroring `set_track_mix`'s re-lock/read-back
+    /// shape) with exactly one `Rebuild`.
+    #[test]
+    fn set_track_instrument_goes_through_the_channel_and_rebuilds_once() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let updated = plane
+            .set_track_instrument("t-1", Some("plugin:x".into()), TxMeta::user("set instrument"))
+            .unwrap();
+        assert_eq!(updated.instrument_id, Some("plugin:x".to_string()));
+        assert_eq!(plane.session().lock().store.tracks[0].instrument_id, Some("plugin:x".to_string()));
         assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
     }
 

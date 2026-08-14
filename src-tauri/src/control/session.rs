@@ -195,6 +195,16 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 from: applied,   // the inverse's `from`: value we just wrote
                 to: from_now,    // the inverse's `to`: value to restore
             };
+            if matches!(path, PropPath::InstrumentId) {
+                // Structural (Plan E Task 3, inventory row 2): rebinding a
+                // track's instrument changes the live graph node, so this
+                // triggers a rebuild + persists the project, instead of the
+                // mix-param-table writes below (InstrumentId has no RT
+                // param counterpart — nothing there to write).
+                effect.rebuild = true;
+                effect.persist.project = true;
+                return Ok(inverse);
+            }
             // Mirror the retired `ops::apply_track_mix` (deleted in Plan B,
             // behavior preserved here): a changed track gets all four mix
             // params rewritten from the current (post-write) snapshot, not
@@ -317,6 +327,58 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 track: removed, index: pos, clips: removed_clips, clip_indices: removed_indices,
             })
         }
+        // Plan E Task 3 (inventory row 3): clip placement — the round-2
+        // "most common editing gesture reaches no backend channel at all"
+        // gap. Property-addressed, but structural in effect (rebuild +
+        // persist) since a moved clip changes what the RT graph renders.
+        Op::Set { object: ObjectRef::Clip(id), path: PropPath::TimelineStartSamples, to, .. } => {
+            let c = session
+                .store
+                .clips
+                .iter_mut()
+                .find(|c| &c.id == id)
+                .ok_or_else(|| format!("unknown clip: {id}"))?;
+            let from_now = serde_json::json!(c.timeline_start_samples); // truth, not caller's `from`
+            let v = to.as_u64().ok_or("timelineStartSamples: expected a non-negative integer")?;
+            c.timeline_start_samples = v;
+            let applied = serde_json::json!(c.timeline_start_samples);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::Set {
+                object: ObjectRef::Clip(id.clone()),
+                path: PropPath::TimelineStartSamples,
+                from: applied, // the inverse's `from`: value we just wrote
+                to: from_now,  // the inverse's `to`: value to restore
+            })
+        }
+        // Plan E Task 3 (inventory rows 16/17/20/23): sinks/threads consume
+        // clip add/remove — the same TrackAdd/TrackRemove pattern (store
+        // truth wins over the caller's advisory payload beyond `.id`).
+        Op::ClipAdd { clip, index } => {
+            if session.store.clips.iter().any(|c| c.id == clip.id) {
+                return Err(format!("duplicate clip id: {}", clip.id));
+            }
+            let idx = (*index).min(session.store.clips.len());
+            session.store.clips.insert(idx, clip.clone());
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::ClipRemove { clip: clip.clone(), index: idx })
+        }
+        Op::ClipRemove { clip, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `Op::Set`'s from/to and
+            // `Op::TrackRemove`'s row lookup).
+            let pos = session
+                .store
+                .clips
+                .iter()
+                .position(|c| c.id == clip.id)
+                .ok_or_else(|| format!("unknown clip: {}", clip.id))?;
+            let removed = session.store.clips.remove(pos);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::ClipAdd { clip: removed, index: pos })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
@@ -330,6 +392,12 @@ fn read_prop(t: &TrackState, path: PropPath) -> serde_json::Value {
         PropPath::Muted => serde_json::json!(t.muted),
         PropPath::Soloed => serde_json::json!(t.soloed),
         PropPath::Armed => serde_json::json!(t.armed),
+        // Option<String> serializes as a JSON string or null, never a
+        // wrapping object — same wire shape `write_prop` below accepts.
+        PropPath::InstrumentId => serde_json::json!(t.instrument_id),
+        PropPath::TimelineStartSamples => {
+            unreachable!("TimelineStartSamples is a Clip path, never dispatched to a Track")
+        }
     }
 }
 
@@ -362,6 +430,18 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             let v = to.as_bool().ok_or("armed: expected a bool")?;
             t.armed = v;
             Ok(serde_json::json!(t.armed))
+        }
+        PropPath::InstrumentId => {
+            let v = match to {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s.clone()),
+                _ => return Err("instrumentId: expected a string or null".into()),
+            };
+            t.instrument_id = v;
+            Ok(serde_json::json!(t.instrument_id))
+        }
+        PropPath::TimelineStartSamples => {
+            unreachable!("TimelineStartSamples is a Clip path, never dispatched to a Track")
         }
     }
 }
@@ -716,5 +796,74 @@ mod tests {
         assert_eq!(c.ops.len(), 3, "cross-barrier wiggle must not elide: {:?}", c.ops);
         // Even though we're back to the original value, the two Sets are in
         // different barrier regions so neither can cancel out
+    }
+
+    // ---- Plan E Task 3: clip move / add / remove, track instrument ----
+
+    #[test]
+    fn clip_move_applies_and_inverse_restores() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let clip = test_clip("c-1", "t-1");
+        m.lock().store.clips.push(clip.clone());
+        let c = Session::transact(&m, TxMeta::user("move clip"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Clip("c-1".into()),
+                path: PropPath::TimelineStartSamples,
+                from: serde_json::Value::Null, // advisory; apply re-reads truth
+                to: serde_json::json!(48_000u64),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.clips[0].timeline_start_samples, 48_000);
+        assert!(c.effect.rebuild, "clip move must request a rebuild");
+        assert!(c.effect.persist.project, "clip move must persist the project");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().store.clips[0].timeline_start_samples,
+            clip.timeline_start_samples,
+            "undo restores the original position"
+        );
+    }
+
+    #[test]
+    fn clip_add_duplicate_id_is_rejected_atomically() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let clip = test_clip("c-1", "t-1");
+        m.lock().store.clips.push(clip.clone());
+        let before = m.lock().store.clips.clone();
+        let r = Session::transact(&m, TxMeta::user("dup clip"), |tx| {
+            tx.apply(Op::ClipAdd { clip: clip.clone(), index: 0 })?;
+            tx.apply(Op::ClipAdd { clip: clip.clone(), index: 1 }) // duplicate id, in-tx
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().store.clips, before, "store untouched, rev unchanged");
+    }
+
+    #[test]
+    fn instrument_set_round_trips_and_requests_rebuild() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        assert_eq!(m.lock().store.tracks[0].instrument_id, None);
+        let c = Session::transact(&m, TxMeta::user("set instrument"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::InstrumentId,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("plugin:x"),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].instrument_id, Some("plugin:x".to_string()));
+        assert!(c.effect.rebuild, "instrument change must request a rebuild");
+        assert!(c.effect.persist.project, "instrument change must persist the project");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].instrument_id, None, "undo restores None");
     }
 }

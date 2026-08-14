@@ -193,6 +193,15 @@ enum RawAction {
     /// but exercised anyway so a clip-carrying `TrackRemove` payload is part
     /// of the fuzzed op vocabulary too.
     Remove(usize, usize),
+    /// Plan E Task 3: `pick` selects an alive CLIP by `pick % alive_clips.len()`;
+    /// `to` is the new `timelineStartSamples`.
+    ClipMove(usize, u64),
+    /// Plan E Task 3: mint a fresh clip on an alive TRACK, `track_pick`
+    /// selects it by `track_pick % alive.len()`.
+    ClipAdd(usize),
+    /// Plan E Task 3: `pick` selects an alive CLIP by
+    /// `pick % alive_clips.len()` to remove.
+    ClipRemove(usize),
 }
 
 fn set_kind_strategy() -> impl Strategy<Value = SetKind> {
@@ -208,12 +217,17 @@ fn set_kind_strategy() -> impl Strategy<Value = SetKind> {
 /// Weighted so removes land often enough (against a growing/shrinking model,
 /// starting from 3 seeded tracks) to exercise restore-at-varied-index, while
 /// Adds keep replenishing the pool so batches don't degenerate into
-/// all-no-op Sets/Removes against an empty track list.
+/// all-no-op Sets/Removes against an empty track list. Plan E Task 3 adds
+/// ClipMove/ClipAdd/ClipRemove at weights 2/1/1 alongside the existing
+/// 4 Set / 2 Add / 3 Remove track actions.
 fn raw_action_strategy() -> impl Strategy<Value = RawAction> {
     prop_oneof![
         4 => (any::<usize>(), set_kind_strategy()).prop_map(|(p, k)| RawAction::Set(p, k)),
         2 => (0usize..=2).prop_map(RawAction::Add),
         3 => (any::<usize>(), 0usize..=2).prop_map(|(p, n)| RawAction::Remove(p, n)),
+        2 => (any::<usize>(), 0u64..=10_000_000u64).prop_map(|(p, to)| RawAction::ClipMove(p, to)),
+        1 => any::<usize>().prop_map(RawAction::ClipAdd),
+        1 => any::<usize>().prop_map(RawAction::ClipRemove),
     ]
 }
 
@@ -230,14 +244,17 @@ fn mint_clips(track_id: &str, n: usize, clip_counter: &mut u32) -> Vec<Clip> {
         .collect()
 }
 
-/// Resolves one `RawAction` against the threaded model, mutating `alive`,
-/// `counter` (fresh, distinct generated-track ids) and `clip_counter` (fresh,
-/// distinct generated-clip ids). Returns `None` when the action is a no-op
-/// given current model state (e.g. a Set/Remove drawn while `alive` is
-/// empty) — the caller filters those out, so a batch may end up shorter than
-/// requested (never invalid).
+/// Resolves one `RawAction` against the threaded model, mutating `alive`
+/// (track ids), `alive_clips` (`(clip_id, track_id)` pairs — Plan E Task 3,
+/// threaded the same way `alive` is), `counter` (fresh, distinct
+/// generated-track ids) and `clip_counter` (fresh, distinct generated-clip
+/// ids). Returns `None` when the action is a no-op given current model state
+/// (e.g. a Set/Remove drawn while `alive`/`alive_clips` is empty) — the
+/// caller filters those out, so a batch may end up shorter than requested
+/// (never invalid).
 fn resolve_one(
-    action: RawAction, alive: &mut Vec<String>, counter: &mut u32, clip_counter: &mut u32,
+    action: RawAction, alive: &mut Vec<String>, alive_clips: &mut Vec<(String, String)>,
+    counter: &mut u32, clip_counter: &mut u32,
 ) -> Option<Op> {
     match action {
         RawAction::Set(pick, kind) => {
@@ -264,6 +281,9 @@ fn resolve_one(
             // exactly right for a genuinely NEW row — there is no prior
             // position to restore.
             let clips = mint_clips(&id, n_clips, clip_counter);
+            for c in &clips {
+                alive_clips.push((c.id.to_string(), id.clone()));
+            }
             Some(Op::TrackAdd {
                 track: test_track(&id), index: alive.len() - 1, clips, clip_indices: vec![],
             })
@@ -274,6 +294,10 @@ fn resolve_one(
             }
             let idx = pick % alive.len();
             let id = alive.remove(idx);
+            // Store truth: the removed track's clips leave WITH it
+            // (`apply_raw`'s `Op::TrackRemove` arm), so the model drops
+            // them from `alive_clips` too — mirrors `alive.remove` above.
+            alive_clips.retain(|(_, track_id)| track_id != &id);
             // `track`/`clips`/`clip_indices` are all advisory-ignored by
             // `apply_raw` (store truth wins for the removed row and its
             // real clips) — only `.id` matters for finding the row to
@@ -283,6 +307,41 @@ fn resolve_one(
             let clips = mint_clips(&id, n_clips, clip_counter);
             Some(Op::TrackRemove { track: test_track(&id), index: idx, clips, clip_indices: vec![] })
         }
+        RawAction::ClipMove(pick, to) => {
+            if alive_clips.is_empty() {
+                return None;
+            }
+            let (clip_id, _track_id) = alive_clips[pick % alive_clips.len()].clone();
+            Some(Op::Set {
+                object: ObjectRef::Clip(clip_id.into()),
+                path: PropPath::TimelineStartSamples,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(to),
+            })
+        }
+        RawAction::ClipAdd(track_pick) => {
+            if alive.is_empty() {
+                return None;
+            }
+            let track_id = alive[track_pick % alive.len()].clone();
+            let cid = format!("gen-clip-{}", *clip_counter);
+            *clip_counter += 1;
+            let clip = test_clip(&cid, &track_id);
+            let index = alive_clips.len();
+            alive_clips.push((cid, track_id));
+            Some(Op::ClipAdd { clip, index })
+        }
+        RawAction::ClipRemove(pick) => {
+            if alive_clips.is_empty() {
+                return None;
+            }
+            let idx = pick % alive_clips.len();
+            let (clip_id, track_id) = alive_clips.remove(idx);
+            // `clip`/`index` beyond `.id` are advisory-ignored by
+            // `apply_raw` (store truth wins), same precedent as
+            // `TrackRemove` above.
+            Some(Op::ClipRemove { clip: test_clip(&clip_id, &track_id), index: idx })
+        }
     }
 }
 
@@ -290,6 +349,7 @@ fn arb_op_batches(num_batches: std::ops::Range<usize>) -> impl Strategy<Value = 
     proptest::collection::vec(proptest::collection::vec(raw_action_strategy(), 1..=4), num_batches)
         .prop_map(|raw_batches| {
             let mut alive: Vec<String> = SEED_IDS.iter().map(|s| s.to_string()).collect();
+            let mut alive_clips: Vec<(String, String)> = Vec::new();
             let mut counter: u32 = 0;
             let mut clip_counter: u32 = 0;
             raw_batches
@@ -297,7 +357,9 @@ fn arb_op_batches(num_batches: std::ops::Range<usize>) -> impl Strategy<Value = 
                 .map(|batch| {
                     batch
                         .into_iter()
-                        .filter_map(|a| resolve_one(a, &mut alive, &mut counter, &mut clip_counter))
+                        .filter_map(|a| {
+                            resolve_one(a, &mut alive, &mut alive_clips, &mut counter, &mut clip_counter)
+                        })
                         .collect::<Vec<Op>>()
                 })
                 .collect()

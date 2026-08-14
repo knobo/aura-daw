@@ -523,11 +523,19 @@ pub fn sampler_preview_note(
 /// `plugin:<instanceId>` naming a registered plugin instance
 /// (`plugin_instantiate`). Plugin-backed tracks render silence while the
 /// instance status is `"stub"` (until zones P1/P2 land the real hosts).
+///
+/// Plan E Task 3: this command's own validation (plugin/sampler existence,
+/// track-kind gate) still runs here, ahead of the call — but the actual
+/// mutation is now `ControlPlane::set_track_instrument`, a thin wrapper
+/// over the transaction channel (`Op::Set`, `PropPath::InstrumentId`). Bug
+/// fix (dossier 10 §2.4): this now emits `project://changed` via `commit`,
+/// which it never did before — the rebuild used to run silently.
 #[tauri::command]
 pub fn set_track_instrument(
     track_id: String,
     instrument_id: Option<String>,
     state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
 ) -> Result<TrackState, String> {
     if let Some(id) = &instrument_id {
         if let Some(pid) = id.strip_prefix("plugin:") {
@@ -540,12 +548,12 @@ pub fn set_track_instrument(
             return Err(format!("unknown instrument: {id} (load it first)"));
         }
     }
-    let track = {
-        let mut session = state.session.lock();
-        let s = &mut session.store;
-        let t = s
+    {
+        let session = state.session.lock();
+        let t = session
+            .store
             .tracks
-            .iter_mut()
+            .iter()
             .find(|t| t.id == track_id)
             .ok_or_else(|| format!("unknown track: {track_id}"))?;
         if t.kind != "midi" {
@@ -554,11 +562,8 @@ pub fn set_track_instrument(
                 t.kind
             ));
         }
-        t.instrument_id = instrument_id;
-        t.clone()
-    };
-    state.engine()?.send(ControlMsg::Rebuild);
-    Ok(track)
+    }
+    control.set_track_instrument(&track_id, instrument_id, control::op::TxMeta::user("set instrument"))
 }
 
 // ---------------------------------------------------------------------------
