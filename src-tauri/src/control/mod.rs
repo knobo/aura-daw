@@ -223,6 +223,12 @@ impl ControlPlane {
         ops::transport_snapshot(&self.session.lock().store, &self.shared)
     }
 
+    /// All automation lanes (Plan E Task 10). PURE session-lock read — no
+    /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
+    pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {
+        self.session.lock().automation.lanes.clone()
+    }
+
     /// Latest 60 Hz meter frame (None until the engine has pumped one).
     /// This is the MCP agent's "ears": peak/RMS per track + master.
     pub fn read_meters(&self) -> Option<MeterFrame> {
@@ -812,7 +818,7 @@ impl ControlPlane {
     /// `pub(crate)` so tests can construct a `PersistEffect` and call this
     /// directly in the meantime.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect) {
-        let (dir, midi_snapshot, project_snapshot) = {
+        let (dir, midi_snapshot, project_snapshot, automation_snapshot) = {
             let s = self.session.lock();
             (
                 s.store.project_dir.clone(),
@@ -824,6 +830,12 @@ impl ControlPlane {
                         self.shared.sample_rate.load(Relaxed),
                     )
                 }),
+                // Plan E Task 10: snapshot taken under this SAME short lock
+                // as the midi/project snapshots above; the actual write
+                // (chunk files + `automation[]` RMW + chunk GC) happens
+                // below, after the guard drops — round-2 §4: no disk I/O
+                // under the session lock.
+                p.automation.then(|| s.automation.lanes.clone()),
             )
         };
         let Some(dir) = dir else { return }; // unsaved in-memory project
@@ -843,6 +855,11 @@ impl ControlPlane {
                     }
                 }
                 Err(e) => log::warn!("project snapshot build failed: {e}"),
+            }
+        }
+        if let Some(lanes) = automation_snapshot {
+            if let Err(e) = crate::plugins::automation::save_into_project(&dir, &lanes) {
+                log::warn!("automation persist failed: {e}");
             }
         }
     }
@@ -2956,6 +2973,116 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Plan E Task 10 mirror of the midi persist test above: a commit whose
+    /// effect sets `persist.automation` writes `automation[]` + chunk files
+    /// WITHOUT holding the session lock during I/O.
+    #[test]
+    fn persist_effect_writes_automation_after_the_lock() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("persist-automation");
+        cp.create_project(parent.to_str().unwrap(), "PersistAutoMe").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        let lane = crate::plugins::automation::AutomationLane {
+            id: "a-1".into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+        };
+        cp.session().lock().automation.lanes.push(lane.clone());
+
+        cp.execute_persist(&PersistEffect { automation: true, ..PersistEffect::default() });
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        let rows = raw["automation"].as_array().expect("automation[] written");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "a-1");
+        let pref = rows[0]["pointsRef"].as_str().expect("chunk ref for a lane with points");
+        assert!(dir.join(pref).exists(), "AMEV point chunk written to disk");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// End-to-end through the real channel (Plan E Task 10 brief: "lane
+    /// persisted to project.json only after commit returns"): the file has
+    /// no automation row before `commit`, and has the full row (chunk
+    /// included) the instant `commit` returns — no async gap, no separate
+    /// "flush" step to remember.
+    #[test]
+    fn automation_set_lane_commits_and_persists_synchronously() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("automation-commit");
+        cp.create_project(parent.to_str().unwrap(), "AutoCommit").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert!(
+            before.get("automation").is_none() || before["automation"].as_array().unwrap().is_empty(),
+            "no automation persisted before the commit"
+        );
+
+        let lane = crate::plugins::automation::AutomationLane {
+            id: "a-1".into(),
+            target_node: "track:t-1".into(),
+            param_id: 3,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 0.5 }],
+        };
+        let committed = cp
+            .commit(op::TxMeta::user("edit automation"), |tx| {
+                tx.apply(op::Op::AutomationSetLane { key: "a-1".into(), lane: Some(lane) })
+            })
+            .unwrap();
+        assert!(committed.effect.persist.automation);
+        assert!(!committed.effect.rebuild, "automation edits don't rebuild yet (see session.rs's arm doc)");
+
+        // By the time `commit` returned above, the write already happened
+        // (persist runs synchronously inside `commit`, before the event
+        // emit) — read it back right away, no waiting.
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        let rows = after["automation"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["paramId"], 3);
+        assert_eq!(cp.automation_lanes().len(), 1, "session.automation reflects the commit too");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// `automation_get`'s purity (Task 10 fix round 1, reviewer finding):
+    /// routed through the REAL production entry point,
+    /// `ControlPlane::automation_lanes()`, not a reimplementation of its
+    /// body — a future regression inside `automation_lanes` itself (e.g.
+    /// someone bolts on a defensive `adopt_open_project` call) would be
+    /// caught here. Asserts: no project needs to be open, no disk access is
+    /// needed, and two consecutive reads return identical lanes with no
+    /// mutation in between (snapshot equality).
+    #[test]
+    fn automation_get_is_a_pure_session_read_no_disk_no_project_dir() {
+        let (cp, _events, _engine) = recording_control_plane();
+        assert!(cp.session().lock().store.project_dir.is_none(), "no project ever opened");
+
+        let lane = crate::plugins::automation::AutomationLane {
+            id: "a-1".into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+        };
+        cp.session().lock().automation.lanes.push(lane.clone());
+
+        // The production entry point, called directly — not reimplemented.
+        let read = cp.automation_lanes();
+        assert_eq!(read, vec![lane], "no project dir, no disk, still reads the lane");
+
+        // Repeat reads are side-effect-free: nothing mutates the session
+        // between them (unlike the retired `with_synced`, which wrote
+        // `loaded_dir` on every single call, mutating reader included) —
+        // snapshot equality pins that.
+        let read_again = cp.automation_lanes();
+        assert_eq!(read, read_again, "two consecutive reads return identical lanes");
     }
 
     /// "New Project" is a blank slate: the previous session's tracks, clips,

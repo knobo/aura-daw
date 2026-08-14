@@ -72,6 +72,16 @@ pub enum Op {
     /// watermark advances monotonically and is NOT rewound by the inverse
     /// (scope ruling 3, ADR 0001).
     MidiSetNotes { clip: crate::ids::ClipId, notes: Vec<crate::midi::types::MidiNote> },
+    /// §4.4 value-replacement wrapper (Plan E Task 10): the automation lane
+    /// analogue of `MidiSetNotes` — one op replaces (or deletes) ONE lane's
+    /// full point set; an edit gesture is one lane write, never one op per
+    /// point (D-03). `key` addresses the lane by its `AutomationLane::id` —
+    /// a plain string, not a struct key, so no new `ObjectRef` variant is
+    /// needed. `lane: None` deletes the lane at `key` (a no-op, not an
+    /// error, if it doesn't exist); `Some` upserts (replaces in place if
+    /// `key` already names a lane, else inserts). Inverse carries the
+    /// previous lane at `key` (or `None` if it didn't exist before this op).
+    AutomationSetLane { key: String, lane: Option<crate::plugins::automation::AutomationLane> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -441,6 +451,28 @@ mod tests {
             let back: PropPath = serde_json::from_str(&s).unwrap();
             assert_eq!(back, path);
         }
+        // Plan E Task 10: AutomationSetLane wire form, both a lane payload
+        // (upsert) and `lane: null` (delete).
+        let lane = crate::plugins::automation::AutomationLane {
+            id: "a-1".into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+        };
+        let automation_set = Op::AutomationSetLane { key: "a-1".into(), lane: Some(lane.clone()) };
+        let s = serde_json::to_string(&automation_set).unwrap();
+        eprintln!("AutomationSetLane wire form: {}", s);
+        assert!(s.contains("\"kind\":\"automationSetLane\""), "wire form was: {s}");
+        assert!(s.contains("\"targetNode\":\"track:t-1\""), "lane fields must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, automation_set);
+
+        let automation_delete = Op::AutomationSetLane { key: "a-1".into(), lane: None };
+        let s = serde_json::to_string(&automation_delete).unwrap();
+        eprintln!("AutomationSetLane (delete) wire form: {}", s);
+        assert!(s.contains("\"lane\":null"), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, automation_delete);
     }
 
     #[test]

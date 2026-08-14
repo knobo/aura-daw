@@ -5,16 +5,31 @@ use crate::audio::types::{Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use crate::ids::TrackId;
 use crate::midi::MidiStore;
+use crate::plugins::automation::AutomationLane;
+
+/// Automation lanes document (Plan E Task 10) — the in-memory half of the
+/// former standalone `plugins::automation::AutomationStore` +
+/// process-global `STORE`, moved under the Session lock (round-2 §4.1's
+/// cross-store atomicity: automation edits are now tx-atomic with every
+/// other document field, mirroring `MidiStore`'s earlier merge). No
+/// `loaded_dir` field — unlike the old lazily-resyncing store, epochs
+/// (project open/create) adopt eagerly (`plugins::automation::
+/// adopt_open_project`), so there is nothing left to lazily reconcile.
+#[derive(Debug, Default)]
+pub struct AutomationDoc {
+    pub lanes: Vec<AutomationLane>,
+}
 
 pub struct Session {
     pub store: Store,
     pub midi: MidiStore,
+    pub automation: AutomationDoc,
     pub(crate) rev: u64,
 }
 
 impl Session {
     pub fn new(store: Store, midi: MidiStore) -> Self {
-        Self { store, midi, rev: 0 }
+        Self { store, midi, automation: AutomationDoc::default(), rev: 0 }
     }
 
     /// Clone of the midi fields `midi::persist` persists — `ppq`,
@@ -544,6 +559,56 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 from: applied, // the inverse's `from`: value we just wrote
                 to: from_now,  // the inverse's `to`: value to restore
             })
+        // §4.4 value-replacement wrapper (Plan E Task 10): one op replaces
+        // (or deletes) ONE lane's full point set — an edit gesture is one
+        // lane write, never one op per point (D-03), mirroring
+        // `MidiSetNotes`. Addressed by `key` (== `AutomationLane::id`, a
+        // plain string) rather than `ObjectRef` — automation lanes have no
+        // struct key, just a string id, so no new `ObjectRef` variant is
+        // needed (checked against the brief's NEEDS_CONTEXT trigger).
+        //
+        // REBUILD PIN (brief-mandated file:line cite): this op does NOT set
+        // `effect.rebuild`. `engine::rebuild` (src/audio/engine.rs:684) never
+        // reads `session.automation` — automation lanes are compiled to
+        // absolute-sample ramps and attached to a live node only through
+        // `GainAutomatedNode` (this file's module, `plugins/automation.rs`),
+        // and nothing in the production graph build wires that node in yet
+        // (see this crate's `plugins/automation.rs` module doc: "Production
+        // graph rebuilds do not yet attach lanes to nodes (roadmap:
+        // automation editing UI round)"). So today automation edits have no
+        // RT-visible effect to rebuild for; when a future round wires lanes
+        // into the graph, this arm needs `effect.rebuild = true` too.
+        Op::AutomationSetLane { key, lane } => {
+            let pos = session.automation.lanes.iter().position(|l| &l.id == key);
+            // Validate + normalize BEFORE any mutation (atomic — round-2 §4:
+            // a failed apply must leave the session untouched).
+            let mut new_lane = match lane {
+                Some(l) => {
+                    let mut nl = l.clone();
+                    nl.id = key.clone(); // the op's `key` is authoritative
+                    crate::plugins::automation::normalize_lane(&mut nl)?;
+                    Some(nl)
+                }
+                None => None,
+            };
+            // Upsert/remove, capturing whatever was there before (store
+            // truth) as the inverse's payload — `None` when the key didn't
+            // exist (mirrors `Op::Set`'s "inverse from store truth, never
+            // guessed" rule).
+            let previous = match pos {
+                Some(idx) => match new_lane.take() {
+                    Some(nl) => Some(std::mem::replace(&mut session.automation.lanes[idx], nl)),
+                    None => Some(session.automation.lanes.remove(idx)),
+                },
+                None => {
+                    if let Some(nl) = new_lane.take() {
+                        session.automation.lanes.push(nl);
+                    }
+                    None // deleting an already-absent lane is a no-op, not an error
+                }
+            };
+            effect.persist.automation = true;
+            Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
         }
         _ => Err("op not yet supported".into()),
     }
@@ -908,6 +973,7 @@ mod tests {
     use crate::audio::types::testutil::{test_clip, test_track};
     use crate::control::op::testutil::set_gain;
     use crate::control::op::{Actor, ObjectRef, PropPath, TxMeta};
+    use crate::plugins::automation::AutomationPoint;
 
     /// Store with one TrackState id `id`. Initial `gain_db` is 1.0 — a
     /// deliberately odd-but-valid dB value inside ops.rs's -160..24 clamp
@@ -1609,6 +1675,34 @@ mod tests {
         // which do set `effect.persist.project`/`.midi`.
         assert_eq!(c.effect.persist, PersistEffect::default(), "transport Sets set no persist flag");
         assert!(!c.effect.rebuild, "transport Sets don't need a graph rebuild");
+    // ---- Plan E Task 10: automation lane op kind ----
+
+    fn test_lane(id: &str, points: Vec<AutomationPoint>) -> AutomationLane {
+        AutomationLane { id: id.into(), target_node: "track:t-1".into(), param_id: 0, points }
+    }
+
+    #[test]
+    fn automation_set_lane_inserts_and_inverse_deletes() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let lane = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        let c = Session::transact(&m, TxMeta::user("set lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(lane.clone()) })
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![lane]);
+        assert!(c.effect.persist.automation, "lane write must persist automation");
+        assert!(
+            !c.effect.rebuild,
+            "automation lanes aren't read at graph-build time yet (audio/engine.rs:684) — no rebuild"
+        );
+        match &c.inverses[0] {
+            Op::AutomationSetLane { key, lane } => {
+                assert_eq!(key, "a-1");
+                assert!(lane.is_none(), "the lane didn't exist before — inverse deletes it");
+            }
+            other => panic!("expected AutomationSetLane, got {other:?}"),
+        }
+
         Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() { tx.apply(op)?; }
             Ok(())
@@ -1695,5 +1789,102 @@ mod tests {
             })
         });
         assert!(r.is_err(), "an unrecognized transport state must error, not silently write garbage");
+        assert!(m.lock().automation.lanes.is_empty(), "undo removes the inserted lane");
+    }
+
+    #[test]
+    fn automation_set_lane_overwrites_and_inverse_restores_previous() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let original = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        m.lock().automation.lanes.push(original.clone());
+
+        let replacement = test_lane("a-1", vec![AutomationPoint { tick: 960, value: 0.5 }]);
+        let c = Session::transact(&m, TxMeta::user("overwrite lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(replacement.clone()) })
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![replacement]);
+        assert!(c.effect.persist.automation);
+        match &c.inverses[0] {
+            Op::AutomationSetLane { key, lane: Some(l) } => {
+                assert_eq!(key, "a-1");
+                assert_eq!(l.points, original.points, "inverse carries the PREVIOUS lane, from store truth");
+            }
+            other => panic!("expected AutomationSetLane{{..Some}}, got {other:?}"),
+        }
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![original], "undo restores the original lane exactly");
+    }
+
+    #[test]
+    fn automation_set_lane_deletes_and_inverse_reinserts() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let lane = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        m.lock().automation.lanes.push(lane.clone());
+
+        let c = Session::transact(&m, TxMeta::user("delete lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: None })
+        })
+        .unwrap();
+        assert!(m.lock().automation.lanes.is_empty(), "lane removed");
+        assert!(c.effect.persist.automation);
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() { tx.apply(op)?; }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().automation.lanes, vec![lane], "undo reinserts the deleted lane");
+    }
+
+    #[test]
+    fn automation_set_lane_deleting_an_unknown_key_is_a_harmless_noop() {
+        // Mirrors the retired command's leniency (`s.lanes.retain(...)`
+        // silently dropped nothing for an unknown id) — deleting a lane
+        // that was never there is not an error.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let c = Session::transact(&m, TxMeta::user("delete ghost"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "ghost".into(), lane: None })
+        })
+        .unwrap();
+        assert!(m.lock().automation.lanes.is_empty());
+        match &c.inverses[0] {
+            Op::AutomationSetLane { key, lane } => {
+                assert_eq!(key, "ghost");
+                assert!(lane.is_none());
+            }
+            other => panic!("expected AutomationSetLane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn automation_set_lane_normalizes_and_rejects_invalid_points_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let bad = test_lane("a-1", vec![AutomationPoint { tick: 0, value: f32::NAN }]);
+        let r = Session::transact(&m, TxMeta::user("bad lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(bad) })
+        });
+        assert!(r.is_err(), "non-finite values must be rejected");
+        assert!(m.lock().automation.lanes.is_empty(), "rejected write leaves the session untouched");
+
+        // Unsorted points get normalized (sorted), not rejected.
+        let unsorted = test_lane(
+            "a-1",
+            vec![AutomationPoint { tick: 960, value: 0.5 }, AutomationPoint { tick: 0, value: 1.0 }],
+        );
+        Session::transact(&m, TxMeta::user("unsorted lane"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(unsorted) })
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().automation.lanes[0].points,
+            vec![AutomationPoint { tick: 0, value: 1.0 }, AutomationPoint { tick: 960, value: 0.5 }],
+            "apply normalizes (sorts) points before storing"
+        );
     }
 }

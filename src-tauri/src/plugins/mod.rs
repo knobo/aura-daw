@@ -211,26 +211,23 @@ pub fn instance_exists(instance_id: &str) -> bool {
 
 pub struct PluginState {
     registry: Arc<Mutex<PluginRegistry>>,
-    /// Automation lanes (zone P4 groundwork) — lives here because lib.rs's
-    /// managed-state roster is frozen; `automation.rs` owns the semantics.
-    pub(crate) automation: Arc<Mutex<automation::AutomationStore>>,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self {
-            registry: Arc::new(Mutex::new(PluginRegistry::default())),
-            automation: Arc::new(Mutex::new(automation::AutomationStore::default())),
-        }
+        Self { registry: Arc::new(Mutex::new(PluginRegistry::default())) }
     }
 }
 
-/// Module init hook (lib.rs setup): publish the registry + automation store
-/// for the engine and the project-open restore seam (zone P4).
+/// Module init hook (lib.rs setup): publish the registry for the engine and
+/// the project-open restore seam (zone P4). Automation lanes moved into
+/// `Session` (Plan E Task 10) — their project-adoption seam is registered
+/// separately, from `MidiState::shared` (`midi/mod.rs`), once the shared
+/// `Session` exists (this hook runs BEFORE it does — see lib.rs's setup
+/// order — so it can't be done here).
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let state = app.state::<PluginState>();
     register_registry(state.registry.clone());
-    automation::register_store(state.automation.clone());
     // The production host-state bridge (ARCHITECTURE §15.3 "State"): project
     // save/open serializes live CLAP/LV2 instance state through the shared
     // plugin main thread. Registered here so `state::save_into_project` /
