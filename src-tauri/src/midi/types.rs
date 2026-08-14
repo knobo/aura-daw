@@ -40,6 +40,18 @@ pub struct TempoPeriodEvent {
     pub period_end: u64,
 }
 
+/// One time-signature change (round-2 §3.3/O-10). Sorted list, first at
+/// tick 0; default is `[{0,4,4}]`. Persisting this is what fixes the
+/// active data-loss bug (dossier 10 trap 3): today's code silently
+/// clobbers the user's signature to 4/4 on every save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeterEvent {
+    pub tick: u64,
+    pub num: u8,
+    pub den: u8,
+}
+
 /// One MIDI note. 16 bytes in the AMEV binary chunk encoding (see
 /// [`crate::midi::events`]); JSON on the IPC surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,6 +175,17 @@ mod tests {
         assert_eq!(v["periodStart"], 4_233_600_000u64);
         assert_eq!(v["periodEnd"], 4_233_600_000u64);
         let back: TempoPeriodEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn meter_event_serializes_camel_case() {
+        let e = MeterEvent { tick: 7680, num: 3, den: 4 };
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["tick"], 7680);
+        assert_eq!(v["num"], 3);
+        assert_eq!(v["den"], 4);
+        let back: MeterEvent = serde_json::from_value(v).unwrap();
         assert_eq!(back, e);
     }
 

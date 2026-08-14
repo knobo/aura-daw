@@ -6,7 +6,7 @@
 //! The RT thread NEVER converts — it receives pre-converted sample
 //! positions / pre-rendered event blocks from the control thread.
 
-use super::types::{TempoEvent, TempoPeriodEvent, DEFAULT_PPQ};
+use super::types::{MeterEvent, TempoEvent, TempoPeriodEvent, DEFAULT_PPQ};
 use crate::time::{Samples, Ticks, SUPERTICKS_PER_SECOND};
 
 /// Piecewise tick<->sample mapping over integer-period tempo events
@@ -216,6 +216,89 @@ fn samples_per_tick_at_period(period: u64, ppq: u32, rate: u32) -> f64 {
     period as f64 / SUPERTICKS_PER_SECOND as f64 * rate as f64 / ppq as f64
 }
 
+/// Persisted time-signature map (round-2 §3.3/O-10): bar/beat lookups.
+/// Separate from `TempoMap` — bars/beats don't need tempo, and a project
+/// can hold BOTH maps independently, changing one without touching the
+/// other.
+#[derive(Debug, Clone)]
+pub struct MeterMap {
+    /// Sorted by tick, first entry at tick 0. Invariant enforced by `new`.
+    events: Vec<MeterEvent>,
+}
+
+impl MeterMap {
+    pub fn new(events: Vec<MeterEvent>) -> Result<Self, String> {
+        if events.is_empty() {
+            return Err("meter map must have at least one entry".into());
+        }
+        if events[0].tick != 0 {
+            return Err("first meter event must be at tick 0".into());
+        }
+        for pair in events.windows(2) {
+            if pair[1].tick <= pair[0].tick {
+                return Err("meter events must have strictly increasing ticks".into());
+            }
+        }
+        for e in &events {
+            if e.num == 0 || e.den == 0 {
+                return Err("meter numerator/denominator must be > 0".into());
+            }
+        }
+        Ok(Self { events })
+    }
+
+    /// The `[{0,4,4}]` default (round-2 §3.3).
+    pub fn default_map() -> Self {
+        Self { events: vec![MeterEvent { tick: 0, num: 4, den: 4 }] }
+    }
+
+    pub fn events(&self) -> &[MeterEvent] {
+        &self.events
+    }
+
+    fn segment_at(&self, tick: u64) -> &MeterEvent {
+        let i = match self.events.binary_search_by(|e| e.tick.cmp(&tick)) {
+            Ok(i) => i,
+            Err(i) => i - 1, // safe: events[0].tick == 0
+        };
+        &self.events[i]
+    }
+
+    /// Ticks spanned by one bar of a `num/den` signature at `ppq`: `num`
+    /// beats of `4/den` whole notes each.
+    fn bar_ticks(num: u8, den: u8, ppq: u32) -> u64 {
+        (num as u64 * ppq as u64 * 4 / den as u64).max(1)
+    }
+
+    /// 0-indexed bar number at `tick`, given the project `ppq`. A single
+    /// forward pass over the segments that end at-or-before `tick`
+    /// accumulates whole bars from each, then adds the bars elapsed inside
+    /// the segment containing `tick` — O(n) in the number of signature
+    /// changes, no repeated position lookups.
+    pub fn bar_at(&self, tick: Ticks, ppq: u32) -> u32 {
+        let tick = tick.0;
+        let mut bars = 0u32;
+        for w in self.events.windows(2) {
+            if tick < w[1].tick {
+                break;
+            }
+            bars += ((w[1].tick - w[0].tick) / Self::bar_ticks(w[0].num, w[0].den, ppq)) as u32;
+        }
+        let e = self.segment_at(tick);
+        bars + ((tick - e.tick) / Self::bar_ticks(e.num, e.den, ppq)) as u32
+    }
+
+    /// Fractional beat position within the current bar (0.0 = downbeat).
+    pub fn beat_at(&self, tick: Ticks, ppq: u32) -> f64 {
+        let tick = tick.0;
+        let e = self.segment_at(tick);
+        let beat_ticks = (ppq as u64 * 4 / e.den as u64).max(1);
+        let bar_ticks = (e.num as u64 * beat_ticks).max(1);
+        let into_bar = (tick - e.tick) % bar_ticks;
+        into_bar as f64 / beat_ticks as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -349,5 +432,45 @@ mod tests {
         .unwrap();
         assert_eq!(m.tick_to_samples(3840), 96_000);
         assert_eq!(m.tick_to_samples(3840 + 960), 96_000 + 48_000);
+    }
+
+    #[test]
+    fn meter_map_default_is_four_four_at_tick_zero() {
+        let m = MeterMap::default_map();
+        assert_eq!(m.events()[0], MeterEvent { tick: 0, num: 4, den: 4 });
+    }
+
+    #[test]
+    fn meter_map_computes_bar_and_beat_at_a_constant_four_four() {
+        let m = MeterMap::new(vec![MeterEvent { tick: 0, num: 4, den: 4 }]).unwrap();
+        let ppq = 960u32;
+        // One bar = 4 beats = 4*960 = 3840 ticks at 4/4.
+        assert_eq!(m.bar_at(Ticks(0), ppq), 0);
+        assert_eq!(m.bar_at(Ticks(3839), ppq), 0);
+        assert_eq!(m.bar_at(Ticks(3840), ppq), 1);
+        assert_eq!(m.bar_at(Ticks(3840 * 3 + 100), ppq), 3);
+        assert!((m.beat_at(Ticks(960), ppq) - 1.0).abs() < 1e-9);
+        assert!((m.beat_at(Ticks(480), ppq) - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn meter_map_handles_a_signature_change_mid_song() {
+        // 4/4 for 2 bars (7680 ticks), then 3/4.
+        let m = MeterMap::new(vec![
+            MeterEvent { tick: 0, num: 4, den: 4 },
+            MeterEvent { tick: 7680, num: 3, den: 4 },
+        ])
+        .unwrap();
+        let ppq = 960u32;
+        assert_eq!(m.bar_at(Ticks(7680), ppq), 2, "bar 2 starts exactly at the signature change");
+        // One 3/4 bar = 3*960 = 2880 ticks.
+        assert_eq!(m.bar_at(Ticks(7680 + 2880), ppq), 3);
+    }
+
+    #[test]
+    fn meter_map_rejects_malformed_maps() {
+        assert!(MeterMap::new(vec![]).is_err());
+        assert!(MeterMap::new(vec![MeterEvent { tick: 5, num: 4, den: 4 }]).is_err());
+        assert!(MeterMap::new(vec![MeterEvent { tick: 0, num: 0, den: 4 }]).is_err());
     }
 }
