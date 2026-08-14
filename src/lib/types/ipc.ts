@@ -413,6 +413,25 @@ export interface InstrumentInfo {
   keyHigh?: number;
 }
 
+// ── library & browser (Track E, src-tauri/src/library.rs) ──────────────────
+
+export type LibraryEntryKind = "dir" | "audio";
+
+/** One row of a `library_scan` listing. Filesystem metadata only — duration
+ * and format are NOT probed during a scan (plan ruling 2). */
+export interface LibraryEntry {
+  /** File or directory name (no path). */
+  name: string;
+  /** Absolute path. */
+  path: string;
+  kind: LibraryEntryKind;
+  /** Lowercased extension without the dot; empty for directories. */
+  ext: string;
+  sizeBytes: number;
+  /** Modification time, ms since the Unix epoch (0 when unknown). */
+  modifiedMs: number;
+}
+
 // ── plugin-descriptor.schema.json + plugin-state.schema.json (phase 3) ─────
 
 export type PluginFormat = "clap" | "lv2";
@@ -472,6 +491,26 @@ export interface PluginListResult {
   plugins: PluginDescriptor[];
   instances: PluginInstanceInfo[];
   scanned: boolean;
+}
+
+// ── automation (plugins::automation) ────────────────────────────────────────
+
+/** One automation breakpoint in MUSICAL time (ticks @ project ppq). Between
+ * points the value ramps linearly; before the first / after the last it
+ * holds. Mirrors `plugins::automation::AutomationPoint`. */
+export interface AutomationPoint {
+  tick: number;
+  value: number;
+}
+
+/** One parameter's automation curve. `targetNode` is `"track:<trackId>"` for
+ * built-in track params (today: gain, `paramId` 0) or a plugin instance id
+ * for plugin params. Mirrors `plugins::automation::AutomationLane`. */
+export interface AutomationLane {
+  id: string;
+  targetNode: string;
+  paramId: number;
+  points: AutomationPoint[];
 }
 
 // ── mcp-policy.schema.json (phase 2) ───────────────────────────────────────

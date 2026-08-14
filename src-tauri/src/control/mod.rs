@@ -370,6 +370,30 @@ impl Committer {
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
         R: FnOnce(),
     {
+        self.commit_with_rebuild_full(meta, f, emit_project_changed, do_rebuild, history_mode, false)
+    }
+
+    /// [`Self::commit_with_rebuild_mode`] with an explicit `defer_persist`
+    /// (I-8): when `true`, the persist described by this commit's
+    /// `PersistEffect` is NOT executed here — the caller (an open gesture,
+    /// via `ControlPlane::commit_transient_for_gesture`) accumulates it
+    /// instead and executes the union once at `close_gesture`. Every other
+    /// existing caller goes through `commit_with_rebuild_mode`'s delegate
+    /// above, which passes `false` — byte-identical behaviour to before
+    /// this fn existed.
+    pub(crate) fn commit_with_rebuild_full<F, R>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+        emit_project_changed: bool,
+        do_rebuild: R,
+        history_mode: history::HistoryMode,
+        defer_persist: bool,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+        R: FnOnce(),
+    {
         let committed = Session::transact(&self.session, meta, f)?;
         // ---- session lock is released here; everything below executes
         // the effect the session merely described. ----
@@ -434,7 +458,7 @@ impl Committer {
         // everything else in `commit_with_rebuild` ([C1]: hosts have their
         // own locks, never called while the session lock is held).
         if !committed.effect.host_forward.is_empty() {
-            self.execute_host_forward(&committed.effect.host_forward);
+            self.execute_host_forward(&committed.effect.host_forward, committed.epoch);
         }
         if committed.effect.rebuild {
             do_rebuild();
@@ -444,7 +468,7 @@ impl Committer {
         // truth, so persistence must have already happened by the time it
         // fires (round-2 §4: persistence is an effect, executed here, never
         // I/O under the session lock).
-        if committed.effect.persist != session::PersistEffect::default() {
+        if !defer_persist && committed.effect.persist != session::PersistEffect::default() {
             self.execute_persist(&committed.effect.persist, committed.epoch);
         }
         // THE OP LOG (Plan E Task 17, Gate E). After the effects — a batch
@@ -609,6 +633,45 @@ impl Committer {
         }
     }
 
+    /// I-3: the `Instantiate` arm's post-host document writeback, split out
+    /// of the match so it is testable without a live plugin host, and
+    /// EPOCH-GUARDED (same rule as `execute_persist`: a document swapped
+    /// between the commit and this re-lock is a different document, and
+    /// writing this commit's host result into it is silent corruption —
+    /// `params.entry(..).or_default()` would even CREATE a row for an
+    /// instance the new project never had). Recorded as residual R-4 in
+    /// `docs/SIDE-CHANNEL-INVENTORY.md`; see that doc for why this stays a
+    /// carve-out rather than becoming an op (the M-3 transient invariant).
+    pub(crate) fn apply_instantiate_writeback(
+        &self,
+        instance: &str,
+        params: Vec<crate::plugins::ParamInfo>,
+        committed_epoch: u64,
+    ) {
+        let mut s = self.session.lock();
+        if s.epoch != committed_epoch {
+            log::warn!(
+                "plugins: instantiate writeback for {instance} skipped: epoch changed \
+                 between commit and host round-trip ({committed_epoch} -> {})",
+                s.epoch
+            );
+            return;
+        }
+        if let Some(r) = s.plugins.instances.iter_mut().find(|r| r.id == instance) {
+            r.status = "active".into();
+        }
+        // Fill only when absent: an undo-of-remove already restored the
+        // REAL param mirror into `session.plugins.params` (parked there by
+        // `apply_raw`'s `PluginRemove` arm) — this must not clobber it with
+        // the host's fresh-reinstantiate DEFAULTS. A genuinely fresh
+        // instantiate's mirror is still the empty seed `Op::PluginAdd`
+        // left, so it gets filled here exactly as before.
+        let entry = s.plugins.params.entry(instance.to_string()).or_default();
+        if entry.is_empty() {
+            *entry = params;
+        }
+    }
+
     /// Executes a `HostForward` list a commit merely described — calling
     /// the SAME host entry points commands call today
     /// (`plugins::clap_host`/`lv2_host`/`state`'s `HostStateBridge`), now
@@ -617,7 +680,7 @@ impl Committer {
     /// method takes ONLY brief re-locks of `self.session` to read a row's
     /// format/uid or to write back a post-host result, never spanning a
     /// host call).
-    fn execute_host_forward(&self, forwards: &[session::HostForward]) {
+    pub(crate) fn execute_host_forward(&self, forwards: &[session::HostForward], committed_epoch: u64) {
         use crate::plugins::{clap_host, lv2_host, state as pstate};
         use session::HostForward;
         for hf in forwards {
@@ -627,19 +690,8 @@ impl Committer {
                         let s = self.session.lock();
                         s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
                     };
-                    match format.as_deref() {
-                        Some("lv2") => {
-                            if let Some(host) = lv2_host::try_global() {
-                                host.set_params(instance, vec![(*index, *value)]);
-                            }
-                        }
-                        Some("clap") => {
-                            let change = crate::plugins::ParamChange { id: *index, value: *value as f64 };
-                            if let Err(e) = clap_host::set_params(instance, vec![change]) {
-                                log::warn!("plugins: clap param write for {instance}: {e}");
-                            }
-                        }
-                        _ => {}
+                    if let Some(format) = format {
+                        forward_param_to_host(instance, &format, *index, *value);
                     }
                 }
                 HostForward::Instantiate { instance } => {
@@ -670,26 +722,7 @@ impl Committer {
                         _ => continue, // non-hosted format: stays "stub", nothing to sync
                     };
                     match hosted {
-                        Ok(params) => {
-                            let mut s = self.session.lock();
-                            if let Some(r) = s.plugins.instances.iter_mut().find(|r| &r.id == instance) {
-                                r.status = "active".into();
-                            }
-                            // Fill only when absent (Task 9 review round 1,
-                            // Important-1): an undo-of-remove already
-                            // restored the REAL param mirror into
-                            // `session.plugins.params` (parked there by
-                            // `apply_raw`'s `PluginRemove` arm) — this must
-                            // not clobber it with the host's fresh-
-                            // reinstantiate DEFAULTS. A genuinely fresh
-                            // instantiate's mirror is still the empty seed
-                            // `Op::PluginAdd` left, so it gets filled here
-                            // exactly as before.
-                            let entry = s.plugins.params.entry(instance.clone()).or_default();
-                            if entry.is_empty() {
-                                *entry = params;
-                            }
-                        }
+                        Ok(params) => self.apply_instantiate_writeback(instance, params, committed_epoch),
                         Err(e) => log::warn!("plugins: instantiate forward for {instance} failed: {e}"),
                     }
                 }
@@ -774,34 +807,55 @@ pub(crate) mod testutil {
 // Gesture IPC (Plan E Task 14, round-2 inventory row 31, ADR 0003)
 // ---------------------------------------------------------------------------
 
+/// What a `CoalesceKey` addresses. Internal to this module (`CoalesceKey`
+/// is `pub(crate)` and is never serialized), which is exactly why an
+/// automation lane can get a coalesce target here without adding a
+/// variant to the JOURNALED `op::ObjectRef` enum.
+#[derive(Debug, Clone, PartialEq)]
+enum CoalesceTarget {
+    Object(op::ObjectRef),
+    /// `AutomationLane::id` — lanes have a string id, not a struct key.
+    AutomationLane(String),
+}
+
 /// The coalescing key a gesture folds by: the op's discriminant + the
-/// `ObjectRef` it targets + the `PropPath` it targets (round-2 §4.4:
+/// target it addresses + the `PropPath` it targets (round-2 §4.4:
 /// "coalesced by (op_kind, target, actor)" — the (kind, target) half; the
 /// actor half is `OpenGesture::actor`/`GestureState::matches_actor`, checked
 /// separately since it gates whether a commit folds AT ALL, not which key it
-/// folds under). `path` is `Option` because a future non-`Set` op kind may
-/// have no property path; today `for_op` only ever returns `Some(path)`,
-/// since `Op::Set` is the only kind it builds a key for. Exported
-/// (`pub(crate)`) — Task 17 imports this exact type to key its own
-/// history-side merge; the name and the (kind, object, path) shape are
-/// load-bearing, not cosmetic.
+/// folds under). `path` is `Option` because a non-`Set` op kind (e.g.
+/// `Op::AutomationSetLane`) has no property path — it addresses a whole
+/// lane, not a property of one. Exported (`pub(crate)`) — Task 17 imports
+/// this exact type to key its own history-side merge; the name and the
+/// (kind, target, path) shape are load-bearing, not cosmetic.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CoalesceKey {
     kind: &'static str,
-    object: op::ObjectRef,
+    target: CoalesceTarget,
     path: Option<op::PropPath>,
 }
 
 impl CoalesceKey {
     /// Builds the key for `op`, or `None` for an op kind gesture folding
-    /// doesn't (yet) handle. Only `Op::Set` today — the only op kind
-    /// `ControlPlane::set_track_mix` (gesture folding's one wired caller)
-    /// ever applies.
+    /// doesn't (yet) handle. `Op::Set` and `Op::AutomationSetLane` today —
+    /// the op kinds `ControlPlane::set_track_mix`, `set_plugin_params`, and
+    /// `set_automation_lane` (gesture folding's wired callers) apply.
     fn for_op(op: &op::Op) -> Option<Self> {
         match op {
-            op::Op::Set { object, path, .. } => {
-                Some(Self { kind: "set", object: object.clone(), path: Some(*path) })
-            }
+            op::Op::Set { object, path, .. } => Some(Self {
+                kind: "set",
+                target: CoalesceTarget::Object(object.clone()),
+                path: Some(*path),
+            }),
+            // §4.4 value-replacement wrapper: a lane drag is a run of
+            // whole-lane replaces of ONE lane; folding them by lane id is
+            // what makes the drag one undo entry AND (with Task 2's
+            // deferral) one automation persist.
+            op::Op::AutomationSetLane { key, .. } => Some(Self {
+                kind: "automationSetLane",
+                target: CoalesceTarget::AutomationLane(key.clone()),
+                path: None,
+            }),
             _ => None,
         }
     }
@@ -812,15 +866,15 @@ impl CoalesceKey {
     ///
     /// Why the two differ, rather than one shared fn: `for_op` decides what
     /// a gesture folds INSIDE an open boundary, where folding also discards
-    /// intermediate commits' effects — only `Op::Set`, the sole op kind
-    /// `set_track_mix` (gesture folding's one wired caller) ever applies,
-    /// is in scope there. The 350 ms fallback merges FINISHED, already
-    /// committed batches, so it can safely cover the other §4.4
-    /// value-replacement wrapper too: `midi_set_notes_core` deliberately
-    /// keeps the FIXED label `"set midi notes"` (its own doc says so)
-    /// precisely so a run of note edits on ONE clip collapses to one undo
-    /// step instead of one per keystroke. `path: None` — a `MidiSetNotes`
-    /// addresses the whole clip, not a property of it.
+    /// intermediate commits' effects — only the op kinds `set_track_mix`,
+    /// `set_plugin_params`, and `set_automation_lane` (gesture folding's
+    /// wired callers) ever apply are in scope there. The 350 ms fallback
+    /// merges FINISHED, already committed batches, so it can safely cover
+    /// the other §4.4 value-replacement wrapper too: `midi_set_notes_core`
+    /// deliberately keeps the FIXED label `"set midi notes"` (its own doc
+    /// says so) precisely so a run of note edits on ONE clip collapses to
+    /// one undo step instead of one per keystroke. `path: None` — a
+    /// `MidiSetNotes` addresses the whole clip, not a property of it.
     ///
     /// Every other op kind is structural and returns `None`, which is what
     /// makes "a structural op breaks the merge" true by construction.
@@ -828,7 +882,7 @@ impl CoalesceKey {
         match op {
             op::Op::MidiSetNotes { clip, .. } => Some(Self {
                 kind: "midiSetNotes",
-                object: op::ObjectRef::MidiClip(clip.clone()),
+                target: CoalesceTarget::Object(op::ObjectRef::MidiClip(clip.clone())),
                 path: None,
             }),
             other => Self::for_op(other),
@@ -913,6 +967,15 @@ struct OpenGesture {
     /// recent fold (overwritten every time the key reappears).
     last: Vec<(CoalesceKey, op::Op)>,
     label: String,
+    /// Union of the persist effects of every commit folded into this
+    /// gesture, executed ONCE at `close_gesture` (I-8). Deferring is what
+    /// turns "one project.json write per rAF batch" into "one per drag".
+    persist: session::PersistEffect,
+    /// `Committed.epoch` of the LAST folded commit — what `execute_persist`
+    /// checks against the current session epoch at close. An epoch boundary
+    /// mid-gesture swaps the document out from under the accumulated
+    /// snapshot, and the epoch's own save owns durability from there.
+    epoch: u64,
 }
 
 /// Holds the (at most one) open gesture. `ControlPlane` owns one instance;
@@ -946,8 +1009,15 @@ impl GestureState {
     fn begin(&self, label: String, actor: op::Actor) -> Option<OpenGesture> {
         let mut guard = self.0.lock();
         let stale = guard.take();
-        *guard =
-            Some(OpenGesture { actor, run: uuid::Uuid::new_v4().to_string(), baselines: Vec::new(), last: Vec::new(), label });
+        *guard = Some(OpenGesture {
+            actor,
+            run: uuid::Uuid::new_v4().to_string(),
+            baselines: Vec::new(),
+            last: Vec::new(),
+            label,
+            persist: session::PersistEffect::default(),
+            epoch: 0,
+        });
         stale
     }
 
@@ -1025,6 +1095,8 @@ impl GestureState {
     /// undo). Private, `&mut OpenGesture`-taking helper — the only caller
     /// is `commit_transient_and_fold`, which already holds this mutex.
     fn fold_committed(g: &mut OpenGesture, committed: &session::Committed) {
+        g.persist.merge(&committed.effect.persist);
+        g.epoch = committed.epoch;
         for (op, inv) in committed.ops.iter().zip(committed.inverses.iter()) {
             let Some(key) = CoalesceKey::for_op(op) else { continue };
             if !g.baselines.iter().any(|(k, _)| *k == key) {
@@ -1046,6 +1118,50 @@ impl MeterSink for LatestMeterCache {
     fn send_frame(&self, frame: &MeterFrame) -> bool {
         *self.0.lock() = Some(frame.clone());
         true
+    }
+}
+
+/// Forward one already-clamped param value to whichever host owns
+/// `instance`. Two callers: `Committer::execute_host_forward`'s `ParamWrite`
+/// arm (a document edit's host effect) and the engine control thread's
+/// automation driver (Track D — an RT-visible override that never touches
+/// the document; see `plugins::automation::ParamAutomationDriver`'s doc and
+/// `docs/SIDE-CHANNEL-INVENTORY.md`). Taking `format` as an argument, rather
+/// than looking it up, is what lets the driver run with zero session locks
+/// on its 2 ms tick.
+pub(crate) fn forward_param_to_host(instance: &str, format: &str, index: u32, value: f32) {
+    forward_params_to_host(instance, format, &[(index, value)]);
+}
+
+/// The same, for a whole BATCH of params on one instance — one host call
+/// instead of one per param (Task 9 review, I-2). This matters for CLAP:
+/// `clap_host::set_params` is a blocking `plugin_main().run(…)` round-trip on
+/// the thread that also serves the param panel, instantiate and `save_state`,
+/// so a handful of automated params on a 2 ms tick would otherwise be
+/// thousands of blocking hops a second. The engine's automation driver hands
+/// its writes out grouped by instance precisely so this is one call per
+/// plugin per tick.
+pub(crate) fn forward_params_to_host(instance: &str, format: &str, changes: &[(u32, f32)]) {
+    use crate::plugins::{clap_host, lv2_host};
+    if changes.is_empty() {
+        return;
+    }
+    match format {
+        "lv2" => {
+            if let Some(host) = lv2_host::try_global() {
+                host.set_params(instance, changes.to_vec());
+            }
+        }
+        "clap" => {
+            let changes = changes
+                .iter()
+                .map(|(id, v)| crate::plugins::ParamChange { id: *id, value: *v as f64 })
+                .collect();
+            if let Err(e) = clap_host::set_params(instance, changes) {
+                log::warn!("plugins: clap param write for {instance}: {e}");
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1711,7 +1827,7 @@ impl ControlPlane {
         // runs is a RUNTIME decision this code can't make ahead of time.
         let gesture_meta = meta.clone();
         let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
-            self.commit_with(gesture_meta.transient(), |tx| apply_mix_changes(&changes, tx), false)
+            self.commit_transient_for_gesture(gesture_meta, |tx| apply_mix_changes(&changes, tx))
         });
         match gesture_result {
             Some(result) => {
@@ -1738,6 +1854,95 @@ impl ControlPlane {
             .filter_map(|c| session.store.tracks.iter().find(|t| t.id == c.track_id).cloned())
             .collect();
         Ok(updated)
+    }
+
+    /// Batched plugin-param writes through the transaction channel — one
+    /// `Op::Set{Plugin, Param}` per change, applied atomically. Gesture-aware
+    /// in exactly the shape `set_track_mix` uses (I-8: plugin knobs are the
+    /// canonical CLAP gesture, round-2 §4.4, and until now they were the one
+    /// drag surface that never consulted `GestureState` — so every rAF batch
+    /// was its own undo entry AND its own `project.json` rewrite).
+    ///
+    /// LOCK ORDER: `commit_transient_and_fold` holds the gesture mutex
+    /// across the nested session-lock acquisition; that direction (gesture,
+    /// then session) is the only safe one and is the one used here.
+    pub fn set_plugin_params(
+        &self,
+        instance_id: &str,
+        changes: &[crate::plugins::ParamChange],
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        // Validate before any commit (the `transact` closure must not panic,
+        // and an unknown instance must fail the whole batch atomically).
+        {
+            let s = self.session.lock();
+            if !s.plugins.instances.iter().any(|r| r.id == instance_id) {
+                return Err(format!("unknown plugin instance: {instance_id}"));
+            }
+        }
+        let apply = |changes: &[crate::plugins::ParamChange], tx: &mut session::Tx<'_>| {
+            for c in changes {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Plugin(instance_id.to_string()),
+                    path: op::PropPath::Param { index: c.id },
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(c.value),
+                })?;
+            }
+            Ok(())
+        };
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| apply(changes, tx))
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| apply(changes, tx))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete, when the normalized lane has no points) ONE
+    /// automation lane through the transaction channel — the §4.4
+    /// value-replacement wrapper, gesture-aware in the same shape as
+    /// `set_track_mix`/`set_plugin_params`. A lane drag therefore folds to
+    /// one `Op::AutomationSetLane` (last write per lane id wins), one undo
+    /// entry, and — with the gesture's deferred persist — one automation
+    /// write to disk.
+    pub fn set_automation_lane(
+        &self,
+        mut lane: crate::plugins::automation::AutomationLane,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if lane.id.is_empty() {
+            lane.id = uuid::Uuid::new_v4().to_string();
+        }
+        // Validate/normalize BEFORE the transaction (the closure must not
+        // panic, and a rejected lane must leave no document trace).
+        crate::plugins::automation::normalize_lane(&mut lane)?;
+        let key = lane.id.clone();
+        let to_apply = if lane.points.is_empty() { None } else { Some(lane) };
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::AutomationSetLane { key: key.clone(), lane: to_apply.clone() })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::AutomationSetLane { key: key.clone(), lane: to_apply.clone() })
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Move a clip on the timeline through the transaction channel
@@ -1862,6 +2067,47 @@ impl ControlPlane {
         self.committer.commit_with_rebuild(meta, f, emit_project_changed, || {
             self.engine.send(ControlMsg::Rebuild)
         })
+    }
+
+    /// The commit shape every gesture-folding caller uses (`set_track_mix`,
+    /// `set_plugin_params`, `set_automation_lane`): TRANSIENT (no history
+    /// entry, no journal line — the synthesized gesture batch is the
+    /// history-bound one), `emit_project_changed: false` (the gesture emits
+    /// exactly one at close), and `defer_persist: true` (I-8 — the persist
+    /// rides `close_gesture`, once).
+    ///
+    /// Callers must only reach this from INSIDE
+    /// `GestureState::commit_transient_and_fold`, which is what guarantees
+    /// the deferred persist is actually accumulated by an open gesture
+    /// rather than silently dropped.
+    fn commit_transient_for_gesture<F>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+    {
+        // Fix round 1, Important-2: the doc comment above states the
+        // contract; this enforces it. `IN_GESTURE_FOLD` only exists under
+        // `#[cfg(debug_assertions)]` (see its declaration), so the whole
+        // check — not just `debug_assert!`'s own internal `cfg!` gate — is
+        // wrapped in `#[cfg(debug_assertions)]`, same as every other
+        // `IN_GESTURE_FOLD` reference in this file.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            IN_GESTURE_FOLD.with(|marker| marker.get()),
+            "commit_transient_for_gesture called outside commit_transient_and_fold — \
+             the deferred persist would be dropped"
+        );
+        self.committer.commit_with_rebuild_full(
+            meta.transient(),
+            f,
+            false,
+            || self.engine.send(ControlMsg::Rebuild),
+            history::HistoryMode::Record,
+            true,
+        )
     }
 
     // ---- undo / redo (Plan E Task 17 — the log turns on) -----------------
@@ -2045,11 +2291,33 @@ impl ControlPlane {
     /// hood.
     ///
     /// A gesture that never folded anything (`last` empty — e.g. a
-    /// `pointerdown`/`pointerup` with no drag in between) produces no batch
-    /// and no emit: nothing changed, so there is nothing for history or the
-    /// UI to hear about.
+    /// `pointerdown`/`pointerup` with no drag in between) produces no
+    /// history batch and no `project://changed` emit — nothing changed to
+    /// this gesture's coalesced KEYS, so there is nothing for history or
+    /// the UI to hear about. It can still owe a deferred PERSIST, though
+    /// (see the early-return branch below) — `last` tracks coalesced ops,
+    /// not persist flags, and the two can disagree.
     fn close_gesture(&self, gesture: OpenGesture) {
+        // I-8: read BEFORE the fields below are moved out of `gesture` by
+        // the destructuring that follows.
+        let gesture_persist = gesture.persist;
+        let gesture_epoch = gesture.epoch;
         if gesture.last.is_empty() {
+            // Fix round 1, Important-1: a folded commit's OWN ops can net
+            // to nothing (session.rs's `fold_ops` elides a same-key Set
+            // pair whose `from == to` — e.g. a drag that ends back at its
+            // starting value within one folded commit) while its
+            // `EngineEffect::persist` was still computed `true` — the
+            // persist flags are set in `apply_raw` unconditionally on a
+            // successful write, before `fold_ops` ever runs. That commit's
+            // persist was already merged into `gesture_persist` by
+            // `fold_committed`, regardless of whether it left anything in
+            // `last`. Returning early here without executing it would
+            // silently drop a write this gesture already promised — so it
+            // runs even on the "nothing to show history" path.
+            if gesture_persist != session::PersistEffect::default() {
+                self.committer.execute_persist(&gesture_persist, gesture_epoch);
+            }
             return;
         }
         let ops: Vec<op::Op> = gesture.last.into_iter().map(|(_, op)| op).collect();
@@ -2088,6 +2356,13 @@ impl ControlPlane {
             &committed.inverses,
         );
         *self.last_gesture_batch.lock() = Some(committed);
+
+        // I-8: the whole drag's persist, once, here — never once per folded
+        // commit. Before the emit, for the same reason `commit_with_rebuild_full`
+        // persists before its own emit: the event announces durable truth.
+        if gesture_persist != session::PersistEffect::default() {
+            self.committer.execute_persist(&gesture_persist, gesture_epoch);
+        }
 
         // Same payload shape `Committer::commit_with_rebuild` emits (Task
         // 13's frozen `project://changed` contract) — the full `Project`
@@ -3532,6 +3807,70 @@ mod tests {
         engine.send(crate::audio::engine::ControlMsg::Shutdown);
     }
 
+    /// I-3 (Plan E whole-branch review): `execute_host_forward`'s Instantiate
+    /// writeback used to re-lock the session and write `status`/`params` with
+    /// no epoch guard, so a project swap in flight got another project's
+    /// plugin state written into it. Same guard shape `execute_persist` uses.
+    #[test]
+    fn instantiate_writeback_lands_when_the_epoch_is_unchanged() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let row = crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        let epoch = {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(row);
+            s.epoch
+        };
+        let params = vec![crate::plugins::ParamInfo {
+            id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+            default: 0.5, value: 0.25, steps: 0,
+        }];
+        cp.committer().apply_instantiate_writeback("inst-1", params, epoch);
+
+        let s = cp.session().lock();
+        assert_eq!(s.plugins.instances[0].status, "active");
+        assert_eq!(s.plugins.params["inst-1"].len(), 1);
+        assert_eq!(s.plugins.params["inst-1"][0].value, 0.25);
+    }
+
+    #[test]
+    fn instantiate_writeback_is_skipped_when_the_epoch_moved_under_it() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let row = crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        let stale_epoch = {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(row);
+            let e = s.epoch;
+            s.epoch += 1; // an epoch function swapped the document meanwhile
+            e
+        };
+        let params = vec![crate::plugins::ParamInfo {
+            id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+            default: 0.5, value: 0.25, steps: 0,
+        }];
+        cp.committer().apply_instantiate_writeback("inst-1", params, stale_epoch);
+
+        let s = cp.session().lock();
+        assert_eq!(s.plugins.instances[0].status, "stub", "status must not be written");
+        assert!(
+            !s.plugins.params.contains_key("inst-1"),
+            "the params mirror must not be CREATED for a document this commit no longer describes"
+        );
+    }
+
     /// Post-review fix: `set_track_mix`'s read-back used to `.expect()` a
     /// row that a concurrent `remove_track` could make vanish between the
     /// commit and the read-back lock, panicking a command thread. A truly
@@ -3669,6 +4008,287 @@ mod tests {
             .collect();
         finals.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(finals, vec![("t-1".to_string(), -6.0), ("t-2".to_string(), -4.0)]);
+    }
+
+    /// I-8 (Plan E whole-branch review): folding a knob drag into a gesture is
+    /// only half the fix — a TRANSIENT commit still executes its full
+    /// `EngineEffect`, persist included, so `project.json` was still rewritten
+    /// once per rAF batch. Deferring the persist onto the open gesture is what
+    /// makes "one drag = one write" true.
+    #[test]
+    fn a_gesture_defers_its_folded_commits_persist_and_executes_it_once_at_close() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let dir = std::env::temp_dir().join(format!(
+            "aura-gesture-persist-{}-{}", std::process::id(), uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_p, dir) = crate::audio::project::create(&dir, "Song", 48_000, 120.0).unwrap();
+        {
+            let mut s = cp.session().lock();
+            s.store.project_dir = Some(dir.clone());
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        let stored_value = |dir: &std::path::Path| -> Option<f64> {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("project.json")).ok()?).ok()?;
+            v.get("plugins")?.as_array()?.iter()
+                .find(|r| r["id"] == "inst-1")?
+                .get("params")?.as_array()?.iter()
+                .find(|p| p["id"] == 7)?
+                .get("value")?.as_f64()
+        };
+
+        cp.gesture_begin("plugin param drag".into()).unwrap();
+        // `commit_transient_for_gesture` is only sound INSIDE
+        // `GestureState::commit_transient_and_fold` (its own doc) — that is
+        // what folds the persist effect into the open gesture's accumulator
+        // (`fold_committed`) and marks `IN_GESTURE_FOLD` for the M-3
+        // sanctioned-transient check. `set_track_mix` wraps it the same
+        // way; this test drives the same path directly rather than through
+        // a mix change.
+        for v in [0.25f64, 0.5, 0.75] {
+            cp.gesture
+                .commit_transient_and_fold(&op::Actor::User, || {
+                    cp.commit_transient_for_gesture(op::TxMeta::user("plugin set param"), |tx| {
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Plugin("inst-1".into()),
+                            path: op::PropPath::Param { index: 7 },
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!(v),
+                        })
+                    })
+                })
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            stored_value(&dir).is_none() || stored_value(&dir) == Some(0.0),
+            "no project.json write may land while the gesture is open"
+        );
+
+        cp.gesture_end().unwrap();
+        assert_eq!(stored_value(&dir), Some(0.75), "one write, at close, with the LAST value");
+        let (undo_depth, _redo) = cp.history_depths();
+        assert_eq!(undo_depth, 1, "three folded commits, one undo entry");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Fix round 1, Important-1: `close_gesture`'s early return (nothing in
+    /// `last` to synthesize a history batch from) must still execute a
+    /// deferred persist. Constructed honestly through the public API: ONE
+    /// folded commit whose two `Set`s on the same (object, path) key net to
+    /// NO change (`session.rs`'s `fold_ops` elides a same-key Set pair
+    /// whose `from == to` — "wiggle and back" within a single transact) —
+    /// its `Committed.ops` end up empty, so nothing lands in `last`/
+    /// `baselines`, but `apply_raw` set `effect.persist.plugins = true` on
+    /// BOTH `tx.apply` calls unconditionally, before `fold_ops` ever runs,
+    /// so `fold_committed` still merges it into the gesture's accumulator.
+    /// Observed via a signal the "no ops, no ONE thing changed" path can't
+    /// fake: a fresh project's `project.json` carries no `plugins` key at
+    /// all until a plugin snapshot is written.
+    #[test]
+    fn close_gesture_executes_a_deferred_persist_even_when_the_gesture_nets_to_no_ops() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let dir = std::env::temp_dir().join(format!(
+            "aura-gesture-persist-empty-batch-{}-{}", std::process::id(), uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_p, dir) = crate::audio::project::create(&dir, "Song", 48_000, 120.0).unwrap();
+        {
+            let mut s = cp.session().lock();
+            s.store.project_dir = Some(dir.clone());
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        let has_plugins_key = |dir: &std::path::Path| -> bool {
+            let Ok(bytes) = std::fs::read(dir.join("project.json")) else { return false };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+            v.get("plugins").is_some()
+        };
+        assert!(!has_plugins_key(&dir), "a fresh project carries no plugins key yet");
+
+        cp.gesture_begin("plugin param wiggle-and-back".into()).unwrap();
+        cp.gesture
+            .commit_transient_and_fold(&op::Actor::User, || {
+                cp.commit_transient_for_gesture(op::TxMeta::user("plugin wiggle"), |tx| {
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::Plugin("inst-1".into()),
+                        path: op::PropPath::Param { index: 7 },
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(0.5),
+                    })?;
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::Plugin("inst-1".into()),
+                        path: op::PropPath::Param { index: 7 },
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(0.0), // back to the starting value
+                    })
+                })
+            })
+            .unwrap()
+            .unwrap();
+
+        cp.gesture_end().unwrap();
+        assert!(
+            has_plugins_key(&dir),
+            "the accumulated persist must run even though this gesture's synthesized batch is empty"
+        );
+        let (undo_depth, _redo) = cp.history_depths();
+        assert_eq!(undo_depth, 0, "a net no-op gesture creates no history entry");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// I-8: a knob drag inside a gesture is ONE undo entry — the per-(instance,
+    /// param) `CoalesceKey` already exists for `Op::Set{Plugin, Param}`; what
+    /// was missing is that `plugin_set_param` never consulted the gesture at
+    /// all (`commit_transient_and_fold` was wired only into `set_track_mix`).
+    #[test]
+    fn plugin_param_writes_fold_into_an_open_gesture() {
+        let (cp, _events, _engine) = recording_control_plane();
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        cp.gesture_begin("plugin param drag".into()).unwrap();
+        for v in [0.25f64, 0.5, 0.75] {
+            cp.set_plugin_params(
+                "inst-1",
+                &[crate::plugins::ParamChange { id: 7, value: v }],
+                op::TxMeta::user("plugin set param"),
+            )
+            .unwrap();
+        }
+        assert_eq!(cp.history_depths().0, 0, "nothing reaches history while the gesture is open");
+        cp.gesture_end().unwrap();
+        assert_eq!(cp.history_depths().0, 1, "the whole drag is one undo entry");
+
+        let batch = cp.take_last_gesture_batch().expect("gesture_end must produce a batch");
+        assert_eq!(batch.ops.len(), 1, "coalesced to the LAST write per (instance, param)");
+        assert!(matches!(
+            &batch.ops[0],
+            op::Op::Set { object: op::ObjectRef::Plugin(id), path: op::PropPath::Param { index: 7 }, to, .. }
+                if id == "inst-1" && to.as_f64() == Some(0.75)
+        ), "{:?}", batch.ops[0]);
+        // and the baseline is the value BEFORE the drag, not the previous move
+        assert!(matches!(
+            &batch.inverses[0],
+            op::Op::Set { to, .. } if to.as_f64() == Some(0.0)
+        ), "{:?}", batch.inverses[0]);
+    }
+
+    /// Outside a gesture, nothing changes: one invoke, one history entry.
+    #[test]
+    fn plugin_param_writes_outside_a_gesture_stay_one_entry_each() {
+        let (cp, _events, _engine) = recording_control_plane();
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        cp.set_plugin_params(
+            "inst-1",
+            &[crate::plugins::ParamChange { id: 7, value: 0.4 }],
+            op::TxMeta::user("plugin set param"),
+        )
+        .unwrap();
+        assert_eq!(cp.history_depths().0, 1);
+    }
+
+    /// A lane drag is ONE undo entry: successive whole-lane replaces of the
+    /// same lane fold by lane id inside an open gesture (the §4.4
+    /// value-replacement wrapper is coalescable by construction — what was
+    /// missing is that `CoalesceKey::for_op` only ever keyed `Op::Set`).
+    #[test]
+    fn automation_lane_edits_fold_into_an_open_gesture_by_lane_id() {
+        use crate::plugins::automation::{AutomationLane, AutomationPoint};
+        let (cp, _events, _engine) = recording_control_plane();
+        let mk = |id: &str, v: f32| AutomationLane {
+            id: id.into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![
+                AutomationPoint { tick: 0, value: 1.0 },
+                AutomationPoint { tick: 3840, value: v },
+            ],
+        };
+        // seed the lane outside the gesture so the gesture's baseline is a real
+        // previous lane, not "absent"
+        cp.set_automation_lane(mk("lane-a", 0.9), op::TxMeta::user("edit automation")).unwrap();
+        assert_eq!(cp.history_depths().0, 1);
+
+        cp.gesture_begin("automation drag".into()).unwrap();
+        for v in [0.6f32, 0.3, 0.0] {
+            cp.set_automation_lane(mk("lane-a", v), op::TxMeta::user("edit automation")).unwrap();
+        }
+        assert_eq!(cp.history_depths().0, 1, "nothing new reaches history while open");
+        cp.gesture_end().unwrap();
+        assert_eq!(cp.history_depths().0, 2, "the whole drag adds exactly one entry");
+
+        let batch = cp.take_last_gesture_batch().expect("a batch");
+        assert_eq!(batch.ops.len(), 1, "coalesced by lane id: {:?}", batch.ops);
+        match &batch.ops[0] {
+            op::Op::AutomationSetLane { key, lane: Some(l) } => {
+                assert_eq!(key, "lane-a");
+                assert_eq!(l.points.last().unwrap().value, 0.0, "last write wins");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &batch.inverses[0] {
+            op::Op::AutomationSetLane { lane: Some(l), .. } => {
+                assert_eq!(l.points.last().unwrap().value, 0.9, "baseline is pre-gesture truth");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Two DIFFERENT lanes edited inside one gesture stay two ops — the key is
+    /// the lane id, not "automation".
+    #[test]
+    fn automation_lane_edits_do_not_coalesce_across_lanes() {
+        use crate::plugins::automation::{AutomationLane, AutomationPoint};
+        let (cp, _events, _engine) = recording_control_plane();
+        let mk = |id: &str, v: f32| AutomationLane {
+            id: id.into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![AutomationPoint { tick: 0, value: v }],
+        };
+        cp.gesture_begin("automation multi".into()).unwrap();
+        cp.set_automation_lane(mk("lane-a", 0.1), op::TxMeta::user("edit automation")).unwrap();
+        cp.set_automation_lane(mk("lane-b", 0.2), op::TxMeta::user("edit automation")).unwrap();
+        cp.gesture_end().unwrap();
+        let batch = cp.take_last_gesture_batch().expect("a batch");
+        assert_eq!(batch.ops.len(), 2, "{:?}", batch.ops);
     }
 
     /// `gesture_begin` while one is already open auto-closes the stale
@@ -5048,7 +5668,7 @@ mod tests {
             })
             .unwrap();
         assert!(committed.effect.persist.automation);
-        assert!(!committed.effect.rebuild, "automation edits don't rebuild yet (see session.rs's arm doc)");
+        assert!(committed.effect.rebuild, "Track D: a lane edit rebuilds (see session.rs's arm doc)");
 
         // By the time `commit` returned above, the write already happened
         // (persist runs synchronously inside `commit`, before the event

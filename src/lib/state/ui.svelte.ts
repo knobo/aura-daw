@@ -3,7 +3,7 @@
 import { PREF_SCHEMA } from "../prefs/schema";
 import { prefs } from "../prefs/prefs.svelte";
 
-export type DockTab = "" | "generate" | "hum" | "instruments" | "plugins" | "mcp";
+export type DockTab = "" | "generate" | "hum" | "library" | "instruments" | "plugins" | "mcp";
 
 export const ui = $state({
   /** "WEBGPU" | "CANVAS2D" | "" until the first painter reports in */

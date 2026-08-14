@@ -488,6 +488,9 @@ struct ExportSnapshot {
     /// resolve `plugin:<id>` track bindings the same way live playback does
     /// ("what you hear is what you export").
     plugins: crate::control::session::PluginDoc,
+    /// Automation lanes (Track D close-out) — without them a bounce ignored
+    /// the gain curves playback obeys.
+    automation: crate::control::session::AutomationDoc,
     rate: u32,
     loop_region: (u64, u64),
 }
@@ -544,6 +547,9 @@ impl ControlPlane {
                     dirty: false,
                 },
                 plugins: session.plugins.clone(),
+                automation: crate::control::session::AutomationDoc {
+                    lanes: session.automation.lanes.clone(),
+                },
                 rate: self.shared.sample_rate.load(Relaxed),
                 loop_region: (
                     self.shared.loop_start.load(Relaxed),
@@ -627,7 +633,7 @@ fn do_export(
     // guard is held only while the graph is built, never during the render.
     let mut og = {
         let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-        offline::build_graph(&snap.store, &snap.midi, &snap.plugins, bank.as_deref(), snap.rate)
+        offline::build_graph(&snap.store, &snap.midi, &snap.plugins, &snap.automation, bank.as_deref(), snap.rate)
     };
 
     let tail = (plan.tail_seconds * snap.rate as f64).round() as u64;
@@ -1034,6 +1040,57 @@ mod tests {
         drop(evs);
         cp.export_job_status(&job).unwrap();
         assert!(cp.export_job_status("ghost").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Track D close-out: the bounce obeys track-gain automation — the
+    /// snapshot must CARRY the session's lanes, not just be able to compile
+    /// them. A flat 0.5 lane on every track must halve the whole file,
+    /// sample for sample; before this, an export ignored automation entirely
+    /// and came out identical to the unautomated bounce.
+    #[test]
+    fn export_song_applies_track_gain_automation() {
+        use crate::plugins::automation::{AutomationLane, AutomationPoint, TRACK_PARAM_GAIN};
+        let (cp, _shared, _events) = control_plane_with_demo();
+        let dir = tmp_dir("e2e-automation");
+
+        let plain_path = dir.join("plain.wav");
+        let job = cp.export_song(req_to(&plain_path)).unwrap();
+        assert_eq!(wait_done(&job, Duration::from_secs(120)).state, "done");
+        let (_, _, plain) = load_wav(&plain_path).unwrap();
+        let peak = plain.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(peak > 0.05, "baseline bounce is audible (peak {peak})");
+
+        {
+            let mut session = cp.session.lock();
+            let ids: Vec<String> =
+                session.store.tracks.iter().map(|t| t.id.to_string()).collect();
+            session.automation.lanes = ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| AutomationLane {
+                    id: format!("lane-{i}"),
+                    target_node: format!("track:{id}"),
+                    param_id: TRACK_PARAM_GAIN,
+                    points: vec![
+                        AutomationPoint { tick: 0, value: 0.5 },
+                        AutomationPoint { tick: 1_000_000, value: 0.5 },
+                    ],
+                })
+                .collect();
+        }
+
+        let auto_path = dir.join("automated.wav");
+        let job = cp.export_song(req_to(&auto_path)).unwrap();
+        assert_eq!(wait_done(&job, Duration::from_secs(120)).state, "done");
+        let (_, _, automated) = load_wav(&auto_path).unwrap();
+        assert_eq!(automated.len(), plain.len(), "same region, same length");
+        for (i, (p, a)) in plain.iter().zip(automated.iter()).enumerate() {
+            assert!(
+                (a - p * 0.5).abs() < 1e-5,
+                "sample {i}: automated bounce must be half the plain one — {a} vs {p}"
+            );
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -12,6 +12,7 @@ import type {
   AudioDevice,
   AuraEventMap,
   AuraEventName,
+  AutomationLane,
   Clip,
   EvolveOptions,
   ExportCapabilities,
@@ -22,6 +23,7 @@ import type {
   ImportClipRequest,
   ImportSplitReply,
   InstrumentInfo,
+  LibraryEntry,
   LoopJamStatus,
   McpPolicy,
   McpStatus,
@@ -138,6 +140,14 @@ export interface Backend {
    * Task 4). Optional — real-engine only, same convention as
    * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
   moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
+
+  /** All automation lanes (points inline — per-project, not per-frame).
+   * Optional: the demo backend has no automation. */
+  automationGet?(): Promise<AutomationLane[]>;
+  /** Upsert one lane; an empty `points` array deletes it. One invoke carries
+   * the lane's FULL point set (D-03: an edit gesture, never one invoke per
+   * point). Returns the updated lane list. */
+  automationSet?(lane: AutomationLane): Promise<AutomationLane[]>;
 
   /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
    * primitive) — call on `pointerdown` of a fader/pan control. Matching
@@ -269,6 +279,17 @@ export interface Backend {
    * selected; irrelevant when `portId` is null (closing the connection). */
   midiSelectInputPort?(portId: string | null, monitor?: boolean): Promise<void>;
   midiInputStatus?(): Promise<MidiInputStatus>;
+
+  // ── library & browser (Track E, additive; desktop only) ──
+  /** List ONE directory level of the sample library. */
+  libraryScan?(dir: string): Promise<LibraryEntry[]>;
+  /** Absolute path of the default library dir, created on demand. */
+  libraryDefaultRoot?(): Promise<string>;
+  /** One-shot audition of a library file. Document-decoupled: no op, no
+   * document field, no dirty flag. */
+  libraryAudition?(path: string, maxSeconds?: number | null): Promise<void>;
+  /** Release whatever the audition path is sounding. */
+  libraryAuditionStop?(): Promise<void>;
 
   // mcp
   mcpGetStatus(): Promise<McpStatus>;
@@ -447,6 +468,12 @@ class TauriBackend implements Backend {
   }
   moveClip(clipId: string, timelineStartSamples: number) {
     return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  automationGet() {
+    return invoke<AutomationLane[]>("automation_get");
+  }
+  automationSet(lane: AutomationLane) {
+    return invoke<AutomationLane[]>("automation_set", { lane });
   }
   undo() {
     return invoke<HistoryStep>("undo");
@@ -628,6 +655,19 @@ class TauriBackend implements Backend {
   }
   midiInputStatus() {
     return invoke<MidiInputStatus>("midi_input_status");
+  }
+
+  libraryScan(dir: string) {
+    return invoke<LibraryEntry[]>("library_scan", { dir });
+  }
+  libraryDefaultRoot() {
+    return invoke<string>("library_default_root");
+  }
+  async libraryAudition(path: string, maxSeconds: number | null = null) {
+    await invoke("library_audition", { path, maxSeconds });
+  }
+  async libraryAuditionStop() {
+    await invoke("library_audition_stop");
   }
 
   mcpGetStatus() {

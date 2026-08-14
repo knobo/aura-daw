@@ -355,18 +355,11 @@ pub fn plugin_set_param(
     changes: Vec<ParamChange>,
     control: State<'_, Arc<crate::control::ControlPlane>>,
 ) -> Result<Vec<ParamInfo>, String> {
-    let meta = crate::control::op::TxMeta::user("plugin set param");
-    control.commit(meta, |tx| {
-        for c in &changes {
-            tx.apply(crate::control::op::Op::Set {
-                object: crate::control::op::ObjectRef::Plugin(instance_id.clone()),
-                path: crate::control::op::PropPath::Param { index: c.id },
-                from: serde_json::Value::Null,
-                to: serde_json::json!(c.value),
-            })?;
-        }
-        Ok(())
-    })?;
+    control.set_plugin_params(
+        &instance_id,
+        &changes,
+        crate::control::op::TxMeta::user("plugin set param"),
+    )?;
     control
         .plugin_params(&instance_id)
         .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))

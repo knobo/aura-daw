@@ -145,6 +145,17 @@ and registers them in the browser on completion:
 
 ![Instrument browser: generated SFZ instruments with per-key audition](docs/screenshots/instrument-builder.png)
 
+### Library & browser panel
+
+The **LIB** dock tab browses three roots: **SAMPLES** (the default AURA
+library folder plus any folders added under Preferences → LIBRARY; click a file
+to audition it without touching the project), **CLIPS** (the open project's
+audio and MIDI clips), and **PRESETS** (loaded sampler instruments and
+ZynAddSubFX bank patches). Drag any row onto a track and it lands through the
+ordinary import/clip-add commands — so every drop is a normal, undoable edit.
+Directory listing and decoding happen in the Rust backend (`library_scan`,
+`library_audition`); the panel is chrome.
+
 ### MCP — agents operate the DAW
 
 An embedded MCP streamable-HTTP server on `127.0.0.1:41717` lets Claude Code,
@@ -386,8 +397,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 535 tests (counted 2026-08-14): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants
-npm test                      # 206 frontend unit tests (counted 2026-08-14; vitest): stores + timeline math + section-table bijection
+cd src-tauri && cargo test    # 626 tests (597 lib + 29 integration; counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition
+npm test                      # 258 frontend unit tests (counted 2026-08-15; vitest): stores + timeline math + section-table bijection + library store + automation lane edit ops
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

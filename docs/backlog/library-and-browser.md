@@ -38,8 +38,29 @@ commands (all channel-routed post-Plan-E, so undoable for free).
 
 ## Suggested cut
 
-1. Panel + samples root + audition + drag-to-track (wires to
-   import_audio_clip at drop position).
-2. Project-clips root (drag = clip copy via the channel).
-3. Presets root (Zyn/sampler lists; apply = existing commands).
-4. Folders config UI + persistence; thumbnails.
+1. **LANDED 2026-08-14, branch `library-browser`.** Panel + samples root +
+   audition + drag-to-track (wires to import_audio_clip at drop position).
+2. **LANDED 2026-08-14, branch `library-browser`.** Project-clips root
+   (drag = clip copy via the channel).
+3. **LANDED 2026-08-14, branch `library-browser`.** Presets root (Zyn/
+   sampler lists; apply = existing commands). Folders config UI +
+   persistence also landed here, via the `pathList` preference kind
+   (Preferences → LIBRARY), rather than as a separate item 4.
+4. **Deferred** (explicit, not silent — see plan doc
+   `docs/superpowers/plans/2026-08-14-library-browser.md`, scope rulings
+   1-11, for the reasoning behind each):
+   - Recursive background scan with progress events — `library_scan` is a
+     synchronous, non-recursive, one-directory-level listing.
+   - Header-only metadata probe (duration/channels/sample rate) on scanned
+     files.
+   - Waveform thumbnails (would reuse the pyramid cache keyed by source,
+     per the design notes above — not built).
+   - Browsing `.sfz`/`.xiz` files directly on disk (the PRESETS root lists
+     already-loaded instruments/patches, not a filesystem walk of preset
+     files).
+   - Dragging a Standard MIDI File in from the panel (SMF import exists via
+     the ordinary import dialog, not as a library-panel drag source).
+   - Tagging/favourites and search (the PRESETS patch filter is local UI
+     state, not a library index).
+   - Dragging clips OUT of the panel to the OS (ties into Track C's
+     cross-instance clipboard work, not started here).

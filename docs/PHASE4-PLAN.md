@@ -622,3 +622,379 @@ collected here so a future round doesn't have to re-mine the ledger:
 - A stale line-number citation in a doc comment (516 vs. 508);
   `tempoBpm` required-vs-conditional tension pre-existing in the v2
   schema (Task 15).
+
+## Track D handoff (2026-08-14, subagent-driven session, external review layer)
+
+Track D (automation audible + lane UI) is **IMPLEMENTED** on branch
+`automation-audible` (**PR #20**), cut from `origin/main` at `3340aa8`,
+with `origin/main` merged in at the Task 5/6 boundary (`8b496e0`, pulling
+in Track E's `a98d7ff`). Plan document:
+`docs/superpowers/plans/2026-08-14-automation-audible.md`. SDD ledger
+(gitignored): `.superpowers/sdd/2026-08-14-automation-audible/progress.md`.
+Ten tasks, commits `9e7871f..HEAD`.
+
+**What landed.** `engine::rebuild` finally reads `session.automation`: it
+compiles track-gain lanes into a slot-indexed `RtGraph::gain_ramps` table
+(attached BEFORE the graph is published, so RCU discipline holds) and
+builds a `ParamAutomationDriver` that writes plugin params on the engine
+control thread's ≤2 ms tick. The REBUILD PIN in `control/session.rs` is
+resolved: `Op::AutomationSetLane`'s apply arm now sets
+`effect.rebuild = true`. On the UI side, a timeline overlay lane draws,
+drags and deletes points, every edit gesture-wrapped through the existing
+`automation_set`; plugin-parameter lanes get a target picker. Gestures grew
+a **persist deferral** — a knob drag or a lane drag is now one history
+entry AND one `project.json` write instead of one of each per rAF batch.
+Song export compiles the same track-gain ramps into the offline graph, so a
+bounce follows the curves playback obeys (close-out task; see the
+divergence below for the plugin-param half, which it does NOT).
+
+**Per task**: T1 `061786b`+`d7ecf34` (I-3/R-4/M-6), T2 `7ef1f70`+`feec7e9`
+(gesture persist deferral), T3 `bb20280` (knob drags, I-8), T4 `55bb370`
+(lane edits fold), T5 `2a11ed0` (frontend store + M-3 re-pull), T6
+`38abcc2` (lane UI), T7 `2755647` (plugin-param targets), T8
+`12429d1`+`f33c15a` (mixer ramps), T9 `c30a830`+`10aeb12` (engine), T10
+close-out (export automation + this section).
+
+**Suites: 566 backend (537 lib + 29 integration) + 258 frontend, all
+green, measured on `automation-audible` 2026-08-15.** Counts dated in
+README/CONTRIBUTING. `main` moved during this track (Track E merged as
+`a98d7ff`) and other tracks are in flight, so the count line is a known
+cross-track merge-conflict point: whoever merges last re-measures rather
+than picking a side.
+
+**Execution note.** Subagent-driven (owner's choice at run start), a fresh
+implementer per task, a task review after each, scoped re-reviews on every
+fix round. Task 9 (the engine task) ran on opus, as did its reviews.
+Four tasks needed one fix round each; none needed two. The review layer
+caught one **Critical**: Task 8's `track_gain_ramp_scales_live_output_too`
+was VACUOUS (a live track with an empty event list is silent whatever the
+gain — the reviewer proved it by sabotaging the gain to ×999 and watching
+the test still pass). It also promoted the export divergence below from
+"suggested follow-up" to a required close-out fix. Both of Task 9's
+judgement calls (re-assert over invalidation; batching without a
+`clap_host` API change) were upheld on re-review AGAINST the reviewer's own
+prior recommendation, after four sabotage mutations all went RED.
+
+### Scope rulings (carried verbatim from the plan doc, per ADR 0007)
+
+1. **Track-gain automation attaches at the MIXER's per-track gain stage,
+   not by wrapping live nodes in `GainAutomatedNode`.** Three reasons, each
+   decisive on its own: (a) NODE REUSE — live nodes come from
+   `LiveNodeRegistry::resolve_with`, keyed so voice and plugin state
+   SURVIVES rebuilds; wrapping means either a fresh node (a full plugin
+   re-instantiation) on every point drag, or mutating a cached node's baked
+   `events` while a published snapshot may still reference it, violating
+   the `LiveNodeCell` safety contract. (b) AUDIO TRACKS —
+   `GainAutomatedNode` wraps a `LiveInstrument`, so only MIDI tracks could
+   ever be automated; "draw a volume curve on an audio track", the primary
+   use, would be impossible. (c) COST — every lane edit would force a node
+   rebuild and an audible discontinuity. The mixer seam has none of these:
+   a slot-indexed `Vec<Option<Arc<Vec<AbsParamEvent>>>>` on `RtGraph`,
+   versioned with the snapshot exactly as `ParamTable` is, swapped by the
+   ordinary RCU graph publish.
+2. **Plugin-parameter lanes are driven at the ENGINE CONTROL THREAD's tick
+   (≤2 ms), not sample-accurately, and their writes go to the HOST only —
+   never to the document.** Sample-accurate plugin-param automation needs a
+   wait-free param ring on the plugin node, which is round-2 §8 node-graph
+   territory. A host param write is a blocking round-trip and is banned on
+   the callback path ([C1]). The writes bypass the document deliberately:
+   automation OVERRIDES the stored knob value during playback; the document
+   keeps what the user set. Routing them through the channel would either
+   trip the M-3 debug assert (transient) or push an undo entry and a
+   `project.json` write every 2 ms (non-transient). **Recorded
+   consequence:** after playing an automated section the plugin's LIVE
+   value can differ from the document's stored value until the next project
+   load or user edit (recorded in `docs/SIDE-CHANNEL-INVENTORY.md`).
+3. **I-3 lands as an epoch guard plus a recorded carve-out (R-4), NOT as an
+   op.** `status` is a field `Op::PluginAdd` carries and addresses, so a
+   TRANSIENT batch writing it trips `debug_assert_transient_invariant`, and
+   a NON-transient batch would push a phantom undo entry for every plugin
+   instantiate and every undo-of-a-remove. So: epoch guard (the same shape
+   `execute_persist` uses), residual R-4, and `execute_host_forward` added
+   to the grep-gate enumeration (that omission IS M-6).
+4. **I-8's real fix is gesture-scoped PERSIST DEFERRAL, not gesture folding
+   alone.** A transient commit still executes its full `EngineEffect`,
+   persist included — so coalescing by itself leaves row 13's frequency
+   claim exactly as wrong as the review found it. The commit folds AND its
+   `PersistEffect` is deferred, accumulated on the open gesture, and
+   executed exactly once at `close_gesture`.
+5. **Automation lanes get a coalesce target WITHOUT a new
+   `op::ObjectRef` variant.** `CoalesceKey` is `pub(crate)`, in memory
+   only, never serialized — so its `object` field became an internal
+   `CoalesceTarget` enum with an `AutomationLane(String)` arm.
+   `op::ObjectRef`, which IS serialized into `journal.ndjson`, is
+   untouched, so no `OP_FORMAT_VERSION` question arises.
+6. **Track-gain lane values are LINEAR GAIN MULTIPLIERS in `[0.0, 1.0]`,
+   applied on top of the fader.** 0.0 is silence, 1.0 is "whatever the
+   fader says" — exactly `GainAutomatedNode`'s landed semantics. The
+   alternative (automation REPLACING the fader, the fader following the
+   curve) needs a fader-follows-automation UI mode and a read/write
+   arbitration story; deferred, recorded. `TRACK_PARAM_GAIN = 0`.
+7. **Lane drags preview locally and commit ONCE on pointerup**, mirroring
+   `project.moveClip`/`commitClipMove` and PR #14's commit-on-release
+   convention. The gesture bracket still opens on pointerdown, because one
+   pointer interaction can produce more than one commit and because the
+   gesture is what defers the persist (ruling 4). Making the ramp audible
+   DURING the drag would need a graph rebuild per pointermove; not done.
+8. **The automation lane renders as an in-lane OVERLAY on the track's
+   existing timeline row, not as an added row.** `Timeline.svelte` keeps
+   the left rail and the lane column in lockstep by a shared
+   `--track-height`; a sub-row would desynchronise them and require a
+   height negotiation through both columns. A dedicated, resizable
+   automation row is a follow-up, recorded not silent.
+
+### Non-goals (held, so the next round knows they were choices)
+
+No sample-accurate plugin-param automation (ruling 2). No automation for
+pan / mute / solo / send levels — track gain and plugin params only; new
+built-in target ids are additive later. No curve shapes beyond linear
+(bezier/hold/step would change the persisted point record). **No
+automation recording (write/touch/latch modes.)** No snapshot-based
+rebuild (Track A's). No `GainAutomatedNode` deletion — it stays, tested,
+as the per-node ramp applier.
+
+### Findings closed by this track
+
+- **I-3 + M-6** → `061786b` (epoch guard on `execute_host_forward`'s
+  writeback, residual R-4 recorded, grep-gate enumeration corrected).
+- **I-8** (inventory row 13's per-knob `project.json` rewrite) →
+  `7ef1f70`/`feec7e9`/`bb20280`; row 13's wording corrected in the same
+  breath.
+- **frontend M-3** (undo/redo re-pull missing automation and plugin
+  panels) → `2a11ed0`.
+
+### KNOWN DIVERGENCE: export ignores PLUGIN-PARAM automation
+
+Track-gain lanes are compiled into the offline graph (close-out task, two
+tests), so a bounce follows them exactly. **Plugin-param lanes are not
+evaluated by a bounce at all**, and the value the export captures is
+whatever the live host instance holds — most recently, whatever the last
+playthrough's driver left there. The same project can therefore bounce
+differently after a playthrough than from a fresh launch.
+
+Not fixed here, deliberately: there is exactly ONE copy of a plugin
+instance in the process, and the only way to set a param is a host
+round-trip. Driving params during a bounce would write the export's
+automation into the user's live plugin — moving the knobs under an open
+panel, and fighting the engine's own driver if the transport is rolling.
+A correct fix needs the bounce to own PRIVATE plugin instances (a second
+instantiation per automated instance, seeded from the live one's
+`save_state`, driven per render block, disposed at the end), i.e. a
+`clap_host`/`lv2_host` API addition plus an offline driver tick — round-2
+§8's plugin-node work. Recorded at `audio::offline::build_graph` and in
+`docs/SIDE-CHANNEL-INVENTORY.md`.
+
+### Deferrals created by this track
+
+- **Sample-accurate plugin-param automation** (ruling 2) — round-2 §8.
+- **Non-blocking CLAP param path.** `clap_host::set_params` is
+  `plugin_main().run(…)`, a BLOCKING round-trip; `lv2_host::set_params`
+  already posts, so only CLAP blocks. Task 9 batched the writes (one call
+  per automated CLAP instance per tick, ~3000 → ~500 round-trips/s at a
+  full-rate ramp, ~2/s for a static curve), which bounds it, but an active
+  ramp on two instances still costs ~1000 blocking round-trips per second
+  onto the plugin-main thread that also serves the param panel,
+  `instantiate` and `save_state`. The fix is a fire-and-forget sibling to
+  `set_params` (post, don't `run`) plus a driver that uses it — a
+  `clap_host` API change deliberately kept out of Task 9's diff.
+- **A GESTURE TOKEN, so `gesture_end` closes the gesture it meant to.**
+  The most valuable thing to come out of this track, and bigger than this
+  track. `gesture_end` takes **no identifier** — it closes "whatever is
+  open", and is deliberately a no-op when nothing is
+  (`control/mod.rs:2072`, contract stated at `:2067-2071`). Its sibling
+  `gesture_begin` (`:2060`) auto-closes a stale open gesture before opening
+  the new one. Together those two facts mean: **any `endGesture()` fired
+  from a promise continuation can close a DIFFERENT gesture — one that
+  began while it was awaiting.** No component-local flag can fix this; the
+  flag Track D added to `AutomationLaneView` fixes only that component's
+  own pairing. Three live instances:
+  - `src/lib/state/plugins.svelte.ts:243-244` (Track D's own, Task 3):
+    `await this.flushParamQueue(); project.endGesture();`. Release a plugin
+    knob — that awaits a rAF plus one IPC round trip — and press a track
+    fader inside that window. `beginGesture("gain drag")` auto-closes the
+    plugin gesture (fine, its edits are already folded), then the PENDING
+    `endGesture()` lands and closes the GAIN gesture immediately. The rest
+    of the fader drag then commits outside any bracket: its own undo entry
+    and its own `project.json` write per rAF batch. **That is the exact I-8
+    regression, inside I-8's own fix.**
+  - `src/lib/state/library.svelte.ts:194-198` — same shape (`beginGesture`
+    … `await` … `finally { endGesture() }`), pre-existing, not Track D's.
+  - `src/lib/components/AutomationLaneView.svelte:116` — the delete path's
+    `.then(() => project.endGesture())` still closes whatever is open when
+    it fires, which may be a gesture a later pointerdown opened.
+
+  **Durable fix to record:** `gesture_begin` returns an id and
+  `gesture_end(id)` no-ops on mismatch — an ADDITIVE parameter change to a
+  frozen-name command, so it stays inside the binding rules. All three
+  instances need a second gesture to begin inside a sub-100 ms window, and
+  the worst outcome is an extra undo entry plus an extra `project.json`
+  write — never data loss — which is why it is recorded rather than
+  rushed. **Owner: whoever owns the gesture IPC model. Tracks A and C
+  inherit this** — both drive gestures from async paths.
+- **Per-lane commit barriers in the automation store** (accepted and open):
+  `#inflight` is ONE field on a singleton store, so it is the last commit
+  issued from inside any gesture, not "this lane's". Two simultaneous
+  pointer interactions on two different lanes (multi-touch or stylus+touch;
+  a mouse cannot produce it) let `commitLatest` await the wrong lane's
+  commit and re-commit a stale set — observed payloads
+  `[["lane-a",2],["lane-b",2],["lane-a",1]]`, where that trailing
+  one-point commit is the click-insert bug alive again. Narrow, and the
+  backend's single-gesture bracket is already degenerate under two
+  simultaneous interactions, so it is documented rather than fixed. The
+  honest fix is a `Map` of barriers keyed by the same identity
+  `commitLatest` resolves by — the TRACK TARGET, **not** the lane id: the
+  mint case the barrier exists for has no lane id yet.
+- **Fader-follows-automation** (ruling 6) — needs read/write arbitration.
+- **A dedicated, resizable automation row** (ruling 8).
+- **Live param-panel follow** (ruling 2) — the open panel shows the
+  document, not the automated value.
+- **Write/touch/latch automation modes** — the non-goal with a live
+  consequence, and it is NOT a transient one. **Every plugin-param lane
+  this UI can create is FLAT**: the "A" button
+  (`automation.automatePluginParam`) mints a lane with exactly ONE point,
+  `compile_lane` yields one event, and `value_at` holds it forever — and
+  "A" is the only way to make a plugin-param lane, because the lane editor
+  (`AutomationLaneView`) reads `gainLaneFor` and draws TRACK GAIN only.
+  There is no curve editor for a plugin param yet. So a flat lane pins its
+  parameter for the WHOLE playthrough: click A on Cutoff at 0.30, press
+  play, turn Cutoff to 0.80 in the plugin's own GUI, and within ~0.5 s it
+  snaps back to 0.30 and stays there, while AURA's param panel still shows
+  0.80. That is intended scope (automation OVERRIDES the knob during
+  playback — ruling 2), not a spec violation, but a reader must not assume
+  the target picker leads to a drawable curve. Drawing curves on plugin
+  params, and write/touch/latch, are the two follow-ups that change it.
+- **`movePoint` deletes a neighbour on a tick collision**
+  (`src/lib/utils/automation-edit.ts:57-66`, review minor 6): dragging a
+  point onto another point's tick silently removes the neighbour. Undo
+  recovers it, but the curve loses a breakpoint mid-drag with no warning.
+  Deliberately NOT fixed in the close-out round.
+- **`.tog.auto.on` is byte-identical to `.tog.arm.on`**
+  (`TrackHeader.svelte`, review minor 7): on `main` an automation-visible
+  track will read as "this track is armed". The plan's own copy
+  instruction produced it; it needs its own colour. Also NOT fixed here.
+
+### WARNING for the next track that touches a component
+
+**This repo has no DOM test environment** — no jsdom, no happy-dom, no
+testing-library. Every frontend test runs in plain node against stores and
+utils, so **nothing inside a `.svelte` file is covered by anything.**
+
+That is not a theoretical gap. BOTH of this track's real frontend bugs
+lived exclusively in `.svelte` event handlers, and both were found by
+READING the code — one by a reviewer, one by the implementer while fixing
+the first:
+- the click-insert race (a drawn point silently erased, intermittent), and
+- the alt-click delete closing its gesture twice, the second time early.
+
+Neither could have been caught by the suite as it exists, and both survived
+a task review that had looked directly at the handler. The pattern to draw
+from it: when logic that ORDERS async effects sits in a component, move it
+to a store where it can be tested — which is what the click-insert fix did
+(`commitInGesture`/`commitLatest`) — and treat any remaining handler logic
+as unverified until read line by line.
+
+Adding a DOM environment is a cross-cutting call **nobody has made**. It
+is not recorded here as a recommendation, only as the missing capability
+that made the above necessary.
+
+### OWED BY THE OWNER: the ear check
+
+**Nobody has yet heard an automation lane change the volume during
+playback.** Task 9's step 6 (start the app, draw a fade on a track, press
+play, listen) was not performed — the implementing agent has no audio
+device. It is the sole verification of `engine.rs:884`, the line the whole
+engine task exists for; everything else is test-verified. **Do this
+first.**
+
+### Mid-flight rulings (from the SDD ledger, each with its one-line why)
+
+- **`compile_automation`'s ramp table is sized by `store.tracks.len()`,
+  not `slots.len()`** (Task 9, judged STRICTLY BETTER than the plan's own
+  code): `derive_slots` keys by track id, so two tracks sharing an id
+  collapse to one map entry pointing at the LAST index — sizing by the map
+  would put that very slot out of range and silently unramp the highest
+  slots. The offline twin follows the same rule, with its own test.
+- **Held params are RE-ASSERTED, not invalidated** (Task 9 fix round 1,
+  finding I-3): the reviewer proposed invalidating the driver's dedup
+  cache whenever `execute_host_forward` writes the same param. The
+  implementer chose a bounded re-assert (`REASSERT_TICKS = 250`, ~0.5 s)
+  instead and the re-review upheld it against its own recommendation:
+  invalidation only covers writes through OUR channel, while the plugin's
+  own GUI, a patch load and `load_state` all move the parameter without us
+  hearing about it. Re-assert covers every writer and needs no new side
+  channel into the engine thread's driver.
+- **CLAP batching landed WITHOUT touching `clap_host`** (Task 9 fix round
+  1, finding I-2): the driver sorts compiled lanes by instance (stable) so
+  a tick's writes arrive in contiguous per-instance runs the caller
+  collapses into one host round-trip per plugin. The non-blocking post
+  path was NOT built, because `set_params`' blocking form is its contract
+  and LV2 already posts — the exposure is narrower than the finding
+  assumed. See the deferral above.
+- **One rebuild per lane commit, including transient folds** (Task 9,
+  accepted): harmless under ruling 7 (a drag is one commit), and it would
+  become expensive only if a future caller committed per pointermove.
+  Noted so that caller knows.
+- **`close_gesture` executes the deferred persist BEFORE its empty-batch
+  early return** (Task 2 fix round 1): the early return could otherwise
+  discard everything a gesture had accumulated. The fold-only contract
+  (`IN_GESTURE_FOLD`) is now enforced rather than merely documented.
+- **Two lanes on the same target resolve LAST-WINS, silently** — track
+  gain (`compile_gain_ramps`) and plugin params
+  (`ParamAutomationDriver::new`) both. No blend, no error; the UI keeps one
+  lane per target, so it is documented rather than rejected.
+- **The lane's commits are SERIALIZED through the store** (whole-track
+  review, blocker): the overlay's pointerdown click-insert commits without
+  awaiting, and the store is only written when `automation_set` RESOLVES —
+  so a pointerup landing inside that round-trip window read the PRE-insert
+  lane and committed it back, erasing the point the user had just drawn.
+  Both commits folded into one gesture, so not even an undo entry revealed
+  it, and a normal 50-150 ms click usually beats the round trip, which made
+  the loss intermittent. Task 6's review had seen the double
+  `automation_set` and filed it as a cosmetic "implicit fold dependency"
+  minor — what it could not see was that the SECOND payload is stale, not
+  merely redundant. The fix is a barrier in the store
+  (`commitInGesture`/`commitLatest`): the closing commit waits for the
+  insert's reply before reading. Found while fixing it, same family: the
+  alt-click delete path closed its gesture from its commit's `.then`, while
+  the pointerup that followed closed it AGAIN and earlier — leaving the
+  delete's commit outside the bracket with its own undo entry and its own
+  persist. A `gestureOpen` flag pairs them properly.
+
+### Deferred-minors roll-up
+
+Every `minor (deferred):` line the ledger recorded, collected so a future
+round doesn't have to re-mine it. All are OPEN and accepted unless marked.
+
+- Epoch-comment precision; a `Copy` type cloned; a dead borrow comment
+  (Task 2).
+- `plugin_set_param`'s doc (`plugins/mod.rs:345-351`) doesn't mention the
+  gesture-fold path (Task 3). Its sibling — `for_op`'s "one wired caller"
+  doc — is **CLOSED**: Task 4 corrected it to name all three wired callers
+  (`control/mod.rs:825-828`, and the matching sentence in
+  `for_history_op`'s doc at `:854-858`).
+- `set_automation_lane` duplicates a closure body its siblings share
+  (Task 4).
+- `reloadOpenParams` shows no `paramsLoading` indicator; a noisy
+  `paramError` in the removed-instance race (Task 5).
+- A click-insert emits two `automation_set`s (an implicit dependency on
+  folding — a comment was wanted); unmount mid-drag can leak a gesture (a
+  shared pattern, not new here); `.tog.auto.on` is visually identical to
+  arm (the plan's own copy instruction); the lane has no keyboard path
+  (Task 6).
+- `ParamAutomationDriver::tick` clones `String`s per write (control
+  thread only); `resolve_targets` has a terse `None` arm (Task 7).
+- The LIVE gain-ramp path is not tested across a loop wrap
+  (`LoopSpec::OFF` in that test). Low risk: the re-seed logic lives in
+  `RampCursor::value`, shared with the clip path, which HAS the wrap test.
+  A note for whoever touches live-path looping (Task 8).
+- A no-op delete of an unknown lane key still triggers a rebuild for
+  nothing (Task 9) — now asserted by a test, accepted as behaviour.
+- **CLOSED by the close-out**: the stale "No rate (headless…)" clause in
+  `engine.rs`'s `compile_automation` test comment, and the missing
+  last-wins note on `ParamAutomationDriver::new` (both Task 9 re-review).
+- **Standing, from the plan's global constraints**: two tests are flaky
+  under the default parallel thread count and pass in isolation —
+  `control::hum::tests::apply_hum_clip_commits_synchronously_and_announces_project_changed`
+  and `plugins::host::tests::plugin_main_thread_slots_and_tickers`. Not
+  this track's to fix; re-run in isolation before calling either a
+  regression.
