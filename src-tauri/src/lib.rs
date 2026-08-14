@@ -30,6 +30,10 @@ pub mod control;
 pub mod ids;
 pub mod mcp;
 pub mod midi;
+// Hardware MIDI input (slice 1: enumerate/select/activity — see module doc).
+// Self-contained; wired here purely additively per the midi-input-ports
+// branch's task spec. Not part of the frozen phase-2 command surface above.
+pub mod midi_input;
 pub mod plugins;
 pub mod sidecars;
 pub mod time;
@@ -48,6 +52,7 @@ pub fn run() {
         .manage(audio::AudioState::default())
         .manage(sidecars::SidecarState::default())
         .manage(midi::MidiState::default())
+        .manage(midi_input::MidiInputManager::default())
         .manage(mcp::McpState::default())
         .manage(plugins::PluginState::default())
         .setup(|app| {
@@ -175,6 +180,10 @@ pub fn run() {
             midi::midi_get_clips,
             midi::midi_import_file,
             midi::midi_export_file,
+            // ---- midi input: hardware ports (slice 1, midi-input-ports) ----
+            midi_input::midi_list_input_ports,
+            midi_input::midi_select_input_port,
+            midi_input::midi_input_status,
             // ---- sidecars: jobs ----
             sidecars::sidecar_split_stems,
             sidecars::sidecar_transcribe,

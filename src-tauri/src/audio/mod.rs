@@ -546,7 +546,7 @@ pub fn sampler_preview_note(
         .lock()
         .compiled(&instrument_id)
         .ok_or_else(|| format!("unknown instrument: {instrument_id}"))?;
-    let handle = state.preview.get_or_init(sampler_preview::start);
+    let handle = state.preview.get_or_init(|| sampler_preview::start("ui"));
     handle.play(compiled, key, velocity.clamp(1, 127))
 }
 

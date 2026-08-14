@@ -57,6 +57,11 @@ rmcp = { version = "3.1", features = ["server", "transport-streamable-http-serve
 # --- MIDI (phase 2, src/midi/: .mid import/export + realtime event types) ---
 midly = "0.5"
 
+# --- Hardware MIDI input (midi-input-ports slice 1, src/midi_input.rs) ---
+# ALSA-seq backend on Linux comes for free (no extra system deps beyond
+# what cpal/ALSA already need).
+midir = "0.11"
+
 # --- Plugin hosting (phase 3, src/plugins/: CLAP + LV2 — ARCHITECTURE §15) ---
 # CLAP: clack (safe host wrapper over clap-sys, CLAP 1.2 ABI, on crates.io
 # since 2026-05; pre-1.0 => pinned to the verified 0.1.x line). Verified on

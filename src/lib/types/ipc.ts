@@ -16,6 +16,25 @@ export interface AudioDevice {
   defaultSampleRate: number;
 }
 
+// ── midi-input (midi-input-ports slice 1, not yet schema'd) ─────────────────
+// Hardware MIDI input port list/select/activity. App-config only — no
+// document coupling (mirrors the audio device selects above).
+
+export interface MidiPortInfo {
+  id: string;
+  name: string;
+}
+
+export interface MidiInputStatus {
+  selected: MidiPortInfo | null;
+  eventsSeen: number;
+  lastEventAgeMs: number | null;
+  lastStatusBytes: number[];
+  /** Live monitoring (slice 1b): incoming notes audible via the preview
+   * voice when true. Always false when nothing is selected. */
+  monitor: boolean;
+}
+
 // ── transport-state.schema.json ─────────────────────────────────────────────
 
 export type TransportMode = "stopped" | "playing" | "recording";
