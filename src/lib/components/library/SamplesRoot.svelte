@@ -9,6 +9,7 @@
   import { onMount } from "svelte";
   import { library } from "../../state/library.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
+  import { encodeLibraryDrag } from "../../utils/library";
   import LibraryRow from "./LibraryRow.svelte";
 
   onMount(() => void library.init());
@@ -56,6 +57,15 @@
           label={e.name}
           meta={e.kind === "dir" ? "" : sizeLabel(e.sizeBytes)}
           active={library.auditioning === e.path}
+          draggable={e.kind === "audio"}
+          ondragstart={(ev) => {
+            if (e.kind === "audio" && ev.dataTransfer)
+              encodeLibraryDrag(ev.dataTransfer, {
+                kind: "sampleFile",
+                path: e.path,
+                name: e.name,
+              });
+          }}
           onclick={() =>
             e.kind === "dir" ? void library.open(e.path) : void library.audition(e.path)}
         />

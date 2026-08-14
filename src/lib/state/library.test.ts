@@ -29,6 +29,21 @@ const invokes = {
   libraryDefaultRoot: vi.fn(async () => "/lib"),
   libraryAudition: vi.fn(async (_p: string, _s?: number | null) => {}),
   libraryAuditionStop: vi.fn(async () => {}),
+  importAudioClip: vi.fn(async (_req: { path: string; trackId?: string | null; atSamples?: number | null }) => ({
+    id: "c1",
+  })),
+  getProjectState: vi.fn(() =>
+    Promise.resolve({
+      projectName: "Untitled",
+      projectDir: null,
+      transport: { sampleRate: 48000, tempoBpm: 120 },
+      tracks: [],
+      clips: [],
+      ppq: 960,
+      tempoEvents: [{ tick: 0, bpm: 120 }],
+      midiClips: [],
+    }),
+  ),
 };
 
 const mockBackend = { mode: "tauri" as const, on: () => () => {}, ...invokes };
@@ -36,11 +51,19 @@ vi.mock("../tauri", () => ({ backend: mockBackend }));
 
 const { prefs } = await import("../prefs/prefs.svelte");
 const { library } = await import("./library.svelte");
+const { project } = await import("./project.svelte");
+const { toasts } = await import("./toasts.svelte");
+
+function lastToast() {
+  return toasts.list[toasts.list.length - 1];
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
   prefs.set("librarySampleFolders", []);
   library.reset();
+  project.tracks = [];
+  toasts.list = [];
 });
 
 describe("library store", () => {
@@ -106,5 +129,36 @@ describe("library store", () => {
     await library.audition("/lib/kick.wav");
     expect(library.auditioning).toBe("");
     expect(library.error).toContain("no output device");
+  });
+});
+
+describe("dropOnTrack — sample file", () => {
+  it("imports the file onto the target track at the drop position", async () => {
+    project.tracks = [
+      { id: "t1", name: "Audio 1", kind: "audio", gainDb: 0, pan: 0, muted: false, soloed: false, armed: false, color: "#888888" },
+    ];
+    await library.dropOnTrack(
+      { kind: "sampleFile", path: "/lib/kick.wav", name: "kick.wav" },
+      "t1",
+      96000,
+    );
+    expect(invokes.importAudioClip).toHaveBeenCalledWith({
+      path: "/lib/kick.wav",
+      trackId: "t1",
+      atSamples: 96000,
+    });
+  });
+
+  it("refuses a MIDI track and never calls the import command", async () => {
+    project.tracks = [
+      { id: "m1", name: "Synth", kind: "midi", gainDb: 0, pan: 0, muted: false, soloed: false, armed: false, color: "#888888" },
+    ];
+    await library.dropOnTrack(
+      { kind: "sampleFile", path: "/lib/kick.wav", name: "kick.wav" },
+      "m1",
+      0,
+    );
+    expect(invokes.importAudioClip).not.toHaveBeenCalled();
+    expect(lastToast().title).toContain("AUDIO TRACK");
   });
 });

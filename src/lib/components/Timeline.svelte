@@ -12,6 +12,9 @@
   import { midi } from "../state/midi.svelte";
   import { loopjam } from "../state/loopjam.svelte";
   import { toasts } from "../state/toasts.svelte";
+  import { canvasPos } from "../utils/canvas-pos";
+  import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
+  import { library } from "../state/library.svelte";
   import TrackHeader from "./TrackHeader.svelte";
   import HScrollbar from "./HScrollbar.svelte";
   import ClipView from "./ClipView.svelte";
@@ -27,6 +30,9 @@
   let lanesEl: HTMLDivElement | undefined = $state();
   let playheadEl: HTMLDivElement | undefined = $state();
   let markerEl: HTMLDivElement | undefined = $state();
+
+  /** Track id currently under a library drag ("" = none). */
+  let dropTrackId = $state("");
 
   // keep viewport width fresh
   $effect(() => {
@@ -368,6 +374,30 @@
     return end;
   });
 
+  /** Drop position in samples. Uses canvasPos (NOT clientX - rect.left) so
+   * the mapping is correct under interface zoom — the standing rule for all
+   * canvas/lane pointer math. */
+  function dropSamples(e: DragEvent): number {
+    const { x } = canvasPos(e.currentTarget as HTMLElement, e.clientX, e.clientY);
+    return Math.max(0, Math.round(view.snapSamples(view.samplesAt(x))));
+  }
+
+  function onLaneDragOver(track: TrackState, e: DragEvent) {
+    // `types` is all a dragover may read — see hasLibraryDrag's doc.
+    if (!hasLibraryDrag(e.dataTransfer)) return; // OS file drags fall through
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    dropTrackId = track.id;
+  }
+
+  function onLaneDrop(track: TrackState, e: DragEvent) {
+    dropTrackId = "";
+    const payload = decodeLibraryDrag(e.dataTransfer);
+    if (!payload) return;
+    e.preventDefault();
+    void library.dropOnTrack(payload, track.id, dropSamples(e));
+  }
+
   /** Double-click an empty span of a midi lane → create a 2-bar clip there. */
   function onLaneDblClick(track: TrackState, e: MouseEvent) {
     if (track.kind !== "midi") return;
@@ -459,8 +489,12 @@
           class="lane"
           class:armed={track.armed}
           class:midilane={track.kind === "midi"}
+          class:droptarget={dropTrackId === track.id}
           role="presentation"
           ondblclick={(e) => onLaneDblClick(track, e)}
+          ondragover={(e) => onLaneDragOver(track, e)}
+          ondragleave={() => (dropTrackId = "")}
+          ondrop={(e) => onLaneDrop(track, e)}
         >
           {#each project.clipsOf(track.id) as clip (clip.id)}
             <ClipView {clip} {track} />
@@ -772,6 +806,10 @@
   }
   .lane.armed {
     background: rgba(255, 65, 82, 0.03);
+  }
+  .lane.droptarget {
+    box-shadow: inset 0 0 0 1px var(--cyan);
+    background: rgba(82, 229, 255, 0.05);
   }
 
   .empty {

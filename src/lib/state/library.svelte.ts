@@ -13,7 +13,9 @@
 
 import { backend } from "../tauri";
 import { prefs } from "../prefs/prefs.svelte";
-import { parentDir } from "../utils/library";
+import { project } from "./project.svelte";
+import { toasts } from "./toasts.svelte";
+import { parentDir, type LibraryDragPayload } from "../utils/library";
 import type { LibraryEntry } from "../types/ipc";
 
 export type LibraryRoot = "samples" | "clips" | "presets";
@@ -121,6 +123,38 @@ class LibraryStore {
       await backend.libraryAuditionStop?.();
     } catch {
       // Stopping a preview that is not running is not worth a message.
+    }
+  }
+
+  /**
+   * A library row was dropped on a track. EVERY branch calls an existing,
+   * channel-routed command — this store never mutates the document itself, so
+   * every drop is undoable for free and adds no op-log exposure.
+   */
+  async dropOnTrack(
+    payload: LibraryDragPayload,
+    trackId: string,
+    atSamples: number,
+  ): Promise<void> {
+    const track = project.trackById(trackId);
+    if (!track) return;
+
+    switch (payload.kind) {
+      case "sampleFile": {
+        if (track.kind !== "audio") {
+          toasts.info("NEEDS AN AUDIO TRACK", `${payload.name} is audio — drop it on an audio track`);
+          return;
+        }
+        try {
+          await backend.importAudioClip({ path: payload.path, trackId, atSamples });
+          await project.reload();
+        } catch (err) {
+          toasts.error("IMPORT FAILED", String(err));
+        }
+        return;
+      }
+      default:
+        return; // remaining kinds land in Tasks 7 and 8
     }
   }
 
