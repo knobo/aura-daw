@@ -410,8 +410,47 @@ plan document:
    (undo/redo commands, journal format) is Plan E's per PHASE4-PLAN ("F …
    informs E's undo exposure").
 
+### Preflight conflict-scan rulings (decided before Task 1 started)
+
+- **`Op::MidiSetNotes` addresses by a `ClipId` field, not `ObjectRef`.**
+  `fold_ops` only groups `Op::Set`, so two `MidiSetNotes` in ONE tx do not
+  fold; coalescing for notes happens at the gesture (Task 14) and
+  history-350ms (Task 17) layers instead, as the plan's §4.4 note says.
+  Cost if wrong: an op-vocabulary asymmetry normalized in a later round;
+  replay unaffected.
+- **Task 9's `PluginInstanceRow` names whatever the existing registry row
+  struct is** (`plugins/mod.rs`) — the implementer reuses the landed type
+  rather than inventing a new one. Cost if wrong: a rename diff.
+- **Task 12's `commit_with(emit_project_changed=false)` is an accepted
+  wart**, noted before implementation: the frozen `project://changed`
+  contract must not start firing per play/stop, so transport commits
+  suppress the emit rather than the frozen event growing a new firing
+  condition.
+
 ### Mid-flight rulings (from the SDD ledger, each with its one-line why)
 
+- **Task 12's Play/Stop fixed twice**: (1) `Play`'s check-then-act TOCTOU
+  (a recording-downgrade window across two lock acquisitions) is closed
+  by re-checking state INSIDE the commit closure via a `Tx` read accessor
+  (the same shape as Task 7's contract, so the later merge deduped it);
+  (2) `Stop`'s ordering is restored to send `StopRecording` FIRST, then
+  commit the `stopped` `Set` — the dispatch text had mandated the reverse
+  order while also saying "mirror today's ordering," a self-contradiction
+  the review caught; the fix preserves the old visibility window instead
+  of exposing "stopped" while finalize is still running.
+- **`ContentLengthTicks == 0` must be rejected on the command surface**
+  (Task 5 ruling, mandatory for Task 7's dispatch): Task 5's validation
+  was weaker than `apply_clip_bounds`'s reject; carried forward so the
+  rewired `midi_set_clip_bounds` closes the gap rather than shipping a
+  silent weakening.
+- **Multi-clip selection/paste is deliberately deferred until Gate E
+  closes** (owner feature request, captured mid-Plan-E into
+  `docs/backlog/multi-clip-selection-and-paste.md`): every gesture in
+  that request maps 1:1 onto the finished channel's primitives (gesture
+  batches, multi-op transactions, one undo entry per gesture); building
+  it pre-gate would have recreated the side-channels this plan removes.
+  This is why it ships as Track C in `next-prompt.md` rather than as a
+  Plan E task.
 - **Task 15 revised after PR #11** (noteId optional convention, not
   required-0-sentinel): PR #11 landed mid-flight and already added an
   optional `noteId` to the TS `MidiNote` type plus strip-on-copy in
