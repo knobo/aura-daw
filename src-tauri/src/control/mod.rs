@@ -36,7 +36,7 @@ use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
 pub use ops::TrackMixChange;
-pub use session::{Committed, EngineEffect, Session, Tx};
+pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -528,6 +528,14 @@ impl ControlPlane {
         if committed.effect.rebuild {
             self.engine.send(ControlMsg::Rebuild);
         }
+        // Persist runs after the effect writes above and BEFORE the
+        // `project://changed` emit below — the event announces durable
+        // truth, so persistence must have already happened by the time it
+        // fires (round-2 §4: persistence is an effect, executed here, never
+        // I/O under the session lock).
+        if committed.effect.persist != session::PersistEffect::default() {
+            self.execute_persist(&committed.effect.persist);
+        }
         // Full-Project payload (the frozen contract) + rev/label/actor as
         // additive fields (D-06). `project_changed_payload` serializes to a
         // JSON object (all of `Project`'s fields are named), so inserting
@@ -545,6 +553,49 @@ impl ControlPlane {
         }
         (self.emit)("project://changed", payload);
         Ok(committed)
+    }
+
+    /// Executes a `PersistEffect` `commit` merely described. Snapshots are
+    /// taken under a fresh, SHORT session lock; ALL disk I/O happens after
+    /// the guard drops — round-2 §4's whole point (persistence is an
+    /// effect, not I/O under the lock). No public trigger sets
+    /// `effect.persist` yet (that arrives with later tasks' apply_raw arms);
+    /// `pub(crate)` so tests can construct a `PersistEffect` and call this
+    /// directly in the meantime.
+    pub(crate) fn execute_persist(&self, p: &session::PersistEffect) {
+        let (dir, midi_snapshot, project_snapshot) = {
+            let s = self.session.lock();
+            (
+                s.store.project_dir.clone(),
+                p.midi.then(|| s.midi_snapshot()),
+                p.project.then(|| {
+                    project::from_store(
+                        &s.store,
+                        self.shared.position.load(Relaxed),
+                        self.shared.sample_rate.load(Relaxed),
+                    )
+                }),
+            )
+        };
+        let Some(dir) = dir else { return }; // unsaved in-memory project
+        if let Some(m) = midi_snapshot {
+            if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
+                log::warn!("midi persist failed: {e}");
+                self.session.lock().midi.dirty = true; // M-5 semantics preserved
+            } else {
+                self.session.lock().midi.dirty = false;
+            }
+        }
+        if let Some(pr) = project_snapshot {
+            match pr {
+                Ok(pr) => {
+                    if let Err(e) = project::save(&dir, &pr) {
+                        log::warn!("project save failed: {e}");
+                    }
+                }
+                Err(e) => log::warn!("project snapshot build failed: {e}"),
+            }
+        }
     }
 
     /// Test-only accessor to the shared session lock, for tests that need
@@ -2172,6 +2223,54 @@ mod tests {
             lane_id: crate::ids::LaneId::default_for_track(track_id),
             content_length_ticks: None,
         }
+    }
+
+    /// Task 2 (Plan E): a commit whose effect sets `persist.midi` writes
+    /// `events/<clip>.bin` + `project.json` WITHOUT holding the session
+    /// lock during I/O, and clears M-5's `midi.dirty` on success. No public
+    /// trigger exists yet (later tasks' apply_raw arms set the flag), so
+    /// this drives `execute_persist` directly with a constructed
+    /// `PersistEffect` — sanctioned by the Task 2 brief; Task 7's wrapper
+    /// tests re-cover this end-to-end through `commit`.
+    #[test]
+    fn persist_effect_writes_midi_after_the_lock_and_before_the_emit() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("persist-midi");
+        cp.create_project(parent.to_str().unwrap(), "PersistMe").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        {
+            let mut session = cp.session().lock();
+            let mut clip = dummy_midi_clip("t-1");
+            clip.notes.push(crate::midi::MidiNote {
+                tick: 0,
+                length_ticks: 480,
+                key: 60,
+                velocity: 100,
+                channel: 0,
+                note_id: crate::ids::NoteId(1),
+            });
+            session.midi.clips.push(clip);
+            // Stale flag (M-5): a successful persist must clear it, not
+            // merely leave it however it already was.
+            session.midi.dirty = true;
+        }
+
+        cp.execute_persist(&PersistEffect { midi: true, ..PersistEffect::default() });
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert_eq!(raw["content"].as_array().unwrap().len(), 1, "midi clip persisted to disk");
+        let ev_ref = raw["content"][0]["eventsRef"]
+            .as_str()
+            .expect("events chunk ref written for a clip with notes");
+        assert!(dir.join(ev_ref).exists(), "AMEV chunk file exists on disk after execute_persist");
+        assert!(
+            !cp.session().lock().midi.dirty,
+            "successful persist clears the M-5 dirty flag"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// "New Project" is a blank slate: the previous session's tracks, clips,

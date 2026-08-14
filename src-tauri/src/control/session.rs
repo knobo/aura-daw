@@ -17,6 +17,20 @@ impl Session {
         Self { store, midi, rev: 0 }
     }
 
+    /// Clone of the midi fields `midi::persist` persists — `ppq`,
+    /// `tempo_events`, `meter_events`, `clips` — taken under the session
+    /// lock so `ControlPlane::execute_persist` can write it to disk AFTER
+    /// the lock is released (round-2 §4: no disk I/O under the session
+    /// lock). `midi::persist::V3Data` already has exactly this shape.
+    pub fn midi_snapshot(&self) -> crate::midi::persist::V3Data {
+        crate::midi::persist::V3Data {
+            ppq: self.midi.ppq,
+            tempo_events: self.midi.tempo_events.clone(),
+            meter_events: self.midi.meter_events.clone(),
+            clips: self.midi.clips.clone(),
+        }
+    }
+
     /// The ONLY way to mutate the document. Returns Err and leaves the
     /// session untouched if the closure fails (inverses rolled back).
     pub fn transact<F>(this: &parking_lot::Mutex<Session>, meta: TxMeta, f: F) -> Result<Committed, String>
@@ -123,6 +137,27 @@ pub struct EngineEffect {
     pub rebuild: bool,
     pub param_writes: Vec<(TrackId, PropPath, f32)>,
     pub any_solo: Option<bool>,
+    /// Which stores to persist to disk, executed by `ControlPlane::commit`
+    /// (Task 6) AFTER the session lock is released — see `PersistEffect`.
+    pub persist: PersistEffect,
+}
+
+/// Which durable stores a transaction touched — described here (plain data,
+/// no I/O), EXECUTED by `ControlPlane::execute_persist` after the session
+/// lock is released (round-2 §4: persistence becomes an effect, not I/O
+/// under the lock). `plugins`/`automation` are fields only for now — no
+/// executor wires them until Tasks 9/10 (YAGNI: this task adds the
+/// machinery, not speculative plugin/automation persistence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PersistEffect {
+    /// `midi::persist::save_snapshot_into_project` from a `midi_snapshot()`.
+    pub midi: bool,
+    /// `audio::project::save` from `audio::project::from_store`.
+    pub project: bool,
+    /// Task 9 wires the executor; the field exists now.
+    pub plugins: bool,
+    /// Task 10 wires the executor; the field exists now.
+    pub automation: bool,
 }
 
 pub struct Committed {
@@ -556,7 +591,7 @@ mod tests {
     #[test]
     fn transact_commits_and_bumps_rev() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "noop".into() };
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "noop".into(), transient: false };
         let c1 = Session::transact(&m, meta.clone(), |_tx| Ok(())).unwrap();
         let c2 = Session::transact(&m, meta, |_tx| Ok(())).unwrap();
         assert_eq!(c2.rev, c1.rev + 1);
@@ -565,7 +600,7 @@ mod tests {
     #[test]
     fn failing_closure_leaves_session_untouched_and_no_rev() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "fail".into() };
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "fail".into(), transient: false };
         let before = Session::transact(&m, meta.clone(), |_| Ok(())).unwrap().rev;
         let r = Session::transact(&m, meta.clone(), |_tx| Err("boom".into()));
         assert!(r.is_err());
@@ -638,7 +673,7 @@ mod tests {
     #[should_panic(expected = "nested transact")]
     fn nested_transact_panics_not_deadlocks() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "outer".into() };
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "outer".into(), transient: false };
         let _ = Session::transact(&m, meta.clone(), |_tx| {
             let _ = Session::transact(&m, meta.clone(), |_| Ok(()));
             Ok(())

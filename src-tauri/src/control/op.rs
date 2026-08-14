@@ -63,6 +63,12 @@ pub struct TxMeta {
     /// Correlation id for a multi-transaction run (an agent task, an import).
     pub run: String,
     pub label: String,
+    /// RT/document-visible, but excluded from history and journal (round-2
+    /// §4.4) — transport/gesture mid-flight commits. Additive field:
+    /// `#[serde(default)]` so pre-existing payloads without it still
+    /// deserialize, defaulting to `false`.
+    #[serde(default)]
+    pub transient: bool,
 }
 
 impl TxMeta {
@@ -71,7 +77,7 @@ impl TxMeta {
     /// `TxMeta` at the call site (Task 7) rather than defaulting one deep
     /// inside `ControlPlane`, so the actor is always an explicit choice.
     pub fn user(label: impl Into<String>) -> Self {
-        Self { actor: Actor::User, run: uuid::Uuid::new_v4().to_string(), label: label.into() }
+        Self { actor: Actor::User, run: uuid::Uuid::new_v4().to_string(), label: label.into(), transient: false }
     }
 
     /// Same, attributed to the named MCP tool call.
@@ -80,13 +86,29 @@ impl TxMeta {
             actor: Actor::Agent { tool: tool.into() },
             run: uuid::Uuid::new_v4().to_string(),
             label: label.into(),
+            transient: false,
         }
     }
 
     /// Same, attributed to an automated system process (e.g. a sidecar
     /// job's post-processing hook, not a direct user/agent request).
     pub fn system(label: impl Into<String>) -> Self {
-        Self { actor: Actor::System, run: uuid::Uuid::new_v4().to_string(), label: label.into() }
+        Self { actor: Actor::System, run: uuid::Uuid::new_v4().to_string(), label: label.into(), transient: false }
+    }
+
+    /// Same, attributed to the engine/RT side itself (e.g. an auto-stop at
+    /// the end of material) — today this is only ever built as a literal
+    /// struct in tests; this constructor gives non-test callers the same
+    /// explicit-actor discipline `user`/`agent`/`system` already have.
+    pub fn engine(label: impl Into<String>) -> Self {
+        Self { actor: Actor::Engine, run: uuid::Uuid::new_v4().to_string(), label: label.into(), transient: false }
+    }
+
+    /// Builder: mark this transaction transient — RT/document-visible, but
+    /// excluded from history and journal (round-2 §4.4).
+    pub fn transient(mut self) -> Self {
+        self.transient = true;
+        self
     }
 }
 
@@ -196,7 +218,7 @@ mod tests {
         // actor/run are non-optional by construction: TxMeta has no Default
         // and no Option fields — this test locks the shape and verifies all
         // required fields serialize and deserialize correctly.
-        let m = TxMeta { actor: Actor::Engine, run: "r-1".into(), label: "auto-stop".into() };
+        let m = TxMeta { actor: Actor::Engine, run: "r-1".into(), label: "auto-stop".into(), transient: false };
         let s = serde_json::to_string(&m).unwrap();
         // Print once to verify actual wire form
         eprintln!("TxMeta wire form: {}", s);
@@ -204,8 +226,24 @@ mod tests {
         assert!(s.contains("\"actor\":\"engine\""), "actor field must serialize as key:value, was: {s}");
         assert!(s.contains("\"run\":\"r-1\""), "run field must serialize as key:value, was: {s}");
         assert!(s.contains("\"label\":\"auto-stop\""), "label field must serialize as key:value, was: {s}");
+        // transient defaults false and round-trips explicitly.
+        assert!(s.contains("\"transient\":false"), "transient field must serialize as key:value, was: {s}");
         // Round-trip and assert equality
         let back: TxMeta = serde_json::from_str(&s).unwrap();
         assert_eq!(back, m, "TxMeta must deserialize to the original value");
+
+        // Additive-field compat: a legacy payload without `transient` still
+        // deserializes (`#[serde(default)]`), defaulting to false.
+        let legacy = r#"{"actor":"engine","run":"r-1","label":"auto-stop"}"#;
+        let parsed: TxMeta = serde_json::from_str(legacy).expect("legacy payload without transient parses");
+        assert!(!parsed.transient, "missing transient defaults to false");
+    }
+
+    #[test]
+    fn engine_meta_constructor_stamps_actor_engine() {
+        let m = TxMeta::engine("auto-stop");
+        assert_eq!(m.actor, Actor::Engine);
+        assert!(!m.transient);
+        assert!(m.transient().transient);
     }
 }

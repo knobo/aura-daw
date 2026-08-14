@@ -68,7 +68,7 @@ fn test_track(id: &str) -> TrackState {
 }
 
 fn user_meta(label: &str) -> TxMeta {
-    TxMeta { actor: Actor::User, run: "prop-run".into(), label: label.into() }
+    TxMeta { actor: Actor::User, run: "prop-run".into(), label: label.into(), transient: false }
 }
 
 /// A standalone `Clip` row for `TrackAdd`/`TrackRemove` op payloads (Gate B
@@ -362,7 +362,7 @@ fn attribution_survives_commit() {
     let m = fresh_session_3_tracks();
     let c = Session::transact(
         &m,
-        TxMeta { actor: Actor::Agent { tool: "set_track_mix".into() }, run: "run-42".into(), label: "agent mix".into() },
+        TxMeta { actor: Actor::Agent { tool: "set_track_mix".into() }, run: "run-42".into(), label: "agent mix".into(), transient: false },
         |tx| tx.apply(set_gain("t-1", 0.5)),
     )
     .unwrap();

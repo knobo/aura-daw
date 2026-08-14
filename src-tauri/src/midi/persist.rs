@@ -141,6 +141,24 @@ struct PersistedLane {
 /// schemaVersion 3 — round-2 §3.3/§0.1 O-9) and the AMEV chunks under
 /// `<dir>/events/`.
 pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
+    save_snapshot_into_project(
+        dir,
+        &V3Data {
+            ppq: midi.ppq,
+            tempo_events: midi.tempo_events.clone(),
+            meter_events: midi.meter_events.clone(),
+            clips: midi.clips.clone(),
+        },
+    )
+}
+
+/// Same as [`save_into_project`], taking a `V3Data` snapshot instead of a
+/// `&MidiStore` — the persist-as-effect seam (round-2 §4): `Session::
+/// midi_snapshot` clones exactly these fields under the session lock, and
+/// `ControlPlane::execute_persist` calls this AFTER the lock is released,
+/// so no disk I/O ever happens while the lock is held. Identical body to
+/// the retired direct-`MidiStore` version this now backs.
+pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
         fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
