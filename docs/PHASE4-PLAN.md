@@ -313,8 +313,9 @@ provably so, because the commit that adds the test, `73bb9a7`, touches
 **zero production files** (`src-tauri/tests/figma_invariant.rs` only, 748
 insertions). The 34-row side-channel inventory closes total, recorded in
 `docs/SIDE-CHANNEL-INVENTORY.md` (landed form of the plan doc's re-derived
-table, with three residual documented non-op writes R-1..R-3 and three
-recorded replay limitations L-1..L-3 — see that doc, not repeated here).
+table, with three residual documented non-op writes R-1..R-3 and the
+recorded replay limitations L-1..L-5 — see that doc, not repeated here;
+L-1 was closed and L-4/L-5 added by the post-merge follow-up PR).
 The op log is now **ON**: `journal.ndjson` (append-only NDJSON, no fsync)
 plus in-memory undo/redo (bounded `Vec`, 200 entries, bottom-eviction),
 wired to Ctrl+Z / Ctrl+Shift+Z in `src/App.svelte`. Suites: **501 backend +
