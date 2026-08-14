@@ -1,5 +1,7 @@
 /** Small shared UI facts (renderer badge, right-dock tab). */
 
+import { readPref, writePref } from "../utils/prefs";
+
 export type DockTab = "" | "generate" | "hum" | "instruments" | "plugins" | "mcp";
 
 export const ui = $state({
@@ -15,7 +17,7 @@ export const ui = $state({
   rollHeight: 340,
   /** Right dock width, CSS px. User-dragged (left edge); session only. */
   dockWidth: 340,
-  /** Interface zoom factor (CSS `zoom` on the shell) — session only. */
+  /** Interface zoom factor (CSS `zoom` on the shell) — persisted as a preference. */
   zoom: 1,
 });
 
@@ -28,6 +30,13 @@ export function setUiZoom(factor: number) {
   if (!Number.isFinite(factor)) return;
   const clamped = Math.min(UI_ZOOM_MAX, Math.max(UI_ZOOM_MIN, factor));
   ui.zoom = Math.round(clamped * 10) / 10;
+  writePref("uiZoom", ui.zoom);
+}
+
+/** Restore the persisted zoom at boot; junk on disk falls through setUiZoom's guards. */
+export function initUiZoom() {
+  const stored = readPref("uiZoom");
+  if (typeof stored === "number") setUiZoom(stored);
 }
 
 export function zoomUiIn() {

@@ -14,7 +14,7 @@
   import { mcp } from "./lib/state/mcp.svelte";
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
   import { view } from "./lib/state/view.svelte";
-  import { resetUiZoom, ui, zoomUiIn, zoomUiOut } from "./lib/state/ui.svelte";
+  import { initUiZoom, resetUiZoom, ui, zoomUiIn, zoomUiOut } from "./lib/state/ui.svelte";
   import { applyUiZoom } from "./lib/utils/ui-zoom";
   import { exporter } from "./lib/state/exporter.svelte";
   import { loopjam } from "./lib/state/loopjam.svelte";
@@ -32,6 +32,7 @@
   import Toasts from "./lib/components/Toasts.svelte";
 
   onMount(() => {
+    initUiZoom(); // restore the persisted interface zoom before anything paints
     void transport.init();
     void project.init();
     void midi.init();
