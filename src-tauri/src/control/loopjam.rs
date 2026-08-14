@@ -990,6 +990,7 @@ mod tests {
             engine,
             Arc::new(JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         // (Sample rate settled by the round-trip above — no sleep needed.)
 

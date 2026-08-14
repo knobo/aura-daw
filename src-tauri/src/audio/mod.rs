@@ -69,6 +69,13 @@ pub struct AudioState {
     samplers: Arc<Mutex<SamplerBank>>,
     /// Lazily started preview/audition player (phase 2, sampler zone).
     preview: OnceLock<sampler_preview::PreviewHandle>,
+    /// The ONE undo/redo history + op journal (Plan E Task 17), created
+    /// here because `init` builds the engine's `Committer` before
+    /// `ControlPlane` exists — both must share this exact `Arc`, or the
+    /// engine's non-transient commits (recording finalize) would land in a
+    /// second, invisible history. `lib.rs`'s setup passes it on via
+    /// [`AudioState::history_log`].
+    log: Arc<control::HistoryLog>,
 }
 
 impl Default for AudioState {
@@ -80,6 +87,7 @@ impl Default for AudioState {
             engine: OnceLock::new(),
             samplers: Arc::new(Mutex::new(SamplerBank::default())),
             preview: OnceLock::new(),
+            log: Arc::new(control::HistoryLog::new()),
         }
     }
 }
@@ -106,6 +114,13 @@ impl AudioState {
 
     pub(crate) fn engine_handle(&self) -> Option<EngineHandle> {
         self.engine.get().cloned()
+    }
+
+    /// The shared history/journal handle (Plan E Task 17) — `lib.rs` hands
+    /// this to `ControlPlane::new` so the control plane and the engine
+    /// control thread commit into the SAME log.
+    pub(crate) fn history_log(&self) -> Arc<control::HistoryLog> {
+        self.log.clone()
     }
 }
 
@@ -134,6 +149,10 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         state.shared.clone(),
         state.tables.clone(),
         std::sync::Arc::new(engine_emit),
+        // The SAME log `ControlPlane` gets a moment later (lib.rs setup):
+        // the engine's `stop recording` finalize is NON-transient, so it
+        // must be an undo step in the user's one history (Task 17).
+        state.log.clone(),
     );
     let handle = engine::start(
         state.shared.clone(),

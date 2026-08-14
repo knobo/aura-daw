@@ -583,6 +583,7 @@ mod tests {
             engine,
             jobs,
             Box::new(|_, _| {}),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ))
     }
 

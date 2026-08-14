@@ -15,10 +15,10 @@
 //!    order, never by executing a parked `effect` (the placeholder rule);
 //! 5. run EVERY declared read path, each bracketed by snapshots that must be
 //!    byte-equal (the pure-reader sweep — a read that mutates fails here);
-//! 6. REDO everything — each undo commit's OWN computed inverses replayed
-//!    forward (round-2 §4: "inverse produced by apply, never guessed"; see
-//!    `undo_then_read_sweep_then_redo_is_byte_identical`'s note on why
-//!    redoing the ORIGINAL forward ops would be wrong for `MidiSetNotes`);
+//! 6. REDO everything — the batches' own forward ops, replayed in the
+//!    original order (sound because every op in the vocabulary is
+//!    absolute-valued, never a delta; this is the same algebra
+//!    `ControlPlane::redo` uses);
 //! 7. assert the post-redo canonical snapshot equals the pre-undo one, with
 //!    per-clip `next_note_id` MASKED per binding scope ruling 3 (ADR 0001:
 //!    the watermark is monotonic and never rewinds) and separately asserted
@@ -80,11 +80,17 @@ fn fixture() -> (Arc<ControlPlane>, engine::EngineHandle) {
     let shared = Arc::new(SharedRt::default());
     let tables = GraphTables::empty();
     let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
+    // ONE `HistoryLog`, shared by the engine's `Committer` and the
+    // `ControlPlane` — the same wiring `audio::init` + lib.rs's setup do in
+    // production (Plan E Task 17). A per-instance log would hide the
+    // engine's own non-transient commits from the history under test.
+    let log = Arc::new(aura_lib::control::HistoryLog::new());
     let committer = Committer::new(
         session.clone(),
         shared.clone(),
         tables.clone(),
         Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter),
+        log.clone(),
     );
     let eng = engine::start(
         shared.clone(),
@@ -100,6 +106,7 @@ fn fixture() -> (Arc<ControlPlane>, engine::EngineHandle) {
         eng.clone(),
         Arc::new(JobManager::new(2, std::time::Duration::ZERO)),
         Box::new(|_e, _p| {}),
+        log,
     ));
     (cp, eng)
 }

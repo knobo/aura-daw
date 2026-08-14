@@ -906,6 +906,7 @@ mod tests {
             engine,
             Arc::new(JobManager::default()),
             Box::new(move |e, p| ev.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         // Demo-song content, placed directly (no engine round-trip needed).
         let (keys, bass) = {

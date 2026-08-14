@@ -17,6 +17,7 @@
 pub mod import;
 pub mod hum;
 pub mod export;
+pub mod history;
 pub mod op;
 pub mod ops;
 pub mod loopjam;
@@ -36,6 +37,7 @@ use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState}
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
+pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
 pub use ops::TrackMixChange;
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 
@@ -216,6 +218,19 @@ pub struct Committer {
     shared: Arc<SharedRt>,
     tables: SharedGraphTables,
     emit: Arc<EventEmitter>,
+    /// Undo/redo stacks + the on-disk journal (Plan E Task 17). SHARED by
+    /// every `Committer` instance — `audio::init` creates the one
+    /// `Arc<HistoryLog>` and hands it to both the engine's `Committer` and
+    /// (via `AudioState::history_log`) `ControlPlane::new`. This has to be
+    /// shared, not per-instance: the engine's recording finalize commits
+    /// NON-transiently (`TxMeta::engine("stop recording")`,
+    /// audio/engine.rs), so a recorded take is a real undo step in the
+    /// user's history, and two independent `History`s would hide it.
+    ///
+    /// LOCK ORDER: `HistoryLog`'s own mutexes are LEAF-most — see its
+    /// module doc. Everything below touches it only after the session lock
+    /// is released.
+    log: Arc<history::HistoryLog>,
 }
 
 impl Committer {
@@ -224,8 +239,15 @@ impl Committer {
         shared: Arc<SharedRt>,
         tables: SharedGraphTables,
         emit: Arc<EventEmitter>,
+        log: Arc<history::HistoryLog>,
     ) -> Self {
-        Self { session, shared, tables, emit }
+        Self { session, shared, tables, emit, log }
+    }
+
+    /// The shared history/journal handle (Task 17) — `ControlPlane` reads
+    /// it for `undo`/`redo` and the epoch functions.
+    pub fn log(&self) -> &Arc<history::HistoryLog> {
+        &self.log
     }
 
     /// Compose the full-project payload `project://changed` carries (the
@@ -299,6 +321,31 @@ impl Committer {
         f: F,
         emit_project_changed: bool,
         do_rebuild: R,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+        R: FnOnce(),
+    {
+        self.commit_with_rebuild_mode(meta, f, emit_project_changed, do_rebuild, history::HistoryMode::Record)
+    }
+
+    /// [`Self::commit_with_rebuild`] with an explicit [`history::HistoryMode`]
+    /// (Plan E Task 17). `Record` — the default every ordinary caller gets
+    /// — records a new undo entry; `Replay` journals the batch but creates
+    /// no entry, because the commit IS an undo or a redo and
+    /// `ControlPlane::undo`/`redo` migrate the ORIGINAL entry between the
+    /// stacks themselves.
+    ///
+    /// The mode travels down the CALL PATH, not through a thread-local:
+    /// undo runs on whatever thread invoked the command, and a thread-local
+    /// would mis-classify any commit a wrapper made on its behalf.
+    pub(crate) fn commit_with_rebuild_mode<F, R>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+        emit_project_changed: bool,
+        do_rebuild: R,
+        history_mode: history::HistoryMode,
     ) -> Result<session::Committed, String>
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
@@ -379,6 +426,26 @@ impl Committer {
         // I/O under the session lock).
         if committed.effect.persist != session::PersistEffect::default() {
             self.execute_persist(&committed.effect.persist, committed.epoch);
+        }
+        // THE OP LOG (Plan E Task 17, Gate E). After the effects — a batch
+        // is journaled once it has actually happened, never before — and
+        // ONLY when it is not transient: scope ruling 2's "through the
+        // channel, never journaled, never undoable" is enforced here, at
+        // exactly one place, for transport ops, mid-gesture folds and the
+        // engine's state mirrors alike.
+        //
+        // Before the `project://changed` emit below, for the same reason
+        // persist runs before it: the event announces durable truth, and by
+        // the time a listener reacts the log must already agree.
+        if !committed.meta.transient {
+            self.log.record_commit(
+                committed.rev,
+                committed.epoch,
+                &committed.meta,
+                &committed.ops,
+                &committed.inverses,
+                history_mode,
+            );
         }
         // Full-Project payload (the frozen contract) + rev/label/actor as
         // additive fields (D-06). `project_changed_payload` serializes to a
@@ -669,6 +736,10 @@ pub(crate) mod testutil {
             shared.clone(),
             tables.clone(),
             Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter),
+            // Its own private log (Task 17): a bare test `Committer` has no
+            // `ControlPlane` to share one with, and a per-fixture log keeps
+            // parallel tests from journaling into each other.
+            Arc::new(history::HistoryLog::new()),
         )
     }
 }
@@ -706,6 +777,35 @@ impl CoalesceKey {
                 Some(Self { kind: "set", object: object.clone(), path: Some(*path) })
             }
             _ => None,
+        }
+    }
+
+    /// The HISTORY-side key (Task 17), a deliberate SUPERSET of
+    /// [`Self::for_op`]: everything a gesture folds, plus `Op::MidiSetNotes`
+    /// keyed by its clip.
+    ///
+    /// Why the two differ, rather than one shared fn: `for_op` decides what
+    /// a gesture folds INSIDE an open boundary, where folding also discards
+    /// intermediate commits' effects — only `Op::Set`, the sole op kind
+    /// `set_track_mix` (gesture folding's one wired caller) ever applies,
+    /// is in scope there. The 350 ms fallback merges FINISHED, already
+    /// committed batches, so it can safely cover the other §4.4
+    /// value-replacement wrapper too: `midi_set_notes_core` deliberately
+    /// keeps the FIXED label `"set midi notes"` (its own doc says so)
+    /// precisely so a run of note edits on ONE clip collapses to one undo
+    /// step instead of one per keystroke. `path: None` — a `MidiSetNotes`
+    /// addresses the whole clip, not a property of it.
+    ///
+    /// Every other op kind is structural and returns `None`, which is what
+    /// makes "a structural op breaks the merge" true by construction.
+    fn for_history_op(op: &op::Op) -> Option<Self> {
+        match op {
+            op::Op::MidiSetNotes { clip, .. } => Some(Self {
+                kind: "midiSetNotes",
+                object: op::ObjectRef::MidiClip(clip.clone()),
+                path: None,
+            }),
+            other => Self::for_op(other),
         }
     }
 }
@@ -918,6 +1018,7 @@ impl ControlPlane {
         engine: EngineHandle,
         jobs: Arc<JobManager>,
         emit: EventEmitter,
+        log: Arc<history::HistoryLog>,
     ) -> Self {
         let latest_meters = Arc::new(Mutex::new(None));
         engine.send(ControlMsg::Subscribe(Box::new(LatestMeterCache(
@@ -927,7 +1028,12 @@ impl ControlPlane {
         // `ControlPlane` and its `committer` can hold a clone of the SAME
         // closure instance — see `Committer`'s doc.
         let emit: Arc<EventEmitter> = Arc::new(emit);
-        let committer = Committer::new(session.clone(), shared.clone(), tables.clone(), emit.clone());
+        // `log` is the SAME `Arc<HistoryLog>` the engine's own `Committer`
+        // holds (Task 17) — `audio::init` creates it and
+        // `AudioState::history_log` hands it here, so the engine's
+        // non-transient commits land in this history.
+        let committer =
+            Committer::new(session.clone(), shared.clone(), tables.clone(), emit.clone(), log);
         Self {
             session,
             shared,
@@ -1502,6 +1608,115 @@ impl ControlPlane {
         })
     }
 
+    // ---- undo / redo (Plan E Task 17 — the log turns on) -----------------
+
+    /// Undo the most recent history step. `Ok(None)` when there is nothing
+    /// to undo — an empty history is not an error, the UI just has a greyed
+    /// menu item.
+    ///
+    /// The entry's `inverses` are applied through the NORMAL commit path
+    /// (`Session::transact` -> effects -> journal), so an undo is a
+    /// first-class transaction: it bumps `rev`, computes its own fresh
+    /// effect, rebuilds the graph if it must, persists, emits
+    /// `project://changed`, and is JOURNALED (a replay must see it — it IS
+    /// a mutation). What it does NOT do is create a new history entry:
+    /// `HistoryMode::Replay` suppresses that, and the ORIGINAL entry
+    /// migrates, unchanged, onto the redo stack.
+    ///
+    /// Why migrate the entry rather than derive a new one from the undo
+    /// commit: an entry is the exact op/inverse pair `Session::transact`
+    /// (or `close_gesture`) produced for that edit, so moving it between
+    /// stacks cannot drift. Redoing applies `entry.ops`, which is sound
+    /// because EVERY op in the vocabulary is absolute-valued rather than a
+    /// delta (`Set` carries `to`; `TempoSet`/`MidiSetNotes`/
+    /// `AutomationSetLane`/`PluginSetState` are whole-value replacements;
+    /// structural ops carry their full row) — see
+    /// `tests/figma_invariant.rs`, which proves the whole cycle
+    /// byte-identical.
+    ///
+    /// `meta`: `Actor::User` (a person asked for this undo, whoever made
+    /// the original edit) but the ORIGINAL entry's `run` is PRESERVED, so
+    /// the journal can correlate an edit with its own undo — attribution
+    /// (§7 test 5) is about tracing a run, and an undo belongs to the run
+    /// it reverses.
+    ///
+    /// On a failed commit the entry goes back on the undo stack untouched:
+    /// a rejected undo must not silently consume a history step.
+    pub fn undo(&self) -> Result<Option<String>, String> {
+        let Some(entry) = self.committer.log().pop_undo() else { return Ok(None) };
+        let meta = op::TxMeta {
+            actor: op::Actor::User,
+            run: entry.run.clone(),
+            label: format!("undo: {}", entry.label),
+            transient: false,
+        };
+        let ops = entry.inverses.clone();
+        match self.commit_replay(meta, ops) {
+            Ok(()) => {
+                let label = entry.label.clone();
+                self.committer.log().push_redo(entry);
+                Ok(Some(label))
+            }
+            Err(e) => {
+                self.committer.log().push_undo_unchanged(entry);
+                Err(e)
+            }
+        }
+    }
+
+    /// Redo the most recently undone step — [`Self::undo`]'s mirror in
+    /// every respect: `entry.ops` through the normal commit path, journaled,
+    /// no new history entry, and the same entry migrates back onto the undo
+    /// stack (via `push_undo_unchanged`, which does NOT clear the redo
+    /// stack — only a genuinely new edit does that).
+    pub fn redo(&self) -> Result<Option<String>, String> {
+        let Some(entry) = self.committer.log().pop_redo() else { return Ok(None) };
+        let meta = op::TxMeta {
+            actor: op::Actor::User,
+            run: entry.run.clone(),
+            label: format!("redo: {}", entry.label),
+            transient: false,
+        };
+        let ops = entry.ops.clone();
+        match self.commit_replay(meta, ops) {
+            Ok(()) => {
+                let label = entry.label.clone();
+                self.committer.log().push_undo_unchanged(entry);
+                Ok(Some(label))
+            }
+            Err(e) => {
+                self.committer.log().push_redo(entry);
+                Err(e)
+            }
+        }
+    }
+
+    /// Apply a recorded op list through the normal commit path in
+    /// `HistoryMode::Replay` — shared by [`Self::undo`] and [`Self::redo`].
+    fn commit_replay(&self, meta: op::TxMeta, ops: Vec<op::Op>) -> Result<(), String> {
+        self.committer
+            .commit_with_rebuild_mode(
+                meta,
+                |tx| {
+                    for op in ops {
+                        tx.apply(op)?;
+                    }
+                    Ok(())
+                },
+                true,
+                || self.engine.send(ControlMsg::Rebuild),
+                history::HistoryMode::Replay,
+            )
+            .map(|_| ())
+    }
+
+    /// `(undo_depth, redo_depth)` — what the `undo`/`redo` commands return
+    /// alongside their result so the UI can enable/disable menu items
+    /// without a second round trip.
+    pub fn history_depths(&self) -> (usize, usize) {
+        self.committer.log().depths()
+    }
+
     // ---- gestures (Plan E Task 14) ---------------------------------------
 
     /// Opens a gesture boundary — the CLAP-style primitive round-2 §4.4 /
@@ -1548,8 +1763,25 @@ impl ControlPlane {
     /// values are the correct ones to stamp a history entry describing
     /// "the document as of gesture-close" with.
     ///
-    /// Parks the batch for `take_last_gesture_batch` (Task 17's real
-    /// consumer; a test hook until then) and emits exactly ONE
+    /// Task 17: HISTORY IS NOW THE DIRECT CONSUMER. The batch is handed to
+    /// `HistoryLog::record_gesture` right here, inside this function,
+    /// BEFORE the `project://changed` emit — so there is no window in which
+    /// a closed gesture exists but is not yet undoable (the single-slot
+    /// `take_last_gesture_batch` park that stood in for this until now is
+    /// kept, and kept a test surface only; see its own doc). Recorded, not
+    /// re-committed: the ops already ran, one transient commit at a time,
+    /// while the gesture was open — this is the one place a `Committed`
+    /// reaches history without passing through `commit_with_rebuild`, and
+    /// it is exactly why `close_gesture`'s `effect` is a documented
+    /// placeholder.
+    ///
+    /// LOCK ORDER: `GestureState`'s mutex is NOT held here —
+    /// `gesture_end`/`gesture_begin` take it, `take`/`end` the gesture out
+    /// of it, and drop it before calling this. So the acquisition here is
+    /// session (briefly, for `rev`/`epoch`) and then the history/journal
+    /// leaf mutexes, never the reverse, never nested with the gesture lock.
+    ///
+    /// Also emits exactly ONE
     /// `project://changed` — every transient commit folded into this
     /// gesture emitted none of its own (`commit_with(..., false)`), so this
     /// is the gesture's only announcement, keeping an "N invokes -> 1
@@ -1590,6 +1822,15 @@ impl ControlPlane {
             effect: session::EngineEffect::default(),
             meta: meta.clone(),
         };
+        // Task 17: the direct sink. No drop-window — the gesture is
+        // undoable the instant it closes.
+        self.committer.log().record_gesture(
+            committed.rev,
+            committed.epoch,
+            &committed.meta,
+            &committed.ops,
+            &committed.inverses,
+        );
         *self.last_gesture_batch.lock() = Some(committed);
 
         // Same payload shape `Committer::commit_with_rebuild` emits (Task
@@ -1605,11 +1846,15 @@ impl ControlPlane {
         (self.emit)("project://changed", payload);
     }
 
-    /// Test/Task-17 surface: takes (removes) the last gesture batch
-    /// `close_gesture` parked — either from an explicit `gesture_end` or an
-    /// auto-close inside `gesture_begin`. `pub(crate)`, not `#[cfg(test)]`:
-    /// Task 17's history sink is this fn's real production caller; until it
-    /// lands, this crate's own tests are the only caller. Draining promptly
+    /// TEST SURFACE (Task 17 settled its status): takes (removes) the last
+    /// gesture batch `close_gesture` parked — either from an explicit
+    /// `gesture_end` or an auto-close inside `gesture_begin`. History is no
+    /// longer a consumer of this slot: `close_gesture` records into
+    /// `HistoryLog` DIRECTLY (see its doc), which is what closes the
+    /// drop-window this park used to stand in for. The slot is retained
+    /// because it is the only way a test can inspect the exact synthesized
+    /// batch — its `ops`/`inverses`/`meta` — without reaching into the
+    /// history stacks. Draining promptly
     /// matters: a second closing gesture overwrites this slot, so a caller
     /// that wants BOTH an auto-closed batch and the one that follows it
     /// must take the first before triggering the second (this crate's own
@@ -1685,6 +1930,7 @@ impl ControlPlane {
         let rate = self.shared.sample_rate.load(Relaxed);
         let tempo = self.session.lock().store.transport.tempo_bpm;
         let (project, dir) = project::create(parent_dir, name, rate, tempo)?;
+        let new_epoch;
         {
             // One `session` guard for the store reset, the tables reset
             // (session-before-tables is already the documented lock order
@@ -1715,10 +1961,13 @@ impl ControlPlane {
             self.shared.position.store(0, Relaxed);
             self.shared.loop_enabled.store(false, Relaxed);
 
-            // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // epoch boundary: Task 17's history-clear + journal rotation runs
+            // just below, once this guard drops (the journal writes to disk,
+            // and no I/O may happen under the session lock — round-2 §4).
             // Fix round 1 (Task 7 review finding 2): bump the document-swap
             // epoch counter here — see `Session::epoch`'s doc.
             session.epoch += 1;
+            new_epoch = session.epoch;
 
             // Blank midi state bound to the new dir; `adopt_midi_dir` then
             // sees loaded_dir == dir and leaves it alone. Same lock as
@@ -1737,6 +1986,11 @@ impl ControlPlane {
             adopt_midi_dir(&mut session.midi, &dir);
         }
         // ---- session lock released; host round-trips + rebuild + emit below ----
+        // epoch boundary (Task 17): document birth — history and redo are
+        // cleared (they describe a document that is no longer open) and the
+        // journal rotates onto the new project dir, where its first record
+        // is this boundary.
+        self.committer.log().epoch_boundary(&dir, history::EpochEvent::Create, new_epoch);
         // App-global plugin/automation registries adopt the (empty) project.
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
@@ -1762,6 +2016,7 @@ impl ControlPlane {
         // over: a project with duplicate track ids must fail cleanly, not
         // after tracks/clips were replaced).
         project::validate(&project)?;
+        let new_epoch;
         {
             let mut session = self.session.lock();
             session.store.tracks = project.tracks.clone();
@@ -1784,10 +2039,13 @@ impl ControlPlane {
                 self.shared.loop_start.store(t.loop_start_samples, Relaxed);
                 self.shared.loop_end.store(t.loop_end_samples, Relaxed);
             }
-            // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // epoch boundary: Task 17's history-clear + journal rotation runs
+            // below, after this guard drops (journal I/O never under the
+            // session lock).
             // Fix round 1 (Task 7 review finding 2): bump the document-swap
             // epoch counter here — see `Session::epoch`'s doc.
             session.epoch += 1;
+            new_epoch = session.epoch;
             // Eager midi adopt (Task 6: no more lazy resync on the first
             // midi command after an open) — same lock as the store swap
             // above, no separate re-acquisition.
@@ -1795,6 +2053,12 @@ impl ControlPlane {
             crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
         }
         // ---- session lock released; host round-trips + rebuild + emit below ----
+        // epoch boundary (Task 17): document swap = history root. Undoing
+        // across it would apply this project's inverses to a DIFFERENT
+        // document (ruling 4), so both stacks are cleared and the journal
+        // rotates onto the newly opened project's own file — appending, so
+        // that project's earlier sessions stay in its log.
+        self.committer.log().epoch_boundary(&dir, history::EpochEvent::Open, new_epoch);
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
         self.engine.send(ControlMsg::Rebuild);
@@ -1840,15 +2104,19 @@ impl ControlPlane {
         let created_at = project::load(dir).ok().and_then(|(p, _)| p.created_at);
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
+        let new_epoch;
         let (project, midi_snapshot) = {
             let mut session = self.session.lock();
             session.store.project_dir = Some(dir.to_path_buf());
             session.store.project_name = Some(name);
             session.store.created_at = created_at;
-            // epoch boundary: Task 17 hooks history-clear + journal rotation here
+            // epoch boundary: Task 17's history-clear + journal rotation runs
+            // below, after this guard drops (journal I/O never under the
+            // session lock).
             // Fix round 1 (Task 7 review finding 2): bump the document-swap
             // epoch counter here — see `Session::epoch`'s doc.
             session.epoch += 1;
+            new_epoch = session.epoch;
             // Mark the midi store as belonging to `dir` NOW (under the same
             // lock as the store swap); the snapshot taken alongside it is
             // written to disk below, AFTER the lock drops.
@@ -1858,6 +2126,12 @@ impl ControlPlane {
             (project, midi_snapshot)
         };
         // ---- session lock released; all disk I/O below ----
+        // epoch boundary (Task 17): the session just acquired an identity.
+        // History is cleared for the same reason as the other swaps — the
+        // pre-save-as entries describe an UNSAVED document that no longer
+        // exists as such — and the journal opens, for the first time in an
+        // unsaved session's life, in the freshly minted dir.
+        self.committer.log().epoch_boundary(dir, history::EpochEvent::SaveAs, new_epoch);
         project::save(dir, &project)?;
         match crate::midi::persist::save_snapshot_into_project(dir, &midi_snapshot) {
             Ok(()) => self.session.lock().midi.dirty = false,
@@ -1884,15 +2158,20 @@ impl ControlPlane {
     pub fn save_project_mark(&self) -> Result<Project, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
-        let (project, dir) = {
+        let (project, dir, epoch) = {
             let session = self.session.lock();
             let dir = session.store.project_dir.clone().ok_or("no project open")?;
             let project = project::from_store(&session.store, position, rate)?;
-            (project, dir)
+            (project, dir, session.epoch)
         };
         // epoch boundary: no document swap here (same project, same
-        // in-memory content) — Task 17 still journals a "save" mark record.
+        // in-memory content) — so history is NOT cleared and the journal is
+        // NOT rotated. Task 17 journals a "save" MARK record instead: it
+        // tells a replay where the on-disk snapshot caught up with the log,
+        // which is the whole difference between a snapshot mark and an
+        // epoch (ruling 4).
         project::save(&dir, &project)?;
+        self.committer.log().snapshot_mark(epoch);
         (self.emit)(
             "project://changed",
             serde_json::to_value(&project).unwrap_or_default(),
@@ -1934,13 +2213,25 @@ impl ControlPlane {
         let rate = self.shared.sample_rate.load(Relaxed);
         match project::ensure_default_project(&self.session, rate)? {
             Some(project) => {
+                let dir =
+                    PathBuf::from(project.path.clone().expect("just-created project has a path"));
+                // epoch boundary (Task 17). The store swap itself lives in
+                // `project::ensure_default_project` (audio/project.rs, which
+                // has no `ControlPlane` and must not grow one), so the
+                // history/journal half hooks in HERE — the one place both
+                // callers of that swap funnel through: this fn is what the
+                // engine's `ensure_project` invokes via the closure lib.rs
+                // installs, and it is also the standalone MCP/command entry
+                // point. `Some(project)` means the swap actually happened
+                // (`None` = a project was already open, nothing to rotate),
+                // so this is exactly as often as the epoch counter bumped.
+                let epoch = self.session.lock().epoch;
+                self.committer.log().epoch_boundary(&dir, history::EpochEvent::Ensure, epoch);
                 (self.emit)(
                     "project://changed",
                     serde_json::to_value(&project).unwrap_or_default(),
                 );
-                Ok(PathBuf::from(
-                    project.path.clone().expect("just-created project has a path"),
-                ))
+                Ok(dir)
             }
             None => Ok(self
                 .session
@@ -2472,6 +2763,39 @@ pub fn gesture_end(control: State<'_, Arc<ControlPlane>>) -> Result<(), String> 
     control.gesture_end()
 }
 
+/// What `undo`/`redo` hand back: the label of the step that moved (or
+/// `null` when the stack was empty — an empty history is not an error) plus
+/// both stack depths, so the UI can update its menu items from ONE round
+/// trip. Additive command, additive payload (D-06: readers ignore fields
+/// they don't recognize).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryStep {
+    /// The undone/redone step's ORIGINAL label (not the `"undo: …"` one the
+    /// commit carries) — that is what a UI shows in "Undo <label>".
+    pub label: Option<String>,
+    pub undo_depth: usize,
+    pub redo_depth: usize,
+}
+
+/// Undo the most recent history step (Plan E Task 17) — thin delegate over
+/// [`ControlPlane::undo`]. Additive command.
+#[tauri::command]
+pub fn undo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
+    let label = control.undo()?;
+    let (undo_depth, redo_depth) = control.history_depths();
+    Ok(HistoryStep { label, undo_depth, redo_depth })
+}
+
+/// Redo the most recently undone step (Plan E Task 17) — thin delegate over
+/// [`ControlPlane::redo`]. Additive command.
+#[tauri::command]
+pub fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
+    let label = control.redo()?;
+    let (undo_depth, redo_depth) = control.history_depths();
+    Ok(HistoryStep { label, undo_depth, redo_depth })
+}
+
 /// Import an audio file as a clip (STUB until zone B lands).
 #[tauri::command]
 pub fn import_audio_clip(
@@ -2560,6 +2884,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         );
         (cp, engine_rx, events)
     }
@@ -2616,6 +2941,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         );
 
         // Real ops through the real channel — remove X, add Y — mirroring
@@ -2885,6 +3211,7 @@ mod tests {
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         (cp, events, engine)
     }
@@ -3313,7 +3640,7 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let tables = empty_tables();
         let committer =
-            Committer::new(session.clone(), shared, tables, Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter));
+            Committer::new(session.clone(), shared, tables, Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter), std::sync::Arc::new(crate::control::HistoryLog::new()));
         (committer, session)
     }
 
@@ -3715,6 +4042,7 @@ mod tests {
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::default()),
             Box::new(|_, _| {}),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         );
         // Barrier: once the engine answers, its startup open_output is done.
         engine
@@ -3852,6 +4180,7 @@ mod tests {
             engine.clone(),
             Arc::new(crate::sidecars::jobs::JobManager::default()),
             Box::new(|_, _| {}),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         );
         // Round-trip barrier: once the engine thread answers, its startup
         // `open_output` has finished, so the rate below is final (a fixed

@@ -50,11 +50,17 @@ fn fixture() -> (ControlPlane, engine::EngineHandle) {
     let shared = Arc::new(SharedRt::default());
     let tables = GraphTables::empty();
     let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
+    // ONE `HistoryLog`, shared by the engine's `Committer` and the
+    // `ControlPlane` — the same wiring `audio::init` + lib.rs's setup do in
+    // production (Plan E Task 17). A per-instance log would hide the
+    // engine's own non-transient commits from the history under test.
+    let log = Arc::new(aura_lib::control::HistoryLog::new());
     let committer = Committer::new(
         session.clone(),
         shared.clone(),
         tables.clone(),
         Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter),
+        log.clone(),
     );
     let eng = engine::start(
         shared.clone(),
@@ -70,6 +76,7 @@ fn fixture() -> (ControlPlane, engine::EngineHandle) {
         eng.clone(),
         Arc::new(JobManager::new(2, std::time::Duration::ZERO)),
         Box::new(|_e, _p| {}),
+        log,
     );
     (cp, eng)
 }

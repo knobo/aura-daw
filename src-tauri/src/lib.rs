@@ -64,6 +64,10 @@ pub fn run() {
             // the engine-rebuild hook (playback integration).
             let audio_state = app.state::<audio::AudioState>();
             let (session, shared, tables) = audio_state.control_parts();
+            // Plan E Task 17: the ONE history + journal, already held by the
+            // engine's own `Committer` (audio::init) — shared, not a second
+            // instance, so the engine's non-transient commits are undoable.
+            let history_log = audio_state.history_log();
             let engine = audio_state
                 .engine_handle()
                 .ok_or("audio engine failed to start")?;
@@ -81,6 +85,7 @@ pub fn run() {
                         log::warn!("emit {event}: {e}");
                     }
                 }),
+                history_log,
             ));
             app.manage(control_plane.clone());
 
@@ -147,6 +152,9 @@ pub fn run() {
             control::move_clip,
             control::gesture_begin,
             control::gesture_end,
+            // ---- control plane: undo/redo (Plan E Task 17, additive) ----
+            control::undo,
+            control::redo,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----

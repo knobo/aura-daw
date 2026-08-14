@@ -791,6 +791,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(|_, _| {}),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         (cp, parent)
     }
@@ -963,6 +964,7 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
 
         let before_rev = cp.session.lock().rev;

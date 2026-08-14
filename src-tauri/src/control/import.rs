@@ -1084,6 +1084,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(|_, _| {}),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         let parent = tmp_parent(name);
         cp.create_project(parent.to_str().unwrap(), "Split").unwrap();
@@ -1113,6 +1114,7 @@ mod tests {
             engine,
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
         let parent = tmp_parent(name);
         cp.create_project(parent.to_str().unwrap(), "Announce").unwrap();
