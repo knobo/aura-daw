@@ -421,7 +421,7 @@ impl Committer {
         // everything else in `commit_with_rebuild` ([C1]: hosts have their
         // own locks, never called while the session lock is held).
         if !committed.effect.host_forward.is_empty() {
-            self.execute_host_forward(&committed.effect.host_forward);
+            self.execute_host_forward(&committed.effect.host_forward, committed.epoch);
         }
         if committed.effect.rebuild {
             do_rebuild();
@@ -604,7 +604,46 @@ impl Committer {
     /// method takes ONLY brief re-locks of `self.session` to read a row's
     /// format/uid or to write back a post-host result, never spanning a
     /// host call).
-    fn execute_host_forward(&self, forwards: &[session::HostForward]) {
+    /// I-3: the `Instantiate` arm's post-host document writeback, split out
+    /// of the match so it is testable without a live plugin host, and
+    /// EPOCH-GUARDED (same rule as `execute_persist`: a document swapped
+    /// between the commit and this re-lock is a different document, and
+    /// writing this commit's host result into it is silent corruption —
+    /// `params.entry(..).or_default()` would even CREATE a row for an
+    /// instance the new project never had). Recorded as residual R-4 in
+    /// `docs/SIDE-CHANNEL-INVENTORY.md`; see that doc for why this stays a
+    /// carve-out rather than becoming an op (the M-3 transient invariant).
+    pub(crate) fn apply_instantiate_writeback(
+        &self,
+        instance: &str,
+        params: Vec<crate::plugins::ParamInfo>,
+        committed_epoch: u64,
+    ) {
+        let mut s = self.session.lock();
+        if s.epoch != committed_epoch {
+            log::warn!(
+                "plugins: instantiate writeback for {instance} skipped: epoch changed \
+                 between commit and host round-trip ({committed_epoch} -> {})",
+                s.epoch
+            );
+            return;
+        }
+        if let Some(r) = s.plugins.instances.iter_mut().find(|r| r.id == instance) {
+            r.status = "active".into();
+        }
+        // Fill only when absent: an undo-of-remove already restored the
+        // REAL param mirror into `session.plugins.params` (parked there by
+        // `apply_raw`'s `PluginRemove` arm) — this must not clobber it with
+        // the host's fresh-reinstantiate DEFAULTS. A genuinely fresh
+        // instantiate's mirror is still the empty seed `Op::PluginAdd`
+        // left, so it gets filled here exactly as before.
+        let entry = s.plugins.params.entry(instance.to_string()).or_default();
+        if entry.is_empty() {
+            *entry = params;
+        }
+    }
+
+    pub(crate) fn execute_host_forward(&self, forwards: &[session::HostForward], committed_epoch: u64) {
         use crate::plugins::{clap_host, lv2_host, state as pstate};
         use session::HostForward;
         for hf in forwards {
@@ -657,26 +696,7 @@ impl Committer {
                         _ => continue, // non-hosted format: stays "stub", nothing to sync
                     };
                     match hosted {
-                        Ok(params) => {
-                            let mut s = self.session.lock();
-                            if let Some(r) = s.plugins.instances.iter_mut().find(|r| &r.id == instance) {
-                                r.status = "active".into();
-                            }
-                            // Fill only when absent (Task 9 review round 1,
-                            // Important-1): an undo-of-remove already
-                            // restored the REAL param mirror into
-                            // `session.plugins.params` (parked there by
-                            // `apply_raw`'s `PluginRemove` arm) — this must
-                            // not clobber it with the host's fresh-
-                            // reinstantiate DEFAULTS. A genuinely fresh
-                            // instantiate's mirror is still the empty seed
-                            // `Op::PluginAdd` left, so it gets filled here
-                            // exactly as before.
-                            let entry = s.plugins.params.entry(instance.clone()).or_default();
-                            if entry.is_empty() {
-                                *entry = params;
-                            }
-                        }
+                        Ok(params) => self.apply_instantiate_writeback(instance, params, committed_epoch),
                         Err(e) => log::warn!("plugins: instantiate forward for {instance} failed: {e}"),
                     }
                 }
@@ -3354,6 +3374,70 @@ mod tests {
             "failed batch must not announce a change"
         );
         engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// I-3 (Plan E whole-branch review): `execute_host_forward`'s Instantiate
+    /// writeback used to re-lock the session and write `status`/`params` with
+    /// no epoch guard, so a project swap in flight got another project's
+    /// plugin state written into it. Same guard shape `execute_persist` uses.
+    #[test]
+    fn instantiate_writeback_lands_when_the_epoch_is_unchanged() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let row = crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        let epoch = {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(row);
+            s.epoch
+        };
+        let params = vec![crate::plugins::ParamInfo {
+            id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+            default: 0.5, value: 0.25, steps: 0,
+        }];
+        cp.committer().apply_instantiate_writeback("inst-1", params, epoch);
+
+        let s = cp.session().lock();
+        assert_eq!(s.plugins.instances[0].status, "active");
+        assert_eq!(s.plugins.params["inst-1"].len(), 1);
+        assert_eq!(s.plugins.params["inst-1"][0].value, 0.25);
+    }
+
+    #[test]
+    fn instantiate_writeback_is_skipped_when_the_epoch_moved_under_it() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let row = crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        let stale_epoch = {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(row);
+            let e = s.epoch;
+            s.epoch += 1; // an epoch function swapped the document meanwhile
+            e
+        };
+        let params = vec![crate::plugins::ParamInfo {
+            id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+            default: 0.5, value: 0.25, steps: 0,
+        }];
+        cp.committer().apply_instantiate_writeback("inst-1", params, stale_epoch);
+
+        let s = cp.session().lock();
+        assert_eq!(s.plugins.instances[0].status, "stub", "status must not be written");
+        assert!(
+            !s.plugins.params.contains_key("inst-1"),
+            "the params mirror must not be CREATED for a document this commit no longer describes"
+        );
     }
 
     /// Post-review fix: `set_track_mix`'s read-back used to `.expect()` a

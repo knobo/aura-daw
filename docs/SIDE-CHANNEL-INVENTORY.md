@@ -269,8 +269,8 @@ than its narrowness suggests now that the log is ON.
 
 ## Residual documented non-op document writes
 
-Three sites still write document fields without an op. All three are
-documented at the site, all three are under the session lock, and none is
+Four sites still write document fields without an op. All four are
+documented at the site, all four are under the session lock, and none is
 a user-visible edit — recorded here so the totality claim stays honest
 rather than absolute-sounding.
 
@@ -300,6 +300,21 @@ user-visible to undo yet.
 Recommended for Plan F: fold this into the seed transaction as
 `Op::PluginAdd`s so the demo's plugin rows are undoable like everything
 else.
+
+**R-4 — `Committer::execute_host_forward`'s `Instantiate` writeback**
+(`src-tauri/src/control/mod.rs`, `apply_instantiate_writeback`). After the
+host round-trip returns, the arm writes `status = "active"` and fills an
+empty param mirror for the instance. `status` IS document state (it
+round-trips through `PluginInstanceInfo`, is carried by `Op::PluginAdd`, and
+is persisted), so this is a genuine non-op document write — found by the
+Plan E whole-branch review as I-3. It stays a carve-out rather than becoming
+an op because both op-shaped routes are closed: a TRANSIENT batch addressing
+`ObjectRef::Plugin` trips `debug_assert_transient_invariant` (the M-3 redo
+invariant), and a NON-transient one would push a phantom undo entry for every
+plugin instantiate and every undo-of-a-remove. What the write now has is an
+EPOCH GUARD, the same one `execute_persist` uses: a document swapped between
+the commit and the host's return is a different document, and this commit's
+host result is not about it.
 
 ---
 
@@ -331,11 +346,11 @@ grep -rn '\.lock()' src-tauri/src --include=*.rs
 
 Every DOCUMENT-writing session-lock site in the tree is one of:
 `src-tauri/src/control/session.rs` (`Session::transact`/`apply_raw` — the
-channel itself), `Committer::commit_with_rebuild`/`execute_persist`
+channel itself), `Committer::commit_with_rebuild`/`execute_persist`/`execute_host_forward`
 (`src-tauri/src/control/mod.rs:296`/`:434` — effect execution and the
 `midi.dirty`/`dirty_state` persist bookkeeping), the five sanctioned epoch
-functions (rows 24-26), the adopt-install helpers (R-2), or the two
-recorded residuals R-1 and R-3.
+functions (rows 24-26), the adopt-install helpers (R-2), or the three
+recorded residuals R-1, R-3 and R-4.
 
 **Every `session.lock()` in `src-tauri/src/audio/engine.rs` is a documented
 read.** All six non-test sites carry an explicit `// read-only:` comment or
