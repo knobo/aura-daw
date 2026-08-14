@@ -2528,6 +2528,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&parent);
     }
 
+    /// `automation_get`'s purity (Task 10 fix round 1, reviewer finding):
+    /// routed through the REAL production entry point,
+    /// `ControlPlane::automation_lanes()`, not a reimplementation of its
+    /// body — a future regression inside `automation_lanes` itself (e.g.
+    /// someone bolts on a defensive `adopt_open_project` call) would be
+    /// caught here. Asserts: no project needs to be open, no disk access is
+    /// needed, and two consecutive reads return identical lanes with no
+    /// mutation in between (snapshot equality).
+    #[test]
+    fn automation_get_is_a_pure_session_read_no_disk_no_project_dir() {
+        let (cp, _events, _engine) = recording_control_plane();
+        assert!(cp.session().lock().store.project_dir.is_none(), "no project ever opened");
+
+        let lane = crate::plugins::automation::AutomationLane {
+            id: "a-1".into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+        };
+        cp.session().lock().automation.lanes.push(lane.clone());
+
+        // The production entry point, called directly — not reimplemented.
+        let read = cp.automation_lanes();
+        assert_eq!(read, vec![lane], "no project dir, no disk, still reads the lane");
+
+        // Repeat reads are side-effect-free: nothing mutates the session
+        // between them (unlike the retired `with_synced`, which wrote
+        // `loaded_dir` on every single call, mutating reader included) —
+        // snapshot equality pins that.
+        let read_again = cp.automation_lanes();
+        assert_eq!(read, read_again, "two consecutive reads return identical lanes");
+    }
+
     /// "New Project" is a blank slate: the previous session's tracks, clips,
     /// midi state, and playhead must all be gone, and the on-disk project.json
     /// must describe the empty project.

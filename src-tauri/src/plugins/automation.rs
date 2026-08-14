@@ -1029,32 +1029,13 @@ mod tests {
 
     // ---- Plan E Task 10: session move ---------------------------------
 
-    /// `automation_get`'s ENTIRE body is now `session.lock().automation
-    /// .lanes.clone()` (`ControlPlane::automation_lanes`) — a pure,
-    /// side-effect-free session-lock read: no lazy resync, no `loaded_dir`
-    /// bookkeeping, no disk I/O, and (unlike the retired `with_synced`) no
-    /// requirement that a project even be open. `tests/pure_readers.rs`
-    /// does not exist at this task's base commit (checked: absent from
-    /// `src-tauri/tests/`), so this purity test lives here instead, per the
-    /// task brief's fallback instruction.
-    #[test]
-    fn automation_get_is_a_pure_session_read_no_disk_no_project_dir() {
-        let session = parking_lot::Mutex::new(crate::control::Session::new(
-            crate::audio::types::Store::default(),
-            crate::midi::MidiStore::default(),
-        ));
-        assert!(session.lock().store.project_dir.is_none(), "no project ever opened");
-        let l = lane(vec![AutomationPoint { tick: 0, value: 1.0 }]);
-        session.lock().automation.lanes.push(l.clone());
-
-        // Exactly what the command reduces to: lock, clone, return.
-        let read = session.lock().automation.lanes.clone();
-        assert_eq!(read, vec![l]);
-        // Repeat reads are side-effect-free (no mutation of any kind —
-        // unlike the retired `with_synced`, which wrote `loaded_dir` on
-        // every single call, mutating reader included).
-        assert_eq!(session.lock().automation.lanes.clone(), read);
-    }
+    // `automation_get`'s purity (no sync, no `loaded_dir`, no disk I/O, no
+    // project-dir requirement) is covered by
+    // `automation_get_is_a_pure_session_read_no_disk_no_project_dir` in
+    // `control/mod.rs`'s test module (Task 10 fix round 1: that test must
+    // call the REAL production entry point, `ControlPlane::automation_lanes`
+    // — `recording_control_plane`, the fixture it needs, is private to
+    // `control/mod.rs`'s own test module and not visible from here).
 
     /// PROJECT-ADOPTION SEAM: `adopt_open_project` now writes into
     /// `session.automation.lanes` (through the registered session global)
