@@ -21,6 +21,7 @@
 pub mod dsp;
 pub mod engine;
 pub mod meters;
+pub mod midi_in;
 pub mod mixer;
 pub mod project;
 pub mod recorder;
@@ -131,6 +132,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // Make the sampler bank reachable from the engine graph rebuild
     // (midi-track instrument routing) and the post-job auto-register hook.
     sampler::register_bank(state.samplers.clone());
+    midi_in::hub().attach_shared(state.shared.clone());
     // The engine's own commit core (Plan E Task 13) — the SAME
     // session/shared/tables `Arc`s `ControlPlane::new` gets a moment later
     // (lib.rs's setup), with its own `emit` closure instance: two closure
