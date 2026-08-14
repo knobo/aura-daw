@@ -655,8 +655,8 @@ divergence below for the plugin-param half, which it does NOT).
 `12429d1`+`f33c15a` (mixer ramps), T9 `c30a830`+`10aeb12` (engine), T10
 close-out (export automation + this section).
 
-**Suites: 566 backend (537 lib + 29 integration) + 255 frontend, all
-green, measured on `automation-audible` 2026-08-14.** Counts dated in
+**Suites: 566 backend (537 lib + 29 integration) + 258 frontend, all
+green, measured on `automation-audible` 2026-08-15.** Counts dated in
 README/CONTRIBUTING. `main` moved during this track (Track E merged as
 `a98d7ff`) and other tracks are in flight, so the count line is a known
 cross-track merge-conflict point: whoever merges last re-measures rather
@@ -802,10 +802,29 @@ instantiation per automated instance, seeded from the live one's
 - **Live param-panel follow** (ruling 2) — the open panel shows the
   document, not the automated value.
 - **Write/touch/latch automation modes** — the non-goal with a live
-  consequence: while the user HOLDS a knob on a FLAT automated param during
-  playback, the driver re-asserts every ~0.5 s, so the plugin's own GUI and
-  the audio snap back at 2 Hz (AURA's own param panel does not fight it).
-  This is exactly the gap those modes fill.
+  consequence, and it is NOT a transient one. **Every plugin-param lane
+  this UI can create is FLAT**: the "A" button
+  (`automation.automatePluginParam`) mints a lane with exactly ONE point,
+  `compile_lane` yields one event, and `value_at` holds it forever — and
+  "A" is the only way to make a plugin-param lane, because the lane editor
+  (`AutomationLaneView`) reads `gainLaneFor` and draws TRACK GAIN only.
+  There is no curve editor for a plugin param yet. So a flat lane pins its
+  parameter for the WHOLE playthrough: click A on Cutoff at 0.30, press
+  play, turn Cutoff to 0.80 in the plugin's own GUI, and within ~0.5 s it
+  snaps back to 0.30 and stays there, while AURA's param panel still shows
+  0.80. That is intended scope (automation OVERRIDES the knob during
+  playback — ruling 2), not a spec violation, but a reader must not assume
+  the target picker leads to a drawable curve. Drawing curves on plugin
+  params, and write/touch/latch, are the two follow-ups that change it.
+- **`movePoint` deletes a neighbour on a tick collision**
+  (`src/lib/utils/automation-edit.ts:57-66`, review minor 6): dragging a
+  point onto another point's tick silently removes the neighbour. Undo
+  recovers it, but the curve loses a breakpoint mid-drag with no warning.
+  Deliberately NOT fixed in the close-out round.
+- **`.tog.auto.on` is byte-identical to `.tog.arm.on`**
+  (`TrackHeader.svelte`, review minor 7): on `main` an automation-visible
+  track will read as "this track is armed". The plan's own copy
+  instruction produced it; it needs its own colour. Also NOT fixed here.
 
 ### OWED BY THE OWNER: the ear check
 
@@ -852,6 +871,23 @@ first.**
   gain (`compile_gain_ramps`) and plugin params
   (`ParamAutomationDriver::new`) both. No blend, no error; the UI keeps one
   lane per target, so it is documented rather than rejected.
+- **The lane's commits are SERIALIZED through the store** (whole-track
+  review, blocker): the overlay's pointerdown click-insert commits without
+  awaiting, and the store is only written when `automation_set` RESOLVES —
+  so a pointerup landing inside that round-trip window read the PRE-insert
+  lane and committed it back, erasing the point the user had just drawn.
+  Both commits folded into one gesture, so not even an undo entry revealed
+  it, and a normal 50-150 ms click usually beats the round trip, which made
+  the loss intermittent. Task 6's review had seen the double
+  `automation_set` and filed it as a cosmetic "implicit fold dependency"
+  minor — what it could not see was that the SECOND payload is stale, not
+  merely redundant. The fix is a barrier in the store
+  (`commitInGesture`/`commitLatest`): the closing commit waits for the
+  insert's reply before reading. Found while fixing it, same family: the
+  alt-click delete path closed its gesture from its commit's `.then`, while
+  the pointerup that followed closed it AGAIN and earlier — leaving the
+  delete's commit outside the bracket with its own undo entry and its own
+  persist. A `gestureOpen` flag pairs them properly.
 
 ### Deferred-minors roll-up
 
@@ -860,8 +896,10 @@ round doesn't have to re-mine it. All are OPEN and accepted unless marked.
 
 - Epoch-comment precision; a `Copy` type cloned; a dead borrow comment
   (Task 2).
-- `for_op`'s doc comment still says "one wired caller";
-  `plugin_set_param`'s doc doesn't mention the fold path (Task 3).
+- `plugin_set_param`'s doc (`plugins/mod.rs:345-351`) doesn't mention the
+  gesture-fold path (Task 3). Its sibling — `for_op`'s "one wired caller"
+  doc — is **CLOSED**: Task 4 corrected it to name all three wired callers
+  (`control/mod.rs:825-828`, and `for_history_op` at `:866-868`).
 - `set_automation_lane` duplicates a closure body its siblings share
   (Task 4).
 - `reloadOpenParams` shows no `paramsLoading` indicator; a noisy

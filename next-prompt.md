@@ -95,10 +95,20 @@ fix these blind — read the report's entry first):
   panel, `instantiate` and `save_state`. Wanted: a fire-and-forget
   sibling to `set_params` plus a driver that uses it. **Owner: the
   plugin-host path.**
-- **Holding a knob on a flat automated param fights the driver**: it
-  re-asserts every ~0.5 s, so the plugin's own GUI and the audio snap back
-  at 2 Hz. Known and accepted — this is the gap write/touch/latch modes
-  fill, and those are an explicit Track D non-goal.
+- **An automated plugin param is PINNED for the whole playthrough**, not
+  just while a knob is held. The "A" button is the only way to create a
+  plugin-param lane and it mints a single-point (flat) lane, and the lane
+  editor draws track gain only — so there is no way to give a plugin param
+  a curve yet. Turn that param in the plugin's own GUI during playback and
+  it snaps back within ~0.5 s and stays, while AURA's panel still shows the
+  new value. Intended scope (automation overrides the knob), but say so
+  plainly. Follow-ups that change it: a curve editor for plugin params, and
+  write/touch/latch modes.
+- **Two UI minors, deliberately left open** by the whole-track review:
+  `movePoint` silently deletes a neighbour on a tick collision
+  (`automation-edit.ts:57-66`), and `.tog.auto.on` is byte-identical to
+  `.tog.arm.on` in `TrackHeader.svelte`, so an automation-visible track
+  reads as armed.
 
 This file is written for a **fresh session after `/clear`**: it assumes no
 memory of the Plan E conversation. Everything it asserts is checked against
@@ -155,8 +165,8 @@ section previously said **506 backend + 206 frontend**, which was already
 stale when written — the real count at `3340aa8` (Track D's branch base,
 verified in a worktree) was **527 backend + 206 frontend**. Known points
 since: **538 + 234** after Track E (`a98d7ff`), and **566 backend (537
-lib + 29 integration) + 255 frontend** on `automation-audible`
-2026-08-14 (Track D, PR #20, includes Track E via a merge). Run both
+lib + 29 integration) + 258 frontend** on `automation-audible`
+2026-08-15 (Track D, PR #20, includes Track E via a merge). Run both
 suites before writing the first line of a track:
 
 ```
@@ -373,8 +383,8 @@ Still open and named there: the **owner's ear check** (nobody has heard it
 yet), **plugin-param automation in a bounce**, the **non-blocking CLAP
 param path**, and holding a knob against a flat automated param.
 
-Baseline after this track: **566 backend (537 lib + 29 integration) + 255
-frontend**, measured on `automation-audible` 2026-08-14.
+Baseline after this track: **566 backend (537 lib + 29 integration) + 258
+frontend**, measured on `automation-audible` 2026-08-15.
 
 ### Track E — Library & browser panel — LANDED 2026-08-14
 
@@ -403,7 +413,7 @@ into `docs/PHASE4-PLAN.md`'s Track E handoff section when one is written
 
 Baseline after this track: 538 backend + 234 frontend tests, all green
 (counted 2026-08-14 on `library-browser`; superseded by Track D's
-566 + 255 above, which includes this track).
+566 + 258 above, which includes this track).
 
 ## 4. Pointers (the master index and everything behind it)
 

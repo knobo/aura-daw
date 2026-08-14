@@ -26,6 +26,12 @@
 
   let canvas: HTMLCanvasElement | undefined = $state();
   let dragIndex = $state(-1);
+  /** True between the pointerdown that OPENED an edit gesture and the
+   * pointerup that closes it. The alt-click delete path closes its own
+   * gesture (after its commit lands), so without this the pointerup that
+   * follows would close it a second time — and early, leaving the delete's
+   * commit outside the bracket with its own undo entry and its own persist. */
+  let gestureOpen = false;
   const HIT_RADIUS_PX = 6;
 
   const lane = $derived(automation.gainLaneFor(track.id));
@@ -105,13 +111,14 @@
     if (e.button === 2 || e.altKey) {
       if (hit < 0) return;
       project.beginGesture("automation delete point");
-      void automation.commit({ ...l, points: deletePoint(l.points, hit) }).then(() =>
-        project.endGesture(),
-      );
+      void automation
+        .commitInGesture({ ...l, points: deletePoint(l.points, hit) })
+        .then(() => project.endGesture()); // close only once the delete lands
       return;
     }
     canvas.setPointerCapture(e.pointerId);
     project.beginGesture("automation edit");
+    gestureOpen = true;
     if (hit >= 0) {
       dragIndex = hit;
       if (l.id) automation.preview(l.id, l.points);
@@ -119,7 +126,7 @@
       const points = insertPoint(l.points, { tick, value });
       dragIndex = points.findIndex((p) => p.tick === tick);
       // an unminted lane must reach the backend before it can be previewed
-      void automation.commit({ ...l, points });
+      void automation.commitInGesture({ ...l, points });
     }
   }
 
@@ -138,12 +145,16 @@
     canvas.releasePointerCapture?.(e.pointerId);
     const wasDragging = dragIndex >= 0;
     dragIndex = -1;
-    const l = automation.gainLaneFor(track.id);
-    if (wasDragging && l) {
-      void automation.commit(l).then(() => project.endGesture()); // ONE invoke per gesture
-    } else {
+    if (!gestureOpen) return; // the delete path owns (and closes) its own
+    gestureOpen = false;
+    if (!wasDragging) {
       project.endGesture();
+      return;
     }
+    // `commitLatest` WAITS for a click-insert's reply before reading the
+    // store: reading now could commit the pre-insert point set back over the
+    // point just drawn (see its doc comment). The gesture closes after it.
+    void automation.commitLatest(track.id).then(() => project.endGesture());
   }
 </script>
 

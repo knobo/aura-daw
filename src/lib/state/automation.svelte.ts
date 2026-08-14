@@ -96,6 +96,34 @@ class AutomationStore {
     }
   }
 
+  /** The one commit of the current gesture that is still on the wire.
+   * `commit` never rejects (it catches), so chaining off this is safe. */
+  #inflight: Promise<unknown> = Promise.resolve();
+
+  /** Commit from INSIDE an open gesture (a click-insert, an alt-click
+   * delete). Returns the barrier the gesture's closing commit — and its
+   * `gesture_end` — must wait for. */
+  commitInGesture(lane: AutomationLane): Promise<void> {
+    const done = this.commit(lane);
+    this.#inflight = done;
+    return done;
+  }
+
+  /** The CLOSING commit of a gesture: the lane as the store now holds it.
+   *
+   * It must wait for `commitInGesture`'s barrier before READING. The store
+   * is only written when `automation_set` resolves, so a pointerup landing
+   * inside the insert's round-trip window would otherwise read the
+   * PRE-insert lane and commit that back — last arrival wins, and the point
+   * the user just drew is silently erased, with both commits folded into
+   * one gesture so not even an undo entry reveals it. A 50-150 ms click
+   * usually beats the round trip, which made the loss intermittent. */
+  async commitLatest(trackId: string): Promise<void> {
+    await this.#inflight;
+    const lane = this.gainLaneFor(trackId);
+    if (lane) await this.commitInGesture(lane);
+  }
+
   isVisible(trackId: string): boolean {
     return this.visible.has(trackId);
   }

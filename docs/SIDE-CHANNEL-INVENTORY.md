@@ -39,13 +39,13 @@ wrapper/op/epoch function.
 | 6 | `midi_set_notes` — bypass, wholesale replace | `Op::MidiSetNotes` (§4.4 value-replacement wrapper, coalescable) | `src-tauri/src/midi/mod.rs:406` (`midi_set_notes_core`) |
 | 7 | `midi_set_clip_bounds` (new since dossier 10 — PR #8) | `Op::Set{MidiClip, TimelineStartTicks/LengthTicks/ContentLengthTicks}`, all three in one commit | `src-tauri/src/midi/mod.rs:494` (`midi_set_clip_bounds_core`) |
 | 8 | `midi_import_file` — 3 lock acquisitions, `ops::add_track` under the lock | prepare-outside parse → ONE composite transaction (`add_track_tx` + optional `TempoSet` + `MidiClipAdd` per clip) | `src-tauri/src/midi/mod.rs:572` (`midi_import_file_core`) |
-| 9 | mutating readers `midi_get_clips`/`midi_export_file` (lazy resync could re-instantiate live plugins) | pure reads; adopt happens EAGERLY at epochs only | `src-tauri/src/midi/mod.rs:244` (`read_midi`), `:559`, `:667`; eager adopt at `src-tauri/src/control/mod.rs:1795` |
-| 10 | mutating reader `automation_get` | pure read (session-lock clone, no sync/no disk) | `src-tauri/src/plugins/automation.rs:568`; body `src-tauri/src/control/mod.rs:997` |
-| 11 | `automation_set` — own store, own persistence | `AutomationStore` moved INTO `Session` + `Op::AutomationSetLane`; persistence is a `PersistEffect` | `src-tauri/src/plugins/automation.rs:581`; op arm `src-tauri/src/control/session.rs:751` |
-| 12 | `plugin_instantiate`/`plugin_remove` — bypass + auto-persist | registry doc-half into `Session`; `Op::PluginAdd`/`Op::PluginRemove` (restore-from-blob inverse) | `src-tauri/src/plugins/mod.rs:211`, `:302`; op arms `src-tauri/src/control/session.rs:786`, `:819` |
-| 13 | `plugin_set_param` — project.json rewritten per knob gesture | `Op::Set{Plugin, Param}` + host-forward effect + `PersistEffect`, folded into `gesture_begin`/`gesture_end` with the persist DEFERRED to gesture close (Track D — the review's I-8: before that, the rewrite had only moved off the lock, one full `project.json` read-modify-write still ran per rAF batch) | `src-tauri/src/plugins/mod.rs:353`; op arm `src-tauri/src/control/session.rs:894` |
-| 14 | `zyn_load_patch` — unmanaged global, patch lost on save | `Op::PluginSetState` (blob inverse) | `src-tauri/src/plugins/patches.rs:322`; op arm `src-tauri/src/control/session.rs:864` |
-| 15 | plugin auto-persist `state::persist_after_mutation` (unserialized project.json RMW) | DELETED; replaced by `PersistEffect` executed post-lock | `src-tauri/src/control/mod.rs:434` (`Committer::execute_persist`); the retired call site is documented at `:499` |
+| 9 | mutating readers `midi_get_clips`/`midi_export_file` (lazy resync could re-instantiate live plugins) | pure reads; adopt happens EAGERLY at epochs only | `src-tauri/src/midi/mod.rs:244` (`read_midi`), `:559`, `:667`; eager adopt at `src-tauri/src/control/mod.rs:2353` (create) / `:2420` (open) |
+| 10 | mutating reader `automation_get` | pure read (session-lock clone, no sync/no disk) | `src-tauri/src/plugins/automation.rs:805`; body `src-tauri/src/control/mod.rs:1299` (`automation_lanes`) |
+| 11 | `automation_set` — own store, own persistence | `AutomationStore` moved INTO `Session` + `Op::AutomationSetLane`; persistence is a `PersistEffect` | `src-tauri/src/plugins/automation.rs:818`; op arm `src-tauri/src/control/session.rs:763` |
+| 12 | `plugin_instantiate`/`plugin_remove` — bypass + auto-persist | registry doc-half into `Session`; `Op::PluginAdd`/`Op::PluginRemove` (restore-from-blob inverse) | `src-tauri/src/plugins/mod.rs:276`, `:302`; op arms `src-tauri/src/control/session.rs:799`, `:832` |
+| 13 | `plugin_set_param` — project.json rewritten per knob gesture | `Op::Set{Plugin, Param}` + host-forward effect + `PersistEffect`, folded into `gesture_begin`/`gesture_end` with the persist DEFERRED to gesture close (Track D — the review's I-8: before that, the rewrite had only moved off the lock, one full `project.json` read-modify-write still ran per rAF batch) | `src-tauri/src/plugins/mod.rs:353`; op arm `src-tauri/src/control/session.rs:922` |
+| 14 | `zyn_load_patch` — unmanaged global, patch lost on save | `Op::PluginSetState` (blob inverse) | `src-tauri/src/plugins/patches.rs:322`; op arm `src-tauri/src/control/session.rs:892` |
+| 15 | plugin auto-persist `state::persist_after_mutation` (unserialized project.json RMW) | DELETED; replaced by `PersistEffect` executed post-lock | `src-tauri/src/control/mod.rs:538` (`Committer::execute_persist`); the retired call site is documented at `:603` |
 | 16 | sink `wrap_sink_with_import`/`do_import` — `add_track` + `clips.push` under two locks | prepare-outside + ONE `Actor::System` tx (`add_track_tx` + `Op::ClipAdd`) | `src-tauri/src/control/import.rs:360` (`do_import`), `:439` (sink) |
 | 17 | sink `wrap_sink_with_stem_import` — track via channel, clip not | fully channel: per-stem tx (`Op::ClipAdd`) | `src-tauri/src/control/import.rs:523` |
 | 18 | sinks `wrap_sink_with_hum_apply`/`wrap_sink_with_accompany_apply` → `apply_hum_clip` (midi disk write under the lock) | prepare-outside + `Actor::System` tx (`Op::MidiClipAdd`), persist as an effect | `src-tauri/src/control/hum.rs:402` (`apply_hum_clip`), `:435`, `:527` (sinks) |
@@ -294,7 +294,8 @@ replaced wholesale, and nothing about that replacement is an op.
 rollback at `:2483`). `seed_demo_project`'s best-effort Zyn bootstrap
 pushes three instance rows into `session.plugins.instances` directly,
 before the demo's single channel transaction runs; the rationale is stated
-on the function itself (`src-tauri/src/control/mod.rs:2424-2429`): no track
+on the function itself (`src-tauri/src/control/mod.rs:2776`,
+`try_seed_zyn_demo_instruments`): no track
 references those ids until the caller binds them, so there is nothing
 user-visible to undo yet.
 Recommended for Plan F: fold this into the seed transaction as
@@ -320,8 +321,12 @@ host result is not about it.
 
 ## Verified non-writers
 
-Checked against the tree at `73bb9a7`, recorded so the totality claim is
-auditable rather than asserted:
+Checked against the tree at `73bb9a7` and RE-VERIFIED line by line on
+`automation-audible` (Track D close-out) — this document's value is its
+navigability, so every citation in it was re-resolved against the current
+tree after Track D grew `plugins/automation.rs`, `control/mod.rs`,
+`control/session.rs` and `audio/engine.rs`. Re-check them again whenever
+those files move:
 
 * `sidecar_split_stems` / `sidecar_transcribe` — job submits only
   (`src-tauri/src/sidecars/mod.rs`).
@@ -376,15 +381,15 @@ grep -rn '\.lock()' src-tauri/src --include=*.rs
 Every DOCUMENT-writing session-lock site in the tree is one of:
 `src-tauri/src/control/session.rs` (`Session::transact`/`apply_raw` — the
 channel itself), `Committer::commit_with_rebuild`/`execute_persist`/`execute_host_forward`
-(`src-tauri/src/control/mod.rs:296`/`:434` — effect execution and the
+(`src-tauri/src/control/mod.rs:324`/`:538` — effect execution and the
 `midi.dirty`/`dirty_state` persist bookkeeping), the five sanctioned epoch
 functions (rows 24-26), the adopt-install helpers (R-2), or the three
 recorded residuals R-1, R-3 and R-4.
 
 **Every `session.lock()` in `src-tauri/src/audio/engine.rs` is a documented
 read.** All six non-test sites carry an explicit `// read-only:` comment or
-are a `transport_snapshot` read: `:769`, `:901`, `:1016`, `:1114`, `:1154`,
-`:1202`. The engine's five WRITE sites do not take the session lock
+are a `transport_snapshot` read: `:780`, `:1004`, `:1119`, `:1217`, `:1257`,
+`:1305`. The engine's five WRITE sites do not take the session lock
 themselves at all — they go through `Committer::commit_with_rebuild`
-(`:740`, `:1130`, `:1328`, `:1434`, `:1459`), which is the whole point of
+(`:751`, `:1233`, `:1431`, `:1537`, `:1562`), which is the whole point of
 Task 13's split.
