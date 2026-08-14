@@ -1886,6 +1886,7 @@ mod tests {
         let midi = crate::midi::MidiStore {
             ppq: 960,
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
             loaded_dir: None,
             dirty: false,
@@ -1959,6 +1960,7 @@ mod tests {
         let midi = crate::midi::MidiStore {
             ppq: 960,
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
             loaded_dir: None,
             dirty: false,

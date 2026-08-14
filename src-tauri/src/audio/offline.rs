@@ -170,7 +170,7 @@ mod tests {
     use super::*;
     use crate::audio::types::TrackState;
     use crate::ids::NoteId;
-    use crate::midi::types::TempoEvent;
+    use crate::midi::types::{MeterEvent, TempoEvent};
     use crate::midi::{MidiClip, MidiNote};
 
     fn track(id: &str, kind: &str) -> TrackState {
@@ -199,6 +199,7 @@ mod tests {
         let midi = MidiStore {
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![arp, groove],
             loaded_dir: None,
             dirty: false,
@@ -268,6 +269,7 @@ mod tests {
         let midi = MidiStore {
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![MidiClip {
                 id: "c1".into(),
                 track_id: "m1".into(),

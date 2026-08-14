@@ -534,6 +534,7 @@ impl ControlPlane {
                 midi: MidiStore {
                     ppq: m.ppq,
                     tempo_events: m.tempo_events.clone(),
+                    meter_events: m.meter_events.clone(),
                     clips: m.clips.clone(),
                     loaded_dir: None,
                     dirty: false,

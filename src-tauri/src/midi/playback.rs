@@ -232,12 +232,13 @@ mod tests {
     use crate::audio::transport::LoopSpec;
     use crate::audio::types::TrackState;
     use crate::ids::NoteId;
-    use crate::midi::types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+    use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
 
     fn midi_store_with(clips: Vec<MidiClip>) -> MidiStore {
         MidiStore {
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips,
             loaded_dir: None,
             dirty: false,

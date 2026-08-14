@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 2,
+  "name": "WithClips",
+  "sampleRate": 48000,
+  "tempoBpm": 120.0,
+  "tracks": [
+    {
+      "id": "t1",
+      "name": "Lead",
+      "kind": "midi",
+      "gainDb": 0.0,
+      "pan": 0.0,
+      "muted": false,
+      "soloed": false,
+      "armed": false,
+      "color": "#7c9cff"
+    }
+  ],
+  "clips": [],
+  "ppq": 960,
+  "tempoMap": [{"tick": 0, "bpm": 120.0}],
+  "midiClips": [
+    {
+      "id": "mc1",
+      "trackId": "t1",
+      "name": "Verse",
+      "timelineStartTicks": 0,
+      "lengthTicks": 3840,
+      "nextNoteId": 1
+    }
+  ]
+}

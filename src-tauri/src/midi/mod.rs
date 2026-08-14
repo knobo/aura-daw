@@ -11,7 +11,8 @@
 //! * [`schedule`] — ticks -> absolute-sample note edges -> per-block events.
 //! * [`playback`] — engine integration: control-side pre-render of midi
 //!                  clips into `RtTrack`s for the RCU graph snapshot.
-//! * [`persist`]  — project.json v2 fields + AMEV chunk save/load/migration.
+//! * [`section_table`] — precomputed constant-tempo segments (round-2 §3.4).
+//! * [`persist`]  — project.json v2/v3 fields + AMEV chunk save/load/migration.
 //! * [`midifile`] — .mid import/export (midly).
 //! * [`amt`]      — AMT infilling params/result/merge (job kind `amtInfill`).
 //! * this file    — `#[tauri::command]` glue + the managed [`MidiState`].
@@ -20,7 +21,7 @@
 //! `midi_add_clip`, `midi_set_notes`, `midi_get_clips`.
 //!
 //! Persistence model: midi edits auto-persist into the open project
-//! (`project.json` v2 + AMEV chunks) on every mutation; when the open
+//! (`project.json` v2/v3 + AMEV chunks) on every mutation; when the open
 //! project changes (open_project happened since the last midi command), the
 //! store lazily reloads from disk before serving. Every mutation triggers an
 //! engine graph rebuild so MIDI is immediately audible.
@@ -48,7 +49,7 @@ use crate::audio::AudioState;
 use crate::control::Session;
 
 pub use tempo::TempoMap;
-pub use types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+pub use types::{MeterEvent, MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
 
 // ---------------------------------------------------------------------------
 // Shared state (constructed with Default and `.manage()`d by lib.rs)
@@ -66,6 +67,9 @@ pub struct MidiState {
 pub struct MidiStore {
     pub ppq: u32,
     pub tempo_events: Vec<TempoEvent>,
+    /// Persisted time signature (round-2 §3.3/O-10), v3+. Defaults to
+    /// `[{tick:0,num:4,den:4}]` for stores that never loaded a v3 file.
+    pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
     /// Project dir this store was last synced with (None = in-memory only).
     pub loaded_dir: Option<PathBuf>,
@@ -82,6 +86,7 @@ impl Default for MidiStore {
         Self {
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: Vec::new(),
             loaded_dir: None,
             dirty: false,
@@ -151,6 +156,7 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
             Ok(Some(v2)) => {
                 midi.ppq = v2.ppq;
                 midi.tempo_events = v2.tempo_events;
+                midi.meter_events = v2.meter_events;
                 midi.clips = v2.clips;
             }
             Ok(None) => {
@@ -158,6 +164,7 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
                     let d0 = persist::v1_migration_defaults(fallback_bpm);
                     midi.ppq = d0.ppq;
                     midi.tempo_events = d0.tempo_events;
+                    midi.meter_events = d0.meter_events;
                     midi.clips = d0.clips;
                 }
             }

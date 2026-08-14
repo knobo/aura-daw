@@ -1,20 +1,28 @@
-//! Project v2 persistence of MIDI data (PHASE2-PLAN §3.C, SCALABILITY §3–4).
+//! Project v2/v3 persistence of MIDI data (PHASE2-PLAN §3.C, SCALABILITY
+//! §3–4; v3 bump: round-2 §3.3, O-9/O-10, ADR 0002).
 //!
-//! `project.json` gains the v2 fields `schemaVersion:2`, `ppq`, `tempoMap`,
-//! `midiClips` (see `docs/ipc-schemas/project-v2.schema.json`). Note payloads
-//! NEVER go inline: each clip's notes are written as an immutable AMEV chunk
-//! `events/<uuid>.bin` referenced by `eventsRef`; edits write a new chunk and
-//! stale chunks are garbage-collected after a successful save.
+//! `project.json` gains the v2 fields `ppq`, `midiClips` (see
+//! `docs/ipc-schemas/project-v2.schema.json`) and, from schemaVersion 3,
+//! an integer-period `tempoMap` (superticks per quarter, not bpm — round-2
+//! §3.3) plus a persisted `meterMap` (time signature, default `[{0,4,4}]`).
+//! Note payloads NEVER go inline: each clip's notes are written as an
+//! immutable AMEV chunk `events/<uuid>.bin` referenced by `eventsRef`;
+//! edits write a new chunk and stale chunks are garbage-collected after a
+//! successful save.
 //!
 //! The v1 fields are owned by `audio::project` (typed reader/writer); this
 //! module only ever touches project.json through a `serde_json::Value`
 //! read-modify-write (atomic tmp+rename), so both writers preserve each
 //! other's fields. Before the FIRST upgrade of a v1 file, a verbatim copy is
-//! kept as `project.json.v1.bak` (SCALABILITY §4).
+//! kept as `project.json.v1.bak` (SCALABILITY §4); before the first v2->v3
+//! upgrade, `project.json.v2.bak` (same discipline, round-2 §3.3).
 //!
 //! v1 -> v2 migration is mechanical: `ppq = 960`, one-entry tempo map from
-//! `tempoBpm`, no midi clips. [`load_from_project`] performs it IN MEMORY
-//! only; the file is upgraded on the first midi save.
+//! `tempoBpm`, no midi clips, no meter map. v2 -> v3 quantizes each bpm
+//! event to the nearest integer period ONCE
+//! (`crate::time::period_from_bpm`) and defaults the meter map to
+//! `[{0,4,4}]`. [`load_from_project`] performs both IN MEMORY only; the
+//! file is upgraded on the first midi save.
 
 use std::fs;
 use std::io::Write as _;
@@ -24,18 +32,32 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::events;
-use super::types::{first_note_id, MidiClip, TempoEvent, DEFAULT_PPQ};
+use super::types::{first_note_id, MeterEvent, MidiClip, TempoEvent, TempoPeriodEvent, DEFAULT_PPQ};
 use super::MidiStore;
 
 const PROJECT_FILE: &str = "project.json";
 const V1_BACKUP: &str = "project.json.v1.bak";
+const V2_BACKUP: &str = "project.json.v2.bak";
 const EVENTS_DIR: &str = "events";
 
-/// v2 midi fields loaded from a project.
+/// The `[{0,4,4}]` default meter map (round-2 §3.3) — used both as the v3
+/// write-time default (fresh stores) and the read-time default (v1/v2
+/// files, which never had a meter map at all).
+fn default_meter_events() -> Vec<MeterEvent> {
+    vec![MeterEvent { tick: 0, num: 4, den: 4 }]
+}
+
+/// v2/v3 midi fields loaded from a project. The name predates the v3 bump
+/// (Task 6 adds `meter_events`, keeps the rest) — `tempo_events` stays
+/// bpm-typed even for a v3 file: `TempoMap` (Task 3) is the actual period-
+/// math authority, this struct is a control-plane cache of display values
+/// quantized losslessly through `crate::time::{period_from_bpm,
+/// bpm_from_period}`'s proven idempotence (Task 2).
 #[derive(Debug, Clone)]
-pub struct V2Data {
+pub struct V3Data {
     pub ppq: u32,
     pub tempo_events: Vec<TempoEvent>,
+    pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
 }
 
@@ -59,7 +81,8 @@ struct PersistedClip {
 }
 
 /// Write the midi store's state into `<dir>/project.json` (upgrading it to
-/// schemaVersion 2) and the AMEV chunks under `<dir>/events/`.
+/// schemaVersion 3 — round-2 §3.3/§0.1 O-9) and the AMEV chunks under
+/// `<dir>/events/`.
 pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
@@ -73,6 +96,11 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
     if was_v1 && !dir.join(V1_BACKUP).exists() {
         fs::copy(&file, dir.join(V1_BACKUP))
             .map_err(|e| format!("write {V1_BACKUP}: {e}"))?;
+    }
+    let was_v2 = root.get("schemaVersion").and_then(Value::as_u64) == Some(2);
+    if was_v2 && !dir.join(V2_BACKUP).exists() {
+        fs::copy(&file, dir.join(V2_BACKUP))
+            .map_err(|e| format!("write {V2_BACKUP}: {e}"))?;
     }
 
     // Chunks first (orphans from a failed save are GC'd on the next one).
@@ -105,11 +133,31 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
         clip_rows.push(row);
     }
 
+    // v3 tempoMap (round-2 §3.3): each bpm event quantizes ONCE, here, into
+    // a constant-period TempoPeriodEvent (period_start == period_end — no
+    // ramp-editing command exists yet to produce anything else). Task 2's
+    // idempotence guarantee (period_from_bpm(bpm_from_period(p)) == p)
+    // means a value that already passed through this quantization once
+    // (loaded back via `load_from_project`'s v3 branch, then re-saved)
+    // never drifts on subsequent saves.
+    let period_events: Vec<TempoPeriodEvent> = midi
+        .tempo_events
+        .iter()
+        .map(|e| {
+            let p = crate::time::period_from_bpm(e.bpm);
+            TempoPeriodEvent { tick: e.tick, period_start: p, period_end: p }
+        })
+        .collect();
+
     let obj = root.as_object_mut().expect("checked above");
-    obj.insert("schemaVersion".into(), json!(2));
+    obj.insert("schemaVersion".into(), json!(3));
     obj.insert("ppq".into(), json!(midi.ppq));
-    obj.insert("tempoMap".into(), serde_json::to_value(&midi.tempo_events).unwrap());
-    // Invariant (project-v2.schema.json): tempoBpm == tempoMap[0].bpm.
+    obj.insert("tempoMap".into(), serde_json::to_value(&period_events).unwrap());
+    obj.insert("meterMap".into(), serde_json::to_value(&midi.meter_events).unwrap());
+    obj.insert("sectionTableRuleVersion".into(), json!(super::section_table::RULE_VERSION));
+    // Invariant (v3): tempoBpm mirrors tempoMap[0]'s period as a DISPLAY
+    // value only — never re-quantized on its own, never the source of
+    // truth (that's tempoMap's period).
     if let Some(first) = midi.tempo_events.first() {
         obj.insert("tempoBpm".into(), json!(first.bpm));
     }
@@ -131,9 +179,14 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
 
 /// Load the midi fields from `<dir>/project.json`.
 ///
-/// * v2 file → `Ok(Some(V2Data))` with clips' notes decoded from their AMEV
-///   chunks (a missing/corrupt chunk logs a warning and yields an empty clip
-///   rather than failing the whole project).
+/// * v2/v3 file → `Ok(Some(V3Data))` with clips' notes decoded from their
+///   AMEV chunks (a missing/corrupt chunk logs a warning and yields an
+///   empty clip rather than failing the whole project). A v2 file's bpm
+///   `tempoMap` loads unchanged (no meter map ever existed pre-v3, so
+///   `meter_events` defaults to `[{0,4,4}]` — round-2 §3.3); a v3 file's
+///   period `tempoMap` projects back to bpm via
+///   `crate::time::bpm_from_period` for this struct's display-value field
+///   (`TempoMap`, Task 3, is the actual period-math authority).
 /// * v1 file → `Ok(None)`; the caller decides whether to adopt in-memory
 ///   state (fresh session) or reset to the mechanical migration defaults,
 ///   which [`v1_migration_defaults`] provides.
@@ -144,7 +197,7 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
 /// instances and AUTOMATION lanes into the app-global registries. Both
 /// hooks are inert until the app registers those globals — unit tests use
 /// local registries/stores and never observe them.
-pub fn load_from_project(dir: &Path) -> Result<Option<V2Data>, String> {
+pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
         fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
@@ -161,13 +214,33 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V2Data>, String> {
         .and_then(Value::as_u64)
         .map(|p| p as u32)
         .unwrap_or(DEFAULT_PPQ);
-    let tempo_events: Vec<TempoEvent> = match root.get("tempoMap") {
-        Some(v) => serde_json::from_value(v.clone())
-            .map_err(|e| format!("tempoMap: {e}"))?,
-        None => vec![TempoEvent {
-            tick: 0,
-            bpm: root.get("tempoBpm").and_then(Value::as_f64).unwrap_or(120.0),
-        }],
+    let tempo_events: Vec<TempoEvent> = if version >= 3 {
+        let period_events: Vec<TempoPeriodEvent> = match root.get("tempoMap") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| format!("tempoMap: {e}"))?,
+            None => vec![TempoPeriodEvent {
+                tick: 0,
+                period_start: crate::time::period_from_bpm(120.0),
+                period_end: crate::time::period_from_bpm(120.0),
+            }],
+        };
+        period_events
+            .into_iter()
+            .map(|e| TempoEvent { tick: e.tick, bpm: crate::time::bpm_from_period(e.period_start) })
+            .collect()
+    } else {
+        match root.get("tempoMap") {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| format!("tempoMap: {e}"))?,
+            None => vec![TempoEvent {
+                tick: 0,
+                bpm: root.get("tempoBpm").and_then(Value::as_f64).unwrap_or(120.0),
+            }],
+        }
+    };
+    let meter_events: Vec<MeterEvent> = match root.get("meterMap") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("meterMap: {e}"))?,
+        None => default_meter_events(), // no meterMap in the file (v1/v2, or a v3 that omitted it)
     };
     let rows: Vec<PersistedClip> = match root.get("midiClips") {
         Some(v) => serde_json::from_value(v.clone())
@@ -203,13 +276,15 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V2Data>, String> {
             next_note_id,
         });
     }
-    Ok(Some(V2Data { ppq, tempo_events, clips }))
+    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips }))
 }
 
-/// The mechanical v1 migration: ppq 960, one-entry tempo map, no clips.
-pub fn v1_migration_defaults(tempo_bpm: f64) -> V2Data {
-    V2Data {
+/// The mechanical v1 migration: ppq 960, one-entry tempo map, default
+/// meter map, no clips.
+pub fn v1_migration_defaults(tempo_bpm: f64) -> V3Data {
+    V3Data {
         ppq: DEFAULT_PPQ,
+        meter_events: default_meter_events(),
         tempo_events: vec![TempoEvent { tick: 0, bpm: tempo_bpm }],
         clips: Vec::new(),
     }
@@ -335,6 +410,7 @@ mod tests {
                 TempoEvent { tick: 0, bpm: 100.0 },
                 TempoEvent { tick: 3840, bpm: 140.0 },
             ],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips,
             loaded_dir: None,
             dirty: false,
@@ -368,7 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_save_load_roundtrip_with_amev_chunks_and_backup() {
+    fn v3_save_load_roundtrip_with_amev_chunks_and_backup() {
         let parent = tmp_parent("roundtrip");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
         let midi = store_with(vec![clip("t1", some_notes(10)), clip("t2", vec![])]);
@@ -377,9 +453,16 @@ mod tests {
         assert!(dir.join(V1_BACKUP).exists(), "v1 backup written on upgrade");
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
-        assert_eq!(raw["schemaVersion"], 2);
+        assert_eq!(raw["schemaVersion"], 3);
         assert_eq!(raw["ppq"], 960);
         assert_eq!(raw["tempoBpm"], 100.0, "tempoBpm == tempoMap[0].bpm");
+        assert_eq!(
+            raw["tempoMap"][0]["periodStart"],
+            crate::time::period_from_bpm(100.0),
+            "v3 tempoMap carries the quantized integer period, not bpm"
+        );
+        assert_eq!(raw["meterMap"][0], serde_json::json!({"tick": 0, "num": 4, "den": 4}));
+        assert_eq!(raw["sectionTableRuleVersion"], crate::midi::section_table::RULE_VERSION);
         assert_eq!(raw["midiClips"].as_array().unwrap().len(), 2);
         let ev_ref = raw["midiClips"][0]["eventsRef"].as_str().unwrap();
         assert!(ev_ref.starts_with("events/") && ev_ref.ends_with(".bin"));
@@ -497,10 +580,12 @@ mod tests {
     }
 
     /// The architect-granted seam in audio/project.rs: a v1-path save (e.g.
-    /// auto-save after recording) must PRESERVE the v2 fields, and keep the
-    /// tempoBpm == tempoMap[0].bpm invariant.
+    /// auto-save after recording) must PRESERVE the v2/v3 fields, and keep
+    /// the tempoBpm-mirrors-tempoMap[0] invariant — v3's period, not v2's
+    /// bpm (round-2 §3.3, see the `existing_schema_version >= 3` branch in
+    /// `audio::project::save`).
     #[test]
-    fn v1_typed_save_preserves_v2_fields() {
+    fn v1_typed_save_preserves_v3_fields() {
         let parent = tmp_parent("preserve");
         let (mut p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
         let midi = store_with(vec![clip("t1", some_notes(3))]);
@@ -512,16 +597,20 @@ mod tests {
 
         let raw: Value =
             serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
-        assert_eq!(raw["schemaVersion"], 2, "stays v2");
+        assert_eq!(raw["schemaVersion"], 3, "stays v3");
         assert_eq!(raw["midiClips"].as_array().unwrap().len(), 1);
         assert_eq!(raw["ppq"], 960);
         assert_eq!(raw["tempoBpm"], 87.0);
-        assert_eq!(raw["tempoMap"][0]["bpm"], 87.0, "invariant maintained");
-        // And the v2 loader still works after the v1-path save.
-        let v2 = load_from_project(&dir).unwrap().unwrap();
-        assert_eq!(v2.clips[0].notes.len(), 3);
-        assert_eq!(v2.tempo_events[0].bpm, 87.0);
-        // v1 reader accepts the v2 file.
+        assert_eq!(
+            raw["tempoMap"][0]["periodStart"],
+            crate::time::period_from_bpm(87.0),
+            "v1-path tempo change updates the v3 period, not a stray bpm field"
+        );
+        // And the v3 loader still works after the v1-path save.
+        let v3 = load_from_project(&dir).unwrap().unwrap();
+        assert_eq!(v3.clips[0].notes.len(), 3);
+        assert!((v3.tempo_events[0].bpm - 87.0).abs() < 3e-7);
+        // v1 reader accepts the v2/v3 file.
         let (loaded, _) = project::load(&dir).unwrap();
         assert_eq!(loaded.tempo_bpm, 87.0);
         let _ = fs::remove_dir_all(&parent);

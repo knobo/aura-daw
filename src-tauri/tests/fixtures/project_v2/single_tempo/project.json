@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "name": "SingleTempo",
+  "sampleRate": 48000,
+  "tempoBpm": 128.0,
+  "tracks": [],
+  "clips": [],
+  "ppq": 960,
+  "tempoMap": [{"tick": 0, "bpm": 128.0}],
+  "midiClips": []
+}

@@ -66,18 +66,22 @@ pub fn create(parent: &Path, name: &str, sample_rate: u32, tempo_bpm: f64) -> Re
 
 /// Atomically write project.json into `dir`.
 ///
-/// v2 seam (PHASE2-PLAN §3.C named integration point, serde_json::Value
+/// v2/v3 seam (PHASE2-PLAN §3.C named integration point, serde_json::Value
 /// round-trip): when the existing file is schemaVersion >= 2, the typed v1
-/// fields are overlaid onto it so the v2 fields written by `midi::persist`
-/// (`ppq`, `tempoMap`, `midiClips`, `instruments`, ...) survive v1-path
-/// saves, and the `tempoBpm == tempoMap[0].bpm` invariant is maintained.
+/// fields are overlaid onto it so the v2/v3 fields written by
+/// `midi::persist` (`ppq`, `tempoMap`, `meterMap`, `midiClips`,
+/// `instruments`, ...) survive v1-path saves, and the
+/// `tempoBpm == tempoMap[0].bpm` (v2) / `tempoBpm` mirrors
+/// `tempoMap[0].periodStart` (v3, round-2 §3.3) invariant is maintained.
 pub fn save(dir: &Path, project: &Project) -> Result<(), String> {
     let mut value = serde_json::to_value(project).map_err(|e| e.to_string())?;
     let dst = dir.join(PROJECT_FILE);
     if let Ok(bytes) = fs::read(&dst) {
         match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(mut base) => {
-                if base.get("schemaVersion").and_then(|v| v.as_u64()).unwrap_or(1) >= 2 {
+                let existing_schema_version =
+                    base.get("schemaVersion").and_then(|v| v.as_u64()).unwrap_or(1);
+                if existing_schema_version >= 2 {
                     if let (Some(bmap), Some(nmap)) = (base.as_object_mut(), value.as_object()) {
                         for (k, v) in nmap {
                             if k != "schemaVersion" {
@@ -86,7 +90,22 @@ pub fn save(dir: &Path, project: &Project) -> Result<(), String> {
                         }
                     }
                     if let Some(first) = base.get_mut("tempoMap").and_then(|v| v.get_mut(0)) {
-                        first["bpm"] = serde_json::json!(project.tempo_bpm);
+                        if existing_schema_version >= 3 {
+                            // v3: tempoMap rows are period-shaped
+                            // (`periodStart`/`periodEnd`, round-2 §3.3), not
+                            // `bpm` — quantize the typed v1-path's bpm the
+                            // same way `midi::persist::save_into_project`
+                            // does, so a v1-path tempo change (e.g. an
+                            // auto-save right after recording) doesn't leave
+                            // a stale period alongside a misleading `bpm`
+                            // field bolted onto a v3 row (that field never
+                            // existed in v3 and nothing reads it).
+                            let period = crate::time::period_from_bpm(project.tempo_bpm);
+                            first["periodStart"] = serde_json::json!(period);
+                            first["periodEnd"] = serde_json::json!(period);
+                        } else {
+                            first["bpm"] = serde_json::json!(project.tempo_bpm);
+                        }
                     }
                     value = base;
                 }
@@ -155,10 +174,11 @@ pub fn load(path: &Path) -> Result<(Project, PathBuf), String> {
     let bytes = fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
     let mut project: Project =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse project.json: {e}"))?;
-    // v1 and v2 are both readable here: the typed struct carries the v1
-    // fields; the v2 midi fields are read by `midi::persist` straight from
-    // the file (unknown fields are ignored per D-06, never rejected).
-    if !(1..=2).contains(&project.schema_version) {
+    // v1, v2 and v3 are all readable here: the typed struct carries the v1
+    // fields; the v2/v3 midi fields (tempoMap, meterMap, midiClips, ...)
+    // are read by `midi::persist` straight from the file (unknown fields
+    // are ignored per D-06, never rejected).
+    if !(1..=3).contains(&project.schema_version) {
         return Err(format!("unsupported project schemaVersion {}", project.schema_version));
     }
     project.path = Some(dir.to_string_lossy().into_owned());
