@@ -11,6 +11,15 @@
 //! * rtrb SPSC queues: new-graph pointers in, retired-graph pointers out
 //!   (deallocation happens here, never on the RT thread), meter blocks out,
 //!   and recorded samples out to the disk-writer thread.
+//!
+//! Hardware MIDI-in (slice 2) adds the SECOND ring that feeds the callback,
+//! and the only one this thread does not produce into: the midir callback
+//! thread pushes `LiveMidiEvent`s through `midi_in::hub()`, the output
+//! callback pops them into a preallocated array. Neither end is exempt from
+//! the rule above — the producer is a non-RT thread that may lock and drop,
+//! the consumer allocates nothing and takes a bounded number of events per
+//! block. Which track they reach is a slot the CONTROL thread resolves
+//! (`follow_live_in_target`); the callback only reads one atomic.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -24,6 +33,7 @@ use parking_lot::Mutex;
 
 use super::dsp::linear_resample;
 use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock, METER_CHUNK_SLOTS};
+use super::midi_in::{self, LiveMidiEvent, MidiInHub, LIVE_IN_RING_SLOTS, MAX_LIVE_IN_PER_BLOCK};
 use super::mixer;
 use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
@@ -190,6 +200,8 @@ pub fn start(
                 ensure_project_fn: None,
                 param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
                 param_writes: Vec::new(),
+                live_in_hub: midi_in::hub().clone(),
+                live_in_target: None,
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -249,6 +261,15 @@ struct OutputCb {
     /// releases live-instrument voices (their note-offs may never arrive).
     next_pos: u64,
     was_playing: bool,
+    /// Consumer half of THIS stream's MIDI-in ring — owned by the callback,
+    /// so a device switch that briefly overlaps two callbacks can never put
+    /// two consumers on one ring: each stream gets its own ring, and the hub
+    /// keeps only the newest producer.
+    live_in_rx: rtrb::Consumer<LiveMidiEvent>,
+    /// Preallocated drain buffer — the RT side never allocates.
+    live_in_buf: [LiveMidiEvent; MAX_LIVE_IN_PER_BLOCK],
+    /// Cloned at open time so the callback never touches a global.
+    live_in_hub: Arc<MidiInHub>,
 }
 
 impl OutputCb {
@@ -295,13 +316,34 @@ impl OutputCb {
         let frames = (out.len() / self.channels.max(1)) as u64;
         let steady_base = self.shared.steady.fetch_add(frames, Relaxed);
 
+        // Hardware MIDI-in. Drained UNCONDITIONALLY, even with nothing
+        // routed: the producer is a foreign thread that keeps pushing
+        // whatever the port sends, and a ring nobody empties would hand the
+        // next armed track a backlog of stale notes. Bounded by the
+        // preallocated buffer, so a flood costs a fixed amount of work.
+        let mut n_in = 0usize;
+        while n_in < MAX_LIVE_IN_PER_BLOCK {
+            match self.live_in_rx.pop() {
+                Ok(ev) => {
+                    self.live_in_buf[n_in] = ev;
+                    n_in += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        // One relaxed load; the control thread resolved this id→slot under
+        // the tables lock (see `MidiInHub::refresh_target`).
+        let live_slot = self.live_in_hub.target_slot();
+        let live_in =
+            live_slot.map(|slot| mixer::LiveInBlock { slot, events: &self.live_in_buf[..n_in] });
+
         match (&mut self.graph, playing) {
             (Some(g), true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                let dropped = mixer::render_rt(
+                let dropped = mixer::render_rt_with_input(
                     g,
                     base,
                     &lp,
@@ -310,6 +352,24 @@ impl OutputCb {
                     self.rate,
                     discontinuity,
                     steady_base,
+                    live_in,
+                    Some(&mut self.meter_tx),
+                );
+                if dropped > 0 {
+                    self.shared.xruns.fetch_add(dropped as u64, Relaxed);
+                }
+            }
+            // Monitoring while STOPPED: render ONLY the routed instrument,
+            // never the frozen clip slice under the parked playhead.
+            (Some(g), false) if live_in.is_some() => {
+                let dropped = mixer::render_live_input_only(
+                    g,
+                    base,
+                    out,
+                    self.channels,
+                    self.rate,
+                    steady_base,
+                    live_in.expect("checked by the guard"),
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -576,6 +636,14 @@ struct Control {
     /// Reused scratch for `param_automation.tick` so the tick allocates
     /// nothing steady-state.
     param_writes: Vec<crate::plugins::automation::ParamWrite>,
+    /// The hardware MIDI-in seam. Held as an `Arc` rather than reached
+    /// through `midi_in::hub()` at each call site so tests can drive the
+    /// engine against their own hub; `start` binds the process-global one.
+    live_in_hub: Arc<MidiInHub>,
+    /// Last routing target this thread acted on — the tick compares against
+    /// the hub to notice a selection that, being app config, commits nothing
+    /// and therefore schedules no rebuild of its own.
+    live_in_target: Option<String>,
 }
 
 impl Control {
@@ -611,6 +679,7 @@ impl Control {
             self.drive_param_automation();
             self.headless_advance();
             self.pump_meter_frames();
+            self.follow_live_in_target();
         }
     }
 
@@ -682,6 +751,12 @@ impl Control {
         // sized for a burst of them so a stalled control thread never makes
         // the callback drop one.
         let (evt_tx, evt_rx) = rtrb::RingBuffer::new(64);
+        // Second rtrb path INTO the callback, and the only one whose producer
+        // is not this thread: the midir callback thread pushes, this stream's
+        // callback pops. A fresh ring per stream, installed before the stream
+        // exists, so no event can be in flight on a ring nobody drains.
+        let (live_in_tx, live_in_rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
+        self.live_in_hub.install_producer(live_in_tx);
         let mut cb = OutputCb {
             graph_rx,
             retire_tx,
@@ -693,6 +768,9 @@ impl Control {
             rate,
             next_pos: u64::MAX, // first playing block is a discontinuity
             was_playing: false,
+            live_in_rx,
+            live_in_buf: [LiveMidiEvent::all_off(); MAX_LIVE_IN_PER_BLOCK],
+            live_in_hub: self.live_in_hub.clone(),
         };
         let stream = device
             .build_output_stream(
@@ -776,6 +854,10 @@ impl Control {
         self.ensure_loaded();
         self.generation += 1;
         let headless = self.output.is_none();
+        // Read BEFORE the session lock is taken: the hub is reachable from
+        // the midir callback thread, and nesting its mutex under the session
+        // lock would invent a lock order this file has none of today.
+        let live_in_target = self.live_in_hub.target_track();
         let (graph, param_driver) = {
             let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
             let store = &session.store;
@@ -858,7 +940,7 @@ impl Control {
                 // reads `session.midi` directly instead of re-locking
                 // through the registered global.
                 let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-                crate::midi::playback::append_from(
+                crate::midi::playback::append_from_with_input(
                     &session.midi,
                     store,
                     &session.plugins,
@@ -867,6 +949,7 @@ impl Control {
                     bank.as_deref(),
                     &mut self.live_nodes,
                     &mut tracks,
+                    live_in_target.as_deref(),
                 );
                 // The timeline boundary belongs to the material, so it is
                 // derived exactly where the material is assembled — same
@@ -903,6 +986,29 @@ impl Control {
             self.rebuild_pending = true;
             log::warn!("audio: graph queue full, rebuild retried next tick");
         }
+    }
+
+    /// CONTROL THREAD, once per tick: keep the hardware MIDI-in routing in
+    /// step with the graph. Two things happen here, in this order.
+    ///
+    /// A rebuild first, when the SELECTION changed. Choosing the routing
+    /// target is app config (ruling 1) — it commits nothing, so no
+    /// `EngineEffect::rebuild` fires — but a midi track with no clips only
+    /// gets a live node when `rebuild` runs with the target already known
+    /// (`append_from_with_input`). Without this the very case the feature
+    /// exists for — arm an empty track and play — would stay silent until
+    /// some unrelated edit happened to rebuild.
+    ///
+    /// Then the id→slot resolution the callback reads, which must come
+    /// SECOND: it has to resolve against the tables the rebuild just
+    /// published, not the previous generation's.
+    fn follow_live_in_target(&mut self) {
+        let target = self.live_in_hub.target_track();
+        if target != self.live_in_target {
+            self.live_in_target = target;
+            self.rebuild();
+        }
+        self.live_in_hub.refresh_target(self.generation, &self.tables);
     }
 
     /// Track D: compile the session's automation lanes into this rebuild's
@@ -1652,6 +1758,11 @@ mod tests {
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
         let (evt_tx, evt_rx) = rtrb::RingBuffer::new(64);
+        // A hub per callback, wired exactly as `open_output` wires the real
+        // one, so no engine test depends on (or perturbs) the global hub.
+        let (live_in_tx, live_in_rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
+        let live_in_hub = Arc::new(MidiInHub::new());
+        live_in_hub.install_producer(live_in_tx);
         (
             OutputCb {
                 graph_rx,
@@ -1664,6 +1775,9 @@ mod tests {
                 rate: 48_000,
                 next_pos: u64::MAX,
                 was_playing: false,
+                live_in_rx,
+                live_in_buf: [LiveMidiEvent::all_off(); MAX_LIVE_IN_PER_BLOCK],
+                live_in_hub,
             },
             evt_rx,
             (graph_tx, retire_rx, meter_rx),
@@ -1818,6 +1932,121 @@ mod tests {
         );
     }
 
+    // ---- hardware MIDI-in through the real callback (slice 2, Task 10) ----
+
+    /// A one-track live graph whose node is a REAL `PolySynth`, so what the
+    /// assertions measure is real audio rather than a recording double.
+    fn polysynth_graph(slot: usize, generation: u64, events: Vec<crate::midi::schedule::AbsNoteEvent>) -> RtGraph {
+        let mut synth = crate::midi::synth::PolySynth::new();
+        crate::audio::dsp::AudioProcessor::prepare(&mut synth, 48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let cell = crate::audio::rt::LiveNodeCell::new(Box::new(synth));
+        RtGraph::new(
+            vec![RtTrack {
+                slot,
+                clips: Vec::new(),
+                live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(events) }),
+            }],
+            generation,
+            Arc::new(ParamTable::with_slots(slot + 1)),
+        )
+    }
+
+    fn peak(out: &[f32]) -> f32 {
+        out.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// Resolve the callback's target slot the way the control thread does.
+    fn target_slot_0(cb: &OutputCb, track_id: &str) {
+        let tables = crate::audio::rt::GraphTables::empty();
+        tables.lock().slots.insert(track_id.into(), 0);
+        cb.live_in_hub.set_target_track(Some(track_id.into()));
+        cb.live_in_hub.refresh_target(1, &tables);
+    }
+
+    /// Monitoring must work with the transport STOPPED — that is the normal
+    /// state when someone plugs in a keyboard and plays.
+    #[test]
+    fn live_in_notes_are_audible_while_the_transport_is_stopped() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        // Pushed exactly as the midir callback thread pushes it.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out); // adopts the graph, drains the ring
+        assert!(peak(&out) > 0.02, "stopped-transport monitoring is audible");
+        assert_eq!(shared.position.load(Relaxed), 0, "monitoring never advances the transport");
+
+        // The voice is HELD by the callback's own node across blocks, and a
+        // note-off from the ring releases it — proof the events reach the
+        // graph's node and not a per-block copy of one.
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "the held voice keeps sounding");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_off(69)));
+        for _ in 0..12 {
+            cb.render(&mut out); // past PolySynth's ~80 ms release
+        }
+        assert_eq!(peak(&out), 0.0, "the note-off released the voice");
+    }
+
+    /// The same routing while PLAYING goes through the full mixer path, and
+    /// the transport still advances exactly as it did before this task.
+    #[test]
+    fn live_in_notes_are_audible_while_playing_and_the_transport_still_advances() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "routed note is audible while playing");
+        assert_eq!(shared.position.load(Relaxed), 512, "playback still advances");
+    }
+
+    /// The drain is bounded per block and the ring drops rather than blocks —
+    /// the two properties that keep the callback inside its deadline when the
+    /// producer outruns it.
+    #[test]
+    fn live_in_drain_is_bounded_and_overflow_is_counted() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, _peers) = output_cb(shared.clone());
+        for i in 0..(LIVE_IN_RING_SLOTS + 50) {
+            cb.live_in_hub.push(LiveMidiEvent::note_on((i % 128) as u8, 100));
+        }
+        assert_eq!(
+            cb.live_in_hub.dropped(),
+            50,
+            "a full ring drops rather than blocks"
+        );
+
+        let mut out = vec![0.0f32; 128 * 2];
+        cb.render(&mut out);
+        assert_eq!(
+            cb.live_in_rx.slots(),
+            LIVE_IN_RING_SLOTS - MAX_LIVE_IN_PER_BLOCK,
+            "one block takes at most MAX_LIVE_IN_PER_BLOCK events"
+        );
+    }
+
+    /// With nothing routed, a stopped transport renders silence — including
+    /// the target track's own SCHEDULED notes, which must never sound from a
+    /// parked playhead.
+    #[test]
+    fn without_a_target_a_stopped_transport_still_renders_silence() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _r, _m)) = output_cb(shared.clone());
+        let scheduled = vec![crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100 }];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        let mut out = vec![1.0f32; 128 * 2];
+        cb.render(&mut out);
+        assert_eq!(peak(&out), 0.0);
+    }
+
     fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
@@ -1891,6 +2120,10 @@ mod tests {
             ensure_project_fn: None,
             param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
             param_writes: Vec::new(),
+            // Its OWN hub, never the process-global one: these tests would
+            // otherwise race every other test that selects a routing target.
+            live_in_hub: Arc::new(MidiInHub::new()),
+            live_in_target: None,
         };
         (ctl, session, tx)
     }
@@ -2008,6 +2241,35 @@ mod tests {
 
         assert!(!ctl.param_automation.is_empty(), "the lane IS compiled");
         assert!(ctl.param_writes.is_empty(), "…but a stopped transport drives nothing");
+    }
+
+    /// Both live-in call sites `run` owns, in one iteration. Selecting the
+    /// routing target is app config (ruling 1): it commits nothing, so NO
+    /// `EngineEffect::rebuild` fires — yet a clip-less midi track only gets a
+    /// live node when a rebuild runs with the target already known. The tick
+    /// therefore has to notice the change itself, rebuild, and only then
+    /// resolve the slot the callback reads.
+    ///
+    /// `Subscribe` is the message that drives the iteration precisely because
+    /// handling it rebuilds nothing — the generation bump can only come from
+    /// the target change.
+    #[test]
+    fn run_rebuilds_and_resolves_the_live_in_target_when_it_changes() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            s.store.tracks.push(t);
+        }
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+        let sink = CountingSink(Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
+        tx.send(ControlMsg::Subscribe(Box::new(sink))).unwrap();
+        drop(tx);
+        ctl.run();
+
+        assert_eq!(ctl.generation, 1, "the target change scheduled a rebuild");
+        assert_eq!(ctl.live_in_hub.target_slot(), Some(0), "the tick resolved the slot");
     }
 
     /// Track D: the gain-ramp half of the same attach. `rebuild` builds no
