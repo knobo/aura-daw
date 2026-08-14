@@ -269,6 +269,10 @@ export interface TempoMapState {
 }
 
 export interface MidiNote {
+  /** Backend-minted stable identity (ADR 0001) — round-trip it untouched on
+   * edits; STRIP it on copies (note-ops copyNote), or the keep-rule re-mints
+   * both the copy and the original. Absent on frontend-drawn notes. */
+  noteId?: number;
   /** Onset, ticks relative to the clip start. */
   tick: number;
   lengthTicks: number;
