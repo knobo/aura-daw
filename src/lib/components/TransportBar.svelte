@@ -8,6 +8,7 @@
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { resetUiZoom, ui, toggleDock, zoomUiIn, zoomUiOut } from "../state/ui.svelte";
+  import { prefs } from "../prefs/prefs.svelte";
   import { mcp } from "../state/mcp.svelte";
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
@@ -176,9 +177,9 @@
     >
     <button
       class="chip"
-      class:on={ui.noteFlash}
+      class:on={prefs.values.noteFlash}
       title="Flash notes at the moment they play"
-      onclick={() => (ui.noteFlash = !ui.noteFlash)}>FLASH</button
+      onclick={() => prefs.set("noteFlash", !prefs.values.noteFlash)}>FLASH</button
     >
     <button
       class="chip exportchip"
@@ -190,7 +191,7 @@
     <span class="divider"></span>
     <button class="chip" title="Interface zoom out — smaller UI (Ctrl/Cmd −)" onclick={zoomUiOut}>A−</button>
     <button class="chip" title="Reset interface zoom (Ctrl/Cmd 0)" onclick={resetUiZoom}
-      >{Math.round(ui.zoom * 100)}%</button
+      >{Math.round(prefs.values.uiZoom * 100)}%</button
     >
     <button class="chip" title="Interface zoom in — bigger UI (Ctrl/Cmd +)" onclick={zoomUiIn}>A+</button>
     <span class="badge mono" title="Waveform renderer in use">{ui.rendererKind || "· · ·"}</span>

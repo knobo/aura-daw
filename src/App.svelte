@@ -14,7 +14,8 @@
   import { mcp } from "./lib/state/mcp.svelte";
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
   import { view } from "./lib/state/view.svelte";
-  import { initUiZoom, resetUiZoom, ui, zoomUiIn, zoomUiOut } from "./lib/state/ui.svelte";
+  import { resetUiZoom, ui, zoomUiIn, zoomUiOut } from "./lib/state/ui.svelte";
+  import { prefs } from "./lib/prefs/prefs.svelte";
   import { applyUiZoom } from "./lib/utils/ui-zoom";
   import { exporter } from "./lib/state/exporter.svelte";
   import { loopjam } from "./lib/state/loopjam.svelte";
@@ -26,13 +27,14 @@
   import PianoRoll from "./lib/components/pianoroll/PianoRoll.svelte";
   import Dock from "./lib/components/Dock.svelte";
   import McpConfirmDialog from "./lib/components/mcp/McpConfirmDialog.svelte";
+  import PreferencesDialog from "./lib/components/prefs/PreferencesDialog.svelte";
   import ExportDialog from "./lib/components/export/ExportDialog.svelte";
   import ProjectDialog from "./lib/components/project/ProjectDialog.svelte";
   import { projectops } from "./lib/state/projectops.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
 
   onMount(() => {
-    initUiZoom(); // restore the persisted interface zoom before anything paints
+    prefs.init(); // restore persisted preferences before anything paints or boots
     void transport.init();
     void project.init();
     void midi.init();
@@ -51,7 +53,7 @@
 
   // Interface zoom on <body> (not .app) so fixed overlays — dialogs,
   // toasts — scale along with the shell.
-  $effect(() => applyUiZoom(document.body, ui.zoom));
+  $effect(() => applyUiZoom(document.body, prefs.values.uiZoom));
 
   /** Where the playhead is right now — interpolated while rolling. */
   function playhead(): number {
@@ -75,6 +77,12 @@
       if (e.key === "0") {
         e.preventDefault();
         resetUiZoom();
+        return;
+      }
+      // Ctrl/Cmd+, — the conventional preferences shortcut.
+      if (e.key === "," && !e.altKey && !e.shiftKey) {
+        e.preventDefault();
+        prefs.dialogOpen = !prefs.dialogOpen;
         return;
       }
     }
@@ -182,6 +190,7 @@
 <McpConfirmDialog />
 <ExportDialog />
 <ProjectDialog />
+<PreferencesDialog />
 <Toasts />
 
 <style>

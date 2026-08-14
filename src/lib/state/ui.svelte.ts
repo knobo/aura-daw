@@ -1,6 +1,7 @@
 /** Small shared UI facts (renderer badge, right-dock tab). */
 
-import { readPref, writePref } from "../utils/prefs";
+import { PREF_SCHEMA } from "../prefs/schema";
+import { prefs } from "../prefs/prefs.svelte";
 
 export type DockTab = "" | "generate" | "hum" | "instruments" | "plugins" | "mcp";
 
@@ -11,44 +12,33 @@ export const ui = $state({
   dock: "" as DockTab,
   /** AI Studio: preselected job kind when opened from elsewhere. */
   studioKind: "aceStepGenerate",
-  /** Flash notes (piano roll, keys, clip bodies) as the playhead hits them. */
-  noteFlash: true,
   /** Piano roll panel height, CSS px. User-dragged (top edge); session only. */
   rollHeight: 340,
   /** Right dock width, CSS px. User-dragged (left edge); session only. */
   dockWidth: 340,
-  /** Interface zoom factor (CSS `zoom` on the shell) — persisted as a preference. */
-  zoom: 1,
 });
 
-export const UI_ZOOM_MIN = 0.8;
-export const UI_ZOOM_MAX = 2.0;
-export const UI_ZOOM_STEP = 0.1;
+// Interface zoom lives in the preferences store (prefs.values.uiZoom) —
+// clamp/snap/persistence all come from its schema entry. These helpers are
+// the ergonomic mutation API for shortcuts and the transport-bar chips.
+export const UI_ZOOM_MIN = PREF_SCHEMA.uiZoom.min;
+export const UI_ZOOM_MAX = PREF_SCHEMA.uiZoom.max;
+export const UI_ZOOM_STEP = PREF_SCHEMA.uiZoom.step;
 
-/** Clamp to [0.8, 2.0] and snap to the 0.1 grid so steps never drift. */
 export function setUiZoom(factor: number) {
-  if (!Number.isFinite(factor)) return;
-  const clamped = Math.min(UI_ZOOM_MAX, Math.max(UI_ZOOM_MIN, factor));
-  ui.zoom = Math.round(clamped * 10) / 10;
-  writePref("uiZoom", ui.zoom);
-}
-
-/** Restore the persisted zoom at boot; junk on disk falls through setUiZoom's guards. */
-export function initUiZoom() {
-  const stored = readPref("uiZoom");
-  if (typeof stored === "number") setUiZoom(stored);
+  prefs.set("uiZoom", factor);
 }
 
 export function zoomUiIn() {
-  setUiZoom(ui.zoom + UI_ZOOM_STEP);
+  setUiZoom(prefs.values.uiZoom + UI_ZOOM_STEP);
 }
 
 export function zoomUiOut() {
-  setUiZoom(ui.zoom - UI_ZOOM_STEP);
+  setUiZoom(prefs.values.uiZoom - UI_ZOOM_STEP);
 }
 
 export function resetUiZoom() {
-  setUiZoom(1);
+  setUiZoom(PREF_SCHEMA.uiZoom.default);
 }
 
 export function toggleDock(tab: Exclude<DockTab, "">) {

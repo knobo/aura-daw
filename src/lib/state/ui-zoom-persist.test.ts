@@ -1,13 +1,14 @@
 /**
  * Interface zoom persistence: the zoom factor survives an app restart.
- * setUiZoom writes the (already clamped/snapped) value to prefs, and
- * initUiZoom restores it at boot — ignoring junk, since anything on disk
- * still goes through setUiZoom's own validation.
+ * setUiZoom writes the (already clamped/snapped) value through the
+ * preferences store, and prefs.init() restores it at boot — ignoring junk,
+ * since anything on disk goes through the schema's own validation.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PREFS_KEY } from "../utils/prefs";
-import { initUiZoom, resetUiZoom, setUiZoom, ui } from "./ui.svelte";
+import { prefs } from "../prefs/prefs.svelte";
+import { resetUiZoom, setUiZoom } from "./ui.svelte";
 
 function fakeStorage(initial: Record<string, string> = {}) {
   const map = new Map(Object.entries(initial));
@@ -29,7 +30,7 @@ let storage: ReturnType<typeof fakeStorage>;
 beforeEach(() => {
   storage = fakeStorage();
   vi.stubGlobal("localStorage", storage);
-  ui.zoom = 1; // reset the singleton without touching prefs
+  prefs.values.uiZoom = 1; // reset the singleton without touching prefs
 });
 
 afterEach(() => {
@@ -53,33 +54,33 @@ describe("interface zoom persistence", () => {
     expect(storage.map.size).toBe(0);
   });
 
-  it("initUiZoom restores a stored zoom", () => {
+  it("prefs.init() restores a stored zoom", () => {
     storage.map.set(PREFS_KEY, JSON.stringify({ uiZoom: 1.5 }));
-    initUiZoom();
-    expect(ui.zoom).toBe(1.5);
+    prefs.init();
+    expect(prefs.values.uiZoom).toBe(1.5);
   });
 
-  it("initUiZoom keeps the default when nothing is stored", () => {
-    initUiZoom();
-    expect(ui.zoom).toBe(1);
+  it("prefs.init() keeps the default when nothing is stored", () => {
+    prefs.init();
+    expect(prefs.values.uiZoom).toBe(1);
   });
 
-  it("initUiZoom clamps an out-of-range stored value", () => {
+  it("prefs.init() clamps an out-of-range stored value", () => {
     storage.map.set(PREFS_KEY, JSON.stringify({ uiZoom: 99 }));
-    initUiZoom();
-    expect(ui.zoom).toBe(2);
+    prefs.init();
+    expect(prefs.values.uiZoom).toBe(2);
   });
 
-  it("initUiZoom ignores a non-numeric stored value", () => {
+  it("prefs.init() ignores a non-numeric stored value", () => {
     storage.map.set(PREFS_KEY, JSON.stringify({ uiZoom: "big" }));
-    initUiZoom();
-    expect(ui.zoom).toBe(1);
+    prefs.init();
+    expect(prefs.values.uiZoom).toBe(1);
   });
 
   it("a restored zoom survives the round trip exactly", () => {
     setUiZoom(1.7);
-    ui.zoom = 1; // simulate restart
-    initUiZoom();
-    expect(ui.zoom).toBe(1.7);
+    prefs.values.uiZoom = 1; // simulate restart
+    prefs.init();
+    expect(prefs.values.uiZoom).toBe(1.7);
   });
 });
