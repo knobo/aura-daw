@@ -596,14 +596,6 @@ impl Committer {
         }
     }
 
-    /// Executes a `HostForward` list a commit merely described — calling
-    /// the SAME host entry points commands call today
-    /// (`plugins::clap_host`/`lv2_host`/`state`'s `HostStateBridge`), now
-    /// sequenced after the session lock is released ([C1]: hosts have their
-    /// own locks, never called while the session lock is held — this
-    /// method takes ONLY brief re-locks of `self.session` to read a row's
-    /// format/uid or to write back a post-host result, never spanning a
-    /// host call).
     /// I-3: the `Instantiate` arm's post-host document writeback, split out
     /// of the match so it is testable without a live plugin host, and
     /// EPOCH-GUARDED (same rule as `execute_persist`: a document swapped
@@ -643,6 +635,14 @@ impl Committer {
         }
     }
 
+    /// Executes a `HostForward` list a commit merely described — calling
+    /// the SAME host entry points commands call today
+    /// (`plugins::clap_host`/`lv2_host`/`state`'s `HostStateBridge`), now
+    /// sequenced after the session lock is released ([C1]: hosts have their
+    /// own locks, never called while the session lock is held — this
+    /// method takes ONLY brief re-locks of `self.session` to read a row's
+    /// format/uid or to write back a post-host result, never spanning a
+    /// host call).
     pub(crate) fn execute_host_forward(&self, forwards: &[session::HostForward], committed_epoch: u64) {
         use crate::plugins::{clap_host, lv2_host, state as pstate};
         use session::HostForward;
