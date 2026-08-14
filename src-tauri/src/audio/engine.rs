@@ -188,6 +188,8 @@ pub fn start(
                 last_tick: Instant::now(),
                 committer,
                 ensure_project_fn: None,
+                param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
+                param_writes: Vec::new(),
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -566,6 +568,14 @@ struct Control {
     /// is the ONLY way `ensure_project` touches project fields — this
     /// thread never swaps `store.project_dir` itself.
     ensure_project_fn: Option<Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>>,
+    /// Track D: this rebuild's compiled plugin-parameter lanes. Ticked by
+    /// `run` (control thread, ≤2 ms), never by the audio callback — a host
+    /// param write is a blocking round-trip. Rebuilt wholesale at every
+    /// `rebuild`, like the graph itself.
+    param_automation: crate::plugins::automation::ParamAutomationDriver,
+    /// Reused scratch for `param_automation.tick` so the tick allocates
+    /// nothing steady-state.
+    param_writes: Vec<crate::plugins::automation::ParamWrite>,
 }
 
 impl Control {
@@ -598,6 +608,7 @@ impl Control {
             }
             self.drain_meters();
             self.drain_rt_events();
+            self.drive_param_automation();
             self.headless_advance();
             self.pump_meter_frames();
         }
@@ -765,7 +776,7 @@ impl Control {
         self.ensure_loaded();
         self.generation += 1;
         let headless = self.output.is_none();
-        let graph = {
+        let (graph, param_driver) = {
             let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
@@ -799,7 +810,9 @@ impl Control {
             // tables (Task 6) — the meter fold resolves blocks under
             // whichever generation produced them, not the current tables.
             self.gen_maps.publish(self.generation, &slots);
-            if headless {
+            let (gain_ramps, param_driver) =
+                self.compile_automation(&session, &slots, store.tracks.len());
+            let graph = if headless {
                 // Headless keeps its narrow scope [I5]: tables are enough
                 // to serve knob writes and recording resolution with no
                 // output device — no clip assembly, no live/plugin node
@@ -863,9 +876,17 @@ impl Control {
                 self.shared
                     .song_end
                     .store(offline::song_end(&tracks), Relaxed);
-                Some(Box::new(RtGraph::new(tracks, self.generation, params)))
-            }
+                let mut g = RtGraph::new(tracks, self.generation, params);
+                // RCU: the ramp table is attached BEFORE the graph is
+                // published, so the callback only ever sees a snapshot whose
+                // ramps already belong to it — and a retired graph keeps
+                // reading its own table, exactly like `params`.
+                g.set_gain_ramps(gain_ramps);
+                Some(Box::new(g))
+            };
+            (graph, param_driver)
         };
+        self.param_automation = param_driver;
         let Some(graph) = graph else { return };
         let Some(out) = self.output.as_mut() else { return };
         // Free anything the callback already retired before queueing more.
@@ -882,6 +903,73 @@ impl Control {
             self.rebuild_pending = true;
             log::warn!("audio: graph queue full, rebuild retried next tick");
         }
+    }
+
+    /// Track D: compile the session's automation lanes into this rebuild's
+    /// two products — a slot-indexed gain-ramp table for the graph, and the
+    /// control thread's plugin-param driver. CONTROL THREAD, called from
+    /// `rebuild` under the same session guard that derived `slots`: this is
+    /// where ticks become absolute samples, so nothing tick-shaped ever
+    /// crosses onto the RT thread (ARCHITECTURE §13/§15.1).
+    ///
+    /// `n_slots` is the TRACK COUNT `ParamTable` was sized with, not
+    /// `slots.len()`, so the ramp table and the param table index alike.
+    /// A tempo map needs a rate; before a device opens (`cache_rate` 0)
+    /// there is nothing to compile against, and both products come back
+    /// empty rather than compiled at a made-up rate.
+    fn compile_automation(
+        &self,
+        session: &Session,
+        slots: &HashMap<crate::ids::TrackId, usize>,
+        n_slots: usize,
+    ) -> (
+        Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>>,
+        crate::plugins::automation::ParamAutomationDriver,
+    ) {
+        use crate::plugins::automation as auto;
+        let map = crate::midi::TempoMap::new(
+            session.midi.ppq,
+            session.midi.tempo_events.clone(),
+            self.cache_rate,
+        )
+        .ok();
+        let Some(map) = map else {
+            return ((0..n_slots).map(|_| None).collect(), auto::ParamAutomationDriver::empty());
+        };
+        let ramps = auto::compile_gain_ramps(&session.automation.lanes, &map, n_slots, &|tid| {
+            slots.get(tid).copied()
+        });
+        let driver = auto::ParamAutomationDriver::new(&session.automation.lanes, &session.plugins, &map);
+        (ramps, driver)
+    }
+
+    /// Track D: apply plugin-parameter automation at this thread's own tick
+    /// (≤2 ms), never on the audio callback — a host param write is a
+    /// blocking round-trip and is banned there ([C1]).
+    ///
+    /// The writes go to the HOST ONLY, never to the document. That is the
+    /// point, not an omission: automation OVERRIDES the stored knob value
+    /// during playback, while the document keeps what the user set (which is
+    /// what gets saved and what the param panel shows). Routing these
+    /// through the channel would either trip the M-3 transient invariant
+    /// (`ObjectRef::Plugin` is a field history entries address) or push an
+    /// undo entry and a `project.json` write every 2 ms. Recorded in
+    /// `docs/SIDE-CHANNEL-INVENTORY.md`.
+    ///
+    /// Only while the transport is playing: a stopped transport leaves the
+    /// last automated value in place, which is what the user sees and hears
+    /// until they move the knob or reload the project.
+    fn drive_param_automation(&mut self) {
+        if self.param_automation.is_empty() || !self.shared.playing.load(Relaxed) {
+            return;
+        }
+        let pos = self.shared.position.load(Relaxed);
+        let mut writes = std::mem::take(&mut self.param_writes);
+        self.param_automation.tick(pos, &mut writes);
+        for w in writes.iter() {
+            crate::control::forward_param_to_host(&w.instance, &w.format, w.index, w.value);
+        }
+        self.param_writes = writes;
     }
 
     /// Decode any clip sources missing from the cache (at the engine rate,
@@ -1775,8 +1863,118 @@ mod tests {
             last_tick: Instant::now(),
             committer,
             ensure_project_fn: None,
+            param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
+            param_writes: Vec::new(),
         };
         (ctl, session)
+    }
+
+    fn test_track(id: &str) -> super::super::types::TrackState {
+        super::super::types::TrackState {
+            id: id.into(),
+            name: id.into(),
+            kind: "audio".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        }
+    }
+
+    fn test_lane(id: &str, target: &str, param_id: u32) -> crate::plugins::automation::AutomationLane {
+        use crate::plugins::automation::{AutomationLane, AutomationPoint};
+        AutomationLane {
+            id: id.into(),
+            target_node: target.into(),
+            param_id,
+            points: vec![
+                AutomationPoint { tick: 0, value: 1.0 },
+                AutomationPoint { tick: 3840, value: 0.0 },
+            ],
+        }
+    }
+
+    /// Track D: a rebuild compiles the session's plugin-param lanes into the
+    /// control-thread driver. Headless (`bare_control`) builds no graph, so
+    /// the driver is the observable half of the attach here; the gain-ramp
+    /// half is pinned by `rebuild_compiles_track_gain_lanes_by_slot` below
+    /// (the compile step `rebuild` itself calls) and at the mixer seam
+    /// (`audio::mixer`'s `track_gain_ramp_*` tests).
+    #[test]
+    fn rebuild_compiles_plugin_param_lanes_into_the_driver() {
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000; // headless has no device; the tempo map needs a rate
+        {
+            let mut s = session.lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: None,
+            });
+            s.automation.lanes.push(test_lane("l1", "inst-1", 7));
+        }
+        assert!(ctl.param_automation.is_empty(), "nothing compiled before the rebuild");
+        ctl.rebuild();
+        assert!(!ctl.param_automation.is_empty(), "the rebuild compiled the lane");
+
+        // A rebuild AFTER the lane is gone drops it again — a deleted lane
+        // stops driving only because the driver is rebuilt wholesale.
+        session.lock().automation.lanes.clear();
+        ctl.rebuild();
+        assert!(ctl.param_automation.is_empty());
+    }
+
+    /// Track D: the gain-ramp half of the same attach. `rebuild` builds no
+    /// graph headlessly (no cpal stream is constructible in-process), so the
+    /// compile step is exercised exactly as `rebuild` calls it — with the
+    /// real `derive_slots` map — and the assertion is on SLOT INDEXING: the
+    /// lane names the SECOND track, so a ramp landing at slot 0 would
+    /// automate the wrong track's audio.
+    #[test]
+    fn rebuild_compiles_track_gain_lanes_by_slot() {
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.tracks.push(test_track("t-2"));
+            s.automation.lanes.push(test_lane("l1", "track:t-2", 0));
+            s.automation.lanes.push(test_lane("l2", "track:ghost", 0));
+            s.automation.lanes.push(test_lane("l3", "inst-1", 7));
+        }
+        let (ramps, driver) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, s.store.tracks.len())
+        };
+        assert_eq!(ramps.len(), 2, "one entry per track slot, like ParamTable");
+        assert!(ramps[0].is_none(), "t-1 has no lane — an unautomated track must stay unramped");
+        let ev = ramps[1].as_ref().expect("t-2's lane compiled into ITS slot");
+        assert_eq!(ev.first().map(|e| e.value), Some(1.0));
+        assert_eq!(ev.last().map(|e| e.value), Some(0.0));
+        assert!(
+            ev.last().unwrap().sample > 0,
+            "ticks became absolute samples on the control thread"
+        );
+        assert!(driver.is_empty(), "no such plugin instance — the plugin lane resolves to nothing");
+
+        // No rate (headless before a device opens) yields a tempo map error:
+        // nothing is compiled rather than something compiled at rate 0.
+        ctl.cache_rate = 0;
+        let (ramps, driver) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, s.store.tracks.len())
+        };
+        assert_eq!(ramps.len(), 2, "still one entry per slot, just nothing in them");
+        assert!(ramps.iter().all(|r| r.is_none()));
+        assert!(driver.is_empty());
     }
 
     /// Plan E Task 13's TDD step 1, at the real `Control` methods (not just

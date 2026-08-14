@@ -50,6 +50,13 @@ pub struct OfflineGraph {
 /// (what you hear is what you export). Slots are derived fresh from display
 /// order (round-2 §2.4) — this graph is exclusively owned, so there is no
 /// cross-generation aliasing concern to begin with.
+///
+/// ONE KNOWN DIVERGENCE (Track D, automation audible): `rebuild` now attaches
+/// compiled track-gain lanes to its graph (`RtGraph::set_gain_ramps`) and this
+/// does not — no `AutomationDoc` reaches here, so an export ignores automation
+/// that live playback obeys. Closing it needs the lanes in `ExportSnapshot`
+/// and one `compile_gain_ramps` call; deliberately not smuggled into the
+/// engine task's diff.
 pub fn build_graph(
     store: &Store,
     midi: &MidiStore,

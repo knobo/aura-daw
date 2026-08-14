@@ -750,17 +750,16 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
         // struct key, just a string id, so no new `ObjectRef` variant is
         // needed (checked against the brief's NEEDS_CONTEXT trigger).
         //
-        // REBUILD PIN (brief-mandated file:line cite): this op does NOT set
-        // `effect.rebuild`. `engine::rebuild` (src/audio/engine.rs:684) never
-        // reads `session.automation` — automation lanes are compiled to
-        // absolute-sample ramps and attached to a live node only through
-        // `GainAutomatedNode` (this file's module, `plugins/automation.rs`),
-        // and nothing in the production graph build wires that node in yet
-        // (see this crate's `plugins/automation.rs` module doc: "Production
-        // graph rebuilds do not yet attach lanes to nodes (roadmap:
-        // automation editing UI round)"). So today automation edits have no
-        // RT-visible effect to rebuild for; when a future round wires lanes
-        // into the graph, this arm needs `effect.rebuild = true` too.
+        // REBUILD PIN — RESOLVED (Track D, automation audible). Until this
+        // task, `engine::rebuild` never read `session.automation`, so a lane
+        // edit had no RT-visible effect and this arm deliberately set no
+        // `effect.rebuild`. It does now: `rebuild` compiles track-gain lanes
+        // into `RtGraph::gain_ramps` (slot-indexed, versioned with the
+        // snapshot) and plugin-param lanes into the control thread's
+        // `ParamAutomationDriver`. Both are rebuilt WHOLESALE from the
+        // session at every rebuild, so an upsert AND a delete must schedule
+        // one — a deleted lane's ramp comes off the graph only by rebuilding
+        // without it.
         Op::AutomationSetLane { key, lane } => {
             let pos = session.automation.lanes.iter().position(|l| &l.id == key);
             // Validate + normalize BEFORE any mutation (atomic — round-2 §4:
@@ -791,6 +790,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 }
             };
             effect.persist.automation = true;
+            effect.rebuild = true;
             Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
         }
         // Plan E Task 9 (round-2 inventory rows 12-15): plugin instance
@@ -2085,8 +2085,8 @@ mod tests {
         assert_eq!(m.lock().automation.lanes, vec![lane]);
         assert!(c.effect.persist.automation, "lane write must persist automation");
         assert!(
-            !c.effect.rebuild,
-            "automation lanes aren't read at graph-build time yet (audio/engine.rs:684) — no rebuild"
+            c.effect.rebuild,
+            "Track D flipped the REBUILD PIN: `engine::rebuild` reads session.automation now"
         );
         match &c.inverses[0] {
             Op::AutomationSetLane { key, lane } => {
@@ -2280,6 +2280,39 @@ mod tests {
             "apply normalizes (sorts) points before storing"
         );
     }
+
+    /// THE REBUILD PIN (Track D). Until the engine read `session.automation`,
+    /// this arm deliberately set no engine effect — the arm's own comment
+    /// named the day this would have to change. That day is Task 9's.
+    #[test]
+    fn automation_set_lane_schedules_a_rebuild() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let lane = test_lane("lane-a", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        let c = Session::transact(&m, TxMeta::user("edit automation"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "lane-a".into(), lane: Some(lane) })
+        })
+        .unwrap();
+        assert!(c.effect.rebuild, "the engine reads session.automation now — lanes must rebuild");
+        assert!(c.effect.persist.automation, "and still persist");
+    }
+
+    /// Deleting a lane rebuilds too — the ramp must come OFF the graph, and
+    /// it only can by rebuilding a graph without it.
+    #[test]
+    fn automation_lane_delete_schedules_a_rebuild() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        m.lock()
+            .automation
+            .lanes
+            .push(test_lane("lane-a", vec![AutomationPoint { tick: 0, value: 1.0 }]));
+        let c = Session::transact(&m, TxMeta::user("edit automation"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "lane-a".into(), lane: None })
+        })
+        .unwrap();
+        assert!(m.lock().automation.lanes.is_empty());
+        assert!(c.effect.rebuild);
+    }
+
     // ---- Plan E Task 9: plugin op kinds ----
 
     fn test_plugin_row(id: &str) -> PluginInstanceInfo {

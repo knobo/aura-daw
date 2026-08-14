@@ -5412,7 +5412,7 @@ mod tests {
             })
             .unwrap();
         assert!(committed.effect.persist.automation);
-        assert!(!committed.effect.rebuild, "automation edits don't rebuild yet (see session.rs's arm doc)");
+        assert!(committed.effect.rebuild, "Track D: a lane edit rebuilds (see session.rs's arm doc)");
 
         // By the time `commit` returned above, the write already happened
         // (persist runs synchronously inside `commit`, before the event
