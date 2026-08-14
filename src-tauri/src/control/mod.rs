@@ -14,6 +14,7 @@
 //!                plus its own `#[tauri::command]` wrappers
 //!                (`get_project_state`, `set_track_mix`, `import_audio_clip`).
 
+pub mod clipboard;
 pub mod import;
 pub mod hum;
 pub mod export;
@@ -3104,7 +3105,7 @@ mod tests {
     /// have no entries). Publish a table matching the seeded tracks up
     /// front so the next person asserting `params.gain` post-commit gets a
     /// real failure instead of a silent no-op.
-    fn test_plane_with_tracks(
+    pub(crate) fn test_plane_with_tracks(
         ids: &[&str],
     ) -> (ControlPlane, crossbeam_channel::Receiver<ControlMsg>, RecordedEvents) {
         let mut store = Store::default();
@@ -4945,7 +4946,7 @@ mod tests {
         }
     }
 
-    fn dummy_midi_clip(track_id: &str) -> crate::midi::MidiClip {
+    pub(crate) fn dummy_midi_clip(track_id: &str) -> crate::midi::MidiClip {
         crate::midi::MidiClip {
             id: "mc1".into(),
             track_id: track_id.into(),

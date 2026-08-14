@@ -156,6 +156,7 @@ pub fn run() {
             control::set_track_mix,
             control::move_clip,
             control::move_clips,
+            control::clipboard::clips_copy,
             control::gesture_begin,
             control::gesture_end,
             // ---- control plane: undo/redo (Plan E Task 17, additive) ----
