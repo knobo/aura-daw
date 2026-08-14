@@ -314,6 +314,19 @@ pub struct PersistEffect {
     pub automation: bool,
 }
 
+impl PersistEffect {
+    /// OR every field of `other` into `self`. An open gesture accumulates
+    /// the persist effects of the transient commits it folds and executes
+    /// the union ONCE at `close_gesture` (I-8): a knob or lane drag is one
+    /// `project.json` write, not one per rAF batch.
+    pub fn merge(&mut self, other: &PersistEffect) {
+        self.midi |= other.midi;
+        self.project |= other.project;
+        self.plugins |= other.plugins;
+        self.automation |= other.automation;
+    }
+}
+
 pub struct Committed {
     pub rev: u64,
     /// `Session::epoch` as observed under the SAME lock as `rev` — see that
@@ -1359,6 +1372,18 @@ mod tests {
             instrument_id: None,
         });
         Session::new(store, MidiStore::default())
+    }
+
+    #[test]
+    fn persist_effect_merge_ors_every_field() {
+        let mut a = PersistEffect { midi: true, project: false, plugins: false, automation: false };
+        let b = PersistEffect { midi: false, project: true, plugins: true, automation: false };
+        a.merge(&b);
+        assert_eq!(a, PersistEffect { midi: true, project: true, plugins: true, automation: false });
+        // merging default changes nothing
+        let before = a.clone();
+        a.merge(&PersistEffect::default());
+        assert_eq!(a, before);
     }
 
     #[test]

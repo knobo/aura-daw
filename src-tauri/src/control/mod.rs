@@ -357,6 +357,30 @@ impl Committer {
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
         R: FnOnce(),
     {
+        self.commit_with_rebuild_full(meta, f, emit_project_changed, do_rebuild, history_mode, false)
+    }
+
+    /// [`Self::commit_with_rebuild_mode`] with an explicit `defer_persist`
+    /// (I-8): when `true`, the persist described by this commit's
+    /// `PersistEffect` is NOT executed here — the caller (an open gesture,
+    /// via `ControlPlane::commit_transient_for_gesture`) accumulates it
+    /// instead and executes the union once at `close_gesture`. Every other
+    /// existing caller goes through `commit_with_rebuild_mode`'s delegate
+    /// above, which passes `false` — byte-identical behaviour to before
+    /// this fn existed.
+    pub(crate) fn commit_with_rebuild_full<F, R>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+        emit_project_changed: bool,
+        do_rebuild: R,
+        history_mode: history::HistoryMode,
+        defer_persist: bool,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+        R: FnOnce(),
+    {
         let committed = Session::transact(&self.session, meta, f)?;
         // ---- session lock is released here; everything below executes
         // the effect the session merely described. ----
@@ -431,7 +455,7 @@ impl Committer {
         // truth, so persistence must have already happened by the time it
         // fires (round-2 §4: persistence is an effect, executed here, never
         // I/O under the session lock).
-        if committed.effect.persist != session::PersistEffect::default() {
+        if !defer_persist && committed.effect.persist != session::PersistEffect::default() {
             self.execute_persist(&committed.effect.persist, committed.epoch);
         }
         // THE OP LOG (Plan E Task 17, Gate E). After the effects — a batch
@@ -920,6 +944,15 @@ struct OpenGesture {
     /// recent fold (overwritten every time the key reappears).
     last: Vec<(CoalesceKey, op::Op)>,
     label: String,
+    /// Union of the persist effects of every commit folded into this
+    /// gesture, executed ONCE at `close_gesture` (I-8). Deferring is what
+    /// turns "one project.json write per rAF batch" into "one per drag".
+    persist: session::PersistEffect,
+    /// `Committed.epoch` of the LAST folded commit — what `execute_persist`
+    /// checks against the current session epoch at close. An epoch boundary
+    /// mid-gesture swaps the document out from under the accumulated
+    /// snapshot, and the epoch's own save owns durability from there.
+    epoch: u64,
 }
 
 /// Holds the (at most one) open gesture. `ControlPlane` owns one instance;
@@ -953,8 +986,15 @@ impl GestureState {
     fn begin(&self, label: String, actor: op::Actor) -> Option<OpenGesture> {
         let mut guard = self.0.lock();
         let stale = guard.take();
-        *guard =
-            Some(OpenGesture { actor, run: uuid::Uuid::new_v4().to_string(), baselines: Vec::new(), last: Vec::new(), label });
+        *guard = Some(OpenGesture {
+            actor,
+            run: uuid::Uuid::new_v4().to_string(),
+            baselines: Vec::new(),
+            last: Vec::new(),
+            label,
+            persist: session::PersistEffect::default(),
+            epoch: 0,
+        });
         stale
     }
 
@@ -1032,6 +1072,8 @@ impl GestureState {
     /// undo). Private, `&mut OpenGesture`-taking helper — the only caller
     /// is `commit_transient_and_fold`, which already holds this mutex.
     fn fold_committed(g: &mut OpenGesture, committed: &session::Committed) {
+        g.persist.merge(&committed.effect.persist);
+        g.epoch = committed.epoch;
         for (op, inv) in committed.ops.iter().zip(committed.inverses.iter()) {
             let Some(key) = CoalesceKey::for_op(op) else { continue };
             if !g.baselines.iter().any(|(k, _)| *k == key) {
@@ -1555,7 +1597,7 @@ impl ControlPlane {
         // runs is a RUNTIME decision this code can't make ahead of time.
         let gesture_meta = meta.clone();
         let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
-            self.commit_with(gesture_meta.transient(), |tx| apply_mix_changes(&changes, tx), false)
+            self.commit_transient_for_gesture(gesture_meta, |tx| apply_mix_changes(&changes, tx))
         });
         match gesture_result {
             Some(result) => {
@@ -1706,6 +1748,35 @@ impl ControlPlane {
         self.committer.commit_with_rebuild(meta, f, emit_project_changed, || {
             self.engine.send(ControlMsg::Rebuild)
         })
+    }
+
+    /// The commit shape every gesture-folding caller uses (`set_track_mix`,
+    /// `set_plugin_params`, `set_automation_lane`): TRANSIENT (no history
+    /// entry, no journal line — the synthesized gesture batch is the
+    /// history-bound one), `emit_project_changed: false` (the gesture emits
+    /// exactly one at close), and `defer_persist: true` (I-8 — the persist
+    /// rides `close_gesture`, once).
+    ///
+    /// Callers must only reach this from INSIDE
+    /// `GestureState::commit_transient_and_fold`, which is what guarantees
+    /// the deferred persist is actually accumulated by an open gesture
+    /// rather than silently dropped.
+    fn commit_transient_for_gesture<F>(
+        &self,
+        meta: op::TxMeta,
+        f: F,
+    ) -> Result<session::Committed, String>
+    where
+        F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
+    {
+        self.committer.commit_with_rebuild_full(
+            meta.transient(),
+            f,
+            false,
+            || self.engine.send(ControlMsg::Rebuild),
+            history::HistoryMode::Record,
+            true,
+        )
     }
 
     // ---- undo / redo (Plan E Task 17 — the log turns on) -----------------
@@ -1896,6 +1967,10 @@ impl ControlPlane {
         if gesture.last.is_empty() {
             return;
         }
+        // I-8: read BEFORE the fields below are moved out of `gesture` by
+        // the destructuring that follows.
+        let gesture_persist = gesture.persist;
+        let gesture_epoch = gesture.epoch;
         let ops: Vec<op::Op> = gesture.last.into_iter().map(|(_, op)| op).collect();
         let mut inverses: Vec<op::Op> = gesture.baselines.into_iter().map(|(_, op)| op).collect();
         inverses.reverse();
@@ -1932,6 +2007,13 @@ impl ControlPlane {
             &committed.inverses,
         );
         *self.last_gesture_batch.lock() = Some(committed);
+
+        // I-8: the whole drag's persist, once, here — never once per folded
+        // commit. Before the emit, for the same reason `commit_with_rebuild_full`
+        // persists before its own emit: the event announces durable truth.
+        if gesture_persist != session::PersistEffect::default() {
+            self.committer.execute_persist(&gesture_persist, gesture_epoch);
+        }
 
         // Same payload shape `Committer::commit_with_rebuild` emits (Task
         // 13's frozen `project://changed` contract) — the full `Project`
@@ -3577,6 +3659,77 @@ mod tests {
             .collect();
         finals.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(finals, vec![("t-1".to_string(), -6.0), ("t-2".to_string(), -4.0)]);
+    }
+
+    /// I-8 (Plan E whole-branch review): folding a knob drag into a gesture is
+    /// only half the fix — a TRANSIENT commit still executes its full
+    /// `EngineEffect`, persist included, so `project.json` was still rewritten
+    /// once per rAF batch. Deferring the persist onto the open gesture is what
+    /// makes "one drag = one write" true.
+    #[test]
+    fn a_gesture_defers_its_folded_commits_persist_and_executes_it_once_at_close() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let dir = std::env::temp_dir().join(format!(
+            "aura-gesture-persist-{}-{}", std::process::id(), uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_p, dir) = crate::audio::project::create(&dir, "Song", 48_000, 120.0).unwrap();
+        {
+            let mut s = cp.session().lock();
+            s.store.project_dir = Some(dir.clone());
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        let stored_value = |dir: &std::path::Path| -> Option<f64> {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("project.json")).ok()?).ok()?;
+            v.get("plugins")?.as_array()?.iter()
+                .find(|r| r["id"] == "inst-1")?
+                .get("params")?.as_array()?.iter()
+                .find(|p| p["id"] == 7)?
+                .get("value")?.as_f64()
+        };
+
+        cp.gesture_begin("plugin param drag".into()).unwrap();
+        // `commit_transient_for_gesture` is only sound INSIDE
+        // `GestureState::commit_transient_and_fold` (its own doc) — that is
+        // what folds the persist effect into the open gesture's accumulator
+        // (`fold_committed`) and marks `IN_GESTURE_FOLD` for the M-3
+        // sanctioned-transient check. `set_track_mix` wraps it the same
+        // way; this test drives the same path directly rather than through
+        // a mix change.
+        for v in [0.25f64, 0.5, 0.75] {
+            cp.gesture
+                .commit_transient_and_fold(&op::Actor::User, || {
+                    cp.commit_transient_for_gesture(op::TxMeta::user("plugin set param"), |tx| {
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Plugin("inst-1".into()),
+                            path: op::PropPath::Param { index: 7 },
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!(v),
+                        })
+                    })
+                })
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            stored_value(&dir).is_none() || stored_value(&dir) == Some(0.0),
+            "no project.json write may land while the gesture is open"
+        );
+
+        cp.gesture_end().unwrap();
+        assert_eq!(stored_value(&dir), Some(0.75), "one write, at close, with the LAST value");
+        let (undo_depth, _redo) = cp.history_depths();
+        assert_eq!(undo_depth, 1, "three folded commits, one undo entry");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     /// `gesture_begin` while one is already open auto-closes the stale
