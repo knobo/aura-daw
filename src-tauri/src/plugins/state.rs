@@ -6,12 +6,15 @@
 //! * The **APST chunked state blob** written to
 //!   `<project>/plugins/<instanceId>.state` — opaque binary, never inline
 //!   JSON (the AMEV rule of SCALABILITY §3 applied to plugin state).
-//! * **Project v2 `plugins[]` persistence** (`persistedInstance` rows):
-//!   [`save_into_project`] runs on every plugin mutation (same auto-persist
-//!   philosophy as midi edits — the frozen `save_project` command cannot be
-//!   extended this round); [`restore_into_registry`] +
-//!   [`reactivate_restored`] run on project open through the
-//!   `midi::persist::load_from_project` adoption seam.
+//! * **Project v2 `plugins[]` persistence** (`persistedInstance` rows) —
+//!   the document (`control::session::PluginDoc`, Task 9) lives in
+//!   `Session.plugins`; [`save_snapshot_into_project`] persists a SNAPSHOT
+//!   of it on every commit that touches plugins (`PersistEffect::plugins`,
+//!   `ControlPlane::execute_persist`), same auto-persist philosophy as midi
+//!   edits. [`restore_into_session`]/[`adopt_open_project`] +
+//!   [`reactivate_restored`] run on project open through
+//!   `midi::sync_midi_store`'s adoption seam (called AFTER its session
+//!   guard drops — see `adopt_open_project`'s doc for the lock contract).
 //! * The **host state bridge** ([`HostStateBridge`]) — the contract through
 //!   which zones P1 (CLAP state extension) / P2 (LV2) serialize live
 //!   instance state on the plugin main thread. Until a bridge registers,
@@ -31,6 +34,17 @@
 //!   without state.
 //! * `stateRef` is path-traversal-safe: only `plugins/<name>.state` directly
 //!   inside the project directory resolves.
+//!
+//! **Known gap (Task 9 review round 1, Important-4)**: live host state is
+//! captured on `save` only via an explicit op that already produced fresh
+//! `pending_state` bytes (`PluginRemove`'s captured blob, `PluginSetState`)
+//! or via `with_host_state: true` (seed_demo's own instantiate path
+//! currently the only production caller — ordinary auto-persist always
+//! passes `false`, since a bare param write must not round-trip the plugin
+//! main thread per rAF batch). A user tweaking a plugin through ITS OWN
+//! native GUI (no AURA op involved at all) is NEVER captured by this path —
+//! that state is lost on save/reopen until a later round adds a periodic
+//! host-state poll.
 
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};
@@ -282,19 +296,31 @@ pub struct PersistedPluginInstance {
 /// State source priority per instance (never lose data):
 /// 1. live host state via the registered [`HostStateBridge`] (only when
 ///    `with_host_state` — param-mirror updates skip the host round-trip),
-/// 2. the existing on-disk blob (kept verbatim),
-/// 3. the pending blob captured earlier (`doc.pending_state` — host not yet
-///    available, or a restore-from-blob undo; written back only when the
-///    file vanished). These bytes are ALREADY APST-encoded (self-describing
-///    — see `PluginDoc`'s doc), so they're written verbatim, never
-///    re-encoded.
+/// 2. `doc.pending_state`, when `doc.dirty_state` marks it newer than disk
+///    (`PluginRemove`'s captured blob, `PluginSetState`'s new blob — Task 9
+///    review round 1, Critical-2: a SECOND `PluginSetState` for the same
+///    instance must not be silently dropped just because the FIRST one
+///    already produced a `.state` file that "exists"),
+/// 3. the existing on-disk blob (kept verbatim) — the pre-Critical-2
+///    fallback, still correct for a NON-dirty id (e.g. one whose blob was
+///    only ever restored from that exact file, never touched this session),
+/// 4. the pending blob when nothing is on disk yet (host not yet available
+///    for a restored instance). These bytes are ALREADY APST-encoded
+///    (self-describing — see `PluginDoc`'s doc), so they're written
+///    verbatim in cases 2/4, never re-encoded.
 ///
 /// The param snapshot from the document mirror always persists in the row.
+///
+/// Returns the ids whose `dirty_state` flag the CALLER should now clear
+/// (every dirty id actually written this call — cases 2 above); `execute_
+/// persist` does that clearing under a short session lock (this function
+/// itself never touches `Session`, only the plain `doc` snapshot it was
+/// handed).
 pub fn save_snapshot_into_project(
     dir: &Path,
     doc: &PluginDoc,
     with_host_state: bool,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     save_snapshot_into_project_with(
         dir,
         doc,
@@ -310,7 +336,7 @@ pub fn save_snapshot_into_project_with(
     doc: &PluginDoc,
     with_host_state: bool,
     bridge: Option<&dyn HostStateBridge>,
-) -> Result<(), String> {
+) -> Result<Vec<String>, String> {
     let sdir = state_dir(dir);
     // Deterministic on-disk ordering (matches the retired
     // `save_into_project`'s `HashMap`-derived sort) — `doc.instances` itself
@@ -321,6 +347,7 @@ pub fn save_snapshot_into_project_with(
 
     let mut rows = Vec::with_capacity(instances.len());
     let mut live_files: Vec<String> = Vec::new();
+    let mut cleared_dirty: Vec<String> = Vec::new();
     for info in instances {
         if !safe_component(&info.id) {
             log::warn!("plugins: refusing to persist unsafe instance id {:?}", info.id);
@@ -339,11 +366,31 @@ pub fn save_snapshot_into_project_with(
         };
 
         let file = sdir.join(format!("{}.state", info.id));
+        let is_dirty = doc.dirty_state.contains(&info.id);
         let mut state_ref = None;
         if let Some(blob) = fresh {
             fs::create_dir_all(&sdir).map_err(|e| e.to_string())?;
             write_state_file(&file, &info.uid, &blob)?;
             state_ref = Some(blob_rel(&info.id));
+            // Fresh host state is even more authoritative than a dirty
+            // pending blob — satisfies the same "now on disk" invariant.
+            if is_dirty {
+                cleared_dirty.push(info.id.clone());
+            }
+        } else if is_dirty {
+            if let Some(pending_bytes) = doc.pending_state.get(&info.id) {
+                // Dirty beats "file exists" (Critical-2 fix): these bytes
+                // are newer than the file, if any.
+                fs::create_dir_all(&sdir).map_err(|e| e.to_string())?;
+                write_state_bytes(&file, pending_bytes)?;
+                state_ref = Some(blob_rel(&info.id));
+                cleared_dirty.push(info.id.clone());
+            } else if file.exists() {
+                // Dirty but nothing pending (shouldn't happen — defensive):
+                // fall back to whatever's on disk rather than losing the
+                // reference.
+                state_ref = Some(blob_rel(&info.id));
+            }
         } else if file.exists() {
             // Keep whatever is on disk (possibly written by an older or
             // newer session) — referenced files survive GC.
@@ -391,7 +438,7 @@ pub fn save_snapshot_into_project_with(
             }
         }
     }
-    Ok(())
+    Ok(cleared_dirty)
 }
 
 /// Read the `plugins[]` rows of `<dir>/project.json`. `Ok(None)` when the
@@ -425,32 +472,28 @@ pub fn load_rows(dir: &Path) -> Result<Option<Vec<PersistedPluginInstance>>, Str
 /// [`reactivate_restored`] then flips available plugins to `"active"`;
 /// unavailable ones stay stub with everything preserved.
 ///
-/// Returns `(restored_count, prior_hosted)` — `(format, id)` pairs of the
-/// PREVIOUS session's active instances; the caller unregisters them from
-/// their format hosts (without holding the session lock — this function is
-/// called WITH the lock held, so all host bookkeeping is the CALLER's job,
-/// same contract the retired `restore_into_registry` had). Projects WITHOUT
-/// a `plugins` field leave the document untouched (`(0, vec![])`): the
-/// document is app-level state until a project has actually persisted
-/// plugin data.
-pub fn restore_into_session(
-    dir: &Path,
-    session: &mut Session,
-) -> Result<(usize, Vec<(String, String)>), String> {
-    let Some(rows) = load_rows(dir)? else { return Ok((0, Vec::new())) };
+/// A restored row, fully assembled from disk — plain data, no `Session`
+/// reference. Task 9 review round 1 (Critical-1/Important-2): splitting
+/// "read from disk" from "install into the document" is what lets the
+/// production path (`adopt_open_project`) do the disk I/O with NO session
+/// lock held at all, then take one SHORT lock just to swap the document's
+/// contents in.
+struct RestoredRow {
+    info: PluginInstanceInfo,
+    params: Vec<ParamInfo>,
+    /// APST-encoded bytes (self-describing), or `None` when the row had no
+    /// `stateRef` / its blob was unreadable.
+    pending_state: Option<Vec<u8>>,
+}
 
-    let prior_hosted: Vec<(String, String)> = session
-        .plugins
-        .instances
-        .iter()
-        .filter(|i| i.status == "active" && (i.format == "lv2" || i.format == "clap"))
-        .map(|i| (i.format.clone(), i.id.clone()))
-        .collect();
-    session.plugins.instances.clear();
-    session.plugins.params.clear();
-    session.plugins.pending_state.clear();
-
-    let mut restored = 0usize;
+/// Read (from `<dir>/project.json` + `<dir>/plugins/*.state`) everything
+/// [`install_restored_rows`] needs — PURE disk I/O, no `Session`, no lock
+/// of any kind. `Ok(None)` when the project carries no `plugins` field at
+/// all (pre-persistence project — the caller must NOT clear the document
+/// then).
+fn read_restored_rows(dir: &Path) -> Result<Option<Vec<RestoredRow>>, String> {
+    let Some(rows) = load_rows(dir)? else { return Ok(None) };
+    let mut out = Vec::with_capacity(rows.len());
     for row in rows {
         if !safe_component(&row.id) {
             log::warn!("plugins: skipping persisted instance with unsafe id {:?}", row.id);
@@ -483,7 +526,7 @@ pub fn restore_into_session(
                 steps: 0,
             })
             .collect();
-        if let Some(r) = &row.state_ref {
+        let pending_state = if let Some(r) = &row.state_ref {
             match blob_path(dir, r)
                 .ok_or_else(|| format!("invalid stateRef {r:?}"))
                 .and_then(|p| read_state_file(&p))
@@ -499,22 +542,77 @@ pub fn restore_into_session(
                     // Re-encoded (self-describing) so `pending_state` stays
                     // byte-identical to what a save would write — Task 9's
                     // "same bytes on disk and in the document" invariant.
-                    session
-                        .plugins
-                        .pending_state
-                        .insert(row.id.clone(), encode_state(&row.uid, &blob));
+                    Some(encode_state(&row.uid, &blob))
                 }
-                Err(e) => log::warn!(
-                    "plugin instance {}: state blob unavailable ({e}); restoring without state",
-                    row.id
-                ),
+                Err(e) => {
+                    log::warn!(
+                        "plugin instance {}: state blob unavailable ({e}); restoring without state",
+                        row.id
+                    );
+                    None
+                }
             }
-        }
-        session.plugins.params.insert(row.id.clone(), params);
-        session.plugins.instances.push(info);
-        restored += 1;
+        } else {
+            None
+        };
+        out.push(RestoredRow { info, params, pending_state });
     }
-    Ok((restored, prior_hosted))
+    Ok(Some(out))
+}
+
+/// Install already-read rows into `session.plugins`, REPLACING the current
+/// instance set. PURE in-memory (no disk I/O, no host calls) — the only
+/// piece of this whole restore that needs the session lock, and only for
+/// as long as this call takes. Returns `(restored_count, prior_hosted)` —
+/// `(format, id)` pairs of the PREVIOUS session's active instances; the
+/// caller unregisters them from their format hosts WITHOUT holding the
+/// session lock (this function never touches a host, so it's the caller's
+/// job either way). `dirty_state` is untouched: a blob just read from that
+/// exact file is, by definition, not ahead of it.
+fn install_restored_rows(
+    session: &mut Session,
+    rows: Vec<RestoredRow>,
+) -> (usize, Vec<(String, String)>) {
+    let prior_hosted: Vec<(String, String)> = session
+        .plugins
+        .instances
+        .iter()
+        .filter(|i| i.status == "active" && (i.format == "lv2" || i.format == "clap"))
+        .map(|i| (i.format.clone(), i.id.clone()))
+        .collect();
+    session.plugins.instances.clear();
+    session.plugins.params.clear();
+    session.plugins.pending_state.clear();
+
+    let restored = rows.len();
+    for r in rows {
+        if let Some(bytes) = r.pending_state {
+            session.plugins.pending_state.insert(r.info.id.clone(), bytes);
+        }
+        session.plugins.params.insert(r.info.id.clone(), r.params);
+        session.plugins.instances.push(r.info);
+    }
+    (restored, prior_hosted)
+}
+
+/// Combined disk-read + install, for callers that already own an UNLOCKED
+/// `Session` outright (this module's own tests: a plain `Session`, never
+/// behind a shared `Arc<Mutex<_>>`, so there is no reentrancy risk reading
+/// disk while "holding" it). The production, LOCKED path
+/// (`adopt_open_project`) does NOT call this — it calls
+/// [`read_restored_rows`]/[`install_restored_rows`] separately so disk I/O
+/// never runs with the session lock held (Task 9 review round 1,
+/// Critical-1/Important-2).
+///
+/// Returns `(restored_count, prior_hosted)` — see [`install_restored_rows`].
+/// Projects WITHOUT a `plugins` field leave the document untouched
+/// (`(0, vec![])`).
+pub fn restore_into_session(
+    dir: &Path,
+    session: &mut Session,
+) -> Result<(usize, Vec<(String, String)>), String> {
+    let Some(rows) = read_restored_rows(dir)? else { return Ok((0, Vec::new())) };
+    Ok(install_restored_rows(session, rows))
 }
 
 /// Re-activate restored `"stub"` instances through the format hosts (LV2 on
@@ -625,21 +723,33 @@ pub fn reactivate_restored_with(
     }
 }
 
-/// PROJECT-OPEN SEAM (called by `midi::persist::load_from_project`): adopt
-/// the opened project's plugins into the app-global session. Inert until
-/// the app registers the session (`midi::playback::register_store`; unit
-/// tests use local sessions directly via `restore_into_session`).
+/// PROJECT-OPEN SEAM: adopt the opened project's plugins into the
+/// app-global session. Inert until the app registers the session
+/// (`midi::playback::register_store`; unit tests use local sessions
+/// directly via `restore_into_session`).
+///
+/// CALLER CONTRACT (Task 9 review round 1, Critical-1): this function
+/// takes the session lock itself, so it must NEVER be called by code that
+/// already holds it — every current call site (`midi::sync_midi_store`'s
+/// three callers) is careful to call this only AFTER dropping its own
+/// guard; see their comments. Internally: disk I/O runs FIRST with no lock
+/// at all ([`read_restored_rows`]), then one SHORT lock installs the rows
+/// ([`install_restored_rows`]) and is dropped, THEN host reactivation runs
+/// (no lock — `reactivate_restored` itself only takes brief, separate
+/// relocks to write back param mirrors, never spanning a host call).
 pub fn adopt_open_project(dir: &Path) {
     let Some(session) = crate::midi::playback::registered_store() else { return };
+    let rows = match read_restored_rows(dir) {
+        Ok(Some(r)) => r,
+        Ok(None) => return, // no `plugins` field — document untouched
+        Err(e) => {
+            log::warn!("plugins: cannot restore from {}: {e}", dir.display());
+            return;
+        }
+    };
     let (restored, prior_hosted) = {
         let mut s = session.lock();
-        match restore_into_session(dir, &mut s) {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!("plugins: cannot restore from {}: {e}", dir.display());
-                return;
-            }
-        }
+        install_restored_rows(&mut s, rows)
     };
     if restored == 0 && prior_hosted.is_empty() {
         return;
@@ -1526,5 +1636,115 @@ mod tests {
             .expect("re-save succeeds")
             .expect("still has state");
         assert!(!again.is_empty());
+    }
+
+    // ---- Task 9 review round 1 regressions ---------------------------------
+
+    /// Critical-1: `adopt_open_project` must not deadlock when driven
+    /// through the REAL production call chain with a REAL session global
+    /// registered. Unit tests that build their own private `Session`
+    /// (everywhere else in this suite) never exercise `midi::playback::
+    /// registered_store() == Some`, which is exactly the blind spot the
+    /// review flagged — this test closes it by registering a session (the
+    /// same `midi::playback::register_store` production wiring uses) and
+    /// driving `crate::midi::notify_project_opened` (the SAME entry point
+    /// `audio::open_project`/`ControlPlane::seed_demo_project` call).
+    /// Before the round-1 fix — `adopt_open_project` re-locking the SAME
+    /// session mutex `with_synced_store`/`notify_project_opened` already
+    /// held — this hung forever; now the whole chain drops its guard
+    /// before adoption runs, so this completes and the row lands.
+    ///
+    /// `midi::playback::register_store` is a process-global `OnceLock`
+    /// (first registration wins) that NO other test in this suite touches
+    /// (grep-verified) — mirrors the existing accepted pattern
+    /// `plugins::register_registry`/`shared_registry` already use for
+    /// their own process-global scan cache in `clap_host`/`lv2_host`'s test
+    /// modules.
+    #[test]
+    fn adopt_open_project_end_to_end_with_a_registered_session_does_not_deadlock() {
+        let parent = tmp_parent("adopt-e2e");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+
+        let blob = StateBlob { kind: KIND_OPAQUE, data: vec![3; 8] };
+        fs::create_dir_all(state_dir(&dir)).unwrap();
+        write_state_file(&state_dir(&dir).join("ghost-e2e.state"), "lv2:urn:aura:ghost-e2e", &blob)
+            .unwrap();
+        crate::midi::persist::update_project_v2(&dir, |obj| {
+            obj.insert(
+                "plugins".into(),
+                serde_json::json!([
+                    {"id": "ghost-e2e", "uid": "lv2:urn:aura:ghost-e2e", "format": "lv2",
+                     "stateRef": "plugins/ghost-e2e.state",
+                     "params": [{"id": 0, "value": 0.25}]}
+                ]),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let session = Arc::new(Mutex::new(new_session()));
+        crate::midi::playback::register_store(session.clone());
+
+        // THE regression check: this call chain used to deadlock. If it
+        // hangs, this test times out instead of failing cleanly — that IS
+        // the signal (cargo test's own timeout / CI kill).
+        crate::midi::notify_project_opened(Some(dir.clone()), 120.0);
+
+        let s = session.lock();
+        assert!(
+            s.plugins.instances.iter().any(|r| r.id == "ghost-e2e"),
+            "plugin row adopted through the real, lock-holding call chain"
+        );
+        assert_eq!(s.plugins.params.get("ghost-e2e").unwrap()[0].value, 0.25);
+        assert_eq!(s.midi.loaded_dir.as_deref(), Some(dir.as_path()), "midi side ALSO synced");
+        drop(s);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Critical-2: a SECOND `PluginSetState` for the same instance (the
+    /// `zyn_load_patch` shape — load a different patch into an
+    /// already-patched instance) must land on disk, not get silently
+    /// dropped because the FIRST write already produced a `.state` file
+    /// that "exists" (the pre-fix ladder let step-2 "keep the file"
+    /// unconditionally beat step-3 "write the pending bytes").
+    #[test]
+    fn plugin_set_state_persists_a_second_write_not_just_the_first() {
+        let parent = tmp_parent("setstate-durable");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+
+        let m = parking_lot::Mutex::new(new_session());
+        let row = PluginInstanceInfo {
+            id: "p-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        };
+        m.lock().plugins.instances.push(row);
+
+        let first = encode_state("lv2:urn:test:synth", &StateBlob { kind: KIND_OPAQUE, data: vec![1; 4] });
+        crate::control::Session::transact(&m, crate::control::op::TxMeta::user("patch 1"), |tx| {
+            tx.apply(crate::control::op::Op::PluginSetState { instance: "p-1".into(), state: first.clone() })
+        })
+        .unwrap();
+        let doc1 = m.lock().plugin_snapshot();
+        save_snapshot_into_project(&dir, &doc1, false).unwrap();
+        let file = state_dir(&dir).join("p-1.state");
+        assert_eq!(fs::read(&file).unwrap(), first, "first patch landed on disk");
+
+        let second = encode_state("lv2:urn:test:synth", &StateBlob { kind: KIND_OPAQUE, data: vec![2; 4] });
+        crate::control::Session::transact(&m, crate::control::op::TxMeta::user("patch 2"), |tx| {
+            tx.apply(crate::control::op::Op::PluginSetState { instance: "p-1".into(), state: second.clone() })
+        })
+        .unwrap();
+        let doc2 = m.lock().plugin_snapshot();
+        save_snapshot_into_project(&dir, &doc2, false).unwrap();
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            second,
+            "SECOND patch also landed on disk (Critical-2 regression — used to stay `first`)"
+        );
+        let _ = fs::remove_dir_all(&parent);
     }
 }

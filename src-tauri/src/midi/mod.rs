@@ -171,9 +171,21 @@ impl From<&section_table::Section> for SectionRow {
 ///   this session had no project yet (fresh in-memory edits are adopted into
 ///   the project and persisted on the next mutation),
 /// * no project -> keep in-memory state.
-fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f64) {
+///
+/// Returns `true` when a NEW project dir was actually adopted (i.e. `dir`
+/// is `Some` and this call didn't early-return on "already synced"/dirty/
+/// error) — callers use this to decide whether to ALSO run
+/// `plugins::state::adopt_open_project`/`plugins::automation::
+/// adopt_open_project` (Task 9 review round 1 fix: those take the SAME
+/// session lock this function is always called under, so the caller MUST
+/// run them only after releasing its guard — see `notify_project_opened`/
+/// `with_synced_store`/`midi_import_file`, this function's only callers).
+/// This function itself does no such adoption anymore (moved out of
+/// `persist::load_from_project`, which this calls) — pure midi-field sync,
+/// session-lock-safe to call from anywhere already holding the guard.
+fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f64) -> bool {
     if midi.loaded_dir == *dir {
-        return;
+        return false;
     }
     if midi.dirty {
         // M-5: a previous auto-persist failed — memory holds the only copy
@@ -183,7 +195,7 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
             "midi: refusing to resync ({:?} -> {dir:?}) — memory has unpersisted edits from a failed save",
             midi.loaded_dir
         );
-        return;
+        return false;
     }
     if let Some(d) = dir {
         match persist::load_from_project(d) {
@@ -207,11 +219,12 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
                 // H-2: do NOT mark synced on a failed load — otherwise the
                 // next mutation persists the OLD project's clips (and
                 // watermarks) into the new dir.
-                return;
+                return false;
             }
         }
     }
     midi.loaded_dir = dir.clone();
+    dir.is_some()
 }
 
 /// REQUESTED ARCHITECT SEAM: one-line eager-resync hook for
@@ -221,8 +234,17 @@ fn sync_midi_store(midi: &mut MidiStore, dir: &Option<PathBuf>, fallback_bpm: f6
 /// lazily resyncs, so only `get_project_state` served BEFORE the first midi
 /// command can observe stale midi fields after an open.
 pub fn notify_project_opened(dir: Option<PathBuf>, fallback_bpm: f64) {
-    if let Some(session) = playback::registered_store() {
-        sync_midi_store(&mut session.lock().midi, &dir, fallback_bpm);
+    let Some(session) = playback::registered_store() else { return };
+    // The `session.lock()` temporary below is dropped at the end of THIS
+    // statement (Rust temporary-lifetime rules: it lives through the whole
+    // `sync_midi_store(...)` call and no longer) — plugin/automation
+    // adoption below runs with the guard already released.
+    let adopted = sync_midi_store(&mut session.lock().midi, &dir, fallback_bpm);
+    if adopted {
+        if let Some(d) = &dir {
+            crate::plugins::state::adopt_open_project(d);
+            crate::plugins::automation::adopt_open_project(d);
+        }
     }
 }
 
@@ -252,7 +274,7 @@ fn with_synced_store<R>(
     let mut session = state.session().lock();
     let (dir, bpm) = (session.store.project_dir.clone(), session.store.transport.tempo_bpm);
 
-    sync_midi_store(&mut session.midi, &dir, bpm);
+    let adopted = sync_midi_store(&mut session.midi, &dir, bpm);
 
     let result = f(&mut session.midi)?;
 
@@ -280,6 +302,16 @@ fn with_synced_store<R>(
         }
     }
     drop(session);
+    // Plugin/automation adoption runs AFTER the session lock releases
+    // above (Task 9 review round 1: `adopt_open_project` takes the SAME
+    // session lock `with_synced_store` holds through the block above —
+    // calling it any earlier deadlocks).
+    if adopted {
+        if let Some(d) = &dir {
+            crate::plugins::state::adopt_open_project(d);
+            crate::plugins::automation::adopt_open_project(d);
+        }
+    }
     if mutating {
         if let Some(engine) = audio.engine_handle() {
             engine.send(ControlMsg::Rebuild);
@@ -548,13 +580,22 @@ pub fn midi_import_file(
     let bytes = std::fs::read(p).map_err(|e| format!("read {path}: {e}"))?;
 
     let (session, _shared, _tables) = audio.control_parts();
-    let ppq = {
+    let (ppq, adopted, dir) = {
         let mut s = session.lock();
         let dir = s.store.project_dir.clone();
         let bpm = s.store.transport.tempo_bpm;
-        sync_midi_store(&mut s.midi, &dir, bpm);
-        s.midi.ppq
+        let adopted = sync_midi_store(&mut s.midi, &dir, bpm);
+        (s.midi.ppq, adopted, dir)
     };
+    // Plugin/automation adoption runs AFTER the session lock above releases
+    // (Task 9 review round 1: `adopt_open_project` takes the session lock
+    // itself — calling it from inside the block above would deadlock).
+    if adopted {
+        if let Some(d) = &dir {
+            crate::plugins::state::adopt_open_project(d);
+            crate::plugins::automation::adopt_open_project(d);
+        }
+    }
     let imported = midifile::import_smf(&bytes, ppq)?;
     if imported.clips.is_empty() {
         return Err("MIDI file contains no note-carrying tracks".into());

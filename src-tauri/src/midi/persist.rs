@@ -297,18 +297,25 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
 ///
 /// PROJECT-ADOPTION SEAM (zone P4): this loader runs exactly when a project
 /// is adopted (open_project eagerly via `notify_project_opened`, or the lazy
-/// midi resync), so it also restores the project's persisted PLUGIN
-/// instances and AUTOMATION lanes into the app-global registries. Both
-/// hooks are inert until the app registers those globals — unit tests use
-/// local registries/stores and never observe them.
+/// midi resync via `with_synced_store`/`midi_import_file`) — those callers
+/// ALSO restore the project's persisted PLUGIN instances and AUTOMATION
+/// lanes into the app-global registries (`plugins::state`/`automation`'s
+/// `adopt_open_project`), but NOT from inside this function anymore (Task 9
+/// review round 1: `plugins::state::adopt_open_project` takes the session
+/// lock, which every caller of THIS function already holds — calling it
+/// from here deadlocked). `sync_midi_store` (midi/mod.rs) returns whether it
+/// adopted a new dir; its callers run the plugin/automation adoption AFTER
+/// releasing their session guard. Both hooks are inert until the app
+/// registers those globals — unit tests use local registries/stores and
+/// never observe them (and never call this loader while holding a session
+/// lock at all, so calling it standalone in a test is still safe — see
+/// `midi::persist::tests`).
 pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
     let file = dir.join(PROJECT_FILE);
     let bytes =
         fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
     let root: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("parse {}: {e}", file.display()))?;
-    crate::plugins::state::adopt_open_project(dir);
-    crate::plugins::automation::adopt_open_project(dir);
     let version = root.get("schemaVersion").and_then(Value::as_u64).unwrap_or(1);
     if version < 2 {
         return Ok(None);
