@@ -1268,10 +1268,26 @@ pub struct GestureState(Mutex<Option<OpenGesture>>);
 
 ### Task 15: `noteId` through the wire + IPC-type/schema honesty
 
+> **REVISED 2026-08-14 (marked per ADR 0007), mid-execution:** PR #11
+> landed on main after this plan was authored and already added
+> `noteId?: number` (OPTIONAL) to the TS `MidiNote` plus
+> `src/lib/utils/note-ops.ts`, whose `copyNote` STRIPS the id on copy
+> (absent id = mint; resending a live id from a copy would make the
+> keep-rule re-mint both). That convention supersedes this task's original
+> required-`noteId`-with-0-sentinel design — do NOT make the field
+> required, and do NOT change the paste path (it now flows through
+> note-ops). Remaining scope: (a) `generation.svelte.ts` infill merge —
+> context notes keep their ids, sidecar-filled notes get no id (absent =
+> mint); (b) the schema-doc work below unchanged; (c) the `ipc.ts`
+> `Project` type refresh unchanged. Steps 1-2's "required field / tsc
+> failure" instructions are void; test the infill rule with vitest
+> against the optional-field convention instead.
+
 Inventory row 33 (Plan B handoff) + the C/D stale-docs item. The TS
-`MidiNote` gains the field the backend already persists; the accidental
-spread-survival becomes contractual; the two stale schema docs and the
-`schemaVersion: 1`-pinned TS `Project` type are brought current.
+`MidiNote` carries the field the backend persists (landed via PR #11,
+optional-with-strip-on-copy); this task finishes the id rules on the
+infill path and brings the two stale schema docs and the
+`schemaVersion: 1`-pinned TS `Project` type current.
 
 **Files:**
 - Modify: `src/lib/types/ipc.ts` (`MidiNote.noteId`, `Project` v3 shape),
