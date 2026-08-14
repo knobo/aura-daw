@@ -10,6 +10,7 @@
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
   import { ui } from "../state/ui.svelte";
+  import { midiPreviewLayout } from "../utils/midi-preview";
   import { view } from "../state/view.svelte";
 
   let { clip, track }: { clip: MidiClip; track: TrackState } = $props();
@@ -97,44 +98,27 @@
     ctx.clearRect(0, 0, w, h);
     if (notes.length === 0) return;
 
-    let lo = 127;
-    let hi = 0;
-    for (const n of notes) {
-      if (n.key < lo) lo = n.key;
-      if (n.key > hi) hi = n.key;
-    }
-    lo -= 2;
-    hi += 2;
-    const rowH = Math.min(4, h / (hi - lo + 1));
-    const contentTicks = midi.effectiveContentLengthTicks(clip);
-    const pxPerTick = widthPx / contentTicks;
-    const offset = visL; // clip-local css px of canvas origin
-    const repeats = Math.max(1, Math.ceil(clip.lengthTicks / contentTicks));
+    const { rects, separatorXs } = midiPreviewLayout({
+      notes,
+      lengthTicks: clip.lengthTicks,
+      contentLengthTicks: midi.effectiveContentLengthTicks(clip),
+      widthPx,
+      offsetPx: visL,
+      canvasW: w,
+      canvasH: h,
+    });
 
     const r = parseInt(track.color.slice(1, 3), 16);
     const g = parseInt(track.color.slice(3, 5), 16);
     const b = parseInt(track.color.slice(5, 7), 16);
-    for (let rep = 0; rep < repeats; rep++) {
-      const repOffsetTicks = rep * contentTicks;
-      if (repOffsetTicks >= clip.lengthTicks) break;
-      for (const n of notes) {
-        const tick = repOffsetTicks + n.tick;
-        if (tick >= clip.lengthTicks) continue; // cropped by the placement end
-        const x = tick * pxPerTick - offset;
-        const nw = Math.max(1.5, n.lengthTicks * pxPerTick);
-        if (x + nw < 0 || x > w) continue;
-        const y = h - ((n.key - lo + 1) / (hi - lo + 1)) * h;
-        ctx.fillStyle = `rgba(${r},${g},${b},${0.4 + 0.6 * (n.velocity / 127)})`;
-        ctx.fillRect(x, y, nw, Math.max(1.5, rowH - 1));
-      }
-      // Separator line at every content boundary (skip rep 0's leading edge).
-      if (rep > 0) {
-        const sepX = repOffsetTicks * pxPerTick - offset;
-        if (sepX >= 0 && sepX <= w) {
-          ctx.fillStyle = `rgba(${r},${g},${b},0.35)`;
-          ctx.fillRect(sepX, 0, 1, h);
-        }
-      }
+    for (const rect of rects) {
+      ctx.fillStyle = `rgba(${r},${g},${b},${0.4 + 0.6 * (rect.velocity / 127)})`;
+      ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+    }
+    // Separator line at every content boundary (skip rep 0's leading edge).
+    ctx.fillStyle = `rgba(${r},${g},${b},0.35)`;
+    for (const sepX of separatorXs) {
+      ctx.fillRect(sepX, 0, 1, h);
     }
   });
 
