@@ -301,9 +301,23 @@ pub struct NoteOutSnapshot {
     pub channel: u8,
 }
 
-/// Scheduler state: a monotonic cursor into `NoteOutSnapshot::events` plus a
-/// per-key sounding flag so `all_off`/`reseek` release exactly what is
-/// actually sounding — never more, never less.
+/// Only `AbsNoteEvent` indices this module ever assumed sorted, ascending
+/// by `sample`, get near either `advance` or `reseek` — both binary-search
+/// or forward-scan the slice on that assumption. Cheap insurance against a
+/// future builder producing out-of-order events, which would otherwise
+/// stop the cursor forever, silently (fix round 1, Important 3).
+fn debug_assert_events_sorted(events: &[crate::midi::schedule::AbsNoteEvent]) {
+    debug_assert!(
+        events.windows(2).all(|w| w[0].sample <= w[1].sample),
+        "NoteOutSnapshot::events must be sorted ascending by sample"
+    );
+}
+
+/// Scheduler state: a cursor into `NoteOutSnapshot::events` (advanced
+/// forward by `advance`, but repositioned in EITHER direction by `reseek`
+/// — see its doc for why) plus a per-key sounding flag so `all_off`/
+/// `reseek` release exactly what is actually sounding — never more, never
+/// less.
 pub struct NoteOutEngine {
     cursor: usize,
     sounding: [bool; 128],
@@ -328,6 +342,7 @@ impl NoteOutEngine {
     /// only bound that actually gates emission.
     pub fn advance(&mut self, snap: &NoteOutSnapshot, from: u64, to: u64, out: &mut Vec<OutMsg>) {
         debug_assert!(from <= to, "advance window must not go backward");
+        debug_assert_events_sorted(&snap.events);
         while self.cursor < snap.events.len() && snap.events[self.cursor].sample < to {
             let ev = snap.events[self.cursor];
             if ev.velocity == 0 {
@@ -356,12 +371,25 @@ impl NoteOutEngine {
     }
 
     /// `all_off` + reposition the cursor to the first event at or after
-    /// `to` (a seek / loop wrap / fresh start).
+    /// `to` (a seek / loop wrap / fresh start / track swap).
+    ///
+    /// Fix round 1, Critical 1: this is the ONLY place the cursor is
+    /// repositioned (`out_tick`'s fresh-start/resync branch AND
+    /// `run_thread`'s track-swap branch both funnel through it), and it has
+    /// to handle three cases that all move the cursor somewhere a
+    /// forward-only walk cannot reach: a loop wrap or plain rewind-then-
+    /// replay (`to` behind the current cursor), and a track swap (`snap`
+    /// is an entirely different array — the old cursor index has no
+    /// meaning against it, shorter or longer). A binary search
+    /// (`partition_point`) over the FULL slice, from scratch every call,
+    /// sidesteps all three at once: it never reads `self.cursor` going in,
+    /// so there is nothing stale to carry across a rewind or a swap, and
+    /// it is O(log n) instead of the O(n) a "reset to 0 then walk forward"
+    /// fallback would cost on a long clip.
     pub fn reseek(&mut self, snap: &NoteOutSnapshot, to: u64, out: &mut Vec<OutMsg>) {
+        debug_assert_events_sorted(&snap.events);
         self.all_off(snap.channel, out);
-        while self.cursor < snap.events.len() && snap.events[self.cursor].sample < to {
-            self.cursor += 1;
-        }
+        self.cursor = snap.events.partition_point(|e| e.sample < to);
     }
 
     pub fn notes_sent(&self) -> u64 {
@@ -755,9 +783,29 @@ fn run_thread(
         thread_shared.resyncs.store(engine.resyncs(), Relaxed);
     }
 
-    // Stop-on-close: an explicit Stop reaches the sink before the
-    // connection is dropped, so a hardware slave synced to MIDI clock does
-    // not keep running forever after AURA lets go of the port.
+    // Fix round 1, Critical 2: release whatever is still sounding BEFORE
+    // the explicit Stop and BEFORE `sink` (and its `midir` connection) is
+    // dropped at the end of this function — otherwise a note started
+    // shortly before a port close/re-select/app-exit hangs on the external
+    // device forever. `notes` is still in scope here regardless of which
+    // branch broke the loop (stop flag), so this runs unconditionally on
+    // every exit path.
+    shutdown_release_and_stop(&mut sink, &mut notes, current_snapshot.channel);
+}
+
+/// All-off (if anything is sounding) + the transport Stop, sent in that
+/// order to `sink` while it is still alive — the caller drops `sink`
+/// immediately after this returns, so both sends must complete here, not
+/// be left to a buffer that dies with the connection. Both `ClockSink`
+/// impls (`MidiOutSink`, `RecordingSink`) send synchronously, so returning
+/// from this function *is* the proof the bytes left this process's side of
+/// the connection.
+fn shutdown_release_and_stop(sink: &mut dyn ClockSink, notes: &mut NoteOutEngine, channel: u8) {
+    let mut edge = Vec::new();
+    notes.all_off(channel, &mut edge);
+    for msg in &edge {
+        let _ = sink.send(msg.as_slice());
+    }
     let _ = sink.send(ClockMsg::Stop.to_out().as_slice());
 }
 
@@ -1140,6 +1188,91 @@ mod tests {
         assert_eq!(out[0].as_slice(), &[0x90, 62, 100], "cursor landed before the next event");
     }
 
+    /// Fix round 1, Critical 1: `reseek` is the ONLY repositioning entry
+    /// point (out_tick's own fresh-start/resync path AND run_thread's
+    /// track-swap path both funnel through it) so it must be able to move
+    /// the cursor BACKWARD — a loop wrap or an ordinary rewind-then-replay
+    /// is exactly that. A forward-only cursor would silently and
+    /// permanently stop emitting the intervening note on every replay.
+    #[test]
+    fn reseek_moves_the_cursor_backward_and_replays_the_intervening_note() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let s = snap(vec![
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+            AbsNoteEvent { sample: 1_000, key: 62, velocity: 100 },
+            AbsNoteEvent { sample: 2_000, key: 64, velocity: 100 },
+        ]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        // Ordinary playback to the end: the cursor sits past every event.
+        e.advance(&s, 0, 3_000, &mut out);
+        assert_eq!(e.notes_sent(), 3, "cursor is now past every event");
+
+        // A loop wrap / rewind: 500 is BEHIND the cursor's current position.
+        out.clear();
+        e.reseek(&s, 500, &mut out);
+
+        out.clear();
+        e.advance(&s, 500, 1_500, &mut out);
+        assert_eq!(
+            out.get(0).map(|m| m.as_slice()),
+            Some(&[0x90, 62, 100][..]),
+            "the note at 1000 sounds again after the rewind: {:?}", out
+        );
+    }
+
+    /// Fix round 1, Critical 1 (track-swap variant): the cursor is shared
+    /// state that survives a routing change (`run_thread` reuses the same
+    /// `NoteOutEngine` across tracks). Swapping to a track whose event
+    /// array is SHORTER than the stale cursor must not permanently stall —
+    /// `reseek` recomputes the cursor from scratch against the NEW array,
+    /// so a track index carried over from the old array is never trusted.
+    #[test]
+    fn a_track_swap_with_a_shorter_array_still_emits_from_the_new_track() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let long = snap(vec![
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+            AbsNoteEvent { sample: 1_000, key: 60, velocity: 0 },
+            AbsNoteEvent { sample: 2_000, key: 62, velocity: 100 },
+            AbsNoteEvent { sample: 3_000, key: 62, velocity: 0 },
+            AbsNoteEvent { sample: 4_000, key: 64, velocity: 100 },
+        ]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&long, 0, 4_500, &mut out); // cursor now past every event (index 5)
+
+        let mut short = snap(vec![AbsNoteEvent { sample: 100, key: 67, velocity: 90 }]);
+        short.track_id = "t-2".into();
+
+        out.clear();
+        e.reseek(&short, 0, &mut out);
+        out.clear();
+        e.advance(&short, 0, 200, &mut out);
+        assert_eq!(
+            out.get(0).map(|m| m.as_slice()),
+            Some(&[0x90, 67, 90][..]),
+            "the newly routed (shorter) track still emits: {:?}", out
+        );
+    }
+
+    /// Fix round 1, Important 3: `advance`/`reseek` both trust
+    /// `snap.events` to be sorted ascending by sample — an out-of-order
+    /// entry from a future builder would stop the cursor forever, silently
+    /// (the same failure mode as Critical 1). Cheap insurance: a debug
+    /// assertion that actually fires, not just exists.
+    #[test]
+    #[should_panic(expected = "sorted ascending")]
+    fn advance_panics_in_debug_on_an_out_of_order_snapshot() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let s = snap(vec![
+            AbsNoteEvent { sample: 500, key: 60, velocity: 100 },
+            AbsNoteEvent { sample: 100, key: 62, velocity: 100 }, // out of order
+        ]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&s, 0, 600, &mut out);
+    }
+
     #[test]
     fn channel_is_encoded_in_the_status_byte() {
         use crate::midi::schedule::AbsNoteEvent;
@@ -1209,5 +1342,132 @@ mod tests {
         out.select_port(None).expect("close sends Stop");
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(seen.lock().iter().any(|m| m.as_slice() == [0xFC]), "Stop reached the port: {:?}", seen.lock());
+    }
+
+    /// Fix round 1, Critical 2: on shutdown (port close, re-select, or app
+    /// exit) the thread must release whatever is sounding BEFORE the
+    /// connection is dropped — a hanging note on real gear is silent and
+    /// permanent otherwise. Proven end-to-end through the REAL thread and a
+    /// REAL ALSA virtual loopback port — not a `RecordingSink` standing in
+    /// for "the bytes probably went out": `select_port(None)` joins the
+    /// thread before returning, so if `seen` (populated by ALSA's own
+    /// callback) has the note-off ahead of the final Stop, the bytes
+    /// provably left the sink before its `midir` connection was dropped at
+    /// the end of `run_thread`.
+    ///
+    /// The note is scheduled to last 4 s — far past this test's ~400 ms
+    /// window — and `shared.position` is kept tracking real wall-clock time
+    /// by a background updater so `ClockEngine` never sees a drift-sized
+    /// gap and resyncs (which release-and-reseek on their own and would
+    /// make this test pass for the wrong reason). We also snapshot how many
+    /// bytes had already arrived BEFORE the shutdown call, so the released
+    /// note-off has to appear strictly AFTER that point — not as a
+    /// coincidence of ordinary playback.
+    #[test]
+    fn shutdown_flushes_note_off_before_stop_and_before_the_connection_drops() {
+        use midir::os::unix::VirtualInput;
+        use crate::audio::types::{Store, TrackState};
+        use crate::ids::NoteId;
+        use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+        use crate::midi::MidiStore;
+
+        let Ok(midi_in) = midir::MidiInput::new("aura-midi-out-test-in-shutdown") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink_seen = seen.clone();
+        let Ok(_conn) = midi_in.create_virtual("aura-out-shutdown-loopback", move |_, msg, _: &mut ()| {
+            sink_seen.lock().push(msg.to_vec());
+        }, ()) else { eprintln!("skipping: virtual port unavailable"); return; };
+
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no output enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-out-shutdown-loopback")) else {
+            eprintln!("skipping: loopback port not visible"); return;
+        };
+
+        let mut store = Store::default();
+        store.tracks.push(TrackState {
+            id: "t-1".into(),
+            name: "t-1".into(),
+            kind: "midi".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        });
+        // 8 beats at 120 bpm = 4 s — well past the ~400 ms this test runs
+        // before forcing shutdown, so the note is still genuinely sounding.
+        let long_ticks = DEFAULT_PPQ as u64 * 8;
+        let midi = MidiStore {
+            ppq: DEFAULT_PPQ,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![MidiClip {
+                id: uuid::Uuid::new_v4().to_string().into(),
+                track_id: "t-1".into(),
+                name: "c".into(),
+                timeline_start_ticks: 0,
+                length_ticks: long_ticks,
+                notes: vec![MidiNote { tick: 0, length_ticks: long_ticks as u32, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) }],
+                next_note_id: 1,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("t-1"),
+                content_length_ticks: None,
+            }],
+            loaded_dir: None,
+            dirty: false,
+        };
+        let session = Arc::new(PlMutex::new(crate::control::Session::new(store, midi)));
+        let shared = Arc::new(SharedRt::default());
+        shared.playing.store(true, Relaxed);
+        shared.position.store(0, Relaxed);
+
+        // Keep `position` tracking real wall-clock time (nothing else here
+        // runs an audio engine to advance it), so the clock never sees a
+        // drift-sized gap and resyncs on its own.
+        let updater_running = Arc::new(AtomicBool::new(true));
+        let updater = {
+            let shared2 = shared.clone();
+            let running2 = updater_running.clone();
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                while running2.load(Relaxed) {
+                    let samples = (t0.elapsed().as_secs_f64() * 48_000.0) as u64;
+                    shared2.position.store(samples, Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+
+        let out = MidiOut::default();
+        out.attach(session, shared.clone());
+        out.select_note_track(Some("t-1".into())).expect("route the midi track");
+        out.select_port(Some(target.id)).expect("open the loopback port");
+
+        // The thread's 250 ms try_lock snapshot window has to pick up the
+        // routed track before we close — give it headroom for more than one
+        // window plus the fresh-start note-on.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let before_shutdown = seen.lock().len();
+
+        out.select_port(None).expect("close releases sounding notes before Stop");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        updater_running.store(false, Relaxed);
+        let _ = updater.join();
+
+        let seen = seen.lock();
+        let after = &seen[before_shutdown..];
+        let off_idx = after.iter().position(|m| m.as_slice() == [0x80, 60, 0]);
+        let stop_idx = after.iter().position(|m| m.as_slice() == [0xFC]);
+        assert!(off_idx.is_some(), "note-off reached the real port DURING shutdown (not before): {:?}", after);
+        assert!(stop_idx.is_some(), "Stop reached the real port: {:?}", after);
+        assert!(
+            off_idx.unwrap() < stop_idx.unwrap(),
+            "note-off precedes Stop, both delivered before the connection dropped: {:?}", after
+        );
     }
 }
