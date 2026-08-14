@@ -1057,7 +1057,9 @@ mod tests {
             return;
         };
 
-        // Global registry (shared with other tests; first registration wins).
+        // Global registry (shared with other tests; first registration wins)
+        // — scan cache only (Task 9: instance rows live in the document, a
+        // local `PluginDoc` here, never the registry).
         register_registry(Arc::new(parking_lot::Mutex::new(PluginRegistry::default())));
         let registry = registered_registry().unwrap().clone();
         {
@@ -1066,8 +1068,11 @@ mod tests {
             scanned.extend(installed());
             reg.scanned = Some(scanned);
         }
-        let info = instantiate_and_activate(&registry, &uid).expect("instantiate");
+        let (info, params) = instantiate_and_activate(&registry, &uid).expect("instantiate");
         assert_eq!(info.status, "active", "contract 4: stub -> active");
+        let mut doc = crate::control::session::PluginDoc::default();
+        doc.params.insert(info.id.clone(), params);
+        doc.instances.push(info.clone());
 
         // One midi track bound to the plugin instance, playing C3 for a beat.
         let mut store = Store::default();
@@ -1115,7 +1120,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut tracks);
+        append_from(&midi, &store, &doc, &slots, 48_000, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             nodes.key_of("m1"),
@@ -1140,7 +1145,6 @@ mod tests {
         // Retire the graph (returns the processor), then clean up.
         drop(g);
         plugin_main().run(|_| ()).unwrap();
-        let _ = registry.lock().remove(&info.id);
         let _ = remove(&info.id);
     }
 }

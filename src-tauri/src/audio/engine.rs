@@ -778,6 +778,7 @@ impl Control {
                 crate::midi::playback::append_from(
                     &session.midi,
                     store,
+                    &session.plugins,
                     &slots,
                     self.cache_rate,
                     bank.as_deref(),

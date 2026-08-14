@@ -647,6 +647,41 @@ impl ControlPlane {
             .ok_or_else(|| format!("unknown track: {track_id}"))
     }
 
+    // ---- plugin document reads (Task 9) ----------------------------------
+    // Thin session reads for the `plugins::` command wrappers — mirrors
+    // `get_track` above. Mutations go through `commit` (`Op::PluginAdd` /
+    // `PluginRemove` / `PluginSetState` / `Set{Plugin, Param}`), never here.
+
+    pub fn plugin_rows(&self) -> Vec<crate::plugins::PluginInstanceInfo> {
+        self.session.lock().plugins.instances.clone()
+    }
+
+    pub fn plugin_row(&self, instance_id: &str) -> Option<crate::plugins::PluginInstanceInfo> {
+        self.session.lock().plugins.instances.iter().find(|r| r.id == instance_id).cloned()
+    }
+
+    pub fn plugin_params(&self, instance_id: &str) -> Option<Vec<crate::plugins::ParamInfo>> {
+        self.session.lock().plugins.params.get(instance_id).cloned()
+    }
+
+    /// True when `instance_id` names a registered plugin instance row (used
+    /// by `set_track_instrument`'s `plugin:` ref validation).
+    pub fn plugin_exists(&self, instance_id: &str) -> bool {
+        self.session.lock().plugins.instances.iter().any(|r| r.id == instance_id)
+    }
+
+    /// Prime `session.plugins.pending_state[instance_id]` with bytes a
+    /// caller ALREADY obtained from the live host (`HostStateBridge::
+    /// save_state`) — a direct write, bypassing `commit`/the op log, used
+    /// ONLY to seed accurate "current truth" before a `PluginSetState`
+    /// commit whose inverse `apply_raw` computes FROM that truth (`zyn_
+    /// load_patch`: apply_raw itself never round-trips the host — [C1] —
+    /// so this is how the wrapper hands it the real previous blob instead
+    /// of a stale/absent one).
+    pub fn set_plugin_pending_state(&self, instance_id: &str, bytes: Vec<u8>) {
+        self.session.lock().plugins.pending_state.insert(instance_id.to_string(), bytes);
+    }
+
     /// Compose the full-project payload `project://changed` carries (the
     /// same shape `project::from_store` serializes, minus its requirement of
     /// an open project dir — mix/structural changes are legal in an unsaved
@@ -759,6 +794,11 @@ impl ControlPlane {
                     // Plan E Task 8: same reasoning for LengthSamples/
                     // OffsetSamples (LoopJam's in-place clip trims) —
                     // structural (rebuild), no ParamTable counterpart.
+                    // Plan E Task 9: same reasoning for `Param` —
+                    // `apply_raw` never pushes plugin params into
+                    // `param_writes` either (they travel through
+                    // `host_forward::ParamWrite` instead, resolved by
+                    // instance id, not by a `GraphTables` slot).
                     op::PropPath::Armed
                     | op::PropPath::InstrumentId
                     | op::PropPath::TimelineStartSamples
@@ -772,12 +812,20 @@ impl ControlPlane {
                     | op::PropPath::LoopStartSamples
                     | op::PropPath::LoopEndSamples
                     | op::PropPath::StopAtEnd
-                    | op::PropPath::SampleRate => {}
+                    | op::PropPath::SampleRate
+                    | op::PropPath::Param { .. } => {}
                 }
             }
             if let Some(any_solo) = committed.effect.any_solo {
                 tables.params.any_solo.store(any_solo, Relaxed);
             }
+        }
+        // Plugin host round-trips (Task 9): after the param-table writes,
+        // before persist — same "session lock is released" guarantee as
+        // everything else in `commit` ([C1]: hosts have their own locks,
+        // never called while the session lock is held).
+        if !committed.effect.host_forward.is_empty() {
+            self.execute_host_forward(&committed.effect.host_forward);
         }
         if committed.effect.rebuild {
             self.engine.send(ControlMsg::Rebuild);
@@ -835,7 +883,7 @@ impl ControlPlane {
     /// `Session::epoch`'s doc). Direct test callers of this fn (that don't
     /// go through `commit`) should pass the session's current epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
-        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot) = {
+        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot, plugin_snapshot) = {
             let s = self.session.lock();
             (
                 s.store.project_dir.clone(),
@@ -854,6 +902,11 @@ impl ControlPlane {
                 // below, after the guard drops — round-2 §4: no disk I/O
                 // under the session lock.
                 p.automation.then(|| s.automation.lanes.clone()),
+                // Plan E Task 9: plugin doc snapshot, taken under this SAME
+                // short lock — the actual write (state blobs + `plugins[]`
+                // dirty-ladder + clearing `dirty_state` for whichever ids
+                // were written) happens below, after the guard drops.
+                p.plugins.then(|| s.plugin_snapshot()),
             )
         };
         if epoch_now != committed_epoch {
@@ -885,6 +938,155 @@ impl ControlPlane {
         if let Some(lanes) = automation_snapshot {
             if let Err(e) = crate::plugins::automation::save_into_project(&dir, &lanes) {
                 log::warn!("automation persist failed: {e}");
+            }
+        }
+        // `with_host_state: false` — a fresh host round-trip (state save)
+        // is never needed here: `PluginAdd`/`PluginRemove`/`PluginSetState`
+        // already keep `session.plugins.pending_state` current through
+        // `host_forward`'s `LoadState`/`Destroy` handling (executed before
+        // `execute_persist` runs, in `commit`), and a bare param write
+        // (`plugin_set_param`) must NOT round-trip the plugin main thread
+        // per rAF batch — same reasoning the retired `persist_after_
+        // mutation(..., with_host_state: false)` call site used.
+        if let Some(doc) = plugin_snapshot {
+            match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
+                Ok(cleared) if !cleared.is_empty() => {
+                    // Clear `dirty_state` for whichever ids' pending bytes
+                    // just landed on disk (Task 9 review round 1,
+                    // Critical-2) — a short, separate re-lock, no disk I/O
+                    // under it.
+                    let mut s = self.session.lock();
+                    for id in cleared {
+                        s.plugins.dirty_state.remove(&id);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("plugins persist failed: {e}"),
+            }
+        }
+    }
+
+    /// Executes a `HostForward` list `commit` merely described — calling
+    /// the SAME host entry points commands call today
+    /// (`plugins::clap_host`/`lv2_host`/`state`'s `HostStateBridge`), now
+    /// sequenced after the session lock is released ([C1]: hosts have their
+    /// own locks, never called while the session lock is held — this
+    /// method takes ONLY brief re-locks of `self.session` to read a row's
+    /// format/uid or to write back a post-host result, never spanning a
+    /// host call).
+    fn execute_host_forward(&self, forwards: &[session::HostForward]) {
+        use crate::plugins::{clap_host, lv2_host, state as pstate};
+        use session::HostForward;
+        for hf in forwards {
+            match hf {
+                HostForward::ParamWrite { instance, index, value } => {
+                    let format = {
+                        let s = self.session.lock();
+                        s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
+                    };
+                    match format.as_deref() {
+                        Some("lv2") => {
+                            if let Some(host) = lv2_host::try_global() {
+                                host.set_params(instance, vec![(*index, *value)]);
+                            }
+                        }
+                        Some("clap") => {
+                            let change = crate::plugins::ParamChange { id: *index, value: *value as f64 };
+                            if let Err(e) = clap_host::set_params(instance, vec![change]) {
+                                log::warn!("plugins: clap param write for {instance}: {e}");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                HostForward::Instantiate { instance } => {
+                    let row = {
+                        let s = self.session.lock();
+                        s.plugins.instances.iter().find(|r| &r.id == instance).cloned()
+                    };
+                    let Some(row) = row else { continue }; // row vanished meanwhile
+                    // Idempotent by construction (doc on `HostForward::
+                    // Instantiate`): if the host already has this id live
+                    // (the prepare-outside fresh-instantiate path), re-sync
+                    // params via a plain read instead of re-instantiating —
+                    // re-registering a live id would reset its voice state.
+                    let hosted = match row.format.as_str() {
+                        "clap" => match clap_host::has_instance(instance) {
+                            Ok(true) => clap_host::get_params(instance),
+                            Ok(false) => clap_host::instantiate(instance, &row.uid),
+                            Err(e) => Err(e),
+                        },
+                        "lv2" => {
+                            let host = lv2_host::global();
+                            match host.has_instance(instance) {
+                                Ok(true) => host.get_params(instance),
+                                Ok(false) => host.register_instance(instance, &row.uid),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        _ => continue, // non-hosted format: stays "stub", nothing to sync
+                    };
+                    match hosted {
+                        Ok(params) => {
+                            let mut s = self.session.lock();
+                            if let Some(r) = s.plugins.instances.iter_mut().find(|r| &r.id == instance) {
+                                r.status = "active".into();
+                            }
+                            // Fill only when absent (Task 9 review round 1,
+                            // Important-1): an undo-of-remove already
+                            // restored the REAL param mirror into
+                            // `session.plugins.params` (parked there by
+                            // `apply_raw`'s `PluginRemove` arm) — this must
+                            // not clobber it with the host's fresh-
+                            // reinstantiate DEFAULTS. A genuinely fresh
+                            // instantiate's mirror is still the empty seed
+                            // `Op::PluginAdd` left, so it gets filled here
+                            // exactly as before.
+                            let entry = s.plugins.params.entry(instance.clone()).or_default();
+                            if entry.is_empty() {
+                                *entry = params;
+                            }
+                        }
+                        Err(e) => log::warn!("plugins: instantiate forward for {instance} failed: {e}"),
+                    }
+                }
+                HostForward::Destroy { instance } => {
+                    let format = {
+                        let s = self.session.lock();
+                        s.plugins.instances.iter().find(|r| &r.id == instance).map(|r| r.format.clone())
+                    };
+                    match format.as_deref() {
+                        Some("lv2") => {
+                            if let Some(host) = lv2_host::try_global() {
+                                host.unregister_instance(instance);
+                            }
+                        }
+                        Some("clap") => {
+                            if let Err(e) = clap_host::remove(instance) {
+                                log::warn!("plugins: clap destroy for {instance}: {e}");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                HostForward::LoadState { instance } => {
+                    let blob = {
+                        let s = self.session.lock();
+                        s.plugins.pending_state.get(instance).cloned()
+                    };
+                    let Some(bytes) = blob else { continue };
+                    let decoded = pstate::decode_state(&bytes);
+                    match decoded {
+                        Ok((_uid, blob)) => {
+                            if let Some(bridge) = pstate::registered_state_bridge() {
+                                if let Err(e) = bridge.load_state(instance, &blob) {
+                                    log::warn!("plugins: state load for {instance} failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => log::warn!("plugins: pending state blob for {instance} unreadable: {e}"),
+                    }
+                }
             }
         }
     }
@@ -1237,9 +1439,8 @@ impl ControlPlane {
         }
 
         // Zyn upgrade path: build the three patched instances BEFORE the
-        // transaction so a failure leaves no half-bound state (None =
-        // PolySynth).
-        let zyn = try_seed_zyn_demo_instruments();
+        // tracks so a failure leaves no half-bound state (None = PolySynth).
+        let zyn = try_seed_zyn_demo_instruments(&self.session);
 
         // Task 7: one commit — 3x add_track_tx, the instrument bindings (if
         // Zyn is available), and the 3 demo clips, all through the channel.
@@ -1278,13 +1479,26 @@ impl ControlPlane {
         })?;
 
         // Plugin instance + state blobs (not the `PersistEffect` machinery's
-        // job yet — Tasks 9/10), so a save/open cycle replays the same demo
-        // through the same patches (zone P4 restore path). Unchanged from
-        // pre-Task-7: a no-op when there's no open project dir
-        // (`persist_after_mutation` checks internally) or no Zyn instances.
+        // job here — `try_seed_zyn_demo_instruments` writes the document
+        // rows DIRECTLY into `session.plugins`, bypassing `commit`/the op
+        // log, so `execute_persist`'s plugin branch never sees this write),
+        // so a save/open cycle replays the same demo through the same
+        // patches (zone P4 restore path). A no-op when there's no open
+        // project dir or no Zyn instances. Task 9: `persist_after_mutation`
+        // is gone — snapshot the doc under a short lock and write it
+        // directly (mirrors `execute_persist`'s own plugin branch).
         if zyn.is_some() {
-            if let Some(reg) = crate::plugins::registered_registry() {
-                crate::plugins::state::persist_after_mutation(&self.session, reg, true);
+            let dir = self.session.lock().store.project_dir.clone();
+            if let Some(d) = &dir {
+                let doc = self.session.lock().plugin_snapshot();
+                // `with_host_state: true` here always takes the `fresh`
+                // branch of the persist ladder for these brand-new
+                // instances, so there's nothing in `dirty_state` to clear
+                // (seed_demo writes rows directly, bypassing `apply_raw`
+                // entirely — see above).
+                if let Err(e) = crate::plugins::state::save_snapshot_into_project(d, &doc, true) {
+                    log::warn!("seed demo: persisting plugins failed: {e}");
+                }
             }
         }
         Ok(self.project_state())
@@ -1354,8 +1568,15 @@ impl ControlPlane {
 /// anything on the Zyn path is unavailable (plugin not installed, banks
 /// missing, no registered plugin registry) — the caller then keeps the
 /// PolySynth fallback, so a machine without plugins is never broken.
-/// Partial failures roll back (no orphan instances).
-fn try_seed_zyn_demo_instruments() -> Option<[String; 3]> {
+/// Partial failures roll back (no orphan instances, no orphan rows).
+///
+/// Task 9: writes the document rows DIRECTLY into `session.plugins`
+/// (bypassing `commit`/the op log), matching `seed_demo_project`'s own
+/// direct-session-mutation style for the rest of the demo's bootstrap —
+/// this pre-track-creation, best-effort batch is not itself a user-visible
+/// edit yet (no track references these ids until the caller binds them),
+/// so there is nothing meaningful to make undoable here.
+fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[String; 3]> {
     use crate::plugins::{self, patches};
     let registry = plugins::registered_registry()?;
     // Patches chosen to sit well together: soft pad chords, a plucked lead
@@ -1381,7 +1602,7 @@ fn try_seed_zyn_demo_instruments() -> Option<[String; 3]> {
     let mut ids: Vec<String> = Vec::with_capacity(3);
     for patch in &wanted {
         match plugins::instantiate_and_activate(registry, &uid) {
-            Ok(info) => {
+            Ok((info, params)) => {
                 if let Err(e) =
                     patches::load_zyn_patch(&info.id, std::path::Path::new(&patch.path))
                 {
@@ -1392,12 +1613,27 @@ fn try_seed_zyn_demo_instruments() -> Option<[String; 3]> {
                         patch.name
                     );
                 }
+                {
+                    let mut s = session.lock();
+                    s.plugins.instances.push(info.clone());
+                    s.plugins.params.insert(info.id.clone(), params);
+                }
                 ids.push(info.id);
             }
             Err(e) => {
                 log::warn!("seed demo: Zyn instantiation failed ({e}); PolySynth fallback");
+                {
+                    // Session lock dropped BEFORE the host call below ([C1]:
+                    // never call a host while holding the session lock —
+                    // `unregister_instance` is fire-and-forget/non-blocking,
+                    // but this stays disciplined regardless).
+                    let mut s = session.lock();
+                    for id in &ids {
+                        s.plugins.instances.retain(|r| &r.id != id);
+                        s.plugins.params.remove(id);
+                    }
+                }
                 for id in &ids {
-                    let _ = registry.lock().remove(id);
                     if let Some(host) = plugins::lv2_host::try_global() {
                         host.unregister_instance(id);
                     }
@@ -2716,7 +2952,7 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
@@ -2748,18 +2984,30 @@ mod tests {
     #[test]
     fn seeded_demo_zyn_instruments_bind_and_render() {
         use crate::audio::types::{Store, TrackState};
-        // The seeder resolves instances through the registered app-global
-        // registry (register-once semantics shared across the test process).
+        // The seeder resolves the scan cache through the registered
+        // app-global registry (register-once semantics shared across the
+        // test process); the document rows land in a local session (Task
+        // 9: the registry no longer holds instance rows).
         crate::plugins::register_registry(Arc::new(Mutex::new(
             crate::plugins::PluginRegistry::default(),
         )));
-        let registry = crate::plugins::registered_registry().unwrap().clone();
-        let Some(ids) = try_seed_zyn_demo_instruments() else {
+        let session = Arc::new(Mutex::new(Session::new(
+            crate::audio::types::Store::default(),
+            crate::midi::MidiStore::default(),
+        )));
+        let Some(ids) = try_seed_zyn_demo_instruments(&session) else {
             eprintln!("skipping: ZynAddSubFX or its banks not installed");
             return;
         };
         for id in &ids {
-            let info = registry.lock().instances.get(id).cloned().expect("registered");
+            let info = session
+                .lock()
+                .plugins
+                .instances
+                .iter()
+                .find(|r| &r.id == id)
+                .cloned()
+                .expect("registered");
             assert_eq!(info.status, "active", "demo Zyn instance is active");
         }
 
@@ -2790,7 +3038,8 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&midi, &store, &slots, 48_000, None, &mut nodes, &mut out);
+        let doc = session.lock().plugin_snapshot();
+        crate::midi::playback::append_from(&midi, &store, &doc, &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3);
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(
@@ -2818,9 +3067,9 @@ mod tests {
         let peak = buf.iter().fold(0.0f32, |m, s| m.max(s.abs()));
         assert!(peak > 0.01, "Zyn-bound demo renders audibly (peak {peak})");
 
-        // Cleanup: drop the demo instances from the shared registry/host.
+        // Cleanup: drop the demo instances from the session/host.
         for id in &ids {
-            let _ = registry.lock().remove(id);
+            session.lock().plugins.instances.retain(|r| &r.id != id);
             if let Some(host) = crate::plugins::lv2_host::try_global() {
                 host.unregister_instance(id);
             }

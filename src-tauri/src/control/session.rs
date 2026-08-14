@@ -1,11 +1,14 @@
 //! The document. `&mut` access is (after Task 3) only reachable through
 //! `Session::transact`. Round-2 §4.1: the remaining three stores
 //! (automation, plugin rows, sampler bank) move in during Plan E.
+use std::collections::HashMap;
+
 use crate::audio::types::{Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use crate::ids::TrackId;
 use crate::midi::MidiStore;
 use crate::plugins::automation::AutomationLane;
+use crate::plugins::{ParamInfo, PluginInstanceInfo};
 
 /// Automation lanes document (Plan E Task 10) — the in-memory half of the
 /// former standalone `plugins::automation::AutomationStore` +
@@ -20,10 +23,55 @@ pub struct AutomationDoc {
     pub lanes: Vec<AutomationLane>,
 }
 
+/// The registry's DOCUMENT half (Plan E Task 9, round-2 inventory rows
+/// 12-15 + 14): instance rows, the generic-UI param mirror, and state blobs
+/// parked for instances whose host half hasn't (yet) accepted them. The
+/// LIVE half — the plugin main thread, the format hosts' own instance
+/// tables, `PluginRegistry::scanned` — stays outside the session, reached
+/// by id through `plugins::clap_host`/`plugins::lv2_host` (their own locks,
+/// never the session's — [C1]).
+///
+/// `instances` is an ordered `Vec` (not a map), matching the
+/// `TrackAdd`/`MidiClipAdd` precedent: `Op::PluginAdd`/`PluginRemove`
+/// address a row by `index` (advisory) with store truth (by `id`) winning,
+/// exactly like `ClipRemove`/`MidiClipRemove`.
+///
+/// `params` keeps the FULL `ParamInfo` mirror (not just the raw values) —
+/// deliberately: ranges/names are synthesized PER INSTANCE for stub rows
+/// (restore-before-activation, `plugins::state::restore_into_registry`) and
+/// per real plugin once activated, so they are genuinely instance-scoped
+/// document state, not a separate lookup keyed by plugin uid.
+///
+/// `pending_state` holds APST-ENCODED bytes (`plugins::state::encode_state`
+/// — magic/version/kind/uid/data, self-describing) — the SAME bytes written
+/// to `<project>/plugins/<id>.state`, so a blob can move between disk,
+/// `PluginRemove.state`/`PluginSetState.state`, and this map without any
+/// re-encoding.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PluginDoc {
+    pub instances: Vec<PluginInstanceInfo>,
+    pub params: HashMap<String, Vec<ParamInfo>>,
+    pub pending_state: HashMap<String, Vec<u8>>,
+    /// Instance ids whose `pending_state` bytes are NEWER than whatever's
+    /// on disk (or nothing is on disk yet for them) — Task 9 review round 1
+    /// Critical-2: `save_snapshot_into_project`'s persist ladder previously
+    /// let a merely-EXISTING `.state` file win over fresher `pending_state`
+    /// bytes, so a second `PluginSetState` (e.g. a second zyn patch load
+    /// into the same instance) was silently dropped on disk. Set by every
+    /// `apply_raw` arm that writes `pending_state` with new authoritative
+    /// bytes (`PluginRemove`'s captured blob, `PluginSetState`); cleared by
+    /// `ControlPlane::execute_persist` for whichever ids
+    /// `save_snapshot_into_project` actually wrote. NOT set by
+    /// `restore_into_session` — a blob just read from that exact file is,
+    /// by definition, not ahead of it.
+    pub dirty_state: std::collections::HashSet<String>,
+}
+
 pub struct Session {
     pub store: Store,
     pub midi: MidiStore,
     pub automation: AutomationDoc,
+    pub plugins: PluginDoc,
     pub(crate) rev: u64,
     /// Document-identity counter (fix round 1, Task 7 review finding 2):
     /// bumped exactly once, under the session lock, at every DOCUMENT-SWAP
@@ -48,7 +96,14 @@ pub struct Session {
 
 impl Session {
     pub fn new(store: Store, midi: MidiStore) -> Self {
-        Self { store, midi, automation: AutomationDoc::default(), rev: 0, epoch: 0 }
+        Self {
+            store,
+            midi,
+            automation: AutomationDoc::default(),
+            plugins: PluginDoc::default(),
+            rev: 0,
+            epoch: 0,
+        }
     }
 
     /// Clone of the midi fields `midi::persist` persists — `ppq`,
@@ -63,6 +118,13 @@ impl Session {
             meter_events: self.midi.meter_events.clone(),
             clips: self.midi.clips.clone(),
         }
+    }
+
+    /// Clone of the plugin document, taken under the session lock so
+    /// `ControlPlane::execute_persist` can write it to disk AFTER the lock
+    /// is released (Task 9, same discipline as `midi_snapshot`).
+    pub fn plugin_snapshot(&self) -> PluginDoc {
+        self.plugins.clone()
     }
 
     /// The ONLY way to mutate the document. Returns Err and leaves the
@@ -197,6 +259,40 @@ pub struct EngineEffect {
     /// Which stores to persist to disk, executed by `ControlPlane::commit`
     /// (Task 6) AFTER the session lock is released — see `PersistEffect`.
     pub persist: PersistEffect,
+    /// Plan E Task 9: plugin host round-trips a commit's plugin ops
+    /// describe, EXECUTED by `ControlPlane::commit` after the session lock
+    /// is released (§4.1/[C1]: hosts have their own locks, never called
+    /// while the session lock is held) — see `HostForward`.
+    pub host_forward: Vec<HostForward>,
+}
+
+/// A plugin-host round-trip `apply_raw` determined is needed, described
+/// here (plain data — id + numbers, no host handle anywhere in this
+/// module), EXECUTED by `ControlPlane::commit` by calling the SAME host
+/// entry points commands call today (`plugins::clap_host`/`lv2_host`/
+/// `state`'s `HostStateBridge`), now sequenced after the session lock.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostForward {
+    /// Forward a single (already-clamped) param value from `Op::Set{Plugin,
+    /// Param}` to the format host — mirrors `plugins::set_params_and_forward`.
+    ParamWrite { instance: String, index: u32, value: f32 },
+    /// Ensure `instance` is live on its format host, then mirror the real
+    /// param list + `"active"` status back into the document (short session
+    /// lock, post host call). Pushed by every `Op::PluginAdd` apply — the
+    /// executor is idempotent (checks `has_instance` first), so the
+    /// prepare-outside fresh-instantiate path (host already live) safely
+    /// no-ops the host call and just re-syncs params; the undo-of-remove
+    /// path (host gone, destroyed by the forward `Destroy`) actually
+    /// re-instantiates.
+    Instantiate { instance: String },
+    /// Destroy `instance` on its format host (`Op::PluginRemove`'s forward
+    /// direction).
+    Destroy { instance: String },
+    /// Offer `session.plugins.pending_state[instance]` to the registered
+    /// `HostStateBridge` (`Op::PluginAdd` when a blob is pending —
+    /// restore-from-blob undo — and `Op::PluginSetState`'s forward
+    /// direction — zyn patch loads).
+    LoadState { instance: String },
 }
 
 /// Which durable stores a transaction touched — described here (plain data,
@@ -211,7 +307,8 @@ pub struct PersistEffect {
     pub midi: bool,
     /// `audio::project::save` from `audio::project::from_store`.
     pub project: bool,
-    /// Task 9 wires the executor; the field exists now.
+    /// `plugins::state::save_snapshot_into_project` from a `PluginDoc`
+    /// snapshot taken under a short session lock (Task 9).
     pub plugins: bool,
     /// Task 10 wires the executor; the field exists now.
     pub automation: bool,
@@ -683,6 +780,160 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.persist.automation = true;
             Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
         }
+        // Plan E Task 9 (round-2 inventory rows 12-15): plugin instance
+        // rows. Same store-truth-wins-by-id discipline as
+        // ClipAdd/ClipRemove/MidiClipAdd/MidiClipRemove.
+        Op::PluginAdd { row, index } => {
+            if session.plugins.instances.iter().any(|r| r.id == row.id) {
+                return Err(format!("duplicate plugin instance id: {}", row.id));
+            }
+            let idx = (*index).min(session.plugins.instances.len());
+            session.plugins.instances.insert(idx, row.clone());
+            // Seed an EMPTY params mirror only when nothing is parked there
+            // already (`.or_default()` is a no-op on an Occupied entry) —
+            // Task 9 review round 1, Important-1: undo-of-remove parks the
+            // removed row's real mirror in `session.plugins.params` (see
+            // `PluginRemove` below) instead of clearing it, specifically so
+            // THIS seed doesn't clobber it with an empty vec. A genuinely
+            // fresh instantiate's id has never been seen before, so this
+            // still seeds empty there; `HostForward::Instantiate` fills
+            // real values in — but ONLY when the mirror is still empty
+            // (same round-1 fix, control/mod.rs), so it never clobbers a
+            // restored mirror with the host's post-reinstantiate defaults.
+            session.plugins.params.entry(row.id.clone()).or_default();
+            effect.rebuild = true;
+            effect.persist.plugins = true;
+            // Always folded in (doc comment on the op): the executor is the
+            // one that knows whether the host call is actually needed.
+            effect.host_forward.push(HostForward::Instantiate { instance: row.id.clone() });
+            if session.plugins.pending_state.contains_key(&row.id) {
+                effect.host_forward.push(HostForward::LoadState { instance: row.id.clone() });
+            }
+            Ok(Op::PluginRemove {
+                row: row.clone(),
+                index: idx,
+                state: session.plugins.pending_state.get(&row.id).cloned(),
+                params: session.plugins.params.get(&row.id).cloned().unwrap_or_default(),
+            })
+        }
+        Op::PluginRemove { row, state, .. } => {
+            // Found by id, not blindly by the caller's recorded index —
+            // store truth wins (same rule as `ClipRemove`/`TrackRemove`).
+            let pos = session
+                .plugins
+                .instances
+                .iter()
+                .position(|r| r.id == row.id)
+                .ok_or_else(|| format!("unknown plugin instance: {}", row.id))?;
+            let removed = session.plugins.instances.remove(pos);
+            // PARK the param mirror — do NOT clear it (Task 9 review round
+            // 1, Important-1). `Op::PluginAdd`'s fixed `{row, index}` shape
+            // has no field to carry the mirror back through on undo, so it
+            // travels via the document itself: a later `PluginAdd` for this
+            // SAME id (undo replaying THIS op's inverse) finds it already
+            // here and its `.or_default()` seed leaves it untouched. A
+            // permanent removal (never undone) leaves a small, bounded
+            // orphaned entry, same trade-off `pending_state` already makes
+            // below — both are GC'd wholesale on the next
+            // `restore_into_session`/project open.
+            effect.rebuild = true;
+            effect.persist.plugins = true;
+            // Park (or clear) the state blob: `state` is the caller-captured
+            // host blob (host `save_state`, taken outside the lock before
+            // this op was applied) — `None` when the instance had nothing to
+            // save. Preserved verbatim so a later undo (`PluginAdd`) can
+            // restore it via `HostForward::LoadState`.
+            match state {
+                Some(bytes) => {
+                    session.plugins.pending_state.insert(removed.id.clone(), bytes.clone());
+                    // Dirty (Task 9 review round 1, Critical-2): these bytes
+                    // are NEWER than whatever `.state` file (if any) is on
+                    // disk for this id — `save_snapshot_into_project`'s
+                    // persist ladder must write them, not silently keep the
+                    // stale file just because it happens to exist.
+                    session.plugins.dirty_state.insert(removed.id.clone());
+                }
+                None => {
+                    session.plugins.pending_state.remove(&removed.id);
+                    session.plugins.dirty_state.remove(&removed.id);
+                }
+            }
+            effect.host_forward.push(HostForward::Destroy { instance: removed.id.clone() });
+            Ok(Op::PluginAdd { row: removed, index: pos })
+        }
+        Op::PluginSetState { instance, state } => {
+            if !session.plugins.instances.iter().any(|r| r.id == *instance) {
+                return Err(format!("unknown plugin instance: {instance}"));
+            }
+            let previous = session.plugins.pending_state.get(instance).cloned();
+            session.plugins.pending_state.insert(instance.clone(), state.clone());
+            // Dirty (Critical-2, same reasoning as `PluginRemove` above):
+            // these are new authoritative bytes, not necessarily reflected
+            // in whatever `.state` file already exists on disk.
+            session.plugins.dirty_state.insert(instance.clone());
+            effect.persist.plugins = true;
+            effect.host_forward.push(HostForward::LoadState { instance: instance.clone() });
+            Ok(Op::PluginSetState {
+                instance: instance.clone(),
+                // Inverse restores whatever was there before (which may be
+                // "nothing" — an instance that never had a blob) by
+                // reapplying an EMPTY blob is wrong (that would forward-load
+                // zero bytes into the host); an absent previous blob simply
+                // means there is nothing meaningful to undo TO, so the
+                // instance's own current blob is kept as a harmless
+                // self-inverse in that corner case (no data loss either way
+                // — never observed by `zyn_load_patch`, which always saves a
+                // real prior blob first).
+                state: previous.unwrap_or_else(|| state.clone()),
+            })
+        }
+        // Plugin params: property-addressed, mirrors `Op::Set{Track, Gain}`
+        // — clamped write, inverse from store truth, folds like mix Sets
+        // (coalescable per (object, path) — a knob drag is Sets on one
+        // instance/param).
+        Op::Set { object: ObjectRef::Plugin(id), path: PropPath::Param { index }, to, .. } => {
+            if !session.plugins.instances.iter().any(|r| &r.id == id) {
+                return Err(format!("unknown plugin instance: {id}"));
+            }
+            let v = to.as_f64().ok_or("param: expected a number")?;
+            let params = session.plugins.params.entry(id.clone()).or_default();
+            let (from_now, applied) = match params.iter_mut().find(|p| p.id == *index) {
+                Some(p) => {
+                    let from_now = p.value;
+                    p.value = v.clamp(p.min, p.max);
+                    (from_now, p.value)
+                }
+                None => {
+                    // Unseen param id (mirrors the retired
+                    // `PluginRegistry::set_params`'s dynamic-entry path for
+                    // stub instances whose real ranges aren't known yet): a
+                    // fresh 0..1-spanning entry, clamped the same way.
+                    let clamped = v.clamp(0.0, 1.0);
+                    params.push(ParamInfo {
+                        id: *index,
+                        name: format!("param {index}"),
+                        min: 0.0,
+                        max: 1.0,
+                        default: 0.0,
+                        value: clamped,
+                        steps: 0,
+                    });
+                    (0.0, clamped)
+                }
+            };
+            effect.persist.plugins = true;
+            effect.host_forward.push(HostForward::ParamWrite {
+                instance: id.clone(),
+                index: *index,
+                value: applied as f32,
+            });
+            Ok(Op::Set {
+                object: ObjectRef::Plugin(id.clone()),
+                path: PropPath::Param { index: *index },
+                from: serde_json::json!(applied), // the inverse's `from`: value we just wrote
+                to: serde_json::json!(from_now),  // the inverse's `to`: value to restore
+            })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
@@ -715,8 +966,9 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         | PropPath::LoopStartSamples
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
-        | PropPath::SampleRate => {
-            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport path)"))
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin path)"))
         }
     }
 }
@@ -771,8 +1023,9 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
         | PropPath::LoopStartSamples
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
-        | PropPath::SampleRate => {
-            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport path)"))
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin path)"))
         }
     }
 }
@@ -802,7 +1055,8 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::LoopStartSamples
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
-        | PropPath::SampleRate => {
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
     }
@@ -855,7 +1109,8 @@ fn write_midi_prop(
         | PropPath::LoopStartSamples
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
-        | PropPath::SampleRate => {
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
     }
@@ -887,7 +1142,8 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
-        | PropPath::ContentLengthTicks => {
+        | PropPath::ContentLengthTicks
+        | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
     }
@@ -955,7 +1211,8 @@ fn write_transport_prop(
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
-        | PropPath::ContentLengthTicks => {
+        | PropPath::ContentLengthTicks
+        | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
     }
@@ -1973,5 +2230,268 @@ mod tests {
             vec![AutomationPoint { tick: 0, value: 1.0 }, AutomationPoint { tick: 960, value: 0.5 }],
             "apply normalizes (sorts) points before storing"
         );
+    }
+    // ---- Plan E Task 9: plugin op kinds ----
+
+    fn test_plugin_row(id: &str) -> PluginInstanceInfo {
+        PluginInstanceInfo {
+            id: id.into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        }
+    }
+
+    /// Mirrors `session_owns_both_stores_under_one_lock`: the plugin
+    /// document is a THIRD field behind the SAME session guard, so a
+    /// caller can read/write tracks, midi and plugin rows under one lock —
+    /// impossible with the old (store, midi) + separate `PluginRegistry`
+    /// layout.
+    #[test]
+    fn session_owns_plugin_rows() {
+        let s = Session::new(Store::default(), MidiStore::default());
+        let m = parking_lot::Mutex::new(s);
+        let mut g = m.lock();
+        g.plugins.instances.push(test_plugin_row("p-1"));
+        g.plugins.params.insert("p-1".into(), Vec::new());
+        g.midi.ppq = 960;
+        assert_eq!(g.plugins.instances.len(), 1);
+        assert_eq!(g.midi.ppq, 960);
+    }
+
+    #[test]
+    fn plugin_add_duplicate_id_is_rejected_atomically() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        m.lock().plugins.instances.push(row.clone());
+        let before = m.lock().plugins.instances.clone();
+        let r = Session::transact(&m, TxMeta::user("dup"), |tx| {
+            tx.apply(Op::PluginAdd { row: row.clone(), index: 1 })
+        });
+        assert!(r.is_err());
+        assert_eq!(m.lock().plugins.instances, before, "document untouched");
+    }
+
+    /// §4.4 restore-from-blob: `PluginRemove`'s `state` (captured via the
+    /// host's `save_state` BEFORE teardown, outside the lock — this test
+    /// hands it in directly, no real host needed) travels into
+    /// `pending_state`; the computed inverse is `PluginAdd`, and REPLAYING
+    /// that inverse (undo) re-emits `Instantiate` + `LoadState` — the
+    /// host-forward round trip a generic undo replay needs since there is
+    /// no "prepare" step for it (unlike the original forward instantiate).
+    #[test]
+    fn plugin_remove_then_undo_restores_state_blob() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(row.id.clone(), Vec::new());
+        }
+        let blob = vec![1u8, 2, 3, 4];
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
+            tx.apply(Op::PluginRemove {
+                row: row.clone(),
+                index: 0,
+                state: Some(blob.clone()),
+                params: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert!(m.lock().plugins.instances.is_empty(), "row removed");
+        assert_eq!(
+            m.lock().plugins.pending_state.get("p-1"),
+            Some(&blob),
+            "blob parked in pending_state"
+        );
+        assert!(
+            c.effect.host_forward.contains(&HostForward::Destroy { instance: "p-1".into() }),
+            "forward remove destroys the host instance post-lock"
+        );
+        assert!(c.effect.persist.plugins, "remove persists via effect");
+        match &c.inverses[0] {
+            Op::PluginAdd { row: r, .. } => assert_eq!(r.id, "p-1", "inverse carries the row"),
+            other => panic!("expected PluginAdd inverse, got {other:?}"),
+        }
+
+        let c2 = Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.instances.len(), 1, "undo restores the row");
+        assert!(
+            c2.effect.host_forward.contains(&HostForward::Instantiate { instance: "p-1".into() }),
+            "undo re-emits Instantiate"
+        );
+        assert!(
+            c2.effect.host_forward.contains(&HostForward::LoadState { instance: "p-1".into() }),
+            "undo re-emits LoadState (a blob is pending)"
+        );
+    }
+
+    /// Task 9 review round 1, Important-1: undo-of-remove must restore the
+    /// user's ACTUAL param mirror, not an empty seed later overwritten by
+    /// the host's post-reinstantiate DEFAULTS. `apply_raw`'s `PluginRemove`
+    /// arm parks the mirror instead of clearing it; `PluginAdd`'s
+    /// `.or_default()` seed must find it already there and leave it alone.
+    #[test]
+    fn plugin_remove_then_undo_restores_the_param_mirror_not_empty() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        let tweaked = ParamInfo {
+            id: 7,
+            name: "cutoff".into(),
+            min: 0.0,
+            max: 1.0,
+            default: 0.5,
+            value: 0.9,
+            steps: 0,
+        };
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(row.id.clone(), vec![tweaked.clone()]);
+        }
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
+            tx.apply(Op::PluginRemove { row: row.clone(), index: 0, state: None, params: vec![] })
+        })
+        .unwrap();
+        // Document truth: the mirror is PARKED (still readable), not wiped,
+        // even though the row itself is gone.
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![tweaked.clone()]),
+            "param mirror survives removal, parked for a possible undo"
+        );
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().plugins.params.get("p-1"),
+            Some(&vec![tweaked]),
+            "undo (PluginAdd replaying the parked id) leaves the real mirror untouched — \
+             not reset to empty"
+        );
+    }
+
+    /// A knob drag: several `Set{Plugin, Param}` writes on the SAME
+    /// (instance, index) within one transaction fold to their net change
+    /// (mirrors mix Sets), and the batch persists via `effect.persist.
+    /// plugins` + forwards the FINAL clamped value to the host
+    /// (`host_forward`) — never disk I/O or a host call inside `apply_raw`
+    /// itself.
+    #[test]
+    fn plugin_set_param_is_coalescable_and_persists_via_effect() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.params.insert(
+                row.id.clone(),
+                vec![ParamInfo {
+                    id: 7,
+                    name: "cutoff".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    value: 0.5,
+                    steps: 0,
+                }],
+            );
+        }
+        let set_param = |v: f64| Op::Set {
+            object: ObjectRef::Plugin("p-1".into()),
+            path: PropPath::Param { index: 7 },
+            from: serde_json::Value::Null,
+            to: serde_json::json!(v),
+        };
+        let c = Session::transact(&m, TxMeta::user("knob drag"), |tx| {
+            tx.apply(set_param(0.2))?;
+            tx.apply(set_param(0.9))
+        })
+        .unwrap();
+        assert_eq!(c.ops.len(), 1, "same (instance, index) coalesces to one net Set");
+        match &c.ops[0] {
+            Op::Set { to, .. } => assert_eq!(to, &serde_json::json!(0.9)),
+            other => panic!("expected Set, got {other:?}"),
+        }
+        assert_eq!(m.lock().plugins.params.get("p-1").unwrap()[0].value, 0.9);
+        assert!(c.effect.persist.plugins, "param write persists via effect");
+        assert!(!c.effect.rebuild, "a param write is not structural");
+        let last = c.effect.host_forward.last().expect("at least one host forward");
+        assert!(
+            matches!(last, HostForward::ParamWrite { instance, index, value }
+                if instance == "p-1" && *index == 7 && (*value - 0.9).abs() < 1e-6),
+            "final host forward carries the net clamped value: {last:?}"
+        );
+
+        // Undo restores the original value.
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.params.get("p-1").unwrap()[0].value, 0.5);
+    }
+
+    #[test]
+    fn plugin_set_param_unknown_instance_fails_cleanly() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let r = Session::transact(&m, TxMeta::user("bad"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Plugin("nope".into()),
+                path: PropPath::Param { index: 0 },
+                from: serde_json::Value::Null,
+                to: serde_json::json!(0.5),
+            })
+        });
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn plugin_set_state_inverse_carries_the_previous_blob() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let row = test_plugin_row("p-1");
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(row.clone());
+            g.plugins.pending_state.insert("p-1".into(), vec![0u8, 0, 0]);
+        }
+        let new_blob = vec![9u8, 9, 9, 9];
+        let c = Session::transact(&m, TxMeta::user("zyn load patch"), |tx| {
+            tx.apply(Op::PluginSetState { instance: "p-1".into(), state: new_blob.clone() })
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.pending_state.get("p-1"), Some(&new_blob));
+        assert!(c.effect.persist.plugins);
+        assert!(c
+            .effect
+            .host_forward
+            .contains(&HostForward::LoadState { instance: "p-1".into() }));
+        match &c.inverses[0] {
+            Op::PluginSetState { state, .. } => assert_eq!(state, &vec![0u8, 0, 0], "old blob"),
+            other => panic!("expected PluginSetState inverse, got {other:?}"),
+        }
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
     }
 }

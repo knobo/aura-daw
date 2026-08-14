@@ -535,7 +535,7 @@ pub fn set_track_instrument(
 ) -> Result<TrackState, String> {
     if let Some(id) = &instrument_id {
         if let Some(pid) = id.strip_prefix("plugin:") {
-            if !crate::plugins::instance_exists(pid) {
+            if !control.plugin_exists(pid) {
                 return Err(format!(
                     "unknown plugin instance: {pid} (plugin_instantiate first)"
                 ));
