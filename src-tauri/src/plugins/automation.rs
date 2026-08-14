@@ -548,6 +548,32 @@ impl RampCursor {
     }
 }
 
+/// Compile every TRACK-GAIN lane into a slot-indexed ramp table for one
+/// rebuild. CONTROL THREAD ONLY — this is where ticks become absolute
+/// samples; nothing tick-shaped crosses onto the RT thread
+/// (ARCHITECTURE §13/§15.1).
+pub fn compile_gain_ramps(
+    lanes: &[AutomationLane],
+    map: &TempoMap,
+    n_slots: usize,
+    slot_of: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<Option<Arc<Vec<AbsParamEvent>>>> {
+    let mut out: Vec<Option<Arc<Vec<AbsParamEvent>>>> = (0..n_slots).map(|_| None).collect();
+    for lane in lanes {
+        let Some(LaneTarget::TrackGain(track_id)) = resolve_target(lane) else { continue };
+        let Some(slot) = slot_of(&track_id) else { continue };
+        if slot >= out.len() {
+            continue;
+        }
+        let events = compile_lane(lane, map);
+        if events.is_empty() {
+            continue;
+        }
+        out[slot] = Some(Arc::new(events));
+    }
+    out
+}
+
 /// One host param write the driver decided is due. `format` is carried so
 /// the tick path never has to take the session lock to look it up.
 #[derive(Debug, Clone, PartialEq)]
@@ -1340,5 +1366,35 @@ mod tests {
         assert_eq!(adopted.points, saved[0].points);
 
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    // ---- Task 8: compile_gain_ramps (slot indexing, control-side) ---------
+
+    #[test]
+    fn compile_gain_ramps_indexes_by_slot_and_skips_what_cannot_resolve() {
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut a = lane(vec![
+            AutomationPoint { tick: 0, value: 1.0 },
+            AutomationPoint { tick: 3840, value: 0.0 },
+        ]);
+        a.target_node = "track:t-1".into();
+        let mut orphan = lane(vec![AutomationPoint { tick: 0, value: 0.5 }]);
+        orphan.target_node = "track:t-gone".into();
+        let mut plugin_lane = lane(vec![AutomationPoint { tick: 0, value: 0.5 }]);
+        plugin_lane.target_node = "inst-1".into();
+        let mut empty = lane(vec![]);
+        empty.target_node = "track:t-2".into();
+
+        let slot_of = |id: &str| match id {
+            "t-1" => Some(0usize),
+            "t-2" => Some(1),
+            _ => None,
+        };
+        let ramps = compile_gain_ramps(&[a, orphan, plugin_lane, empty], &map, 2, &slot_of);
+        assert_eq!(ramps.len(), 2);
+        let r0 = ramps[0].as_ref().expect("t-1 has a compiled ramp");
+        assert_eq!(r0[0], AbsParamEvent { sample: 0, value: 1.0 });
+        assert_eq!(r0[1], AbsParamEvent { sample: 96_000, value: 0.0 });
+        assert!(ramps[1].is_none(), "an empty lane compiles to no ramp");
     }
 }
