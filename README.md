@@ -386,7 +386,7 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 369 tests (counted 2026-08-14): engine, MIDI, sampler, plugins, MCP, sidecars, control plane
+cd src-tauri && cargo test    # 370 tests (counted 2026-08-14): engine, MIDI, sampler, plugins, MCP, sidecars, control plane
 npm test                      # 80 frontend unit tests (counted 2026-08-14; vitest): stores + timeline math
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build

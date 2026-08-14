@@ -168,6 +168,7 @@ fn run_writer(
             .finish()
             .write_dir(&w.spec.cache_dir)
             .map_err(|e| format!("waveform cache: {e}"))?;
+        let lane_id = crate::ids::LaneId::default_for_track(&w.spec.track_id);
         clips.push(Clip {
             id: w.spec.clip_id.into(),
             track_id: w.spec.track_id.into(),
@@ -183,6 +184,8 @@ fn run_writer(
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id,
         });
     }
     Ok(clips)

@@ -2122,6 +2122,8 @@ mod tests {
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
         }
     }
 

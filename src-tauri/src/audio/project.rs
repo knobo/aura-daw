@@ -186,7 +186,39 @@ pub fn load(path: &Path) -> Result<(Project, PathBuf), String> {
     // minted per unique source_path, so every clip entering the store from this
     // point on carries a real identity for the decode cache.
     assign_source_ids(&mut project.clips);
+    // Round-2 §5: same treatment for content_id/lane_id (ADR 0004) — every
+    // clip entering the store carries real placement/content addressing.
+    assign_content_and_lane_ids(&mut project.clips);
     Ok((project, dir))
+}
+
+/// Fixed namespace for deterministic content-id minting on legacy audio
+/// clips (round-2 §5, ADR 0004) — same discipline as `AURA_SOURCE_NS`: a
+/// separate namespace from MIDI's own content-id minting
+/// (`midi::persist::CONTENT_NS`) is fine — `ContentId` is just a UUID
+/// space, not required to share one minting function across domains — and
+/// keeps this module's identity assignment self-contained.
+const AURA_CONTENT_NS: uuid::Uuid = uuid::uuid!("2b6e9f31-4d7c-4e0a-8f2b-6a1d3c5e7f90");
+
+/// Mint `content_id`/`lane_id` for every clip that doesn't already carry
+/// one (round-2 §5, ADR 0004). Audio clips are content-backed too — a thin
+/// content object wrapping the `SourceId` — so the placement schema stays
+/// uniform with MIDI's; scope ruling (this plan's preamble): addressing is
+/// real from these fields on, but the JSON stays a single clip row (no
+/// content[]/placements[] array split for audio yet). `lane_id` uses the
+/// SAME `LaneId::default_for_track` function MIDI clips use, so a track's
+/// default lane is one id regardless of which domain's clip asks for it.
+pub(crate) fn assign_content_and_lane_ids(clips: &mut [Clip]) {
+    for clip in clips.iter_mut() {
+        if clip.content_id.as_str().is_empty() {
+            clip.content_id = crate::ids::ContentId(
+                uuid::Uuid::new_v5(&AURA_CONTENT_NS, clip.id.as_str().as_bytes()).to_string(),
+            );
+        }
+        if clip.lane_id.as_str().is_empty() {
+            clip.lane_id = crate::ids::LaneId::default_for_track(clip.track_id.as_str());
+        }
+    }
 }
 
 /// Mint one `SourceId` per unique (normalized) `source_path` for every clip
@@ -490,7 +522,46 @@ mod tests {
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: Default::default(),
+            lane_id: Default::default(),
         }
+    }
+
+    #[test]
+    fn legacy_clips_get_deterministic_content_and_lane_ids() {
+        // Content is keyed by CLIP id (1:1 with its placement — no
+        // split/merge/copy content-op exists yet, round-2 §2.1's remint
+        // rules bind those from the day they land, not before); lane is
+        // keyed by TRACK id (round-2 §5's default-lane rule, same function
+        // MIDI's LaneId::default_for_track already uses).
+        let mut clips = vec![clip_n("c0", "audio/x.wav", ""), clip_n("c1", "audio/y.wav", "")];
+        clips[1].track_id = "t1".into();
+        assign_content_and_lane_ids(&mut clips);
+        assert!(!clips[0].content_id.as_str().is_empty());
+        assert!(!clips[1].content_id.as_str().is_empty());
+        assert_ne!(clips[0].content_id, clips[1].content_id, "each clip gets its own content id");
+        assert_eq!(
+            clips[0].lane_id,
+            crate::ids::LaneId::default_for_track("t0"),
+            "lane id matches the shared default_for_track function MIDI uses"
+        );
+        assert_ne!(clips[0].lane_id, clips[1].lane_id, "different track -> different lane");
+
+        // Deterministic across independent runs (same discipline as
+        // assign_source_ids — M-6).
+        let mut clips2 = vec![clip_n("c0", "audio/x.wav", "")];
+        assign_content_and_lane_ids(&mut clips2);
+        assert_eq!(clips2[0].content_id, clips[0].content_id, "deterministic across runs");
+        assert_eq!(clips2[0].lane_id, clips[0].lane_id);
+
+        // Already-assigned ids are never re-minted.
+        let mut pre = clip_n("c0", "audio/x.wav", "");
+        pre.content_id = crate::ids::ContentId("pre-existing-content".into());
+        pre.lane_id = crate::ids::LaneId("pre-existing-lane".into());
+        let mut pre_vec = vec![pre];
+        assign_content_and_lane_ids(&mut pre_vec);
+        assert_eq!(pre_vec[0].content_id.as_str(), "pre-existing-content");
+        assert_eq!(pre_vec[0].lane_id.as_str(), "pre-existing-lane");
     }
 
     #[test]

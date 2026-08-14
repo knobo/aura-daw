@@ -154,6 +154,8 @@ mod tests {
             gain_db: 0.0,
             fade_in_samples: 0,
             fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-2"),
         };
         let track_add = Op::TrackAdd {
             track: track.clone(), index: 0, clips: vec![clip.clone()], clip_indices: vec![0],

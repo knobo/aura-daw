@@ -22,7 +22,7 @@ use proptest::prelude::*;
 use aura_lib::audio::types::{Clip, Store, TrackState};
 use aura_lib::control::op::{Actor, Op, TxMeta};
 use aura_lib::control::Session;
-use aura_lib::ids::{ClipId, SourceId, TrackId};
+use aura_lib::ids::{ClipId, ContentId, LaneId, SourceId, TrackId};
 use aura_lib::midi::MidiStore;
 
 // ---------------------------------------------------------------------------
@@ -64,6 +64,8 @@ fn test_clip(id: &ClipId, track_id: &TrackId) -> Clip {
         gain_db: 0.0,
         fade_in_samples: 0,
         fade_out_samples: 0,
+        content_id: ContentId::mint(),
+        lane_id: LaneId::default_for_track(track_id.as_str()),
     }
 }
 
