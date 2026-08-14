@@ -116,6 +116,11 @@ pub fn ensure_default_project(
     let (project, dir) = create(&parent, &name, sample_rate, 120.0)?;
     {
         let mut session = session.lock();
+        // epoch boundary: Task 17 hooks history-clear + journal rotation
+        // here — this is the actual swap site for the "ensure" epoch (both
+        // the engine's own `ensure_project` and `ControlPlane::
+        // ensure_project_epoch` call through here; neither does its own
+        // separate store write).
         session.store.project_dir = Some(dir);
         session.store.project_name = Some(project.name.clone());
         session.store.created_at = project.created_at.clone();

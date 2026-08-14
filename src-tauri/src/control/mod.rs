@@ -913,14 +913,37 @@ impl ControlPlane {
     /// Engine auto-project, as a sanctioned `ControlPlane` epoch fn (round-2
     /// §4.5 carve-out, "document birth") — same behavior as the engine
     /// control thread's own `ensure_project` (engine.rs), sharing its core
-    /// via `project::ensure_default_project`; NOT yet wired to the engine
-    /// (Task 13 switches that call site over). No-op (just returns the
-    /// already-open dir) when a project is already open.
+    /// via `project::ensure_default_project` (the store swap, and its Task
+    /// 17 epoch-boundary marker, live there — this fn does no store write
+    /// of its own). NOT yet wired to the engine (Task 13 switches that call
+    /// site over). No-op (just returns the already-open dir) when a project
+    /// is already open.
+    ///
+    /// Deliberately skips steps (3) adopt and (4) Rebuild of the 5-step
+    /// epoch contract the other four functions follow — this is NOT an
+    /// oversight, it's why this fn exists as a separate, narrower epoch:
+    /// (a) `ensure_default_project` only ever swaps when
+    ///     `store.project_dir` was `None` — there is no PRIOR project's
+    ///     plugin/automation state to evict, so adopting from the fresh
+    ///     (empty) dir would be a no-op against an already-empty
+    ///     registry/lane set;
+    /// (b) no graph rebuild is needed because "document birth" here changes
+    ///     no tracks/clips — the store's musical content is UNCHANGED, only
+    ///     `project_dir`/`project_name`/`created_at` are set, so there is
+    ///     nothing for a rebuild to pick up that the current graph doesn't
+    ///     already have;
+    /// (c) this fn's whole reason to exist is byte-for-byte parity with the
+    ///     engine's current `ensure_project` (Task 13 routes the engine's
+    ///     own call site through here) — adding adopt/Rebuild would make it
+    ///     diverge from the behavior it's standing in for. A future
+    ///     standalone caller (MCP tool, command) that actually needs
+    ///     adopt/Rebuild semantics on project birth should call
+    ///     `create_project_at` (via `create_project`/`create_project_epoch`),
+    ///     not this one.
     pub fn ensure_project_epoch(&self) -> Result<PathBuf, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
         match project::ensure_default_project(&self.session, rate)? {
             Some(project) => {
-                // epoch boundary: Task 17 hooks history-clear + journal rotation here
                 (self.emit)(
                     "project://changed",
                     serde_json::to_value(&project).unwrap_or_default(),
