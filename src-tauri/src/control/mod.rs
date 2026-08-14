@@ -805,34 +805,55 @@ pub(crate) mod testutil {
 // Gesture IPC (Plan E Task 14, round-2 inventory row 31, ADR 0003)
 // ---------------------------------------------------------------------------
 
+/// What a `CoalesceKey` addresses. Internal to this module (`CoalesceKey`
+/// is `pub(crate)` and is never serialized), which is exactly why an
+/// automation lane can get a coalesce target here without adding a
+/// variant to the JOURNALED `op::ObjectRef` enum.
+#[derive(Debug, Clone, PartialEq)]
+enum CoalesceTarget {
+    Object(op::ObjectRef),
+    /// `AutomationLane::id` — lanes have a string id, not a struct key.
+    AutomationLane(String),
+}
+
 /// The coalescing key a gesture folds by: the op's discriminant + the
-/// `ObjectRef` it targets + the `PropPath` it targets (round-2 §4.4:
+/// target it addresses + the `PropPath` it targets (round-2 §4.4:
 /// "coalesced by (op_kind, target, actor)" — the (kind, target) half; the
 /// actor half is `OpenGesture::actor`/`GestureState::matches_actor`, checked
 /// separately since it gates whether a commit folds AT ALL, not which key it
-/// folds under). `path` is `Option` because a future non-`Set` op kind may
-/// have no property path; today `for_op` only ever returns `Some(path)`,
-/// since `Op::Set` is the only kind it builds a key for. Exported
-/// (`pub(crate)`) — Task 17 imports this exact type to key its own
-/// history-side merge; the name and the (kind, object, path) shape are
-/// load-bearing, not cosmetic.
+/// folds under). `path` is `Option` because a non-`Set` op kind (e.g.
+/// `Op::AutomationSetLane`) has no property path — it addresses a whole
+/// lane, not a property of one. Exported (`pub(crate)`) — Task 17 imports
+/// this exact type to key its own history-side merge; the name and the
+/// (kind, target, path) shape are load-bearing, not cosmetic.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CoalesceKey {
     kind: &'static str,
-    object: op::ObjectRef,
+    target: CoalesceTarget,
     path: Option<op::PropPath>,
 }
 
 impl CoalesceKey {
     /// Builds the key for `op`, or `None` for an op kind gesture folding
-    /// doesn't (yet) handle. Only `Op::Set` today — the only op kind
-    /// `ControlPlane::set_track_mix` (gesture folding's one wired caller)
-    /// ever applies.
+    /// doesn't (yet) handle. `Op::Set` and `Op::AutomationSetLane` today —
+    /// the op kinds `ControlPlane::set_track_mix`, `set_plugin_params`, and
+    /// `set_automation_lane` (gesture folding's wired callers) apply.
     fn for_op(op: &op::Op) -> Option<Self> {
         match op {
-            op::Op::Set { object, path, .. } => {
-                Some(Self { kind: "set", object: object.clone(), path: Some(*path) })
-            }
+            op::Op::Set { object, path, .. } => Some(Self {
+                kind: "set",
+                target: CoalesceTarget::Object(object.clone()),
+                path: Some(*path),
+            }),
+            // §4.4 value-replacement wrapper: a lane drag is a run of
+            // whole-lane replaces of ONE lane; folding them by lane id is
+            // what makes the drag one undo entry AND (with Task 2's
+            // deferral) one automation persist.
+            op::Op::AutomationSetLane { key, .. } => Some(Self {
+                kind: "automationSetLane",
+                target: CoalesceTarget::AutomationLane(key.clone()),
+                path: None,
+            }),
             _ => None,
         }
     }
@@ -843,15 +864,15 @@ impl CoalesceKey {
     ///
     /// Why the two differ, rather than one shared fn: `for_op` decides what
     /// a gesture folds INSIDE an open boundary, where folding also discards
-    /// intermediate commits' effects — only `Op::Set`, the sole op kind
-    /// `set_track_mix` (gesture folding's one wired caller) ever applies,
-    /// is in scope there. The 350 ms fallback merges FINISHED, already
-    /// committed batches, so it can safely cover the other §4.4
-    /// value-replacement wrapper too: `midi_set_notes_core` deliberately
-    /// keeps the FIXED label `"set midi notes"` (its own doc says so)
-    /// precisely so a run of note edits on ONE clip collapses to one undo
-    /// step instead of one per keystroke. `path: None` — a `MidiSetNotes`
-    /// addresses the whole clip, not a property of it.
+    /// intermediate commits' effects — only the op kinds `set_track_mix`,
+    /// `set_plugin_params`, and `set_automation_lane` (gesture folding's
+    /// wired callers) ever apply are in scope there. The 350 ms fallback
+    /// merges FINISHED, already committed batches, so it can safely cover
+    /// the other §4.4 value-replacement wrapper too: `midi_set_notes_core`
+    /// deliberately keeps the FIXED label `"set midi notes"` (its own doc
+    /// says so) precisely so a run of note edits on ONE clip collapses to
+    /// one undo step instead of one per keystroke. `path: None` — a
+    /// `MidiSetNotes` addresses the whole clip, not a property of it.
     ///
     /// Every other op kind is structural and returns `None`, which is what
     /// makes "a structural op breaks the merge" true by construction.
@@ -859,7 +880,7 @@ impl CoalesceKey {
         match op {
             op::Op::MidiSetNotes { clip, .. } => Some(Self {
                 kind: "midiSetNotes",
-                object: op::ObjectRef::MidiClip(clip.clone()),
+                target: CoalesceTarget::Object(op::ObjectRef::MidiClip(clip.clone())),
                 path: None,
             }),
             other => Self::for_op(other),
@@ -1671,6 +1692,45 @@ impl ControlPlane {
             }
             None => {
                 self.commit(meta, |tx| apply(changes, tx))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete, when the normalized lane has no points) ONE
+    /// automation lane through the transaction channel — the §4.4
+    /// value-replacement wrapper, gesture-aware in the same shape as
+    /// `set_track_mix`/`set_plugin_params`. A lane drag therefore folds to
+    /// one `Op::AutomationSetLane` (last write per lane id wins), one undo
+    /// entry, and — with the gesture's deferred persist — one automation
+    /// write to disk.
+    pub fn set_automation_lane(
+        &self,
+        mut lane: crate::plugins::automation::AutomationLane,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if lane.id.is_empty() {
+            lane.id = uuid::Uuid::new_v4().to_string();
+        }
+        // Validate/normalize BEFORE the transaction (the closure must not
+        // panic, and a rejected lane must leave no document trace).
+        crate::plugins::automation::normalize_lane(&mut lane)?;
+        let key = lane.id.clone();
+        let to_apply = if lane.points.is_empty() { None } else { Some(lane) };
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::AutomationSetLane { key: key.clone(), lane: to_apply.clone() })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::AutomationSetLane { key: key.clone(), lane: to_apply.clone() })
+                })?;
             }
         }
         Ok(())
@@ -3953,6 +4013,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cp.history_depths().0, 1);
+    }
+
+    /// A lane drag is ONE undo entry: successive whole-lane replaces of the
+    /// same lane fold by lane id inside an open gesture (the §4.4
+    /// value-replacement wrapper is coalescable by construction — what was
+    /// missing is that `CoalesceKey::for_op` only ever keyed `Op::Set`).
+    #[test]
+    fn automation_lane_edits_fold_into_an_open_gesture_by_lane_id() {
+        use crate::plugins::automation::{AutomationLane, AutomationPoint};
+        let (cp, _events, _engine) = recording_control_plane();
+        let mk = |id: &str, v: f32| AutomationLane {
+            id: id.into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![
+                AutomationPoint { tick: 0, value: 1.0 },
+                AutomationPoint { tick: 3840, value: v },
+            ],
+        };
+        // seed the lane outside the gesture so the gesture's baseline is a real
+        // previous lane, not "absent"
+        cp.set_automation_lane(mk("lane-a", 0.9), op::TxMeta::user("edit automation")).unwrap();
+        assert_eq!(cp.history_depths().0, 1);
+
+        cp.gesture_begin("automation drag".into()).unwrap();
+        for v in [0.6f32, 0.3, 0.0] {
+            cp.set_automation_lane(mk("lane-a", v), op::TxMeta::user("edit automation")).unwrap();
+        }
+        assert_eq!(cp.history_depths().0, 1, "nothing new reaches history while open");
+        cp.gesture_end().unwrap();
+        assert_eq!(cp.history_depths().0, 2, "the whole drag adds exactly one entry");
+
+        let batch = cp.take_last_gesture_batch().expect("a batch");
+        assert_eq!(batch.ops.len(), 1, "coalesced by lane id: {:?}", batch.ops);
+        match &batch.ops[0] {
+            op::Op::AutomationSetLane { key, lane: Some(l) } => {
+                assert_eq!(key, "lane-a");
+                assert_eq!(l.points.last().unwrap().value, 0.0, "last write wins");
+            }
+            other => panic!("{other:?}"),
+        }
+        match &batch.inverses[0] {
+            op::Op::AutomationSetLane { lane: Some(l), .. } => {
+                assert_eq!(l.points.last().unwrap().value, 0.9, "baseline is pre-gesture truth");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Two DIFFERENT lanes edited inside one gesture stay two ops — the key is
+    /// the lane id, not "automation".
+    #[test]
+    fn automation_lane_edits_do_not_coalesce_across_lanes() {
+        use crate::plugins::automation::{AutomationLane, AutomationPoint};
+        let (cp, _events, _engine) = recording_control_plane();
+        let mk = |id: &str, v: f32| AutomationLane {
+            id: id.into(),
+            target_node: "track:t-1".into(),
+            param_id: 0,
+            points: vec![AutomationPoint { tick: 0, value: v }],
+        };
+        cp.gesture_begin("automation multi".into()).unwrap();
+        cp.set_automation_lane(mk("lane-a", 0.1), op::TxMeta::user("edit automation")).unwrap();
+        cp.set_automation_lane(mk("lane-b", 0.2), op::TxMeta::user("edit automation")).unwrap();
+        cp.gesture_end().unwrap();
+        let batch = cp.take_last_gesture_batch().expect("a batch");
+        assert_eq!(batch.ops.len(), 2, "{:?}", batch.ops);
     }
 
     /// `gesture_begin` while one is already open auto-closes the stale

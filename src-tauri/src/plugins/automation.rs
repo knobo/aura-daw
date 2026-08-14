@@ -579,18 +579,10 @@ pub fn automation_get(
 /// updated lane list.
 #[tauri::command]
 pub fn automation_set(
-    mut lane: AutomationLane,
+    lane: AutomationLane,
     control: State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<Vec<AutomationLane>, String> {
-    if lane.id.is_empty() {
-        lane.id = uuid::Uuid::new_v4().to_string();
-    }
-    normalize_lane(&mut lane)?;
-    let key = lane.id.clone();
-    let to_apply = if lane.points.is_empty() { None } else { Some(lane) };
-    control.commit(crate::control::op::TxMeta::user("edit automation"), move |tx| {
-        tx.apply(crate::control::op::Op::AutomationSetLane { key, lane: to_apply })
-    })?;
+    control.set_automation_lane(lane, crate::control::op::TxMeta::user("edit automation"))?;
     Ok(control.automation_lanes())
 }
 
