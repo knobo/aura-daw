@@ -15,6 +15,11 @@
 //!   same RCU discipline as the engine graph swap).
 //! * Notes travel over the node's [`NoteCmd`] queue with an auto-release
 //!   hold, so one command plays a complete, envelope-shaped audition note.
+//! * [`PreviewHandle::note_on`]/`note_off`/`all_off` (added for the
+//!   `midi_input` live-monitoring path, slice 1b) are the sustained-note
+//!   siblings of `play`: fire-and-forget sends (no reply channel, so a
+//!   caller — including a non-RT MIDI input callback thread — never
+//!   blocks), holding until an explicit release instead of auto-releasing.
 //!
 //! When zone C's midi-track sources land, previews can additionally route
 //! through the master bus by installing the same `SamplerNode` there; this
@@ -45,11 +50,21 @@ enum Msg {
         velocity: u8,
         reply: Sender<Result<(), String>>,
     },
+    /// Fire-and-forget sustained note-on (no auto-release hold; waits for an
+    /// explicit `NoteOff`). No reply channel — the caller never blocks. Added
+    /// for live-monitoring callers (e.g. `midi_input`) that manage their own
+    /// note-off timing and must not stall on the control thread.
+    NoteOn { instrument: Arc<CompiledInstrument>, key: u8, velocity: u8 },
+    /// Fire-and-forget release. A no-op if nothing is installed/playing.
+    NoteOff { key: u8 },
+    /// Fire-and-forget release-all (e.g. monitor toggled off, port changed).
+    AllOff,
     #[allow(dead_code)]
     Shutdown,
 }
 
 /// Cheap clonable handle; owns nothing but the channel to the preview thread.
+#[derive(Clone)]
 pub struct PreviewHandle {
     tx: Sender<Msg>,
 }
@@ -69,6 +84,31 @@ impl PreviewHandle {
             .map_err(|_| "preview thread is gone".to_string())?;
         rx.recv_timeout(Duration::from_secs(10))
             .map_err(|_| "preview thread did not respond".to_string())?
+    }
+
+    /// Sustained note-on for live monitoring: no auto-release, holds until a
+    /// matching [`PreviewHandle::note_off`]. Non-blocking — only enqueues on
+    /// the control channel (a plain crossbeam send), so it is safe to call
+    /// from a non-RT callback thread (e.g. a `midir` input callback) without
+    /// risking a stall there. Errors (stream/queue trouble) are NOT reported
+    /// back to the caller by design — this is preview-grade monitoring, not
+    /// a user-initiated command with a result to surface; the control thread
+    /// logs failures itself.
+    pub fn note_on(&self, instrument: Arc<CompiledInstrument>, key: u8, velocity: u8) -> Result<(), String> {
+        self.tx
+            .send(Msg::NoteOn { instrument, key, velocity })
+            .map_err(|_| "preview thread is gone".to_string())
+    }
+
+    /// Release a sustained note started with [`PreviewHandle::note_on`].
+    /// Non-blocking, same rationale as `note_on`.
+    pub fn note_off(&self, key: u8) -> Result<(), String> {
+        self.tx.send(Msg::NoteOff { key }).map_err(|_| "preview thread is gone".to_string())
+    }
+
+    /// Release every currently-sounding note. Non-blocking.
+    pub fn all_off(&self) -> Result<(), String> {
+        self.tx.send(Msg::AllOff).map_err(|_| "preview thread is gone".to_string())
     }
 }
 
@@ -168,6 +208,25 @@ fn preview_thread(rx: Receiver<Msg>) {
             Ok(Msg::Play { instrument, key, velocity, reply }) => {
                 let _ = reply.send(handle_play(&mut bundle, instrument, key, velocity));
             }
+            Ok(Msg::NoteOn { instrument, key, velocity }) => {
+                if let Err(e) = handle_note_on(&mut bundle, instrument, key, velocity) {
+                    log::warn!("live monitor note-on failed: {e}");
+                }
+            }
+            Ok(Msg::NoteOff { key }) => {
+                if let Some(b) = bundle.as_mut() {
+                    if let Some(tx) = b.note_tx.as_mut() {
+                        let _ = tx.push(NoteCmd::Off { key });
+                    }
+                }
+            }
+            Ok(Msg::AllOff) => {
+                if let Some(b) = bundle.as_mut() {
+                    if let Some(tx) = b.note_tx.as_mut() {
+                        let _ = tx.push(NoteCmd::AllOff);
+                    }
+                }
+            }
             Ok(Msg::Shutdown) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
@@ -187,12 +246,41 @@ fn handle_play(
     key: u8,
     velocity: u8,
 ) -> Result<(), String> {
+    let b = ensure_instrument_installed(bundle, instrument)?;
+    let hold = (b.rate as f64 * PREVIEW_HOLD_SECS) as u64;
+    let tx = b.note_tx.as_mut().expect("note queue installed above");
+    tx.push(NoteCmd::On { key, velocity: velocity.clamp(1, 127), hold_frames: hold })
+        .map_err(|_| "preview note queue full — too many overlapping previews".to_string())
+}
+
+/// Sustained (no auto-release) note-on, for live monitoring — the note holds
+/// until a matching `Msg::NoteOff` releases it.
+fn handle_note_on(
+    bundle: &mut Option<Bundle>,
+    instrument: Arc<CompiledInstrument>,
+    key: u8,
+    velocity: u8,
+) -> Result<(), String> {
+    let b = ensure_instrument_installed(bundle, instrument)?;
+    let tx = b.note_tx.as_mut().expect("note queue installed above");
+    // hold_frames: 0 => SamplerNode maps this to HOLD_MANUAL (sustain until
+    // an explicit NoteCmd::Off), not "zero-length note".
+    tx.push(NoteCmd::On { key, velocity: velocity.clamp(1, 127), hold_frames: 0 })
+        .map_err(|_| "preview note queue full — too many overlapping notes".to_string())
+}
+
+/// Lazily open the preview output stream and (re)install `instrument` in the
+/// callback's node if it isn't already the one installed. Shared by both the
+/// auto-release `Play` path and the sustained `NoteOn` monitoring path.
+fn ensure_instrument_installed(
+    bundle: &mut Option<Bundle>,
+    instrument: Arc<CompiledInstrument>,
+) -> Result<&mut Bundle, String> {
     if bundle.is_none() {
         *bundle = Some(open_stream()?);
     }
     let b = bundle.as_mut().expect("bundle just ensured");
 
-    // Install the instrument if it isn't the one currently in the callback.
     if b.instrument_id.as_deref() != Some(instrument.id.as_str()) || b.note_tx.is_none() {
         let mut node = Box::new(SamplerNode::new((*instrument).clone()));
         let note_tx = node.command_queue(NOTE_QUEUE);
@@ -205,11 +293,7 @@ fn handle_play(
         b.note_tx = Some(note_tx);
         b.instrument_id = Some(instrument.id.clone());
     }
-
-    let hold = (b.rate as f64 * PREVIEW_HOLD_SECS) as u64;
-    let tx = b.note_tx.as_mut().expect("note queue installed above");
-    tx.push(NoteCmd::On { key, velocity: velocity.clamp(1, 127), hold_frames: hold })
-        .map_err(|_| "preview note queue full — too many overlapping previews".to_string())
+    Ok(b)
 }
 
 fn open_stream() -> Result<Bundle, String> {

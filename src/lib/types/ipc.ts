@@ -30,6 +30,9 @@ export interface MidiInputStatus {
   eventsSeen: number;
   lastEventAgeMs: number | null;
   lastStatusBytes: number[];
+  /** Live monitoring (slice 1b): incoming notes audible via the preview
+   * voice when true. Always false when nothing is selected. */
+  monitor: boolean;
 }
 
 // ── transport-state.schema.json ─────────────────────────────────────────────

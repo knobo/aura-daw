@@ -16,12 +16,15 @@
   let outputs = $state<AudioDevice[]>([]);
   let dbEl: HTMLSpanElement | undefined = $state();
 
-  // Hardware MIDI input (midi-input-ports slice 1): port list/select + a
-  // live activity dot. Optional backend methods — no-op (empty list, dot
-  // never lights) in demo mode, which has no hardware to simulate.
+  // Hardware MIDI input (midi-input-ports slice 1/1b): port list/select, a
+  // live activity dot, and a "monitor" toggle that makes incoming notes
+  // audible through a preview-grade voice (see docs/midi-input.md).
+  // Optional backend methods — no-op (empty list, dot never lights) in
+  // demo mode, which has no hardware to simulate.
   let midiPorts = $state<MidiPortInfo[]>([]);
   let midiSelectedId = $state("");
   let midiActive = $state(false);
+  let midiMonitor = $state(true); // default ON, matches the backend default
 
   onMount(() => {
     backend.listInputDevices().then((d) => (inputs = d)).catch(() => {});
@@ -38,10 +41,21 @@
       backend.midiInputStatus?.().then((s) => {
         midiSelectedId = s.selected?.id ?? "";
         midiActive = s.lastEventAgeMs != null && s.lastEventAgeMs < 300;
+        if (s.selected) midiMonitor = s.monitor;
       }).catch(() => {});
     }, 500);
     return () => clearInterval(id);
   });
+
+  function selectMidiPort(id: string) {
+    midiSelectedId = id;
+    backend.midiSelectInputPort?.(id || null, midiMonitor);
+  }
+
+  function toggleMidiMonitor(enabled: boolean) {
+    midiMonitor = enabled;
+    if (midiSelectedId) backend.midiSelectInputPort?.(midiSelectedId, enabled);
+  }
 
   // live dB readout without reactivity churn
   $effect(() => {
@@ -89,11 +103,11 @@
         {/each}
       </select>
     </label>
-    <label class="dev">
+    <div class="dev">
       <span class="silk">midi in</span>
       <select
         name="midi-input-device"
-        onchange={(e) => backend.midiSelectInputPort?.((e.currentTarget as HTMLSelectElement).value || null)}
+        onchange={(e) => selectMidiPort((e.currentTarget as HTMLSelectElement).value)}
       >
         <option value="" selected={midiSelectedId === ""}>None</option>
         {#each midiPorts as p (p.id)}
@@ -101,7 +115,15 @@
         {/each}
       </select>
       <span class="midi-dot" class:active={midiActive} title="MIDI activity"></span>
-    </label>
+      <label class="monitor" title="Hear incoming notes through a preview-grade voice (docs/midi-input.md)">
+        <input
+          type="checkbox"
+          checked={midiMonitor}
+          onchange={(e) => toggleMidiMonitor((e.currentTarget as HTMLInputElement).checked)}
+        />
+        <span class="silk">monitor</span>
+      </label>
+    </div>
   </div>
 
   <div class="section jobsbox">
@@ -195,6 +217,19 @@
   .midi-dot.active {
     background: var(--cyan);
     box-shadow: 0 0 6px 1px var(--cyan);
+  }
+  .monitor {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+  }
+  .monitor input {
+    accent-color: var(--cyan);
+    width: 11px;
+    height: 11px;
+    margin: 0;
+    cursor: pointer;
   }
 
   .jobsbox {

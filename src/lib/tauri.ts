@@ -229,7 +229,9 @@ export interface Backend {
   // same carve-out as hintClipCharacter/registerClip above. UI callers must
   // guard with `backend.midiListInputPorts?.(...)`.
   midiListInputPorts?(): Promise<MidiPortInfo[]>;
-  midiSelectInputPort?(portId: string | null): Promise<void>;
+  /** `monitor` defaults to true (audible) when omitted and a port is
+   * selected; irrelevant when `portId` is null (closing the connection). */
+  midiSelectInputPort?(portId: string | null, monitor?: boolean): Promise<void>;
   midiInputStatus?(): Promise<MidiInputStatus>;
 
   // mcp
@@ -577,8 +579,8 @@ class TauriBackend implements Backend {
   midiListInputPorts() {
     return invoke<MidiPortInfo[]>("midi_list_input_ports");
   }
-  async midiSelectInputPort(portId: string | null) {
-    await invoke("midi_select_input_port", { portId });
+  async midiSelectInputPort(portId: string | null, monitor?: boolean) {
+    await invoke("midi_select_input_port", { portId, monitor: monitor ?? null });
   }
   midiInputStatus() {
     return invoke<MidiInputStatus>("midi_input_status");
