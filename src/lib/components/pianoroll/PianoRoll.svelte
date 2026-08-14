@@ -18,6 +18,7 @@
   import { instruments } from "../../state/instruments.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { openStudio, ui } from "../../state/ui.svelte";
+  import { toasts } from "../../state/toasts.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import HScrollbar from "../HScrollbar.svelte";
   import { canvasPos } from "../../utils/canvas-pos";
@@ -88,7 +89,14 @@
       tpp = Math.max(1, (midi.effectiveContentLengthTicks(c) + midi.ticksPerBar) / Math.max(320, gridW));
     } else {
       // outside edit (AMT merge, backend echo): adopt unless mid-gesture
-      if (!gesture) working = c.notes.map((n) => ({ ...n }));
+      if (!gesture) {
+        // A commit echo has the same note count (and, via commit()'s
+        // pre-sort, the same order), so the index selection stays valid; an
+        // outside edit that grew/shrank the array would leave it pointing
+        // at the wrong notes — drop it instead of lying.
+        if (c.notes.length !== working.length) selection = new Set();
+        working = c.notes.map((n) => ({ ...n }));
+      }
     }
   });
 
@@ -307,7 +315,12 @@
       const pasted = pasteNotes(working, midi.noteClipboard, midi.effectiveContentLengthTicks(clip));
       working = pasted.notes;
       selection = pasted.selection;
-      commit();
+      if (pasted.dropped > 0)
+        toasts.info(
+          "Paste clipped",
+          `${pasted.dropped} note${pasted.dropped === 1 ? "" : "s"} past the clip's content end were skipped`,
+        );
+      if (pasted.selection.size > 0) commit();
     } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       if (selection.size === 0) return;
       e.preventDefault();

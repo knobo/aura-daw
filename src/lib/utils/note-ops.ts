@@ -11,7 +11,19 @@ import type { MidiNote } from "../types/ipc";
 
 export type MarqueeMode = "replace" | "add" | "subtract";
 
-const byTickKey = (a: MidiNote, b: MidiNote) => a.tick - b.tick || a.key - b.key;
+/** THE note ordering — (tick, key), matching the backend's
+ * `assign_incoming_note_ids` sort. Import this everywhere frontend code
+ * sorts notes (midi store, demo backend) so the index-based selection
+ * remap in `sortWithSelection` can never diverge from the echoed order. */
+export const byTickKey = (a: MidiNote, b: MidiNote) => a.tick - b.tick || a.key - b.key;
+
+/** Deep-copy a note WITHOUT its backend-minted id: a copy is a new note,
+ * and resending an existing id makes the backend's keep-rule re-mint both
+ * the copy and the original (id stability lost). */
+function copyNote(n: MidiNote): MidiNote {
+  const { noteId: _dropId, ...copy } = n;
+  return copy;
+}
 
 /** Sort notes the way the store does and remap selection indices along. */
 export function sortWithSelection(
@@ -86,23 +98,25 @@ export function nudgeSelection(
   return notes.map((n, i) => (selection.has(i) ? { ...n, tick: n.tick + dTick } : n));
 }
 
-/** Deep copies of the selected notes, sorted by (tick, key). */
+/** Deep copies of the selected notes (ids stripped), sorted by (tick, key). */
 export function copySelection(notes: MidiNote[], selection: Set<number>): MidiNote[] {
   return [...selection]
-    .map((i) => ({ ...notes[i] }))
+    .map((i) => copyNote(notes[i]))
     .sort(byTickKey);
 }
 
-/** Append deep copies of the clipboard (notes starting past the content end
- * are dropped) and select exactly the pasted notes. */
+/** Append deep copies of the clipboard and select exactly the pasted notes.
+ * Notes starting past the content end are dropped — `dropped` reports how
+ * many, so the caller can tell the user instead of losing them silently. */
 export function pasteNotes(
   notes: MidiNote[],
   clipboard: MidiNote[],
   contentLengthTicks: number,
-): { notes: MidiNote[]; selection: Set<number> } {
-  const pasted = clipboard.filter((n) => n.tick < contentLengthTicks).map((n) => ({ ...n }));
+): { notes: MidiNote[]; selection: Set<number>; dropped: number } {
+  const pasted = clipboard.filter((n) => n.tick < contentLengthTicks).map(copyNote);
   return {
     notes: [...notes, ...pasted],
     selection: new Set(pasted.map((_, j) => notes.length + j)),
+    dropped: clipboard.length - pasted.length,
   };
 }

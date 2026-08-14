@@ -113,6 +113,15 @@ describe("copySelection", () => {
     expect(notes[1].tick).toBe(0);
   });
 
+  it("strips the backend-minted noteId so copies get fresh identities", () => {
+    // keeping the id would make a same-clip paste send it twice, and the
+    // backend's keep-rule then re-mints BOTH notes — the original loses
+    // its stable id
+    const notes = [{ ...note(0, 60), noteId: 7 }];
+    const copied = copySelection(notes, new Set([0]));
+    expect("noteId" in copied[0]).toBe(false);
+  });
+
   it("returns an empty array for an empty selection", () => {
     expect(copySelection([note(0, 60)], new Set())).toEqual([]);
   });
@@ -122,17 +131,19 @@ describe("pasteNotes", () => {
   it("appends deep copies and selects exactly the pasted notes", () => {
     const existing = [note(0, 60)];
     const clip = [note(240, 64), note(480, 67)];
-    const { notes, selection } = pasteNotes(existing, clip, 1920);
+    const { notes, selection, dropped } = pasteNotes(existing, clip, 1920);
     expect(notes).toHaveLength(3);
     expect(selection).toEqual(new Set([1, 2]));
+    expect(dropped).toBe(0);
     // deep copy: mutating the result must not touch the clipboard
     notes[1].key = 0;
     expect(clip[0].key).toBe(64);
   });
 
-  it("drops clipboard notes starting at or past the content length", () => {
-    const { notes, selection } = pasteNotes([], [note(0, 60), note(1920, 62)], 1920);
+  it("drops clipboard notes starting at or past the content length and reports the count", () => {
+    const { notes, selection, dropped } = pasteNotes([], [note(0, 60), note(1920, 62)], 1920);
     expect(notes).toHaveLength(1);
     expect(selection).toEqual(new Set([0]));
+    expect(dropped).toBe(1);
   });
 });

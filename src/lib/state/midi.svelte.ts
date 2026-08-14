@@ -11,6 +11,7 @@ import { backend } from "../tauri";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { project } from "./project.svelte";
 import { sampleAtTick, tickAtSample, type SectionRow } from "../sectionTable";
+import { byTickKey } from "../utils/note-ops";
 import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent } from "../types/ipc";
 
 export interface MidiRegion {
@@ -131,7 +132,7 @@ class MidiStore {
 
   /** Whole-clip note replace — one invoke per edit gesture (D-03). */
   async setNotes(clipId: string, notes: MidiNote[]): Promise<void> {
-    const sorted = [...notes].sort((a, b) => a.tick - b.tick || a.key - b.key);
+    const sorted = [...notes].sort(byTickKey);
     this.clips = this.clips.map((c) => (c.id === clipId ? { ...c, notes: sorted } : c));
     try {
       const clip = await backend.midiSetNotes(clipId, sorted);
