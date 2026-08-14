@@ -892,25 +892,54 @@ mod tests {
     }
 
     /// A LIVE (instrument) track's output goes through the same gain stage,
-    /// so one ramp covers both source kinds.
+    /// so one ramp covers both source kinds. A note is actually triggered
+    /// (an empty event list would render silence regardless of gain, making
+    /// the assertion pass no matter what the ramp code does) and the ramped
+    /// render is checked frame-by-frame against an un-ramped control render
+    /// of the identical note, scaled by the lane's own `value_at`.
     #[test]
     fn track_gain_ramp_scales_live_output_too() {
         use crate::plugins::automation::AbsParamEvent;
+        const RATE: u32 = 48_000;
+        let events = vec![AbsNoteEvent { sample: 0, key: 69, velocity: 110 }];
+
+        let mut control = RtGraph::new(
+            vec![live_track(0, events.clone(), RATE)],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        let mut control_out = vec![0.0f32; 512 * 2];
+        render(&mut control, 0, &LoopSpec::OFF, &mut control_out, 2, RATE, false, None);
+        assert!(peak(&control_out) > 0.01, "control note is audible");
+
         let mut g = RtGraph::new(
-            vec![live_track(0, vec![], 48_000)],
+            vec![live_track(0, events, RATE)],
             1,
             Arc::new(ParamTable::with_slots(1)),
         );
         let ev = Arc::new(vec![
-            AbsParamEvent { sample: 0, value: 0.0 },
+            AbsParamEvent { sample: 0, value: 1.0 },
             AbsParamEvent { sample: 512, value: 0.0 },
         ]);
-        g.set_gain_ramps(vec![Some(ev)]);
+        g.set_gain_ramps(vec![Some(ev.clone())]);
         let mut out = vec![0.0f32; 512 * 2];
-        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
+
+        for (i, (frame, cframe)) in out.chunks_exact(2).zip(control_out.chunks_exact(2)).enumerate() {
+            let want = crate::plugins::automation::value_at(&ev, i as u64).unwrap();
+            for ch in 0..2 {
+                let expected = cframe[ch] * want;
+                assert!(
+                    (frame[ch] - expected).abs() < 1e-4,
+                    "frame {i} ch {ch}: got {} want {expected} (control {}, want-gain {want})",
+                    frame[ch],
+                    cframe[ch]
+                );
+            }
+        }
         assert!(
-            out.iter().all(|s| s.abs() < 1e-6),
-            "a lane pinned at 0.0 silences the live node's contribution"
+            peak(&out) < peak(&control_out),
+            "the closing ramp must leave the live path quieter than the unramped control"
         );
     }
 }
