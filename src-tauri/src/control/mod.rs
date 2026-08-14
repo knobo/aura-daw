@@ -1576,6 +1576,39 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Route a MIDI track's notes to external gear (ruling 10: app config, a
+    /// routing carve-out — no document field, no `Op`). `None` clears the
+    /// routing. `Some(id)` must name an existing `kind: "midi"` track,
+    /// validated under a SHORT session read that is dropped BEFORE touching
+    /// `MidiOut` — mirrors `select_midi_input_track`'s validation shape.
+    pub fn select_midi_output_track(&self, track_id: Option<String>, meta: op::TxMeta) -> Result<(), String> {
+        if let Some(id) = &track_id {
+            let session = self.session.lock();
+            let t = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id.as_str() == id)
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            if t.kind != "midi" {
+                return Err(format!(
+                    "track {id} is kind \"{}\" (midi output needs a midi track)",
+                    t.kind
+                ));
+            }
+        }
+        log::info!(
+            "select_midi_output_track: actor={:?} label={:?} track={track_id:?}",
+            meta.actor,
+            meta.label
+        );
+        let out = self
+            .midi_out
+            .get()
+            .ok_or_else(|| "midi output driver not attached".to_string())?;
+        out.select_note_track(track_id)
+    }
+
     // ---- structure ------------------------------------------------------
 
     /// Create a track and insert it through the transaction channel

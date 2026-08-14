@@ -213,6 +213,7 @@ pub fn run() {
             midi_out::midi_select_output_port,
             midi_out::midi_set_clock_enabled,
             midi_out::midi_output_status,
+            midi_out::midi_select_output_track,
             // ---- sidecars: jobs ----
             sidecars::sidecar_split_stems,
             sidecars::sidecar_transcribe,

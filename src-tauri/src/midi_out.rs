@@ -281,6 +281,94 @@ impl ClockSink for RecordingSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 8: note-out. The routed track's notes are scheduled off the SAME
+// anchor the clock uses (`ClockEngine::estimated_sample`) — one conversion
+// (`midi::playback::track_events`), two consumers (the internal live node
+// and this scheduler). Ruling 10: a routing carve-out — app config, no
+// document field, no `Op`.
+// ---------------------------------------------------------------------------
+
+/// The routed track's scheduled events, absolute engine samples, sorted —
+/// exactly what `midi::playback` hands the internal live node, so external
+/// and internal timing come from ONE conversion.
+#[derive(Clone, Default)]
+pub struct NoteOutSnapshot {
+    pub track_id: String,
+    pub events: Arc<Vec<crate::midi::schedule::AbsNoteEvent>>,
+    /// MIDI channel for outgoing notes (0-based on the wire). Fixed at 0 in
+    /// this slice.
+    pub channel: u8,
+}
+
+/// Scheduler state: a monotonic cursor into `NoteOutSnapshot::events` plus a
+/// per-key sounding flag so `all_off`/`reseek` release exactly what is
+/// actually sounding — never more, never less.
+pub struct NoteOutEngine {
+    cursor: usize,
+    sounding: [bool; 128],
+    notes_sent: u64,
+}
+
+impl Default for NoteOutEngine {
+    fn default() -> Self {
+        Self { cursor: 0, sounding: [false; 128], notes_sent: 0 }
+    }
+}
+
+impl NoteOutEngine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Emit note messages for the half-open sample window `[from, to)`. The
+    /// cursor is monotonic — it only ever moves forward through `snap.
+    /// events` — so `from` is documentation of intent (the caller's last
+    /// window edge) rather than a filter this method re-checks; `to` is the
+    /// only bound that actually gates emission.
+    pub fn advance(&mut self, snap: &NoteOutSnapshot, from: u64, to: u64, out: &mut Vec<OutMsg>) {
+        debug_assert!(from <= to, "advance window must not go backward");
+        while self.cursor < snap.events.len() && snap.events[self.cursor].sample < to {
+            let ev = snap.events[self.cursor];
+            if ev.velocity == 0 {
+                out.push(OutMsg::three(0x80 | snap.channel, ev.key, 0));
+                self.sounding[ev.key as usize] = false;
+            } else {
+                out.push(OutMsg::three(0x90 | snap.channel, ev.key, ev.velocity));
+                self.sounding[ev.key as usize] = true;
+            }
+            self.notes_sent += 1;
+            self.cursor += 1;
+        }
+    }
+
+    /// Release everything currently sounding (transport stop, resync, track
+    /// change, port close). Emits one Note Off per sounding key — explicit
+    /// offs, not just CC 123, because not every device honors All Notes Off.
+    pub fn all_off(&mut self, channel: u8, out: &mut Vec<OutMsg>) {
+        for key in 0..128u8 {
+            if self.sounding[key as usize] {
+                out.push(OutMsg::three(0x80 | channel, key, 0));
+                self.sounding[key as usize] = false;
+                self.notes_sent += 1;
+            }
+        }
+    }
+
+    /// `all_off` + reposition the cursor to the first event at or after
+    /// `to` (a seek / loop wrap / fresh start).
+    pub fn reseek(&mut self, snap: &NoteOutSnapshot, to: u64, out: &mut Vec<OutMsg>) {
+        self.all_off(snap.channel, out);
+        while self.cursor < snap.events.len() && snap.events[self.cursor].sample < to {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn notes_sent(&self) -> u64 {
+        self.notes_sent
+    }
+}
+
 /// Enumerate MIDI OUTPUT ports currently visible to the platform backend
 /// (ALSA-seq on Linux). Mirrors `midi_input::list_ports`: same `"<name>#
 /// <index>"` id scheme, same skip-on-vanish rule (a port that disappears
@@ -309,8 +397,13 @@ pub struct MidiOutputStatus {
     pub running: bool,
     pub pulses_sent: u64,
     pub resyncs: u64,
-    /// Task 8 fills these; declared here so the wire shape is final.
+    /// The track routed to external gear (ruling 10: app config, not
+    /// document state) — read from `MidiOut::note_track`, so this is correct
+    /// even with no output port selected (same "hub-sourced fields are
+    /// correct even idle" precedent as `midi_input::MidiInputStatus`).
     pub note_track_id: Option<String>,
+    /// Zero whenever no `aura-midi-out` thread is running (no port
+    /// selected) — mirrors `pulses_sent`'s "idle when nothing selected".
     pub notes_sent: u64,
 }
 
@@ -322,6 +415,7 @@ struct ThreadShared {
     pulses_sent: AtomicU64,
     resyncs: AtomicU64,
     running: AtomicBool,
+    notes_sent: AtomicU64,
 }
 
 struct ActiveOutput {
@@ -351,6 +445,16 @@ pub struct MidiOut {
     /// and pressing play "just works" without an extra step, mirroring
     /// `midi_input`'s "default ON when a port is selected" precedent.
     clock_enabled: Arc<AtomicBool>,
+    /// The track routed to external gear (Task 8, ruling 10: app config —
+    /// no `Op`, no document field). Top-level like `clock_enabled` so a
+    /// routing choice survives a port re-select and is readable even with
+    /// no port open. `None` = no track routed, notes stay internal-only.
+    note_track: Arc<PlMutex<Option<String>>>,
+    /// The routed track's converted events, refreshed by the thread in the
+    /// same 250 ms window as the `TempoMap` — set here (rather than kept
+    /// purely thread-local) so a future status/debug readout can see what
+    /// the thread is actually scheduling from.
+    snapshot: Arc<PlMutex<NoteOutSnapshot>>,
     inner: PlMutex<Inner>,
 }
 
@@ -360,6 +464,8 @@ impl Default for MidiOut {
             session: OnceLock::new(),
             shared: OnceLock::new(),
             clock_enabled: Arc::new(AtomicBool::new(true)),
+            note_track: Arc::new(PlMutex::new(None)),
+            snapshot: Arc::new(PlMutex::new(NoteOutSnapshot::default())),
             inner: PlMutex::new(Inner::default()),
         }
     }
@@ -427,11 +533,21 @@ impl MidiOut {
         let session_for_thread = self.session.get().cloned();
         let shared_for_thread = self.shared.get().cloned();
         let clock_enabled = self.clock_enabled.clone();
+        let note_track = self.note_track.clone();
+        let snapshot = self.snapshot.clone();
 
         let handle = std::thread::Builder::new()
             .name("aura-midi-out".to_string())
             .spawn(move || {
-                run_thread(sink, ts_for_thread, session_for_thread, shared_for_thread, clock_enabled)
+                run_thread(
+                    sink,
+                    ts_for_thread,
+                    session_for_thread,
+                    shared_for_thread,
+                    clock_enabled,
+                    note_track,
+                    snapshot,
+                )
             })
             .map_err(|e| e.to_string())?;
 
@@ -445,10 +561,23 @@ impl MidiOut {
         self.clock_enabled.store(enabled, Relaxed);
     }
 
+    /// Route (or, on `None`, un-route) a track's notes to external gear.
+    /// Never touches the thread/connection directly — safe to call whether
+    /// or not a port is currently open. The `aura-midi-out` thread picks up
+    /// the change on its next 250 ms refresh window and releases whatever
+    /// the PREVIOUS routing left sounding before adopting the new one (same
+    /// "all_off first" rule as a port close/change).
+    pub fn select_note_track(&self, track_id: Option<String>) -> Result<(), String> {
+        *self.note_track.lock() = track_id;
+        Ok(())
+    }
+
     /// Cheap live snapshot for polling.
     pub fn status(&self) -> MidiOutputStatus {
         let inner = self.inner.lock();
         let clock_enabled = self.clock_enabled.load(Relaxed);
+        // Hub-sourced (well, MidiOut-field-sourced): correct even idle.
+        let note_track_id = self.note_track.lock().clone();
         match inner.active.as_ref() {
             Some(active) => MidiOutputStatus {
                 selected: Some(active.port.clone()),
@@ -456,8 +585,8 @@ impl MidiOut {
                 running: active.thread_shared.running.load(Relaxed),
                 pulses_sent: active.thread_shared.pulses_sent.load(Relaxed),
                 resyncs: active.thread_shared.resyncs.load(Relaxed),
-                note_track_id: None,
-                notes_sent: 0,
+                note_track_id,
+                notes_sent: active.thread_shared.notes_sent.load(Relaxed),
             },
             None => MidiOutputStatus {
                 selected: None,
@@ -465,7 +594,7 @@ impl MidiOut {
                 running: false,
                 pulses_sent: 0,
                 resyncs: 0,
-                note_track_id: None,
+                note_track_id,
                 notes_sent: 0,
             },
         }
@@ -506,8 +635,11 @@ fn run_thread(
     session: Option<Arc<PlMutex<Session>>>,
     shared_rt: Option<Arc<SharedRt>>,
     clock_enabled: Arc<AtomicBool>,
+    note_track: Arc<PlMutex<Option<String>>>,
+    snapshot: Arc<PlMutex<NoteOutSnapshot>>,
 ) {
     let mut engine = ClockEngine::new();
+    let mut notes = NoteOutEngine::new();
     let fallback_rate = shared_rt
         .as_ref()
         .map(|s| s.sample_rate.load(Relaxed))
@@ -517,6 +649,11 @@ fn run_thread(
     // The last (ppq, tempo_events, rate) triple the map was built from —
     // rebuilding is skipped when nothing in this triple changed.
     let mut snapshot_key: Option<(u32, Vec<TempoEvent>, u32)> = None;
+    // The routed track's current events snapshot (Task 8) — rebuilt every
+    // 250 ms window alongside the `TempoMap`, from the SAME `session.midi`
+    // read, so external and internal timing come from one conversion.
+    let mut current_snapshot = NoteOutSnapshot::default();
+    let mut last_note_track: Option<String> = None;
     // Backdated so the very first loop iteration attempts a snapshot
     // immediately, rather than waiting a full 250 ms to see a project's
     // real tempo for the first time.
@@ -541,13 +678,47 @@ fn run_thread(
                         .filter(|&r| r > 0)
                         .unwrap_or(fallback_rate);
                     let key = (guard.midi.ppq, guard.midi.tempo_events.clone(), rate);
-                    drop(guard);
                     if snapshot_key.as_ref() != Some(&key) {
                         if let Ok(new_map) = TempoMap::new(key.0, key.1.clone(), key.2) {
                             map = new_map;
                             snapshot_key = Some(key);
                         }
                     }
+
+                    // Task 8: note_track + its events snapshot, refreshed in
+                    // this SAME try_lock window (and off the SAME map) as
+                    // the tempo — one conversion, two consumers.
+                    let track_now = note_track.lock().clone();
+                    let events = match &track_now {
+                        Some(id) => crate::midi::playback::track_events(&guard.midi, id, &map),
+                        None => Vec::new(),
+                    };
+                    drop(guard);
+
+                    let new_snapshot = NoteOutSnapshot {
+                        track_id: track_now.clone().unwrap_or_default(),
+                        events: Arc::new(events),
+                        channel: 0,
+                    };
+
+                    if track_now != last_note_track {
+                        // Routing changed (select_output_track / a track
+                        // swap detected here): release whatever the OLD
+                        // routing left sounding, then reposition the cursor
+                        // into the new track at the current playhead —
+                        // "all_off first", same rule as a port close.
+                        let mut edge = Vec::new();
+                        notes.all_off(current_snapshot.channel, &mut edge);
+                        let pos_now = shared_rt.as_ref().map(|s| s.position.load(Relaxed)).unwrap_or(0);
+                        notes.reseek(&new_snapshot, pos_now, &mut edge);
+                        for m in &edge {
+                            let _ = sink.send(m.as_slice());
+                        }
+                        last_note_track = track_now;
+                    }
+
+                    current_snapshot = new_snapshot;
+                    *snapshot.lock() = current_snapshot.clone();
                     last_snapshot = Instant::now();
                 }
                 // Contended try_lock: keep the previous snapshot and simply
@@ -574,9 +745,10 @@ fn run_thread(
         let enabled = clock_enabled.load(Relaxed);
 
         let input = ClockInput { now_micros, playing, position, rate, map: &map };
-        if let Err(e) = out_tick(&mut engine, &mut sink, input, enabled) {
+        if let Err(e) = out_tick(&mut engine, &mut notes, &mut sink, input, enabled, Some(&current_snapshot)) {
             log::warn!("aura-midi-out: send failed: {e}");
         }
+        thread_shared.notes_sent.store(notes.notes_sent(), Relaxed);
 
         thread_shared.running.store(engine.running(), Relaxed);
         thread_shared.pulses_sent.store(engine.pulses_sent(), Relaxed);
@@ -599,9 +771,11 @@ fn run_thread(
 /// and the port alive for Task 8's note-out.
 pub(crate) fn out_tick(
     engine: &mut ClockEngine,
+    notes: &mut NoteOutEngine,
     sink: &mut dyn ClockSink,
     input: ClockInput<'_>,
     clock_enabled: bool,
+    snap: Option<&NoteOutSnapshot>,
 ) -> Result<(), String> {
     // The engine steps UNCONDITIONALLY every tick — its anchor/
     // `estimated_sample()` is the SAME window Task 8's note scheduler
@@ -609,8 +783,43 @@ pub(crate) fn out_tick(
     // disabled (fix round 1: it previously froze here, which would have
     // frozen note-out in lockstep). `clock_enabled` gates ONLY the byte
     // emission below, not whether the transport state advances.
+    let playing = input.playing;
+    let was_running = engine.running();
+    let prev_estimated = engine.estimated_sample();
     let mut out = Vec::new();
     engine.step(input, &mut out);
+
+    if let Some(snap) = snap {
+        let mut note_out = Vec::new();
+        if !playing {
+            if was_running {
+                notes.all_off(snap.channel, &mut note_out);
+            }
+        } else if !was_running {
+            // Fresh start: reposition past anything already behind us, then
+            // catch the boundary sample itself — `reseek`'s "at or after"
+            // cursor deliberately leaves an event exactly AT the landing
+            // point unprocessed for the very next `advance`, so a start
+            // from a position that lands exactly on a note (the common
+            // "start from bar 1" case) needs that immediate follow-up
+            // advance in the SAME tick, not the next one.
+            let est = engine.estimated_sample();
+            notes.reseek(snap, est, &mut note_out);
+            notes.advance(snap, est, est.saturating_add(1), &mut note_out);
+        } else if was_running && out.iter().any(|m| matches!(m, ClockMsg::SongPosition(_))) {
+            // Resync (backward jump / large forward seek): same "reseek +
+            // catch the boundary" shape as a fresh start.
+            let est = engine.estimated_sample();
+            notes.reseek(snap, est, &mut note_out);
+            notes.advance(snap, est, est.saturating_add(1), &mut note_out);
+        } else {
+            notes.advance(snap, prev_estimated, engine.estimated_sample(), &mut note_out);
+        }
+        for msg in &note_out {
+            sink.send(msg.as_slice())?;
+        }
+    }
+
     if !clock_enabled {
         return Ok(());
     }
@@ -651,6 +860,17 @@ pub fn midi_set_clock_enabled(
 #[tauri::command]
 pub fn midi_output_status(state: tauri::State<'_, Arc<MidiOut>>) -> Result<MidiOutputStatus, String> {
     Ok(state.status())
+}
+
+#[tauri::command]
+pub fn midi_select_output_track(
+    track_id: Option<String>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.select_midi_output_track(
+        track_id,
+        crate::control::op::TxMeta::user("select midi output track"),
+    )
 }
 
 #[cfg(test)]
@@ -803,11 +1023,12 @@ mod tests {
     fn out_tick_writes_start_then_clocks_to_the_sink() {
         let map = map120();
         let mut engine = ClockEngine::new();
+        let mut notes = NoteOutEngine::new();
         let mut sink = RecordingSink::default();
-        out_tick(&mut engine, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true).unwrap();
+        out_tick(&mut engine, &mut notes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true, None).unwrap();
         assert_eq!(sink.0, vec![vec![0xFA]]);
         for ms in 1..=25u64 {
-            out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, true).unwrap();
+            out_tick(&mut engine, &mut notes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, true, None).unwrap();
         }
         assert!(sink.0.iter().any(|b| b == &vec![0xF8]), "clock bytes reached the sink");
     }
@@ -816,9 +1037,10 @@ mod tests {
     fn out_tick_writes_nothing_while_the_clock_is_disabled() {
         let map = map120();
         let mut engine = ClockEngine::new();
+        let mut notes = NoteOutEngine::new();
         let mut sink = RecordingSink::default();
         for ms in 0..=25u64 {
-            out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
+            out_tick(&mut engine, &mut notes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false, None).unwrap();
         }
         assert!(sink.0.is_empty(), "clock disabled means no bytes");
     }
@@ -831,13 +1053,133 @@ mod tests {
     fn out_tick_still_steps_the_engine_while_the_clock_is_disabled() {
         let map = map120();
         let mut engine = ClockEngine::new();
+        let mut notes = NoteOutEngine::new();
         let mut sink = RecordingSink::default();
         for ms in 0..=25u64 {
-            out_tick(&mut engine, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
+            out_tick(&mut engine, &mut notes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false, None).unwrap();
         }
         assert!(sink.0.is_empty(), "clock disabled means no bytes");
         assert!(engine.running(), "the transport still registers as running");
         assert_eq!(engine.estimated_sample(), 25 * 48, "the anchor kept advancing with real time");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 8: note-out.
+    // -----------------------------------------------------------------
+
+    fn snap(events: Vec<crate::midi::schedule::AbsNoteEvent>) -> NoteOutSnapshot {
+        NoteOutSnapshot { track_id: "t-1".into(), events: Arc::new(events), channel: 0 }
+    }
+
+    #[test]
+    fn advance_emits_on_and_off_inside_the_window_only() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let s = snap(vec![
+            AbsNoteEvent { sample: 100, key: 60, velocity: 100 },
+            AbsNoteEvent { sample: 500, key: 60, velocity: 0 },
+        ]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&s, 0, 200, &mut out);
+        assert_eq!(out.iter().map(|m| m.as_slice().to_vec()).collect::<Vec<_>>(), vec![vec![0x90, 60, 100]]);
+        out.clear();
+        e.advance(&s, 200, 400, &mut out);
+        assert!(out.is_empty(), "nothing due in this window");
+        e.advance(&s, 400, 600, &mut out);
+        assert_eq!(out[0].as_slice(), &[0x80, 60, 0]);
+        assert_eq!(e.notes_sent(), 2);
+    }
+
+    #[test]
+    fn advance_never_replays_an_event_across_windows() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let s = snap(vec![AbsNoteEvent { sample: 10, key: 64, velocity: 90 }]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&s, 0, 100, &mut out);
+        let first = out.len();
+        e.advance(&s, 100, 200, &mut out);
+        assert_eq!(out.len(), first, "the cursor never rewinds on its own");
+    }
+
+    #[test]
+    fn all_off_releases_exactly_the_sounding_keys() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let s = snap(vec![
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+            AbsNoteEvent { sample: 0, key: 67, velocity: 100 },
+            AbsNoteEvent { sample: 10, key: 60, velocity: 0 },
+        ]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&s, 0, 20, &mut out);
+        out.clear();
+        e.all_off(0, &mut out);
+        assert_eq!(out.len(), 1, "only key 67 is still sounding: {:?}", out);
+        assert_eq!(out[0].as_slice(), &[0x80, 67, 0]);
+        out.clear();
+        e.all_off(0, &mut out);
+        assert!(out.is_empty(), "all_off is idempotent");
+    }
+
+    #[test]
+    fn reseek_releases_and_repositions_the_cursor() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let s = snap(vec![
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+            AbsNoteEvent { sample: 1_000, key: 62, velocity: 100 },
+        ]);
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&s, 0, 10, &mut out);
+        out.clear();
+        e.reseek(&s, 900, &mut out);
+        assert_eq!(out[0].as_slice(), &[0x80, 60, 0], "the sounding note is released");
+        out.clear();
+        e.advance(&s, 900, 1_100, &mut out);
+        assert_eq!(out[0].as_slice(), &[0x90, 62, 100], "cursor landed before the next event");
+    }
+
+    #[test]
+    fn channel_is_encoded_in_the_status_byte() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let mut s = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100 }]);
+        s.channel = 9; // GM drums
+        let mut e = NoteOutEngine::new();
+        let mut out = Vec::new();
+        e.advance(&s, 0, 10, &mut out);
+        assert_eq!(out[0].as_slice(), &[0x99, 60, 100]);
+    }
+
+    #[test]
+    fn out_tick_sends_clock_and_notes_from_one_anchor() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let map = map120();
+        let s = snap(vec![AbsNoteEvent { sample: 4_800, key: 60, velocity: 100 }]); // 100 ms in
+        let (mut clock, mut notes) = (ClockEngine::new(), NoteOutEngine::new());
+        let mut sink = RecordingSink::default();
+        for ms in 0..=150u64 {
+            out_tick(&mut clock, &mut notes, &mut sink,
+                ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map },
+                true, Some(&s)).unwrap();
+        }
+        assert!(sink.0.iter().any(|b| b == &vec![0xFA]), "Start went out");
+        assert!(sink.0.iter().any(|b| b == &vec![0xF8]), "clock went out");
+        assert!(sink.0.iter().any(|b| b == &vec![0x90, 60, 100]), "the note went out: {:?}", sink.0);
+    }
+
+    #[test]
+    fn stopping_the_transport_releases_outgoing_notes() {
+        use crate::midi::schedule::AbsNoteEvent;
+        let map = map120();
+        let s = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100 }]);
+        let (mut clock, mut notes) = (ClockEngine::new(), NoteOutEngine::new());
+        let mut sink = RecordingSink::default();
+        out_tick(&mut clock, &mut notes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true, Some(&s)).unwrap();
+        sink.0.clear();
+        out_tick(&mut clock, &mut notes, &mut sink, ClockInput { now_micros: 10_000, playing: false, position: 480, rate: 48_000, map: &map }, true, Some(&s)).unwrap();
+        assert!(sink.0.iter().any(|b| b == &vec![0x80, 60, 0]), "no hanging note after stop: {:?}", sink.0);
+        assert!(sink.0.iter().any(|b| b == &vec![0xFC]), "and the slave was told to stop");
     }
 
     /// Real `midir` loopback: a virtual INPUT port receives what a real
