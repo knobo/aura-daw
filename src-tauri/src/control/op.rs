@@ -1,6 +1,78 @@
 //! Op vocabulary and transaction metadata for session mutations.
 
-pub const OP_FORMAT_VERSION: u16 = 1;
+/// The op wire-format version every journal line carries as `"v"`.
+///
+/// **2 — state blobs are base64, not JSON number arrays** (whole-branch
+/// review, I-5). `serde_json` renders a `Vec<u8>` as `[104,101,108,...]`:
+/// roughly a 4x expansion, and the two fields carrying one
+/// ([`Op::PluginRemove::state`], [`Op::PluginSetState::state`]) hold real
+/// plugin state — a Zynaddsubfx patch is routinely hundreds of kilobytes.
+/// Every patch load and every plugin removal therefore wrote a
+/// multi-megabyte NDJSON line, synchronously flushed, on the command
+/// thread, and kept the same blob in its `HistoryEntry`.
+///
+/// WHY THIS WAS THE MOMENT, and why the change is not additive-compatible:
+/// `OP_FORMAT_VERSION` became load-bearing when Plan E Task 17 wrote the
+/// first journal line, but the journal is still WRITE-ONLY — nothing reads
+/// it back until Plan F gives it a reader. So the entire population of
+/// version-1 data is logs no code will ever parse, and the correct move is
+/// the clean one: change the encoding outright and bump the version, rather
+/// than carry a dual-shape reader forever for data that has no readers.
+/// That window closes permanently the moment Plan F ships a replayer.
+/// After that, a change of this kind costs a migration.
+///
+/// The same bump covers L-1 (`Op::PluginRemove::params` is now actually
+/// read on apply) — two format edits under one version, while the format
+/// is one day old, instead of two migrations later.
+///
+/// Additive fields with `#[serde(default)]` remain non-breaking and do NOT
+/// need a bump (`clip_indices`, `transient`, `params` all arrived that way
+/// at version 1). Anything else does, plus a reader that understands both
+/// shapes.
+pub const OP_FORMAT_VERSION: u16 = 2;
+
+/// `#[serde(with = "b64")]` for a `Vec<u8>` field: standard base64 with
+/// padding on the wire, bytes in memory. See [`OP_FORMAT_VERSION`].
+pub(crate) mod b64 {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(bytes))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = String::deserialize(d)?;
+        STANDARD.decode(s.as_bytes()).map_err(serde::de::Error::custom)
+    }
+}
+
+/// The same, for an `Option<Vec<u8>>`: `null` stays `null` (an instance
+/// with no host state to save), `Some` becomes a base64 string.
+pub(crate) mod b64_opt {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => s.serialize_str(&STANDARD.encode(b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+        let s = Option::<String>::deserialize(d)?;
+        match s {
+            Some(s) => STANDARD
+                .decode(s.as_bytes())
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            None => Ok(None),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -115,9 +187,21 @@ pub enum Op {
     /// genuinely permanent removal (never undone) leaves a small, bounded
     /// orphaned entry — acceptable, GC'd wholesale on the next
     /// `restore_into_session`/project open.
+    ///
+    /// L-1 CLOSED (whole-branch review): the parked mirror is an IN-MEMORY
+    /// fact, so a COLD REPLAY — a fresh process applying journal lines,
+    /// with nothing parked anywhere — used to restore the row without its
+    /// params, and this field was captured but never read. `apply_raw` now
+    /// SEEDS the mirror from this field when the in-memory one is absent or
+    /// empty, which makes the op self-describing in fact and not just in
+    /// intent. In-process nothing changes: the parked mirror is already
+    /// there and wins.
     PluginRemove {
         row: crate::plugins::PluginInstanceInfo,
         index: usize,
+        /// Base64 on the wire from `OP_FORMAT_VERSION` 2 (I-5) — see that
+        /// constant's doc for why a plain `Vec<u8>` was not viable here.
+        #[serde(with = "b64_opt")]
         state: Option<Vec<u8>>,
         #[serde(default)]
         params: Vec<crate::plugins::ParamInfo>,
@@ -127,7 +211,15 @@ pub enum Op {
     /// carries the PREVIOUS blob (captured via host `save_state` before the
     /// load) so the patch load is durable AND undoable (closes round-2
     /// inventory row 14).
-    PluginSetState { instance: String, state: Vec<u8> },
+    PluginSetState {
+        instance: String,
+        /// Base64 on the wire from `OP_FORMAT_VERSION` 2 (I-5) — this is
+        /// the field that made the old encoding expensive: every
+        /// `zyn_load_patch` wrote its whole patch, number by JSON number,
+        /// into the journal.
+        #[serde(with = "b64")]
+        state: Vec<u8>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -287,7 +379,7 @@ mod tests {
 
     #[test]
     fn op_serde_round_trips_and_carries_version() {
-        assert_eq!(OP_FORMAT_VERSION, 1);
+        assert_eq!(OP_FORMAT_VERSION, 2, "I-5: base64 state blobs bumped the wire format");
         let op = Op::Set {
             object: ObjectRef::Track("t-1".into()),
             path: PropPath::Gain,
@@ -548,6 +640,66 @@ mod tests {
         assert!(s.contains("\"lane\":null"), "wire form was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, automation_delete);
+    }
+
+    /// I-5 (whole-branch review), the reason `OP_FORMAT_VERSION` is 2: the
+    /// two state-carrying fields must reach the wire as base64 STRINGS, not
+    /// as JSON number arrays, and must round-trip byte-for-byte.
+    #[test]
+    fn plugin_state_blobs_serialize_as_base64_strings_not_number_arrays() {
+        let row = crate::plugins::PluginInstanceInfo {
+            id: "p-1".into(),
+            uid: "clap:zyn".into(),
+            name: "Zyn".into(),
+            format: "clap".into(),
+            status: "active".into(),
+            track_id: Some("t-1".into()),
+        };
+        // "hello" — the exact bytes the review's `[104,101,108,108,111]`
+        // example expands to under the old encoding.
+        let blob = b"hello".to_vec();
+
+        let set_state = Op::PluginSetState { instance: "p-1".into(), state: blob.clone() };
+        let s = serde_json::to_string(&set_state).unwrap();
+        eprintln!("PluginSetState wire form: {}", s);
+        assert!(s.contains("\"state\":\"aGVsbG8=\""), "state must be base64, was: {s}");
+        assert!(!s.contains("[104,101"), "the JSON number-array form must be gone: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, set_state, "base64 round-trips byte-for-byte");
+
+        let remove = Op::PluginRemove {
+            row: row.clone(),
+            index: 0,
+            state: Some(blob.clone()),
+            params: vec![],
+        };
+        let s = serde_json::to_string(&remove).unwrap();
+        eprintln!("PluginRemove wire form: {}", s);
+        assert!(s.contains("\"state\":\"aGVsbG8=\""), "state must be base64, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, remove);
+
+        // `None` stays `null` — an instance with no host state to save is
+        // not the same as one whose state is the empty blob.
+        let removed_stateless = Op::PluginRemove { row, index: 0, state: None, params: vec![] };
+        let s = serde_json::to_string(&removed_stateless).unwrap();
+        assert!(s.contains("\"state\":null"), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, removed_stateless);
+
+        // The size claim, made concrete: 4x is not rhetorical.
+        let big: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let b64_len = serde_json::to_string(&Op::PluginSetState {
+            instance: "p-1".into(),
+            state: big.clone(),
+        })
+        .unwrap()
+        .len();
+        let array_len = serde_json::to_string(&serde_json::json!(big)).unwrap().len();
+        assert!(
+            b64_len * 2 < array_len,
+            "base64 must be dramatically smaller than the number array ({b64_len} vs {array_len})"
+        );
     }
 
     #[test]

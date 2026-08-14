@@ -500,7 +500,7 @@ fn an_epoch_boundary_clears_history_and_rotates_the_journal() {
     let b_lines = journal_lines(&dir_b);
     assert_eq!(b_lines.len(), 1, "the new journal starts with its boundary record");
     assert_eq!(b_lines[0]["epochEvent"], "create");
-    assert_eq!(b_lines[0]["v"], 1);
+    assert_eq!(b_lines[0]["v"], aura_lib::control::op::OP_FORMAT_VERSION);
     assert!(b_lines[0]["epoch"].as_u64().unwrap() >= 1);
     assert_eq!(
         f.log.journal_path().unwrap(),
@@ -684,7 +684,11 @@ fn every_journal_line_carries_a_resolvable_actor_and_run() {
     let lines = journal_lines(&dir);
     let mut seen: Vec<String> = Vec::new();
     for line in &lines {
-        assert_eq!(line["v"], 1, "every line carries the op-format version");
+        assert_eq!(
+            line["v"],
+            aura_lib::control::op::OP_FORMAT_VERSION,
+            "every line carries the op-format version"
+        );
         if line.get("epochEvent").is_some() {
             // An epoch record: no actor by design (ruling 4 — epochs are
             // not ops), but it must carry its epoch.
@@ -798,22 +802,46 @@ fn journal_op_kinds_match_the_corrected_envelope_schema_pattern() {
                 track_id: Some(t.clone()),
             },
             index: 0,
-        })
+        })?;
+        // I-5: a state-carrying op, so the base64 assertion below runs
+        // against a line a real session actually wrote.
+        tx.apply(Op::PluginSetState { instance: "p-1".into(), state: b"hello".to_vec() })
     })
     .unwrap();
     f.cp.undo().unwrap();
 
     let lines = journal_lines(&dir);
     let mut kinds = 0usize;
+    let mut state_blobs = 0usize;
     for line in &lines {
+        assert_eq!(
+            line["v"],
+            aura_lib::control::op::OP_FORMAT_VERSION,
+            "every line declares the format its ops are encoded in"
+        );
         let Some(ops) = line["ops"].as_array() else { continue };
         for op in ops {
             let k = op["kind"].as_str().unwrap_or_else(|| panic!("op without a kind: {op}"));
             assert!(matches_kind_pattern(k), "journaled op kind {k:?} violates the schema pattern");
             kinds += 1;
+            // I-5: a state blob is a base64 STRING on the wire. A JSON
+            // number array here is the ~4x blowup the format-2 bump exists
+            // to remove — and `additionalProperties: true` means the
+            // envelope schema would happily validate either, so the shape
+            // has to be asserted here or nowhere.
+            if let Some(state) = op.get("state") {
+                if !state.is_null() {
+                    assert!(
+                        state.is_string(),
+                        "journaled state blob must be base64, not a number array: {op}"
+                    );
+                    state_blobs += 1;
+                }
+            }
         }
     }
     assert!(kinds >= 8, "the session should have journaled a good spread of kinds, got {kinds}");
+    assert!(state_blobs >= 1, "the session should have journaled at least one state blob");
 
     f.eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);

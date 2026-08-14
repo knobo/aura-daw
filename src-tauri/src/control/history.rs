@@ -349,8 +349,13 @@ impl JournalWriter {
     /// now requires bumping `OP_FORMAT_VERSION` and teaching the reader
     /// both shapes. Additive fields with `#[serde(default)]` stay
     /// non-breaking (that is why `clip_indices`, `transient` and
-    /// `PluginRemove::params` were added that way) and keep the version at
-    /// 1.
+    /// `PluginRemove::params` were added that way) and need no bump.
+    ///
+    /// The version is 2 as of the Plan E follow-up (I-5): plugin state
+    /// blobs are base64 on the wire, not JSON number arrays. That WAS a
+    /// breaking change and deliberately shipped without a dual-shape
+    /// reader, because the journal is still write-only — see
+    /// `OP_FORMAT_VERSION`'s own doc for why that window was the moment.
     ///
     /// Ops serialize through their own `serde` impls — the SAME wire form
     /// the IPC surface uses, single-camelCase-token `kind`s per ruling 1.
@@ -367,7 +372,7 @@ impl JournalWriter {
         self.write_line(&line);
     }
 
-    /// A boundary record: `{"v":1,"epochEvent":"open","epoch":N}`.
+    /// A boundary record: `{"v":<OP_FORMAT_VERSION>,"epochEvent":"open","epoch":N}`.
     pub fn append_epoch(&mut self, event: EpochEvent, epoch: u64) {
         let line = serde_json::json!({
             "v": OP_FORMAT_VERSION,
@@ -848,11 +853,11 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3, "one line per record, nothing buffered");
         let epoch: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
-        assert_eq!(epoch["v"], 1);
+        assert_eq!(epoch["v"], OP_FORMAT_VERSION);
         assert_eq!(epoch["epochEvent"], "create");
         assert_eq!(epoch["epoch"], 1);
         let batch: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
-        assert_eq!(batch["v"], 1);
+        assert_eq!(batch["v"], OP_FORMAT_VERSION);
         assert_eq!(batch["rev"], 1);
         assert_eq!(batch["actor"], "user");
         assert_eq!(batch["run"], "r-1");
