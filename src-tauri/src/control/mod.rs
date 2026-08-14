@@ -128,9 +128,12 @@ pub struct ControlPlane {
     /// `gesture_begin`/`gesture_end` and `set_track_mix`'s transient-fold
     /// check all go through it. See `GestureState`'s doc.
     gesture: GestureState,
-    /// The last gesture batch `close_gesture` synthesized, parked here for
-    /// `take_last_gesture_batch` (Task 17's real consumer; this crate's own
-    /// tests until it lands).
+    /// The last gesture batch `close_gesture` synthesized, parked for
+    /// `take_last_gesture_batch`. TEST-ONLY as of Task 17: history is now
+    /// fed DIRECTLY by `close_gesture` (see its doc), so nothing in
+    /// production reads this slot — it exists so a test can inspect the
+    /// exact synthesized `ops`/`inverses`/`meta` without reaching into the
+    /// history stacks.
     last_gesture_batch: Mutex<Option<session::Committed>>,
 }
 
@@ -1865,7 +1868,10 @@ impl ControlPlane {
     /// gesture was open. A history consumer replays `ops`/`inverses`
     /// through a NEW commit; it never reads or executes this `effect`
     /// field directly (see `close_gesture`'s doc on that field).
-    #[allow(dead_code)] // Task 17 is the real production caller; tests only until then.
+    // Read only by this crate's tests (Task 17 made history the direct
+    // consumer at `close_gesture`), so the compiler sees no production
+    // caller in a non-test build.
+    #[allow(dead_code)]
     pub(crate) fn take_last_gesture_batch(&self) -> Option<session::Committed> {
         self.last_gesture_batch.lock().take()
     }
