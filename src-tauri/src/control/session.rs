@@ -1229,6 +1229,15 @@ fn write_transport_prop(
 /// barrier: grouping never reaches back across a structural op boundary to
 /// merge with earlier Set groups, preserving replay order once ops persist.
 ///
+/// NON-`Set` OPS NEVER FOLD AWAY (Plan E review ask, made explicit here so
+/// nobody "optimizes" it later): only the `Grouped` arm can drop an entry,
+/// and only when a group's net `from == to`. Every non-`Set` op takes the
+/// `Passthrough` arm, which always emits both the op and its inverse — so a
+/// structurally no-op mutation still reaches history and the journal. A
+/// `Op::AutomationSetLane { lane: None }` that deletes an already-absent
+/// lane changes nothing in the document, and it STILL journals: the log
+/// records what was attempted through the channel, not merely what moved.
+///
 /// A linear scan (not a `HashMap`) is used deliberately: `PropPath` isn't
 /// `Hash` (op.rs's closed enum, Task 2 territory, left untouched), and
 /// transaction batches are small enough that O(n²) is a non-issue.
