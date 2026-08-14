@@ -1769,6 +1769,18 @@ impl ControlPlane {
     where
         F: FnOnce(&mut session::Tx<'_>) -> Result<(), String>,
     {
+        // Fix round 1, Important-2: the doc comment above states the
+        // contract; this enforces it. `IN_GESTURE_FOLD` only exists under
+        // `#[cfg(debug_assertions)]` (see its declaration), so the whole
+        // check — not just `debug_assert!`'s own internal `cfg!` gate — is
+        // wrapped in `#[cfg(debug_assertions)]`, same as every other
+        // `IN_GESTURE_FOLD` reference in this file.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            IN_GESTURE_FOLD.with(|marker| marker.get()),
+            "commit_transient_for_gesture called outside commit_transient_and_fold — \
+             the deferred persist would be dropped"
+        );
         self.committer.commit_with_rebuild_full(
             meta.transient(),
             f,
@@ -1960,17 +1972,35 @@ impl ControlPlane {
     /// hood.
     ///
     /// A gesture that never folded anything (`last` empty — e.g. a
-    /// `pointerdown`/`pointerup` with no drag in between) produces no batch
-    /// and no emit: nothing changed, so there is nothing for history or the
-    /// UI to hear about.
+    /// `pointerdown`/`pointerup` with no drag in between) produces no
+    /// history batch and no `project://changed` emit — nothing changed to
+    /// this gesture's coalesced KEYS, so there is nothing for history or
+    /// the UI to hear about. It can still owe a deferred PERSIST, though
+    /// (see the early-return branch below) — `last` tracks coalesced ops,
+    /// not persist flags, and the two can disagree.
     fn close_gesture(&self, gesture: OpenGesture) {
-        if gesture.last.is_empty() {
-            return;
-        }
         // I-8: read BEFORE the fields below are moved out of `gesture` by
         // the destructuring that follows.
         let gesture_persist = gesture.persist;
         let gesture_epoch = gesture.epoch;
+        if gesture.last.is_empty() {
+            // Fix round 1, Important-1: a folded commit's OWN ops can net
+            // to nothing (session.rs's `fold_ops` elides a same-key Set
+            // pair whose `from == to` — e.g. a drag that ends back at its
+            // starting value within one folded commit) while its
+            // `EngineEffect::persist` was still computed `true` — the
+            // persist flags are set in `apply_raw` unconditionally on a
+            // successful write, before `fold_ops` ever runs. That commit's
+            // persist was already merged into `gesture_persist` by
+            // `fold_committed`, regardless of whether it left anything in
+            // `last`. Returning early here without executing it would
+            // silently drop a write this gesture already promised — so it
+            // runs even on the "nothing to show history" path.
+            if gesture_persist != session::PersistEffect::default() {
+                self.committer.execute_persist(&gesture_persist, gesture_epoch);
+            }
+            return;
+        }
         let ops: Vec<op::Op> = gesture.last.into_iter().map(|(_, op)| op).collect();
         let mut inverses: Vec<op::Op> = gesture.baselines.into_iter().map(|(_, op)| op).collect();
         inverses.reverse();
@@ -3729,6 +3759,78 @@ mod tests {
         assert_eq!(stored_value(&dir), Some(0.75), "one write, at close, with the LAST value");
         let (undo_depth, _redo) = cp.history_depths();
         assert_eq!(undo_depth, 1, "three folded commits, one undo entry");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// Fix round 1, Important-1: `close_gesture`'s early return (nothing in
+    /// `last` to synthesize a history batch from) must still execute a
+    /// deferred persist. Constructed honestly through the public API: ONE
+    /// folded commit whose two `Set`s on the same (object, path) key net to
+    /// NO change (`session.rs`'s `fold_ops` elides a same-key Set pair
+    /// whose `from == to` — "wiggle and back" within a single transact) —
+    /// its `Committed.ops` end up empty, so nothing lands in `last`/
+    /// `baselines`, but `apply_raw` set `effect.persist.plugins = true` on
+    /// BOTH `tx.apply` calls unconditionally, before `fold_ops` ever runs,
+    /// so `fold_committed` still merges it into the gesture's accumulator.
+    /// Observed via a signal the "no ops, no ONE thing changed" path can't
+    /// fake: a fresh project's `project.json` carries no `plugins` key at
+    /// all until a plugin snapshot is written.
+    #[test]
+    fn close_gesture_executes_a_deferred_persist_even_when_the_gesture_nets_to_no_ops() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let dir = std::env::temp_dir().join(format!(
+            "aura-gesture-persist-empty-batch-{}-{}", std::process::id(), uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_p, dir) = crate::audio::project::create(&dir, "Song", 48_000, 120.0).unwrap();
+        {
+            let mut s = cp.session().lock();
+            s.store.project_dir = Some(dir.clone());
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(), uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(), format: "lv2".into(), status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
+                id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
+                default: 0.0, value: 0.0, steps: 0,
+            }]);
+        }
+        let has_plugins_key = |dir: &std::path::Path| -> bool {
+            let Ok(bytes) = std::fs::read(dir.join("project.json")) else { return false };
+            let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return false };
+            v.get("plugins").is_some()
+        };
+        assert!(!has_plugins_key(&dir), "a fresh project carries no plugins key yet");
+
+        cp.gesture_begin("plugin param wiggle-and-back".into()).unwrap();
+        cp.gesture
+            .commit_transient_and_fold(&op::Actor::User, || {
+                cp.commit_transient_for_gesture(op::TxMeta::user("plugin wiggle"), |tx| {
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::Plugin("inst-1".into()),
+                        path: op::PropPath::Param { index: 7 },
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(0.5),
+                    })?;
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::Plugin("inst-1".into()),
+                        path: op::PropPath::Param { index: 7 },
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(0.0), // back to the starting value
+                    })
+                })
+            })
+            .unwrap()
+            .unwrap();
+
+        cp.gesture_end().unwrap();
+        assert!(
+            has_plugins_key(&dir),
+            "the accumulated persist must run even though this gesture's synthesized batch is empty"
+        );
+        let (undo_depth, _redo) = cp.history_depths();
+        assert_eq!(undo_depth, 0, "a net no-op gesture creates no history entry");
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
