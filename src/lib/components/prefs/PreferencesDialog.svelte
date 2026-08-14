@@ -15,6 +15,23 @@
     return entries.filter(([, def]) => def.category === cat);
   }
 
+  // Number prefs commit on RELEASE (change), not per-input: a pref like
+  // uiZoom re-lays-out the whole shell — this dialog included — so applying
+  // it mid-drag moves the slider away from under the pointer and the drag
+  // chases its own effect. During the drag only this preview value updates;
+  // the label shows it, the world changes once, on release.
+  let pending = $state<Partial<Record<PrefId, number>>>({});
+
+  function shownNumber(id: PrefId): number {
+    return pending[id] ?? (prefs.values[id] as number);
+  }
+
+  function commitNumber(id: PrefId, raw: string) {
+    delete pending[id];
+    const v = parseFloat(raw);
+    if (Number.isFinite(v)) prefs.set(id, v);
+  }
+
   /** The number control's visible value — percent for "%" defs, raw otherwise. */
   function numberLabel(def: PrefDef, value: number): string {
     if (def.kind !== "number") return String(value);
@@ -82,11 +99,12 @@
                       min={def.min}
                       max={def.max}
                       step={def.step}
-                      value={prefs.values[id] as number}
+                      value={shownNumber(id)}
                       aria-label={def.label}
-                      oninput={(e) => prefs.set(id, parseFloat(e.currentTarget.value))}
+                      oninput={(e) => (pending[id] = parseFloat(e.currentTarget.value))}
+                      onchange={(e) => commitNumber(id, e.currentTarget.value)}
                     />
-                    <span class="numval mono">{numberLabel(def, prefs.values[id] as number)}</span>
+                    <span class="numval mono">{numberLabel(def, shownNumber(id))}</span>
                   </div>
                 {/if}
               </div>
