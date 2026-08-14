@@ -178,6 +178,21 @@ class PluginsStore {
     }
   }
 
+  /** Re-pull the OPEN instance's params without closing/reopening the panel
+   * (M-3): an undo/redo of a plugin-param step changed the backend's values
+   * under a panel that is still showing the pre-undo ones. No-op when no
+   * panel is open. */
+  async reloadOpenParams(): Promise<void> {
+    const id = this.openInstanceId;
+    if (!id) return;
+    try {
+      this.params = await backend.pluginGetParams(id);
+      this.paramError = null;
+    } catch (err) {
+      this.paramError = String(err);
+    }
+  }
+
   closeParams() {
     void this.flushParamQueue(); // don't drop trailing knob motion
     this.openInstanceId = "";

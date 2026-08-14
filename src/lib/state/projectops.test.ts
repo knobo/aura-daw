@@ -36,6 +36,11 @@ const invokes = {
       midiClips: [],
     }),
   ),
+  automationGet: vi.fn(() => Promise.resolve([])),
+  pluginList: vi.fn(() =>
+    Promise.resolve({ plugins: [], scanned: true, instances: [] }),
+  ),
+  pluginGetParams: vi.fn(() => Promise.resolve([])),
 };
 
 const mockBackend = {
@@ -318,5 +323,26 @@ describe("undo / redo (Plan E Task 17)", () => {
     await projectops.undo();
     expect(toasts.list).toHaveLength(0);
     mockBackend.undo = saved;
+  });
+
+  /**
+   * M-3 (Plan E whole-branch review): `step()` re-pulled project + midi and
+   * nothing else, so undoing an automation-lane or plugin-param step left
+   * those views showing pre-undo values until something else refreshed
+   * them. The re-pull now covers every store an op can address.
+   */
+  it("re-pulls automation lanes and plugin panels after an undo", async () => {
+    const { plugins } = await import("./plugins.svelte");
+    plugins.openInstanceId = "inst-1";
+    await projectops.undo();
+    expect(invokes.automationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginList).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginGetParams).toHaveBeenCalledWith("inst-1");
+  });
+
+  it("re-pulls them after a redo too", async () => {
+    await projectops.redo();
+    expect(invokes.automationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginList).toHaveBeenCalledTimes(1);
   });
 });
