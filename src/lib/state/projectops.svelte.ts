@@ -8,8 +8,10 @@
  */
 
 import { backend } from "../tauri";
+import { automation } from "./automation.svelte";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { midi } from "./midi.svelte";
+import { plugins } from "./plugins.svelte";
 import { project } from "./project.svelte";
 import { toasts } from "./toasts.svelte";
 
@@ -183,12 +185,29 @@ class ProjectOpsStore {
     try {
       const step = await call.call(backend);
       if (!step?.label) return; // nothing to undo/redo — silent, not an error
-      await project.reload();
-      await midi.init();
+      await this.repull();
       toasts.info(dir === "undo" ? "UNDO" : "REDO", step.label);
     } catch (err) {
       toasts.error(dir === "undo" ? "UNDO FAILED" : "REDO FAILED", String(err));
     }
+  }
+
+  /**
+   * Re-pull every store an op can address. `project://changed` carries only
+   * the `Project` shape, so midi, automation and the plugin registry each
+   * need their own pull — M-3 (Plan E whole-branch review): this used to
+   * stop after project + midi, leaving automation lanes and an open plugin
+   * param panel showing pre-undo values until something else refreshed them.
+   */
+  private async repull() {
+    await project.reload();
+    await midi.init();
+    await automation.reload();
+    // reloadOpenParams BEFORE refresh: refresh()'s applyInstances closes the
+    // param panel when the instance registry no longer lists the open
+    // instance, which would otherwise race the re-pull it's meant to serve.
+    await plugins.reloadOpenParams();
+    await plugins.refresh();
   }
 
   /** Re-pull the full snapshot; `project://changed` alone leaves projectDir stale. */
@@ -198,8 +217,7 @@ class ProjectOpsStore {
     // `exit()`, which would replay the old snapshot's loop/solo writes onto
     // whatever project just got adopted).
     clipEditLoop.reset();
-    await project.reload();
-    await midi.init();
+    await this.repull();
   }
 }
 

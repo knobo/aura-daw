@@ -14,12 +14,14 @@
 //! scratch, which is then mixed through the same gain/pan/mute path as clips.
 
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::rt::{RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
+use crate::plugins::automation::{AbsParamEvent, RampCursor};
 
 /// Fader dB to linear gain. -160 dB (and below) encodes -inf.
 pub fn db_to_linear(db: f64) -> f32 {
@@ -129,6 +131,7 @@ fn render_live(
     discontinuity: bool,
     steady_base: Option<u64>,
     mix: (f32, f32, f32, bool),
+    ramp: &[AbsParamEvent],
     acc: &mut TrackAccum,
 ) {
     let Some(live) = &tr.live else { return };
@@ -143,6 +146,10 @@ fn render_live(
     // the first run, then true again after every loop wrap (the position
     // jumps back to the loop start).
     let mut run_discontinuity = discontinuity;
+    // Track D: one cursor for the whole call; `pos` is this run's base, and
+    // runs advance monotonically except across a loop wrap, which the
+    // cursor re-seeds for.
+    let mut ramp_cursor = RampCursor::new();
     let mut f = 0usize;
     while f < frames {
         let pos = frame_pos(base_pos, f as u64, lp);
@@ -188,8 +195,9 @@ fn render_live(
             run_discontinuity = false;
         }
         for i in 0..run {
-            let mut l = scratch[i * 2] * gain * gl;
-            let mut r = scratch[i * 2 + 1] * gain * gr;
+            let g = gain * ramp_cursor.value(ramp, pos + i as u64).unwrap_or(1.0);
+            let mut l = scratch[i * 2] * g * gl;
+            let mut r = scratch[i * 2 + 1] * g * gr;
             if !on {
                 l = 0.0;
                 r = 0.0;
@@ -302,7 +310,8 @@ fn render_impl(
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
-    let RtGraph { tracks, scratch, meter_scratch, .. } = graph;
+    let RtGraph { tracks, scratch, meter_scratch, gain_ramps, .. } = graph;
+    let gain_ramps: &[Option<Arc<Vec<AbsParamEvent>>>] = gain_ramps;
 
     // Reset this callback's chunk templates in place (Task 7: preallocated
     // at BUILD time on the control thread; `render` never grows this Vec).
@@ -322,6 +331,15 @@ fn render_impl(
         let (gl, gr) = pan_gains(pan);
         let mut acc = TrackAccum::default();
 
+        // Track D: this snapshot's compiled gain automation for the slot.
+        // RT-safe: a slice read + an index walk, no allocation, no locks.
+        let ramp: &[AbsParamEvent] = gain_ramps
+            .get(tr.slot)
+            .and_then(|r| r.as_ref())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        let mut clip_ramp = RampCursor::new();
+
         if !tr.clips.is_empty() {
             for i in 0..frames {
                 let pos = frame_pos(base_pos, i as u64, lp);
@@ -332,8 +350,9 @@ fn render_impl(
                     l += s[0];
                     r += s[1];
                 }
-                l *= gain * gl;
-                r *= gain * gr;
+                let g = gain * clip_ramp.value(ramp, pos).unwrap_or(1.0);
+                l *= g * gl;
+                r *= g * gr;
                 if !on {
                     l = 0.0;
                     r = 0.0;
@@ -355,6 +374,7 @@ fn render_impl(
             discontinuity,
             steady_base,
             (gain, gl, gr, on),
+            ramp,
             &mut acc,
         );
 
@@ -397,7 +417,6 @@ mod tests {
     use super::super::rt::ParamTable;
     use super::super::rt::RtClipData;
     use super::super::rt::RtTrack;
-    use std::sync::Arc;
 
     fn clip(start: u64, offset: u64, len: u64, data: Vec<f32>, channels: u16) -> RtClip {
         RtClip {
@@ -794,5 +813,133 @@ mod tests {
         assert_eq!(seen.len(), 3, "one steady value observed per rendered block");
         assert!(seen[1] > seen[0], "monotonic across the loop wrap: {:?}", seen);
         assert!(seen[2] > seen[1], "still climbing after the wrap: {:?}", seen);
+    }
+
+    // ---- Task 8: slot-indexed gain ramps applied by the mixer -------------
+
+    /// Track D's audibility proof at the MIXER seam (scope ruling 1: the
+    /// ramp attaches at the per-track gain stage, so it scales CLIP audio
+    /// and LIVE audio alike — `GainAutomatedNode` could only ever have done
+    /// the latter). Offline render, amplitude asserted against the lane.
+    #[test]
+    fn track_gain_ramp_scales_clip_output_sample_accurately() {
+        use crate::plugins::automation::AbsParamEvent;
+        // A DC-1.0 mono clip so the applied gain is directly readable.
+        let data = Arc::new(RtClipData { channels: 1, data: vec![1.0; 4096] });
+        let clip = RtClip {
+            start: 0, offset: 0, len: 4096, gain: 1.0,
+            fade_in: 0, fade_out: 0, samples: data,
+        };
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(0, vec![clip])],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        g.params.set_pan(0, -1.0); // hard left: channel 0 carries unity
+        let ev = Arc::new(vec![
+            AbsParamEvent { sample: 0, value: 1.0 },
+            AbsParamEvent { sample: 1000, value: 0.0 },
+        ]);
+        g.set_gain_ramps(vec![Some(ev.clone())]);
+
+        let mut out = vec![0.0f32; 1024 * 2];
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        for (i, frame) in out.chunks_exact(2).enumerate() {
+            let want = crate::plugins::automation::value_at(&ev, i as u64).unwrap();
+            assert!(
+                (frame[0] - want).abs() < 1e-4,
+                "sample {i}: got {} want {want}",
+                frame[0]
+            );
+        }
+    }
+
+    /// The cursor must re-seed on a BACKWARD position jump: one callback
+    /// block crossing a loop end renders the tail of the ramp and then the
+    /// loop start's value, mid-block.
+    #[test]
+    fn track_gain_ramp_re_seeds_across_a_loop_wrap() {
+        use crate::plugins::automation::AbsParamEvent;
+        let data = Arc::new(RtClipData { channels: 1, data: vec![1.0; 8192] });
+        let clip = RtClip {
+            start: 0, offset: 0, len: 8192, gain: 1.0,
+            fade_in: 0, fade_out: 0, samples: data,
+        };
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(0, vec![clip])],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        g.params.set_pan(0, -1.0);
+        let ev = Arc::new(vec![
+            AbsParamEvent { sample: 0, value: 1.0 },
+            AbsParamEvent { sample: 2000, value: 0.0 },
+        ]);
+        g.set_gain_ramps(vec![Some(ev.clone())]);
+
+        let lp = LoopSpec { enabled: true, start: 500, end: 2000 };
+        let mut out = vec![0.0f32; 1024 * 2];
+        render(&mut g, 1_744, &lp, &mut out, 2, 48_000, true, None);
+        for (i, frame) in out.chunks_exact(2).enumerate() {
+            let pos = crate::audio::transport::frame_pos(1_744, i as u64, &lp);
+            let want = crate::plugins::automation::value_at(&ev, pos).unwrap();
+            assert!(
+                (frame[0] - want).abs() < 1e-4,
+                "frame {i} (pos {pos}): got {} want {want}",
+                frame[0]
+            );
+        }
+    }
+
+    /// A LIVE (instrument) track's output goes through the same gain stage,
+    /// so one ramp covers both source kinds. A note is actually triggered
+    /// (an empty event list would render silence regardless of gain, making
+    /// the assertion pass no matter what the ramp code does) and the ramped
+    /// render is checked frame-by-frame against an un-ramped control render
+    /// of the identical note, scaled by the lane's own `value_at`.
+    #[test]
+    fn track_gain_ramp_scales_live_output_too() {
+        use crate::plugins::automation::AbsParamEvent;
+        const RATE: u32 = 48_000;
+        let events = vec![AbsNoteEvent { sample: 0, key: 69, velocity: 110 }];
+
+        let mut control = RtGraph::new(
+            vec![live_track(0, events.clone(), RATE)],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        let mut control_out = vec![0.0f32; 512 * 2];
+        render(&mut control, 0, &LoopSpec::OFF, &mut control_out, 2, RATE, false, None);
+        assert!(peak(&control_out) > 0.01, "control note is audible");
+
+        let mut g = RtGraph::new(
+            vec![live_track(0, events, RATE)],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        let ev = Arc::new(vec![
+            AbsParamEvent { sample: 0, value: 1.0 },
+            AbsParamEvent { sample: 512, value: 0.0 },
+        ]);
+        g.set_gain_ramps(vec![Some(ev.clone())]);
+        let mut out = vec![0.0f32; 512 * 2];
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
+
+        for (i, (frame, cframe)) in out.chunks_exact(2).zip(control_out.chunks_exact(2)).enumerate() {
+            let want = crate::plugins::automation::value_at(&ev, i as u64).unwrap();
+            for ch in 0..2 {
+                let expected = cframe[ch] * want;
+                assert!(
+                    (frame[ch] - expected).abs() < 1e-4,
+                    "frame {i} ch {ch}: got {} want {expected} (control {}, want-gain {want})",
+                    frame[ch],
+                    cframe[ch]
+                );
+            }
+        }
+        assert!(
+            peak(&out) < peak(&control_out),
+            "the closing ramp must leave the live path quieter than the unramped control"
+        );
     }
 }

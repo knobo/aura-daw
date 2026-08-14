@@ -10,6 +10,7 @@
   import { transport } from "../state/transport.svelte";
   import { view } from "../state/view.svelte";
   import { midi } from "../state/midi.svelte";
+  import { automation } from "../state/automation.svelte";
   import { loopjam } from "../state/loopjam.svelte";
   import { toasts } from "../state/toasts.svelte";
   import { canvasPos } from "../utils/canvas-pos";
@@ -19,6 +20,7 @@
   import HScrollbar from "./HScrollbar.svelte";
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
+  import AutomationLaneView from "./AutomationLaneView.svelte";
   import ImportDropZone from "./ImportDropZone.svelte";
   import LoopJamPanel from "./loopjam/LoopJamPanel.svelte";
   import type { TrackState } from "../types/ipc";
@@ -502,6 +504,9 @@
           {#each midi.clipsOf(track.id) as clip (clip.id)}
             <MidiClipView {clip} {track} />
           {/each}
+          {#if automation.isVisible(track.id)}
+            <AutomationLaneView {track} />
+          {/if}
         </div>
       {/each}
       {#if project.tracks.length === 0}

@@ -12,6 +12,7 @@ import type {
   AudioDevice,
   AuraEventMap,
   AuraEventName,
+  AutomationLane,
   Clip,
   EvolveOptions,
   ExportCapabilities,
@@ -139,6 +140,14 @@ export interface Backend {
    * Task 4). Optional — real-engine only, same convention as
    * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
   moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
+
+  /** All automation lanes (points inline — per-project, not per-frame).
+   * Optional: the demo backend has no automation. */
+  automationGet?(): Promise<AutomationLane[]>;
+  /** Upsert one lane; an empty `points` array deletes it. One invoke carries
+   * the lane's FULL point set (D-03: an edit gesture, never one invoke per
+   * point). Returns the updated lane list. */
+  automationSet?(lane: AutomationLane): Promise<AutomationLane[]>;
 
   /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
    * primitive) — call on `pointerdown` of a fader/pan control. Matching
@@ -459,6 +468,12 @@ class TauriBackend implements Backend {
   }
   moveClip(clipId: string, timelineStartSamples: number) {
     return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  automationGet() {
+    return invoke<AutomationLane[]>("automation_get");
+  }
+  automationSet(lane: AutomationLane) {
+    return invoke<AutomationLane[]>("automation_set", { lane });
   }
   undo() {
     return invoke<HistoryStep>("undo");

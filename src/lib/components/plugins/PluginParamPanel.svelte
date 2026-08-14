@@ -8,6 +8,7 @@
    * inside one scroll container. Writes go through the store's rAF batch —
    * one plugin_set_param per frame regardless of drag rate.
    */
+  import { automation } from "../../state/automation.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import type { PluginParamInfo } from "../../types/ipc";
 
@@ -156,6 +157,15 @@
                   {:else}
                     <span class="val mono">{fmt(p)}<span class="unit">{unitOf(p)}</span></span>
                   {/if}
+                  <button
+                    class="autobtn mono"
+                    class:on={!!automation.pluginLaneFor(plugins.openInstanceId, p.id)}
+                    title="Automate {p.name}"
+                    aria-pressed={!!automation.pluginLaneFor(plugins.openInstanceId, p.id)}
+                    onclick={() =>
+                      void automation.automatePluginParam(plugins.openInstanceId, p.id, p.value)}
+                    >A</button
+                  >
                 </div>
                 {#if !isToggle(p) && !isEnum(p)}
                   <input
@@ -170,6 +180,9 @@
                     aria-label="{p.name} ({fmt(p)}{unitOf(p)})"
                     title="{p.name} — double-click resets to {fmt(p, p.default)}"
                     oninput={(e) => onSlide(p, e)}
+                    onpointerdown={() => plugins.beginParamGesture()}
+                    onpointerup={() => void plugins.endParamGesture()}
+                    onpointercancel={() => void plugins.endParamGesture()}
                     ondblclick={() => plugins.resetParam(p)}
                   />
                 {/if}
@@ -366,6 +379,32 @@
     background: var(--cyan);
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(82, 229, 255, 0.35);
+  }
+
+  /* "automate this knob" toggle — same small-button language as `.toggle`,
+     violet so it reads as a lane affordance, not a param value. */
+  .autobtn {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    line-height: 1;
+    font-size: 8px;
+    letter-spacing: 0;
+    border-radius: 3px;
+    border: 1px solid rgba(122, 160, 220, 0.2);
+    background: rgba(5, 7, 13, 0.7);
+    color: var(--text-faint);
+    cursor: pointer;
+  }
+  .autobtn:hover {
+    color: var(--violet);
+    border-color: rgba(157, 123, 255, 0.4);
+  }
+  .autobtn.on {
+    color: var(--bg-0);
+    background: var(--violet);
+    border-color: var(--violet);
+    box-shadow: 0 0 8px rgba(157, 123, 255, 0.35);
   }
 
   .enum {

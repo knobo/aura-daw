@@ -7,6 +7,7 @@
   import { project } from "../state/project.svelte";
   import { instruments } from "../state/instruments.svelte";
   import { plugins } from "../state/plugins.svelte";
+  import { automation } from "../state/automation.svelte";
   import { ui } from "../state/ui.svelte";
   import { formatDb } from "../utils/format";
   import Meter from "./Meter.svelte";
@@ -112,6 +113,13 @@
           class:on={track.soloed}
           title="Solo"
           onclick={() => project.toggleSolo(track.id)}>S</button
+        >
+        <button
+          class="tog auto"
+          class:on={automation.isVisible(track.id)}
+          title="Show gain automation lane"
+          aria-pressed={automation.isVisible(track.id)}
+          onclick={() => automation.toggleVisible(track.id)}>A</button
         >
       </div>
 
@@ -301,6 +309,12 @@
     background: var(--cyan);
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(82, 229, 255, 0.4);
+  }
+  .tog.auto.on {
+    color: #fff;
+    background: rgba(255, 65, 82, 0.8);
+    border-color: var(--red);
+    box-shadow: 0 0 8px rgba(255, 65, 82, 0.4);
   }
 
   .fader-wrap {

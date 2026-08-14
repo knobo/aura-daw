@@ -41,10 +41,10 @@ fix these blind — read the report's entry first):
   rows when `project.json` has no `plugins` key. These two are the
   branch's real data-loss surface. **Owner: the epoch/persist path — take
   them together, they interact (see also R-3).**
-- **I-3** `execute_host_forward` writes `status`/`params` with no op, no
-  epoch guard, and no inventory residual (with **M-6**, the grep gate's
-  matching omission). **Owner: the plugin-host path (Track D's
-  neighbourhood).**
+- ~~**I-3** `execute_host_forward` writes `status`/`params` with no op, no
+  epoch guard, and no inventory residual (with **M-6**).~~ → **closed by
+  Track D** (`061786b`): epoch guard + residual R-4 + the grep-gate
+  enumeration corrected.
 - **I-6** `undo`/`redo` are sync Tauri commands and can block the UI
   thread on plugin re-instantiation + disk I/O. **Owner: Track A** (it
   owns undo/redo's substrate; `async` + `spawn_blocking`, mirroring
@@ -58,11 +58,13 @@ fix these blind — read the report's entry first):
   journal half is closed; the stack half needs `Committed.epoch` plumbed
   through `undo`/`redo`. **Bundle with I-6** — it restructures exactly
   that code, and doing both at once is one edit instead of two.
-- **I-8** inventory row 13 claims the per-knob `project.json` rewrite is
+- ~~**I-8** inventory row 13 claims the per-knob `project.json` rewrite is
   closed; only its position moved off the lock, the frequency is
-  unchanged. **Owner: Track D / the gesture path** — the real answer is
-  extending gestures to plugin params, which is what round-2 §4.4's
-  CLAP-style primitive is for.
+  unchanged.~~ → **closed by Track D** (`7ef1f70`/`feec7e9`/`bb20280`):
+  gesture-scoped persist DEFERRAL (folding alone was not enough — a
+  transient commit still runs its full `EngineEffect`), so a knob or lane
+  drag is one undo entry and one `project.json` write; row 13's wording
+  corrected.
 - **Minors M-1, M-2, M-4, M-5, M-7, M-8** (dirty_state clear race,
   Ctrl+S cannot recover a failed auto-persist, undo during an open
   gesture bypasses the fold, the Gate E precision sentence, `VecDeque`
@@ -70,8 +72,62 @@ fix these blind — read the report's entry first):
   recorded in the report, unowned, all cheap. **M-9 is RESOLVED** by the
   review itself (`ClapNode::reset` verified to leave `steady_fallback`
   alone); close that ledger item.
-- **M-3 (frontend)** undo/redo re-pull misses automation and plugin
-  panels. **Owner: Track D.**
+- ~~**M-3 (frontend)** undo/redo re-pull misses automation and plugin
+  panels.~~ → **closed by Track D** (`2a11ed0`).
+
+**New, from Track D, still open** (details in `docs/PHASE4-PLAN.md`'s
+"Track D handoff"):
+
+- **The ear check is OWED.** Nobody has heard an automation lane change
+  the volume during playback — the implementing agents had no audio
+  device. It is the sole verification of `engine.rs:884`, the line the
+  whole engine task exists for. **Do this before anything else:** start
+  the app, draw a fade on a track, press play, listen.
+- **A bounce ignores PLUGIN-PARAM automation** and captures whatever the
+  live host instance happens to hold. Track-gain lanes DO export
+  correctly. The fix needs private per-render plugin instances — see the
+  handoff and the note on `audio::offline::build_graph`.
+- **The non-blocking CLAP param path.** `clap_host::set_params` is
+  `plugin_main().run(…)`, a blocking round-trip; `lv2_host::set_params`
+  already posts, so only CLAP blocks. Writes are batched per instance per
+  tick, but an active ramp on two instances still costs ~1000 blocking
+  round-trips/s onto the plugin-main thread that also serves the param
+  panel, `instantiate` and `save_state`. Wanted: a fire-and-forget
+  sibling to `set_params` plus a driver that uses it. **Owner: the
+  plugin-host path.**
+- **An automated plugin param is PINNED for the whole playthrough**, not
+  just while a knob is held. The "A" button is the only way to create a
+  plugin-param lane and it mints a single-point (flat) lane, and the lane
+  editor draws track gain only — so there is no way to give a plugin param
+  a curve yet. Turn that param in the plugin's own GUI during playback and
+  it snaps back within ~0.5 s and stays, while AURA's panel still shows the
+  new value. Intended scope (automation overrides the knob), but say so
+  plainly. Follow-ups that change it: a curve editor for plugin params, and
+  write/touch/latch modes.
+- **`gesture_end` has no id — it closes whatever is open. TRACKS A AND C
+  INHERIT THIS.** Any `endGesture()` fired from a promise continuation can
+  close a gesture that began while it was awaiting; `gesture_begin`
+  auto-closes a stale one, so the two compose into a real regression.
+  Live example, Track D's own: release a plugin knob (awaits a rAF + one
+  IPC round trip) and press a track fader inside that window — the pending
+  `endGesture()` closes the FADER's gesture, and the rest of that drag
+  commits unbracketed, one undo entry and one `project.json` write per rAF
+  batch. That is the I-8 regression inside I-8's own fix. Two more
+  instances (`library.svelte.ts`, the automation delete path) are listed
+  in the handoff. Fix to make: `gesture_begin` returns an id,
+  `gesture_end(id)` no-ops on mismatch — additive, so it stays inside the
+  frozen-command rules. Worst case is an extra undo entry and an extra
+  persist, never data loss. **If your track drives gestures from an async
+  path, read the handoff entry before writing that code.**
+- **No DOM test environment exists** (no jsdom/testing-library), so nothing
+  inside a `.svelte` file is covered by any test. Both of Track D's real
+  frontend bugs lived in event handlers and both were found by reading.
+  Move async-ordering logic into a store where it can be tested.
+- **Two UI minors, deliberately left open** by the whole-track review:
+  `movePoint` silently deletes a neighbour on a tick collision
+  (`automation-edit.ts:57-66`), and `.tog.auto.on` is byte-identical to
+  `.tog.arm.on` in `TrackHeader.svelte`, so an automation-visible track
+  reads as armed.
 
 This file is written for a **fresh session after `/clear`**: it assumes no
 memory of the Plan E conversation. Everything it asserts is checked against
@@ -121,12 +177,15 @@ independently of Plan E, before or around the same time as PR #12. Nothing
 further to do about any of them; they're why the frontend baseline moved
 past Plan E's own count (see below).
 
-**Baseline to verify at the start of any track**: **506 backend + 206
-frontend tests, all green** (the frontend count grew from Plan E's own 174
-because PRs #14/#15/#16 added tests independently; the backend count grew
-from 501 by the five regression tests the post-merge follow-up PR #18
-added). `origin/main` is still at 501 backend until #18 lands — if you
-branch before it merges, expect 501 and re-baseline afterwards. Run both
+**Baseline to verify at the start of any track**: MEASURE IT, don't trust
+this line — several tracks are in flight and each moves the number, so it
+is a standing merge-conflict point. Marked correction (ADR 0007): this
+section previously said **506 backend + 206 frontend**, which was already
+stale when written — the real count at `3340aa8` (Track D's branch base,
+verified in a worktree) was **527 backend + 206 frontend**. Known points
+since: **538 + 234** after Track E (`a98d7ff`), and **566 backend (537
+lib + 29 integration) + 258 frontend** on `automation-audible`
+2026-08-15 (Track D, PR #20, includes Track E via a merge). Run both
 suites before writing the first line of a track:
 
 ```
@@ -317,29 +376,34 @@ clipboard glue; no `engine.rs`, no overlap with A/B/D's backend footprint.
 The one shared surface is the gesture IPC commands themselves (already
 frozen/additive, so no real contention).
 
-### Track D — Automation audible + lane UI
+### Track D — Automation audible + lane UI — LANDED 2026-08-14
 
-Backlog doc: `docs/backlog/automation-audible-and-ui.md`. Scope: RT attach
-(the data layer landed in Plan E Task 10 — `AutomationLane` persists,
-`Op::AutomationSetLane` is atomic/attributed/undoable — but
-`engine::rebuild` never reads `session.automation`; compiled ramps and
-`GainAutomatedNode` exist but aren't wired into the production graph),
-then a timeline lane UI (draw/drag points, gesture-wrapped edits through
-`automation_set`), then plugin-parameter targets.
+**Done, branch `automation-audible`, PR #20** (10 tasks, plan doc
+`docs/superpowers/plans/2026-08-14-automation-audible.md`). Full handoff —
+all eight scope rulings, the non-goals, the mid-flight rulings and the
+deferred-minors roll-up — is **`docs/PHASE4-PLAN.md`'s "Track D
+handoff"** section; read that, not this paragraph, before touching
+automation.
 
-**Prerequisites**: branch from `origin/main` — PR #12 is merged, so the
-RT-attach half's target (`engine.rs` as Plan E's Task 13 rewrote it —
-`Committer`, `steady_time`) is already there.
+`engine::rebuild` now reads `session.automation`: track-gain lanes compile
+into a slot-indexed `RtGraph::gain_ramps` table applied at the mixer's
+per-track gain stage (NOT by wrapping nodes in `GainAutomatedNode` — see
+ruling 1), and plugin-param lanes are driven on the engine control thread's
+≤2 ms tick, host-only, never through the document (ruling 2). The REBUILD
+PIN in `control/session.rs` is resolved. The timeline gained an in-lane
+overlay for drawing/dragging/deleting points, plus a plugin-param target
+picker. Gestures grew a persist deferral, so a drag is one undo entry and
+one `project.json` write. Song export compiles the same gain ramps.
 
-**Footprint**: `src-tauri/src/audio/engine.rs` (attach at rebuild time —
-the day this lands, `Op::AutomationSetLane`'s apply arm must flip
-`effect.rebuild = true`; the arm's own comment already says this, marked
-"REBUILD PIN" in `control/session.rs`), `src-tauri/src/plugins/automation.rs`
-(the attach path), timeline components + a small store (UI).
+Three Plan E findings closed on the way: **I-3 + M-6**, **I-8** (inventory
+row 13) and the **frontend M-3** — struck from the held list above.
 
-**Conflicts**: with Track B (MIDI slice 2) and Track A in `engine.rs` — if
-run in parallel, sequence the engine-touching halves (see Track B's note;
-the same rule applies here).
+Still open and named there: the **owner's ear check** (nobody has heard it
+yet), **plugin-param automation in a bounce**, the **non-blocking CLAP
+param path**, and holding a knob against a flat automated param.
+
+Baseline after this track: **566 backend (537 lib + 29 integration) + 258
+frontend**, measured on `automation-audible` 2026-08-15.
 
 ### Track E — Library & browser panel — LANDED 2026-08-14
 
@@ -367,8 +431,8 @@ into `docs/PHASE4-PLAN.md`'s Track E handoff section when one is written
 (not done as part of this track — `PHASE4-PLAN.md` wasn't touched here).
 
 Baseline after this track: 538 backend + 234 frontend tests, all green
-(counted 2026-08-14 on `library-browser`, same day as the 506/206 baseline
-above — that baseline predates this track's merge).
+(counted 2026-08-14 on `library-browser`; superseded by Track D's
+566 + 258 above, which includes this track).
 
 ## 4. Pointers (the master index and everything behind it)
 

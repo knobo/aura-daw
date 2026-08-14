@@ -493,6 +493,26 @@ export interface PluginListResult {
   scanned: boolean;
 }
 
+// ── automation (plugins::automation) ────────────────────────────────────────
+
+/** One automation breakpoint in MUSICAL time (ticks @ project ppq). Between
+ * points the value ramps linearly; before the first / after the last it
+ * holds. Mirrors `plugins::automation::AutomationPoint`. */
+export interface AutomationPoint {
+  tick: number;
+  value: number;
+}
+
+/** One parameter's automation curve. `targetNode` is `"track:<trackId>"` for
+ * built-in track params (today: gain, `paramId` 0) or a plugin instance id
+ * for plugin params. Mirrors `plugins::automation::AutomationLane`. */
+export interface AutomationLane {
+  id: string;
+  targetNode: string;
+  paramId: number;
+  points: AutomationPoint[];
+}
+
 // ── mcp-policy.schema.json (phase 2) ───────────────────────────────────────
 
 export type McpPolicyMode = "readOnly" | "confirmDestructive" | "full";

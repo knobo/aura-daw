@@ -50,10 +50,42 @@ pub struct OfflineGraph {
 /// (what you hear is what you export). Slots are derived fresh from display
 /// order (round-2 §2.4) — this graph is exclusively owned, so there is no
 /// cross-generation aliasing concern to begin with.
+///
+/// TRACK-GAIN automation is compiled here exactly as `Control::rebuild`
+/// compiles it (`Control::compile_automation`), so a bounce follows the same
+/// curves playback does.
+///
+/// KNOWN DIVERGENCE, PLUGIN-PARAM LANES ONLY (Track D). Plugin-param lanes
+/// are NOT evaluated by a bounce, and the value the export captures is
+/// whatever the live host instance happens to hold — most recently, whatever
+/// the last playthrough's `ParamAutomationDriver` left there. So the same
+/// project can bounce differently after a playthrough than from a fresh
+/// launch. Why it is not fixed here, precisely:
+/// - The values are not ours to place. Plugin params live INSIDE the host
+///   instance; the only way to set one is a host round-trip
+///   (`plugins::forward_param_to_host`). Offline nodes are fresh
+///   `LiveNodeCell`s but they call the SAME process-wide host instance the
+///   live engine and the param panel use — there is exactly one copy of a
+///   plugin instance in the process.
+/// - So driving them during a bounce would write the export's automation
+///   into the user's live plugin: a background bounce would move the knobs
+///   under the open panel, and would fight the engine's own driver if the
+///   transport is rolling. That is a worse bug than the one it fixes.
+/// - A correct fix needs a bounce to own PRIVATE plugin instances: a second
+///   instantiation per automated instance, seeded from the live one's
+///   `save_state`, params driven per render block, and disposed at the end.
+///   That is a `clap_host`/`lv2_host` API addition (instantiate-for-render +
+///   per-block param application) plus an offline driver tick, i.e. the
+///   node-graph round's plugin-node work (round-2 §8) — not a close-out
+///   change.
+///
+/// Until then: a bounce reproduces plugin automation only by accident.
+/// Recorded in `docs/SIDE-CHANNEL-INVENTORY.md` and in the Track D handoff.
 pub fn build_graph(
     store: &Store,
     midi: &MidiStore,
     plugins: &crate::control::session::PluginDoc,
+    automation: &crate::control::session::AutomationDoc,
     bank: Option<&SamplerBank>,
     rate: u32,
 ) -> OfflineGraph {
@@ -108,7 +140,34 @@ pub fn build_graph(
     append_from(midi, store, plugins, &slots, rate, bank, &mut nodes, &mut tracks);
 
     let end_samples = song_end(&tracks);
-    OfflineGraph { graph: RtGraph::new(tracks, 0, params), end_samples }
+    let mut graph = RtGraph::new(tracks, 0, params);
+    graph.set_gain_ramps(compile_gain_ramps(automation, midi, &slots, store.tracks.len(), rate));
+    OfflineGraph { graph, end_samples }
+}
+
+/// Compile this snapshot's TRACK-GAIN lanes into the slot-indexed ramp table
+/// — the offline twin of `engine::Control::compile_automation`, same rules:
+/// no lanes (or no usable tempo map) means an all-`None` table of exactly
+/// `n_slots` entries, and the table is sized by the TRACK COUNT, not by
+/// `slots.len()` — duplicate track ids collapse in the slot map, and a short
+/// table would silently unramp the highest slots.
+fn compile_gain_ramps(
+    automation: &crate::control::session::AutomationDoc,
+    midi: &MidiStore,
+    slots: &std::collections::HashMap<crate::ids::TrackId, usize>,
+    n_slots: usize,
+    rate: u32,
+) -> Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>> {
+    let none = || (0..n_slots).map(|_| None).collect();
+    if automation.lanes.is_empty() {
+        return none();
+    }
+    let Ok(map) = crate::midi::TempoMap::new(midi.ppq, midi.tempo_events.clone(), rate) else {
+        return none();
+    };
+    crate::plugins::automation::compile_gain_ramps(&automation.lanes, &map, n_slots, &|tid| {
+        slots.get(tid).copied()
+    })
 }
 
 /// Last audible sample of a track set: clip `start + len` and the last
@@ -220,7 +279,7 @@ mod tests {
         const RATE: u32 = 48_000;
         let (store, midi) = demo_project();
         let render_once = || {
-            let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
+            let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
             // Engine-rebuild parity: one (empty) clip track per store track
             // plus one LIVE track per audible midi track.
             let live = og.graph.tracks.iter().filter(|t| t.live.is_some()).count();
@@ -286,7 +345,7 @@ mod tests {
             loaded_dir: None,
             dirty: false,
         };
-        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
+        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
         // Region [24000, 44000): starts after note A's on (skipped) and
         // before note B's on at 30000 (audible).
         let (start, end) = (24_000u64, 44_000u64);
@@ -350,7 +409,7 @@ mod tests {
             lane_id: crate::ids::LaneId::default_for_track("a1"),
         });
         let midi = MidiStore { clips: vec![], ..MidiStore::default() };
-        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
+        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
         assert_eq!(og.end_samples, 600, "clip end = start + len");
         let out = render(&mut og.graph, 0, 700, RATE, 0.5, &mut |_, _| {});
         let center = 0.5 * std::f32::consts::FRAC_1_SQRT_2 * 0.5; // sample * pan * master
@@ -359,6 +418,129 @@ mod tests {
         assert!((out[150 * 2 + 1] - center).abs() < 1e-6);
         assert_eq!(out[650 * 2], 0.0, "silent past the clip");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Track D close-out: a track-gain lane must shape the BOUNCE exactly as
+    /// it shapes playback ("what you hear is what you export"). A constant
+    /// clip under a 1.0 -> 0.0 fade lane must leave the mix ramping linearly;
+    /// before this, `build_graph` published a graph with no `gain_ramps` and
+    /// the export came out at full level throughout.
+    #[test]
+    fn build_graph_applies_track_gain_automation_to_the_bounce() {
+        const RATE: u32 = 48_000;
+        const LEN: u64 = 4_000; // ppq 960 @120bpm -> 25 samples/tick -> 160 ticks
+        let dir = std::env::temp_dir().join(format!(
+            "aura-offline-auto-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("audio/c1.wav"), spec).unwrap();
+        for _ in 0..LEN {
+            w.write_sample(0.5f32).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut store = Store::default();
+        store.project_dir = Some(dir.clone());
+        store.tracks.push(track("a1", "audio"));
+        store.clips.push(crate::audio::types::Clip {
+            id: "c1".into(),
+            track_id: "a1".into(),
+            name: "c1".into(),
+            source_path: "audio/c1.wav".into(),
+            source_id: crate::ids::SourceId::default(),
+            source_channels: 1,
+            source_sample_rate: RATE,
+            source_length_samples: LEN,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: LEN,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("a1"),
+        });
+        let midi = MidiStore {
+            ppq: 960,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![],
+            loaded_dir: None,
+            dirty: false,
+        };
+        let automation = crate::control::session::AutomationDoc {
+            lanes: vec![crate::plugins::automation::AutomationLane {
+                id: "l1".into(),
+                target_node: "track:a1".into(),
+                param_id: crate::plugins::automation::TRACK_PARAM_GAIN,
+                points: vec![
+                    crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 },
+                    crate::plugins::automation::AutomationPoint { tick: 160, value: 0.0 },
+                ],
+            }],
+        };
+        let mut og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &automation,
+            None,
+            RATE,
+        );
+        let out = render(&mut og.graph, 0, LEN, RATE, 1.0, &mut |_, _| {});
+        // sample * centre pan, times the lane's linear fade at that frame.
+        let unramped = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        for i in [0u64, 1_000, 2_000, 3_000] {
+            let want = unramped * (1.0 - i as f32 / LEN as f32);
+            assert!(
+                (out[i as usize * 2] - want).abs() < 1e-6,
+                "frame {i}: bounce must follow the lane — got {}, want {want}",
+                out[i as usize * 2]
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The ramp table is sized by the TRACK COUNT, not by `slots.len()`.
+    /// `derive_slots` keys by track id, so two tracks sharing an id collapse
+    /// to one map entry pointing at the LAST index — sizing by the map would
+    /// make that very slot out of range and silently drop its ramp.
+    #[test]
+    fn offline_ramp_table_is_sized_by_track_count_not_slot_map() {
+        let store = Store {
+            tracks: vec![track("dup", "audio"), track("dup", "audio")],
+            ..Store::default()
+        };
+        let slots = derive_slots(&store.tracks);
+        assert_eq!(slots.len(), 1, "duplicate ids collapse in the slot map");
+        assert_eq!(slots["dup"], 1, "…onto the LAST index");
+        let midi = MidiStore {
+            ppq: 960,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            ..MidiStore::default()
+        };
+        let automation = crate::control::session::AutomationDoc {
+            lanes: vec![crate::plugins::automation::AutomationLane {
+                id: "l1".into(),
+                target_node: "track:dup".into(),
+                param_id: crate::plugins::automation::TRACK_PARAM_GAIN,
+                points: vec![
+                    crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 },
+                    crate::plugins::automation::AutomationPoint { tick: 160, value: 0.0 },
+                ],
+            }],
+        };
+        let ramps = compile_gain_ramps(&automation, &midi, &slots, store.tracks.len(), 48_000);
+        assert_eq!(ramps.len(), 2, "one entry per TRACK");
+        assert!(ramps[1].is_some(), "slot 1's ramp survives");
     }
 
     /// Finding 4: `build_graph` used to allocate a fixed 64-slot
@@ -377,7 +559,7 @@ mod tests {
             store.tracks.push(track(&format!("t{i}"), "audio"));
         }
         let midi = MidiStore::default();
-        let og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), None, RATE);
+        let og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
         assert_eq!(og.graph.tracks.len(), N, "one RtTrack per store track");
         assert_eq!(
             og.graph.params.len(),
