@@ -61,6 +61,20 @@ it onto the landed architecture.
   4/5/7), the op vocabulary for clip add/move (Tasks 3/5), history/undo
   (Task 17).
 
+## Cross-instance / OS-clipboard copy (owner request 2026-08-14)
+
+Today the clip/note clipboard is per-window frontend memory — a second
+AURA instance (or any other app) never sees it. Extension: on copy,
+ALSO write the OS clipboard with (a) an `application/x-aura-clips` JSON
+payload (clips + notes + offsets + source-track hints, schema-versioned)
+and (b) a standard MIDI file (SMF) fallback so other DAWs can paste too;
+on paste, prefer the AURA payload, fall back to SMF. Audio clips ride as
+project-relative source references within the same machine (absolute-path
+fallback + copy-into-project on paste across projects). NOTE: true
+two-instance workflows also need the fixed MCP port collision solved
+(41717 hardcoded — dynamic port + token discovery), tracked in the
+roadmap's Tier 2.
+
 ## Suggested cut when picked up
 
 1. Timeline multi-select (marquee + shift-click) — frontend only.
