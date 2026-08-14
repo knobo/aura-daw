@@ -259,6 +259,19 @@ impl ControlPlane {
     /// (session lock released before anything engine/RT-visible happens)
     /// is preserved exactly as `commit`'s own doc describes for param
     /// writes.
+    ///
+    /// `Play`/`Stop` are special-cased below, each for its own reason —
+    /// worth being precise about which property survives:
+    /// * `Play`'s recording guard preserves both the VALUE (state stays
+    ///   "recording") AND atomicity (the check-and-set runs under one
+    ///   session lock, via `tx.store()` inside the transaction closure —
+    ///   fix round 1; a `self.session.lock()` taken and dropped BEFORE the
+    ///   transaction would only preserve the value in the race-free case).
+    /// * `Stop` preserves ordering, not atomicity: `StopRecording`'s engine
+    ///   round-trip is sent BEFORE the "stopped" Set commits (restored,
+    ///   fix round 1) so a reader can't observe "stopped" while the take
+    ///   is still finalizing — but the round-trip itself is a separate,
+    ///   non-transactional engine call (§4.2), not part of this commit.
     pub fn transport(&self, action: TransportAction) -> Result<TransportState, String> {
         // An explicit transport command supersedes any parking position the
         // engine still owes (`SharedRt::park`) — otherwise a stop that is
@@ -271,28 +284,58 @@ impl ControlPlane {
         }
         match action {
             TransportAction::Play => {
-                // Recording owns the state label while a take is running —
-                // Play must never downgrade "recording" back to "playing"
-                // (preserved exactly as the pre-Task-12 direct write did).
-                let already_recording = self.session.lock().store.transport.state == "recording";
-                if !already_recording {
-                    let meta = op::TxMeta::user("transport play").transient();
-                    self.commit_with(
-                        meta,
-                        |tx| {
-                            tx.apply(op::Op::Set {
-                                object: op::ObjectRef::Transport,
-                                path: op::PropPath::TransportState,
-                                from: serde_json::Value::Null,
-                                to: serde_json::json!("playing"),
-                            })
-                        },
-                        false,
-                    )?;
-                }
+                let meta = op::TxMeta::user("transport play").transient();
+                self.commit_with(
+                    meta,
+                    |tx| {
+                        // Recording owns the state label while a take is
+                        // running — Play must never downgrade "recording"
+                        // back to "playing". Checked-and-set ATOMICALLY:
+                        // the check reads `tx.store()` (the SAME session
+                        // lock `apply` writes through, held for the whole
+                        // closure), not a separate `self.session.lock()`
+                        // taken and dropped before the transaction — that
+                        // earlier shape was a TOCTOU (fix round 1): the
+                        // engine control thread's own recording-start
+                        // write could land in the gap between the read and
+                        // the commit, and this Set would then stomp
+                        // "recording" back to "playing". Applying nothing
+                        // and returning `Ok(())` is a legal empty
+                        // transient commit — it preserves the pre-Task-12
+                        // VALUE semantics (state stays "recording") without
+                        // reproducing the old code's non-atomic check.
+                        if tx.store().transport.state == "recording" {
+                            return Ok(());
+                        }
+                        tx.apply(op::Op::Set {
+                            object: op::ObjectRef::Transport,
+                            path: op::PropPath::TransportState,
+                            from: serde_json::Value::Null,
+                            to: serde_json::json!("playing"),
+                        })
+                    },
+                    false,
+                )?;
                 self.shared.playing.store(true, Relaxed);
             }
             TransportAction::Stop => {
+                // Stopping while recording finalizes the take (DAW
+                // convention) — sent BEFORE the state Set commits below,
+                // restoring the pre-Task-12 ordering (fix round 1): the
+                // old code sent this first and only wrote "stopped"
+                // afterward, so any reader mid-finalize (which can take up
+                // to 15s — `writer.finish`'s timeout, audio/engine.rs) saw
+                // "recording", never a premature "stopped" while the take
+                // is still draining to disk. Kept OUTSIDE this transaction
+                // either way (§4.2) — `StopRecording`'s own finalize write
+                // to `store.transport.state` (audio/engine.rs's
+                // `stop_recording`) races harmlessly with the Set below
+                // (both converge on "stopped"); Task 13 revisits this once
+                // that finalize becomes its own `Actor::Engine` tx.
+                if self.shared.recording.load(Relaxed) {
+                    self.engine
+                        .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
+                }
                 let meta = op::TxMeta::user("transport stop").transient();
                 self.commit_with(
                     meta,
@@ -306,18 +349,6 @@ impl ControlPlane {
                     },
                     false,
                 )?;
-                // Stopping while recording finalizes the take (DAW
-                // convention). Kept OUTSIDE this transaction (§4.2), sent
-                // AFTER the Set above commits, per Task 12's ordering —
-                // `StopRecording`'s own finalize write to
-                // `store.transport.state` (audio/engine.rs's
-                // `stop_recording`) is Task 13's concern, not this op; it
-                // races harmlessly with the Set above (both converge on
-                // "stopped").
-                if self.shared.recording.load(Relaxed) {
-                    self.engine
-                        .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
-                }
                 self.shared.playing.store(false, Relaxed);
             }
             TransportAction::Seek { position_samples } => {
@@ -2026,6 +2057,14 @@ mod tests {
     /// No commit happens in that branch, so `rev` doesn't move either.
     #[test]
     fn transport_play_does_not_downgrade_recording_state() {
+        // Sets `state = "recording"` via a direct store write (as the
+        // engine control thread's own recording-start write would), THEN
+        // calls Play — exercising the guard through the SAME path a racing
+        // recording-start would use, not just as a pre-existing fixture
+        // value. Fix round 1: the guard lives inside the commit closure
+        // (`tx.store()`), checked-and-set under the one session lock —
+        // there is no window between the check and the write for a
+        // concurrent recording-start to land in.
         let (plane, _engine_rx, _events) = test_plane_with_tracks(&[]);
         plane.session().lock().store.transport.state = "recording".into();
         let rev_before = plane.session().lock().rev;
@@ -2033,7 +2072,13 @@ mod tests {
         let snap = plane.transport(TransportAction::Play).unwrap();
 
         assert_eq!(snap.state, "recording", "play must not overwrite an active recording");
-        assert_eq!(plane.session().lock().rev, rev_before, "no-op play issues no commit");
+        // The guard's `Ok(())` with no `tx.apply` is a legal EMPTY
+        // transient commit — `Session::transact` still bumps `rev`
+        // unconditionally (it doesn't inspect whether the closure applied
+        // any ops), so `rev` moves by exactly one even though the document
+        // itself is untouched. That's the VALUE guarantee ("recording"
+        // survives); it is a distinct claim from atomicity (checked above).
+        assert_eq!(plane.session().lock().rev, rev_before + 1, "an empty transient commit still bumps rev");
     }
 
     /// `TransportAction::SetLoop`'s three Sets (`LoopEnabled`,

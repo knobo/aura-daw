@@ -130,3 +130,79 @@ green**: 408 lib tests (baseline 395 + 13 new: 6 in `session.rs`, 7 in
   the two new device methods, `commit`/`commit_with`, and the op.rs/session.rs
   arms; nothing else in `control/mod.rs` (epoch fns, midi wrappers) was
   touched.
+
+## Fix round 1 (review findings)
+
+Commit `fix(transport): Play guard atomic under the tx lock; Stop keeps
+pre-change ordering`, on top of `54a4ae1`.
+
+**FINDING 1 (Play TOCTOU).** The original `Play` arm read
+`session.store.transport.state == "recording"` under one `self.session.lock()`,
+dropped it, then `commit_with` re-acquired the lock separately — a window
+where a concurrent recording-start (engine control thread) could land
+between the read and the commit, letting Play's "playing" Set stomp the
+just-set "recording" state (exactly the downgrade the guard exists to
+prevent).
+
+Fix: added `pub fn store(&self) -> &Store` on `Tx` in `session.rs`, placed
+right after `Tx::apply` (per the controller's exact-shape instruction, for
+clean dedup with a parallel task adding the identical accessor). The Play
+guard now runs *inside* the `commit_with` closure via `tx.store().transport.state`
+— checked and (conditionally) written under the single session lock the
+transaction already holds. When already "recording", the closure applies
+nothing and returns `Ok(())`: a legal empty transient commit.
+`Session::transact` bumps `rev` unconditionally regardless of whether any
+op was applied, so this still bumps `rev` by one (unlike the old branch,
+which issued no commit and left `rev` untouched) — the VALUE guarantee
+("recording" survives) is preserved; a phantom no-op revision is the
+honest cost of doing the check atomically instead of via a stale outer
+read.
+
+Extended `control::tests::transport_play_does_not_downgrade_recording_state`:
+still sets `state = "recording"` via a direct store write in the fixture
+(exercising the guard through the same shape a racing engine-thread write
+would take) then calls Play, asserting `snap.state == "recording"` and
+now `rev == rev_before + 1` (was `rev_before`, no-commit) to match the
+empty-commit semantics above.
+
+**FINDING 2 (Stop ordering).** Fix round 1's dispatch was
+self-contradictory — it said "commit the Set first, then send
+StopRecording" while also saying "mirror today's ordering." The pre-Task-12
+code sent `ControlMsg::StopRecording` FIRST (which can block up to 15s —
+`writer.finish`'s timeout, `audio/engine.rs`) and only wrote `"stopped"`
+afterward, so any reader mid-finalize still saw `"recording"`. My original
+Task 12 change reordered this so `"stopped"` became visible immediately,
+before the take had actually finished draining to disk — a real behavior
+regression.
+
+Fix: restored the original order in the `Stop` arm — `ControlMsg::StopRecording`
+sent first (when `shared.recording` is set), *then* the `TransportState =
+"stopped"` `commit_with`. The engine round-trip stays outside the
+transaction either way (§4.2 is satisfied regardless of ordering). Updated
+the inline comment to state the rationale (visibility during finalize,
+not just "restored ordering") and kept the note that Task 13 — which
+turns the engine's own finalize write into its own `Actor::Engine`
+transaction — revisits this interaction.
+
+**Minor (Play/Stop comment precision).** Rewrote the doc comment above
+`ControlPlane::transport` to distinguish the two guarantees explicitly:
+`Play`'s guard preserves both VALUE and ATOMICITY (fixed via `tx.store()`
+under one lock); `Stop`'s reordering preserves visibility/ORDERING, not
+atomicity (the engine round-trip is a separate, non-transactional call).
+
+### Fix-round verification
+
+- `cargo build --lib`: clean, zero warnings.
+- Covering tests re-run: `cargo test --lib control::` — 102 passed, 0
+  failed (includes `transport_play_does_not_downgrade_recording_state`,
+  `transport_play_then_stop_bumps_rev_twice_and_never_emits_project_changed`,
+  `transport_set_loop_is_one_commit_and_writes_rt_atomics`,
+  `transport_set_loop_empty_region_rejected_without_committing`,
+  `select_input_and_output_device_send_the_existing_control_msg`,
+  `commit_with_false_bumps_rev_and_meta_but_skips_project_changed`,
+  `commit_still_fires_project_changed_via_commit_with_delegation`, plus
+  every `session::tests::transport_*`/`mismatched_*transport*` test).
+- Full suite, foreground: `timeout 900 cargo test --manifest-path
+  src-tauri/Cargo.toml` — 408 lib tests + 11 integration tests, 0
+  failures (same counts as fix round 0; no new tests added this round,
+  only two existing ones edited).

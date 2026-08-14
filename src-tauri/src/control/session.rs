@@ -96,6 +96,17 @@ impl Tx<'_> {
         self.inverses.push(inverse);
         Ok(())
     }
+
+    /// A read-only view of the session's store, for closures that need to
+    /// branch on current truth (e.g. "don't downgrade an in-flight
+    /// recording") under the SAME lock `apply` writes through — reading via
+    /// a separate `self.session.lock()` outside the transaction closure is
+    /// a TOCTOU: another thread (the engine control thread, for a
+    /// recording start/stop) can write between that read and this
+    /// transaction's commit.
+    pub fn store(&self) -> &Store {
+        &self.session.store
+    }
 }
 
 /// What `apply_raw` did that the engine/RT side must eventually see, folded
