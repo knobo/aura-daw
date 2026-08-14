@@ -9,6 +9,7 @@
   import { library, type LibraryRoot } from "../../state/library.svelte";
   import SamplesRoot from "./SamplesRoot.svelte";
   import ClipsRoot from "./ClipsRoot.svelte";
+  import PresetsRoot from "./PresetsRoot.svelte";
 
   const ROOTS: { id: LibraryRoot; label: string }[] = [
     { id: "samples", label: "SAMPLES" },
@@ -37,6 +38,8 @@
       <SamplesRoot />
     {:else if library.root === "clips"}
       <ClipsRoot />
+    {:else if library.root === "presets"}
+      <PresetsRoot />
     {/if}
   </div>
 </div>

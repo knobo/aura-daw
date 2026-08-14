@@ -16,6 +16,8 @@ import { prefs } from "../prefs/prefs.svelte";
 import { project } from "./project.svelte";
 import { midi } from "./midi.svelte";
 import { toasts } from "./toasts.svelte";
+import { plugins } from "./plugins.svelte";
+import { zyn, isZynInstance } from "./zynpatches.svelte";
 import { parentDir, type LibraryDragPayload } from "../utils/library";
 import type { LibraryEntry } from "../types/ipc";
 
@@ -191,8 +193,34 @@ class LibraryStore {
         return;
       }
 
-      default:
-        return; // remaining kinds land in Task 8
+      case "samplerInstrument": {
+        if (track.kind !== "midi") {
+          toasts.info("NEEDS A MIDI TRACK", `${payload.name} is an instrument — drop it on a MIDI track`);
+          return;
+        }
+        try {
+          await backend.setTrackInstrument(trackId, payload.instrumentId);
+          project.patchTrackLocal(trackId, { instrumentId: payload.instrumentId });
+        } catch (err) {
+          toasts.error("BIND FAILED", String(err));
+        }
+        return;
+      }
+
+      case "zynPatch": {
+        // A patch needs a live Zyn instance. Instantiating one behind the
+        // user's back on a drop would be a surprise mutation — toast instead
+        // (ruling 9).
+        const ref = track.instrumentId ?? "";
+        const instanceId = ref.startsWith("plugin:") ? ref.slice("plugin:".length) : "";
+        if (!instanceId || !isZynInstance(plugins.byId(instanceId))) {
+          toasts.info("NO ZYN ON THIS TRACK", "bind a ZynAddSubFX instance first, then drop the patch");
+          return;
+        }
+        const ok = await zyn.load(instanceId, payload.patch);
+        if (!ok) toasts.error("PATCH LOAD FAILED", zyn.error ?? "zyn_load_patch failed");
+        return;
+      }
     }
   }
 

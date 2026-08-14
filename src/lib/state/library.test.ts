@@ -96,6 +96,23 @@ const invokes = {
       midiClips: [],
     }),
   ),
+  setTrackInstrument: vi.fn(async (trackId: string, instrumentId: string | null) => ({
+    id: trackId,
+    name: "Synth",
+    kind: "midi" as const,
+    gainDb: 0,
+    pan: 0,
+    muted: false,
+    soloed: false,
+    armed: false,
+    color: "#888888",
+    instrumentId,
+  })),
+  samplerPreviewNote: vi.fn(async (_instrumentId: string, _key: number, _velocity: number) => {}),
+  zynLoadPatch: vi.fn(async (_instanceId: string, _path: string) => {}),
+  samplerListInstruments: vi.fn(async () => []),
+  zynListPatches: vi.fn(async () => []),
+  pluginList: vi.fn(async () => ({ plugins: [], instances: [], scanned: true })),
 };
 
 const mockBackend = { mode: "tauri" as const, on: () => () => {}, ...invokes };
@@ -109,6 +126,7 @@ const { library } = await import("./library.svelte");
 const { project } = await import("./project.svelte");
 const { midi } = await import("./midi.svelte");
 const { toasts } = await import("./toasts.svelte");
+const { plugins } = await import("./plugins.svelte");
 
 function lastToast() {
   return toasts.list[toasts.list.length - 1];
@@ -120,6 +138,7 @@ beforeEach(() => {
   library.reset();
   project.tracks = [];
   toasts.list = [];
+  plugins.instances = [];
 });
 
 describe("library store", () => {
@@ -272,5 +291,58 @@ describe("dropOnTrack — project clips", () => {
     ];
     await library.dropOnTrack({ kind: "projectMidiClip", clipId: "k1" }, "t1", 0);
     expect(invokes.midiAddClip).not.toHaveBeenCalled();
+  });
+});
+
+describe("dropOnTrack — presets", () => {
+  it("binds a sampler instrument to a MIDI track", async () => {
+    project.tracks = [midiTrack("m1")];
+    await library.dropOnTrack(
+      { kind: "samplerInstrument", instrumentId: "inst-1", name: "Piano" },
+      "m1",
+      0,
+    );
+    expect(invokes.setTrackInstrument).toHaveBeenCalledWith("m1", "inst-1");
+  });
+
+  it("refuses to bind an instrument to an audio track", async () => {
+    project.tracks = [audioTrack("t1")];
+    await library.dropOnTrack(
+      { kind: "samplerInstrument", instrumentId: "inst-1", name: "Piano" },
+      "t1",
+      0,
+    );
+    expect(invokes.setTrackInstrument).not.toHaveBeenCalled();
+    expect(lastToast().title).toContain("MIDI TRACK");
+  });
+
+  it("loads a Zyn patch into the instance the target track already hosts", async () => {
+    project.tracks = [{ ...midiTrack("m1"), instrumentId: "plugin:zyn-1" }];
+    plugins.instances = [
+      {
+        id: "zyn-1",
+        uid: "lv2:http://zynaddsubfx.sf.net",
+        name: "ZynAddSubFX",
+        format: "lv2",
+        trackId: "m1",
+        status: "active",
+      },
+    ];
+    const patch = { bank: "Arpeggios", name: "Arp 1", program: 1, path: "/a.xiz" };
+
+    await library.dropOnTrack({ kind: "zynPatch", patch }, "m1", 0);
+    expect(invokes.zynLoadPatch).toHaveBeenCalledWith("zyn-1", "/a.xiz");
+  });
+
+  it("toasts instead of instantiating a plugin when the track hosts no Zyn", async () => {
+    project.tracks = [midiTrack("m1")];
+    plugins.instances = [];
+    await library.dropOnTrack(
+      { kind: "zynPatch", patch: { bank: "B", name: "P", program: 0, path: "/p.xiz" } },
+      "m1",
+      0,
+    );
+    expect(invokes.zynLoadPatch).not.toHaveBeenCalled();
+    expect(lastToast().title).toContain("ZYN");
   });
 });
