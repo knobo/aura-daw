@@ -43,6 +43,16 @@
 //! it"; slice 2 (post architecture-gate) is expected to do real low-latency
 //! routing into a track's instrument through the RT graph properly.
 //!
+//! **The monitor toggle is a live flag, not a reconnect** (fix round 1):
+//! `select_port` re-invoked for the SAME already-connected port id only
+//! flips `ActiveConnection::monitor` (an `Arc<AtomicBool>` the callback
+//! reads every message) — it does not tear down/rebuild the midir
+//! connection, so `events_seen`/activity keep counting continuously across
+//! a toggle and no events are dropped during a reconnect window. Only an
+//! actual port change (or closing to `None`) does the full teardown +
+//! rebuild, which — being a genuinely new connection — does reset the
+//! activity counters (unavoidable and correct).
+//!
 //! ## Callback discipline
 //!
 //! midir invokes the input callback on its own backend thread (not the
@@ -59,7 +69,7 @@
 //! down the MIDI backend thread.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -280,13 +290,15 @@ struct ActiveConnection {
     port: MidiPortInfo,
     shared: Arc<ConnShared>,
     opened_at: Instant,
-    /// Set at `select_port` time (slice 1b); read back by `status()`. Not
-    /// independently toggleable yet — re-run `select_port` to change it
-    /// (see module doc; the connection is always fully rebuilt anyway).
-    monitor: bool,
+    /// Live flag (fix round 1): the callback reads this on every message,
+    /// and `select_port`'s fast path flips it in place — same port,
+    /// monitor-only change — WITHOUT touching the connection, so activity
+    /// counters never reset just from toggling monitor.
+    monitor: Arc<AtomicBool>,
     /// Held only to keep the connection alive; the callback never touches
     /// this directly (it only sees `Arc<ConnShared>` + `opened_at` + the
-    /// preview handle + its own running-status byte, all captured by move).
+    /// monitor flag + the preview handle + its own running-status byte,
+    /// all captured by move).
     _conn: MidiInputConnection<()>,
 }
 
@@ -310,18 +322,35 @@ pub struct MidiInputManager {
 
 impl MidiInputManager {
     fn preview_handle(&self) -> &PreviewHandle {
-        self.preview.get_or_init(sampler_preview::start)
+        self.preview.get_or_init(|| sampler_preview::start("midi"))
     }
 
     /// Select a port by id (as returned by [`list_ports`]), or close the
-    /// current connection when `port_id` is `None`. Any previously open
-    /// connection is always closed first, so re-selecting the same id (or
-    /// flipping `monitor` on the same id) resets the activity counters and
-    /// releases any currently-sustained monitor note.
+    /// current connection when `port_id` is `None`. **Fast path (fix
+    /// round 1):** if `port_id` names the port that is ALREADY connected,
+    /// this only flips the live `monitor` atomic the callback reads — the
+    /// connection itself is untouched, so `events_seen`/activity keep
+    /// counting continuously and no events are dropped. Any other change
+    /// (a different port, or closing to `None`) fully tears down and
+    /// rebuilds the connection, which does reset the activity counters —
+    /// unavoidable since it is a genuinely new midir connection.
     pub fn select_port(&self, port_id: Option<String>, monitor: bool) -> Result<(), String> {
         let mut inner = self.inner.lock().map_err(|_| "midi input manager lock poisoned".to_string())?;
-        // Drop closes the previous connection (if any) regardless of what
-        // happens next; always release any note it left sustained.
+
+        if let Some(active) = inner.connection.as_ref() {
+            if port_id.as_deref() == Some(active.port.id.as_str()) {
+                // Same port already connected: live-flip only, no reconnect.
+                let was_on = active.monitor.swap(monitor, Relaxed);
+                if was_on && !monitor {
+                    let _ = self.preview_handle().all_off();
+                }
+                return Ok(());
+            }
+        }
+
+        // Slow path: an actual port change (including closing to `None`).
+        // Drop closes the previous connection (if any); always release any
+        // note it left sustained.
         inner.connection = None;
         let _ = self.preview_handle().all_off();
 
@@ -347,10 +376,13 @@ impl MidiInputManager {
         let shared = Arc::new(ConnShared::default());
         let opened_at = Instant::now();
         let cb_shared = shared.clone();
-        // `monitor` is fixed for this connection's lifetime (re-run
-        // `select_port` to change it — it always fully rebuilds the
-        // connection anyway, see the doc above), so a plain `bool` moved
-        // into the closure is enough; no atomic needed.
+        // Live flag: the callback reads this on every message, and
+        // `select_port`'s fast path above flips it without touching the
+        // connection. The diagnostic atomics (`shared`) keep updating
+        // regardless of this flag — the activity dot works even with
+        // monitor off.
+        let monitor_flag = Arc::new(AtomicBool::new(monitor));
+        let cb_monitor = monitor_flag.clone();
         let preview_for_cb = self.preview_handle().clone();
         let mut running_status: Option<u8> = None;
         let conn = midi_in
@@ -365,15 +397,21 @@ impl MidiInputManager {
                     // inside this one guarded body.
                     let _ = catch_unwind(AssertUnwindSafe(|| {
                         record_event(&cb_shared, opened_at, message);
-                        forward_for_monitoring(&preview_for_cb, &mut running_status, monitor, message);
+                        let enabled = cb_monitor.load(Relaxed);
+                        forward_for_monitoring(&preview_for_cb, &mut running_status, enabled, message);
                     }));
                 },
                 (),
             )
             .map_err(|e| e.to_string())?;
 
-        inner.connection =
-            Some(ActiveConnection { port: info, shared, opened_at, monitor, _conn: conn });
+        inner.connection = Some(ActiveConnection {
+            port: info,
+            shared,
+            opened_at,
+            monitor: monitor_flag,
+            _conn: conn,
+        });
         Ok(())
     }
 
@@ -406,7 +444,7 @@ impl MidiInputManager {
             events_seen,
             last_event_age_ms,
             last_status_bytes,
-            monitor: active.monitor,
+            monitor: active.monitor.load(Relaxed),
         })
     }
 }
@@ -675,7 +713,7 @@ mod tests {
     /// is disabled, but must still keep running-status parsing correct.
     #[test]
     fn forward_for_monitoring_respects_toggle_and_never_panics() {
-        let handle = sampler_preview::start();
+        let handle = sampler_preview::start("test");
         let mut rs = None;
         // Disabled: no panic, no crash even with a very plausible note.
         forward_for_monitoring(&handle, &mut rs, false, &[0x90, 60, 100]);
@@ -715,5 +753,79 @@ mod tests {
         let mgr = MidiInputManager::default();
         assert!(mgr.select_port(Some("nope#0".into()), true).is_err());
         assert!(!mgr.status().unwrap().monitor);
+    }
+
+    /// Fix round 1's core regression test: re-selecting the SAME connected
+    /// port with only `monitor` changed must NOT reset the activity
+    /// counters (previously `select_port` unconditionally tore down and
+    /// rebuilt the connection on every call, including monitor-only
+    /// toggles). Exercised through the real public `MidiInputManager` API
+    /// (`select_port`/`status`), per the fix instructions.
+    ///
+    /// This needs exactly one REAL (but otherwise inert — nothing ever
+    /// sends data through it) `midir::MidiInputConnection`, since that type
+    /// has no public constructor besides `connect`/`create_virtual`. We get
+    /// one cheaply via ALSA's virtual-port support (no hardware required —
+    /// the same mechanism midir's own `tests/virtual.rs` relies on; this
+    /// sandbox has a working `/dev/snd/seq`, confirmed separately). The
+    /// manually-assembled `ActiveConnection` around it, and the simulated
+    /// prior event count, are test-only setup — the assertions below run
+    /// through the manager's real, unmodified `select_port`/`status`.
+    #[test]
+    fn monitor_toggle_via_manager_does_not_reset_activity_counters() {
+        use midir::os::unix::VirtualInput;
+
+        let Ok(midi_in) = MidiInput::new("aura-midi-input-test") else {
+            eprintln!("skipping: ALSA seq unavailable in this environment");
+            return;
+        };
+        let Ok(conn) = midi_in.create_virtual("aura-test-virtual", |_, _, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: ALSA virtual port unavailable in this environment");
+            return;
+        };
+
+        let mgr = MidiInputManager::default();
+        let port = MidiPortInfo {
+            id: "virtual-test-port#0".to_string(),
+            name: "virtual-test-port".to_string(),
+        };
+        let shared = Arc::new(ConnShared::default());
+        for _ in 0..7 {
+            record_event(&shared, Instant::now(), &[0x90, 60, 100]);
+        }
+        let monitor_flag = Arc::new(AtomicBool::new(true));
+
+        {
+            let mut inner = mgr.inner.lock().unwrap();
+            inner.connection = Some(ActiveConnection {
+                port: port.clone(),
+                shared: shared.clone(),
+                opened_at: Instant::now(),
+                monitor: monitor_flag.clone(),
+                _conn: conn,
+            });
+        }
+
+        let before = mgr.status().unwrap();
+        assert_eq!(before.events_seen, 7);
+        assert!(before.monitor);
+
+        // Fast path: same port id, monitor flips OFF — must not reset.
+        mgr.select_port(Some(port.id.clone()), false).unwrap();
+        let after_off = mgr.status().unwrap();
+        assert_eq!(
+            after_off.events_seen, 7,
+            "toggling monitor off must not reset activity counters"
+        );
+        assert!(!after_off.monitor);
+
+        // Flip back ON — still no reset, and still the same connection
+        // (never rebuilt): keep bumping `shared` directly to prove it's
+        // literally the same underlying atomics, not a fresh set at 0.
+        record_event(&shared, Instant::now(), &[0x80, 60, 0]);
+        mgr.select_port(Some(port.id.clone()), true).unwrap();
+        let after_on = mgr.status().unwrap();
+        assert_eq!(after_on.events_seen, 8);
+        assert!(after_on.monitor);
     }
 }

@@ -112,11 +112,15 @@ impl PreviewHandle {
     }
 }
 
-/// Spawn the preview control thread (call once, lazily).
-pub fn start() -> PreviewHandle {
+/// Spawn the preview control thread (call once, lazily). `name_suffix`
+/// distinguishes independent preview streams in thread dumps/logs when more
+/// than one caller lazily starts its own (e.g. `sampler_preview_note`'s
+/// "ui" stream vs. `midi_input`'s "midi" live-monitoring stream) — each
+/// gets its own thread named `aura-sampler-preview-<name_suffix>`.
+pub fn start(name_suffix: &str) -> PreviewHandle {
     let (tx, rx) = unbounded();
     std::thread::Builder::new()
-        .name("aura-sampler-preview".into())
+        .name(format!("aura-sampler-preview-{name_suffix}"))
         .spawn(move || preview_thread(rx))
         .expect("spawn sampler preview thread");
     PreviewHandle { tx }
@@ -421,7 +425,7 @@ mod tests {
     /// (never panic). With a device it must play. Either way: no hang.
     #[test]
     fn play_reports_cleanly_with_or_without_device() {
-        let handle = start();
+        let handle = start("test");
         let res = handle.play(Arc::new(compiled("x", 330.0)), 60, 100);
         match res {
             Ok(()) => {

@@ -328,12 +328,13 @@ Read `src-tauri/src/audio/sampler_preview.rs` (option 1) and confirmed the
   wiring + a doc update; the change is UI wiring, not logic with its own
   test file to extend).
 - `npx tsc --noEmit -p .`: no errors.
-- **Manual verification NOT done** (no physical MIDI keyboard available in
-  this sandboxed worktree — `/dev/snd/seq` exists but `aconnect -l` shows
-  no external clients). Documented in `docs/midi-input.md` as the expected
-  end-to-end behavior; the note-parsing, toggle, and instrument-construction
-  logic are covered by the unit tests above instead, per the task's
-  "manually verified later, do NOT fake it" instruction.
+- **Manual verification: DONE by the owner (update per branch-review
+  feedback).** No physical MIDI keyboard was available in this sandboxed
+  worktree at implementation time, so the note-parsing/toggle/instrument-
+  construction logic was covered by the unit tests above instead. The
+  owner has since manually verified slice 1 + 1b end-to-end with a real
+  LPK25 controller: port listed, activity dot lights on incoming messages,
+  and the monitor tone is audible. Confirmed working outside this sandbox.
 
 ## Concerns / notes for follow-up
 
@@ -366,3 +367,135 @@ Read `src-tauri/src/audio/sampler_preview.rs` (option 1) and confirmed the
 Branch: `midi-input-ports`
 Commit: see final short status reply (message:
 `feat(midi): live monitoring — keyboard notes audible via the preview voice path (slice 1b)`).
+
+---
+
+# Addendum — fix round 1: monitor toggle is a live flag, no reconnect (on top of 3503e00)
+
+## Status: DONE
+
+Branch review verdict was "Approved with ONE Important finding to fix
+before the PR opens." Fixed both the Important finding and the minor
+one-liner in the same round.
+
+## Finding (Important) — what was wrong and the fix
+
+`midi_select_input_port` toggling the `monitor` checkbox re-invoked
+`MidiInputManager::select_port`, which **unconditionally** tore down and
+rebuilt the whole midir connection — so `events_seen`/activity reset on
+every toggle, and incoming events were dropped during the reconnect
+window.
+
+Fix in `src-tauri/src/midi_input.rs`:
+
+- `ActiveConnection::monitor` changed from a plain `bool` (fixed for the
+  connection's lifetime, as flagged as a known limitation in the previous
+  report) to `Arc<AtomicBool>`, shared with the midir callback closure.
+  The callback now does `cb_monitor.load(Relaxed)` each message instead of
+  reading a captured plain bool — the diagnostic atomics (`record_event`)
+  keep updating regardless of this flag, so the activity dot still works
+  with monitor off, per the fix spec.
+- `select_port(port_id, monitor)` now checks, BEFORE touching the
+  connection: if `inner.connection` is `Some` and its port id equals the
+  requested `port_id`, this is a same-port monitor-only change — `swap`
+  the atomic in place and `return Ok(())` immediately, never reaching the
+  teardown/reconnect code below. Only a genuine port change (different id,
+  or closing to `None`) falls through to the existing full teardown +
+  rebuild path (which necessarily does reset the counters — a real new
+  connection, unavoidable and correct, called out explicitly in the
+  updated module doc).
+- On a monitor-OFF flip specifically (`was_on && !monitor`, using the
+  `bool` returned by `AtomicBool::swap`), `preview_handle().all_off()`
+  fires once so no note is left hanging — matches the fix's explicit
+  requirement, and mirrors the existing all_off() call already present on
+  the slow (reconnect) path.
+- Module doc gained a new paragraph under "Live monitoring" explaining the
+  live-flag design and why only genuine port changes reset counters.
+
+## Minor: distinguishable preview thread names
+
+`sampler_preview::start()` was hardcoded to name its thread
+`"aura-sampler-preview"`; both `sampler_preview_note`'s UI stream and
+`midi_input`'s monitoring stream used the same name, indistinguishable in
+thread dumps/logs. Changed to `start(name_suffix: &str)`, thread name
+`format!("aura-sampler-preview-{name_suffix}")`:
+
+- `audio/mod.rs`'s `sampler_preview_note` now calls
+  `sampler_preview::start("ui")` → thread `aura-sampler-preview-ui`.
+- `midi_input.rs`'s `preview_handle()` now calls
+  `sampler_preview::start("midi")` → thread `aura-sampler-preview-midi`.
+- Both test call sites (`sampler_preview.rs`'s own tests, and
+  `midi_input.rs`'s `forward_for_monitoring_respects_toggle_and_never_panics`)
+  updated to pass a `"test"` suffix.
+
+`audio/mod.rs`'s diff is exactly this one line — verified with
+`git diff -- src-tauri/src/audio/mod.rs` before committing, to make sure
+no incidental coupling snuck in from touching a file outside
+`midi_input.rs`/`sampler_preview.rs`.
+
+## New test: counter continuity across a toggle, via the manager API
+
+Per the fix spec ("assert counter continuity across a toggle in the unit
+tests via the manager API"), added
+`monitor_toggle_via_manager_does_not_reset_activity_counters`. Since no
+physical MIDI port is available in this sandbox, the test needed exactly
+one REAL (but inert — nothing ever sends data through it)
+`midir::MidiInputConnection`, because that type has no public constructor
+besides `connect`/`create_virtual`. Got one via ALSA's virtual-port
+support (`midir::os::unix::VirtualInput::create_virtual`) — no hardware
+required, the same mechanism midir's own `tests/virtual.rs` relies on;
+this sandbox's `/dev/snd/seq` makes it work. The test:
+
+1. Creates a virtual (inert) `MidiInputConnection` and manually assembles
+   an `ActiveConnection` around it (test-only setup, using this module's
+   private-field access from the child `tests` module — `mgr.inner.lock()`
+   directly) with 7 events already recorded via the existing `record_event`
+   helper and `monitor: true`.
+2. Calls the REAL, unmodified `mgr.select_port(Some(same_port_id), false)`
+   — the fast path — and asserts `status().events_seen` is STILL 7 (not
+   reset to 0) and `status().monitor` is now `false`.
+3. Records one more event directly on the same `shared` atomics, flips
+   monitor back `true` via `select_port` again, and asserts
+   `events_seen == 8` and `monitor == true` — proving it's literally the
+   same underlying `ConnShared`/connection, never rebuilt.
+4. Gracefully skips (prints + returns, does not fail) if ALSA seq or
+   virtual-port creation is unavailable in whatever environment runs the
+   suite — same "don't fake it, don't hang on missing hardware" posture as
+   the rest of this module's tests.
+
+Ran and passed in this sandbox (confirmed below).
+
+## Self-review
+
+- Grepped the diff (`midi_input.rs`, `sampler_preview.rs`, and the
+  1-line `audio/mod.rs` change) for `control::`/`Session`/`Store`: only
+  hit is the pre-existing module-doc sentence describing the app-config
+  carve-out (unchanged from before this fix round) — no new coupling.
+  `src-tauri/src/control/`, `src-tauri/src/midi/` (document module), and
+  `src/lib/demo.ts` all have zero diff for this fix round.
+- Frontend: **zero changes needed**. `midiSelectInputPort`'s wire shape
+  was already `(portId, monitor?)` from slice 1b; `MasterBar.svelte`'s
+  `toggleMidiMonitor` already calls exactly that — it just gets cheaper
+  server-side now, per the fix spec's "keep the wire shape unchanged."
+- Callback discipline unchanged: still one `catch_unwind` around the whole
+  body; the only new operation inside is `cb_monitor.load(Relaxed)`, a
+  single atomic load — no new blocking risk introduced.
+
+## Test summary
+
+- `timeout 900 cargo test --manifest-path src-tauri/Cargo.toml`: **394
+  lib tests + 11 integration tests, 405 total, 0 failed** (net +1 over the
+  slice-1b report's 404: one new regression test; existing test call sites
+  updated for the `start("test")` signature change, no assertions
+  otherwise altered).
+- `cargo check --manifest-path src-tauri/Cargo.toml --lib --tests`: clean
+  rebuild after touching all three changed files — **zero warnings**.
+- `timeout 300 npx vitest run`: **185 passed (19 files), 0 failed**
+  (unchanged — no frontend files touched this round).
+- `npx tsc --noEmit -p .`: no errors.
+
+## Branch + commit (fix round 1)
+
+Branch: `midi-input-ports`
+Commit: see final short status reply (message:
+`fix(midi): monitor toggle is a live atomic flag, no reconnect; distinct preview thread names`).
