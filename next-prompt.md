@@ -104,6 +104,25 @@ fix these blind — read the report's entry first):
   new value. Intended scope (automation overrides the knob), but say so
   plainly. Follow-ups that change it: a curve editor for plugin params, and
   write/touch/latch modes.
+- **`gesture_end` has no id — it closes whatever is open. TRACKS A AND C
+  INHERIT THIS.** Any `endGesture()` fired from a promise continuation can
+  close a gesture that began while it was awaiting; `gesture_begin`
+  auto-closes a stale one, so the two compose into a real regression.
+  Live example, Track D's own: release a plugin knob (awaits a rAF + one
+  IPC round trip) and press a track fader inside that window — the pending
+  `endGesture()` closes the FADER's gesture, and the rest of that drag
+  commits unbracketed, one undo entry and one `project.json` write per rAF
+  batch. That is the I-8 regression inside I-8's own fix. Two more
+  instances (`library.svelte.ts`, the automation delete path) are listed
+  in the handoff. Fix to make: `gesture_begin` returns an id,
+  `gesture_end(id)` no-ops on mismatch — additive, so it stays inside the
+  frozen-command rules. Worst case is an extra undo entry and an extra
+  persist, never data loss. **If your track drives gestures from an async
+  path, read the handoff entry before writing that code.**
+- **No DOM test environment exists** (no jsdom/testing-library), so nothing
+  inside a `.svelte` file is covered by any test. Both of Track D's real
+  frontend bugs lived in event handlers and both were found by reading.
+  Move async-ordering logic into a store where it can be tested.
 - **Two UI minors, deliberately left open** by the whole-track review:
   `movePoint` silently deletes a neighbour on a tick collision
   (`automation-edit.ts:57-66`), and `.tog.auto.on` is byte-identical to

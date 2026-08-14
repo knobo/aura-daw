@@ -96,8 +96,17 @@ class AutomationStore {
     }
   }
 
-  /** The one commit of the current gesture that is still on the wire.
-   * `commit` never rejects (it catches), so chaining off this is safe. */
+  /** The LAST commit issued from inside a gesture — store-wide, not
+   * per-lane and not per-gesture: one field on a singleton, overwritten by
+   * whichever `commitInGesture` ran most recently. `commit` never rejects
+   * (it catches), so chaining off this is safe.
+   *
+   * KNOWN EDGE, accepted and open: two SIMULTANEOUS pointer interactions on
+   * two different lanes (multi-touch or stylus+touch — a mouse cannot) let
+   * `commitLatest` await the other lane's commit and re-commit a stale set.
+   * The honest fix is a `Map` of barriers keyed by the same identity
+   * `commitLatest` resolves by — the TRACK TARGET, not the lane id, because
+   * the mint case this barrier exists for has no lane id yet. */
   #inflight: Promise<unknown> = Promise.resolve();
 
   /** Commit from INSIDE an open gesture (a click-insert, an alt-click

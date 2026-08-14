@@ -797,6 +797,53 @@ instantiation per automated instance, seeded from the live one's
   `instantiate` and `save_state`. The fix is a fire-and-forget sibling to
   `set_params` (post, don't `run`) plus a driver that uses it — a
   `clap_host` API change deliberately kept out of Task 9's diff.
+- **A GESTURE TOKEN, so `gesture_end` closes the gesture it meant to.**
+  The most valuable thing to come out of this track, and bigger than this
+  track. `gesture_end` takes **no identifier** — it closes "whatever is
+  open", and is deliberately a no-op when nothing is
+  (`control/mod.rs:2072`, contract stated at `:2067-2071`). Its sibling
+  `gesture_begin` (`:2060`) auto-closes a stale open gesture before opening
+  the new one. Together those two facts mean: **any `endGesture()` fired
+  from a promise continuation can close a DIFFERENT gesture — one that
+  began while it was awaiting.** No component-local flag can fix this; the
+  flag Track D added to `AutomationLaneView` fixes only that component's
+  own pairing. Three live instances:
+  - `src/lib/state/plugins.svelte.ts:243-244` (Track D's own, Task 3):
+    `await this.flushParamQueue(); project.endGesture();`. Release a plugin
+    knob — that awaits a rAF plus one IPC round trip — and press a track
+    fader inside that window. `beginGesture("gain drag")` auto-closes the
+    plugin gesture (fine, its edits are already folded), then the PENDING
+    `endGesture()` lands and closes the GAIN gesture immediately. The rest
+    of the fader drag then commits outside any bracket: its own undo entry
+    and its own `project.json` write per rAF batch. **That is the exact I-8
+    regression, inside I-8's own fix.**
+  - `src/lib/state/library.svelte.ts:194-198` — same shape (`beginGesture`
+    … `await` … `finally { endGesture() }`), pre-existing, not Track D's.
+  - `src/lib/components/AutomationLaneView.svelte:116` — the delete path's
+    `.then(() => project.endGesture())` still closes whatever is open when
+    it fires, which may be a gesture a later pointerdown opened.
+
+  **Durable fix to record:** `gesture_begin` returns an id and
+  `gesture_end(id)` no-ops on mismatch — an ADDITIVE parameter change to a
+  frozen-name command, so it stays inside the binding rules. All three
+  instances need a second gesture to begin inside a sub-100 ms window, and
+  the worst outcome is an extra undo entry plus an extra `project.json`
+  write — never data loss — which is why it is recorded rather than
+  rushed. **Owner: whoever owns the gesture IPC model. Tracks A and C
+  inherit this** — both drive gestures from async paths.
+- **Per-lane commit barriers in the automation store** (accepted and open):
+  `#inflight` is ONE field on a singleton store, so it is the last commit
+  issued from inside any gesture, not "this lane's". Two simultaneous
+  pointer interactions on two different lanes (multi-touch or stylus+touch;
+  a mouse cannot produce it) let `commitLatest` await the wrong lane's
+  commit and re-commit a stale set — observed payloads
+  `[["lane-a",2],["lane-b",2],["lane-a",1]]`, where that trailing
+  one-point commit is the click-insert bug alive again. Narrow, and the
+  backend's single-gesture bracket is already degenerate under two
+  simultaneous interactions, so it is documented rather than fixed. The
+  honest fix is a `Map` of barriers keyed by the same identity
+  `commitLatest` resolves by — the TRACK TARGET, **not** the lane id: the
+  mint case the barrier exists for has no lane id yet.
 - **Fader-follows-automation** (ruling 6) — needs read/write arbitration.
 - **A dedicated, resizable automation row** (ruling 8).
 - **Live param-panel follow** (ruling 2) — the open panel shows the
@@ -825,6 +872,30 @@ instantiation per automated instance, seeded from the live one's
   (`TrackHeader.svelte`, review minor 7): on `main` an automation-visible
   track will read as "this track is armed". The plan's own copy
   instruction produced it; it needs its own colour. Also NOT fixed here.
+
+### WARNING for the next track that touches a component
+
+**This repo has no DOM test environment** — no jsdom, no happy-dom, no
+testing-library. Every frontend test runs in plain node against stores and
+utils, so **nothing inside a `.svelte` file is covered by anything.**
+
+That is not a theoretical gap. BOTH of this track's real frontend bugs
+lived exclusively in `.svelte` event handlers, and both were found by
+READING the code — one by a reviewer, one by the implementer while fixing
+the first:
+- the click-insert race (a drawn point silently erased, intermittent), and
+- the alt-click delete closing its gesture twice, the second time early.
+
+Neither could have been caught by the suite as it exists, and both survived
+a task review that had looked directly at the handler. The pattern to draw
+from it: when logic that ORDERS async effects sits in a component, move it
+to a store where it can be tested — which is what the click-insert fix did
+(`commitInGesture`/`commitLatest`) — and treat any remaining handler logic
+as unverified until read line by line.
+
+Adding a DOM environment is a cross-cutting call **nobody has made**. It
+is not recorded here as a recommendation, only as the missing capability
+that made the above necessary.
 
 ### OWED BY THE OWNER: the ear check
 
@@ -899,7 +970,8 @@ round doesn't have to re-mine it. All are OPEN and accepted unless marked.
 - `plugin_set_param`'s doc (`plugins/mod.rs:345-351`) doesn't mention the
   gesture-fold path (Task 3). Its sibling — `for_op`'s "one wired caller"
   doc — is **CLOSED**: Task 4 corrected it to name all three wired callers
-  (`control/mod.rs:825-828`, and `for_history_op` at `:866-868`).
+  (`control/mod.rs:825-828`, and the matching sentence in
+  `for_history_op`'s doc at `:854-858`).
 - `set_automation_lane` duplicates a closure body its siblings share
   (Task 4).
 - `reloadOpenParams` shows no `paramsLoading` indicator; a noisy
