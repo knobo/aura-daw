@@ -967,6 +967,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         // Event-driven readiness: the control thread opens (or fails to
         // open) its output stream BEFORE draining its first message, so one

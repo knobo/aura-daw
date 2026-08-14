@@ -32,7 +32,7 @@ use parking_lot::Mutex;
 use aura_lib::audio::engine::{self, ControlMsg, EventSink};
 use aura_lib::audio::rt::{GraphTables, SharedRt};
 use aura_lib::audio::types::Store;
-use aura_lib::control::{op::TxMeta, ControlPlane, Session};
+use aura_lib::control::{op::TxMeta, Committer, ControlPlane, EventEmitter, Session};
 use aura_lib::midi::MidiStore;
 use aura_lib::sidecars::jobs::JobManager;
 
@@ -50,7 +50,19 @@ fn fixture() -> (ControlPlane, engine::EngineHandle) {
     let shared = Arc::new(SharedRt::default());
     let tables = GraphTables::empty();
     let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
-    let eng = engine::start(shared.clone(), tables.clone(), session.clone(), Box::new(NullEvents));
+    let committer = Committer::new(
+        session.clone(),
+        shared.clone(),
+        tables.clone(),
+        Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter),
+    );
+    let eng = engine::start(
+        shared.clone(),
+        tables.clone(),
+        session.clone(),
+        Box::new(NullEvents),
+        committer,
+    );
     let cp = ControlPlane::new(
         session,
         shared,

@@ -782,6 +782,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let cp = Arc::new(ControlPlane::new(
             session,
@@ -951,6 +952,7 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev2 = Arc::clone(&events);

@@ -888,6 +888,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         // Round-trip barrier: once the engine thread answers, its startup
         // `open_output` has finished, so the engine rate is final (a mid-test

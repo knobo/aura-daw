@@ -505,6 +505,37 @@ impl Committer {
     }
 }
 
+/// Test-only fixture, reachable crate-wide (`crate::control::testutil::
+/// test_committer`) — every `engine::start` test call site across the crate
+/// (control/{export,hum,import,loopjam}.rs, mcp/server.rs, this file's own
+/// test module, engine.rs's `spin_up`) needs a `Committer` now (Task 13);
+/// this is the one place that fixture lives instead of duplicated inline
+/// construction at every call site. Mirrors `audio::rt::testutil::
+/// empty_tables`'s shape.
+#[cfg(test)]
+pub(crate) mod testutil {
+    use super::*;
+
+    /// A `Committer` over the SAME `session`/`shared`/`tables` `Arc`s the
+    /// caller's engine/`ControlPlane` fixture already uses, with a no-op
+    /// `emit` — most fixtures don't assert on the engine's own committed
+    /// events; tests that need to (this file's own `mod tests`) build a
+    /// recording `EventEmitter` directly and pass it to `Committer::new`
+    /// themselves instead of calling this helper.
+    pub fn test_committer(
+        session: &Arc<Mutex<Session>>,
+        shared: &Arc<SharedRt>,
+        tables: &SharedGraphTables,
+    ) -> Committer {
+        Committer::new(
+            session.clone(),
+            shared.clone(),
+            tables.clone(),
+            Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter),
+        )
+    }
+}
+
 /// MeterSink that keeps only the latest frame so MCP's `read_meters` tool can
 /// "hear" current levels without a streaming subscription. Never unsubscribes.
 struct LatestMeterCache(Arc<Mutex<Option<MeterFrame>>>);
@@ -2334,6 +2365,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -2727,6 +2759,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(Recorder(Arc::clone(&events))),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let cp = ControlPlane::new(
             session,
@@ -2863,6 +2896,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         let cp = ControlPlane::new(
             session.clone(),

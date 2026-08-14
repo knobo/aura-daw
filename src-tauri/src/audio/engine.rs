@@ -13,7 +13,7 @@
 //!   and recorded samples out to the disk-writer thread.
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,7 +35,7 @@ use super::transport;
 use super::types::{derive_slots, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use super::project;
-use crate::control::Session;
+use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
 
 /// Meter frame cadence (~60 Hz).
@@ -93,6 +93,15 @@ pub enum ControlMsg {
     SelectInput { device_id: Option<String>, reply: Reply<()> },
     StartRecording { track_ids: Option<Vec<String>>, reply: Reply<Vec<String>> },
     StopRecording { reply: Reply<Vec<Clip>> },
+    /// Installs the narrow "document birth" closure `ensure_project` calls
+    /// (Plan E Task 13, round-2 §4.5 carve-out) — bound over the
+    /// `ControlPlane` `Arc`, so it can only be built AFTER `ControlPlane`
+    /// exists, which is AFTER the engine control thread is already
+    /// running (`audio::init` -> `engine::start` -> later, `lib.rs`
+    /// constructs `ControlPlane` and sends this). Fire-and-forget, sent
+    /// exactly once at startup; the engine thread never touches project
+    /// fields itself, only calls this closure.
+    SetEnsureProject(Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>),
     Shutdown,
 }
 
@@ -104,6 +113,17 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub fn send(&self, msg: ControlMsg) {
         let _ = self.tx.send(msg);
+    }
+
+    /// Installs the engine's `ensure_project` closure — `lib.rs` calls this
+    /// once, right after constructing the shared `ControlPlane` (Plan E
+    /// Task 13; see `ControlMsg::SetEnsureProject`'s doc for why this can't
+    /// happen any earlier).
+    pub fn install_ensure_project(
+        &self,
+        f: Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>,
+    ) {
+        self.send(ControlMsg::SetEnsureProject(f));
     }
 
     /// Send a request-style message and await the control thread's reply.
@@ -139,6 +159,7 @@ pub fn start(
     tables: SharedGraphTables,
     session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
+    committer: Committer,
 ) -> EngineHandle {
     let (tx, rx) = unbounded();
     std::thread::Builder::new()
@@ -166,6 +187,8 @@ pub fn start(
                 sinks: Vec::new(),
                 last_frame: Instant::now(),
                 last_tick: Instant::now(),
+                committer,
+                ensure_project_fn: None,
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -531,6 +554,19 @@ struct Control {
     sinks: Vec<(Box<dyn MeterSink>, u64)>,
     last_frame: Instant,
     last_tick: Instant,
+    /// The engine's own commit core (Plan E Task 13) — same
+    /// `session`/`shared`/`tables` `Arc`s as everything else in `Control`,
+    /// its own `emit` closure instance. Every engine-side document write
+    /// goes through this now; see `Committer`'s doc for the deadlock audit
+    /// covering the engine control thread committing from inside its own
+    /// message loop.
+    committer: Committer,
+    /// "Document birth" closure, installed post-construction by `lib.rs`
+    /// once `ControlPlane` exists (`ControlMsg::SetEnsureProject`'s doc) —
+    /// `None` until then. Bound over the `ControlPlane` `Arc`; calling it
+    /// is the ONLY way `ensure_project` touches project fields — this
+    /// thread never swaps `store.project_dir` itself.
+    ensure_project_fn: Option<Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>>,
 }
 
 impl Control {
@@ -592,6 +628,9 @@ impl Control {
             }
             ControlMsg::StopRecording { reply } => {
                 let _ = reply.send(self.stop_recording());
+            }
+            ControlMsg::SetEnsureProject(f) => {
+                self.ensure_project_fn = Some(f);
             }
             ControlMsg::Shutdown => return false,
         }
@@ -665,9 +704,16 @@ impl Control {
             evt_rx,
         });
         self.shared.sample_rate.store(rate, Relaxed);
-        {
-            let mut session = self.session.lock();
-            session.store.transport.sample_rate = rate;
+        // Site 1 (Plan E Task 13): a transient `Actor::Engine` tx — the
+        // document mirror of the RT atomic just above. `Op::Set{Transport,
+        // SampleRate}` never sets `effect.rebuild` (Task 12's transport
+        // family deliberately sets no engine-effect flags — session.rs's
+        // `ObjectRef::Transport` arm doc), so this commit's `do_rebuild`
+        // closure is a no-op; the unconditional `self.rebuild()` below
+        // (unchanged from before this task) is what actually rebuilds,
+        // exactly as it always has.
+        if let Err(e) = self.commit_output_sample_rate(rate) {
+            log::warn!("open_output: sample-rate commit failed: {e}");
         }
         if self.cache_rate != rate {
             self.cache.clear();
@@ -680,6 +726,31 @@ impl Control {
         );
         self.rebuild();
         Ok(())
+    }
+
+    /// The commit `open_output` submits when the engine (re)opens its
+    /// output stream at a new sample rate — split out so it's independently
+    /// testable. Transient, `emit_project_changed: false` (matches every
+    /// other transport-family commit: `ControlPlane::transport`'s four
+    /// actions all pass `false` too — `project://changed`'s payload
+    /// contract is the full `Project` shape, and firing it once per
+    /// device-open would be a behavior change from today's silent
+    /// writeback).
+    fn commit_output_sample_rate(&mut self, rate: u32) -> Result<Committed, String> {
+        let committer = self.committer.clone();
+        committer.commit_with_rebuild(
+            op::TxMeta::engine("sample rate").transient(),
+            |tx| {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Transport,
+                    path: op::PropPath::SampleRate,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(rate),
+                })
+            },
+            false,
+            || {},
+        )
     }
 
     // -- graph lifecycle (prepare on control thread, swap by pointer) -------
@@ -1518,6 +1589,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
+            crate::control::testutil::test_committer(&session, &shared, &tables),
         );
         (handle, shared, tables, session)
     }

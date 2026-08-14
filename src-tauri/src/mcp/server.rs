@@ -570,6 +570,7 @@ mod tests {
             tables.clone(),
             session.clone(),
             Box::new(NullSink),
+            crate::control::testutil::test_committer(&session, &shared_rt, &tables),
         );
         let jobs = Arc::new(crate::sidecars::jobs::JobManager::new(
             2,

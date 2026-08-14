@@ -116,11 +116,31 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // Make the sampler bank reachable from the engine graph rebuild
     // (midi-track instrument routing) and the post-job auto-register hook.
     sampler::register_bank(state.samplers.clone());
+    // The engine's own commit core (Plan E Task 13) — the SAME
+    // session/shared/tables `Arc`s `ControlPlane::new` gets a moment later
+    // (lib.rs's setup), with its own `emit` closure instance: two closure
+    // instances, both ultimately calling the one live `AppHandle::emit`, so
+    // they're behaviorally one emitter (see `control::Committer`'s doc).
+    let engine_emit: control::EventEmitter = {
+        let app = app.clone();
+        Box::new(move |event: &str, payload: serde_json::Value| {
+            if let Err(e) = app.emit(event, payload) {
+                log::warn!("emit {event}: {e}");
+            }
+        })
+    };
+    let committer = control::Committer::new(
+        state.session.clone(),
+        state.shared.clone(),
+        state.tables.clone(),
+        std::sync::Arc::new(engine_emit),
+    );
     let handle = engine::start(
         state.shared.clone(),
         state.tables.clone(),
         state.session.clone(),
         Box::new(TauriEvents(app.clone())),
+        committer,
     );
     let _ = state.engine.set(handle);
     log::info!("audio::init — engine control thread started");
