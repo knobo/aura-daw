@@ -2808,8 +2808,26 @@ impl ControlPlane {
     ///
     /// On a failed commit the entry goes back on the undo stack untouched:
     /// a rejected undo must not silently consume a history step.
+    ///
+    /// M-4 — AN OPEN GESTURE IS CLOSED FIRST. Ctrl+Z with the pointer still
+    /// down used to walk straight past the drag: its writes are transient
+    /// folds that have reached no history entry yet, so the pop found the
+    /// step BEFORE the gesture, undid that, and the drag's own value then
+    /// landed as a separate step whenever the pointer finally came up. The
+    /// auto-close is F-7's — the very same `end()` + `close_gesture` pair
+    /// `gesture_begin` uses for a stale gesture — so the drag becomes the
+    /// finished, undoable step it already looks like to the user, and the
+    /// undo consumes THAT.
+    ///
+    /// LOCK ORDER is unchanged and unnested: `close_gesture` takes (and
+    /// releases) the gesture and session locks before `pop_undo` is called;
+    /// `pop_undo`/`push_*` take `epoch` -> `history` with NO session lock
+    /// held (`commit_replay` returns before the push).
     pub fn undo(&self) -> Result<Option<String>, String> {
-        let Some(entry) = self.committer.log().pop_undo() else { return Ok(None) };
+        if let Some(g) = self.gesture.end() {
+            self.close_gesture(g);
+        }
+        let Some((entry, popped_epoch)) = self.committer.log().pop_undo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
             run: entry.run.clone(),
@@ -2817,14 +2835,14 @@ impl ControlPlane {
             transient: false,
         };
         let ops = entry.inverses.clone();
-        match self.commit_replay(meta, ops) {
+        match self.commit_replay(meta, ops, popped_epoch) {
             Ok(()) => {
                 let label = entry.label.clone();
-                self.committer.log().push_redo(entry);
+                self.committer.log().push_redo(entry, popped_epoch);
                 Ok(Some(label))
             }
             Err(e) => {
-                self.committer.log().push_undo_unchanged(entry);
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
                 Err(e)
             }
         }
@@ -2835,8 +2853,19 @@ impl ControlPlane {
     /// no new history entry, and the same entry migrates back onto the undo
     /// stack (via `push_undo_unchanged`, which does NOT clear the redo
     /// stack — only a genuinely new edit does that).
+    ///
+    /// Closes an open gesture first for [`Self::undo`]'s reason (M-4). The
+    /// visible consequence differs from undo's: the close records a fresh
+    /// edit, and a fresh edit CLEARS the redo stack (`History::record`), so
+    /// a redo pressed mid-drag now finds nothing and returns `Ok(None)`
+    /// instead of replaying a future the drag has already invalidated —
+    /// which is the same answer it would have given a moment later, once
+    /// the pointer came up.
     pub fn redo(&self) -> Result<Option<String>, String> {
-        let Some(entry) = self.committer.log().pop_redo() else { return Ok(None) };
+        if let Some(g) = self.gesture.end() {
+            self.close_gesture(g);
+        }
+        let Some((entry, popped_epoch)) = self.committer.log().pop_redo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
             run: entry.run.clone(),
@@ -2844,14 +2873,14 @@ impl ControlPlane {
             transient: false,
         };
         let ops = entry.ops.clone();
-        match self.commit_replay(meta, ops) {
+        match self.commit_replay(meta, ops, popped_epoch) {
             Ok(()) => {
                 let label = entry.label.clone();
-                self.committer.log().push_undo_unchanged(entry);
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
                 Ok(Some(label))
             }
             Err(e) => {
-                self.committer.log().push_redo(entry);
+                self.committer.log().push_redo(entry, popped_epoch);
                 Err(e)
             }
         }
@@ -2859,11 +2888,40 @@ impl ControlPlane {
 
     /// Apply a recorded op list through the normal commit path in
     /// `HistoryMode::Replay` — shared by [`Self::undo`] and [`Self::redo`].
-    fn commit_replay(&self, meta: op::TxMeta, ops: Vec<op::Op>) -> Result<(), String> {
+    ///
+    /// `expected_epoch`: the epoch the entry was POPPED under
+    /// (`HistoryLog::pop_undo`). The closure checks it FIRST, before any
+    /// `tx.apply`, under the same session lock the writes go through — the
+    /// dangerous half of the C-1 residual. `record_commit`'s guard drops a
+    /// stale journal line and a stale history entry, but it runs after the
+    /// effect phase: by then a stale undo's inverses have already been
+    /// APPLIED. Re-opening the same project is routine and keeps every id,
+    /// so those inverses apply CLEANLY against the wrong revision instead of
+    /// failing loudly. Checking inside the closure is what makes "nothing
+    /// applied" true rather than "nothing recorded".
+    ///
+    /// The mismatch returns `Err` — it never panics (a `transact` closure
+    /// must not: `Session::transact` holds the session lock across it) — and
+    /// on the `Err` path `transact` rolls back the inverses collected so
+    /// far, which here is none: the check is the closure's first statement,
+    /// so nothing was applied to roll back.
+    fn commit_replay(
+        &self,
+        meta: op::TxMeta,
+        ops: Vec<op::Op>,
+        expected_epoch: u64,
+    ) -> Result<(), String> {
         self.committer
             .commit_with_rebuild_mode(
                 meta,
                 |tx| {
+                    if tx.epoch() != expected_epoch {
+                        return Err(format!(
+                            "document changed under undo/redo (epoch {expected_epoch} -> {}) — \
+                             nothing applied",
+                            tx.epoch()
+                        ));
+                    }
                     for op in ops {
                         tx.apply(op)?;
                     }
@@ -4105,20 +4163,43 @@ pub struct HistoryStep {
 
 /// Undo the most recent history step (Plan E Task 17) — thin delegate over
 /// [`ControlPlane::undo`]. Additive command.
+///
+/// I-6 — ASYNC ON PURPOSE, exactly like `seed_demo_project` below and for
+/// the same reason: a sync `#[tauri::command]` runs on the MAIN thread, and
+/// on Linux the WebKitGTK webview shares the GTK main loop. An undo is a
+/// full commit and can be arbitrarily heavy — undoing a `PluginRemove`
+/// RE-INSTANTIATES the plugin and reloads its state (the seconds-long Zyn
+/// case) — so running it there freezes the window for the whole duration.
+/// `spawn_blocking` moves it off both the main thread and the async runtime.
+///
+/// ASYNC IS INVISIBLE ON THE WIRE: the command name, its (empty) payload and
+/// the [`HistoryStep`] it resolves to are byte-identical; the frontend's
+/// `invoke` was already promise-based.
 #[tauri::command]
-pub fn undo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
-    let label = control.undo()?;
-    let (undo_depth, redo_depth) = control.history_depths();
-    Ok(HistoryStep { label, undo_depth, redo_depth })
+pub async fn undo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let label = cp.undo()?;
+        let (undo_depth, redo_depth) = cp.history_depths();
+        Ok(HistoryStep { label, undo_depth, redo_depth })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Redo the most recently undone step (Plan E Task 17) — thin delegate over
-/// [`ControlPlane::redo`]. Additive command.
+/// [`ControlPlane::redo`]. Additive command, async for [`undo`]'s reason
+/// (I-6) and with the same unchanged wire shape.
 #[tauri::command]
-pub fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
-    let label = control.redo()?;
-    let (undo_depth, redo_depth) = control.history_depths();
-    Ok(HistoryStep { label, undo_depth, redo_depth })
+pub async fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let label = cp.redo()?;
+        let (undo_depth, redo_depth) = cp.history_depths();
+        Ok(HistoryStep { label, undo_depth, redo_depth })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Import an audio file as a clip (STUB until zone B lands).
@@ -6740,6 +6821,61 @@ mod tests {
         );
         let mtime_after = std::fs::metadata(&project_json).unwrap().modified().unwrap();
         assert_eq!(mtime_before, mtime_after, "project.json was never touched by the skipped persist");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// C-1 RESIDUAL, the dangerous half — the sibling of the persist skip
+    /// above, at the undo door. `HistoryLog::record_commit`'s guard drops a
+    /// stale journal line and a stale history entry, but it runs AFTER the
+    /// effect phase: by then a stale undo's inverses have already been
+    /// applied to the document. Re-opening the same project is routine and
+    /// keeps every id, so those inverses apply CLEANLY against the wrong
+    /// revision instead of failing loudly.
+    ///
+    /// Staged exactly like the persist test: bump `session.epoch` directly,
+    /// standing in for an epoch function's swap block — which really does
+    /// bump it under the session lock BEFORE calling
+    /// `HistoryLog::epoch_boundary`, so this IS the window in which the pop
+    /// reports the old epoch while `Tx` already runs under the new one.
+    /// Evidence the guard fired: `commit_replay` returns Err AND the gain
+    /// never moved — "nothing applied", not merely "nothing recorded".
+    #[test]
+    fn an_undo_whose_document_swapped_after_the_pop_applies_nothing() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("undo-epoch-skip");
+        cp.create_project(parent.to_str().unwrap(), "UndoEpochSkip").unwrap();
+
+        let id =
+            cp.add_track(Some("Audio".into()), None, TxMeta::user("add track")).unwrap().id.to_string();
+        cp.set_track_mix(
+            vec![TrackMixChange { gain_db: Some(-6.0), ..TrackMixChange::new(id.clone()) }],
+            TxMeta::user("set track gain"),
+        )
+        .unwrap();
+        let gain = || cp.session().lock().store.tracks.iter().find(|t| t.id == id).unwrap().gain_db;
+        assert_eq!(gain(), -6.0);
+        let depths_before = cp.history_depths();
+        assert_eq!(depths_before, (2, 0), "the add and the gain are two undoable steps");
+
+        // The document swaps out from under the undo, after it popped.
+        cp.session().lock().epoch += 1;
+
+        let err = cp.undo().expect_err("an undo against a swapped document must fail, not apply");
+        assert!(err.contains("document changed"), "the failure must name the reason, got {err:?}");
+        assert_eq!(gain(), -6.0, "NOTHING was applied to the swapped-in document");
+        assert_eq!(
+            cp.history_depths(),
+            depths_before,
+            "a rejected undo consumes no history step — the entry went back untouched"
+        );
+
+        // The guard is a staleness check, not a mute button: once the
+        // epochs agree again the very same entry undoes normally.
+        cp.session().lock().epoch -= 1;
+        assert_eq!(cp.undo().unwrap().as_deref(), Some("set track gain"));
+        assert_eq!(gain(), 0.0);
+        assert_eq!(cp.history_depths(), (1, 1));
 
         let _ = std::fs::remove_dir_all(&parent);
     }

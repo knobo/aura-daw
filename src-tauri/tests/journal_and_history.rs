@@ -615,6 +615,67 @@ fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream()
     let _ = std::fs::remove_dir_all(&parent);
 }
 
+/// M-4: Ctrl+Z with the pointer still down. `undo` used to go straight to
+/// the history stacks, so the open gesture's folded (transient, un-recorded)
+/// writes were invisible to it: the undo skipped past the whole drag to the
+/// step BEFORE it, and the drag's own value then landed as a separate step
+/// whenever the pointer finally came up. `undo` now closes the gesture
+/// first (F-7's auto-close, the same one `gesture_begin` uses), so the drag
+/// is a finished, undoable step by the time the pop happens.
+#[test]
+fn undo_mid_gesture_closes_the_gesture_first_and_undoes_its_fold() {
+    let f = fixture();
+    let parent = tmp_parent("undo-mid-gesture");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let t = add_track(&f.cp, "Audio");
+    let (undo_before, _) = f.log.depths();
+
+    f.cp.gesture_begin("fader".into()).unwrap();
+    for db in [-2.0, -4.0, -8.0] {
+        f.cp.set_track_mix(
+            vec![TrackMixChange { track_id: t.clone(), gain_db: Some(db), ..TrackMixChange::new(t.clone()) }],
+            TxMeta::user("set track gain"),
+        )
+        .unwrap();
+    }
+    assert_eq!(gain_of(&f.cp, &t), -8.0);
+    assert_eq!(
+        f.log.depths().0,
+        undo_before,
+        "mid-gesture folds are transient — the drag is not yet a history step"
+    );
+
+    // Ctrl+Z, pointer still down.
+    let label = f.cp.undo().unwrap();
+    assert_eq!(label.as_deref(), Some("fader"), "the undo consumed the GESTURE's own step");
+    assert_eq!(gain_of(&f.cp, &t), 0.0, "the gain is back at its pre-gesture baseline");
+    assert_eq!(
+        f.log.depths(),
+        (undo_before, 1),
+        "exactly ONE entry was created by the close and consumed by the undo"
+    );
+
+    // The gesture really is closed: the next mix commit is its OWN history
+    // step, not another fold into a still-open gesture.
+    f.cp.set_track_mix(
+        vec![TrackMixChange { track_id: t.clone(), gain_db: Some(-1.0), ..TrackMixChange::new(t.clone()) }],
+        TxMeta::user("set track gain"),
+    )
+    .unwrap();
+    assert_eq!(
+        f.log.depths(),
+        (undo_before + 1, 0),
+        "a fresh, non-transient edit — so the gesture was closed, not left open"
+    );
+
+    // A late pointerup is still the no-op it always was.
+    f.cp.gesture_end().unwrap();
+    assert_eq!(f.log.depths(), (undo_before + 1, 0), "the trailing gesture_end changes nothing");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
 #[test]
 fn an_unsaved_session_journals_nothing_but_undo_still_works() {
     let f = fixture();

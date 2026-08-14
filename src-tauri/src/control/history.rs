@@ -622,19 +622,80 @@ impl HistoryLog {
         self.journal.lock().append_epoch(EpochEvent::Save, epoch);
     }
 
-    pub fn pop_undo(&self) -> Option<HistoryEntry> {
-        self.history.lock().pop_undo()
+    /// Pop the next step to undo, TOGETHER with the epoch it was popped
+    /// under (C-1 residual). The caller applies its `inverses` through a
+    /// normal commit and hands that epoch back to [`Self::push_redo`] (on
+    /// success) or [`Self::push_undo_unchanged`] (on failure), which migrate
+    /// the entry only if the document is still the same one.
+    ///
+    /// LOCK ORDER: `epoch` then `history` — the SAME internal order
+    /// [`Self::record_commit`] already uses, so this introduces no new one.
+    /// The epoch is read under its own mutex rather than through
+    /// [`Self::current_epoch`] so the pop and the read are one step with
+    /// respect to a concurrent [`Self::epoch_boundary`]: an interleaved
+    /// boundary either clears the stack before this pop (nothing to pop) or
+    /// lands after it (and the push-back is then dropped).
+    ///
+    /// The session lock is NEVER held around this call — `ControlPlane::undo`
+    /// pops before `commit_replay` and pushes after it returns.
+    pub fn pop_undo(&self) -> Option<(HistoryEntry, u64)> {
+        let epoch = self.epoch.lock();
+        let entry = self.history.lock().pop_undo()?;
+        Some((entry, *epoch))
     }
 
-    pub fn pop_redo(&self) -> Option<HistoryEntry> {
-        self.history.lock().pop_redo()
+    /// [`Self::pop_undo`]'s mirror for the redo stack; the caller applies
+    /// the entry's `ops`.
+    pub fn pop_redo(&self) -> Option<(HistoryEntry, u64)> {
+        let epoch = self.epoch.lock();
+        let entry = self.history.lock().pop_redo()?;
+        Some((entry, *epoch))
     }
 
-    pub fn push_redo(&self, e: HistoryEntry) {
+    /// Migrate an entry onto the redo stack after a successful undo — ONLY
+    /// if the document is still the one it was popped under.
+    ///
+    /// C-1 RESIDUAL. [`Self::record_commit`]'s guard covers the fresh-edit
+    /// sink; undo/redo reach the stacks through this other door, and the
+    /// window between the pop and the push is the widest in the system — it
+    /// contains a whole commit (plugin main-thread round-trips, disk I/O).
+    /// An [`Self::epoch_boundary`] landing inside it clears stacks that no
+    /// longer hold this entry, and an unguarded push would then put it back:
+    /// a live, poppable step describing a document that is no longer open,
+    /// which [`History::clear`]'s own doc calls corruption. So it is dropped
+    /// with a warn instead — the entry belongs to a document nobody can
+    /// reach any more.
+    ///
+    /// Same lock order as [`Self::pop_undo`] (`epoch` -> `history`), with
+    /// the check and the push under the epoch mutex so the drop is atomic
+    /// with respect to a concurrent boundary rather than merely likely.
+    pub fn push_redo(&self, e: HistoryEntry, popped_epoch: u64) {
+        let current = self.epoch.lock();
+        if popped_epoch != *current {
+            log::warn!(
+                "history: dropping entry {:?} on its way to the redo stack — epoch changed \
+                 between pop and push ({popped_epoch} -> {current}); it describes a document \
+                 that is no longer open",
+                e.label
+            );
+            return;
+        }
         self.history.lock().push_redo(e);
     }
 
-    pub fn push_undo_unchanged(&self, e: HistoryEntry) {
+    /// The same migration back onto the undo stack — after a successful
+    /// redo, or to restore the stack when an undo's commit failed — with
+    /// [`Self::push_redo`]'s guard, for the same reason.
+    pub fn push_undo_unchanged(&self, e: HistoryEntry, popped_epoch: u64) {
+        let current = self.epoch.lock();
+        if popped_epoch != *current {
+            log::warn!(
+                "history: dropping entry {:?} on its way back to the undo stack — epoch changed \
+                 between pop and push ({popped_epoch} -> {current})",
+                e.label
+            );
+            return;
+        }
         self.history.lock().push_undo_unchanged(e);
     }
 
@@ -939,6 +1000,57 @@ mod tests {
             std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap().lines().count(),
             lines_after_swap + 2
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The C-1 RESIDUAL: `record_commit`'s guard covers the fresh-edit sink,
+    /// but undo/redo reach the stacks through a DIFFERENT door — pop the
+    /// entry, commit it, push it back. A document swap landing between the
+    /// pop and the push used to resurrect the entry onto the NEW document's
+    /// stack: `epoch_boundary` cleared stacks that no longer held it, and
+    /// the push then put it back, poppable, describing a document that is
+    /// no longer open.
+    #[test]
+    fn a_push_back_after_an_epoch_boundary_drops_the_entry_instead_of_resurrecting_it() {
+        let log = HistoryLog::new();
+        let dir = std::env::temp_dir().join(format!("aura-journal-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "mix".into(), transient: false };
+        let ops = [set_gain("t-1", -3.0)];
+
+        log.epoch_boundary(&dir, EpochEvent::Create, 1);
+        log.record_commit(1, 1, &meta, &ops, &ops, HistoryMode::Record);
+        assert_eq!(log.depths(), (1, 0));
+
+        // The undo pops — and learns WHICH document it popped under.
+        let (entry, popped) = log.pop_undo().expect("one step to undo");
+        assert_eq!(popped, 1, "the pop reports the epoch it was popped under");
+        assert_eq!(log.depths(), (0, 0));
+
+        // ...and the document is swapped before the push-back lands.
+        log.epoch_boundary(&dir, EpochEvent::Open, 2);
+        log.push_redo(entry, popped);
+        assert_eq!(log.depths(), (0, 0), "the migrated entry must not survive the swap");
+
+        // Same door, same guard, the other direction.
+        log.record_commit(2, 2, &meta, &ops, &ops, HistoryMode::Record);
+        let (entry, popped) = log.pop_undo().unwrap();
+        assert_eq!(popped, 2);
+        log.epoch_boundary(&dir, EpochEvent::Open, 3);
+        log.push_undo_unchanged(entry, popped);
+        assert_eq!(log.depths(), (0, 0), "a failed undo's restore is dropped across a swap too");
+
+        // The guard is a staleness check, not a mute button: a push at the
+        // LIVE epoch migrates normally.
+        log.record_commit(3, 3, &meta, &ops, &ops, HistoryMode::Record);
+        let (entry, popped) = log.pop_undo().unwrap();
+        log.push_redo(entry, popped);
+        assert_eq!(log.depths(), (0, 1), "same document — the entry migrates onto the redo stack");
+        let (entry, popped) = log.pop_redo().expect("one step to redo");
+        assert_eq!(popped, 3);
+        log.push_undo_unchanged(entry, popped);
+        assert_eq!(log.depths(), (1, 0), "and back again");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

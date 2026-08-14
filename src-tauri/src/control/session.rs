@@ -230,6 +230,18 @@ impl Tx<'_> {
     pub fn midi(&self) -> &MidiStore {
         &self.session.midi
     }
+
+    /// The document epoch this transaction runs under — read inside the
+    /// closure, under the SAME lock `apply` writes through, so an undo can
+    /// refuse to apply an entry popped under a DIFFERENT document (C-1
+    /// residual, `ControlPlane::commit_replay`). Read-only, like
+    /// [`Tx::store`]/[`Tx::midi`], and for the same TOCTOU reason: reading
+    /// `session.epoch` through a separate lock outside the closure leaves
+    /// exactly the window the check exists to close — an epoch function can
+    /// swap the document between that read and this transaction's writes.
+    pub fn epoch(&self) -> u64 {
+        self.session.epoch
+    }
 }
 
 /// What `apply_raw` did that the engine/RT side must eventually see, folded
