@@ -31,6 +31,7 @@ pub mod midifile;
 pub mod persist;
 pub mod playback;
 pub mod schedule;
+pub mod section_table;
 pub mod synth;
 pub mod tempo;
 pub mod types;
