@@ -7,11 +7,13 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Clip } from "../types/ipc";
+import type { Clip, TrackState } from "../types/ipc";
 
 const moveClip = vi.fn(() => Promise.resolve());
 const gestureBegin = vi.fn(() => Promise.resolve());
 const gestureEnd = vi.fn(() => Promise.resolve());
+const setTrackArm = vi.fn(() => Promise.resolve());
+const midiSelectInputTrack = vi.fn(() => Promise.resolve());
 
 vi.mock("../tauri", () => ({
   backend: {
@@ -20,10 +22,27 @@ vi.mock("../tauri", () => ({
     moveClip,
     gestureBegin,
     gestureEnd,
+    setTrackArm,
+    midiSelectInputTrack,
   },
 }));
 
 const { project } = await import("./project.svelte");
+
+function testTrack(overrides: Partial<TrackState> = {}): TrackState {
+  return {
+    id: "t-1",
+    name: "Track",
+    kind: "audio",
+    gainDb: 0,
+    pan: 0,
+    muted: false,
+    soloed: false,
+    armed: false,
+    color: "#888888",
+    ...overrides,
+  };
+}
 
 function testClip(overrides: Partial<Clip> = {}): Clip {
   return {
@@ -90,5 +109,26 @@ describe("beginGesture / endGesture", () => {
   it("endGesture invokes backend.gestureEnd", () => {
     project.endGesture();
     expect(gestureEnd).toHaveBeenCalledWith();
+  });
+});
+
+/**
+ * Task 9's arm→target glue (scope ruling 1): arming a `kind: "midi"` track
+ * routes hardware MIDI-in to it via the same click; disarming clears the
+ * route. Audio tracks never touch the routing seam.
+ */
+describe("toggleArm — MIDI routing glue", () => {
+  it("arming a midi track routes MIDI input to it, disarming clears it", async () => {
+    project.tracks = [testTrack({ id: "t-1", kind: "midi", armed: false })];
+    await project.toggleArm("t-1");
+    expect(midiSelectInputTrack).toHaveBeenCalledWith("t-1");
+    await project.toggleArm("t-1");
+    expect(midiSelectInputTrack).toHaveBeenLastCalledWith(null);
+  });
+
+  it("arming an audio track does not touch the midi routing", async () => {
+    project.tracks = [testTrack({ id: "a-1", kind: "audio", armed: false })];
+    await project.toggleArm("a-1");
+    expect(midiSelectInputTrack).not.toHaveBeenCalled();
   });
 });

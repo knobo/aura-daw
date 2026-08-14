@@ -31,6 +31,7 @@ import type {
   MidiClip,
   MidiInputStatus,
   MidiNote,
+  MidiOutputStatus,
   MidiPortInfo,
   OpenSidecarEvent,
   PluginDescriptor,
@@ -279,6 +280,17 @@ export interface Backend {
    * selected; irrelevant when `portId` is null (closing the connection). */
   midiSelectInputPort?(portId: string | null, monitor?: boolean): Promise<void>;
   midiInputStatus?(): Promise<MidiInputStatus>;
+  /** Route incoming notes to this track's instrument (slice 2), or null to
+   * clear the route back to the slice-1 preview tone. */
+  midiSelectInputTrack?(trackId: string | null): Promise<void>;
+
+  // ── hardware MIDI output (slice 2: clock/sync + note-out) ──
+  midiListOutputPorts?(): Promise<MidiPortInfo[]>;
+  midiSelectOutputPort?(portId: string | null): Promise<void>;
+  midiSetClockEnabled?(enabled: boolean): Promise<void>;
+  /** Route this MIDI track's notes to the selected output port, or null. */
+  midiSelectOutputTrack?(trackId: string | null): Promise<void>;
+  midiOutputStatus?(): Promise<MidiOutputStatus>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -655,6 +667,25 @@ class TauriBackend implements Backend {
   }
   midiInputStatus() {
     return invoke<MidiInputStatus>("midi_input_status");
+  }
+  async midiSelectInputTrack(trackId: string | null) {
+    await invoke("midi_select_input_track", { trackId });
+  }
+
+  midiListOutputPorts() {
+    return invoke<MidiPortInfo[]>("midi_list_output_ports");
+  }
+  async midiSelectOutputPort(portId: string | null) {
+    await invoke("midi_select_output_port", { portId });
+  }
+  async midiSetClockEnabled(enabled: boolean) {
+    await invoke("midi_set_clock_enabled", { enabled });
+  }
+  async midiSelectOutputTrack(trackId: string | null) {
+    await invoke("midi_select_output_track", { trackId });
+  }
+  midiOutputStatus() {
+    return invoke<MidiOutputStatus>("midi_output_status");
   }
 
   libraryScan(dir: string) {

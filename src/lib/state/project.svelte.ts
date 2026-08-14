@@ -9,6 +9,7 @@
  */
 
 import { backend } from "../tauri";
+import { midiIo } from "./midiio.svelte";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
@@ -159,6 +160,12 @@ class ProjectStore {
     if (!t) return;
     this.patchTrack(trackId, { armed: !t.armed });
     await backend.setTrackArm(trackId, !t.armed);
+    // Ruling 1's UX bridge: arming a MIDI track routes the keyboard to it;
+    // disarming clears the route. `armed` stays the document flag, the
+    // routing target is a separate app-config selection (no op).
+    if (t.kind === "midi") {
+      await midiIo.setInputTrack(!t.armed ? trackId : null);
+    }
   }
 
   /** Open a gesture boundary (Plan E Task 14) — call on `pointerdown` of a
