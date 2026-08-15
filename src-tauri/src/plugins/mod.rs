@@ -15,6 +15,9 @@
 //!   [`state::FormatStateBridge`]) — zone P4.
 //! * [`automation`] — automation lanes: schema, persistence, ramp
 //!   compilation and the automated-node wrapper — zone P4.
+//! * [`stderr_guard`] — dedupes/re-homes fd 2 so a chatty native plugin
+//!   (Zyn's headless "Events Output" spam) can't block the RT audio thread
+//!   on a full pipe/terminal buffer.
 //!
 //! This file is Tauri glue: `PluginState`, the phase-3 commands (names
 //! frozen once registered in lib.rs), `init`, and [`live_node_for`] — the
@@ -30,6 +33,7 @@ pub mod patches;
 pub mod scan;
 pub mod scan_worker;
 pub mod state;
+pub mod stderr_guard;
 
 use std::sync::{Arc, OnceLock};
 

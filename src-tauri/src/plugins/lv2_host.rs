@@ -111,6 +111,11 @@ fn world_mut(ctx: &mut MainCtx) -> &mut WorldInner {
     ensure_ticker(ctx);
     let slot = ctx.slot_mut::<Lv2World>(SLOT);
     if slot.inner.is_none() {
+        // Before any LV2 plugin can be instantiated: some (Zyn, hosted
+        // headless) call blocking libc stderr I/O from inside `run()` —
+        // i.e. on the RT audio thread. Guard fd 2 first so that can never
+        // block the RT thread or flood the console (see stderr_guard).
+        super::stderr_guard::install();
         let world = livi::World::new();
         let features = world.build_features(livi::FeaturesBuilder {
             min_block_length: 1,
@@ -928,6 +933,68 @@ mod tests {
         assert!(
             tail < held_peak * 0.1,
             "all_notes_off released the voice (tail {tail} vs held {held_peak})"
+        );
+    }
+
+    /// Manual repro/verification harness for [`super::stderr_guard`]: the
+    /// fast offline batch renders above (a few blocks, computed in
+    /// milliseconds) never reproduce Zyn's headless "Events Output" spam —
+    /// it appears to be wall-clock-timer-driven inside the plugin, not
+    /// sample-count-driven. This paces real 512-frame callbacks to real
+    /// time so a long-held note gives Zyn's internal timer the same
+    /// wall-clock exposure a live session would. Run with:
+    /// `cargo test --lib zyn_repro_stderr_guard_under_sustained_playback -- --ignored --nocapture`
+    /// and read the terminal: raw repeated "Sending key 'state' to UI
+    /// failed, out of space" lines means the guard isn't doing its job;
+    /// silence, or a single line plus periodic "(previous line repeated N
+    /// times so far)" summaries, means it is.
+    #[test]
+    #[ignore]
+    fn zyn_repro_stderr_guard_under_sustained_playback() {
+        const RATE: u32 = 48_000;
+        let reg = shared_registry();
+        let Some((instance_id, doc)) = activate_zyn(&reg) else { return };
+
+        let note = MidiNote {
+            tick: 0,
+            length_ticks: 960_000,
+            key: 69,
+            velocity: 110,
+            channel: 0,
+            note_id: crate::ids::NoteId(0),
+        };
+        let (store, midi) =
+            store_with_clip("zyn-repro", &format!("plugin:{instance_id}"), note, 960_000);
+
+        let mut nodes = LiveNodeRegistry::default();
+        let mut tracks: Vec<RtTrack> = Vec::new();
+        let slots = crate::audio::types::derive_slots(&store.tracks);
+        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
+        let mut g = RtGraph::new(tracks, 2, Arc::new(ParamTable::default()));
+
+        const CHUNK: usize = 512;
+        const SECONDS: usize = 15;
+        let total_frames = RATE as usize * SECONDS;
+        let mut buf = vec![0.0f32; CHUNK * 2];
+        let mut pos = 0u64;
+        let mut discontinuity = true;
+        let mut frames_done = 0usize;
+        let start = std::time::Instant::now();
+        while frames_done < total_frames {
+            let tick = std::time::Instant::now();
+            mixer::render(&mut g, pos, &LoopSpec::OFF, &mut buf, 2, RATE, discontinuity, None);
+            discontinuity = false;
+            pos += CHUNK as u64;
+            frames_done += CHUNK;
+            // Pace to real time, like the live audio callback would.
+            let due = std::time::Duration::from_secs_f64(CHUNK as f64 / RATE as f64);
+            if let Some(rest) = due.checked_sub(tick.elapsed()) {
+                std::thread::sleep(rest);
+            }
+        }
+        eprintln!(
+            "repro: rendered {SECONDS}s of held A4 in {:.1}s wall-clock",
+            start.elapsed().as_secs_f64()
         );
     }
 
