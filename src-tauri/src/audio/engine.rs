@@ -1768,6 +1768,15 @@ impl Control {
         )
     }
 
+    /// Stop the take and register it.
+    ///
+    /// `Err` does NOT mean "nothing happened": except for the "not
+    /// recording" case, the take has ALREADY been committed (the MIDI clip
+    /// and whatever audio clips survived, one undo entry), the transport is
+    /// already stopped and `recording://state` has already been emitted. The
+    /// error reports the AUDIO half — the WAV writer failed and its clips
+    /// were lost — never the transaction. A caller must not treat it as a
+    /// signal to retry or to skip its own stop bookkeeping.
     fn stop_recording(&mut self) -> Result<Vec<Clip>, String> {
         // Disarm the capture unconditionally and first: after this line no
         // further hardware note can join the take, whichever half fails

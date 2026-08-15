@@ -998,3 +998,188 @@ round doesn't have to re-mine it. All are OPEN and accepted unless marked.
   and `plugins::host::tests::plugin_main_thread_slots_and_tickers`. Not
   this track's to fix; re-run in isolation before calling either a
   regression.
+
+## Track B handoff (2026-08-15, MIDI slice 2, subagent-driven, external review layer)
+
+Track B (hardware MIDI I/O — input routing, recording, clock/sync out) is
+**IMPLEMENTED** on branch `midi-slice-2` (**PR #21**), cut from
+`origin/main` at `3340aa8`, with `origin/main` merged in at the Task 8/9
+boundary (`85cf07c`, pulling in Track E *and* Track D). Plan document:
+`docs/superpowers/plans/2026-08-14-midi-slice-2.md`. SDD ledger
+(gitignored): `.superpowers/sdd/2026-08-14-midi-slice-2/progress.md`.
+Twelve tasks.
+
+**What landed.** A process-global `MidiInHub` (`audio/midi_in.rs`) owns a
+wait-free SPSC ring from the midir callback thread to the RT output
+callback; the mixer dispatches the drained events into the target track's
+existing `LiveNodeCell`, so monitoring plays the *same* instrument node
+playback uses, with the transport playing or stopped. The same hub buffers
+the take control-side; at stop, `midi::capture` converts the edges to ticks
+through the same `TempoMap` bijection playback schedules from, and
+`Op::MidiClipAdd` rides in the SAME `commit_recording_finalize`
+transaction as the audio `ClipAdd`s — one take, one undo entry, no new op
+kind, no format bump. MIDI OUT is a dedicated non-RT `aura-midi-out`
+thread (`midi_out.rs`) reading `SharedRt` + a tempo/event snapshot: 24 PPQN
+clock, Start/Stop/Continue/SPP, and note-out from one chosen MIDI track —
+it never touches `engine.rs`. Frontend: a `midiIo` store, the master
+strip's midi-in/midi-out groups, and arm-a-MIDI-track → route-the-keyboard
+glue. User docs: `docs/midi-input.md` (rewritten), `docs/midi-output.md`
+(new).
+
+**Suites: 661 backend (632 lib + 29 integration) + 270 frontend, all
+green, measured on `midi-slice-2` 2026-08-15**; `npx svelte-check` 0
+errors, 0 warnings. Doc-tests are 0 and are NOT a test target — an earlier
+report in this track counted them and reported 641 where the truth was
+640. Counts dated in README/CONTRIBUTING. Other tracks are in flight, so
+the count line is a known cross-track merge-conflict point: whoever merges
+last re-measures rather than picking a side.
+
+### OWED BY THE OWNER: three ear checks, and no test in this chain substitutes
+
+Nothing in this track has been heard by a human — the implementing agents
+have no MIDI hardware and no audio device. **Do these first, in this
+order:**
+
+1. **Note-out to real gear** (Task 8): route a MIDI track to an external
+   synth and hear it play. This is the owner's own stated priority half of
+   the slice and the only thing that proves it end to end. Byte delivery
+   over a real ALSA loopback IS proven by tests; "the synth makes the right
+   sound" is not.
+2. **Hydrogen clock sync** (Task 7): slave Hydrogen to AURA, press play,
+   confirm it follows — and specifically confirm whether the loop-wrap
+   re-cue (`Stop`/SPP/`Continue`, ruling 5) sounds acceptable, since that
+   is the ruling most likely to be wrong for a real device.
+3. **A real keyboard, the whole loop** (Task 11): arm → hear the track's
+   instrument → record a few bars → stop → Ctrl+Z removes the take in one
+   step → Ctrl+Shift+Z → save, reopen, the take is still there.
+
+### THE ONE THAT CAN COST A USER WORK: recording under an active loop
+
+**Recording while a loop is active silently produces a musically wrong
+take.** Full mechanism, both candidate fixes and the reason the plan's
+non-goals do *not* cover it: `docs/backlog/hardware-midi-io.md`, "Still
+open after slice 2". The user-facing "don't do that" is in
+`docs/midi-input.md`. Choosing between the two fixes is a **behaviour
+decision for the owner**, not a refactor.
+
+### Standing hazards a future round must not rediscover the hard way
+
+- **`live_in_release_slot` holds ONE slot and compares slot NUMBERS, not
+  track ids.** A second target change inside the ~85 ms release window
+  steals it (a ≤85 ms decayed fragment, never a drone). The dangerous path
+  is not human speed: a rebuild that renumbers slots after a track delete
+  both steals the window AND aims mask-derived note-offs at whatever track
+  now owns that number, where they can cut THAT track's clip note. The real
+  fix is comparing target *identity* rather than slot index — a design
+  change, deliberately not attempted in a fix round.
+- **`RELEASE_SECS` is PolySynth's constant applied to every instrument.** A
+  sampler or plugin with a longer tail is cut mid-decay when it loses the
+  target, and raising the constant trades that against a longer deaf window
+  on the new target. The real answer is a per-node `release_tail()` on the
+  processor trait.
+- **Events drained during the release window are discarded**: a key struck
+  inside it is silently swallowed (its later note-off arrives orphaned and
+  harmless).
+- **`render_live_input_only` applies static gain/pan/mute/solo but NOT
+  Track D's compiled gain ramp**, so stopped-transport monitoring on an
+  automated track monitors at a different level than it plays.
+- **The engine expands `EV_ALL_OFF` into per-key note-offs before it
+  reaches the mixer**, so the mixer's own `EV_ALL_OFF` arms are now reached
+  only by mixer tests. Deliberate, and cross-referenced in comments
+  (`mixer.rs`) precisely so nobody reads the mixer test as a live contract
+  and deletes the engine-side expansion.
+- **Two `RtTrack` rows exist at one slot for a midi track.** Both write the
+  same meter lane via `set_slot_local`, so it is last-writer-wins, and it
+  is correct ONLY because `append_from_with_input` appends the live rows
+  AFTER the assembly loop. Invert that order and the midi track's meters
+  silently read zero.
+- **`start_recording(Some(vec!["m-1"]))` with no routing target fails with
+  "no armed tracks to record"** even though the caller named a track
+  explicitly — reachable from MCP's `record_take`. The plan pinned that
+  wording; the missing piece is a distinct branch for a non-empty explicit
+  request.
+- **TOCTOU on the take's target track**: the session read lock drops before
+  `take_clip` and is re-taken inside `transact`, so a concurrent
+  `remove_track` in that window commits a MidiClip pointing at a dead
+  track. `ClipAdd` has the same exposure; closing it means holding the
+  session lock across the commit.
+- **The arm-edge invariant at `begin_capture` is comment-only and
+  untestable as stated**: a future refactor that moves the call up will not
+  go RED anywhere.
+- **The R5 guard in the release-window countdown is deliberately a comment,
+  not a `debug_assert!` — controller's ruling, and the reason matters**:
+  `engine.rs:714` documents a `debug_assert!(false)` that was REMOVED from
+  `stale_sources` because its "unreachable" condition turned out reachable
+  in production and panicked the control thread. This one would sit on the
+  AUDIO CALLBACK, where a panic is worse.
+- **Deleting a routed track** now clears both routings
+  (`ControlPlane::remove_track` → `clear_midi_routing_for`, Task 12).
+  Undoing a `TrackAdd` does not pass through there and still leaves a stale
+  id until the next explicit selection — cosmetic (`refresh_target`
+  resolves an unknown id to `NO_SLOT`, and a missing track's note-out
+  snapshot is empty), but it is why both selectors must keep tolerating an
+  id the store does not have.
+
+### Rulings later rounds inherit (from the plan, ADR 0007)
+
+1. **The MIDI-in target track is app config, not document state** — a
+   `ControlPlane` seam with attribution and no op, NOT derived from
+   `TrackState.armed` (deriving it would force every `armed` writer —
+   commands, undo/redo, project open, MCP — to re-publish the routing, a
+   side-channel by construction). The frontend calls the selection from the
+   same arm click, so the UX still reads "arm a track, play it".
+4. **The clock's musical position is `SharedRt::position` + the `TempoMap`
+   bijection, not `SharedRt::steady`** — `steady` never stops, seeks or
+   wraps, and those are exactly what Start/Stop/Continue/SPP are. The
+   `SectionTable` buys nothing at 24 PPQN.
+5. **A backward transport jump re-cues the slave** with `Stop` + SPP +
+   `Continue` rather than free-running. Switch to a silent re-anchor if the
+   owner's gear dislikes it (see ear check 2).
+9. **MIDI-in timestamps are transport-position-at-arrival**, i.e. quantised
+   to the audio block (~5–11 ms).
+10. **Note-out is a routing carve-out, not a track field** — no document
+    field, no op, no `OP_FORMAT_VERSION` bump. The track keeps sounding
+    internally; muting it in AURA is the documented anti-doubling move.
+11. **No persistence of selected ports/target across restarts**, because a
+    port id is `"<name>#<index>"` and can name a different device after a
+    replug.
+
+### Deferred minors, rolled up (all OPEN and accepted unless marked)
+
+- `cargo fmt` is not clean on `midi/capture.rs` — project-wide
+  pre-existing, not this track's (Task 2).
+- Mandated duplication `render_live` ↔ `render_live_input_only` and
+  `append_from` ↔ `append_from_with_input`, with keep-in-sync comments
+  (Task 4).
+- A theoretical parallel-test race on the process-global hub between the
+  two `ControlPlane` selection tests, and now the two Task 12 routing
+  tests. The plan's own accepted trade-off; the fix if a flake appears is
+  an injectable hub, not a serialized suite (Task 5).
+- Unchecked `u64` multiplication in the clock's interpolation (~3 years of
+  continuous anchor age before overflow); `estimated_sample()` is stale
+  while stopped (Task 6).
+- In RELEASE builds an unsorted event array is now marginally worse than
+  before: the binary-search cursor can in principle move BACKWARD into
+  already-fired territory, where the old forward walk stopped predictably.
+  No live path triggers it (`track_events` sorts unconditionally), and the
+  `debug_assert` covers debug builds (Task 8).
+- No integration test drives `out_tick` through a real `ClockEngine` drift
+  jump with a `NoteOutSnapshot` attached. Closed at primitive level
+  (backward `reseek` is proven directly), so not blocking (Task 8).
+- The `~85 ms`/one-block release window's own costs are the first three
+  standing hazards above (Task 10/11).
+- `midiClipId` on `recording://state` is now consumed (Task 12 wires the
+  MIDI store to pull, select and flash the take) — **CLOSED**.
+- **CLOSED by the close-out**: the dangling routing after a track delete;
+  the missing note-out **track** selector in the UI (the store method
+  existed and was unreachable — the plan's Task 9 never specified the
+  control, while Task 12's own doc step told users to use it); the
+  uncaught `stopRecording()` rejection in `TransportBar`/`HumPanel`; the
+  undocumented `Err`-after-commit contract on `stop_recording`.
+- **Standing, from the plan's global constraints**: three tests are flaky
+  under the default parallel thread count and pass in isolation —
+  `control::hum::tests::apply_hum_clip_commits_synchronously_and_announces_project_changed`,
+  `plugins::host::tests::plugin_main_thread_slots_and_tickers` and
+  `pure_readers::library_audition_core_leaves_the_document_and_the_history_untouched`.
+  Re-run in isolation before calling any of them a regression. Zyn host
+  spam on stderr is expected noise.

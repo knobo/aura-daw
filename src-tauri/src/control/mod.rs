@@ -1522,6 +1522,9 @@ impl ControlPlane {
         Ok(snap)
     }
 
+    /// See `Control::stop_recording`: on `Err` the take HAS been committed
+    /// (one undo entry) and the transport has stopped — the error reports a
+    /// failed WAV write, not a failed registration. Never a retry signal.
     pub fn stop_recording(&self) -> Result<Vec<Clip>, String> {
         let clips = self
             .engine
@@ -1777,7 +1780,34 @@ impl ControlPlane {
         self.commit(meta, |tx| {
             tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
         })?;
+        self.clear_midi_routing_for(id);
         Ok(())
+    }
+
+    /// The MIDI-in target and the note-out target are app config holding a
+    /// track id (rulings 1 and 10), so nothing in the document model retires
+    /// them when the track goes away. Called AFTER the commit succeeds: a
+    /// failed removal must leave the routing exactly as it was.
+    ///
+    /// Only this explicit delete path is covered. Undoing a `TrackAdd`
+    /// removes a track without passing here, and leaves the id in place
+    /// until the next explicit selection — cosmetic (`refresh_target`
+    /// resolves an unknown id to `NO_SLOT`, and the note-out snapshot of a
+    /// missing track is empty), but it is why the selectors must keep
+    /// tolerating an id the store does not have.
+    fn clear_midi_routing_for(&self, id: &str) {
+        let hub = crate::audio::midi_in::hub();
+        if hub.target_track().as_deref() == Some(id) {
+            // Goes through `set_target_track`, so the outgoing target still
+            // gets its `all_off` — a key held while the track is deleted
+            // must not be left sounding.
+            hub.set_target_track(None);
+        }
+        if let Some(out) = self.midi_out.get() {
+            if out.note_track().as_deref() == Some(id) {
+                let _ = out.select_note_track(None);
+            }
+        }
     }
 
     /// Batched mix changes through the transaction channel: one `Op::Set`
@@ -4872,6 +4902,57 @@ mod tests {
         assert!(cp.select_midi_output_port(Some("x#0".into()), TxMeta::user("x")).is_err());
         assert!(cp.set_midi_clock_enabled(true, TxMeta::user("x")).is_err());
         assert_eq!(cp.session().lock().rev, rev_before);
+    }
+
+    /// Deleting the routed track must not leave the MIDI-in target pointing
+    /// at an id the document no longer has. HAZARD: process-global `hub()`
+    /// (same as the two selection tests above) — cleared on the way out.
+    #[test]
+    fn removing_the_routed_track_clears_the_midi_input_target() {
+        let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        let keys = cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
+        let other = cp.add_track(Some("Pads".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
+        cp.select_midi_input_track(Some(other.id.to_string()), TxMeta::user("route")).unwrap();
+
+        // Removing a DIFFERENT track leaves the routing alone.
+        cp.remove_track(keys.id.as_str(), TxMeta::user("delete")).unwrap();
+        assert_eq!(
+            crate::audio::midi_in::hub().target_track().as_deref(),
+            Some(other.id.as_str()),
+            "an unrelated delete must not clear the routing"
+        );
+
+        cp.remove_track(other.id.as_str(), TxMeta::user("delete")).unwrap();
+        let target = crate::audio::midi_in::hub().target_track();
+        crate::audio::midi_in::hub().set_target_track(None);
+        assert_eq!(target, None, "deleting the routed track leaves a dangling target");
+    }
+
+    /// Same for note-out (ruling 10's app-config routing): the deleted
+    /// track's id must not survive in `midi_output_status`. Needs a real
+    /// attached `MidiOut` — no port is opened, so no thread starts.
+    #[test]
+    fn removing_the_routed_track_clears_the_note_out_target() {
+        let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        let out = Arc::new(crate::midi_out::MidiOut::default());
+        cp.attach_midi_out(Arc::clone(&out));
+        let keys = cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
+        let other = cp.add_track(Some("Pads".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
+        cp.select_midi_output_track(Some(other.id.to_string()), TxMeta::user("route")).unwrap();
+
+        cp.remove_track(keys.id.as_str(), TxMeta::user("delete")).unwrap();
+        assert_eq!(
+            out.status().note_track_id.as_deref(),
+            Some(other.id.as_str()),
+            "an unrelated delete must not clear the routing"
+        );
+
+        cp.remove_track(other.id.as_str(), TxMeta::user("delete")).unwrap();
+        assert_eq!(
+            out.status().note_track_id,
+            None,
+            "deleting the routed track leaves a dangling note-out target"
+        );
     }
 
     /// MCP-parity regression (found filming the MCP demo): jobs submitted

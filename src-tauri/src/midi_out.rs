@@ -600,12 +600,19 @@ impl MidiOut {
         Ok(())
     }
 
+    /// The routed track id, readable without the `inner` lock `status`
+    /// takes — `ControlPlane::remove_track` needs it to retire a routing
+    /// whose track is being deleted.
+    pub fn note_track(&self) -> Option<String> {
+        self.note_track.lock().clone()
+    }
+
     /// Cheap live snapshot for polling.
     pub fn status(&self) -> MidiOutputStatus {
         let inner = self.inner.lock();
         let clock_enabled = self.clock_enabled.load(Relaxed);
         // Hub-sourced (well, MidiOut-field-sourced): correct even idle.
-        let note_track_id = self.note_track.lock().clone();
+        let note_track_id = self.note_track();
         match inner.active.as_ref() {
             Some(active) => MidiOutputStatus {
                 selected: Some(active.port.clone()),

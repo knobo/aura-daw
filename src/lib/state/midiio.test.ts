@@ -93,6 +93,18 @@ describe("midiIo", () => {
     expect(midiSelectInputTrack).toHaveBeenCalledWith(null);
   });
 
+  /** Note-out routing (ruling 10) — the MasterBar "midi trk" selector's one
+   * call. Its `""` option must reach the backend as `null`, same rule the
+   * port selectors follow. */
+  it("setOutputTrack forwards the track id and mirrors it locally", async () => {
+    await midiIo.setOutputTrack("t-9");
+    expect(midiSelectOutputTrack).toHaveBeenCalledWith("t-9");
+    expect(midiIo.noteTrackId).toBe("t-9");
+    await midiIo.setOutputTrack(null);
+    expect(midiSelectOutputTrack).toHaveBeenCalledWith(null);
+    expect(midiIo.noteTrackId).toBeNull();
+  });
+
   it("polling mirrors backend status into the store", async () => {
     const stop = midiIo.startPolling(1);
     await vi.waitFor(() => expect(midiIo.routing).toBe(true));

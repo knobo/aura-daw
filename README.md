@@ -79,6 +79,15 @@ Notes flash at the moment they sound during playback (FLASH toggle):
 
 ![Note flash during playback](docs/screenshots/piano-roll-note-flash.png)
 
+### Hardware MIDI in and out
+
+Plug in a keyboard, pick the port in the master strip, arm a MIDI track and
+play its instrument — then record what you play as one clip and one undo
+step ([docs/midi-input.md](docs/midi-input.md)). Outward, AURA sends MIDI
+clock plus Start/Stop/Continue/SPP (Hydrogen and friends slave to it) and
+can play one MIDI track's notes through an external synth
+([docs/midi-output.md](docs/midi-output.md)).
+
 ### Plugin hosting — CLAP + LV2 instruments
 
 Real in-graph hosting of third-party instruments on MIDI tracks, with one shared
@@ -397,8 +406,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 626 tests (597 lib + 29 integration; counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition
-npm test                      # 258 frontend unit tests (counted 2026-08-15; vitest): stores + timeline math + section-table bijection + library store + automation lane edit ops
+cd src-tauri && cargo test    # 661 tests (632 lib + 29 integration; counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition
+npm test                      # 270 frontend unit tests (counted 2026-08-15; vitest): stores + timeline math + section-table bijection + library store + automation lane edit ops + MIDI I/O
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

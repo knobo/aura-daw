@@ -334,6 +334,11 @@ pub fn start_recording(
 
 /// Finalizes the take: WAV files closed, waveform pyramids cached, clips
 /// registered on their tracks and returned.
+///
+/// An `Err` reaching the frontend means the take WAS registered (the MIDI
+/// clip and any audio clips that survived) but the WAV write failed — the
+/// caller should surface it and carry on with its own stop bookkeeping,
+/// never retry.
 #[tauri::command]
 pub fn stop_recording(control: State<'_, Arc<ControlPlane>>) -> Result<Vec<Clip>, String> {
     control.stop_recording()

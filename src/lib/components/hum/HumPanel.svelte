@@ -15,6 +15,8 @@
   import { instruments } from "../../state/instruments.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { zyn } from "../../state/zynpatches.svelte";
+  import { toasts } from "../../state/toasts.svelte";
+  import type { Clip } from "../../types/ipc";
 
   type SourceMode = "clip" | "path";
   let sourceMode = $state<SourceMode>("clip");
@@ -63,7 +65,15 @@
 
   async function toggleRecord() {
     if (transport.isRecording) {
-      const clips = await backend.stopRecording();
+      let clips: Clip[] = [];
+      try {
+        clips = await backend.stopRecording();
+      } catch (err) {
+        // The take is already registered (one undo entry) — only the WAV
+        // write failed, which is exactly why there are no clips to pick a
+        // hum source from. Report it and finish stopping.
+        toasts.error("TAKE AUDIO NOT WRITTEN", String(err));
+      }
       await transport.pause();
       if (clips.length > 0) {
         sourceMode = "clip";

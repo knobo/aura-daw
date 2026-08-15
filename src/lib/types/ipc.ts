@@ -139,8 +139,13 @@ export interface RecordingState {
   trackIds: string[];
   startedAtSamples?: number;
   xruns?: number;
-  /** Present on the stop notification. */
+  /** Present on the stop notification: the take's AUDIO clips only. */
   clips?: Clip[];
+  /** Stop notification, MIDI take only: the clip `MidiClipAdd` registered
+   * in the take's transaction. `null`/absent when the take recorded no
+   * MIDI. It is an id, not the clip — the store re-pulls, since the clip
+   * arrives through no other channel. */
+  midiClipId?: string | null;
 }
 
 // ── project.schema.json ─────────────────────────────────────────────────────

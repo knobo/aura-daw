@@ -18,6 +18,10 @@
   let outputs = $state<AudioDevice[]>([]);
   let dbEl: HTMLSpanElement | undefined = $state();
 
+  /** Note-out (ruling 10) can only address a MIDI track — the backend
+   * rejects anything else, so the selector never offers it. */
+  const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
+
   const targetTrackName = $derived(
     midiIo.targetTrackId ? (project.trackById(midiIo.targetTrackId)?.name ?? midiIo.targetTrackId) : null,
   );
@@ -49,6 +53,10 @@
 
   function toggleClock(enabled: boolean) {
     void midiIo.setClockEnabled(enabled);
+  }
+
+  function selectMidiOutTrack(id: string) {
+    void midiIo.setOutputTrack(id || null);
   }
 
   // live dB readout without reactivity churn
@@ -142,6 +150,17 @@
         />
         <span class="silk">clock</span>
       </label>
+      <span class="silk">trk</span>
+      <select
+        name="midi-output-track"
+        title="Play this MIDI track's notes through the output port (mute it in AURA to avoid doubling)"
+        onchange={(e) => selectMidiOutTrack((e.currentTarget as HTMLSelectElement).value)}
+      >
+        <option value="" selected={!midiIo.noteTrackId}>None</option>
+        {#each midiTracks as t (t.id)}
+          <option value={t.id} selected={t.id === midiIo.noteTrackId}>{t.name}</option>
+        {/each}
+      </select>
     </div>
   </div>
 

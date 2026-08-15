@@ -16,6 +16,7 @@
   import { mcp } from "../state/mcp.svelte";
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
+  import { toasts } from "../state/toasts.svelte";
   import { formatBarsBeats, formatClock } from "../utils/format";
   import { computeVisible } from "../utils/toolbar-overflow";
   import ProjectMenu from "./project/ProjectMenu.svelte";
@@ -46,7 +47,14 @@
 
   async function toggleRecord() {
     if (transport.isRecording) {
-      await backend.stopRecording();
+      try {
+        await backend.stopRecording();
+      } catch (err) {
+        // An Err means the take WAS registered (one undo entry, MIDI
+        // included) and only the WAV write failed — never a retry signal,
+        // and never a reason to skip the stop below.
+        toasts.error("TAKE AUDIO NOT WRITTEN", String(err));
+      }
       await transport.pause(); // halt, keep the playhead at the take end
     } else {
       await backend.startRecording(null);
