@@ -154,6 +154,18 @@ pub enum Op {
     /// `key` already names a lane, else inserts). Inverse carries the
     /// previous lane at `key` (or `None` if it didn't exist before this op).
     AutomationSetLane { key: String, lane: Option<crate::plugins::automation::AutomationLane> },
+    /// Track F: upsert/delete one curve in `session.modulation` by `key`
+    /// (`Curve::id`). Same §4.4 value-replacement shape as
+    /// `AutomationSetLane` — `None` deletes (no-op if absent); `Some`
+    /// upserts. Inverse carries previous store truth. Additive; does NOT
+    /// bump `OP_FORMAT_VERSION`.
+    ModulationSetCurve { key: String, curve: Option<crate::modulation::Curve> },
+    /// Track F: upsert/delete one binding in `session.modulation` by `key`
+    /// (`Binding::id`). Invalid bindings are rejected before any mutation.
+    ModulationSetBinding { key: String, binding: Option<crate::modulation::Binding> },
+    /// Track F: upsert/delete one automation-track clip by `key`
+    /// (`AutomationClip::id`).
+    AutomationClipSet { key: String, clip: Option<crate::modulation::AutomationClip> },
     /// Plan E Task 9 (round-2 inventory rows 12-15): register a plugin
     /// instance row in the document. Prepare-outside: the host instance
     /// already exists (instantiation round-trip BEFORE the tx, so a plugin
@@ -645,6 +657,67 @@ mod tests {
         assert!(s.contains("\"lane\":null"), "wire form was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, automation_delete);
+
+        // Track F: modulation op wire forms (additive; OP_FORMAT_VERSION stays 2).
+        let curve = crate::modulation::Curve {
+            id: "cur-1".into(),
+            name: "fade".into(),
+            length_ticks: None,
+            points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+        };
+        let set_curve = Op::ModulationSetCurve { key: "cur-1".into(), curve: Some(curve.clone()) };
+        let s = serde_json::to_string(&set_curve).unwrap();
+        eprintln!("ModulationSetCurve wire form: {}", s);
+        assert!(s.contains("\"kind\":\"modulationSetCurve\""), "wire form was: {s}");
+        assert!(s.contains("\"points\""), "curve points must be present, was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, set_curve);
+
+        let set_binding = Op::ModulationSetBinding {
+            key: "bnd-1".into(),
+            binding: Some(crate::modulation::Binding {
+                id: "bnd-1".into(),
+                source: crate::modulation::Source::Curve { curve_id: "cur-1".into() },
+                target: crate::modulation::TargetRef::TrackParam {
+                    track_id: "t1".into(),
+                    param: crate::modulation::TrackParam::Gain,
+                },
+                mode: crate::modulation::BindingMode::Multiply,
+                depth: 1.0,
+                range: crate::modulation::Range::default(),
+                domain: crate::modulation::Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            }),
+        };
+        let s = serde_json::to_string(&set_binding).unwrap();
+        eprintln!("ModulationSetBinding wire form: {}", s);
+        assert!(s.contains("\"kind\":\"modulationSetBinding\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, set_binding);
+
+        let clip_set = Op::AutomationClipSet {
+            key: "acl-1".into(),
+            clip: Some(crate::modulation::AutomationClip {
+                id: "acl-1".into(),
+                track_id: "t-auto".into(),
+                curve_id: "cur-1".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 3840,
+                content_length_ticks: None,
+            }),
+        };
+        let s = serde_json::to_string(&clip_set).unwrap();
+        eprintln!("AutomationClipSet wire form: {}", s);
+        assert!(s.contains("\"kind\":\"automationClipSet\""), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, clip_set);
+
+        let curve_delete = Op::ModulationSetCurve { key: "cur-1".into(), curve: None };
+        let s = serde_json::to_string(&curve_delete).unwrap();
+        assert!(s.contains("\"curve\":null"), "wire form was: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, curve_delete);
     }
 
     /// I-5 (whole-branch review), the reason `OP_FORMAT_VERSION` is 2: the

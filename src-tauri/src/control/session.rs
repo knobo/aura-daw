@@ -81,6 +81,10 @@ pub struct Session {
     pub store: Store,
     pub midi: MidiStore,
     pub automation: AutomationDoc,
+    /// Track F modulation graph (curves, bindings, automation clips).
+    /// Coexists with `automation` until Task 7's compatibility facade
+    /// retires the lane document.
+    pub modulation: crate::modulation::ModulationDoc,
     pub plugins: PluginDoc,
     pub(crate) rev: u64,
     /// Document-identity counter (fix round 1, Task 7 review finding 2):
@@ -110,6 +114,7 @@ impl Session {
             store,
             midi,
             automation: AutomationDoc::default(),
+            modulation: crate::modulation::ModulationDoc::default(),
             plugins: PluginDoc::default(),
             rev: 0,
             epoch: 0,
@@ -322,6 +327,10 @@ pub struct PersistEffect {
     pub plugins: bool,
     /// Task 10 wires the executor; the field exists now.
     pub automation: bool,
+    /// Track F: `modulation::persist::save_into_project` from a
+    /// `ModulationDoc` snapshot. Coexists with `automation` until Task 7
+    /// retires the lane persist path.
+    pub modulation: bool,
 }
 
 impl PersistEffect {
@@ -334,6 +343,7 @@ impl PersistEffect {
         self.project |= other.project;
         self.plugins |= other.plugins;
         self.automation |= other.automation;
+        self.modulation |= other.modulation;
     }
 }
 
@@ -805,6 +815,103 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.persist.automation = true;
             effect.rebuild = true;
             Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
+        }
+        // Track F: modulation document arms. Same shape as
+        // `AutomationSetLane` — validate/normalize BEFORE mutation,
+        // upsert/remove by key, previous store truth as inverse, rebuild.
+        // Old `AutomationSetLane` continues to write `session.automation`
+        // (Task 7 owns the compat facade that will route journals into the
+        // new document).
+        Op::ModulationSetCurve { key, curve } => {
+            let pos = session.modulation.curves.iter().position(|c| &c.id == key);
+            let mut new_curve = match curve {
+                Some(c) => {
+                    let mut nc = c.clone();
+                    nc.id = key.clone(); // the op's `key` is authoritative
+                    crate::modulation::normalize_curve(&mut nc)?;
+                    Some(nc)
+                }
+                None => None,
+            };
+            let previous = match pos {
+                Some(idx) => match new_curve.take() {
+                    Some(nc) => Some(std::mem::replace(&mut session.modulation.curves[idx], nc)),
+                    None => Some(session.modulation.curves.remove(idx)),
+                },
+                None => {
+                    if let Some(nc) = new_curve.take() {
+                        session.modulation.curves.push(nc);
+                    }
+                    None // deleting an already-absent curve is a no-op
+                }
+            };
+            effect.persist.modulation = true;
+            effect.rebuild = true;
+            Ok(Op::ModulationSetCurve { key: key.clone(), curve: previous })
+        }
+        Op::ModulationSetBinding { key, binding } => {
+            let pos = session.modulation.bindings.iter().position(|b| &b.id == key);
+            let new_binding = match binding {
+                Some(b) => {
+                    let mut nb = b.clone();
+                    nb.id = key.clone();
+                    crate::modulation::validate_binding(&nb)?;
+                    Some(nb)
+                }
+                None => None,
+            };
+            let previous = match pos {
+                Some(idx) => match new_binding {
+                    Some(nb) => Some(std::mem::replace(&mut session.modulation.bindings[idx], nb)),
+                    None => Some(session.modulation.bindings.remove(idx)),
+                },
+                None => {
+                    if let Some(nb) = new_binding {
+                        session.modulation.bindings.push(nb);
+                    }
+                    None
+                }
+            };
+            effect.persist.modulation = true;
+            effect.rebuild = true;
+            Ok(Op::ModulationSetBinding { key: key.clone(), binding: previous })
+        }
+        Op::AutomationClipSet { key, clip } => {
+            let pos = session.modulation.automation_clips.iter().position(|c| &c.id == key);
+            let new_clip = match clip {
+                Some(c) => {
+                    let mut nc = c.clone();
+                    nc.id = key.clone();
+                    if nc.id.is_empty() {
+                        return Err("automation clip id must not be empty".into());
+                    }
+                    if nc.track_id.is_empty() {
+                        return Err("automation clip trackId must not be empty".into());
+                    }
+                    if nc.curve_id.is_empty() {
+                        return Err("automation clip curveId must not be empty".into());
+                    }
+                    Some(nc)
+                }
+                None => None,
+            };
+            let previous = match pos {
+                Some(idx) => match new_clip {
+                    Some(nc) => {
+                        Some(std::mem::replace(&mut session.modulation.automation_clips[idx], nc))
+                    }
+                    None => Some(session.modulation.automation_clips.remove(idx)),
+                },
+                None => {
+                    if let Some(nc) = new_clip {
+                        session.modulation.automation_clips.push(nc);
+                    }
+                    None
+                }
+            };
+            effect.persist.modulation = true;
+            effect.rebuild = true;
+            Ok(Op::AutomationClipSet { key: key.clone(), clip: previous })
         }
         // Plan E Task 9 (round-2 inventory rows 12-15): plugin instance
         // rows. Same store-truth-wins-by-id discipline as
@@ -1409,10 +1516,31 @@ mod tests {
 
     #[test]
     fn persist_effect_merge_ors_every_field() {
-        let mut a = PersistEffect { midi: true, project: false, plugins: false, automation: false };
-        let b = PersistEffect { midi: false, project: true, plugins: true, automation: false };
+        let mut a = PersistEffect {
+            midi: true,
+            project: false,
+            plugins: false,
+            automation: false,
+            modulation: false,
+        };
+        let b = PersistEffect {
+            midi: false,
+            project: true,
+            plugins: true,
+            automation: false,
+            modulation: true,
+        };
         a.merge(&b);
-        assert_eq!(a, PersistEffect { midi: true, project: true, plugins: true, automation: false });
+        assert_eq!(
+            a,
+            PersistEffect {
+                midi: true,
+                project: true,
+                plugins: true,
+                automation: false,
+                modulation: true,
+            }
+        );
         // merging default changes nothing
         let before = a.clone();
         a.merge(&PersistEffect::default());
@@ -2349,6 +2477,226 @@ mod tests {
         .unwrap();
         assert!(m.lock().automation.lanes.is_empty());
         assert!(c.effect.rebuild);
+    }
+
+    // ---- Track F Task 5: modulation document + ops + rebuild pin ----
+
+    fn test_curve(id: &str, points: Vec<AutomationPoint>) -> crate::modulation::Curve {
+        crate::modulation::Curve {
+            id: id.into(),
+            name: String::new(),
+            length_ticks: None,
+            points,
+        }
+    }
+
+    fn test_binding(id: &str, curve_id: &str) -> crate::modulation::Binding {
+        crate::modulation::Binding {
+            id: id.into(),
+            source: crate::modulation::Source::Curve { curve_id: curve_id.into() },
+            target: crate::modulation::TargetRef::TrackParam {
+                track_id: "t1".into(),
+                param: crate::modulation::TrackParam::Gain,
+            },
+            mode: crate::modulation::BindingMode::Multiply,
+            depth: 1.0,
+            range: crate::modulation::Range::default(),
+            domain: crate::modulation::Domain::Normalized,
+            range_snapshot: None,
+            enabled: true,
+        }
+    }
+
+    fn test_auto_clip(id: &str) -> crate::modulation::AutomationClip {
+        crate::modulation::AutomationClip {
+            id: id.into(),
+            track_id: "t-auto".into(),
+            curve_id: "cur-1".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 3840,
+            content_length_ticks: None,
+        }
+    }
+
+    #[test]
+    fn set_curve_upserts_and_its_inverse_restores_store_truth() {
+        // Mirrors automation_set_lane_inserts_and_inverse_deletes /
+        // automation_set_lane_overwrites_and_inverse_restores_previous.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let curve = test_curve("cur-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        let c = Session::transact(&m, TxMeta::user("set curve"), |tx| {
+            tx.apply(Op::ModulationSetCurve { key: "cur-1".into(), curve: Some(curve.clone()) })
+        })
+        .unwrap();
+        assert_eq!(m.lock().modulation.curves, vec![curve.clone()]);
+        assert!(c.effect.persist.modulation, "curve write must persist modulation");
+        assert!(c.effect.rebuild, "REBUILD PIN: modulation edits must rebuild");
+        match &c.inverses[0] {
+            Op::ModulationSetCurve { key, curve } => {
+                assert_eq!(key, "cur-1");
+                assert!(curve.is_none(), "curve didn't exist before — inverse deletes it");
+            }
+            other => panic!("expected ModulationSetCurve, got {other:?}"),
+        }
+
+        let replacement = test_curve("cur-1", vec![AutomationPoint { tick: 960, value: 0.5 }]);
+        let c2 = Session::transact(&m, TxMeta::user("overwrite curve"), |tx| {
+            tx.apply(Op::ModulationSetCurve {
+                key: "cur-1".into(),
+                curve: Some(replacement.clone()),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().modulation.curves, vec![replacement]);
+        match &c2.inverses[0] {
+            Op::ModulationSetCurve { key, curve: Some(prev) } => {
+                assert_eq!(key, "cur-1");
+                assert_eq!(prev.points, curve.points, "inverse carries PREVIOUS curve, store truth");
+            }
+            other => panic!("expected ModulationSetCurve{{..Some}}, got {other:?}"),
+        }
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c2.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            m.lock().modulation.curves,
+            vec![curve],
+            "undo restores the original curve exactly"
+        );
+    }
+
+    #[test]
+    fn set_binding_rejects_an_invalid_binding_without_mutating_the_session() {
+        // Atomicity — round-2 §4: a failed apply leaves the session untouched.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let mut bad = test_binding("bnd-1", "cur-1");
+        bad.depth = 4.0; // outside [-1, 1]
+        let r = Session::transact(&m, TxMeta::user("bad binding"), |tx| {
+            tx.apply(Op::ModulationSetBinding { key: "bnd-1".into(), binding: Some(bad) })
+        });
+        assert!(r.is_err(), "out-of-range depth must be rejected");
+        assert!(
+            m.lock().modulation.bindings.is_empty(),
+            "rejected write leaves the session untouched"
+        );
+
+        // A second invalid shape: empty curveId.
+        let mut empty_src = test_binding("bnd-1", "");
+        empty_src.source = crate::modulation::Source::Curve { curve_id: String::new() };
+        let r = Session::transact(&m, TxMeta::user("empty curve"), |tx| {
+            tx.apply(Op::ModulationSetBinding {
+                key: "bnd-1".into(),
+                binding: Some(empty_src),
+            })
+        });
+        assert!(r.is_err(), "empty curveId must be rejected");
+        assert!(m.lock().modulation.bindings.is_empty());
+    }
+
+    #[test]
+    fn every_modulation_op_sets_rebuild_on_its_effect() {
+        // Track D REBUILD PIN lesson: a document change nobody rebuilds on
+        // is inaudible. Every modulation mutation schedules a rebuild.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+
+        let c = Session::transact(&m, TxMeta::user("curve"), |tx| {
+            tx.apply(Op::ModulationSetCurve {
+                key: "cur-1".into(),
+                curve: Some(test_curve("cur-1", vec![AutomationPoint { tick: 0, value: 1.0 }])),
+            })
+        })
+        .unwrap();
+        assert!(c.effect.rebuild, "ModulationSetCurve must rebuild");
+        assert!(c.effect.persist.modulation);
+
+        let c = Session::transact(&m, TxMeta::user("binding"), |tx| {
+            tx.apply(Op::ModulationSetBinding {
+                key: "bnd-1".into(),
+                binding: Some(test_binding("bnd-1", "cur-1")),
+            })
+        })
+        .unwrap();
+        assert!(c.effect.rebuild, "ModulationSetBinding must rebuild");
+        assert!(c.effect.persist.modulation);
+
+        let c = Session::transact(&m, TxMeta::user("clip"), |tx| {
+            tx.apply(Op::AutomationClipSet {
+                key: "acl-1".into(),
+                clip: Some(test_auto_clip("acl-1")),
+            })
+        })
+        .unwrap();
+        assert!(c.effect.rebuild, "AutomationClipSet must rebuild");
+        assert!(c.effect.persist.modulation);
+
+        // Deletes rebuild too — the compiled ramps must come OFF the graph.
+        let c = Session::transact(&m, TxMeta::user("del curve"), |tx| {
+            tx.apply(Op::ModulationSetCurve { key: "cur-1".into(), curve: None })
+        })
+        .unwrap();
+        assert!(c.effect.rebuild, "deleting a curve must rebuild");
+    }
+
+    #[test]
+    fn deleting_a_curve_that_bindings_still_reference_leaves_those_bindings_inert_not_dangling() {
+        // A binding whose curve is gone contributes nothing and is
+        // reported, never panics — compile skips missing curves.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        Session::transact(&m, TxMeta::user("seed"), |tx| {
+            tx.apply(Op::ModulationSetCurve {
+                key: "cur-1".into(),
+                curve: Some(test_curve("cur-1", vec![AutomationPoint { tick: 0, value: 1.0 }])),
+            })?;
+            tx.apply(Op::ModulationSetBinding {
+                key: "bnd-1".into(),
+                binding: Some(test_binding("bnd-1", "cur-1")),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+
+        Session::transact(&m, TxMeta::user("delete curve"), |tx| {
+            tx.apply(Op::ModulationSetCurve { key: "cur-1".into(), curve: None })
+        })
+        .unwrap();
+
+        let s = m.lock();
+        assert!(s.modulation.curves.is_empty(), "curve removed");
+        assert_eq!(s.modulation.bindings.len(), 1, "binding stays — not cascade-deleted");
+        assert_eq!(s.modulation.bindings[0].id, "bnd-1");
+
+        // Compile must not panic; missing curve → inert (no gain ramp).
+        let map = crate::midi::TempoMap::new(
+            crate::midi::types::DEFAULT_PPQ,
+            vec![crate::midi::types::TempoEvent { tick: 0, bpm: 120.0 }],
+            48_000,
+        )
+        .unwrap();
+        let slot_of = |t: &str| (t == "t1").then_some(0usize);
+        let track_pan = |_: &str| None::<f32>;
+        let param_range = |_: &str, _: u32| None::<(f32, f32)>;
+        let param_value = |_: &str, _: u32| None::<f32>;
+        let instrument_of = |_: &str| None::<String>;
+        let content_placements = |_: &str| Vec::new();
+        let ctx = crate::modulation::CompileCtx {
+            n_slots: 1,
+            slot_of: &slot_of,
+            track_pan: &track_pan,
+            param_range: &param_range,
+            param_value: &param_value,
+            instrument_of: &instrument_of,
+            content_placements: &content_placements,
+        };
+        let out = crate::modulation::compile(&s.modulation, &map, &ctx);
+        assert!(
+            out.tracks[0].gain.is_none(),
+            "a binding whose curve is gone contributes nothing"
+        );
     }
 
     // ---- Plan E Task 9: plugin op kinds ----

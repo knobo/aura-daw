@@ -586,7 +586,15 @@ impl Committer {
     /// go through `commit_with_rebuild`) should pass the session's current
     /// epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
-        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot, plugin_snapshot) = {
+        let (
+            dir,
+            epoch_now,
+            midi_snapshot,
+            project_snapshot,
+            automation_snapshot,
+            modulation_snapshot,
+            plugin_snapshot,
+        ) = {
             let s = self.session.lock();
             (
                 s.store.project_dir.clone(),
@@ -605,6 +613,9 @@ impl Committer {
                 // below, after the guard drops — round-2 §4: no disk I/O
                 // under the session lock.
                 p.automation.then(|| s.automation.lanes.clone()),
+                // Track F: modulation doc snapshot. Still coexists with the
+                // lane path above; Task 7 retires the lane persist.
+                p.modulation.then(|| s.modulation.clone()),
                 // Plan E Task 9: plugin doc snapshot, taken under this SAME
                 // short lock — the actual write (state blobs + `plugins[]`
                 // dirty-ladder + clearing `dirty_state` for whichever ids
@@ -641,6 +652,11 @@ impl Committer {
         if let Some(lanes) = automation_snapshot {
             if let Err(e) = crate::plugins::automation::save_into_project(&dir, &lanes) {
                 log::warn!("automation persist failed: {e}");
+            }
+        }
+        if let Some(doc) = modulation_snapshot {
+            if let Err(e) = crate::modulation::persist::save_into_project(&dir, &doc) {
+                log::warn!("modulation persist failed: {e}");
             }
         }
         // `with_host_state: false` — a fresh host round-trip (state save)
@@ -853,6 +869,8 @@ enum CoalesceTarget {
     Object(op::ObjectRef),
     /// `AutomationLane::id` — lanes have a string id, not a struct key.
     AutomationLane(String),
+    /// Modulation graph keys (`Curve::id` / `Binding::id` / `AutomationClip::id`).
+    ModulationKey(String),
 }
 
 /// The coalescing key a gesture folds by: the op's discriminant + the
@@ -891,6 +909,21 @@ impl CoalesceKey {
             op::Op::AutomationSetLane { key, .. } => Some(Self {
                 kind: "automationSetLane",
                 target: CoalesceTarget::AutomationLane(key.clone()),
+                path: None,
+            }),
+            op::Op::ModulationSetCurve { key, .. } => Some(Self {
+                kind: "modulationSetCurve",
+                target: CoalesceTarget::ModulationKey(key.clone()),
+                path: None,
+            }),
+            op::Op::ModulationSetBinding { key, .. } => Some(Self {
+                kind: "modulationSetBinding",
+                target: CoalesceTarget::ModulationKey(key.clone()),
+                path: None,
+            }),
+            op::Op::AutomationClipSet { key, .. } => Some(Self {
+                kind: "automationClipSet",
+                target: CoalesceTarget::ModulationKey(key.clone()),
                 path: None,
             }),
             _ => None,
@@ -1401,6 +1434,11 @@ impl ControlPlane {
     /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
     pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {
         self.session.lock().automation.lanes.clone()
+    }
+
+    /// Track F: the modulation document. PURE session-lock read — no disk.
+    pub fn modulation_doc(&self) -> crate::modulation::ModulationDoc {
+        self.session.lock().modulation.clone()
     }
 
     /// Latest 60 Hz meter frame (None until the engine has pumped one).
@@ -2212,6 +2250,129 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Upsert (or delete when `curve` is `None`) one curve through the
+    /// transaction channel — Track F, same gesture-aware shape as
+    /// `set_automation_lane`.
+    pub fn set_curve(
+        &self,
+        key: String,
+        mut curve: Option<crate::modulation::Curve>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if let Some(c) = curve.as_mut() {
+            c.id = key.clone();
+            crate::modulation::normalize_curve(c)?;
+        }
+        let to_apply = curve;
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::ModulationSetCurve {
+                    key: key.clone(),
+                    curve: to_apply.clone(),
+                })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::ModulationSetCurve {
+                        key: key.clone(),
+                        curve: to_apply.clone(),
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete when `binding` is `None`) one binding through the
+    /// transaction channel — Track F.
+    pub fn set_binding(
+        &self,
+        key: String,
+        mut binding: Option<crate::modulation::Binding>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if let Some(b) = binding.as_mut() {
+            b.id = key.clone();
+            crate::modulation::validate_binding(b)?;
+        }
+        let to_apply = binding;
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::ModulationSetBinding {
+                    key: key.clone(),
+                    binding: to_apply.clone(),
+                })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::ModulationSetBinding {
+                        key: key.clone(),
+                        binding: to_apply.clone(),
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete when `clip` is `None`) one automation clip through
+    /// the transaction channel — Track F.
+    pub fn set_automation_clip(
+        &self,
+        key: String,
+        mut clip: Option<crate::modulation::AutomationClip>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if let Some(c) = clip.as_mut() {
+            c.id = key.clone();
+            if c.id.is_empty() {
+                return Err("automation clip id must not be empty".into());
+            }
+            if c.track_id.is_empty() {
+                return Err("automation clip trackId must not be empty".into());
+            }
+            if c.curve_id.is_empty() {
+                return Err("automation clip curveId must not be empty".into());
+            }
+        }
+        let to_apply = clip;
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::AutomationClipSet {
+                    key: key.clone(),
+                    clip: to_apply.clone(),
+                })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::AutomationClipSet {
+                        key: key.clone(),
+                        clip: to_apply.clone(),
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Move a clip on the timeline through the transaction channel
     /// (`Op::Set`, `PropPath::TimelineStartSamples`) — Plan E Task 3
     /// (round-2 inventory row 3). A thin `commit` wrapper mirroring
@@ -2884,6 +3045,12 @@ impl ControlPlane {
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
         }
+        // Track F: `session.modulation` is NOT loaded here yet. Prefer
+        // `modulation::persist::load_from_project` + (when still v3)
+        // `migrate_v3_lanes` with a live param-range callback from the
+        // plugin doc once Task 6/7 wire the engine to the modulation
+        // document. Clearing to default on create is enough for this task.
+        self.session.lock().modulation = crate::modulation::ModulationDoc::default();
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)(
             "project://changed",
@@ -2954,6 +3121,14 @@ impl ControlPlane {
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
         }
+        // Track F: do not leave the previous project's modulation graph in
+        // memory across a document swap. Full load via
+        // `modulation::persist::load_from_project` (and
+        // `migrate_v3_lanes` with a live param-range callback when the file
+        // is still v3) is deferred — awkward here because the plugin param
+        // table is only available after host adopt, and Task 7 owns the
+        // lane→modulation handoff that makes open complete.
+        self.session.lock().modulation = crate::modulation::ModulationDoc::default();
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
         Ok(project)
