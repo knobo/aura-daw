@@ -19,6 +19,21 @@
 //! while a 96kHz interface is attached must produce the exact same anchor
 //! math as one made at 44.1kHz. Task 9's paste MUST resolve this payload's
 //! ticks/samples through the same nominal map, not the engine rate.
+//!
+//! TRUST BOUNDARY (fix round 1). A payload arrives as text off the OS
+//! clipboard, so nothing in it is a guarantee — not note ids, not paths, not
+//! ppq, not sample windows. `clips_copy` producing well-formed payloads is a
+//! property of AURA's own copy, never of the input `clips_paste` receives.
+//! Everything the payload asserts is re-derived or refused in Phase 2,
+//! BEFORE the transaction opens, so no payload can be fatal to the rest of
+//! a paste.
+//!
+//! Known limitations, deliberate:
+//! - A file copied into the project by Phase 2 is NOT removed when the paste
+//!   is undone (and, if the commit itself fails, is orphaned with no clip
+//!   referencing it). Undo restores the document, not the asset directory.
+//! - Paste-to-new-tracks can produce two rows named `"<name> copy"` when one
+//!   source row is split by kind. Unreachable from an AURA-produced payload.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -303,21 +318,36 @@ enum ResolvedAsset {
     Copied(String),
 }
 
-impl ResolvedAsset {
-    fn into_relative_path(self) -> String {
-        match self {
-            ResolvedAsset::InPlace(p) | ResolvedAsset::Copied(p) => p,
-        }
-    }
-}
-
 /// One clip that survived validation, paired with whatever Phase 2 had to
 /// settle for it. Owns its `ClipboardClip` (moved out of the payload) so the
 /// transaction closure never indexes back into a parallel vec.
 struct Planned {
     clip: ClipboardClip,
     /// `Some` for audio clips only — MIDI travels by value, it has no asset.
-    asset: Option<ResolvedAsset>,
+    /// The project-relative path the clip will reference, and the `SourceId`
+    /// it will carry (see [`ControlPlane::clips_paste`]'s Phase 2 for why the
+    /// id is decided out here rather than left to `assign_source_ids`).
+    audio: Option<(String, crate::ids::SourceId)>,
+}
+
+/// Ticks are ppq-RELATIVE, and ppq is a per-project value read from
+/// `project.json` (`midi/persist.rs:320`, `unwrap_or(DEFAULT_PPQ)`) — so a
+/// payload off the OS clipboard is not structurally at this session's
+/// resolution. Rescale rather than refuse: ppq is a resolution unit, not a
+/// musical difference, exactly as the nominal-rate map converts samples
+/// without refusing a foreign device rate. Exact whenever one ppq divides
+/// the other (the 480/960 case that actually occurs); otherwise rounded to
+/// the nearest tick, an error far below one sample.
+///
+/// `None` on overflow — the caller skips that clip rather than wrapping a
+/// note into the far future.
+fn rescale_ticks(value: u64, from_ppq: u32, to_ppq: u32) -> Option<u64> {
+    if from_ppq == to_ppq {
+        return Some(value);
+    }
+    let from = from_ppq as u128;
+    let scaled = (value as u128) * (to_ppq as u128) + from / 2;
+    u64::try_from(scaled / from).ok()
 }
 
 /// A negative placement is impossible on AURA's timeline (time starts at 0),
@@ -353,6 +383,16 @@ fn resolve_audio_asset(
     source_path: &str,
     source_abs_path: Option<&str>,
 ) -> Result<ResolvedAsset, String> {
+    // `source_path` arrives from the OS clipboard, so it is attacker-
+    // controlled. `Path::join` lets an ABSOLUTE path replace the base
+    // entirely and a `..` segment walks out of the project, and a clip
+    // carrying either gets an empty `SourceId` from the project's own L-1
+    // normalization — which the engine's H-3 rule then warn-skips, leaving a
+    // permanently SILENT clip that was never reported as skipped. Refuse it
+    // here, through the project's own normalizer so the two rules cannot
+    // drift apart.
+    let source_path = &crate::audio::project::normalize_source_path(source_path)
+        .map_err(|e| format!("unusable source path for {name}: {e}"))?;
     if let Some(dir) = project_dir {
         if dir.join(source_path).is_file() {
             return Ok(ResolvedAsset::InPlace(source_path.to_string()));
@@ -428,11 +468,16 @@ impl ControlPlane {
                 payload.schema_version
             ));
         }
+        // Every tick in the payload is relative to this; 0 is not a
+        // resolution, it is a divide-by-zero waiting in `rescale_ticks`.
+        if payload.ppq == 0 {
+            return Err("clipboard payload declares ppq 0".to_string());
+        }
 
         // ---- Phase 2: resolve, outside the transaction -------------------
         // One short lock for everything the resolution needs; dropped before
         // any filesystem call (round-2 §4.4).
-        let (project_dir, tracks, ppq, tempo_events) = {
+        let (project_dir, tracks, ppq, mut known_sources) = {
             let session = self.session.lock();
             let tracks: Vec<(String, String)> = session
                 .store
@@ -440,21 +485,19 @@ impl ControlPlane {
                 .iter()
                 .map(|t| (t.id.to_string(), t.kind.clone()))
                 .collect();
-            (
-                session.store.project_dir.clone(),
-                tracks,
-                session.midi.ppq,
-                session.midi.tempo_events.clone(),
-            )
+            // Every (path -> SourceId) this project already knows. The
+            // engine's decode cache is keyed by SOURCE, not by clip, so an
+            // in-place paste that minted a second id for the same file would
+            // decode and cache that wav twice.
+            let known_sources: Vec<(String, crate::ids::SourceId)> = session
+                .store
+                .clips
+                .iter()
+                .filter(|c| !c.source_id.as_str().is_empty())
+                .map(|c| (c.source_path.clone(), c.source_id.clone()))
+                .collect();
+            (session.store.project_dir.clone(), tracks, session.midi.ppq, known_sources)
         };
-        // NOMINAL rate, never the live device rate — this module's WIRE
-        // DOMAIN note: the payload's tick/sample numbers were built against
-        // the 48kHz nominal map, so the paste must resolve them through the
-        // same one or a copy made on one interface would land elsewhere on
-        // another.
-        let tempo = TempoMap::new(ppq, tempo_events, NOMINAL_SAMPLE_RATE)
-            .map_err(|e| format!("clips_paste: tempo map: {e}"))?;
-        let at_ticks = i64::try_from(tempo.samples_to_tick(at_samples)).unwrap_or(i64::MAX);
         let at_samples_i = i64::try_from(at_samples).unwrap_or(i64::MAX);
 
         let payload_dir = payload.source_project_dir;
@@ -487,10 +530,26 @@ impl ControlPlane {
                     Some(_) => {}
                 }
             }
+            let mut clip = clip;
             // Asset resolution (audio only) — the one place this method
             // touches the filesystem, and it is outside the transaction.
-            let asset = match &clip {
-                ClipboardClip::Audio { name, source_path, source_abs_path, .. } => {
+            let audio = match &mut clip {
+                ClipboardClip::Audio {
+                    name, source_path, source_abs_path, offset_samples, length_samples, ..
+                } => {
+                    // `offset_samples` reaches the RT thread as
+                    // `clip.offset + rel` (`audio/mixer.rs:60`): a payload
+                    // claiming an absurd window is a debug panic ON THE AUDIO
+                    // THREAD and a wrap in release. Refused at the boundary.
+                    if offset_samples.checked_add(*length_samples).is_none() {
+                        skipped.push(SkippedClip {
+                            name: name.clone(),
+                            reason: format!(
+                                "sample window out of range: offset {offset_samples} + length {length_samples}"
+                            ),
+                        });
+                        continue;
+                    }
                     match resolve_audio_asset(
                         project_dir.as_deref(),
                         payload_dir.as_deref(),
@@ -498,16 +557,97 @@ impl ControlPlane {
                         source_path,
                         source_abs_path.as_deref(),
                     ) {
-                        Ok(asset) => Some(asset),
+                        // In place: inherit the identity this project already
+                        // uses for that file (including one an earlier clip
+                        // in THIS paste just established), so the wav is
+                        // decoded once. A file copied in is a genuinely new
+                        // asset and gets its own id. Either way the id is
+                        // non-empty, so `assign_source_ids` — a legacy-LOAD
+                        // migration that mints UUIDv5-of-path, not the
+                        // identity live clips carry — is never involved.
+                        Ok(ResolvedAsset::InPlace(path)) => {
+                            let id = known_sources
+                                .iter()
+                                .find(|(p, _)| p == &path)
+                                .map(|(_, id)| id.clone())
+                                .unwrap_or_else(|| {
+                                    let id = crate::ids::SourceId::mint();
+                                    known_sources.push((path.clone(), id.clone()));
+                                    id
+                                });
+                            Some((path, id))
+                        }
+                        Ok(ResolvedAsset::Copied(path)) => {
+                            Some((path, crate::ids::SourceId::mint()))
+                        }
                         Err(reason) => {
                             skipped.push(SkippedClip { name: name.clone(), reason });
                             continue;
                         }
                     }
                 }
-                ClipboardClip::Midi { .. } => None,
+                ClipboardClip::Midi {
+                    name,
+                    offset_from_anchor_ticks,
+                    length_ticks,
+                    content_length_ticks,
+                    notes,
+                    ..
+                } => {
+                    // PASTE IS THE TRUST BOUNDARY. `clips_copy` zeroes every
+                    // note id, but a payload off the OS clipboard need not
+                    // have come from `clips_copy` at all: duplicate ids would
+                    // make `ensure_note_ids` FAIL the whole transaction (one
+                    // bad clip taking every good one with it), and kept ids
+                    // with a fresh watermark would let a later mint collide
+                    // with a live note (ADR 0001). Re-mint unconditionally.
+                    for n in notes.iter_mut() {
+                        n.note_id = crate::ids::NoteId(0);
+                    }
+                    if payload.ppq != ppq {
+                        let rescaled = (|| {
+                            let sign = offset_from_anchor_ticks.signum();
+                            let off = rescale_ticks(
+                                offset_from_anchor_ticks.unsigned_abs(),
+                                payload.ppq,
+                                ppq,
+                            )?;
+                            *offset_from_anchor_ticks = i64::try_from(off).ok()? * sign;
+                            *length_ticks = rescale_ticks(*length_ticks, payload.ppq, ppq)?;
+                            if let Some(c) = content_length_ticks {
+                                *c = rescale_ticks(*c, payload.ppq, ppq)?;
+                            }
+                            for n in notes.iter_mut() {
+                                n.tick = u32::try_from(rescale_ticks(
+                                    n.tick as u64,
+                                    payload.ppq,
+                                    ppq,
+                                )?)
+                                .ok()?;
+                                n.length_ticks = u32::try_from(rescale_ticks(
+                                    n.length_ticks as u64,
+                                    payload.ppq,
+                                    ppq,
+                                )?)
+                                .ok()?;
+                            }
+                            Some(())
+                        })();
+                        if rescaled.is_none() {
+                            skipped.push(SkippedClip {
+                                name: name.clone(),
+                                reason: format!(
+                                    "ticks do not fit this project's resolution (payload ppq {}, project ppq {ppq})",
+                                    payload.ppq
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                    None
+                }
             };
-            planned.push(Planned { clip, asset });
+            planned.push(Planned { clip, audio });
         }
 
         // Paste-to-new-tracks: one row per DISTINCT source track, in
@@ -545,13 +685,32 @@ impl ControlPlane {
 
         // ---- Phase 3: ONE transaction ------------------------------------
         self.commit(TxMeta::user("paste clips"), |tx| {
+            // Derived INSIDE the transaction: tempo events are user-editable
+            // at runtime, so a map built from the Phase-2 snapshot could place
+            // MIDI clips by a tempo the document no longer has. (`ppq` above
+            // is safe to read outside: it changes only when a project is
+            // LOADED, which replaces the whole session.)
+            //
+            // NOMINAL rate, never the live device rate — this module's WIRE
+            // DOMAIN note: the payload's tick/sample numbers were built
+            // against the 48kHz nominal map, so the paste must resolve them
+            // through the same one or a copy made on one interface would land
+            // elsewhere on another.
+            let tempo = TempoMap::new(
+                tx.midi().ppq,
+                tx.midi().tempo_events.clone(),
+                NOMINAL_SAMPLE_RATE,
+            )
+            .map_err(|e| format!("clips_paste: tempo map: {e}"))?;
+            let at_ticks = i64::try_from(tempo.samples_to_tick(at_samples)).unwrap_or(i64::MAX);
+
             let mut created: Vec<(String, bool, crate::ids::TrackId)> = Vec::new();
             for (src, midi, name, kind) in groups {
                 let track = ops::add_track_tx(tx, Some(name), Some(kind))?;
                 created.push((src, midi, track.id.clone()));
                 result.created_tracks.push(track);
             }
-            for Planned { clip, asset } in planned {
+            for Planned { clip, audio } in planned {
                 let target = if to_new_tracks {
                     match created
                         .iter()
@@ -611,17 +770,18 @@ impl ControlPlane {
                         fade_out_samples,
                         ..
                     } => {
-                        let mut new_clip = crate::audio::types::Clip {
+                        let new_clip = crate::audio::types::Clip {
                             id: crate::ids::ClipId::mint(),
                             track_id: target,
                             name,
-                            // Phase 2 guarantees an asset for every audio
-                            // clip that got this far; the fallback keeps the
-                            // closure panic-free either way.
-                            source_path: asset
-                                .map(ResolvedAsset::into_relative_path)
-                                .unwrap_or_default(),
-                            source_id: crate::ids::SourceId::default(),
+                            // Phase 2 settled both, for every audio clip that
+                            // got this far; the fallback keeps the closure
+                            // panic-free either way.
+                            source_path: audio.as_ref().map(|(p, _)| p.clone()).unwrap_or_default(),
+                            source_id: audio
+                                .as_ref()
+                                .map(|(_, id)| id.clone())
+                                .unwrap_or_else(crate::ids::SourceId::mint),
                             source_channels,
                             source_sample_rate,
                             source_length_samples,
@@ -638,13 +798,6 @@ impl ControlPlane {
                             content_id: crate::ids::ContentId::mint(),
                             lane_id,
                         };
-                        // The SourceId is the deterministic function of the
-                        // path the loader uses, so a same-project paste
-                        // shares the original's source identity (and its
-                        // decode cache) while an imported copy gets its own.
-                        crate::audio::project::assign_source_ids(std::slice::from_mut(
-                            &mut new_clip,
-                        ));
                         let index = tx.store().clips.len();
                         tx.apply(Op::ClipAdd { clip: new_clip.clone(), index })?;
                         result.audio_clips.push(new_clip);
@@ -666,6 +819,10 @@ impl ControlPlane {
                             ),
                             length_ticks,
                             notes,
+                            // Phase 2 zeroed every incoming id, so
+                            // `ensure_note_ids` below mints the whole clip
+                            // from 1 and this watermark is correct by
+                            // construction.
                             next_note_id: 1,
                             content_id: crate::ids::ContentId::mint(),
                             lane_id,
@@ -731,6 +888,10 @@ mod tests {
     fn plane() -> crate::control::ControlPlane {
         let (cp, _rx, _events) =
             crate::control::tests::test_plane_with_tracks(&["t-1", "t-2", "t-3"]);
+        // Fixture setup writes the kind straight into the store rather than
+        // through an op. That is fine HERE (it happens before any history
+        // exists, so nothing can undo past it) but it is not a pattern to
+        // copy into production code, where every field change is an op.
         cp.session().lock().store.tracks[1].kind = "midi".into();
         cp
     }
@@ -741,7 +902,7 @@ mod tests {
         cp.commit(TxMeta::user("seed"), |tx| {
             let mut a = crate::audio::types::testutil::test_clip("a-1", "t-1");
             a.timeline_start_samples = 96_000;
-            let mut b = crate::audio::types::testutil::test_clip("a-2", "t-2");
+            let mut b = crate::audio::types::testutil::test_clip("a-2", "t-3");
             b.timeline_start_samples = 48_000;
             tx.apply(Op::ClipAdd { clip: a, index: 0 })?;
             tx.apply(Op::ClipAdd { clip: b, index: 1 })
@@ -943,7 +1104,7 @@ mod tests {
         })
         .unwrap();
         let mid = cp.session().lock().midi.clips[0].id.to_string();
-        let payload = cp.clips_copy(vec!["a-1".into()], vec![mid]).unwrap();
+        let payload = cp.clips_copy(vec!["a-1".into()], vec![mid.clone()]).unwrap();
         let (undo_before, _) = cp.history_depths();
 
         let res = cp.clips_paste(paste_req(payload, 96_000, false)).unwrap();
@@ -963,8 +1124,15 @@ mod tests {
 
         cp.undo().unwrap();
         let s = cp.session().lock();
-        assert_eq!(s.store.clips.len(), 1, "one Ctrl+Z removed the whole paste");
-        assert_eq!(s.midi.clips.len(), 1);
+        assert_eq!(
+            s.store.clips.iter().map(|c| c.id.to_string()).collect::<Vec<_>>(),
+            vec!["a-1".to_string()],
+            "one Ctrl+Z removed the whole paste and left the ORIGINAL row, not merely one row"
+        );
+        assert_eq!(
+            s.midi.clips.iter().map(|c| c.id.to_string()).collect::<Vec<_>>(),
+            vec![mid]
+        );
     }
 
     /// Requirement 2, verbatim: every clip lands at the playhead WITH its
@@ -1057,22 +1225,29 @@ mod tests {
         let payload = cp
             .clips_copy(vec!["a-1".into(), "a-2".into(), "a-3".into()], vec![])
             .unwrap();
-        let tracks_before = cp.session().lock().store.tracks.len();
+        let tracks_before: Vec<String> =
+            cp.session().lock().store.tracks.iter().map(|t| t.id.to_string()).collect();
         let (undo_before, _) = cp.history_depths();
 
         let res = cp.clips_paste(paste_req(payload, 0, true)).unwrap();
         assert_eq!(res.created_tracks.len(), 2, "two distinct source tracks -> two new tracks");
-        assert_eq!(cp.session().lock().store.tracks.len(), tracks_before + 2);
+        assert_eq!(cp.session().lock().store.tracks.len(), tracks_before.len() + 2);
         // the two clips from t-1 share ONE new track
         let new_ids: Vec<String> = res.created_tracks.iter().map(|t| t.id.to_string()).collect();
         assert!(res.audio_clips.iter().all(|c| new_ids.contains(&c.track_id.to_string())));
         assert_eq!(cp.history_depths().0, undo_before + 1, "still ONE undo step");
 
         cp.undo().unwrap();
+        let s = cp.session().lock();
         assert_eq!(
-            cp.session().lock().store.tracks.len(),
+            s.store.tracks.iter().map(|t| t.id.to_string()).collect::<Vec<_>>(),
             tracks_before,
-            "undo removes the tracks the paste created, not just its clips"
+            "undo removes the tracks the paste created — the ORIGINAL rows survive, by identity"
+        );
+        assert_eq!(
+            s.store.clips.iter().map(|c| c.id.to_string()).collect::<Vec<_>>(),
+            vec!["a-1".to_string(), "a-2".into(), "a-3".into()],
+            "and every original clip is still there"
         );
     }
 
@@ -1208,6 +1383,377 @@ mod tests {
         assert_eq!(kinds, vec!["audio", "midi"]);
         assert_eq!(res.audio_clips[0].track_id, res.created_tracks[0].id);
         assert_eq!(res.midi_clips[0].track_id, res.created_tracks[1].id);
+    }
+
+    /// A session with a project dir on disk, plus the seeded audio clip's
+    /// own `SourceId` — what the `InPlace` reuse rule has to match.
+    fn plane_with_project(dir: &std::path::Path) -> crate::control::ControlPlane {
+        let cp = plane();
+        cp.session().lock().store.project_dir = Some(dir.to_path_buf());
+        cp
+    }
+
+    fn hand_payload(ppq: u32, clips: Vec<ClipboardClip>) -> AuraClipsPayload {
+        AuraClipsPayload {
+            mime: AURA_CLIPS_MIME.into(),
+            schema_version: AURA_CLIPS_SCHEMA_VERSION,
+            anchor_samples: 0,
+            anchor_ticks: 0,
+            ppq,
+            source_project_dir: None,
+            clips,
+        }
+    }
+
+    fn hand_audio(name: &str, track: &str, source_path: &str) -> ClipboardClip {
+        ClipboardClip::Audio {
+            name: name.into(),
+            source_track_id: track.into(),
+            source_track_name: track.into(),
+            offset_from_anchor_samples: 0,
+            length_samples: 1_000,
+            source_path: source_path.into(),
+            source_abs_path: None,
+            source_channels: 2,
+            source_sample_rate: 48_000,
+            source_length_samples: 1_000,
+            offset_samples: 0,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+        }
+    }
+
+    fn note(tick: u32, length_ticks: u32, id: u32) -> crate::midi::types::MidiNote {
+        crate::midi::types::MidiNote {
+            tick,
+            length_ticks,
+            key: 60,
+            velocity: 100,
+            channel: 0,
+            note_id: crate::ids::NoteId(id),
+        }
+    }
+
+    /// C-1: a FOREIGN payload need not have gone through `clips_copy`, so it
+    /// can carry duplicate note ids. `ensure_note_ids` errors on those — and
+    /// it runs inside the commit closure, so one bad clip used to abort the
+    /// WHOLE paste, taking every good clip with it. Paste is the trust
+    /// boundary: incoming ids are re-minted, so no payload can be fatal.
+    #[test]
+    fn paste_of_a_payload_with_duplicate_note_ids_still_lands_every_clip() {
+        let cp = plane();
+        let payload = hand_payload(
+            960,
+            vec![
+                ClipboardClip::Midi {
+                    name: "bad".into(),
+                    source_track_id: "t-2".into(),
+                    source_track_name: "T2".into(),
+                    offset_from_anchor_ticks: 0,
+                    length_ticks: 960,
+                    content_length_ticks: None,
+                    notes: vec![note(0, 480, 5), note(480, 480, 5)],
+                },
+                ClipboardClip::Midi {
+                    name: "good".into(),
+                    source_track_id: "t-2".into(),
+                    source_track_name: "T2".into(),
+                    offset_from_anchor_ticks: 0,
+                    length_ticks: 960,
+                    content_length_ticks: None,
+                    notes: vec![note(0, 480, 0)],
+                },
+            ],
+        );
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(res.midi_clips.len(), 2, "the good clip is not taken down with the bad one");
+        let bad = &res.midi_clips[0];
+        let ids: Vec<u32> = bad.notes.iter().map(|n| n.note_id.0).collect();
+        assert_eq!(ids, vec![1, 2], "both duplicates were re-minted, distinct");
+        assert_eq!(bad.next_note_id, 3);
+    }
+
+    /// C-2: incoming note ids are never trusted into the document. Keeping
+    /// them while hardcoding `next_note_id: 1` put the watermark BEHIND live
+    /// ids, so `assign_incoming_note_ids` would later mint a duplicate of a
+    /// note already in the same clip (ADR 0001).
+    #[test]
+    fn paste_rebases_incoming_note_ids_and_the_watermark() {
+        let cp = plane();
+        let payload = hand_payload(
+            960,
+            vec![ClipboardClip::Midi {
+                name: "kept-ids".into(),
+                source_track_id: "t-2".into(),
+                source_track_name: "T2".into(),
+                offset_from_anchor_ticks: 0,
+                length_ticks: 960,
+                content_length_ticks: None,
+                notes: vec![note(0, 240, 7), note(240, 240, 9)],
+            }],
+        );
+
+        let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
+        let ids: Vec<u32> = pasted.notes.iter().map(|n| n.note_id.0).collect();
+        assert_eq!(ids, vec![1, 2], "the payload's 7 and 9 did not enter the document");
+        assert!(
+            pasted.next_note_id > ids.iter().copied().max().unwrap(),
+            "the watermark is ahead of every live id, so the next mint cannot collide"
+        );
+    }
+
+    /// C-3: `source_path` is attacker-controlled. An absolute path makes
+    /// `Path::join` discard the project base entirely, and a `..` segment
+    /// walks out of it — both are exactly what `normalize_source_path`
+    /// (L-1) refuses, and a clip carrying one gets an empty `SourceId` and
+    /// renders SILENT forever under the engine's H-3 warn-skip. A silent
+    /// clip with no skip report is the worst possible outcome.
+    #[test]
+    fn resolve_audio_asset_refuses_a_source_path_that_escapes_the_project() {
+        let root = std::env::temp_dir().join(format!("aura-paste-esc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        for bad in ["../secret.wav", "/etc/passwd", "audio/../../secret.wav", "C:\\secret.wav"] {
+            let err = resolve_audio_asset(Some(&root), None, "s", bad, None).unwrap_err();
+            assert!(err.contains("source path"), "{bad}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn paste_skips_a_clip_whose_source_path_escapes_the_project() {
+        let cp = plane();
+        let payload = hand_payload(960, vec![hand_audio("evil", "t-1", "../../secret.wav")]);
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert!(res.audio_clips.is_empty());
+        assert_eq!(cp.session().lock().store.clips.len(), 0, "nothing reached project.json");
+        assert_eq!(res.skipped.len(), 1);
+        assert!(res.skipped[0].reason.contains("source path"), "{:?}", res.skipped[0]);
+    }
+
+    /// I-1: the same file must not be decoded and cached twice. An in-place
+    /// paste inherits the existing clip's `SourceId` (the engine's decode
+    /// cache is keyed by source, not by clip), while a file copied in is a
+    /// genuinely new asset and gets its own.
+    #[test]
+    fn paste_in_place_reuses_the_existing_source_id_and_a_copy_gets_a_fresh_one() {
+        let root = std::env::temp_dir().join(format!("aura-paste-srcid-{}", uuid::Uuid::new_v4()));
+        let proj = root.join("B.aura");
+        std::fs::create_dir_all(proj.join("audio")).unwrap();
+        std::fs::write(proj.join("audio").join("take.wav"), b"RIFF").unwrap();
+        let foreign = root.join("A.aura").join("audio");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("other.wav"), b"RIFF2").unwrap();
+
+        let cp = plane_with_project(&proj);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            let mut c = crate::audio::types::testutil::test_clip("a-1", "t-1");
+            c.source_path = "audio/take.wav".into();
+            c.source_id = crate::ids::SourceId("the-original-source".into());
+            tx.apply(Op::ClipAdd { clip: c, index: 0 })
+        })
+        .unwrap();
+
+        let in_place = cp.clips_copy(vec!["a-1".into()], vec![]).unwrap();
+        let res = cp.clips_paste(paste_req(in_place, 0, false)).unwrap();
+        assert_eq!(
+            res.audio_clips[0].source_id.as_str(),
+            "the-original-source",
+            "an in-place paste shares the source identity, so the wav is decoded once"
+        );
+
+        let mut foreign_payload =
+            hand_payload(960, vec![hand_audio("other", "t-1", "audio/other.wav")]);
+        if let ClipboardClip::Audio { source_abs_path, .. } = &mut foreign_payload.clips[0] {
+            *source_abs_path = Some(foreign.join("other.wav").to_string_lossy().into_owned());
+        }
+        let res2 = cp.clips_paste(paste_req(foreign_payload, 0, false)).unwrap();
+        assert!(res2.skipped.is_empty(), "{:?}", res2.skipped);
+        let copied = &res2.audio_clips[0];
+        assert!(!copied.source_id.as_str().is_empty(), "never an empty SourceId (H-3 silence)");
+        assert_ne!(copied.source_id.as_str(), "the-original-source", "a new file is a new asset");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Two clips in ONE paste referencing the same file share the id the
+    /// first of them established — the dedup must not depend on a matching
+    /// clip already being in the store.
+    #[test]
+    fn paste_gives_two_clips_of_the_same_file_one_source_id() {
+        let cp = plane();
+        let payload = hand_payload(
+            960,
+            vec![hand_audio("one", "t-1", "audio/x.wav"), hand_audio("two", "t-1", "audio/x.wav")],
+        );
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(res.audio_clips.len(), 2);
+        assert_eq!(
+            res.audio_clips[0].source_id, res.audio_clips[1].source_id,
+            "one file, one source identity — the engine decodes it once"
+        );
+        assert!(!res.audio_clips[0].source_id.as_str().is_empty());
+    }
+
+    /// I-2: ticks are ppq-RELATIVE, and ppq comes from `project.json`
+    /// (`midi/persist.rs:320`), so it is not structurally 960. A payload
+    /// from a ppq-480 project is rescaled into this session's resolution
+    /// rather than landing at half its intended offsets, silently.
+    #[test]
+    fn paste_rescales_ticks_from_a_payload_with_a_different_ppq() {
+        let cp = plane();
+        assert_eq!(cp.session().lock().midi.ppq, 960, "fixture precondition");
+        let payload = hand_payload(
+            480,
+            vec![ClipboardClip::Midi {
+                name: "half-res".into(),
+                source_track_id: "t-2".into(),
+                source_track_name: "T2".into(),
+                offset_from_anchor_ticks: 480,
+                length_ticks: 480,
+                content_length_ticks: Some(240),
+                notes: vec![note(120, 240, 0)],
+            }],
+        );
+
+        let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
+        assert_eq!(pasted.timeline_start_ticks, 960, "one beat at ppq 480 is one beat at 960");
+        assert_eq!(pasted.length_ticks, 960);
+        assert_eq!(pasted.content_length_ticks, Some(480));
+        assert_eq!(pasted.notes[0].tick, 240);
+        assert_eq!(pasted.notes[0].length_ticks, 480);
+    }
+
+    #[test]
+    fn paste_rejects_a_payload_with_a_zero_ppq() {
+        let cp = plane();
+        let err = cp.clips_paste(paste_req(hand_payload(0, vec![]), 0, false)).unwrap_err();
+        assert!(err.contains("ppq"), "{err}");
+    }
+
+    /// I-4: the Phase-2 kind check is the one that keeps a fully-rejected
+    /// paste from opening a transaction at all. Phase 3 would catch the same
+    /// clips, but only after the commit opened and bumped `rev`.
+    #[test]
+    fn paste_where_every_clip_is_kind_rejected_opens_no_transaction() {
+        let cp = plane();
+        let rev_before = cp.session().lock().rev;
+        let (undo_before, _) = cp.history_depths();
+        let payload = hand_payload(960, vec![hand_audio("wave", "t-2", "audio/x.wav")]);
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert_eq!(res.skipped.len(), 1);
+        assert_eq!(cp.session().lock().rev, rev_before, "no transaction opened, so no rev bump");
+        assert_eq!(cp.history_depths().0, undo_before);
+    }
+
+    /// M-4: `offset_samples` is attacker-controlled and reaches the RT
+    /// thread as `clip.offset + rel` (`audio/mixer.rs:60`) — a debug panic
+    /// ON THE AUDIO THREAD, a wrap in release. Refused at the boundary.
+    #[test]
+    fn paste_skips_an_audio_clip_whose_sample_window_would_overflow() {
+        let cp = plane();
+        let mut payload = hand_payload(960, vec![hand_audio("huge", "t-1", "audio/x.wav")]);
+        if let ClipboardClip::Audio { offset_samples, length_samples, .. } = &mut payload.clips[0] {
+            *offset_samples = u64::MAX;
+            *length_samples = 10;
+        }
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert!(res.audio_clips.is_empty());
+        assert_eq!(res.skipped.len(), 1);
+        assert!(res.skipped[0].reason.contains("sample window"), "{:?}", res.skipped[0]);
+    }
+
+    /// I-3: undo of a PARTIAL paste (some clips skipped) restores exactly
+    /// the original rows — by identity, not by count.
+    #[test]
+    fn undo_of_a_partial_paste_restores_exactly_the_original_rows() {
+        let cp = plane();
+        cp.commit(TxMeta::user("seed"), |tx| {
+            tx.apply(Op::ClipAdd {
+                clip: crate::audio::types::testutil::test_clip("a-1", "t-1"),
+                index: 0,
+            })?;
+            tx.apply(Op::MidiClipAdd {
+                clip: crate::control::tests::dummy_midi_clip("t-2"),
+                index: 0,
+            })
+        })
+        .unwrap();
+        let before: (Vec<String>, Vec<String>) = {
+            let s = cp.session().lock();
+            (
+                s.store.clips.iter().map(|c| c.id.to_string()).collect(),
+                s.midi.clips.iter().map(|c| c.id.to_string()).collect(),
+            )
+        };
+        let mut payload = hand_payload(
+            960,
+            vec![
+                hand_audio("ok", "t-1", "audio/x.wav"),
+                hand_audio("doomed", "t-1", "../escape.wav"),
+            ],
+        );
+        payload.clips.push(ClipboardClip::Midi {
+            name: "notes".into(),
+            source_track_id: "t-2".into(),
+            source_track_name: "T2".into(),
+            offset_from_anchor_ticks: 0,
+            length_ticks: 960,
+            content_length_ticks: None,
+            notes: vec![],
+        });
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert_eq!(res.skipped.len(), 1, "{:?}", res.skipped);
+        assert_eq!(res.audio_clips.len(), 1);
+        assert_eq!(res.midi_clips.len(), 1);
+
+        cp.undo().unwrap();
+        let s = cp.session().lock();
+        assert_eq!(
+            (
+                s.store.clips.iter().map(|c| c.id.to_string()).collect::<Vec<_>>(),
+                s.midi.clips.iter().map(|c| c.id.to_string()).collect::<Vec<_>>()
+            ),
+            before,
+            "one Ctrl+Z restored the exact rows that were there, not merely the same count"
+        );
+    }
+
+    /// I-3: N clips landing on ONE track still undo as one step, and the
+    /// surviving rows are the originals.
+    #[test]
+    fn undo_of_many_clips_on_one_track_restores_the_originals_by_identity() {
+        let cp = plane();
+        cp.commit(TxMeta::user("seed"), |tx| {
+            tx.apply(Op::ClipAdd {
+                clip: crate::audio::types::testutil::test_clip("a-1", "t-1"),
+                index: 0,
+            })?;
+            tx.apply(Op::ClipAdd {
+                clip: crate::audio::types::testutil::test_clip("a-2", "t-1"),
+                index: 1,
+            })
+        })
+        .unwrap();
+        let payload = cp.clips_copy(vec!["a-1".into(), "a-2".into()], vec![]).unwrap();
+        let (undo_before, _) = cp.history_depths();
+
+        let res = cp.clips_paste(paste_req(payload, 96_000, false)).unwrap();
+        assert_eq!(res.audio_clips.len(), 2);
+        assert_eq!(cp.history_depths().0, undo_before + 1);
+
+        cp.undo().unwrap();
+        let ids: Vec<String> =
+            cp.session().lock().store.clips.iter().map(|c| c.id.to_string()).collect();
+        assert_eq!(ids, vec!["a-1".to_string(), "a-2".into()]);
     }
 
     /// A payload with an audio clip this machine cannot resolve is skipped;
@@ -1515,7 +2061,7 @@ mod tests {
         // Step 2: not in THIS project, but the absolute path resolves.
         let copied = resolve_audio_asset(
             Some(&dst_proj),
-            Some(&src_proj.to_string_lossy().into_owned()),
+            Some(&src_proj.to_string_lossy()),
             "take",
             "audio/take.wav",
             Some(&abs),
