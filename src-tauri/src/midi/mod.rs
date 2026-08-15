@@ -599,6 +599,38 @@ pub fn midi_rename_clip(
     midi_rename_clip_core(&control, clip_id, name)
 }
 
+/// Core of `midi_remove_clip`: ONE `Op::MidiClipRemove`, the structural
+/// analogue of `midi_rename_clip_core`'s `Op::Set`. `apply_raw`'s
+/// `Op::MidiClipRemove` arm finds the clip by id (store truth wins) and
+/// computes the inverse `Op::MidiClipAdd`, so undo restores the clip
+/// byte-identically — same free-inverse shape the audio-side `remove_clip`
+/// gets from `Op::ClipRemove`.
+pub(crate) fn midi_remove_clip_core(
+    control: &ControlPlane,
+    clip_id: crate::ids::ClipId,
+) -> Result<(), String> {
+    control.commit(TxMeta::user("remove midi clip"), |tx| {
+        let clip = tx
+            .midi()
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .cloned()
+            .ok_or_else(|| format!("unknown MIDI clip: {clip_id}"))?;
+        tx.apply(Op::MidiClipRemove { clip, index: 0 })
+    })?;
+    Ok(())
+}
+
+/// Remove a MIDI clip from its track.
+#[tauri::command]
+pub fn midi_remove_clip(
+    clip_id: crate::ids::ClipId,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    midi_remove_clip_core(&control, clip_id)
+}
+
 #[tauri::command]
 pub fn midi_get_clips(state: State<'_, MidiState>) -> Result<Vec<MidiClip>, String> {
     read_midi(&state, |s| Ok(s.clips.clone()))
@@ -1045,6 +1077,54 @@ mod tests {
         let snap = cp.project_state();
         let stored = snap.midi_clips.iter().find(|c| c.id == clip.id).unwrap();
         assert_eq!(stored.name, "Riff");
+    }
+
+    // ---- midi_remove_clip_core ----
+
+    #[test]
+    fn midi_remove_clip_core_removes_the_clip_with_one_event() {
+        let (cp, events, track_id) = plane_with_midi_track();
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+        let before = changed_count(&events);
+
+        midi_remove_clip_core(&cp, clip.id.clone()).unwrap();
+
+        let snap = cp.project_state();
+        assert!(snap.midi_clips.iter().all(|c| c.id != clip.id), "clip is gone from document truth");
+        assert_eq!(changed_count(&events) - before, 1, "exactly one project://changed per invoke");
+    }
+
+    #[test]
+    fn midi_remove_clip_core_rejects_unknown_clip() {
+        let (cp, _events, track_id) = plane_with_midi_track();
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+
+        assert!(midi_remove_clip_core(&cp, "no-such-clip".into()).is_err());
+
+        let snap = cp.project_state();
+        assert!(snap.midi_clips.iter().any(|c| c.id == clip.id), "an unknown-id removal leaves truth untouched");
+    }
+
+    /// The inverse (`Op::MidiClipAdd`) must restore the clip byte-identically
+    /// — same precedent as `remove_track_inverse_restores_row_and_clips_
+    /// byte_identically` (control/mod.rs).
+    #[test]
+    fn midi_remove_clip_inverse_restores_the_clip() {
+        let (cp, _events, track_id) = plane_with_midi_track();
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+
+        midi_remove_clip_core(&cp, clip.id.clone()).unwrap();
+
+        cp.commit(TxMeta::user("undo remove"), |tx| {
+            tx.apply(Op::MidiClipAdd { clip: clip.clone(), index: 0 })
+        })
+        .unwrap();
+
+        let snap = cp.project_state();
+        let restored = snap.midi_clips.iter().find(|c| c.id == clip.id).unwrap();
+        assert_eq!(restored.name, "Riff");
+        assert_eq!(restored.timeline_start_ticks, 0);
+        assert_eq!(restored.length_ticks, 960);
     }
 
     // ---- midi_set_clip_bounds_core ----

@@ -245,6 +245,14 @@ class ProjectStore {
   select(clipId: string | null) {
     this.selectedClipId = clipId;
   }
+
+  /** Remove a clip from its track — same optimistic-then-backend shape as
+   * `removeTrack`. */
+  async removeClip(clipId: string): Promise<void> {
+    this.clips = this.clips.filter((c) => c.id !== clipId);
+    if (this.selectedClipId === clipId) this.selectedClipId = null;
+    await backend.removeClip(clipId);
+  }
 }
 
 export const project = new ProjectStore();

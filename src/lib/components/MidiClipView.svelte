@@ -145,6 +145,12 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    // The × button (main's clip-delete) lives INSIDE the clip, so its
+    // pointerdown must not select, must not move the anchor and must not
+    // open a drag — otherwise deleting one clip silently collapses a
+    // multi-clip selection on the way out. Ahead of everything, as in
+    // ClipView.
+    if ((e.target as HTMLElement).closest("button")) return;
     const ref = { kind: "midi", id: clip.id } as const;
     const mode = selectionModeFor(e);
     if (!(mode === "replace" && clipSelection.has(ref))) {
@@ -225,6 +231,9 @@
       const dir = e.key === "ArrowLeft" ? -1 : 1;
       midi.moveClip(clip.id, clip.timelineStartTicks + dir * midi.ppq);
       void midi.commitBounds(clip.id);
+    } else if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      void midi.removeClip(clip.id);
     }
   }
 </script>
@@ -273,6 +282,17 @@
            onPointerDown) — this element only carries the cursor. -->
       <div class="namestrip" title="Double-click to rename"></div>
       <span class="tag mono" style:left="{visL + 4}px">▦ {clip.name}</span>
+    {/if}
+    {#if selected}
+      <button
+        class="del"
+        title="Delete clip"
+        aria-label="Delete clip {clip.name}"
+        onclick={(e) => {
+          e.stopPropagation();
+          void midi.removeClip(clip.id);
+        }}>×</button
+      >
     {/if}
     <span class="count silk">{clip.notes.length}n</span>
   </div>
@@ -390,5 +410,24 @@
     bottom: 3px;
     pointer-events: none;
     color: color-mix(in srgb, var(--clip-color) 60%, var(--text-faint));
+  }
+
+  .del {
+    position: absolute;
+    top: 1px;
+    right: 4px;
+    width: 15px;
+    height: 12px;
+    line-height: 1;
+    border: none;
+    background: rgba(5, 7, 13, 0.55);
+    color: var(--text-faint);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 3px;
+    z-index: 1;
+  }
+  .del:hover {
+    color: var(--red);
   }
 </style>

@@ -161,6 +161,8 @@ export interface Backend {
   /** OS clipboard text slot (cross-instance copy/paste). */
   osClipboardWriteText?(text: string): Promise<void>;
   osClipboardReadText?(): Promise<string>;
+  /** Remove an audio clip from its track. */
+  removeClip(clipId: string): Promise<void>;
 
   /** All automation lanes (points inline — per-project, not per-frame).
    * Optional: the demo backend has no automation. */
@@ -214,6 +216,8 @@ export interface Backend {
     contentLengthTicks: number | null,
   ): Promise<MidiClip>;
   midiRenameClip(clipId: string, name: string): Promise<MidiClip>;
+  /** Remove a MIDI clip from its track. */
+  midiRemoveClip(clipId: string): Promise<void>;
   midiGetClips(): Promise<MidiClip[]>;
   midiImportFile(path: string, trackId?: string | null, atTicks?: number | null): Promise<MidiClip[]>;
   midiExportFile(path: string, clipIds?: string[] | null): Promise<string>;
@@ -517,6 +521,9 @@ class TauriBackend implements Backend {
   osClipboardReadText() {
     return invoke<string>("os_clipboard_read_text");
   }
+  async removeClip(clipId: string) {
+    await invoke("remove_clip", { clipId });
+  }
   automationGet() {
     return invoke<AutomationLane[]>("automation_get");
   }
@@ -563,6 +570,9 @@ class TauriBackend implements Backend {
   }
   midiRenameClip(clipId: string, name: string) {
     return invoke<MidiClip>("midi_rename_clip", { clipId, name });
+  }
+  async midiRemoveClip(clipId: string) {
+    await invoke("midi_remove_clip", { clipId });
   }
   midiGetClips() {
     return invoke<MidiClip[]>("midi_get_clips");

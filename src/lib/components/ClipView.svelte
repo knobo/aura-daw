@@ -130,6 +130,9 @@
       const dir = e.key === "ArrowLeft" ? -1 : 1;
       project.moveClip(clip.id, clip.timelineStartSamples + dir * beat);
       void project.commitClipMove(clip.id);
+    } else if (e.key === "Delete" || e.key === "Backspace") {
+      e.preventDefault();
+      void project.removeClip(clip.id);
     }
   }
 </script>
@@ -156,6 +159,18 @@
     <canvas bind:this={canvas} class="wave" style:left="{visL}px" style:width="{visW}px"></canvas>
 
     <span class="cname mono" style:left="{visL + 5}px">{clip.name}</span>
+
+    {#if selected}
+      <button
+        class="del"
+        title="Delete clip"
+        aria-label="Delete clip {clip.name}"
+        onclick={(e) => {
+          e.stopPropagation();
+          void project.removeClip(clip.id);
+        }}>×</button
+      >
+    {/if}
 
     {#if selected && !job}
       <button
@@ -225,6 +240,25 @@
     border-radius: 3px;
     pointer-events: none;
     white-space: nowrap;
+  }
+
+  .del {
+    position: absolute;
+    bottom: 4px;
+    right: 5px;
+    width: 15px;
+    height: 15px;
+    line-height: 1;
+    border: none;
+    background: rgba(5, 7, 13, 0.55);
+    color: var(--text-faint);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 3px;
+    z-index: 1;
+  }
+  .del:hover {
+    color: var(--red);
   }
 
   .magic {

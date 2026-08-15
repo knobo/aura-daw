@@ -191,6 +191,7 @@ pub fn run() {
             control::clipboard::clips_paste,
             osclipboard::os_clipboard_write_text,
             osclipboard::os_clipboard_read_text,
+            control::remove_clip,
             control::gesture_begin,
             control::gesture_end,
             // ---- control plane: undo/redo (Plan E Task 17, additive) ----
@@ -214,6 +215,7 @@ pub fn run() {
             midi::midi_set_notes,
             midi::midi_set_clip_bounds,
             midi::midi_rename_clip,
+            midi::midi_remove_clip,
             midi::midi_get_clips,
             midi::midi_import_file,
             midi::midi_export_file,

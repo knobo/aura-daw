@@ -233,6 +233,17 @@ class MidiStore {
     await this.setClipBounds(clipId, c.timelineStartTicks, c.lengthTicks, c.contentLengthTicks);
   }
 
+  /** Remove a clip from its track — same optimistic-then-backend shape as
+   * `project.removeTrack`. Clears any selection/editor/flash state pointing
+   * at the removed clip so nothing lingers referencing a dead id. */
+  async removeClip(clipId: string): Promise<void> {
+    this.clips = this.clips.filter((c) => c.id !== clipId);
+    if (this.selectedClipId === clipId) this.selectedClipId = null;
+    if (this.openClipId === clipId) this.closeEditor();
+    if (this.flashClipId === clipId) this.flashClipId = null;
+    await backend.midiRemoveClip(clipId);
+  }
+
   open(clipId: string) {
     this.openClipId = clipId;
     this.selectedClipId = clipId;
