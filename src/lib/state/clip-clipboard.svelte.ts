@@ -20,14 +20,26 @@
  * toast below).
  *
  * `paste()` ALWAYS tries the OS clipboard before falling back to the
- * in-memory payload — the caller (App.svelte) must never gate that scan
- * behind "is anything selected right now", because a fresh window has
- * nothing selected and nothing in memory, and that is exactly the
- * cross-instance case this store exists to serve (fix round 1, plan defect
- * #14: the previous caller-side guard skipped the OS-clipboard read
- * entirely in that window). `paste()` reports back whether it found a
- * payload ANYWHERE, so the caller knows whether to fall back to the
- * legacy single-clip stamp instead — not whether the paste fully succeeded.
+ * in-memory payload — the caller must never gate that scan behind "is
+ * anything selected right now", because a fresh window has nothing
+ * selected and nothing in memory, and that is exactly the cross-instance
+ * case this store exists to serve (fix round 1, plan defect #14: the
+ * previous caller-side guard skipped the OS-clipboard read entirely in
+ * that window). `paste()` reports back whether it found a payload
+ * ANYWHERE, so a caller knows whether to fall back to the legacy
+ * single-clip stamp instead — not whether the paste fully succeeded.
+ *
+ * `pasteAtPlayhead` is the one Ctrl+V entry point and OWNS that fallback:
+ * it is the only place that may show a "nothing to paste" toast, and only
+ * AFTER the legacy stamp has also come back empty (fix round 2). `paste()`
+ * itself must never toast on "nothing found" — a MIDI take recording
+ * (`midi.adoptTake` → `midi.select`) sets `midi.selectedClipId` without
+ * touching `clipSelection`, so `clipSelection.count()` can be 0 while
+ * `midi.clipboard` (filled by the legacy `Ctrl+C` branch) is not; `paste()`
+ * has no way to know a legacy fallback exists, so toasting from inside it
+ * produced a real "NOTHING TO PASTE" toast in the same keystroke that the
+ * legacy stamp silently succeeded — the user watched a clip land while
+ * being told there was nothing to paste.
  */
 
 import { backend } from "../tauri";
@@ -87,17 +99,17 @@ class ClipClipboardStore {
           // "Ok" from the write above only means arboard accepted the text
           // and this process took selection ownership — NOT that another
           // AURA instance will ever see it (osclipboard.rs's measured
-          // ceiling), and taking ownership already means whatever was on
-          // the system clipboard before this copy is gone if the transfer
-          // to another instance fails. Same-instance paste is unaffected
-          // (it reads `this.payload`), so this warns about the OTHER
-          // instance and about clipboard content outside AURA, not about a
-          // failure of this copy.
+          // ceiling). The harm worth naming is not "this copy replaced the
+          // old clipboard" (true of every copy, and read as boilerplate) —
+          // it is that if the cross-instance transfer fails, the OTHER
+          // window's clipboard ends up with NEITHER the old content NOR
+          // this one: not a truncated paste, an empty one. Same-instance
+          // paste is unaffected (it reads `this.payload`).
           toasts.info(
-            "LARGE SELECTION COPIED",
-            `${audioIds.length + midiIds.length} clips may be too much for the OS clipboard to carry between windows — ` +
-              "pasting in THIS window will work, but a paste in another AURA instance may come back empty, " +
-              "and this copy has already replaced whatever was previously on the system clipboard.",
+            "COPY MAY NOT REACH ANOTHER WINDOW",
+            `${audioIds.length + midiIds.length} clips is a lot of data for the OS clipboard — pasting HERE will work regardless, ` +
+              "but the transfer to another AURA window can fail silently, and if it does that window's clipboard ends up with " +
+              "nothing at all: not this copy, and not whatever was on it before.",
           );
         }
       } catch (err) {
@@ -124,23 +136,20 @@ class ClipClipboardStore {
     } catch (err) {
       console.warn("[aura] OS clipboard read failed:", err);
     }
-    if (!payload) {
-      // The one moment an empty clipboard, a foreign clipboard and a large
-      // copy that silently failed to cross instances are indistinguishable
-      // to the user — say so rather than doing nothing visibly at all.
-      toasts.info(
-        "NOTHING TO PASTE",
-        "if you copied a large selection in another window, it may not have survived the transfer",
-      );
-      return false;
-    }
+    if (!payload) return false;
     try {
       const res = await backend.clipsPaste?.({
         payload,
         atSamples: Math.max(0, Math.round(atSamples)),
         toNewTracks,
       });
-      if (!res) return true;
+      if (!res) {
+        // `backend.clipsPaste` itself is missing (a partial/demo backend,
+        // same convention as `moveClip?`) — a payload WAS found (the whole
+        // reason this method returns `true` here), there is simply no
+        // command to apply it with. Nothing to apply, nothing to undo.
+        return true;
+      }
       // `clipsPaste` commits `project://changed` INSIDE its transaction, so
       // `project.applyProject` can already have replaced `tracks` with the
       // authoritative post-paste list by the time THIS await resolves —
@@ -148,7 +157,13 @@ class ClipClipboardStore {
       // from landing twice (fix round 1, Important 1).
       for (const t of res.createdTracks) project.upsertTrack(t);
       for (const c of res.audioClips) project.upsertClip(c);
-      if (res.midiClips.length > 0) midi.clips = [...midi.clips, ...res.midiClips];
+      // Provably safe as a blind append TODAY — `project://changed` carries
+      // only the audio-shaped `Project` (`midi.svelte.ts` doc), so nothing
+      // races this — but `midi.upsert` costs nothing extra and keeps every
+      // apply-loop in this method idempotent rather than leaving one kind
+      // as the odd one out for the next reader to imitate (fix round 2,
+      // minor 5).
+      for (const c of res.midiClips) midi.upsert(c);
       clipSelection.apply(
         [
           ...res.audioClips.map((c) => ({ kind: "audio" as const, id: c.id })),
@@ -167,6 +182,31 @@ class ClipClipboardStore {
       toasts.error("PASTE FAILED", String(err));
     }
     return true;
+  }
+
+  /** The one Ctrl+V entry point. Always tries the multi-clip clipboard
+   * (`paste`, which scans the OS clipboard unconditionally) first; falls
+   * back to the legacy single-clip note stamp only when `paste` found
+   * nothing anywhere AND this is not a to-new-tracks paste, which the
+   * legacy stamp has no concept of (so it is skipped, not attempted and
+   * ignored). Toasts "nothing to paste" whenever every path that COULD
+   * have pasted came back empty — see the module doc for why that toast
+   * cannot live inside `paste()` itself. */
+  async pasteAtPlayhead(atSamples: number, toNewTracks: boolean): Promise<void> {
+    const found = await this.paste(atSamples, toNewTracks);
+    if (found) return;
+    const pasted = toNewTracks ? null : await midi.pasteAtPlayhead(midi.samplesToTicks(atSamples));
+    if (!pasted) {
+      // Lead with the ordinary cause (nothing was ever copied) — the
+      // cross-instance transfer failure is the rare case, and a toast that
+      // explains the exotic case to someone in the everyday one is how
+      // toasts get trained into background noise (fix round 2, minor 3).
+      toasts.info(
+        "NOTHING TO PASTE",
+        "copy something first — Ctrl+C a clip here, or in another AURA window. " +
+          "(A very large copy can occasionally fail to cross between windows.)",
+      );
+    }
   }
 }
 

@@ -28,14 +28,22 @@ const osClipboardWriteText = vi.fn(async (t: string) => {
   clipboardText = t;
 });
 const osClipboardReadText = vi.fn(async () => clipboardText);
+const midiAddClip = vi.fn();
+// `backend.clipsPaste` needs to be genuinely ABSENT (not a function that
+// resolves to something falsy) for the demo-mode test below — a getter lets
+// one test flip it to `undefined` and every other test keep the real mock.
+let clipsPasteAvailable = true;
 
 vi.mock("../tauri", () => ({
   backend: {
     on: () => () => {},
     clipsCopy: (a: string[], m: string[]) => clipsCopy(a as never, m as never),
-    clipsPaste: (r: unknown) => clipsPaste(r as never),
+    get clipsPaste() {
+      return clipsPasteAvailable ? (r: unknown) => clipsPaste(r as never) : undefined;
+    },
     osClipboardWriteText: (t: string) => osClipboardWriteText(t),
     osClipboardReadText: () => osClipboardReadText(),
+    midiAddClip: (...args: unknown[]) => midiAddClip(...args),
     getProjectState: () =>
       Promise.resolve({ ppq: 960, tempoEvents: [{ tick: 0, bpm: 120 }], midiClips: [] }),
   },
@@ -65,10 +73,12 @@ function testTrack(overrides: Partial<TrackState> = {}): TrackState {
 beforeEach(() => {
   vi.clearAllMocks();
   clipsCopy.mockImplementation(async () => payload);
+  clipsPasteAvailable = true;
   clipboardText = "";
   project.tracks = [];
   project.clips = [{ id: "a1", trackId: "t1" } as Clip];
   midi.clips = [{ id: "m1", trackId: "t2" } as MidiClip];
+  midi.clipboard = null;
   clipSelection.clear();
   clipClipboard.payload = null;
 });
@@ -187,21 +197,42 @@ describe("clipClipboard.paste", () => {
     expect(clipsPaste).toHaveBeenCalledWith({ payload, atSamples: 0, toNewTracks: false });
   });
 
-  it("does nothing at all and tells the user, when there is no payload anywhere", async () => {
+  /**
+   * Fix round 2: `paste()` itself must NEVER toast — it cannot know whether
+   * a caller-side fallback exists, so a toast fired from in here fires
+   * "NOTHING TO PASTE" the moment BEFORE a legacy stamp silently succeeds
+   * (the exact bug: a MIDI-take recording sets `midi.selectedClipId`
+   * without touching `clipSelection`, so this store finds nothing while
+   * `midi.clipboard` still has something). Silence here, `false`, and let
+   * `pasteAtPlayhead` decide.
+   */
+  it("does nothing at all, silently, when there is no payload anywhere", async () => {
     const before = toasts.list.length;
     const found = await clipClipboard.paste(0, false);
     expect(clipsPaste).not.toHaveBeenCalled();
     expect(found).toBe(false);
-    expect(toasts.list.length).toBeGreaterThan(before);
+    expect(toasts.list.length).toBe(before);
   });
 
-  it("reports a payload was found even when the paste call itself is unavailable (demo mode)", async () => {
+  /**
+   * Fix round 1, minor 1, corrected: the ORIGINAL version of this test
+   * mocked `clipsPaste` (so it only re-covered the ordinary success path).
+   * The `!res` branch is reachable only when `backend.clipsPaste` itself is
+   * ABSENT (a partial backend, same convention as `moveClip?`) — this test
+   * makes it genuinely absent via the mock's getter.
+   */
+  it("reports a payload was found even when clips_paste itself is unavailable (partial backend)", async () => {
+    clipsPasteAvailable = false;
     clipClipboard.payload = payload;
+    const before = toasts.list.length;
     const found = await clipClipboard.paste(0, false);
-    // clipsPaste IS mocked here (real-engine test double), so this also
-    // covers the ordinary success path: a payload was found, so the caller
-    // must not fall back to the legacy single-clip stamp.
+    expect(clipsPaste).not.toHaveBeenCalled();
     expect(found).toBe(true);
+    // Distinguishes the intended early-return branch from a masked crash:
+    // indexing into an undefined `res` would throw, land in the outer
+    // catch, and ALSO return true — but only via a "PASTE FAILED" toast
+    // this path must never show.
+    expect(toasts.list.length).toBe(before);
   });
 
   it("passes toNewTracks through", async () => {
@@ -265,5 +296,68 @@ describe("clipClipboard.paste", () => {
     clipClipboard.payload = payload;
     await clipClipboard.paste(0, true);
     expect(project.tracks.filter((t) => t.id === "t-new").length).toBe(1);
+  });
+});
+
+/**
+ * The one Ctrl+V entry point (fix round 2). Reproduces the exact bug the
+ * review caught: recording a MIDI take fills `midi.clipboard` via the
+ * legacy stamp path WITHOUT ever touching `clipSelection`, so
+ * `clipClipboard.paste` finds nothing while a legacy paste would still
+ * succeed. A toast fired from inside `paste()` itself would tell the user
+ * "nothing to paste" in the exact keystroke where a clip is about to land.
+ */
+describe("clipClipboard.pasteAtPlayhead", () => {
+  function fakeMidiClip(overrides: Partial<MidiClip> = {}): MidiClip {
+    return {
+      id: "legacy-src",
+      trackId: "t2",
+      name: "riff",
+      timelineStartTicks: 0,
+      lengthTicks: 480,
+      notes: [],
+      ...overrides,
+    };
+  }
+
+  it("does NOT toast when the multi-clip clipboard is empty but the legacy stamp still succeeds", async () => {
+    // The bug's exact precondition: nothing multi-selected/copied, but a
+    // legacy MIDI clipboard entry exists (as `midi.adoptTake` leaves it).
+    midi.clipboard = fakeMidiClip();
+    midiAddClip.mockResolvedValueOnce(fakeMidiClip({ id: "new-legacy" }));
+
+    const before = toasts.list.length;
+    await clipClipboard.pasteAtPlayhead(0, false);
+
+    expect(midiAddClip).toHaveBeenCalled();
+    expect(midi.clips.some((c) => c.id === "new-legacy")).toBe(true);
+    expect(toasts.list.length).toBe(before);
+  });
+
+  it("toasts NOTHING TO PASTE only when both the multi-clip clipboard AND the legacy stamp come back empty", async () => {
+    midi.clipboard = null; // legacy clipboard also empty
+    const before = toasts.list.length;
+    await clipClipboard.pasteAtPlayhead(0, false);
+
+    expect(midiAddClip).not.toHaveBeenCalled();
+    expect(toasts.list.length).toBeGreaterThan(before);
+  });
+
+  it("never attempts the legacy stamp, and still toasts, for a to-new-tracks paste that finds nothing", async () => {
+    midi.clipboard = fakeMidiClip(); // legacy clipboard has content...
+    const before = toasts.list.length;
+    await clipClipboard.pasteAtPlayhead(0, true); // ...but this is Ctrl+Shift+V
+
+    expect(midiAddClip).not.toHaveBeenCalled(); // never invoked: no concept of "to new tracks"
+    expect(toasts.list.length).toBeGreaterThan(before);
+  });
+
+  it("does not fall back or toast when the multi-clip clipboard itself found something", async () => {
+    clipClipboard.payload = payload;
+    const before = toasts.list.length;
+    await clipClipboard.pasteAtPlayhead(0, false);
+
+    expect(midiAddClip).not.toHaveBeenCalled();
+    expect(toasts.list.length).toBe(before);
   });
 });

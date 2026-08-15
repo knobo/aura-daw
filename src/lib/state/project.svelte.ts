@@ -104,7 +104,13 @@ class ProjectStore {
     const track = await backend.addTrack(init);
     // Backend may ignore cosmetic fields; keep requested ones locally.
     const merged = { ...track, ...("color" in init ? { color: init.color! } : {}), ...("name" in init ? { name: init.name! } : {}) };
-    this.tracks = [...this.tracks, merged];
+    // `project://changed` is emitted inside the add-track transaction too,
+    // same as `clips_paste` — a blind append here would carry the identical
+    // duplicate-track race `upsertTrack` exists to close (fix round 2,
+    // minor 4). `upsertTrack` REPLACES a matching entry rather than
+    // skipping it, so the cosmetic-override merge above still lands even
+    // if the store already picked the track up via the event.
+    this.upsertTrack(merged);
     return merged;
   }
 

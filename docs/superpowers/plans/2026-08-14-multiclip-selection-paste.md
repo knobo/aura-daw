@@ -3956,6 +3956,49 @@ in instance B press Ctrl+V. MIDI clips must land with their notes; audio
 clips referencing a project B does not have must appear in a toast listing
 the skip reason, not vanish. Record the result in the task's review notes.
 
+**BINDING RULE (fix round 2, Task 11): do not attempt this step by driving
+the real app's keyboard/mouse with input-automation tooling (`xdotool` and
+similar), and do not retry it after a first inconclusive attempt.** An
+implementer tried exactly this in a real X11 + `gpaste-daemon` desktop
+(matching Task 10's own environment) and found the sandbox's X display
+concurrently driven by another agent session — focus jumped to unrelated
+windows mid-test, a keystroke silently queued and fired minutes later, one
+attempt toggled a dock panel and duplicated demo tracks that no action in
+this task's own sequence explains. A green result from a headless `Xvfb`
+run would be **weaker than the unit tests, not stronger**: Xvfb has no
+clipboard manager, which is exactly the configuration where the OS-clipboard
+transfer already works reliably (Task 10's own measurement) — a pass there
+answers a question nobody asked and retires this step without answering it.
+Driving `xclip` from a shell proves only what Task 10 already proved
+(the `arboard`/X11 mechanism works cross-process); it says nothing about
+whether instance B's `os_clipboard_read_text` — reached through this task's
+own frontend orchestration — receives instance A's bytes on a real desktop.
+
+**Exactly one link is unproven and belongs to the owner, on a real desktop,
+by hand:** that instance B's Ctrl+V (via `clipClipboard.pasteAtPlayhead`)
+actually receives and applies instance A's Ctrl+C payload. The owed
+procedure:
+1. Launch instance A and instance B (`AURA_SIDECAR_SIMULATE=1`, each on its
+   own devUrl/dev port if both run from the same worktree — the fixed
+   port 1420 in `vite.config.ts`/`tauri.conf.json` only allows one).
+2. In A: "+ LOAD DEMO SONG", click the "demo lead" MIDI clip once (the
+   corner cell should read "1 clip selected"), press Ctrl+C.
+3. In B (a project with at least one MIDI track, e.g. its own loaded demo
+   song): press Ctrl+V at the playhead.
+4. PASS: the clip's notes land in B, on its own MIDI track (or the source
+   track's name if B has no matching track — check `clipsPaste`'s track
+   resolution, scope ruling B). FAIL modes to record precisely, not just
+   "didn't work": a "NOTHING TO PASTE" toast in B (the OS-clipboard read
+   found nothing — check the write actually landed, e.g. via `xclip -o
+   -selection clipboard` run AFTER step 2, in a shell, BEFORE step 3), a
+   "SOME CLIPS COULD NOT BE PASTED" toast (track-kind mismatch or missing
+   audio source — expected and correct for an audio clip B's project
+   lacks), or silence with no toast and no clip (a real bug — the
+   `pasteAtPlayhead` fallback chain has nowhere left to go quiet).
+5. Repeat once more with a MULTI-clip selection (marquee two-plus clips in
+   A) to also confirm the anchor/offset math survives the OS clipboard,
+   not just single-clip content.
+
 - [ ] **Step 13: Commit**
 
 ```bash

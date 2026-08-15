@@ -194,21 +194,17 @@
       if (clipSelection.count() > 0) void clipClipboard.copy();
       else midi.copySelected();
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "v") {
-      // Paste at the playhead: Shift pastes onto NEW tracks. The multi-clip
-      // clipboard is ALWAYS tried FIRST — it is the only path that reads the
-      // OS clipboard, so gating it behind "something is selected right now"
-      // (as a prior version did) meant a fresh window with an empty
-      // in-memory payload and nothing selected never even looked at the OS
-      // clipboard, and cross-instance paste did nothing (fix round 1, plan
-      // defect #14). Only fall back to the legacy single-clip stamp when
-      // the store found no payload anywhere — never for a to-new-tracks
-      // paste, which the legacy stamp has no concept of.
+      // Paste at the playhead: Shift pastes onto NEW tracks.
+      // `clipClipboard.pasteAtPlayhead` OWNS the multi-clip-first / legacy-
+      // fallback / nothing-to-paste-toast orchestration (fix round 2) — a
+      // thin delegation here, not reimplemented, so App.svelte stays inside
+      // the "no logic a test can't reach" rule. `playhead()` is evaluated
+      // ONCE, right here, as the argument: it is a live interpolated
+      // position, and reading it again after an internal await would let
+      // the legacy fallback land at a later position than the one the key
+      // was actually pressed at.
       e.preventDefault();
-      const toNewTracks = e.shiftKey;
-      void (async () => {
-        const found = await clipClipboard.paste(playhead(), toNewTracks);
-        if (!found && !toNewTracks) void midi.pasteAtPlayhead(midi.samplesToTicks(playhead()));
-      })();
+      void clipClipboard.pasteAtPlayhead(playhead(), e.shiftKey);
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "d") {
       // Duplicate immediately after the selected clip.
       e.preventDefault();

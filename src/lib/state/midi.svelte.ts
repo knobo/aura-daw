@@ -134,7 +134,11 @@ class MidiStore {
 
   // ── mutations (optimistic; backend value wins on return) ──
 
-  private upsert(clip: MidiClip) {
+  /** Idempotent clip insert (id-based) — `project.upsertClip`'s MIDI-side
+   * counterpart. Public so cross-store callers (e.g. clip-clipboard's
+   * paste application) can keep every store's apply-loop idempotent rather
+   * than one being the odd blind-append out. */
+  upsert(clip: MidiClip) {
     const exists = this.clips.some((c) => c.id === clip.id);
     this.clips = exists
       ? this.clips.map((c) => (c.id === clip.id ? clip : c))
