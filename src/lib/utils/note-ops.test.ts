@@ -6,6 +6,7 @@ import {
   marqueeHits,
   nudgeSelection,
   pasteNotes,
+  quantizeSelection,
   sortWithSelection,
   toggleIndex,
   transposeSelection,
@@ -145,5 +146,47 @@ describe("pasteNotes", () => {
     expect(notes).toHaveLength(1);
     expect(selection).toEqual(new Set([0]));
     expect(dropped).toBe(1);
+  });
+});
+
+describe("quantizeSelection", () => {
+  it("snaps selected note starts toward the nearest grid tick", () => {
+    const notes = [note(100, 60, 200), note(500, 64, 200)];
+    const { notes: out, selection } = quantizeSelection(notes, new Set([0, 1]), 480, 1);
+    expect(out.map((n) => n.tick)).toEqual([0, 480]);
+    expect(out.map((n) => n.lengthTicks)).toEqual([200, 200]);
+    expect(selection).toEqual(new Set([0, 1]));
+  });
+
+  it("strength blends between the original tick and the grid", () => {
+    const notes = [note(100, 60)];
+    const { notes: out } = quantizeSelection(notes, new Set([0]), 480, 0.5);
+    expect(out[0].tick).toBe(50); // 100 + (0 - 100) * 0.5
+  });
+
+  it("leaves unselected notes alone", () => {
+    const notes = [note(100, 60), note(500, 64)];
+    const { notes: out } = quantizeSelection(notes, new Set([0]), 480, 1);
+    expect(out.map((n) => n.tick)).toEqual([0, 500]);
+  });
+
+  it("optionally snaps lengths to the grid as well", () => {
+    const notes = [note(100, 60, 250)];
+    const { notes: out } = quantizeSelection(notes, new Set([0]), 480, 1, true);
+    expect(out[0].tick).toBe(0);
+    expect(out[0].lengthTicks).toBe(480);
+  });
+
+  it("never lets a quantized length fall below 1 tick", () => {
+    const notes = [note(0, 60, 10)];
+    const { notes: out } = quantizeSelection(notes, new Set([0]), 480, 1, true);
+    expect(out[0].lengthTicks).toBe(1);
+  });
+
+  it("is a no-op for an empty selection", () => {
+    const notes = [note(100, 60)];
+    const { notes: out, selection } = quantizeSelection(notes, new Set(), 480, 1);
+    expect(out).toEqual(notes);
+    expect(selection.size).toBe(0);
   });
 });

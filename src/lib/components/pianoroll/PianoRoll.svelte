@@ -5,7 +5,8 @@
    * drag to move, edge-drag to resize, double-click / Delete to remove;
    * shift-drag marquees a tick region (feeds AMT infill) and selects notes
    * (ctrl = add, alt = subtract, shift-click toggles one). Ctrl+C/X/V work
-   * on the note selection; arrows nudge in time / transpose in pitch.
+   * on the note selection; arrows nudge in time / transpose in pitch;
+   * Q quantizes selected starts to the grid (Shift+Q also lengths).
    * Velocity lane below; piano keys at left audition through
    * sampler_preview_note when the track carries an instrument.
    * Same discipline as the timeline: canvases repaint on state changes only,
@@ -30,6 +31,7 @@
     marqueeHits,
     nudgeSelection,
     pasteNotes,
+    quantizeSelection,
     sortWithSelection,
     toggleIndex,
     transposeSelection,
@@ -377,6 +379,14 @@
         working = next;
         commitSoon();
       }
+    } else if (e.key.toLowerCase() === "q" && !mod && !e.altKey) {
+      if (selection.size === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const q = quantizeSelection(working, selection, gridTicks, 1, e.shiftKey);
+      working = q.notes;
+      selection = q.selection;
+      commit();
     }
   }
 

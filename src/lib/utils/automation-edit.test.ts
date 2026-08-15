@@ -53,6 +53,15 @@ describe("movePoint", () => {
   it("is a no-op for an out-of-range index", () => {
     expect(movePoint(pts, 9, 0, 0, 0, 1)).toEqual({ points: pts, index: 9 });
   });
+
+  it("does not delete a neighbour when the drag lands on its tick", () => {
+    const { points, index } = movePoint(pts, 0, 960, 0.8, 0, 1);
+    expect(points).toHaveLength(3);
+    expect(points.map((p) => p.tick)).toEqual([0, 960, 3840]);
+    expect(points[0]).toEqual({ tick: 0, value: 0.8 });
+    expect(points[1]).toEqual({ tick: 960, value: 0.5 });
+    expect(index).toBe(0);
+  });
 });
 
 describe("deletePoint", () => {
