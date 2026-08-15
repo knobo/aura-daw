@@ -1526,12 +1526,16 @@ correct fix made this failure quieter, not louder.
   assert surviving rows by ID (one compares the whole before/after id
   tuple), and the frontend cancel-restore tests seed distinct values per
   clip and across two stores, so a swap cannot hide in them.
-- **Worth knowing before sabotaging an inverse here**: for grouped
-  property-addressed `Op::Set`s, `fold_ops` REBUILDS the folded inverse from
-  the original op's `object`/`path`, so the `object` field `apply_raw`
-  returns on those arms is discarded. A sabotage that swaps the object
-  inside `apply_raw` is inert BY CONSTRUCTION and reports a false all-green:
-  sabotage the fold, or the value, instead. (Found by running exactly that
+- **Worth knowing before sabotaging an inverse here — the trap is
+  ARM-SPECIFIC.** Sabotaging the target of the inverse `apply_raw` returns is
+  **live for structural ops** (`ClipAdd`, `MidiClipAdd`, `TrackAdd`), because
+  `fold_ops`' `Slot::Passthrough` forwards that inverse verbatim — which is
+  exactly why this track's `SH` sabotage on `Op::ClipAdd`'s inverse genuinely
+  killed four paste tests. It is **dead for property-addressed `Op::Set`s
+  that reach the grouped path**, where `fold_ops` REBUILDS the folded inverse
+  from the original op's `object`/`path` and keeps only the values: a swap
+  there is inert BY CONSTRUCTION and reports a false all-green. On those,
+  sabotage the fold or the values instead. (Found by running exactly that
   sabotage and watching it change nothing.)
 
 ### Ledgered by the same review, NOT fixed
