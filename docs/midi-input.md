@@ -92,7 +92,7 @@ the main audio graph. You never get both at once, and never neither.
 
 ## Limitations
 
-### Do not record while a loop is active
+### Do not record while a loop is active — or seek mid-take
 
 **Recording with the loop turned on produces a take whose timing is
 wrong.** Nothing errors, nothing looks broken, and the clip is a perfectly
@@ -104,9 +104,26 @@ have to notice it yourself.
 Until this is fixed: **turn the loop off before you arm and record**, and
 if you did record under a loop, undo the take and do it again without one.
 
+**Moving the playhead during a take does the same thing.** A backward seek
+while recording corrupts the take exactly as a loop wrap does, and a
+forward seek leaves a matching hole. Start the take where you want it and
+leave the playhead alone until you stop.
+
 (Mechanism, for whoever fixes it: incoming events are stamped with the
-transport position, which jumps backwards on a loop wrap, and the take's
-tick conversion clamps at zero. See `docs/backlog/hardware-midi-io.md`.)
+transport position, which jumps backwards on a loop wrap or a seek, and the
+take's tick conversion clamps at zero. Nothing in the seek path checks
+whether a take is running. See `docs/backlog/hardware-midi-io.md`.)
+
+### Jamming over a loop: held notes cut off at each wrap
+
+If you hold a chord while the transport wraps around a loop, the chord
+stops at the wrap and you have to strike the keys again on the next pass.
+The wrap tells the track's instrument to release everything — which is
+right for the clip's own notes (their note-offs live past the loop end),
+but monitoring shares that instrument, so your held keys go with them.
+
+Nothing hangs and nothing is lost; short notes and re-struck chords behave
+normally. It only bites when you hold a note *through* the wrap.
 
 ### Everything else
 

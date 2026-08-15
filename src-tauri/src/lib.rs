@@ -248,6 +248,13 @@ pub fn run() {
             plugins::automation::automation_get,
             plugins::automation::automation_set,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // `build` + `run(callback)` rather than `run(context)`: the app has
+        // to do something on the way out. See `RunEvent::Exit` below.
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                midi_out::release_on_exit(app.state::<Arc<midi_out::MidiOut>>().inner());
+            }
+        });
 }

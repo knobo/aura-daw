@@ -1791,10 +1791,17 @@ impl ControlPlane {
     ///
     /// Only this explicit delete path is covered. Undoing a `TrackAdd`
     /// removes a track without passing here, and leaves the id in place
-    /// until the next explicit selection — cosmetic (`refresh_target`
-    /// resolves an unknown id to `NO_SLOT`, and the note-out snapshot of a
-    /// missing track is empty), but it is why the selectors must keep
-    /// tolerating an id the store does not have.
+    /// until the next explicit selection. On the INPUT side that is
+    /// cosmetic: `refresh_target` resolves an unknown id to `NO_SLOT`, so
+    /// events are simply dropped. On the OUTPUT side it is only survivable
+    /// because of the whole-track review's Critical 1 fix: the vanished
+    /// track's events snapshot becomes EMPTY under an UNCHANGED track id,
+    /// which is exactly the shape that used to strand the cursor and hang a
+    /// sounding note — `run_thread` now keys its release+reseek on the
+    /// snapshot's CONTENT, so the note is released instead. Do not restore
+    /// an id-only comparison there on the assumption that this path is
+    /// harmless. Either way, both selectors must keep tolerating an id the
+    /// store does not have.
     fn clear_midi_routing_for(&self, id: &str) {
         let hub = crate::audio::midi_in::hub();
         if hub.target_track().as_deref() == Some(id) {
@@ -4906,7 +4913,9 @@ mod tests {
 
     /// Deleting the routed track must not leave the MIDI-in target pointing
     /// at an id the document no longer has. HAZARD: process-global `hub()`
-    /// (same as the two selection tests above) — cleared on the way out.
+    /// (same as the two selection tests above). Every observation is taken
+    /// FIRST and the global restored BEFORE the first assertion, so a
+    /// failing assertion cannot leak a routing target into sibling tests.
     #[test]
     fn removing_the_routed_track_clears_the_midi_input_target() {
         let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
@@ -4914,18 +4923,18 @@ mod tests {
         let other = cp.add_track(Some("Pads".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
         cp.select_midi_input_track(Some(other.id.to_string()), TxMeta::user("route")).unwrap();
 
-        // Removing a DIFFERENT track leaves the routing alone.
         cp.remove_track(keys.id.as_str(), TxMeta::user("delete")).unwrap();
+        let after_unrelated = crate::audio::midi_in::hub().target_track();
+        cp.remove_track(other.id.as_str(), TxMeta::user("delete")).unwrap();
+        let after_routed = crate::audio::midi_in::hub().target_track();
+        crate::audio::midi_in::hub().set_target_track(None);
+
         assert_eq!(
-            crate::audio::midi_in::hub().target_track().as_deref(),
+            after_unrelated.as_deref(),
             Some(other.id.as_str()),
             "an unrelated delete must not clear the routing"
         );
-
-        cp.remove_track(other.id.as_str(), TxMeta::user("delete")).unwrap();
-        let target = crate::audio::midi_in::hub().target_track();
-        crate::audio::midi_in::hub().set_target_track(None);
-        assert_eq!(target, None, "deleting the routed track leaves a dangling target");
+        assert_eq!(after_routed, None, "deleting the routed track leaves a dangling target");
     }
 
     /// Same for note-out (ruling 10's app-config routing): the deleted

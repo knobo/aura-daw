@@ -93,6 +93,14 @@ Plan: `docs/superpowers/plans/2026-08-14-midi-slice-2.md` (slice 2, PR #21).
   loop-plus-record is a normal workflow people will want back); (b)
   truncate the take at the first backward jump (keeps the pre-wrap pass,
   silently discards the rest). Neither is obviously right; ask the owner.
+- **Seeking during a take corrupts it the same way** — the seek path never
+  checks whether a take is running, so the same `saturating_sub` collapse
+  applies. Whatever fix is chosen for the loop case should cover this one.
+- **A held note is cut at every loop wrap while jamming.** The wrap issues
+  `all_notes_off` on the track's node, which is right for clip notes but
+  also releases the keys the player is holding, since monitoring shares
+  the node. The fix is to re-issue monitoring's held note-ons after a wrap,
+  which means the held-key mask has to reach the mixer.
 - **Sub-block MIDI-in timestamping.** Events are quantised to the audio
   block they arrived in (~5–11 ms). The follow-up is midir's `stamp_us` +
   a block-start wall-clock anchor.

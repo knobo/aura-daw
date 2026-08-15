@@ -186,8 +186,8 @@ stale when written — the real count at `3340aa8` (Track D's branch base,
 verified in a worktree) was **527 backend + 206 frontend**. Known points
 since: **538 + 234** after Track E (`a98d7ff`), and **566 backend (537
 lib + 29 integration) + 258 frontend** on `automation-audible`
-2026-08-15 (Track D, PR #20, includes Track E via a merge), and **661
-backend (632 lib + 29 integration) + 270 frontend** on `midi-slice-2`
+2026-08-15 (Track D, PR #20, includes Track E via a merge), and **662
+backend (633 lib + 29 integration) + 271 frontend** on `midi-slice-2`
 2026-08-15 (Track B, PR #21, includes both E and D via a merge). Doc-tests
 report 0 and are not a test target — do not add them to the count. Run
 both suites before writing the first line of a track:
@@ -319,9 +319,15 @@ needed.
 
 **Conflicts**: with Track B and Track D in `engine.rs` — see their
 sections. Both have LANDED (PR #21, PR #20), so Track A rebases onto them
-rather than sequencing with them; Track B's `rebuild` touch is one line
-(`append_from_with_input`'s extra target-track argument, sourced from the
-hub, not the session — a snapshot-based read does not change it). Track A's `engine.rs` touch is the `rebuild` function
+rather than sequencing with them. Track B's engine footprint is THREE
+places, not the "one line" the plan predicted — count on all three when
+planning the `rebuild` rewrite: the hub read at `engine.rs:1070`
+(before the session lock is taken), the `append_from_with_input`
+target-track argument at `:1159` (sourced from the hub, not the
+session, so a snapshot-based read does not change its value), and
+`follow_live_in_target` (`:1221`), called from the engine loop at
+`:880`, which rebuilds when the routing target changes and then
+re-resolves it. Track A's `engine.rs` touch is the `rebuild` function
 specifically; sequence with B/D if running genuinely concurrently
 (smallest safe unit: land A's `rebuild` change first, since B and D both
 build on top of "how does the engine read the document" more than they

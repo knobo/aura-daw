@@ -1026,7 +1026,7 @@ strip's midi-in/midi-out groups, and arm-a-MIDI-track → route-the-keyboard
 glue. User docs: `docs/midi-input.md` (rewritten), `docs/midi-output.md`
 (new).
 
-**Suites: 661 backend (632 lib + 29 integration) + 270 frontend, all
+**Suites: 662 backend (633 lib + 29 integration) + 271 frontend, all
 green, measured on `midi-slice-2` 2026-08-15**; `npx svelte-check` 0
 errors, 0 warnings. Doc-tests are 0 and are NOT a test target — an earlier
 report in this track counted them and reported 641 where the truth was
@@ -1061,6 +1061,24 @@ non-goals do *not* cover it: `docs/backlog/hardware-midi-io.md`, "Still
 open after slice 2". The user-facing "don't do that" is in
 `docs/midi-input.md`. Choosing between the two fixes is a **behaviour
 decision for the owner**, not a refactor.
+
+### Two more limitations found by the whole-track review (documented, not fixed)
+
+- **Jamming over a loop silences held notes at every wrap.** `render_live`
+  calls `node.all_notes_off()` on each loop wrap — correct for clip notes
+  (their note-offs lie past the loop end), but the monitored live-in voice
+  SHARES that node, so a chord held across the wrap decays away and the
+  player must re-strike it every pass. `docs/midi-input.md` advertises
+  exactly this workflow ("press play, arm a track, jam along"), so it is
+  documented there. Never a hang, always a premature cut. Not a one-line
+  fix: the alternative is re-issuing the held note-ons after a wrap, which
+  needs the held-key mask on the mixer side.
+- **Seeking during a take corrupts it the same way a loop wrap does.**
+  Nothing in the seek path (`control/mod.rs`'s `TransportAction::Seek`)
+  checks whether a take is running, and `capture.rs`'s
+  `saturating_sub(start_ticks)` then collapses every later event toward 0.
+  Documented alongside the loop-wrap limitation; the fix is the same
+  decision.
 
 ### Standing hazards a future round must not rediscover the hard way
 
@@ -1115,10 +1133,25 @@ decision for the owner**, not a refactor.
 - **Deleting a routed track** now clears both routings
   (`ControlPlane::remove_track` → `clear_midi_routing_for`, Task 12).
   Undoing a `TrackAdd` does not pass through there and still leaves a stale
-  id until the next explicit selection — cosmetic (`refresh_target`
-  resolves an unknown id to `NO_SLOT`, and a missing track's note-out
-  snapshot is empty), but it is why both selectors must keep tolerating an
-  id the store does not have.
+  id until the next explicit selection. On the INPUT side that is cosmetic
+  (`refresh_target` resolves an unknown id to `NO_SLOT`). On the OUTPUT
+  side the close-out's first "cosmetic" claim was WRONG and is corrected
+  here: a vanished track yields an EMPTY events snapshot under an
+  UNCHANGED track id, which is precisely the shape that used to strand the
+  note-out cursor and hang a sounding note. It is survivable only because
+  `run_thread` now keys its release+reseek on snapshot CONTENT (Critical 1
+  below). Do not restore an id-only comparison there. Either way, both
+  selectors must keep tolerating an id the store does not have.
+- **The 1–2 block window after a rebuild** where the callback still holds
+  the OLD graph while the hub already resolves the NEW slot number: a key
+  struck in that window can reach the wrong instrument. This is the
+  note-ON half of the slot-number problem above (which covers only the
+  release window), and it is the one part of `MidiInHub`'s design that a
+  slot-index→identity change would also have to address.
+- **A device switch during an open release window** leaves the outgoing
+  node frozen mid-decay — a new `OutputCb` starts with all counters zero,
+  so nothing finishes the countdown, and the fragment surfaces on that
+  node's next arm. Same family as the one-slot steal.
 
 ### Rulings later rounds inherit (from the plan, ADR 0007)
 
@@ -1176,6 +1209,48 @@ decision for the owner**, not a refactor.
   control, while Task 12's own doc step told users to use it); the
   uncaught `stopRecording()` rejection in `TransportBar`/`HumPanel`; the
   undocumented `Err`-after-commit contract on `stop_recording`.
+- **Fixed by the whole-track review round, both in the owner's priority
+  half, both of which hung a note on real hardware**: (C1) `run_thread`
+  keyed its note-out release+reseek on the track ID alone, so any edit to
+  the ROUTED track's clips — a note delete, a clip delete, a tempo change —
+  swapped a new events array under a stale cursor index; a note sounding at
+  that moment never got its note-off, and an emptied array killed note-out
+  for the rest of the pass. Now keyed on snapshot CONTENT, with a real
+  ALSA-loopback test that goes RED (clock bytes only, no note-off) when the
+  comparison is reverted. Task 8's gate missed it because its track-swap
+  test calls `reseek` BY HAND, proving the explicit path rather than the
+  one the thread takes. (C2) NOTHING asked the out thread to exit on app
+  quit: `MidiOut::drop` never runs because Tauri's event loop ends in
+  `process::exit`, so closing the window mid-note hung that note forever
+  and never sent `Stop`. `lib.rs` now uses `build` + `run(callback)` and
+  calls `midi_out::release_on_exit` on `RunEvent::Exit`. **The handler
+  BODY is proven** (the ALSA shutdown test drives that exact function);
+  **that Tauri fires the event is NOT verified here** — it needs a windowed
+  run, so treat it as owner ear-check 0.
+- **Carried in from the same review, still open** (each real, none
+  blocking): space-bar stop after a WAV-writer failure leaves the UI stuck
+  in "recording" with no message — `control/mod.rs:1432` skips
+  `emit_transport` and `App.svelte:137-139` `void`s the rejection (the
+  TransportBar/HumPanel catches do NOT cover the keyboard path; recoverable
+  by a second keypress, no duplication risk). Every MasterBar MIDI handler
+  `void`s a rejecting promise, and its selects use `<option selected={…}>`
+  with no `value=` on the `<select>`, so once the user has picked an
+  option the DOM cannot repaint from the store: pick a busy MIDI-out port,
+  `select_port` fails, the store reverts to `null` and the dropdown still
+  shows the port name with no error. House style (the audio device selects
+  do the same) — but these are the first selects with a POLLING store
+  behind them, which is what makes it visible. A failed `sink.send`
+  mid-batch clears the sounding mask first (`midi_out.rs` `all_off` vs its
+  caller), discarding the remaining note-offs with no state that knows a
+  note is up — it breaks "the mask tracks reality" by construction.
+  `adoptTake` can resurrect an undone take: Ctrl+Z right after a take runs
+  `init()`→`applySnapshot()`, and if that resolves before `adoptTake`'s
+  in-flight `midiGetClips()`, the undone take is written back and stays
+  until the next refresh — needs an epoch guard.
+- **Deferred minors recovered from the ledger** (they were missing from
+  this roll-up's first draft): Task 3's `routing:false` duplication, and
+  Task 7's three (a default-value test, teardown duplication, avoidable
+  clones).
 - **Standing, from the plan's global constraints**: three tests are flaky
   under the default parallel thread count and pass in isolation —
   `control::hum::tests::apply_hum_clip_commits_synchronously_and_announces_project_changed`,

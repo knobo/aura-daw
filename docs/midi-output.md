@@ -43,9 +43,17 @@ slowly stop lining up. If your Hydrogen dislikes the re-cue, that is the
 knob to change — it is a one-line behaviour swap in `midi_out.rs`.
 
 **Tempo changes** reach the slave within about 250 ms (the out thread
-re-snapshots the tempo map on that cadence). Clock pacing between blocks
-is interpolated but re-anchored on the engine's own observed position, so
-it cannot drift away from AURA over a long song.
+re-snapshots the tempo map on that cadence).
+
+**Expect an occasional re-cue on a long take, with no loop involved.**
+Between transport events the clock is paced by the system clock from an
+anchor set at start; AURA's audio runs on the soundcard's clock. The two
+differ by a few tens of parts per million on ordinary hardware, so the gap
+crosses the 20 ms threshold roughly every 5–10 minutes of continuous play
+and the thread re-anchors with the same `Stop`/SPP/`Continue` a loop wrap
+uses. The tempo stays right; you hear the re-cue. Re-anchoring more often
+than the threshold would trade the artifact for jitter, which is why it is
+where it is.
 
 ---
 
@@ -81,15 +89,24 @@ and the workaround today is a smaller audio buffer.
   `aconnect -l` shows both AURA and the target. Check the receiving app is
   actually set to slave to external MIDI clock — most default to their own
   internal clock.
-* **Hydrogen starts but drifts / restarts oddly.** That is likely the loop
-  re-cue above, firing on every wrap.
+* **Hydrogen restarts itself now and then.** Two causes, both above: the
+  loop re-cue on every wrap, and the periodic clock re-anchor on long
+  continuous playback. Neither is a fault you can configure away today.
 * **A note hangs on the external device.** AURA releases sounding notes
-  when you change port, change routed track or close the app. If one hangs
-  anyway, toggle the **trk** selector to None and back.
+  when you change port, change the routed track, edit the routed track's
+  clips, or close the app. If one hangs anyway, toggle the **trk** selector
+  to None and back.
 * **Timing gets lumpy under heavy CPU load.** The out thread is a plain OS
-  thread at default priority and can be starved. The symptom is visible
-  rather than mysterious: the `resyncs` counter in `midi_output_status`
-  climbs.
+  thread at default priority and can be starved. Note that starvation does
+  NOT show up in the `resyncs` counter — a starved thread's clock estimate
+  still tracks the engine, so no jump is detected; the pulses it could not
+  send in time are simply dropped (the burst clamp), and the slave hears a
+  brief slow-down instead. `resyncs` counts transport jumps and the
+  periodic re-anchor above, not starvation.
+
+* **Editing the routed track while it plays** releases whatever it has
+  sounding at that moment, so a long note being played out to gear stops
+  when you edit that clip. Deliberate: the alternative is a stuck note.
 
 ## Not in this slice
 

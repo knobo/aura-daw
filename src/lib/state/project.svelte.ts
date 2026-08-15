@@ -163,8 +163,16 @@ class ProjectStore {
     // Ruling 1's UX bridge: arming a MIDI track routes the keyboard to it;
     // disarming clears the route. `armed` stays the document flag, the
     // routing target is a separate app-config selection (no op).
+    // Disarming only clears the route when THIS track holds it: with two
+    // MIDI tracks armed the route belongs to the last one armed, and
+    // disarming the other used to take the keyboard away from it silently
+    // (whole-track review).
     if (t.kind === "midi") {
-      await midiIo.setInputTrack(!t.armed ? trackId : null);
+      if (!t.armed) {
+        await midiIo.setInputTrack(trackId);
+      } else if (midiIo.targetTrackId === trackId) {
+        await midiIo.setInputTrack(null);
+      }
     }
   }
 

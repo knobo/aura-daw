@@ -37,10 +37,18 @@
 //! trivially, by construction, with no cross-thread ordering argument
 //! needed.
 //!
-//! On stop (close, re-select to a different port, or `Drop`): the thread
-//! sends an explicit `ClockMsg::Stop` to its sink before the sink (and the
-//! underlying `midir` connection) is dropped, so a hardware slave synced to
-//! MIDI clock does not keep running forever after AURA lets go of the port.
+//! On stop (close, re-select to a different port, `Drop`, or the app's
+//! `RunEvent::Exit` — see [`release_on_exit`]): the thread releases every
+//! sounding note and then sends an explicit `ClockMsg::Stop` to its sink,
+//! both before the sink (and the underlying `midir` connection) is dropped,
+//! so a hardware slave synced to MIDI clock does not keep running forever
+//! after AURA lets go of the port, and no note is left hanging on it.
+//!
+//! `Drop` is NOT the app-exit path and must not be relied on as one: Tauri
+//! runs its event loop to a `process::exit`, so managed state is never
+//! dropped. That is what `release_on_exit` exists for (whole-track review,
+//! Critical 2 — before it, closing the window mid-note hung that note on
+//! the hardware forever and never sent `Stop`).
 //!
 //! `MidiOut::set_clock_enabled(false)` suppresses clock/transport bytes
 //! (the thread stops emitting `ClockMsg`s to the sink) but leaves the
@@ -653,6 +661,25 @@ impl Drop for MidiOut {
     }
 }
 
+/// Release the hardware on app exit: closes the port, which joins the
+/// `aura-midi-out` thread and runs its proven shutdown sequence (every
+/// sounding note released, then `Stop`, both while the connection is still
+/// alive). Wired to `RunEvent::Exit` in `lib.rs::run`.
+///
+/// Whole-track review, Critical 2: `MidiOut::drop` cannot serve this
+/// purpose — Tauri's event loop ends in `process::exit`, so managed state
+/// is never dropped, and before this existed, closing the window while a
+/// note sounded left it hanging on the external synth forever while
+/// Hydrogen free-ran with no `Stop`.
+///
+/// A close failure is logged, not propagated: nothing can act on an error
+/// at this point, and the process is going away regardless.
+pub fn release_on_exit(out: &MidiOut) {
+    if let Err(e) = out.select_port(None) {
+        log::warn!("aura-midi-out: releasing the output port on exit failed: {e}");
+    }
+}
+
 /// A 120 bpm, one-event tempo map at the given rate — the fallback used
 /// before the first successful tempo snapshot (or permanently, in tests
 /// that never call `attach`).
@@ -736,12 +763,29 @@ fn run_thread(
                         channel: 0,
                     };
 
-                    if track_now != last_note_track {
+                    // Whole-track review, Critical 1: the cursor is a bare
+                    // INDEX into `snap.events`, so it is meaningful only
+                    // against the array it was advanced through. Keying the
+                    // release+reseek on the track ID alone left the id
+                    // UNCHANGED case — the user edits a note, deletes a clip
+                    // or changes the tempo on the routed track — reassigning
+                    // a different array under a stale index. A note sounding
+                    // at that moment then never gets its note-off (the
+                    // cursor is already past where it moved to, or the array
+                    // is now empty and `advance` is a permanent no-op) and
+                    // HANGS on the external device. Comparing contents is a
+                    // `Vec` compare every 250 ms on a non-RT thread.
+                    let contents_changed = new_snapshot.events != current_snapshot.events;
+                    if track_now != last_note_track || contents_changed {
                         // Routing changed (select_output_track / a track
-                        // swap detected here): release whatever the OLD
-                        // routing left sounding, then reposition the cursor
-                        // into the new track at the current playhead —
-                        // "all_off first", same rule as a port close.
+                        // swap detected here) or the routed track's events
+                        // changed under it: release whatever the OLD
+                        // snapshot left sounding, then reposition the cursor
+                        // into the new array at the current playhead —
+                        // "all_off first", same rule as a port close. A note
+                        // held across the edit is released rather than
+                        // retriggered: it stops early, which is audible and
+                        // recoverable, instead of hanging forever.
                         let mut edge = Vec::new();
                         notes.all_off(current_snapshot.channel, &mut edge);
                         let pos_now = shared_rt.as_ref().map(|s| s.position.load(Relaxed)).unwrap_or(0);
@@ -1351,8 +1395,135 @@ mod tests {
         assert!(seen.lock().iter().any(|m| m.as_slice() == [0xFC]), "Stop reached the port: {:?}", seen.lock());
     }
 
-    /// Fix round 1, Critical 2: on shutdown (port close, re-select, or app
-    /// exit) the thread must release whatever is sounding BEFORE the
+    /// Whole-track review, Critical 1: editing the ROUTED track while a
+    /// note is sounding must not hang that note on the hardware. The thread
+    /// rebuilds `events` every 250 ms from the live session; the cursor is
+    /// an index into that array, so a same-id contents change silently
+    /// reinterprets it. Here the deleted note shortens the array to BEHIND
+    /// the cursor, which is exactly the case where key 60's note-off is
+    /// never reached by `advance` and the synth drones until transport stop.
+    ///
+    /// Real ALSA loopback, like the shutdown test below, and asserted
+    /// STRICTLY BETWEEN a pre-edit marker and the port close — a note-off
+    /// emitted by the close would prove nothing. `resyncs` is asserted to
+    /// stay 0 throughout: a drift resync releases and reseeks on its own,
+    /// which would make this test pass for the wrong reason (the same trap
+    /// the shutdown test's first version fell into).
+    #[test]
+    fn editing_the_routed_track_releases_a_sounding_note_instead_of_hanging_it() {
+        use midir::os::unix::VirtualInput;
+        use crate::audio::types::{Store, TrackState};
+        use crate::ids::NoteId;
+        use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+        use crate::midi::MidiStore;
+
+        let Ok(midi_in) = midir::MidiInput::new("aura-midi-out-test-in-edit") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let seen = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Vec<u8>>::new()));
+        let sink_seen = seen.clone();
+        let Ok(_conn) = midi_in.create_virtual("aura-out-edit-loopback", move |_, msg, _: &mut ()| {
+            sink_seen.lock().push(msg.to_vec());
+        }, ()) else { eprintln!("skipping: virtual port unavailable"); return; };
+
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no output enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-out-edit-loopback")) else {
+            eprintln!("skipping: loopback port not visible"); return;
+        };
+
+        let mut store = Store::default();
+        store.tracks.push(TrackState {
+            id: "t-1".into(),
+            name: "t-1".into(),
+            kind: "midi".into(),
+            gain_db: 0.0,
+            pan: 0.0,
+            muted: false,
+            soloed: false,
+            armed: false,
+            color: "#7c9cff".into(),
+            instrument_id: None,
+        });
+        let long_ticks = DEFAULT_PPQ as u64 * 8; // 4 s at 120 bpm: still sounding
+        let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
+        let midi = MidiStore {
+            ppq: DEFAULT_PPQ,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![MidiClip {
+                id: clip_id.clone(),
+                track_id: "t-1".into(),
+                name: "c".into(),
+                timeline_start_ticks: 0,
+                length_ticks: long_ticks,
+                // The short note supplies the two edges (on+off) that push
+                // the cursor past where it lands once they are deleted.
+                notes: vec![
+                    MidiNote { tick: 0, length_ticks: 240, key: 62, velocity: 100, channel: 0, note_id: NoteId(0) },
+                    MidiNote { tick: 0, length_ticks: long_ticks as u32, key: 60, velocity: 100, channel: 0, note_id: NoteId(1) },
+                ],
+                next_note_id: 2,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("t-1"),
+                content_length_ticks: None,
+            }],
+            loaded_dir: None,
+            dirty: false,
+        };
+        let session = Arc::new(PlMutex::new(crate::control::Session::new(store, midi)));
+        let shared = Arc::new(SharedRt::default());
+        shared.playing.store(true, Relaxed);
+        shared.position.store(0, Relaxed);
+
+        let updater_running = Arc::new(AtomicBool::new(true));
+        let updater = {
+            let shared2 = shared.clone();
+            let running2 = updater_running.clone();
+            std::thread::spawn(move || {
+                let t0 = std::time::Instant::now();
+                while running2.load(Relaxed) {
+                    shared2.position.store((t0.elapsed().as_secs_f64() * 48_000.0) as u64, Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+
+        let out = MidiOut::default();
+        out.attach(session.clone(), shared.clone());
+        out.select_note_track(Some("t-1".into())).expect("route the midi track");
+        out.select_port(Some(target.id)).expect("open the loopback port");
+
+        // Past the short note's own note-off (125 ms) and at least one
+        // snapshot window, so the cursor is genuinely past both its edges.
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(
+            seen.lock().iter().any(|m| m.as_slice() == [0x90, 60, 100]),
+            "the long note is actually sounding before the edit: {:?}", seen.lock()
+        );
+        let before_edit = seen.lock().len();
+        assert_eq!(out.status().resyncs, 0, "no resync before the edit — it would release notes on its own");
+
+        // The edit: delete the short note. Same track id, different array.
+        session.lock().midi.clips[0].notes.retain(|n| n.key != 62);
+
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let after: Vec<Vec<u8>> = seen.lock()[before_edit..].to_vec();
+        let resyncs = out.status().resyncs;
+
+        updater_running.store(false, Relaxed);
+        let _ = updater.join();
+        out.select_port(None).ok();
+
+        assert_eq!(resyncs, 0, "the release came from the content change, not a drift resync");
+        assert!(
+            after.iter().any(|m| m.as_slice() == [0x80, 60, 0]),
+            "the sounding note was released after the edit instead of hanging: {:?}", after
+        );
+    }
+
+    /// Fix round 1, Critical 2 (and the app-exit entry point added by the
+    /// whole-track review): on shutdown the thread must release whatever is
+    /// sounding BEFORE the
     /// connection is dropped — a hanging note on real gear is silent and
     /// permanent otherwise. Proven end-to-end through the REAL thread and a
     /// REAL ALSA virtual loopback port — not a `RecordingSink` standing in
@@ -1460,7 +1631,13 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let before_shutdown = seen.lock().len();
 
-        out.select_port(None).expect("close releases sounding notes before Stop");
+        // Driven through `release_on_exit` — the EXACT function `lib.rs`'s
+        // `RunEvent::Exit` handler calls (whole-track review, Critical 2) —
+        // rather than `select_port(None)` directly, so the app-exit entry
+        // point is what these assertions pin. What this test cannot cover
+        // is whether Tauri actually fires `RunEvent::Exit`; that needs a
+        // windowed run.
+        release_on_exit(&out);
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         updater_running.store(false, Relaxed);

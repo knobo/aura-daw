@@ -331,10 +331,16 @@ impl OutputCb {
             if !self.live_in_held[key] {
                 continue;
             }
-            self.live_in_held[key] = false;
+            // Bail BEFORE clearing the mask, never after: the buffer is
+            // sized so this cannot trigger today (128 note-offs + 64 pops
+            // into 192), but if a future event kind on this same ring ever
+            // makes it reachable, dropping a note-off we have already
+            // forgotten about hangs that voice forever, while keeping the
+            // key marked held means the next release still frees it.
             if at + n >= LIVE_IN_BUF_SLOTS {
                 break;
             }
+            self.live_in_held[key] = false;
             self.live_in_buf[at + n] = LiveMidiEvent::note_off(key as u8);
             n += 1;
         }

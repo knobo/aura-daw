@@ -28,6 +28,7 @@ vi.mock("../tauri", () => ({
 }));
 
 const { project } = await import("./project.svelte");
+const { midiIo } = await import("./midiio.svelte");
 
 function testTrack(overrides: Partial<TrackState> = {}): TrackState {
   return {
@@ -124,6 +125,24 @@ describe("toggleArm — MIDI routing glue", () => {
     expect(midiSelectInputTrack).toHaveBeenCalledWith("t-1");
     await project.toggleArm("t-1");
     expect(midiSelectInputTrack).toHaveBeenLastCalledWith(null);
+  });
+
+  /** Whole-track review: with A and B both armed, the route is B's (last
+   * armed wins). Disarming A must not take B's keyboard away — the old
+   * unconditional `null` did exactly that, silently. */
+  it("disarming a track that is not the routed one leaves the route alone", async () => {
+    project.tracks = [
+      testTrack({ id: "t-1", kind: "midi", armed: false }),
+      testTrack({ id: "t-2", kind: "midi", armed: false }),
+    ];
+    await project.toggleArm("t-1");
+    await project.toggleArm("t-2");
+    expect(midiIo.targetTrackId).toBe("t-2");
+    midiSelectInputTrack.mockClear();
+
+    await project.toggleArm("t-1"); // disarm the one that is NOT routed
+    expect(midiSelectInputTrack).not.toHaveBeenCalled();
+    expect(midiIo.targetTrackId).toBe("t-2");
   });
 
   it("arming an audio track does not touch the midi routing", async () => {
