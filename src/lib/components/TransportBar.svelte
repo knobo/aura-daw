@@ -450,7 +450,11 @@
     border-right: none;
     border-top: none;
     position: relative;
-    z-index: 20;
+    /* Above Dock (30) and PanelResizeHandle (40): `z-index` here opens a
+       stacking context, so the ⋯ menu's own z-index only sorts INSIDE the
+       bar — this value is what the whole bar, dropdown included, competes
+       with. Below Toasts (90), which must stay on top of everything. */
+    z-index: 50;
   }
 
   .left {
