@@ -37,11 +37,15 @@
 //!   clip-delete hook to retrofit, see `docs/midi-output.md`).
 //!
 //! Tempo snapshot: at most every 250 ms the thread attempts
-//! `session.try_lock()` — **never** a blocking lock, because
-//! `engine::rebuild` holds the session lock across a full graph build and a
-//! blocking lock here would stall clock output for that whole window. A
-//! contended try_lock is not an error: the thread simply keeps whatever it
-//! already has and tries again on the next 250 ms boundary.
+//! `session.try_lock()` — **never** a blocking lock, because a blocking
+//! lock here would stall clock output for as long as the holder keeps it.
+//! (CORRECTION, ADR 0007, Plan F Task 6: the holder this warning was
+//! written against — `engine::rebuild` across a full graph build — is gone;
+//! the rebuild now assembles from a published snapshot and takes the lock
+//! only for a short param/slot read. The rule stands anyway: this thread
+//! must not be at the mercy of any future long holder.) A contended
+//! try_lock is not an error: the thread simply keeps whatever it already
+//! has and tries again on the next 250 ms boundary.
 //!
 //! Lock order: these threads take the session lock and the `routes` lock
 //! only — never `EngineHandle::request` — so the Committer deadlock
@@ -1057,9 +1061,10 @@ fn run_thread(
 
         if last_snapshot.elapsed() >= Duration::from_millis(250) {
             if let Some(session) = &session {
-                // NEVER a blocking lock — `engine::rebuild` holds the
-                // session across a graph build, and this thread must never
-                // stall waiting for it out.
+                // NEVER a blocking lock — this thread must never stall
+                // waiting for a document writer (see the module doc's
+                // correction: the graph build no longer holds it, but the
+                // rule does not depend on who the holder is).
                 if let Some(guard) = session.try_lock() {
                     let rate = shared_rt
                         .as_ref()
@@ -1115,7 +1120,7 @@ fn run_thread(
                     for (scope, target) in &mine {
                         let events = match scope {
                             RouteScope::Track(track_id) => crate::midi::playback::track_events_excluding(
-                                &guard.midi,
+                                guard.midi.clips.iter(),
                                 track_id,
                                 &overridden_clips,
                                 &map,

@@ -56,6 +56,24 @@ pub struct MidiSnapshot {
     pub clips: Arc<Vec<Arc<MidiClip>>>,
 }
 
+impl MidiSnapshot {
+    /// Standalone image of a LIVE `MidiStore`, for the callers that hold the
+    /// document rather than a published image — the offline bounce and the
+    /// playback unit tests. Structural sharing is not available to them (a
+    /// live store owns its clips inline), so this allocates one Arc per
+    /// clip; both callers are one-shot next to a full decode, so the cost is
+    /// noise. `engine::rebuild` never calls this: it reads the image the
+    /// committer already published.
+    pub fn from_store(midi: &crate::midi::MidiStore) -> Self {
+        Self {
+            ppq: midi.ppq,
+            tempo_events: Arc::new(midi.tempo_events.clone()),
+            meter_events: Arc::new(midi.meter_events.clone()),
+            clips: Arc::new(midi.clips.iter().cloned().map(Arc::new).collect()),
+        }
+    }
+}
+
 /// Which parts of the document a batch touched — derived from the folded
 /// ops, so capture re-allocates ONLY what changed. `all()` is the epoch/
 /// non-op-writer path.

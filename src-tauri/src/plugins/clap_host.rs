@@ -1120,7 +1120,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &doc, &slots, 48_000, None, &mut nodes, &mut tracks);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, 48_000, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             nodes.key_of("m1"),

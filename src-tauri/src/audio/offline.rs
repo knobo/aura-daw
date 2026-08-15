@@ -139,7 +139,16 @@ pub fn build_graph(
     // Midi tracks as LIVE instrument nodes — a private registry, so the
     // cells are fresh (deterministic voice state) and exclusively ours.
     let mut nodes = LiveNodeRegistry::default();
-    append_from(midi, store, plugins, &slots, rate, bank, &mut nodes, &mut tracks);
+    append_from(
+        &crate::control::snapshot::MidiSnapshot::from_store(midi),
+        &store.tracks,
+        plugins,
+        &slots,
+        rate,
+        bank,
+        &mut nodes,
+        &mut tracks,
+    );
 
     let end_samples = song_end(&tracks);
     let mut graph = RtGraph::new(tracks, 0, params);

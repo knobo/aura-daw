@@ -181,6 +181,7 @@ pub fn start(
     committer: Committer,
 ) -> EngineHandle {
     let (tx, rx) = unbounded();
+    let published = session.lock().published_handle();
     std::thread::Builder::new()
         .name("aura-engine-control".into())
         .spawn(move || {
@@ -212,6 +213,9 @@ pub fn start(
                 param_writes: Vec::new(),
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
+                published,
+                #[cfg(test)]
+                after_assembly: None,
                 count_in_bars: 0,
                 pending_record: None,
             };
@@ -890,6 +894,19 @@ struct Control {
     /// the hub to notice a selection that, being app config, commits nothing
     /// and therefore schedules no rebuild of its own.
     live_in_target: Option<String>,
+    /// Plan F Task 6: the published-snapshot slot behind the SAME `Session`
+    /// this thread holds, cloned once at construction. This is the door the
+    /// heavy half of `rebuild` (and all of `ensure_loaded`) reads the
+    /// document through, so neither takes the session lock any more. The
+    /// inner mutex is a LEAF below `session` [C1]: held only long enough to
+    /// clone the `Arc`, never across another lock and never across I/O.
+    published: Arc<parking_lot::Mutex<Arc<crate::control::snapshot::SessionSnapshot>>>,
+    /// TEST-ONLY seam (sanctioned by the Task 6 plan). Fires exactly once
+    /// per `rebuild`, BETWEEN the lock-free assembly and the short session
+    /// lock, which is the one instant the two phases can be told apart from
+    /// outside. The field does not exist in a production build.
+    #[cfg(test)]
+    after_assembly: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Count-in length for the next take (app config). 0 = record immediately.
     count_in_bars: u8,
     /// A take waiting for `countin_left` to hit zero before capture arms.
@@ -1224,16 +1241,140 @@ impl Control {
     /// (`RtGraph::params`) — a retired graph keeps reading its own table,
     /// so the O-13 alias window is dead by construction (Step 5's test
     /// pins this).
+    ///
+    /// Plan F Task 6 splits this into two phases — a lock-free assembly from
+    /// the published snapshot and a short session lock that reads param
+    /// values, derives slots and publishes the tables. Each phase's comment
+    /// carries its own half of the argument; the seam between them is where
+    /// a commit may land, and `a_param_write_committed_during_assembly_is_
+    /// never_lost` is the pin that it costs nothing when it does.
     fn rebuild(&mut self) {
-        self.ensure_loaded();
+        // ONE image for the whole rebuild: the decode pass and the assembly
+        // that consumes its cache read the same `s`, so "a clip in the graph
+        // whose source this pass never looked at" cannot happen within a
+        // rebuild. (Before Task 6 these were two independent reads under two
+        // separate lock blocks and that window did exist.)
+        let s = self.published.lock().clone();
+        self.ensure_loaded(&s);
         self.generation += 1;
         let headless = self.output.is_none();
         // Read BEFORE the session lock is taken: the hub is reachable from
         // the midir callback thread, and nesting its mutex under the session
         // lock would invent a lock order this file has none of today.
         let live_in_target = self.live_in_hub.target_track();
-        let (graph, param_driver) = {
-            let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
+
+        // PHASE 1 — NO SESSION LOCK. The heavy half (clip assembly, live
+        // node instantiation, tick->sample conversion) reads the published
+        // image S: an immutable, fully-constructed document the committer
+        // assigned into the slot inside its own transaction. Nothing mutates
+        // a published image, so there is no torn read to observe and no
+        // guard to hold while this runs. The leaf mutex is held for one
+        // pointer clone at the top of this function (lock order [C1]:
+        // session -> leaf, never the reverse, and the leaf is never held
+        // across another acquisition).
+        let mut assembled: Option<(HashMap<crate::ids::TrackId, usize>, Vec<RtTrack>)> = None;
+        if !headless {
+            // Headless keeps its narrow scope [I5]: tables are enough to
+            // serve knob writes and recording resolution with no output
+            // device — no clip assembly, no live/plugin node instantiation,
+            // no `song_end` write. Enabling any of that headlessly (every
+            // structural commit in the whole backend test suite runs through
+            // here) would be a silent behavior change this refactor must not
+            // smuggle in.
+            let slots_s = derive_slots(&s.tracks);
+            let mut tracks = Vec::with_capacity(s.tracks.len());
+            for t in s.tracks.iter() {
+                let slot = slots_s[&t.id];
+                let clips = s
+                    .clips
+                    .iter()
+                    .filter(|c| c.track_id == t.id)
+                    .filter_map(|c| {
+                        let samples = self.cache.get(&c.source_id).map(|e| e.data.clone())?;
+                        Some(RtClip {
+                            start: c.timeline_start_samples,
+                            offset: c.offset_samples,
+                            len: c.length_samples,
+                            gain: mixer::db_to_linear(c.gain_db),
+                            fade_in: c.fade_in_samples,
+                            fade_out: c.fade_out_samples,
+                            samples,
+                        })
+                    })
+                    .collect();
+                tracks.push(RtTrack::clips(slot, clips));
+            }
+            // LIVE instrument tracks (phase 3, ARCHITECTURE §15): midi
+            // tracks become RtTracks carrying a live node (SamplerNode when
+            // the track's `instrument_id` resolves, plugin node for
+            // `plugin:` refs, PolySynth fallback) plus this snapshot's
+            // pre-scheduled events (ticks -> absolute samples via TempoMap,
+            // HERE on the control thread; the RT thread only slices
+            // sample-offset events). Nodes come from `live_nodes` so
+            // voice/plugin state SURVIVES rebuilds; brand-new nodes are
+            // prepared before the graph is published (RCU discipline).
+            let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
+            // ORDER MATTERS: a midi track already has a clips-only row from
+            // the loop above, so this adds a SECOND row for the same slot.
+            // Both write that slot's meter lane and the last writer wins —
+            // appending the live rows here is what makes the live one win.
+            // Push them before the loop and the midi track's meters silently
+            // read zero.
+            crate::midi::playback::append_from_with_input(
+                &s.midi,
+                &s.tracks,
+                &s.clips,
+                &s.plugins,
+                &slots_s,
+                self.cache_rate,
+                bank.as_deref(),
+                &mut self.live_nodes,
+                &mut tracks,
+                live_in_target.as_deref(),
+            );
+            // The timeline boundary belongs to the material, so it is
+            // derived exactly where the material is assembled — same helper
+            // the offline bounce uses, so live and export agree on where the
+            // song ends (clip ends AND the final scheduled note-off).
+            self.shared
+                .song_end
+                .store(offline::song_end(&tracks), Relaxed);
+            assembled = Some((slots_s, tracks));
+        }
+        #[cfg(test)]
+        if let Some(f) = self.after_assembly.clone() {
+            f();
+        }
+
+        // PHASE 2 — the SHORT session lock, and the whole of the [C1]
+        // argument. Publishing `GraphTables` under this lock is load-bearing,
+        // not style: it makes <read doc, publish tables> atomic against every
+        // commit's <transact, execute writes>. Publish tables built from an
+        // older read and a commit that transacted in between resolves its
+        // param writes through the still-old tables, then this rebuild
+        // overwrites them from the older revision — silently losing the write
+        // forever (a plain `Set` schedules no rebuild of its own).
+        //
+        // Task 6 keeps the atomic pair and SHRINKS the read to what actually
+        // needs it. Param VALUES and the slot map come from the LIVE document
+        // L read here, never from the assembly image S, so a commit landing
+        // during phase 1 is still in L and still reaches the table.
+        //
+        // Graph STRUCTURE may be S != L, and that is accepted: any structural
+        // commit between the two set `effect.rebuild`, whose `do_rebuild()`
+        // queued another `ControlMsg::Rebuild`, so the stale structure is
+        // transient by exactly the mechanism that already covers "a commit
+        // lands while a rebuild waits in the queue".
+        //
+        // L is read as the live document rather than through the published
+        // slot (DEVIATION from the plan's literal step 3, which says to
+        // re-read the image under the lock). Under this lock the two are the
+        // same document by the publication invariant — except at the three
+        // enumerated sites where a command swaps the document and
+        // republishes a few statements later; there, live truth is what [C1]
+        // requires and the image is momentarily behind it.
+        let (params, slots, track_ramps, param_driver, clicks) = {
+            let session = self.session.lock(); // read-only: param VALUES + slot map + automation compile — short, no assembly
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
             // Sized to mixer slots, not store track count: automation tracks
@@ -1248,18 +1389,7 @@ impl Control {
                 params.set_flag(slot, super::rt::FLAG_SOLO, t.soloed);
             }
             params.any_solo.store(store.any_solo(), Relaxed);
-            // PUBLISH UNDER THE SESSION LOCK [C1]: this is load-bearing, not
-            // style. Publishing after the lock is released would open a
-            // window where a commit transacts against a NEWER document
-            // revision than the one this rebuild read, resolves its param
-            // writes through the STILL-OLD tables (because these fresher
-            // ones aren't published yet), and then this rebuild publishes
-            // tables built from the OLDER revision — silently losing the
-            // commit's write forever (a plain `Set` never schedules a
-            // rebuild). Publishing here, still holding `session`, makes
-            // <read doc, publish tables> atomic against every commit's
-            // <transact, execute writes> sequence (see `SharedGraphTables`'s
-            // doc for the full argument and the lock-order rule).
+            // THE [C1] PUBLISH SITE — still under `session`, see above.
             *self.tables.lock() = GraphTables {
                 generation: self.generation,
                 params: params.clone(),
@@ -1271,90 +1401,47 @@ impl Control {
             self.gen_maps.publish(self.generation, &slots);
             let (track_ramps, param_driver) =
                 self.compile_automation(&session, &slots, n_slots);
-            let graph = if headless {
-                // Headless keeps its narrow scope [I5]: tables are enough
-                // to serve knob writes and recording resolution with no
-                // output device — no clip assembly, no live/plugin node
-                // instantiation, no `song_end` write. Enabling any of that
-                // headlessly (every structural commit in the whole backend
-                // test suite runs through here) would be a silent behavior
-                // change this refactor must not smuggle in.
-                None
-            } else {
-                let mut tracks = Vec::with_capacity(n_slots);
-                for t in &store.tracks {
-                    let Some(&slot) = slots.get(&t.id) else { continue };
-                    let clips = store
-                        .clips
-                        .iter()
-                        .filter(|c| c.track_id == t.id)
-                        .filter_map(|c| {
-                            let samples = self.cache.get(&c.source_id).map(|e| e.data.clone())?;
-                            Some(RtClip {
-                                start: c.timeline_start_samples,
-                                offset: c.offset_samples,
-                                len: c.length_samples,
-                                gain: mixer::db_to_linear(c.gain_db),
-                                fade_in: c.fade_in_samples,
-                                fade_out: c.fade_out_samples,
-                                samples,
-                            })
-                        })
-                        .collect();
-                    tracks.push(RtTrack::clips(slot, clips));
-                }
-                // LIVE instrument tracks (phase 3, ARCHITECTURE §15): midi
-                // tracks become RtTracks carrying a live node (SamplerNode
-                // when the track's `instrument_id` resolves, plugin node
-                // for `plugin:` refs — stub until zones P1/P2 land —,
-                // PolySynth fallback) plus this snapshot's pre-scheduled
-                // events (ticks -> absolute samples via TempoMap, HERE on
-                // the control thread; the RT thread only slices
-                // sample-offset events). Nodes come from `live_nodes` so
-                // voice/plugin state SURVIVES rebuilds; brand-new nodes are
-                // prepared before the snapshot is published (RCU
-                // discipline). Store and midi share one guard now, so this
-                // reads `session.midi` directly instead of re-locking
-                // through the registered global.
-                let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-                // ORDER MATTERS: a midi track already has a clips-only row
-                // from the loop above, so this adds a SECOND row for the
-                // same slot. Both write that slot's meter lane and the last
-                // writer wins — appending the live rows here is what makes
-                // the live one win. Push them before the loop and the midi
-                // track's meters silently read zero.
-                crate::midi::playback::append_from_with_input(
-                    &session.midi,
-                    store,
-                    &session.plugins,
-                    &slots,
-                    self.cache_rate,
-                    bank.as_deref(),
-                    &mut self.live_nodes,
-                    &mut tracks,
-                    live_in_target.as_deref(),
-                );
-                // The timeline boundary belongs to the material, so it is
-                // derived exactly where the material is assembled — same
-                // helper the offline bounce uses, so live and export agree
-                // on where the song ends (clip ends AND the final scheduled
-                // note-off).
-                let song_end = offline::song_end(&tracks);
-                self.shared.song_end.store(song_end, Relaxed);
-                let clicks = compile_clicks(&session, self.cache_rate, song_end);
-                let mut g = RtGraph::new(tracks, self.generation, params);
-                // RCU: the ramp table is attached BEFORE the graph is
-                // published, so the callback only ever sees a snapshot whose
-                // ramps already belong to it — and a retired graph keeps
-                // reading its own table, exactly like `params`.
-                g.set_track_ramps(track_ramps);
-                g.clicks = Arc::new(clicks);
-                Some(Box::new(g))
-            };
-            (graph, param_driver)
+            let clicks = compile_clicks(
+                &session,
+                self.cache_rate,
+                self.shared.song_end.load(Relaxed),
+            );
+            (params, slots, track_ramps, param_driver, clicks)
         };
         self.param_automation = param_driver;
-        let Some(graph) = graph else { return };
+
+        let Some((slots_s, mut tracks)) = assembled else { return };
+        // The rows were assembled against S's slot map; the tables just
+        // published describe L. Re-key by TRACK ID so the graph and the
+        // tables it reads agree on what a slot means: a track S had and L
+        // does not is dropped (it vanishes in the rebuild that removal
+        // queued), and a track only L has contributes params but no clips
+        // until then — the same "no slot yet" tolerance the assembly loop
+        // always had, mirrored. Dropping is also what keeps every row's slot
+        // inside the freshly sized `ParamTable`.
+        let mut id_of_slot: Vec<Option<&crate::ids::TrackId>> = vec![None; slots_s.len()];
+        for (id, &slot) in &slots_s {
+            id_of_slot[slot] = Some(id);
+        }
+        tracks.retain_mut(|row| {
+            match id_of_slot.get(row.slot).copied().flatten().and_then(|id| slots.get(id)) {
+                Some(&slot) => {
+                    row.slot = slot;
+                    true
+                }
+                None => false,
+            }
+        });
+
+        let mut g = RtGraph::new(tracks, self.generation, params);
+        // RCU: the ramp table is attached BEFORE the graph is published, so
+        // the callback only ever sees a snapshot whose ramps already belong
+        // to it — and a retired graph keeps reading its own table, exactly
+        // like `params`.
+        g.set_track_ramps(track_ramps);
+        g.clicks = Arc::new(clicks);
+        let graph = Box::new(g);
+
         let Some(out) = self.output.as_mut() else { return };
         // Free anything the callback already retired before queueing more.
         while let Ok(gp) = out.retire_rx.pop() {
@@ -1495,7 +1582,14 @@ impl Control {
     /// Decode any clip sources missing from the cache (at the engine rate,
     /// or stale under a changed `source_path` — round-2 §2.2) and make sure
     /// every referencing clip's waveform pyramid exists.
-    fn ensure_loaded(&mut self) {
+    ///
+    /// Reads `s`, the image its caller's whole rebuild is built from — no
+    /// session lock (Plan F Task 6). It is a pure read whose entire output
+    /// is control-thread cache bookkeeping, and it is followed by file I/O:
+    /// precisely the shape that must not sit under the document's lock. An
+    /// image one commit behind can only cost this pass a decode it redoes
+    /// next rebuild — the commit that added the clip queued one.
+    fn ensure_loaded(&mut self, s: &crate::control::snapshot::SessionSnapshot) {
         let rate = self.engine_rate();
         if self.cache_rate != rate {
             self.cache.clear();
@@ -1506,19 +1600,17 @@ impl Control {
         // visual cache stays clip-id-keyed — dedup opportunity ledgered,
         // not taken here).
         let (project_dir, todo, live_sources, clips_by_source) = {
-            let session = self.session.lock(); // read-only: stale-source scan (import cache maintenance) — no writes
-            let store = &session.store;
-            let todo = stale_sources(&store.clips, &self.cache);
+            let todo = stale_sources(&s.clips, &self.cache);
             let mut live_sources: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
             let mut clips_by_source: HashMap<SourceId, Vec<String>> = HashMap::new();
-            for c in &store.clips {
+            for c in s.clips.iter() {
                 if c.source_id.as_str().is_empty() {
                     continue; // stale_sources already warned about this
                 }
                 live_sources.insert(c.source_id.clone());
                 clips_by_source.entry(c.source_id.clone()).or_default().push(c.id.to_string());
             }
-            (store.project_dir.clone(), todo, live_sources, clips_by_source)
+            (s.project_dir.clone(), todo, live_sources, clips_by_source)
         };
         // GC by source (round-2 §2.2's "sane asset GC" half of O-12): an
         // asset shared by two clips survives one clip's deletion, since the
@@ -3107,6 +3199,8 @@ mod tests {
             // otherwise race every other test that selects a routing target.
             live_in_hub: Arc::new(MidiInHub::new()),
             live_in_target: None,
+            published: session.lock().published_handle(),
+            after_assembly: None,
             count_in_bars: 0,
             pending_record: None,
         };
@@ -3276,6 +3370,11 @@ mod tests {
             let mut t = test_track("t-1");
             t.kind = "midi".into();
             s.store.tracks.push(t);
+            // The published image IS the document these readers see, so a
+            // test that pokes the live document must republish — a live/image
+            // divergence with no lock held is not a state production can be
+            // in (`Session::published`'s contract).
+            s.republish_full();
         }
         let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
         let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
@@ -3300,6 +3399,218 @@ mod tests {
             graph.tracks.iter().any(|t| t.slot == 0 && t.live.is_some()),
             "an armed empty midi track has a node to play"
         );
+    }
+
+    /// Plan F Task 6 — the Plan A deferral's own pin, and the reason this
+    /// task exists: the GRAPH BUILD no longer runs under the session lock.
+    ///
+    /// The probe is an ordering one, not a timing one. Another thread takes
+    /// the session lock and holds it until told to let go; the only thing
+    /// that ever tells it is the assembly hook, which fires between the
+    /// lock-free phase and the short publish lock. So `holder_holds` is
+    /// still true at hook time IFF the whole assembly ran with the lock in
+    /// someone else's hands. The holder also has a 10 s ceiling, so the
+    /// PREVIOUS structure (assemble under the lock) fails this on an
+    /// assertion — `holder_holds == false`, seen == 2 — instead of hanging
+    /// the suite.
+    #[test]
+    fn rebuild_does_not_hold_the_session_lock_across_the_graph_build() {
+        use std::sync::atomic::{AtomicBool, AtomicU8};
+        let (mut ctl, session) = bare_control();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            s.store.tracks.push(t);
+            // The document these tests poke directly is only a legal state
+            // once the image matches it — that equivalence is the contract
+            // every reader here relies on.
+            s.republish_full();
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+
+        let holds = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(AtomicU8::new(0));
+        let (h2, r2, s2) = (holds.clone(), release.clone(), session.clone());
+        let holder = std::thread::spawn(move || {
+            let guard = s2.lock();
+            h2.store(true, Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !r2.load(Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            h2.store(false, Relaxed);
+            drop(guard);
+        });
+        while !holds.load(Relaxed) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (h3, r3, s3) = (holds.clone(), release.clone(), seen.clone());
+        ctl.after_assembly = Some(Arc::new(move || {
+            s3.store(if h3.load(Relaxed) { 1 } else { 2 }, Relaxed);
+            r3.store(true, Relaxed);
+        }));
+
+        ctl.rebuild();
+        holder.join().unwrap();
+
+        assert_eq!(
+            seen.load(Relaxed),
+            1,
+            "the graph assembly finished while ANOTHER thread held the session lock (0 = the hook never ran)"
+        );
+        let graph = graph_rx.pop().expect("the rebuild published a graph").into_box();
+        assert!(
+            graph.tracks.iter().any(|t| t.slot == 0 && t.live.is_some()),
+            "and it is a REAL graph: the live node was instantiated from the published image"
+        );
+    }
+
+    /// Plan F Task 6 — the seam between the two phases, in the one case
+    /// where they DISAGREE. The graph is assembled from image S; the tables
+    /// published under the short lock describe the live document L. A track
+    /// removed in between shifts every later track's slot, so a row carried
+    /// over unchanged would read another track's gain/mute lane and write
+    /// another track's meter — and, with the fresh `ParamTable` now one slot
+    /// shorter, the last row would index past it entirely. Rows are re-keyed
+    /// by TRACK ID against L, so the departed track's row is dropped and the
+    /// survivor moves to its new slot.
+    #[test]
+    fn rows_assembled_from_the_snapshot_are_re_keyed_onto_the_live_slot_map() {
+        use crate::midi::types::{MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+        let (mut ctl, session) = bare_control();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        {
+            let mut s = session.lock();
+            for id in ["t-1", "t-2"] {
+                let mut t = test_track(id);
+                t.kind = "midi".into();
+                s.store.tracks.push(t);
+            }
+            s.midi.ppq = DEFAULT_PPQ;
+            s.midi.tempo_events = vec![TempoEvent { tick: 0, bpm: 120.0 }];
+            // Only t-2 has material, so the surviving row is identifiable by
+            // its events alone — t-1's row comes from the live-in target and
+            // carries none.
+            s.midi.clips.push(MidiClip {
+                id: "mc-1".into(),
+                track_id: "t-2".into(),
+                name: "c".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 1920,
+                notes: vec![MidiNote {
+                    tick: 0,
+                    length_ticks: 480,
+                    key: 60,
+                    velocity: 100,
+                    channel: 0,
+                    note_id: crate::ids::NoteId(1),
+                }],
+                next_note_id: 2,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("t-2"),
+                content_length_ticks: None,
+            });
+            s.republish_full();
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+
+        let s2 = session.clone();
+        ctl.after_assembly = Some(Arc::new(move || {
+            // Assembly is done and the lock is free: retire t-1 so the image
+            // the rows came from no longer describes the document the tables
+            // are about to. (A direct write + republish, not a transact —
+            // what this pins is the S/L divergence, not the commit path.)
+            let mut s = s2.lock();
+            s.store.tracks.retain(|t| t.id.as_str() != "t-1");
+            s.republish_full();
+        }));
+
+        ctl.rebuild();
+
+        let graph = graph_rx.pop().expect("the rebuild published a graph").into_box();
+        assert_eq!(graph.params.len(), 1, "the table is sized by the live document");
+        // t-2 contributes two rows (a clips-only one from the assembly loop
+        // and a live one) — t-1's two are gone, not carried at a stale slot.
+        assert_eq!(graph.tracks.len(), 2, "the departed track's rows were dropped");
+        assert!(
+            graph.tracks.iter().all(|t| t.slot < graph.params.len()),
+            "no row survives pointing past the table this graph reads"
+        );
+        assert!(
+            graph.tracks.iter().all(|t| t.slot == 0),
+            "t-2 moved into the slot the live document gives it"
+        );
+        assert_eq!(
+            graph.tracks.iter().filter(|t| t.live.as_ref().is_some_and(|l| !l.events.is_empty())).count(),
+            1,
+            "the surviving live row is t-2's (the one with material), not t-1's empty live-in row"
+        );
+    }
+
+    /// Plan F Task 6 — the [C1] regression pin, snapshot edition. A param
+    /// write that commits DURING the lock-free assembly must still reach the
+    /// tables this rebuild publishes: values come from the LIVE document
+    /// read under the short lock, never from the image the graph was
+    /// assembled from. Building the `ParamTable` from the assembly image
+    /// instead loses the write forever — a plain `Set` schedules no rebuild
+    /// of its own.
+    #[test]
+    fn a_param_write_committed_during_assembly_is_never_lost() {
+        let (mut ctl, session) = bare_control();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.republish_full();
+        }
+        let (graph_tx, _graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+
+        let s2 = session.clone();
+        ctl.after_assembly = Some(Arc::new(move || {
+            // A real commit, on this thread, holding nothing: that it can
+            // take the session lock here at all is the other half of the
+            // proof that the assembly released it.
+            Session::transact(
+                &s2,
+                crate::control::op::TxMeta::engine("gain mid-assembly"),
+                |tx| {
+                    tx.apply(crate::control::op::Op::Set {
+                        object: crate::control::op::ObjectRef::Track("t-1".into()),
+                        path: crate::control::op::PropPath::Gain,
+                        from: serde_json::json!(0.0),
+                        to: serde_json::json!(-6.0),
+                    })
+                },
+            )
+            .expect("the mid-assembly commit landed");
+        }));
+
+        ctl.rebuild();
+
+        let tables = ctl.tables.lock();
+        let published = f32::from_bits(tables.params.gain[0].load(Relaxed));
+        assert!(
+            (published - mixer::db_to_linear(-6.0)).abs() < 1e-6,
+            "the published table carries the gain committed during assembly, got {published}"
+        );
+        assert_eq!(tables.generation, ctl.generation, "published at THIS rebuild's generation");
     }
 
     /// Track D: the gain-ramp half of the same attach. `rebuild` builds no
@@ -4163,6 +4474,11 @@ mod tests {
             let mut c1 = test_clip("c1", "t1");
             c1.source_id = sid.clone();
             s.clips.push(c1);
+            // The published image IS the document these readers see, so a
+            // test that pokes the live document must republish — a live/image
+            // divergence with no lock held is not a state production can be
+            // in (`Session::published`'s contract).
+            session.republish_full();
         }
         handle.send(ControlMsg::Rebuild);
 
@@ -4180,6 +4496,7 @@ mod tests {
             let mut c2 = test_clip("c2", "t1");
             c2.source_id = sid.clone();
             session.store.clips.push(c2);
+            session.republish_full();
         }
         handle.send(ControlMsg::Rebuild);
 
@@ -4250,6 +4567,11 @@ mod tests {
             let mut c1 = test_clip("c1", "t1");
             c1.source_id = sid.clone();
             s.clips.push(c1);
+            // The published image IS the document these readers see, so a
+            // test that pokes the live document must republish — a live/image
+            // divergence with no lock held is not a state production can be
+            // in (`Session::published`'s contract).
+            session.republish_full();
         }
         handle.send(ControlMsg::Rebuild);
 

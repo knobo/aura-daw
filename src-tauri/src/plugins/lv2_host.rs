@@ -870,7 +870,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         // The registry key proves the PLUGIN node resolved (a PolySynth
         // fallback would be keyed "synth@48000" — and would fake the pitch).
@@ -919,7 +919,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
         assert_eq!(nodes.key_of("zyn-hold"), Some(format!("plugin:{instance_id}@{RATE}#0").as_str()));
         let mut g = RtGraph::new(tracks, 2, Arc::new(ParamTable::default()));
 
@@ -969,7 +969,7 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
         let mut g = RtGraph::new(tracks, 2, Arc::new(ParamTable::default()));
 
         const CHUNK: usize = 512;
