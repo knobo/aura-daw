@@ -484,10 +484,13 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
   differentiating (landed), Tier 1 (weeks — includes Tracks B/C/D/E plus
   smaller **inline** items: metronome/click+count-in, piano-roll quantize,
   and the biggest single Tier-1 architecture item — **insert FX chains +
-  sends/busses, candidate "Plan G"**, which needs its own research → plan
-  → gates round because it touches the RT graph invariants round-2 §8
-  reserves for the node-graph round, and is bound by the standing "PDC
-  before sends ship" rule), and Tier 2 (months — time-stretch, pattern
+  sends/busses, Plan G**, product decision in
+  `docs/backlog/insert-fx-sends-sidechain.md`: host already-scanned
+  CLAP/LV2 effects, do not write a stock FX suite; G1 inserts+PDC, G2
+  bus+sends, G3 sidechain taps, G4 envelope-follower later. Still needs
+  its own research → plan → gates round because it touches the RT graph
+  invariants round-2 §8 reserves for the node-graph round, and is bound
+  by the standing "PDC before sends ship" rule), and Tier 2 (months — time-stretch, pattern
   instancing, takes/comping, stems export, freeze/bounce, external
   instrument tracks, two-instance coexistence). **Start here** for
   anything not already one of the five tracks above.
@@ -505,6 +508,9 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
 - `docs/backlog/hardware-midi-io.md`, `docs/backlog/multi-clip-selection-and-paste.md`,
   `docs/backlog/automation-audible-and-ui.md`, `docs/backlog/library-and-browser.md`
   — Tracks B/C/D/E's own docs, read in full before starting that track.
+- `docs/backlog/insert-fx-sends-sidechain.md` — Plan G product decision
+  (inserts / sends / sidechain / what we will not write). Read before
+  opening the graph-compiler plan round.
 - `docs/CORE-REDESIGN-ROUND-2.md` (ACCEPTED) §6 for Plan F's spec; ADR
   0005 for the history-storage decision it implements.
 
