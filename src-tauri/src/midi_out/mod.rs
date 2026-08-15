@@ -715,17 +715,61 @@ impl MidiOut {
     /// the per-machine routing file, resolve this project's persisted
     /// routes (by track/clip id) and remembered ports (by NAME) against
     /// whatever is visible on this machine right now, open what resolves,
-    /// and adopt each port's clock-enabled preference. Best-effort
-    /// throughout — missing hardware, or a track/clip id the project no
-    /// longer has, is logged and skipped, never an error.
+    /// and adopt each port's clock-enabled preference. A missing persist
+    /// entry is empty routing — leftover routes/ports from the previous
+    /// project are cleared, not left in place for the next `persist` to
+    /// file under the new key. Best-effort throughout — missing hardware,
+    /// or a track/clip id the project no longer has, is logged and skipped,
+    /// never an error. Unresolved rows stay on disk (see [`Self::persist`]).
     pub fn adopt_project(&self, project_dir: &Path) {
         let file = self.load_routing();
         let key = persist::project_key(project_dir);
-        let Some(proj) = file.projects.get(&key) else { return };
+        let empty = persist::ProjectRouting::default();
+        let proj = file.projects.get(&key).unwrap_or(&empty);
 
         let available = list_output_ports().unwrap_or_default();
         let name_to_id: HashMap<&str, &str> =
             available.iter().map(|p| (p.name.as_str(), p.id.as_str())).collect();
+
+        // Drop the previous project's table first so a leftover route cannot
+        // emit into a port we are about to open for this one.
+        *self.routes.lock() = HashMap::new();
+
+        let mut wanted_names: HashSet<&str> = proj.open_ports.iter().map(String::as_str).collect();
+        for r in &proj.routes {
+            wanted_names.insert(r.port_name.as_str());
+        }
+
+        let leftover: Vec<String> = self
+            .inner
+            .lock()
+            .active
+            .values()
+            .filter(|a| !wanted_names.contains(a.port.name.as_str()))
+            .map(|a| a.port.id.clone())
+            .collect();
+        for id in leftover {
+            let _ = self.close_port(&id);
+        }
+
+        for name in &wanted_names {
+            let Some(&port_id) = name_to_id.get(name) else { continue };
+            if self.inner.lock().active.contains_key(port_id) {
+                continue;
+            }
+            if let Err(e) = self.open_port(port_id.to_string()) {
+                log::warn!("midi routing: failed to open persisted port {port_id}: {e}");
+            }
+        }
+
+        {
+            let inner = self.inner.lock();
+            for active in inner.active.values() {
+                if let Some(prefs) = file.ports.get(&active.port.name) {
+                    active.clock_enabled.store(prefs.clock_enabled, Relaxed);
+                }
+            }
+        }
 
         let mut new_routes = HashMap::new();
         for r in &proj.routes {
@@ -737,10 +781,7 @@ impl MidiOut {
                 continue;
             };
             if !self.inner.lock().active.contains_key(port_id) {
-                if let Err(e) = self.open_port(port_id.to_string()) {
-                    log::warn!("midi routing: failed to open persisted port {port_id}: {e}");
-                    continue;
-                }
+                continue;
             }
             let scope = match r.scope.as_str() {
                 "track" => RouteScope::Track(r.id.clone()),
@@ -753,13 +794,6 @@ impl MidiOut {
             new_routes.insert(scope, RouteTarget { port_id: port_id.to_string(), channel: r.channel });
         }
         *self.routes.lock() = new_routes;
-
-        let inner = self.inner.lock();
-        for active in inner.active.values() {
-            if let Some(prefs) = file.ports.get(&active.port.name) {
-                active.clock_enabled.store(prefs.clock_enabled, Relaxed);
-            }
-        }
     }
 
     /// Save the current port-clock prefs (always) and, if `project_dir` is
@@ -767,8 +801,21 @@ impl MidiOut {
     /// directory) to the per-machine file. `project_dir` is `None` for an
     /// unsaved project — its routes simply aren't written, so they fall
     /// back to session-only, same as before persistence existed at all.
+    ///
+    /// Merge-on-write: rows whose port name is not visible right now stay
+    /// on disk. Adopt only loads what can open this session; rewriting
+    /// `file.projects[key]` from that live subset would permanently forget
+    /// a route to an unplugged device (see `docs/midi-output.md`).
     pub fn persist(&self, project_dir: Option<&Path>) {
         let mut file = self.load_routing();
+        // Enumerate BEFORE taking `inner` — midir's client create is not
+        // something we want to do under the active-port lock, and a failed
+        // list degrades to "nothing visible" so merge keeps every
+        // previously persisted name rather than dropping unresolved rows.
+        let available_names: HashSet<String> = list_output_ports()
+            .map(|ports| ports.into_iter().map(|p| p.name).collect())
+            .unwrap_or_default();
+
         let inner = self.inner.lock();
         for active in inner.active.values() {
             file.ports.insert(
@@ -777,10 +824,11 @@ impl MidiOut {
             );
         }
         if let Some(dir) = project_dir {
+            let key = persist::project_key(dir);
             let id_to_name: HashMap<&str, &str> =
                 inner.active.values().map(|a| (a.port.id.as_str(), a.port.name.as_str())).collect();
             let routes = self.routes.lock();
-            let persisted: Vec<persist::PersistedRoute> = routes
+            let mut persisted: Vec<persist::PersistedRoute> = routes
                 .iter()
                 .filter_map(|(scope, target)| {
                     let port_name = (*id_to_name.get(target.port_id.as_str())?).to_string();
@@ -796,7 +844,34 @@ impl MidiOut {
                     })
                 })
                 .collect();
-            file.projects.insert(persist::project_key(dir), persist::ProjectRouting { routes: persisted });
+            drop(routes);
+
+            let written: HashSet<(String, String)> =
+                persisted.iter().map(|r| (r.scope.clone(), r.id.clone())).collect();
+            if let Some(existing) = file.projects.get(&key) {
+                for r in &existing.routes {
+                    if written.contains(&(r.scope.clone(), r.id.clone())) {
+                        continue;
+                    }
+                    if !available_names.contains(&r.port_name) {
+                        persisted.push(r.clone());
+                    }
+                }
+            }
+
+            let mut open_ports: Vec<String> =
+                inner.active.values().map(|a| a.port.name.clone()).collect();
+            if let Some(existing) = file.projects.get(&key) {
+                for name in &existing.open_ports {
+                    if !open_ports.iter().any(|n| n == name) && !available_names.contains(name) {
+                        open_ports.push(name.clone());
+                    }
+                }
+            }
+            open_ports.sort();
+            open_ports.dedup();
+
+            file.projects.insert(key, persist::ProjectRouting { routes: persisted, open_ports });
         }
         drop(inner);
         self.save_routing(&file);
@@ -2043,6 +2118,243 @@ mod tests {
 
         after.close_port(&status.outputs[0].port.id).ok();
         let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    fn test_routing_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "aura-midi-routing-{label}-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn test_project_dir(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "aura-midi-routing-{label}-project-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    /// File > New (or opening a project that has never been routed) must
+    /// not keep the previous project's in-memory table: `create_project_at`
+    /// / `open_project_epoch` both call `adopt_project` after the document
+    /// swap, and the next `persist` would otherwise write those leftover
+    /// routes under the NEW project's key.
+    #[test]
+    fn adopt_project_with_no_persist_entry_clears_leftover_routes() {
+        let routing_path = test_routing_path("adopt-empty-routes");
+        let new_project = test_project_dir("adopt-empty-routes");
+
+        let out = MidiOut::default();
+        out.set_routing_path_for_test(routing_path.clone());
+        out.set_route(
+            RouteScope::Track("t-prev".into()),
+            Some(RouteTarget { port_id: "ghost#0".into(), channel: 2 }),
+        );
+        assert!(
+            !out.routes().is_empty(),
+            "precondition: leftover routes from the previous project"
+        );
+
+        out.adopt_project(&new_project);
+        assert!(
+            out.routes().is_empty(),
+            "a project with no persist entry is empty routing, not 'leave the previous table alone': {:?}",
+            out.routes()
+        );
+
+        out.persist(Some(&new_project));
+        let file = persist::load_from_path(&routing_path);
+        let proj = file.projects.get(&persist::project_key(&new_project));
+        assert!(
+            proj.is_none() || proj.unwrap().routes.is_empty(),
+            "persist after adopting an unrouted project must not file the previous project's routes under the new key: {proj:?}"
+        );
+        let _ = std::fs::remove_file(&routing_path);
+    }
+
+    /// Same adopt-empty contract for open ports: File > New must close
+    /// hardware the new project does not need, or the leftover connection
+    /// (and its clock) keeps running against the wrong song.
+    #[test]
+    fn adopt_project_with_no_persist_entry_closes_leftover_ports() {
+        use midir::os::unix::VirtualInput;
+        let Ok(midi_in) = midir::MidiInput::new("aura-midi-out-test-in-adopt-empty") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let Ok(_conn) = midi_in.create_virtual("aura-out-adopt-empty-loopback", |_, _msg, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: virtual port unavailable"); return;
+        };
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no output enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-out-adopt-empty-loopback")) else {
+            eprintln!("skipping: loopback port not visible"); return;
+        };
+
+        let out = MidiOut::default();
+        out.set_routing_path_for_test(test_routing_path("adopt-empty-ports"));
+        out.open_port(target.id.clone()).expect("open the leftover port");
+        assert_eq!(out.status().outputs.len(), 1, "precondition: a port is open from the previous project");
+
+        out.adopt_project(&test_project_dir("adopt-empty-ports"));
+        assert!(
+            out.status().outputs.is_empty(),
+            "adopting a project with no persist entry closes ports the new project does not need: {:?}",
+            out.status().outputs
+        );
+    }
+
+    /// Docs (`docs/midi-output.md`): a route to an unplugged device stays
+    /// on disk and is reapplied when that name reappears. Adopt builds the
+    /// in-memory table from whatever is visible *right now*, but persist
+    /// must not rewrite `file.projects[key]` as only that subset — otherwise
+    /// the unresolved rows are forgotten forever.
+    #[test]
+    fn persist_keeps_unresolved_routes_after_adopt() {
+        let routing_path = test_routing_path("unresolved-keep");
+        let project_dir = test_project_dir("unresolved-keep");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let key = persist::project_key(&project_dir);
+
+        let mut file = persist::RoutingFile::default();
+        file.projects.insert(
+            key.clone(),
+            persist::ProjectRouting {
+                routes: vec![
+                    persist::PersistedRoute {
+                        scope: "track".into(),
+                        id: "t-1".into(),
+                        port_name: "Unplugged Synth".into(),
+                        channel: 3,
+                    },
+                    persist::PersistedRoute {
+                        scope: "clip".into(),
+                        id: "c-9".into(),
+                        port_name: "Missing Drum Machine".into(),
+                        channel: 9,
+                    },
+                ],
+                open_ports: vec!["Unplugged Synth".into()],
+            },
+        );
+        persist::save_to_path(&routing_path, &file);
+
+        let out = MidiOut::default();
+        out.set_routing_path_for_test(routing_path.clone());
+        out.adopt_project(&project_dir);
+        assert!(
+            out.routes().is_empty(),
+            "nothing to resolve — those devices are not visible: {:?}",
+            out.routes()
+        );
+
+        // A later persist (clock toggle, another route change, File > Save
+        // adjacent) must not clobber the on-disk list with the empty live
+        // subset.
+        out.persist(Some(&project_dir));
+        let back = persist::load_from_path(&routing_path);
+        let proj = back.projects.get(&key).expect("the project entry must survive");
+        assert!(
+            proj.routes.iter().any(|r| r.scope == "track" && r.id == "t-1" && r.port_name == "Unplugged Synth" && r.channel == 3),
+            "the unplugged track route stays on disk: {:?}",
+            proj.routes
+        );
+        assert!(
+            proj.routes.iter().any(|r| r.scope == "clip" && r.id == "c-9" && r.port_name == "Missing Drum Machine" && r.channel == 9),
+            "the unplugged clip route stays on disk: {:?}",
+            proj.routes
+        );
+        assert!(
+            proj.open_ports.iter().any(|n| n == "Unplugged Synth"),
+            "an unplugged clock/route port name stays in the per-project open list: {:?}",
+            proj.open_ports
+        );
+
+        let _ = std::fs::remove_file(&routing_path);
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    /// Recipe 1 in `docs/midi-output.md`: a port opened solely for clock
+    /// (no track/clip route) must come back on adopt. `ProjectRouting`
+    /// used to store only routes, so `adopt_project` never reopened it.
+    #[test]
+    fn adopt_project_reopens_a_clock_only_port() {
+        use midir::os::unix::VirtualInput;
+        let Ok(midi_in) = midir::MidiInput::new("aura-midi-out-test-in-clock-only") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let Ok(_conn) = midi_in.create_virtual("aura-out-clock-only-loopback", |_, _msg, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: virtual port unavailable"); return;
+        };
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no output enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-out-clock-only-loopback")) else {
+            eprintln!("skipping: loopback port not visible"); return;
+        };
+
+        let routing_path = test_routing_path("clock-only");
+        let project_dir = test_project_dir("clock-only");
+
+        let before = MidiOut::default();
+        before.set_routing_path_for_test(routing_path.clone());
+        before.open_port(target.id.clone()).expect("open the clock-only port");
+        before.set_clock_enabled(&target.id, false).unwrap();
+        assert!(before.routes().is_empty(), "precondition: no routes — clock only");
+        before.persist(Some(&project_dir));
+        before.close_port(&target.id).ok();
+
+        let after = MidiOut::default();
+        after.set_routing_path_for_test(routing_path);
+        after.adopt_project(&project_dir);
+
+        let status = after.status();
+        assert_eq!(
+            status.outputs.len(),
+            1,
+            "a port opened solely for clock is restored even with an empty route table: {:?}",
+            status.outputs
+        );
+        assert_eq!(status.outputs[0].port.name, target.name);
+        assert!(!status.outputs[0].clock_enabled, "the persisted clock-enabled preference was restored");
+        assert!(after.routes().is_empty(), "still no routes — this was clock-only");
+
+        after.close_port(&status.outputs[0].port.id).ok();
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    /// Closing a port must drop it from the per-project open-port list so
+    /// the next adopt does not sneak it back open.
+    #[test]
+    fn persist_after_close_does_not_restore_the_closed_port() {
+        use midir::os::unix::VirtualInput;
+        let Ok(midi_in) = midir::MidiInput::new("aura-midi-out-test-in-close-forget") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let Ok(_conn) = midi_in.create_virtual("aura-out-close-forget-loopback", |_, _msg, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: virtual port unavailable"); return;
+        };
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no output enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-out-close-forget-loopback")) else {
+            eprintln!("skipping: loopback port not visible"); return;
+        };
+
+        let routing_path = test_routing_path("close-forget");
+        let project_dir = test_project_dir("close-forget");
+
+        let live = MidiOut::default();
+        live.set_routing_path_for_test(routing_path.clone());
+        live.open_port(target.id.clone()).expect("open");
+        live.persist(Some(&project_dir));
+        live.close_port(&target.id).ok();
+        live.persist(Some(&project_dir));
+
+        let after = MidiOut::default();
+        after.set_routing_path_for_test(routing_path);
+        after.adopt_project(&project_dir);
+        assert!(
+            after.status().outputs.is_empty(),
+            "a deliberately closed port stays closed across adopt: {:?}",
+            after.status().outputs
+        );
     }
 
     /// On shutdown the thread must release whatever is sounding BEFORE the

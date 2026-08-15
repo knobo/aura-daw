@@ -1120,6 +1120,15 @@ mod tests {
         use std::sync::Arc;
         let (cp, _events, track_id) = plane_with_midi_track();
         let out = Arc::new(crate::midi_out::MidiOut::default());
+        // Same contract as `removing_the_routed_track_clears_the_note_out_
+        // target` (control/mod.rs): attach a real MidiOut only after
+        // redirecting persist to a throwaway path, or `clear_midi_route_
+        // for_clip` overwrites the developer machine's midi-routing.json.
+        out.set_routing_path_for_test(std::env::temp_dir().join(format!(
+            "aura-midi-routing-test-remove-clip-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
         cp.attach_midi_out(Arc::clone(&out));
         let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
         out.set_route(

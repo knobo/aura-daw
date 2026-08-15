@@ -36,6 +36,12 @@ pub struct PortPrefs {
 pub struct ProjectRouting {
     #[serde(default)]
     pub routes: Vec<PersistedRoute>,
+    /// Port names that were open for this project, including clock-only
+    /// ports that have no routes. Distinct from `routes` so Recipe 1
+    /// (clock slave, no note routing) survives a restart. `#[serde(default)]`
+    /// keeps files written before this field readable.
+    #[serde(default)]
+    pub open_ports: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -164,6 +170,7 @@ mod tests {
                     port_name: "Hydrogen".into(),
                     channel: 9,
                 }],
+                open_ports: vec!["Hydrogen".into()],
             },
         );
 
@@ -176,5 +183,16 @@ mod tests {
     fn project_key_is_stable_for_the_same_directory() {
         let dir = tmp_dir("key-stability");
         assert_eq!(project_key(&dir), project_key(&dir));
+    }
+
+    /// Files written before `open_ports` existed must still load — a missing
+    /// field is empty, never a hard parse failure that would wipe routing.
+    #[test]
+    fn project_routing_missing_open_ports_deserializes_as_empty() {
+        let json = r#"{"routes":[{"scope":"track","id":"t-1","port_name":"Hydrogen","channel":9}]}"#;
+        let proj: ProjectRouting = serde_json::from_str(json).unwrap();
+        assert!(proj.open_ports.is_empty());
+        assert_eq!(proj.routes.len(), 1);
+        assert_eq!(proj.routes[0].port_name, "Hydrogen");
     }
 }
