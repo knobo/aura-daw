@@ -187,7 +187,12 @@ impl Session {
     /// Materialize a scratch, standalone `Session` from an image (Task 7's
     /// replay-only materialization, Task 8's rollback restore source, Task
     /// 9's replay base). Bookkeeping fields default (`dirty=false`,
-    /// `loaded_dir=None`, `dirty_state` empty).
+    /// `loaded_dir=None`, `dirty_state` empty) — EXCEPT `plugins.state_rev`,
+    /// which is carried whole from the image rather than defaulted: it keys
+    /// the live plugin node cache, and a scratch session has no live nodes,
+    /// so there is nothing to retire and nothing that could observe a rewind.
+    /// (`restore_from_snapshot`, which overwrites the LIVE document, is the
+    /// opposite case and must never take the image's copy — see its doc.)
     pub fn from_snapshot(snap: &SessionSnapshot) -> Session {
         let mut store = Store::default();
         store.transport = snap.transport.clone();
