@@ -215,10 +215,17 @@ impl SessionSnapshot {
     /// The per-clip reuse in the midi list is by id — sound because
     /// `ChangeSet::from_ops` is exhaustive (every op that touches a clip's
     /// row flags it) and the full-capture path (`midi_clips_all`) never
-    /// reuses. The id lookup is a linear scan per clip (O(n²) on a
-    /// structural rebuild) — clip counts are timeline-scale, not note-scale,
-    /// so this is fine.
+    /// reuses. The lookup goes through a map built ONCE per capture (Task 7:
+    /// it was a linear scan per clip, O(n²) on a structural rebuild, and
+    /// this runs INSIDE the session lock on every commit — a bulk paste is
+    /// exactly the shape that makes clip counts stop being small).
     pub(crate) fn capture(session: &Session, prev: &SessionSnapshot, changed: &ChangeSet) -> Self {
+        let reusable: std::collections::HashMap<&ClipId, &Arc<MidiClip>> =
+            if changed.midi_clips_all || !changed.midi_list_rederives() {
+                std::collections::HashMap::new()
+            } else {
+                prev.midi.clips.iter().map(|c| (&c.id, c)).collect()
+            };
         let midi = MidiSnapshot {
             ppq: session.midi.ppq,
             tempo_events: if changed.midi_meta {
@@ -239,10 +246,8 @@ impl SessionSnapshot {
                         .iter()
                         .map(|c| {
                             if !changed.midi_clips_all && !changed.midi_clips.contains(&c.id) {
-                                if let Some(reuse) =
-                                    prev.midi.clips.iter().find(|p| p.id == c.id)
-                                {
-                                    return reuse.clone();
+                                if let Some(reuse) = reusable.get(&c.id) {
+                                    return (*reuse).clone();
                                 }
                             }
                             Arc::new(c.clone())
@@ -293,9 +298,15 @@ impl SessionSnapshot {
 /// params + pending_state byte lengths. An approximation of allocator
 /// truth, exact enough for classification (the threshold is 64 KB and the
 /// error is bounded by struct padding plus inline heap fields — strings and
-/// small inner vecs — that `size_of` doesn't see). One known, accepted gap: a
-/// track/clip row's `String` fields charge their struct slot (24 bytes), not
-/// their heap bytes.
+/// small inner vecs — that `size_of` doesn't see).
+///
+/// TASK 7 CLOSED THE STRING GAP (Task 5 carried it forward as accepted: a
+/// row's `String` fields charged their 24-byte slot, not their heap bytes).
+/// It has to be closed because this number DECIDES the 64 KB replay-only
+/// classification: a `Clip` carries a `source_path` that is routinely
+/// longer than its slot, and a row-heavy batch under-charged by tens of
+/// percent lands on the wrong side of the threshold. Note counts, the other
+/// half of a big charge, were never affected — `MidiNote` is inline.
 pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     use std::mem::size_of;
     let mut charge = 0usize;
@@ -309,9 +320,11 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     }
     if changed.tracks {
         charge += next.tracks.len() * size_of::<TrackState>();
+        charge += next.tracks.iter().map(track_heap).sum::<usize>();
     }
     if changed.clips {
         charge += next.clips.len() * size_of::<Clip>();
+        charge += next.clips.iter().map(clip_heap).sum::<usize>();
     }
     if changed.midi_meta {
         charge += next.midi.tempo_events.len() * size_of::<TempoEvent>();
@@ -323,7 +336,9 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
         // The rebuilt clip Arcs: row + note content.
         for clip in next.midi.clips.iter() {
             if changed.midi_clips_all || changed.midi_clips.contains(&clip.id) {
-                charge += size_of::<MidiClip>() + clip.notes.len() * size_of::<MidiNote>();
+                charge += size_of::<MidiClip>()
+                    + midi_clip_heap(clip)
+                    + clip.notes.len() * size_of::<MidiNote>();
             }
         }
     }
@@ -340,6 +355,27 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
         }
     }
     charge
+}
+
+/// Heap bytes of a row's `String`/id fields (see [`charge_of`]).
+fn track_heap(t: &TrackState) -> usize {
+    t.id.as_str().len()
+        + t.name.len()
+        + t.kind.len()
+        + t.color.len()
+        + t.instrument_id.as_ref().map_or(0, String::len)
+}
+
+fn clip_heap(c: &Clip) -> usize {
+    c.id.as_str().len()
+        + c.track_id.as_str().len()
+        + c.name.len()
+        + c.source_path.len()
+        + c.source_id.as_str().len()
+}
+
+fn midi_clip_heap(c: &MidiClip) -> usize {
+    c.id.as_str().len() + c.track_id.as_str().len() + c.name.len() + c.lane_id.as_str().len()
 }
 
 #[cfg(test)]
@@ -480,6 +516,31 @@ mod tests {
             c.snapshot_charge >= 4_000 * std::mem::size_of::<MidiNote>(),
             "a clip rewrite must charge its note content, got {}",
             c.snapshot_charge
+        );
+    }
+
+    /// The charge decides the 64 KB replay-only classification, so a row's
+    /// heap has to be in it: a `Clip`'s `source_path` is a real path, not a
+    /// 24-byte slot, and a clip-heavy batch charged by `size_of` alone lands
+    /// on the wrong side of the threshold.
+    #[test]
+    fn charge_of_counts_a_rows_string_heap_and_not_just_its_slot() {
+        let charge_for = |path: &str| {
+            let m = two_clip_session();
+            let mut clip = crate::audio::types::testutil::test_clip("c-1", "t-1");
+            clip.source_path = path.to_string();
+            Session::transact(&m, TxMeta::user("add clip"), |tx| {
+                tx.apply(Op::ClipAdd { clip: clip.clone(), index: 0 })
+            })
+            .unwrap()
+            .snapshot_charge
+        };
+        let short = charge_for("a.wav");
+        let long = charge_for(&format!("{}.wav", "d/".repeat(400)));
+        assert_eq!(
+            long - short,
+            800 + 4 - 5,
+            "the extra path bytes are charged, one for one"
         );
     }
 

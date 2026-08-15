@@ -110,10 +110,19 @@ impl EventSink for NullEvents {
 /// the live half must be read under the SAME lock acquisition to be a
 /// meaningful comparison).
 fn fixture() -> (Arc<ControlPlane>, Arc<Mutex<Session>>, engine::EngineHandle) {
+    let (cp, session, eng, _log) = fixture_with_log();
+    (cp, session, eng)
+}
+
+/// The same fixture, plus the `HistoryLog` handle — the version graph lives
+/// behind it, and Task 7's test needs to read its stats.
+fn fixture_with_log(
+) -> (Arc<ControlPlane>, Arc<Mutex<Session>>, engine::EngineHandle, Arc<aura_lib::control::HistoryLog>) {
     let shared = Arc::new(SharedRt::default());
     let tables = GraphTables::empty();
     let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
     let log = Arc::new(aura_lib::control::HistoryLog::new());
+    let log2 = log.clone();
     let committer = Committer::new(
         session.clone(),
         shared.clone(),
@@ -137,7 +146,7 @@ fn fixture() -> (Arc<ControlPlane>, Arc<Mutex<Session>>, engine::EngineHandle) {
         Box::new(|_e, _p| {}),
         log,
     ));
-    (cp, session, eng)
+    (cp, session, eng, log2)
 }
 
 fn tmp_parent(name: &str) -> std::path::PathBuf {
@@ -782,6 +791,94 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
              had adopted lanes, its own republish would be shadowing the install again"
         );
     }
+
+    eng.send(aura_lib::audio::engine::ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+// ---------------------------------------------------------------------------
+// Plan F Task 7 — the version graph, driven through the real ControlPlane
+// ---------------------------------------------------------------------------
+
+/// The graph is fed from ONE sink, so what it holds must follow the same
+/// rule the journal and the undo stack follow: one node per NON-transient
+/// batch, nothing for a transient one, nothing across a document swap.
+///
+/// Driven through a real `ControlPlane` rather than `VersionGraph` directly,
+/// because the claim under test is about the WIRING — that
+/// `commit_with_rebuild`'s single call site reaches the third stream too.
+#[test]
+fn the_version_graph_gets_one_node_per_non_transient_commit_and_drains_at_a_swap() {
+    let parent = tmp_parent("vergraph");
+    let (cp, session, eng, log) = fixture_with_log();
+
+    cp.create_project(parent.to_str().unwrap(), "Versions").expect("create project");
+    // The create is an epoch boundary: the chain is rooted, empty, and now
+    // describes THIS document.
+    assert_eq!(log.version_stats().nodes, 0, "an epoch boundary leaves an empty chain");
+
+    let mut track_id = String::new();
+    cp.commit(TxMeta::user("add track"), |tx| {
+        track_id = aura_lib::control::ops::add_track_tx(tx, Some("Keys".into()), Some("midi".into()))?
+            .id
+            .to_string();
+        Ok(())
+    })
+    .expect("add track");
+    assert_eq!(log.version_stats().nodes, 1, "a non-transient commit is one node");
+
+    // A run of ordinary edits. Each is its own batch, so each is its own
+    // node — the graph does NOT coalesce the way the 350 ms undo merge does.
+    for db in [-3.0, -6.0, -9.0] {
+        cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_track(&track_id, PropPath::Gain, serde_json::json!(db))))
+            .expect("set gain");
+    }
+    let s = log.version_stats();
+    assert_eq!(s.nodes, 4);
+    assert_eq!(s.materialized, 4, "small batches materialize");
+    assert!(s.retained_bytes > 0, "and they charge what they created");
+    assert_eq!(s.newest_rev, Some(session.lock().rev()), "the newest node IS the live rev");
+
+    // TRANSIENT: a transport batch captures an image (the engine needs it)
+    // but is journaled nowhere, undoable nowhere, and retained nowhere.
+    let before = log.version_stats();
+    cp.transport(TransportAction::SetLoop { enabled: true, start_samples: 0, end_samples: 48_000 })
+        .expect("set loop");
+    assert!(session.lock().rev() > before.newest_rev.unwrap(), "the transient batch really committed");
+    assert_eq!(log.version_stats(), before, "...and left the version graph untouched");
+
+    // An empty batch (a Set whose net from == to) is recorded nowhere
+    // either — the same guard, now covering three streams.
+    cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_track(&track_id, PropPath::Gain, serde_json::json!(-9.0))))
+        .expect("no-op gain");
+    assert_eq!(log.version_stats().nodes, 4, "a batch that folded to nothing retains nothing");
+
+    // A MATERIALIZABLE rev: what the graph holds can be read back, and it is
+    // the document that rev produced.
+    let rev = log.version_stats().newest_rev.unwrap();
+    let image = log.materialize_version(rev).expect("the retained rev materializes");
+    assert_eq!(image.rev, rev);
+    let live_gain = session.lock().store.tracks.iter().find(|t| t.id == track_id).unwrap().gain_db;
+    assert_eq!(
+        image.tracks.iter().find(|t| t.id == track_id).unwrap().gain_db,
+        live_gain,
+        "the materialized image is the document, not an empty one"
+    );
+    assert!(log.materialize_version(rev + 999).is_none(), "an unknown rev materializes nothing");
+
+    // THE DOCUMENT SWAP: every node describes a document nobody can reach.
+    cp.create_project(parent.to_str().unwrap(), "Other").expect("create second project");
+    assert_eq!(log.version_stats().nodes, 0, "a swap drains the chain");
+    assert_eq!(log.version_stats().retained_bytes, 0, "including its byte accounting");
+    assert!(log.materialize_version(rev).is_none(), "and the old revs are honestly gone");
+
+    // ...and the guard is not a mute button: the new document records again.
+    cp.commit(TxMeta::user("add track"), |tx| {
+        aura_lib::control::ops::add_track_tx(tx, Some("New".into()), Some("audio".into()))?;
+        Ok(())
+    })
+    .expect("add track in the new document");
+    assert_eq!(log.version_stats().nodes, 1, "the new document's chain starts recording");
 
     eng.send(aura_lib::audio::engine::ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);

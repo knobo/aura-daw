@@ -290,6 +290,27 @@ impl Session {
         self.plugins.clone()
     }
 
+    /// Apply already-committed ops to a SCRATCH session — the version
+    /// graph's replay step (Plan F Task 7).
+    ///
+    /// Deliberately NOT a `transact`: there is nothing to journal (these ops
+    /// are already in the log), nothing to publish (a scratch session has no
+    /// readers), no `rev` to bump (the caller knows which revision it is
+    /// rebuilding) and no effect to execute (each op executed its own when
+    /// it was first committed). The computed inverses and effects are
+    /// discarded for exactly that reason.
+    ///
+    /// ONLY for a session nothing else can see. Applying ops to the LIVE
+    /// document this way would mutate it outside the one door, leaving the
+    /// published image behind and the log with no record.
+    pub(crate) fn apply_replay(&mut self, ops: &[Op]) -> Result<(), String> {
+        let mut discarded = EngineEffect::default();
+        for op in ops {
+            apply_raw(self, op, &mut discarded)?;
+        }
+        Ok(())
+    }
+
     /// The ONLY way to mutate the document. Returns Err and leaves the
     /// session untouched if the closure fails (inverses rolled back).
     pub fn transact<F>(this: &parking_lot::Mutex<Session>, meta: TxMeta, f: F) -> Result<Committed, String>

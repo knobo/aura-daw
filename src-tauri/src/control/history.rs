@@ -11,6 +11,10 @@
 //!   One line per NON-transient committed batch, plus a record at every
 //!   epoch boundary. This is where `OP_FORMAT_VERSION` stops being
 //!   decorative (see [`JournalWriter::append_batch`]).
+//! * [`VersionGraph`] — the retention substrate (Plan F Task 7): one node
+//!   per non-transient batch, materialized or replay-only, bounded by a
+//!   bytes ceiling and a steps floor, with evicted loads dropped on the
+//!   janitor thread. Fed from the same sink as the other two.
 //!
 //! WHY ONE HANDLE: both are driven from exactly the same place —
 //! `Committer::commit_with_rebuild`, after the effects, when
@@ -22,13 +26,13 @@
 //! `audio::init` and handed to both.
 //!
 //! LOCK ORDER (binding, and it is the LEAF of the whole system):
-//! `gesture` -> `session` -> `epoch` -> `history` / `journal`. All three
-//! mutexes here are acquired ONLY inside this module's own methods, are
-//! never held across any other lock acquisition, and no code path takes the
-//! session or gesture lock while holding one of them. Within the module,
-//! [`HistoryLog::epoch`] is the outermost of the three (C-1's guard needs
-//! the check and the write to be one atomic step) and `history`/`journal`
-//! are never held at the same time. Concretely: [`HistoryLog`]'s
+//! `gesture` -> `session` -> `epoch` -> `history` / `journal` / `versions`.
+//! All four mutexes here are acquired ONLY inside this module's own methods,
+//! are never held across any other lock acquisition, and no code path takes
+//! the session or gesture lock while holding one of them. Within the module,
+//! [`HistoryLog::epoch`] is the outermost of the four (C-1's guard needs
+//! the check and the write to be one atomic step) and `history`/`journal`/
+//! `versions` are never held at the same time. Concretely: [`HistoryLog`]'s
 //! methods are called from `commit_with_rebuild` AFTER the session lock is
 //! released, and from the epoch functions after their swap block ends. The
 //! journal's disk write happens under the journal mutex — which is legal
@@ -51,6 +55,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use super::op::{Actor, Op, TxMeta, OP_FORMAT_VERSION};
+use super::vergraph::{Janitor, VersionGraph, VersionStats};
 use super::CoalesceKey;
 
 // ---------------------------------------------------------------------------
@@ -460,6 +465,19 @@ pub struct HistoryLog {
     epoch: Mutex<u64>,
     history: Mutex<History>,
     journal: Mutex<JournalWriter>,
+    /// The retention substrate (Plan F Task 7). A THIRD stream fed from the
+    /// same sink, under the same two guards (empty batch, stale epoch) as
+    /// the other two — the guards now cover three streams instead of two,
+    /// which is the point of there being one sink.
+    ///
+    /// LOCK ORDER: `epoch` first, as for the others; `versions` is never
+    /// held at the same time as `history` or `journal`, and — like them —
+    /// never across another acquisition. Evicted loads leave this mutex
+    /// before they are disposed of, so no drop ever runs under it.
+    versions: Mutex<VersionGraph>,
+    /// Where evicted loads go to die: another thread, always. Never behind
+    /// a mutex — `dispose` is called after every lock above is released.
+    janitor: Janitor,
 }
 
 impl Default for HistoryLog {
@@ -477,6 +495,8 @@ impl HistoryLog {
             epoch: Mutex::new(0),
             history: Mutex::new(History::new()),
             journal: Mutex::new(JournalWriter::closed()),
+            versions: Mutex::new(VersionGraph::new()),
+            janitor: Janitor::spawn(),
         }
     }
 
@@ -537,24 +557,39 @@ impl HistoryLog {
     /// uses at the persist sink. The epoch mutex is held across the check
     /// AND both writes, which is what makes the drop atomic with respect to
     /// a concurrent boundary rather than merely likely.
-    pub fn record_commit(&self, rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op], mode: HistoryMode) {
-        if ops.is_empty() {
+    ///
+    /// TAKES THE WHOLE `Committed` (Task 7): the version graph classifies on
+    /// `snapshot_charge` and retains `snapshot`, so the six-arg form could
+    /// no longer describe the batch. Same values, one argument.
+    pub fn record_commit(&self, committed: &super::Committed, mode: HistoryMode) {
+        if committed.ops.is_empty() {
             return;
         }
-        let current = self.epoch.lock();
-        if epoch != *current {
-            log::warn!(
-                "history/journal: dropping batch rev {rev} — epoch changed between commit and \
-                 record ({epoch} -> {current}); it describes a document that is no longer open"
-            );
-            return;
-        }
-        // Journal FIRST, unconditionally: an undo/redo is a mutation and
-        // replay must see it, even though it creates no new history entry.
-        self.journal.lock().append_batch(rev, epoch, meta, ops);
-        if mode == HistoryMode::Record {
-            self.history.lock().record(HistoryEntry::from_committed(meta, ops, inverses));
-        }
+        let (rev, epoch) = (committed.rev, committed.epoch);
+        let evicted = {
+            let current = self.epoch.lock();
+            if epoch != *current {
+                log::warn!(
+                    "history/journal: dropping batch rev {rev} — epoch changed between commit and \
+                     record ({epoch} -> {current}); it describes a document that is no longer open"
+                );
+                return;
+            }
+            // Journal FIRST, unconditionally: an undo/redo is a mutation and
+            // replay must see it, even though it creates no new history entry.
+            self.journal.lock().append_batch(rev, epoch, &committed.meta, &committed.ops);
+            if mode == HistoryMode::Record {
+                self.history.lock().record(HistoryEntry::from_committed(
+                    &committed.meta,
+                    &committed.ops,
+                    &committed.inverses,
+                ));
+            }
+            self.versions.lock().record(committed)
+        };
+        // Every mutex above is released here — the drop runs on the janitor,
+        // never on the thread that just committed.
+        self.janitor.dispose(evicted);
     }
 
     /// A closed GESTURE's synthesized batch (Task 14). Journaled like any
@@ -572,20 +607,34 @@ impl HistoryLog {
     /// reads `rev`/`epoch` under its own short session lock and then commits
     /// the synthesized batch through the ordinary effect phase before
     /// reaching here.
-    pub fn record_gesture(&self, rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op]) {
-        if ops.is_empty() {
+    ///
+    /// Takes a `Committed` too (Task 7), but a SYNTHESIZED one:
+    /// `close_gesture` builds it from the folded ops plus the image the
+    /// gesture's last transient commit published (which IS the folded
+    /// state), because there is no real `Committed` for the net batch.
+    pub fn record_gesture(&self, committed: &super::Committed) {
+        if committed.ops.is_empty() {
             return;
         }
-        let current = self.epoch.lock();
-        if epoch != *current {
-            log::warn!(
-                "history/journal: dropping gesture batch rev {rev} — epoch changed between commit \
-                 and record ({epoch} -> {current})"
-            );
-            return;
-        }
-        self.journal.lock().append_batch(rev, epoch, meta, ops);
-        self.history.lock().record(HistoryEntry::from_gesture(meta, ops, inverses));
+        let (rev, epoch) = (committed.rev, committed.epoch);
+        let evicted = {
+            let current = self.epoch.lock();
+            if epoch != *current {
+                log::warn!(
+                    "history/journal: dropping gesture batch rev {rev} — epoch changed between \
+                     commit and record ({epoch} -> {current})"
+                );
+                return;
+            }
+            self.journal.lock().append_batch(rev, epoch, &committed.meta, &committed.ops);
+            self.history.lock().record(HistoryEntry::from_gesture(
+                &committed.meta,
+                &committed.ops,
+                &committed.inverses,
+            ));
+            self.versions.lock().record(committed)
+        };
+        self.janitor.dispose(evicted);
     }
 
     /// A DOCUMENT-SWAP epoch boundary (ruling 4): clear history and redo,
@@ -601,12 +650,22 @@ impl HistoryLog {
     /// correct) or observes the new epoch and drops itself. There is no
     /// interleaving in which it appends to the new journal.
     pub fn epoch_boundary(&self, dir: &Path, event: EpochEvent, epoch: u64) {
-        let mut current = self.epoch.lock();
-        *current = epoch;
-        self.history.lock().clear();
-        let mut j = self.journal.lock();
-        j.open_in(dir);
-        j.append_epoch(event, epoch);
+        let drained = {
+            let mut current = self.epoch.lock();
+            *current = epoch;
+            self.history.lock().clear();
+            {
+                let mut j = self.journal.lock();
+                j.open_in(dir);
+                j.append_epoch(event, epoch);
+            }
+            // Task 7: the graph is cleared for `History::clear`'s reason and
+            // then some — its nodes hold IMAGES of a document nobody can
+            // reach any more, which is the largest thing in the process that
+            // a swap makes garbage.
+            self.versions.lock().clear(epoch)
+        };
+        self.janitor.dispose(drained);
     }
 
     /// The SNAPSHOT MARK (`save_project_mark`): same document, same
@@ -717,6 +776,32 @@ impl HistoryLog {
     pub fn journal_path(&self) -> Option<PathBuf> {
         self.journal.lock().path().map(|p| p.to_path_buf())
     }
+
+    /// What the version graph currently retains. A plain method, not
+    /// `#[cfg(test)]`: the integration suite (`tests/snapshot_store.rs`) is
+    /// a separate crate and cannot see cfg(test) items, and Task 11 wants it
+    /// for the browsing UI's depth report anyway.
+    pub fn version_stats(&self) -> VersionStats {
+        self.versions.lock().stats()
+    }
+
+    /// Rebuild the document at `rev`, or `None` if that revision was never
+    /// recorded or has been evicted.
+    ///
+    /// TWO PHASES ON PURPOSE: the plan is cloned out under the mutex, the
+    /// REPLAY runs after it is released. The replay is CPU-bound (a scratch
+    /// session plus an `apply_raw` loop) and holding the leaf-most mutex of
+    /// the system across it would stall every committing thread.
+    ///
+    /// A document swap landing between the two phases does NOT invalidate
+    /// the result — it invalidates its RELEVANCE. The returned image carries
+    /// the epoch it belongs to, and a caller that would apply it to the live
+    /// document must compare that against the live epoch, exactly as every
+    /// other cross-window consumer here does.
+    pub fn materialize_version(&self, rev: u64) -> Option<crate::control::SessionSnapshot> {
+        let plan = self.versions.lock().replay_plan(rev)?;
+        plan.run()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -765,6 +850,23 @@ mod tests {
             clip_indices: vec![],
             automation_clips: vec![],
             bindings: vec![],
+        }
+    }
+
+    /// A `Committed` for the sink's tests — the batch plus the snapshot and
+    /// charge Task 7's version graph needs. `rev`/`epoch` are what the two
+    /// guards read; the image is an empty one, because these tests are about
+    /// the guards and the stacks, not about content.
+    fn committed_for_test(rev: u64, epoch: u64, meta: &TxMeta, ops: &[Op], inverses: &[Op]) -> super::super::Committed {
+        super::super::Committed {
+            rev,
+            epoch,
+            ops: ops.to_vec(),
+            inverses: inverses.to_vec(),
+            effect: crate::control::session::EngineEffect::default(),
+            meta: meta.clone(),
+            snapshot: std::sync::Arc::new(crate::control::SessionSnapshot::empty()),
+            snapshot_charge: 64,
         }
     }
 
@@ -955,9 +1057,9 @@ mod tests {
 
         let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "mix".into(), transient: false };
         let ops = [set_gain("t-1", -3.0)];
-        log.record_commit(1, 1, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_commit(&committed_for_test(1, 1, &meta, &ops, &ops), HistoryMode::Record);
         assert_eq!(log.depths(), (1, 0));
-        log.record_commit(2, 1, &meta, &ops, &ops, HistoryMode::Replay);
+        log.record_commit(&committed_for_test(2, 1, &meta, &ops, &ops), HistoryMode::Replay);
         assert_eq!(log.depths(), (1, 0), "a replay commit creates no new entry");
 
         let text = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap();
@@ -980,7 +1082,7 @@ mod tests {
 
         log.epoch_boundary(&dir, EpochEvent::Create, 1);
         assert_eq!(log.current_epoch(), 1);
-        log.record_commit(1, 1, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_commit(&committed_for_test(1, 1, &meta, &ops, &ops), HistoryMode::Record);
         assert_eq!(log.depths(), (1, 0));
 
         // The document is swapped (re-opening the SAME dir, the reachable
@@ -990,8 +1092,8 @@ mod tests {
         let lines_after_swap = std::fs::read_to_string(dir.join(JOURNAL_FILE)).unwrap().lines().count();
 
         // The overtaken commit's sink call finally lands, carrying epoch 1.
-        log.record_commit(2, 1, &meta, &ops, &ops, HistoryMode::Record);
-        log.record_gesture(2, 1, &meta, &ops, &ops);
+        log.record_commit(&committed_for_test(2, 1, &meta, &ops, &ops), HistoryMode::Record);
+        log.record_gesture(&committed_for_test(2, 1, &meta, &ops, &ops));
         log.snapshot_mark(1);
         assert_eq!(log.depths(), (0, 0), "no stale undo entry survives the swap");
         assert_eq!(
@@ -1001,7 +1103,7 @@ mod tests {
         );
 
         // ...and the guard is not a mute button: the LIVE epoch still records.
-        log.record_commit(3, 2, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_commit(&committed_for_test(3, 2, &meta, &ops, &ops), HistoryMode::Record);
         log.snapshot_mark(2);
         assert_eq!(log.depths(), (1, 0));
         assert_eq!(
@@ -1027,7 +1129,7 @@ mod tests {
         let ops = [set_gain("t-1", -3.0)];
 
         log.epoch_boundary(&dir, EpochEvent::Create, 1);
-        log.record_commit(1, 1, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_commit(&committed_for_test(1, 1, &meta, &ops, &ops), HistoryMode::Record);
         assert_eq!(log.depths(), (1, 0));
 
         // The undo pops — and learns WHICH document it popped under.
@@ -1041,7 +1143,7 @@ mod tests {
         assert_eq!(log.depths(), (0, 0), "the migrated entry must not survive the swap");
 
         // Same door, same guard, the other direction.
-        log.record_commit(2, 2, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_commit(&committed_for_test(2, 2, &meta, &ops, &ops), HistoryMode::Record);
         let (entry, popped) = log.pop_undo().unwrap();
         assert_eq!(popped, 2);
         log.epoch_boundary(&dir, EpochEvent::Open, 3);
@@ -1050,7 +1152,7 @@ mod tests {
 
         // The guard is a staleness check, not a mute button: a push at the
         // LIVE epoch migrates normally.
-        log.record_commit(3, 3, &meta, &ops, &ops, HistoryMode::Record);
+        log.record_commit(&committed_for_test(3, 3, &meta, &ops, &ops), HistoryMode::Record);
         let (entry, popped) = log.pop_undo().unwrap();
         log.push_redo(entry, popped);
         assert_eq!(log.depths(), (0, 1), "same document — the entry migrates onto the redo stack");

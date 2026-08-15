@@ -24,6 +24,7 @@ pub mod ops;
 pub mod loopjam;
 pub mod session;
 pub mod snapshot;
+pub mod vergraph;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -43,6 +44,7 @@ pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, Jo
 pub use ops::TrackMixChange;
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
+pub use vergraph::{VersionGraph, VersionNode, VersionStats};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -534,14 +536,7 @@ impl Committer {
         // outcome, and it must produce neither a phantom undo step nor an
         // empty journal line.
         if !committed.meta.transient {
-            self.log.record_commit(
-                committed.rev,
-                committed.epoch,
-                &committed.meta,
-                &committed.ops,
-                &committed.inverses,
-                history_mode,
-            );
+            self.log.record_commit(&committed, history_mode);
         }
         // Full-Project payload (the frozen contract) + rev/label/actor as
         // additive fields (D-06). `project_changed_payload` serializes to a
@@ -2955,6 +2950,12 @@ impl ControlPlane {
         self.committer.log().depths()
     }
 
+    /// What the version graph currently retains (Plan F Task 7). Reported
+    /// alongside the undo depths by Task 11's browsing surface.
+    pub fn version_stats(&self) -> vergraph::VersionStats {
+        self.committer.log().version_stats()
+    }
+
     // ---- gestures (Plan E Task 14) ---------------------------------------
 
     /// Opens a gesture boundary — the CLAP-style primitive round-2 §4.4 /
@@ -3072,6 +3073,8 @@ impl ControlPlane {
             let snapshot = session.published_handle().lock().clone();
             (session.rev, session.epoch, snapshot)
         };
+        let snapshot_charge =
+            snapshot::charge_of(&snapshot, &snapshot::ChangeSet::from_ops(&ops));
         let committed = session::Committed {
             rev,
             epoch,
@@ -3089,21 +3092,20 @@ impl ControlPlane {
             // `effect` field, which would silently do nothing on redo.
             effect: session::EngineEffect::default(),
             meta: meta.clone(),
+            // CORRECTION to this field's Task 5 comment, which said 0 to
+            // avoid double-counting the transient folds' own captures. The
+            // folds are TRANSIENT, so none of them ever reached
+            // `record_commit` and none of them has a version node: this
+            // synthesized batch is the drag's ONLY node, and a charge of 0
+            // would make the graph's budget blind to the image it retains.
+            // Charged from the NET ops, which is exactly the own-created
+            // work the last fold's capture did.
+            snapshot_charge,
             snapshot,
-            // The gesture's transient commits each charged their own
-            // capture already; charging this synthesized entry again would
-            // double-count the same bytes in Task 7's accounting.
-            snapshot_charge: 0,
         };
         // Task 17: the direct sink. No drop-window — the gesture is
         // undoable the instant it closes.
-        self.committer.log().record_gesture(
-            committed.rev,
-            committed.epoch,
-            &committed.meta,
-            &committed.ops,
-            &committed.inverses,
-        );
+        self.committer.log().record_gesture(&committed);
         *self.last_gesture_batch.lock() = Some(committed);
 
         // I-8: the whole drag's persist, once, here — never once per folded
@@ -4694,9 +4696,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cp.history_depths().0, undo_before, "mid-gesture commits are transient");
+        let versions_mid_gesture = cp.version_stats();
         cp.gesture_end().unwrap();
 
         assert_eq!(cp.history_depths().0, undo_before + 1, "the whole drag is ONE step");
+        // ...and ONE version node, charged. The mid-gesture folds are
+        // transient, so they leave no node of their own — which is exactly
+        // why this synthesized batch's charge may not be zero: it is the
+        // only node the whole drag produces (Plan F Task 7).
+        let versions = cp.version_stats();
+        assert_eq!(
+            versions.nodes,
+            versions_mid_gesture.nodes + 1,
+            "a closed gesture is one version node, and its transient folds were none"
+        );
+        assert!(
+            versions.retained_bytes > versions_mid_gesture.retained_bytes,
+            "and it charges the image it retains"
+        );
         let batch = cp.take_last_gesture_batch().expect("gesture synthesized a batch");
         assert_eq!(batch.ops.len(), 1, "folded to one net Set: {:?}", batch.ops);
         assert!(

@@ -567,14 +567,9 @@ fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream()
     let after_swap = journal_lines(&dir).len();
 
     // ...and only now does the overtaken commit reach the sink.
-    f.log.record_commit(
-        committed.rev,
-        stale_epoch,
-        &committed.meta,
-        &committed.ops,
-        &committed.inverses,
-        aura_lib::control::HistoryMode::Record,
-    );
+    let versions_after_swap = f.log.version_stats();
+    assert_eq!(versions_after_swap.nodes, 0, "the swap drained the version graph too");
+    f.log.record_commit(&committed, aura_lib::control::HistoryMode::Record);
     assert_eq!(
         f.log.depths(),
         (0, 0),
@@ -586,16 +581,17 @@ fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream()
         "a stale-epoch commit must not write a line into the NEW document's journal"
     );
 
-    // The gesture sink is the same sink and gets the same guard.
-    f.log.record_gesture(
-        committed.rev,
-        stale_epoch,
-        &committed.meta,
-        &committed.ops,
-        &committed.inverses,
+    assert_eq!(
+        f.log.version_stats(),
+        versions_after_swap,
+        "...nor a version node onto the NEW document's chain"
     );
+
+    // The gesture sink is the same sink and gets the same guard.
+    f.log.record_gesture(&committed);
     assert_eq!(f.log.depths(), (0, 0), "same for a gesture batch");
     assert_eq!(journal_lines(&dir).len(), after_swap, "same for a gesture batch");
+    assert_eq!(f.log.version_stats(), versions_after_swap, "same for a gesture batch");
 
     // The guard is a stale-epoch guard, not a mute button: a commit at the
     // LIVE epoch still records, in both streams.
