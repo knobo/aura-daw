@@ -21,6 +21,9 @@
 //! Design: `docs/superpowers/specs/2026-08-15-modulation-system-design.md`.
 
 pub mod model;
+pub mod resolve;
+
+pub use resolve::{plan_targets, resolve_target, ResolveCtx, ResolvedTarget, TargetPlan};
 
 pub use model::{
     normalize_curve, validate_binding, AutomationClip, AutomationPoint, Binding, BindingMode,
