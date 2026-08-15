@@ -233,7 +233,17 @@ class LibraryStore {
           return;
         }
         const ok = await zyn.load(instanceId, payload.patch);
-        if (!ok) toasts.error("PATCH LOAD FAILED", zyn.error ?? "zyn_load_patch failed");
+        if (!ok) {
+          toasts.error("PATCH LOAD FAILED", zyn.error ?? "zyn_load_patch failed");
+          return;
+        }
+        // A patch changes how the track SOUNDS, nothing about how it looks —
+        // and every refused drop above toasts, so a silent success is the one
+        // outcome that reads as "the drop did nothing".
+        toasts.success(
+          "PATCH LOADED",
+          `${payload.patch.bank} / ${payload.patch.name} → ${track.name}`,
+        );
         return;
       }
     }

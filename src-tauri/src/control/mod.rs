@@ -5414,7 +5414,7 @@ mod tests {
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(
                 nodes.key_of(track),
-                Some(format!("plugin:{inst}@48000").as_str()),
+                Some(format!("plugin:{inst}@48000#0").as_str()),
                 "track {track} resolved to its Zyn node (not the fallback)"
             );
         }
