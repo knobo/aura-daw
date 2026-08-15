@@ -25,6 +25,54 @@
 //! wrote) are NOT subject to this delay in testing — which is the case this
 //! module exists to serve.
 //!
+//! WHAT `Ok(())` FROM `os_clipboard_write_text` ACTUALLY MEANS: that
+//! `arboard` accepted the text and this process became the X11 selection
+//! owner. It does NOT mean the payload reached a clipboard manager, is
+//! durable past this process's next clipboard operation, or will be
+//! readable by another process — see the size ceiling below, where the
+//! write reports success and the content is then lost in transit anyway.
+//!
+//! MEASURED SIZE CEILING (this is a property of the TEST ENVIRONMENT, not
+//! of this module or of AURA — see below): on X11 with `gpaste-daemon`,
+//! text payloads up to ~165KB round-tripped byte-for-byte through a real
+//! cross-process read every time tested; at ~200KB and above the write
+//! still reports success, but the cross-process read comes back completely
+//! EMPTY (not truncated) even after waits up to 10s. In `clips_copy`
+//! payload terms (which zero every `noteId`, so this is the payload at its
+//! most compact) the marginal cost is ~80 bytes/MIDI note, so the ceiling
+//! sits around 2,000-2,500 notes — reachable by ordinary use: one
+//! multi-minute recorded MIDI performance in a single clip, or a
+//! multi-track song-section selection at a few hundred notes per track.
+//!
+//! THE CONSEQUENCE THAT MATTERS MOST: because the local write succeeds
+//! before the manager handoff is attempted, AURA has already taken
+//! selection ownership away from whatever previously held it — including a
+//! different application entirely. When the handoff to the manager then
+//! fails, that prior clipboard content is gone, not restored. A large copy
+//! that silently exceeds this ceiling can therefore destroy clipboard
+//! content the user never asked AURA to touch, while reporting success.
+//!
+//! WHY THIS MODULE DELIBERATELY ADDS NO SIZE THRESHOLD OR REFUSAL: the
+//! ceiling above is a property of THIS machine's X11-plus-clipboard-manager
+//! combination, not of the OS clipboard in general — a session with no
+//! clipboard manager routinely handles multi-megabyte X11 INCR transfers,
+//! and macOS/Windows have entirely different limits. Hard-coding one
+//! desktop's measurement into a cross-platform text command would produce
+//! false refusals where a larger payload would have gone through fine, and
+//! false confidence anywhere the real limit is tighter. A size guard is
+//! legitimate, but it belongs at the CALLER that knows the payload's
+//! meaning — `clips_copy`'s frontend orchestration, which can say "this
+//! selection is too large to send to another instance" — not here, where
+//! all that's known is a byte length.
+//!
+//! SCOPING NOTE FOR THE FRONTEND ORCHESTRATION (clips_copy/clips_paste):
+//! keeping the just-copied payload in memory for same-instance paste (see
+//! above) sidesteps the write-then-read asynchrony, but it does NOT fix
+//! cross-instance paste of a large selection — the size ceiling above still
+//! applies to that path, which is this feature's whole reason to exist.
+//! Treat the in-memory payload as a same-instance MITIGATION, not as a fix
+//! for the cross-instance ceiling.
+//!
 //! WHY NOT UNIT-TESTED AGAINST A REAL CLIPBOARD: a headless test environment
 //! has none, so a test here would either be skipped or flaky. The CODEC on
 //! both sides (`control::clipboard`'s payload tests,
@@ -33,7 +81,11 @@
 //! `Result<String, String>` — is pure and is tested below without touching
 //! a clipboard at all.
 
-/// Put `text` on the OS clipboard.
+/// Offer `text` to the OS clipboard: `arboard` accepts it and this process
+/// becomes the X11 selection owner. This does NOT assert that the text
+/// reaches a clipboard manager or will be readable by another process — see
+/// the module doc's measured size ceiling, where that handoff is exactly
+/// what fails while this call still reports success.
 #[tauri::command]
 pub fn os_clipboard_write_text(text: String) -> Result<(), String> {
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("clipboard unavailable: {e}"))?;
