@@ -43,6 +43,9 @@ pub mod midi_input;
 // external gear (slice 2, Task 6/7). Engine-free per ruling 3 — pure state
 // machine (Task 6) driven by the `aura-midi-out` thread (Task 7).
 pub mod midi_out;
+// OS clipboard text slot for cross-instance clip copy/paste (Track C, Task
+// 10). Self-contained; additive per the same carve-out midi_input takes.
+pub mod osclipboard;
 pub mod plugins;
 pub mod sidecars;
 pub mod time;
@@ -186,6 +189,8 @@ pub fn run() {
             control::move_clips,
             control::clipboard::clips_copy,
             control::clipboard::clips_paste,
+            osclipboard::os_clipboard_write_text,
+            osclipboard::os_clipboard_read_text,
             control::gesture_begin,
             control::gesture_end,
             // ---- control plane: undo/redo (Plan E Task 17, additive) ----

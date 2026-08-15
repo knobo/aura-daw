@@ -79,6 +79,11 @@ clack-extensions = { version = "0.1", features = [
 livi = "0.7"
 walkdir = "2"      # CLAP search-path scanning
 
+# OS clipboard text slot for cross-instance clip copy/paste (Track C). Not
+# the Tauri clipboard plugin: adding that would need an edit to
+# capabilities/default.json, which is a frozen file.
+arboard = "3"
+
 # --- Utilities ---
 rand = "0.9"           # MCP session-token generation (crypto-seeded via OsRng/StdRng)
 thiserror = "2"
