@@ -100,7 +100,14 @@ pub enum ControlMsg {
     Rebuild,
     SelectOutput { device_id: Option<String>, reply: Reply<()> },
     SelectInput { device_id: Option<String>, reply: Reply<()> },
-    StartRecording { track_ids: Option<Vec<String>>, reply: Reply<Vec<String>> },
+    StartRecording {
+        track_ids: Option<Vec<String>>,
+        /// Track id → cpal input-device name for MIDI tracks that have an
+        /// audio return (X1). Empty = today's behaviour (audio tracks use
+        /// the global input; MIDI tracks are MIDI-only).
+        return_sources: HashMap<String, String>,
+        reply: Reply<Vec<String>>,
+    },
     StopRecording { reply: Reply<Vec<Clip>> },
     /// Installs the narrow "document birth" closure `ensure_project` calls
     /// (Plan E Task 13, round-2 §4.5 carve-out) — bound over the
@@ -183,8 +190,8 @@ pub fn start(
                 events,
                 rx,
                 output: None,
-                input: None,
-                writer: None,
+                inputs: Vec::new(),
+                writers: Vec::new(),
                 rec_track_ids: Vec::new(),
                 sel_output: None,
                 sel_input: None,
@@ -789,8 +796,8 @@ struct Control {
     events: Box<dyn EventSink>,
     rx: Receiver<ControlMsg>,
     output: Option<OutputBundle>,
-    input: Option<InputBundle>,
-    writer: Option<DiskWriter>,
+    inputs: Vec<InputBundle>,
+    writers: Vec<DiskWriter>,
     rec_track_ids: Vec<String>,
     sel_output: Option<String>,
     sel_input: Option<String>,
@@ -890,7 +897,7 @@ impl Control {
                 let _ = reply.send(self.open_output());
             }
             ControlMsg::SelectInput { device_id, reply } => {
-                let res = if self.writer.is_some() {
+                let res = if !self.writers.is_empty() {
                     Err("cannot switch input device while recording — stop recording first"
                         .to_string())
                 } else {
@@ -900,8 +907,8 @@ impl Control {
                 };
                 let _ = reply.send(res);
             }
-            ControlMsg::StartRecording { track_ids, reply } => {
-                let _ = reply.send(self.start_recording(track_ids));
+            ControlMsg::StartRecording { track_ids, return_sources, reply } => {
+                let _ = reply.send(self.start_recording(track_ids, return_sources));
             }
             ControlMsg::StopRecording { reply } => {
                 let _ = reply.send(self.stop_recording());
@@ -1422,7 +1429,7 @@ impl Control {
                 self.accum.fold(&blk, &self.gen_maps);
             }
         }
-        if let Some(inp) = self.input.as_mut() {
+        for inp in &mut self.inputs {
             while let Ok(blk) = inp.meter_rx.pop() {
                 self.accum.fold(&blk, &self.gen_maps);
             }
@@ -1569,11 +1576,119 @@ impl Control {
 
     // -- recording ----------------------------------------------------------
 
-    fn start_recording(&mut self, track_ids: Option<Vec<String>>) -> Result<Vec<String>, String> {
-        // A MIDI-only take opens no device, so `self.writer` stays None for
-        // the whole take — the capture is the other half of "is a take
+    /// Open one cpal input stream + disk writer for a group of tracks that
+    /// share a capture device. `device_id` `None` (or the empty string the
+    /// group key uses for "no preference") is the selected/default input.
+    fn open_capture_group(
+        &self,
+        device_id: Option<&str>,
+        tracks: &[AudioRecTarget],
+        start_pos: u64,
+    ) -> Result<(InputBundle, DiskWriter, u64), String> {
+        let host = cpal::default_host();
+        let device = match device_id.filter(|s| !s.is_empty()) {
+            Some(id) => host
+                .input_devices()
+                .map_err(|e| e.to_string())?
+                .find(|d| d.name().map(|n| n == id).unwrap_or(false))
+                .ok_or_else(|| format!("unknown input device: {id}"))?,
+            None => host
+                .default_input_device()
+                .ok_or_else(|| "no default input device".to_string())?,
+        };
+        let cfg = device.default_input_config().map_err(|e| e.to_string())?;
+        if cfg.sample_format() != cpal::SampleFormat::F32 {
+            return Err(format!(
+                "unsupported input sample format {:?} (prototype supports f32)",
+                cfg.sample_format()
+            ));
+        }
+        let in_ch = cfg.channels().max(1) as usize;
+        let rec_ch = in_ch.min(2);
+        let rate = cfg.sample_rate().0;
+
+        let (project_dir, take_no, slots, rec_generation) = {
+            let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
+            let store = &session.store;
+            let dir = store.project_dir.clone().ok_or("no project open")?;
+            let take_no = store.clips.len() + 1;
+            let tables = self.tables.lock();
+            let slots: Vec<usize> = tracks
+                .iter()
+                .filter_map(|t| tables.slots.get(t.track_id.as_str()).copied())
+                .collect();
+            (dir, take_no, slots, tables.generation)
+        };
+        let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+        chunk_lanes.entry(0).or_default();
+        for &slot in &slots {
+            let chunk_idx = slot / METER_CHUNK_SLOTS;
+            let lane = slot % METER_CHUNK_SLOTS;
+            chunk_lanes.entry(chunk_idx).or_default().push(lane);
+        }
+        let mut blocks = Vec::with_capacity(chunk_lanes.len());
+        for (chunk_idx, lanes) in chunk_lanes {
+            let mut b = RawMeterBlock::new(rec_generation, 0, 0);
+            b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
+            blocks.push((b, lanes));
+        }
+
+        let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
+        let mut producers = Vec::with_capacity(tracks.len());
+        let mut consumers = Vec::with_capacity(tracks.len());
+        let mut specs = Vec::with_capacity(tracks.len());
+        for (i, t) in tracks.iter().enumerate() {
+            let clip_id = uuid::Uuid::new_v4().to_string();
+            let source_id = crate::ids::SourceId::mint();
+            let rel = format!("audio/{source_id}.wav");
+            let (p, c) = rtrb::RingBuffer::new(capacity);
+            producers.push(p);
+            consumers.push(c);
+            specs.push(RecSpec {
+                track_id: t.track_id.clone(),
+                take_name: format!("Take {}", take_no + i),
+                wav_path: project_dir.join(&rel),
+                rel_path: rel,
+                source_id,
+                cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
+                clip_id,
+                start_pos,
+            });
+        }
+
+        let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
+        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
+        let n_producers = producers.len();
+        let mut cb = InputCb {
+            producers,
+            owed: vec![0; n_producers],
+            meter_tx,
+            blocks,
+            in_ch,
+            rec_ch,
+            shared: self.shared.clone(),
+        };
+        let stream = device
+            .build_input_stream(
+                &cfg.into(),
+                move |data: &[f32], _| cb.capture(data),
+                |e| log::warn!("input stream error: {e}"),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        stream.play().map_err(|e| e.to_string())?;
+        Ok((InputBundle { _stream: stream, meter_rx }, writer, rec_generation))
+    }
+
+    fn start_recording(
+        &mut self,
+        track_ids: Option<Vec<String>>,
+        return_sources: HashMap<String, String>,
+    ) -> Result<Vec<String>, String> {
+        // A MIDI-only take opens no device, so `self.writers` stays empty
+        // for the whole take — the capture is the other half of "is a take
         // running".
-        if self.writer.is_some() || self.live_in_hub.capturing() {
+        if !self.writers.is_empty() || self.live_in_hub.capturing() {
             return Err("already recording".to_string());
         }
 
@@ -1582,7 +1697,7 @@ impl Control {
         let live_in_target = self.live_in_hub.target_track();
         let (targets, midi_target) = {
             let session = self.session.lock(); // read-only: resolve/validate target track ids before recording starts
-            split_record_targets(&session.store, track_ids, live_in_target)?
+            split_record_targets(&session.store, track_ids, live_in_target, &return_sources)?
         };
 
         // A take needs a project dir whether it is audio or MIDI.
@@ -1591,133 +1706,53 @@ impl Control {
         let start_pos = self.shared.position.load(Relaxed);
 
         if !targets.is_empty() {
-            // Input device + stream.
-            let host = cpal::default_host();
-            let device = match &self.sel_input {
-                Some(id) => host
-                    .input_devices()
-                    .map_err(|e| e.to_string())?
-                    .find(|d| d.name().map(|n| &n == id).unwrap_or(false))
-                    .ok_or_else(|| format!("unknown input device: {id}"))?,
-                None => host
-                    .default_input_device()
-                    .ok_or_else(|| "no default input device".to_string())?,
-            };
-            let cfg = device.default_input_config().map_err(|e| e.to_string())?;
-            if cfg.sample_format() != cpal::SampleFormat::F32 {
-                return Err(format!(
-                    "unsupported input sample format {:?} (prototype supports f32)",
-                    cfg.sample_format()
-                ));
-            }
-            let in_ch = cfg.channels().max(1) as usize;
-            let rec_ch = in_ch.min(2);
-            let rate = cfg.sample_rate().0;
-
-            // Rings + writer specs. Slot resolution reads the CURRENT graph's
-            // tables, not the store — round-2 §2.4; lock order: session before
-            // tables [C1].
-            let (project_dir, take_no, slots, rec_generation) = {
-                let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
-                let store = &session.store;
-                let dir = store.project_dir.clone().ok_or("no project open")?;
-                let take_no = store.clips.len() + 1;
-                let tables = self.tables.lock();
-                let slots: Vec<usize> = targets
-                    .iter()
-                    .filter_map(|id| tables.slots.get(id.as_str()).copied())
-                    .collect();
-                (dir, take_no, slots, tables.generation)
-            };
-            // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
-            // preallocated `RawMeterBlock` template per distinct chunk, plus the
-            // base-0 chunk (frame accounting [I3]) even if no recorded slot
-            // lands there. Built here (control thread) so `InputCb::capture`
-            // (RT) never allocates.
-            let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-            chunk_lanes.entry(0).or_default();
-            for &slot in &slots {
-                let chunk_idx = slot / METER_CHUNK_SLOTS;
-                let lane = slot % METER_CHUNK_SLOTS;
-                chunk_lanes.entry(chunk_idx).or_default().push(lane);
-            }
-            let mut blocks = Vec::with_capacity(chunk_lanes.len());
-            for (chunk_idx, lanes) in chunk_lanes {
-                let mut b = RawMeterBlock::new(rec_generation, 0, 0);
-                b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
-                blocks.push((b, lanes));
+            // Group by capture device so two tracks sharing a return (or
+            // the global input) share one stream; distinct devices each
+            // get their own (X1). Device lookup is the first fallible
+            // step so a missing return source fails before any writer
+            // thread is spawned.
+            let mut by_device: BTreeMap<String, Vec<AudioRecTarget>> = BTreeMap::new();
+            for t in &targets {
+                let key = t
+                    .device_id
+                    .clone()
+                    .or_else(|| self.sel_input.clone())
+                    .unwrap_or_default();
+                by_device.entry(key).or_default().push(t.clone());
             }
 
-            let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
-            let mut producers = Vec::with_capacity(targets.len());
-            let mut consumers = Vec::with_capacity(targets.len());
-            let mut specs = Vec::with_capacity(targets.len());
-            for (i, track_id) in targets.iter().enumerate() {
-                let clip_id = uuid::Uuid::new_v4().to_string();
-                // The take's wav is named by a freshly-minted SourceId (round-2
-                // §2.2) — the decode cache re-keys by source, not by clip.
-                // Waveform pyramid cache dirs stay keyed by clip id.
-                let source_id = crate::ids::SourceId::mint();
-                let rel = format!("audio/{source_id}.wav");
-                let (p, c) = rtrb::RingBuffer::new(capacity);
-                producers.push(p);
-                consumers.push(c);
-                specs.push(RecSpec {
-                    track_id: track_id.clone(),
-                    take_name: format!("Take {}", take_no + i),
-                    wav_path: project_dir.join(&rel),
-                    rel_path: rel,
-                    source_id,
-                    cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
-                    clip_id,
-                    start_pos,
-                });
+            let mut groups: Vec<(InputBundle, DiskWriter)> = Vec::new();
+            let mut rec_generation = None;
+            for (device_key, group) in by_device {
+                let wanted = if device_key.is_empty() { None } else { Some(device_key.as_str()) };
+                match self.open_capture_group(wanted, &group, start_pos) {
+                    Ok((bundle, writer, gen)) => {
+                        rec_generation = Some(gen);
+                        groups.push((bundle, writer));
+                    }
+                    Err(e) => {
+                        // Drop any groups already opened so a failed second
+                        // device does not leave a writer thread running.
+                        for (input, writer) in groups {
+                            drop(input);
+                            writer.stop.store(true, Relaxed);
+                            let _ = writer.finish(Duration::from_secs(2));
+                        }
+                        return Err(e);
+                    }
+                }
             }
 
-            let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
-
-            let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
-            let n_producers = producers.len();
-            let mut cb = InputCb {
-                producers,
-                owed: vec![0; n_producers],
-                meter_tx,
-                blocks,
-                in_ch,
-                rec_ch,
-                shared: self.shared.clone(),
-            };
-            let stream = device
-                .build_input_stream(
-                    &cfg.into(),
-                    move |data: &[f32], _| cb.capture(data),
-                    |e| log::warn!("input stream error: {e}"),
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
-            stream.play().map_err(|e| e.to_string())?;
-
-            // Pin the generation the slots above were resolved against (Task 6
-            // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
-            // in its plain window must not lose its input meters. INVARIANT:
-            // pin only AFTER every fallible step above has succeeded (device
-            // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
-            // `stop_recording` is the only unpin, and it can only ever run once
-            // `self.writer`/`self.input` are actually populated. Pinning
-            // earlier and then returning `Err` from one of those `?`s would
-            // leak the pin: a generation stays exempt from pruning forever for
-            // a recording that never started (self-healing only on the NEXT
-            // successful recording, which is not good enough).
-            self.gen_maps.pin(rec_generation);
-
-            self.input = Some(InputBundle { _stream: stream, meter_rx });
-            self.writer = Some(writer);
-            log::info!(
-                "audio: recording {} track(s) @ {} Hz x{}ch",
-                targets.len(),
-                rate,
-                rec_ch
-            );
+            // Pin AFTER every fallible step (device lookup, spawn, play)
+            // succeeded — `stop_recording` is the only unpin.
+            if let Some(gen) = rec_generation {
+                self.gen_maps.pin(gen);
+            }
+            for (input, writer) in groups {
+                self.inputs.push(input);
+                self.writers.push(writer);
+            }
+            log::info!("audio: recording {} track(s) on {} input(s)", targets.len(), self.inputs.len());
         } // ruling 8: a take with only a MIDI target opens no device at all
 
         // Arm the capture LAST among the fallible work: every `?` above
@@ -1731,7 +1766,7 @@ impl Control {
             log::info!("audio: recording MIDI take on track {t}");
         }
 
-        let mut recorded = targets;
+        let mut recorded: Vec<String> = targets.into_iter().map(|t| t.track_id).collect();
         recorded.extend(midi_target);
         self.rec_track_ids = recorded.clone();
         self.shared.recording.store(true, Relaxed);
@@ -1788,13 +1823,13 @@ impl Control {
         // further hardware note can join the take, whichever half fails
         // below. Either half alone counts as "recording" (ruling 8).
         let capture = self.live_in_hub.end_capture();
-        let writer = self.writer.take();
-        if writer.is_none() && capture.is_none() {
+        let writers = std::mem::take(&mut self.writers);
+        if writers.is_empty() && capture.is_none() {
             return Err("not recording".to_string());
         }
-        // Drop the input stream FIRST so the ring producers close and the
-        // writer can drain to empty.
-        self.input = None;
+        // Drop the input streams FIRST so the ring producers close and the
+        // writers can drain to empty.
+        self.inputs.clear();
         // A writer failure (disk full, a WAV header that would not close,
         // the 15 s drain timeout) is reported, but only after everything it
         // does NOT own has been salvaged. It used to return early, which
@@ -1803,21 +1838,25 @@ impl Control {
         // hub above, and the stop itself — `shared.recording` stayed true
         // and the transport-state commit never ran, leaving the UI claiming
         // a take was still running.
-        let (clips, writer_err) = match writer {
-            Some(w) => {
-                // Release the pin (Task 6 [I2]) — recording is over, so its
-                // generation no longer needs exemption from the plain
-                // window. Only the audio half ever pinned one.
-                self.gen_maps.unpin();
+        let (clips, writer_err) = if writers.is_empty() {
+            (Vec::new(), None)
+        } else {
+            // Release the pin (Task 6 [I2]) — recording is over, so its
+            // generation no longer needs exemption from the plain
+            // window. Only the audio half ever pinned one.
+            self.gen_maps.unpin();
+            let mut clips = Vec::new();
+            let mut writer_err = None;
+            for w in writers {
                 match w.finish(Duration::from_secs(15)) {
-                    Ok(clips) => (clips, None),
+                    Ok(mut c) => clips.append(&mut c),
                     Err(e) => {
                         log::error!("stop_recording: the take's audio was lost: {e}");
-                        (Vec::new(), Some(e))
+                        writer_err = Some(e);
                     }
                 }
             }
-            None => (Vec::new(), None),
+            (clips, writer_err)
         };
 
         self.shared.recording.store(false, Relaxed);
@@ -2039,24 +2078,49 @@ impl Control {
 ///   an explicit `requested` list naming only MIDI tracks with no routing
 ///   target set is reported as "no armed tracks" although nothing was armed
 ///   or unarmed. Reachable from MCP's `record_take`; wants its own branch.
+/// One audio take target. `device_id` is `None` for a normal audio track
+/// (uses the engine's selected/default input) and `Some` for a MIDI track
+/// that has an X1 return source (uses that device).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AudioRecTarget {
+    track_id: String,
+    device_id: Option<String>,
+}
+
 fn split_record_targets(
     store: &Store,
     requested: Option<Vec<String>>,
     midi_target: Option<String>,
-) -> Result<(Vec<String>, Option<String>), String> {
+    returns: &HashMap<String, String>,
+) -> Result<(Vec<AudioRecTarget>, Option<String>), String> {
     let is_midi =
         |id: &str| store.tracks.iter().any(|t| t.id.as_str() == id && t.kind == "midi");
-    let audio: Vec<String> = match requested {
+    let candidates: Vec<String> = match requested {
         Some(ids) => {
             for id in &ids {
                 if !store.tracks.iter().any(|t| &t.id == id) {
                     return Err(format!("unknown track: {id}"));
                 }
             }
-            ids.into_iter().filter(|id| !is_midi(id)).collect()
+            ids
         }
-        None => store.armed_track_ids().into_iter().filter(|id| !is_midi(id)).collect(),
+        None => store.armed_track_ids(),
     };
+    let audio: Vec<AudioRecTarget> = candidates
+        .into_iter()
+        .filter_map(|id| {
+            if is_midi(&id) {
+                // A routed MIDI track with a return is an audio take on
+                // that device. Without a return it stays MIDI-only.
+                returns.get(&id).map(|dev| AudioRecTarget {
+                    track_id: id,
+                    device_id: Some(dev.clone()),
+                })
+            } else {
+                Some(AudioRecTarget { track_id: id, device_id: None })
+            }
+        })
+        .collect();
     let midi = midi_target.filter(|id| is_midi(id));
     if audio.is_empty() && midi.is_none() {
         return Err("no armed tracks to record".to_string());
@@ -2750,8 +2814,8 @@ mod tests {
             events: Box::new(NullEvents),
             rx,
             output: None,
-            input: None,
-            writer: None,
+            inputs: Vec::new(),
+            writers: Vec::new(),
             rec_track_ids: Vec::new(),
             sel_output: None,
             sel_input: None,
@@ -3829,19 +3893,49 @@ mod tests {
         store.tracks[0].armed = true;
         store.tracks[1].armed = true;
 
-        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into())).unwrap();
-        assert_eq!(audio, vec!["a-1".to_string()], "an armed midi track is not a WAV target");
+        let empty = HashMap::new();
+        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into()), &empty).unwrap();
+        assert_eq!(
+            audio.iter().map(|t| t.track_id.as_str()).collect::<Vec<_>>(),
+            vec!["a-1"],
+            "an armed midi track without a return is not a WAV target"
+        );
         assert_eq!(midi.as_deref(), Some("m-1"));
 
         let (audio, midi) =
-            split_record_targets(&store, Some(vec!["m-1".into()]), Some("m-1".into())).unwrap();
-        assert!(audio.is_empty(), "midi tracks never record audio, got {audio:?}");
+            split_record_targets(&store, Some(vec!["m-1".into()]), Some("m-1".into()), &empty).unwrap();
+        assert!(audio.is_empty(), "midi tracks without a return never record audio, got {audio:?}");
         assert_eq!(midi.as_deref(), Some("m-1"));
 
-        let (audio, midi) =
-            split_record_targets(&store, Some(vec!["a-1".into(), "m-1".into()]), Some("m-1".into()))
-                .unwrap();
-        assert_eq!(audio, vec!["a-1".to_string()]);
+        let (audio, midi) = split_record_targets(
+            &store,
+            Some(vec!["a-1".into(), "m-1".into()]),
+            Some("m-1".into()),
+            &empty,
+        )
+        .unwrap();
+        assert_eq!(audio.iter().map(|t| t.track_id.as_str()).collect::<Vec<_>>(), vec!["a-1"]);
+        assert_eq!(midi.as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn split_record_targets_includes_a_midi_track_with_a_return() {
+        let mut store = Store::default();
+        store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        store.tracks.push(midi_track("m-1"));
+        store.tracks[0].armed = true;
+        store.tracks[1].armed = true;
+
+        let mut returns = HashMap::new();
+        returns.insert("m-1".into(), "Mic 2".into());
+        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into()), &returns).unwrap();
+        assert_eq!(
+            audio,
+            vec![
+                AudioRecTarget { track_id: "a-1".into(), device_id: None },
+                AudioRecTarget { track_id: "m-1".into(), device_id: Some("Mic 2".into()) },
+            ]
+        );
         assert_eq!(midi.as_deref(), Some("m-1"));
     }
 
@@ -3849,7 +3943,8 @@ mod tests {
     fn split_record_targets_allows_a_midi_only_take() {
         let mut store = Store::default();
         store.tracks.push(midi_track("m-1"));
-        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into())).unwrap();
+        let (audio, midi) =
+            split_record_targets(&store, None, Some("m-1".into()), &HashMap::new()).unwrap();
         assert!(audio.is_empty());
         assert_eq!(midi.as_deref(), Some("m-1"));
     }
@@ -3857,17 +3952,17 @@ mod tests {
     #[test]
     fn split_record_targets_errors_when_nothing_is_recordable() {
         let store = Store::default();
-        let err = split_record_targets(&store, None, None).unwrap_err();
+        let err = split_record_targets(&store, None, None, &HashMap::new()).unwrap_err();
         assert!(err.contains("no armed tracks"), "got {err}");
 
         let mut store2 = Store::default();
         store2.tracks.push(crate::audio::types::testutil::test_track("a-1"));
         assert!(
-            split_record_targets(&store2, None, Some("a-1".into())).is_err(),
+            split_record_targets(&store2, None, Some("a-1".into()), &HashMap::new()).is_err(),
             "an audio track as routing target is not a midi take"
         );
         assert!(
-            split_record_targets(&store2, None, Some("ghost".into())).is_err(),
+            split_record_targets(&store2, None, Some("ghost".into()), &HashMap::new()).is_err(),
             "a routing target that no longer exists is not a midi take"
         );
     }
@@ -3875,7 +3970,8 @@ mod tests {
     #[test]
     fn split_record_targets_rejects_an_unknown_explicit_track() {
         let store = Store::default();
-        let err = split_record_targets(&store, Some(vec!["ghost".into()]), None).unwrap_err();
+        let err = split_record_targets(&store, Some(vec!["ghost".into()]), None, &HashMap::new())
+            .unwrap_err();
         assert!(err.contains("unknown track"), "got {err}");
     }
 
@@ -4008,7 +4104,7 @@ mod tests {
             cache_dir: dir.join("cache"),
             start_pos: 0,
         };
-        ctl.writer = Some(recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap());
+        ctl.writers = vec![recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap()];
         ctl.live_in_hub.begin_capture("m-1".into(), 0);
         ctl.live_in_hub.capture_event(true, 60, 100);
 
@@ -4057,7 +4153,7 @@ mod tests {
             cache_dir: dir.join("blocker/cache"),
             start_pos: 0,
         };
-        ctl.writer = Some(recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap());
+        ctl.writers = vec![recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap()];
         ctl.shared.recording.store(true, Relaxed);
         ctl.shared.playing.store(true, Relaxed);
         ctl.live_in_hub.begin_capture("m-1".into(), 0);
@@ -4138,10 +4234,12 @@ mod tests {
         ctl.live_in_hub.set_target_track(Some("m-1".into()));
         ctl.shared.position.store(24_000, Relaxed);
 
-        let recorded = ctl.start_recording(None).expect("a routing target alone is a take");
+        let recorded = ctl
+            .start_recording(None, HashMap::new())
+            .expect("a routing target alone is a take");
         assert_eq!(recorded, vec!["m-1".to_string()], "the midi target is reported as recorded");
-        assert!(ctl.writer.is_none(), "no WAV writer for a midi-only take");
-        assert!(ctl.input.is_none(), "no input device opened");
+        assert!(ctl.writers.is_empty(), "no WAV writer for a midi-only take");
+        assert!(ctl.inputs.is_empty(), "no input device opened");
         assert!(ctl.live_in_hub.capturing(), "the capture is armed");
         assert!(ctl.shared.recording.load(Relaxed) && ctl.shared.playing.load(Relaxed));
 
@@ -4167,6 +4265,28 @@ mod tests {
         let (mut ctl, session) = bare_control();
         session.lock().store.tracks.push(midi_track("m-1"));
         ctl.live_in_hub.begin_capture("m-1".into(), 0);
-        assert_eq!(ctl.start_recording(None).unwrap_err(), "already recording");
+        assert_eq!(ctl.start_recording(None, HashMap::new()).unwrap_err(), "already recording");
+    }
+
+    /// X1: a MIDI track with a return is an audio take on THAT device. A
+    /// name that is not a cpal input fails before any writer starts — that
+    /// is how we prove the engine asked for the return device rather than
+    /// the global default (which on a headless runner may not exist either,
+    /// but would say "no default input device", not "unknown input device").
+    #[test]
+    fn start_recording_a_returned_midi_track_asks_for_that_device() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        session.lock().store.tracks[0].armed = true;
+        ctl.ensure_project_fn = Some(Arc::new(|| Ok(PathBuf::from("/nonexistent"))));
+        let mut returns = HashMap::new();
+        returns.insert("m-1".into(), "aura-x1-no-such-input".into());
+        let err = ctl.start_recording(None, returns).unwrap_err();
+        assert!(
+            err.contains("unknown input device: aura-x1-no-such-input"),
+            "must fail on the return device, got {err}"
+        );
+        assert!(ctl.writers.is_empty() && ctl.inputs.is_empty());
+        assert!(!ctl.live_in_hub.capturing(), "a failed start must not arm MIDI capture");
     }
 }

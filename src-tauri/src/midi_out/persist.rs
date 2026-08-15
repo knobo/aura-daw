@@ -51,6 +51,11 @@ pub struct PersistedRoute {
     pub id: String,
     pub port_name: String,
     pub channel: u8,
+    /// cpal input-device name this track records its audio return from.
+    /// Track routes only; clip overrides never carry one. Missing in files
+    /// written before X1 — `None` means "no return, MIDI-only".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_device: Option<String>,
 }
 
 fn default_dir() -> Option<PathBuf> {
@@ -169,6 +174,7 @@ mod tests {
                     id: "t-1".into(),
                     port_name: "Hydrogen".into(),
                     channel: 9,
+                    return_device: Some("Interface In 3-4".into()),
                 }],
                 open_ports: vec!["Hydrogen".into()],
             },
@@ -194,5 +200,16 @@ mod tests {
         assert!(proj.open_ports.is_empty());
         assert_eq!(proj.routes.len(), 1);
         assert_eq!(proj.routes[0].port_name, "Hydrogen");
+        assert_eq!(proj.routes[0].return_device, None);
+    }
+
+    /// Files written before X1 must still load — a missing `return_device`
+    /// is "no return", never a hard parse failure that would wipe routing.
+    #[test]
+    fn persisted_route_missing_return_device_deserializes_as_none() {
+        let json = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen","channel":9}"#;
+        let r: PersistedRoute = serde_json::from_str(json).unwrap();
+        assert_eq!(r.return_device, None);
+        assert_eq!(r.port_name, "Hydrogen");
     }
 }

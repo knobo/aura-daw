@@ -11,7 +11,8 @@ tracks (MIDI out + audio return)* and for track B's still-open item 6
 in-process offline bounce (`audio::offline`) and never hears Hydrogen
 or a hardware synth.
 
-Status: **decision recorded, not started.**
+Status: **X1 in progress / landing** (`feat/external-return-x1`). X2–X4
+not started.
 
 ## Decision
 

@@ -304,10 +304,22 @@ pub enum RouteScope {
 
 /// Where a route sends its notes: a port id (as returned by
 /// [`list_output_ports`]) and a MIDI channel (0-based on the wire, 0-15).
+///
+/// `return_device` is the cpal input-device **name** this track records its
+/// audio return from (X1). Clip routes never carry one; track routes may.
+/// Changing the port/channel via [`MidiOut::set_route`] preserves a
+/// previously-set return so a port swap does not silently drop it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTarget {
     pub port_id: String,
     pub channel: u8,
+    pub return_device: Option<String>,
+}
+
+impl RouteTarget {
+    pub fn new(port_id: impl Into<String>, channel: u8) -> Self {
+        Self { port_id: port_id.into(), channel, return_device: None }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -462,6 +474,10 @@ pub struct RouteStatus {
     pub id: String,
     pub port_id: String,
     pub channel: u8,
+    /// cpal input-device name for this track's audio return. `None` on clip
+    /// routes and on track routes that have not picked a return yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_device: Option<String>,
 }
 
 /// Live status snapshot returned by [`MidiOut::status`].
@@ -648,13 +664,46 @@ impl MidiOut {
     pub fn set_route(&self, scope: RouteScope, target: Option<RouteTarget>) {
         let mut routes = self.routes.lock();
         match target {
-            Some(t) => {
+            Some(mut t) => {
+                // Port/channel edits must not drop an existing return; the
+                // dedicated `set_return` is how a return is cleared.
+                if t.return_device.is_none() {
+                    if let Some(old) = routes.get(&scope) {
+                        t.return_device = old.return_device.clone();
+                    }
+                }
                 routes.insert(scope, t);
             }
             None => {
                 routes.remove(&scope);
             }
         }
+    }
+
+    /// Set (or, on `None`, clear) the audio-return input device on an
+    /// already-routed **track**. Clip routes have no return — they inherit
+    /// the track's. Errors if the track is not currently routed.
+    pub fn set_return(&self, track_id: &str, device: Option<String>) -> Result<(), String> {
+        let mut routes = self.routes.lock();
+        let target = routes.get_mut(&RouteScope::Track(track_id.to_string())).ok_or_else(|| {
+            format!("track {track_id} is not routed — pick a MIDI output before a return source")
+        })?;
+        target.return_device = device.filter(|s| !s.is_empty());
+        Ok(())
+    }
+
+    /// Track-id → cpal input-device name, for every track that has a return.
+    /// The engine reads this at `start_recording` so a MIDI track with a
+    /// return becomes an audio take on *that* device.
+    pub fn return_sources(&self) -> HashMap<String, String> {
+        self.routes
+            .lock()
+            .iter()
+            .filter_map(|(scope, t)| match scope {
+                RouteScope::Track(id) => t.return_device.clone().map(|d| (id.clone(), d)),
+                RouteScope::Clip(_) => None,
+            })
+            .collect()
     }
 
     /// Every route currently targeting `port_id` — removed as a group. A
@@ -705,7 +754,16 @@ impl MidiOut {
                     RouteScope::Track(id) => ("track", id),
                     RouteScope::Clip(id) => ("clip", id),
                 };
-                RouteStatus { scope: kind, id, port_id: target.port_id, channel: target.channel }
+                RouteStatus {
+                    scope: kind,
+                    id,
+                    port_id: target.port_id,
+                    channel: target.channel,
+                    return_device: match kind {
+                        "track" => target.return_device,
+                        _ => None,
+                    },
+                }
             })
             .collect();
         MidiOutputStatus { outputs, routes }
@@ -791,7 +849,14 @@ impl MidiOut {
                     continue;
                 }
             };
-            new_routes.insert(scope, RouteTarget { port_id: port_id.to_string(), channel: r.channel });
+            new_routes.insert(
+                scope,
+                RouteTarget {
+                    port_id: port_id.to_string(),
+                    channel: r.channel,
+                    return_device: r.return_device.clone(),
+                },
+            );
         }
         *self.routes.lock() = new_routes;
     }
@@ -841,6 +906,10 @@ impl MidiOut {
                         id,
                         port_name,
                         channel: target.channel,
+                        return_device: match kind {
+                            "track" => target.return_device.clone(),
+                            _ => None,
+                        },
                     })
                 })
                 .collect();
@@ -1295,6 +1364,19 @@ pub fn midi_set_track_route(
         port_id,
         channel.unwrap_or(0),
         crate::control::op::TxMeta::user("set midi track route"),
+    )
+}
+
+#[tauri::command]
+pub fn midi_set_track_return(
+    track_id: String,
+    device_id: Option<String>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.set_midi_track_return(
+        track_id,
+        device_id,
+        crate::control::op::TxMeta::user("set midi track return"),
     )
 }
 
@@ -1833,7 +1915,7 @@ mod tests {
 
         let out = MidiOut::default();
         out.attach(session.clone(), shared.clone());
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget { port_id: target.id.clone(), channel: 0 }));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 0)));
         out.open_port(target.id.clone()).expect("open the loopback port");
 
         // Past the short note's own note-off (125 ms) and at least one
@@ -1962,8 +2044,8 @@ mod tests {
         out.attach(session, shared.clone());
         // Track routed on channel 0; the second clip overrides to channel 5
         // on the SAME port.
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget { port_id: target.id.clone(), channel: 0 }));
-        out.set_route(RouteScope::Clip(overridden_clip_id.to_string()), Some(RouteTarget { port_id: target.id.clone(), channel: 5 }));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 0)));
+        out.set_route(RouteScope::Clip(overridden_clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), 5)));
         out.open_port(target.id.clone()).expect("open the loopback port");
 
         std::thread::sleep(std::time::Duration::from_millis(400));
@@ -2042,7 +2124,7 @@ mod tests {
             eprintln!("skipping: loopback port not visible"); return;
         };
 
-        out.set_route(RouteScope::Clip(clip_id.to_string()), Some(RouteTarget { port_id: target.id.clone(), channel: 0 }));
+        out.set_route(RouteScope::Clip(clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), 0)));
         out.open_port(target.id.clone()).expect("open the loopback port");
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
@@ -2093,7 +2175,7 @@ mod tests {
         before.set_routing_path_for_test(routing_path.clone());
         before.open_port(target.id.clone()).expect("open the loopback port");
         before.set_clock_enabled(&target.id, false).unwrap();
-        before.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget { port_id: target.id.clone(), channel: 3 }));
+        before.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 3)));
         before.persist(Some(&project_dir));
         before.close_port(&target.id).ok();
         assert!(before.status().outputs.is_empty(), "the OLD instance's port is closed, simulating app exit");
@@ -2111,7 +2193,7 @@ mod tests {
         assert!(!status.outputs[0].clock_enabled, "the persisted clock-enabled preference was restored");
         assert!(
             after.routes().get(&RouteScope::Track("t-1".into()))
-                == Some(&RouteTarget { port_id: status.outputs[0].port.id.clone(), channel: 3 }),
+                == Some(&RouteTarget::new(status.outputs[0].port.id.clone(), 3)),
             "the persisted track route was reapplied, re-pointed at the freshly resolved port id: {:?}",
             after.routes()
         );
@@ -2150,7 +2232,7 @@ mod tests {
         out.set_routing_path_for_test(routing_path.clone());
         out.set_route(
             RouteScope::Track("t-prev".into()),
-            Some(RouteTarget { port_id: "ghost#0".into(), channel: 2 }),
+            Some(RouteTarget::new("ghost#0", 2)),
         );
         assert!(
             !out.routes().is_empty(),
@@ -2172,6 +2254,38 @@ mod tests {
             "persist after adopting an unrouted project must not file the previous project's routes under the new key: {proj:?}"
         );
         let _ = std::fs::remove_file(&routing_path);
+    }
+
+    /// X1: a return source hangs on the track route, survives a port/channel
+    /// edit (set_route preserves it), and is dropped with the route.
+    #[test]
+    fn set_return_requires_a_track_route_and_survives_a_port_edit() {
+        let out = MidiOut::default();
+        assert!(
+            out.set_return("t-1", Some("Mic 2".into())).is_err(),
+            "no route yet — cannot hang a return on nothing"
+        );
+
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new("out#0", 0)));
+        out.set_return("t-1", Some("Mic 2".into())).unwrap();
+        assert_eq!(out.return_sources().get("t-1").map(String::as_str), Some("Mic 2"));
+        assert_eq!(
+            out.status().routes.iter().find(|r| r.id == "t-1").and_then(|r| r.return_device.as_deref()),
+            Some("Mic 2")
+        );
+
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new("out#1", 4)));
+        let kept = out.routes().get(&RouteScope::Track("t-1".into())).cloned().unwrap();
+        assert_eq!(kept.port_id, "out#1");
+        assert_eq!(kept.channel, 4);
+        assert_eq!(kept.return_device.as_deref(), Some("Mic 2"), "port/channel edit must not drop the return");
+
+        out.set_return("t-1", None).unwrap();
+        assert!(out.return_sources().is_empty());
+
+        out.set_return("t-1", Some("Mic 2".into())).unwrap();
+        out.set_route(RouteScope::Track("t-1".into()), None);
+        assert!(out.return_sources().is_empty(), "clearing the route clears the return");
     }
 
     /// Same adopt-empty contract for open ports: File > New must close
@@ -2226,12 +2340,14 @@ mod tests {
                         id: "t-1".into(),
                         port_name: "Unplugged Synth".into(),
                         channel: 3,
+                        return_device: Some("Mic 2".into()),
                     },
                     persist::PersistedRoute {
                         scope: "clip".into(),
                         id: "c-9".into(),
                         port_name: "Missing Drum Machine".into(),
                         channel: 9,
+                        return_device: None,
                     },
                 ],
                 open_ports: vec!["Unplugged Synth".into()],
@@ -2255,8 +2371,14 @@ mod tests {
         let back = persist::load_from_path(&routing_path);
         let proj = back.projects.get(&key).expect("the project entry must survive");
         assert!(
-            proj.routes.iter().any(|r| r.scope == "track" && r.id == "t-1" && r.port_name == "Unplugged Synth" && r.channel == 3),
-            "the unplugged track route stays on disk: {:?}",
+            proj.routes.iter().any(|r| {
+                r.scope == "track"
+                    && r.id == "t-1"
+                    && r.port_name == "Unplugged Synth"
+                    && r.channel == 3
+                    && r.return_device.as_deref() == Some("Mic 2")
+            }),
+            "the unplugged track route (and its return) stays on disk: {:?}",
             proj.routes
         );
         assert!(
@@ -2445,7 +2567,7 @@ mod tests {
 
         let out = MidiOut::default();
         out.attach(session, shared.clone());
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget { port_id: target.id.clone(), channel: 0 }));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 0)));
         out.open_port(target.id.clone()).expect("open the loopback port");
 
         // The thread's 250 ms try_lock snapshot window has to pick up the

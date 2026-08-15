@@ -78,6 +78,11 @@
     void midiIo.setTrackRoute(editingTrackId, editingRoute.portId, channel);
   }
 
+  function selectRouteReturn(deviceId: string) {
+    if (!editingTrackId || !editingRoute) return;
+    void midiIo.setTrackReturn(editingTrackId, deviceId || null);
+  }
+
   // live dB readout without reactivity churn
   $effect(() => {
     let raf = 0;
@@ -218,6 +223,16 @@
             value={editingRoute.channel}
             onchange={(e) => selectRouteChannel(Math.max(0, Math.min(15, (e.currentTarget as HTMLInputElement).valueAsNumber || 0)))}
           />
+          <select
+            name="midi-output-track-return"
+            title="Audio input this track records its return from (so export hears the external synth). Patch the synth into this input yourself."
+            onchange={(e) => selectRouteReturn((e.currentTarget as HTMLSelectElement).value)}
+          >
+            <option value="" selected={!editingRoute.returnDevice}>return: none</option>
+            {#each inputs as d (d.id)}
+              <option value={d.id} selected={d.id === editingRoute.returnDevice}>{d.name}</option>
+            {/each}
+          </select>
         {/if}
       {/if}
     </div>

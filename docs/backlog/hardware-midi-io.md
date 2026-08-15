@@ -70,10 +70,11 @@ request and the architecture it lands on, for pickup after Plan E.
    which is why no document field, no new op and no `OP_FORMAT_VERSION`
    bump were needed. The *audio return* (so export hears Hydrogen) is
    the remaining half — product cut in
-   `docs/backlog/external-instrument-return.md`: visible clips on the
-   same track, PipeWire as a one-click helper, freeze-then-export. No
-   hidden tracks, no silent graph rewrite. JACK transport / Link still
-   deferred.
+   `docs/backlog/external-instrument-return.md`. **X1 landing:** a
+   routed MIDI track can pick a cpal return and record a WAV clip onto
+   itself; a freeze clip replaces the internal instrument. X2 PipeWire
+   helper and X3 freeze-then-export still later. JACK transport / Link
+   still deferred.
 
 Plan: `docs/superpowers/plans/2026-08-14-midi-slice-2.md` (slice 2, PR #21).
 
