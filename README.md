@@ -406,7 +406,7 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 715 tests (686 lib + 29 integration; counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard
+cd src-tauri && cargo test    # 717 tests (688 lib + 29 integration; counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard
 npm test                      # 316 frontend unit tests (counted 2026-08-15; vitest): stores + timeline math + section-table bijection + library store + automation lane edit ops + MIDI I/O + group drag/resize + clip selection/clipboard
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
