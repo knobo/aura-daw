@@ -41,17 +41,31 @@ export interface MidiInputStatus {
   capturing: boolean;
 }
 
-// ── midi-output (slice 2: clock/sync + note-out) ────────────────────────────
-// App-config only, same carve-out as the input side above.
+// ── midi-output: clock/sync + per-track/per-clip routing ───────────────────
+// App-config only, same carve-out as the input side above — never stored in
+// the project. Any number of ports can be open at once (`outputs`); a
+// track- or clip-scoped route (`routes`) sends that track's/clip's notes to
+// one port+channel. A clip route always wins over its track's route.
 
-export interface MidiOutputStatus {
-  selected: MidiPortInfo | null;
+export interface MidiOutputPortStatus {
+  port: MidiPortInfo;
   clockEnabled: boolean;
   running: boolean;
   pulsesSent: number;
   resyncs: number;
-  noteTrackId: string | null;
   notesSent: number;
+}
+
+export interface MidiRouteStatus {
+  scope: "track" | "clip";
+  id: string;
+  portId: string;
+  channel: number;
+}
+
+export interface MidiOutputStatus {
+  outputs: MidiOutputPortStatus[];
+  routes: MidiRouteStatus[];
 }
 
 // ── transport-state.schema.json ─────────────────────────────────────────────
