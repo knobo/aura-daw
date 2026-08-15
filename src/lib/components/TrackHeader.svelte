@@ -7,6 +7,8 @@
   import { project } from "../state/project.svelte";
   import { instruments } from "../state/instruments.svelte";
   import { plugins } from "../state/plugins.svelte";
+  import { zyn } from "../state/zynpatches.svelte";
+  import { automation } from "../state/automation.svelte";
   import { ui } from "../state/ui.svelte";
   import { formatDb } from "../utils/format";
   import Meter from "./Meter.svelte";
@@ -21,6 +23,10 @@
   const pluginInst = $derived(
     track.kind === "midi" ? plugins.instanceForRef(track.instrumentId) : undefined,
   );
+  /** The bank patch loaded into that instance, if any (Zyn). The patch is
+   * what a user picks and re-picks, so it — not the constant host name —
+   * is what the chip shows once one is loaded. */
+  const patch = $derived(pluginInst ? zyn.loaded[pluginInst.id] : undefined);
 
   function openInstrumentPanel() {
     if (pluginInst) {
@@ -70,14 +76,16 @@
           class:stub={pluginInst?.status === "stub"}
           class:crashed={pluginInst?.status === "crashed"}
           title={pluginInst
-            ? `Plugin: ${pluginInst.name} (${pluginInst.format}, ${pluginInst.status}) — open params`
+            ? `Plugin: ${pluginInst.name} (${pluginInst.format}, ${pluginInst.status})${
+                patch ? ` — patch: ${patch.bank} / ${patch.name}` : ""
+              } — open params`
             : instrument
               ? `Instrument: ${instrument.name} — open browser`
               : "MIDI track — built-in polysynth; assign an instrument"}
           onclick={openInstrumentPanel}
         >
           {#if pluginInst}
-            ⚡ {pluginInst.name}
+            ⚡ {patch?.name ?? pluginInst.name}
           {:else if instrument}
             ⌁ {instrument.name}
           {:else}
@@ -112,6 +120,13 @@
           class:on={track.soloed}
           title="Solo"
           onclick={() => project.toggleSolo(track.id)}>S</button
+        >
+        <button
+          class="tog auto"
+          class:on={automation.isVisible(track.id)}
+          title="Show gain automation lane"
+          aria-pressed={automation.isVisible(track.id)}
+          onclick={() => automation.toggleVisible(track.id)}>A</button
         >
       </div>
 
@@ -301,6 +316,12 @@
     background: var(--cyan);
     border-color: var(--cyan);
     box-shadow: 0 0 8px rgba(82, 229, 255, 0.4);
+  }
+  .tog.auto.on {
+    color: #fff;
+    background: rgba(255, 65, 82, 0.8);
+    border-color: var(--red);
+    box-shadow: 0 0 8px rgba(255, 65, 82, 0.4);
   }
 
   .fader-wrap {

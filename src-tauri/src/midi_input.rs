@@ -1,18 +1,36 @@
 //! Hardware MIDI input — **slice 1** (port list/select/activity) + **slice
-//! 1b** (live monitoring: incoming notes are made audible).
+//! 1b** (live monitoring: incoming notes are made audible) + **slice 2**
+//! (feeding `crate::audio::midi_in::MidiInHub`: routing to a target track
+//! and take capture).
 //!
 //! Scope: port enumeration, port selection, a live "MIDI activity"
-//! indicator, and — slice 1b — routing incoming NoteOn/NoteOff to a
-//! preview-grade voice so a connected keyboard is actually audible. Still
-//! NO document mutations, NO recording, NO routing to project
-//! instruments/tracks — those remain later slices. This module never
-//! touches `crate::control`, `crate::midi` (the tick-timeline/clip/synth
-//! document module), or the engine's real-time audio graph. Its one
-//! live-resource dependency, `crate::audio::sampler_preview`, is the same
-//! "no project needed" audition path `sampler_preview_note` already uses —
-//! not the document, not the RT graph. It is wired into `lib.rs` purely
-//! additively (new `pub mod`, a new managed state, three new commands
-//! appended to `generate_handler!`).
+//! indicator, slice 1b's routing of incoming NoteOn/NoteOff to a
+//! preview-grade voice, and — **slice 2** — feeding the hub: capturing
+//! every note edge into a take's buffer while a track is armed, and routing
+//! notes to a target track's real instrument instead of the preview tone
+//! when one is set (see `crate::audio::midi_in::MidiInHub`, scope rulings 1
+//! and 2 in the slice-2 plan). Still NO document mutations and no op is
+//! ever emitted from here — the routing target is app config, not document
+//! state (ruling 1) — and NO routing decision besides "preview vs. this
+//! track's instrument" lives in this module (the hub owns target
+//! resolution and the RT-side plumbing). This module never touches
+//! `crate::control` or `crate::midi` (the tick-timeline/clip/synth document
+//! module) directly, and — unlike slice 1 — it no longer sits fully outside
+//! the engine's real-time audio graph either, but only as a FEEDER: the
+//! callback pushes routed notes into `crate::audio::midi_in::MidiInHub`'s
+//! wait-free ring (ruling 2: exactly one monitoring path is ever live —
+//! either slice 1b's preview tone with no target set, or the hub push with
+//! a target set, never both, never neither), and the hub is the wiring
+//! point the engine's RT output callback will *drain* — that consumer side
+//! is a separate, not-yet-landed task (Task 10). Until Task 10 installs a
+//! producer there, every hub push in this slice counts as a drop
+//! (`MidiInputStatus::dropped_events`) rather than reaching any audio graph
+//! node; nothing in *this* module claims otherwise. Its live-resource
+//! dependencies are `crate::audio::sampler_preview` (the same "no project
+//! needed" audition path `sampler_preview_note` already uses) for the
+//! preview path, and `crate::audio::midi_in::hub()` for the routed/captured
+//! path. It is wired into `lib.rs` purely additively (new `pub mod`, a new
+//! managed state, three new commands appended to `generate_handler!`).
 //!
 //! Backend: [`midir`], which gets the ALSA-seq backend on Linux for free.
 //!
@@ -56,17 +74,25 @@
 //! ## Callback discipline
 //!
 //! midir invokes the input callback on its own backend thread (not the
-//! audio RT thread). The callback does two small things: (1) bump the
-//! activity atomics / status-byte ring (slice 1), and (2) parse a
-//! NoteOn/NoteOff out of the raw bytes and, if monitoring is enabled,
-//! forward it with a **non-blocking** channel send to the preview control
-//! thread (slice 1b) — see [`crate::audio::sampler_preview::PreviewHandle`]
-//! doc: `note_on`/`note_off`/`all_off` never wait for a reply, so this
-//! callback never blocks on an audio lock or on the preview thread's own
-//! work (stream open, node swap, etc. all happen asynchronously over
-//! there). The whole body is wrapped in `catch_unwind` so a bug in it can
-//! never unwind across the FFI/thread boundary into a panic that takes
-//! down the MIDI backend thread.
+//! audio RT thread). The callback does three small things, all inside
+//! [`handle_incoming`]: (1) bump the activity atomics / status-byte ring
+//! (slice 1) — done just before, in the caller; (2) capture the parsed
+//! NoteOn/NoteOff into the hub's take buffer via `MidiInHub::capture_event`
+//! **unconditionally whenever a take is armed** (slice 2) — this does NOT
+//! depend on the monitor toggle, so recording never silently drops notes
+//! just because monitoring happens to be off; and (3) route the same event
+//! per [`monitor_route`] to exactly one of: nowhere (monitor off), the
+//! preview control thread with a **non-blocking** channel send (slice 1b,
+//! no target track set) — see
+//! [`crate::audio::sampler_preview::PreviewHandle`] doc: `note_on`/
+//! `note_off`/`all_off` never wait for a reply — or `MidiInHub::push`
+//! (slice 2, a target track is set), which is likewise non-blocking (an
+//! rtrb push, never a wait). So this callback never blocks on an audio
+//! lock, on the preview thread's own work (stream open, node swap, etc.
+//! all happen asynchronously over there), or on the RT audio callback. The
+//! whole body is wrapped in `catch_unwind` so a bug in it can never unwind
+//! across the FFI/thread boundary into a panic that takes down the MIDI
+//! backend thread.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -76,6 +102,7 @@ use std::time::Instant;
 use midir::{MidiInput, MidiInputConnection};
 use serde::{Deserialize, Serialize};
 
+use crate::audio::midi_in::{self, LiveMidiEvent, MidiInHub};
 use crate::audio::sampler_engine::CompiledInstrument;
 use crate::audio::sampler_preview::{self, PreviewHandle};
 use crate::audio::sampler_voice::{CompiledRegion, SampleData};
@@ -106,6 +133,21 @@ pub struct MidiInputStatus {
     /// voice (slice 1b). `false` (never "stuck on") when no port is
     /// selected. Set at `select_port` time — see module doc.
     pub monitor: bool,
+    /// The track incoming notes are routed to (ruling 1), or None. Read
+    /// from the hub, so this is correct even with no port selected.
+    pub target_track_id: Option<String>,
+    /// True when notes are actually reaching a track's instrument (monitor
+    /// on AND a target set) — i.e. [`MonitorRoute::Track`]. Read from the
+    /// hub; unlike `monitor`, not forced false just because no port is
+    /// selected... except that with no port selected `monitor` itself is
+    /// always false, so this is false too (see `monitor_route`).
+    pub routing: bool,
+    /// Events the hub could not enqueue (ring full / no producer) since
+    /// start. Read from the hub, so correct even with no port selected.
+    pub dropped_events: u64,
+    /// A take is armed and buffering. Read from the hub, so correct even
+    /// with no port selected.
+    pub capturing: bool,
 }
 
 const RECENT_STATUS_CAP: usize = 3;
@@ -203,31 +245,77 @@ fn build_monitor_instrument() -> Arc<CompiledInstrument> {
     })
 }
 
-/// Forward a parsed note event to the preview voice, if monitoring is
-/// enabled. Never blocks — see [`PreviewHandle::note_on`] doc. Errors are
-/// logged, not propagated (no caller to report them to from a MIDI
-/// callback thread).
-fn forward_for_monitoring(
+/// Where an incoming note goes. Pure decision function so the routing rule
+/// is testable with no hardware and no audio device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MonitorRoute {
+    /// Monitoring is off: the note is neither previewed nor routed.
+    Silent,
+    /// Monitoring is on, no target track is set: slice 1b's preview tone.
+    Preview,
+    /// Monitoring is on AND a target track is set: ruling 2 — the target
+    /// track's real instrument, never the preview tone (exactly one
+    /// monitoring path is ever live).
+    Track,
+}
+
+/// Decide where an incoming note goes. See [`MonitorRoute`] and scope
+/// ruling 2 (slice-2 plan): with a target set, the target ALWAYS wins over
+/// the preview tone whenever monitoring is on — never both, never neither.
+pub(crate) fn monitor_route(monitor_enabled: bool, has_target: bool) -> MonitorRoute {
+    match (monitor_enabled, has_target) {
+        (false, _) => MonitorRoute::Silent,
+        (true, false) => MonitorRoute::Preview,
+        (true, true) => MonitorRoute::Track,
+    }
+}
+
+/// Handle one raw incoming MIDI message (replaces slice 1's
+/// `forward_for_monitoring`: it now also captures). Parses unconditionally
+/// so running-status tracking stays correct even while monitoring is off;
+/// captures unconditionally into the hub's take buffer while a track is
+/// armed (recording must never depend on the monitor toggle — the hub's
+/// `capture_event` is itself a no-op when nothing is armed); and routes the
+/// note per [`monitor_route`]: to the preview voice, to the hub (which the
+/// RT graph drains), or nowhere. Never blocks — both `PreviewHandle` calls
+/// and `MidiInHub::push` are non-blocking. Errors are logged, not
+/// propagated (no caller to report them to from a MIDI callback thread).
+fn handle_incoming(
     preview: &PreviewHandle,
+    hub: &MidiInHub,
     running_status: &mut Option<u8>,
     monitor_enabled: bool,
     message: &[u8],
 ) {
-    // Parse unconditionally so running-status tracking stays correct even
-    // while monitoring is toggled off; only FORWARD when enabled.
     let Some(ev) = parse_note_event(running_status, message) else {
         return;
     };
-    if !monitor_enabled {
-        return;
-    }
-    let result = if ev.on {
-        preview.note_on(monitor_instrument(), ev.key, ev.velocity)
-    } else {
-        preview.note_off(ev.key)
-    };
-    if let Err(e) = result {
-        log::warn!("midi_input: live-monitor forward failed: {e}");
+
+    // Capture is independent of the monitor toggle (recording must not
+    // depend on whether the operator can currently hear it). No-op when no
+    // take is armed.
+    hub.capture_event(ev.on, ev.key, ev.velocity);
+
+    match monitor_route(monitor_enabled, hub.has_target()) {
+        MonitorRoute::Silent => {}
+        MonitorRoute::Preview => {
+            let result = if ev.on {
+                preview.note_on(monitor_instrument(), ev.key, ev.velocity)
+            } else {
+                preview.note_off(ev.key)
+            };
+            if let Err(e) = result {
+                log::warn!("midi_input: live-monitor forward failed: {e}");
+            }
+        }
+        MonitorRoute::Track => {
+            let live = if ev.on {
+                LiveMidiEvent::note_on(ev.key, ev.velocity)
+            } else {
+                LiveMidiEvent::note_off(ev.key)
+            };
+            hub.push(live);
+        }
     }
 }
 
@@ -310,7 +398,6 @@ struct Inner {
 /// Owns the (at most one) open MIDI input connection. `select_port`
 /// replaces or closes it; `status` reads a cheap snapshot; the callback
 /// itself never reaches back into this type.
-#[derive(Default)]
 pub struct MidiInputManager {
     inner: Mutex<Inner>,
     /// Lazily-started, dedicated preview output stream for live monitoring
@@ -318,9 +405,29 @@ pub struct MidiInputManager {
     /// handle used by `sampler_preview_note`, so the two never contend for
     /// the same installed instrument/node.
     preview: OnceLock<PreviewHandle>,
+    /// The slice-2 hub the port callback feeds (target routing + take
+    /// capture). `Default` fills this from the process-global hub
+    /// (`crate::audio::midi_in::hub()`, the same one the engine's RT graph
+    /// and control plane read from); [`Self::with_hub`] injects a private
+    /// one for tests.
+    hub: Arc<MidiInHub>,
+}
+
+impl Default for MidiInputManager {
+    fn default() -> Self {
+        Self { inner: Mutex::default(), preview: OnceLock::new(), hub: midi_in::hub().clone() }
+    }
 }
 
 impl MidiInputManager {
+    /// Test seam: a manager wired to an injected hub instead of the global
+    /// one, so tests can assert on hub state without cross-test
+    /// interference through the process-global singleton.
+    #[cfg(test)]
+    pub(crate) fn with_hub(hub: Arc<MidiInHub>) -> Self {
+        Self { inner: Mutex::default(), preview: OnceLock::new(), hub }
+    }
+
     fn preview_handle(&self) -> &PreviewHandle {
         self.preview.get_or_init(|| sampler_preview::start("midi"))
     }
@@ -343,6 +450,7 @@ impl MidiInputManager {
                 let was_on = active.monitor.swap(monitor, Relaxed);
                 if was_on && !monitor {
                     let _ = self.preview_handle().all_off();
+                    self.hub.push(LiveMidiEvent::all_off());
                 }
                 return Ok(());
             }
@@ -350,7 +458,8 @@ impl MidiInputManager {
 
         // Slow path: an actual port change (including closing to `None`).
         // Drop closes the previous connection (if any); always release any
-        // note it left sustained.
+        // note it left sustained, on both monitoring paths (ruling 2).
+        self.hub.push(LiveMidiEvent::all_off());
         inner.connection = None;
         let _ = self.preview_handle().all_off();
 
@@ -384,6 +493,7 @@ impl MidiInputManager {
         let monitor_flag = Arc::new(AtomicBool::new(monitor));
         let cb_monitor = monitor_flag.clone();
         let preview_for_cb = self.preview_handle().clone();
+        let hub_for_cb = self.hub.clone();
         let mut running_status: Option<u8> = None;
         let conn = midi_in
             .connect(
@@ -393,12 +503,13 @@ impl MidiInputManager {
                     // Defense in depth: never let a callback panic unwind
                     // into the midir backend thread (constraint from the
                     // task spec). Both the activity bookkeeping (slice 1)
-                    // and the note-forward (slice 1b, non-blocking) happen
-                    // inside this one guarded body.
+                    // and the note handling (monitor-route + capture,
+                    // slice 1b/2, non-blocking) happen inside this one
+                    // guarded body.
                     let _ = catch_unwind(AssertUnwindSafe(|| {
                         record_event(&cb_shared, opened_at, message);
                         let enabled = cb_monitor.load(Relaxed);
-                        forward_for_monitoring(&preview_for_cb, &mut running_status, enabled, message);
+                        handle_incoming(&preview_for_cb, &hub_for_cb, &mut running_status, enabled, message);
                     }));
                 },
                 (),
@@ -416,8 +527,16 @@ impl MidiInputManager {
     }
 
     /// Cheap live snapshot for polling (~2 Hz from the frontend is plenty).
+    /// The hub-sourced fields (`target_track_id`/`routing`/`dropped_events`/
+    /// `capturing`) are correct even with no port selected — only
+    /// `monitor`/`events_seen` keep the "idle when nothing selected" rule,
+    /// per the task spec.
     pub fn status(&self) -> Result<MidiInputStatus, String> {
         let inner = self.inner.lock().map_err(|_| "midi input manager lock poisoned".to_string())?;
+        let target_track_id = self.hub.target_track();
+        let dropped_events = self.hub.dropped();
+        let capturing = self.hub.capturing();
+
         let Some(active) = inner.connection.as_ref() else {
             return Ok(MidiInputStatus {
                 selected: None,
@@ -425,6 +544,12 @@ impl MidiInputManager {
                 last_event_age_ms: None,
                 last_status_bytes: Vec::new(),
                 monitor: false,
+                target_track_id,
+                // No port selected => monitor is always false => never
+                // routing regardless of a target being set.
+                routing: false,
+                dropped_events,
+                capturing,
             });
         };
 
@@ -438,13 +563,19 @@ impl MidiInputManager {
         };
         let last_status_bytes =
             active.shared.recent_status.lock().map(|b| b.clone()).unwrap_or_default();
+        let monitor = active.monitor.load(Relaxed);
+        let routing = monitor_route(monitor, target_track_id.is_some()) == MonitorRoute::Track;
 
         Ok(MidiInputStatus {
             selected: Some(active.port.clone()),
             events_seen,
             last_event_age_ms,
             last_status_bytes,
-            monitor: active.monitor.load(Relaxed),
+            monitor,
+            target_track_id,
+            routing,
+            dropped_events,
+            capturing,
         })
     }
 }
@@ -458,20 +589,41 @@ pub fn midi_list_input_ports() -> Result<Vec<MidiPortInfo>, String> {
     list_ports()
 }
 
+/// Task 5 (MIDI slice 2, §4.5 config carve-out): the body is now a thin
+/// wrapper over `ControlPlane::select_midi_input_port` — the front door
+/// both Tauri and MCP call through, so actor/label attribution is
+/// captured. Default ON when a port is selected (slice 1b requirement);
+/// the value is irrelevant when `port_id` is `None` (closing the
+/// connection).
 #[tauri::command]
 pub fn midi_select_input_port(
     port_id: Option<String>,
     monitor: Option<bool>,
-    state: tauri::State<'_, MidiInputManager>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
 ) -> Result<(), String> {
-    // Default ON when a port is selected (slice 1b requirement); the value
-    // is irrelevant when `port_id` is `None` (closing the connection).
-    state.select_port(port_id, monitor.unwrap_or(true))
+    control.select_midi_input_port(
+        port_id,
+        monitor.unwrap_or(true),
+        crate::control::op::TxMeta::user("select midi input port"),
+    )
+}
+
+/// NEW, additive (Task 5): routes hardware MIDI-in to a track's instrument.
+/// `None` clears the routing (back to the slice-1b preview tone).
+#[tauri::command]
+pub fn midi_select_input_track(
+    track_id: Option<String>,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.select_midi_input_track(
+        track_id,
+        crate::control::op::TxMeta::user("select midi input track"),
+    )
 }
 
 #[tauri::command]
 pub fn midi_input_status(
-    state: tauri::State<'_, MidiInputManager>,
+    state: tauri::State<'_, Arc<MidiInputManager>>,
 ) -> Result<MidiInputStatus, String> {
     state.status()
 }
@@ -709,20 +861,158 @@ mod tests {
         assert!(parse_note_event(&mut rs, &[0x90, 60]).is_none()); // incomplete
     }
 
-    /// `forward_for_monitoring` must not forward (or error) when monitoring
-    /// is disabled, but must still keep running-status parsing correct.
+    /// `handle_incoming` must not forward to the preview voice (or error)
+    /// when monitoring is disabled, but must still keep running-status
+    /// parsing correct. Renamed from slice 1's `forward_for_monitoring`.
     #[test]
-    fn forward_for_monitoring_respects_toggle_and_never_panics() {
+    fn handle_incoming_respects_toggle_and_never_panics() {
         let handle = sampler_preview::start("test");
+        let hub = MidiInHub::new();
         let mut rs = None;
         // Disabled: no panic, no crash even with a very plausible note.
-        forward_for_monitoring(&handle, &mut rs, false, &[0x90, 60, 100]);
+        handle_incoming(&handle, &hub, &mut rs, false, &[0x90, 60, 100]);
         assert_eq!(rs, Some(0x90)); // running status still tracked while off
         // Enabled: also must not panic (device may or may not exist in CI;
         // PreviewHandle::note_on/note_off swallow their own errors).
-        forward_for_monitoring(&handle, &mut rs, true, &[0x90, 60, 100]);
-        forward_for_monitoring(&handle, &mut rs, true, &[0x80, 60, 0]);
+        handle_incoming(&handle, &hub, &mut rs, true, &[0x90, 60, 100]);
+        handle_incoming(&handle, &hub, &mut rs, true, &[0x80, 60, 0]);
         let _ = handle.all_off();
+    }
+
+    // -----------------------------------------------------------------
+    // Slice 2: hub routing (ruling 2) + take capture, independent of the
+    // monitor toggle. All hardware-independent.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn monitor_route_prefers_the_track_when_one_is_targeted() {
+        assert_eq!(monitor_route(false, false), MonitorRoute::Silent);
+        assert_eq!(monitor_route(false, true), MonitorRoute::Silent);
+        assert_eq!(monitor_route(true, false), MonitorRoute::Preview);
+        assert_eq!(monitor_route(true, true), MonitorRoute::Track);
+    }
+
+    #[test]
+    fn incoming_notes_reach_the_hub_when_a_track_is_targeted() {
+        use crate::audio::midi_in::{MidiInHub, EV_NOTE_ON, EV_NOTE_OFF, LIVE_IN_RING_SLOTS};
+        let hub = Arc::new(MidiInHub::new());
+        let (tx, mut rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
+        hub.install_producer(tx);
+        hub.set_target_track(Some("t-1".into()));
+        let preview = sampler_preview::start("test");
+        let mut rs = None;
+        handle_incoming(&preview, &hub, &mut rs, true, &[0x90, 60, 100]);
+        handle_incoming(&preview, &hub, &mut rs, true, &[0x80, 60, 0]);
+        assert_eq!(rx.pop().unwrap(), LiveMidiEvent { kind: EV_NOTE_ON, key: 60, velocity: 100 });
+        assert_eq!(rx.pop().unwrap(), LiveMidiEvent { kind: EV_NOTE_OFF, key: 60, velocity: 0 });
+    }
+
+    #[test]
+    fn no_hub_traffic_without_a_target_slice_1_preview_still_owns_it() {
+        use crate::audio::midi_in::MidiInHub;
+        let hub = Arc::new(MidiInHub::new());
+        let (tx, mut rx) = rtrb::RingBuffer::new(8);
+        hub.install_producer(tx);
+        let preview = sampler_preview::start("test");
+        let mut rs = None;
+        handle_incoming(&preview, &hub, &mut rs, true, &[0x90, 60, 100]);
+        assert!(rx.pop().is_err(), "no target => preview tone, nothing routed");
+        let _ = preview.all_off();
+    }
+
+    /// Turning the monitor OFF with a key still down is the one state where
+    /// nothing else releases the routed note: armed and stopped means no
+    /// stop edge, no disarm, no target switch. So the toggle's falling edge
+    /// itself has to ask for the release — with monitoring off, the physical
+    /// note-off is routed nowhere (`MonitorRoute::Silent`) and never
+    /// arrives. Both `select_port` paths push it; this pins the fast one,
+    /// which is the path the toggle actually takes (same port, monitor
+    /// flipped).
+    #[test]
+    fn toggling_the_monitor_off_asks_the_hub_to_release_the_routed_note() {
+        use crate::audio::midi_in::{MidiInHub, EV_ALL_OFF, LIVE_IN_RING_SLOTS};
+        use midir::os::unix::VirtualInput;
+
+        let Ok(midi_in) = MidiInput::new("aura-midi-input-test") else {
+            eprintln!("skipping: ALSA seq unavailable in this environment");
+            return;
+        };
+        let Ok(conn) = midi_in.create_virtual("aura-test-monitor-off", |_, _, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: ALSA virtual port unavailable in this environment");
+            return;
+        };
+
+        let hub = Arc::new(MidiInHub::new());
+        let (tx, mut rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
+        hub.install_producer(tx);
+        hub.set_target_track(Some("t-1".into()));
+        let mgr = MidiInputManager::with_hub(hub.clone());
+        let port = MidiPortInfo {
+            id: "virtual-test-port#0".to_string(),
+            name: "virtual-test-port".to_string(),
+        };
+        let monitor_flag = Arc::new(AtomicBool::new(true));
+        {
+            let mut inner = mgr.inner.lock().unwrap();
+            inner.connection = Some(ActiveConnection {
+                port: port.clone(),
+                shared: Arc::new(ConnShared::default()),
+                opened_at: Instant::now(),
+                monitor: monitor_flag.clone(),
+                _conn: conn,
+            });
+        }
+
+        let preview = sampler_preview::start("test");
+        let mut rs = None;
+        handle_incoming(&preview, &hub, &mut rs, true, &[0x90, 60, 100]);
+        assert_eq!(rx.pop().unwrap().kind, crate::audio::midi_in::EV_NOTE_ON);
+
+        mgr.select_port(Some(port.id.clone()), false).unwrap();
+        assert_eq!(
+            rx.pop().map(|e| e.kind),
+            Ok(EV_ALL_OFF),
+            "the falling edge asks for a release"
+        );
+
+        // And with monitoring off the key's own note-off really does go
+        // nowhere, which is what makes that release load-bearing.
+        handle_incoming(&preview, &hub, &mut rs, false, &[0x80, 60, 0]);
+        assert!(rx.pop().is_err(), "monitor off routes nothing to the track");
+        let _ = preview.all_off();
+    }
+
+    #[test]
+    fn capture_is_independent_of_the_monitor_toggle() {
+        use crate::audio::midi_in::MidiInHub;
+        let hub = Arc::new(MidiInHub::new());
+        hub.begin_capture("t-1".into(), 0);
+        let preview = sampler_preview::start("test");
+        let mut rs = None;
+        // Monitoring OFF: still captured (recording must not depend on hearing).
+        handle_incoming(&preview, &hub, &mut rs, false, &[0x90, 60, 100]);
+        handle_incoming(&preview, &hub, &mut rs, false, &[0x80, 60, 0]);
+        let take = hub.end_capture().unwrap();
+        assert_eq!(take.events.len(), 2);
+    }
+
+    #[test]
+    fn status_reports_target_routing_and_drops() {
+        use crate::audio::midi_in::MidiInHub;
+        let hub = Arc::new(MidiInHub::new());
+        let mgr = MidiInputManager::with_hub(hub.clone());
+        let idle = mgr.status().unwrap();
+        assert_eq!(idle.target_track_id, None);
+        assert!(!idle.routing);
+        assert!(!idle.capturing);
+
+        hub.set_target_track(Some("t-9".into()));
+        let s = mgr.status().unwrap();
+        assert_eq!(s.target_track_id.as_deref(), Some("t-9"));
+        // No port selected => monitor is false => not routing yet.
+        assert!(!s.routing);
+        hub.push(LiveMidiEvent::note_on(60, 100)); // no producer installed
+        assert_eq!(mgr.status().unwrap().dropped_events, 1);
     }
 
     /// The built-in monitor instrument must be well-formed: non-empty

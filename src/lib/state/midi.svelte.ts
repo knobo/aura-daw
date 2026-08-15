@@ -11,6 +11,7 @@ import { backend } from "../tauri";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { project } from "./project.svelte";
 import { sampleAtTick, tickAtSample, type SectionRow } from "../sectionTable";
+import { toasts } from "./toasts.svelte";
 import { byTickKey } from "../utils/note-ops";
 import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent } from "../types/ipc";
 
@@ -90,11 +91,37 @@ class MidiStore {
   }
 
   async init() {
+    this.subscribeToTakes();
     try {
       this.applySnapshot(await backend.getProjectState());
     } catch (err) {
       console.warn("[aura] midi init failed:", err);
     }
+  }
+
+  /** One subscription for the process. `init()` is ALSO the undo/redo
+   * re-pull (projectops.repull), so subscribing unguarded would add a
+   * listener per undo. */
+  private takesSubscribed = false;
+  private subscribeToTakes() {
+    if (this.takesSubscribed) return;
+    this.takesSubscribed = true;
+    backend.on("recording://state", (rs) => {
+      if (rs.recording || !rs.midiClipId) return;
+      void this.adoptTake(rs.midiClipId);
+    });
+  }
+
+  /** A MIDI take is registered by the engine's own transaction, and the
+   * `project://changed` that transaction emits carries only the
+   * audio-shaped `Project` — `clips` on `recording://state` is likewise the
+   * audio half. Nothing else pulls the take's MIDI clip in, so without this
+   * the notes the user just played stay invisible until an undo/redo or a
+   * reopen. Selecting + flashing it mirrors what a landed hum result does. */
+  private async adoptTake(clipId: string) {
+    await this.refresh();
+    this.select(clipId);
+    this.flash(clipId);
   }
 
   async refresh() {
@@ -125,8 +152,25 @@ class MidiStore {
       this.upsert(clip);
       return clip;
     } catch (err) {
+      // A double-click that produces no clip and no message reads as a dead
+      // UI; the console is not a user surface.
+      toasts.error("COULD NOT ADD MIDI CLIP", String(err));
       console.error("[aura] midi_add_clip failed:", err);
       return null;
+    }
+  }
+
+  /** Rename a clip. The backend trims and rejects empty names; this returns
+   *  false (with the reason toasted) rather than throwing at the caller. */
+  async renameClip(clipId: string, name: string): Promise<boolean> {
+    const previous = this.clips.find((c) => c.id === clipId)?.name;
+    if (name.trim() === previous) return true;
+    try {
+      this.upsert(await backend.midiRenameClip(clipId, name));
+      return true;
+    } catch (err) {
+      toasts.error("RENAME FAILED", String(err));
+      return false;
     }
   }
 
@@ -245,6 +289,20 @@ class MidiStore {
     const src = this.selectedClip;
     if (!src) return null;
     return this.stamp(src, src.trackId, src.timelineStartTicks + src.lengthTicks);
+  }
+
+  /** Public entry to the copy-stamp behind paste/duplicate: place an
+   * independent copy of `clipId` on `trackId` at `timelineStartTicks`. The
+   * library panel's project-clips drag lands here, so there is exactly ONE
+   * stamping path in the app. */
+  async stampClipTo(
+    clipId: string,
+    trackId: string,
+    timelineStartTicks: number,
+  ): Promise<MidiClip | null> {
+    const src = this.clipById(clipId);
+    if (!src) return null;
+    return this.stamp(src, trackId, Math.max(0, Math.round(timelineStartTicks)));
   }
 
   private async stamp(

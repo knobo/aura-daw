@@ -4,7 +4,7 @@
    * browser and the MCP control panel. Overlays the timeline; toggled from
    * the transport bar chips.
    */
-  import { ui, type DockTab } from "../state/ui.svelte";
+  import { DOCK_SHORTCUT, ui, type DockTab } from "../state/ui.svelte";
   import { DOCK_RESIZE } from "../utils/panel-resize";
   import PanelResizeHandle from "./PanelResizeHandle.svelte";
   import { mcp } from "../state/mcp.svelte";
@@ -12,6 +12,7 @@
   import { zyn } from "../state/zynpatches.svelte";
   import AiStudio from "./generate/AiStudio.svelte";
   import HumPanel from "./hum/HumPanel.svelte";
+  import LibraryPanel from "./library/LibraryPanel.svelte";
   import InstrumentBrowser from "./instruments/InstrumentBrowser.svelte";
   import PluginBrowser from "./plugins/PluginBrowser.svelte";
   import PluginParamPanel from "./plugins/PluginParamPanel.svelte";
@@ -21,6 +22,7 @@
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
     { id: "generate", label: "AI STUDIO" },
     { id: "hum", label: "🎤 HUM" },
+    { id: "library", label: "LIBRARY" },
     { id: "instruments", label: "INSTRUMENTS" },
     { id: "plugins", label: "PLUGINS" },
     { id: "mcp", label: "MCP" },
@@ -43,9 +45,11 @@
           class:on={ui.dock === t.id}
           role="tab"
           aria-selected={ui.dock === t.id}
+          title="{t.label} — press {DOCK_SHORTCUT[t.id].toUpperCase()}"
           onclick={() => (ui.dock = t.id)}
         >
           {t.label}
+          <span class="key silk" aria-hidden="true">{DOCK_SHORTCUT[t.id]}</span>
           {#if t.id === "mcp" && mcp.pending.length > 0}
             <span class="alertdot"></span>
           {/if}
@@ -59,6 +63,8 @@
         <AiStudio />
       {:else if ui.dock === "hum"}
         <HumPanel />
+      {:else if ui.dock === "library"}
+        <LibraryPanel />
       {:else if ui.dock === "instruments"}
         <InstrumentBrowser />
       {:else if ui.dock === "plugins"}
@@ -123,6 +129,13 @@
     color: var(--cyan);
     border-bottom-color: var(--cyan);
     text-shadow: 0 0 8px var(--cyan-dim);
+  }
+  .key {
+    margin-left: 4px;
+    padding: 0 3px;
+    border-radius: 2px;
+    border: 1px solid var(--glass-border);
+    text-transform: uppercase;
   }
   .alertdot {
     position: absolute;

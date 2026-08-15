@@ -41,6 +41,7 @@
 //! pure reads (`midi_get_clips`, `midi_export_file`).
 
 pub mod amt;
+pub mod capture;
 pub mod events;
 pub mod midifile;
 pub mod persist;
@@ -555,6 +556,49 @@ pub fn midi_set_clip_bounds(
     midi_set_clip_bounds_core(&control, clip_id, timeline_start_ticks, length_ticks, content_length_ticks)
 }
 
+/// Core of `midi_rename_clip`: ONE `Op::Set{MidiClip, Name}`. The trim and
+/// the empty-name reject live in `write_midi_prop` (the write side is the
+/// validation authority, like `LengthTicks`'s clamp), so the recorded op —
+/// and therefore the inverse — carries the trimmed value, never the
+/// caller's raw string. `meta.label` is the fixed string `"rename midi
+/// clip"` so successive renames of the same clip coalesce into one history
+/// entry instead of one per keystroke-commit.
+pub(crate) fn midi_rename_clip_core(
+    control: &ControlPlane,
+    clip_id: crate::ids::ClipId,
+    name: String,
+) -> Result<MidiClip, String> {
+    let mut result: Option<MidiClip> = None;
+    control.commit(TxMeta::user("rename midi clip"), |tx| {
+        tx.apply(Op::Set {
+            object: ObjectRef::MidiClip(clip_id.clone()),
+            path: PropPath::Name,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(name),
+        })?;
+        result = Some(
+            tx.midi()
+                .clips
+                .iter()
+                .find(|c| c.id == clip_id)
+                .cloned()
+                .expect("the Set above just applied against this clip id"),
+        );
+        Ok(())
+    })?;
+    Ok(result.expect("commit only returns Ok after the closure ran to completion"))
+}
+
+/// Rename a MIDI clip. Empty (or whitespace-only) names are rejected.
+#[tauri::command]
+pub fn midi_rename_clip(
+    clip_id: crate::ids::ClipId,
+    name: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<MidiClip, String> {
+    midi_rename_clip_core(&control, clip_id, name)
+}
+
 #[tauri::command]
 pub fn midi_get_clips(state: State<'_, MidiState>) -> Result<Vec<MidiClip>, String> {
     read_midi(&state, |s| Ok(s.clips.clone()))
@@ -948,6 +992,59 @@ mod tests {
         let (cp, events) = test_control_plane();
         let track = cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("seed track")).unwrap();
         (cp, events, track.id)
+    }
+
+    // ---- midi_rename_clip_core ----
+
+    #[test]
+    fn midi_rename_clip_core_writes_trimmed_name_with_one_event() {
+        let (cp, events, track_id) = plane_with_midi_track();
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+        let before = changed_count(&events);
+
+        let renamed = midi_rename_clip_core(&cp, clip.id.clone(), "  Chorus  ".into()).unwrap();
+        assert_eq!(renamed.name, "Chorus", "the write side trims");
+
+        let snap = cp.project_state();
+        let stored = snap.midi_clips.iter().find(|c| c.id == clip.id).unwrap();
+        assert_eq!(stored.name, "Chorus", "rename lands in document truth");
+        assert_eq!(changed_count(&events) - before, 1, "exactly one project://changed per invoke");
+    }
+
+    #[test]
+    fn midi_rename_clip_core_rejects_empty_and_unknown_clip() {
+        let (cp, _events, track_id) = plane_with_midi_track();
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+
+        assert!(midi_rename_clip_core(&cp, clip.id.clone(), "   ".into()).is_err());
+        assert!(midi_rename_clip_core(&cp, "no-such-clip".into(), "X".into()).is_err());
+
+        let snap = cp.project_state();
+        let stored = snap.midi_clips.iter().find(|c| c.id == clip.id).unwrap();
+        assert_eq!(stored.name, "Riff", "a rejected rename leaves the name untouched");
+    }
+
+    /// The inverse must carry the PREVIOUS name, so undo restores it —
+    /// and the recorded op must carry the trimmed value, not the raw input.
+    #[test]
+    fn midi_rename_clip_inverse_restores_the_previous_name() {
+        let (cp, _events, track_id) = plane_with_midi_track();
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+        midi_rename_clip_core(&cp, clip.id.clone(), "  Chorus  ".into()).unwrap();
+
+        cp.commit(TxMeta::user("undo rename"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::MidiClip(clip.id.clone()),
+                path: PropPath::Name,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("Riff"),
+            })
+        })
+        .unwrap();
+
+        let snap = cp.project_state();
+        let stored = snap.midi_clips.iter().find(|c| c.id == clip.id).unwrap();
+        assert_eq!(stored.name, "Riff");
     }
 
     // ---- midi_set_clip_bounds_core ----

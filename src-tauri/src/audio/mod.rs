@@ -21,6 +21,7 @@
 pub mod dsp;
 pub mod engine;
 pub mod meters;
+pub mod midi_in;
 pub mod mixer;
 pub mod project;
 pub mod recorder;
@@ -131,6 +132,7 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // Make the sampler bank reachable from the engine graph rebuild
     // (midi-track instrument routing) and the post-job auto-register hook.
     sampler::register_bank(state.samplers.clone());
+    midi_in::hub().attach_shared(state.shared.clone());
     // The engine's own commit core (Plan E Task 13) — the SAME
     // session/shared/tables `Arc`s `ControlPlane::new` gets a moment later
     // (lib.rs's setup), with its own `emit` closure instance: two closure
@@ -332,6 +334,11 @@ pub fn start_recording(
 
 /// Finalizes the take: WAV files closed, waveform pyramids cached, clips
 /// registered on their tracks and returned.
+///
+/// An `Err` reaching the frontend means the take WAS registered (the MIDI
+/// clip and any audio clips that survived) but the WAV write failed — the
+/// caller should surface it and carry on with its own stop bookkeeping,
+/// never retry.
 #[tauri::command]
 pub fn stop_recording(control: State<'_, Arc<ControlPlane>>) -> Result<Vec<Clip>, String> {
     control.stop_recording()
@@ -548,6 +555,43 @@ pub fn sampler_preview_note(
         .ok_or_else(|| format!("unknown instrument: {instrument_id}"))?;
     let handle = state.preview.get_or_init(|| sampler_preview::start("ui"));
     handle.play(compiled, key, velocity.clamp(1, 127))
+}
+
+/// Audition a LIBRARY FILE — no project, no clip, no document. The Gate-safe
+/// preview category (`sampler_preview_note`, `midi_input`'s live monitoring):
+/// no op, no document field, no dirty flag. Plays at most
+/// `library::AUDITION_MAX_SECS` of the file once through the shared "ui"
+/// preview stream; whatever was auditioning is released first, so a click
+/// cancels the previous one.
+///
+/// `async` + `spawn_blocking`: decoding is disk + CPU work and sync commands
+/// run on the MAIN thread (see `seed_demo_project`).
+#[tauri::command]
+pub async fn library_audition(
+    path: String,
+    max_seconds: Option<f32>,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    let handle = state.preview.get_or_init(|| sampler_preview::start("ui")).clone();
+    let secs = max_seconds.unwrap_or(crate::library::AUDITION_MAX_SECS);
+    tauri::async_runtime::spawn_blocking(move || {
+        let inst = crate::library::compile_audition(std::path::Path::new(&path), secs)?;
+        // Cancel whatever is sounding before installing the next sample.
+        handle.all_off()?;
+        handle.play_held(std::sync::Arc::new(inst), 60, 100)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Release whatever the audition path is sounding. A no-op (never an error)
+/// when nothing has ever been auditioned — the preview stream is lazy.
+#[tauri::command]
+pub fn library_audition_stop(state: State<'_, AudioState>) -> Result<(), String> {
+    match state.preview.get() {
+        Some(h) => h.all_off(),
+        None => Ok(()),
+    }
 }
 
 /// Bind (or unbind, with `instrument_id: null`) an instrument to a midi

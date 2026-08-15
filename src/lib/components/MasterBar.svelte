@@ -8,53 +8,55 @@
   import { jobs } from "../state/jobs.svelte";
   import { generation, KIND_LABEL } from "../state/generation.svelte";
   import { latestMeter } from "../state/meters.svelte";
+  import { midiIo } from "../state/midiio.svelte";
+  import { project } from "../state/project.svelte";
   import { formatDb, linToDb } from "../utils/format";
-  import type { AudioDevice, MidiPortInfo } from "../types/ipc";
+  import type { AudioDevice } from "../types/ipc";
   import Meter from "./Meter.svelte";
 
   let inputs = $state<AudioDevice[]>([]);
   let outputs = $state<AudioDevice[]>([]);
   let dbEl: HTMLSpanElement | undefined = $state();
 
-  // Hardware MIDI input (midi-input-ports slice 1/1b): port list/select, a
-  // live activity dot, and a "monitor" toggle that makes incoming notes
-  // audible through a preview-grade voice (see docs/midi-input.md).
-  // Optional backend methods — no-op (empty list, dot never lights) in
-  // demo mode, which has no hardware to simulate.
-  let midiPorts = $state<MidiPortInfo[]>([]);
-  let midiSelectedId = $state("");
-  let midiActive = $state(false);
-  let midiMonitor = $state(true); // default ON, matches the backend default
+  /** Note-out (ruling 10) can only address a MIDI track — the backend
+   * rejects anything else, so the selector never offers it. */
+  const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
+
+  const targetTrackName = $derived(
+    midiIo.targetTrackId ? (project.trackById(midiIo.targetTrackId)?.name ?? midiIo.targetTrackId) : null,
+  );
 
   onMount(() => {
     backend.listInputDevices().then((d) => (inputs = d)).catch(() => {});
     backend.listOutputDevices().then((d) => (outputs = d)).catch(() => {});
-    backend.midiListInputPorts?.().then((p) => (midiPorts = p)).catch(() => {});
+    void midiIo.loadPorts();
   });
 
-  // Poll live MIDI status at ~2 Hz while this bar is mounted (mirrors the
-  // mcp status poll cadence pattern in state/mcp.svelte.ts, just faster
+  // Hardware MIDI I/O (slice 1/1b input, slice 2 output): port list/select,
+  // a live activity dot, monitor toggle, input routing readout, output
+  // port, clock toggle — all mirrored from `midiIo`'s poll (500 ms, mirrors
+  // the mcp status poll cadence pattern in state/mcp.svelte.ts, just faster
   // since "activity" needs to feel live).
-  $effect(() => {
-    if (!backend.midiInputStatus) return;
-    const id = setInterval(() => {
-      backend.midiInputStatus?.().then((s) => {
-        midiSelectedId = s.selected?.id ?? "";
-        midiActive = s.lastEventAgeMs != null && s.lastEventAgeMs < 300;
-        if (s.selected) midiMonitor = s.monitor;
-      }).catch(() => {});
-    }, 500);
-    return () => clearInterval(id);
-  });
+  $effect(() => midiIo.startPolling());
 
-  function selectMidiPort(id: string) {
-    midiSelectedId = id;
-    backend.midiSelectInputPort?.(id || null, midiMonitor);
+  function selectMidiInPort(id: string) {
+    void midiIo.selectInPort(id);
   }
 
   function toggleMidiMonitor(enabled: boolean) {
-    midiMonitor = enabled;
-    if (midiSelectedId) backend.midiSelectInputPort?.(midiSelectedId, enabled);
+    void midiIo.setMonitor(enabled);
+  }
+
+  function selectMidiOutPort(id: string) {
+    void midiIo.selectOutPort(id);
+  }
+
+  function toggleClock(enabled: boolean) {
+    void midiIo.setClockEnabled(enabled);
+  }
+
+  function selectMidiOutTrack(id: string) {
+    void midiIo.setOutputTrack(id || null);
   }
 
   // live dB readout without reactivity churn
@@ -107,22 +109,58 @@
       <span class="silk">midi in</span>
       <select
         name="midi-input-device"
-        onchange={(e) => selectMidiPort((e.currentTarget as HTMLSelectElement).value)}
+        onchange={(e) => selectMidiInPort((e.currentTarget as HTMLSelectElement).value)}
       >
-        <option value="" selected={midiSelectedId === ""}>None</option>
-        {#each midiPorts as p (p.id)}
-          <option value={p.id} selected={p.id === midiSelectedId}>{p.name}</option>
+        <option value="" selected={midiIo.inPortId === ""}>None</option>
+        {#each midiIo.inPorts as p (p.id)}
+          <option value={p.id} selected={p.id === midiIo.inPortId}>{p.name}</option>
         {/each}
       </select>
-      <span class="midi-dot" class:active={midiActive} title="MIDI activity"></span>
+      <span class="midi-dot" class:active={midiIo.active} title="MIDI activity"></span>
       <label class="monitor" title="Hear incoming notes through a preview-grade voice (docs/midi-input.md)">
         <input
           type="checkbox"
-          checked={midiMonitor}
+          checked={midiIo.monitor}
           onchange={(e) => toggleMidiMonitor((e.currentTarget as HTMLInputElement).checked)}
         />
         <span class="silk">monitor</span>
       </label>
+      {#if targetTrackName}
+        <span class="silk target" title="Incoming notes are routed to this track's instrument">
+          → {targetTrackName}
+        </span>
+      {/if}
+    </div>
+    <div class="dev">
+      <span class="silk">midi out</span>
+      <select
+        name="midi-output-device"
+        onchange={(e) => selectMidiOutPort((e.currentTarget as HTMLSelectElement).value)}
+      >
+        <option value="" selected={midiIo.outPortId === ""}>None</option>
+        {#each midiIo.outPorts as p (p.id)}
+          <option value={p.id} selected={p.id === midiIo.outPortId}>{p.name}</option>
+        {/each}
+      </select>
+      <label class="monitor" title="Send MIDI clock + transport (Start/Stop/Continue/SPP) to the output port">
+        <input
+          type="checkbox"
+          checked={midiIo.clockEnabled}
+          onchange={(e) => toggleClock((e.currentTarget as HTMLInputElement).checked)}
+        />
+        <span class="silk">clock</span>
+      </label>
+      <span class="silk">trk</span>
+      <select
+        name="midi-output-track"
+        title="Play this MIDI track's notes through the output port (mute it in AURA to avoid doubling)"
+        onchange={(e) => selectMidiOutTrack((e.currentTarget as HTMLSelectElement).value)}
+      >
+        <option value="" selected={!midiIo.noteTrackId}>None</option>
+        {#each midiTracks as t (t.id)}
+          <option value={t.id} selected={t.id === midiIo.noteTrackId}>{t.name}</option>
+        {/each}
+      </select>
     </div>
   </div>
 
@@ -230,6 +268,10 @@
     height: 11px;
     margin: 0;
     cursor: pointer;
+  }
+  .target {
+    color: var(--cyan);
+    white-space: nowrap;
   }
 
   .jobsbox {

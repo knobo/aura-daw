@@ -12,11 +12,12 @@
 
 import type { McpPolicyMode } from "../types/ipc";
 
-export type PrefCategoryId = "editing" | "interface" | "ai";
+export type PrefCategoryId = "editing" | "interface" | "library" | "ai";
 
 export const PREF_CATEGORIES: readonly { id: PrefCategoryId; label: string }[] = [
   { id: "editing", label: "EDITING" },
   { id: "interface", label: "INTERFACE" },
+  { id: "library", label: "LIBRARY" },
   { id: "ai", label: "AI AGENTS" },
 ];
 
@@ -30,6 +31,9 @@ export interface PrefValues {
   uiZoom: number;
   /** MCP policy mode pushed to the agent server at startup. */
   mcpDefaultMode: McpPolicyMode;
+  /** Absolute folders listed under the library panel's SAMPLES root. The
+   * default library dir is supplied by the backend and is not stored here. */
+  librarySampleFolders: string[];
 }
 
 export type PrefId = keyof PrefValues;
@@ -62,16 +66,30 @@ export type EnumDef<T extends string> = BaseDef & {
   options: readonly PrefOption<T>[];
 };
 
+/** An ordered list of absolute filesystem paths (the library's sample
+ * folders). Rendered by the dialog as a removable list plus an "add" button
+ * driven by the native directory picker. */
+export type PathListDef = BaseDef & {
+  kind: "pathList";
+  default: string[];
+  /** Copy on the dialog's add button, e.g. "ADD FOLDER". */
+  addLabel: string;
+};
+
 /** Maps a value type to the def shape that can declare it. The [V] tuple
  * wrapper stops the conditional from distributing over union values (an
- * enum like McpPolicyMode must yield ONE EnumDef over the whole union). */
+ * enum like McpPolicyMode must yield ONE EnumDef over the whole union).
+ * string[] is matched BEFORE the bare-string (enum) arm so the intent is
+ * readable at a glance. */
 type DefFor<V> = [V] extends [boolean]
   ? BooleanDef
   : [V] extends [number]
     ? NumberDef
-    : [V] extends [string]
-      ? EnumDef<V>
-      : never;
+    : [V] extends [string[]]
+      ? PathListDef
+      : [V] extends [string]
+        ? EnumDef<V>
+        : never;
 
 export type PrefDef = { [K in PrefId]: DefFor<PrefValues[K]> }[PrefId];
 
@@ -100,6 +118,14 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     category: "interface",
     label: "Interface zoom",
     blurb: "Scale the whole interface. Also Ctrl/Cmd + and −.",
+  },
+  librarySampleFolders: {
+    kind: "pathList",
+    default: [],
+    addLabel: "ADD FOLDER",
+    category: "library",
+    label: "Sample folders",
+    blurb: "Folders browsed under SAMPLES in the library panel. The default AURA library folder is always listed first.",
   },
   mcpDefaultMode: {
     kind: "enum",
@@ -137,12 +163,23 @@ export function coercePref<D extends PrefDef>(def: D, value: unknown): D["defaul
       const stepInt = Math.round(def.step * scale);
       return (minInt + Math.round((clamped * scale - minInt) / stepInt) * stepInt) / scale;
     }
+    case "pathList": {
+      // Reject a non-array whole (the schema's own convention); inside an
+      // array, drop junk entries and duplicates rather than losing the list.
+      if (!Array.isArray(value)) return undefined;
+      const paths = value.filter((p): p is string => typeof p === "string" && p.length > 0);
+      return [...new Set(paths)] as D["default"];
+    }
   }
 }
 
-/** A fresh { id → default } object covering the whole schema. */
+/** A fresh { id → default } object covering the whole schema. Array defaults
+ * are COPIED: the store's value must never alias the schema's own default. */
 export function schemaDefaults(): PrefValues {
   return Object.fromEntries(
-    (Object.keys(PREF_SCHEMA) as PrefId[]).map((id) => [id, PREF_SCHEMA[id].default]),
+    (Object.keys(PREF_SCHEMA) as PrefId[]).map((id) => {
+      const d = PREF_SCHEMA[id].default;
+      return [id, Array.isArray(d) ? [...d] : d];
+    }),
   ) as unknown as PrefValues;
 }

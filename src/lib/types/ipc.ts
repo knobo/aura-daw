@@ -33,6 +33,25 @@ export interface MidiInputStatus {
   /** Live monitoring (slice 1b): incoming notes audible via the preview
    * voice when true. Always false when nothing is selected. */
   monitor: boolean;
+  /** Track incoming notes are routed to (slice 2), or null. */
+  targetTrackId: string | null;
+  /** Notes are reaching a track's instrument right now. */
+  routing: boolean;
+  droppedEvents: number;
+  capturing: boolean;
+}
+
+// ── midi-output (slice 2: clock/sync + note-out) ────────────────────────────
+// App-config only, same carve-out as the input side above.
+
+export interface MidiOutputStatus {
+  selected: MidiPortInfo | null;
+  clockEnabled: boolean;
+  running: boolean;
+  pulsesSent: number;
+  resyncs: number;
+  noteTrackId: string | null;
+  notesSent: number;
 }
 
 // ── transport-state.schema.json ─────────────────────────────────────────────
@@ -120,8 +139,13 @@ export interface RecordingState {
   trackIds: string[];
   startedAtSamples?: number;
   xruns?: number;
-  /** Present on the stop notification. */
+  /** Present on the stop notification: the take's AUDIO clips only. */
   clips?: Clip[];
+  /** Stop notification, MIDI take only: the clip `MidiClipAdd` registered
+   * in the take's transaction. `null`/absent when the take recorded no
+   * MIDI. It is an id, not the clip — the store re-pulls, since the clip
+   * arrives through no other channel. */
+  midiClipId?: string | null;
 }
 
 // ── project.schema.json ─────────────────────────────────────────────────────
@@ -427,6 +451,25 @@ export interface InstrumentInfo {
   keyHigh?: number;
 }
 
+// ── library & browser (Track E, src-tauri/src/library.rs) ──────────────────
+
+export type LibraryEntryKind = "dir" | "audio";
+
+/** One row of a `library_scan` listing. Filesystem metadata only — duration
+ * and format are NOT probed during a scan (plan ruling 2). */
+export interface LibraryEntry {
+  /** File or directory name (no path). */
+  name: string;
+  /** Absolute path. */
+  path: string;
+  kind: LibraryEntryKind;
+  /** Lowercased extension without the dot; empty for directories. */
+  ext: string;
+  sizeBytes: number;
+  /** Modification time, ms since the Unix epoch (0 when unknown). */
+  modifiedMs: number;
+}
+
 // ── plugin-descriptor.schema.json + plugin-state.schema.json (phase 3) ─────
 
 export type PluginFormat = "clap" | "lv2";
@@ -486,6 +529,26 @@ export interface PluginListResult {
   plugins: PluginDescriptor[];
   instances: PluginInstanceInfo[];
   scanned: boolean;
+}
+
+// ── automation (plugins::automation) ────────────────────────────────────────
+
+/** One automation breakpoint in MUSICAL time (ticks @ project ppq). Between
+ * points the value ramps linearly; before the first / after the last it
+ * holds. Mirrors `plugins::automation::AutomationPoint`. */
+export interface AutomationPoint {
+  tick: number;
+  value: number;
+}
+
+/** One parameter's automation curve. `targetNode` is `"track:<trackId>"` for
+ * built-in track params (today: gain, `paramId` 0) or a plugin instance id
+ * for plugin params. Mirrors `plugins::automation::AutomationLane`. */
+export interface AutomationLane {
+  id: string;
+  targetNode: string;
+  paramId: number;
+  points: AutomationPoint[];
 }
 
 // ── mcp-policy.schema.json (phase 2) ───────────────────────────────────────

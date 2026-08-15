@@ -15,7 +15,9 @@ describe("PREF_SCHEMA integrity", () => {
   it("every default survives its own coercion unchanged", () => {
     for (const id of ids) {
       const def = PREF_SCHEMA[id];
-      expect(coercePref(def, def.default), id).toBe(def.default);
+      // toEqual, not toBe: pathList coercion always builds a fresh array
+      // (de-dupe via Set), so an array default is value-equal, not identical.
+      expect(coercePref(def, def.default), id).toEqual(def.default);
     }
   });
 
@@ -66,5 +68,35 @@ describe("coercePref", () => {
     for (const junk of [NaN, Infinity, "1.2", null, undefined]) {
       expect(coercePref(def, junk)).toBeUndefined();
     }
+  });
+});
+
+describe("pathList preferences", () => {
+  it("declares librarySampleFolders as an empty pathList in the library category", () => {
+    const def = PREF_SCHEMA.librarySampleFolders;
+    expect(def.kind).toBe("pathList");
+    expect(def.default).toEqual([]);
+    expect(def.category).toBe("library");
+    expect(PREF_CATEGORIES.map((c) => c.id)).toContain("library");
+  });
+
+  it("coerces a pathList: keeps strings, drops junk, de-dupes, preserves order", () => {
+    const def = PREF_SCHEMA.librarySampleFolders;
+    expect(coercePref(def, ["/a", "/b", "/a", "", 7, null, "/c"])).toEqual(["/a", "/b", "/c"]);
+  });
+
+  it("rejects a non-array pathList value whole", () => {
+    const def = PREF_SCHEMA.librarySampleFolders;
+    expect(coercePref(def, "/a")).toBeUndefined();
+    expect(coercePref(def, 3)).toBeUndefined();
+    expect(coercePref(def, null)).toBeUndefined();
+  });
+
+  it("hands out a FRESH array from schemaDefaults so the schema default cannot be mutated", () => {
+    const a = schemaDefaults().librarySampleFolders;
+    const b = schemaDefaults().librarySampleFolders;
+    expect(a).toEqual([]);
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(PREF_SCHEMA.librarySampleFolders.default);
   });
 });

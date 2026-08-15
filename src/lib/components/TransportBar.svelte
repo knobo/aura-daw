@@ -16,6 +16,7 @@
   import { mcp } from "../state/mcp.svelte";
   import { exporter } from "../state/exporter.svelte";
   import { hum } from "../state/hum.svelte";
+  import { toasts } from "../state/toasts.svelte";
   import { formatBarsBeats, formatClock } from "../utils/format";
   import { computeVisible } from "../utils/toolbar-overflow";
   import ProjectMenu from "./project/ProjectMenu.svelte";
@@ -46,7 +47,14 @@
 
   async function toggleRecord() {
     if (transport.isRecording) {
-      await backend.stopRecording();
+      try {
+        await backend.stopRecording();
+      } catch (err) {
+        // An Err means the take WAS registered (one undo entry, MIDI
+        // included) and only the WAV write failed — never a retry signal,
+        // and never a reason to skip the stop below.
+        toasts.error("TAKE AUDIO NOT WRITTEN", String(err));
+      }
       await transport.pause(); // halt, keep the playhead at the take end
     } else {
       await backend.startRecording(null);
@@ -94,6 +102,15 @@
       on: ui.dock === "hum",
       busy: hum.busy,
       onClick: () => toggleDock("hum"),
+    },
+    {
+      id: "lib",
+      kind: "chip",
+      priority: 5,
+      label: "LIB",
+      title: "Library — samples, project clips, presets",
+      on: ui.dock === "library",
+      onClick: () => toggleDock("library"),
     },
     {
       id: "inst",
@@ -433,7 +450,11 @@
     border-right: none;
     border-top: none;
     position: relative;
-    z-index: 20;
+    /* Above Dock (30) and PanelResizeHandle (40): `z-index` here opens a
+       stacking context, so the ⋯ menu's own z-index only sorts INSIDE the
+       bar — this value is what the whole bar, dropdown included, competes
+       with. Below Toasts (90), which must stay on top of everything. */
+    z-index: 50;
   }
 
   .left {

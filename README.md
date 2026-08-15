@@ -79,6 +79,15 @@ Notes flash at the moment they sound during playback (FLASH toggle):
 
 ![Note flash during playback](docs/screenshots/piano-roll-note-flash.png)
 
+### Hardware MIDI in and out
+
+Plug in a keyboard, pick the port in the master strip, arm a MIDI track and
+play its instrument — then record what you play as one clip and one undo
+step ([docs/midi-input.md](docs/midi-input.md)). Outward, AURA sends MIDI
+clock plus Start/Stop/Continue/SPP (Hydrogen and friends slave to it) and
+can play one MIDI track's notes through an external synth
+([docs/midi-output.md](docs/midi-output.md)).
+
 ### Plugin hosting — CLAP + LV2 instruments
 
 Real in-graph hosting of third-party instruments on MIDI tracks, with one shared
@@ -144,6 +153,17 @@ An RT-safe 64-voice SFZ-subset sampler plays instruments on MIDI tracks;
 and registers them in the browser on completion:
 
 ![Instrument browser: generated SFZ instruments with per-key audition](docs/screenshots/instrument-builder.png)
+
+### Library & browser panel
+
+The **LIB** dock tab browses three roots: **SAMPLES** (the default AURA
+library folder plus any folders added under Preferences → LIBRARY; click a file
+to audition it without touching the project), **CLIPS** (the open project's
+audio and MIDI clips), and **PRESETS** (loaded sampler instruments and
+ZynAddSubFX bank patches). Drag any row onto a track and it lands through the
+ordinary import/clip-add commands — so every drop is a normal, undoable edit.
+Directory listing and decoding happen in the Rust backend (`library_scan`,
+`library_audition`); the panel is chrome.
 
 ### MCP — agents operate the DAW
 
@@ -386,8 +406,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 575 tests (counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants
-npm test                      # 251 frontend unit tests (counted 2026-08-14; vitest): stores + timeline math + section-table bijection + group drag/resize
+cd src-tauri && cargo test    # 715 tests (686 lib + 29 integration; counted 2026-08-15): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard
+npm test                      # 316 frontend unit tests (counted 2026-08-15; vitest): stores + timeline math + section-table bijection + library store + automation lane edit ops + MIDI I/O + group drag/resize + clip selection/clipboard
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

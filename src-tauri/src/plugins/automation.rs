@@ -464,6 +464,243 @@ fn segment_value(events: &[AbsParamEvent], idx: usize, sample: u64) -> f32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Lane targets, the RT ramp cursor, and the control-side param driver
+// (Track D)
+// ---------------------------------------------------------------------------
+
+/// `targetNode` prefix addressing a track's built-in node params.
+pub const TRACK_TARGET_PREFIX: &str = "track:";
+/// Built-in param ids on a `"track:<id>"` target node. Gain is 0 — the id
+/// this module's own tests have used since Plan E Task 10.
+pub const TRACK_PARAM_GAIN: u32 = 0;
+
+/// What a lane actually drives.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LaneTarget {
+    /// Track id; the lane's value is a LINEAR GAIN MULTIPLIER applied on top
+    /// of the fader (scope ruling 6).
+    TrackGain(String),
+    PluginParam { instance: String, index: u32 },
+}
+
+/// Classify a lane's target. `None` for a `"track:"` target naming a
+/// built-in param this build does not know — an unknown id is ignored,
+/// never guessed at.
+pub fn resolve_target(lane: &AutomationLane) -> Option<LaneTarget> {
+    match lane.target_node.strip_prefix(TRACK_TARGET_PREFIX) {
+        Some(track_id) if !track_id.is_empty() => match lane.param_id {
+            TRACK_PARAM_GAIN => Some(LaneTarget::TrackGain(track_id.to_string())),
+            // Unknown built-in param: ignored, never guessed at. New ids are
+            // additive here and in the frontend twin (`automation.svelte.ts`).
+            _ => None,
+        },
+        Some(_) => None, // "track:" with no id
+        None if !lane.target_node.is_empty() => Some(LaneTarget::PluginParam {
+            instance: lane.target_node.clone(),
+            index: lane.param_id,
+        }),
+        None => None,
+    }
+}
+
+/// RT-side ramp reader: O(1) amortized per frame, correct across BACKWARD
+/// jumps (a loop wrap moves the position back mid-block). No allocation, no
+/// locks — safe on the audio callback. Agrees with [`value_at`] on every
+/// probe by construction: both index the curve with the same
+/// `partition_point` invariant and share [`segment_value`].
+pub struct RampCursor {
+    /// `events.partition_point(|e| e.sample <= last)` — maintained
+    /// incrementally while the position only moves forward.
+    idx: usize,
+    last: u64,
+}
+
+impl Default for RampCursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RampCursor {
+    pub fn new() -> Self {
+        // `u64::MAX` forces the first call to re-seed by binary search.
+        Self { idx: 0, last: u64::MAX }
+    }
+
+    /// Value at `sample`, or `None` for an empty curve (parameter untouched
+    /// — the caller's neutral applies).
+    #[inline]
+    pub fn value(&mut self, events: &[AbsParamEvent], sample: u64) -> Option<f32> {
+        if events.is_empty() {
+            return None;
+        }
+        if sample < self.last {
+            // Backward jump (loop wrap, seek): re-seed. O(log n), once.
+            self.idx = events.partition_point(|e| e.sample <= sample);
+        } else {
+            while self.idx < events.len() && events[self.idx].sample <= sample {
+                self.idx += 1;
+            }
+        }
+        self.last = sample;
+        Some(segment_value(events, self.idx, sample))
+    }
+}
+
+/// Compile every TRACK-GAIN lane into a slot-indexed ramp table for one
+/// rebuild. CONTROL THREAD ONLY — this is where ticks become absolute
+/// samples; nothing tick-shaped crosses onto the RT thread
+/// (ARCHITECTURE §13/§15.1).
+///
+/// One slot holds ONE ramp: if two lanes name the same track's gain, the
+/// LAST one in `lanes` wins and the earlier is silently dropped (no blend,
+/// no error). Nothing produces that today — the UI keeps one gain lane per
+/// track — so it is documented rather than rejected.
+pub fn compile_gain_ramps(
+    lanes: &[AutomationLane],
+    map: &TempoMap,
+    n_slots: usize,
+    slot_of: &dyn Fn(&str) -> Option<usize>,
+) -> Vec<Option<Arc<Vec<AbsParamEvent>>>> {
+    let mut out: Vec<Option<Arc<Vec<AbsParamEvent>>>> = (0..n_slots).map(|_| None).collect();
+    for lane in lanes {
+        let Some(LaneTarget::TrackGain(track_id)) = resolve_target(lane) else { continue };
+        let Some(slot) = slot_of(&track_id) else { continue };
+        if slot >= out.len() {
+            continue;
+        }
+        let events = compile_lane(lane, map);
+        if events.is_empty() {
+            continue;
+        }
+        out[slot] = Some(Arc::new(events));
+    }
+    out
+}
+
+/// One host param write the driver decided is due. `format` is carried so
+/// the tick path never has to take the session lock to look it up.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParamWrite {
+    pub instance: String,
+    pub format: String,
+    pub index: u32,
+    pub value: f32,
+}
+
+struct CompiledParamLane {
+    instance: String,
+    format: String,
+    index: u32,
+    events: Vec<AbsParamEvent>,
+    cursor: RampCursor,
+    last_emitted: Option<f32>,
+    /// Consecutive ticks whose value was suppressed as unchanged.
+    ticks_held: u32,
+}
+
+/// Control-thread evaluator for plugin-parameter lanes. See scope ruling 2
+/// in `docs/superpowers/plans/2026-08-14-automation-audible.md`: block-rate
+/// (the engine control loop's ≤2 ms tick), never on the audio callback (a
+/// host param write is a blocking round-trip), and HOST-ONLY — automation
+/// overrides the stored knob value during playback; the document keeps what
+/// the user set. Built fresh at every rebuild from the session's lanes +
+/// plugin rows.
+#[derive(Default)]
+pub struct ParamAutomationDriver {
+    lanes: Vec<CompiledParamLane>,
+}
+
+impl ParamAutomationDriver {
+    /// Values closer than this to the last emitted one are not re-sent.
+    pub const EPSILON: f32 = 1e-4;
+    /// …but a value held for this many consecutive ticks is re-asserted
+    /// anyway. At the engine control loop's ≤2 ms tick that is ~0.5 s.
+    pub const REASSERT_TICKS: u32 = 250;
+
+    pub fn empty() -> Self {
+        Self { lanes: Vec::new() }
+    }
+
+    /// Two lanes naming the SAME instance and the SAME param index both
+    /// compile, and the LAST one in `lanes` wins at every tick (the sort
+    /// below is stable, so the input order survives it) — no blend, no
+    /// error, exactly like `compile_gain_ramps`' track-gain equivalent.
+    /// Nothing produces that today: the UI keeps one lane per target.
+    pub fn new(
+        lanes: &[AutomationLane],
+        plugins: &crate::control::session::PluginDoc,
+        map: &TempoMap,
+    ) -> Self {
+        let mut compiled = Vec::new();
+        for lane in lanes {
+            let Some(LaneTarget::PluginParam { instance, index }) = resolve_target(lane) else {
+                continue;
+            };
+            let Some(row) = plugins.instances.iter().find(|r| r.id == instance) else {
+                continue; // the instance is gone; the lane stays on disk, silent
+            };
+            let events = compile_lane(lane, map);
+            if events.is_empty() {
+                continue;
+            }
+            compiled.push(CompiledParamLane {
+                instance,
+                format: row.format.clone(),
+                index,
+                events,
+                cursor: RampCursor::new(),
+                last_emitted: None,
+                ticks_held: 0,
+            });
+        }
+        // Group by instance (review I-2) so `tick`'s output arrives in
+        // contiguous per-instance runs and the caller can collapse a tick
+        // into ONE host round-trip per plugin. Sorting is a per-rebuild
+        // cost on the control thread; the tick stays a linear walk.
+        compiled.sort_by(|a, b| a.instance.cmp(&b.instance));
+        Self { lanes: compiled }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lanes.is_empty()
+    }
+
+    /// Append every write due at `position` into `out` (cleared first).
+    pub fn tick(&mut self, position: u64, out: &mut Vec<ParamWrite>) {
+        out.clear();
+        for l in self.lanes.iter_mut() {
+            let Some(v) = l.cursor.value(&l.events, position) else {
+                continue;
+            };
+            if let Some(prev) = l.last_emitted {
+                if (v - prev).abs() <= Self::EPSILON {
+                    // Suppress — but only for a bounded stretch (review
+                    // I-3). The host is not ours alone: a knob drag
+                    // (`execute_host_forward`) or the plugin's own GUI can
+                    // move this param behind our back, and a flat lane
+                    // would then never correct it. Re-asserting a held
+                    // value keeps "automation overrides the knob during
+                    // playback" true without spamming the host.
+                    l.ticks_held += 1;
+                    if l.ticks_held < Self::REASSERT_TICKS {
+                        continue;
+                    }
+                }
+            }
+            l.ticks_held = 0;
+            l.last_emitted = Some(v);
+            out.push(ParamWrite {
+                instance: l.instance.clone(),
+                format: l.format.clone(),
+                index: l.index,
+                value: v,
+            });
+        }
+    }
+}
+
 /// A live-instrument wrapper applying a compiled gain curve to its inner
 /// node's output, sample-accurately (the ONE proven end-to-end automation
 /// path of this round; the same wrapper shape serves any scalar param once
@@ -579,18 +816,10 @@ pub fn automation_get(
 /// updated lane list.
 #[tauri::command]
 pub fn automation_set(
-    mut lane: AutomationLane,
+    lane: AutomationLane,
     control: State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<Vec<AutomationLane>, String> {
-    if lane.id.is_empty() {
-        lane.id = uuid::Uuid::new_v4().to_string();
-    }
-    normalize_lane(&mut lane)?;
-    let key = lane.id.clone();
-    let to_apply = if lane.points.is_empty() { None } else { Some(lane) };
-    control.commit(crate::control::op::TxMeta::user("edit automation"), move |tx| {
-        tx.apply(crate::control::op::Op::AutomationSetLane { key, lane: to_apply })
-    })?;
+    control.set_automation_lane(lane, crate::control::op::TxMeta::user("edit automation"))?;
     Ok(control.automation_lanes())
 }
 
@@ -797,6 +1026,195 @@ mod tests {
         assert_eq!(value_at(&ev, 199), Some(1.0 - 0.5 * 0.99));
         assert_eq!(value_at(&ev, 200), Some(0.5));
         assert_eq!(value_at(&ev, 10_000), Some(0.5), "holds last after the curve");
+    }
+
+    // ---- lane targets, the RT ramp cursor, the control-side param driver ----
+
+    #[test]
+    fn resolve_target_classifies_track_and_plugin_lanes() {
+        let mut l = lane(vec![]);
+        l.target_node = "track:t-1".into();
+        l.param_id = TRACK_PARAM_GAIN;
+        assert_eq!(resolve_target(&l), Some(LaneTarget::TrackGain("t-1".into())));
+
+        // an unknown built-in param id is IGNORED, never guessed at
+        l.param_id = 99;
+        assert_eq!(resolve_target(&l), None);
+
+        let mut p = lane(vec![]);
+        p.target_node = "inst-1".into();
+        p.param_id = 7;
+        assert_eq!(
+            resolve_target(&p),
+            Some(LaneTarget::PluginParam { instance: "inst-1".into(), index: 7 })
+        );
+    }
+
+    #[test]
+    fn ramp_cursor_matches_value_at_forward_and_after_a_backward_jump() {
+        let ev = vec![
+            AbsParamEvent { sample: 100, value: 1.0 },
+            AbsParamEvent { sample: 200, value: 0.5 },
+        ];
+        let mut c = RampCursor::new();
+        assert_eq!(c.value(&[], 0), None, "empty curve leaves the param untouched");
+        for s in [0u64, 50, 100, 150, 199, 200, 10_000] {
+            assert_eq!(c.value(&ev, s), value_at(&ev, s), "forward walk at {s}");
+        }
+        // a loop wrap moves the position BACKWARD: the cursor must re-seed,
+        // not keep its advanced index
+        assert_eq!(c.value(&ev, 150), Some(0.75), "re-seeded after a backward jump");
+        assert_eq!(c.value(&ev, 0), Some(1.0));
+    }
+
+    #[test]
+    fn param_driver_emits_only_on_change_and_carries_the_host_format() {
+        use crate::control::session::PluginDoc;
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut l = lane(vec![
+            AutomationPoint { tick: 0, value: 0.0 },
+            AutomationPoint { tick: 3840, value: 1.0 }, // 96_000 samples
+        ]);
+        l.target_node = "inst-1".into();
+        l.param_id = 7;
+
+        let mut doc = PluginDoc::default();
+        doc.instances.push(crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        });
+
+        let mut d = ParamAutomationDriver::new(&[l], &doc, &map);
+        assert!(!d.is_empty());
+        let mut out = Vec::new();
+
+        d.tick(0, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].format, "lv2");
+        assert_eq!(out[0].index, 7);
+        assert!((out[0].value - 0.0).abs() < 1e-6);
+
+        d.tick(0, &mut out);
+        assert!(out.is_empty(), "an unchanged value is not re-sent");
+
+        d.tick(48_000, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!((out[0].value - 0.5).abs() < 1e-3, "halfway up the ramp: {}", out[0].value);
+    }
+
+    /// Task 9 review, I-3: the epsilon suppression above must not let a
+    /// knob grab win the rest of the pass. Anything else that writes the
+    /// same param behind the driver's back — the user dragging the knob
+    /// (`execute_host_forward`), or the plugin's OWN GUI, which never
+    /// touches our channel at all — leaves the host holding a value the
+    /// driver thinks it already emitted. A HELD lane value must therefore
+    /// be re-asserted periodically, or `drive_param_automation`'s
+    /// "automation OVERRIDES the stored knob value during playback" is
+    /// false whenever the curve is flat.
+    #[test]
+    fn param_driver_reasserts_a_held_value_so_a_knob_grab_cannot_win_the_pass() {
+        use crate::control::session::PluginDoc;
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut l = lane(vec![
+            AutomationPoint { tick: 0, value: 0.5 },
+            AutomationPoint { tick: 3840, value: 0.5 }, // dead flat
+        ]);
+        l.target_node = "inst-1".into();
+        l.param_id = 7;
+        let mut doc = PluginDoc::default();
+        doc.instances.push(crate::plugins::PluginInstanceInfo {
+            id: "inst-1".into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "active".into(),
+            track_id: None,
+        });
+
+        let mut d = ParamAutomationDriver::new(&[l], &doc, &map);
+        let mut out = Vec::new();
+        d.tick(0, &mut out);
+        assert_eq!(out.len(), 1, "the first tick asserts the value");
+
+        // The knob grab happens HERE, host-side, invisible to the driver.
+        let mut emitted = 0usize;
+        for i in 1..=ParamAutomationDriver::REASSERT_TICKS {
+            d.tick(i as u64, &mut out);
+            emitted += out.len();
+        }
+        assert_eq!(
+            emitted, 1,
+            "exactly one re-assert within REASSERT_TICKS ticks — not silence, not every tick"
+        );
+        assert!((out[0].value - 0.5).abs() < 1e-6, "and it re-asserts the LANE's value");
+
+        // …and then it goes quiet again: the hold counter restarts, so a
+        // held value costs one host round-trip per REASSERT_TICKS, not one
+        // per tick from here on.
+        let n = ParamAutomationDriver::REASSERT_TICKS as u64;
+        let mut emitted = 0usize;
+        for i in n + 1..2 * n {
+            d.tick(i, &mut out);
+            emitted += out.len();
+        }
+        assert_eq!(emitted, 0, "the hold counter restarts after a re-assert");
+    }
+
+    /// Task 9 review, I-2: a tick's writes come out GROUPED by instance, so
+    /// the caller can issue one host call per plugin per tick instead of one
+    /// per param — a CLAP param write is a blocking round-trip on the shared
+    /// plugin-main thread. Lanes are authored in any order; the grouping is
+    /// the driver's job, once per rebuild, not the tick's.
+    #[test]
+    fn param_driver_groups_its_writes_by_instance() {
+        use crate::control::session::PluginDoc;
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut doc = PluginDoc::default();
+        let mut lanes = Vec::new();
+        // Interleaved on purpose: a, b, a, b.
+        for (i, inst) in ["inst-a", "inst-b", "inst-a", "inst-b"].iter().enumerate() {
+            let mut l = lane(vec![
+                AutomationPoint { tick: 0, value: 0.0 },
+                AutomationPoint { tick: 3840, value: 1.0 },
+            ]);
+            l.id = format!("l{i}");
+            l.target_node = (*inst).into();
+            l.param_id = i as u32;
+            lanes.push(l);
+        }
+        for inst in ["inst-a", "inst-b"] {
+            doc.instances.push(crate::plugins::PluginInstanceInfo {
+                id: inst.into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: None,
+            });
+        }
+
+        let mut d = ParamAutomationDriver::new(&lanes, &doc, &map);
+        let mut out = Vec::new();
+        d.tick(48_000, &mut out);
+        assert_eq!(out.len(), 4, "all four lanes are due");
+        let runs = out.chunk_by(|a, b| a.instance == b.instance).count();
+        assert_eq!(runs, 2, "one contiguous run per instance, not {runs} — got {out:?}");
+    }
+
+    #[test]
+    fn param_driver_skips_lanes_whose_instance_is_gone_and_track_lanes() {
+        use crate::control::session::PluginDoc;
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut orphan = lane(vec![AutomationPoint { tick: 0, value: 0.5 }]);
+        orphan.target_node = "inst-missing".into();
+        orphan.param_id = 1;
+        let track_lane = lane(vec![AutomationPoint { tick: 0, value: 0.5 }]); // "track:t1"
+        let d = ParamAutomationDriver::new(&[orphan, track_lane], &PluginDoc::default(), &map);
+        assert!(d.is_empty(), "no plugin lane resolves");
     }
 
     // ---- the ramp applied by a node, sample-exact --------------------------
@@ -1079,5 +1497,35 @@ mod tests {
         assert_eq!(adopted.points, saved[0].points);
 
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    // ---- Task 8: compile_gain_ramps (slot indexing, control-side) ---------
+
+    #[test]
+    fn compile_gain_ramps_indexes_by_slot_and_skips_what_cannot_resolve() {
+        let map = TempoMap::from_v1(120.0, 48_000).unwrap();
+        let mut a = lane(vec![
+            AutomationPoint { tick: 0, value: 1.0 },
+            AutomationPoint { tick: 3840, value: 0.0 },
+        ]);
+        a.target_node = "track:t-1".into();
+        let mut orphan = lane(vec![AutomationPoint { tick: 0, value: 0.5 }]);
+        orphan.target_node = "track:t-gone".into();
+        let mut plugin_lane = lane(vec![AutomationPoint { tick: 0, value: 0.5 }]);
+        plugin_lane.target_node = "inst-1".into();
+        let mut empty = lane(vec![]);
+        empty.target_node = "track:t-2".into();
+
+        let slot_of = |id: &str| match id {
+            "t-1" => Some(0usize),
+            "t-2" => Some(1),
+            _ => None,
+        };
+        let ramps = compile_gain_ramps(&[a, orphan, plugin_lane, empty], &map, 2, &slot_of);
+        assert_eq!(ramps.len(), 2);
+        let r0 = ramps[0].as_ref().expect("t-1 has a compiled ramp");
+        assert_eq!(r0[0], AbsParamEvent { sample: 0, value: 1.0 });
+        assert_eq!(r0[1], AbsParamEvent { sample: 96_000, value: 0.0 });
+        assert!(ramps[1].is_none(), "an empty lane compiles to no ramp");
     }
 }

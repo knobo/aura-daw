@@ -3,7 +3,7 @@
 import { PREF_SCHEMA } from "../prefs/schema";
 import { prefs } from "../prefs/prefs.svelte";
 
-export type DockTab = "" | "generate" | "hum" | "instruments" | "plugins" | "mcp";
+export type DockTab = "" | "generate" | "hum" | "library" | "instruments" | "plugins" | "mcp";
 
 export const ui = $state({
   /** "WEBGPU" | "CANVAS2D" | "" until the first painter reports in */
@@ -43,6 +43,29 @@ export function resetUiZoom() {
 
 export function toggleDock(tab: Exclude<DockTab, "">) {
   ui.dock = ui.dock === tab ? "" : tab;
+}
+
+/**
+ * One bare letter per dock panel. Single source of truth: the window
+ * shortcut in App.svelte and the hints on the tabs both read this map, so
+ * a rebind cannot leave the UI advertising a key that no longer works.
+ */
+export const DOCK_SHORTCUT: Record<Exclude<DockTab, "">, string> = {
+  generate: "g",
+  hum: "h",
+  library: "l",
+  instruments: "i",
+  plugins: "p",
+  mcp: "m",
+};
+
+const BY_KEY = new Map(
+  Object.entries(DOCK_SHORTCUT).map(([tab, key]) => [key, tab as Exclude<DockTab, "">]),
+);
+
+/** The panel a bare keypress opens, or undefined for an unbound key. */
+export function dockTabForKey(key: string): Exclude<DockTab, ""> | undefined {
+  return BY_KEY.get(key.toLowerCase());
 }
 
 export function openStudio(kind?: string) {

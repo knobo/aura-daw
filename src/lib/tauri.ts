@@ -12,6 +12,7 @@ import type {
   AudioDevice,
   AuraEventMap,
   AuraEventName,
+  AutomationLane,
   Clip,
   ClipPlacement,
   EvolveOptions,
@@ -23,6 +24,7 @@ import type {
   ImportClipRequest,
   ImportSplitReply,
   InstrumentInfo,
+  LibraryEntry,
   LoopJamStatus,
   McpPolicy,
   McpStatus,
@@ -30,6 +32,7 @@ import type {
   MidiClip,
   MidiInputStatus,
   MidiNote,
+  MidiOutputStatus,
   MidiPortInfo,
   OpenSidecarEvent,
   PluginDescriptor,
@@ -146,6 +149,14 @@ export interface Backend {
    * convention as `moveClip?`. */
   moveClips?(placements: ClipPlacement[]): Promise<void>;
 
+  /** All automation lanes (points inline — per-project, not per-frame).
+   * Optional: the demo backend has no automation. */
+  automationGet?(): Promise<AutomationLane[]>;
+  /** Upsert one lane; an empty `points` array deletes it. One invoke carries
+   * the lane's FULL point set (D-03: an edit gesture, never one invoke per
+   * point). Returns the updated lane list. */
+  automationSet?(lane: AutomationLane): Promise<AutomationLane[]>;
+
   /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
    * primitive) — call on `pointerdown` of a fader/pan control. Matching
    * mid-gesture commits (e.g. `setTrackGain`/`setTrackPan`) coalesce
@@ -189,6 +200,7 @@ export interface Backend {
     lengthTicks: number,
     contentLengthTicks: number | null,
   ): Promise<MidiClip>;
+  midiRenameClip(clipId: string, name: string): Promise<MidiClip>;
   midiGetClips(): Promise<MidiClip[]>;
   midiImportFile(path: string, trackId?: string | null, atTicks?: number | null): Promise<MidiClip[]>;
   midiExportFile(path: string, clipIds?: string[] | null): Promise<string>;
@@ -276,6 +288,28 @@ export interface Backend {
    * selected; irrelevant when `portId` is null (closing the connection). */
   midiSelectInputPort?(portId: string | null, monitor?: boolean): Promise<void>;
   midiInputStatus?(): Promise<MidiInputStatus>;
+  /** Route incoming notes to this track's instrument (slice 2), or null to
+   * clear the route back to the slice-1 preview tone. */
+  midiSelectInputTrack?(trackId: string | null): Promise<void>;
+
+  // ── hardware MIDI output (slice 2: clock/sync + note-out) ──
+  midiListOutputPorts?(): Promise<MidiPortInfo[]>;
+  midiSelectOutputPort?(portId: string | null): Promise<void>;
+  midiSetClockEnabled?(enabled: boolean): Promise<void>;
+  /** Route this MIDI track's notes to the selected output port, or null. */
+  midiSelectOutputTrack?(trackId: string | null): Promise<void>;
+  midiOutputStatus?(): Promise<MidiOutputStatus>;
+
+  // ── library & browser (Track E, additive; desktop only) ──
+  /** List ONE directory level of the sample library. */
+  libraryScan?(dir: string): Promise<LibraryEntry[]>;
+  /** Absolute path of the default library dir, created on demand. */
+  libraryDefaultRoot?(): Promise<string>;
+  /** One-shot audition of a library file. Document-decoupled: no op, no
+   * document field, no dirty flag. */
+  libraryAudition?(path: string, maxSeconds?: number | null): Promise<void>;
+  /** Release whatever the audition path is sounding. */
+  libraryAuditionStop?(): Promise<void>;
 
   // mcp
   mcpGetStatus(): Promise<McpStatus>;
@@ -458,6 +492,12 @@ class TauriBackend implements Backend {
   moveClips(placements: ClipPlacement[]) {
     return invoke<void>("move_clips", { placements });
   }
+  automationGet() {
+    return invoke<AutomationLane[]>("automation_get");
+  }
+  automationSet(lane: AutomationLane) {
+    return invoke<AutomationLane[]>("automation_set", { lane });
+  }
   undo() {
     return invoke<HistoryStep>("undo");
   }
@@ -495,6 +535,9 @@ class TauriBackend implements Backend {
       lengthTicks,
       contentLengthTicks,
     });
+  }
+  midiRenameClip(clipId: string, name: string) {
+    return invoke<MidiClip>("midi_rename_clip", { clipId, name });
   }
   midiGetClips() {
     return invoke<MidiClip[]>("midi_get_clips");
@@ -638,6 +681,38 @@ class TauriBackend implements Backend {
   }
   midiInputStatus() {
     return invoke<MidiInputStatus>("midi_input_status");
+  }
+  async midiSelectInputTrack(trackId: string | null) {
+    await invoke("midi_select_input_track", { trackId });
+  }
+
+  midiListOutputPorts() {
+    return invoke<MidiPortInfo[]>("midi_list_output_ports");
+  }
+  async midiSelectOutputPort(portId: string | null) {
+    await invoke("midi_select_output_port", { portId });
+  }
+  async midiSetClockEnabled(enabled: boolean) {
+    await invoke("midi_set_clock_enabled", { enabled });
+  }
+  async midiSelectOutputTrack(trackId: string | null) {
+    await invoke("midi_select_output_track", { trackId });
+  }
+  midiOutputStatus() {
+    return invoke<MidiOutputStatus>("midi_output_status");
+  }
+
+  libraryScan(dir: string) {
+    return invoke<LibraryEntry[]>("library_scan", { dir });
+  }
+  libraryDefaultRoot() {
+    return invoke<string>("library_default_root");
+  }
+  async libraryAudition(path: string, maxSeconds: number | null = null) {
+    await invoke("library_audition", { path, maxSeconds });
+  }
+  async libraryAuditionStop() {
+    await invoke("library_audition_stop");
   }
 
   mcpGetStatus() {

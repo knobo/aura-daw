@@ -65,6 +65,16 @@ pub struct PluginDoc {
     /// `restore_into_session` — a blob just read from that exact file is,
     /// by definition, not ahead of it.
     pub dirty_state: std::collections::HashSet<String>,
+    /// Per-instance state-load counter, bumped by every `PluginSetState`
+    /// (a zyn patch load, and its undo). `midi::playback::node_for_track`
+    /// carries it in the live-node key, so a load retires the cached node
+    /// and the next rebuild instantiates a replacement — without this the
+    /// blob would sit in `lv2_host`'s `loaded_blob` reaching only FUTURE
+    /// nodes, i.e. never the one currently rendering the track. Purely
+    /// derived bookkeeping: it is never persisted or restored (a document
+    /// re-opened from disk builds every node from scratch anyway), so it
+    /// starts at 0 for each session and only ever moves forward.
+    pub state_rev: HashMap<String, u64>,
 }
 
 pub struct Session {
@@ -312,6 +322,19 @@ pub struct PersistEffect {
     pub plugins: bool,
     /// Task 10 wires the executor; the field exists now.
     pub automation: bool,
+}
+
+impl PersistEffect {
+    /// OR every field of `other` into `self`. An open gesture accumulates
+    /// the persist effects of the transient commits it folds and executes
+    /// the union ONCE at `close_gesture` (I-8): a knob or lane drag is one
+    /// `project.json` write, not one per rAF batch.
+    pub fn merge(&mut self, other: &PersistEffect) {
+        self.midi |= other.midi;
+        self.project |= other.project;
+        self.plugins |= other.plugins;
+        self.automation |= other.automation;
+    }
 }
 
 pub struct Committed {
@@ -663,7 +686,10 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown midi clip: {id}"))?;
             let from_now = read_midi_prop(c, *path)?; // truth, not caller's `from`
             let applied = write_midi_prop(c, *path, to)?; // clamps LengthTicks like write_prop clamps Gain
-            effect.rebuild = true;
+            // Only the placement/content-length paths feed `append_from`'s
+            // pre-render (see the arm's doc above); `Name` is document-only,
+            // so a rename must not cost a full engine rebuild.
+            effect.rebuild = !matches!(path, PropPath::Name);
             effect.persist.midi = true;
             Ok(Op::Set {
                 object: ObjectRef::MidiClip(id.clone()),
@@ -737,17 +763,16 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
         // struct key, just a string id, so no new `ObjectRef` variant is
         // needed (checked against the brief's NEEDS_CONTEXT trigger).
         //
-        // REBUILD PIN (brief-mandated file:line cite): this op does NOT set
-        // `effect.rebuild`. `engine::rebuild` (src/audio/engine.rs:684) never
-        // reads `session.automation` — automation lanes are compiled to
-        // absolute-sample ramps and attached to a live node only through
-        // `GainAutomatedNode` (this file's module, `plugins/automation.rs`),
-        // and nothing in the production graph build wires that node in yet
-        // (see this crate's `plugins/automation.rs` module doc: "Production
-        // graph rebuilds do not yet attach lanes to nodes (roadmap:
-        // automation editing UI round)"). So today automation edits have no
-        // RT-visible effect to rebuild for; when a future round wires lanes
-        // into the graph, this arm needs `effect.rebuild = true` too.
+        // REBUILD PIN — RESOLVED (Track D, automation audible). Until this
+        // task, `engine::rebuild` never read `session.automation`, so a lane
+        // edit had no RT-visible effect and this arm deliberately set no
+        // `effect.rebuild`. It does now: `rebuild` compiles track-gain lanes
+        // into `RtGraph::gain_ramps` (slot-indexed, versioned with the
+        // snapshot) and plugin-param lanes into the control thread's
+        // `ParamAutomationDriver`. Both are rebuilt WHOLESALE from the
+        // session at every rebuild, so an upsert AND a delete must schedule
+        // one — a deleted lane's ramp comes off the graph only by rebuilding
+        // without it.
         Op::AutomationSetLane { key, lane } => {
             let pos = session.automation.lanes.iter().position(|l| &l.id == key);
             // Validate + normalize BEFORE any mutation (atomic — round-2 §4:
@@ -778,6 +803,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 }
             };
             effect.persist.automation = true;
+            effect.rebuild = true;
             Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
         }
         // Plan E Task 9 (round-2 inventory rows 12-15): plugin instance
@@ -886,6 +912,13 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // these are new authoritative bytes, not necessarily reflected
             // in whatever `.state` file already exists on disk.
             session.plugins.dirty_state.insert(instance.clone());
+            // The blob only becomes AUDIBLE through a fresh RT node (see
+            // `state_rev`'s doc): bump the revision so the node key changes,
+            // and ask for the rebuild that acts on it. `ControlPlane::commit`
+            // runs `host_forward` BEFORE the rebuild, so the host already
+            // holds the new blob when the replacement node is instantiated.
+            *session.plugins.state_rev.entry(instance.clone()).or_insert(0) += 1;
+            effect.rebuild = true;
             effect.persist.plugins = true;
             effect.host_forward.push(HostForward::LoadState { instance: instance.clone() });
             Ok(Op::PluginSetState {
@@ -970,7 +1003,8 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         // Option<String> serializes as a JSON string or null, never a
         // wrapping object — same wire shape `write_prop` below accepts.
         PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
-        PropPath::TimelineStartSamples
+        PropPath::Name
+        | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
@@ -1027,7 +1061,8 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             t.instrument_id = v;
             Ok(serde_json::json!(t.instrument_id))
         }
-        PropPath::TimelineStartSamples
+        PropPath::Name
+        | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
@@ -1053,6 +1088,7 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
 /// atomically, never panic.
 fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<serde_json::Value, String> {
     match path {
+        PropPath::Name => Ok(serde_json::json!(c.name)),
         PropPath::TimelineStartTicks => Ok(serde_json::json!(c.timeline_start_ticks)),
         PropPath::LengthTicks => Ok(serde_json::json!(c.length_ticks)),
         PropPath::ContentLengthTicks => Ok(serde_json::json!(c.content_length_ticks)),
@@ -1088,6 +1124,14 @@ fn write_midi_prop(
     to: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     match path {
+        PropPath::Name => {
+            let v = to.as_str().ok_or("name: expected a string")?.trim();
+            if v.is_empty() {
+                return Err("name: must not be empty".into());
+            }
+            c.name = v.to_string();
+            Ok(serde_json::json!(c.name))
+        }
         PropPath::TimelineStartTicks => {
             let v = to.as_u64().ok_or("timelineStartTicks: expected a non-negative integer")?;
             c.timeline_start_ticks = v;
@@ -1152,6 +1196,7 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Name
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
@@ -1221,6 +1266,7 @@ fn write_transport_prop(
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Name
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
@@ -1359,6 +1405,18 @@ mod tests {
             instrument_id: None,
         });
         Session::new(store, MidiStore::default())
+    }
+
+    #[test]
+    fn persist_effect_merge_ors_every_field() {
+        let mut a = PersistEffect { midi: true, project: false, plugins: false, automation: false };
+        let b = PersistEffect { midi: false, project: true, plugins: true, automation: false };
+        a.merge(&b);
+        assert_eq!(a, PersistEffect { midi: true, project: true, plugins: true, automation: false });
+        // merging default changes nothing
+        let before = a.clone();
+        a.merge(&PersistEffect::default());
+        assert_eq!(a, before);
     }
 
     #[test]
@@ -2060,8 +2118,8 @@ mod tests {
         assert_eq!(m.lock().automation.lanes, vec![lane]);
         assert!(c.effect.persist.automation, "lane write must persist automation");
         assert!(
-            !c.effect.rebuild,
-            "automation lanes aren't read at graph-build time yet (audio/engine.rs:684) — no rebuild"
+            c.effect.rebuild,
+            "Track D flipped the REBUILD PIN: `engine::rebuild` reads session.automation now"
         );
         match &c.inverses[0] {
             Op::AutomationSetLane { key, lane } => {
@@ -2221,6 +2279,11 @@ mod tests {
         })
         .unwrap();
         assert!(m.lock().automation.lanes.is_empty());
+        // Track D: the arm schedules a rebuild unconditionally, so even this
+        // no-op costs one. Cheaper than proving a delete changed nothing,
+        // and a rebuild of an unchanged session is inaudible — but it IS the
+        // behaviour, so it is asserted rather than left to be discovered.
+        assert!(c.effect.rebuild, "an absent-key delete still rebuilds");
         match &c.inverses[0] {
             Op::AutomationSetLane { key, lane } => {
                 assert_eq!(key, "ghost");
@@ -2255,6 +2318,39 @@ mod tests {
             "apply normalizes (sorts) points before storing"
         );
     }
+
+    /// THE REBUILD PIN (Track D). Until the engine read `session.automation`,
+    /// this arm deliberately set no engine effect — the arm's own comment
+    /// named the day this would have to change. That day is Task 9's.
+    #[test]
+    fn automation_set_lane_schedules_a_rebuild() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let lane = test_lane("lane-a", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        let c = Session::transact(&m, TxMeta::user("edit automation"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "lane-a".into(), lane: Some(lane) })
+        })
+        .unwrap();
+        assert!(c.effect.rebuild, "the engine reads session.automation now — lanes must rebuild");
+        assert!(c.effect.persist.automation, "and still persist");
+    }
+
+    /// Deleting a lane rebuilds too — the ramp must come OFF the graph, and
+    /// it only can by rebuilding a graph without it.
+    #[test]
+    fn automation_lane_delete_schedules_a_rebuild() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        m.lock()
+            .automation
+            .lanes
+            .push(test_lane("lane-a", vec![AutomationPoint { tick: 0, value: 1.0 }]));
+        let c = Session::transact(&m, TxMeta::user("edit automation"), |tx| {
+            tx.apply(Op::AutomationSetLane { key: "lane-a".into(), lane: None })
+        })
+        .unwrap();
+        assert!(m.lock().automation.lanes.is_empty());
+        assert!(c.effect.rebuild);
+    }
+
     // ---- Plan E Task 9: plugin op kinds ----
 
     fn test_plugin_row(id: &str) -> PluginInstanceInfo {
@@ -2594,5 +2690,37 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.lock().plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
+    }
+
+    /// A state load changes what the instance SOUNDS like, and the live RT
+    /// node only picks a blob up when it is (re)instantiated. So the arm both
+    /// bumps the instance's state revision — which `midi::playback`'s node key
+    /// carries, retiring the cached node — and asks for a rebuild to build the
+    /// replacement. Undo restores an older blob and needs the same treatment.
+    #[test]
+    fn plugin_set_state_bumps_the_state_revision_and_rebuilds() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(test_plugin_row("p-1"));
+            g.plugins.pending_state.insert("p-1".into(), vec![0u8, 0, 0]);
+        }
+        assert_eq!(m.lock().plugins.state_rev.get("p-1"), None, "no load yet");
+
+        let c = Session::transact(&m, TxMeta::user("zyn load patch"), |tx| {
+            tx.apply(Op::PluginSetState { instance: "p-1".into(), state: vec![9u8, 9, 9, 9] })
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.state_rev.get("p-1"), Some(&1));
+        assert!(c.effect.rebuild, "the live node must be replaced for the patch to be heard");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.state_rev.get("p-1"), Some(&2), "undo needs a fresh node too");
     }
 }

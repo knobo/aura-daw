@@ -305,9 +305,12 @@ pub fn zyn_list_patches() -> Result<Vec<ZynPatch>, String> {
     Ok(list_zyn_patches())
 }
 
-/// Load a `.xiz` bank patch into a registered Zyn LV2 instance. NOTE: an
-/// already-bound track keeps its live node across rebuilds; pair this with a
-/// rebind (`set_track_instrument`) until node invalidation ships (wave 2).
+/// Load a `.xiz` bank patch into a registered Zyn LV2 instance. The blob
+/// reaches an instance only at instantiation (`lv2_host::make_node`), so the
+/// `PluginSetState` commit below also bumps the instance's state revision —
+/// part of the live-node key — which retires the node the track is currently
+/// rendering and lets the commit's rebuild instantiate a patched replacement.
+/// Callers need no rebind of their own.
 ///
 /// Task 9 (closes round-2 inventory row 14): the patch load itself still
 /// goes straight through the host (`load_zyn_patch`, prepare-outside — the

@@ -178,8 +178,23 @@ class PluginsStore {
     }
   }
 
+  /** Re-pull the OPEN instance's params without closing/reopening the panel
+   * (M-3): an undo/redo of a plugin-param step changed the backend's values
+   * under a panel that is still showing the pre-undo ones. No-op when no
+   * panel is open. */
+  async reloadOpenParams(): Promise<void> {
+    const id = this.openInstanceId;
+    if (!id) return;
+    try {
+      this.params = await backend.pluginGetParams(id);
+      this.paramError = null;
+    } catch (err) {
+      this.paramError = String(err);
+    }
+  }
+
   closeParams() {
-    this.flushParamQueue(); // don't drop trailing knob motion
+    void this.flushParamQueue(); // don't drop trailing knob motion
     this.openInstanceId = "";
     this.params = [];
     this.paramError = null;
@@ -200,7 +215,7 @@ class PluginsStore {
     if (this.rafId == null) {
       this.rafId = requestAnimationFrame(() => {
         this.rafId = null;
-        this.flushParamQueue();
+        void this.flushParamQueue();
       });
     }
   }
@@ -209,17 +224,37 @@ class PluginsStore {
     this.setParam(param.id, param.default);
   }
 
-  private flushParamQueue() {
-    if (this.pending.size === 0 || !this.openInstanceId) return;
+  /** Open a knob-drag gesture boundary — call on `pointerdown` of a param
+   * fader, before the first `setParam` of the drag (I-8). */
+  beginParamGesture() {
+    project.beginGesture("plugin param drag");
+  }
+
+  /** Close a knob-drag gesture: cancel the pending rAF, flush whatever is
+   * queued, WAIT for it to land, and only then close the boundary. The
+   * order is load-bearing (I-8): a batch that reaches the backend after
+   * `gesture_end` gets its own undo entry and its own project.json write —
+   * the two things the gesture exists to collapse. */
+  async endParamGesture(): Promise<void> {
+    if (this.rafId != null) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    await this.flushParamQueue();
+    project.endGesture();
+  }
+
+  private flushParamQueue(): Promise<void> {
+    if (this.pending.size === 0 || !this.openInstanceId) return Promise.resolve();
     if (this.inFlight) {
       // A batch is on the wire; the rAF after it lands picks these up.
-      if (this.rafId == null) {
+      return new Promise<void>((resolve) => {
+        if (this.rafId != null) cancelAnimationFrame(this.rafId);
         this.rafId = requestAnimationFrame(() => {
           this.rafId = null;
-          this.flushParamQueue();
+          void this.flushParamQueue().then(resolve);
         });
-      }
-      return;
+      });
     }
     const instanceId = this.openInstanceId;
     const changes: PluginParamChange[] = [...this.pending.entries()].map(([id, value]) => ({
@@ -228,7 +263,7 @@ class PluginsStore {
     }));
     this.pending.clear();
     this.inFlight = true;
-    backend
+    return backend
       .pluginSetParam(instanceId, changes)
       .then(() => {
         this.paramError = null;
