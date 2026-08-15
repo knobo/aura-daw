@@ -5,6 +5,8 @@ import {
   parseKey,
   refKey,
   startsMarquee,
+  movedPastMarqueeSlop,
+  MARQUEE_SLOP_PX,
   type ClipRef,
   type LaneBox,
 } from "./clip-selection";
@@ -118,5 +120,17 @@ describe("startsMarquee", () => {
   it("starts on empty lane background, and never on a null target", () => {
     expect(startsMarquee(targetIn([".lane", ".lanes"]))).toBe(true);
     expect(startsMarquee(null)).toBe(false);
+  });
+});
+
+describe("movedPastMarqueeSlop", () => {
+  it("stays false for a click / the first half of a double-click", () => {
+    expect(movedPastMarqueeSlop(0, 0)).toBe(false);
+    expect(movedPastMarqueeSlop(MARQUEE_SLOP_PX - 1, 0)).toBe(false);
+  });
+
+  it("arms the marquee once the pointer has moved a slop away", () => {
+    expect(movedPastMarqueeSlop(MARQUEE_SLOP_PX, 0)).toBe(true);
+    expect(movedPastMarqueeSlop(3, 3)).toBe(true);
   });
 });
