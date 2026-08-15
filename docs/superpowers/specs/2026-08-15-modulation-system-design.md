@@ -180,9 +180,16 @@ normalized domain**, also `[0,1]`, defined per target kind:
 
 | Target | Normalized 0..1 means | Document base |
 |---|---|---|
-| `trackParam.gain` | linear multiplier 0..1 on top of the fader | the fader |
-| `trackParam.pan` | -1..1 remapped: 0 → hard L, 0.5 → centre, 1 → hard R | `TrackState::pan` |
-| `pluginParam` | `min..max` of the param's declared range | the stored knob value |
+| `trackParam.gain` | linear multiplier 0..1 on top of the fader | **1.0**, the unity multiplier |
+| `trackParam.pan` | -1..1 remapped: 0 → hard L, 0.5 → centre, 1 → hard R | `TrackState::pan`, as `(pan + 1) / 2` |
+| `pluginParam` | `min..max` of the param's declared range | the stored knob value, normalized |
+
+Gain's base is the unity multiplier rather than the fader because the mixer
+applies the fader *separately*, at the same stage (`gain * ramp`). A
+consequence worth knowing: on gain, `absolute` and `multiply` at full depth
+compute the same thing. That is not a redundancy to clean up — it is what
+keeps the fader independently movable while a curve is playing, and it is
+why Track D's ruling 6 survives the model change untouched.
 
 `range` narrows the excursion (`min..max` inside the normalized domain);
 `depth` scales it, negative depth inverts.
