@@ -330,14 +330,17 @@ struct Planned {
     audio: Option<(String, crate::ids::SourceId)>,
 }
 
-/// Ticks are ppq-RELATIVE, and ppq is a per-project value read from
-/// `project.json` (`midi/persist.rs:320`, `unwrap_or(DEFAULT_PPQ)`) — so a
-/// payload off the OS clipboard is not structurally at this session's
-/// resolution. Rescale rather than refuse: ppq is a resolution unit, not a
+/// Ticks are ppq-RELATIVE. ppq is read from `project.json`
+/// (`midi/persist.rs:320`, `unwrap_or(DEFAULT_PPQ)`) and is also RUNTIME-
+/// MUTABLE through `Op::TempoSet` (`control/session.rs:612`), so a payload
+/// off the OS clipboard is not structurally at this session's resolution —
+/// and this session's resolution is not even fixed for the life of a paste. Rescale rather than refuse: ppq is a resolution unit, not a
 /// musical difference, exactly as the nominal-rate map converts samples
 /// without refusing a foreign device rate. Exact whenever one ppq divides
 /// the other (the 480/960 case that actually occurs); otherwise rounded to
-/// the nearest tick, an error far below one sample.
+/// the nearest tick — at 960 ppq / 120 bpm / 48 kHz a tick is 25 samples, so
+/// the worst case is half of that, ~12 samples (~0.26 ms). Inaudible, but
+/// NOT sub-sample.
 ///
 /// `None` on overflow — the caller skips that clip rather than wrapping a
 /// note into the far future.
@@ -363,8 +366,9 @@ fn clamp0(v: i64) -> u64 {
 /// paste and never silently dropped.
 ///
 /// 1. `<project>/<source_path>` exists → reference it in place (a
-///    same-project paste moves no bytes and keeps the decode cache warm,
-///    since `assign_source_ids` mints the SAME `SourceId` for the same path).
+///    same-project paste moves no bytes; the CALLER then gives the clip the
+///    `SourceId` this project already uses for that path, so the engine's
+///    per-source decode cache is shared rather than filled twice).
 /// 2. else the payload's absolute path exists AND a project is open → copy
 ///    into `<project>/audio/<uuid>-<file name>` (never overwriting) and use
 ///    the new project-relative path.
@@ -477,7 +481,7 @@ impl ControlPlane {
         // ---- Phase 2: resolve, outside the transaction -------------------
         // One short lock for everything the resolution needs; dropped before
         // any filesystem call (round-2 §4.4).
-        let (project_dir, tracks, ppq, mut known_sources) = {
+        let (project_dir, tracks, mut known_sources) = {
             let session = self.session.lock();
             let tracks: Vec<(String, String)> = session
                 .store
@@ -489,18 +493,29 @@ impl ControlPlane {
             // engine's decode cache is keyed by SOURCE, not by clip, so an
             // in-place paste that minted a second id for the same file would
             // decode and cache that wav twice.
+            // Keyed by the NORMALIZED path, because that is what
+            // `resolve_audio_asset` returns and therefore what the lookup
+            // compares against — a stored `"audio/./x.wav"` must not miss and
+            // mint a second id for a file this project already has. A stored
+            // path that will not normalize (legacy, L-1) is dropped: it could
+            // never match a normalized key anyway.
             let known_sources: Vec<(String, crate::ids::SourceId)> = session
                 .store
                 .clips
                 .iter()
                 .filter(|c| !c.source_id.as_str().is_empty())
-                .map(|c| (c.source_path.clone(), c.source_id.clone()))
+                .filter_map(|c| {
+                    crate::audio::project::normalize_source_path(&c.source_path)
+                        .ok()
+                        .map(|path| (path, c.source_id.clone()))
+                })
                 .collect();
-            (session.store.project_dir.clone(), tracks, session.midi.ppq, known_sources)
+            (session.store.project_dir.clone(), tracks, known_sources)
         };
         let at_samples_i = i64::try_from(at_samples).unwrap_or(i64::MAX);
 
         let payload_dir = payload.source_project_dir;
+        let payload_ppq = payload.ppq;
         let mut skipped: Vec<SkippedClip> = Vec::new();
         let mut planned: Vec<Planned> = Vec::new();
         for clip in payload.clips {
@@ -586,14 +601,7 @@ impl ControlPlane {
                         }
                     }
                 }
-                ClipboardClip::Midi {
-                    name,
-                    offset_from_anchor_ticks,
-                    length_ticks,
-                    content_length_ticks,
-                    notes,
-                    ..
-                } => {
+                ClipboardClip::Midi { notes, .. } => {
                     // PASTE IS THE TRUST BOUNDARY. `clips_copy` zeroes every
                     // note id, but a payload off the OS clipboard need not
                     // have come from `clips_copy` at all: duplicate ids would
@@ -601,48 +609,11 @@ impl ControlPlane {
                     // bad clip taking every good one with it), and kept ids
                     // with a fresh watermark would let a later mint collide
                     // with a live note (ADR 0001). Re-mint unconditionally.
+                    //
+                    // Note ids are ppq-independent, so this belongs out here.
+                    // The tick RESCALE does not: see the Phase 3 MIDI arm.
                     for n in notes.iter_mut() {
                         n.note_id = crate::ids::NoteId(0);
-                    }
-                    if payload.ppq != ppq {
-                        let rescaled = (|| {
-                            let sign = offset_from_anchor_ticks.signum();
-                            let off = rescale_ticks(
-                                offset_from_anchor_ticks.unsigned_abs(),
-                                payload.ppq,
-                                ppq,
-                            )?;
-                            *offset_from_anchor_ticks = i64::try_from(off).ok()? * sign;
-                            *length_ticks = rescale_ticks(*length_ticks, payload.ppq, ppq)?;
-                            if let Some(c) = content_length_ticks {
-                                *c = rescale_ticks(*c, payload.ppq, ppq)?;
-                            }
-                            for n in notes.iter_mut() {
-                                n.tick = u32::try_from(rescale_ticks(
-                                    n.tick as u64,
-                                    payload.ppq,
-                                    ppq,
-                                )?)
-                                .ok()?;
-                                n.length_ticks = u32::try_from(rescale_ticks(
-                                    n.length_ticks as u64,
-                                    payload.ppq,
-                                    ppq,
-                                )?)
-                                .ok()?;
-                            }
-                            Some(())
-                        })();
-                        if rescaled.is_none() {
-                            skipped.push(SkippedClip {
-                                name: name.clone(),
-                                reason: format!(
-                                    "ticks do not fit this project's resolution (payload ppq {}, project ppq {ppq})",
-                                    payload.ppq
-                                ),
-                            });
-                            continue;
-                        }
                     }
                     None
                 }
@@ -696,12 +667,17 @@ impl ControlPlane {
             // against the 48kHz nominal map, so the paste must resolve them
             // through the same one or a copy made on one interface would land
             // elsewhere on another.
-            let tempo = TempoMap::new(
-                tx.midi().ppq,
-                tx.midi().tempo_events.clone(),
-                NOMINAL_SAMPLE_RATE,
-            )
-            .map_err(|e| format!("clips_paste: tempo map: {e}"))?;
+            // ONE read, feeding BOTH the tick map and the payload rescale
+            // below. They must never come from two reads: `Op::TempoSet`
+            // writes `session.midi.ppq` (`control/session.rs:612`) from the
+            // live `set_tempo_map` command, so a paste that decided "no
+            // rescale needed" against one ppq and then converted
+            // `at_samples` against another would place every clip at the
+            // wrong musical position, silently and with no skip report.
+            let tx_ppq = tx.midi().ppq;
+            let tempo =
+                TempoMap::new(tx_ppq, tx.midi().tempo_events.clone(), NOMINAL_SAMPLE_RATE)
+                    .map_err(|e| format!("clips_paste: tempo map: {e}"))?;
             let at_ticks = i64::try_from(tempo.samples_to_tick(at_samples)).unwrap_or(i64::MAX);
 
             let mut created: Vec<(String, bool, crate::ids::TrackId)> = Vec::new();
@@ -804,12 +780,56 @@ impl ControlPlane {
                     }
                     ClipboardClip::Midi {
                         name,
-                        offset_from_anchor_ticks,
-                        length_ticks,
-                        content_length_ticks,
-                        notes,
+                        mut offset_from_anchor_ticks,
+                        mut length_ticks,
+                        mut content_length_ticks,
+                        mut notes,
                         ..
                     } => {
+                        // Ticks are ppq-relative, so the rescale has to use
+                        // the SAME resolution `tempo` was built from — hence
+                        // in here, against `tx_ppq`, not against a pre-lock
+                        // snapshot. Pure arithmetic: no I/O, no panic, legal
+                        // inside `transact`.
+                        if payload_ppq != tx_ppq {
+                            let rescaled = (|| {
+                                let sign = offset_from_anchor_ticks.signum();
+                                let off = rescale_ticks(
+                                    offset_from_anchor_ticks.unsigned_abs(),
+                                    payload_ppq,
+                                    tx_ppq,
+                                )?;
+                                offset_from_anchor_ticks = i64::try_from(off).ok()? * sign;
+                                length_ticks = rescale_ticks(length_ticks, payload_ppq, tx_ppq)?;
+                                if let Some(c) = content_length_ticks.as_mut() {
+                                    *c = rescale_ticks(*c, payload_ppq, tx_ppq)?;
+                                }
+                                for n in notes.iter_mut() {
+                                    n.tick = u32::try_from(rescale_ticks(
+                                        n.tick as u64,
+                                        payload_ppq,
+                                        tx_ppq,
+                                    )?)
+                                    .ok()?;
+                                    n.length_ticks = u32::try_from(rescale_ticks(
+                                        n.length_ticks as u64,
+                                        payload_ppq,
+                                        tx_ppq,
+                                    )?)
+                                    .ok()?;
+                                }
+                                Some(())
+                            })();
+                            if rescaled.is_none() {
+                                result.skipped.push(SkippedClip {
+                                    name,
+                                    reason: format!(
+                                        "ticks do not fit this project's resolution (payload ppq {payload_ppq}, project ppq {tx_ppq})"
+                                    ),
+                                });
+                                continue;
+                            }
+                        }
                         let mut new_clip = crate::midi::types::MidiClip {
                             id: crate::ids::ClipId::mint(),
                             track_id: target,
@@ -1600,6 +1620,38 @@ mod tests {
         assert!(!res.audio_clips[0].source_id.as_str().is_empty());
     }
 
+    /// M-N3: the store's paths and the resolver's paths must be compared in
+    /// the SAME normal form, or a project that happens to hold a
+    /// non-canonical path mints a second `SourceId` for a file it already
+    /// has — the double decode I-1 exists to prevent.
+    #[test]
+    fn paste_matches_an_existing_source_through_a_non_canonical_stored_path() {
+        let root = std::env::temp_dir().join(format!("aura-paste-norm-{}", uuid::Uuid::new_v4()));
+        let proj = root.join("P.aura");
+        std::fs::create_dir_all(proj.join("audio")).unwrap();
+        std::fs::write(proj.join("audio").join("x.wav"), b"RIFF").unwrap();
+
+        let cp = plane_with_project(&proj);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            let mut c = crate::audio::types::testutil::test_clip("a-1", "t-1");
+            c.source_path = "audio/./x.wav".into();
+            c.source_id = crate::ids::SourceId("already-known".into());
+            tx.apply(Op::ClipAdd { clip: c, index: 0 })
+        })
+        .unwrap();
+
+        let payload = hand_payload(960, vec![hand_audio("dup", "t-1", "audio/x.wav")]);
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert!(res.skipped.is_empty(), "{:?}", res.skipped);
+        assert_eq!(
+            res.audio_clips[0].source_id.as_str(),
+            "already-known",
+            "the same file, however the stored path spelled it, is one source"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// I-2: ticks are ppq-RELATIVE, and ppq comes from `project.json`
     /// (`midi/persist.rs:320`), so it is not structurally 960. A payload
     /// from a ppq-480 project is rescaled into this session's resolution
@@ -1627,6 +1679,48 @@ mod tests {
         assert_eq!(pasted.content_length_ticks, Some(480));
         assert_eq!(pasted.notes[0].tick, 240);
         assert_eq!(pasted.notes[0].length_ticks, 480);
+    }
+
+    /// The ppq the rescale uses and the ppq the tick map is built from must
+    /// be ONE value, read once inside the transaction. `Op::TempoSet` writes
+    /// `session.midi.ppq` (`control/session.rs:612`) from the live
+    /// `set_tempo_map` command, so ppq is runtime-mutable, and two reads that
+    /// disagreed would place every clip at the wrong musical position with no
+    /// skip report. Here the session's resolution is moved through the REAL
+    /// op path first, so the whole paste runs at a non-default ppq.
+    #[test]
+    fn paste_rescales_against_the_same_ppq_the_tick_map_is_built_from() {
+        let cp = plane();
+        crate::midi::set_tempo_map_core(
+            &cp,
+            Some(480),
+            vec![crate::midi::types::TempoEvent { tick: 0, bpm: 120.0 }],
+        )
+        .unwrap();
+        assert_eq!(cp.session().lock().midi.ppq, 480, "the op really moved the resolution");
+
+        let payload = hand_payload(
+            960,
+            vec![ClipboardClip::Midi {
+                name: "beat".into(),
+                source_track_id: "t-2".into(),
+                source_track_name: "T2".into(),
+                offset_from_anchor_ticks: 960,
+                length_ticks: 960,
+                content_length_ticks: Some(960),
+                notes: vec![note(480, 480, 0)],
+            }],
+        );
+
+        let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
+        assert_eq!(
+            pasted.timeline_start_ticks, 480,
+            "one beat past the anchor, expressed in THIS session's 480 ppq"
+        );
+        assert_eq!(pasted.length_ticks, 480);
+        assert_eq!(pasted.content_length_ticks, Some(480));
+        assert_eq!(pasted.notes[0].tick, 240);
+        assert_eq!(pasted.notes[0].length_ticks, 240);
     }
 
     #[test]
