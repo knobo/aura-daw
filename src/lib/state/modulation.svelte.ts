@@ -17,6 +17,15 @@ import type {
   TargetRef,
 } from "../types/ipc";
 
+function emptyBinding(partial: Partial<Binding> & Pick<Binding, "source" | "target">): Binding {
+  return {
+    id: "",
+    mode: "absolute",
+    depth: 1,
+    ...partial,
+  };
+}
+
 export function targetsEqual(a: TargetRef, b: TargetRef): boolean {
   if (a.kind !== b.kind) return false;
   switch (a.kind) {
@@ -80,6 +89,17 @@ class ModulationStore {
 
   bindingsFor(target: TargetRef): Binding[] {
     return this.bindings.filter((b) => targetsEqual(b.target, target));
+  }
+
+  /** Bindings whose source is this automation track. */
+  bindingsFrom(trackId: string): Binding[] {
+    return this.bindings.filter(
+      (b) => b.source.kind === "automationTrack" && b.source.trackId === trackId,
+    );
+  }
+
+  clipsOn(trackId: string): AutomationClip[] {
+    return this.automationClips.filter((c) => c.trackId === trackId);
   }
 
   curveOf(binding: Binding): Curve | undefined {
@@ -173,6 +193,88 @@ class ModulationStore {
     const minted = this.bindings.find((b) => !beforeB.has(b.id));
     if (minted) this.show(trackId, minted.id);
     return minted;
+  }
+
+  /**
+   * Bind an automation track to a target. Unlike `pickTarget` this does
+   * not mint a timeline curve — the track's clips are the source.
+   */
+  async addTarget(autoTrackId: string, target: TargetRef): Promise<Binding | undefined> {
+    const existing = this.bindingsFrom(autoTrackId).find((b) => targetsEqual(b.target, target));
+    if (existing) return existing;
+    const before = new Set(this.bindings.map((b) => b.id));
+    await this.setBinding(
+      emptyBinding({
+        source: { kind: "automationTrack", trackId: autoTrackId },
+        target,
+        mode: defaultMode(target),
+        depth: 1,
+      }),
+    );
+    return this.bindings.find((b) => !before.has(b.id));
+  }
+
+  async setDepth(binding: Binding, depth: number): Promise<void> {
+    const clamped = Math.min(1, Math.max(-1, depth));
+    await this.setBinding({ ...binding, depth: clamped });
+  }
+
+  async removeBinding(bindingId: string): Promise<void> {
+    const binding = this.bindings.find((b) => b.id === bindingId);
+    if (!binding || !backend.modulationSetBinding) return;
+    try {
+      this.adopt(await backend.modulationSetBinding(binding, true));
+    } catch (err) {
+      console.error("[aura] modulation_set_binding(delete) failed:", err);
+    }
+  }
+
+  async setClip(clip: AutomationClip): Promise<void> {
+    if (!backend.automationClipSet) return;
+    try {
+      this.adopt(await backend.automationClipSet(clip));
+    } catch (err) {
+      console.error("[aura] automation_clip_set failed:", err);
+    }
+  }
+
+  async removeClip(clipId: string): Promise<void> {
+    const clip = this.automationClips.find((c) => c.id === clipId);
+    if (!clip || !backend.automationClipSet) return;
+    try {
+      this.adopt(await backend.automationClipSet(clip, true));
+    } catch (err) {
+      console.error("[aura] automation_clip_set(delete) failed:", err);
+    }
+  }
+
+  /** Mint a default curve and place it as an automation clip. */
+  async addClip(
+    trackId: string,
+    timelineStartTicks: number,
+    lengthTicks: number,
+  ): Promise<AutomationClip | undefined> {
+    const beforeCurves = new Set(this.curves.map((c) => c.id));
+    await this.commit({
+      id: "",
+      name: "automation",
+      lengthTicks,
+      points: [
+        { tick: 0, value: 1 },
+        { tick: Math.max(0, Math.round(lengthTicks) - 1), value: 1 },
+      ],
+    });
+    const mintedCurve = this.curves.find((c) => !beforeCurves.has(c.id));
+    if (!mintedCurve) return undefined;
+    const beforeClips = new Set(this.automationClips.map((c) => c.id));
+    await this.setClip({
+      id: "",
+      trackId,
+      curveId: mintedCurve.id,
+      timelineStartTicks,
+      lengthTicks,
+    });
+    return this.automationClips.find((c) => !beforeClips.has(c.id));
   }
 
   async reload(): Promise<void> {

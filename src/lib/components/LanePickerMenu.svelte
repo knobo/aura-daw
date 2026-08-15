@@ -5,19 +5,37 @@
    * has a binding. Picking mints a curve+binding when none exists and
    * shows that overlay.
    */
-  import type { PluginInstanceInfo, PluginParamInfo, TrackState } from "../types/ipc";
+  import type { PluginInstanceInfo, PluginParamInfo, TargetRef, TrackState } from "../types/ipc";
   import { modulation, panNormalizedOf } from "../state/modulation.svelte";
   import { plugins } from "../state/plugins.svelte";
+  import { project } from "../state/project.svelte";
   import { backend } from "../tauri";
 
-  let { track, onclose }: { track: TrackState; onclose: () => void } = $props();
+  let {
+    track,
+    onclose,
+    sourceTrackId,
+  }: {
+    track?: TrackState;
+    onclose: () => void;
+    /** When set, picks bind this automation track (project-wide targets). */
+    sourceTrackId?: string;
+  } = $props();
+
+  const projectScope = $derived(!!sourceTrackId);
+  const mixerTracks = $derived(
+    projectScope ? project.tracks.filter((t) => t.kind !== "automation") : track ? [track] : [],
+  );
 
   let groups = $state<{ inst: PluginInstanceInfo; params: PluginParamInfo[] }[]>([]);
 
   $effect(() => {
-    const insts = plugins.instances.filter(
-      (i) => i.trackId === track.id || track.instrumentId === `plugin:${i.id}`,
-    );
+    const insts = projectScope
+      ? plugins.instances.slice()
+      : plugins.instances.filter(
+          (i) =>
+            !!track && (i.trackId === track.id || track.instrumentId === `plugin:${i.id}`),
+        );
     let cancelled = false;
     void Promise.all(
       insts.map(async (inst) => ({
@@ -32,69 +50,68 @@
     };
   });
 
-  function boundGain(): boolean {
-    return (
-      modulation.bindingsFor({ kind: "trackParam", trackId: track.id, param: "gain" }).length > 0
-    );
-  }
-  function boundPan(): boolean {
-    return (
-      modulation.bindingsFor({ kind: "trackParam", trackId: track.id, param: "pan" }).length > 0
-    );
-  }
-  function boundPlugin(instanceId: string, paramId: number): boolean {
-    return (
-      modulation.bindingsFor({ kind: "pluginParam", instanceId, paramId }).length > 0
-    );
+  function bound(target: TargetRef): boolean {
+    if (sourceTrackId) {
+      return modulation.bindingsFrom(sourceTrackId).some((b) => {
+        const t = b.target;
+        if (t.kind !== target.kind) return false;
+        if (t.kind === "trackParam" && target.kind === "trackParam") {
+          return t.trackId === target.trackId && t.param === target.param;
+        }
+        if (t.kind === "pluginParam" && target.kind === "pluginParam") {
+          return t.instanceId === target.instanceId && t.paramId === target.paramId;
+        }
+        return false;
+      });
+    }
+    return modulation.bindingsFor(target).length > 0;
   }
 
-  function pickGain() {
-    void modulation.pickTarget(track.id, {
-      kind: "trackParam",
-      trackId: track.id,
-      param: "gain",
-    });
+  function pick(target: TargetRef, initial?: number) {
+    if (sourceTrackId) {
+      void modulation.addTarget(sourceTrackId, target);
+    } else if (track) {
+      void modulation.pickTarget(track.id, target, initial);
+    }
     onclose();
   }
-  function pickPan() {
-    void modulation.pickTarget(
-      track.id,
-      { kind: "trackParam", trackId: track.id, param: "pan" },
-      panNormalizedOf(track.pan),
-    );
-    onclose();
+  function pickGain(t: TrackState) {
+    pick({ kind: "trackParam", trackId: t.id, param: "gain" });
+  }
+  function pickPan(t: TrackState) {
+    pick({ kind: "trackParam", trackId: t.id, param: "pan" }, panNormalizedOf(t.pan));
   }
   function pickPlugin(inst: PluginInstanceInfo, p: PluginParamInfo) {
     const n = p.max === p.min ? 0 : (p.value - p.min) / (p.max - p.min);
-    void modulation.pickTarget(
-      track.id,
-      { kind: "pluginParam", instanceId: inst.id, paramId: p.id },
-      n,
-    );
-    onclose();
+    pick({ kind: "pluginParam", instanceId: inst.id, paramId: p.id }, n);
   }
 </script>
 
 <div class="backdrop" role="presentation" onpointerdown={onclose}></div>
-<div class="menu glass mono" role="menu" aria-label="Automation lanes">
-  <button role="menuitem" onclick={pickGain}>
-    <span>Gain</span>
-    {#if boundGain()}<span class="mark" aria-label="bound">✓</span>{/if}
-  </button>
-  <button role="menuitem" onclick={pickPan}>
-    <span>Pan</span>
-    {#if boundPan()}<span class="mark" aria-label="bound">✓</span>{/if}
-  </button>
+<div class="menu glass mono" role="menu" aria-label={projectScope ? "Add automation target" : "Automation lanes"}>
+  {#each mixerTracks as t (t.id)}
+    {#if projectScope}
+      <div class="group">{t.name}</div>
+    {/if}
+    <button role="menuitem" onclick={() => pickGain(t)}>
+      <span>Gain</span>
+      {#if bound({ kind: "trackParam", trackId: t.id, param: "gain" })}<span class="mark" aria-label="bound">✓</span>{/if}
+    </button>
+    <button role="menuitem" onclick={() => pickPan(t)}>
+      <span>Pan</span>
+      {#if bound({ kind: "trackParam", trackId: t.id, param: "pan" })}<span class="mark" aria-label="bound">✓</span>{/if}
+    </button>
+  {/each}
   {#each groups as g (g.inst.id)}
     <div class="group">{g.inst.name}</div>
     {#each g.params as p (p.id)}
       <button role="menuitem" onclick={() => pickPlugin(g.inst, p)}>
         <span title={p.name}>{p.name}</span>
-        {#if boundPlugin(g.inst.id, p.id)}<span class="mark" aria-label="bound">✓</span>{/if}
+        {#if bound({ kind: "pluginParam", instanceId: g.inst.id, paramId: p.id })}<span class="mark" aria-label="bound">✓</span>{/if}
       </button>
     {/each}
   {/each}
-  {#if modulation.hasVisible(track.id)}
+  {#if track && !projectScope && modulation.hasVisible(track.id)}
     <button
       class="hide"
       role="menuitem"

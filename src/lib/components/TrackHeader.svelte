@@ -17,6 +17,29 @@
 
   let { track, index }: { track: TrackState; index: number } = $props();
   let pickerOpen = $state(false);
+  const isAutomation = $derived(track.kind === "automation");
+  const autoTargets = $derived(isAutomation ? modulation.bindingsFrom(track.id) : []);
+
+  function targetLabel(b: (typeof autoTargets)[number]): string {
+    const t = b.target;
+    if (t.kind === "trackParam") {
+      const name = project.trackById(t.trackId)?.name ?? t.trackId;
+      return `→ ${name} · ${t.param}`;
+    }
+    if (t.kind === "pluginParam") {
+      const inst = plugins.instances.find((i) => i.id === t.instanceId);
+      return `→ ${inst?.name ?? t.instanceId} · ${t.paramId}`;
+    }
+    return "→ target";
+  }
+
+  function onDepth(b: (typeof autoTargets)[number], e: Event) {
+    const v = parseFloat((e.currentTarget as HTMLInputElement).value);
+    void modulation.setDepth(b, v);
+  }
+  function onDepthDown() {
+    project.beginGesture("depth drag");
+  }
 
   const gainPct = $derived(((track.gainDb + 60) / 72) * 100);
   const instrument = $derived(
@@ -64,12 +87,20 @@
   }
 </script>
 
-<div class="header" class:picking={pickerOpen} style:--track-color={track.color}>
+<div
+  class="header"
+  class:picking={pickerOpen}
+  class:auto={isAutomation}
+  style:--track-color={track.color}
+>
   <div class="stripe"></div>
   <div class="body">
     <div class="row top">
       <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
       <span class="name" title={track.name}>{track.name}</span>
+      {#if isAutomation}
+        <span class="autotag mono">auto</span>
+      {/if}
       {#if track.kind === "midi"}
         <button
           class="instchip mono"
@@ -103,6 +134,49 @@
       >
     </div>
 
+    {#if isAutomation}
+      <div class="targets">
+        {#each autoTargets as b (b.id)}
+          <div class="target">
+            <span class="tlabel mono" title={targetLabel(b)}>{targetLabel(b)}</span>
+            <input
+              class="fader depth"
+              type="range"
+              min="-1"
+              max="1"
+              step="0.01"
+              value={b.depth}
+              style:--fader-pct="{((b.depth + 1) / 2) * 100}%"
+              style:--fader-fill="var(--violet)"
+              title="Depth"
+              aria-label="Depth for {targetLabel(b)}"
+              oninput={(e) => onDepth(b, e)}
+              onpointerdown={onDepthDown}
+              onpointerup={onGestureEnd}
+              onpointercancel={onGestureEnd}
+            />
+            <button
+              class="todel"
+              title="Remove target"
+              aria-label="Remove {targetLabel(b)}"
+              onclick={() => modulation.removeBinding(b.id)}>×</button
+            >
+          </div>
+        {/each}
+        <span class="picker">
+          <button
+            class="addtgt mono"
+            class:on={pickerOpen}
+            aria-haspopup="menu"
+            aria-expanded={pickerOpen}
+            onclick={() => (pickerOpen = !pickerOpen)}>+ add target</button
+          >
+          {#if pickerOpen}
+            <LanePickerMenu sourceTrackId={track.id} onclose={() => (pickerOpen = false)} />
+          {/if}
+        </span>
+      </div>
+    {:else}
     <div class="row mid">
       <div class="toggles">
         <button
@@ -183,6 +257,7 @@
     <div class="row meter-row">
       <Meter trackId={track.id} height={10} />
     </div>
+    {/if}
   </div>
 </div>
 
@@ -195,6 +270,71 @@
   }
   .header.picking {
     z-index: 20;
+  }
+  .autotag {
+    font-size: 8px;
+    letter-spacing: 0.14em;
+    color: var(--violet);
+    border: 1px solid rgba(157, 123, 255, 0.4);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  .targets {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .target {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .tlabel {
+    flex: 1;
+    min-width: 0;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .depth {
+    width: 72px;
+    flex: none;
+  }
+  .todel {
+    width: 14px;
+    height: 14px;
+    line-height: 1;
+    border: none;
+    background: transparent;
+    color: var(--text-faint);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 3px;
+    flex: none;
+  }
+  .todel:hover {
+    color: var(--red);
+  }
+  .addtgt {
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px dashed rgba(157, 123, 255, 0.35);
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+  }
+  .addtgt:hover,
+  .addtgt.on {
+    color: var(--violet);
+    border-color: var(--violet);
   }
   .stripe {
     width: 3px;

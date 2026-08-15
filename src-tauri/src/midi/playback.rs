@@ -137,9 +137,8 @@ impl LiveNodeRegistry {
 /// per audible midi track. `bank` = None means "no sampler instruments
 /// available" (instrument-bound tracks fall back to PolySynth). `slots` is
 /// the CURRENT rebuild's derived slot map (round-2 §2.4,
-/// `types::derive_slots`) — every store track has an entry, so lookups here
-/// are infallible by construction (a track absent from `slots` would be a
-/// caller bug, not a runtime case to skip).
+/// `types::derive_slots`) — every mixer track has an entry. Automation
+/// tracks are absent by design (no slot); midi rows are never that kind.
 pub fn append_from(
     midi: &MidiStore,
     store: &Store,

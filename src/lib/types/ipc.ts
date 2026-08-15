@@ -93,7 +93,7 @@ export interface TransportState {
 
 // ── track-state.schema.json ─────────────────────────────────────────────────
 
-export type TrackKind = "audio" | "midi" | "bus";
+export type TrackKind = "audio" | "midi" | "automation" | "bus";
 
 export interface TrackState {
   id: string;

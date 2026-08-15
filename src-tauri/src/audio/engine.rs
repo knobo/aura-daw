@@ -42,7 +42,7 @@ use super::rt::{
     SharedRt, TrackRamps, NO_PARK,
 };
 use super::transport;
-use super::types::{derive_slots, Clip, MeterFrame, Store};
+use super::types::{derive_slots, mixer_slot_count, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
@@ -1200,13 +1200,16 @@ impl Control {
             let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
-            // Task 7: sized to THIS rebuild's track count, not a fixed cap.
-            let params = Arc::new(ParamTable::with_slots(store.tracks.len()));
-            for (i, t) in store.tracks.iter().enumerate() {
-                params.set_gain_linear(i, mixer::db_to_linear(t.gain_db));
-                params.set_pan(i, t.pan as f32);
-                params.set_flag(i, super::rt::FLAG_MUTE, t.muted);
-                params.set_flag(i, super::rt::FLAG_SOLO, t.soloed);
+            // Sized to mixer slots, not store track count: automation tracks
+            // take no slot (design §3.6) and must not shift later rows.
+            let n_slots = mixer_slot_count(&store.tracks);
+            let params = Arc::new(ParamTable::with_slots(n_slots));
+            for t in store.tracks.iter() {
+                let Some(&slot) = slots.get(&t.id) else { continue };
+                params.set_gain_linear(slot, mixer::db_to_linear(t.gain_db));
+                params.set_pan(slot, t.pan as f32);
+                params.set_flag(slot, super::rt::FLAG_MUTE, t.muted);
+                params.set_flag(slot, super::rt::FLAG_SOLO, t.soloed);
             }
             params.any_solo.store(store.any_solo(), Relaxed);
             // PUBLISH UNDER THE SESSION LOCK [C1]: this is load-bearing, not
@@ -1231,7 +1234,7 @@ impl Control {
             // whichever generation produced them, not the current tables.
             self.gen_maps.publish(self.generation, &slots);
             let (track_ramps, param_driver) =
-                self.compile_automation(&session, &slots, store.tracks.len());
+                self.compile_automation(&session, &slots, n_slots);
             let graph = if headless {
                 // Headless keeps its narrow scope [I5]: tables are enough
                 // to serve knob writes and recording resolution with no
@@ -1242,9 +1245,9 @@ impl Control {
                 // change this refactor must not smuggle in.
                 None
             } else {
-                let mut tracks = Vec::with_capacity(store.tracks.len());
+                let mut tracks = Vec::with_capacity(n_slots);
                 for t in &store.tracks {
-                    let slot = slots[&t.id];
+                    let Some(&slot) = slots.get(&t.id) else { continue };
                     let clips = store
                         .clips
                         .iter()
@@ -1364,8 +1367,9 @@ impl Control {
     /// nothing tick-shaped ever crosses onto the RT thread
     /// (ARCHITECTURE §13/§15.1).
     ///
-    /// `n_slots` is the TRACK COUNT `ParamTable` was sized with, not
-    /// `slots.len()`, so the ramp table and the param table index alike.
+    /// `n_slots` is the MIXER-SLOT COUNT `ParamTable` was sized with, not
+    /// `slots.len()` (duplicate ids collapse in the map) and not
+    /// `store.tracks.len()` (automation tracks take no slot).
     ///
     /// The `TempoMap` can fail to build — a zero `ppq`, an empty or
     /// non-monotonic `tempo_events`, a zero rate — and then nothing is

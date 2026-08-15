@@ -30,6 +30,7 @@
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
   import ModulationLaneView from "./ModulationLaneView.svelte";
+  import AutomationTrackRow from "./AutomationTrackRow.svelte";
   import ImportDropZone from "./ImportDropZone.svelte";
   import LoopJamPanel from "./loopjam/LoopJamPanel.svelte";
   import type { TrackState } from "../types/ipc";
@@ -347,6 +348,15 @@
     await project.addTrack({ name: `MIDI ${project.tracks.length + 1}`, color, kind: "midi" });
   }
 
+  async function addAutomationTrack() {
+    const color = TRACK_PALETTE[project.tracks.length % TRACK_PALETTE.length];
+    await project.addTrack({
+      name: `Auto ${project.tracks.length + 1}`,
+      color,
+      kind: "automation",
+    });
+  }
+
   /**
    * Seed the empty session with the built-in demo song (control plane).
    *
@@ -381,6 +391,8 @@
     for (const c of project.clips) end = Math.max(end, c.timelineStartSamples + c.lengthSamples);
     for (const c of midi.clips)
       end = Math.max(end, midi.ticksToSamples(c.timelineStartTicks + c.lengthTicks));
+    for (const c of modulation.automationClips)
+      end = Math.max(end, midi.ticksToSamples(c.timelineStartTicks + c.lengthTicks));
     return end;
   });
 
@@ -393,6 +405,7 @@
   }
 
   function onLaneDragOver(track: TrackState, e: DragEvent) {
+    if (track.kind === "automation") return;
     // `types` is all a dragover may read — see hasLibraryDrag's doc.
     if (!hasLibraryDrag(e.dataTransfer)) return; // OS file drags fall through
     e.preventDefault();
@@ -402,6 +415,7 @@
 
   function onLaneDrop(track: TrackState, e: DragEvent) {
     dropTrackId = "";
+    if (track.kind === "automation") return;
     const payload = decodeLibraryDrag(e.dataTransfer);
     if (!payload) return;
     e.preventDefault();
@@ -410,6 +424,14 @@
 
   /** Double-click an empty span of a midi lane → create a 2-bar clip there. */
   function onLaneDblClick(track: TrackState, e: MouseEvent) {
+    if (track.kind === "automation") {
+      if ((e.target as HTMLElement).closest(".aclip, .clip, .mclip")) return;
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const samples = view.snapSamples(Math.max(0, view.samplesAt(e.clientX - rect.left)));
+      const startTicks = Math.round(midi.samplesToTicks(samples) / midi.ppq) * midi.ppq;
+      void modulation.addClip(track.id, Math.max(0, startTicks), 2 * midi.ticksPerBar);
+      return;
+    }
     if (track.kind !== "midi") {
       toasts.info("NOT A MIDI LANE", `"${track.name}" is an audio track — midi clips need a midi lane`);
       return;
@@ -600,6 +622,7 @@
       <div class="addrow">
         <button class="add mono" onclick={addTrack}>+ AUDIO</button>
         <button class="add midi mono" onclick={addMidiTrack}>+ MIDI</button>
+        <button class="add auto mono" onclick={addAutomationTrack}>+ AUTO</button>
       </div>
     </div>
 
@@ -619,6 +642,7 @@
           class="lane"
           class:armed={track.armed}
           class:midilane={track.kind === "midi"}
+          class:autolane={track.kind === "automation"}
           class:droptarget={dropTrackId === track.id}
           role="presentation"
           ondblclick={(e) => onLaneDblClick(track, e)}
@@ -626,6 +650,9 @@
           ondragleave={() => (dropTrackId = "")}
           ondrop={(e) => onLaneDrop(track, e)}
         >
+          {#if track.kind === "automation"}
+            <AutomationTrackRow {track} />
+          {:else}
           {#each project.clipsOf(track.id) as clip (clip.id)}
             <ClipView {clip} {track} />
           {/each}
@@ -640,6 +667,7 @@
                 <ModulationLaneView {track} {binding} {curve} />
               {/if}
             {/each}
+          {/if}
           {/if}
         </div>
       {/each}
@@ -901,6 +929,7 @@
   }
   .addrow {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
     margin: 10px;
   }
@@ -923,6 +952,10 @@
   .add.midi:hover {
     color: #5cf2b8;
     border-color: rgba(92, 242, 184, 0.4);
+  }
+  .add.auto:hover {
+    color: var(--violet);
+    border-color: rgba(157, 123, 255, 0.45);
   }
   .lane.midilane {
     background:

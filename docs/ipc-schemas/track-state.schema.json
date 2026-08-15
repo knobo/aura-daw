@@ -17,9 +17,9 @@
       "maxLength": 256
     },
     "kind": {
-      "description": "Track type. Only \"audio\" exists in the prototype; \"midi\" and \"bus\" are reserved.",
+      "description": "Track type. \"automation\" holds clips that drive bindings and takes no mixer slot.",
       "type": "string",
-      "enum": ["audio", "midi", "bus"]
+      "enum": ["audio", "midi", "automation", "bus"]
     },
     "gainDb": {
       "description": "Fader gain in decibels relative to unity. -160.0 encodes -infinity (silence). Typical UI range -60..+12.",

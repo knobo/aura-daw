@@ -182,10 +182,10 @@ export interface Backend {
   modulationGet?(): Promise<ModulationSnapshot>;
   /** Upsert one curve; returns the updated snapshot (D-03). */
   modulationSetCurve?(curve: Curve): Promise<ModulationSnapshot>;
-  /** Upsert one binding; returns the updated snapshot. */
-  modulationSetBinding?(binding: Binding): Promise<ModulationSnapshot>;
-  /** Upsert one automation clip; returns the updated snapshot. */
-  automationClipSet?(clip: AutomationClip): Promise<ModulationSnapshot>;
+  /** Upsert one binding (`delete: true` removes it); returns the snapshot. */
+  modulationSetBinding?(binding: Binding, del?: boolean): Promise<ModulationSnapshot>;
+  /** Upsert one automation clip (`delete: true` removes it); returns the snapshot. */
+  automationClipSet?(clip: AutomationClip, del?: boolean): Promise<ModulationSnapshot>;
 
   /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
    * primitive) — call on `pointerdown` of a fader/pan control. Matching
@@ -565,11 +565,11 @@ class TauriBackend implements Backend {
   modulationSetCurve(curve: Curve) {
     return invoke<ModulationSnapshot>("modulation_set_curve", { curve });
   }
-  modulationSetBinding(binding: Binding) {
-    return invoke<ModulationSnapshot>("modulation_set_binding", { binding });
+  modulationSetBinding(binding: Binding, del?: boolean) {
+    return invoke<ModulationSnapshot>("modulation_set_binding", { binding, delete: del });
   }
-  automationClipSet(clip: AutomationClip) {
-    return invoke<ModulationSnapshot>("automation_clip_set", { clip });
+  automationClipSet(clip: AutomationClip, del?: boolean) {
+    return invoke<ModulationSnapshot>("automation_clip_set", { clip, delete: del });
   }
   undo() {
     return invoke<HistoryStep>("undo");

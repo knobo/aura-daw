@@ -53,30 +53,64 @@ pub fn modulation_set_curve(
         curve.id = uuid::Uuid::new_v4().to_string();
     }
     let key = curve.id.clone();
-    control.set_curve(key, Some(curve), crate::control::op::TxMeta::user("edit curve"))?;
+    control.set_curve(
+        key,
+        Some(curve),
+        crate::control::op::TxMeta::user("edit curve"),
+    )?;
     Ok(snapshot(&control))
 }
 
-/// Upsert one binding. Returns the updated snapshot.
+/// Upsert one binding (`delete: true` removes it by `binding.id`).
+/// Returns the updated snapshot.
 #[tauri::command]
 pub fn modulation_set_binding(
     mut binding: Binding,
+    delete: Option<bool>,
     control: State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<ModulationSnapshot, String> {
+    if delete == Some(true) {
+        if binding.id.is_empty() {
+            return Err("cannot delete a binding without an id".into());
+        }
+        control.set_binding(
+            binding.id,
+            None,
+            crate::control::op::TxMeta::user("remove binding"),
+        )?;
+        return Ok(snapshot(&control));
+    }
     if binding.id.is_empty() {
         binding.id = uuid::Uuid::new_v4().to_string();
     }
     let key = binding.id.clone();
-    control.set_binding(key, Some(binding), crate::control::op::TxMeta::user("edit binding"))?;
+    control.set_binding(
+        key,
+        Some(binding),
+        crate::control::op::TxMeta::user("edit binding"),
+    )?;
     Ok(snapshot(&control))
 }
 
-/// Upsert one automation clip. Returns the updated snapshot.
+/// Upsert one automation clip (`delete: true` removes it by `clip.id`).
+/// Returns the updated snapshot.
 #[tauri::command]
 pub fn automation_clip_set(
     mut clip: AutomationClip,
+    delete: Option<bool>,
     control: State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<ModulationSnapshot, String> {
+    if delete == Some(true) {
+        if clip.id.is_empty() {
+            return Err("cannot delete an automation clip without an id".into());
+        }
+        control.set_automation_clip(
+            clip.id,
+            None,
+            crate::control::op::TxMeta::user("remove automation clip"),
+        )?;
+        return Ok(snapshot(&control));
+    }
     if clip.id.is_empty() {
         clip.id = uuid::Uuid::new_v4().to_string();
     }

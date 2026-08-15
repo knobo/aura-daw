@@ -110,7 +110,8 @@ pub struct TrackMeter {
 pub struct TrackState {
     pub id: TrackId,
     pub name: String,
-    /// "audio" (future: "midi", "bus")
+    /// "audio" | "midi" | "automation" ("bus" reserved). Automation tracks
+    /// hold clips that drive bindings; they take no mixer slot (design §3.6).
     pub kind: String,
     /// Fader gain in dB (-inf encoded as -160.0).
     pub gain_db: f64,
@@ -234,6 +235,19 @@ pub struct Store {
     pub created_at: Option<String>,
 }
 
+/// True when the track occupies a mixer slot (everything except
+/// `kind: "automation"`, which drives bindings and renders no audio).
+pub fn is_mixer_track(track: &TrackState) -> bool {
+    track.kind != "automation"
+}
+
+/// Number of mixer slots for `tracks` — every non-automation row, including
+/// duplicate ids (sizing by `derive_slots(...).len()` would drop the last
+/// duplicate's slot; see `offline_ramp_table_is_sized_by_track_count_not_slot_map`).
+pub fn mixer_slot_count(tracks: &[TrackState]) -> usize {
+    tracks.iter().filter(|t| is_mixer_track(t)).count()
+}
+
 /// Derive RT parameter slots from display order (round-2 §2.4). Pure: no
 /// stored allocation state, so there is nothing to free and therefore
 /// nothing that can be reused while a stale graph still reads it — the
@@ -242,9 +256,12 @@ pub struct Store {
 /// `ParamTable`/`GraphTables` from the result; a retired graph keeps
 /// reading the table it was built with, so a later renumbering (tracks
 /// added/removed) can never bleed into it.
+///
+/// Automation tracks are skipped: they take no mixer slot (design §3.6).
 pub fn derive_slots(tracks: &[TrackState]) -> HashMap<TrackId, usize> {
     tracks
         .iter()
+        .filter(|t| is_mixer_track(t))
         .enumerate()
         .map(|(i, t)| (t.id.clone(), i))
         .collect()
@@ -252,7 +269,7 @@ pub fn derive_slots(tracks: &[TrackState]) -> HashMap<TrackId, usize> {
 
 impl Store {
     pub fn any_solo(&self) -> bool {
-        self.tracks.iter().any(|t| t.soloed)
+        self.tracks.iter().any(|t| is_mixer_track(t) && t.soloed)
     }
 
     /// Absolute path for a project-relative source path.
@@ -339,6 +356,33 @@ mod tests {
         // engine-level test (Task 8) proves end to end.
         let s2 = derive_slots(&tracks[1..]);
         assert_eq!((s2["b"], s2["c"]), (0, 1));
+    }
+
+    /// Direct `derive_slots` pin: an automation track must not consume a
+    /// mixer slot, or every slot-indexed table (params, ramps, meters)
+    /// shifts under an added automation row and the wrong track's audio
+    /// moves. Dense renumber of the remaining mixer tracks is the contract.
+    #[test]
+    fn an_automation_track_takes_no_mixer_slot_and_renders_no_audio() {
+        let mut tracks = vec![test_track("a"), test_track("b")];
+        let before = derive_slots(&tracks);
+        assert_eq!((before["a"], before["b"]), (0, 1));
+
+        let mut auto = test_track("auto");
+        auto.kind = "automation".into();
+        tracks.insert(1, auto);
+
+        let after = derive_slots(&tracks);
+        assert!(
+            !after.contains_key("auto"),
+            "kind:automation takes no mixer slot"
+        );
+        assert_eq!(
+            (after["a"], after["b"]),
+            (0, 1),
+            "inserting an automation track in the middle must not shift existing slots"
+        );
+        assert_eq!(after.len(), 2);
     }
 
     #[test]

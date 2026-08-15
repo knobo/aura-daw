@@ -74,7 +74,7 @@ pub(crate) fn new_track_row(
     kind: Option<String>,
 ) -> Result<(TrackState, usize), String> {
     let kind = kind.unwrap_or_else(|| "audio".into());
-    if !matches!(kind.as_str(), "audio" | "midi") {
+    if !matches!(kind.as_str(), "audio" | "midi" | "automation") {
         return Err(format!("unsupported track kind: {kind}"));
     }
     let n = store.tracks.len();
@@ -97,7 +97,8 @@ pub(crate) fn new_track_row(
 /// Create a track in the store. STRUCTURAL — the caller must send
 /// `ControlMsg::Rebuild` afterwards (the next rebuild derives the row's
 /// slot and populates its params — round-2 §2.4). `kind`: "audio" (default)
-/// or "midi" (phase 2; "bus" reserved). Used directly by callers that
+/// or "midi" (phase 2) or "automation" (Track F; no mixer slot). "bus"
+/// is reserved. Used directly by callers that
 /// mutate the store outside the transaction channel (currently only
 /// `seed_demo_project`, which builds several tracks under one lock before
 /// any engine/event side effect); the frozen `add_track` COMMAND goes
@@ -178,5 +179,13 @@ mod tests {
         assert!(add_track(&mut store, None, Some("bus".into())).is_err());
         let t = add_track(&mut store, None, Some("midi".into())).unwrap();
         assert_eq!(t.kind, "midi");
+    }
+
+    #[test]
+    fn add_track_accepts_automation_kind() {
+        let mut store = store_with_tracks(0);
+        let t = add_track(&mut store, Some("Auto".into()), Some("automation".into())).unwrap();
+        assert_eq!(t.kind, "automation");
+        assert_eq!(store.tracks[0].kind, "automation");
     }
 }
