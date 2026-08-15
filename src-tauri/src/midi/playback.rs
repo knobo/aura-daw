@@ -306,7 +306,22 @@ fn node_for_track(
             // load has to retire the cached node rather than let it keep
             // rendering the old sound. See `PluginDoc::state_rev`.
             let rev = plugins.state_rev.get(pid).copied().unwrap_or(0);
-            let key = format!("plugin:{pid}@{rate}#{rev}");
+            // ...and so is the row's STATUS, because `live_node_for` branches
+            // on it: a still-"stub" row yields a silent `StubPluginNode`. A
+            // rebuild assembling from an image captured before the
+            // instantiation writeback flipped the row to "active" would
+            // otherwise cache that stub under a key the activation's own
+            // queued rebuild recomputes IDENTICALLY — so the track would stay
+            // silent for the rest of the session, with no rebuild able to
+            // converge it. The window is real and wide (the image is captured
+            // before `ensure_loaded`'s decode; `plugins::state::
+            // adopt_open_project` does its blob I/O with no session lock).
+            let status = plugins
+                .instances
+                .iter()
+                .find(|r| r.id == pid)
+                .map_or("absent", |r| r.status.as_str());
+            let key = format!("plugin:{pid}@{rate}#{rev}!{status}");
             if let Some(cell) = nodes
                 .resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(plugins, pid, rate))
             {
@@ -803,13 +818,13 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
         append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut out);
-        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0"));
+        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0!stub"));
 
         // Rebuilding with the SAME revision reuses the node (instantiation is
         // expensive — that reuse is the whole point of the registry).
         out.clear();
         append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut out);
-        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0"), "no needless rebuild");
+        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0!stub"), "no needless rebuild");
 
         // A patch load bumps the instance's state revision (Op::PluginSetState).
         doc.state_rev.insert("zyn-1".into(), 1);
@@ -817,8 +832,66 @@ mod tests {
         append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut out);
         assert_eq!(
             nodes.key_of("m1"),
-            Some("plugin:zyn-1@48000#1"),
+            Some("plugin:zyn-1@48000#1!stub"),
             "the node is rebuilt, so the loaded patch reaches the RT instance"
+        );
+    }
+
+    /// THE CONVERGENCE CASE (Task 6 review). Phase 1 of a rebuild reads the
+    /// published image with no session lock, so it can assemble from a
+    /// document captured BEFORE `apply_instantiate_writeback` flipped the
+    /// instance row from "stub" to "active" — caching the silent stub node.
+    /// The activation queues its own rebuild to fix that; if `status` is not
+    /// in the key, that rebuild computes the same key and gets the SAME stub
+    /// back out of the cache, and the track is silent for the rest of the
+    /// session. No later rebuild can converge it, because convergence is
+    /// exactly what the cache defeats.
+    #[test]
+    fn an_activation_retires_the_stub_node_the_pre_activation_rebuild_cached() {
+        const RATE: u32 = 48_000;
+        let mut store = Store::default();
+        let mut t = track("m1", "midi");
+        t.instrument_id = Some("plugin:zyn-1".into());
+        store.tracks.push(t);
+        let slots = crate::audio::types::derive_slots(&store.tracks);
+        let midi = midi_store_with(vec![clip(
+            "m1",
+            0,
+            960,
+            vec![MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 100, channel: 0, note_id: NoteId(0) }],
+        )]);
+        let mut doc = crate::control::session::PluginDoc::default();
+        doc.instances.push(crate::plugins::descriptor::PluginInstanceInfo {
+            id: "zyn-1".into(),
+            uid: "lv2:http://zynaddsubfx.sourceforge.net".into(),
+            name: "ZynAddSubFX".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: Some("m1".into()),
+        });
+
+        // Rebuild 1: from the PRE-activation image — a silent stub.
+        let mut nodes = LiveNodeRegistry::default();
+        let mut out = Vec::new();
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        let stub_key = nodes.key_of("m1").unwrap().to_string();
+        let stub_node = Arc::as_ptr(&out[0].live.as_ref().expect("a live node").node);
+        assert!(stub_key.starts_with("plugin:zyn-1@"), "the stub row really resolved to a plugin node");
+
+        // The writeback lands: the row is active. The rebuild it queues must
+        // NOT be served the cached stub.
+        doc.instances[0].status = "active".into();
+        out.clear();
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        assert_ne!(
+            nodes.key_of("m1"),
+            Some(stub_key.as_str()),
+            "an activation must retire the cached stub, not re-key onto it"
+        );
+        assert_ne!(
+            Arc::as_ptr(&out[0].live.as_ref().expect("a live node").node),
+            stub_node,
+            "the track must get a DIFFERENT node — the same Arc back is the silent-forever bug"
         );
     }
 }

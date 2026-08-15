@@ -1124,7 +1124,7 @@ mod tests {
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             nodes.key_of("m1"),
-            Some(format!("plugin:{}@48000#0", info.id).as_str()),
+            Some(format!("plugin:{}@48000#0!active", info.id).as_str()),
             "plugin node keyed by instance + rate + state revision"
         );
 

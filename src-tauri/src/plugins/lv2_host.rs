@@ -878,7 +878,7 @@ mod tests {
         // loaded into this document (see `PluginDoc::state_rev`).
         assert_eq!(
             nodes.key_of("zyn-track"),
-            Some(format!("plugin:{instance_id}@{RATE}#0").as_str()),
+            Some(format!("plugin:{instance_id}@{RATE}#0!active").as_str()),
             "track resolved to the real LV2 node"
         );
 
@@ -920,7 +920,7 @@ mod tests {
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
         append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, RATE, None, &mut nodes, &mut tracks);
-        assert_eq!(nodes.key_of("zyn-hold"), Some(format!("plugin:{instance_id}@{RATE}#0").as_str()));
+        assert_eq!(nodes.key_of("zyn-hold"), Some(format!("plugin:{instance_id}@{RATE}#0!active").as_str()));
         let mut g = RtGraph::new(tracks, 2, Arc::new(ParamTable::default()));
 
         let sounding = mono_of(&render_from(&mut g, 0, RATE as usize / 2, RATE, false));
