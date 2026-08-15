@@ -263,6 +263,11 @@ pub fn run() {
             // ---- automation groundwork (phase 3, zone P4) ----
             plugins::automation::automation_get,
             plugins::automation::automation_set,
+            // ---- modulation graph (Track F) ----
+            modulation::commands::modulation_get,
+            modulation::commands::modulation_set_curve,
+            modulation::commands::modulation_set_binding,
+            modulation::commands::automation_clip_set,
         ])
         // `build` + `run(callback)` rather than `run(context)`: the app has
         // to do something on the way out. See `RunEvent::Exit` below.

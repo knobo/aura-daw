@@ -20,7 +20,9 @@
 //!
 //! Design: `docs/superpowers/specs/2026-08-15-modulation-system-design.md`.
 
+pub mod commands;
 pub mod compile;
+pub mod compat;
 pub mod model;
 pub mod persist;
 pub mod resolve;
@@ -37,6 +39,7 @@ pub use model::{
     Curve, Domain, Range, RangeSnapshot, Source, TargetRef, TrackParam,
 };
 
+pub use commands::ModulationSnapshot;
 pub use persist::{load_from_project, migrate_v3_lanes, save_into_project};
 
 /// The document half of the modulation graph. Lives in `Session`, mirrors

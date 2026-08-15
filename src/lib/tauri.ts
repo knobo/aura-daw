@@ -13,9 +13,13 @@ import type {
   AuraClipsPayload,
   AuraEventMap,
   AuraEventName,
+  AutomationClip,
   AutomationLane,
+  Binding,
   Clip,
   ClipPlacement,
+  Curve,
+  ModulationSnapshot,
   EvolveOptions,
   ExportCapabilities,
   ExportJobStatus,
@@ -172,6 +176,16 @@ export interface Backend {
    * the lane's FULL point set (D-03: an edit gesture, never one invoke per
    * point). Returns the updated lane list. */
   automationSet?(lane: AutomationLane): Promise<AutomationLane[]>;
+
+  /** Full modulation document (curves + bindings + automation clips).
+   * Optional: the demo backend has no modulation. */
+  modulationGet?(): Promise<ModulationSnapshot>;
+  /** Upsert one curve; returns the updated snapshot (D-03). */
+  modulationSetCurve?(curve: Curve): Promise<ModulationSnapshot>;
+  /** Upsert one binding; returns the updated snapshot. */
+  modulationSetBinding?(binding: Binding): Promise<ModulationSnapshot>;
+  /** Upsert one automation clip; returns the updated snapshot. */
+  automationClipSet?(clip: AutomationClip): Promise<ModulationSnapshot>;
 
   /** Open a gesture boundary (Plan E Task 14, round-2 §4.4's CLAP-style
    * primitive) — call on `pointerdown` of a fader/pan control. Matching
@@ -544,6 +558,18 @@ class TauriBackend implements Backend {
   }
   automationSet(lane: AutomationLane) {
     return invoke<AutomationLane[]>("automation_set", { lane });
+  }
+  modulationGet() {
+    return invoke<ModulationSnapshot>("modulation_get");
+  }
+  modulationSetCurve(curve: Curve) {
+    return invoke<ModulationSnapshot>("modulation_set_curve", { curve });
+  }
+  modulationSetBinding(binding: Binding) {
+    return invoke<ModulationSnapshot>("modulation_set_binding", { binding });
+  }
+  automationClipSet(clip: AutomationClip) {
+    return invoke<ModulationSnapshot>("automation_clip_set", { clip });
   }
   undo() {
     return invoke<HistoryStep>("undo");

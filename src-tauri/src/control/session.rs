@@ -82,8 +82,8 @@ pub struct Session {
     pub midi: MidiStore,
     pub automation: AutomationDoc,
     /// Track F modulation graph (curves, bindings, automation clips).
-    /// Coexists with `automation` until Task 7's compatibility facade
-    /// retires the lane document.
+    /// Source of truth after Task 7's facade. `automation` is the derived
+    /// lane view `automation_get` still reads.
     pub modulation: crate::modulation::ModulationDoc,
     pub plugins: PluginDoc,
     pub(crate) rev: u64,
@@ -328,8 +328,8 @@ pub struct PersistEffect {
     /// Task 10 wires the executor; the field exists now.
     pub automation: bool,
     /// Track F: `modulation::persist::save_into_project` from a
-    /// `ModulationDoc` snapshot. Coexists with `automation` until Task 7
-    /// retires the lane persist path.
+    /// `ModulationDoc` snapshot. Authoritative once the Task 7 facade
+    /// owns the document — see `execute_persist`.
     pub modulation: bool,
 }
 
@@ -369,6 +369,13 @@ pub struct Committed {
 /// store / engine handle / control-message reference anywhere in this
 /// module (grep-gated, see `ControlPlane::commit`). `ControlPlane::commit`
 /// EXECUTES the folded effect after the session lock is released.
+/// Keep `session.automation` as the derived lane view of the modulation
+/// document so `automation_get` and the plugin-param driver stay in sync
+/// when the new commands mutate curves/bindings directly.
+fn sync_derived_lanes(session: &mut Session) {
+    session.automation.lanes = crate::modulation::compat::lanes_from_doc(&session.modulation);
+}
+
 fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Result<Op, String> {
     match op {
         Op::Set { object: ObjectRef::Track(id), path, to, .. } => {
@@ -800,6 +807,11 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // truth) as the inverse's payload — `None` when the key didn't
             // exist (mirrors `Op::Set`'s "inverse from store truth, never
             // guessed" rule).
+            // Facade: journals replay into the modulation document.
+            // `session.automation` stays as the derived view the existing
+            // tests and `automation_get` inspect; the pair is written
+            // together so a persist of either half describes the same edit.
+            crate::modulation::compat::apply_lane(&mut session.modulation, key, new_lane.as_ref());
             let previous = match pos {
                 Some(idx) => match new_lane.take() {
                     Some(nl) => Some(std::mem::replace(&mut session.automation.lanes[idx], nl)),
@@ -813,15 +825,15 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 }
             };
             effect.persist.automation = true;
+            effect.persist.modulation = true;
             effect.rebuild = true;
             Ok(Op::AutomationSetLane { key: key.clone(), lane: previous })
         }
         // Track F: modulation document arms. Same shape as
         // `AutomationSetLane` — validate/normalize BEFORE mutation,
         // upsert/remove by key, previous store truth as inverse, rebuild.
-        // Old `AutomationSetLane` continues to write `session.automation`
-        // (Task 7 owns the compat facade that will route journals into the
-        // new document).
+        // `Op::AutomationSetLane` also writes `session.modulation` via
+        // `modulation::compat` so old journals replay into the new document.
         Op::ModulationSetCurve { key, curve } => {
             let pos = session.modulation.curves.iter().position(|c| &c.id == key);
             let mut new_curve = match curve {
@@ -847,6 +859,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             };
             effect.persist.modulation = true;
             effect.rebuild = true;
+            sync_derived_lanes(session);
             Ok(Op::ModulationSetCurve { key: key.clone(), curve: previous })
         }
         Op::ModulationSetBinding { key, binding } => {
@@ -874,6 +887,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             };
             effect.persist.modulation = true;
             effect.rebuild = true;
+            sync_derived_lanes(session);
             Ok(Op::ModulationSetBinding { key: key.clone(), binding: previous })
         }
         Op::AutomationClipSet { key, clip } => {
@@ -911,6 +925,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             };
             effect.persist.modulation = true;
             effect.rebuild = true;
+            sync_derived_lanes(session);
             Ok(Op::AutomationClipSet { key: key.clone(), clip: previous })
         }
         // Plan E Task 9 (round-2 inventory rows 12-15): plugin instance
