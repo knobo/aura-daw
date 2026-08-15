@@ -493,7 +493,7 @@
 <div class="timeline" onwheel={onWheel}>
   <!-- ruler row -->
   <div class="ruler-row">
-    <div class="corner silk" title="Ctrl+C copy · Ctrl+V paste at playhead · Ctrl+Shift+V paste onto new tracks">
+    <div class="corner silk" title="Ctrl+C copy · Ctrl+V paste at playhead · Ctrl+Shift+V paste onto new tracks · Ctrl+Shift+M export selection as MIDI">
       {clipSelection.count() > 0
         ? `${clipSelection.count()} clip${clipSelection.count() === 1 ? "" : "s"} selected`
         : `tracks · ${project.tracks.length}`}

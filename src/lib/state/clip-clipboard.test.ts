@@ -33,6 +33,9 @@ const midiAddClip = vi.fn();
 // resolves to something falsy) for the demo-mode test below — a getter lets
 // one test flip it to `undefined` and every other test keep the real mock.
 let clipsPasteAvailable = true;
+const midiExportFile = vi.fn(async (path: string, _ids: string[] | null) => path);
+let savePath: string | null = "/tmp/out.mid";
+vi.mock("@tauri-apps/plugin-dialog", () => ({ save: async () => savePath }));
 
 vi.mock("../tauri", () => ({
   backend: {
@@ -44,6 +47,7 @@ vi.mock("../tauri", () => ({
     osClipboardWriteText: (t: string) => osClipboardWriteText(t),
     osClipboardReadText: () => osClipboardReadText(),
     midiAddClip: (...args: unknown[]) => midiAddClip(...args),
+    midiExportFile: (p: string, ids: string[] | null) => midiExportFile(p, ids as never),
     getProjectState: () =>
       Promise.resolve({ ppq: 960, tempoEvents: [{ tick: 0, bpm: 120 }], midiClips: [] }),
   },
@@ -75,6 +79,7 @@ beforeEach(() => {
   clipsCopy.mockImplementation(async () => payload);
   clipsPasteAvailable = true;
   clipboardText = "";
+  savePath = "/tmp/out.mid";
   project.tracks = [];
   project.clips = [{ id: "a1", trackId: "t1" } as Clip];
   midi.clips = [{ id: "m1", trackId: "t2" } as MidiClip];
@@ -359,5 +364,33 @@ describe("clipClipboard.pasteAtPlayhead", () => {
 
     expect(midiAddClip).not.toHaveBeenCalled();
     expect(toasts.list.length).toBe(before);
+  });
+});
+
+describe("clipClipboard.exportSelectionSmf", () => {
+  it("does nothing when no MIDI clip is selected", async () => {
+    clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
+    await clipClipboard.exportSelectionSmf();
+    expect(midiExportFile).not.toHaveBeenCalled();
+  });
+
+  it("exports exactly the selected MIDI clip ids to the chosen path", async () => {
+    savePath = "/tmp/riff.mid";
+    clipSelection.apply(
+      [
+        { kind: "midi", id: "m1" },
+        { kind: "audio", id: "a1" },
+      ],
+      "replace",
+    );
+    await clipClipboard.exportSelectionSmf();
+    expect(midiExportFile).toHaveBeenCalledWith("/tmp/riff.mid", ["m1"]);
+  });
+
+  it("does nothing when the save dialog is cancelled", async () => {
+    savePath = null;
+    clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
+    await clipClipboard.exportSelectionSmf();
+    expect(midiExportFile).not.toHaveBeenCalled();
   });
 });

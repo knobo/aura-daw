@@ -210,6 +210,35 @@ class ClipClipboardStore {
       );
     }
   }
+
+  /**
+   * Export the selected MIDI clips as a format-1 .mid file — the
+   * interchange half of "copy", for DAWs that will never understand the
+   * AURA envelope. EXPORT-ONLY on purpose (plan scope ruling C): the OS
+   * clipboard slot this app can own is text, so SMF cannot ride on the
+   * clipboard, and paste therefore never parses SMF.
+   *
+   * Reuses the FROZEN `midi_export_file(path, clipIds)` command — its
+   * clip-id filter is exactly this feature.
+   */
+  async exportSelectionSmf(): Promise<void> {
+    const ids = clipSelection.midiIds();
+    if (ids.length === 0) return;
+    const { save } = await import("@tauri-apps/plugin-dialog");
+    const path = await save({
+      title: "Export selection as MIDI",
+      defaultPath: "selection.mid",
+      filters: [{ name: "MIDI", extensions: ["mid"] }],
+    });
+    if (!path) return;
+    try {
+      await backend.midiExportFile(path, ids);
+      toasts.info("EXPORTED", path);
+    } catch (err) {
+      console.error("[aura] midi_export_file failed:", err);
+      toasts.error("MIDI EXPORT FAILED", String(err));
+    }
+  }
 }
 
 export const clipClipboard = new ClipClipboardStore();

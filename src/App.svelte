@@ -205,6 +205,11 @@
       // was actually pressed at.
       e.preventDefault();
       void clipClipboard.pasteAtPlayhead(playhead(), e.shiftKey);
+    } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "m") {
+      // Export the selected MIDI clips as a .mid file — the interchange
+      // half of copy, for other DAWs (SMF never rides on the clipboard).
+      e.preventDefault();
+      void clipClipboard.exportSelectionSmf();
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "d") {
       // Duplicate immediately after the selected clip.
       e.preventDefault();
