@@ -96,3 +96,13 @@ const MARQUEE_IGNORE = ".clip, .mclip, button, .autolane";
 export function startsMarquee(target: { closest(sel: string): unknown } | null): boolean {
   return !!target && !target.closest(MARQUEE_IGNORE);
 }
+
+/** Pixels of movement before an empty-lane press becomes a marquee.
+ * Below this, the press is a click / the first half of a double-click —
+ * capturing the pointer on pointerdown (WebKit/Tauri) swallows `dblclick`
+ * on the lane, which is how a MIDI clip is created. */
+export const MARQUEE_SLOP_PX = 4;
+
+export function movedPastMarqueeSlop(dx: number, dy: number): boolean {
+  return dx * dx + dy * dy >= MARQUEE_SLOP_PX * MARQUEE_SLOP_PX;
+}

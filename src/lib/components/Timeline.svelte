@@ -15,7 +15,12 @@
   import { toasts } from "../state/toasts.svelte";
   import { clipSelection } from "../state/clip-selection.svelte";
   import { canvasPos } from "../utils/canvas-pos";
-  import { applySelection, marqueeClipHits, startsMarquee } from "../utils/clip-selection";
+  import {
+    applySelection,
+    marqueeClipHits,
+    movedPastMarqueeSlop,
+    startsMarquee,
+  } from "../utils/clip-selection";
   import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildLaneBoxes, laneIndexAt, TRACK_HEIGHT_PX } from "../utils/lane-geometry";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
@@ -432,6 +437,10 @@
     mode: ReturnType<typeof selectionModeFor>;
   };
   let marquee: Marquee | null = $state(null);
+  /** Press on empty lane that has not moved far enough to be a marquee.
+   * Capturing on pointerdown (the old path) ate `dblclick` on WebKit, so
+   * double-click-to-create a MIDI clip never fired. */
+  let pendingMarquee: Marquee | null = null;
 
   const marqueeRect = $derived.by(() => {
     const m = marquee;
@@ -450,18 +459,33 @@
     if (!lanesEl) return;
     const p = canvasPos(lanesEl, e.clientX, e.clientY);
     const mode = selectionModeFor(e);
-    marquee = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, baseKeys: new Set(clipSelection.keys), mode };
-    if (mode === "replace") clipSelection.clear();
-    try {
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    } catch {
-      /* synthetic pointer */
-    }
+    pendingMarquee = {
+      x0: p.x,
+      y0: p.y,
+      x1: p.x,
+      y1: p.y,
+      baseKeys: new Set(clipSelection.keys),
+      mode,
+    };
+    // Capture only after slop — see pendingMarquee. Without it the second
+    // click of a double-click is retargeted and onLaneDblClick never runs.
   }
 
   function onLanesPointerMove(e: PointerEvent) {
-    if (!marquee || !lanesEl) return;
+    if (!lanesEl) return;
     const p = canvasPos(lanesEl, e.clientX, e.clientY);
+    if (pendingMarquee && !marquee) {
+      if (!movedPastMarqueeSlop(p.x - pendingMarquee.x0, p.y - pendingMarquee.y0)) return;
+      marquee = { ...pendingMarquee, x1: p.x, y1: p.y };
+      pendingMarquee = null;
+      if (marquee.mode === "replace") clipSelection.clear();
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        /* synthetic pointer */
+      }
+    }
+    if (!marquee) return;
     marquee = { ...marquee, x1: p.x, y1: p.y };
     const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
     const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
@@ -481,6 +505,13 @@
   }
 
   function onLanesPointerUp(e: PointerEvent) {
+    // A press that never crossed slop is a click on empty lane: drop the
+    // selection, same as the old immediate-replace clear, but without
+    // eating the following dblclick.
+    if (pendingMarquee && !marquee && pendingMarquee.mode === "replace") {
+      clipSelection.clear();
+    }
+    pendingMarquee = null;
     marquee = null;
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
