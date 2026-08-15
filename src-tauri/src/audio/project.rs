@@ -336,7 +336,7 @@ fn mint_deterministic_source_id(normalized_path: &str) -> SourceId {
 /// on the caller side discards the join base for an absolute `rel`, which
 /// can point straight out of the project. Absolute paths are now rejected
 /// exactly like `..`, never salvaged.
-fn normalize_source_path(source_path: &str) -> Result<String, String> {
+pub(crate) fn normalize_source_path(source_path: &str) -> Result<String, String> {
     let slashed = source_path.replace('\\', "/");
     if slashed.starts_with('/') {
         return Err(format!("source_path is absolute, refusing to normalize: {source_path:?}"));

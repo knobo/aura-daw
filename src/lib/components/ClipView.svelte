@@ -10,6 +10,9 @@
   import { view } from "../state/view.svelte";
   import { jobs } from "../state/jobs.svelte";
   import { ui } from "../state/ui.svelte";
+  import { clipSelection } from "../state/clip-selection.svelte";
+  import { clipDrag } from "../state/clip-drag.svelte";
+  import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildPeakColumns } from "../render/tiles";
   import { createPainter, hexToRgba, type WaveformPainter } from "../render/painter";
 
@@ -24,7 +27,7 @@
   const visL = $derived(Math.max(0, -leftPx));
   const visR = $derived(Math.min(widthPx, view.width - leftPx));
   const visW = $derived(Math.max(0, Math.floor(visR - visL)));
-  const selected = $derived(project.selectedClipId === clip.id);
+  const selected = $derived(clipSelection.has({ kind: "audio", id: clip.id }));
   const job = $derived(jobs.jobForClip(clip.id));
 
   // ── waveform painting ──
@@ -82,19 +85,24 @@
 
   // ── drag ──
 
-  let dragging = $state(false);
-  let dragStartX = 0;
-  let dragOrigSamples = 0;
-  let dragMoved = false;
+  const dragging = $derived(clipDrag.active && selected);
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest("button")) return;
+    const ref = { kind: "audio", id: clip.id } as const;
+    const mode = selectionModeFor(e);
+    // A plain click on an ALREADY-selected clip must not collapse the
+    // selection — that is what makes dragging a group possible at all.
+    if (!(mode === "replace" && clipSelection.has(ref))) {
+      clipSelection.apply([ref], mode);
+    } else {
+      clipSelection.anchor = ref;
+    }
+    // Focused clip (scope ruling F): SPLIT STEMS, the Dock and AI-Studio
+    // targeting still act on exactly one clip.
     project.select(clip.id);
-    dragging = true;
-    dragMoved = false;
-    dragStartX = e.clientX;
-    dragOrigSamples = clip.timelineStartSamples;
+    clipDrag.begin(ref, e.clientX);
     try {
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     } catch {
@@ -103,24 +111,16 @@
   }
 
   function onPointerMove(e: PointerEvent) {
-    if (!dragging) return;
-    const dx = e.clientX - dragStartX;
-    if (Math.abs(dx) > 2) dragMoved = true;
-    if (!dragMoved) return;
-    let target = dragOrigSamples + dx * view.spp;
-    if (!e.altKey) target = view.snapSamples(target);
-    project.moveClip(clip.id, target);
+    clipDrag.move(e.clientX, e.altKey);
   }
 
   function onPointerUp(e: PointerEvent) {
-    const wasDragging = dragging && dragMoved;
-    dragging = false;
     try {
       (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
     } catch {
       /* not captured */
     }
-    if (wasDragging) void project.commitClipMove(clip.id);
+    void clipDrag.end();
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -153,6 +153,7 @@
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
+    onpointercancel={() => clipDrag.cancel()}
     onkeydown={onKeydown}
   >
     <canvas bind:this={canvas} class="wave" style:left="{visL}px" style:width="{visW}px"></canvas>

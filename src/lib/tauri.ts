@@ -10,10 +10,12 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AudioDevice,
+  AuraClipsPayload,
   AuraEventMap,
   AuraEventName,
   AutomationLane,
   Clip,
+  ClipPlacement,
   EvolveOptions,
   ExportCapabilities,
   ExportJobStatus,
@@ -39,6 +41,8 @@ import type {
   PluginListResult,
   PluginParamChange,
   PluginParamInfo,
+  PasteRequest,
+  PasteResult,
   Project,
   ProjectSnapshot,
   SidecarEvent,
@@ -142,6 +146,21 @@ export interface Backend {
    * `seedDemoProject?`; the demo backend keeps clip placement local-only. */
   moveClip?(clipId: string, timelineStartSamples: number): Promise<void>;
 
+  /** Batch placement move — the group-drag counterpart of `moveClip`. Sent
+   * ONCE at gesture end, inside a `gestureBegin`/`gestureEnd` boundary, so
+   * the whole drag is one undo step. Optional — real-engine only, same
+   * convention as `moveClip?`. */
+  moveClips?(placements: ClipPlacement[]): Promise<void>;
+
+  /** Build the application/x-aura-clips payload for these clips — a pure
+   * backend READ. Selection stays frontend-side; the backend is told WHICH
+   * clips, never "what is selected". */
+  clipsCopy?(audioClipIds: string[], midiClipIds: string[]): Promise<AuraClipsPayload>;
+  /** Paste a payload at `atSamples` as ONE transaction (one undo step). */
+  clipsPaste?(request: PasteRequest): Promise<PasteResult>;
+  /** OS clipboard text slot (cross-instance copy/paste). */
+  osClipboardWriteText?(text: string): Promise<void>;
+  osClipboardReadText?(): Promise<string>;
   /** Remove an audio clip from its track. */
   removeClip(clipId: string): Promise<void>;
 
@@ -486,6 +505,21 @@ class TauriBackend implements Backend {
   }
   moveClip(clipId: string, timelineStartSamples: number) {
     return invoke<void>("move_clip", { clipId, timelineStartSamples });
+  }
+  moveClips(placements: ClipPlacement[]) {
+    return invoke<void>("move_clips", { placements });
+  }
+  clipsCopy(audioClipIds: string[], midiClipIds: string[]) {
+    return invoke<AuraClipsPayload>("clips_copy", { audioClipIds, midiClipIds });
+  }
+  clipsPaste(request: PasteRequest) {
+    return invoke<PasteResult>("clips_paste", { request });
+  }
+  osClipboardWriteText(text: string) {
+    return invoke<void>("os_clipboard_write_text", { text });
+  }
+  osClipboardReadText() {
+    return invoke<string>("os_clipboard_read_text");
   }
   async removeClip(clipId: string) {
     await invoke("remove_clip", { clipId });

@@ -364,6 +364,79 @@ export interface MidiClip {
   notes: MidiNote[];
 }
 
+/** One clip's new placement in a `move_clips` batch (Track C). Audio is
+ * placed in SAMPLES, MIDI in TICKS — two units that must never be
+ * confusable, hence the `kind` tag. `lengthTicks`/`contentLengthTicks` are
+ * additive and OPTIONAL: absent means "unchanged", never "clear". */
+export type ClipPlacement =
+  | { kind: "audio"; clipId: string; timelineStartSamples: number }
+  | {
+      kind: "midi";
+      clipId: string;
+      timelineStartTicks: number;
+      lengthTicks?: number;
+      contentLengthTicks?: number;
+    };
+
+// ── application/x-aura-clips (Track C) ──────────────────────────────────────
+
+export interface SkippedClip {
+  name: string;
+  reason: string;
+}
+
+export type ClipboardClip =
+  | {
+      kind: "audio";
+      name: string;
+      sourceTrackId: string;
+      sourceTrackName: string;
+      offsetFromAnchorSamples: number;
+      lengthSamples: number;
+      sourcePath: string;
+      sourceAbsPath: string | null;
+      sourceChannels: number;
+      sourceSampleRate: number;
+      sourceLengthSamples: number;
+      offsetSamples: number;
+      gainDb: number;
+      fadeInSamples: number;
+      fadeOutSamples: number;
+    }
+  | {
+      kind: "midi";
+      name: string;
+      sourceTrackId: string;
+      sourceTrackName: string;
+      offsetFromAnchorTicks: number;
+      lengthTicks: number;
+      contentLengthTicks: number | null;
+      notes: MidiNote[];
+    };
+
+export interface AuraClipsPayload {
+  mime: string;
+  schemaVersion: number;
+  anchorSamples: number;
+  anchorTicks: number;
+  ppq: number;
+  sourceProjectDir: string | null;
+  clips: ClipboardClip[];
+}
+
+export interface PasteRequest {
+  payload: AuraClipsPayload;
+  atSamples: number;
+  toNewTracks: boolean;
+}
+
+export interface PasteResult {
+  audioClips: Clip[];
+  midiClips: MidiClip[];
+  createdTracks: TrackState[];
+  skipped: SkippedClip[];
+}
+
 /** Result of get_project_state (control plane cold-start snapshot). */
 export interface ProjectSnapshot {
   projectName?: string | null;

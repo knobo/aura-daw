@@ -12,6 +12,9 @@
   import { prefs } from "../prefs/prefs.svelte";
   import { midiPreviewLayout } from "../utils/midi-preview";
   import { view } from "../state/view.svelte";
+  import { clipSelection } from "../state/clip-selection.svelte";
+  import { clipDrag } from "../state/clip-drag.svelte";
+  import { selectionModeFor } from "../utils/selection-modifiers";
 
   let { clip, track }: { clip: MidiClip; track: TrackState } = $props();
 
@@ -70,7 +73,11 @@
   const widthPx = $derived(lengthSamples / view.spp);
   const visL = $derived(Math.max(0, -leftPx));
   const visR = $derived(Math.min(widthPx, view.width - leftPx));
-  const selected = $derived(midi.selectedClipId === clip.id);
+  const selected = $derived(clipSelection.has({ kind: "midi", id: clip.id }));
+  /** True while the pointer hovers ANY selected MIDI clip's right edge —
+   * so a group resize announces itself on every clip it will affect, not
+   * just the one under the pointer. */
+  const groupEdgeHover = $derived(clipDrag.edgeHoverActive && clipSelection.count() > 1);
   const open = $derived(midi.openClipId === clip.id);
   // freshly landed (hum-to-song etc.) — transient glow set by midi.flash()
   const landed = $derived(midi.flashClipId === clip.id);
@@ -123,13 +130,8 @@
   });
 
   // ── drag / select / edge-resize (mirrors ClipView + the ruler's loop pins) ──
-  let dragging = $state(false);
+  let dragging = $derived(clipDrag.active && selected);
   let dragMode: "move" | "resize" = $state("move");
-  let dragStartX = 0;
-  let dragOrigTicks = 0;
-  let dragOrigLengthTicks = 0;
-  let dragOrigContentTicks = 0; // pinned once, at drag start, for a resize gesture
-  let dragMoved = false;
 
   const EDGE_PX = 8;
 
@@ -138,62 +140,44 @@
     if (dragging) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     hoverEdge = rect.right - e.clientX <= EDGE_PX;
+    clipDrag.edgeHoverActive = hoverEdge;
   }
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    // The × button (main's clip-delete) lives INSIDE the clip, so its
+    // pointerdown must not select, must not move the anchor and must not
+    // open a drag — otherwise deleting one clip silently collapses a
+    // multi-clip selection on the way out. Ahead of everything, as in
+    // ClipView.
     if ((e.target as HTMLElement).closest("button")) return;
+    const ref = { kind: "midi", id: clip.id } as const;
+    const mode = selectionModeFor(e);
+    if (!(mode === "replace" && clipSelection.has(ref))) {
+      clipSelection.apply([ref], mode);
+    } else {
+      clipSelection.anchor = ref;
+    }
     midi.select(clip.id);
     project.select(null);
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const nearRightEdge = rect.right - e.clientX <= EDGE_PX;
     dragMode = nearRightEdge ? "resize" : "move";
-    dragging = true;
-    dragMoved = false;
-    dragStartX = e.clientX;
-    dragOrigTicks = clip.timelineStartTicks;
-    dragOrigLengthTicks = clip.lengthTicks;
-    // Content length is pinned the moment a resize STARTS, not re-read every
-    // pointermove — the spec's "set the first time the right edge is
-    // dragged" rule: if the clip has no explicit content length yet, this
-    // drag's start-of-gesture placement length BECOMES the content length.
-    dragOrigContentTicks = midi.effectiveContentLengthTicks(clip);
     // Which half of the clip the gesture started in, decided by geometry
     // rather than by e.target: the capture below retargets the following
     // click/dblclick to this element, and the name tag is a 9px-tall hit
     // target nobody can reliably hit anyway.
     downOnHeader = e.clientY - rect.top <= HEADER_PX;
+    clipDrag.begin(ref, e.clientX, dragMode);
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   }
   function onPointerMove(e: PointerEvent) {
     updateHoverEdge(e);
-    if (!dragging) return;
-    const dx = e.clientX - dragStartX;
-    if (Math.abs(dx) > 2) dragMoved = true;
-    if (!dragMoved) return;
-    if (dragMode === "resize") {
-      let targetSamples = midi.ticksToSamples(dragOrigTicks + dragOrigLengthTicks) + dx * view.spp;
-      if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
-      const newLengthTicks = Math.max(
-        1,
-        Math.round(midi.samplesToTicks(Math.max(0, targetSamples)) - dragOrigTicks),
-      );
-      midi.clips = midi.clips.map((c) =>
-        c.id === clip.id
-          ? { ...c, lengthTicks: newLengthTicks, contentLengthTicks: dragOrigContentTicks }
-          : c,
-      );
-    } else {
-      let targetSamples = midi.ticksToSamples(dragOrigTicks) + dx * view.spp;
-      if (!e.altKey) targetSamples = view.snapSamples(targetSamples);
-      midi.moveClip(clip.id, midi.samplesToTicks(Math.max(0, targetSamples)));
-    }
+    clipDrag.move(e.clientX, e.altKey);
   }
   function onPointerUp(e: PointerEvent) {
-    const wasDragging = dragging && dragMoved;
-    dragging = false;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
-    if (wasDragging) void midi.commitBounds(clip.id);
+    void clipDrag.end();
   }
   // ── rename ──
   // The clip body's double-click is already taken (piano roll), so the name
@@ -260,7 +244,7 @@
     class:selected
     class:open
     class:landed
-    class:edge={hoverEdge || (dragging && dragMode === "resize")}
+    class:edge={hoverEdge || (dragging && dragMode === "resize") || (selected && groupEdgeHover)}
     style:left="{leftPx}px"
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
@@ -270,6 +254,11 @@
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
+    onpointercancel={() => clipDrag.cancel()}
+    onpointerleave={() => {
+      hoverEdge = false;
+      clipDrag.edgeHoverActive = false;
+    }}
     ondblclick={() => (downOnHeader ? startRename() : midi.open(clip.id))}
     onkeydown={onKeydown}
   >

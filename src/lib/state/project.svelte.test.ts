@@ -15,6 +15,7 @@ const gestureBegin = vi.fn(() => Promise.resolve());
 const gestureEnd = vi.fn(() => Promise.resolve());
 const setTrackArm = vi.fn(() => Promise.resolve());
 const midiSelectInputTrack = vi.fn(() => Promise.resolve());
+const addTrack = vi.fn();
 
 vi.mock("../tauri", () => ({
   backend: {
@@ -26,6 +27,7 @@ vi.mock("../tauri", () => ({
     gestureEnd,
     setTrackArm,
     midiSelectInputTrack,
+    addTrack: (init: Partial<TrackState>) => addTrack(init as never),
   },
 }));
 
@@ -124,6 +126,60 @@ describe("removeClip", () => {
  * (label passed through on begin; end is a plain, argument-less close),
  * not the DOM event wiring itself.
  */
+/**
+ * `clips_paste` commits `project://changed` INSIDE its transaction, and
+ * `applyProject` replaces `tracks` wholesale — so the authoritative
+ * post-paste list can already contain a just-created track by the time the
+ * paste command's own promise resolves and its caller tries to append it.
+ * `upsertTrack` is the de-dup `upsertClip` already has on the clip side.
+ */
+describe("upsertTrack", () => {
+  it("appends a track whose id is not yet in the store", () => {
+    project.tracks = [testTrack({ id: "t-1" })];
+    project.upsertTrack(testTrack({ id: "t-2", name: "New" }));
+    expect(project.tracks.map((t) => t.id)).toEqual(["t-1", "t-2"]);
+  });
+
+  it("replaces, rather than duplicates, a track whose id is already present", () => {
+    project.tracks = [testTrack({ id: "t-1", name: "Old" })];
+    project.upsertTrack(testTrack({ id: "t-1", name: "Renamed" }));
+    expect(project.tracks.map((t) => t.id)).toEqual(["t-1"]);
+    expect(project.tracks[0].name).toBe("Renamed");
+  });
+});
+
+/**
+ * `add_track` also emits `project://changed` INSIDE its transaction — the
+ * identical race `upsertTrack`'s own tests cover for `clips_paste`. `addTrack`
+ * now routes through `upsertTrack` (fix round 2, minor 4) so a track the
+ * event handler already applied is replaced, not duplicated, when this
+ * method's own promise resolves after it.
+ */
+describe("addTrack", () => {
+  it("does not duplicate a track that project://changed already applied before the backend call resolved", async () => {
+    project.tracks = [];
+    const created = testTrack({ id: "t-new", name: "Bass" });
+    addTrack.mockImplementationOnce(async () => {
+      project.upsertTrack(created);
+      return created;
+    });
+    await project.addTrack({ name: "Bass" });
+    expect(project.tracks.filter((t) => t.id === "t-new").length).toBe(1);
+  });
+
+  it("still applies a requested cosmetic override even when the event landed the track first", async () => {
+    project.tracks = [];
+    const created = testTrack({ id: "t-new", name: "Bass", color: "#000000" });
+    addTrack.mockImplementationOnce(async () => {
+      project.upsertTrack(created); // the event's own (pre-override) copy
+      return created;
+    });
+    const result = await project.addTrack({ name: "Bass", color: "#ff00ff" });
+    expect(result.color).toBe("#ff00ff");
+    expect(project.tracks.find((t) => t.id === "t-new")?.color).toBe("#ff00ff");
+  });
+});
+
 describe("beginGesture / endGesture", () => {
   it("beginGesture invokes backend.gestureBegin with the given label", () => {
     project.beginGesture("gain drag");

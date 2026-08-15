@@ -30,6 +30,8 @@
   import { loopjam } from "./lib/state/loopjam.svelte";
   import { generation } from "./lib/state/generation.svelte";
   import { clipEdges, edgeJump, gridStep } from "./lib/utils/timeline-nav";
+  import { clipClipboard } from "./lib/state/clip-clipboard.svelte";
+  import { clipSelection } from "./lib/state/clip-selection.svelte";
   import TransportBar from "./lib/components/TransportBar.svelte";
   import Timeline from "./lib/components/Timeline.svelte";
   import MasterBar from "./lib/components/MasterBar.svelte";
@@ -185,13 +187,29 @@
       );
       if (target !== null) void transport.seek(target);
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "c") {
-      // Copy the selected timeline clip (spec §6 stamping).
+      // Copy the timeline selection (multi-clip, audio + MIDI). Falls back
+      // to the legacy single-clip stamp when nothing is multi-selected, so
+      // the old Ctrl+C behaviour never regresses.
       e.preventDefault();
-      midi.copySelected();
-    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "v") {
-      // Paste at the playhead, on the selected clip's track.
+      if (clipSelection.count() > 0) void clipClipboard.copy();
+      else midi.copySelected();
+    } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "v") {
+      // Paste at the playhead: Shift pastes onto NEW tracks.
+      // `clipClipboard.pasteAtPlayhead` OWNS the multi-clip-first / legacy-
+      // fallback / nothing-to-paste-toast orchestration (fix round 2) — a
+      // thin delegation here, not reimplemented, so App.svelte stays inside
+      // the "no logic a test can't reach" rule. `playhead()` is evaluated
+      // ONCE, right here, as the argument: it is a live interpolated
+      // position, and reading it again after an internal await would let
+      // the legacy fallback land at a later position than the one the key
+      // was actually pressed at.
       e.preventDefault();
-      void midi.pasteAtPlayhead(midi.samplesToTicks(playhead()));
+      void clipClipboard.pasteAtPlayhead(playhead(), e.shiftKey);
+    } else if ((e.ctrlKey || e.metaKey) && e.shiftKey && !e.altKey && e.key.toLowerCase() === "m") {
+      // Export the selected MIDI clips as a .mid file — the interchange
+      // half of copy, for other DAWs (SMF never rides on the clipboard).
+      e.preventDefault();
+      void clipClipboard.exportSelectionSmf();
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "d") {
       // Duplicate immediately after the selected clip.
       e.preventDefault();

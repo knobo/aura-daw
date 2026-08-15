@@ -104,8 +104,27 @@ class ProjectStore {
     const track = await backend.addTrack(init);
     // Backend may ignore cosmetic fields; keep requested ones locally.
     const merged = { ...track, ...("color" in init ? { color: init.color! } : {}), ...("name" in init ? { name: init.name! } : {}) };
-    this.tracks = [...this.tracks, merged];
+    // `project://changed` is emitted inside the add-track transaction too,
+    // same as `clips_paste` — a blind append here would carry the identical
+    // duplicate-track race `upsertTrack` exists to close (fix round 2,
+    // minor 4). `upsertTrack` REPLACES a matching entry rather than
+    // skipping it, so the cosmetic-override merge above still lands even
+    // if the store already picked the track up via the event.
+    this.upsertTrack(merged);
     return merged;
+  }
+
+  /** Idempotent track insert (the `addTrack`-shaped duplicate `upsertClip`
+   * already guards against on the clip side). Needed because `clips_paste`
+   * commits `project://changed` INSIDE the transaction — `applyProject` can
+   * already have replaced `tracks` with the authoritative post-paste list
+   * by the time the paste's own `await` resolves and tries to append the
+   * track it just asked for, which a blind spread would duplicate. */
+  upsertTrack(track: TrackState) {
+    const exists = this.tracks.some((t) => t.id === track.id);
+    this.tracks = exists
+      ? this.tracks.map((t) => (t.id === track.id ? track : t))
+      : [...this.tracks, track];
   }
 
   async removeTrack(trackId: string) {

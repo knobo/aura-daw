@@ -1258,3 +1258,471 @@ decision for the owner**, not a refactor.
   `pure_readers::library_audition_core_leaves_the_document_and_the_history_untouched`.
   Re-run in isolation before calling any of them a regression. Zyn host
   spam on stderr is expected noise.
+
+## Track C handoff (2026-08-15, subagent-driven session, external review layer)
+
+Track C (multi-clip selection, group drag/resize, cross-track and
+cross-instance paste, SMF export of a selection) is **IMPLEMENTED** on
+branch `multiclip-clipboard` (**PR #22**), cut from `origin/main` at
+`3340aa8`, with `origin/main` merged in twice: at the Task 9/10
+boundary (`c26d01d`, pulling in Tracks E, D and B plus two commits the owner
+merged himself) and again at close-out (`79ae94c`, pulling in PR #26 clip
+delete and PR #29's LV2 stderr guard — see "The second merge" below). Plan document:
+`docs/superpowers/plans/2026-08-14-multiclip-selection-paste.md`. SDD ledger
+(gitignored): `.superpowers/sdd/2026-08-14-multiclip-selection-paste/progress.md`.
+Thirteen tasks.
+
+**What landed.** Selection is **viewer state** and nothing else: a flat
+`Set<"<kind>:<id>">` in `src/lib/state/clip-selection.svelte.ts` over the
+pure algebra in `src/lib/utils/clip-selection.ts` (click / shift / ctrl /
+marquee), never serialized, never an op, never read by the backend — the
+new commands take explicit clip-id lists. A group drag or MIDI group resize
+runs through `clip-drag.svelte.ts` as ONE gesture: local preview per
+pointermove, then one additive `move_clips` command whose `ControlPlane`
+method copies `set_track_mix`'s gesture-aware fold verbatim (gesture mutex
+held across the nested session lock), so a whole-group move is one undo
+entry and audio and MIDI clips move in one cross-store transaction.
+Snapping snaps the ANCHOR only and applies the resulting delta to every
+clip, so relative offsets survive and a one-clip selection behaves exactly
+as it did before. Copy/paste rides a backend-built
+`application/x-aura-clips` JSON envelope (`control/clipboard.rs`:
+`clips_copy` read command, `clips_paste` single-transaction write command
+composing the existing `TrackAdd`/`ClipAdd`/`MidiClipAdd`) reaching the OS
+clipboard through two thin `arboard` commands (`osclipboard.rs`) rather
+than webview clipboard permissions — the frozen `capabilities/default.json`
+is untouched. MIDI travels by value with note ids zeroed; audio travels by
+reference with a three-step resolution on paste. Ctrl+C / Ctrl+V /
+Ctrl+Shift+V (paste to new tracks) / Ctrl+Shift+M (export the selection as
+a .mid, reusing the frozen `midi_export_file` clip-id filter).
+
+**No new op kind, no new `PropPath` or `ObjectRef` variant,
+`OP_FORMAT_VERSION` stays 2, no journal migration, no `engine.rs` change
+(zero).** Five additive commands: `move_clips`, `clips_copy`, `clips_paste`,
+`os_clipboard_write_text`, `os_clipboard_read_text`.
+
+**Suites: 729 backend (700 lib + 29 integration, plus main's 2 `#[ignore]`d
+plugin repros) + 359 frontend, all green, measured on `multiclip-clipboard`
+2026-08-15 after the second `origin/main` merge**; `npx svelte-check` 0 errors,
+0 warnings. Doc-tests are 0 and are NOT a test target. Counts dated in
+README/CONTRIBUTING. `main` moved FIVE times during this track and this
+branch absorbed all of it at `c26d01d`, so the count line is a known
+cross-track merge-conflict point: whoever merges last re-measures rather
+than picking a side.
+
+### OWED BY THE OWNER: the cross-instance check, and no test substitutes
+
+**Task 11's Step 12 was never performed end to end.** TWO links in the
+cross-instance chain were unproven, and one has since been closed: the
+whole-track review found that **the frontend's unconditional OS-clipboard
+scan had no test either** — every paste test seeded an in-memory payload
+first, so re-gating the scan (this track's own Critical 1, plan defect #14)
+kept all 348 tests green. That gap is now closed by a test with `payload ===
+null` and a valid envelope on the clipboard, verified to die under exactly
+that re-gating. What remains is **ONE unproven link, and no test in this
+repo can make it**: that instance B's `os_clipboard_read_text` receives
+instance A's bytes **through
+this track's own frontend orchestration**. Task 10 proved the raw
+`arboard`/X11 mechanism transfers between processes; it never proved
+FIDELITY, and it never exercised AURA's own read path. The numbered
+procedure to follow is in the plan file at **Step 12 of Task 11**
+(`docs/superpowers/plans/2026-08-14-multiclip-selection-paste.md:3950`) —
+two instances, Ctrl+C in A, Ctrl+V in B, then a repeat with a multi-clip
+marquee so the anchor/offset math is checked across the clipboard too, with
+each FAIL mode spelled out so a failure gets recorded precisely instead of
+as "didn't work". Expect the second instance to log an MCP port-41717
+collision; that is known and out of scope.
+
+**BINDING RULE, and the reason it exists: do NOT drive the real app's
+keyboard or mouse with input automation (`xdotool` and similar), and do not
+retry after a first inconclusive attempt.** An implementer tried exactly
+that on a real X11 + `gpaste-daemon` desktop and found the X display being
+driven concurrently by someone else — focus jumped mid-test, a keystroke
+queued silently and fired minutes later, and one attempt **toggled the
+Library dock and duplicated demo tracks** in what is almost certainly the
+owner's live session. Read-only inspection of the screen is fine; synthetic
+input is not. A headless `Xvfb` pass would also be **weaker than the unit
+tests, not stronger**: Xvfb has no clipboard manager, which is precisely the
+configuration where the transfer already works, so it would retire the step
+without answering it. `xclip` from a shell only re-proves Task 10.
+
+### THE PRODUCT CONSTRAINT: the clipboard size ceiling
+
+Cross-instance transfer is reliable to **~165 KB** and **TOTALLY LOST — not
+truncated — at ~200 KB** on X11 with a clipboard manager; the write reports
+success, the cross-process read returns EMPTY, and waits up to 10 s do not
+help. Measured against real `clips_copy` payloads the marginal cost is
+**~80 B per MIDI note** (100 notes = 8 126 B, 1 000 = 79 788, 2 000 =
+160 212), putting the cliff at **~2 000–2 500 notes** — and that is the
+payload at its most compact, since `clips_copy` zeroes every note id. One
+three-minute recorded take at 10 notes/second is 1 800 notes in a single
+clip; a song section across 8 MIDI tracks at ~300 notes each is 2 400.
+**The operation most likely to exceed the ceiling is the operation this
+feature exists for.** Audio clips are irrelevant (references, hundreds of
+bytes) — this is a MIDI-note ceiling.
+
+**The harm the user cannot undo:** the local write SUCCEEDS, so AURA takes
+X11 selection ownership and the previous owner loses it; the handoff to the
+clipboard manager then fails and leaves an empty entry. **A failed large
+copy destroys whatever was on the system clipboard beforehand — from any
+application — and replaces it with nothing.** Data loss outside AURA from
+an operation that reported success.
+
+**Ruling: warn at copy time, never refuse — deliberate, twice upheld.** The
+cliff belongs to the ENVIRONMENT (X11 + which clipboard manager + its
+config; without a manager, megabyte INCR transfers are routine, and
+macOS/Windows differ), not to AURA. A hard threshold in a cross-platform
+layer is a false-refusal/false-confidence trap in both directions, and a
+size guard only makes sense where the payload's MEANING is known — at the
+caller that built the selection, not in a command that knows only that it
+holds text. The store additionally keeps the payload in memory, which
+MITIGATES the same-instance case and sidesteps the write-then-read handoff
+window entirely; it is **not a fix** — cross-instance paste of a large
+selection, the feature's stated reason to exist, is untouched by it. Also
+note the ugly interaction: because `os_clipboard_read_text` now correctly
+maps only `ContentNotAvailable` to "nothing to paste", a lost large copy
+looks to the user like an EMPTY clipboard rather than a corrupt one — the
+correct fix made this failure quieter, not louder.
+
+### Scope rulings (carried from the plan doc, per ADR 0007)
+
+1. **Paste composes existing ops in ONE transaction** — zero or more
+   `TrackAdd`, then one `ClipAdd`/`MidiClipAdd` per clip, in one
+   `commit`. `batch_coalesce_key` returns `None` for structural batches, so
+   the 350 ms fallback can never merge two pastes either: one Ctrl+Z removes
+   every pasted clip AND every track the paste created.
+2. **MIDI by value, audio by REFERENCE, and a missing asset skips THAT clip,
+   never the whole paste.** Resolution order before the transaction opens:
+   in-project path → copy in from `sourceAbsPath` → skip and report
+   `{name, reason}`. An all-skipped paste is a precise report, not an error.
+3. **SMF is EXPORT-ONLY, to a file.** The clipboard slot a Tauri v2 /
+   WebKitGTK app can own is plain text, so the `application/x-aura-clips`
+   MIME name lives inside the JSON envelope and paste never parses SMF.
+4. **Group-drag snapping snaps the ANCHOR only**; the delta is clamped (not
+   the individual clips) so the leftmost clip lands at 0 and no further.
+5. **Selection keys are `"<kind>:<id>"`** — a marked widening of the brief's
+   `Set<ClipId>`, because two independent stores mint clip ids.
+6. **The legacy single-selection fields stay** as the "focused clip"
+   (`project.selectedClipId` / `midi.selectedClipId`); Ctrl+D is still
+   single-clip `midi.duplicateSelected`.
+7. **Group resize is MIDI-only** (ruling G) and **`contentLengthTicks` can
+   be SET but not CLEARED through `move_clips`** (ruling H).
+8. **The OS clipboard is reached through two Rust commands over `arboard`**,
+   not the webview: `navigator.clipboard.readText()` needs a permission
+   WebKitGTK does not grant, and a clipboard plugin would require editing
+   the FROZEN `capabilities/default.json`.
+
+### Mid-flight rulings and deviations (all reviewed and accepted)
+
+- **The wire tempo domain is the NOMINAL 48 kHz rate**, not the engine's
+  live rate (Task 8 Critical). Pinned by a 96 kHz regression test that dies
+  if the unit rate comes back.
+- **Paste validates track KIND in BOTH directions** (plan defect #11: the
+  plan only checked MIDI-on-audio, but `import.rs` refuses audio clips on
+  non-audio rows). Paste is the one path a FOREIGN document reaches the
+  store, so it must not write a row the app itself cannot produce.
+- **Paste-to-new-tracks groups on `(source track, kind)`**, not source track
+  alone — identical for any AURA-produced payload, and it stops a
+  hand-edited mixed row from stranding half its clips.
+- **`resolve_audio_asset` carve-out:** with no project dir on EITHER side the
+  relative reference travels verbatim instead of being skipped. The plan
+  contradicted itself here (its own mixed-paste test asserts
+  `skipped.is_empty()` in a project-less harness); plan defect #12.
+- **Every incoming note id is ZEROED in phase 2** (Task 9 C-1/C-2). This one
+  fix removed a fatal path (a payload with duplicate non-zero note ids made
+  the WHOLE paste fail, orphaning copied wavs) and made the hardcoded
+  `next_note_id: 1` correct BY CONSTRUCTION. Copy stripping ids is a
+  property of AURA's own copy, never a guarantee about a foreign payload.
+- **`source_path` is validated through the project's OWN
+  `normalize_source_path`** (Task 9 C-3), not a hand-rolled check, so paste
+  and L-1 cannot drift. Before the fix, `../secret.wav` and absolute paths
+  passed straight through and produced a PERMANENTLY SILENT clip that never
+  appeared in `skipped`.
+- **A foreign `ppq` is RESCALED, not refused** — exact when one divides the
+  other (the 480/960 case that actually occurs), else rounded to the nearest
+  tick; clips that no longer fit are skipped with a reason, never wrapped.
+  `ppq == 0` is refused in the envelope. Refusing would make cross-instance
+  paste impossible between whole projects with nothing the user could do
+  about it (ppq is fixed at project creation).
+- **The tick rescale decision moved INSIDE the commit closure.** A re-check
+  would have added a mechanism with its own failure modes and answered a
+  divergence by SKIPPING the user's MIDI clips; not diverging is better than
+  detecting divergence. The old "ppq only changes at project load" comment
+  was provably FALSE (`Op::TempoSet` writes `session.midi.ppq`, and
+  `set_tempo_map` is a live command).
+- **In-place paste INHERITS the `SourceId` the project already uses for that
+  path** (including one established by an earlier clip in the SAME paste);
+  copied files mint fresh. The previous comment claiming `assign_source_ids`
+  kept the decode cache warm was false and is gone.
+- **Cross-instance paste is unconditional** (Task 11 Critical, plan defect
+  #14): `paste()` returns "found a payload somewhere" (deliberately NOT
+  "the paste succeeded"), Ctrl+V always scans the OS clipboard first and
+  only then falls back to the legacy single-clip stamp. Before the fix,
+  pasting into a FRESH window — the track's entire reason to exist — did
+  nothing at all, silently.
+- **The "nothing to paste" message lives at the CALLER**
+  (`clipClipboard.pasteAtPlayhead`), which is the only Ctrl+V entry point
+  and the only place that knows BOTH paths came back empty. Putting it in
+  the store made the app claim there was nothing to paste while the legacy
+  path pasted a clip.
+
+### The second merge (`79ae94c`): main's clip delete meets multi-selection
+
+PR #26 added a `×` button and Delete/Backspace on both clip components —
+the same handlers this track filled with selection, anchor and drag logic.
+Four conflicts, all additive-on-both-sides except one; the handler list was
+verified by SET COMPARISON (ours 93, main 90, union 95, merged 95, nothing
+missing, nothing invented). Two things are worth carrying forward.
+
+**RULING — Delete with a multi-selection stays SINGLE-CLIP, deliberately.**
+Delete/Backspace deletes the focused clip; three other selected clips stay.
+The plan's non-goals already say "no multi-clip DELETE, split or duplicate",
+and nothing about main's commit changes that reasoning — but the decisive
+argument is the undo shape, not the scope line. `remove_clip` and
+`midi_remove_clip` are SINGLE-clip commands, one transaction each, so
+extending Delete to a selection of four would commit **four transactions and
+four history entries**. The user would then press Ctrl+Z, get ONE clip back,
+and have to press it three more times — a partial undo of a single gesture,
+which is exactly the failure mode this whole track (and Task 9 in
+particular) exists to prevent. Shipping a destructive multi-clip operation
+with the wrong undo granularity, in a close-out, is strictly worse than not
+shipping it. **The honest cost is real and named:** a user who has just
+learned that clips select as a group will press Delete and be surprised that
+only one disappears. That surprise is recoverable with one correct Ctrl+Z;
+the alternative's is not.
+
+**The follow-on, with its design question already answered:** add a
+`clips_remove` batch command that composes `Op::ClipRemove` /
+`Op::MidiClipRemove` for the whole selection inside ONE
+`commit(TxMeta::user("delete clips"), …)`, exactly as `clips_paste`
+composes the add ops — one undo entry for the batch, no new op kind, and
+`OP_FORMAT_VERSION` stays 2. Then wire Delete to it. That is a task, not a
+close-out fix.
+
+**The `×` button now appears on EVERY selected clip, not just one.** In main
+`selected` meant the single focused clip; on this branch it means
+multi-selection membership, so `{#if selected}` renders one `×` per selected
+clip. Judged coherent and kept: each `×` deletes its own clip and (after the
+merge fix) no longer disturbs the selection. Named here because it is a
+visible behaviour change nobody chose — it fell out of the merge, and the
+next person to see four `×`s should know it was inspected rather than
+missed.
+
+**A merge-mechanics lesson worth more than the merge:** the mechanical
+keep-both resolution of `tauri.ts` ate a shared closing brace and left the
+file syntactically invalid — and **`npm test` still passed**, because every
+store test mocks `../tauri`, so the frontend suite structurally cannot see a
+broken `tauri.ts`. Only `svelte-check` caught it. It is a required gate, not
+a formality, and a green `npm test` is not evidence that the frontend
+compiles.
+
+**One new test, at the seam neither parent covered:** deleting a clip
+through `project.removeClip` / `midi.removeClip` while it is part of a
+multi-selection drops it from the selection and leaves the rest intact. The
+pre-existing live-filter test sets `project.clips` directly and never
+touches the delete path; a sabotage that stops `removeClip` from updating
+the store kills ONLY the new test. (Green on first run — a characterization
+test of an already-correct seam, sabotage-proved rather than RED-first, and
+recorded as such.) The property matters because a stale key would reach
+`move_clips` as an unknown id and fail the whole NEXT group drag.
+
+### Closed by the whole-track final review (2026-08-15)
+
+- **CRITICAL — `clips_paste` validated track kinds and paths but NOT note
+  FIELDS.** A pasted `key >= 128` reaches `midi_out.rs`'s
+  `sounding[ev.key as usize]` against a `[bool; 128]`: **an out-of-bounds
+  panic on the `aura-midi-out` thread**, reachable from a hand-edited
+  envelope onto a MIDI track routed to hardware (Track B, now on main). It
+  is also DURABLE — the raw byte survives save/load, and the user's own
+  later `midi_set_notes` on that clip then fails forever. `velocity: 0`,
+  `channel: 99` and `lengthTicks: 0` rode the same gap. Fixed by calling the
+  document's OWN `MidiNote::validate()` in the same phase-2 loop that zeroes
+  `note_id`, skip-and-report per clip (never fatal to the rest, ruling B).
+  **The lesson is about the shape of the miss, not the field:** the module's
+  trust-boundary doc ENUMERATED what it distrusts ("not note ids, not paths,
+  not ppq, not sample windows"), and note ranges simply fell out of the
+  list. An enumeration is where a trust boundary silently loses items.
+- **IMPORTANT — clip `gain_db` crossed the same boundary unclamped.**
+  `"gainDb": 800` → `10f64.powf(40.0) as f32` → `f32::INFINITY` → the mixer's
+  `l * g` turns a silent sample into NaN, and nothing on the sample path
+  checks `is_finite` (only `pan` is clamped). The TRACK gain setter already
+  clamps to `-160..=24`; paste was the one writer that did not. Now clamped
+  at the boundary (non-finite mapped to unity first, since `clamp` passes
+  NaN through), and clamped rather than skipped — an absurd gain is a value
+  error the user can see and change, not an unusable clip.
+- **IMPORTANT — Track C's marquee and Track D's automation lane collided.**
+  `.autolane` is `position:absolute; inset:0` inside `.lane` and does not
+  stop propagation, so dragging a gain point ALSO ran `onLanesPointerDown`:
+  `replace` mode wiped an existing multi-clip selection, and because the
+  automation canvas had captured the pointer, every later `pointermove`
+  bubbled to `.lanes` and dragged a live selection band across the timeline.
+  A following Ctrl+C then copies clips the user never selected; a following
+  drag group-moves them. Fixed on **Track C's side** — `.autolane` added to
+  the guard, now the pure, tested `startsMarquee` in
+  `src/lib/utils/clip-selection.ts` — rather than by `stopPropagation()` in
+  Track D's component: adding a selector cannot change another track's
+  behaviour, while swallowing the event changes the flow for every ancestor
+  listener, present and future. Whoever adds the next absolutely-positioned
+  overlay inside `.lane` adds it to that list.
+- **The frontend's unconditional OS-clipboard scan gained the test it never
+  had** (see the OWED section above) — the fifth test-that-could-not-fail on
+  this track, and the first one found by an outside reviewer's sabotage
+  rather than by the implementer's own.
+- **`clip-drag`'s await-before-`gestureEnd` is no longer inspection-grade.**
+  The existing call-order test could not see it: its mocks record
+  synchronously, so `void backend.moveClips?.()` still ordered
+  "moveClips" before "gestureEnd" and stayed green. The added test records
+  only after the mock's promise has SETTLED, and dies under exactly that
+  `await`→`void` change. Worth generalizing: **a call-ORDER assertion over
+  synchronous mocks does not test asynchronous ordering** — it tests
+  invocation order, which is a different property.
+
+- **`move_clips_undo_restores_every_clip_in_the_batch` could not fail on
+  identity — the SIXTH such test, and now closed.** It seeded both clips at
+  0 and asserted both back at 0, so an inverse restoring the wrong clip
+  passed. The clips are now seeded at distinct starts and asserted back at
+  their own, looked up BY ID rather than by store index. Killed by two
+  independent sabotages (an inverse rotated onto the next clip's object; an
+  inverse carrying the wrong pre-value), and the OLD version was re-run
+  under the same sabotage and PASSED — the evidence, not the assumption.
+  **An audit for a seventh found none**: all four paste-side undo tests
+  assert surviving rows by ID (one compares the whole before/after id
+  tuple), and the frontend cancel-restore tests seed distinct values per
+  clip and across two stores, so a swap cannot hide in them.
+- **Worth knowing before sabotaging an inverse here — the trap is
+  ARM-SPECIFIC.** Sabotaging the target of the inverse `apply_raw` returns is
+  **live for structural ops** (`ClipAdd`, `MidiClipAdd`, `TrackAdd`), because
+  `fold_ops`' `Slot::Passthrough` forwards that inverse verbatim — which is
+  exactly why this track's `SH` sabotage on `Op::ClipAdd`'s inverse genuinely
+  killed four paste tests. It is **dead for property-addressed `Op::Set`s
+  that reach the grouped path**, where `fold_ops` REBUILDS the folded inverse
+  from the original op's `object`/`path` and keeps only the values: a swap
+  there is inert BY CONSTRUCTION and reports a false all-green. On those,
+  sabotage the fold or the values instead. (Found by running exactly that
+  sabotage and watching it change nothing.)
+
+### Ledgered by the same review, NOT fixed
+
+- **Ctrl-click-deselect still sets the focused clip and the drag anchor**, so
+  deselecting leaves the clip focused for the Dock and targeted by a drag.
+- **`begin()` while a previous `end()` is still pending** is not covered.
+- **`onpointerleave` flicker** on the lane hover state.
+
+### Deferred minors and accepted-open items (nothing from the ledger dropped)
+
+Fixed on the way, listed so nobody re-derives them: the resize-snap
+regression and the drag/resize `cancel()` restore (Task 6/7), the
+UTF-16-vs-bytes size guard, `startsWith` rejecting BOM/CRLF envelopes,
+duplicated pasted tracks (`upsertTrack`, id-based dedupe — the THIRD
+appearance of the async-ordering trap on this project), and the copy-time
+toast's scope ("the system clipboard, in any program", because there is only
+one and the harm reaches outside AURA).
+
+**Accepted and still OPEN:**
+
+- **An empty transaction bumps `rev`.** A payload where EVERY clip fails the
+  tick rescale now opens a transaction that applies no ops: `rev` bumps and
+  `project://changed` fires where the earlier code returned before
+  committing. Ruling B's "commits nothing" holds in the OP sense; "no rev
+  bump" does not.
+- **`known_sources` can produce a same-`SourceId`/different-`source_path`
+  pair.** Path normalization broke the one-source-one-path invariant in the
+  direction `engine.rs:462` explicitly names. Verified benign: `stale_sources`
+  SETTLES (one warning per rebuild plus one extra decode, not thrash) and
+  both spellings name the same file, so the audio is correct. **Two one-line
+  remedies were noted**: normalize `known_sources`' keys the same way the
+  in-place lookup does, or key the lookup on the RAW stored path.
+- **Copied assets are NOT rolled back by undo** — real garbage accumulation
+  in `<project>/audio/`, and a FAILED commit orphans them with no clip at
+  all.
+- **A split mixed-kind row produces two tracks with the SAME `"<name> copy"`
+  name.**
+- **"No panic in `transact`" is an INSPECTION-grade property**, not a tested
+  one, on both the Task 5 and Task 9 arms.
+- **The tempo-map TOCTOU is CLOSED but UNTESTABLE.** `at_ticks` is now
+  derived inside the transaction. The implementer could not build a
+  deterministic RED for the race itself and refused to dress up a surrogate:
+  the window needs a commit between phase 2 releasing the lock and phase 3
+  taking it, `std::fs::copy` rejects non-regular files (so the FIFO trick
+  does not open it), and holding the session lock from the test thread just
+  moves the race. Accepted on a specific ground worth preserving: the change
+  did not ADD a compensating CHECK (a mechanism with its own failure modes,
+  where "nobody proved it fires" is a real hole) — it REMOVED the second
+  read. A sabotage that splits the two readings apart proves the new test
+  detects exactly the regression SHAPE the race could produce.
+- **`midi.clips`' remaining blind append is provably safe ONLY because
+  `project://changed` carries the audio-shaped `Project`.** If that ever
+  carries MIDI clips too, this becomes the same duplication bug
+  `upsertTrack` just fixed.
+- **`midi.pasteAtPlayhead` rejecting is an unhandled rejection** — the `void`
+  in `App.svelte` swallows it with no toast. Pre-existing form, but
+  `pasteAtPlayhead` now OWNS "tell the user what happened", so the `catch`
+  belongs there.
+- **Cosmetic/nit:** the focused-clip comment exists only in `ClipView`, not
+  `MidiClipView`; `onLaneDblClick` still has raw-`clientX` zoom drift;
+  marquee never updates the selection ANCHOR (latent gap for a future
+  shift-click range after a marquee); no test for subtract mode's anchor
+  rule; `has()`/`audioIds()` build full `Set`s per call; the cancel-resize
+  test does not assert the `contentLengthTicks` revert; two fast Ctrl+C are
+  last-RESOLVED-wins.
+
+### A PATTERN, not just six fixed defects: tests that could not fail
+
+**SIX tests on this track could not fail** — seven counting the call-order
+test that could not see asynchronous ordering — and each new mechanism was
+found by RUNNING a sabotage, never by reading. The fourth's mechanism was
+new. Three were weak assertions (a `reason.contains("track")` that the
+wrong-kind message also satisfies; a sabotage that never reached the branch;
+undo assertions that checked LENGTHS and never that the survivors were the
+ORIGINALS — a sabotaged inverse removing the WRONG row passed). The fourth:
+a test passed because deleting the code under test raised an exception that
+an outer `catch` swallowed and **converted into the same return value the
+correct code produces**. Reading the assertions could never reveal that —
+only RUNNING the sabotage did. Two habits earned their keep here: sabotage
+every test you are tempted to call obviously-correct, and when a store
+method wraps its body in a `try`, check explicitly whether the early returns
+sit inside or outside it (Task 12 did, which is why its three tests hold).
+
+The FIFTH, found by the whole-track reviewer rather than by anyone inside
+the track, is the one worth generalizing: **a whole suite can pin a
+behaviour's every branch and still not pin that the behaviour is REACHED.**
+Every paste test seeded an in-memory payload before calling `paste()`, so
+all of them exercised the code AFTER the OS-clipboard scan and none could
+notice the scan being gated away again — while the gate is precisely the
+defect the track already fixed once. When a fix consists of REMOVING a
+condition, the test that guards it must set up the state in which that
+condition used to be false.
+
+### A REPO-LEVEL GAP — an owner decision, not another review round
+
+**This repo has NO DOM test environment** — no `jsdom`, no `happy-dom`, no
+testing-library; `vitest.config.ts` runs plain node. **Four real defects on
+this track lived exclusively in `.svelte` handlers, and all four were found
+by READING, not by tests**: the Ctrl+V gate that made cross-instance paste a
+no-op in a fresh window, the duplicated pasted tracks, the merge's
+`MidiClipView` rename/drag interaction, and the marquee/automation-lane
+collision — the last of which needed a hand-built stub of `closest` before it
+could be tested at all, which is the cost of this gap made concrete. Track D reports two more of the same
+shape. The stores here are thoroughly tested and the components are not
+tested at all, so defects accumulate exactly where nothing is looking.
+Adding a DOM test environment is a cross-cutting choice every future track
+inherits — cost, CI time, house style — so it is stated here as evidence for
+the owner to decide, and deliberately not decided by this track.
+
+### Flaky tests seen on this branch (rerun in isolation, and CAPTURE the name)
+
+`control::hum::tests::apply_hum_clip_commits_synchronously_and_announces_project_changed`,
+`plugins::host::tests::plugin_main_thread_slots_and_tickers`,
+`pure_readers::library_audition_core_leaves_the_document_and_the_history_untouched`,
+plus the two `midi_out` ones in the Track B follow-up below. Zyn host spam on
+stderr is expected noise. A grep that drops the failing test's NAME turns an
+absence of evidence into a reported fact — this happened twice on this track;
+capture the name before concluding anything.
+
+### FOLLOW-UP OWED TO TRACK B (found here, already on `main` without it)
+
+Two tests in `midi_out` are flaky under parallel load:
+`shutdown_flushes_note_off_before_stop_and_before_the_connection_drops` and
+`editing_the_routed_track_releases_a_sounding_note_instead_of_hanging_it`.
+Recorded in `docs/backlog/hardware-midi-io.md` under "Still open after slice
+2" with the full reading, the recommended fix and the discriminating check
+that would falsify it.

@@ -13,7 +13,11 @@
   import { automation } from "../state/automation.svelte";
   import { loopjam } from "../state/loopjam.svelte";
   import { toasts } from "../state/toasts.svelte";
+  import { clipSelection } from "../state/clip-selection.svelte";
   import { canvasPos } from "../utils/canvas-pos";
+  import { applySelection, marqueeClipHits, startsMarquee } from "../utils/clip-selection";
+  import { selectionModeFor } from "../utils/selection-modifiers";
+  import { buildLaneBoxes, laneIndexAt, TRACK_HEIGHT_PX } from "../utils/lane-geometry";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { library } from "../state/library.svelte";
   import TrackHeader from "./TrackHeader.svelte";
@@ -118,7 +122,7 @@
     const start = view.viewStart;
     const w = view.width;
     const trackCount = project.tracks.length;
-    const trackH = 88;
+    const trackH = TRACK_HEIGHT_PX;
     const h = Math.max(1, trackCount * trackH);
 
     const dpr = Math.min(3, window.devicePixelRatio || 1);
@@ -186,8 +190,8 @@
   function onWheel(e: WheelEvent) {
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
-      const rect = (lanesEl ?? (e.currentTarget as HTMLElement)).getBoundingClientRect();
-      view.zoomAt(e.clientX - rect.left, Math.exp(e.deltaY * 0.002));
+      const el = lanesEl ?? (e.currentTarget as HTMLElement);
+      view.zoomAt(canvasPos(el, e.clientX, e.clientY).x, Math.exp(e.deltaY * 0.002));
     } else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
       e.preventDefault();
       view.scrollBy(e.deltaX !== 0 ? e.deltaX : e.deltaY);
@@ -196,16 +200,16 @@
 
   let scrubbing = false;
   function rulerSeek(e: PointerEvent) {
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    let samples = view.samplesAt(e.clientX - rect.left);
+    const el = e.currentTarget as HTMLElement;
+    let samples = view.samplesAt(canvasPos(el, e.clientX, e.clientY).x);
     samples = view.snapSamples(Math.max(0, samples));
     void transport.seek(samples);
   }
   function onRulerDown(e: PointerEvent) {
     // Top strip of the ruler = the loop lane: dragging there sets the loop
     // region (snapped, like clip drags). The lower strip keeps seek/scrub.
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    if (e.clientY - rect.top < rect.height * 0.5) {
+    const el = e.currentTarget as HTMLElement;
+    if (canvasPos(el, e.clientX, e.clientY).y < el.clientHeight * 0.5) {
       const anchor = loopSampleAt(e);
       loopGesture = { kind: "create", anchor };
       loopDraft = { start: anchor, end: anchor };
@@ -278,8 +282,7 @@
   function loopSampleAt(e: PointerEvent): number {
     const el = rulerEl;
     if (!el) return 0;
-    const rect = el.getBoundingClientRect();
-    return Math.max(0, view.snapSamples(view.samplesAt(e.clientX - rect.left)));
+    return Math.max(0, view.snapSamples(view.samplesAt(canvasPos(el, e.clientX, e.clientY).x)));
   }
 
   /** Commit the drag draft: a real span sets (and on create enables) the
@@ -414,12 +417,87 @@
       .addClip(track.id, Math.max(0, startTicks), 2 * midi.ticksPerBar)
       .then((clip) => clip && midi.open(clip.id));
   }
+
+  // ── marquee selection over the lane area ──
+  // Starts only on the lane BACKGROUND, so it never competes with a clip
+  // drag. Pointer maths go through canvasPos: under interface zoom
+  // (prefs.uiZoom) raw clientX/rect maths drift down-right.
+
+  type Marquee = {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+    baseKeys: Set<string>;
+    mode: ReturnType<typeof selectionModeFor>;
+  };
+  let marquee: Marquee | null = $state(null);
+
+  const marqueeRect = $derived.by(() => {
+    const m = marquee;
+    if (!m) return null;
+    return {
+      left: Math.min(m.x0, m.x1),
+      top: Math.min(m.y0, m.y1),
+      width: Math.abs(m.x1 - m.x0),
+      height: Math.abs(m.y1 - m.y0),
+    };
+  });
+
+  function onLanesPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    if (!startsMarquee(e.target as HTMLElement)) return;
+    if (!lanesEl) return;
+    const p = canvasPos(lanesEl, e.clientX, e.clientY);
+    const mode = selectionModeFor(e);
+    marquee = { x0: p.x, y0: p.y, x1: p.x, y1: p.y, baseKeys: new Set(clipSelection.keys), mode };
+    if (mode === "replace") clipSelection.clear();
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic pointer */
+    }
+  }
+
+  function onLanesPointerMove(e: PointerEvent) {
+    if (!marquee || !lanesEl) return;
+    const p = canvasPos(lanesEl, e.clientX, e.clientY);
+    marquee = { ...marquee, x1: p.x, y1: p.y };
+    const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
+    const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
+    const n = project.tracks.length;
+    const laneLo = laneIndexAt(Math.min(marquee.y0, marquee.y1), n);
+    const laneHi = laneIndexAt(Math.max(marquee.y0, marquee.y1), n);
+    const boxes = buildLaneBoxes({
+      trackIds: project.tracks.map((t) => t.id),
+      audioClips: project.clips,
+      midiClips: midi.clips,
+      ticksToSamples: (t) => midi.ticksToSamples(t),
+    });
+    const hits = marqueeClipHits(boxes, s0, s1, laneLo, laneHi);
+    // Recomputed from the drag's STARTING selection every move, so dragging
+    // the band back over a clip un-hits it instead of latching.
+    clipSelection.keys = applySelection(marquee.baseKeys, hits, marquee.mode);
+  }
+
+  function onLanesPointerUp(e: PointerEvent) {
+    marquee = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      /* not captured */
+    }
+  }
 </script>
 
 <div class="timeline" onwheel={onWheel}>
   <!-- ruler row -->
   <div class="ruler-row">
-    <div class="corner silk">tracks · {project.tracks.length}</div>
+    <div class="corner silk" title="Ctrl+C copy · Ctrl+V paste at playhead · Ctrl+Shift+V paste onto new tracks · Ctrl+Shift+M export selection as MIDI">
+      {clipSelection.count() > 0
+        ? `${clipSelection.count()} clip${clipSelection.count() === 1 ? "" : "s"} selected`
+        : `tracks · ${project.tracks.length}`}
+    </div>
     <div
       class="ruler"
       bind:this={rulerEl}
@@ -494,7 +572,16 @@
       </div>
     </div>
 
-    <div class="lanes" id="timeline-lanes" bind:this={lanesEl}>
+    <div
+      class="lanes"
+      id="timeline-lanes"
+      bind:this={lanesEl}
+      role="presentation"
+      onpointerdown={onLanesPointerDown}
+      onpointermove={onLanesPointerMove}
+      onpointerup={onLanesPointerUp}
+      onpointercancel={onLanesPointerUp}
+    >
       <canvas bind:this={gridCanvas} class="grid"></canvas>
       {#each project.tracks as track (track.id)}
         <div
@@ -555,6 +642,15 @@
         ></div>
       {/if}
       <ImportDropZone />
+      {#if marqueeRect && marqueeRect.width > 2}
+        <div
+          class="marquee"
+          style:left="{marqueeRect.left}px"
+          style:top="{marqueeRect.top}px"
+          style:width="{marqueeRect.width}px"
+          style:height="{marqueeRect.height}px"
+        ></div>
+      {/if}
       <div bind:this={playheadEl} class="playhead"></div>
     </div>
   </div>
@@ -917,6 +1013,14 @@
     margin-top: 8px;
     font-size: 10px;
     color: var(--text-faint);
+  }
+
+  .marquee {
+    position: absolute;
+    background: rgba(82, 229, 255, 0.08);
+    border: 1px solid var(--cyan-dim);
+    pointer-events: none;
+    z-index: 3;
   }
 
   .playhead {

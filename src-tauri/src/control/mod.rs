@@ -14,6 +14,7 @@
 //!                plus its own `#[tauri::command]` wrappers
 //!                (`get_project_state`, `set_track_mix`, `import_audio_clip`).
 
+pub mod clipboard;
 pub mod import;
 pub mod hum;
 pub mod export;
@@ -79,6 +80,39 @@ pub struct ImportClipRequest {
     pub track_id: Option<String>,
     /// Timeline placement in samples; None = 0.
     pub at_samples: Option<u64>,
+}
+
+/// One clip's new placement in a `move_clips` batch. Externally tagged by
+/// `kind` because audio clips are placed in SAMPLES and MIDI clips in TICKS
+/// — two different units that must not be confusable on the wire, and two
+/// different stores (`store.clips` / `midi.clips`) resolved by two different
+/// lookups. A batch mixes both freely; the channel is cross-store atomic.
+///
+/// `length_ticks` / `content_length_ticks` are additive `#[serde(default)]`
+/// fields carrying the group loop-length adjust. `None` means UNCHANGED, not
+/// "clear" — clearing `content_length_ticks` back to "same as length" keeps
+/// going through the existing `midi_set_clip_bounds(…, null)` command
+/// (plan scope ruling H).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ClipPlacement {
+    Audio { clip_id: String, timeline_start_samples: u64 },
+    Midi {
+        clip_id: String,
+        timeline_start_ticks: u64,
+        #[serde(default)]
+        length_ticks: Option<u64>,
+        #[serde(default)]
+        content_length_ticks: Option<u64>,
+    },
+}
+
+impl ClipPlacement {
+    fn clip_id(&self) -> &str {
+        match self {
+            Self::Audio { clip_id, .. } | Self::Midi { clip_id, .. } => clip_id,
+        }
+    }
 }
 
 /// Transport action for `transport_control` (MCP tool + future command).
@@ -1206,6 +1240,57 @@ fn apply_mix_changes(changes: &[TrackMixChange], tx: &mut session::Tx<'_>) -> Re
     Ok(())
 }
 
+/// Apply one `move_clips` batch inside an open transaction. Pure op
+/// emission — every id was validated by the caller before the lock, so this
+/// never needs to reject anything and never panics.
+fn apply_clip_placements(
+    placements: &[ClipPlacement],
+    tx: &mut session::Tx<'_>,
+) -> Result<(), String> {
+    for p in placements {
+        match p {
+            ClipPlacement::Audio { clip_id, timeline_start_samples } => {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Clip(clip_id.as_str().into()),
+                    path: op::PropPath::TimelineStartSamples,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(timeline_start_samples),
+                })?;
+            }
+            ClipPlacement::Midi {
+                clip_id,
+                timeline_start_ticks,
+                length_ticks,
+                content_length_ticks,
+            } => {
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::MidiClip(clip_id.as_str().into()),
+                    path: op::PropPath::TimelineStartTicks,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(timeline_start_ticks),
+                })?;
+                if let Some(len) = length_ticks {
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::MidiClip(clip_id.as_str().into()),
+                        path: op::PropPath::LengthTicks,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(len),
+                    })?;
+                }
+                if let Some(cl) = content_length_ticks {
+                    tx.apply(op::Op::Set {
+                        object: op::ObjectRef::MidiClip(clip_id.as_str().into()),
+                        path: op::PropPath::ContentLengthTicks,
+                        from: serde_json::Value::Null,
+                        to: serde_json::json!(cl),
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Mark `midi` as belonging to freshly-`project::create`d `dir` and settle
 /// `midi.dirty` — `create_project`/`create_project_epoch`'s case: a fresh
 /// project's on-disk state already matches this blank in-memory reset (both
@@ -2005,6 +2090,70 @@ impl ControlPlane {
                 to: serde_json::json!(timeline_start_samples),
             })
         })
+    }
+
+    /// Move (and, for MIDI, optionally resize) a BATCH of clips in ONE
+    /// transaction — the group-drag counterpart of [`Self::move_clip`].
+    /// Audio and MIDI clips mix freely: both stores live under the one
+    /// session lock (round-2 §4.1's cross-store atomicity), so a mixed
+    /// selection is one atomic batch and ONE undo entry.
+    ///
+    /// GESTURE-AWARE, and deliberately the same shape as
+    /// [`Self::set_track_mix`]: when a gesture matching this actor is open,
+    /// the batch commits TRANSIENT and folds into the gesture's accumulator
+    /// through `GestureState::commit_transient_and_fold` — which holds the
+    /// gesture mutex across the nested session-lock acquisition, the ONE
+    /// safe nesting direction (Task 14, fix round 1 Finding 2). Do not
+    /// reorder those locks. With no gesture open it falls back to a plain
+    /// `commit`, which is still exactly one history entry.
+    ///
+    /// Every id is validated BEFORE any op is applied: a batch with one bad
+    /// id fails whole, having moved nothing (`Session::transact` would roll
+    /// back the applied ops, but pre-checking makes the failure atomic at
+    /// the batch level and keeps the error message about the id the caller
+    /// got wrong).
+    pub fn move_clips(
+        &self,
+        placements: Vec<ClipPlacement>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if placements.is_empty() {
+            return Ok(());
+        }
+        {
+            let session = self.session.lock();
+            for p in &placements {
+                let known = match p {
+                    ClipPlacement::Audio { clip_id, .. } => {
+                        session.store.clips.iter().any(|c| c.id == *clip_id)
+                    }
+                    ClipPlacement::Midi { clip_id, .. } => {
+                        session.midi.clips.iter().any(|c| c.id == *clip_id)
+                    }
+                };
+                if !known {
+                    return Err(format!("unknown clip: {}", p.clip_id()));
+                }
+            }
+        }
+        let gesture_meta = meta.clone();
+        let placements_for_gesture = placements.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_with(
+                gesture_meta.transient(),
+                |tx| apply_clip_placements(&placements_for_gesture, tx),
+                false,
+            )
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| apply_clip_placements(&placements, tx))?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove an audio clip through the transaction channel
@@ -3341,6 +3490,19 @@ pub fn move_clip(
     control.move_clip(&clip_id, timeline_start_samples, op::TxMeta::user("move clip")).map(|_| ())
 }
 
+/// Move (and optionally resize) a BATCH of clips in one transaction — thin
+/// delegate over [`ControlPlane::move_clips`]. The frontend previews a group
+/// drag locally and calls this ONCE at gesture end, inside a
+/// `gesture_begin`/`gesture_end` boundary, so the whole drag is one undo
+/// step. Additive command.
+#[tauri::command]
+pub fn move_clips(
+    placements: Vec<ClipPlacement>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.move_clips(placements, op::TxMeta::user("move clips"))
+}
+
 /// Remove an audio clip from its track — thin delegate over
 /// [`ControlPlane::remove_clip`], mirroring `move_clip`'s State/ControlPlane
 /// access shape. The frontend removes the clip locally on click/keypress and
@@ -3466,7 +3628,7 @@ mod tests {
     /// have no entries). Publish a table matching the seeded tracks up
     /// front so the next person asserting `params.gain` post-commit gets a
     /// real failure instead of a silent no-op.
-    fn test_plane_with_tracks(
+    pub(crate) fn test_plane_with_tracks(
         ids: &[&str],
     ) -> (ControlPlane, crossbeam_channel::Receiver<ControlMsg>, RecordedEvents) {
         let mut store = Store::default();
@@ -3707,6 +3869,188 @@ mod tests {
             "a failed move must not announce a change"
         );
         engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// The batch's whole reason to exist: audio and MIDI clips move in ONE
+    /// transaction (cross-store atomicity, round-2 §4.1) and produce exactly
+    /// ONE undo entry — not one per clip.
+    #[test]
+    fn move_clips_moves_audio_and_midi_in_one_transaction_and_one_history_entry() {
+        let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            tx.apply(Op::ClipAdd { clip: test_clip("a-1", "t-1"), index: 0 })?;
+            tx.apply(Op::ClipAdd { clip: test_clip("a-2", "t-1"), index: 1 })?;
+            tx.apply(Op::MidiClipAdd { clip: dummy_midi_clip("t-1"), index: 0 })
+        })
+        .unwrap();
+        let midi_id = cp.session().lock().midi.clips[0].id.to_string();
+        let (undo_before, _) = cp.history_depths();
+
+        cp.move_clips(
+            vec![
+                ClipPlacement::Audio { clip_id: "a-1".into(), timeline_start_samples: 1_000 },
+                ClipPlacement::Audio { clip_id: "a-2".into(), timeline_start_samples: 2_000 },
+                ClipPlacement::Midi {
+                    clip_id: midi_id.clone(),
+                    timeline_start_ticks: 480,
+                    length_ticks: None,
+                    content_length_ticks: None,
+                },
+            ],
+            TxMeta::user("move clips"),
+        )
+        .unwrap();
+
+        {
+            let s = cp.session().lock();
+            assert_eq!(s.store.clips[0].timeline_start_samples, 1_000);
+            assert_eq!(s.store.clips[1].timeline_start_samples, 2_000);
+            assert_eq!(s.midi.clips[0].timeline_start_ticks, 480);
+        }
+        let (undo_after, _) = cp.history_depths();
+        assert_eq!(undo_after, undo_before + 1, "a group move is ONE undo step");
+    }
+
+    /// One Ctrl+Z puts every clip in the batch back — and back to ITS OWN
+    /// position. The two clips are seeded at DISTINCT starts on purpose: with
+    /// both at 0, an inverse that restored the wrong clip's value would pass,
+    /// which is the "length-only assertion" failure mode this track already
+    /// shipped once (see the paste-side undo tests, which assert by identity
+    /// for the same reason).
+    #[test]
+    fn move_clips_undo_restores_every_clip_in_the_batch() {
+        let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            let mut a1 = test_clip("a-1", "t-1");
+            a1.timeline_start_samples = 1_111;
+            let mut a2 = test_clip("a-2", "t-1");
+            a2.timeline_start_samples = 2_222;
+            tx.apply(Op::ClipAdd { clip: a1, index: 0 })?;
+            tx.apply(Op::ClipAdd { clip: a2, index: 1 })
+        })
+        .unwrap();
+        cp.move_clips(
+            vec![
+                ClipPlacement::Audio { clip_id: "a-1".into(), timeline_start_samples: 7_000 },
+                ClipPlacement::Audio { clip_id: "a-2".into(), timeline_start_samples: 9_000 },
+            ],
+            TxMeta::user("move clips"),
+        )
+        .unwrap();
+        cp.undo().unwrap();
+        let s = cp.session().lock();
+        let by_id = |id: &str| {
+            s.store.clips.iter().find(|c| c.id == id).expect("clip survived").timeline_start_samples
+        };
+        assert_eq!(by_id("a-1"), 1_111, "a-1 is back at its OWN start, not a-2's");
+        assert_eq!(by_id("a-2"), 2_222, "a-2 is back at its OWN start, not a-1's");
+    }
+
+    /// Validate-before-mutate (the `transact`-must-not-panic rule's sibling):
+    /// one bad id fails the WHOLE batch, and nothing moved.
+    #[test]
+    fn move_clips_rejects_an_unknown_id_without_moving_anything() {
+        let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            tx.apply(Op::ClipAdd { clip: test_clip("a-1", "t-1"), index: 0 })
+        })
+        .unwrap();
+        let (undo_before, _) = cp.history_depths();
+
+        let err = cp
+            .move_clips(
+                vec![
+                    ClipPlacement::Audio { clip_id: "a-1".into(), timeline_start_samples: 5_000 },
+                    ClipPlacement::Audio { clip_id: "nope".into(), timeline_start_samples: 5_000 },
+                ],
+                TxMeta::user("move clips"),
+            )
+            .unwrap_err();
+        assert!(err.contains("nope"), "the error names the offending id: {err}");
+        assert_eq!(cp.session().lock().store.clips[0].timeline_start_samples, 0);
+        assert_eq!(cp.history_depths().0, undo_before, "a rejected batch is not a history step");
+    }
+
+    /// Inside an open gesture the batch runs TRANSIENT and folds; the ONE
+    /// history entry is synthesized by `gesture_end`, and it carries the LAST
+    /// position per clip, not the first.
+    #[test]
+    fn move_clips_folds_into_an_open_gesture_as_one_entry_with_the_last_position() {
+        let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            tx.apply(Op::ClipAdd { clip: test_clip("a-1", "t-1"), index: 0 })
+        })
+        .unwrap();
+        let (undo_before, _) = cp.history_depths();
+
+        cp.gesture_begin("move clips".into()).unwrap();
+        cp.move_clips(
+            vec![ClipPlacement::Audio { clip_id: "a-1".into(), timeline_start_samples: 100 }],
+            TxMeta::user("move clips"),
+        )
+        .unwrap();
+        cp.move_clips(
+            vec![ClipPlacement::Audio { clip_id: "a-1".into(), timeline_start_samples: 900 }],
+            TxMeta::user("move clips"),
+        )
+        .unwrap();
+        assert_eq!(cp.history_depths().0, undo_before, "mid-gesture commits are transient");
+        cp.gesture_end().unwrap();
+
+        assert_eq!(cp.history_depths().0, undo_before + 1, "the whole drag is ONE step");
+        let batch = cp.take_last_gesture_batch().expect("gesture synthesized a batch");
+        assert_eq!(batch.ops.len(), 1, "folded to one net Set: {:?}", batch.ops);
+        assert!(
+            matches!(&batch.ops[0], Op::Set { to, .. } if to == &serde_json::json!(900u64)),
+            "the gesture batch carries the LAST position: {:?}",
+            batch.ops[0]
+        );
+        assert_eq!(cp.session().lock().store.clips[0].timeline_start_samples, 900);
+    }
+
+    /// A MIDI entry may carry bounds too (the group loop-length adjust,
+    /// Task 7) — and `contentLengthTicks: None` means "unchanged", never
+    /// "clear" (scope ruling H).
+    #[test]
+    fn move_clips_midi_entry_sets_bounds_and_leaves_content_length_alone_when_absent() {
+        let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
+        cp.commit(TxMeta::user("seed"), |tx| {
+            let mut c = dummy_midi_clip("t-1");
+            c.content_length_ticks = Some(1_920);
+            tx.apply(Op::MidiClipAdd { clip: c, index: 0 })
+        })
+        .unwrap();
+        let id = cp.session().lock().midi.clips[0].id.to_string();
+
+        cp.move_clips(
+            vec![ClipPlacement::Midi {
+                clip_id: id,
+                timeline_start_ticks: 960,
+                length_ticks: Some(7_680),
+                content_length_ticks: None,
+            }],
+            TxMeta::user("resize clips"),
+        )
+        .unwrap();
+
+        let s = cp.session().lock();
+        assert_eq!(s.midi.clips[0].timeline_start_ticks, 960);
+        assert_eq!(s.midi.clips[0].length_ticks, 7_680);
+        assert_eq!(
+            s.midi.clips[0].content_length_ticks,
+            Some(1_920),
+            "an absent contentLengthTicks means UNCHANGED, not cleared"
+        );
+    }
+
+    /// An empty batch is a no-op, not an error and not a history step — the
+    /// same "nothing to do is not a failure" rule set_mute/set_solo follow.
+    #[test]
+    fn move_clips_with_no_placements_is_a_no_op() {
+        let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let (undo_before, _) = cp.history_depths();
+        cp.move_clips(vec![], TxMeta::user("move clips")).unwrap();
+        assert_eq!(cp.history_depths().0, undo_before);
     }
 
     /// Plan E Task 3: `set_track_instrument` runs through the channel and
@@ -5649,7 +5993,7 @@ mod tests {
         }
     }
 
-    fn dummy_midi_clip(track_id: &str) -> crate::midi::MidiClip {
+    pub(crate) fn dummy_midi_clip(track_id: &str) -> crate::midi::MidiClip {
         crate::midi::MidiClip {
             id: "mc1".into(),
             track_id: track_id.into(),

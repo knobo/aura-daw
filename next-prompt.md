@@ -375,30 +375,48 @@ the owner); then sub-block timestamping, port persistence, MIDI thru, CC/
 pitch-bend, a MIDI-out latency offset, and the document-model
 external-instrument target.
 
-### Track C — Multi-clip selection, group-drag, cross-track paste + cross-instance clipboard
+### Track C — Multi-clip selection, group-drag, cross-track paste + cross-instance clipboard — LANDED 2026-08-15
 
-Backlog doc: `docs/backlog/multi-clip-selection-and-paste.md`. Scope:
-timeline multi-select (`Set<ClipId>` viewer state, mirrors PR #11's
-note-level selection model), group drag as one `gesture_begin`/
-`gesture_end`-wrapped multi-op transaction (audio and MIDI clips mix
-freely in one tx — the channel is cross-store atomic), copy/paste at the
-playhead with per-clip offsets preserved, paste-to-new-tracks, and a
-cross-instance/OS-clipboard extension (an `application/x-aura-clips` JSON
-payload + SMF fallback on the OS clipboard).
+**Done, branch `multiclip-clipboard`, PR #22** (13 tasks, plan doc
+`docs/superpowers/plans/2026-08-14-multiclip-selection-paste.md`). Full
+handoff — all eight scope rulings, the mid-flight rulings, the
+deferred-minors roll-up and what is still OWED — is
+**`docs/PHASE4-PLAN.md`'s "Track C handoff"** section; read that, not this
+paragraph, before touching selection, group drag or the clipboard.
 
-**Prerequisites**: branch from `origin/main` — the backend primitives this
-needs (gesture IPC, `move_clip`, MIDI bounds ops, `ClipAdd`/`MidiClipAdd`,
-undo) all landed in Plan E and are present on `main` now that PR #12 is
-merged. (Historical note: these primitives are verified absent on
-pre-merge `main` — a session that branched before the merge would have
-found them missing. Not a live concern now, but the reason this line
-exists.)
+The timeline has a real multi-selection (click / shift / ctrl / marquee) as
+**viewer state** — a `Set<"<kind>:<id>">` that never enters the document and
+that the backend never reads. A group drag or MIDI group resize is ONE
+gesture and ONE undo entry through the new `move_clips`; copy/paste rides a
+backend-built `application/x-aura-clips` JSON envelope through two `arboard`
+commands, so it works across two running AURA instances. Five new additive
+commands: **`move_clips`, `clips_copy`, `clips_paste`,
+`os_clipboard_write_text`, `os_clipboard_read_text`**. Keys: Ctrl+C,
+Ctrl+V, Ctrl+Shift+V (paste to new tracks), Ctrl+Shift+M (export the
+selection as .mid).
 
-**Mostly frontend + a thin command layer** on top of those primitives.
-**Conflict-light**: touches timeline components + a view-state store + the
-clipboard glue; no `engine.rs`, no overlap with A/B/D's backend footprint.
-The one shared surface is the gesture IPC commands themselves (already
-frozen/additive, so no real contention).
+**Rulings other tracks must not contradict:** no new op kind, no new
+`PropPath`/`ObjectRef` variant, `OP_FORMAT_VERSION` still **2** (paste
+composes `TrackAdd`/`ClipAdd`/`MidiClipAdd` in one transaction); selection
+is viewer state and never document state; the clipboard wire's tempo domain
+is the NOMINAL 48 kHz rate; SMF is export-only (the OS clipboard slot this
+app can own is plain text); `engine.rs` untouched.
+
+**Still owed, and it belongs to the owner:** the manual **cross-instance
+check** (copy in instance A, Ctrl+V in instance B) — the one link no test in
+this repo can make, with a **binding no-input-automation rule**; procedure
+and rationale in the handoff. Also read the handoff's **clipboard size
+ceiling** before promising anyone large-selection copy between windows: a
+failed large copy empties the system clipboard for every application.
+
+**Left deliberately undone:** multi-clip delete/duplicate (Delete and the
+`×` from PR #26 stay single-clip — a batch `clips_remove` in ONE transaction
+is the prerequisite, see the handoff), arrow-key nudge over a selection,
+audio-clip resize, true content instancing, SMF paste, and the hardcoded MCP
+port 41717 that real two-instance workflows still hit.
+
+Baseline after this track: **729 backend (700 lib + 29 integration) + 359
+frontend**, measured on `multiclip-clipboard` 2026-08-15.
 
 ### Track D — Automation audible + lane UI — LANDED 2026-08-14
 
