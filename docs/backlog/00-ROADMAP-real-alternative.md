@@ -30,7 +30,7 @@ described here only.
 | Cross-instance / OS-clipboard copy (incl. SMF fallback) | **[track C]** same doc, §cross-instance |
 | Metronome/click + count-in | **[inline]** engine-side click synth on the RT path, tempo-map-driven (section table already gives sample-exact beats); UI toggle + volume; count-in = N bars of click before record start. No document state beyond a project setting. |
 | Quantize in the piano roll | **[inline]** command over the selection (note-ops already has the selection model): snap note starts (and optionally lengths) to grid with strength %; one `midi_set_notes` commit = one undo step. Backend-side math (thin renderer). |
-| Insert FX chains per track + sends/busses | **[inline→plan]** biggest Tier-1 architecture item: per-track insert chain (CLAP/LV2 effects, not just instruments), bus tracks, sends. Round-2 rule: **PDC (plugin delay compensation) before sends ship**. Deserves its own plan round (graph/mixer work) — candidate "Plan G". |
+| Insert FX chains per track + sends/busses | **[plan G]** `insert-fx-sends-sidechain.md` — host CLAP/LV2 effects (do **not** write a stock FX suite). Sequence: G1 insert chain + PDC, G2 bus + sends, G3 sidechain listen-taps, G4 envelope-follower modulator (later, not Plan G). Round-2 rule still binds: **PDC before sends ship**. Needs its own research → plan → gates round (graph/mixer work). |
 | MIDI clock/start-stop out (Hydrogen sync) | **[track B]** slice 4 |
 
 ## Tier 2 — competitive (months)
@@ -51,5 +51,6 @@ described here only.
   track map for file footprints; B and D overlap in engine.rs).
 - The FX/bus item should be planned like the core rounds were (research →
   plan doc → gates), not improvised — it touches the RT graph invariants
-  round-2 §8 reserves for the node-graph round.
+  round-2 §8 reserves for the node-graph round. Product cut is in
+  `insert-fx-sends-sidechain.md` (host plugins, PDC in G1, no stock DSP).
 - Plan F (history storage, round-2 §6) runs beneath all of this as track A.
