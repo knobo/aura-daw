@@ -1293,6 +1293,13 @@ export class DemoBackend implements Backend {
     this.resyncAudio();
   }
 
+  async removeClip(clipId: string): Promise<void> {
+    const before = this.clips.length;
+    this.clips = this.clips.filter((c) => c.id !== clipId);
+    if (this.clips.length === before) throw new Error(`unknown clip: ${clipId}`);
+    this.resyncAudio();
+  }
+
   async getTracks(): Promise<TrackState[]> {
     return this.tracks.map((t) => ({ ...t }));
   }
@@ -1573,6 +1580,13 @@ export class DemoBackend implements Backend {
     if (!trimmed) throw new Error("name: must not be empty");
     clip.name = trimmed;
     return { ...clip };
+  }
+
+  async midiRemoveClip(clipId: string): Promise<void> {
+    const before = this.midiClips.length;
+    this.midiClips = this.midiClips.filter((c) => c.id !== clipId);
+    if (this.midiClips.length === before) throw new Error(`unknown MIDI clip: ${clipId}`);
+    this.resyncAudio();
   }
 
   async midiGetClips(): Promise<MidiClip[]> {

@@ -2007,6 +2007,28 @@ impl ControlPlane {
         })
     }
 
+    /// Remove an audio clip through the transaction channel
+    /// (`Op::ClipRemove`, `commit`) — the structural analogue of
+    /// `remove_track`, scoped to a single clip. Looks the clip up via
+    /// `tx.store()` INSIDE the closure (`Tx::store`'s documented TOCTOU
+    /// rule), not a separate pre-commit lock. `apply_raw`'s `Op::ClipRemove`
+    /// arm re-finds it by id (store truth wins over the caller's payload
+    /// beyond `.id`) and computes the inverse `Op::ClipAdd`, so undo restores
+    /// the clip byte-identically — same free-inverse shape as `remove_track`.
+    pub fn remove_clip(&self, clip_id: &str, meta: op::TxMeta) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            let clip = tx
+                .store()
+                .clips
+                .iter()
+                .find(|c| c.id == clip_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown clip: {clip_id}"))?;
+            tx.apply(op::Op::ClipRemove { clip, index: 0 })
+        })?;
+        Ok(())
+    }
+
     /// Bind (or unbind, with `instrument_id: None`) a track's instrument
     /// through the transaction channel (`Op::Set`, `PropPath::InstrumentId`)
     /// — Plan E Task 3 (round-2 inventory row 2). `set_track_instrument`
@@ -3319,6 +3341,16 @@ pub fn move_clip(
     control.move_clip(&clip_id, timeline_start_samples, op::TxMeta::user("move clip")).map(|_| ())
 }
 
+/// Remove an audio clip from its track — thin delegate over
+/// [`ControlPlane::remove_clip`], mirroring `move_clip`'s State/ControlPlane
+/// access shape. The frontend removes the clip locally on click/keypress and
+/// awaits this to persist it; a failed call leaves the clip in the backend
+/// (the caller re-adds it locally on error, same convention as `removeTrack`).
+#[tauri::command]
+pub fn remove_clip(clip_id: String, control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    control.remove_clip(&clip_id, op::TxMeta::user("remove clip"))
+}
+
 /// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
 /// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. The frontend
 /// calls this on `pointerdown` of a fader/pan control; matching mid-gesture
@@ -3759,6 +3791,58 @@ mod tests {
             (session.store.tracks.clone(), session.store.clips.clone())
         };
         assert_eq!(after, before, "row AND clips restored byte-identically");
+    }
+
+    /// `remove_clip` runs through the channel — the clip leaves the store
+    /// and exactly one `Rebuild` is sent (structural, same as `move_clip`).
+    #[test]
+    fn remove_clip_goes_through_the_channel_and_rebuilds_once() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        {
+            let mut session = plane.session().lock();
+            session.store.clips.push(test_clip("c-1", "t-1"));
+        }
+        plane.remove_clip("c-1", TxMeta::user("remove clip")).unwrap();
+        assert!(plane.session().lock().store.clips.iter().all(|c| c.id != "c-1"));
+        assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
+    }
+
+    #[test]
+    fn remove_clip_rejects_unknown_clip_id() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        plane.session().lock().store.clips.push(test_clip("c-1", "t-1"));
+
+        assert!(plane.remove_clip("no-such-clip", TxMeta::user("remove clip")).is_err());
+        assert!(plane.session().lock().store.clips.iter().any(|c| c.id == "c-1"), "an unknown-id removal leaves truth untouched");
+    }
+
+    /// The inverse (`Op::ClipAdd`) must restore the clip byte-identically —
+    /// same precedent as `remove_track_inverse_restores_row_and_clips_
+    /// byte_identically` above.
+    #[test]
+    fn remove_clip_inverse_restores_the_clip_byte_identically() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let clip = test_clip("c-1", "t-1");
+        plane.session().lock().store.clips.push(clip.clone());
+
+        let committed = plane
+            .commit(TxMeta::user("remove"), |tx| {
+                let c = tx.store().clips.iter().find(|c| c.id == clip.id).cloned().unwrap();
+                tx.apply(Op::ClipRemove { clip: c, index: 0 })
+            })
+            .unwrap();
+        assert!(plane.session().lock().store.clips.iter().all(|c| c.id != "c-1"));
+
+        plane
+            .commit(TxMeta::user("undo"), |tx| {
+                for op in committed.inverses.clone() {
+                    tx.apply(op)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let restored = plane.session().lock().store.clips.clone();
+        assert_eq!(restored, vec![clip], "clip restored byte-identically");
     }
 
     fn recording_control_plane() -> (Arc<ControlPlane>, RecordedEvents, EngineHandle) {
