@@ -9,6 +9,8 @@ import type { Clip, MidiClip } from "../types/ipc";
 vi.mock("../tauri", () => ({
   backend: {
     on: () => () => {},
+    removeClip: () => Promise.resolve(),
+    midiRemoveClip: () => Promise.resolve(),
     getProjectState: () =>
       Promise.resolve({ ppq: 960, tempoEvents: [{ tick: 0, bpm: 120 }], midiClips: [] }),
   },
@@ -64,6 +66,30 @@ describe("clipSelection", () => {
     expect(clipSelection.count()).toBe(1);
     expect(clipSelection.refs()).toEqual([{ kind: "audio", id: "a1" }]);
     expect(clipSelection.has({ kind: "audio", id: "a2" })).toBe(false);
+  });
+
+  /**
+   * The seam between main's clip delete (PR #26) and this track's selection
+   * store, which no test on either side of the merge crossed: `removeClip`
+   * is the live path that takes a clip out of the document while it is
+   * selected. A stale key surviving here is not cosmetic — it would reach
+   * `move_clips` as an unknown id and fail the WHOLE next group drag, which
+   * is the failure mode live filtering exists to prevent.
+   */
+  it("drops a clip deleted through removeClip, and keeps the rest of the selection", async () => {
+    clipSelection.apply(
+      [
+        { kind: "audio", id: "a1" },
+        { kind: "audio", id: "a2" },
+        { kind: "midi", id: "m1" },
+      ],
+      "replace",
+    );
+    await project.removeClip("a2");
+    await midi.removeClip("m1");
+    expect(clipSelection.refs()).toEqual([{ kind: "audio", id: "a1" }]);
+    expect(clipSelection.has({ kind: "audio", id: "a2" })).toBe(false);
+    expect(clipSelection.has({ kind: "midi", id: "m1" })).toBe(false);
   });
 
   it("clears the anchor too when the anchored clip disappears", () => {

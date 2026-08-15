@@ -1264,9 +1264,10 @@ decision for the owner**, not a refactor.
 Track C (multi-clip selection, group drag/resize, cross-track and
 cross-instance paste, SMF export of a selection) is **IMPLEMENTED** on
 branch `multiclip-clipboard` (**PR #22**), cut from `origin/main` at
-`3340aa8`, with `origin/main` merged in at the Task 9/10 boundary
-(`c26d01d`, pulling in Tracks E, D and B plus two commits the owner merged
-himself). Plan document:
+`3340aa8`, with `origin/main` merged in twice: at the Task 9/10
+boundary (`c26d01d`, pulling in Tracks E, D and B plus two commits the owner
+merged himself) and again at close-out (`79ae94c`, pulling in PR #26 clip
+delete and PR #29's LV2 stderr guard — see "The second merge" below). Plan document:
 `docs/superpowers/plans/2026-08-14-multiclip-selection-paste.md`. SDD ledger
 (gitignored): `.superpowers/sdd/2026-08-14-multiclip-selection-paste/progress.md`.
 Thirteen tasks.
@@ -1299,8 +1300,9 @@ a .mid, reusing the frozen `midi_export_file` clip-id filter).
 (zero).** Five additive commands: `move_clips`, `clips_copy`, `clips_paste`,
 `os_clipboard_write_text`, `os_clipboard_read_text`.
 
-**Suites: 720 backend (691 lib + 29 integration) + 353 frontend, all green,
-measured on `multiclip-clipboard` 2026-08-15**; `npx svelte-check` 0 errors,
+**Suites: 729 backend (700 lib + 29 integration, plus main's 2 `#[ignore]`d
+plugin repros) + 359 frontend, all green, measured on `multiclip-clipboard`
+2026-08-15 after the second `origin/main` merge**; `npx svelte-check` 0 errors,
 0 warnings. Doc-tests are 0 and are NOT a test target. Counts dated in
 README/CONTRIBUTING. `main` moved FIVE times during this track and this
 branch absorbed all of it at `c26d01d`, so the count line is a known
@@ -1462,6 +1464,66 @@ correct fix made this failure quieter, not louder.
   and the only place that knows BOTH paths came back empty. Putting it in
   the store made the app claim there was nothing to paste while the legacy
   path pasted a clip.
+
+### The second merge (`79ae94c`): main's clip delete meets multi-selection
+
+PR #26 added a `×` button and Delete/Backspace on both clip components —
+the same handlers this track filled with selection, anchor and drag logic.
+Four conflicts, all additive-on-both-sides except one; the handler list was
+verified by SET COMPARISON (ours 93, main 90, union 95, merged 95, nothing
+missing, nothing invented). Two things are worth carrying forward.
+
+**RULING — Delete with a multi-selection stays SINGLE-CLIP, deliberately.**
+Delete/Backspace deletes the focused clip; three other selected clips stay.
+The plan's non-goals already say "no multi-clip DELETE, split or duplicate",
+and nothing about main's commit changes that reasoning — but the decisive
+argument is the undo shape, not the scope line. `remove_clip` and
+`midi_remove_clip` are SINGLE-clip commands, one transaction each, so
+extending Delete to a selection of four would commit **four transactions and
+four history entries**. The user would then press Ctrl+Z, get ONE clip back,
+and have to press it three more times — a partial undo of a single gesture,
+which is exactly the failure mode this whole track (and Task 9 in
+particular) exists to prevent. Shipping a destructive multi-clip operation
+with the wrong undo granularity, in a close-out, is strictly worse than not
+shipping it. **The honest cost is real and named:** a user who has just
+learned that clips select as a group will press Delete and be surprised that
+only one disappears. That surprise is recoverable with one correct Ctrl+Z;
+the alternative's is not.
+
+**The follow-on, with its design question already answered:** add a
+`clips_remove` batch command that composes `Op::ClipRemove` /
+`Op::MidiClipRemove` for the whole selection inside ONE
+`commit(TxMeta::user("delete clips"), …)`, exactly as `clips_paste`
+composes the add ops — one undo entry for the batch, no new op kind, and
+`OP_FORMAT_VERSION` stays 2. Then wire Delete to it. That is a task, not a
+close-out fix.
+
+**The `×` button now appears on EVERY selected clip, not just one.** In main
+`selected` meant the single focused clip; on this branch it means
+multi-selection membership, so `{#if selected}` renders one `×` per selected
+clip. Judged coherent and kept: each `×` deletes its own clip and (after the
+merge fix) no longer disturbs the selection. Named here because it is a
+visible behaviour change nobody chose — it fell out of the merge, and the
+next person to see four `×`s should know it was inspected rather than
+missed.
+
+**A merge-mechanics lesson worth more than the merge:** the mechanical
+keep-both resolution of `tauri.ts` ate a shared closing brace and left the
+file syntactically invalid — and **`npm test` still passed**, because every
+store test mocks `../tauri`, so the frontend suite structurally cannot see a
+broken `tauri.ts`. Only `svelte-check` caught it. It is a required gate, not
+a formality, and a green `npm test` is not evidence that the frontend
+compiles.
+
+**One new test, at the seam neither parent covered:** deleting a clip
+through `project.removeClip` / `midi.removeClip` while it is part of a
+multi-selection drops it from the selection and leaves the rest intact. The
+pre-existing live-filter test sets `project.clips` directly and never
+touches the delete path; a sabotage that stops `removeClip` from updating
+the store kills ONLY the new test. (Green on first run — a characterization
+test of an already-correct seam, sabotage-proved rather than RED-first, and
+recorded as such.) The property matters because a stale key would reach
+`move_clips` as an unknown id and fail the whole NEXT group drag.
 
 ### Closed by the whole-track final review (2026-08-15)
 

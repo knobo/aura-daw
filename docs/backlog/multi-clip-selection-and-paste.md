@@ -148,8 +148,15 @@ roadmap's Tier 2.
 - **The owed manual cross-instance check** — see the handoff; the one link
   no test in this repo can make.
 - **Multi-clip DELETE, split and DUPLICATE.** Ctrl+D is still
-  `midi.duplicateSelected` (single, focused clip); Delete is still
-  single-clip. The selection store already gives them the set.
+  `midi.duplicateSelected` (single, focused clip). Delete/Backspace and the
+  `×` button (PR #26, merged in at close-out) are also still single-clip,
+  and that is a RULING, not an oversight: `remove_clip` /
+  `midi_remove_clip` are one transaction each, so deleting a four-clip
+  selection through them would be FOUR undo entries and a partial Ctrl+Z.
+  The fix is a `clips_remove` batch command composing `Op::ClipRemove` /
+  `Op::MidiClipRemove` in ONE transaction, exactly as `clips_paste`
+  composes the add ops — then wire Delete to it. Full reasoning in the
+  handoff.
 - **Arrow-key nudge over a selection.** `nudgeSelection` is note-level in
   the piano roll; the clip-level equivalent would reuse `move_clips`
   directly (it is already a batch command).

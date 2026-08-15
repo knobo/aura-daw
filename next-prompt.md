@@ -409,11 +409,13 @@ and rationale in the handoff. Also read the handoff's **clipboard size
 ceiling** before promising anyone large-selection copy between windows: a
 failed large copy empties the system clipboard for every application.
 
-**Left deliberately undone:** multi-clip delete/duplicate, arrow-key nudge
-over a selection, audio-clip resize, true content instancing, SMF paste, and
-the hardcoded MCP port 41717 that real two-instance workflows still hit.
+**Left deliberately undone:** multi-clip delete/duplicate (Delete and the
+`×` from PR #26 stay single-clip — a batch `clips_remove` in ONE transaction
+is the prerequisite, see the handoff), arrow-key nudge over a selection,
+audio-clip resize, true content instancing, SMF paste, and the hardcoded MCP
+port 41717 that real two-instance workflows still hit.
 
-Baseline after this track: **720 backend (691 lib + 29 integration) + 353
+Baseline after this track: **729 backend (700 lib + 29 integration) + 359
 frontend**, measured on `multiclip-clipboard` 2026-08-15.
 
 ### Track D — Automation audible + lane UI — LANDED 2026-08-14
