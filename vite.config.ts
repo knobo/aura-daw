@@ -6,7 +6,10 @@ import tailwindcss from "@tailwindcss/vite";
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
-  plugins: [svelte(), tailwindcss()],
+  // tailwindcss() BEFORE svelte(): in the other order Tailwind's transform can
+  // reach a .svelte virtual css module before vite-plugin-svelte has loaded it,
+  // then parses the component's JS as CSS ("Invalid declaration: `onMount`").
+  plugins: [tailwindcss(), svelte()],
 
   // Vite options tailored for Tauri development.
   clearScreen: false,
