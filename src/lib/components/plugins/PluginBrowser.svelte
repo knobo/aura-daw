@@ -9,6 +9,8 @@
   import { project } from "../../state/project.svelte";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
   import type { PluginDescriptor, PluginInstanceInfo } from "../../types/ipc";
+  import { tracksBoundToInstance } from "../../utils/plugin-binding";
+  import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   let instrumentsOnly = $state(true);
 
@@ -31,8 +33,12 @@
     sel.value = "";
   }
 
-  function trackName(trackId: string | null | undefined): string {
-    return trackId ? (project.trackById(trackId)?.name ?? "?") : "";
+  function boundTo(inst: PluginInstanceInfo, trackId: string): boolean {
+    return tracksBoundToInstance(project.tracks, inst.id).some((t) => t.id === trackId);
+  }
+
+  function isBound(inst: PluginInstanceInfo): boolean {
+    return tracksBoundToInstance(project.tracks, inst.id).length > 0;
   }
 </script>
 
@@ -132,15 +138,15 @@
               </button>
             {/if}
             <select title="Bind to a MIDI track" onchange={(e) => onBind(inst, e)}>
-              <option value="">{inst.trackId ? "rebind…" : "bind to track…"}</option>
+              <option value="">{isBound(inst) ? "rebind…" : "bind to track…"}</option>
               {#each midiTracks as t (t.id)}
-                <option value={t.id}>{t.name}{inst.trackId === t.id ? " ✓" : ""}</option>
+                <option value={t.id}>{t.name}{boundTo(inst, t.id) ? " ✓" : ""}</option>
               {/each}
             </select>
           </div>
-          {#if inst.trackId}
-            <div class="row bound silk" title="Bound track">⌁ {trackName(inst.trackId)}</div>
-          {/if}
+          <div class="row">
+            <PluginConnectionBadge instanceId={inst.id} />
+          </div>
         </div>
       {/each}
     </div>
@@ -373,10 +379,5 @@
     margin-top: 2px;
     padding-top: 8px;
     border-top: 1px solid var(--glass-border);
-  }
-
-  .bound {
-    color: #5cf2b8;
-    letter-spacing: 0.1em;
   }
 </style>
