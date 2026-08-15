@@ -920,6 +920,68 @@ mod tests {
         let _ = preview.all_off();
     }
 
+    /// Turning the monitor OFF with a key still down is the one state where
+    /// nothing else releases the routed note: armed and stopped means no
+    /// stop edge, no disarm, no target switch. So the toggle's falling edge
+    /// itself has to ask for the release — with monitoring off, the physical
+    /// note-off is routed nowhere (`MonitorRoute::Silent`) and never
+    /// arrives. Both `select_port` paths push it; this pins the fast one,
+    /// which is the path the toggle actually takes (same port, monitor
+    /// flipped).
+    #[test]
+    fn toggling_the_monitor_off_asks_the_hub_to_release_the_routed_note() {
+        use crate::audio::midi_in::{MidiInHub, EV_ALL_OFF, LIVE_IN_RING_SLOTS};
+        use midir::os::unix::VirtualInput;
+
+        let Ok(midi_in) = MidiInput::new("aura-midi-input-test") else {
+            eprintln!("skipping: ALSA seq unavailable in this environment");
+            return;
+        };
+        let Ok(conn) = midi_in.create_virtual("aura-test-monitor-off", |_, _, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: ALSA virtual port unavailable in this environment");
+            return;
+        };
+
+        let hub = Arc::new(MidiInHub::new());
+        let (tx, mut rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
+        hub.install_producer(tx);
+        hub.set_target_track(Some("t-1".into()));
+        let mgr = MidiInputManager::with_hub(hub.clone());
+        let port = MidiPortInfo {
+            id: "virtual-test-port#0".to_string(),
+            name: "virtual-test-port".to_string(),
+        };
+        let monitor_flag = Arc::new(AtomicBool::new(true));
+        {
+            let mut inner = mgr.inner.lock().unwrap();
+            inner.connection = Some(ActiveConnection {
+                port: port.clone(),
+                shared: Arc::new(ConnShared::default()),
+                opened_at: Instant::now(),
+                monitor: monitor_flag.clone(),
+                _conn: conn,
+            });
+        }
+
+        let preview = sampler_preview::start("test");
+        let mut rs = None;
+        handle_incoming(&preview, &hub, &mut rs, true, &[0x90, 60, 100]);
+        assert_eq!(rx.pop().unwrap().kind, crate::audio::midi_in::EV_NOTE_ON);
+
+        mgr.select_port(Some(port.id.clone()), false).unwrap();
+        assert_eq!(
+            rx.pop().map(|e| e.kind),
+            Ok(EV_ALL_OFF),
+            "the falling edge asks for a release"
+        );
+
+        // And with monitoring off the key's own note-off really does go
+        // nowhere, which is what makes that release load-bearing.
+        handle_incoming(&preview, &hub, &mut rs, false, &[0x80, 60, 0]);
+        assert!(rx.pop().is_err(), "monitor off routes nothing to the track");
+        let _ = preview.all_off();
+    }
+
     #[test]
     fn capture_is_independent_of_the_monitor_toggle() {
         use crate::audio::midi_in::MidiInHub;

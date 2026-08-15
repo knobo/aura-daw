@@ -247,6 +247,12 @@ struct InputBundle {
     meter_rx: rtrb::Consumer<RawMeterBlock>,
 }
 
+/// Drain-buffer capacity: a block's `MAX_LIVE_IN_PER_BLOCK` popped events,
+/// plus room for one release expanded into note-offs for every key at once.
+/// Sized so the expansion can never overrun (`take_held_note_offs` clamps
+/// as well, so the arithmetic here is not load-bearing).
+const LIVE_IN_BUF_SLOTS: usize = MAX_LIVE_IN_PER_BLOCK + 128;
+
 /// State owned by the cpal OUTPUT callback closure. `render` obeys the RT
 /// contract: the only "syscalls" are what cpal itself does.
 struct OutputCb {
@@ -271,25 +277,58 @@ struct OutputCb {
     /// keeps only the newest producer.
     live_in_rx: rtrb::Consumer<LiveMidiEvent>,
     /// Preallocated drain buffer — the RT side never allocates.
-    live_in_buf: [LiveMidiEvent; MAX_LIVE_IN_PER_BLOCK],
+    live_in_buf: [LiveMidiEvent; LIVE_IN_BUF_SLOTS],
     /// Cloned at open time so the callback never touches a global.
     live_in_hub: Arc<MidiInHub>,
     /// The slot this callback dispatched live-in events to LAST block. The
     /// hub publishes only where events go NEXT, and a release has to be
     /// addressed to where they went before.
     live_in_slot: Option<usize>,
-    /// A monitored node owes an all-off before its next monitored block.
-    /// Sticky until it is actually delivered, so a target change and a stop
-    /// landing in the same block still release both nodes.
-    live_in_release: bool,
+    /// A monitored node owes a NODE-WIDE all-off before its next monitored
+    /// block. Sticky until it is actually delivered, so a target change and
+    /// a stop landing in the same block still release both nodes.
+    live_in_all_off: bool,
+    /// The keys MONITORING currently has down on the target node — the one
+    /// thing that separates a monitored voice from a clip voice, since they
+    /// live in the same node.
+    live_in_held: [bool; 128],
     /// A node that lost the routing target and is being released. It keeps
     /// the live-in channel for `live_in_release_left` samples, because an
     /// envelope only advances while its node is rendered.
+    ///
+    /// ONE slot, deliberately: a `LiveInBlock` addresses one slot per block,
+    /// so a queue here would only serialize release windows, not overlap
+    /// them. A second target change inside an open window therefore drops
+    /// the first node mid-decay (a ≤80 ms fragment on its next arm — never a
+    /// drone). Two clicks that fast are not human, but a rebuild that
+    /// RENUMBERS slots gets there without a human: this compares slot
+    /// NUMBERS, and after a track delete the old number names a different
+    /// track. The real fix is to compare the target's identity rather than
+    /// its slot index; ledgered for the close-out, not smuggled in here.
     live_in_release_slot: Option<usize>,
     live_in_release_left: u64,
 }
 
 impl OutputCb {
+    /// Writes a note-off into `live_in_buf` for every key monitoring has
+    /// down, starting at `at`, and clears the mask. Returns how many were
+    /// written. RT-safe: a fixed 128-step scan over an inline array.
+    fn take_held_note_offs(&mut self, at: usize) -> usize {
+        let mut n = 0usize;
+        for key in 0..128usize {
+            if !self.live_in_held[key] {
+                continue;
+            }
+            self.live_in_held[key] = false;
+            if at + n >= LIVE_IN_BUF_SLOTS {
+                break;
+            }
+            self.live_in_buf[at + n] = LiveMidiEvent::note_off(key as u8);
+            n += 1;
+        }
+        n
+    }
+
     fn render(&mut self, out: &mut [f32]) {
         // Adopt a new graph snapshot if one is queued — but only when the
         // retire queue can take the old one (drop must happen control-side).
@@ -336,64 +375,101 @@ impl OutputCb {
         // Hardware MIDI-in. One relaxed load; the control thread resolved
         // this id→slot under the tables lock (`MidiInHub::refresh_target`).
         let live_slot = self.live_in_hub.target_slot();
-        // The events on the ring carry no slot of their own, so every
-        // release the routing needs has to be addressed HERE, by the only
-        // party that knows which node was being monitored last block:
+        // Ring events carry no slot, so every release the routing needs is
+        // addressed HERE, by the only party that knows which node was being
+        // monitored last block. There are two KINDS of release and the
+        // difference is load-bearing, because monitoring shares the node
+        // that plays the track's clips:
         //
-        // * the outgoing node on a target change. `set_target_track` does
-        //   push an all-off, but it is drained under the NEW slot (or, when
-        //   nothing is routed any more, dropped on the floor with the rest
-        //   of the block) — so a held note would survive, silent, and come
-        //   back the moment that track is armed again.
-        // * the incoming node before it is monitored, and the target node
-        //   when the transport stops. Nothing else releases the clip note
-        //   under a playhead that just stopped: the stopped branch used to
-        //   be `out.fill(0.0)` and the graph's own release only happens at
-        //   the next play start (`discontinuity`), which may never come.
+        // * NODE-WIDE (`all_off`) — only where nothing may legitimately be
+        //   sounding: the block the transport stops on, and a node armed
+        //   while stopped (it can be holding a clip voice frozen from the
+        //   last playthrough, which nothing else will ever release).
+        // * MONITORING'S OWN KEYS (`live_in_held`) — everywhere the graph
+        //   may still be playing: a target change, and every release the
+        //   producer asks for. A node-wide release there would cut the clip
+        //   note the song is in the middle of, and a note-on that already
+        //   happened never comes back.
         if live_slot != self.live_in_slot {
             if let Some(old) = self.live_in_slot {
                 self.live_in_release_slot = Some(old);
-                // A node's envelope only advances while it is RENDERED, so
-                // one all-off is not enough: a node left frozen mid-release
-                // resurrects that fragment the next time it is armed. The
-                // outgoing node therefore keeps the live-in channel until
-                // its release has had time to run — monitoring on the new
-                // target starts one release later, which is ~85 ms after a
-                // click nobody can play through.
-                self.live_in_release_left =
-                    (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames;
+                // An envelope only advances while its node is RENDERED, so
+                // delivering the note-offs is not enough: a node left frozen
+                // mid-release resurrects that fragment the next time it is
+                // armed. The outgoing node therefore keeps the live-in
+                // channel until its release has had time to run. While
+                // PLAYING the graph renders it every block anyway, so one
+                // block — just enough to carry the note-offs — is the whole
+                // window, and monitoring on the new target is never deaf for
+                // longer than the gesture that caused it.
+                // PolySynth's release, applied to every instrument: a
+                // sampler or plugin with a longer tail is still cut short
+                // (bounded and silent, never a drone). Raising it only
+                // trades that for a longer deaf window on the new target —
+                // a per-node `release_tail()` on the processor trait is the
+                // real answer, and a separate cut.
+                self.live_in_release_left = if playing {
+                    frames
+                } else {
+                    (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames
+                };
             }
-            self.live_in_release = true;
+            if !playing {
+                self.live_in_all_off = true;
+            }
         }
         if self.was_playing && !playing {
-            self.live_in_release = true;
+            self.live_in_all_off = true;
         }
         self.live_in_slot = live_slot;
         let outgoing = self.live_in_release_slot;
 
-        // Drained UNCONDITIONALLY, even with nothing routed and even on the
-        // block that is spent releasing: the producer is a foreign thread
-        // that keeps pushing whatever the port sends, and a ring nobody
-        // empties would hand the next armed track a backlog of stale notes.
-        // Bounded by the preallocated buffer, so a flood costs a fixed
-        // amount of work.
+        // Drained UNCONDITIONALLY, even with nothing routed and even on a
+        // block spent releasing: the producer is a foreign thread that keeps
+        // pushing whatever the port sends, and a ring nobody empties would
+        // hand the next armed track a backlog of stale notes. `popped` is
+        // what the RT bound applies to; the buffer is sized so that
+        // expanding a release into it can never overrun (see
+        // `LIVE_IN_BUF_SLOTS`).
         let mut n_in = 0usize;
-        if self.live_in_release && outgoing.is_none() {
+        let mut popped = 0usize;
+        if outgoing.is_some() {
+            // This block belongs to the node that just lost the target:
+            // exactly the keys monitoring put down on it, and nothing else.
+            n_in = self.take_held_note_offs(0);
+        } else if self.live_in_all_off {
             // FIRST in the block, so this block's own note-ons survive it.
             self.live_in_buf[0] = LiveMidiEvent::all_off();
             n_in = 1;
-            self.live_in_release = false;
+            self.live_in_all_off = false;
+            self.live_in_held = [false; 128];
         }
-        while n_in < MAX_LIVE_IN_PER_BLOCK {
-            match self.live_in_rx.pop() {
-                Ok(ev) => {
+        while popped < MAX_LIVE_IN_PER_BLOCK {
+            let Ok(ev) = self.live_in_rx.pop() else { break };
+            popped += 1;
+            if outgoing.is_some() {
+                // Dropped with the block that is releasing: a key struck
+                // inside the window is swallowed, and its later note-off
+                // arrives orphaned (harmless — note-offs are idempotent).
+                continue;
+            }
+            match ev.kind {
+                // A producer-side release request (`set_target_track`, the
+                // monitor toggle, a port change) — expanded rather than
+                // passed through, for the same reason a target change is.
+                midi_in::EV_ALL_OFF => n_in += self.take_held_note_offs(n_in),
+                midi_in::EV_NOTE_ON if ev.velocity > 0 => {
+                    self.live_in_held[(ev.key & 127) as usize] = true;
                     self.live_in_buf[n_in] = ev;
                     n_in += 1;
                 }
-                Err(_) => break,
+                _ => {
+                    self.live_in_held[(ev.key & 127) as usize] = false;
+                    self.live_in_buf[n_in] = ev;
+                    n_in += 1;
+                }
             }
         }
-        let release = [LiveMidiEvent::all_off()];
         if outgoing.is_some() {
             self.live_in_release_left = self.live_in_release_left.saturating_sub(frames);
             if self.live_in_release_left == 0 {
@@ -401,13 +477,7 @@ impl OutputCb {
             }
         }
         let live_in = match outgoing {
-            // These blocks belong to the node we stopped monitoring. This
-            // block's own events go with them — they arrived while the
-            // target was ambiguous, and `all_notes_off` clears the node's
-            // queue anyway. Re-sent every block: it is idempotent (only
-            // HELD voices move to released), so no bookkeeping is needed to
-            // find the first block of the window.
-            Some(old) => Some(mixer::LiveInBlock { slot: old, events: &release }),
+            Some(old) => Some(mixer::LiveInBlock { slot: old, events: &self.live_in_buf[..n_in] }),
             None => {
                 live_slot.map(|slot| mixer::LiveInBlock { slot, events: &self.live_in_buf[..n_in] })
             }
@@ -845,10 +915,11 @@ impl Control {
             next_pos: u64::MAX, // first playing block is a discontinuity
             was_playing: false,
             live_in_rx,
-            live_in_buf: [LiveMidiEvent::all_off(); MAX_LIVE_IN_PER_BLOCK],
+            live_in_buf: [LiveMidiEvent::all_off(); LIVE_IN_BUF_SLOTS],
             live_in_hub: self.live_in_hub.clone(),
             live_in_slot: None,
-            live_in_release: false,
+            live_in_all_off: false,
+            live_in_held: [false; 128],
             live_in_release_slot: None,
             live_in_release_left: 0,
         };
@@ -1026,6 +1097,12 @@ impl Control {
                 // reads `session.midi` directly instead of re-locking
                 // through the registered global.
                 let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
+                // ORDER MATTERS: a midi track already has a clips-only row
+                // from the loop above, so this adds a SECOND row for the
+                // same slot. Both write that slot's meter lane and the last
+                // writer wins — appending the live rows here is what makes
+                // the live one win. Push them before the loop and the midi
+                // track's meters silently read zero.
                 crate::midi::playback::append_from_with_input(
                     &session.midi,
                     store,
@@ -1862,10 +1939,11 @@ mod tests {
                 next_pos: u64::MAX,
                 was_playing: false,
                 live_in_rx,
-                live_in_buf: [LiveMidiEvent::all_off(); MAX_LIVE_IN_PER_BLOCK],
+                live_in_buf: [LiveMidiEvent::all_off(); LIVE_IN_BUF_SLOTS],
                 live_in_hub,
                 live_in_slot: None,
-                live_in_release: false,
+                live_in_all_off: false,
+                live_in_held: [false; 128],
                 live_in_release_slot: None,
                 live_in_release_left: 0,
             },
@@ -2046,8 +2124,12 @@ mod tests {
     }
 
     /// A two-track live graph, both slots a real `PolySynth`.
-    fn polysynth_graph_pair(generation: u64) -> RtGraph {
-        let track = |slot: usize| {
+    fn polysynth_graph_pair(
+        generation: u64,
+        events0: Vec<crate::midi::schedule::AbsNoteEvent>,
+    ) -> RtGraph {
+        let mut events0 = Some(events0);
+        let mut track = |slot: usize| {
             let mut synth = crate::midi::synth::PolySynth::new();
             crate::audio::dsp::AudioProcessor::prepare(&mut synth, 48_000, crate::audio::rt::MAX_LIVE_BLOCK);
             RtTrack {
@@ -2055,7 +2137,7 @@ mod tests {
                 clips: Vec::new(),
                 live: Some(crate::audio::rt::LiveSource {
                     node: crate::audio::rt::LiveNodeCell::new(Box::new(synth)),
-                    events: Arc::new(Vec::new()),
+                    events: Arc::new(events0.take().unwrap_or_default()),
                 }),
             }
         };
@@ -2191,6 +2273,119 @@ mod tests {
         assert_eq!(peak(&out), 0.0, "stopping released the note");
     }
 
+    /// Fix round 2, Important 1. Monitoring shares the node that plays the
+    /// clips, so a node-wide release cannot tell a monitored voice from a
+    /// clip voice. Arming mid-playback is the feature's primary gesture —
+    /// play the song, arm the track, jam along — and it must not cut the
+    /// note the song is in the middle of. The note-on has already happened,
+    /// so a cut one is gone until the clip's next note.
+    #[test]
+    fn arming_mid_playback_leaves_the_clip_note_that_is_already_sounding_alone() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        let sounding = peak(&out);
+        assert!(sounding > 0.02, "the clip note is sounding before the arm");
+
+        target_slot_0(&cb, "t-1");
+        // Well past the release the blanket all-off would have started: a cut
+        // note is all the way down by now, a held one has not moved at all.
+        for _ in 0..12 {
+            cb.render(&mut out);
+            assert!(
+                peak(&out) > sounding * 0.9,
+                "arming cut the sounding clip note: {} was {}",
+                peak(&out),
+                sounding
+            );
+        }
+        // …and monitoring is live on the same node, in the same breath.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        cb.render(&mut out);
+        assert!(peak(&out) > sounding, "the monitored note plays on top of the clip");
+    }
+
+    /// The mirror image, same mechanism: taking the target AWAY from a track
+    /// whose clip is sounding must release only what MONITORING put down.
+    #[test]
+    fn switching_target_mid_playback_leaves_the_clip_note_alone() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, scheduled)))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        let sounding = peak(&out);
+        assert!(sounding > 0.02);
+
+        retarget(&cb, Some("t-2"));
+        for _ in 0..12 {
+            cb.render(&mut out);
+            assert!(
+                peak(&out) > sounding * 0.9,
+                "the switch cut t-1's clip note: {} was {}",
+                peak(&out),
+                sounding
+            );
+        }
+    }
+
+    /// Fix round 2, Important 2. Everything that asks the hub to release
+    /// monitoring — the monitor toggle's falling edge, a port change, a
+    /// port close — pushes one `all_off` onto the ring. Passed through to
+    /// the node it would cut the clip note too, which is why the callback
+    /// expands it into note-offs for the keys MONITORING put down.
+    #[test]
+    fn a_release_request_from_the_port_stops_monitoring_without_cutting_the_clip() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        let clip_only = peak(&out);
+        assert!(clip_only > 0.02);
+
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        cb.render(&mut out);
+        let both = peak(&out);
+        assert!(both > clip_only * 1.2, "the monitored key is audible on top");
+
+        assert!(cb.live_in_hub.push(LiveMidiEvent::all_off()));
+        for _ in 0..12 {
+            cb.render(&mut out);
+        }
+        let after = peak(&out);
+        assert!(after < both * 0.9, "monitoring was released");
+        assert!(
+            after > clip_only * 0.9,
+            "…and the clip note was not: {after} (clip alone was {clip_only})"
+        );
+    }
+
     /// The other half of Critical 1: a track that was NOT the target when
     /// the transport stopped got no release at all (nothing renders it, so
     /// nothing can deliver one). Arming it afterwards starts monitoring a
@@ -2258,7 +2453,7 @@ mod tests {
     fn switching_target_releases_the_track_that_was_holding_the_key() {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
-        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1)))).unwrap();
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
         target_slot_0(&cb, "t-1");
         assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
 
