@@ -22,6 +22,7 @@
 
 pub mod compile;
 pub mod model;
+pub mod persist;
 pub mod resolve;
 
 pub use compile::{
@@ -35,6 +36,8 @@ pub use model::{
     normalize_curve, validate_binding, AutomationClip, AutomationPoint, Binding, BindingMode,
     Curve, Domain, Range, RangeSnapshot, Source, TargetRef, TrackParam,
 };
+
+pub use persist::{load_from_project, migrate_v3_lanes, save_into_project};
 
 /// The document half of the modulation graph. Lives in `Session`, mirrors
 /// `project.json`'s `modulation{}` object.

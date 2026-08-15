@@ -246,11 +246,11 @@ pub fn load(path: &Path) -> Result<(Project, PathBuf), String> {
     let bytes = fs::read(&file).map_err(|e| format!("read {}: {e}", file.display()))?;
     let mut project: Project =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse project.json: {e}"))?;
-    // v1, v2 and v3 are all readable here: the typed struct carries the v1
-    // fields; the v2/v3 midi fields (tempoMap, meterMap, midiClips, ...)
-    // are read by `midi::persist` straight from the file (unknown fields
-    // are ignored per D-06, never rejected).
-    if !(1..=3).contains(&project.schema_version) {
+    // v1–v4 are all readable here: the typed struct carries the v1 fields;
+    // the v2+ midi/modulation fields (tempoMap, meterMap, midiClips,
+    // modulation, ...) are read by their own loaders straight from the file
+    // (unknown fields are ignored per D-06, never rejected).
+    if !(1..=4).contains(&project.schema_version) {
         return Err(format!("unsupported project schemaVersion {}", project.schema_version));
     }
     project.path = Some(dir.to_string_lossy().into_owned());
