@@ -107,6 +107,35 @@ export function copySelection(notes: MidiNote[], selection: Set<number>): MidiNo
     .sort(byTickKey);
 }
 
+function snapToward(value: number, grid: number, strength: number): number {
+  if (grid <= 0) return value;
+  const target = Math.round(value / grid) * grid;
+  const s = Math.min(1, Math.max(0, strength));
+  return Math.round(value + (target - value) * s);
+}
+
+/** Snap selected note starts (and optionally lengths) toward `gridTicks`.
+ * `strength` is 0..1 — 1 is full snap, 0.5 lands halfway. One `midi_set_notes`
+ * commit at the call site = one undo step. */
+export function quantizeSelection(
+  notes: MidiNote[],
+  selection: Set<number>,
+  gridTicks: number,
+  strength: number,
+  lengths = false,
+): { notes: MidiNote[]; selection: Set<number> } {
+  if (selection.size === 0 || gridTicks <= 0) return { notes, selection };
+  const next = notes.map((n, i) => {
+    if (!selection.has(i)) return n;
+    const tick = Math.max(0, snapToward(n.tick, gridTicks, strength));
+    const lengthTicks = lengths
+      ? Math.max(1, snapToward(n.lengthTicks, gridTicks, strength))
+      : n.lengthTicks;
+    return { ...n, tick, lengthTicks };
+  });
+  return sortWithSelection(next, selection);
+}
+
 /** Append deep copies of the clipboard and select exactly the pasted notes.
  * Notes starting past the content end are dropped — `dropped` reports how
  * many, so the caller can tell the user instead of losing them silently. */

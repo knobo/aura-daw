@@ -318,10 +318,10 @@
     box-shadow: 0 0 8px rgba(82, 229, 255, 0.4);
   }
   .tog.auto.on {
-    color: #fff;
-    background: rgba(255, 65, 82, 0.8);
-    border-color: var(--red);
-    box-shadow: 0 0 8px rgba(255, 65, 82, 0.4);
+    color: var(--bg-0);
+    background: var(--magenta);
+    border-color: var(--magenta);
+    box-shadow: 0 0 8px rgba(255, 79, 216, 0.4);
   }
 
   .fader-wrap {

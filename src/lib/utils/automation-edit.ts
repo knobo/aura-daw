@@ -63,7 +63,13 @@ export function movePoint(
     tick: Math.max(0, Math.round(tick)),
     value: Math.min(max, Math.max(min, value)),
   };
-  const rest = points.filter((_, i) => i !== index).filter((q) => q.tick !== moved.tick);
+  const rest = points.filter((_, i) => i !== index);
+  // A drag onto another point's tick must not eat the neighbour — insert
+  // last-wins is for a click-to-place, not for a move. Keep the original
+  // tick (value still updates) so a vertical drag still works.
+  if (rest.some((q) => q.tick === moved.tick)) {
+    moved.tick = points[index].tick;
+  }
   const out = sorted([...rest, moved]);
   return { points: out, index: out.findIndex((q) => q === moved) };
 }
