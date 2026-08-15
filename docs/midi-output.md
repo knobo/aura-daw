@@ -70,7 +70,16 @@ why it is where it is.
 5. **Mute the track in AURA** if you don't want to hear its internal
    instrument at the same time. The track keeps sounding internally
    otherwise — routing to a device does not replace AURA's own voice, and
-   muting is the documented way to avoid doubling.
+   muting is the documented way to avoid doubling — until a return clip
+   lands on the track (step 7), which replaces the internal instrument.
+6. To **capture the synth into the project** (so export hears it): next
+   to the channel box, pick a **return** input — the same list as the
+   master-strip input picker. Patch the synth (or Hydrogen) into that
+   input yourself (a cable, or Helvum / qpwgraph). Arm the track and
+   record. A WAV clip lands on *this* MIDI track.
+7. Once that clip exists, AURA stops playing the internal instrument on
+   the track so the return is what you hear and what `export_song` mixes.
+   Delete the clip to get the internal voice back.
 
 Unlike the single-track carve-out this shipped with originally, **more than
 one track can be routed at once** — pick a different track from the **trk**
@@ -153,8 +162,7 @@ and the workaround today is a smaller audio buffer.
   config on purpose (see the persistence section above).
 * No JACK transport / Ableton Link.
 * No MIDI-out latency offset (see the timing caveat above).
-* No audio **return** — notes leave, the synth's sound does not come
-  back, and `export_song` will not hear it. The planned cut is
-  `docs/backlog/external-instrument-return.md` (record/freeze onto the
-  same track, then bounce). Until that lands, record the device into an
-  audio track yourself if the WAV needs to include it.
+* **X1 audio return is in:** a routed MIDI track can pick a cpal input
+  and record onto itself. PipeWire one-click link (X2) and freeze-then-
+  export (X3) are still later — see
+  `docs/backlog/external-instrument-return.md`.

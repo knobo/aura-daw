@@ -1603,8 +1603,19 @@ impl ControlPlane {
         &self,
         track_ids: Option<Vec<String>>,
     ) -> Result<TransportState, String> {
-        self.engine
-            .request::<Vec<String>>(|reply| ControlMsg::StartRecording { track_ids, reply })?;
+        // X1: MIDI tracks with a return source become audio takes on that
+        // device. The engine does not talk to MidiOut (ruling: midi_out
+        // never touches engine.rs); we pass the map in on the message.
+        let return_sources = self
+            .midi_out
+            .get()
+            .map(|out| out.return_sources())
+            .unwrap_or_default();
+        self.engine.request::<Vec<String>>(|reply| ControlMsg::StartRecording {
+            track_ids,
+            return_sources,
+            reply,
+        })?;
         let snap = self.transport_state();
         self.emit_transport(&snap);
         Ok(snap)
@@ -1849,8 +1860,43 @@ impl ControlPlane {
         let out = self.midi_out()?;
         out.set_route(
             crate::midi_out::RouteScope::Track(track_id),
-            port_id.map(|port_id| crate::midi_out::RouteTarget { port_id, channel }),
+            port_id.map(|port_id| crate::midi_out::RouteTarget::new(port_id, channel)),
         );
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
+    }
+
+    /// Pick (or clear) the audio-return input device on a routed MIDI track.
+    /// App config, same file as the route — no `Op`. The track must already
+    /// be routed (`MidiOut::set_return` rejects otherwise).
+    pub fn set_midi_track_return(
+        &self,
+        track_id: String,
+        device_id: Option<String>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        {
+            let session = self.session.lock();
+            let t = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            if t.kind != "midi" {
+                return Err(format!(
+                    "track {track_id} is kind \"{}\" (a return hangs on a midi track)",
+                    t.kind
+                ));
+            }
+        }
+        log::info!(
+            "set_midi_track_return: actor={:?} label={:?} track={track_id} device={device_id:?}",
+            meta.actor,
+            meta.label
+        );
+        let out = self.midi_out()?;
+        out.set_return(&track_id, device_id)?;
         out.persist(self.current_project_dir().as_deref());
         Ok(())
     }
@@ -1879,7 +1925,7 @@ impl ControlPlane {
         let out = self.midi_out()?;
         out.set_route(
             crate::midi_out::RouteScope::Clip(clip_id),
-            port_id.map(|port_id| crate::midi_out::RouteTarget { port_id, channel }),
+            port_id.map(|port_id| crate::midi_out::RouteTarget::new(port_id, channel)),
         );
         out.persist(self.current_project_dir().as_deref());
         Ok(())

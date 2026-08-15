@@ -156,6 +156,12 @@ pub fn append_from(
             Ok(map) => {
                 for t in store.tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = slots.get(&t.id) else { continue };
+                    // A freeze return is an audio clip on this MIDI track.
+                    // Playing the internal instrument on top of it would
+                    // double the take (and track-mute would silence both).
+                    if store.clips.iter().any(|c| c.track_id == t.id) {
+                        continue;
+                    }
                     let events = track_events(midi, t.id.as_str(), &map);
                     if events.is_empty() {
                         continue;
@@ -200,6 +206,12 @@ pub fn append_from_with_input(
             Ok(map) => {
                 for t in store.tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = slots.get(&t.id) else { continue };
+                    // A freeze return is an audio clip on this MIDI track.
+                    // Playing the internal instrument on top of it would
+                    // double the take (and track-mute would silence both).
+                    if store.clips.iter().any(|c| c.track_id == t.id) {
+                        continue;
+                    }
                     let events = track_events(midi, t.id.as_str(), &map);
                     if events.is_empty() {
                         continue;
@@ -228,7 +240,9 @@ pub fn append_from_with_input(
                 .iter()
                 .find(|t| t.id.as_str() == target_id && t.kind == "midi")
             {
-                if let Some(&slot) = slots.get(&t.id) {
+                if store.clips.iter().any(|c| c.track_id == t.id) {
+                    // Frozen return: no live node to monitor through.
+                } else if let Some(&slot) = slots.get(&t.id) {
                     let node = node_for_track(t, plugins, bank, rate, nodes);
                     live_ids.insert(t.id.to_string());
                     out.push(RtTrack {

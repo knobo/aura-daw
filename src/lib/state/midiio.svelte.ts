@@ -110,9 +110,22 @@ class MidiIoStore {
   }
 
   async setTrackRoute(trackId: string, portId: string | null, channel = 0): Promise<void> {
+    const prev = this.trackRoute(trackId);
     this.routes = this.routes.filter((r) => !(r.scope === "track" && r.id === trackId));
-    if (portId) this.routes = [...this.routes, { scope: "track", id: trackId, portId, channel }];
+    if (portId) {
+      this.routes = [
+        ...this.routes,
+        { scope: "track", id: trackId, portId, channel, returnDevice: prev?.returnDevice ?? null },
+      ];
+    }
     await backend.midiSetTrackRoute?.(trackId, portId, channel);
+  }
+
+  async setTrackReturn(trackId: string, deviceId: string | null): Promise<void> {
+    this.routes = this.routes.map((r) =>
+      r.scope === "track" && r.id === trackId ? { ...r, returnDevice: deviceId } : r,
+    );
+    await backend.midiSetTrackReturn?.(trackId, deviceId);
   }
 
   async setClipRoute(clipId: string, portId: string | null, channel = 0): Promise<void> {

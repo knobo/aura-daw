@@ -19,6 +19,7 @@ const midiOpenOutputPort = vi.fn(() => Promise.resolve());
 const midiCloseOutputPort = vi.fn(() => Promise.resolve());
 const midiSetOutputClockEnabled = vi.fn(() => Promise.resolve());
 const midiSetTrackRoute = vi.fn(() => Promise.resolve());
+const midiSetTrackReturn = vi.fn(() => Promise.resolve());
 const midiSetClipRoute = vi.fn(() => Promise.resolve());
 
 const inputStatus: MidiInputStatus = {
@@ -52,6 +53,7 @@ vi.mock("../tauri", () => ({
     midiCloseOutputPort,
     midiSetOutputClockEnabled,
     midiSetTrackRoute,
+    midiSetTrackReturn,
     midiSetClipRoute,
     midiInputStatus,
     midiOutputStatus,
@@ -106,7 +108,13 @@ describe("midiIo", () => {
   it("setTrackRoute forwards the route and mirrors it locally, clearing on null", async () => {
     await midiIo.setTrackRoute("t-9", "out#0", 3);
     expect(midiSetTrackRoute).toHaveBeenCalledWith("t-9", "out#0", 3);
-    expect(midiIo.trackRoute("t-9")).toEqual({ scope: "track", id: "t-9", portId: "out#0", channel: 3 });
+    expect(midiIo.trackRoute("t-9")).toEqual({
+      scope: "track",
+      id: "t-9",
+      portId: "out#0",
+      channel: 3,
+      returnDevice: null,
+    });
 
     await midiIo.setTrackRoute("t-9", null);
     expect(midiSetTrackRoute).toHaveBeenCalledWith("t-9", null, 0);
@@ -136,6 +144,20 @@ describe("midiIo", () => {
     expect(midiIo.outputs[0].port.id).toBe("out#0");
     expect(midiIo.outputs[0].clockEnabled).toBe(true);
     stop();
+  });
+
+  it("setTrackReturn mirrors locally and keeps the return across a port edit", async () => {
+    await midiIo.setTrackRoute("t-9", "out#0", 0);
+    await midiIo.setTrackReturn("t-9", "Mic 2");
+    expect(midiSetTrackReturn).toHaveBeenCalledWith("t-9", "Mic 2");
+    expect(midiIo.trackRoute("t-9")?.returnDevice).toBe("Mic 2");
+
+    await midiIo.setTrackRoute("t-9", "out#0", 4);
+    expect(midiIo.trackRoute("t-9")?.returnDevice).toBe("Mic 2");
+
+    await midiIo.setTrackReturn("t-9", null);
+    expect(midiSetTrackReturn).toHaveBeenCalledWith("t-9", null);
+    expect(midiIo.trackRoute("t-9")?.returnDevice).toBeNull();
   });
 
   it("the clock toggle is a pure command emission scoped to one port", async () => {

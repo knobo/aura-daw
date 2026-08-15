@@ -61,6 +61,9 @@ export interface MidiRouteStatus {
   id: string;
   portId: string;
   channel: number;
+  /** cpal input-device name this track records its audio return from. Clip
+   * routes never have one; missing/null = MIDI-only. */
+  returnDevice?: string | null;
 }
 
 export interface MidiOutputStatus {

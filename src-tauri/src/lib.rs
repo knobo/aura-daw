@@ -231,6 +231,7 @@ pub fn run() {
             midi_out::midi_set_output_clock_enabled,
             midi_out::midi_output_status,
             midi_out::midi_set_track_route,
+            midi_out::midi_set_track_return,
             midi_out::midi_set_clip_route,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,

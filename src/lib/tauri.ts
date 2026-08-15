@@ -320,6 +320,9 @@ export interface Backend {
    * clear the route. A clip's own route (below) always wins over its
    * track's. */
   midiSetTrackRoute?(trackId: string, portId: string | null, channel?: number): Promise<void>;
+  /** Pick (or `deviceId: null` to clear) the audio-return input on a
+   * routed MIDI track. The track must already have a MIDI-out route. */
+  midiSetTrackReturn?(trackId: string, deviceId: string | null): Promise<void>;
   /** Route one MIDI clip's notes, overriding its track's route, or
    * `portId: null` to fall back to the track's routing. */
   midiSetClipRoute?(clipId: string, portId: string | null, channel?: number): Promise<void>;
@@ -743,6 +746,9 @@ class TauriBackend implements Backend {
   }
   async midiSetTrackRoute(trackId: string, portId: string | null, channel?: number) {
     await invoke("midi_set_track_route", { trackId, portId, channel: channel ?? null });
+  }
+  async midiSetTrackReturn(trackId: string, deviceId: string | null) {
+    await invoke("midi_set_track_return", { trackId, deviceId });
   }
   async midiSetClipRoute(clipId: string, portId: string | null, channel?: number) {
     await invoke("midi_set_clip_route", { clipId, portId, channel: channel ?? null });
