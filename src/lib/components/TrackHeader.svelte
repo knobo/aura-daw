@@ -9,6 +9,7 @@
   import { plugins } from "../state/plugins.svelte";
   import { zyn } from "../state/zynpatches.svelte";
   import { automation } from "../state/automation.svelte";
+  import { openPluginParams } from "../state/plugin-panel";
   import { ui } from "../state/ui.svelte";
   import { formatDb } from "../utils/format";
   import Meter from "./Meter.svelte";
@@ -30,8 +31,7 @@
 
   function openInstrumentPanel() {
     if (pluginInst) {
-      ui.dock = "plugins";
-      void plugins.openParams(pluginInst.id);
+      void openPluginParams(pluginInst.id);
     } else {
       ui.dock = "instruments";
     }

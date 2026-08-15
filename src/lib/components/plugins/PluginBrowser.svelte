@@ -7,6 +7,7 @@
    */
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
+  import { openPluginParams } from "../../state/plugin-panel";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
   import type { PluginDescriptor, PluginInstanceInfo } from "../../types/ipc";
   import { tracksBoundToInstance } from "../../utils/plugin-binding";
@@ -125,7 +126,7 @@
             >
           </div>
           <div class="row">
-            <button class="params mono" onclick={() => plugins.openParams(inst.id)}>
+            <button class="params mono" onclick={() => void openPluginParams(inst.id)}>
               ⚙ PARAMS
             </button>
             {#if isZynInstance(inst)}
