@@ -359,10 +359,11 @@ impl VersionGraph {
 /// ships (row `String` heap on both sides): ops **70 020 B**, ops + inverses
 /// **140 040 B**, against **68 740 B** — **2.037x**. MARKED CORRECTION (ADR
 /// 0007, Task 7 re-review): this row previously read 69 810 / 139 620 /
-/// 68 530, which implies a row-heap sum of 850 B; the shipped
-/// `midi_clip_heap` also counts `lane_id`, so the fixture's rows weigh
-/// 1 060 B (lane_id 36 x 20 = 720, ids 90, track_ids 60, names 190). The
-/// ratio and the conclusion are unchanged. The ops halves are `ops_bytes`'
+/// 68 530, which is not reproducible from the shipped code. The fixture's
+/// row heap is 1 060 B under the helpers as they stand — lane_id 36 x 20 =
+/// 720, ids 90, track_ids 60, names 190 — and that is what the figures
+/// above use. The ratio and the conclusion are unchanged. The ops halves
+/// are `ops_bytes`'
 /// actual output; the IMAGE half of BOTH rows is a HAND-COMPUTED PROXY, not
 /// `charge_of`'s output — the real thing would add the list of pointers,
 /// 20 x `size_of::<Arc<MidiClip>>()` = 160 B, which moves neither the ratio

@@ -64,6 +64,12 @@ npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
 
+`midi_out::tests` is **known flaky as a module**, not as individual tests:
+its cases share a process-global hub and open real ALSA virtual ports, so
+under a parallel run any one of them can lose the race. Three distinct names
+have flaked so far; re-run the module in isolation before believing a failure
+there (`cargo test --lib midi_out::tests`).
+
 Some tests are **gated** and skip politely when their requirements are absent:
 
 - **Plugin tests** (Zyn acceptance + state round-trip, CLAP lifecycle, LV2

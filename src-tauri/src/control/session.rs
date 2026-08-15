@@ -333,20 +333,31 @@ impl Session {
     /// truncated. The pre-transaction image is total: it describes the whole
     /// document at a point the transaction had certainly not yet reached.
     ///
-    /// Every lock the crate takes is `parking_lot`, which does NOT poison, so
-    /// a contained panic leaves no lock in a degraded state and every later
-    /// `lock()` behaves exactly as before — the channel stays open. (Under
-    /// `std::sync::Mutex` this design would instead hand every subsequent
-    /// caller a `PoisonError`, which is why the choice is load-bearing rather
-    /// than incidental.)
+    /// Every lock REACHABLE FROM A CLOSURE is `parking_lot`, which does NOT
+    /// poison, so a contained panic leaves no lock in a degraded state and
+    /// every later `lock()` behaves exactly as before — the channel stays
+    /// open. Scoped deliberately, because the crate is NOT uniformly
+    /// `parking_lot`: `midi_input`'s `MidiInputManager.inner` and
+    /// `ConnShared.recent_status` are `std::sync::Mutex`es. They are off this
+    /// path today (reached only from `ControlPlane::select_midi_input_*`,
+    /// never from inside a transaction) and MUST STAY OFF IT — a closure that
+    /// consulted the MIDI-input manager, which is exactly the TOCTOU-avoiding
+    /// read [`Tx::store`]'s doc encourages, would on a contained panic poison
+    /// that mutex for the rest of the session.
+    ///
+    /// Containment also depends on unwinding: a future `panic = "abort"` in
+    /// any profile deletes this feature silently, since `catch_unwind` never
+    /// runs. `Cargo.toml` sets no `panic` key in either profile.
     ///
     /// RESIDUAL, deliberately not covered: the Err arm's own rollback carries
     /// `expect("rollback must not fail")`. A panic THERE is outside this
-    /// containment and would leave the L-5 divergence it exists to close. It
-    /// is left alone because no test can reach it without a test-only hook —
-    /// every index on the apply path is `.min()`-clamped and every lookup
-    /// returns `Result` — and shipping an unreachable branch would only buy a
-    /// test that cannot fail.
+    /// containment and re-opens L-5 for the closure-returned-`Err` path (not
+    /// for the panic path, which never reaches that arm). Reaching it needs a
+    /// test-only seam — `apply_raw` has no arithmetic, no `unwrap`/`expect`,
+    /// and every index is `.min()`-clamped or comes from a position search in
+    /// the same function — and the FIX is cheap without one (`pre_tx` is in
+    /// scope: log, `restore_from_snapshot(&pre_tx)`, break). What is missing
+    /// is coverage, not code, which is why nothing was shipped blind here.
     pub fn transact<F>(this: &parking_lot::Mutex<Session>, meta: TxMeta, f: F) -> Result<Committed, String>
     where
         F: FnOnce(&mut Tx<'_>) -> Result<(), String>,
@@ -357,12 +368,17 @@ impl Session {
             }
             t.set(true);
         });
+        // Drop-based, and STILL LOAD-BEARING after Task 8: containment
+        // returns normally, but a panic in the Ok arm or in the Err arm's
+        // rollback still unwinds past here, and only this resets the flag.
         let _reset = scopeguard(|| IN_TX.with(|t| t.set(false)));
         let mut guard = this.lock();
         // Taken BEFORE the closure runs: by Task 5's equivalence invariant
         // this IS the live document, and it is one Arc clone. Reading it
-        // afterwards would work today only because nothing reachable from a
-        // closure can publish; taking it up front does not depend on that.
+        // after the catch would rely on no PRODUCTION path publishing during
+        // the closure — true today, but `published_handle()` is `pub` and the
+        // slot behind it is assignable, so that is a property of the callers
+        // rather than of the type. Taking it up front does not depend on it.
         let pre_tx = guard.published.lock().clone();
         let mut tx = Tx { session: &mut guard, ops: vec![], inverses: vec![], effect: EngineEffect::default() };
         // `AssertUnwindSafe` is not a formality here — `tx` holds `&mut
@@ -383,6 +399,11 @@ impl Session {
                 // arm, so no revision is consumed and no `Committed` exists
                 // — journal, history and the version graph all take their
                 // work from a `Committed` and therefore record nothing.
+                // Not total in one place, by design: `plugins.dirty_state`
+                // entries a half-applied op set survive, because they
+                // describe the live persistence relationship rather than
+                // document content (see `restore_from_snapshot`). The cost
+                // is a redundant state write, never a lost one.
                 guard.restore_from_snapshot(&pre_tx);
                 log::error!(
                     "transact: closure panicked; document restored — this is a bug in the caller: {what}"
@@ -2041,22 +2062,53 @@ mod tests {
 
     #[test]
     fn a_panic_mid_batch_reverts_every_op_and_leaves_the_published_image_equal() {
+        // Covers ALL SIX document field families a `transact` closure can
+        // reach — tracks, clips, midi clips, transport, tempo/meter and
+        // automation — because "the restore is total" is this task's
+        // load-bearing claim and each family is a separate line in
+        // `restore_from_snapshot` that can be dropped independently.
+        // (`project_dir`/`project_name`/`created_at` are the remaining
+        // three: no op writes them, so a closure cannot half-apply them and
+        // there is nothing here for a test to pin.)
         let mut s = session_with_one_track("t-1");
         s.store.tracks.push(test_track("t-2"));
         s.midi.clips.push(test_midi_clip("mc-keep", "t-1"));
+        s.automation.lanes.push(test_lane("a-keep", vec![AutomationPoint { tick: 0, value: 0.25 }]));
         s.republish_full();
         let m = parking_lot::Mutex::new(s);
         let before = {
             let g = m.lock();
-            (g.store.tracks.clone(), g.store.clips.clone(), g.midi.clips.clone())
+            (
+                g.store.tracks.clone(),
+                g.store.clips.clone(),
+                g.midi.clips.clone(),
+                serde_json::to_value(&g.store.transport).unwrap(),
+                (g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()),
+                g.automation.lanes.clone(),
+            )
         };
         let t2 = m.lock().store.tracks[1].clone();
         let published = m.lock().published_handle();
 
-        let r = Session::transact(&m, TxMeta::user("three ops then die"), |tx| {
+        let r = Session::transact(&m, TxMeta::user("six ops then die"), |tx| {
             tx.apply(set_gain("t-1", -20.0))?;
             tx.apply(Op::TrackRemove { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
             tx.apply(Op::MidiClipAdd { clip: test_midi_clip("mc-new", "t-1"), index: 1 })?;
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEnabled,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(true),
+            })?;
+            tx.apply(Op::TempoSet {
+                ppq: 480,
+                events: vec![crate::midi::types::TempoEvent { tick: 0, bpm: 143.0 }],
+                meter: vec![crate::midi::types::MeterEvent { tick: 0, num: 7, den: 8 }],
+            })?;
+            tx.apply(Op::AutomationSetLane {
+                key: "a-keep".into(),
+                lane: Some(test_lane("a-keep", vec![AutomationPoint { tick: 960, value: 0.9 }])),
+            })?;
             // Nothing half-mutated is EVER published: the lock-free engine
             // reader (Task 6) sees only the pre-transaction image until the
             // Ok arm's capture. Both halves are asserted so the comparison
@@ -2066,7 +2118,9 @@ mod tests {
             assert_eq!(image.tracks[0].gain_db, 1.0, "published image still pre-tx");
             assert_eq!(tx.store().tracks.len(), 1, "…while the LIVE document is mid-batch");
             assert_eq!(tx.store().tracks[0].gain_db, -20.0, "…while the LIVE document is mid-batch");
-            panic!("after three ops, one structural");
+            assert!(!image.transport.loop_enabled, "published transport still pre-tx");
+            assert!(tx.store().transport.loop_enabled, "…while the LIVE transport is mid-batch");
+            panic!("after six ops, one structural");
         });
         assert!(matches!(&r, Err(e) if e.contains("panicked")), "must be contained as Err");
 
@@ -2074,6 +2128,17 @@ mod tests {
         assert_eq!(g.store.tracks, before.0, "the property op AND the structural op both reverted");
         assert_eq!(g.store.clips, before.1);
         assert_eq!(g.midi.clips, before.2, "the midi store reverted too");
+        assert_eq!(
+            serde_json::to_value(&g.store.transport).unwrap(),
+            before.3,
+            "transport reverted (Task 11 must not break this)",
+        );
+        assert_eq!(
+            (g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()),
+            before.4,
+            "tempo and meter reverted",
+        );
+        assert_eq!(g.automation.lanes, before.5, "automation lanes reverted");
         // Equivalence (Task 5) is restored before the lock releases.
         let image = published.lock().clone();
         assert_eq!(image.tracks.as_ref(), &g.store.tracks, "published image equals the live document");
@@ -2083,6 +2148,14 @@ mod tests {
             g.midi.clips,
             "published midi equals the live midi",
         );
+        assert_eq!(
+            serde_json::to_value(&image.transport).unwrap(),
+            serde_json::to_value(&g.store.transport).unwrap(),
+            "published transport equals the live transport",
+        );
+        assert_eq!(image.automation.as_ref(), &g.automation.lanes, "published automation equals the live lanes");
+        assert_eq!(image.midi.tempo_events.as_ref(), &g.midi.tempo_events);
+        assert_eq!(image.midi.meter_events.as_ref(), &g.midi.meter_events);
         assert_eq!(image.rev, g.rev(), "the image claims the rev that is actually live");
     }
 
