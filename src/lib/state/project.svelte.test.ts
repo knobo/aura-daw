@@ -10,6 +10,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Clip, TrackState } from "../types/ipc";
 
 const moveClip = vi.fn(() => Promise.resolve());
+const removeClip = vi.fn(() => Promise.resolve());
 const gestureBegin = vi.fn(() => Promise.resolve());
 const gestureEnd = vi.fn(() => Promise.resolve());
 const setTrackArm = vi.fn(() => Promise.resolve());
@@ -20,6 +21,7 @@ vi.mock("../tauri", () => ({
     mode: "tauri" as const,
     on: () => () => {},
     moveClip,
+    removeClip,
     gestureBegin,
     gestureEnd,
     setTrackArm,
@@ -67,6 +69,7 @@ function testClip(overrides: Partial<Clip> = {}): Clip {
 beforeEach(() => {
   vi.clearAllMocks();
   project.clips = [];
+  project.selectedClipId = null;
 });
 
 describe("commitClipMove", () => {
@@ -85,6 +88,26 @@ describe("commitClipMove", () => {
     await project.commitClipMove("no-such-clip");
 
     expect(moveClip).not.toHaveBeenCalled();
+  });
+});
+
+describe("removeClip", () => {
+  it("removes the clip from the store and invokes backend.removeClip", async () => {
+    project.clips = [testClip({ id: "c-1" }), testClip({ id: "c-2" })];
+
+    await project.removeClip("c-1");
+
+    expect(project.clips.map((c) => c.id)).toEqual(["c-2"]);
+    expect(removeClip).toHaveBeenCalledWith("c-1");
+  });
+
+  it("clears the selection when the removed clip was selected", async () => {
+    project.clips = [testClip({ id: "c-1" })];
+    project.select("c-1");
+
+    await project.removeClip("c-1");
+
+    expect(project.selectedClipId).toBeNull();
   });
 });
 

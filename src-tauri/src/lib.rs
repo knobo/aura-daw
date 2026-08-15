@@ -183,6 +183,7 @@ pub fn run() {
             control::get_project_state,
             control::set_track_mix,
             control::move_clip,
+            control::remove_clip,
             control::gesture_begin,
             control::gesture_end,
             // ---- control plane: undo/redo (Plan E Task 17, additive) ----
@@ -206,6 +207,7 @@ pub fn run() {
             midi::midi_set_notes,
             midi::midi_set_clip_bounds,
             midi::midi_rename_clip,
+            midi::midi_remove_clip,
             midi::midi_get_clips,
             midi::midi_import_file,
             midi::midi_export_file,
