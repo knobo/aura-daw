@@ -292,9 +292,15 @@ struct OutputCb {
     /// thing that separates a monitored voice from a clip voice, since they
     /// live in the same node.
     live_in_held: [bool; 128],
-    /// A node that lost the routing target and is being released. It keeps
-    /// the live-in channel for `live_in_release_left` samples, because an
-    /// envelope only advances while its node is rendered.
+    /// A node that lost the routing target and whose envelope may still be
+    /// running: `live_in_release_left` is how much of that envelope is still
+    /// owed, and it only counts down on blocks where the node is actually
+    /// rendered.
+    ///
+    /// Holding the live-in channel is a SEPARATE, usually much shorter fact
+    /// (`live_in_hold_left`), because the channel is what the incoming
+    /// target is waiting for — every event popped while it is held is
+    /// discarded, so the hold is measured in swallowed keystrokes.
     ///
     /// ONE slot, deliberately: a `LiveInBlock` addresses one slot per block,
     /// so a queue here would only serialize release windows, not overlap
@@ -307,6 +313,12 @@ struct OutputCb {
     /// its slot index; ledgered for the close-out, not smuggled in here.
     live_in_release_slot: Option<usize>,
     live_in_release_left: u64,
+    /// How much longer `live_in_release_slot` also keeps the live-in
+    /// channel. One block while the transport plays (the graph renders every
+    /// live node anyway, so the envelope needs no help); re-opened to the
+    /// remaining envelope on the stop edge, where nothing else would render
+    /// that node again.
+    live_in_hold_left: u64,
 }
 
 impl OutputCb {
@@ -327,6 +339,13 @@ impl OutputCb {
             n += 1;
         }
         n
+    }
+
+    /// How long an outgoing node must keep the live-in channel for its
+    /// envelope to reach silence, counted from the START of the block that
+    /// opens the window (the same block decrements it by `frames`).
+    fn release_window(&self, frames: u64) -> u64 {
+        (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames
     }
 
     fn render(&mut self, out: &mut [f32]) {
@@ -396,21 +415,30 @@ impl OutputCb {
                 // An envelope only advances while its node is RENDERED, so
                 // delivering the note-offs is not enough: a node left frozen
                 // mid-release resurrects that fragment the next time it is
-                // armed. The outgoing node therefore keeps the live-in
-                // channel until its release has had time to run. The window
-                // is unconditional: shortening it to one block while playing
-                // looks free (the graph renders every live node each block
-                // anyway) but ends the moment the transport stops, so a stop
-                // landing inside the window refreezes the outgoing node
-                // mid-decay and it replays that fragment on its next arm.
+                // armed. The outgoing node therefore stays accounted for
+                // until its release has had time to run.
+                //
+                // How long it keeps the LIVE-IN CHANNEL is a different
+                // question, and the answer is "as briefly as possible": the
+                // incoming target hears nothing until the channel is free
+                // (every event popped meanwhile is discarded), so the hold
+                // is measured in swallowed keystrokes. While PLAYING the
+                // graph renders every live node each block regardless, so
+                // one block — just enough to carry the note-offs — is
+                // enough, and arming a track mid-song costs the player
+                // nothing. Only where the node would stop being rendered
+                // altogether does the hold have to cover the envelope: that
+                // is the stop edge, handled below.
+                //
                 // PolySynth's release, applied to every instrument: a
                 // sampler or plugin with a longer tail is still cut short
                 // (bounded and silent, never a drone). Raising it only
                 // trades that for a longer deaf window on the new target —
                 // a per-node `release_tail()` on the processor trait is the
                 // real answer, and a separate cut.
-                self.live_in_release_left =
-                    (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames;
+                self.live_in_release_left = self.release_window(frames);
+                self.live_in_hold_left =
+                    if playing { frames } else { self.live_in_release_left };
             }
             if !playing {
                 self.live_in_all_off = true;
@@ -418,9 +446,18 @@ impl OutputCb {
         }
         if self.was_playing && !playing {
             self.live_in_all_off = true;
+            // The playing graph was what kept the outgoing node's envelope
+            // moving; stopping takes that away, and a node frozen mid-decay
+            // replays the fragment on its next arm. Hand it the channel for
+            // whatever release it still has left — while stopped,
+            // `render_live_input_only` renders exactly the slot that holds
+            // the channel, so the release actually runs to silence.
+            if self.live_in_release_slot.is_some() {
+                self.live_in_hold_left = self.live_in_release_left;
+            }
         }
         self.live_in_slot = live_slot;
-        let outgoing = self.live_in_release_slot;
+        let outgoing = if self.live_in_hold_left > 0 { self.live_in_release_slot } else { None };
 
         // Drained UNCONDITIONALLY, even with nothing routed and even on a
         // block spent releasing: the producer is a foreign thread that keeps
@@ -468,10 +505,21 @@ impl OutputCb {
                 }
             }
         }
-        if outgoing.is_some() {
-            self.live_in_release_left = self.live_in_release_left.saturating_sub(frames);
+        if self.live_in_release_slot.is_some() {
+            // The envelope only advances on blocks where the node is
+            // rendered: every block while playing, and while it holds the
+            // channel when stopped. (Stopped and NOT holding is currently
+            // unreachable — a stopped switch sets the hold to the whole
+            // remaining release, so the two reach zero together — which is
+            // why dropping this guard changes no behavior today. It states
+            // the invariant the two counters are kept apart for.)
+            if playing || outgoing.is_some() {
+                self.live_in_release_left = self.live_in_release_left.saturating_sub(frames);
+            }
+            self.live_in_hold_left = self.live_in_hold_left.saturating_sub(frames);
             if self.live_in_release_left == 0 {
                 self.live_in_release_slot = None;
+                self.live_in_hold_left = 0;
             }
         }
         let live_in = match outgoing {
@@ -920,6 +968,7 @@ impl Control {
             live_in_held: [false; 128],
             live_in_release_slot: None,
             live_in_release_left: 0,
+            live_in_hold_left: 0,
         };
         let stream = device
             .build_output_stream(
@@ -1667,7 +1716,10 @@ impl Control {
 
         // Arm the capture LAST among the fallible work: every `?` above
         // returns without a take running, so a failed start never leaves the
-        // hub buffering into a recording that does not exist.
+        // hub buffering into a recording that does not exist. Untestable as
+        // stated — a MIDI-only take has no fallible step above this, and a
+        // mixed one needs a real input device — so moving this call up will
+        // not turn anything red.
         if let Some(t) = &midi_target {
             self.live_in_hub.begin_capture(t.clone(), start_pos);
             log::info!("audio: recording MIDI take on track {t}");
@@ -1728,15 +1780,29 @@ impl Control {
         // Drop the input stream FIRST so the ring producers close and the
         // writer can drain to empty.
         self.input = None;
-        let clips = match writer {
+        // A writer failure (disk full, a WAV header that would not close,
+        // the 15 s drain timeout) is reported, but only after everything it
+        // does NOT own has been salvaged. It used to return early, which
+        // took two things with it that never depended on the writer: the
+        // MIDI take, which is pure in-memory data already lifted out of the
+        // hub above, and the stop itself — `shared.recording` stayed true
+        // and the transport-state commit never ran, leaving the UI claiming
+        // a take was still running.
+        let (clips, writer_err) = match writer {
             Some(w) => {
                 // Release the pin (Task 6 [I2]) — recording is over, so its
                 // generation no longer needs exemption from the plain
                 // window. Only the audio half ever pinned one.
                 self.gen_maps.unpin();
-                w.finish(Duration::from_secs(15))?
+                match w.finish(Duration::from_secs(15)) {
+                    Ok(clips) => (clips, None),
+                    Err(e) => {
+                        log::error!("stop_recording: the take's audio was lost: {e}");
+                        (Vec::new(), Some(e))
+                    }
+                }
             }
-            None => Vec::new(),
+            None => (Vec::new(), None),
         };
 
         self.shared.recording.store(false, Relaxed);
@@ -1783,6 +1849,13 @@ impl Control {
             // transaction can never fail on it and take the audio clips
             // down with it. `transact` closures must not panic and must
             // validate before mutating.
+            //
+            // This closes the mid-take window, not a concurrent one: the
+            // lock drops before `take_clip` and is re-taken inside the
+            // transaction, so a `remove_track` landing in between still
+            // registers a clip on a dead track. `ClipAdd` has the same
+            // exposure, and closing it means holding the session lock
+            // across the commit — a different, bigger change.
             if !session.store.tracks.iter().any(|t| t.id.as_str() == c.track_id && t.kind == "midi") {
                 log::warn!("stop_recording: midi take dropped — track {} is gone", c.track_id);
                 return None;
@@ -1827,7 +1900,10 @@ impl Control {
                 "midiClipId": midi_clip.as_ref().map(|c| c.id.to_string()),
             }),
         );
-        Ok(clips)
+        match writer_err {
+            Some(e) => Err(e),
+            None => Ok(clips),
+        }
     }
 
     /// The ONE non-transient `Actor::Engine` tx `stop_recording` submits to
@@ -1944,6 +2020,10 @@ impl Control {
 ///   monitoring never becomes a MIDI take;
 /// * an empty result on BOTH halves is the "no armed tracks to record"
 ///   error, unchanged in wording (ruling 8: either half alone is a take).
+///   The wording is the plan's and is kept, but it is wrong for one caller:
+///   an explicit `requested` list naming only MIDI tracks with no routing
+///   target set is reported as "no armed tracks" although nothing was armed
+///   or unarmed. Reachable from MCP's `record_take`; wants its own branch.
 fn split_record_targets(
     store: &Store,
     requested: Option<Vec<String>>,
@@ -2051,6 +2131,7 @@ mod tests {
                 live_in_held: [false; 128],
                 live_in_release_slot: None,
                 live_in_release_left: 0,
+                live_in_hold_left: 0,
             },
             evt_rx,
             (graph_tx, retire_rx, meter_rx),
@@ -3581,13 +3662,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Task 10's leftover Minor A. The release window used to be shortened
-    /// to a single block while playing, on the reasoning that a playing
-    /// graph renders every live node every block anyway. It does — until
-    /// the transport stops. Stop within the window and the outgoing node is
-    /// frozen mid-release with nothing left to render it, and it serves the
-    /// fragment back on its next arm. The window is unconditional for
-    /// exactly this case.
+    /// The other half of the release window, and the reason it must stay
+    /// short while playing: the outgoing node holds the LIVE-IN CHANNEL,
+    /// and every event popped while it does is discarded outright, never
+    /// re-delivered. Stretching that hold to the envelope's length would
+    /// swallow ~80 ms of keystrokes on the incoming target — during "play
+    /// the song, arm a track, jam with it", which is the gesture the
+    /// feature exists for.
+    #[test]
+    fn a_key_struck_just_after_a_switch_while_playing_is_not_swallowed() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert_eq!(peak(&out), 0.0, "nothing is sounding yet");
+
+        retarget(&cb, Some("t-2"));
+        cb.render(&mut out);
+        cb.render(&mut out);
+
+        // Two blocks (~21 ms) after the switch — well inside an
+        // envelope-length hold, well outside a one-block one.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        let mut best = 0.0f32;
+        for _ in 0..20 {
+            cb.render(&mut out);
+            best = best.max(peak(&out));
+        }
+        assert!(best > 0.02, "the key was swallowed by the release window: {best}");
+    }
+
+    /// The stop edge re-opens the hold for a release still in flight — and
+    /// only then. A release that already finished during playback must not
+    /// hand its node the channel again at the next stop, or every stop after
+    /// a target switch would deafen the current target for ~80 ms.
+    #[test]
+    fn a_release_finished_while_playing_does_not_re_open_at_the_next_stop() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "t-1 is sounding");
+
+        // Switch, then keep PLAYING well past the envelope: the graph
+        // renders t-1 every block, so its release finishes here.
+        retarget(&cb, Some("t-2"));
+        for _ in 0..24 {
+            cb.render(&mut out);
+        }
+        shared.playing.store(false, Relaxed);
+        cb.render(&mut out);
+
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        let mut best = 0.0f32;
+        for _ in 0..20 {
+            cb.render(&mut out);
+            best = best.max(peak(&out));
+        }
+        assert!(best > 0.02, "the stop re-opened a window that had nothing left to release: {best}");
+    }
+
+    /// Task 10's leftover Minor A. Holding the live-in channel for one
+    /// block while playing rests on "a playing graph renders every live node
+    /// every block anyway". It does — until the transport stops. Stop before
+    /// the outgoing node's envelope has finished and nothing renders it
+    /// again, so it freezes mid-release and serves the fragment back on its
+    /// next arm. The stop edge hands it the channel for whatever release it
+    /// still has left, which is why the release is tracked separately from
+    /// the hold.
     #[test]
     fn stopping_right_after_a_target_switch_still_finishes_the_outgoing_release() {
         let shared = Arc::new(SharedRt::default());
@@ -3858,6 +4009,57 @@ mod tests {
             undo_before + 1,
             "ruling 6: one take is ONE undo entry — undoing it must never leave \
              half the take on the timeline"
+        );
+    }
+
+    /// The MIDI take is pure in-memory data lifted out of the hub before
+    /// the writer is ever touched, so a disk failure has no claim on it —
+    /// nor on the stop itself, which used to be abandoned along with it and
+    /// left the UI showing a take that was no longer running.
+    #[test]
+    fn a_disk_writer_failure_does_not_take_the_midi_take_down_with_it() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        session.lock().store.tracks.push(midi_track("m-1"));
+        session.lock().store.transport.state = "recording".into();
+
+        let dir = std::env::temp_dir()
+            .join(format!("aura-take-fail-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A plain FILE where the writer needs a directory: `create_dir_all`
+        // fails, so the writer thread returns Err without any disk-full
+        // theatre and without depending on sandbox permissions.
+        std::fs::write(dir.join("blocker"), b"not a directory").unwrap();
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        drop(producer);
+        let spec = recorder::RecSpec {
+            track_id: "a-1".into(),
+            clip_id: uuid::Uuid::new_v4().to_string(),
+            source_id: crate::ids::SourceId::mint(),
+            take_name: "Take 1".into(),
+            wav_path: dir.join("blocker/audio/take.wav"),
+            rel_path: "audio/take.wav".into(),
+            cache_dir: dir.join("blocker/cache"),
+            start_pos: 0,
+        };
+        ctl.writer = Some(recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap());
+        ctl.shared.recording.store(true, Relaxed);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+
+        let err = ctl.stop_recording().expect_err("the audio half really did fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!err.is_empty(), "the failure is reported, not swallowed");
+
+        assert_eq!(session.lock().midi.clips.len(), 1, "the midi take survived the writer");
+        assert!(session.lock().store.clips.is_empty(), "and no audio clip was invented");
+        assert!(!ctl.shared.recording.load(Relaxed), "the take is over");
+        assert!(!ctl.shared.playing.load(Relaxed));
+        assert_eq!(
+            session.lock().store.transport.state,
+            "stopped",
+            "the transport-state commit ran, so the UI cannot stay stuck on 'recording'"
         );
     }
 
