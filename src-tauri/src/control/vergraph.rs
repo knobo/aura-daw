@@ -20,15 +20,37 @@
 //! ties the two together: the graph never evicts below as many steps as undo
 //! can reach, so every rev the UI still offers is materializable.
 //!
-//! WHAT AN EVICTION ACTUALLY FREES. Images are Arc-structurally shared with
-//! each other and with `Session::published`, so dropping one frees exactly
-//! the parts no other retained image points at — which is precisely the
-//! node's OWN-CREATED bytes, i.e. its charge. That is why own-created bytes
-//! (not "document size") is the accounting unit: the number subtracted from
-//! `retained_bytes` is the number of bytes that actually become free. An
-//! eviction racing Task 6's lock-free rebuild is safe by the same mechanism:
-//! the rebuild holds its own `Arc` to the image, so the drop merely
-//! decrements and the memory is released when that reader finishes.
+//! WHAT AN EVICTION ACTUALLY FREES — and `retained_bytes` IS A LOWER BOUND,
+//! NOT A CEILING. Images are Arc-structurally shared with each other and
+//! with `Session::published`, so dropping a node frees only the allocations
+//! no OTHER holder still points at. Own-created bytes is the right
+//! accounting UNIT (charging each node the whole document would count the
+//! same allocation once per version), but it is not a measure of what an
+//! eviction releases, because structural sharing runs FORWARD as well as
+//! back: an image reuses the previous image's untouched content Arcs, which
+//! is the entire point of the COW substrate. So a node's own-created content
+//! outlives its eviction whenever a SURVIVING node's image still reuses it.
+//!
+//! MEASURED (fix round 1, I-1): v1 rewrites a clip to 1 000 notes (charge
+//! 16 244 B), v2 touches only a track — so v2's capture REUSES v1's clip
+//! content Arc — and v3 releases it from the live document. Evicting v1
+//! leaves the graph reporting `retained_bytes: 427` while still exclusively
+//! holding ~16 KB through v2. `evicting_a_node_frees_only_what_no_survivor_
+//! reuses` pins exactly that.
+//!
+//! The overhang is BOUNDED BY ONE DOCUMENT: everything a survivor reuses
+//! from before the cut is, by construction, a subset of the document as of
+//! the cut. So the graph can exceed its budget by at most one document's
+//! worth — a 50–100 % overshoot on a large project at a 512 MiB budget,
+//! which is a real number and belongs to whoever fixes the accounting
+//! (charging the LAST holder rather than the creator, or a reachability
+//! sweep). It is not a leak and it is not unbounded. Note also that the
+//! FRONT node pins a complete document while being charged only its delta.
+//!
+//! An eviction racing Task 6's lock-free rebuild is safe by the same
+//! sharing mechanism: the rebuild holds its own `Arc` to the image, so the
+//! drop merely decrements and the memory is released when that reader
+//! finishes.
 
 use std::sync::Arc;
 
@@ -62,11 +84,13 @@ pub enum VersionNode {
 }
 
 impl VersionNode {
-    /// Bytes this node RETAINS — and, for a materialized node, the bytes an
-    /// eviction actually frees (see the module doc). Deliberately NOT
-    /// "bytes the batch touched": a replay-only node holds op and inverse
-    /// vectors of its own, and charging it the image charge it avoided
-    /// would defend the budget against a fiction.
+    /// Bytes this node ADDED — its own-created image bytes, or (replay-only)
+    /// the op and inverse vectors it stores. Charging a replay-only node the
+    /// image charge it avoided would defend the budget against a fiction.
+    ///
+    /// NOT the bytes dropping it frees: a surviving node's image may still
+    /// reuse this node's own-created content Arcs, in which case the drop
+    /// frees none of it. See the module doc's lower-bound argument.
     pub fn charge(&self) -> usize {
         match self {
             VersionNode::Materialized { charge, .. } | VersionNode::ReplayOnly { charge, .. } => {
@@ -104,6 +128,20 @@ impl ReplayPlan {
     /// journal, no effects — `Session::apply_replay` is a bare `apply_raw`
     /// loop, and the effect descriptions it produces are discarded (the ops
     /// already ran, once, when they were committed).
+    ///
+    /// THE RESULT'S `transport` IS THE REPLAY BASE'S, NOT THE TARGET REV'S,
+    /// and a caller MUST NOT restore it (fix round 1, I-2). Transport writes
+    /// (play/stop/loop/stop-at-end/sample-rate, recording start and stop)
+    /// commit TRANSIENTLY: they bump `rev` but leave no version node, so the
+    /// chain has gaps and no `apply_replay` step ever carries their ops. A
+    /// replay-only rev therefore reproduces CONTENT faithfully and transport
+    /// only as of the nearest materialized ancestor. Restoring it through
+    /// `Session::restore_from_snapshot` (which does write `store.transport`)
+    /// would silently rewind loop points, stop-at-end and recording state.
+    /// Fixing it properly means either recording transient batches as
+    /// something, or replaying the journal rather than the graph — a
+    /// question for the round that owns transport-in-history, not a
+    /// paper-over here.
     pub fn run(self) -> Option<SessionSnapshot> {
         let mut scratch = super::session::Session::from_snapshot(&self.base);
         for ops in &self.steps {
@@ -273,18 +311,17 @@ impl VersionGraph {
             .iter()
             .map(|(_, n)| match n {
                 VersionNode::ReplayOnly { ops, .. } => ops.clone(),
-                // A materialized node between base and target still has to
-                // be APPLIED: its image is a shortcut, not a substitute for
-                // its ops. (Reachable only when a later out-of-order insert
-                // lands behind an already-materialized node.)
-                VersionNode::Materialized { .. } => Vec::new(),
+                VersionNode::Materialized { .. } => {
+                    unreachable!("base_idx is the NEAREST materialized ancestor")
+                }
             })
             .collect();
         Some(ReplayPlan { rev, base: snapshot.clone(), steps })
     }
 
     /// Convenience for tests and single-shot callers: [`Self::replay_plan`]
-    /// then [`ReplayPlan::run`]. Production callers holding the `HistoryLog`
+    /// then [`ReplayPlan::run`]. The result's `transport` is the replay
+    /// BASE's and must not be restored — see [`ReplayPlan::run`]. Production callers holding the `HistoryLog`
     /// mutex must use the two halves (see `HistoryLog::materialize_version`)
     /// — the replay is CPU-bound and must not run under a lock.
     pub fn materialize(&self, rev: u64) -> Option<SessionSnapshot> {
@@ -312,15 +349,34 @@ impl VersionGraph {
 /// `MidiClipAdd` holds the entire clip. A materialized node, by contrast,
 /// holds an Arc-SHARED image whose own-created bytes are one copy of that
 /// same content. So for exactly the op class the 64 KB threshold targets,
-/// the replay-only representation costs ~2x what it saves — and Track C's
-/// measured multi-clip paste (one `MidiClipAdd` per clip, ~200 KB of ops in
-/// a single history entry) is the worst case: ops + inverses dwarf the
-/// image's own-created bytes.
+/// the replay-only representation costs ~2x what it saves.
+///
+/// MEASURED, on Track C's multi-clip paste shape (20 clips x 200 notes, one
+/// `MidiClipAdd` per clip; `size_of::<Op>() = 248`, `MidiNote = 16`,
+/// `MidiClip = 184`). At the finding, charging no row heap on the ops side:
+/// ops 68 960 B, ops + inverses 137 920 B, against an image own-created
+/// charge of 67 680 B — **2.038x**. Under the parity accounting this file
+/// ships (row `String` heap on both sides): ops 69 810 B, ops + inverses
+/// **139 620 B**, against **68 530 B** — **2.037x**. Both are reproducible
+/// from `ops_bytes` and `charge_of`; the image charge lands just over the
+/// 64 KB threshold either way. The pathology is SCALE-INVARIANT: replay is
+/// ~2x content and the image ~1x content at any size, so no threshold VALUE
+/// separates the classes — only this guard does.
+///
+/// It is not a mechanism-killer either: a single gain nudge on a 300-clip
+/// project charges ~70 KB of image against ~500 B of ops, a ~140x
+/// replay-only win, and this guard fires there.
 ///
 /// So the threshold decides WHETHER to consider replay-only, and this
 /// decides whether it would pay. Without the guard the mechanism is a
 /// memory pessimization on the one class it was built for, which no
 /// eviction budget can make correct.
+///
+/// BOTH SIDES ARE WEIGHED BY THE SAME RULES (fix round 1): `charge_of` and
+/// [`ops_bytes`] share `snapshot::{track,clip,midi_clip}_heap`, so a row's
+/// `String` heap counts on both sides and no future tightening of one can
+/// silently move this decision boundary. Plugin rows are charged at their
+/// slot on both sides.
 ///
 /// The route to making replay-only pay off is named rather than left to be
 /// rediscovered: the undo stack ALREADY retains these same op vectors for
@@ -336,41 +392,69 @@ fn replay_pays_off(replay_charge: usize, image_charge: usize) -> bool {
 ///
 /// EXHAUSTIVE match over `Op`, deliberately (same discipline as
 /// `ChangeSet::from_ops`): a new variant must fail to compile here until
-/// somebody decides what it weighs. Approximate in the same, documented way
-/// `snapshot::charge_of` is — inline `String` fields inside the enum slot
-/// are charged at their slot, not their heap bytes.
+/// somebody decides what it weighs.
+///
+/// PARITY WITH `charge_of` IS STRUCTURAL, NOT REMEMBERED (fix round 1):
+/// this number is compared against an image charge in [`replay_pays_off`],
+/// so the two must weigh a row the same way. Both sides call the SAME
+/// `snapshot::{track,clip,midi_clip}_heap` helpers, so tightening one
+/// tightens both. `charge_of` counting a row's `String` heap while this
+/// function charged it at its slot biased the comparison toward
+/// replay-only — the dangerous direction, since replay-only is the side
+/// that can cost 2x.
 pub fn ops_bytes(ops: &[Op]) -> usize {
+    use super::snapshot::{clip_heap, midi_clip_heap, track_heap};
     use std::mem::size_of;
     let mut bytes = std::mem::size_of_val(ops);
     for op in ops {
         bytes += match op {
-            Op::Set { from, to, .. } => json_bytes(from) + json_bytes(to),
-            Op::TrackAdd { clips, clip_indices, .. }
-            | Op::TrackRemove { clips, clip_indices, .. } => {
-                clips.len() * size_of::<crate::audio::types::Clip>()
+            Op::Set { object, from, to, .. } => {
+                objectref_heap(object) + json_bytes(from) + json_bytes(to)
+            }
+            Op::TrackAdd { track, clips, clip_indices, .. }
+            | Op::TrackRemove { track, clips, clip_indices, .. } => {
+                track_heap(track)
+                    + clips.len() * size_of::<crate::audio::types::Clip>()
+                    + clips.iter().map(clip_heap).sum::<usize>()
                     + clip_indices.len() * size_of::<usize>()
             }
-            Op::ClipAdd { .. } | Op::ClipRemove { .. } => 0,
+            Op::ClipAdd { clip, .. } | Op::ClipRemove { clip, .. } => clip_heap(clip),
             Op::TempoSet { events, meter, .. } => {
                 events.len() * size_of::<crate::midi::TempoEvent>()
                     + meter.len() * size_of::<crate::midi::MeterEvent>()
             }
             Op::MidiClipAdd { clip, .. } | Op::MidiClipRemove { clip, .. } => {
-                clip.notes.len() * size_of::<crate::midi::MidiNote>()
+                midi_clip_heap(clip) + clip.notes.len() * size_of::<crate::midi::MidiNote>()
             }
-            Op::MidiSetNotes { notes, .. } => notes.len() * size_of::<crate::midi::MidiNote>(),
+            Op::MidiSetNotes { clip, notes, .. } => {
+                clip.as_str().len() + notes.len() * size_of::<crate::midi::MidiNote>()
+            }
             Op::AutomationSetLane { lane, .. } => lane.as_ref().map_or(0, |l| {
                 l.points.len() * size_of::<crate::plugins::automation::AutomationPoint>()
             }),
+            // Plugin rows are charged at their slot on BOTH sides
+            // (`charge_of`'s `instances.len() * size_of`), so no row heap
+            // here either — parity, not an oversight.
             Op::PluginAdd { .. } => 0,
             Op::PluginRemove { state, params, .. } => {
                 state.as_ref().map_or(0, |b| b.len())
                     + params.len() * size_of::<crate::plugins::ParamInfo>()
             }
-            Op::PluginSetState { state, .. } => state.len(),
+            Op::PluginSetState { instance, state, .. } => instance.len() + state.len(),
         };
     }
     bytes
+}
+
+/// The id a `Set` addresses — heap the stored op really holds.
+fn objectref_heap(object: &super::op::ObjectRef) -> usize {
+    use super::op::ObjectRef;
+    match object {
+        ObjectRef::Track(id) => id.as_str().len(),
+        ObjectRef::Clip(id) | ObjectRef::MidiClip(id) => id.as_str().len(),
+        ObjectRef::Transport => 0,
+        ObjectRef::Plugin(id) => id.len(),
+    }
 }
 
 /// Heap bytes of a JSON payload (an op's `from`/`to`). Numbers and bools
@@ -643,6 +727,81 @@ mod tests {
         );
     }
 
+    /// I-2, pinned as a LIMITATION rather than documented away: transport
+    /// writes commit transiently, so they bump `rev` and leave no node — the
+    /// chain has gaps no `apply_replay` step can carry. A materialized rev
+    /// therefore reproduces CONTENT exactly and `transport` only as of its
+    /// replay base. This test exists so that stops being a surprise: if a
+    /// later round teaches the graph about transport, it fails and someone
+    /// reads the doc that says why.
+    #[test]
+    fn a_materialized_rev_carries_the_replay_bases_transport_not_the_revs() {
+        let m = session_with_one_clip();
+        let mut g = VersionGraph::new();
+
+        let base = Session::transact(&m, TxMeta::user("base"), |tx| {
+            tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(1) })
+        })
+        .unwrap();
+        g.record(&base);
+        assert!(!base.snapshot.transport.loop_enabled, "the base really has loop off");
+
+        // A TRANSIENT transport write: it commits, it bumps `rev`, and the
+        // sink never offers it to the graph (`!meta.transient` at the call
+        // site) — so no node exists for it.
+        Session::transact(&m, TxMeta::user("loop").transient(), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEnabled,
+                from: serde_json::json!(false),
+                to: serde_json::json!(true),
+            })
+        })
+        .unwrap();
+
+        // ...and then an ordinary content batch, forced replay-only.
+        let mut later = Session::transact(&m, TxMeta::user("rewrite"), |tx| {
+            tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(40) })
+        })
+        .unwrap();
+        later.snapshot_charge = 10 * 1024 * 1024;
+        let rev = later.rev;
+        g.record(&later);
+        assert_eq!(g.stats().replay_only, 1, "the rev under test really is replay-only");
+
+        let live = m.lock().published_handle().lock().clone();
+        assert!(live.transport.loop_enabled, "the live document really has loop ON");
+        let image = g.materialize(rev).expect("materializable");
+        assert_eq!(canonical(&image), canonical(&live), "CONTENT is reproduced exactly");
+        assert!(
+            !image.transport.loop_enabled,
+            "...but transport is the replay BASE's — a caller must not restore it \
+             (see ReplayPlan::run)"
+        );
+    }
+
+    /// `replay_pays_off` compares an image charge with an ops charge, so the
+    /// two must weigh a row the same way — otherwise tightening one side
+    /// moves the classification boundary with nobody deciding to move it.
+    /// The image half of this pair is
+    /// `snapshot::tests::charge_of_counts_a_rows_string_heap_and_not_just_its_slot`,
+    /// which asserts the SAME delta for the same row.
+    #[test]
+    fn the_ops_side_weighs_a_rows_string_heap_exactly_as_the_image_side_does() {
+        let with_path = |path: &str| {
+            let mut clip = crate::audio::types::testutil::test_clip("c-1", "t-1");
+            clip.source_path = path.to_string();
+            ops_bytes(&[Op::ClipAdd { clip, index: 0 }])
+        };
+        let short = with_path("a.wav");
+        let long = with_path(&format!("{}.wav", "d/".repeat(400)));
+        assert_eq!(
+            long - short,
+            800 + 4 - 5,
+            "the extra path bytes are charged on the ops side too, one for one"
+        );
+    }
+
     #[test]
     fn materializing_a_replay_only_rev_replays_from_the_nearest_ancestor() {
         let m = session_with_one_clip();
@@ -769,44 +928,118 @@ mod tests {
         assert_eq!(g.stats().nodes, 0, "a stale-epoch batch reaches no node");
     }
 
-    /// Dropping a version node must actually FREE something. Images share
-    /// Arcs with each other and with the published slot, so what an eviction
-    /// frees is exactly the parts no surviving image points at — the node's
-    /// own-created bytes.
+    /// A genuine PREFIX EVICTION with a survivor: what the drop frees is
+    /// the evicted node's own-created content — provided no surviving image
+    /// reuses it, which here it does not, because both versions rewrite the
+    /// same clip and so each mints its own content Arc.
+    ///
+    /// (This used to drive `clear()`, which drains every node — it measured
+    /// a total drain rather than the eviction it is named for. Fix round 1.)
     #[test]
     fn evicting_a_node_frees_its_own_created_content_and_nothing_shared() {
         let m = session_with_one_clip();
-        let mut g = VersionGraph::with_limits(usize::MAX, 0);
+        // Two ~16 KB nodes do not fit under 20 KB; the floor allows the cut.
+        let mut g = VersionGraph::with_limits(20 * 1024, 1);
 
-        let c1 = Session::transact(&m, TxMeta::user("v1"), |tx| {
-            tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(10) })
-        })
-        .unwrap();
-        // The content Arc this version CREATED.
-        let own = c1.snapshot.midi.clips[0].clone();
-        g.record(&c1);
-        drop(c1);
-        let c2 = Session::transact(&m, TxMeta::user("v2"), |tx| {
-            tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(20) })
-        })
-        .unwrap();
-        let shared_tracks = c2.snapshot.tracks.clone();
-        g.record(&c2);
-        drop(c2);
+        let rewrite = |g: &mut VersionGraph| {
+            let c = Session::transact(&m, TxMeta::user("rewrite"), |tx| {
+                tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(1_000) })
+            })
+            .unwrap();
+            let own = c.snapshot.midi.clips[0].clone();
+            let tracks = c.snapshot.tracks.clone();
+            let evicted = g.record(&c);
+            (own, tracks, evicted)
+        };
 
-        assert!(Arc::strong_count(&own) > 1, "the graph holds v1's content");
-        let load = g.clear(0);
-        assert_eq!(load.len(), 2);
-        drop(load);
+        let (own_1, _, evicted) = rewrite(&mut g);
+        assert!(evicted.is_empty(), "one node fits under the budget");
+        let (own_2, shared_tracks, evicted) = rewrite(&mut g);
+
+        // THE PREFIX EVICTION: rev 1 is cut, rev 2 survives.
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(g.stats().nodes, 1, "and a survivor really is left behind");
+        assert!(
+            Arc::strong_count(&own_1) > 1,
+            "the load still holds rev 1's content, so the drop below IS the release"
+        );
+        drop(evicted);
         assert_eq!(
-            Arc::strong_count(&own),
+            Arc::strong_count(&own_1),
             1,
-            "v1's own-created clip content is freed once its node is dropped"
+            "the evicted node's own-created clip content is freed — no survivor reuses it"
+        );
+        assert!(
+            Arc::strong_count(&own_2) > 1,
+            "...and the survivor's own content is untouched"
         );
         assert!(
             Arc::strong_count(&shared_tracks) > 1,
-            "...while the track list it SHARED with the live document is not — \
-             an eviction frees own-created bytes, which is exactly what it charged"
+            "...as is the track list SHARED with the live document"
+        );
+    }
+
+    /// I-1, pinned as a LIMITATION, because the module doc used to claim the
+    /// opposite: `retained_bytes` is a LOWER BOUND. Structural sharing runs
+    /// forward — a later image reuses an earlier one's untouched content
+    /// Arcs — so evicting the creator of those bytes can free NOTHING while
+    /// the graph subtracts the full charge.
+    #[test]
+    fn evicting_a_node_frees_only_what_no_survivor_reuses() {
+        let m = session_with_one_clip();
+        // Budget 1 B, floor 2: no cut is legal until there are three nodes,
+        // and then it takes exactly rev 1.
+        let mut g = VersionGraph::with_limits(1, 2);
+
+        let v1 = Session::transact(&m, TxMeta::user("1000 notes"), |tx| {
+            tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(1_000) })
+        })
+        .unwrap();
+        let own = v1.snapshot.midi.clips[0].clone();
+        let v1_charge = v1.snapshot_charge;
+        assert!(v1_charge > 16_000, "v1 really created ~16 KB, got {v1_charge}");
+        assert!(g.record(&v1).is_empty(), "the floor forbids a cut this early");
+        drop(v1);
+
+        // v2 touches only a TRACK, so its capture REUSES v1's clip content.
+        let v2 = Session::transact(&m, TxMeta::user("gain"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::Gain,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(-6.0),
+            })
+        })
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&v2.snapshot.midi.clips[0], &own),
+            "v2's image REUSES v1's content Arc — without that this test proves nothing"
+        );
+        assert!(g.record(&v2).is_empty());
+        drop(v2);
+
+        // v3 rewrites the clip, so the LIVE document stops holding v1's
+        // content: the only remaining holders are the two images. This is
+        // also the record that makes a cut legal.
+        let v3 = Session::transact(&m, TxMeta::user("rewrite"), |tx| {
+            tx.apply(Op::MidiSetNotes { clip: "mc-a".into(), notes: notes(1) })
+        })
+        .unwrap();
+        let evicted = g.record(&v3);
+        drop(v3);
+
+        assert_eq!(evicted.len(), 1, "rev 1 was evicted");
+        drop(evicted);
+        assert!(
+            Arc::strong_count(&own) > 1,
+            "THE POINT: v1's node is gone and its content is STILL HELD — by v2's \
+             surviving image, which reuses it. The eviction freed none of it."
+        );
+        let reported = g.stats().retained_bytes;
+        assert!(
+            reported < v1_charge,
+            "...while the graph reports {reported} bytes retained, having subtracted \
+             all {v1_charge} of v1's charge. retained_bytes is a LOWER BOUND (I-1)."
         );
     }
 
@@ -899,3 +1132,4 @@ mod tests {
         );
     }
 }
+

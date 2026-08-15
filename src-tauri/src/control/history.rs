@@ -793,6 +793,13 @@ impl HistoryLog {
     /// session plus an `apply_raw` loop) and holding the leaf-most mutex of
     /// the system across it would stall every committing thread.
     ///
+    /// THE RESULT'S `transport` IS NOT THE REV'S — it is the replay base's,
+    /// because transport batches commit transiently and leave no node
+    /// (`vergraph::ReplayPlan::run` carries the full argument). A caller
+    /// restoring this image into the live document must keep the live
+    /// transport and take only the content, or loop points, stop-at-end and
+    /// recording state rewind silently.
+    ///
     /// A document swap landing between the two phases does NOT invalidate
     /// the result — it invalidates its RELEVANCE. The returned image carries
     /// the epoch it belongs to, and a caller that would apply it to the live

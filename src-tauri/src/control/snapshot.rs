@@ -358,7 +358,12 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
 }
 
 /// Heap bytes of a row's `String`/id fields (see [`charge_of`]).
-fn track_heap(t: &TrackState) -> usize {
+///
+/// `pub(crate)` because `vergraph::ops_bytes` weighs the SAME rows on the
+/// other side of `replay_pays_off`'s comparison, and two hand-matched
+/// rules would drift the moment one is tightened. Sharing the helper makes
+/// parity structural instead of remembered.
+pub(crate) fn track_heap(t: &TrackState) -> usize {
     t.id.as_str().len()
         + t.name.len()
         + t.kind.len()
@@ -366,7 +371,7 @@ fn track_heap(t: &TrackState) -> usize {
         + t.instrument_id.as_ref().map_or(0, String::len)
 }
 
-fn clip_heap(c: &Clip) -> usize {
+pub(crate) fn clip_heap(c: &Clip) -> usize {
     c.id.as_str().len()
         + c.track_id.as_str().len()
         + c.name.len()
@@ -374,7 +379,7 @@ fn clip_heap(c: &Clip) -> usize {
         + c.source_id.as_str().len()
 }
 
-fn midi_clip_heap(c: &MidiClip) -> usize {
+pub(crate) fn midi_clip_heap(c: &MidiClip) -> usize {
     c.id.as_str().len() + c.track_id.as_str().len() + c.name.len() + c.lane_id.as_str().len()
 }
 
