@@ -391,40 +391,67 @@ fn parse_line(line: &str) -> Result<JournalRecord, SkipReason> {
 /// A MARK IS NEVER "BEYOND THE END": it has no index into anything, only a
 /// position among records, so there is no out-of-range case to handle.
 ///
-/// SAVED WORK IS NEVER RE-APPLIED, and that is a property of the anchoring
-/// rule rather than a hope. A batch enters the tail only if its rev exceeds
-/// the mark's anchor; the anchor is the MAXIMUM rev over the batches that
-/// precede the mark in file order; so no batch preceding the mark can exceed
-/// it. The rule is also right for a batch that arrives AFTER the mark
-/// carrying a LOWER rev, which out-of-order journaling produces: revs are
-/// minted under the session lock, so a lower rev is an earlier mutation, and
-/// the snapshot the mark describes was taken from a document that had already
-/// reached the higher one. A late LINE is not a late mutation — which is the
-/// whole reason this reader sorts by rev instead of trusting the file.
-/// An unreadable line can only LOWER the anchor, and a lower anchor admits
-/// only higher revs, i.e. mutations the snapshot had not reached. Pinned by
-/// `a_batch_written_before_the_mark_never_enters_the_tail_however_torn_the_file`.
-/// (Fix round 1 correction, ADR 0007: the previous version of this doc
-/// claimed the opposite, "the tail can begin earlier than the truth". That
-/// was inherited from an earlier last-seen anchoring rule and is false for
-/// the max-so-far rule this module actually ships.)
+/// HOW EXACT THE TAIL IS — stated at the width the proof actually supports,
+/// because the two earlier versions of this paragraph were both absolute and
+/// both wrong in the direction that flatters the design (ADR 0007; fix round
+/// 1 claimed the tail could re-offer preceding batches, fix round 2 claimed
+/// saved work is never re-offered at all).
 ///
-/// THE REAL RESIDUAL IS IN THE OTHER DIRECTION — WORK GOES MISSING, and it
-/// is survivable only because nothing auto-applies (ruling F-8): the tail is
-/// a detection signal, and a human decides.
+/// WHAT IS PROVED, and it is narrow: **no batch that precedes the mark in
+/// file order can enter the tail.** A batch enters only if its rev is
+/// STRICTLY above the mark's anchor (equal revs sort before the mark, since
+/// `Class::Batch < Class::SaveMark`), and the anchor is the maximum rev over
+/// exactly those preceding batches. Pinned by
+/// `a_batch_written_before_the_mark_never_enters_the_tail_however_torn_the_file`.
+///
+/// WHAT IS NOT TRUE: that saved work is never re-offered. A batch can FOLLOW
+/// the mark in file order and still be saved — revs are minted under the
+/// session lock, so a lower rev is an earlier mutation and a late LINE is not
+/// a late mutation (which is the whole reason this reader sorts by rev
+/// instead of trusting the file). Such a batch is excluded only while its rev
+/// stays under the anchor, and an unreadable line at the pre-mark high-water
+/// rev drops the anchor beneath it:
+///
+/// ```text
+/// b rev1   UNREADABLE rev9   b rev4   [MARK]   b rev7   b rev14
+/// anchor = max(1, 4) = 4  ->  tail = [rev7, rev14]
+/// ```
+///
+/// rev 7 was committed before rev 9 and the snapshot had reached rev 9, so it
+/// is saved — and it is offered back. Pinned by
+/// `an_unreadable_line_at_the_high_water_rev_re_offers_saved_work`.
+///
+/// THE TRUE GENERAL PROPERTY, and the reason the design is still right: the
+/// mark CARRIES NO REV, so the anchor is only a LOWER BOUND on the revision
+/// the snapshot actually reached. The tail is therefore a SUPERSET of the
+/// genuinely-unsaved batches — over-wide, never under-wide — and unreadable
+/// lines only widen it further. Over-wide is the safe direction for a
+/// detector (it over-reports work at risk, never under-reports it) and the
+/// unsafe direction for an applier, which is why re-application is
+/// human-gated (ruling F-8) and why a future "restore unsaved work"
+/// affordance MUST NOT read this as "replay cannot duplicate saved work".
+/// Giving the mark the rev it was written at would make the tail exact; that
+/// is a journal FORMAT change, and it belongs with the segmentation work this
+/// module's header hands forward.
+///
+/// TWO RESIDUALS IN THE OTHER DIRECTION — work goes missing — each
+/// survivable only because nothing auto-applies:
 ///
 /// * AN UNREADABLE BATCH LINE IS LOST, full stop: it is counted in
 ///   `skipped_malformed` and can never be replayed, whether it was saved or
 ///   not. The counter is the whole defence.
-/// * `ControlPlane::save_project_mark` releases the
-///   session lock, writes `project.json`, and only then calls
-///   `HistoryLog::snapshot_mark`. A commit that journals inside that window
-///   lands BEFORE the mark in file order and is classified as saved, even
-///   though the snapshot on disk predates it. Closing it means moving the
-///   mark under the same critical section as the snapshot — a change to the
-///   epoch/save path's locking, which is `save_project_mark`'s territory,
-///   not the reader's. Named here so the next person on that path knows the
-///   reader depends on it.
+/// * `ControlPlane::save_project_mark` releases the session lock, writes
+///   `project.json`, and only then calls `HistoryLog::snapshot_mark`. A
+///   commit that journals inside that window lands BEFORE the mark in file
+///   order and is classified as saved, even though the snapshot on disk
+///   predates it. This is also the one thing that can push the anchor ABOVE
+///   the snapshot's revision, so it is the exception to the superset property
+///   above — with that window open, the tail can be under-wide. Closing it
+///   means moving the mark under the same critical section as the snapshot —
+///   a locking decision on the save path (and one round-2 §4's
+///   no-disk-I/O-under-the-session-lock rule constrains), not a reader
+///   change. Named here so the next person on that path knows the reader
+///   depends on it.
 pub fn unsaved_tail(report: &ReadReport) -> Vec<&JournalRecord> {
     let Some(last_epoch) = report
         .records
@@ -937,6 +964,60 @@ mod tests {
         // counted. The counter is the whole defence.
         assert_eq!(r.skipped_malformed, 1);
         assert!(!labels(&r.records).iter().any(|l| l == "lost"));
+    }
+
+    /// THE LIMIT OF THE PROPERTY ABOVE, as a test rather than as a caveat.
+    /// The sibling test's unreadable line sits ABOVE every surviving pre-mark
+    /// rev, so the anchor stays high and nothing saved is re-offered. Move it
+    /// DOWN to the high-water rev — one number — and the anchor drops beneath
+    /// a batch the snapshot already contained, which is then handed back as
+    /// unsaved work.
+    ///
+    /// Asserted, not lamented: the tail is a SUPERSET of the genuinely
+    /// unsaved batches, and this is what makes it a strict superset. That is
+    /// the safe direction for a detector and the unsafe one for an applier,
+    /// which is exactly why nothing auto-applies (ruling F-8).
+    ///
+    /// THIS IS A CHARACTERIZATION TEST OF A KNOWN IMPRECISION, not a
+    /// requirement: it holds because a save mark carries no rev. Give the
+    /// mark the rev it was written at (a journal FORMAT change, handed
+    /// forward with the segmentation work) and the tail becomes exact and
+    /// this test SHOULD go red — delete it then, do not weaken it.
+    /// Measured to discriminate: making the rev-9 line readable, and
+    /// changing nothing else, collapses the tail to `["genuinely-after"]`.
+    #[test]
+    fn an_unreadable_line_at_the_high_water_rev_re_offers_saved_work() {
+        let text = [
+            batch_line(1, 1, "saved-1").as_str(),
+            // The pre-mark HIGH-WATER rev is the unreadable one. Nothing
+            // surviving records that the document ever reached rev 9.
+            r#"{"v":2,"rev":9,"epoch":1,"actor":"user","run":"r","label":"lost","ops":[{"kind":"noSuchOp"}]}"#,
+            batch_line(4, 1, "saved-low").as_str(),
+            epoch_line("save", 1).as_str(),
+            // Committed BEFORE rev 9, journaled after the mark. Saved — the
+            // snapshot was taken from a document that had reached rev 9.
+            batch_line(7, 1, "saved-but-journaled-late").as_str(),
+            batch_line(14, 1, "genuinely-after").as_str(),
+        ]
+        .join("\n")
+            + "\n";
+        let r = parse_journal(&text);
+        assert_eq!(
+            labels(&unsaved_tail(&r).into_iter().cloned().collect::<Vec<_>>()),
+            vec!["saved-but-journaled-late", "genuinely-after"],
+            "anchor fell to 4 with rev 9 unreadable, so a SAVED batch is re-offered"
+        );
+        // Anti-vacuity: this differs from the sibling test in exactly one
+        // number. Both parts must hold or the fixture proves nothing — the
+        // high-water line really is gone, and the re-offered batch really did
+        // follow the mark in the file.
+        assert_eq!(r.skipped_malformed, 1, "the rev-9 line really is unreadable");
+        assert!(!labels(&r.records).iter().any(|l| l == "lost"));
+        assert!(
+            text.find("\"label\":\"saved-but-journaled-late\"").unwrap()
+                > text.find("\"epochEvent\":\"save\"").unwrap(),
+            "and rev 7 really was journaled after the mark"
+        );
     }
 
     #[test]
