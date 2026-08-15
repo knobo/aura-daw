@@ -46,6 +46,7 @@ pub mod midi_out;
 // OS clipboard text slot for cross-instance clip copy/paste (Track C, Task
 // 10). Self-contained; additive per the same carve-out midi_input takes.
 pub mod osclipboard;
+pub mod modulation;
 pub mod plugins;
 pub mod sidecars;
 pub mod time;
