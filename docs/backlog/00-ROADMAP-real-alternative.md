@@ -41,7 +41,10 @@ described here only.
 - Takes & comping (natural continuation of Plan F's history storage).
 - Stems/multitrack export (export_song exists; add per-track/stem render).
 - Freeze / bounce-in-place.
-- External instrument tracks (MIDI out + audio return; track B slice 6).
+- External instrument tracks (MIDI out + audio return; track B slice 6)
+  — product cut in `external-instrument-return.md`: per-track return
+  source, visible freeze clips, PipeWire one-click link. No hidden
+  tracks.
 - Two-instance coexistence (fixed MCP port 41717 collides today — dynamic
   port + discovery needed before "copy between instances" is fully real).
 

@@ -153,3 +153,8 @@ and the workaround today is a smaller audio buffer.
   config on purpose (see the persistence section above).
 * No JACK transport / Ableton Link.
 * No MIDI-out latency offset (see the timing caveat above).
+* No audio **return** — notes leave, the synth's sound does not come
+  back, and `export_song` will not hear it. The planned cut is
+  `docs/backlog/external-instrument-return.md` (record/freeze onto the
+  same track, then bounce). Until that lands, record the device into an
+  audio track yourself if the WAV needs to include it.

@@ -511,6 +511,9 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
 - `docs/backlog/insert-fx-sends-sidechain.md` — Plan G product decision
   (inserts / sends / sidechain / what we will not write). Read before
   opening the graph-compiler plan round.
+- `docs/backlog/external-instrument-return.md` — MIDI-out's missing
+  half: per-track audio return, visible freeze clips, PipeWire as a
+  helper. Read before adding "hidden tracks" or a PW graph orchestrator.
 - `docs/CORE-REDESIGN-ROUND-2.md` (ACCEPTED) §6 for Plan F's spec; ADR
   0005 for the history-storage decision it implements.
 
