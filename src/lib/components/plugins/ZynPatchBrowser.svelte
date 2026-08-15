@@ -8,6 +8,7 @@
    */
   import { zyn } from "../../state/zynpatches.svelte";
   import type { ZynPatch } from "../../types/ipc";
+  import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   let search = $state("");
   let scroller: HTMLDivElement | undefined = $state();
@@ -65,6 +66,11 @@
     <span class="title" title={inst?.uid}>{inst?.name ?? "Zyn"} · patches</span>
     <span class="count silk">{zyn.patches.length}</span>
   </div>
+  {#if inst}
+    <div class="connrow">
+      <PluginConnectionBadge instanceId={inst.id} />
+    </div>
+  {/if}
 
   <input
     type="text"
@@ -163,6 +169,9 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .connrow {
+    flex: none;
   }
   .count {
     letter-spacing: 0.1em;

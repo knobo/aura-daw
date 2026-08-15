@@ -19,6 +19,7 @@
   import { transport } from "../../state/transport.svelte";
   import { instruments } from "../../state/instruments.svelte";
   import { plugins } from "../../state/plugins.svelte";
+  import { openPluginParams } from "../../state/plugin-panel";
   import { openStudio, ui } from "../../state/ui.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { toasts } from "../../state/toasts.svelte";
@@ -889,8 +890,7 @@
             : "No instrument — open the browser"}
         onclick={() => {
           if (pluginInst) {
-            ui.dock = "plugins";
-            void plugins.openParams(pluginInst.id);
+            void openPluginParams(pluginInst.id);
           } else {
             ui.dock = "instruments";
           }

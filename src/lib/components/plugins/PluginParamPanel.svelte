@@ -11,6 +11,7 @@
   import { automation } from "../../state/automation.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import type { PluginParamInfo } from "../../types/ipc";
+  import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   interface ParamGroup {
     label: string;
@@ -106,6 +107,11 @@
       <span class="status mono {inst.status}">{inst.status}</span>
     {/if}
   </div>
+  {#if inst}
+    <div class="connrow">
+      <PluginConnectionBadge instanceId={inst.id} />
+    </div>
+  {/if}
 
   {#if inst?.status === "stub"}
     <div class="note silk">dsp not hosted yet — parameters mirror into the registry</div>
@@ -234,6 +240,9 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  .connrow {
+    flex: none;
   }
 
   .badge {
