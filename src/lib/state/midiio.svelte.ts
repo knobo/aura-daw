@@ -1,14 +1,16 @@
 /**
- * MIDI I/O store (slice 2): hardware port lists (in + out), the input
- * routing target track, the output clock toggle and note-out target track,
- * and a status poll mirroring both hubs' app-config state (ruling 1/10:
- * config, not document state — no op, no undo). Thin renderer throughout:
- * every setter is a command emission, nothing computed here feeds a
- * document mutation.
+ * MIDI I/O store: hardware port lists (in + out), the input routing target
+ * track, and hardware MIDI-out state — any number of simultaneously open
+ * output ports, each with its own clock toggle, plus a routing table
+ * (`routes`) mapping MIDI tracks or individual clips to a port+channel. A
+ * clip's own route always wins over its track's. All of it mirrors the
+ * backend's app-config state (ruling 1/10: config, not document state — no
+ * op, no undo). Thin renderer throughout: every setter is a command
+ * emission, nothing computed here feeds a document mutation.
  */
 
 import { backend } from "../tauri";
-import type { MidiPortInfo } from "../types/ipc";
+import type { MidiOutputPortStatus, MidiPortInfo, MidiRouteStatus } from "../types/ipc";
 
 const POLL_MS_DEFAULT = 500;
 
@@ -22,10 +24,30 @@ class MidiIoStore {
   capturing = $state(false);
 
   outPorts = $state<MidiPortInfo[]>([]);
-  outPortId = $state("");
-  clockEnabled = $state(false);
-  clockRunning = $state(false);
-  noteTrackId = $state<string | null>(null);
+  /** Currently open output ports, each with its own clock/activity status. */
+  outputs = $state<MidiOutputPortStatus[]>([]);
+  /** The current track- and clip-scoped routing table. */
+  routes = $state<MidiRouteStatus[]>([]);
+
+  /** The route that would win for a given clip: its own override if one
+   * exists, otherwise its track's route (or undefined if neither). */
+  routeForClip(clipId: string, trackId: string): MidiRouteStatus | undefined {
+    return (
+      this.routes.find((r) => r.scope === "clip" && r.id === clipId) ??
+      this.routes.find((r) => r.scope === "track" && r.id === trackId)
+    );
+  }
+
+  /** This clip's OWN override, ignoring any track-level fallback — the
+   * clip picker needs to distinguish "inheriting from the track" from "no
+   * route at all" (the fallback above collapses that distinction). */
+  clipOverride(clipId: string): MidiRouteStatus | undefined {
+    return this.routes.find((r) => r.scope === "clip" && r.id === clipId);
+  }
+
+  trackRoute(trackId: string): MidiRouteStatus | undefined {
+    return this.routes.find((r) => r.scope === "track" && r.id === trackId);
+  }
 
   /** Both port lists, tolerant of a backend without the optional midi
    * methods (demo mode has no hardware to simulate). */
@@ -51,10 +73,8 @@ class MidiIoStore {
         this.capturing = s.capturing;
       }).catch(() => {});
       backend.midiOutputStatus?.().then((s) => {
-        this.outPortId = s.selected?.id ?? "";
-        this.clockEnabled = s.clockEnabled;
-        this.clockRunning = s.running;
-        this.noteTrackId = s.noteTrackId;
+        this.outputs = s.outputs;
+        this.routes = s.routes;
       }).catch(() => {});
     }, intervalMs);
     return () => clearInterval(id);
@@ -75,19 +95,30 @@ class MidiIoStore {
     await backend.midiSelectInputTrack?.(trackId);
   }
 
-  async selectOutPort(id: string): Promise<void> {
-    this.outPortId = id;
-    await backend.midiSelectOutputPort?.(id || null);
+  async openOutPort(id: string): Promise<void> {
+    await backend.midiOpenOutputPort?.(id);
   }
 
-  async setClockEnabled(on: boolean): Promise<void> {
-    this.clockEnabled = on;
-    await backend.midiSetClockEnabled?.(on);
+  async closeOutPort(id: string): Promise<void> {
+    this.outputs = this.outputs.filter((o) => o.port.id !== id);
+    await backend.midiCloseOutputPort?.(id);
   }
 
-  async setOutputTrack(trackId: string | null): Promise<void> {
-    this.noteTrackId = trackId;
-    await backend.midiSelectOutputTrack?.(trackId);
+  async setClockEnabled(portId: string, on: boolean): Promise<void> {
+    this.outputs = this.outputs.map((o) => (o.port.id === portId ? { ...o, clockEnabled: on } : o));
+    await backend.midiSetOutputClockEnabled?.(portId, on);
+  }
+
+  async setTrackRoute(trackId: string, portId: string | null, channel = 0): Promise<void> {
+    this.routes = this.routes.filter((r) => !(r.scope === "track" && r.id === trackId));
+    if (portId) this.routes = [...this.routes, { scope: "track", id: trackId, portId, channel }];
+    await backend.midiSetTrackRoute?.(trackId, portId, channel);
+  }
+
+  async setClipRoute(clipId: string, portId: string | null, channel = 0): Promise<void> {
+    this.routes = this.routes.filter((r) => !(r.scope === "clip" && r.id === clipId));
+    if (portId) this.routes = [...this.routes, { scope: "clip", id: clipId, portId, channel }];
+    await backend.midiSetClipRoute?.(clipId, portId, channel);
   }
 }
 

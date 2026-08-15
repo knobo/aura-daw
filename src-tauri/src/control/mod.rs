@@ -179,8 +179,8 @@ pub struct ControlPlane {
     /// The `aura-midi-out` driver (Task 7), same carve-out shape as
     /// `midi_input` above: attached once by lib.rs setup AFTER `.manage`,
     /// so unit-test `ControlPlane`s (never routed through `lib.rs::run`)
-    /// have this unset and `select_midi_output_port`/
-    /// `set_midi_clock_enabled` error rather than panic.
+    /// have this unset and the MIDI-out routing/port/clock methods error
+    /// rather than panic.
     midi_out: std::sync::OnceLock<Arc<crate::midi_out::MidiOut>>,
 }
 
@@ -1730,18 +1730,19 @@ impl ControlPlane {
         Ok(())
     }
 
-    // ---- MIDI-out selection / clock -----------------------------------
-    // MIDI slice 2, Task 7 (§4.5 config carve-out, same shape as the pair
-    // above): the selected output port and whether clock/transport bytes
-    // are sent are both app config, not document state — no `Op`, no
-    // `commit`. Moving them behind `ControlPlane` methods is purely so the
-    // ACTOR/LABEL attribution is captured at the one front door both Tauri
-    // and MCP call through.
+    // ---- MIDI-out routing / clock --------------------------------------
+    // Which track/clip goes to which port+channel, and whether a port is
+    // clock-slaved, are all app config, not document state — no `Op`, no
+    // `commit` (ruling 10, extended from slice 2's single-track carve-out
+    // to per-track/per-clip routing across multiple open ports). Moving
+    // them behind `ControlPlane` methods is purely so the ACTOR/LABEL
+    // attribution is captured at the one front door both Tauri and MCP
+    // call through, and so every mutation re-persists the per-machine
+    // routing file (`midi_out::persist`) for the CURRENT project path.
 
     /// lib.rs setup calls this once, after `.manage` — before that, every
-    /// unit test's `ControlPlane` has an unattached `midi_out`, and
-    /// `select_midi_output_port`/`set_midi_clock_enabled` error instead of
-    /// panicking.
+    /// unit test's `ControlPlane` has an unattached `midi_out`, and the
+    /// methods below error instead of panicking.
     pub fn attach_midi_out(&self, out: Arc<crate::midi_out::MidiOut>) {
         // `OnceLock::set` returning `Err` (already attached) is silently
         // ignored — lib.rs calls this exactly once in `setup`, and a
@@ -1749,71 +1750,139 @@ impl ControlPlane {
         let _ = self.midi_out.set(out);
     }
 
-    /// Select the hardware MIDI-out port, logging the attribution before
-    /// delegating to the attached `MidiOut` — same shape as
-    /// `select_midi_input_port`; the driver owns the connection/thread
-    /// directly (Task 7).
-    pub fn select_midi_output_port(&self, port_id: Option<String>, meta: op::TxMeta) -> Result<(), String> {
-        log::info!(
-            "select_midi_output_port: actor={:?} label={:?} port={port_id:?}",
-            meta.actor,
-            meta.label
-        );
-        let out = self
-            .midi_out
-            .get()
-            .ok_or_else(|| "midi output driver not attached".to_string())?;
-        out.select_port(port_id)
+    fn midi_out(&self) -> Result<&Arc<crate::midi_out::MidiOut>, String> {
+        self.midi_out.get().ok_or_else(|| "midi output driver not attached".to_string())
     }
 
-    /// Toggle whether the `aura-midi-out` thread emits clock/transport
-    /// bytes. Leaves the thread and the open port alive either way (Task
-    /// 8's note-out keeps working).
-    pub fn set_midi_clock_enabled(&self, enabled: bool, meta: op::TxMeta) -> Result<(), String> {
+    /// The current project's directory, if it has one yet (an unsaved
+    /// project has none, and its routing simply isn't persisted — see
+    /// `midi_out::MidiOut::persist`'s doc).
+    fn current_project_dir(&self) -> Option<std::path::PathBuf> {
+        self.session.lock().store.project_dir.clone()
+    }
+
+    /// Open one more hardware MIDI-out port — additive, does not affect any
+    /// other port already open.
+    pub fn open_midi_output_port(&self, port_id: String, meta: op::TxMeta) -> Result<(), String> {
         log::info!(
-            "set_midi_clock_enabled: actor={:?} label={:?} enabled={enabled}",
+            "open_midi_output_port: actor={:?} label={:?} port={port_id:?}",
             meta.actor,
             meta.label
         );
-        let out = self
-            .midi_out
-            .get()
-            .ok_or_else(|| "midi output driver not attached".to_string())?;
-        out.set_clock_enabled(enabled);
+        let out = self.midi_out()?;
+        out.open_port(port_id)?;
+        out.persist(self.current_project_dir().as_deref());
         Ok(())
     }
 
-    /// Route a MIDI track's notes to external gear (ruling 10: app config, a
-    /// routing carve-out — no document field, no `Op`). `None` clears the
-    /// routing. `Some(id)` must name an existing `kind: "midi"` track,
-    /// validated under a SHORT session read that is dropped BEFORE touching
-    /// `MidiOut` — mirrors `select_midi_input_track`'s validation shape.
-    pub fn select_midi_output_track(&self, track_id: Option<String>, meta: op::TxMeta) -> Result<(), String> {
-        if let Some(id) = &track_id {
+    /// Close one open hardware MIDI-out port. Any route still pointing at
+    /// it is dropped too — a route silently pointing at nothing forever
+    /// would be confusing; the user re-routes explicitly if they meant to
+    /// swap devices.
+    pub fn close_midi_output_port(&self, port_id: String, meta: op::TxMeta) -> Result<(), String> {
+        log::info!(
+            "close_midi_output_port: actor={:?} label={:?} port={port_id:?}",
+            meta.actor,
+            meta.label
+        );
+        let out = self.midi_out()?;
+        out.close_port(&port_id)?;
+        out.clear_routes_for_port(&port_id);
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
+    }
+
+    /// Toggle whether a specific open port's `aura-midi-out-<n>` thread
+    /// emits clock/transport bytes. Leaves the thread and the connection
+    /// alive either way (note-out keeps working).
+    pub fn set_midi_output_clock_enabled(
+        &self,
+        port_id: String,
+        enabled: bool,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        log::info!(
+            "set_midi_output_clock_enabled: actor={:?} label={:?} port={port_id:?} enabled={enabled}",
+            meta.actor,
+            meta.label
+        );
+        let out = self.midi_out()?;
+        out.set_clock_enabled(&port_id, enabled)?;
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
+    }
+
+    /// Route a MIDI track's notes to external gear, or (on `port_id: None`)
+    /// clear its routing (ruling 10: app config — no document field, no
+    /// `Op`). The track must exist and be `kind: "midi"`, validated under a
+    /// SHORT session read dropped BEFORE touching `MidiOut` — mirrors
+    /// `select_midi_input_track`'s validation shape. A clip belonging to
+    /// this track with its OWN route is unaffected — a clip override
+    /// always wins over its track's route (see `midi_out`'s module doc).
+    pub fn set_midi_track_route(
+        &self,
+        track_id: String,
+        port_id: Option<String>,
+        channel: u8,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        {
             let session = self.session.lock();
             let t = session
                 .store
                 .tracks
                 .iter()
-                .find(|t| t.id.as_str() == id)
-                .ok_or_else(|| format!("unknown track: {id}"))?;
+                .find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
             if t.kind != "midi" {
                 return Err(format!(
-                    "track {id} is kind \"{}\" (midi output needs a midi track)",
+                    "track {track_id} is kind \"{}\" (midi output needs a midi track)",
                     t.kind
                 ));
             }
         }
         log::info!(
-            "select_midi_output_track: actor={:?} label={:?} track={track_id:?}",
+            "set_midi_track_route: actor={:?} label={:?} track={track_id} port={port_id:?} channel={channel}",
             meta.actor,
             meta.label
         );
-        let out = self
-            .midi_out
-            .get()
-            .ok_or_else(|| "midi output driver not attached".to_string())?;
-        out.select_note_track(track_id)
+        let out = self.midi_out()?;
+        out.set_route(
+            crate::midi_out::RouteScope::Track(track_id),
+            port_id.map(|port_id| crate::midi_out::RouteTarget { port_id, channel }),
+        );
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
+    }
+
+    /// Route one MIDI clip's notes to external gear, overriding its
+    /// track's route (or, on `port_id: None`, clear the override so the
+    /// clip falls back to its track's routing). The clip must exist.
+    pub fn set_midi_clip_route(
+        &self,
+        clip_id: String,
+        port_id: Option<String>,
+        channel: u8,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        {
+            let session = self.session.lock();
+            if !session.midi.clips.iter().any(|c| c.id.as_str() == clip_id) {
+                return Err(format!("unknown midi clip: {clip_id}"));
+            }
+        }
+        log::info!(
+            "set_midi_clip_route: actor={:?} label={:?} clip={clip_id} port={port_id:?} channel={channel}",
+            meta.actor,
+            meta.label
+        );
+        let out = self.midi_out()?;
+        out.set_route(
+            crate::midi_out::RouteScope::Clip(clip_id),
+            port_id.map(|port_id| crate::midi_out::RouteTarget { port_id, channel }),
+        );
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
     }
 
     // ---- structure ------------------------------------------------------
@@ -1855,42 +1924,58 @@ impl ControlPlane {
     /// (controller ruling 2) — the removed row may have been the only
     /// soloed track.
     pub fn remove_track(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
-        let track = {
+        let (track, clip_ids) = {
             let session = self.session.lock();
-            session
+            let track = session
                 .store
                 .tracks
                 .iter()
                 .find(|t| t.id == id)
                 .cloned()
-                .ok_or_else(|| format!("unknown track: {id}"))?
+                .ok_or_else(|| format!("unknown track: {id}"))?;
+            let clip_ids: Vec<String> = session
+                .midi
+                .clips
+                .iter()
+                .filter(|c| c.track_id.as_str() == id)
+                .map(|c| c.id.to_string())
+                .collect();
+            (track, clip_ids)
         };
         self.commit(meta, |tx| {
             tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
         })?;
-        self.clear_midi_routing_for(id);
+        self.clear_midi_routing_for(id, &clip_ids);
         Ok(())
     }
 
-    /// The MIDI-in target and the note-out target are app config holding a
-    /// track id (rulings 1 and 10), so nothing in the document model retires
-    /// them when the track goes away. Called AFTER the commit succeeds: a
-    /// failed removal must leave the routing exactly as it was.
+    /// The MIDI-in target and every MIDI-out route (track- or clip-scoped)
+    /// are app config holding track/clip ids (rulings 1 and 10), so nothing
+    /// in the document model retires them when the track goes away. Called
+    /// AFTER the commit succeeds: a failed removal must leave the routing
+    /// exactly as it was.
     ///
-    /// Only this explicit delete path is covered. Undoing a `TrackAdd`
-    /// removes a track without passing here, and leaves the id in place
-    /// until the next explicit selection. On the INPUT side that is
-    /// cosmetic: `refresh_target` resolves an unknown id to `NO_SLOT`, so
-    /// events are simply dropped. On the OUTPUT side it is only survivable
-    /// because of the whole-track review's Critical 1 fix: the vanished
-    /// track's events snapshot becomes EMPTY under an UNCHANGED track id,
-    /// which is exactly the shape that used to strand the cursor and hang a
+    /// This explicit delete path (and `clear_midi_route_for_clip` below, for
+    /// `midi::midi_remove_clip_core`) clears eagerly; the OUTPUT side also
+    /// has a second line of defense that covers every other case (undoing a
+    /// `TrackAdd`/`MidiClipAdd`, or an `Op::MidiClipRemove` applied directly
+    /// without going through either wrapper — e.g. inside `midi_add_clip_
+    /// core`'s own undo path) — `midi_out::run_thread` re-validates every
+    /// route it owns against the live document on each 250 ms window and
+    /// drops whatever no longer exists (self-healing, see that module's
+    /// doc). On the INPUT side that second line is `refresh_target`
+    /// resolving an unknown id to `NO_SLOT`,
+    /// so events are simply dropped. On the OUTPUT side it is only
+    /// survivable because of the whole-track review's Critical 1 fix: the
+    /// vanished track's events snapshot becomes EMPTY under an UNCHANGED
+    /// track id, which is exactly the shape that used to strand the cursor
+    /// and hang a
     /// sounding note — `run_thread` now keys its release+reseek on the
     /// snapshot's CONTENT, so the note is released instead. Do not restore
     /// an id-only comparison there on the assumption that this path is
     /// harmless. Either way, both selectors must keep tolerating an id the
     /// store does not have.
-    fn clear_midi_routing_for(&self, id: &str) {
+    fn clear_midi_routing_for(&self, id: &str, clip_ids: &[String]) {
         let hub = crate::audio::midi_in::hub();
         if hub.target_track().as_deref() == Some(id) {
             // Goes through `set_target_track`, so the outgoing target still
@@ -1899,9 +1984,19 @@ impl ControlPlane {
             hub.set_target_track(None);
         }
         if let Some(out) = self.midi_out.get() {
-            if out.note_track().as_deref() == Some(id) {
-                let _ = out.select_note_track(None);
-            }
+            out.clear_routes_for_track(id, clip_ids);
+            out.persist(self.current_project_dir().as_deref());
+        }
+    }
+
+    /// Clear a single clip's MIDI-out route (if any) — the single-clip
+    /// analogue of `clear_midi_routing_for`, called from `midi::
+    /// midi_remove_clip_core` after its commit succeeds. A no-op if no
+    /// `MidiOut` is attached (every unit test's `ControlPlane` by default).
+    pub fn clear_midi_route_for_clip(&self, clip_id: &str) {
+        if let Some(out) = self.midi_out.get() {
+            out.set_route(crate::midi_out::RouteScope::Clip(clip_id.to_string()), None);
+            out.persist(self.current_project_dir().as_deref());
         }
     }
 
@@ -2739,6 +2834,9 @@ impl ControlPlane {
         // App-global plugin/automation registries adopt the (empty) project.
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
+        if let Some(out) = self.midi_out.get() {
+            out.adopt_project(&dir);
+        }
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)(
             "project://changed",
@@ -2806,6 +2904,9 @@ impl ControlPlane {
         self.committer.log().epoch_boundary(&dir, history::EpochEvent::Open, new_epoch);
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
+        if let Some(out) = self.midi_out.get() {
+            out.adopt_project(&dir);
+        }
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
         Ok(project)
@@ -3614,6 +3715,20 @@ mod tests {
 
     use crate::audio::types::testutil::{test_clip, test_track};
     use crate::control::op::testutil::set_gain;
+
+    /// A throwaway per-machine routing file path for a test — every test
+    /// that exercises `MidiOut` persistence (directly or through
+    /// `ControlPlane`'s route/port/clock methods) MUST feed this into
+    /// `MidiOut::set_routing_path_for_test` right after construction, or it
+    /// silently reads/overwrites the real developer machine's MIDI routing
+    /// config.
+    fn test_routing_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "aura-midi-routing-test-{label}-{}-{}.json",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
 
     /// A `ControlPlane` wired to `EngineHandle::for_tests()` (no real engine
     /// thread — just a channel that records sent `ControlMsg`s) and a
@@ -5337,8 +5452,8 @@ mod tests {
         let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
         let rev_before = cp.session().lock().rev;
         // Unattached: an honest error, never a panic and never a document write.
-        assert!(cp.select_midi_output_port(Some("x#0".into()), TxMeta::user("x")).is_err());
-        assert!(cp.set_midi_clock_enabled(true, TxMeta::user("x")).is_err());
+        assert!(cp.open_midi_output_port("x#0".into(), TxMeta::user("x")).is_err());
+        assert!(cp.set_midi_output_clock_enabled("x#0".into(), true, TxMeta::user("x")).is_err());
         assert_eq!(cp.session().lock().rev, rev_before);
     }
 
@@ -5375,22 +5490,21 @@ mod tests {
     fn removing_the_routed_track_clears_the_note_out_target() {
         let (cp, _engine_rx, _events) = test_plane_with_tracks(&[]);
         let out = Arc::new(crate::midi_out::MidiOut::default());
+        out.set_routing_path_for_test(test_routing_path("note-out-target"));
         cp.attach_midi_out(Arc::clone(&out));
         let keys = cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
         let other = cp.add_track(Some("Pads".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
-        cp.select_midi_output_track(Some(other.id.to_string()), TxMeta::user("route")).unwrap();
+        cp.set_midi_track_route(other.id.to_string(), Some("x#0".into()), 0, TxMeta::user("route")).unwrap();
 
         cp.remove_track(keys.id.as_str(), TxMeta::user("delete")).unwrap();
-        assert_eq!(
-            out.status().note_track_id.as_deref(),
-            Some(other.id.as_str()),
+        assert!(
+            out.routes().contains_key(&crate::midi_out::RouteScope::Track(other.id.to_string())),
             "an unrelated delete must not clear the routing"
         );
 
         cp.remove_track(other.id.as_str(), TxMeta::user("delete")).unwrap();
-        assert_eq!(
-            out.status().note_track_id,
-            None,
+        assert!(
+            !out.routes().contains_key(&crate::midi_out::RouteScope::Track(other.id.to_string())),
             "deleting the routed track leaves a dangling note-out target"
         );
     }

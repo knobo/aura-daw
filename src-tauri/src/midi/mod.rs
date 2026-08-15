@@ -619,6 +619,13 @@ pub(crate) fn midi_remove_clip_core(
             .ok_or_else(|| format!("unknown MIDI clip: {clip_id}"))?;
         tx.apply(Op::MidiClipRemove { clip, index: 0 })
     })?;
+    // A clip-scoped MIDI-out route (if any) has nothing in the document
+    // model retiring it — same carve-out as `remove_track`'s
+    // `clear_midi_routing_for`. `midi_out::run_thread`'s self-heal would
+    // also catch this within ~250 ms, but clearing it eagerly here (now
+    // that this explicit delete path exists) means a routed clip's port
+    // release isn't left waiting on that window.
+    control.clear_midi_route_for_clip(clip_id.as_str());
     Ok(())
 }
 
@@ -1103,6 +1110,30 @@ mod tests {
 
         let snap = cp.project_state();
         assert!(snap.midi_clips.iter().any(|c| c.id == clip.id), "an unknown-id removal leaves truth untouched");
+    }
+
+    /// `midi_remove_clip_core` clears a clip-scoped MIDI-out route eagerly
+    /// (`ControlPlane::clear_midi_route_for_clip`) rather than relying only
+    /// on `midi_out::run_thread`'s 250 ms self-heal.
+    #[test]
+    fn midi_remove_clip_core_clears_a_clip_scoped_midi_out_route() {
+        use std::sync::Arc;
+        let (cp, _events, track_id) = plane_with_midi_track();
+        let out = Arc::new(crate::midi_out::MidiOut::default());
+        cp.attach_midi_out(Arc::clone(&out));
+        let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
+        out.set_route(
+            crate::midi_out::RouteScope::Clip(clip.id.to_string()),
+            Some(crate::midi_out::RouteTarget { port_id: "x#0".into(), channel: 0 }),
+        );
+        assert!(out.routes().contains_key(&crate::midi_out::RouteScope::Clip(clip.id.to_string())));
+
+        midi_remove_clip_core(&cp, clip.id.clone()).unwrap();
+
+        assert!(
+            !out.routes().contains_key(&crate::midi_out::RouteScope::Clip(clip.id.to_string())),
+            "the route to the deleted clip is cleared eagerly, not left for self-heal"
+        );
     }
 
     /// The inverse (`Op::MidiClipAdd`) must restore the clip byte-identically
