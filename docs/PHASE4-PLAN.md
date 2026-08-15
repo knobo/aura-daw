@@ -1726,3 +1726,132 @@ Two tests in `midi_out` are flaky under parallel load:
 Recorded in `docs/backlog/hardware-midi-io.md` under "Still open after slice
 2" with the full reading, the recommended fix and the discriminating check
 that would falsify it.
+
+## Track F handoff (2026-08-15/16, modulation system, subagent-driven, controller-led)
+
+Track F (modulation graph — several curves per track, automation tracks,
+clip envelopes) is **IMPLEMENTED** on branch `modulation-system`, cut for
+the Track F work with HEAD at the close-out commit of this section. Design:
+`docs/superpowers/specs/2026-08-15-modulation-system-design.md` (owner
+rulings R1–R5). Plan:
+`docs/superpowers/plans/2026-08-15-modulation-system.md`. ADR:
+`docs/adr/0008-modulation-graph.md`. SDD ledger (gitignored):
+`.superpowers/sdd/2026-08-15-modulation-system/progress.md`. Eleven tasks
+(P0 foundation through P4 docs).
+
+**What landed.** The document model is a modulation graph: `Curve`,
+`Binding`, `AutomationClip` under `session.modulation`, persisted as
+`project.json` **schemaVersion 4** with a one-way v3 `automation[]` →
+`modulation{}` migration. Sources expand on the **control thread at
+rebuild** into the same absolute-sample event lists Track D already fed the
+RT path — looping, clip envelopes, and multi-target automation tracks cost
+the audio callback nothing new. Track-gain remains a per-sample
+`RampCursor` multiplier on the fader; **pan** is block-boundary-evaluated
+with a per-block linear lerp of `(gl, gr)` (design §6.1, deliberate trig
+cost). Plugin-param bindings rebuild `ParamAutomationDriver` from the graph
+(Track D ruling 2 holds). UI: a track-header target picker and several
+overlay lanes per track (incl. pan), a real automation-track kind with
+clips and multi-target routing, and a piano-roll clip-envelope lane keyed
+by content. Old `automation_get`/`automation_set` and
+`Op::AutomationSetLane` stay as a **compatibility facade** over the graph
+so old journals and any leftover callers still work.
+
+**Per task** (controller-recorded SHAs):
+
+| Task | Commit(s) | Summary |
+|---|---|---|
+| T1 | `bfa252d` | Document objects (`Curve`, `Source`, `TargetRef`, `Binding`, `AutomationClip`) |
+| T2 | `ec2ea18` | Target resolution and per-target arbitration |
+| T3 | `e4d941a` | Source expansion, looping, combination law |
+| T4 | `11608c1` | Project v4 persistence + one-way v3 migration |
+| T5 | `94b489e` | Session document, ops, rebuild wiring |
+| T6 | `3a40bc9` | Per-track ramp table with pan |
+| T7 | `abafca2` | IPC surface, lane compatibility facade, frontend mirror |
+| T8 | `231b5d9` | Several automation lanes per track + target picker + pan |
+| T9 | `26d1e11` + `c86e501` | Automation tracks; fix (drag, TrackRemove, plugin-param drive) |
+| T10 | `8a0798a` + `1a1d589` | Clip envelopes; fix (`plugin:` prefix on instrument resolve) |
+| T11 | this section | ADR 0008, handoff, `next-prompt.md` → design §8, suite re-measure |
+
+**Suites: 731 backend (702 lib + 29 integration) + 299 frontend, all
+green, measured on `modulation-system` 2026-08-16.** Counts dated in
+README/CONTRIBUTING. Other tracks may be in flight; the count line is a
+known cross-track merge-conflict point — whoever merges last re-measures
+rather than picking a side. Doc-tests remain 0 and are not a test target.
+No new side channel appeared; `docs/SIDE-CHANNEL-INVENTORY.md` is
+untouched.
+
+### Controller rulings (R5 implementer decisions, ADR 0007-marked)
+
+Recorded in the SDD preflight and held through the round:
+
+1. **T3 API names follow the implementation**, not the plan's draft names:
+   `expand_repeated`, `CompiledSource`, `Contribution`, `compile()`. The
+   landed API is a strict superset of the plan's five behaviour tests;
+   later tasks follow `compile.rs`, not the draft identifiers.
+2. **T10 wires placements; it does not rewrite compile.**
+   `CompileCtx.content_placements` is filled from real `MidiClip`s;
+   `expand_repeated` is unchanged. Cost if wrong would have been a second
+   expansion path.
+3. **T5 left `Op::AutomationSetLane` applying as today; T7 routed it
+   through compat.** Old journals keep replaying; both document halves
+   stay coherent until the facade owns the write.
+4. **midi persist still stamps `schemaVersion: 3`** (deferred). A
+   midi-only write after a v4 modulation save can sit `modulation{}` under
+   version 3. Load still prefers `modulation{}` when present; explicit
+   save upgrades. Not fixed in this round — no suite failure depends on
+   it.
+5. **P0 manual v3 open/play/save was not driven in-app.** Persist, open,
+   and facade paths that gate depends on are test-covered; the owner's
+   hand check remains owed (below).
+
+### Non-goals held (design §9 — choices, not omissions)
+
+LFO / macro / MIDI-CC / envelope-follower implementations; curve shapes
+beyond linear; automation recording (write/touch/latch); sample-accurate
+plugin params; `mute` and send targets (format + resolver arms that return
+`None`); plugin-param automation in a bounce (Track D known divergence —
+private instances per render); per-voice modulation; any change to Track
+D's gesture/undo shape (rulings 4 and 7 stand). The ordered path that
+finishes each of these is design §8 — linked from `next-prompt.md`, not
+restated here.
+
+### Divergences and known thin spots found on the way
+
+- **Pan is block-lerped, gain is per-sample** (design §6.1) — deliberate;
+  documented at the mixer call site so a later reader does not "fix" it.
+- **Audio clips are not envelope-wired.** Clip envelopes key on
+  `contentId` for MIDI; audio placements are sample-based with no
+  `contentLengthTicks` loop model. Piano roll is MIDI-only this round.
+- **Plugin-param bounce still ignores automation** (Track D carry-forward,
+  design §6.3). Track-gain and pan ramps export; plugin params do not.
+- **Overlays stack by last-picked** — behind lanes are not hittable
+  without re-picking; `visible` is not pruned on adopt.
+- **Plugin panel `A` no longer unbinds** (mint/show only); hide is via the
+  lane picker.
+- **Empty automation-clip body click no longer inserts a point** after the
+  T9 fix (drag the clip / hit a vertex). First click on a clip envelope
+  can mint without inserting a point; hide-envelope is a no-op in places.
+- **Curves are not deleted with their track** — orphan curves can remain
+  until GC/edit.
+- **App never driven end-to-end** for pan, multi-target automation tracks,
+  or looping clip envelopes. Same constraint as Track D: implementing
+  agents had no audio device. Offline render tests cover the shapes.
+
+### OWED BY THE OWNER
+
+1. **Ear checks that no suite substitutes:** draw pan on a track and
+   hear L/R move; bind one automation track to two targets and hear both;
+   loop a MIDI clip with an envelope and hear bar 1 match bar 3.
+2. **P0 migration hand check:** open a real v3 project with a gain lane,
+   play, save, confirm `schemaVersion: 4` and `modulation{}` with no
+   behaviour change.
+3. Everything still open from Track D that this round did not claim
+   (gesture token, non-blocking CLAP path, plugin-param bounce, DOM test
+   environment) remains open — see the Track D handoff above.
+
+### Path forward
+
+Design §8 is the contract for the rounds after this one. ADR 0008 records
+why tagged `TargetRef` is a step toward ports. Fresh sessions start at
+`next-prompt.md`, which links that section rather than restating it.
+
