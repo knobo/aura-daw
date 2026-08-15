@@ -83,6 +83,12 @@ class ClipClipboardStore {
    * result — an older one that resolves late is discarded, not applied. */
   private copySeq = 0;
 
+  /** Last-write-wins queue for the OS clipboard. `copySeq` only protects
+   * in-memory `payload`; paste prefers the OS envelope, so an older write
+   * that finishes last would make the next paste apply the stale copy. */
+  private osWriteChain: Promise<void> = Promise.resolve();
+  private osWritePending: string | null = null;
+
   async copy(): Promise<void> {
     const audioIds = clipSelection.audioIds();
     const midiIds = clipSelection.midiIds();
@@ -94,7 +100,7 @@ class ClipClipboardStore {
       this.payload = p;
       const encoded = encodeAuraClips(p);
       try {
-        await backend.osClipboardWriteText?.(encoded);
+        await this.enqueueOsWrite(encoded);
         if (seq === this.copySeq && payloadByteLength(encoded) > OS_CLIPBOARD_RISK_BYTES) {
           // "Ok" from the write above only means arboard accepted the text
           // and this process took selection ownership — NOT that another
@@ -122,6 +128,21 @@ class ClipClipboardStore {
       console.error("[aura] clips_copy failed:", err);
       toasts.error("COPY FAILED", String(err));
     }
+  }
+
+  /** Serialize OS writes and drop superseded payloads so an older write
+   * that finishes last cannot be what paste reads. */
+  private enqueueOsWrite(encoded: string): Promise<void> {
+    this.osWritePending = encoded;
+    const done = this.osWriteChain.then(async () => {
+      while (this.osWritePending !== null) {
+        const next = this.osWritePending;
+        this.osWritePending = null;
+        await backend.osClipboardWriteText?.(next);
+      }
+    });
+    this.osWriteChain = done.catch(() => {});
+    return done;
   }
 
   /** Paste at `atSamples`. Returns whether a payload was found anywhere (OS
