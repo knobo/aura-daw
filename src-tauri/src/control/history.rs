@@ -6,7 +6,9 @@
 //!   document-swap epoch boundary, with the 350 ms same-key merge round-2
 //!   §4.4 specifies as the FALLBACK for callers that emit no explicit
 //!   gesture boundary (the mechanism is `gesture_begin`/`gesture_end`,
-//!   Task 14 — this is the safety net under it, not a replacement).
+//!   Task 14 — this is the safety net under it, not a replacement). Ordered
+//!   by the commits' `rev`, not by arrival at the sink (Plan F Task 11,
+//!   L-4's stack half — see [`History`]).
 //! * [`JournalWriter`] — the append-only `<project dir>/journal.ndjson`.
 //!   One line per NON-transient committed batch, plus a record at every
 //!   epoch boundary. This is where `OP_FORMAT_VERSION` stops being
@@ -69,8 +71,9 @@ use super::CoalesceKey;
 /// same label, landing within this window, fold into one undo step.
 pub const COALESCE_WINDOW: Duration = Duration::from_millis(350);
 
-/// Maximum number of entries kept on the undo stack. When the stack is
-/// full the OLDEST entry is dropped (a DAW's undo history is a recency
+/// Maximum number of entries kept on the undo stack. When the stack is full
+/// the LOWEST-REV entry is dropped — the oldest COMMIT, which since Task 11
+/// is not necessarily the oldest arrival (a DAW's undo history is a recency
 /// window, not an archive — the journal keeps the full record on disk).
 ///
 /// 200 is chosen to be generous for a session's worth of interactive
@@ -106,6 +109,13 @@ pub struct HistoryEntry {
     /// `Session::transact` reverses them before handing them out.
     pub inverses: Vec<Op>,
     pub at: Instant,
+    /// The `rev` of the batch this entry describes — the session-lock-minted
+    /// sequence number, which is the ONLY total order on commits that
+    /// exists. Arrival at the sink is not that order (L-4: `record_commit`
+    /// runs after the session lock is released, so two committers can reach
+    /// it inverted), and [`History::record`] uses this field to put the
+    /// entry where the commit happened rather than where it arrived.
+    pub rev: u64,
     /// `Some(key)` when EVERY op in the batch shares one coalesce key —
     /// the 350 ms boundary-less fallback merges consecutive same-key
     /// entries (round-2 §4.4: fallback, not mechanism). `None` disables
@@ -124,7 +134,7 @@ impl HistoryEntry {
     /// to the SAME key. A batch containing any op with no key at all (every
     /// structural op: `TrackAdd`, `ClipRemove`, `PluginAdd`, …) yields
     /// `None`, which is exactly the "a structural op breaks the merge" rule.
-    pub fn from_committed(meta: &TxMeta, ops: &[Op], inverses: &[Op]) -> Self {
+    pub fn from_committed(meta: &TxMeta, ops: &[Op], inverses: &[Op], rev: u64) -> Self {
         Self {
             label: meta.label.clone(),
             actor: meta.actor.clone(),
@@ -132,6 +142,7 @@ impl HistoryEntry {
             ops: ops.to_vec(),
             inverses: inverses.to_vec(),
             at: Instant::now(),
+            rev,
             coalesce: batch_coalesce_key(ops),
         }
     }
@@ -142,8 +153,8 @@ impl HistoryEntry {
     /// letting a 350 ms window merge it with a neighbour would silently
     /// join two deliberate gestures into one, defeating the very boundary
     /// the user's `pointerdown`/`pointerup` drew.
-    pub fn from_gesture(meta: &TxMeta, ops: &[Op], inverses: &[Op]) -> Self {
-        Self { coalesce: None, ..Self::from_committed(meta, ops, inverses) }
+    pub fn from_gesture(meta: &TxMeta, ops: &[Op], inverses: &[Op], rev: u64) -> Self {
+        Self { coalesce: None, ..Self::from_committed(meta, ops, inverses, rev) }
     }
 }
 
@@ -164,10 +175,30 @@ fn batch_coalesce_key(ops: &[Op]) -> Option<CoalesceKey> {
 // History
 // ---------------------------------------------------------------------------
 
+/// The undo/redo stacks, ordered by [`HistoryEntry::rev`] rather than by
+/// arrival (Plan F Task 11, L-4's stack half; ruling F-4 chose ordered
+/// consumption over a commit-sequence lock).
+///
+/// `undo` is kept ASCENDING in `rev`, so [`Self::pop_undo`] takes the
+/// highest-rev entry and eviction drops the lowest — both ends of the same
+/// invariant. `VecDeque`, not `Vec`, so eviction at the cap is a pop instead
+/// of an O(n) memmove on every commit once the stack is full (M-7).
+///
+/// SCOPE OF THE ORDERING CLAIM, since it is easy to overstate: this orders
+/// the STACK, it does not serialize the commits. Two batches that raced
+/// still applied to the document in whatever order the session lock granted
+/// — `rev` IS that order — and this only guarantees that the stack replays
+/// their inverses in the reverse of it. It says nothing about batches that
+/// never reach the sink (a stale-epoch drop) or about `redo`, which is
+/// ordered by construction: `redo` is populated ONLY by [`Self::push_redo`]
+/// after an undo pop, and undo pops are rev-descending, so the redo stack is
+/// descending from bottom to top and its `pop_redo` therefore returns the
+/// lowest-rev entry — the step to redo first. [`Self::record`] clears it, so
+/// no fresh edit can ever interleave a rev into it.
 #[derive(Default)]
 pub struct History {
-    undo: Vec<HistoryEntry>,
-    redo: Vec<HistoryEntry>,
+    undo: std::collections::VecDeque<HistoryEntry>,
+    redo: std::collections::VecDeque<HistoryEntry>,
 }
 
 impl History {
@@ -191,48 +222,78 @@ impl History {
     /// `at` advances to the new entry's timestamp so a continuous stream of
     /// edits keeps merging (the window is "since the last edit", not "since
     /// the run began"); a pause longer than the window starts a new step.
+    ///
+    /// THE INSERTION POINT (Task 11): the entry goes where its `rev` belongs,
+    /// found by scanning from the BACK — which is one comparison for the
+    /// ordinary in-order arrival and only walks as far as an inversion
+    /// actually reaches. A late-arriving older batch therefore lands BELOW
+    /// the newer entries instead of on top of them.
+    ///
+    /// AN OUT-OF-ORDER ARRIVAL NEVER MERGES. The merge only ever considers
+    /// the entry immediately below the insertion point, and only when that
+    /// point is the top of the stack (see [`merges`]'s `rev` clause). Merging
+    /// an inverted pair would be wrong twice over: the folded entry would
+    /// take the OLDER batch's ops as "where redo must land", and it would
+    /// have to claim one of two revs it does not span.
     pub fn record(&mut self, e: HistoryEntry) {
         self.redo.clear();
-        if let Some(top) = self.undo.last_mut() {
-            if merges(top, &e) {
-                top.ops = e.ops;
-                top.at = e.at;
-                return;
+        let at = self.undo.iter().rposition(|x| x.rev <= e.rev).map_or(0, |i| i + 1);
+        if at == self.undo.len() {
+            if let Some(top) = self.undo.back_mut() {
+                if merges(top, &e) {
+                    top.ops = e.ops;
+                    top.at = e.at;
+                    // The folded step now describes the document as of the
+                    // NEWER batch, so it must sort as that batch — otherwise
+                    // a third entry between the two revs would insert above
+                    // a step that already contains it.
+                    top.rev = e.rev;
+                    return;
+                }
             }
         }
-        self.undo.push(e);
+        self.undo.insert(at, e);
         if self.undo.len() > UNDO_STACK_LIMIT {
-            self.undo.remove(0);
+            self.undo.pop_front();
         }
     }
 
-    /// Pop the next step to undo. The caller applies its `inverses` through
-    /// a normal commit and then calls [`Self::push_redo`] with the SAME
-    /// entry on success (or [`Self::push_undo_unchanged`] to put it back on
-    /// failure).
+    /// Pop the next step to undo — the back, which [`Self::record`]'s
+    /// ordering makes the highest-rev entry rather than merely the
+    /// last-arrived one. The caller applies its `inverses` through a normal
+    /// commit and then calls [`Self::push_redo`] with the SAME entry on
+    /// success (or [`Self::push_undo_unchanged`] to put it back on failure).
     pub fn pop_undo(&mut self) -> Option<HistoryEntry> {
-        self.undo.pop()
+        self.undo.pop_back()
     }
 
     /// Pop the next step to redo. The caller applies its `ops`.
     pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
-        self.redo.pop()
+        self.redo.pop_back()
     }
 
     /// Put an entry on the redo stack (after a successful undo). Does NOT
     /// clear anything — that is [`Self::record`]'s job, and a redo future
     /// must survive its own undo.
     pub fn push_redo(&mut self, e: HistoryEntry) {
-        self.redo.push(e);
+        self.redo.push_back(e);
     }
 
     /// Put an entry back on the undo stack — after a successful redo, or to
     /// restore the stack when an undo commit failed. Never merges (the
     /// entry is already a finished step) and never clears the redo stack.
+    ///
+    /// Pushes onto the BACK without consulting `rev`, and that is correct
+    /// rather than an omission: this only ever returns an entry that
+    /// [`Self::pop_undo`] just took off the back, and nothing can have been
+    /// recorded in between — [`Self::record`] clears `redo`, so a redo
+    /// future only exists while no fresh edit has landed, and the failed-undo
+    /// path restores the entry inside the same command. Ordering it would
+    /// compute the same position at O(n).
     pub fn push_undo_unchanged(&mut self, e: HistoryEntry) {
-        self.undo.push(e);
+        self.undo.push_back(e);
         if self.undo.len() > UNDO_STACK_LIMIT {
-            self.undo.remove(0);
+            self.undo.pop_front();
         }
     }
 
@@ -255,13 +316,35 @@ impl History {
 
 /// The 350 ms same-key merge predicate. Both entries must carry a key
 /// (`None` — structural, mixed, or gesture — never merges in either
-/// direction), the keys/actors/labels must match, and the gap must be
-/// under the window.
+/// direction), the keys/actors/labels must match, the gap must be under the
+/// window, and `next` must be the LATER commit.
+///
+/// The `rev` clause is ordering, not adjacency: `next.rev` only has to
+/// EXCEED `top.rev`, never to be `top.rev + 1`. Transient batches consume
+/// revs without leaving a history entry, so consecutive undo steps are
+/// routinely several revs apart — requiring literal adjacency would silently
+/// switch the coalescing fallback off for exactly the knob-drag case round-2
+/// §4.4 wrote it for.
+///
+/// AND IT IS NOT INDEPENDENTLY OBSERVABLE TODAY — measured, not assumed:
+/// deleting this one clause leaves the whole suite green. [`History::record`]
+/// only consults this predicate when the insertion point is the top of the
+/// stack, which already implies `next.rev >= top.rev`, so the clause bites
+/// exactly on the residue: two DISTINCT batches carrying the SAME rev. That
+/// is not impossible, only unreachable from the tests — `close_gesture`
+/// READS `session.rev` rather than minting one, so a gesture entry can share
+/// a rev with a concurrent committer's batch that minted it. Merging those
+/// two would fold a gesture into an unrelated edit; the clause refuses, and
+/// the `coalesce: None` a gesture entry carries refuses first. It stays as
+/// depth, on Task 9's `Class` ruling (unobservable defence belongs in a
+/// recovery path), and is written down as unobservable — not as impossible —
+/// so the next reader does not mistake it for tested behaviour.
 fn merges(top: &HistoryEntry, next: &HistoryEntry) -> bool {
     let (Some(a), Some(b)) = (&top.coalesce, &next.coalesce) else { return false };
     a == b
         && top.actor == next.actor
         && top.label == next.label
+        && next.rev > top.rev
         && next.at.saturating_duration_since(top.at) < COALESCE_WINDOW
 }
 
@@ -590,6 +673,7 @@ impl HistoryLog {
                     &committed.meta,
                     &committed.ops,
                     &committed.inverses,
+                    rev,
                 ));
             }
             self.versions.lock().record(committed)
@@ -638,6 +722,7 @@ impl HistoryLog {
                 &committed.meta,
                 &committed.ops,
                 &committed.inverses,
+                rev,
             ));
             self.versions.lock().record(committed)
         };
@@ -884,10 +969,21 @@ mod tests {
         }
     }
 
+    /// Entries for the merge/bound tests, whose `rev`s only have to be
+    /// ASCENDING (the ordering tests below set `rev` explicitly instead).
+    /// A monotonic counter is what a same-thread run of commits produces, so
+    /// this helper reproduces the ordinary case and never accidentally
+    /// exercises the out-of-order one.
     fn entry(label: &str, ops: Vec<Op>, at: Instant) -> HistoryEntry {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_REV: AtomicU64 = AtomicU64::new(1);
+        entry_rev(label, ops, at, NEXT_REV.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn entry_rev(label: &str, ops: Vec<Op>, at: Instant, rev: u64) -> HistoryEntry {
         let meta = TxMeta { actor: Actor::User, run: "r".into(), label: label.into(), transient: false };
         let inverses = ops.clone();
-        HistoryEntry { at, ..HistoryEntry::from_committed(&meta, &ops, &inverses) }
+        HistoryEntry { at, ..HistoryEntry::from_committed(&meta, &ops, &inverses, rev) }
     }
 
     #[test]
@@ -950,11 +1046,11 @@ mod tests {
         let mut h = History::new();
         let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "fader".into(), transient: false };
         let ops = vec![set_gain("t-1", -3.0)];
-        h.record(HistoryEntry::from_gesture(&meta, &ops, &ops));
-        h.record(HistoryEntry::from_gesture(&meta, &ops, &ops));
+        h.record(HistoryEntry::from_gesture(&meta, &ops, &ops, 1));
+        h.record(HistoryEntry::from_gesture(&meta, &ops, &ops, 2));
         assert_eq!(h.undo_len(), 2, "two deliberate gestures stay two undo steps");
         // ...and a plain entry does not merge INTO a gesture batch either.
-        h.record(entry("fader", vec![set_gain("t-1", -6.0)], Instant::now()));
+        h.record(entry_rev("fader", vec![set_gain("t-1", -6.0)], Instant::now(), 3));
         assert_eq!(h.undo_len(), 3);
     }
 
@@ -1007,6 +1103,107 @@ mod tests {
         assert_eq!(h.undo_len(), UNDO_STACK_LIMIT);
         let newest = h.pop_undo().unwrap();
         assert_eq!(newest.label, format!("edit {}", UNDO_STACK_LIMIT + 9), "the NEWEST survives");
+    }
+
+    /// L-4's stack half. `record_commit` runs AFTER the session lock is
+    /// released, so two concurrent committers can reach the sink inverted:
+    /// the batch that committed FIRST arrives LAST. Under an arrival-ordered
+    /// stack the top would then be the OLDER batch, and Ctrl+Z would apply
+    /// an older inverse over a newer write while leaving the newer one
+    /// undoable — the document ends up in a state no edit ever produced.
+    #[test]
+    fn a_late_arriving_older_batch_inserts_below_the_newer_one() {
+        let mut h = History::new();
+        let t0 = Instant::now();
+        // Distinct labels throughout so nothing can merge and hide the order.
+        h.record(entry_rev("a", vec![set_gain("t-1", -1.0)], t0, 5));
+        h.record(entry_rev("c", vec![set_gain("t-1", -3.0)], t0, 7));
+        // ...and rev 6 finally arrives, having committed BEFORE rev 7.
+        h.record(entry_rev("b", vec![set_gain("t-1", -2.0)], t0, 6));
+
+        assert_eq!(h.undo_len(), 3, "an out-of-order arrival is kept, not dropped");
+        let order: Vec<(u64, String)> =
+            std::iter::from_fn(|| h.pop_undo()).map(|e| (e.rev, e.label)).collect();
+        assert_eq!(
+            order,
+            vec![(7, "c".to_string()), (6, "b".to_string()), (5, "a".to_string())],
+            "undo pops in DESCENDING rev — commit order, not arrival order"
+        );
+
+        // A MERGED step must sort as the batch it now ends at, or the very
+        // next late arrival sorts above a step that already contains it.
+        let mut h2 = History::new();
+        h2.record(entry_rev("set gain", vec![set_gain("t-1", -1.0)], t0, 5));
+        h2.record(entry_rev("set gain", vec![set_gain("t-1", -2.0)], t0 + Duration::from_millis(100), 8));
+        assert_eq!(h2.undo_len(), 1, "the in-order same-key pair still merges");
+        h2.record(entry_rev("pan", vec![set_pan("t-1", 0.5)], t0, 6));
+        let order: Vec<u64> = std::iter::from_fn(|| h2.pop_undo()).map(|e| e.rev).collect();
+        assert_eq!(order, vec![8, 6], "the folded step carries the NEWER rev");
+    }
+
+    /// The same inversion at the sink itself, which is the only place that
+    /// can get the `rev` wrong: `History::record` cannot order by a number
+    /// `record_commit` never handed it. A hard-coded `rev` would leave both
+    /// entries equal, restoring arrival order while the unit test above
+    /// still passed.
+    #[test]
+    fn the_sink_carries_the_commits_rev_onto_the_entry() {
+        let log = HistoryLog::new();
+        let dir = std::env::temp_dir().join(format!("aura-journal-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        log.epoch_boundary(&dir, EpochEvent::Create, 1);
+
+        let meta = |label: &str| TxMeta {
+            actor: Actor::User,
+            run: "r".into(),
+            label: label.into(),
+            transient: false,
+        };
+        let ops = [set_gain("t-1", -3.0)];
+        log.record_commit(&committed_for_test(7, 1, &meta("newer"), &ops, &ops), HistoryMode::Record);
+        log.record_commit(&committed_for_test(6, 1, &meta("older"), &ops, &ops), HistoryMode::Record);
+        assert_eq!(log.depths(), (2, 0));
+
+        let (top, _) = log.pop_undo().expect("a step to undo");
+        assert_eq!(top.rev, 7, "the entry learned its batch's rev");
+        assert_eq!(top.label, "newer", "the NEWER batch is undone first");
+        let (next, _) = log.pop_undo().expect("a second step");
+        assert_eq!((next.rev, next.label.as_str()), (6, "older"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Eviction is the OTHER end of the same order. It must drop the lowest
+    /// rev, which under an arrival-ordered stack is not the front.
+    #[test]
+    fn eviction_at_the_cap_drops_the_lowest_rev_entry() {
+        let mut h = History::new();
+        let t0 = Instant::now();
+        // Ascending revs, distinct labels: the ordinary case, cap exceeded.
+        for i in 1..=(UNDO_STACK_LIMIT + 10) {
+            h.record(entry_rev(&format!("edit {i}"), vec![set_gain("t-1", i as f64)], t0, i as u64));
+        }
+        assert_eq!(h.undo_len(), UNDO_STACK_LIMIT);
+        let newest = h.pop_undo().unwrap();
+        assert_eq!(newest.rev, (UNDO_STACK_LIMIT + 10) as u64, "the NEWEST survives");
+        h.push_undo_unchanged(newest);
+
+        // Now a batch from BELOW the surviving window arrives late. It is the
+        // lowest rev on the stack, so it is the one eviction must drop — and
+        // it must never become poppable ahead of anything.
+        h.record(entry_rev("straggler", vec![set_gain("t-1", 0.0)], t0, 2));
+        assert_eq!(h.undo_len(), UNDO_STACK_LIMIT, "still capped");
+        let top = h.pop_undo().unwrap();
+        assert_eq!(
+            top.rev,
+            (UNDO_STACK_LIMIT + 10) as u64,
+            "the straggler did not displace the newest entry"
+        );
+        h.push_undo_unchanged(top);
+        assert!(
+            std::iter::from_fn(|| h.pop_undo()).all(|e| e.label != "straggler"),
+            "the lowest rev is what the cap drops, wherever it arrived"
+        );
     }
 
     #[test]

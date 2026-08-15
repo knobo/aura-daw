@@ -35,13 +35,27 @@
 //!   monotonic watermark can fail a comparison.
 //!
 //! WHAT THIS SWEEP DOES AND DOES NOT PIN — measured, not guessed. Every one
-//! of the TEN `// snapshot republish:` sites was deleted in turn and this
+//! of the ELEVEN `// snapshot republish:` sites was deleted in turn and this
 //! test re-run (Task 10: `try_seed_zyn_demo_instruments`'s two direct-write
 //! sites — the push and its rollback arm — died with the function itself;
 //! R-3 closed, the demo's Zyn bootstrap is ops in the seed transaction now,
-//! so there is nothing left there to republish). Eight of the ten turn it
+//! so there is nothing left there to republish). NINE of the eleven turn it
 //! RED at the exact step that lost the call. The two that do not, and what
 //! covers them instead:
+//!
+//! MARKED CORRECTION (ADR 0007, Plan F Task 11): this paragraph said TEN and
+//! "eight of the ten" through Task 10. Both were wrong, and the error is
+//! older than Task 10's subtraction: there were THIRTEEN marked sites before
+//! it, not twelve, so removing two leaves eleven. The RED tally also missed
+//! `plugins::state::adopt_open_project`'s install (`state.rs`), which IS
+//! driven RED by this sweep's unreadable-automation step below. Re-counted
+//! for this correction by two independently shaped audits that agree on
+//! eleven: reading every `// snapshot republish:` marker, and an
+//! ACCESSOR-anchored audit (`iter_mut(` / `get_mut(` / `entry(` /
+//! `values_mut(` / `first_mut(` / `last_mut(` on a document collection, plus
+//! every fn taking `&mut Session`/`Store`/`MidiStore`/`PluginDoc`/
+//! `AutomationDoc`) that traced each production mutable borrow either into
+//! `apply_raw` (captured by `transact`) or into one of the eleven.
 //! * `Committer::apply_instantiate_writeback` (R-4, `control/mod.rs`) —
 //!   unreachable from here BY CONSTRUCTION: this sweep uses `format: "stub"`
 //!   rows precisely so no host round-trip happens, and that writeback only
