@@ -250,11 +250,24 @@ pub fn append_from_with_input(
 /// All of a track's clip notes as absolute-sample note edges, merged and
 /// sorted (offs before ons at equal positions).
 pub fn track_events(midi: &MidiStore, track_id: &str, map: &TempoMap) -> Vec<AbsNoteEvent> {
+    track_events_excluding(midi, track_id, &std::collections::HashSet::new(), map)
+}
+
+/// Same as [`track_events`], but skipping any clip whose id is in `exclude`
+/// — used by hardware MIDI-out routing (`midi_out`) so a clip with its own
+/// output override is never ALSO sent out via its track's route (a clip
+/// route always wins; see `midi_out`'s module doc).
+pub fn track_events_excluding(
+    midi: &MidiStore,
+    track_id: &str,
+    exclude: &HashSet<String>,
+    map: &TempoMap,
+) -> Vec<AbsNoteEvent> {
     let mut events: Vec<AbsNoteEvent> = Vec::new();
     for c in midi
         .clips
         .iter()
-        .filter(|c| c.track_id == track_id && !c.notes.is_empty())
+        .filter(|c| c.track_id == track_id && !c.notes.is_empty() && !exclude.contains(c.id.as_str()))
     {
         events.extend(schedule::clip_events(c, map));
     }
@@ -486,6 +499,28 @@ mod tests {
         append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert!(out.is_empty());
         assert!(nodes.is_empty(), "no nodes retained for non-live tracks");
+    }
+
+    /// `track_events_excluding` (used by `midi_out` routing so a
+    /// clip-level override is never ALSO sent via its track's route) skips
+    /// exactly the named clip ids and otherwise matches `track_events`.
+    #[test]
+    fn track_events_excluding_skips_only_the_named_clips() {
+        let midi = midi_store_with(vec![
+            clip("m1", 0, 960, vec![MidiNote { tick: 0, length_ticks: 480, key: 60, velocity: 100, channel: 0, note_id: NoteId(0) }]),
+            clip("m1", 960, 960, vec![MidiNote { tick: 0, length_ticks: 480, key: 62, velocity: 90, channel: 0, note_id: NoteId(0) }]),
+        ]);
+        let overridden = midi.clips[1].id.to_string();
+
+        let all = track_events(&midi, "m1", &TempoMap::from_v1(120.0, 48_000).unwrap());
+        assert!(all.iter().any(|e| e.key == 60), "both clips present without exclusion");
+        assert!(all.iter().any(|e| e.key == 62));
+
+        let mut exclude = HashSet::new();
+        exclude.insert(overridden);
+        let filtered = track_events_excluding(&midi, "m1", &exclude, &TempoMap::from_v1(120.0, 48_000).unwrap());
+        assert!(filtered.iter().any(|e| e.key == 60), "the non-overridden clip's notes still come through");
+        assert!(!filtered.iter().any(|e| e.key == 62), "the overridden clip's notes are excluded");
     }
 
     /// Node identity survives rebuilds (same key -> same cell) and is

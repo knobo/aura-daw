@@ -290,12 +290,20 @@ export interface Backend {
    * clear the route back to the slice-1 preview tone. */
   midiSelectInputTrack?(trackId: string | null): Promise<void>;
 
-  // ── hardware MIDI output (slice 2: clock/sync + note-out) ──
+  // ── hardware MIDI output: clock/sync + per-track/per-clip routing ──
   midiListOutputPorts?(): Promise<MidiPortInfo[]>;
-  midiSelectOutputPort?(portId: string | null): Promise<void>;
-  midiSetClockEnabled?(enabled: boolean): Promise<void>;
-  /** Route this MIDI track's notes to the selected output port, or null. */
-  midiSelectOutputTrack?(trackId: string | null): Promise<void>;
+  /** Open an additional output port — does not affect any other port
+   * already open. Any number of ports may be open simultaneously. */
+  midiOpenOutputPort?(portId: string): Promise<void>;
+  midiCloseOutputPort?(portId: string): Promise<void>;
+  midiSetOutputClockEnabled?(portId: string, enabled: boolean): Promise<void>;
+  /** Route this MIDI track's notes to a port+channel, or `portId: null` to
+   * clear the route. A clip's own route (below) always wins over its
+   * track's. */
+  midiSetTrackRoute?(trackId: string, portId: string | null, channel?: number): Promise<void>;
+  /** Route one MIDI clip's notes, overriding its track's route, or
+   * `portId: null` to fall back to the track's routing. */
+  midiSetClipRoute?(clipId: string, portId: string | null, channel?: number): Promise<void>;
   midiOutputStatus?(): Promise<MidiOutputStatus>;
 
   // ── library & browser (Track E, additive; desktop only) ──
@@ -690,14 +698,20 @@ class TauriBackend implements Backend {
   midiListOutputPorts() {
     return invoke<MidiPortInfo[]>("midi_list_output_ports");
   }
-  async midiSelectOutputPort(portId: string | null) {
-    await invoke("midi_select_output_port", { portId });
+  async midiOpenOutputPort(portId: string) {
+    await invoke("midi_open_output_port", { portId });
   }
-  async midiSetClockEnabled(enabled: boolean) {
-    await invoke("midi_set_clock_enabled", { enabled });
+  async midiCloseOutputPort(portId: string) {
+    await invoke("midi_close_output_port", { portId });
   }
-  async midiSelectOutputTrack(trackId: string | null) {
-    await invoke("midi_select_output_track", { trackId });
+  async midiSetOutputClockEnabled(portId: string, enabled: boolean) {
+    await invoke("midi_set_output_clock_enabled", { portId, enabled });
+  }
+  async midiSetTrackRoute(trackId: string, portId: string | null, channel?: number) {
+    await invoke("midi_set_track_route", { trackId, portId, channel: channel ?? null });
+  }
+  async midiSetClipRoute(clipId: string, portId: string | null, channel?: number) {
+    await invoke("midi_set_clip_route", { clipId, portId, channel: channel ?? null });
   }
   midiOutputStatus() {
     return invoke<MidiOutputStatus>("midi_output_status");

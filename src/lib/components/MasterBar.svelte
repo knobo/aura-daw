@@ -26,6 +26,15 @@
     midiIo.targetTrackId ? (project.trackById(midiIo.targetTrackId)?.name ?? midiIo.targetTrackId) : null,
   );
 
+  // Output ports not currently open — the "+ add" dropdown's choices.
+  const closedOutPorts = $derived(midiIo.outPorts.filter((p) => !midiIo.outputs.some((o) => o.port.id === p.id)));
+
+  // Per-track routing: one MIDI track is "being edited" at a time in this
+  // compact strip; its current route (if any) drives the port/channel
+  // controls next to the track picker.
+  let editingTrackId = $state("");
+  const editingRoute = $derived(editingTrackId ? midiIo.trackRoute(editingTrackId) : undefined);
+
   onMount(() => {
     backend.listInputDevices().then((d) => (inputs = d)).catch(() => {});
     backend.listOutputDevices().then((d) => (outputs = d)).catch(() => {});
@@ -47,16 +56,26 @@
     void midiIo.setMonitor(enabled);
   }
 
-  function selectMidiOutPort(id: string) {
-    void midiIo.selectOutPort(id);
+  function openOutputPort(id: string) {
+    if (id) void midiIo.openOutPort(id);
   }
 
-  function toggleClock(enabled: boolean) {
-    void midiIo.setClockEnabled(enabled);
+  function closeOutputPort(id: string) {
+    void midiIo.closeOutPort(id);
   }
 
-  function selectMidiOutTrack(id: string) {
-    void midiIo.setOutputTrack(id || null);
+  function toggleClock(portId: string, enabled: boolean) {
+    void midiIo.setClockEnabled(portId, enabled);
+  }
+
+  function selectRoutePort(portId: string) {
+    if (!editingTrackId) return;
+    void midiIo.setTrackRoute(editingTrackId, portId || null, editingRoute?.channel ?? 0);
+  }
+
+  function selectRouteChannel(channel: number) {
+    if (!editingTrackId || !editingRoute) return;
+    void midiIo.setTrackRoute(editingTrackId, editingRoute.portId, channel);
   }
 
   // live dB readout without reactivity churn
@@ -131,36 +150,76 @@
         </span>
       {/if}
     </div>
-    <div class="dev">
+    <div class="dev midiout">
       <span class="silk">midi out</span>
-      <select
-        name="midi-output-device"
-        onchange={(e) => selectMidiOutPort((e.currentTarget as HTMLSelectElement).value)}
-      >
-        <option value="" selected={midiIo.outPortId === ""}>None</option>
-        {#each midiIo.outPorts as p (p.id)}
-          <option value={p.id} selected={p.id === midiIo.outPortId}>{p.name}</option>
-        {/each}
-      </select>
-      <label class="monitor" title="Send MIDI clock + transport (Start/Stop/Continue/SPP) to the output port">
-        <input
-          type="checkbox"
-          checked={midiIo.clockEnabled}
-          onchange={(e) => toggleClock((e.currentTarget as HTMLInputElement).checked)}
-        />
-        <span class="silk">clock</span>
-      </label>
+      {#each midiIo.outputs as o (o.port.id)}
+        <span class="portchip" title={o.port.name}>
+          <span class="pname mono">{o.port.name}</span>
+          <label class="monitor" title="Send MIDI clock + transport (Start/Stop/Continue/SPP) to this port">
+            <input
+              type="checkbox"
+              checked={o.clockEnabled}
+              onchange={(e) => toggleClock(o.port.id, (e.currentTarget as HTMLInputElement).checked)}
+            />
+            <span class="silk">clock</span>
+          </label>
+          <button
+            type="button"
+            class="portclose"
+            title="Close this output port"
+            onclick={() => closeOutputPort(o.port.id)}
+          >×</button>
+        </span>
+      {/each}
+      {#if closedOutPorts.length > 0}
+        <select
+          name="midi-output-add"
+          title="Open an additional MIDI output port"
+          onchange={(e) => {
+            openOutputPort((e.currentTarget as HTMLSelectElement).value);
+            (e.currentTarget as HTMLSelectElement).value = "";
+          }}
+        >
+          <option value="" selected>+ open…</option>
+          {#each closedOutPorts as p (p.id)}
+            <option value={p.id}>{p.name}</option>
+          {/each}
+        </select>
+      {/if}
       <span class="silk">trk</span>
       <select
         name="midi-output-track"
-        title="Play this MIDI track's notes through the output port (mute it in AURA to avoid doubling)"
-        onchange={(e) => selectMidiOutTrack((e.currentTarget as HTMLSelectElement).value)}
+        title="Configure which port+channel this MIDI track's notes are routed to (mute it in AURA to avoid doubling)"
+        onchange={(e) => (editingTrackId = (e.currentTarget as HTMLSelectElement).value)}
       >
-        <option value="" selected={!midiIo.noteTrackId}>None</option>
+        <option value="" selected={!editingTrackId}>None</option>
         {#each midiTracks as t (t.id)}
-          <option value={t.id} selected={t.id === midiIo.noteTrackId}>{t.name}</option>
+          <option value={t.id} selected={t.id === editingTrackId}>{t.name}</option>
         {/each}
       </select>
+      {#if editingTrackId}
+        <select
+          name="midi-output-track-port"
+          title="Port this track's notes are routed to"
+          onchange={(e) => selectRoutePort((e.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value="" selected={!editingRoute}>None</option>
+          {#each midiIo.outputs as o (o.port.id)}
+            <option value={o.port.id} selected={o.port.id === editingRoute?.portId}>{o.port.name}</option>
+          {/each}
+        </select>
+        {#if editingRoute}
+          <input
+            class="channel mono"
+            type="number"
+            min="0"
+            max="15"
+            title="MIDI channel (0-15)"
+            value={editingRoute.channel}
+            onchange={(e) => selectRouteChannel(Math.max(0, Math.min(15, (e.currentTarget as HTMLInputElement).valueAsNumber || 0)))}
+          />
+        {/if}
+      {/if}
     </div>
   </div>
 
@@ -272,6 +331,48 @@
   .target {
     color: var(--cyan);
     white-space: nowrap;
+  }
+
+  .midiout {
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+  .portchip {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--glass-border);
+    background: rgba(5, 7, 13, 0.7);
+  }
+  .pname {
+    font-size: 10px;
+    color: var(--text-dim);
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .portclose {
+    all: unset;
+    cursor: pointer;
+    font-size: 11px;
+    line-height: 1;
+    color: var(--text-faint);
+    padding: 0 2px;
+  }
+  .portclose:hover {
+    color: var(--text);
+  }
+  .channel {
+    width: 34px;
+    background: rgba(5, 7, 13, 0.7);
+    color: var(--text-dim);
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 3px 4px;
   }
 
   .jobsbox {

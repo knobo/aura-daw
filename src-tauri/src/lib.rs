@@ -116,8 +116,8 @@ pub fn run() {
                 .attach_midi_input(app.state::<Arc<midi_input::MidiInputManager>>().inner().clone());
             // MIDI slice 2, Task 7: wire the `aura-midi-out` driver the same
             // way — attach its transport-atomics/session handles once, then
-            // attach it to the control plane so `select_midi_output_port`/
-            // `set_midi_clock_enabled` can reach it.
+            // attach it to the control plane so the MIDI-out routing/port/
+            // clock methods can reach it.
             let midi_out = app.state::<Arc<midi_out::MidiOut>>().inner().clone();
             midi_out.attach(midi_out_session, midi_out_shared);
             control_plane.attach_midi_out(midi_out);
@@ -216,12 +216,14 @@ pub fn run() {
             midi_input::midi_select_input_port,
             midi_input::midi_select_input_track,
             midi_input::midi_input_status,
-            // ---- midi output: clock/sync (slice 2) ----
+            // ---- midi output: clock/sync + per-track/per-clip routing ----
             midi_out::midi_list_output_ports,
-            midi_out::midi_select_output_port,
-            midi_out::midi_set_clock_enabled,
+            midi_out::midi_open_output_port,
+            midi_out::midi_close_output_port,
+            midi_out::midi_set_output_clock_enabled,
             midi_out::midi_output_status,
-            midi_out::midi_select_output_track,
+            midi_out::midi_set_track_route,
+            midi_out::midi_set_clip_route,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,

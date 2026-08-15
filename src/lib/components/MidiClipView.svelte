@@ -7,6 +7,7 @@
    */
   import type { MidiClip, TrackState } from "../types/ipc";
   import { midi } from "../state/midi.svelte";
+  import { midiIo } from "../state/midiio.svelte";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
   import { prefs } from "../prefs/prefs.svelte";
@@ -236,6 +237,37 @@
     }
   }
 
+  // ── MIDI output override (right-click) ──
+  // No context-menu infra exists on clips today (rename is inline
+  // double-click/F2). A single-entry popover — the same toggle+backdrop
+  // shape ProjectMenu.svelte uses — opens a small inline port+channel
+  // picker, positioned like the rename input. "Inherit from track" clears
+  // the override so the clip falls back to its track's routing.
+  let menuOpen = $state(false);
+  let pickerOpen = $state(false);
+  const override = $derived(midiIo.clipOverride(clip.id));
+
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    pickerOpen = false;
+    menuOpen = true;
+  }
+
+  function openMidiOutputPicker() {
+    menuOpen = false;
+    pickerOpen = true;
+  }
+
+  function selectOverridePort(portId: string) {
+    void midiIo.setClipRoute(clip.id, portId || null, override?.channel ?? 0);
+  }
+
+  function selectOverrideChannel(channel: number) {
+    if (!override) return;
+    void midiIo.setClipRoute(clip.id, override.portId, channel);
+  }
+
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "F2") {
       e.preventDefault();
@@ -272,6 +304,7 @@
     onpointerup={onPointerUp}
     ondblclick={() => (downOnHeader ? startRename() : midi.open(clip.id))}
     onkeydown={onKeydown}
+    oncontextmenu={onContextMenu}
   >
     <div bind:this={pulseEl} class="pulse"></div>
     <canvas bind:this={canvas} class="mini" style:left="{visL}px" style:width="{Math.max(1, Math.floor(visR - visL))}px"></canvas>
@@ -306,6 +339,39 @@
       >
     {/if}
     <span class="count silk">{clip.notes.length}n</span>
+    {#if override}
+      <span class="routedot" title="MIDI output override: {override.portId}, channel {override.channel + 1}">⇥</span>
+    {/if}
+    {#if menuOpen}
+      <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (menuOpen = false)}></div>
+      <div class="clipmenu" style:left="{visL + 4}px" role="menu">
+        <button type="button" role="menuitem" onclick={openMidiOutputPicker}>MIDI output…</button>
+      </div>
+    {/if}
+    {#if pickerOpen}
+      <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (pickerOpen = false)}></div>
+      <div class="midipicker mono" role="presentation" style:left="{visL + 4}px" onpointerdown={(e) => e.stopPropagation()}>
+        <select
+          value={override?.portId ?? ""}
+          onchange={(e) => selectOverridePort((e.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value="">Inherit from track</option>
+          {#each midiIo.outputs as o (o.port.id)}
+            <option value={o.port.id}>{o.port.name}</option>
+          {/each}
+        </select>
+        {#if override}
+          <input
+            type="number"
+            min="0"
+            max="15"
+            value={override.channel}
+            onchange={(e) =>
+              selectOverrideChannel(Math.max(0, Math.min(15, (e.currentTarget as HTMLInputElement).valueAsNumber || 0)))}
+          />
+        {/if}
+      </div>
+    {/if}
   </div>
 {/if}
 
@@ -440,5 +506,68 @@
   }
   .del:hover {
     color: var(--red);
+  }
+
+  .routedot {
+    position: absolute;
+    left: 5px;
+    bottom: 3px;
+    font-size: 9px;
+    color: var(--cyan);
+    pointer-events: none;
+  }
+
+  .clipmenu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+  }
+  .clipmenu {
+    position: absolute;
+    top: 16px;
+    z-index: 31;
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--glass-border);
+    border-radius: 4px;
+    background: rgba(10, 13, 23, 0.96);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+    overflow: hidden;
+  }
+  .clipmenu button {
+    all: unset;
+    padding: 5px 10px;
+    font-size: 10px;
+    color: var(--text);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .clipmenu button:hover {
+    background: color-mix(in srgb, var(--clip-color) 25%, transparent);
+  }
+  .midipicker {
+    position: absolute;
+    top: 16px;
+    z-index: 31;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 6px;
+    border: 1px solid var(--clip-color);
+    border-radius: 4px;
+    background: rgba(5, 7, 13, 0.96);
+  }
+  .midipicker select,
+  .midipicker input {
+    font: inherit;
+    font-size: 9px;
+    color: var(--text);
+    background: rgba(5, 7, 13, 0.8);
+    border: 1px solid var(--glass-border);
+    border-radius: 3px;
+    padding: 2px 4px;
+  }
+  .midipicker input {
+    width: 3ch;
   }
 </style>
