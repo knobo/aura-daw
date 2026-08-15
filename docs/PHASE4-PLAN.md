@@ -1514,15 +1514,28 @@ correct fix made this failure quieter, not louder.
   synchronous mocks does not test asynchronous ordering** — it tests
   invocation order, which is a different property.
 
+- **`move_clips_undo_restores_every_clip_in_the_batch` could not fail on
+  identity — the SIXTH such test, and now closed.** It seeded both clips at
+  0 and asserted both back at 0, so an inverse restoring the wrong clip
+  passed. The clips are now seeded at distinct starts and asserted back at
+  their own, looked up BY ID rather than by store index. Killed by two
+  independent sabotages (an inverse rotated onto the next clip's object; an
+  inverse carrying the wrong pre-value), and the OLD version was re-run
+  under the same sabotage and PASSED — the evidence, not the assumption.
+  **An audit for a seventh found none**: all four paste-side undo tests
+  assert surviving rows by ID (one compares the whole before/after id
+  tuple), and the frontend cancel-restore tests seed distinct values per
+  clip and across two stores, so a swap cannot hide in them.
+- **Worth knowing before sabotaging an inverse here**: for grouped
+  property-addressed `Op::Set`s, `fold_ops` REBUILDS the folded inverse from
+  the original op's `object`/`path`, so the `object` field `apply_raw`
+  returns on those arms is discarded. A sabotage that swaps the object
+  inside `apply_raw` is inert BY CONSTRUCTION and reports a false all-green:
+  sabotage the fold, or the value, instead. (Found by running exactly that
+  sabotage and watching it change nothing.)
+
 ### Ledgered by the same review, NOT fixed
 
-- **`move_clips_undo_restores_every_clip_in_the_batch`
-  (`control/mod.rs:3893`) cannot fail on identity.** It seeds both clips at
-  0 and asserts both back at 0, so an inverse restoring the WRONG clip
-  passes — the same shape as the length-only assertion that already slipped
-  a gate on this track, and the odd one out, since every paste-side undo
-  test IS identity-correct. A two-line fix (seed distinct positions);
-  deliberately left for whoever touches `move_clips` next.
 - **Ctrl-click-deselect still sets the focused clip and the drag anchor**, so
   deselecting leaves the clip focused for the Dock and targeted by a drag.
 - **`begin()` while a previous `end()` is still pending** is not covered.
@@ -1586,9 +1599,9 @@ one and the harm reaches outside AURA).
   test does not assert the `contentLengthTicks` revert; two fast Ctrl+C are
   last-RESOLVED-wins.
 
-### A PATTERN, not just five fixed defects: tests that could not fail
+### A PATTERN, not just six fixed defects: tests that could not fail
 
-**FIVE tests on this track could not fail** — six counting the call-order
+**SIX tests on this track could not fail** — seven counting the call-order
 test that could not see asynchronous ordering — and each new mechanism was
 found by RUNNING a sabotage, never by reading. The fourth's mechanism was
 new. Three were weak assertions (a `reason.contains("track")` that the

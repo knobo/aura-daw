@@ -3879,13 +3879,22 @@ mod tests {
         assert_eq!(undo_after, undo_before + 1, "a group move is ONE undo step");
     }
 
-    /// One Ctrl+Z puts every clip in the batch back.
+    /// One Ctrl+Z puts every clip in the batch back — and back to ITS OWN
+    /// position. The two clips are seeded at DISTINCT starts on purpose: with
+    /// both at 0, an inverse that restored the wrong clip's value would pass,
+    /// which is the "length-only assertion" failure mode this track already
+    /// shipped once (see the paste-side undo tests, which assert by identity
+    /// for the same reason).
     #[test]
     fn move_clips_undo_restores_every_clip_in_the_batch() {
         let (cp, _rx, _events) = test_plane_with_tracks(&["t-1"]);
         cp.commit(TxMeta::user("seed"), |tx| {
-            tx.apply(Op::ClipAdd { clip: test_clip("a-1", "t-1"), index: 0 })?;
-            tx.apply(Op::ClipAdd { clip: test_clip("a-2", "t-1"), index: 1 })
+            let mut a1 = test_clip("a-1", "t-1");
+            a1.timeline_start_samples = 1_111;
+            let mut a2 = test_clip("a-2", "t-1");
+            a2.timeline_start_samples = 2_222;
+            tx.apply(Op::ClipAdd { clip: a1, index: 0 })?;
+            tx.apply(Op::ClipAdd { clip: a2, index: 1 })
         })
         .unwrap();
         cp.move_clips(
@@ -3898,8 +3907,11 @@ mod tests {
         .unwrap();
         cp.undo().unwrap();
         let s = cp.session().lock();
-        assert_eq!(s.store.clips[0].timeline_start_samples, 0);
-        assert_eq!(s.store.clips[1].timeline_start_samples, 0);
+        let by_id = |id: &str| {
+            s.store.clips.iter().find(|c| c.id == id).expect("clip survived").timeline_start_samples
+        };
+        assert_eq!(by_id("a-1"), 1_111, "a-1 is back at its OWN start, not a-2's");
+        assert_eq!(by_id("a-2"), 2_222, "a-2 is back at its OWN start, not a-1's");
     }
 
     /// Validate-before-mutate (the `transact`-must-not-panic rule's sibling):
