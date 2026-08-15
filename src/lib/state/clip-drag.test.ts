@@ -140,6 +140,29 @@ describe("clipDrag group move", () => {
     ]);
   });
 
+  /**
+   * The gesture-before-session lock rule's frontend half (Plan E Task 14):
+   * `gestureEnd` must not be sent until `move_clips` has RESOLVED, or the
+   * gesture closes while its own mutation is still in flight — the exact
+   * TOCTOU Task 14 closed backend-side. The order test above cannot see
+   * this: its mock records synchronously, so `void backend.moveClips?.()`
+   * still pushes "moveClips" before "gestureEnd" and stays green (proved by
+   * sabotage during the whole-track review). This one records only AFTER
+   * the mock's promise has settled, which is the property that matters.
+   */
+  it("does not close the gesture until moveClips has actually resolved", async () => {
+    moveClips.mockImplementationOnce(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      calls.push("moveClipsSettled");
+    });
+    clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(500, true);
+    await clipDrag.end();
+    expect(calls).toEqual(["gestureBegin", "moveClipsSettled", "gestureEnd"]);
+  });
+
   it("a drag that never moved sends no moveClips but still closes the gesture", async () => {
     clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
     clipDrag.begin({ kind: "audio", id: "a1" }, 0);

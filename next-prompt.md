@@ -413,7 +413,7 @@ failed large copy empties the system clipboard for every application.
 over a selection, audio-clip resize, true content instancing, SMF paste, and
 the hardcoded MCP port 41717 that real two-instance workflows still hit.
 
-Baseline after this track: **717 backend (688 lib + 29 integration) + 348
+Baseline after this track: **720 backend (691 lib + 29 integration) + 353
 frontend**, measured on `multiclip-clipboard` 2026-08-15.
 
 ### Track D — Automation audible + lane UI — LANDED 2026-08-14

@@ -80,3 +80,19 @@ export function marqueeClipHits(
     )
     .map((b) => b.ref);
 }
+
+/** Elements inside the lane area that own the pointer themselves, so a
+ * pointerdown on them must NOT also start a marquee. */
+const MARQUEE_IGNORE = ".clip, .mclip, button, .autolane";
+
+/** Whether a pointerdown on `target` should begin a marquee band.
+ *
+ * The guard lives HERE, on Track C's side, rather than as a
+ * `stopPropagation()` in the automation lane: adding a selector cannot
+ * change any other track's behaviour, while swallowing the event in a
+ * component owned by another track changes the flow for every ancestor
+ * listener, present and future. Whoever adds a new absolutely-positioned
+ * overlay inside `.lane` adds it to this list. */
+export function startsMarquee(target: { closest(sel: string): unknown } | null): boolean {
+  return !!target && !target.closest(MARQUEE_IGNORE);
+}

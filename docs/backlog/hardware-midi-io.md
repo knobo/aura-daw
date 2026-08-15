@@ -138,7 +138,7 @@ real-ALSA AND timed-assertion — the other ~25 are pure state-machine tests
 and never flake. What is unguarded is the ASSERTION BUDGET: "run ~400 ms,
 then assert that specific bytes arrived over a real ALSA loopback", with a
 delivery path of thread → ALSA seq kernel queue → virtual input callback
-thread → mutex push, while 688 lib tests run one per core.
+thread → mutex push, while ~690 lib tests run one per core.
 
 **Recommended fix — NOT `#[serial]`.** Serializing hides the budget problem,
 slows the suite, and does not help on a loaded CI runner where the contention

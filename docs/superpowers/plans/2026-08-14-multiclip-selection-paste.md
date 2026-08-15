@@ -4322,7 +4322,8 @@ paste doing nothing at all in a fresh window.
 `origin/main` moved FIVE times during this track and was merged in at the
 Task 9/10 boundary (`c26d01d`). The counts the tasks above predict (549 + 265)
 are therefore obsolete by construction; the measured baseline at close-out is
-**717 backend (688 lib + 29 integration) + 348 frontend**, 2026-08-15.
+**720 backend (691 lib + 29 integration) + 353 frontend**, 2026-08-15
+(717 + 348 at the close-out commit, plus the whole-track review's fixes).
 
 **Every mid-flight ruling, deviation, deferred minor and still-owed item is
 rolled up in `docs/PHASE4-PLAN.md`'s "Track C handoff" section, per ADR

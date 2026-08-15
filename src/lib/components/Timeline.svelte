@@ -15,7 +15,7 @@
   import { toasts } from "../state/toasts.svelte";
   import { clipSelection } from "../state/clip-selection.svelte";
   import { canvasPos } from "../utils/canvas-pos";
-  import { applySelection, marqueeClipHits } from "../utils/clip-selection";
+  import { applySelection, marqueeClipHits, startsMarquee } from "../utils/clip-selection";
   import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildLaneBoxes, laneIndexAt, TRACK_HEIGHT_PX } from "../utils/lane-geometry";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
@@ -446,7 +446,7 @@
 
   function onLanesPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
-    if ((e.target as HTMLElement).closest(".clip, .mclip, button")) return;
+    if (!startsMarquee(e.target as HTMLElement)) return;
     if (!lanesEl) return;
     const p = canvasPos(lanesEl, e.clientX, e.clientY);
     const mode = selectionModeFor(e);

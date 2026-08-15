@@ -4,6 +4,7 @@ import {
   marqueeClipHits,
   parseKey,
   refKey,
+  startsMarquee,
   type ClipRef,
   type LaneBox,
 } from "./clip-selection";
@@ -82,5 +83,40 @@ describe("marqueeClipHits", () => {
 
   it("returns an empty array when nothing overlaps", () => {
     expect(marqueeClipHits(boxes, 2000, 3000, 0, 2)).toEqual([]);
+  });
+});
+
+/**
+ * Whole-track review, Important: Track C's marquee and Track D's automation
+ * lane collided. `.autolane` is `position:absolute; inset:0` INSIDE `.lane`
+ * and does not stop propagation, so dragging an automation point ALSO
+ * started a marquee: the `replace` mode wiped an existing multi-clip
+ * selection, and every later pointermove ran a live selection band across
+ * the timeline. A following Ctrl+C then copies clips the user never
+ * selected. The guard, not the automation lane, is where this belongs — see
+ * `startsMarquee`'s doc comment.
+ */
+describe("startsMarquee", () => {
+  /** A faithful mini-`closest` over a fake ancestor chain: each ancestor is
+   * a selector-shaped token (".clip", "button", …), and a match is any token
+   * in the chain that the comma-separated selector list names. */
+  const targetIn = (chain: string[]) => ({
+    closest: (sel: string) =>
+      chain.find((tok) => sel.split(",").some((s) => s.trim() === tok)) ?? null,
+  });
+
+  it("does not start on an automation lane — Track D owns that pointer", () => {
+    expect(startsMarquee(targetIn([".autolane", ".lane", ".lanes"]))).toBe(false);
+  });
+
+  it("does not start on a clip, a MIDI clip or a button", () => {
+    expect(startsMarquee(targetIn([".clip", ".lane"]))).toBe(false);
+    expect(startsMarquee(targetIn([".mclip", ".lane"]))).toBe(false);
+    expect(startsMarquee(targetIn(["button", ".lane"]))).toBe(false);
+  });
+
+  it("starts on empty lane background, and never on a null target", () => {
+    expect(startsMarquee(targetIn([".lane", ".lanes"]))).toBe(true);
+    expect(startsMarquee(null)).toBe(false);
   });
 });

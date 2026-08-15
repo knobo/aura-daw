@@ -21,8 +21,12 @@
 //! ticks/samples through the same nominal map, not the engine rate.
 //!
 //! TRUST BOUNDARY (fix round 1). A payload arrives as text off the OS
-//! clipboard, so nothing in it is a guarantee — not note ids, not paths, not
-//! ppq, not sample windows. `clips_copy` producing well-formed payloads is a
+//! clipboard, so nothing in it is a guarantee — not note ids, not note
+//! RANGES, not clip gain, not paths, not ppq, not sample windows.
+//! (Ranges and gain were missing from this list until the whole-track
+//! review: an enumeration is where a trust boundary silently loses items,
+//! so add to it rather than assume it is complete.)
+//! `clips_copy` producing well-formed payloads is a
 //! property of AURA's own copy, never of the input `clips_paste` receives.
 //! Everything the payload asserts is re-derived or refused in Phase 2,
 //! BEFORE the transaction opens, so no payload can be fatal to the rest of
@@ -550,8 +554,28 @@ impl ControlPlane {
             // touches the filesystem, and it is outside the transaction.
             let audio = match &mut clip {
                 ClipboardClip::Audio {
-                    name, source_path, source_abs_path, offset_samples, length_samples, ..
+                    name,
+                    source_path,
+                    source_abs_path,
+                    offset_samples,
+                    length_samples,
+                    gain_db,
+                    ..
                 } => {
+                    // `gain_db` reaches the RT thread as `db_to_linear(g)`
+                    // (`audio/mixer.rs`), which guards only the LOW side: 800
+                    // dB is `f32::INFINITY`, and the mixer's `l * g` then
+                    // turns a silent sample into NaN, which nothing on the
+                    // sample path checks for. The TRACK gain setter already
+                    // clamps to the document's own bounds
+                    // (`control/session.rs`, `PropPath::Gain`); paste was the
+                    // one writer that did not. Clamped rather than skipped —
+                    // an absurd gain is a value error, not an unusable clip,
+                    // and the user can see and change it. A non-finite value
+                    // cannot survive JSON, but `clamp` would pass NaN
+                    // through, so it is mapped to unity first.
+                    *gain_db = if gain_db.is_finite() { *gain_db } else { 0.0 };
+                    *gain_db = gain_db.clamp(-160.0, 24.0);
                     // `offset_samples` reaches the RT thread as
                     // `clip.offset + rel` (`audio/mixer.rs:60`): a payload
                     // claiming an absurd window is a debug panic ON THE AUDIO
@@ -601,7 +625,7 @@ impl ControlPlane {
                         }
                     }
                 }
-                ClipboardClip::Midi { notes, .. } => {
+                ClipboardClip::Midi { name, notes, .. } => {
                     // PASTE IS THE TRUST BOUNDARY. `clips_copy` zeroes every
                     // note id, but a payload off the OS clipboard need not
                     // have come from `clips_copy` at all: duplicate ids would
@@ -612,8 +636,29 @@ impl ControlPlane {
                     //
                     // Note ids are ppq-independent, so this belongs out here.
                     // The tick RESCALE does not: see the Phase 3 MIDI arm.
+                    //
+                    // The SAME argument covers every other note field, and
+                    // ranges fell out of the enumeration above until the
+                    // whole-track review put them back: `key >= 128` indexes
+                    // `midi_out.rs`'s `sounding[ev.key as usize]` against a
+                    // `[bool; 128]` and PANICS the `aura-midi-out` thread,
+                    // and the raw byte is durable through save/load, so the
+                    // user's own later `midi_set_notes` on that clip fails
+                    // forever. Validate through the document's OWN
+                    // `MidiNote::validate`, the way every path the app writes
+                    // notes through already does, so the two cannot drift.
+                    let mut invalid: Option<String> = None;
                     for n in notes.iter_mut() {
                         n.note_id = crate::ids::NoteId(0);
+                        if invalid.is_none() {
+                            if let Err(e) = n.validate() {
+                                invalid = Some(e);
+                            }
+                        }
+                    }
+                    if let Some(reason) = invalid {
+                        skipped.push(SkippedClip { name: name.clone(), reason });
+                        continue;
                     }
                     None
                 }
@@ -1522,6 +1567,119 @@ mod tests {
         assert!(
             pasted.next_note_id > ids.iter().copied().max().unwrap(),
             "the watermark is ahead of every live id, so the next mint cannot collide"
+        );
+    }
+
+    /// Whole-track review, C-1: the same trust-boundary argument that covers
+    /// track KINDS and PATHS applies to note FIELDS, and they fell out of the
+    /// enumeration. A pasted `key >= 128` reaches `midi_out`'s
+    /// `sounding[ev.key as usize]` against a `[bool; 128]` — an out-of-bounds
+    /// PANIC on the `aura-midi-out` thread — and it is durable: the raw byte
+    /// survives save/load, and the user's own later `midi_set_notes` on that
+    /// clip then fails forever. Every path the app itself writes notes
+    /// through calls `MidiNote::validate()`; paste must too.
+    #[test]
+    fn paste_skips_a_midi_clip_carrying_an_out_of_range_note_and_lands_the_rest() {
+        let cp = plane();
+        let mut poisoned = note(0, 480, 0);
+        poisoned.key = 200;
+        let payload = hand_payload(
+            960,
+            vec![
+                ClipboardClip::Midi {
+                    name: "poisoned".into(),
+                    source_track_id: "t-2".into(),
+                    source_track_name: "T2".into(),
+                    offset_from_anchor_ticks: 0,
+                    length_ticks: 960,
+                    content_length_ticks: None,
+                    notes: vec![note(0, 480, 0), poisoned],
+                },
+                ClipboardClip::Midi {
+                    name: "good".into(),
+                    source_track_id: "t-2".into(),
+                    source_track_name: "T2".into(),
+                    offset_from_anchor_ticks: 0,
+                    length_ticks: 960,
+                    content_length_ticks: None,
+                    notes: vec![note(0, 480, 0)],
+                },
+            ],
+        );
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert_eq!(res.midi_clips.len(), 1, "only the clean clip landed");
+        assert_eq!(res.midi_clips[0].name, "good");
+        assert_eq!(res.skipped.len(), 1);
+        assert_eq!(res.skipped[0].name, "poisoned");
+        assert!(res.skipped[0].reason.contains("key"), "{:?}", res.skipped[0]);
+        assert!(
+            cp.session().lock().midi.clips.iter().all(|c| c.notes.iter().all(|n| n.key <= 127)),
+            "no out-of-range key reached the document"
+        );
+    }
+
+    /// The other three fields `MidiNote::validate` guards travel the same
+    /// road: velocity 0 is a silent note the document forbids, channel 99
+    /// is written as a raw nibble, and a zero-length note is dropped by the
+    /// exporter but kept by the store. Skipped per clip, never fatal.
+    #[test]
+    fn paste_refuses_every_note_field_the_document_validates() {
+        for (field, mutate) in [
+            ("velocity", (|n: &mut crate::midi::types::MidiNote| n.velocity = 0) as fn(&mut _)),
+            ("channel", |n: &mut crate::midi::types::MidiNote| n.channel = 99),
+            ("lengthTicks", |n: &mut crate::midi::types::MidiNote| n.length_ticks = 0),
+        ] {
+            let cp = plane();
+            let mut bad = note(0, 480, 0);
+            mutate(&mut bad);
+            let payload = hand_payload(
+                960,
+                vec![ClipboardClip::Midi {
+                    name: "bad".into(),
+                    source_track_id: "t-2".into(),
+                    source_track_name: "T2".into(),
+                    offset_from_anchor_ticks: 0,
+                    length_ticks: 960,
+                    content_length_ticks: None,
+                    notes: vec![bad],
+                }],
+            );
+
+            let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+            assert!(res.midi_clips.is_empty(), "{field}: the clip must not land");
+            assert_eq!(res.skipped.len(), 1, "{field}");
+            assert!(res.skipped[0].reason.contains(field), "{field}: {:?}", res.skipped[0]);
+            assert_eq!(cp.session().lock().midi.clips.len(), 0, "{field}");
+        }
+    }
+
+    /// Whole-track review, the paired Important: `gain_db` crossed the
+    /// boundary unbounded. `10f64.powf(40.0) as f32` is `f32::INFINITY`, and
+    /// the mixer's `l * g` then makes a silent sample NaN — nothing on the
+    /// sample path checks `is_finite`. The TRACK gain setter clamps
+    /// (`session.rs`, `-160..=24`); paste was the one writer that did not.
+    #[test]
+    fn paste_clamps_an_absurd_clip_gain_to_the_documents_own_bounds() {
+        let cp = plane();
+        let mut payload = hand_payload(
+            960,
+            vec![hand_audio("loud", "t-1", "audio/x.wav"), hand_audio("quiet", "t-1", "audio/y.wav")],
+        );
+        if let ClipboardClip::Audio { gain_db, .. } = &mut payload.clips[0] {
+            *gain_db = 800.0;
+        }
+        if let ClipboardClip::Audio { gain_db, .. } = &mut payload.clips[1] {
+            *gain_db = -1.0e9;
+        }
+
+        let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
+        assert!(res.skipped.is_empty(), "a loud clip is clamped, not refused: {:?}", res.skipped);
+        assert_eq!(res.audio_clips[0].gain_db, 24.0);
+        assert_eq!(res.audio_clips[1].gain_db, -160.0);
+        assert!(
+            res.audio_clips.iter().all(|c| crate::audio::mixer::db_to_linear(c.gain_db).is_finite()),
+            "the linear gain the RT thread multiplies by is finite"
         );
     }
 

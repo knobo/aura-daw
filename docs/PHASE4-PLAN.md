@@ -1299,7 +1299,7 @@ a .mid, reusing the frozen `midi_export_file` clip-id filter).
 (zero).** Five additive commands: `move_clips`, `clips_copy`, `clips_paste`,
 `os_clipboard_write_text`, `os_clipboard_read_text`.
 
-**Suites: 717 backend (688 lib + 29 integration) + 348 frontend, all green,
+**Suites: 720 backend (691 lib + 29 integration) + 353 frontend, all green,
 measured on `multiclip-clipboard` 2026-08-15**; `npx svelte-check` 0 errors,
 0 warnings. Doc-tests are 0 and are NOT a test target. Counts dated in
 README/CONTRIBUTING. `main` moved FIVE times during this track and this
@@ -1309,9 +1309,16 @@ than picking a side.
 
 ### OWED BY THE OWNER: the cross-instance check, and no test substitutes
 
-**Task 11's Step 12 was never performed end to end.** Everything else on
-this track is proven by tests; exactly **ONE link is unproven**: that
-instance B's `os_clipboard_read_text` receives instance A's bytes **through
+**Task 11's Step 12 was never performed end to end.** TWO links in the
+cross-instance chain were unproven, and one has since been closed: the
+whole-track review found that **the frontend's unconditional OS-clipboard
+scan had no test either** — every paste test seeded an in-memory payload
+first, so re-gating the scan (this track's own Critical 1, plan defect #14)
+kept all 348 tests green. That gap is now closed by a test with `payload ===
+null` and a valid envelope on the clipboard, verified to die under exactly
+that re-gating. What remains is **ONE unproven link, and no test in this
+repo can make it**: that instance B's `os_clipboard_read_text` receives
+instance A's bytes **through
 this track's own frontend orchestration**. Task 10 proved the raw
 `arboard`/X11 mechanism transfers between processes; it never proved
 FIDELITY, and it never exercised AURA's own read path. The numbered
@@ -1456,6 +1463,71 @@ correct fix made this failure quieter, not louder.
   the store made the app claim there was nothing to paste while the legacy
   path pasted a clip.
 
+### Closed by the whole-track final review (2026-08-15)
+
+- **CRITICAL — `clips_paste` validated track kinds and paths but NOT note
+  FIELDS.** A pasted `key >= 128` reaches `midi_out.rs`'s
+  `sounding[ev.key as usize]` against a `[bool; 128]`: **an out-of-bounds
+  panic on the `aura-midi-out` thread**, reachable from a hand-edited
+  envelope onto a MIDI track routed to hardware (Track B, now on main). It
+  is also DURABLE — the raw byte survives save/load, and the user's own
+  later `midi_set_notes` on that clip then fails forever. `velocity: 0`,
+  `channel: 99` and `lengthTicks: 0` rode the same gap. Fixed by calling the
+  document's OWN `MidiNote::validate()` in the same phase-2 loop that zeroes
+  `note_id`, skip-and-report per clip (never fatal to the rest, ruling B).
+  **The lesson is about the shape of the miss, not the field:** the module's
+  trust-boundary doc ENUMERATED what it distrusts ("not note ids, not paths,
+  not ppq, not sample windows"), and note ranges simply fell out of the
+  list. An enumeration is where a trust boundary silently loses items.
+- **IMPORTANT — clip `gain_db` crossed the same boundary unclamped.**
+  `"gainDb": 800` → `10f64.powf(40.0) as f32` → `f32::INFINITY` → the mixer's
+  `l * g` turns a silent sample into NaN, and nothing on the sample path
+  checks `is_finite` (only `pan` is clamped). The TRACK gain setter already
+  clamps to `-160..=24`; paste was the one writer that did not. Now clamped
+  at the boundary (non-finite mapped to unity first, since `clamp` passes
+  NaN through), and clamped rather than skipped — an absurd gain is a value
+  error the user can see and change, not an unusable clip.
+- **IMPORTANT — Track C's marquee and Track D's automation lane collided.**
+  `.autolane` is `position:absolute; inset:0` inside `.lane` and does not
+  stop propagation, so dragging a gain point ALSO ran `onLanesPointerDown`:
+  `replace` mode wiped an existing multi-clip selection, and because the
+  automation canvas had captured the pointer, every later `pointermove`
+  bubbled to `.lanes` and dragged a live selection band across the timeline.
+  A following Ctrl+C then copies clips the user never selected; a following
+  drag group-moves them. Fixed on **Track C's side** — `.autolane` added to
+  the guard, now the pure, tested `startsMarquee` in
+  `src/lib/utils/clip-selection.ts` — rather than by `stopPropagation()` in
+  Track D's component: adding a selector cannot change another track's
+  behaviour, while swallowing the event changes the flow for every ancestor
+  listener, present and future. Whoever adds the next absolutely-positioned
+  overlay inside `.lane` adds it to that list.
+- **The frontend's unconditional OS-clipboard scan gained the test it never
+  had** (see the OWED section above) — the fifth test-that-could-not-fail on
+  this track, and the first one found by an outside reviewer's sabotage
+  rather than by the implementer's own.
+- **`clip-drag`'s await-before-`gestureEnd` is no longer inspection-grade.**
+  The existing call-order test could not see it: its mocks record
+  synchronously, so `void backend.moveClips?.()` still ordered
+  "moveClips" before "gestureEnd" and stayed green. The added test records
+  only after the mock's promise has SETTLED, and dies under exactly that
+  `await`→`void` change. Worth generalizing: **a call-ORDER assertion over
+  synchronous mocks does not test asynchronous ordering** — it tests
+  invocation order, which is a different property.
+
+### Ledgered by the same review, NOT fixed
+
+- **`move_clips_undo_restores_every_clip_in_the_batch`
+  (`control/mod.rs:3893`) cannot fail on identity.** It seeds both clips at
+  0 and asserts both back at 0, so an inverse restoring the WRONG clip
+  passes — the same shape as the length-only assertion that already slipped
+  a gate on this track, and the odd one out, since every paste-side undo
+  test IS identity-correct. A two-line fix (seed distinct positions);
+  deliberately left for whoever touches `move_clips` next.
+- **Ctrl-click-deselect still sets the focused clip and the drag anchor**, so
+  deselecting leaves the clip focused for the Dock and targeted by a drag.
+- **`begin()` while a previous `end()` is still pending** is not covered.
+- **`onpointerleave` flicker** on the lane hover state.
+
 ### Deferred minors and accepted-open items (nothing from the ledger dropped)
 
 Fixed on the way, listed so nobody re-derives them: the resize-snap
@@ -1514,9 +1586,11 @@ one and the harm reaches outside AURA).
   test does not assert the `contentLengthTicks` revert; two fast Ctrl+C are
   last-RESOLVED-wins.
 
-### A PATTERN, not just four fixed defects: tests that could not fail
+### A PATTERN, not just five fixed defects: tests that could not fail
 
-**FOUR tests on this track could not fail**, and the fourth's mechanism was
+**FIVE tests on this track could not fail** — six counting the call-order
+test that could not see asynchronous ordering — and each new mechanism was
+found by RUNNING a sabotage, never by reading. The fourth's mechanism was
 new. Three were weak assertions (a `reason.contains("track")` that the
 wrong-kind message also satisfies; a sabotage that never reached the branch;
 undo assertions that checked LENGTHS and never that the survivors were the
@@ -1529,14 +1603,26 @@ every test you are tempted to call obviously-correct, and when a store
 method wraps its body in a `try`, check explicitly whether the early returns
 sit inside or outside it (Task 12 did, which is why its three tests hold).
 
+The FIFTH, found by the whole-track reviewer rather than by anyone inside
+the track, is the one worth generalizing: **a whole suite can pin a
+behaviour's every branch and still not pin that the behaviour is REACHED.**
+Every paste test seeded an in-memory payload before calling `paste()`, so
+all of them exercised the code AFTER the OS-clipboard scan and none could
+notice the scan being gated away again — while the gate is precisely the
+defect the track already fixed once. When a fix consists of REMOVING a
+condition, the test that guards it must set up the state in which that
+condition used to be false.
+
 ### A REPO-LEVEL GAP — an owner decision, not another review round
 
 **This repo has NO DOM test environment** — no `jsdom`, no `happy-dom`, no
-testing-library; `vitest.config.ts` runs plain node. **Three real defects on
-this track lived exclusively in `.svelte` handlers, and all three were found
-by READING, not by tests** (the Ctrl+V gate that made cross-instance paste a
-no-op in a fresh window, the duplicated pasted tracks, and the merge's
-`MidiClipView` rename/drag interaction). Track D reports two more of the same
+testing-library; `vitest.config.ts` runs plain node. **Four real defects on
+this track lived exclusively in `.svelte` handlers, and all four were found
+by READING, not by tests**: the Ctrl+V gate that made cross-instance paste a
+no-op in a fresh window, the duplicated pasted tracks, the merge's
+`MidiClipView` rename/drag interaction, and the marquee/automation-lane
+collision — the last of which needed a hand-built stub of `closest` before it
+could be tested at all, which is the cost of this gap made concrete. Track D reports two more of the same
 shape. The stores here are thoroughly tested and the components are not
 tested at all, so defects accumulate exactly where nothing is looking.
 Adding a DOM test environment is a cross-cutting choice every future track

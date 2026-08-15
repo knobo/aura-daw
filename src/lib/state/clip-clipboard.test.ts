@@ -183,6 +183,33 @@ describe("payloadByteLength", () => {
 });
 
 describe("clipClipboard.paste", () => {
+  /**
+   * THE CROSS-INSTANCE CASE, and the whole reason this track exists: a
+   * FRESH window has copied nothing, so `payload` is null and the selection
+   * is empty. The OS-clipboard scan must therefore be UNCONDITIONAL — the
+   * moment it is gated on anything the frontend already knows, instance B's
+   * Ctrl+V does nothing at all (plan defect #14, this track's own
+   * Critical 1). Every other paste test seeds `clipClipboard.payload`
+   * first, so all of them survive a re-gating; this one is the only test
+   * that can fail when the gate comes back.
+   */
+  it("reads the OS clipboard even with NOTHING in memory (a fresh instance B)", async () => {
+    const fromA = { ...payload, anchorSamples: 777 };
+    clipboardText = `AURA-CLIPS/1\n${JSON.stringify(fromA)}`;
+    clipClipboard.payload = null;
+    clipSelection.clear();
+
+    const found = await clipClipboard.paste(48000, false);
+
+    expect(osClipboardReadText).toHaveBeenCalled();
+    expect(clipsPaste).toHaveBeenCalledWith({
+      payload: fromA,
+      atSamples: 48000,
+      toNewTracks: false,
+    });
+    expect(found).toBe(true);
+  });
+
   it("prefers a valid AURA envelope on the OS clipboard over its own memory", async () => {
     const foreign = { ...payload, anchorSamples: 12345 };
     clipboardText = `AURA-CLIPS/1\n${JSON.stringify(foreign)}`;
