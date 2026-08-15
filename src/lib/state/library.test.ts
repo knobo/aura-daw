@@ -350,6 +350,14 @@ describe("dropOnTrack — presets", () => {
 
     await library.dropOnTrack({ kind: "zynPatch", patch }, "m1", 0);
     expect(invokes.zynLoadPatch).toHaveBeenCalledWith("zyn-1", "/a.xiz");
+    // A patch load changes nothing on screen, so the drop has to say so —
+    // every REFUSED drop toasts, and a silent success reads as "broken".
+    expect(lastToast().title).toContain("PATCH LOADED");
+    expect(lastToast().lines.join(" ")).toContain("Arpeggios / Arp 1");
+    // The engine retires the live node off the state commit itself, so the
+    // store no longer re-binds the track to force a graph rebuild — that
+    // workaround cost a second, confusing undo entry per patch load.
+    expect(invokes.setTrackInstrument).not.toHaveBeenCalled();
   });
 
   it("toasts instead of instantiating a plugin when the track hosts no Zyn", async () => {

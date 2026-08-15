@@ -1,14 +1,18 @@
 /**
  * ZynAddSubFX patch bank browser state: the 1318-patch .xiz bank list
- * (zyn_list_patches), per-instance loads (zyn_load_patch), and the backend
- * caveat handled in one place: a loaded patch reaches only FUTURE nodes, so
- * every successful load re-binds the owning track (set_track_instrument →
- * engine Rebuild) to make the change audible without a restart.
+ * (zyn_list_patches) and per-instance loads (zyn_load_patch).
+ *
+ * A patch reaches an LV2 instance only when the instance is instantiated, so
+ * a load has to retire the track's live node. That is the ENGINE's job now:
+ * `Op::PluginSetState` bumps the instance's state revision, which the live-node
+ * key carries, so the commit's own rebuild instantiates the replacement. This
+ * store used to re-bind the owning track to force that rebuild — a workaround
+ * that never worked (the rebind produced an identical node key, so the cached
+ * node was reused) and cost a second undo entry per patch load.
  */
 
 import { backend } from "../tauri";
 import { plugins } from "./plugins.svelte";
-import { project } from "./project.svelte";
 import { toasts } from "./toasts.svelte";
 import type { PluginInstanceInfo, ZynPatch } from "../types/ipc";
 
@@ -23,8 +27,8 @@ class ZynPatchStore {
   patches = $state<ZynPatch[]>([]);
   loading = $state(false);
   error = $state<string | null>(null);
-  /** Patch path currently loaded per instance (frontend mirror). */
-  loaded = $state<Record<string, string>>({});
+  /** Patch currently loaded per instance (frontend mirror). */
+  loaded = $state<Record<string, ZynPatch>>({});
   /** Patch path with a load in flight. */
   busyPath = $state<string | null>(null);
 
@@ -55,30 +59,16 @@ class ZynPatchStore {
     }
   }
 
-  /** The bound midi track of an instance (registry ref or track mirror). */
-  private boundTrackId(instanceId: string): string | null {
-    const inst = plugins.byId(instanceId);
-    if (inst?.trackId) return inst.trackId;
-    const ref = `plugin:${instanceId}`;
-    return project.tracks.find((t) => t.instrumentId === ref)?.id ?? null;
-  }
-
   /**
-   * Load a patch into a Zyn instance, then re-bind its track so the engine
-   * rebuilds the live node with the new sound (backend caveat: patches reach
-   * only future nodes until node invalidation ships).
+   * Load a patch into a Zyn instance. `zyn_load_patch` commits the state,
+   * which retires the instance's live node and rebuilds it — no rebind here.
    */
   async load(instanceId: string, patch: ZynPatch): Promise<boolean> {
     this.busyPath = patch.path;
     this.error = null;
     try {
       await backend.zynLoadPatch(instanceId, patch.path);
-      this.loaded = { ...this.loaded, [instanceId]: patch.path };
-      const trackId = this.boundTrackId(instanceId);
-      if (trackId) {
-        // Rebind → graph Rebuild → the patched instance is what renders.
-        await plugins.bind(instanceId, trackId);
-      }
+      this.loaded = { ...this.loaded, [instanceId]: patch };
       return true;
     } catch (err) {
       this.error = String(err);
@@ -134,7 +124,7 @@ class ZynPatchStore {
         return null;
       }
       await backend.zynLoadPatch(inst.id, pick.path);
-      this.loaded = { ...this.loaded, [inst.id]: pick.path };
+      this.loaded = { ...this.loaded, [inst.id]: pick };
       await plugins.bind(inst.id, trackId); // bind AFTER load ⇒ node sees the patch
       if (plugins.error) {
         toasts.error("ZYN BIND FAILED", plugins.error);

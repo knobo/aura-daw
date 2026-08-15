@@ -51,7 +51,7 @@
   });
 
   const inst = $derived(zyn.openInstance);
-  const loadedPath = $derived(inst ? zyn.loaded[inst.id] : undefined);
+  const loadedPath = $derived(inst ? zyn.loaded[inst.id]?.path : undefined);
 
   async function pick(patch: ZynPatch) {
     if (!inst || zyn.busyPath) return;

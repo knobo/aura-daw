@@ -65,6 +65,16 @@ pub struct PluginDoc {
     /// `restore_into_session` — a blob just read from that exact file is,
     /// by definition, not ahead of it.
     pub dirty_state: std::collections::HashSet<String>,
+    /// Per-instance state-load counter, bumped by every `PluginSetState`
+    /// (a zyn patch load, and its undo). `midi::playback::node_for_track`
+    /// carries it in the live-node key, so a load retires the cached node
+    /// and the next rebuild instantiates a replacement — without this the
+    /// blob would sit in `lv2_host`'s `loaded_blob` reaching only FUTURE
+    /// nodes, i.e. never the one currently rendering the track. Purely
+    /// derived bookkeeping: it is never persisted or restored (a document
+    /// re-opened from disk builds every node from scratch anyway), so it
+    /// starts at 0 for each session and only ever moves forward.
+    pub state_rev: HashMap<String, u64>,
 }
 
 pub struct Session {
@@ -902,6 +912,13 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // these are new authoritative bytes, not necessarily reflected
             // in whatever `.state` file already exists on disk.
             session.plugins.dirty_state.insert(instance.clone());
+            // The blob only becomes AUDIBLE through a fresh RT node (see
+            // `state_rev`'s doc): bump the revision so the node key changes,
+            // and ask for the rebuild that acts on it. `ControlPlane::commit`
+            // runs `host_forward` BEFORE the rebuild, so the host already
+            // holds the new blob when the replacement node is instantiated.
+            *session.plugins.state_rev.entry(instance.clone()).or_insert(0) += 1;
+            effect.rebuild = true;
             effect.persist.plugins = true;
             effect.host_forward.push(HostForward::LoadState { instance: instance.clone() });
             Ok(Op::PluginSetState {
@@ -2673,5 +2690,37 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.lock().plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
+    }
+
+    /// A state load changes what the instance SOUNDS like, and the live RT
+    /// node only picks a blob up when it is (re)instantiated. So the arm both
+    /// bumps the instance's state revision — which `midi::playback`'s node key
+    /// carries, retiring the cached node — and asks for a rebuild to build the
+    /// replacement. Undo restores an older blob and needs the same treatment.
+    #[test]
+    fn plugin_set_state_bumps_the_state_revision_and_rebuilds() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(test_plugin_row("p-1"));
+            g.plugins.pending_state.insert("p-1".into(), vec![0u8, 0, 0]);
+        }
+        assert_eq!(m.lock().plugins.state_rev.get("p-1"), None, "no load yet");
+
+        let c = Session::transact(&m, TxMeta::user("zyn load patch"), |tx| {
+            tx.apply(Op::PluginSetState { instance: "p-1".into(), state: vec![9u8, 9, 9, 9] })
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.state_rev.get("p-1"), Some(&1));
+        assert!(c.effect.rebuild, "the live node must be replaced for the patch to be heard");
+
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().plugins.state_rev.get("p-1"), Some(&2), "undo needs a fresh node too");
     }
 }
