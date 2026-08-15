@@ -10,7 +10,9 @@
 //! * [`JournalWriter`] — the append-only `<project dir>/journal.ndjson`.
 //!   One line per NON-transient committed batch, plus a record at every
 //!   epoch boundary. This is where `OP_FORMAT_VERSION` stops being
-//!   decorative (see [`JournalWriter::append_batch`]).
+//!   decorative (see [`JournalWriter::append_batch`]). Its READER lives in
+//!   [`crate::control::replay`] (Plan F Task 9) — the writer here and the
+//!   parse rules there are a matched pair.
 //! * [`VersionGraph`] — the retention substrate (Plan F Task 7): one node
 //!   per non-transient batch, materialized or replay-only, bounded by a
 //!   bytes ceiling and a steps floor, with evicted loads dropped on the
@@ -367,8 +369,13 @@ impl JournalWriter {
     /// The version is 2 as of the Plan E follow-up (I-5): plugin state
     /// blobs are base64 on the wire, not JSON number arrays. That WAS a
     /// breaking change and deliberately shipped without a dual-shape
-    /// reader, because the journal is still write-only — see
+    /// reader, because the journal was then still write-only — see
     /// `OP_FORMAT_VERSION`'s own doc for why that window was the moment.
+    ///
+    /// CORRECTION (ADR 0007, Plan F Task 9): the journal is NO LONGER
+    /// write-only. [`crate::control::replay`] reads these lines back and
+    /// gates each one on `v`, so the freedom that justified the v2 bump is
+    /// spent: the next breaking change costs a migration.
     ///
     /// Ops serialize through their own `serde` impls — the SAME wire form
     /// the IPC surface uses, single-camelCase-token `kind`s per ruling 1.

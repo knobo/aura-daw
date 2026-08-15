@@ -21,6 +21,7 @@ pub mod export;
 pub mod history;
 pub mod op;
 pub mod ops;
+pub mod replay;
 pub mod loopjam;
 pub mod session;
 pub mod snapshot;
@@ -3375,6 +3376,11 @@ impl ControlPlane {
             out.adopt_project(&dir);
         }
         self.adopt_modulation_from_dir(&dir);
+        // Plan F Task 9: the journal now has a reader, and this is its only
+        // production call site — DETECTION ONLY (ruling F-8), no auto-apply,
+        // no event, no UI. After the adopts, so the warning describes the
+        // document that is actually open; no lock is held here.
+        replay::detect_unsaved_tail(&dir);
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
         Ok(project)
