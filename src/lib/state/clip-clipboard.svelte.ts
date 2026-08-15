@@ -220,6 +220,27 @@ class ClipClipboardStore {
    *
    * Reuses the FROZEN `midi_export_file(path, clipIds)` command — its
    * clip-id filter is exactly this feature.
+   *
+   * TWO BEHAVIOURS THAT SURPRISE USERS, both correct, neither a bug to
+   * "fix" without deciding what the alternative should be:
+   *
+   * 1. The file is ABSOLUTE-POSITIONED. A four-bar selection sitting at
+   *    bar 50 exports as a .mid with 49 bars of silence in front of it.
+   *    The reason is load-bearing: `export_smf` writes each clip at its
+   *    ABSOLUTE tick, so track 0 must carry the project's WHOLE tempo map
+   *    — the tempo history BEFORE the selection is what places those
+   *    ticks at the right musical time. Filtering the tempo map without
+   *    also rebasing every clip to the selection's start would produce a
+   *    WRONG file, not a tighter one. Rebasing is the real feature if
+   *    anyone wants one; it is not implemented.
+   * 2. Clip LOOPING IS NOT EXPANDED. `export_smf` iterates `clip.notes`
+   *    exactly once and never consults `content_length_ticks`, so a clip
+   *    the user just looped 4× with THIS PLAN'S OWN group-resize gesture
+   *    (Tasks 6/7) exports as a single pass. That is a plan-internal
+   *    inconsistency — two features from one plan, and the export
+   *    silently ignores the other's output. Known limitation; expanding
+   *    it means repeating the note list per repetition inside
+   *    `export_smf`, which is frozen-command territory.
    */
   async exportSelectionSmf(): Promise<void> {
     const ids = clipSelection.midiIds();

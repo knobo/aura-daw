@@ -4311,7 +4311,21 @@ count-changing task updates the dated counts.
 
 ## Execution note
 
-*(Filled in at execution time: mode chosen, per-task review rounds, any
-mid-flight rulings. Mid-flight rulings are recorded here AND rolled into
-`docs/PHASE4-PLAN.md`'s eventual "Track C handoff" section, verbatim, per
-ADR 0007.)*
+**Executed 2026-08-14/15, subagent-driven** (owner's choice at run start): a
+fresh implementer per task, a task review after each, scoped re-reviews on
+every fix round; opus for Tasks 9-11 and for the heaviest reviews. Tasks 6,
+8, 10, 11 and 12 needed fix rounds (Task 9 needed two, Task 11 two); the
+review layer caught four Criticals — the ppq/tempo wire domain, the fatal
+duplicate-note-id paste, the unvalidated `source_path`, and cross-instance
+paste doing nothing at all in a fresh window.
+
+`origin/main` moved FIVE times during this track and was merged in at the
+Task 9/10 boundary (`c26d01d`). The counts the tasks above predict (549 + 265)
+are therefore obsolete by construction; the measured baseline at close-out is
+**717 backend (688 lib + 29 integration) + 348 frontend**, 2026-08-15.
+
+**Every mid-flight ruling, deviation, deferred minor and still-owed item is
+rolled up in `docs/PHASE4-PLAN.md`'s "Track C handoff" section, per ADR
+0007 — including the ONE thing still owed to the owner: Task 11's Step 12
+cross-instance verification, which was never performed end to end, together
+with the binding no-input-automation rule above.**

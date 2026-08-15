@@ -117,3 +117,37 @@ Plan: `docs/superpowers/plans/2026-08-14-midi-slice-2.md` (slice 2, PR #21).
   take comping.
 - **JACK transport / Ableton Link** (the design notes' path (b)).
 - **The document-model external-instrument track target** (item 6 above).
+
+### Two flaky `midi_out` tests (found by Track C, 2026-08-15)
+
+`midi_out::tests::shutdown_flushes_note_off_before_stop_and_before_the_connection_drops`
+and
+`midi_out::tests::editing_the_routed_track_releases_a_sounding_note_instead_of_hanging_it`
+each failed once under a full parallel `cargo test`, and each was green in
+isolation, green under `--test-threads=1`, and green on an immediate full
+re-run. Both were observed from a branch that touched **zero Rust files**.
+
+**The reading — recorded as a READING, not as a fact.** Inherent wall-clock
+timing under parallel load, not mutual interference. Supporting it: the two
+are correctly isolated by identity (distinct ALSA client names and distinct
+virtual port names); setup failures are guarded into SKIPS rather than
+failures; they failed INDEPENDENTLY in different runs (mutual interference
+would tend to fell them together); one was reproduced on a diff containing no
+Rust at all; and they are the only two tests in the module that are BOTH
+real-ALSA AND timed-assertion — the other ~25 are pure state-machine tests
+and never flake. What is unguarded is the ASSERTION BUDGET: "run ~400 ms,
+then assert that specific bytes arrived over a real ALSA loopback", with a
+delivery path of thread → ALSA seq kernel queue → virtual input callback
+thread → mutex push, while 688 lib tests run one per core.
+
+**Recommended fix — NOT `#[serial]`.** Serializing hides the budget problem,
+slows the suite, and does not help on a loaded CI runner where the contention
+is external. Poll-until-condition with a generous ceiling instead: poll the
+`seen` vector every few ms up to ~5 s and assert as soon as the bytes land —
+fast when idle, robust under load, and red only when the behaviour is
+actually broken.
+
+**The discriminating check, for whoever picks this up:** record the SHAPE of
+the failing assertion. If `seen` is EMPTY or SHORT (bytes missing), the
+budget reading holds. If the bytes are PRESENT but WRONG, it is interference
+and this reading is wrong.

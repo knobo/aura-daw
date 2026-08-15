@@ -1,5 +1,63 @@
 # Backlog: multi-clip selection, group drag, and cross-track copy/paste
 
+> **LANDED 2026-08-15** (Track C, branch `multiclip-clipboard`, PR #22).
+> Plan: `docs/superpowers/plans/2026-08-14-multiclip-selection-paste.md` —
+> read its scope rulings before changing any of this. Full handoff (rulings,
+> mid-flight rulings, deferred minors, what is still owed):
+> **`docs/PHASE4-PLAN.md`'s "Track C handoff"** section. Deviations from the
+> design notes below, all recorded there rather than silently taken:
+>
+> - **Plain copy, not instancing** — a paste mints a fresh `ContentId` per
+>   clip (the "decide at implementation time" question below, decided).
+> - **No new op and no batch paste op** — paste composes the existing
+>   `TrackAdd`/`ClipAdd`/`MidiClipAdd` in ONE transaction, so
+>   `OP_FORMAT_VERSION` stays 2.
+> - **SMF is export-only, to a file** (Ctrl+Shift+M). The OS clipboard slot
+>   a Tauri v2 desktop app can own is plain text, so SMF cannot ride on the
+>   clipboard and paste never parses it. The `application/x-aura-clips` MIME
+>   name lives INSIDE the JSON envelope.
+> - **Audio travels by reference**, with a three-step resolution on paste
+>   (in-project → copy-in from an absolute path → skip-and-report).
+> - **Group resize is MIDI-only**; audio clips have no shipped resize
+>   gesture yet.
+> - **Multi-clip delete/duplicate and arrow-key nudge stay single-clip** —
+>   not in Track C's brief.
+> - **Selection keys are `"<kind>:<id>"`**, not bare `ClipId` — audio and
+>   MIDI clips are minted by two independent stores.
+>
+> ### The size ceiling on cross-instance copy (product constraint, read this)
+>
+> Cross-instance transfer is reliable to **~165 KB** and **TOTALLY LOST —
+> not truncated — at ~200 KB** on X11 with a clipboard manager running:
+> the write reports success, the cross-process read comes back EMPTY, and
+> waits of up to 10 s do not help. Measured on real payloads, the marginal
+> cost is **~80 bytes per MIDI note** (100 notes = 8 126 B, 1 000 = 79 788,
+> 2 000 = 160 212), i.e. the cliff sits at roughly **2 000–2 500 notes**.
+> That is not an exotic size: one three-minute recorded MIDI take at a
+> modest 10 notes/second is 1 800 notes in a SINGLE clip, and a song section
+> across 8 MIDI tracks at ~300 notes each is 2 400. **The operation most
+> likely to exceed the ceiling is the operation this feature exists for.**
+> Audio clips are irrelevant here — they travel as references, a few hundred
+> bytes each. This is a MIDI-note ceiling.
+>
+> **The harm the user cannot undo:** the local write SUCCEEDS and AURA takes
+> X11 selection ownership before the handoff to the clipboard manager fails.
+> A failed large copy therefore **destroys whatever was on the system
+> clipboard beforehand — from any application — and leaves it empty**. Data
+> loss outside AURA, caused by an operation that reported success.
+>
+> **Deliberate ruling: the frontend WARNS at copy time, it does not refuse.**
+> The cliff is a property of the ENVIRONMENT (X11 + which clipboard manager
+> + its configuration; without a manager, megabyte INCR transfers are
+> routine, and macOS/Windows differ), not of AURA. Baking one desktop's
+> measurement into a cross-platform layer buys false refusals where it would
+> have worked and false confidence where the limit is tighter. The store
+> keeps the payload IN MEMORY as well, so same-instance paste is unaffected
+> — that is a MITIGATION of the same-instance case, **not a fix**: it does
+> nothing for cross-instance paste of a large selection, which is the
+> feature's stated reason to exist. Details in `src-tauri/src/osclipboard.rs`'s
+> module doc.
+
 **Captured 2026-08-14 from the owner, mid-Plan-E. Deliberately deferred
 until Gate E closes** — every gesture below maps directly onto the finished
 channel's primitives (gesture batches, multi-op transactions, one undo
@@ -82,3 +140,30 @@ roadmap's Tier 2.
 3. Copy/paste same-tracks at playhead.
 4. Group loop-length adjust.
 5. Paste-to-new-tracks.
+
+*(All five landed; see the banner at the top.)*
+
+## Still open after Track C
+
+- **The owed manual cross-instance check** — see the handoff; the one link
+  no test in this repo can make.
+- **Multi-clip DELETE, split and DUPLICATE.** Ctrl+D is still
+  `midi.duplicateSelected` (single, focused clip); Delete is still
+  single-clip. The selection store already gives them the set.
+- **Arrow-key nudge over a selection.** `nudgeSelection` is note-level in
+  the piano roll; the clip-level equivalent would reuse `move_clips`
+  directly (it is already a batch command).
+- **Audio-clip resize.** Group resize is MIDI-only because audio clips have
+  no shipped edge-drag gesture at all; adding one means settling
+  source-length clamping and fades first. `move_clips`' payload already
+  leaves room (an audio entry simply never carries a length).
+- **True content instancing** (shared `ContentId`) — round-2 §5 / ADR 0004's
+  own later feature.
+- **SMF paste/import**, and rebased/looping-expanded SMF export (see
+  `exportSelectionSmf`'s doc comment for the two documented surprises).
+- **The hardcoded MCP port 41717**, which every real two-instance workflow
+  hits — the second instance logs a collision. Roadmap Tier 2, deliberately
+  out of Track C's scope.
+- **Clearing `contentLengthTicks` still goes through
+  `midi_set_clip_bounds(…, null)`** — `Option<u64>` on `move_clips`' wire
+  means "unchanged", never "clear" (ruling H).
