@@ -378,6 +378,65 @@ export type ClipPlacement =
       contentLengthTicks?: number;
     };
 
+// ── application/x-aura-clips (Track C) ──────────────────────────────────────
+
+export interface SkippedClip {
+  name: string;
+  reason: string;
+}
+
+export type ClipboardClip =
+  | {
+      kind: "audio";
+      name: string;
+      sourceTrackId: string;
+      sourceTrackName: string;
+      offsetFromAnchorSamples: number;
+      lengthSamples: number;
+      sourcePath: string;
+      sourceAbsPath: string | null;
+      sourceChannels: number;
+      sourceSampleRate: number;
+      sourceLengthSamples: number;
+      offsetSamples: number;
+      gainDb: number;
+      fadeInSamples: number;
+      fadeOutSamples: number;
+    }
+  | {
+      kind: "midi";
+      name: string;
+      sourceTrackId: string;
+      sourceTrackName: string;
+      offsetFromAnchorTicks: number;
+      lengthTicks: number;
+      contentLengthTicks: number | null;
+      notes: MidiNote[];
+    };
+
+export interface AuraClipsPayload {
+  mime: string;
+  schemaVersion: number;
+  anchorSamples: number;
+  anchorTicks: number;
+  ppq: number;
+  sourceProjectDir: string | null;
+  clips: ClipboardClip[];
+}
+
+export interface PasteRequest {
+  payload: AuraClipsPayload;
+  atSamples: number;
+  toNewTracks: boolean;
+}
+
+export interface PasteResult {
+  audioClips: Clip[];
+  midiClips: MidiClip[];
+  createdTracks: TrackState[];
+  skipped: SkippedClip[];
+}
+
 /** Result of get_project_state (control plane cold-start snapshot). */
 export interface ProjectSnapshot {
   projectName?: string | null;

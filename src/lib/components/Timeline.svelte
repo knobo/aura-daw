@@ -493,7 +493,11 @@
 <div class="timeline" onwheel={onWheel}>
   <!-- ruler row -->
   <div class="ruler-row">
-    <div class="corner silk">tracks · {project.tracks.length}</div>
+    <div class="corner silk" title="Ctrl+C copy · Ctrl+V paste at playhead · Ctrl+Shift+V paste onto new tracks">
+      {clipSelection.count() > 0
+        ? `${clipSelection.count()} clip${clipSelection.count() === 1 ? "" : "s"} selected`
+        : `tracks · ${project.tracks.length}`}
+    </div>
     <div
       class="ruler"
       bind:this={rulerEl}
