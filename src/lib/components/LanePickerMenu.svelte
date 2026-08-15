@@ -36,10 +36,14 @@
   $effect(() => {
     const insts = projectScope
       ? plugins.instances.slice()
-      : plugins.instances.filter(
-          (i) =>
-            !!track && (i.trackId === track.id || track.instrumentId === `plugin:${i.id}`),
-        );
+      : clipScope
+        ? [plugins.instanceForRef(track?.instrumentId)].filter(
+            (i): i is PluginInstanceInfo => i != null,
+          )
+        : plugins.instances.filter(
+            (i) =>
+              !!track && (i.trackId === track.id || track.instrumentId === `plugin:${i.id}`),
+          );
     let cancelled = false;
     void Promise.all(
       insts.map(async (inst) => ({

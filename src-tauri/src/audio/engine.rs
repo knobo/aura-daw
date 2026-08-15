@@ -955,7 +955,10 @@ fn overlay_modulation_ramps(
             .tracks
             .iter()
             .find(|t| t.id.as_str() == tid)
-            .and_then(|t| t.instrument_id.clone())
+            .and_then(|t| t.instrument_id.as_deref())
+            // PluginDoc.params is keyed by the bare instance id; the track
+            // stores the `plugin:<id>` ref (set_track_instrument).
+            .and_then(|id| id.strip_prefix("plugin:").map(str::to_string))
     };
     let param_range = |inst: &str, idx: u32| {
         plugins
@@ -3504,6 +3507,103 @@ mod tests {
         assert!(
             ramps[1].gain.is_some(),
             "the same content on t-2 must drive t-2's own gain"
+        );
+    }
+
+    /// Clip-envelope `selfInstrumentParam` must resolve through the track's
+    /// `plugin:<id>` ref to the BARE instance id `PluginDoc.params` is
+    /// keyed by. Returning the ref verbatim makes `param_range` miss and
+    /// the whole group compiles to nothing.
+    #[test]
+    fn a_clip_envelope_self_instrument_param_compiles_into_the_driver() {
+        use crate::modulation::model::{
+            Binding, BindingMode, Curve, Domain, Range, Source, TargetRef,
+        };
+        use crate::plugins::automation::AutomationPoint;
+        use crate::plugins::descriptor::ParamInfo;
+
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            t.instrument_id = Some("plugin:inst-1".into());
+            s.store.tracks.push(t);
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: Some("t-1".into()),
+            });
+            s.plugins.params.insert(
+                "inst-1".into(),
+                vec![ParamInfo {
+                    id: 7,
+                    name: "cutoff".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    value: 0.5,
+                    steps: 0,
+                }],
+            );
+            s.midi.clips.push(crate::midi::MidiClip {
+                id: "c1".into(),
+                track_id: "t-1".into(),
+                name: "c1".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 960,
+                notes: Vec::new(),
+                next_note_id: 1,
+                content_id: "con".into(),
+                lane_id: crate::ids::LaneId::default_for_track("t-1"),
+                content_length_ticks: None,
+            });
+            s.modulation.curves.push(Curve {
+                id: "cur".into(),
+                name: "cur".into(),
+                length_ticks: Some(960),
+                points: vec![AutomationPoint { tick: 0, value: 0.25 }],
+            });
+            s.modulation.bindings.push(Binding {
+                id: "b".into(),
+                source: Source::ClipEnvelope {
+                    content_id: "con".into(),
+                    curve_id: "cur".into(),
+                },
+                target: TargetRef::SelfInstrumentParam { param_id: 7 },
+                mode: BindingMode::Absolute,
+                depth: 1.0,
+                range: Range::default(),
+                domain: Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            });
+        }
+        let (_, mut driver) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
+        };
+        assert!(
+            !driver.is_empty(),
+            "selfInstrumentParam must reach the driver — range lookup uses the bare instance id"
+        );
+        let mut writes = Vec::new();
+        driver.tick(0, &mut writes);
+        assert_eq!(writes.len(), 1, "the driver emits at the clip start");
+        assert_eq!(
+            writes[0].instance, "inst-1",
+            "must be the bare instance id, not plugin:inst-1"
+        );
+        assert_eq!(writes[0].index, 7);
+        assert!(
+            (writes[0].value - 0.25).abs() < 1e-5,
+            "native value follows the curve: {}",
+            writes[0].value
         );
     }
 
