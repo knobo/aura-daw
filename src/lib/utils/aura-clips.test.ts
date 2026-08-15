@@ -53,4 +53,11 @@ describe("aura-clips envelope", () => {
     const newer = { ...payload, schemaVersion: 99 };
     expect(parseAuraClips(encodeAuraClips(newer))?.schemaVersion).toBe(99);
   });
+
+  it("tolerates CRLF and a leading BOM before the magic line — the human round trip the module doc promises", () => {
+    const crlf = `AURA-CLIPS/1\r\n${JSON.stringify(payload)}`;
+    expect(parseAuraClips(crlf)).toEqual(payload);
+    const bom = `﻿AURA-CLIPS/1\n${JSON.stringify(payload)}`;
+    expect(parseAuraClips(bom)).toEqual(payload);
+  });
 });

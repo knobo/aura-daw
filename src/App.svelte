@@ -194,13 +194,21 @@
       if (clipSelection.count() > 0) void clipClipboard.copy();
       else midi.copySelected();
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "v") {
-      // Paste at the playhead: Shift pastes onto NEW tracks.
+      // Paste at the playhead: Shift pastes onto NEW tracks. The multi-clip
+      // clipboard is ALWAYS tried FIRST — it is the only path that reads the
+      // OS clipboard, so gating it behind "something is selected right now"
+      // (as a prior version did) meant a fresh window with an empty
+      // in-memory payload and nothing selected never even looked at the OS
+      // clipboard, and cross-instance paste did nothing (fix round 1, plan
+      // defect #14). Only fall back to the legacy single-clip stamp when
+      // the store found no payload anywhere — never for a to-new-tracks
+      // paste, which the legacy stamp has no concept of.
       e.preventDefault();
-      if (clipClipboard.payload || clipSelection.count() > 0) {
-        void clipClipboard.paste(playhead(), e.shiftKey);
-      } else {
-        void midi.pasteAtPlayhead(midi.samplesToTicks(playhead()));
-      }
+      const toNewTracks = e.shiftKey;
+      void (async () => {
+        const found = await clipClipboard.paste(playhead(), toNewTracks);
+        if (!found && !toNewTracks) void midi.pasteAtPlayhead(midi.samplesToTicks(playhead()));
+      })();
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "d") {
       // Duplicate immediately after the selected clip.
       e.preventDefault();

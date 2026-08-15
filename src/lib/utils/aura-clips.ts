@@ -20,9 +20,20 @@ export function encodeAuraClips(payload: AuraClipsPayload): string {
 }
 
 export function parseAuraClips(text: string): AuraClipsPayload | null {
-  if (!text.startsWith(`${MAGIC}\n`)) return null;
+  // Tolerant of a leading BOM and CRLF line endings: the module's own promise
+  // that a human can paste this into an editor and see what it is means the
+  // envelope must survive exactly the round trip that promise invites —
+  // Windows/many chat clients rewrite \n to \r\n, and a BOM is routine on
+  // anything that went through Notepad or a Windows clipboard manager.
+  const stripped = text.startsWith("﻿") ? text.slice(1) : text;
+  const nl = stripped.indexOf("\n");
+  if (nl === -1) return null;
+  const firstLine = stripped.slice(0, nl).endsWith("\r")
+    ? stripped.slice(0, nl - 1)
+    : stripped.slice(0, nl);
+  if (firstLine !== MAGIC) return null;
   try {
-    const parsed = JSON.parse(text.slice(MAGIC.length + 1)) as unknown;
+    const parsed = JSON.parse(stripped.slice(nl + 1)) as unknown;
     if (
       typeof parsed !== "object" ||
       parsed === null ||

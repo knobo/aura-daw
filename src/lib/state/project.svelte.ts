@@ -108,6 +108,19 @@ class ProjectStore {
     return merged;
   }
 
+  /** Idempotent track insert (the `addTrack`-shaped duplicate `upsertClip`
+   * already guards against on the clip side). Needed because `clips_paste`
+   * commits `project://changed` INSIDE the transaction — `applyProject` can
+   * already have replaced `tracks` with the authoritative post-paste list
+   * by the time the paste's own `await` resolves and tries to append the
+   * track it just asked for, which a blind spread would duplicate. */
+  upsertTrack(track: TrackState) {
+    const exists = this.tracks.some((t) => t.id === track.id);
+    this.tracks = exists
+      ? this.tracks.map((t) => (t.id === track.id ? track : t))
+      : [...this.tracks, track];
+  }
+
   async removeTrack(trackId: string) {
     this.tracks = this.tracks.filter((t) => t.id !== trackId);
     this.clips = this.clips.filter((c) => c.trackId !== trackId);

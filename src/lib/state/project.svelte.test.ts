@@ -101,6 +101,28 @@ describe("commitClipMove", () => {
  * (label passed through on begin; end is a plain, argument-less close),
  * not the DOM event wiring itself.
  */
+/**
+ * `clips_paste` commits `project://changed` INSIDE its transaction, and
+ * `applyProject` replaces `tracks` wholesale — so the authoritative
+ * post-paste list can already contain a just-created track by the time the
+ * paste command's own promise resolves and its caller tries to append it.
+ * `upsertTrack` is the de-dup `upsertClip` already has on the clip side.
+ */
+describe("upsertTrack", () => {
+  it("appends a track whose id is not yet in the store", () => {
+    project.tracks = [testTrack({ id: "t-1" })];
+    project.upsertTrack(testTrack({ id: "t-2", name: "New" }));
+    expect(project.tracks.map((t) => t.id)).toEqual(["t-1", "t-2"]);
+  });
+
+  it("replaces, rather than duplicates, a track whose id is already present", () => {
+    project.tracks = [testTrack({ id: "t-1", name: "Old" })];
+    project.upsertTrack(testTrack({ id: "t-1", name: "Renamed" }));
+    expect(project.tracks.map((t) => t.id)).toEqual(["t-1"]);
+    expect(project.tracks[0].name).toBe("Renamed");
+  });
+});
+
 describe("beginGesture / endGesture", () => {
   it("beginGesture invokes backend.gestureBegin with the given label", () => {
     project.beginGesture("gain drag");
