@@ -39,6 +39,10 @@ pub mod midi;
 // Self-contained; wired here purely additively per the midi-input-ports
 // branch's task spec. Not part of the frozen phase-2 command surface above.
 pub mod midi_input;
+// MIDI output: transport sync (clock/Start/Stop/Continue/SPP) + note-out to
+// external gear (slice 2, Task 6/7). Engine-free per ruling 3 — pure state
+// machine (Task 6) driven by the `aura-midi-out` thread (Task 7).
+pub mod midi_out;
 pub mod plugins;
 pub mod sidecars;
 pub mod time;
@@ -57,7 +61,8 @@ pub fn run() {
         .manage(audio::AudioState::default())
         .manage(sidecars::SidecarState::default())
         .manage(midi::MidiState::default())
-        .manage(midi_input::MidiInputManager::default())
+        .manage(Arc::new(midi_input::MidiInputManager::default()))
+        .manage(Arc::new(midi_out::MidiOut::default()))
         .manage(mcp::McpState::default())
         .manage(plugins::PluginState::default())
         .setup(|app| {
@@ -84,6 +89,11 @@ pub fn run() {
             let jobs = app.state::<sidecars::SidecarState>().manager();
             let session = app.state::<midi::MidiState>().shared(session);
             let emitter = handle.clone();
+            // Task 7: the `aura-midi-out` thread needs its own clones of the
+            // same session/shared-atomics `Arc`s `ControlPlane::new` is
+            // about to consume below.
+            let midi_out_session = session.clone();
+            let midi_out_shared = shared.clone();
             let control_plane = Arc::new(control::ControlPlane::new(
                 session,
                 shared,
@@ -98,6 +108,19 @@ pub fn run() {
                 history_log,
             ));
             app.manage(control_plane.clone());
+            // MIDI slice 2, Task 5: attach the already-`.manage`d MIDI-input
+            // manager so `ControlPlane::select_midi_input_port` can reach it
+            // (unit tests' `ControlPlane`s never attach one — see the field's
+            // doc for why the port method errors instead of panicking there).
+            control_plane
+                .attach_midi_input(app.state::<Arc<midi_input::MidiInputManager>>().inner().clone());
+            // MIDI slice 2, Task 7: wire the `aura-midi-out` driver the same
+            // way — attach its transport-atomics/session handles once, then
+            // attach it to the control plane so `select_midi_output_port`/
+            // `set_midi_clock_enabled` can reach it.
+            let midi_out = app.state::<Arc<midi_out::MidiOut>>().inner().clone();
+            midi_out.attach(midi_out_session, midi_out_shared);
+            control_plane.attach_midi_out(midi_out);
 
             // Plan E Task 13: the engine's narrow "document birth" closure,
             // installable only now that `ControlPlane` exists — bound over
@@ -188,7 +211,14 @@ pub fn run() {
             // ---- midi input: hardware ports (slice 1, midi-input-ports) ----
             midi_input::midi_list_input_ports,
             midi_input::midi_select_input_port,
+            midi_input::midi_select_input_track,
             midi_input::midi_input_status,
+            // ---- midi output: clock/sync (slice 2) ----
+            midi_out::midi_list_output_ports,
+            midi_out::midi_select_output_port,
+            midi_out::midi_set_clock_enabled,
+            midi_out::midi_output_status,
+            midi_out::midi_select_output_track,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,
@@ -218,6 +248,13 @@ pub fn run() {
             plugins::automation::automation_get,
             plugins::automation::automation_set,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        // `build` + `run(callback)` rather than `run(context)`: the app has
+        // to do something on the way out. See `RunEvent::Exit` below.
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                midi_out::release_on_exit(app.state::<Arc<midi_out::MidiOut>>().inner());
+            }
+        });
 }

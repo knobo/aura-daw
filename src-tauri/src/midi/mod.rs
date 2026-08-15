@@ -41,6 +41,7 @@
 //! pure reads (`midi_get_clips`, `midi_export_file`).
 
 pub mod amt;
+pub mod capture;
 pub mod events;
 pub mod midifile;
 pub mod persist;

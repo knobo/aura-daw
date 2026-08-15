@@ -165,7 +165,8 @@ owner-verified end-to-end with an LPK25). It has been updated with
 post-merge `origin/main` (conflict-free, suites green) and is **cleanly
 mergeable now** (`gh pr view 17` — `mergeStateStatus: CLEAN`), but is
 **still OPEN** — verify its status before starting Track B, which needs it
-merged.
+merged. (Historical: PR #17 was merged as `3340aa8`, which is the base
+Track B's slice 2 branched from.)
 
 Main also carries **PR #9** (timeline/piano-roll horizontal scrollbars),
 **PR #10** (interface-zoom preference), **PR #11** (piano-roll note
@@ -185,8 +186,11 @@ stale when written — the real count at `3340aa8` (Track D's branch base,
 verified in a worktree) was **527 backend + 206 frontend**. Known points
 since: **538 + 234** after Track E (`a98d7ff`), and **566 backend (537
 lib + 29 integration) + 258 frontend** on `automation-audible`
-2026-08-15 (Track D, PR #20, includes Track E via a merge). Run both
-suites before writing the first line of a track:
+2026-08-15 (Track D, PR #20, includes Track E via a merge), and **662
+backend (633 lib + 29 integration) + 271 frontend** on `midi-slice-2`
+2026-08-15 (Track B, PR #21, includes both E and D via a merge). Doc-tests
+report 0 and are not a test target — do not add them to the count. Run
+both suites before writing the first line of a track:
 
 ```
 timeout 900 cargo test --manifest-path src-tauri/Cargo.toml
@@ -314,42 +318,62 @@ journal/history layer) is present from the start. No separate merge step
 needed.
 
 **Conflicts**: with Track B and Track D in `engine.rs` — see their
-sections. Track A's `engine.rs` touch is the `rebuild` function
+sections. Both have LANDED (PR #21, PR #20), so Track A rebases onto them
+rather than sequencing with them. Track B's engine footprint is THREE
+places, not the "one line" the plan predicted — count on all three when
+planning the `rebuild` rewrite: the hub read at `engine.rs:1070`
+(before the session lock is taken), the `append_from_with_input`
+target-track argument at `:1159` (sourced from the hub, not the
+session, so a snapshot-based read does not change its value), and
+`follow_live_in_target` (`:1221`), called from the engine loop at
+`:880`, which rebuilds when the routing target changes and then
+re-resolves it. Track A's `engine.rs` touch is the `rebuild` function
 specifically; sequence with B/D if running genuinely concurrently
 (smallest safe unit: land A's `rebuild` change first, since B and D both
 build on top of "how does the engine read the document" more than they
 change it).
 
-### Track B — MIDI slice 2+: routing, recording, clock/sync out
+### Track B — MIDI slice 2: routing, recording, clock/sync out — LANDED 2026-08-15
 
-Backlog doc: `docs/backlog/hardware-midi-io.md` (also read for slice 1's
-already-landed shape and the design notes that led to this slice's cut).
-Scope: MIDI-in routing to a track's instrument (live monitoring beyond
-slice 1's preview-only tone), MIDI-in recording registered as ONE
-`Actor::Engine` take transaction (`MidiClipAdd` with the captured notes —
-"the op is the registration, never the recording itself," same pattern as
-audio-recording finalize from Plan E Task 13), and MIDI clock + Start/Stop
-output on transport changes (Hydrogen sync) driven by the engine-global
-steady clock (Plan E Task 16) + the section table.
+**Done, branch `midi-slice-2`, PR #21** (12 tasks, plan doc
+`docs/superpowers/plans/2026-08-14-midi-slice-2.md`). Full handoff — the
+scope rulings later rounds inherit, the standing hazards, the deferred
+minors and the three ear checks the owner still owes — is
+**`docs/PHASE4-PLAN.md`'s "Track B handoff"** section; read that, not this
+paragraph, before touching hardware MIDI.
 
-**REQUIRES PR #17 merged first** (PR #12 is already merged — `origin/main`
-has it). This slice extends slice 1's branch and needs the full
-post-Gate-E channel (take registration as an op needs `Actor::Engine`
-transactions, which is Plan E's Task 13 machinery) AND slice 1's port
-handling — verify `gh pr view 17` shows `MERGED` before branching.
+A `MidiInHub` (`src-tauri/src/audio/midi_in.rs`) rings hardware MIDI from
+the midir callback thread into the RT output callback, where the mixer
+dispatches it into the target track's own live node — so a keyboard plays
+the track's real instrument, playing or stopped. A take is captured
+control-side and registered as ONE `Actor::Engine` transaction:
+`Op::MidiClipAdd` rides inside the existing `commit_recording_finalize`
+alongside the audio `ClipAdd`s, so a take is one undo entry. No new op
+kind, no shape change, `OP_FORMAT_VERSION` stays 2. MIDI OUT is a
+dedicated non-RT `aura-midi-out` thread (`src-tauri/src/midi_out.rs`) over
+`SharedRt` + a tempo/event snapshot — 24 PPQN clock, Start/Stop/Continue/
+SPP, and note-out from one chosen MIDI track — and it touches `engine.rs`
+not at all. User docs: `docs/midi-input.md`, `docs/midi-output.md`.
 
-**Footprint**: `src-tauri/src/audio/engine.rs` (routing + recording +
-clock-out on the engine's own turn), `src-tauri/src/midi_input.rs` (slice
-1's module — port handling grows here), control-layer seams
-(`ControlPlane` methods for attribution, mirroring the device-selection
-carve-out pattern).
+**Rulings a later round inherits** (all in the plan, ADR 0007-marked): (1)
+the MIDI-in target track is app config behind a `ControlPlane` seam, NOT
+derived from `TrackState.armed` — the frontend calls it from the same arm
+click; (4) the clock's musical position is `SharedRt::position` + the
+`TempoMap`, not `steady`; (5) a backward jump re-cues the slave with
+`Stop`/SPP/`Continue`; (9) MIDI-in timestamps are quantised to the audio
+block; (10) note-out is a routing carve-out, not a track field; (11) no
+persistence of ports/targets across restarts while port ids are unstable.
 
-**Conflicts**: with Track A (`engine.rs`'s `rebuild`/session-read path)
-and with Track D (`engine.rs`'s RT-attach work) — all three touch
-`engine.rs`. Sequence the engine-touching halves: land whichever of A's
-`rebuild` change or D's RT-attach lands first, then rebase the other two.
-Do not run B, D, and A's `rebuild` work concurrently in the same file
-without a merge plan.
+**What is left**, in priority order: the owner's **three ear checks**
+(note-out to real gear, Hydrogen sync, a real keyboard through
+arm→record→undo→reopen) — nothing in the test suite substitutes; then
+**recording under an active loop, which silently produces a musically
+wrong take** (mechanism, both candidate fixes and why the plan's non-goals
+do not cover it: `docs/backlog/hardware-midi-io.md`, "Still open after
+slice 2" — the choice between the two fixes is a behaviour decision for
+the owner); then sub-block timestamping, port persistence, MIDI thru, CC/
+pitch-bend, a MIDI-out latency offset, and the document-model
+external-instrument target.
 
 ### Track C — Multi-clip selection, group-drag, cross-track paste + cross-instance clipboard
 

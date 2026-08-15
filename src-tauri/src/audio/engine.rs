@@ -11,6 +11,15 @@
 //! * rtrb SPSC queues: new-graph pointers in, retired-graph pointers out
 //!   (deallocation happens here, never on the RT thread), meter blocks out,
 //!   and recorded samples out to the disk-writer thread.
+//!
+//! Hardware MIDI-in (slice 2) adds the SECOND ring that feeds the callback,
+//! and the only one this thread does not produce into: the midir callback
+//! thread pushes `LiveMidiEvent`s through `midi_in::hub()`, the output
+//! callback pops them into a preallocated array. Neither end is exempt from
+//! the rule above — the producer is a non-RT thread that may lock and drop,
+//! the consumer allocates nothing and takes a bounded number of events per
+//! block. Which track they reach is a slot the CONTROL thread resolves
+//! (`follow_live_in_target`); the callback only reads one atomic.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -24,6 +33,7 @@ use parking_lot::Mutex;
 
 use super::dsp::linear_resample;
 use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock, METER_CHUNK_SLOTS};
+use super::midi_in::{self, LiveMidiEvent, MidiInHub, LIVE_IN_RING_SLOTS, MAX_LIVE_IN_PER_BLOCK};
 use super::mixer;
 use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
@@ -190,6 +200,8 @@ pub fn start(
                 ensure_project_fn: None,
                 param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
                 param_writes: Vec::new(),
+                live_in_hub: midi_in::hub().clone(),
+                live_in_target: None,
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -205,7 +217,11 @@ pub fn start(
 // ---------------------------------------------------------------------------
 
 struct OutputBundle {
-    _stream: cpal::Stream,
+    /// `None` only in tests, which cannot construct a `cpal::Stream` but do
+    /// need a non-headless `rebuild` — the branch that assembles clips and
+    /// live nodes and publishes a graph. Production always holds the stream
+    /// here: dropping it is what stops the callback (see `Drop`).
+    _stream: Option<cpal::Stream>,
     graph_tx: rtrb::Producer<GraphPtr>,
     retire_rx: rtrb::Consumer<GraphPtr>,
     meter_rx: rtrb::Consumer<RawMeterBlock>,
@@ -231,6 +247,12 @@ struct InputBundle {
     meter_rx: rtrb::Consumer<RawMeterBlock>,
 }
 
+/// Drain-buffer capacity: a block's `MAX_LIVE_IN_PER_BLOCK` popped events,
+/// plus room for one release expanded into note-offs for every key at once.
+/// Sized so the expansion can never overrun (`take_held_note_offs` clamps
+/// as well, so the arithmetic here is not load-bearing).
+const LIVE_IN_BUF_SLOTS: usize = MAX_LIVE_IN_PER_BLOCK + 128;
+
 /// State owned by the cpal OUTPUT callback closure. `render` obeys the RT
 /// contract: the only "syscalls" are what cpal itself does.
 struct OutputCb {
@@ -249,9 +271,89 @@ struct OutputCb {
     /// releases live-instrument voices (their note-offs may never arrive).
     next_pos: u64,
     was_playing: bool,
+    /// Consumer half of THIS stream's MIDI-in ring — owned by the callback,
+    /// so a device switch that briefly overlaps two callbacks can never put
+    /// two consumers on one ring: each stream gets its own ring, and the hub
+    /// keeps only the newest producer.
+    live_in_rx: rtrb::Consumer<LiveMidiEvent>,
+    /// Preallocated drain buffer — the RT side never allocates.
+    live_in_buf: [LiveMidiEvent; LIVE_IN_BUF_SLOTS],
+    /// Cloned at open time so the callback never touches a global.
+    live_in_hub: Arc<MidiInHub>,
+    /// The slot this callback dispatched live-in events to LAST block. The
+    /// hub publishes only where events go NEXT, and a release has to be
+    /// addressed to where they went before.
+    live_in_slot: Option<usize>,
+    /// A monitored node owes a NODE-WIDE all-off before its next monitored
+    /// block. Sticky until it is actually delivered, so a target change and
+    /// a stop landing in the same block still release both nodes.
+    live_in_all_off: bool,
+    /// The keys MONITORING currently has down on the target node — the one
+    /// thing that separates a monitored voice from a clip voice, since they
+    /// live in the same node.
+    live_in_held: [bool; 128],
+    /// A node that lost the routing target and whose envelope may still be
+    /// running: `live_in_release_left` is how much of that envelope is still
+    /// owed, and it only counts down on blocks where the node is actually
+    /// rendered.
+    ///
+    /// Holding the live-in channel is a SEPARATE, usually much shorter fact
+    /// (`live_in_hold_left`), because the channel is what the incoming
+    /// target is waiting for — every event popped while it is held is
+    /// discarded, so the hold is measured in swallowed keystrokes.
+    ///
+    /// ONE slot, deliberately: a `LiveInBlock` addresses one slot per block,
+    /// so a queue here would only serialize release windows, not overlap
+    /// them. A second target change inside an open window therefore drops
+    /// the first node mid-decay (a ≤80 ms fragment on its next arm — never a
+    /// drone). Two clicks that fast are not human, but a rebuild that
+    /// RENUMBERS slots gets there without a human: this compares slot
+    /// NUMBERS, and after a track delete the old number names a different
+    /// track. The real fix is to compare the target's identity rather than
+    /// its slot index; ledgered for the close-out, not smuggled in here.
+    live_in_release_slot: Option<usize>,
+    live_in_release_left: u64,
+    /// How much longer `live_in_release_slot` also keeps the live-in
+    /// channel. One block while the transport plays (the graph renders every
+    /// live node anyway, so the envelope needs no help); re-opened to the
+    /// remaining envelope on the stop edge, where nothing else would render
+    /// that node again.
+    live_in_hold_left: u64,
 }
 
 impl OutputCb {
+    /// Writes a note-off into `live_in_buf` for every key monitoring has
+    /// down, starting at `at`, and clears the mask. Returns how many were
+    /// written. RT-safe: a fixed 128-step scan over an inline array.
+    fn take_held_note_offs(&mut self, at: usize) -> usize {
+        let mut n = 0usize;
+        for key in 0..128usize {
+            if !self.live_in_held[key] {
+                continue;
+            }
+            // Bail BEFORE clearing the mask, never after: the buffer is
+            // sized so this cannot trigger today (128 note-offs + 64 pops
+            // into 192), but if a future event kind on this same ring ever
+            // makes it reachable, dropping a note-off we have already
+            // forgotten about hangs that voice forever, while keeping the
+            // key marked held means the next release still frees it.
+            if at + n >= LIVE_IN_BUF_SLOTS {
+                break;
+            }
+            self.live_in_held[key] = false;
+            self.live_in_buf[at + n] = LiveMidiEvent::note_off(key as u8);
+            n += 1;
+        }
+        n
+    }
+
+    /// How long an outgoing node must keep the live-in channel for its
+    /// envelope to reach silence, counted from the START of the block that
+    /// opens the window (the same block decrements it by `frames`).
+    fn release_window(&self, frames: u64) -> u64 {
+        (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames
+    }
+
     fn render(&mut self, out: &mut [f32]) {
         // Adopt a new graph snapshot if one is queued — but only when the
         // retire queue can take the old one (drop must happen control-side).
@@ -295,13 +397,151 @@ impl OutputCb {
         let frames = (out.len() / self.channels.max(1)) as u64;
         let steady_base = self.shared.steady.fetch_add(frames, Relaxed);
 
+        // Hardware MIDI-in. One relaxed load; the control thread resolved
+        // this id→slot under the tables lock (`MidiInHub::refresh_target`).
+        let live_slot = self.live_in_hub.target_slot();
+        // Ring events carry no slot, so every release the routing needs is
+        // addressed HERE, by the only party that knows which node was being
+        // monitored last block. There are two KINDS of release and the
+        // difference is load-bearing, because monitoring shares the node
+        // that plays the track's clips:
+        //
+        // * NODE-WIDE (`all_off`) — only where nothing may legitimately be
+        //   sounding: the block the transport stops on, and a node armed
+        //   while stopped (it can be holding a clip voice frozen from the
+        //   last playthrough, which nothing else will ever release).
+        // * MONITORING'S OWN KEYS (`live_in_held`) — everywhere the graph
+        //   may still be playing: a target change, and every release the
+        //   producer asks for. A node-wide release there would cut the clip
+        //   note the song is in the middle of, and a note-on that already
+        //   happened never comes back.
+        if live_slot != self.live_in_slot {
+            if let Some(old) = self.live_in_slot {
+                self.live_in_release_slot = Some(old);
+                // An envelope only advances while its node is RENDERED, so
+                // delivering the note-offs is not enough: a node left frozen
+                // mid-release resurrects that fragment the next time it is
+                // armed. The outgoing node therefore stays accounted for
+                // until its release has had time to run.
+                //
+                // How long it keeps the LIVE-IN CHANNEL is a different
+                // question, and the answer is "as briefly as possible": the
+                // incoming target hears nothing until the channel is free
+                // (every event popped meanwhile is discarded), so the hold
+                // is measured in swallowed keystrokes. While PLAYING the
+                // graph renders every live node each block regardless, so
+                // one block — just enough to carry the note-offs — is
+                // enough, and arming a track mid-song costs the player
+                // nothing. Only where the node would stop being rendered
+                // altogether does the hold have to cover the envelope: that
+                // is the stop edge, handled below.
+                //
+                // PolySynth's release, applied to every instrument: a
+                // sampler or plugin with a longer tail is still cut short
+                // (bounded and silent, never a drone). Raising it only
+                // trades that for a longer deaf window on the new target —
+                // a per-node `release_tail()` on the processor trait is the
+                // real answer, and a separate cut.
+                self.live_in_release_left = self.release_window(frames);
+                self.live_in_hold_left =
+                    if playing { frames } else { self.live_in_release_left };
+            }
+            if !playing {
+                self.live_in_all_off = true;
+            }
+        }
+        if self.was_playing && !playing {
+            self.live_in_all_off = true;
+            // The playing graph was what kept the outgoing node's envelope
+            // moving; stopping takes that away, and a node frozen mid-decay
+            // replays the fragment on its next arm. Hand it the channel for
+            // whatever release it still has left — while stopped,
+            // `render_live_input_only` renders exactly the slot that holds
+            // the channel, so the release actually runs to silence.
+            if self.live_in_release_slot.is_some() {
+                self.live_in_hold_left = self.live_in_release_left;
+            }
+        }
+        self.live_in_slot = live_slot;
+        let outgoing = if self.live_in_hold_left > 0 { self.live_in_release_slot } else { None };
+
+        // Drained UNCONDITIONALLY, even with nothing routed and even on a
+        // block spent releasing: the producer is a foreign thread that keeps
+        // pushing whatever the port sends, and a ring nobody empties would
+        // hand the next armed track a backlog of stale notes. `popped` is
+        // what the RT bound applies to; the buffer is sized so that
+        // expanding a release into it can never overrun (see
+        // `LIVE_IN_BUF_SLOTS`).
+        let mut n_in = 0usize;
+        let mut popped = 0usize;
+        if outgoing.is_some() {
+            // This block belongs to the node that just lost the target:
+            // exactly the keys monitoring put down on it, and nothing else.
+            n_in = self.take_held_note_offs(0);
+        } else if self.live_in_all_off {
+            // FIRST in the block, so this block's own note-ons survive it.
+            self.live_in_buf[0] = LiveMidiEvent::all_off();
+            n_in = 1;
+            self.live_in_all_off = false;
+            self.live_in_held = [false; 128];
+        }
+        while popped < MAX_LIVE_IN_PER_BLOCK {
+            let Ok(ev) = self.live_in_rx.pop() else { break };
+            popped += 1;
+            if outgoing.is_some() {
+                // Dropped with the block that is releasing: a key struck
+                // inside the window is swallowed, and its later note-off
+                // arrives orphaned (harmless — note-offs are idempotent).
+                continue;
+            }
+            match ev.kind {
+                // A producer-side release request (`set_target_track`, the
+                // monitor toggle, a port change) — expanded rather than
+                // passed through, for the same reason a target change is.
+                midi_in::EV_ALL_OFF => n_in += self.take_held_note_offs(n_in),
+                midi_in::EV_NOTE_ON if ev.velocity > 0 => {
+                    self.live_in_held[(ev.key & 127) as usize] = true;
+                    self.live_in_buf[n_in] = ev;
+                    n_in += 1;
+                }
+                _ => {
+                    self.live_in_held[(ev.key & 127) as usize] = false;
+                    self.live_in_buf[n_in] = ev;
+                    n_in += 1;
+                }
+            }
+        }
+        if self.live_in_release_slot.is_some() {
+            // The envelope only advances on blocks where the node is
+            // rendered: every block while playing, and while it holds the
+            // channel when stopped. (Stopped and NOT holding is currently
+            // unreachable — a stopped switch sets the hold to the whole
+            // remaining release, so the two reach zero together — which is
+            // why dropping this guard changes no behavior today. It states
+            // the invariant the two counters are kept apart for.)
+            if playing || outgoing.is_some() {
+                self.live_in_release_left = self.live_in_release_left.saturating_sub(frames);
+            }
+            self.live_in_hold_left = self.live_in_hold_left.saturating_sub(frames);
+            if self.live_in_release_left == 0 {
+                self.live_in_release_slot = None;
+                self.live_in_hold_left = 0;
+            }
+        }
+        let live_in = match outgoing {
+            Some(old) => Some(mixer::LiveInBlock { slot: old, events: &self.live_in_buf[..n_in] }),
+            None => {
+                live_slot.map(|slot| mixer::LiveInBlock { slot, events: &self.live_in_buf[..n_in] })
+            }
+        };
+
         match (&mut self.graph, playing) {
             (Some(g), true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                let dropped = mixer::render_rt(
+                let dropped = mixer::render_rt_with_input(
                     g,
                     base,
                     &lp,
@@ -310,6 +550,24 @@ impl OutputCb {
                     self.rate,
                     discontinuity,
                     steady_base,
+                    live_in,
+                    Some(&mut self.meter_tx),
+                );
+                if dropped > 0 {
+                    self.shared.xruns.fetch_add(dropped as u64, Relaxed);
+                }
+            }
+            // Monitoring while STOPPED: render ONLY the routed instrument,
+            // never the frozen clip slice under the parked playhead.
+            (Some(g), false) if live_in.is_some() => {
+                let dropped = mixer::render_live_input_only(
+                    g,
+                    base,
+                    out,
+                    self.channels,
+                    self.rate,
+                    steady_base,
+                    live_in.expect("checked by the guard"),
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -576,6 +834,14 @@ struct Control {
     /// Reused scratch for `param_automation.tick` so the tick allocates
     /// nothing steady-state.
     param_writes: Vec<crate::plugins::automation::ParamWrite>,
+    /// The hardware MIDI-in seam. Held as an `Arc` rather than reached
+    /// through `midi_in::hub()` at each call site so tests can drive the
+    /// engine against their own hub; `start` binds the process-global one.
+    live_in_hub: Arc<MidiInHub>,
+    /// Last routing target this thread acted on — the tick compares against
+    /// the hub to notice a selection that, being app config, commits nothing
+    /// and therefore schedules no rebuild of its own.
+    live_in_target: Option<String>,
 }
 
 impl Control {
@@ -611,6 +877,7 @@ impl Control {
             self.drive_param_automation();
             self.headless_advance();
             self.pump_meter_frames();
+            self.follow_live_in_target();
         }
     }
 
@@ -682,6 +949,12 @@ impl Control {
         // sized for a burst of them so a stalled control thread never makes
         // the callback drop one.
         let (evt_tx, evt_rx) = rtrb::RingBuffer::new(64);
+        // Second rtrb path INTO the callback, and the only one whose producer
+        // is not this thread: the midir callback thread pushes, this stream's
+        // callback pops. A fresh ring per stream — but the producer is only
+        // handed to the hub once the stream is actually RUNNING (see below),
+        // because everything between here and there can fail.
+        let (live_in_tx, live_in_rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
         let mut cb = OutputCb {
             graph_rx,
             retire_tx,
@@ -693,6 +966,15 @@ impl Control {
             rate,
             next_pos: u64::MAX, // first playing block is a discontinuity
             was_playing: false,
+            live_in_rx,
+            live_in_buf: [LiveMidiEvent::all_off(); LIVE_IN_BUF_SLOTS],
+            live_in_hub: self.live_in_hub.clone(),
+            live_in_slot: None,
+            live_in_all_off: false,
+            live_in_held: [false; 128],
+            live_in_release_slot: None,
+            live_in_release_left: 0,
+            live_in_hold_left: 0,
         };
         let stream = device
             .build_output_stream(
@@ -704,10 +986,16 @@ impl Control {
             .map_err(|e| e.to_string())?;
         stream.play().map_err(|e| e.to_string())?;
 
+        // Only now, past every `?` above: a device that fails to open must
+        // leave the PREVIOUS stream's ring installed, or the failed switch
+        // would silently kill hardware MIDI-in (the old callback keeps
+        // running, but its ring would have no producer) until some later
+        // switch happened to succeed.
+        self.live_in_hub.install_producer(live_in_tx);
         // Replacing the bundle drops the previous stream + its graph here on
         // the control thread.
         self.output = Some(OutputBundle {
-            _stream: stream,
+            _stream: Some(stream),
             graph_tx,
             retire_rx,
             meter_rx,
@@ -776,6 +1064,10 @@ impl Control {
         self.ensure_loaded();
         self.generation += 1;
         let headless = self.output.is_none();
+        // Read BEFORE the session lock is taken: the hub is reachable from
+        // the midir callback thread, and nesting its mutex under the session
+        // lock would invent a lock order this file has none of today.
+        let live_in_target = self.live_in_hub.target_track();
         let (graph, param_driver) = {
             let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
             let store = &session.store;
@@ -858,7 +1150,13 @@ impl Control {
                 // reads `session.midi` directly instead of re-locking
                 // through the registered global.
                 let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-                crate::midi::playback::append_from(
+                // ORDER MATTERS: a midi track already has a clips-only row
+                // from the loop above, so this adds a SECOND row for the
+                // same slot. Both write that slot's meter lane and the last
+                // writer wins — appending the live rows here is what makes
+                // the live one win. Push them before the loop and the midi
+                // track's meters silently read zero.
+                crate::midi::playback::append_from_with_input(
                     &session.midi,
                     store,
                     &session.plugins,
@@ -867,6 +1165,7 @@ impl Control {
                     bank.as_deref(),
                     &mut self.live_nodes,
                     &mut tracks,
+                    live_in_target.as_deref(),
                 );
                 // The timeline boundary belongs to the material, so it is
                 // derived exactly where the material is assembled — same
@@ -903,6 +1202,29 @@ impl Control {
             self.rebuild_pending = true;
             log::warn!("audio: graph queue full, rebuild retried next tick");
         }
+    }
+
+    /// CONTROL THREAD, once per tick: keep the hardware MIDI-in routing in
+    /// step with the graph. Two things happen here, in this order.
+    ///
+    /// A rebuild first, when the SELECTION changed. Choosing the routing
+    /// target is app config (ruling 1) — it commits nothing, so no
+    /// `EngineEffect::rebuild` fires — but a midi track with no clips only
+    /// gets a live node when `rebuild` runs with the target already known
+    /// (`append_from_with_input`). Without this the very case the feature
+    /// exists for — arm an empty track and play — would stay silent until
+    /// some unrelated edit happened to rebuild.
+    ///
+    /// Then the id→slot resolution the callback reads, which must come
+    /// SECOND: it has to resolve against the tables the rebuild just
+    /// published, not the previous generation's.
+    fn follow_live_in_target(&mut self) {
+        let target = self.live_in_hub.target_track();
+        if target != self.live_in_target {
+            self.live_in_target = target;
+            self.rebuild();
+        }
+        self.live_in_hub.refresh_target(self.generation, &self.tables);
     }
 
     /// Track D: compile the session's automation lanes into this rebuild's
@@ -1248,155 +1570,170 @@ impl Control {
     // -- recording ----------------------------------------------------------
 
     fn start_recording(&mut self, track_ids: Option<Vec<String>>) -> Result<Vec<String>, String> {
-        if self.writer.is_some() {
+        // A MIDI-only take opens no device, so `self.writer` stays None for
+        // the whole take — the capture is the other half of "is a take
+        // running".
+        if self.writer.is_some() || self.live_in_hub.capturing() {
             return Err("already recording".to_string());
         }
 
-        // Resolve target tracks (explicit list or armed flags).
-        let targets: Vec<String> = {
+        // Read the routing target BEFORE the session lock: the hub's own
+        // mutex must never be taken under it ([C1] ordering).
+        let live_in_target = self.live_in_hub.target_track();
+        let (targets, midi_target) = {
             let session = self.session.lock(); // read-only: resolve/validate target track ids before recording starts
-            let store = &session.store;
-            match track_ids {
-                Some(ids) => {
-                    for id in &ids {
-                        if !store.tracks.iter().any(|t| &t.id == id) {
-                            return Err(format!("unknown track: {id}"));
-                        }
-                    }
-                    ids
-                }
-                None => store.armed_track_ids(),
-            }
+            split_record_targets(&session.store, track_ids, live_in_target)?
         };
-        if targets.is_empty() {
-            return Err("no armed tracks to record".to_string());
-        }
 
+        // A take needs a project dir whether it is audio or MIDI.
         self.ensure_project()?;
 
-        // Input device + stream.
-        let host = cpal::default_host();
-        let device = match &self.sel_input {
-            Some(id) => host
-                .input_devices()
-                .map_err(|e| e.to_string())?
-                .find(|d| d.name().map(|n| &n == id).unwrap_or(false))
-                .ok_or_else(|| format!("unknown input device: {id}"))?,
-            None => host
-                .default_input_device()
-                .ok_or_else(|| "no default input device".to_string())?,
-        };
-        let cfg = device.default_input_config().map_err(|e| e.to_string())?;
-        if cfg.sample_format() != cpal::SampleFormat::F32 {
-            return Err(format!(
-                "unsupported input sample format {:?} (prototype supports f32)",
-                cfg.sample_format()
-            ));
-        }
-        let in_ch = cfg.channels().max(1) as usize;
-        let rec_ch = in_ch.min(2);
-        let rate = cfg.sample_rate().0;
         let start_pos = self.shared.position.load(Relaxed);
 
-        // Rings + writer specs. Slot resolution reads the CURRENT graph's
-        // tables, not the store — round-2 §2.4; lock order: session before
-        // tables [C1].
-        let (project_dir, take_no, slots, rec_generation) = {
-            let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
-            let store = &session.store;
-            let dir = store.project_dir.clone().ok_or("no project open")?;
-            let take_no = store.clips.len() + 1;
-            let tables = self.tables.lock();
-            let slots: Vec<usize> = targets
-                .iter()
-                .filter_map(|id| tables.slots.get(id.as_str()).copied())
-                .collect();
-            (dir, take_no, slots, tables.generation)
-        };
-        // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
-        // preallocated `RawMeterBlock` template per distinct chunk, plus the
-        // base-0 chunk (frame accounting [I3]) even if no recorded slot
-        // lands there. Built here (control thread) so `InputCb::capture`
-        // (RT) never allocates.
-        let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        chunk_lanes.entry(0).or_default();
-        for &slot in &slots {
-            let chunk_idx = slot / METER_CHUNK_SLOTS;
-            let lane = slot % METER_CHUNK_SLOTS;
-            chunk_lanes.entry(chunk_idx).or_default().push(lane);
+        if !targets.is_empty() {
+            // Input device + stream.
+            let host = cpal::default_host();
+            let device = match &self.sel_input {
+                Some(id) => host
+                    .input_devices()
+                    .map_err(|e| e.to_string())?
+                    .find(|d| d.name().map(|n| &n == id).unwrap_or(false))
+                    .ok_or_else(|| format!("unknown input device: {id}"))?,
+                None => host
+                    .default_input_device()
+                    .ok_or_else(|| "no default input device".to_string())?,
+            };
+            let cfg = device.default_input_config().map_err(|e| e.to_string())?;
+            if cfg.sample_format() != cpal::SampleFormat::F32 {
+                return Err(format!(
+                    "unsupported input sample format {:?} (prototype supports f32)",
+                    cfg.sample_format()
+                ));
+            }
+            let in_ch = cfg.channels().max(1) as usize;
+            let rec_ch = in_ch.min(2);
+            let rate = cfg.sample_rate().0;
+
+            // Rings + writer specs. Slot resolution reads the CURRENT graph's
+            // tables, not the store — round-2 §2.4; lock order: session before
+            // tables [C1].
+            let (project_dir, take_no, slots, rec_generation) = {
+                let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
+                let store = &session.store;
+                let dir = store.project_dir.clone().ok_or("no project open")?;
+                let take_no = store.clips.len() + 1;
+                let tables = self.tables.lock();
+                let slots: Vec<usize> = targets
+                    .iter()
+                    .filter_map(|id| tables.slots.get(id.as_str()).copied())
+                    .collect();
+                (dir, take_no, slots, tables.generation)
+            };
+            // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
+            // preallocated `RawMeterBlock` template per distinct chunk, plus the
+            // base-0 chunk (frame accounting [I3]) even if no recorded slot
+            // lands there. Built here (control thread) so `InputCb::capture`
+            // (RT) never allocates.
+            let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            chunk_lanes.entry(0).or_default();
+            for &slot in &slots {
+                let chunk_idx = slot / METER_CHUNK_SLOTS;
+                let lane = slot % METER_CHUNK_SLOTS;
+                chunk_lanes.entry(chunk_idx).or_default().push(lane);
+            }
+            let mut blocks = Vec::with_capacity(chunk_lanes.len());
+            for (chunk_idx, lanes) in chunk_lanes {
+                let mut b = RawMeterBlock::new(rec_generation, 0, 0);
+                b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
+                blocks.push((b, lanes));
+            }
+
+            let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
+            let mut producers = Vec::with_capacity(targets.len());
+            let mut consumers = Vec::with_capacity(targets.len());
+            let mut specs = Vec::with_capacity(targets.len());
+            for (i, track_id) in targets.iter().enumerate() {
+                let clip_id = uuid::Uuid::new_v4().to_string();
+                // The take's wav is named by a freshly-minted SourceId (round-2
+                // §2.2) — the decode cache re-keys by source, not by clip.
+                // Waveform pyramid cache dirs stay keyed by clip id.
+                let source_id = crate::ids::SourceId::mint();
+                let rel = format!("audio/{source_id}.wav");
+                let (p, c) = rtrb::RingBuffer::new(capacity);
+                producers.push(p);
+                consumers.push(c);
+                specs.push(RecSpec {
+                    track_id: track_id.clone(),
+                    take_name: format!("Take {}", take_no + i),
+                    wav_path: project_dir.join(&rel),
+                    rel_path: rel,
+                    source_id,
+                    cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
+                    clip_id,
+                    start_pos,
+                });
+            }
+
+            let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
+
+            let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
+            let n_producers = producers.len();
+            let mut cb = InputCb {
+                producers,
+                owed: vec![0; n_producers],
+                meter_tx,
+                blocks,
+                in_ch,
+                rec_ch,
+                shared: self.shared.clone(),
+            };
+            let stream = device
+                .build_input_stream(
+                    &cfg.into(),
+                    move |data: &[f32], _| cb.capture(data),
+                    |e| log::warn!("input stream error: {e}"),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            stream.play().map_err(|e| e.to_string())?;
+
+            // Pin the generation the slots above were resolved against (Task 6
+            // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
+            // in its plain window must not lose its input meters. INVARIANT:
+            // pin only AFTER every fallible step above has succeeded (device
+            // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
+            // `stop_recording` is the only unpin, and it can only ever run once
+            // `self.writer`/`self.input` are actually populated. Pinning
+            // earlier and then returning `Err` from one of those `?`s would
+            // leak the pin: a generation stays exempt from pruning forever for
+            // a recording that never started (self-healing only on the NEXT
+            // successful recording, which is not good enough).
+            self.gen_maps.pin(rec_generation);
+
+            self.input = Some(InputBundle { _stream: stream, meter_rx });
+            self.writer = Some(writer);
+            log::info!(
+                "audio: recording {} track(s) @ {} Hz x{}ch",
+                targets.len(),
+                rate,
+                rec_ch
+            );
+        } // ruling 8: a take with only a MIDI target opens no device at all
+
+        // Arm the capture LAST among the fallible work: every `?` above
+        // returns without a take running, so a failed start never leaves the
+        // hub buffering into a recording that does not exist. Untestable as
+        // stated — a MIDI-only take has no fallible step above this, and a
+        // mixed one needs a real input device — so moving this call up will
+        // not turn anything red.
+        if let Some(t) = &midi_target {
+            self.live_in_hub.begin_capture(t.clone(), start_pos);
+            log::info!("audio: recording MIDI take on track {t}");
         }
-        let mut blocks = Vec::with_capacity(chunk_lanes.len());
-        for (chunk_idx, lanes) in chunk_lanes {
-            let mut b = RawMeterBlock::new(rec_generation, 0, 0);
-            b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
-            blocks.push((b, lanes));
-        }
 
-        let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
-        let mut producers = Vec::with_capacity(targets.len());
-        let mut consumers = Vec::with_capacity(targets.len());
-        let mut specs = Vec::with_capacity(targets.len());
-        for (i, track_id) in targets.iter().enumerate() {
-            let clip_id = uuid::Uuid::new_v4().to_string();
-            // The take's wav is named by a freshly-minted SourceId (round-2
-            // §2.2) — the decode cache re-keys by source, not by clip.
-            // Waveform pyramid cache dirs stay keyed by clip id.
-            let source_id = crate::ids::SourceId::mint();
-            let rel = format!("audio/{source_id}.wav");
-            let (p, c) = rtrb::RingBuffer::new(capacity);
-            producers.push(p);
-            consumers.push(c);
-            specs.push(RecSpec {
-                track_id: track_id.clone(),
-                take_name: format!("Take {}", take_no + i),
-                wav_path: project_dir.join(&rel),
-                rel_path: rel,
-                source_id,
-                cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
-                clip_id,
-                start_pos,
-            });
-        }
-
-        let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
-
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
-        let n_producers = producers.len();
-        let mut cb = InputCb {
-            producers,
-            owed: vec![0; n_producers],
-            meter_tx,
-            blocks,
-            in_ch,
-            rec_ch,
-            shared: self.shared.clone(),
-        };
-        let stream = device
-            .build_input_stream(
-                &cfg.into(),
-                move |data: &[f32], _| cb.capture(data),
-                |e| log::warn!("input stream error: {e}"),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        stream.play().map_err(|e| e.to_string())?;
-
-        // Pin the generation the slots above were resolved against (Task 6
-        // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
-        // in its plain window must not lose its input meters. INVARIANT:
-        // pin only AFTER every fallible step above has succeeded (device
-        // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
-        // `stop_recording` is the only unpin, and it can only ever run once
-        // `self.writer`/`self.input` are actually populated. Pinning
-        // earlier and then returning `Err` from one of those `?`s would
-        // leak the pin: a generation stays exempt from pruning forever for
-        // a recording that never started (self-healing only on the NEXT
-        // successful recording, which is not good enough).
-        self.gen_maps.pin(rec_generation);
-
-        self.input = Some(InputBundle { _stream: stream, meter_rx });
-        self.writer = Some(writer);
-        self.rec_track_ids = targets.clone();
+        let mut recorded = targets;
+        recorded.extend(midi_target);
+        self.rec_track_ids = recorded.clone();
         self.shared.recording.store(true, Relaxed);
         self.shared.playing.store(true, Relaxed);
         if let Err(e) = self.commit_start_recording_state() {
@@ -1406,18 +1743,12 @@ impl Control {
             "recording://state",
             serde_json::json!({
                 "recording": true,
-                "trackIds": targets,
+                "trackIds": recorded,
                 "startedAtSamples": start_pos,
                 "xruns": 0,
             }),
         );
-        log::info!(
-            "audio: recording {} track(s) @ {} Hz x{}ch",
-            targets.len(),
-            rate,
-            rec_ch
-        );
-        Ok(targets)
+        Ok(recorded)
     }
 
     /// The commit `start_recording` submits for the "recording" transport
@@ -1443,15 +1774,51 @@ impl Control {
         )
     }
 
+    /// Stop the take and register it.
+    ///
+    /// `Err` does NOT mean "nothing happened": except for the "not
+    /// recording" case, the take has ALREADY been committed (the MIDI clip
+    /// and whatever audio clips survived, one undo entry), the transport is
+    /// already stopped and `recording://state` has already been emitted. The
+    /// error reports the AUDIO half — the WAV writer failed and its clips
+    /// were lost — never the transaction. A caller must not treat it as a
+    /// signal to retry or to skip its own stop bookkeeping.
     fn stop_recording(&mut self) -> Result<Vec<Clip>, String> {
-        let writer = self.writer.take().ok_or("not recording")?;
+        // Disarm the capture unconditionally and first: after this line no
+        // further hardware note can join the take, whichever half fails
+        // below. Either half alone counts as "recording" (ruling 8).
+        let capture = self.live_in_hub.end_capture();
+        let writer = self.writer.take();
+        if writer.is_none() && capture.is_none() {
+            return Err("not recording".to_string());
+        }
         // Drop the input stream FIRST so the ring producers close and the
         // writer can drain to empty.
         self.input = None;
-        // Release the pin (Task 6 [I2]) — recording is over, so its
-        // generation no longer needs exemption from the plain window.
-        self.gen_maps.unpin();
-        let clips = writer.finish(Duration::from_secs(15))?;
+        // A writer failure (disk full, a WAV header that would not close,
+        // the 15 s drain timeout) is reported, but only after everything it
+        // does NOT own has been salvaged. It used to return early, which
+        // took two things with it that never depended on the writer: the
+        // MIDI take, which is pure in-memory data already lifted out of the
+        // hub above, and the stop itself — `shared.recording` stayed true
+        // and the transport-state commit never ran, leaving the UI claiming
+        // a take was still running.
+        let (clips, writer_err) = match writer {
+            Some(w) => {
+                // Release the pin (Task 6 [I2]) — recording is over, so its
+                // generation no longer needs exemption from the plain
+                // window. Only the audio half ever pinned one.
+                self.gen_maps.unpin();
+                match w.finish(Duration::from_secs(15)) {
+                    Ok(clips) => (clips, None),
+                    Err(e) => {
+                        log::error!("stop_recording: the take's audio was lost: {e}");
+                        (Vec::new(), Some(e))
+                    }
+                }
+            }
+            None => (Vec::new(), None),
+        };
 
         self.shared.recording.store(false, Relaxed);
         self.shared.playing.store(false, Relaxed);
@@ -1486,7 +1853,47 @@ impl Control {
         // and saved unconditionally, even for zero clips; this is an
         // intentional narrowing (a commit that materially changes nothing
         // now does nothing), not an oversight.
-        if let Err(e) = self.commit_recording_finalize(&clips) {
+        // Prepare-outside: all the unbounded work for the MIDI half — the
+        // TempoMap build, the sample→tick conversion, the note pairing —
+        // happens HERE, before any commit, so the transaction stays a short
+        // apply. The session lock is held only for the reads.
+        let midi_clip = capture.and_then(|c| {
+            let session = self.session.lock(); // read-only: validate the target + read tempo/ppq/take number
+            // The target track can be deleted (or turned into an audio
+            // track) mid-take: validate BEFORE building the op, so the
+            // transaction can never fail on it and take the audio clips
+            // down with it. `transact` closures must not panic and must
+            // validate before mutating.
+            //
+            // This closes the mid-take window, not a concurrent one: the
+            // lock drops before `take_clip` and is re-taken inside the
+            // transaction, so a `remove_track` landing in between still
+            // registers a clip on a dead track. `ClipAdd` has the same
+            // exposure, and closing it means holding the session lock
+            // across the commit — a different, bigger change.
+            if !session.store.tracks.iter().any(|t| t.id.as_str() == c.track_id && t.kind == "midi") {
+                log::warn!("stop_recording: midi take dropped — track {} is gone", c.track_id);
+                return None;
+            }
+            let map = match crate::midi::tempo::TempoMap::new(
+                session.midi.ppq,
+                session.midi.tempo_events.clone(),
+                self.shared.sample_rate.load(Relaxed),
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("stop_recording: midi take dropped — tempo map: {e}");
+                    return None;
+                }
+            };
+            let name = format!("MIDI Take {}", session.midi.clips.len() + 1);
+            drop(session);
+            // `None` when nothing was played: an empty clip on the timeline
+            // would be worse than no take at all.
+            crate::midi::capture::take_clip(&c, &name, &map)
+        });
+
+        if let Err(e) = self.commit_recording_finalize(&clips, midi_clip.as_ref()) {
             log::warn!("stop_recording: finalize commit failed: {e}");
         }
         // Own, transient commit — same reasoning as `commit_auto_stop`/
@@ -1505,15 +1912,26 @@ impl Control {
                 "trackIds": track_ids,
                 "xruns": self.shared.xruns.load(Relaxed),
                 "clips": clips,
+                "midiClipId": midi_clip.as_ref().map(|c| c.id.to_string()),
             }),
         );
-        Ok(clips)
+        match writer_err {
+            Some(e) => Err(e),
+            None => Ok(clips),
+        }
     }
 
     /// The ONE non-transient `Actor::Engine` tx `stop_recording` submits to
     /// register the take's clips — split out so it's independently testable
     /// without a live input stream/disk writer (`clips` is exactly what
     /// `writer.finish` returned; this fn does no I/O of its own).
+    ///
+    /// Ruling 6, one take = one transaction: the audio `ClipAdd`s and the
+    /// MIDI `MidiClipAdd` ride HERE together, so a take is one undo entry —
+    /// undoing it removes the whole take, never half of it.
+    /// `TransportState` still rides its own transient commit (below).
+    /// `midi_clip` is prepared outside, already validated against the store;
+    /// this closure only applies it, and can therefore never panic on it.
     /// `emit_project_changed: true` — unlike the transient sites,
     /// registering new clips IS a document edit (mirrors the `set_track_
     /// instrument` precedent: routing a previously-raw write through
@@ -1532,7 +1950,11 @@ impl Control {
     /// ever un-registers clips; the state mirror is a separate, transient
     /// fact that was never meant to be undo-tracked in the first place
     /// (same reasoning as every other transport-family commit — Task 12).
-    fn commit_recording_finalize(&mut self, clips: &[Clip]) -> Result<Committed, String> {
+    fn commit_recording_finalize(
+        &mut self,
+        clips: &[Clip],
+        midi_clip: Option<&crate::midi::types::MidiClip>,
+    ) -> Result<Committed, String> {
         let committer = self.committer.clone();
         committer.commit_with_rebuild(
             op::TxMeta::engine("stop recording"),
@@ -1540,6 +1962,10 @@ impl Control {
                 for clip in clips {
                     let idx = tx.store().clips.len();
                     tx.apply(op::Op::ClipAdd { clip: clip.clone(), index: idx })?;
+                }
+                if let Some(mc) = midi_clip {
+                    let index = tx.midi().clips.len();
+                    tx.apply(op::Op::MidiClipAdd { clip: mc.clone(), index })?;
                 }
                 Ok(())
             },
@@ -1593,6 +2019,49 @@ impl Control {
         f()?;
         Ok(())
     }
+}
+
+/// Split a record request into the audio tracks that get a WAV writer and
+/// the (at most one) MIDI track that gets a captured take. Pure, so the
+/// whole policy is testable without a device, a project or a writer.
+///
+/// * explicit `requested` ids are validated against the store, and
+///   `kind: "midi"` ids are dropped from the AUDIO set (ruling 7) — they are
+///   recorded as MIDI when they are the routing target, never as a WAV;
+/// * `None` means "the armed tracks", audio ones only;
+/// * `midi_target` is the MIDI-in routing target, kept only when it still
+///   names an existing `kind: "midi"` track — the take is what makes the
+///   routing target a record target, so an audio track routed for
+///   monitoring never becomes a MIDI take;
+/// * an empty result on BOTH halves is the "no armed tracks to record"
+///   error, unchanged in wording (ruling 8: either half alone is a take).
+///   The wording is the plan's and is kept, but it is wrong for one caller:
+///   an explicit `requested` list naming only MIDI tracks with no routing
+///   target set is reported as "no armed tracks" although nothing was armed
+///   or unarmed. Reachable from MCP's `record_take`; wants its own branch.
+fn split_record_targets(
+    store: &Store,
+    requested: Option<Vec<String>>,
+    midi_target: Option<String>,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let is_midi =
+        |id: &str| store.tracks.iter().any(|t| t.id.as_str() == id && t.kind == "midi");
+    let audio: Vec<String> = match requested {
+        Some(ids) => {
+            for id in &ids {
+                if !store.tracks.iter().any(|t| &t.id == id) {
+                    return Err(format!("unknown track: {id}"));
+                }
+            }
+            ids.into_iter().filter(|id| !is_midi(id)).collect()
+        }
+        None => store.armed_track_ids().into_iter().filter(|id| !is_midi(id)).collect(),
+    };
+    let midi = midi_target.filter(|id| is_midi(id));
+    if audio.is_empty() && midi.is_none() {
+        return Err("no armed tracks to record".to_string());
+    }
+    Ok((audio, midi))
 }
 
 /// Decode a WAV file to interleaved f32 (int formats normalized to ±1.0).
@@ -1652,6 +2121,11 @@ mod tests {
         let (retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(64);
         let (evt_tx, evt_rx) = rtrb::RingBuffer::new(64);
+        // A hub per callback, wired exactly as `open_output` wires the real
+        // one, so no engine test depends on (or perturbs) the global hub.
+        let (live_in_tx, live_in_rx) = rtrb::RingBuffer::new(LIVE_IN_RING_SLOTS);
+        let live_in_hub = Arc::new(MidiInHub::new());
+        live_in_hub.install_producer(live_in_tx);
         (
             OutputCb {
                 graph_rx,
@@ -1664,6 +2138,15 @@ mod tests {
                 rate: 48_000,
                 next_pos: u64::MAX,
                 was_playing: false,
+                live_in_rx,
+                live_in_buf: [LiveMidiEvent::all_off(); LIVE_IN_BUF_SLOTS],
+                live_in_hub,
+                live_in_slot: None,
+                live_in_all_off: false,
+                live_in_held: [false; 128],
+                live_in_release_slot: None,
+                live_in_release_left: 0,
+                live_in_hold_left: 0,
             },
             evt_rx,
             (graph_tx, retire_rx, meter_rx),
@@ -1818,6 +2301,399 @@ mod tests {
         );
     }
 
+    // ---- hardware MIDI-in through the real callback (slice 2, Task 10) ----
+
+    /// A one-track live graph whose node is a REAL `PolySynth`, so what the
+    /// assertions measure is real audio rather than a recording double.
+    fn polysynth_graph(slot: usize, generation: u64, events: Vec<crate::midi::schedule::AbsNoteEvent>) -> RtGraph {
+        let mut synth = crate::midi::synth::PolySynth::new();
+        crate::audio::dsp::AudioProcessor::prepare(&mut synth, 48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let cell = crate::audio::rt::LiveNodeCell::new(Box::new(synth));
+        RtGraph::new(
+            vec![RtTrack {
+                slot,
+                clips: Vec::new(),
+                live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(events) }),
+            }],
+            generation,
+            Arc::new(ParamTable::with_slots(slot + 1)),
+        )
+    }
+
+    fn peak(out: &[f32]) -> f32 {
+        out.iter().fold(0.0f32, |m, s| m.max(s.abs()))
+    }
+
+    /// A two-track live graph, both slots a real `PolySynth`.
+    fn polysynth_graph_pair(
+        generation: u64,
+        events0: Vec<crate::midi::schedule::AbsNoteEvent>,
+    ) -> RtGraph {
+        let mut events0 = Some(events0);
+        let mut track = |slot: usize| {
+            let mut synth = crate::midi::synth::PolySynth::new();
+            crate::audio::dsp::AudioProcessor::prepare(&mut synth, 48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+            RtTrack {
+                slot,
+                clips: Vec::new(),
+                live: Some(crate::audio::rt::LiveSource {
+                    node: crate::audio::rt::LiveNodeCell::new(Box::new(synth)),
+                    events: Arc::new(events0.take().unwrap_or_default()),
+                }),
+            }
+        };
+        RtGraph::new(vec![track(0), track(1)], generation, Arc::new(ParamTable::with_slots(2)))
+    }
+
+    /// Select a routing target and resolve it, the way the control thread's
+    /// tick does — `t-1` is slot 0, `t-2` is slot 1, `None` clears.
+    fn retarget(cb: &OutputCb, track_id: Option<&str>) {
+        let tables = crate::audio::rt::GraphTables::empty();
+        tables.lock().slots.insert("t-1".into(), 0);
+        tables.lock().slots.insert("t-2".into(), 1);
+        cb.live_in_hub.set_target_track(track_id.map(|s| s.to_string()));
+        cb.live_in_hub.refresh_target(1, &tables);
+    }
+
+    fn target_slot_0(cb: &OutputCb, track_id: &str) {
+        retarget(cb, Some(track_id));
+    }
+
+    /// Monitoring must work with the transport STOPPED — that is the normal
+    /// state when someone plugs in a keyboard and plays.
+    #[test]
+    fn live_in_notes_are_audible_while_the_transport_is_stopped() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        // Pushed exactly as the midir callback thread pushes it.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out); // adopts the graph, drains the ring
+        assert!(peak(&out) > 0.02, "stopped-transport monitoring is audible");
+        assert_eq!(shared.position.load(Relaxed), 0, "monitoring never advances the transport");
+
+        // The voice is HELD by the callback's own node across blocks, and a
+        // note-off from the ring releases it — proof the events reach the
+        // graph's node and not a per-block copy of one.
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "the held voice keeps sounding");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_off(69)));
+        for _ in 0..12 {
+            cb.render(&mut out); // past PolySynth's ~80 ms release
+        }
+        assert_eq!(peak(&out), 0.0, "the note-off released the voice");
+    }
+
+    /// The same routing while PLAYING goes through the full mixer path, and
+    /// the transport still advances exactly as it did before this task.
+    #[test]
+    fn live_in_notes_are_audible_while_playing_and_the_transport_still_advances() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "routed note is audible while playing");
+        assert_eq!(shared.position.load(Relaxed), 512, "playback still advances");
+    }
+
+    /// The drain is bounded per block and the ring drops rather than blocks —
+    /// the two properties that keep the callback inside its deadline when the
+    /// producer outruns it.
+    #[test]
+    fn live_in_drain_is_bounded_and_overflow_is_counted() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, _peers) = output_cb(shared.clone());
+        for i in 0..(LIVE_IN_RING_SLOTS + 50) {
+            cb.live_in_hub.push(LiveMidiEvent::note_on((i % 128) as u8, 100));
+        }
+        assert_eq!(
+            cb.live_in_hub.dropped(),
+            50,
+            "a full ring drops rather than blocks"
+        );
+
+        let mut out = vec![0.0f32; 128 * 2];
+        cb.render(&mut out);
+        assert_eq!(
+            cb.live_in_rx.slots(),
+            LIVE_IN_RING_SLOTS - MAX_LIVE_IN_PER_BLOCK,
+            "one block takes at most MAX_LIVE_IN_PER_BLOCK events"
+        );
+    }
+
+    /// With nothing routed, a stopped transport renders silence — including
+    /// the target track's own SCHEDULED notes, which must never sound from a
+    /// parked playhead.
+    #[test]
+    fn without_a_target_a_stopped_transport_still_renders_silence() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _r, _m)) = output_cb(shared.clone());
+        let scheduled = vec![crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100 }];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        let mut out = vec![1.0f32; 128 * 2];
+        cb.render(&mut out);
+        assert_eq!(peak(&out), 0.0);
+    }
+
+    /// Fix round 1, Critical 1. Rendering the armed track while STOPPED
+    /// removed the thing that used to silence it — the stopped branch was
+    /// `out.fill(0.0)`. A clip note whose note-off is still ahead on the
+    /// timeline is HELD in the node when the user presses Stop, and the
+    /// graph's own release only fires at the next play start, so without an
+    /// explicit release the note drones for as long as the track stays
+    /// armed.
+    #[test]
+    fn stopping_mid_note_releases_the_armed_track_instead_of_droning() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "the clip note is sounding when Stop is pressed");
+
+        shared.playing.store(false, Relaxed);
+        for _ in 0..20 {
+            cb.render(&mut out); // ~213 ms, well past PolySynth's release
+        }
+        assert_eq!(peak(&out), 0.0, "stopping released the note");
+    }
+
+    /// Fix round 2, Important 1. Monitoring shares the node that plays the
+    /// clips, so a node-wide release cannot tell a monitored voice from a
+    /// clip voice. Arming mid-playback is the feature's primary gesture —
+    /// play the song, arm the track, jam along — and it must not cut the
+    /// note the song is in the middle of. The note-on has already happened,
+    /// so a cut one is gone until the clip's next note.
+    #[test]
+    fn arming_mid_playback_leaves_the_clip_note_that_is_already_sounding_alone() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        let sounding = peak(&out);
+        assert!(sounding > 0.02, "the clip note is sounding before the arm");
+
+        target_slot_0(&cb, "t-1");
+        // Well past the release the blanket all-off would have started: a cut
+        // note is all the way down by now, a held one has not moved at all.
+        for _ in 0..12 {
+            cb.render(&mut out);
+            assert!(
+                peak(&out) > sounding * 0.9,
+                "arming cut the sounding clip note: {} was {}",
+                peak(&out),
+                sounding
+            );
+        }
+        // …and monitoring is live on the same node, in the same breath.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        cb.render(&mut out);
+        assert!(peak(&out) > sounding, "the monitored note plays on top of the clip");
+    }
+
+    /// The mirror image, same mechanism: taking the target AWAY from a track
+    /// whose clip is sounding must release only what MONITORING put down.
+    #[test]
+    fn switching_target_mid_playback_leaves_the_clip_note_alone() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, scheduled)))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        let sounding = peak(&out);
+        assert!(sounding > 0.02);
+
+        retarget(&cb, Some("t-2"));
+        for _ in 0..12 {
+            cb.render(&mut out);
+            assert!(
+                peak(&out) > sounding * 0.9,
+                "the switch cut t-1's clip note: {} was {}",
+                peak(&out),
+                sounding
+            );
+        }
+    }
+
+    /// Fix round 2, Important 2. Everything that asks the hub to release
+    /// monitoring — the monitor toggle's falling edge, a port change, a
+    /// port close — pushes one `all_off` onto the ring. Passed through to
+    /// the node it would cut the clip note too, which is why the callback
+    /// expands it into note-offs for the keys MONITORING put down.
+    #[test]
+    fn a_release_request_from_the_port_stops_monitoring_without_cutting_the_clip() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        let clip_only = peak(&out);
+        assert!(clip_only > 0.02);
+
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        cb.render(&mut out);
+        let both = peak(&out);
+        assert!(both > clip_only * 1.2, "the monitored key is audible on top");
+
+        assert!(cb.live_in_hub.push(LiveMidiEvent::all_off()));
+        for _ in 0..12 {
+            cb.render(&mut out);
+        }
+        let after = peak(&out);
+        assert!(after < both * 0.9, "monitoring was released");
+        assert!(
+            after > clip_only * 0.9,
+            "…and the clip note was not: {after} (clip alone was {clip_only})"
+        );
+    }
+
+    /// The other half of Critical 1: a track that was NOT the target when
+    /// the transport stopped got no release at all (nothing renders it, so
+    /// nothing can deliver one). Arming it afterwards starts monitoring a
+    /// node that is still holding the clip note from the last playthrough.
+    #[test]
+    fn arming_a_track_that_was_left_holding_a_clip_note_does_not_start_it_droning() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        let scheduled = vec![
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+        ];
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "the clip note is sounding");
+        shared.playing.store(false, Relaxed);
+        cb.render(&mut out);
+
+        target_slot_0(&cb, "t-1");
+        for _ in 0..12 {
+            cb.render(&mut out);
+        }
+        assert_eq!(peak(&out), 0.0, "arming released the leftover voice");
+    }
+
+    /// Fix round 1, Critical 2. `set_target_track` pushes an all-off for the
+    /// OUTGOING node, but the ring carries no slot: by the time the callback
+    /// drains it, `target_slot()` already names the new target — and when
+    /// there is none, the whole block is discarded. The held voice survives
+    /// in the node, silent, and comes back the instant the track is armed
+    /// again.
+    #[test]
+    fn disarming_releases_the_held_note_so_re_arming_cannot_resurrect_it() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "the held key is sounding");
+
+        // Disarm — no note-off was ever played, the key is still down.
+        retarget(&cb, None);
+        for _ in 0..20 {
+            cb.render(&mut out);
+        }
+
+        retarget(&cb, Some("t-1"));
+        cb.render(&mut out);
+        assert_eq!(peak(&out), 0.0, "re-arming must not resurrect the old voice");
+    }
+
+    /// Same root cause, switch variant: a fix that only handled
+    /// `Some -> None` would leave this one open, because the all-off lands
+    /// on the INCOMING node while the outgoing one keeps holding the key.
+    /// Inaudible while t-2 is armed (only the target slot renders), which is
+    /// exactly what makes it a trap.
+    #[test]
+    fn switching_target_releases_the_track_that_was_holding_the_key() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "t-1 is sounding");
+
+        retarget(&cb, Some("t-2"));
+        for _ in 0..20 {
+            cb.render(&mut out);
+        }
+        assert_eq!(peak(&out), 0.0, "t-1's held key does not sound through t-2");
+
+        // The release window must EXPIRE — a countdown that never cleared
+        // would leave the outgoing node holding the live-in channel and kill
+        // monitoring for good.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "the new target monitors once the release is done");
+
+        // Let t-2 go quiet, so from here on ANY sound can only be t-1's.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_off(72)));
+        for _ in 0..12 {
+            cb.render(&mut out);
+        }
+        assert_eq!(peak(&out), 0.0, "t-2 is quiet again");
+
+        // Re-arm t-1 and watch EVERY block, not just the last: a voice that
+        // was left frozen mid-release surfaces as a decaying fragment on the
+        // first block that renders slot 0, whenever that lands.
+        retarget(&cb, Some("t-1"));
+        let mut loudest = 0.0f32;
+        for _ in 0..16 {
+            cb.render(&mut out);
+            loudest = loudest.max(peak(&out));
+        }
+        assert_eq!(loudest, 0.0, "t-1's voice was released when it lost the target");
+    }
+
     fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
@@ -1891,6 +2767,10 @@ mod tests {
             ensure_project_fn: None,
             param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
             param_writes: Vec::new(),
+            // Its OWN hub, never the process-global one: these tests would
+            // otherwise race every other test that selects a routing target.
+            live_in_hub: Arc::new(MidiInHub::new()),
+            live_in_target: None,
         };
         (ctl, session, tx)
     }
@@ -2010,6 +2890,80 @@ mod tests {
         assert!(ctl.param_writes.is_empty(), "…but a stopped transport drives nothing");
     }
 
+    /// Both live-in call sites `run` owns, in one iteration. Selecting the
+    /// routing target is app config (ruling 1): it commits nothing, so NO
+    /// `EngineEffect::rebuild` fires — yet a clip-less midi track only gets a
+    /// live node when a rebuild runs with the target already known. The tick
+    /// therefore has to notice the change itself, rebuild, and only then
+    /// resolve the slot the callback reads.
+    ///
+    /// `Subscribe` is the message that drives the iteration precisely because
+    /// handling it rebuilds nothing — the generation bump can only come from
+    /// the target change.
+    #[test]
+    fn run_rebuilds_and_resolves_the_live_in_target_when_it_changes() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            s.store.tracks.push(t);
+        }
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+        let sink = CountingSink(Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(Vec::new())));
+        tx.send(ControlMsg::Subscribe(Box::new(sink))).unwrap();
+        drop(tx);
+        ctl.run();
+
+        assert_eq!(ctl.generation, 1, "the target change scheduled a rebuild");
+        assert_eq!(ctl.live_in_hub.target_slot(), Some(0), "the tick resolved the slot");
+    }
+
+    /// The whole point of the feature, at the seam where it was invisible:
+    /// arming an EMPTY midi track has to put a live node in the next
+    /// published graph. Nothing else does — the track has no clips, so
+    /// `append_from`'s clip-driven loop skips it, and only the target
+    /// argument `rebuild` passes makes `append_from_with_input` add it.
+    ///
+    /// Needs the NON-headless half of `rebuild`, which is why `OutputBundle`
+    /// holds an `Option<cpal::Stream>`: everything else about the branch is
+    /// real (real slots, real registry, real graph publish over the real
+    /// ring), only the device is absent.
+    #[test]
+    fn arming_an_empty_midi_track_publishes_a_graph_with_a_live_node_for_it() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            s.store.tracks.push(t);
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+        tx.send(ControlMsg::Subscribe(Box::new(CountingSink(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ))))
+        .unwrap();
+        drop(tx);
+        ctl.run();
+
+        let graph = graph_rx.pop().expect("the tick published a graph").into_box();
+        // A midi track also gets a clips-only `RtTrack` at the same slot from
+        // the assembly loop above `append_from_with_input`, so this asks for
+        // the LIVE one specifically rather than the first row for the slot.
+        assert!(
+            graph.tracks.iter().any(|t| t.slot == 0 && t.live.is_some()),
+            "an armed empty midi track has a node to play"
+        );
+    }
+
     /// Track D: the gain-ramp half of the same attach. `rebuild` builds no
     /// graph headlessly (no cpal stream is constructible in-process), so the
     /// compile step is exercised exactly as `rebuild` calls it — with the
@@ -2085,7 +3039,7 @@ mod tests {
             crate::audio::types::testutil::test_clip("c-2", "t-1"),
         ];
 
-        let clip_committed = ctl.commit_recording_finalize(&clips).unwrap();
+        let clip_committed = ctl.commit_recording_finalize(&clips, None).unwrap();
         assert!(
             matches!(clip_committed.meta.actor, crate::control::op::Actor::Engine),
             "got {:?}",
@@ -2721,5 +3675,498 @@ mod tests {
 
         handle.send(ControlMsg::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the release window, and the reason it must stay
+    /// short while playing: the outgoing node holds the LIVE-IN CHANNEL,
+    /// and every event popped while it does is discarded outright, never
+    /// re-delivered. Stretching that hold to the envelope's length would
+    /// swallow ~80 ms of keystrokes on the incoming target — during "play
+    /// the song, arm a track, jam with it", which is the gesture the
+    /// feature exists for.
+    #[test]
+    fn a_key_struck_just_after_a_switch_while_playing_is_not_swallowed() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert_eq!(peak(&out), 0.0, "nothing is sounding yet");
+
+        retarget(&cb, Some("t-2"));
+        cb.render(&mut out);
+        cb.render(&mut out);
+
+        // Two blocks (~21 ms) after the switch — well inside an
+        // envelope-length hold, well outside a one-block one.
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        let mut best = 0.0f32;
+        for _ in 0..20 {
+            cb.render(&mut out);
+            best = best.max(peak(&out));
+        }
+        assert!(best > 0.02, "the key was swallowed by the release window: {best}");
+    }
+
+    /// The stop edge re-opens the hold for a release still in flight — and
+    /// only then. A release that already finished during playback must not
+    /// hand its node the channel again at the next stop, or every stop after
+    /// a target switch would deafen the current target for ~80 ms.
+    #[test]
+    fn a_release_finished_while_playing_does_not_re_open_at_the_next_stop() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "t-1 is sounding");
+
+        // Switch, then keep PLAYING well past the envelope: the graph
+        // renders t-1 every block, so its release finishes here.
+        retarget(&cb, Some("t-2"));
+        for _ in 0..24 {
+            cb.render(&mut out);
+        }
+        shared.playing.store(false, Relaxed);
+        cb.render(&mut out);
+
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(72, 110)));
+        let mut best = 0.0f32;
+        for _ in 0..20 {
+            cb.render(&mut out);
+            best = best.max(peak(&out));
+        }
+        assert!(best > 0.02, "the stop re-opened a window that had nothing left to release: {best}");
+    }
+
+    /// Task 10's leftover Minor A. Holding the live-in channel for one
+    /// block while playing rests on "a playing graph renders every live node
+    /// every block anyway". It does — until the transport stops. Stop before
+    /// the outgoing node's envelope has finished and nothing renders it
+    /// again, so it freezes mid-release and serves the fragment back on its
+    /// next arm. The stop edge hands it the channel for whatever release it
+    /// still has left, which is why the release is tracked separately from
+    /// the hold.
+    #[test]
+    fn stopping_right_after_a_target_switch_still_finishes_the_outgoing_release() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "t-1 is sounding");
+
+        // Switch while playing, then stop one block later — inside the
+        // release window either way, but past the end of the one-block one.
+        retarget(&cb, Some("t-2"));
+        cb.render(&mut out);
+        shared.playing.store(false, Relaxed);
+        for _ in 0..20 {
+            cb.render(&mut out);
+        }
+
+        // Scanned block by block: t-1 is not rendered at all until t-2's own
+        // release window expires, so a single block after the re-arm would
+        // pass vacuously.
+        retarget(&cb, Some("t-1"));
+        let mut worst = 0.0f32;
+        for _ in 0..40 {
+            cb.render(&mut out);
+            worst = worst.max(peak(&out));
+        }
+        assert_eq!(worst, 0.0, "t-1 replayed a frozen release fragment on re-arm");
+    }
+
+    // -- Task 11: the take ------------------------------------------------
+
+    fn midi_track(id: &str) -> crate::audio::types::TrackState {
+        let mut t = crate::audio::types::testutil::test_track(id);
+        t.kind = "midi".into();
+        t
+    }
+
+    fn take_map() -> crate::midi::tempo::TempoMap {
+        crate::midi::tempo::TempoMap::new(
+            crate::midi::types::DEFAULT_PPQ,
+            vec![crate::midi::types::TempoEvent { tick: 0, bpm: 120.0 }],
+            48_000,
+        )
+        .unwrap()
+    }
+
+    /// A one-note take on `track`, built through the same
+    /// `midi::capture::take_clip` the engine uses.
+    fn take_clip_for(track: &str) -> crate::midi::types::MidiClip {
+        let capture = crate::audio::midi_in::Capture {
+            track_id: track.to_string(),
+            start_sample: 0,
+            end_sample: 48_000,
+            events: vec![
+                crate::audio::midi_in::CapturedEvent { sample: 0, on: true, key: 60, velocity: 100 },
+                crate::audio::midi_in::CapturedEvent { sample: 24_000, on: false, key: 60, velocity: 0 },
+            ],
+        };
+        crate::midi::capture::take_clip(&capture, "MIDI Take 1", &take_map())
+            .expect("a note was played")
+    }
+
+    #[test]
+    fn split_record_targets_keeps_audio_and_midi_apart() {
+        let mut store = Store::default();
+        store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        store.tracks.push(midi_track("m-1"));
+        store.tracks[0].armed = true;
+        store.tracks[1].armed = true;
+
+        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into())).unwrap();
+        assert_eq!(audio, vec!["a-1".to_string()], "an armed midi track is not a WAV target");
+        assert_eq!(midi.as_deref(), Some("m-1"));
+
+        let (audio, midi) =
+            split_record_targets(&store, Some(vec!["m-1".into()]), Some("m-1".into())).unwrap();
+        assert!(audio.is_empty(), "midi tracks never record audio, got {audio:?}");
+        assert_eq!(midi.as_deref(), Some("m-1"));
+
+        let (audio, midi) =
+            split_record_targets(&store, Some(vec!["a-1".into(), "m-1".into()]), Some("m-1".into()))
+                .unwrap();
+        assert_eq!(audio, vec!["a-1".to_string()]);
+        assert_eq!(midi.as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn split_record_targets_allows_a_midi_only_take() {
+        let mut store = Store::default();
+        store.tracks.push(midi_track("m-1"));
+        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into())).unwrap();
+        assert!(audio.is_empty());
+        assert_eq!(midi.as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn split_record_targets_errors_when_nothing_is_recordable() {
+        let store = Store::default();
+        let err = split_record_targets(&store, None, None).unwrap_err();
+        assert!(err.contains("no armed tracks"), "got {err}");
+
+        let mut store2 = Store::default();
+        store2.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        assert!(
+            split_record_targets(&store2, None, Some("a-1".into())).is_err(),
+            "an audio track as routing target is not a midi take"
+        );
+        assert!(
+            split_record_targets(&store2, None, Some("ghost".into())).is_err(),
+            "a routing target that no longer exists is not a midi take"
+        );
+    }
+
+    #[test]
+    fn split_record_targets_rejects_an_unknown_explicit_track() {
+        let store = Store::default();
+        let err = split_record_targets(&store, Some(vec!["ghost".into()]), None).unwrap_err();
+        assert!(err.contains("unknown track"), "got {err}");
+    }
+
+    /// The take is ONE `Actor::Engine`, NON-transient transaction (ruling 6) —
+    /// §4.4's "the op is the registration, never the recording itself" for MIDI.
+    #[test]
+    fn midi_take_registers_as_one_engine_transaction() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        let clip = take_clip_for("m-1");
+        let gen_before = ctl.generation;
+
+        let committed = ctl.commit_recording_finalize(&[], Some(&clip)).unwrap();
+        assert!(
+            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            "got {:?}",
+            committed.meta.actor
+        );
+        assert!(!committed.meta.transient, "a take is a real document edit");
+        assert_eq!(committed.ops.len(), 1, "got {:?}", committed.ops);
+        assert!(matches!(&committed.ops[0], crate::control::op::Op::MidiClipAdd { .. }));
+        assert!(committed.effect.persist.midi, "MidiClipAdd persists the midi store");
+        assert_eq!(session.lock().midi.clips.len(), 1);
+        assert_eq!(ctl.generation, gen_before + 1, "exactly one rebuild");
+    }
+
+    #[test]
+    fn an_audio_and_a_midi_take_land_in_the_same_transaction() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(crate::audio::types::testutil::test_track("t-1"));
+        session.lock().store.tracks.push(midi_track("m-1"));
+        let clip = take_clip_for("m-1");
+        let committed = ctl
+            .commit_recording_finalize(
+                &[crate::audio::types::testutil::test_clip("c-1", "t-1")],
+                Some(&clip),
+            )
+            .unwrap();
+        assert_eq!(committed.ops.len(), 2, "one take, one transaction, one undo entry");
+        assert!(matches!(&committed.ops[0], crate::control::op::Op::ClipAdd { .. }));
+        assert!(matches!(&committed.ops[1], crate::control::op::Op::MidiClipAdd { .. }));
+    }
+
+    #[test]
+    fn finalize_without_a_midi_clip_is_unchanged() {
+        let (mut ctl, _session) = bare_control();
+        let clips = vec![crate::audio::types::testutil::test_clip("c-1", "t-1")];
+        let committed = ctl.commit_recording_finalize(&clips, None).unwrap();
+        assert!(
+            committed
+                .ops
+                .iter()
+                .all(|op| matches!(op, crate::control::op::Op::ClipAdd { .. })),
+            "got {:?}",
+            committed.ops
+        );
+    }
+
+    #[test]
+    fn stop_recording_with_neither_writer_nor_capture_still_errors() {
+        let (mut ctl, _session) = bare_control();
+        assert_eq!(ctl.stop_recording().unwrap_err(), "not recording");
+    }
+
+    /// The whole MIDI-only take, end to end through `stop_recording`: no
+    /// input device, no WAV writer, no disk — the capture buffer is the only
+    /// source, and the tick math goes through the same `TempoMap` playback
+    /// schedules from.
+    #[test]
+    fn a_midi_only_take_lands_a_clip_through_stop_recording() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+
+        ctl.shared.position.store(24_000, Relaxed);
+        ctl.live_in_hub.begin_capture("m-1".into(), 24_000);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+        ctl.shared.position.store(48_000, Relaxed);
+        ctl.live_in_hub.capture_event(false, 60, 0);
+        ctl.shared.position.store(72_000, Relaxed);
+        let undo_before = ctl.committer.log().depths().0;
+
+        let clips = ctl.stop_recording().expect("a capture alone is a recording");
+        assert_eq!(
+            ctl.committer.log().depths().0,
+            undo_before + 1,
+            "ruling 6: one take is ONE undo entry — the take must not be split \
+             across transactions, and the transient transport-state commit must \
+             not become one"
+        );
+        assert!(clips.is_empty(), "no audio target, no audio clips");
+        let midi = session.lock().midi.clips.clone();
+        assert_eq!(midi.len(), 1, "the take registered exactly one clip");
+        assert_eq!(midi[0].track_id.as_str(), "m-1");
+        assert_eq!(
+            midi[0].timeline_start_ticks, 960,
+            "placed where the take started, in ticks (one beat @120bpm/48k)"
+        );
+        assert_eq!(midi[0].notes.len(), 1);
+        assert_eq!(midi[0].notes[0].key, 60);
+        assert_eq!(midi[0].notes[0].tick, 0, "the note is relative to the clip start");
+        assert_eq!(midi[0].notes[0].length_ticks, 960, "one beat held");
+        assert!(!ctl.live_in_hub.capturing(), "stop disarms the capture");
+    }
+
+    /// Ruling 6 at the level that can actually break it: `stop_recording`
+    /// must hand BOTH halves to the SAME `commit_recording_finalize` call.
+    /// A midi-only take cannot tell the difference (there is no audio clip
+    /// to be separated from), so this drives a real disk writer — no audio
+    /// is ever pushed, the ring is abandoned immediately, and the writer
+    /// still returns one zero-length clip, which is all this needs.
+    #[test]
+    fn an_audio_and_a_midi_take_stop_into_one_undo_entry() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        session.lock().store.tracks.push(midi_track("m-1"));
+
+        let dir = std::env::temp_dir()
+            .join(format!("aura-take-tx-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        drop(producer);
+        let spec = recorder::RecSpec {
+            track_id: "a-1".into(),
+            clip_id: uuid::Uuid::new_v4().to_string(),
+            source_id: crate::ids::SourceId::mint(),
+            take_name: "Take 1".into(),
+            wav_path: dir.join("audio/take.wav"),
+            rel_path: "audio/take.wav".into(),
+            cache_dir: dir.join("cache"),
+            start_pos: 0,
+        };
+        ctl.writer = Some(recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap());
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+
+        let undo_before = ctl.committer.log().depths().0;
+        let clips = ctl.stop_recording().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(clips.len(), 1, "the audio half produced its clip");
+        assert_eq!(session.lock().store.clips.len(), 1);
+        assert_eq!(session.lock().midi.clips.len(), 1, "the midi half produced its clip");
+        assert_eq!(
+            ctl.committer.log().depths().0,
+            undo_before + 1,
+            "ruling 6: one take is ONE undo entry — undoing it must never leave \
+             half the take on the timeline"
+        );
+    }
+
+    /// The MIDI take is pure in-memory data lifted out of the hub before
+    /// the writer is ever touched, so a disk failure has no claim on it —
+    /// nor on the stop itself, which used to be abandoned along with it and
+    /// left the UI showing a take that was no longer running.
+    #[test]
+    fn a_disk_writer_failure_does_not_take_the_midi_take_down_with_it() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        session.lock().store.tracks.push(midi_track("m-1"));
+        session.lock().store.transport.state = "recording".into();
+
+        let dir = std::env::temp_dir()
+            .join(format!("aura-take-fail-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A plain FILE where the writer needs a directory: `create_dir_all`
+        // fails, so the writer thread returns Err without any disk-full
+        // theatre and without depending on sandbox permissions.
+        std::fs::write(dir.join("blocker"), b"not a directory").unwrap();
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        drop(producer);
+        let spec = recorder::RecSpec {
+            track_id: "a-1".into(),
+            clip_id: uuid::Uuid::new_v4().to_string(),
+            source_id: crate::ids::SourceId::mint(),
+            take_name: "Take 1".into(),
+            wav_path: dir.join("blocker/audio/take.wav"),
+            rel_path: "audio/take.wav".into(),
+            cache_dir: dir.join("blocker/cache"),
+            start_pos: 0,
+        };
+        ctl.writer = Some(recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap());
+        ctl.shared.recording.store(true, Relaxed);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+
+        let err = ctl.stop_recording().expect_err("the audio half really did fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!err.is_empty(), "the failure is reported, not swallowed");
+
+        assert_eq!(session.lock().midi.clips.len(), 1, "the midi take survived the writer");
+        assert!(session.lock().store.clips.is_empty(), "and no audio clip was invented");
+        assert!(!ctl.shared.recording.load(Relaxed), "the take is over");
+        assert!(!ctl.shared.playing.load(Relaxed));
+        assert_eq!(
+            session.lock().store.transport.state,
+            "stopped",
+            "the transport-state commit ran, so the UI cannot stay stuck on 'recording'"
+        );
+    }
+
+    /// A take with nothing played registers NOTHING — an empty clip on the
+    /// timeline would be worse than no take at all.
+    #[test]
+    fn a_take_with_no_notes_registers_no_clip() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        let gen_before = ctl.generation;
+        ctl.stop_recording().expect("stop still succeeds");
+        assert!(session.lock().midi.clips.is_empty(), "nothing was played, nothing registers");
+        assert_eq!(ctl.generation, gen_before, "and nothing rebuilds");
+    }
+
+    /// Prepare-outside: the target track can be deleted mid-take, and the
+    /// validation happens BEFORE the op is built so the transaction can
+    /// never fail on it and take the audio clips down with it.
+    #[test]
+    fn a_take_whose_track_is_gone_is_dropped_without_losing_the_audio_clips() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+        ctl.shared.position.store(24_000, Relaxed);
+        ctl.live_in_hub.capture_event(false, 60, 0);
+        session.lock().store.tracks.clear();
+
+        ctl.stop_recording().expect("stop must not fail on a deleted target");
+        assert!(session.lock().midi.clips.is_empty(), "the take is dropped, not committed");
+    }
+
+    /// A take whose target is no longer a `kind: "midi"` track is dropped
+    /// too — `MidiClipAdd` on an audio track would be a malformed document.
+    #[test]
+    fn a_take_whose_track_became_audio_is_dropped() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+        session.lock().store.tracks[0].kind = "audio".into();
+        ctl.stop_recording().unwrap();
+        assert!(session.lock().midi.clips.is_empty());
+    }
+
+    /// The MIDI-only take through its REAL entry points: `start_recording`
+    /// opens no input device (ruling 8), arms the capture at the transport
+    /// position it started from, and reports the midi target in its reply;
+    /// `stop_recording` turns the notes played in between into the clip.
+    /// This is the only place the `begin_capture(target, start_pos)` wiring
+    /// is exercised — `stop_recording`-only tests arm the hub themselves and
+    /// would pass with that call deleted.
+    #[test]
+    fn start_recording_arms_a_midi_only_take_without_touching_a_device() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.ensure_project_fn = Some(Arc::new(|| Ok(PathBuf::from("/nonexistent"))));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.live_in_hub.set_target_track(Some("m-1".into()));
+        ctl.shared.position.store(24_000, Relaxed);
+
+        let recorded = ctl.start_recording(None).expect("a routing target alone is a take");
+        assert_eq!(recorded, vec!["m-1".to_string()], "the midi target is reported as recorded");
+        assert!(ctl.writer.is_none(), "no WAV writer for a midi-only take");
+        assert!(ctl.input.is_none(), "no input device opened");
+        assert!(ctl.live_in_hub.capturing(), "the capture is armed");
+        assert!(ctl.shared.recording.load(Relaxed) && ctl.shared.playing.load(Relaxed));
+
+        ctl.live_in_hub.capture_event(true, 64, 90);
+        ctl.shared.position.store(48_000, Relaxed);
+        ctl.live_in_hub.capture_event(false, 64, 0);
+
+        ctl.stop_recording().unwrap();
+        let midi = session.lock().midi.clips.clone();
+        assert_eq!(midi.len(), 1);
+        assert_eq!(
+            midi[0].timeline_start_ticks, 960,
+            "armed at the position the transport was at when recording started"
+        );
+        assert_eq!(midi[0].notes[0].key, 64);
+        assert_eq!(midi[0].notes[0].tick, 0);
+    }
+
+    /// A MIDI-only take opens no device, so `self.writer` stays `None` — the
+    /// "already recording" guard has to see the capture instead.
+    #[test]
+    fn start_recording_refuses_while_a_midi_capture_is_running() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        assert_eq!(ctl.start_recording(None).unwrap_err(), "already recording");
     }
 }

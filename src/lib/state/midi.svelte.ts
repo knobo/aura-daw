@@ -90,11 +90,37 @@ class MidiStore {
   }
 
   async init() {
+    this.subscribeToTakes();
     try {
       this.applySnapshot(await backend.getProjectState());
     } catch (err) {
       console.warn("[aura] midi init failed:", err);
     }
+  }
+
+  /** One subscription for the process. `init()` is ALSO the undo/redo
+   * re-pull (projectops.repull), so subscribing unguarded would add a
+   * listener per undo. */
+  private takesSubscribed = false;
+  private subscribeToTakes() {
+    if (this.takesSubscribed) return;
+    this.takesSubscribed = true;
+    backend.on("recording://state", (rs) => {
+      if (rs.recording || !rs.midiClipId) return;
+      void this.adoptTake(rs.midiClipId);
+    });
+  }
+
+  /** A MIDI take is registered by the engine's own transaction, and the
+   * `project://changed` that transaction emits carries only the
+   * audio-shaped `Project` — `clips` on `recording://state` is likewise the
+   * audio half. Nothing else pulls the take's MIDI clip in, so without this
+   * the notes the user just played stay invisible until an undo/redo or a
+   * reopen. Selecting + flashing it mirrors what a landed hum result does. */
+  private async adoptTake(clipId: string) {
+    await this.refresh();
+    this.select(clipId);
+    this.flash(clipId);
   }
 
   async refresh() {
