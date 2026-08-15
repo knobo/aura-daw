@@ -246,6 +246,11 @@ pub enum PropPath {
     /// Track: sampler-bank id or `plugin:<instanceId>`, `None` = unbound.
     /// Wire form: JSON string or `null` (not an `Option`-shaped object).
     InstrumentId,
+    /// MidiClip: display name (wire: JSON string). Trimmed on write and
+    /// rejected when empty — a nameless clip is unaddressable in the UI, and
+    /// the write side is the validation authority so the inverse observes
+    /// the post-trim value (mirroring `LengthTicks`'s clamp rule).
+    Name,
     /// Clip: timeline placement position, in samples.
     TimelineStartSamples,
     /// Clip: placement length, in samples (Plan E Task 8 — LoopJam's

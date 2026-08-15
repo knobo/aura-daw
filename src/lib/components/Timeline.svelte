@@ -402,7 +402,10 @@
 
   /** Double-click an empty span of a midi lane → create a 2-bar clip there. */
   function onLaneDblClick(track: TrackState, e: MouseEvent) {
-    if (track.kind !== "midi") return;
+    if (track.kind !== "midi") {
+      toasts.info("NOT A MIDI LANE", `"${track.name}" is an audio track — midi clips need a midi lane`);
+      return;
+    }
     if ((e.target as HTMLElement).closest(".mclip, .clip")) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const samples = view.snapSamples(Math.max(0, view.samplesAt(e.clientX - rect.left)));
@@ -470,6 +473,13 @@
       {/if}
       <div bind:this={markerEl} class="marker"></div>
     </div>
+  </div>
+
+  <!-- Own band rather than an overlay inside .lanes: the jam cluster used to
+       sit on top of the first lane. Empty (and zero-height) with no loop
+       region, and outside .body so the rail and the lanes stay row-aligned. -->
+  <div class="jamband">
+    <LoopJamPanel />
   </div>
 
   <!-- scrollable body -->
@@ -544,7 +554,6 @@
           ).toFixed(1)}px"
         ></div>
       {/if}
-      <LoopJamPanel />
       <ImportDropZone />
       <div bind:this={playheadEl} class="playhead"></div>
     </div>
@@ -789,6 +798,14 @@
         transparent 0 13px,
         rgba(96, 130, 190, 0.03) 13px 14px
       );
+  }
+
+  .jamband {
+    position: relative;
+    flex: none;
+    /* content box starts at the lane origin, so the panel's `left` stays in
+       the same coordinates it used when it lived inside .lanes */
+    padding-left: var(--rail-width);
   }
 
   .lanes {

@@ -193,6 +193,7 @@ export interface Backend {
     lengthTicks: number,
     contentLengthTicks: number | null,
   ): Promise<MidiClip>;
+  midiRenameClip(clipId: string, name: string): Promise<MidiClip>;
   midiGetClips(): Promise<MidiClip[]>;
   midiImportFile(path: string, trackId?: string | null, atTicks?: number | null): Promise<MidiClip[]>;
   midiExportFile(path: string, clipIds?: string[] | null): Promise<string>;
@@ -524,6 +525,9 @@ class TauriBackend implements Backend {
       lengthTicks,
       contentLengthTicks,
     });
+  }
+  midiRenameClip(clipId: string, name: string) {
+    return invoke<MidiClip>("midi_rename_clip", { clipId, name });
   }
   midiGetClips() {
     return invoke<MidiClip[]>("midi_get_clips");

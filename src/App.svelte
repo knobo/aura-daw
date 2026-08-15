@@ -15,7 +15,15 @@
   import { mcp } from "./lib/state/mcp.svelte";
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
   import { view } from "./lib/state/view.svelte";
-  import { resetUiZoom, ui, zoomUiIn, zoomUiOut } from "./lib/state/ui.svelte";
+  import {
+    dockTabForKey,
+    resetUiZoom,
+    toggleDock,
+    ui,
+    zoomUiIn,
+    zoomUiOut,
+  } from "./lib/state/ui.svelte";
+  import { library } from "./lib/state/library.svelte";
   import { prefs } from "./lib/prefs/prefs.svelte";
   import { applyUiZoom } from "./lib/utils/ui-zoom";
   import { exporter } from "./lib/state/exporter.svelte";
@@ -194,8 +202,14 @@
       view.zoomAt(view.width / 2, 1.33);
     } else if (e.key.toLowerCase() === "s" && !e.metaKey && !e.ctrlKey) {
       view.snap = !view.snap;
-    } else if (e.key.toLowerCase() === "g" && !e.metaKey && !e.ctrlKey) {
-      ui.dock = ui.dock === "generate" ? "" : "generate";
+    } else if (!e.metaKey && !e.ctrlKey && !e.altKey && dockTabForKey(e.key)) {
+      toggleDock(dockTabForKey(e.key)!);
+    } else if (e.key.toLowerCase() === "c" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      // The library's CLIPS root is a destination in its own right, so it
+      // gets its own key rather than "open the library, now find the tab".
+      const onClips = ui.dock === "library" && library.root === "clips";
+      library.root = "clips";
+      ui.dock = onClips ? "" : "library";
     }
   }
 </script>

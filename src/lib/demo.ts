@@ -1566,6 +1566,15 @@ export class DemoBackend implements Backend {
     return { ...clip };
   }
 
+  async midiRenameClip(clipId: string, name: string): Promise<MidiClip> {
+    const clip = this.midiClips.find((c) => c.id === clipId);
+    if (!clip) throw new Error(`unknown MIDI clip: ${clipId}`);
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("name: must not be empty");
+    clip.name = trimmed;
+    return { ...clip };
+  }
+
   async midiGetClips(): Promise<MidiClip[]> {
     return this.midiClips.map((c) => ({ ...c, notes: [...c.notes] }));
   }

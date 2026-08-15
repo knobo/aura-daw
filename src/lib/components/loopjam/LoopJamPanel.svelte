@@ -1,7 +1,8 @@
 <script lang="ts">
   /**
-   * Loop-jam "EVOLVE" cluster — floats just under the ruler at the loop
-   * region's left edge. Evolve button (+ optional prompt/seed popover),
+   * Loop-jam "EVOLVE" cluster — sits in Timeline's `.jamband`, the strip
+   * between the ruler and the lanes, horizontally tracking the loop region's
+   * left edge. Evolve button (+ optional prompt/seed popover),
    * state chip driven by loopjam://state, cancel while in flight. The loop
    * band itself breathes/flashes via classes set in Timeline.svelte.
    */
@@ -81,8 +82,11 @@
 
 <style>
   .jam {
-    position: absolute;
-    top: 6px;
+    /* relative, not absolute: the panel lives in Timeline's .jamband and
+       gives that band its height, instead of floating over the first lane.
+       `left` still tracks the loop region's left edge. */
+    position: relative;
+    margin: 4px 0;
     z-index: 12;
     display: flex;
     flex-direction: column;

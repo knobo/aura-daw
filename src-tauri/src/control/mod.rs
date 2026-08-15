@@ -432,7 +432,10 @@ impl Committer {
                     // `param_writes` either (they travel through
                     // `host_forward::ParamWrite` instead, resolved by
                     // instance id, not by a `GraphTables` slot).
-                    op::PropPath::Armed
+                    // Rename: document-only, no ParamTable counterpart and
+                    // no rebuild — `apply_raw` never pushes it here either.
+                    op::PropPath::Name
+                    | op::PropPath::Armed
                     | op::PropPath::InstrumentId
                     | op::PropPath::TimelineStartSamples
                     | op::PropPath::LengthSamples

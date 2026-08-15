@@ -24,19 +24,29 @@
   }: Props = $props();
 </script>
 
-<button
+<!-- A div, not a <button>: WebKit refuses to start a drag from a native form
+     control even with draggable="true", which silently killed every library
+     drag under WebKitGTK (Tauri on Linux). -->
+<div
   class="row"
   class:on={active}
   {draggable}
-  type="button"
+  role="button"
+  tabindex="0"
   title={label}
   onclick={() => onclick?.()}
+  onkeydown={(e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onclick?.();
+    }
+  }}
   ondragstart={(e) => ondragstart?.(e)}
 >
   {#if icon}<span class="icon" aria-hidden="true">{icon}</span>{/if}
   <span class="label">{label}</span>
   {#if meta}<span class="meta silk">{meta}</span>{/if}
-</button>
+</div>
 
 <style>
   .row {
