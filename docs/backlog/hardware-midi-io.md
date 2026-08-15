@@ -68,8 +68,12 @@ request and the architecture it lands on, for pickup after Plan E.
    — **PARTLY LANDED, slice 2**: note-out to external gear works as an
    app-config routing ("play this MIDI track through the output port"),
    which is why no document field, no new op and no `OP_FORMAT_VERSION`
-   bump were needed. The *document-model* per-track external-instrument
-   target is still deferred.
+   bump were needed. The *audio return* (so export hears Hydrogen) is
+   the remaining half — product cut in
+   `docs/backlog/external-instrument-return.md`: visible clips on the
+   same track, PipeWire as a one-click helper, freeze-then-export. No
+   hidden tracks, no silent graph rewrite. JACK transport / Link still
+   deferred.
 
 Plan: `docs/superpowers/plans/2026-08-14-midi-slice-2.md` (slice 2, PR #21).
 
