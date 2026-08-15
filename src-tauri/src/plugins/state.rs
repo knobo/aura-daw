@@ -690,10 +690,16 @@ pub fn reactivate_restored_with(
                     };
                     // snapshot republish: `status` + the param mirror are
                     // document content and this write-back bypasses
-                    // `transact`. Not in Task 5's brief enumeration — the
-                    // equivalence sweep's adopt step is what surfaces it;
-                    // same lock as the write, so no intermediate is ever
-                    // published.
+                    // `transact`; same lock as the write, so no intermediate
+                    // is ever published. COVERAGE GAP, stated where the
+                    // decision is: the only test that reaches this line is
+                    // `zyn_state_roundtrips_through_real_project_save_open`,
+                    // which SKIPS when zynaddsubfx-lv2 is absent — so on a
+                    // host-less machine this republish is unguarded while
+                    // appearing pinned. `tests/snapshot_store.rs` cannot
+                    // reach it (its rows are `format: "stub"` by design), and
+                    // reaching it host-free would mean adding a host-
+                    // injection seam to this module.
                     s.republish_full();
                     applied
                 };

@@ -737,6 +737,13 @@ impl Committer {
         if entry.is_empty() {
             *entry = params;
         }
+        // snapshot republish: R-4 — `status` and the param mirror are
+        // document content, and this writeback is a carve-out that bypasses
+        // `transact` (see this fn's doc), so nothing else would publish it.
+        // Same lock as the writes, so the intermediate is never observable.
+        // The structural twin of `plugins::state::reactivate_restored_with`'s
+        // post-host writeback, which republishes for the same reason.
+        s.republish_full();
     }
 
     /// Clear `dirty_state` ONLY for ids whose live pending bytes still equal
@@ -4982,9 +4989,23 @@ mod tests {
             status: "stub".into(),
             track_id: None,
         };
+        // Through the op, not a direct push: that is what production does
+        // (the commit lands the stub row and publishes it), and it is what
+        // makes the published image EQUAL to the live document on entry —
+        // so the only divergence the assertions below can detect is the
+        // writeback's own.
         let epoch = {
-            let mut s = cp.session().lock();
-            s.plugins.instances.push(row);
+            let m = cp.session();
+            session::Session::transact(m, op::TxMeta::user("add plugin"), |tx| {
+                tx.apply(op::Op::PluginAdd { row: row.clone(), index: 0 })
+            })
+            .expect("plugin add commits");
+            let s = m.lock();
+            let image = s.published_handle().lock().clone();
+            assert_eq!(
+                image.plugins.instances[0].status, "stub",
+                "precondition: the image starts equal to the live document"
+            );
             s.epoch
         };
         let params = vec![crate::plugins::ParamInfo {
@@ -4997,6 +5018,20 @@ mod tests {
         assert_eq!(s.plugins.instances[0].status, "active");
         assert_eq!(s.plugins.params["inst-1"].len(), 1);
         assert_eq!(s.plugins.params["inst-1"][0].value, 0.25);
+        // Plan F Task 5: the writeback is a document write outside
+        // `transact`, so it republishes — without this the published slot
+        // (which `engine::rebuild` reads) would describe a freshly
+        // instantiated plugin as a stub with an empty param mirror until
+        // some unrelated commit happened to refresh it.
+        let image = s.published_handle().lock().clone();
+        assert_eq!(
+            image.plugins.instances[0].status, s.plugins.instances[0].status,
+            "the instantiate writeback must republish"
+        );
+        assert_eq!(
+            image.plugins.params.get("inst-1"), s.plugins.params.get("inst-1"),
+            "including the real param mirror it just installed"
+        );
     }
 
     #[test]

@@ -34,28 +34,45 @@
 //!   `channel_properties.rs`) so this test never becomes the one place a
 //!   monotonic watermark can fail a comparison.
 //!
-//! WHAT THIS SWEEP CANNOT PROVE — measured, not guessed. Every republish
-//! site was deleted in turn and this test re-run. Eight of eleven deletions
-//! turn it red at the exact step that lost the call. The three that stay
-//! GREEN, and why, so nobody reads green here as proof they are covered:
-//! * `create_project_at`'s and `open_project_epoch`'s own swap republishes,
-//!   and `plugins::state::adopt_open_project`'s install republish. Each is
-//!   followed, still inside the same command, by
-//!   `plugins::automation::adopt_open_project`, which does a FULL republish
-//!   — so by the time this test can next take the lock, equivalence is
-//!   restored no matter which of the earlier three ran. They are load-
-//!   bearing only for a reader sampling the published slot DURING the
-//!   command (Task 6's engine is the first such reader) and for any future
-//!   path where no adopt follows. A sampling test between two statements of
-//!   one command is not expressible from out here.
-//! * `try_seed_zyn_demo_instruments`'s two sites — same shadowing (the demo
-//!   bootstrap commits after seeding), and additionally environment-gated.
-//!   Deleted with the function in Task 10.
+//! WHAT THIS SWEEP DOES AND DOES NOT PIN — measured, not guessed. Every one
+//! of the twelve `// snapshot republish:` sites was deleted in turn and this
+//! test re-run. Eight of the twelve turn it RED at the exact step that lost
+//! the call. The four that do not, and what covers them instead:
+//! * `Committer::apply_instantiate_writeback` (R-4, `control/mod.rs`) —
+//!   unreachable from here BY CONSTRUCTION: this sweep uses `format: "stub"`
+//!   rows precisely so no host round-trip happens, and that writeback only
+//!   runs on a real host's `Instantiate` result. Pinned instead by
+//!   `control`'s `instantiate_writeback_lands_when_the_epoch_is_unchanged`,
+//!   where deleting the republish is measured to fail.
+//! * `plugins::state::reactivate_restored_with` — unreachable for the same
+//!   reason and then some (it needs a live plugin host, not just a real
+//!   format). Pinned instead by `plugins::state`'s
+//!   `zyn_state_roundtrips_through_real_project_save_open`, where deleting
+//!   the republish is measured to fail. KNOWN GAP: that test SKIPS at
+//!   runtime when zynaddsubfx-lv2 is absent, so on a machine without it this
+//!   site has no coverage at all while looking covered. Reaching it without
+//!   a host would need a host-injection seam in `plugins::state`, which is
+//!   production API surface this task deliberately does not add.
+//! * `try_seed_zyn_demo_instruments`'s two sites — environment-gated the
+//!   same way, and shadowed by the demo bootstrap's own later commits.
+//!   Deleted with the whole function in Task 10.
 //!
-//! `plugins::state::reactivate_restored_with`'s republish is unreachable
-//! from here at all (it needs a live plugin host); it is covered instead by
-//! `plugins::state`'s plugin-gated `zyn_state_roundtrips_through_real_
-//! project_save_open`, where deleting it is measured to fail.
+//! Three sites USED to be unpinnable-looking and are not. They are each
+//! followed, inside the same command, by `plugins::automation::
+//! adopt_open_project`, which republishes on both its `Ok` arms and so
+//! restored equivalence before this test could next take the lock. Both
+//! shadows are removed by construction rather than documented away:
+//! * `create_project_at`'s and `open_project_epoch`'s swap republishes are
+//!   exercised on a sub-fixture that never registers the adoption seams, so
+//!   both cascades bail at their first line and the swap republish is the
+//!   command's only one.
+//! * `plugins::state::adopt_open_project`'s install republish is exercised
+//!   through a `project.json` whose `automation` field is not an array —
+//!   `load_lanes` returns `Err` and that arm does NOT republish. A real
+//!   production path, not a contrivance.
+//!
+//! Each of the three is measured RED when its republish is deleted, and each
+//! step carries an anti-vacuity assertion that the content really changed.
 //!
 //! Everything else — tracks, audio clips, midi rows AND their notes,
 //! tempo/meter maps, ppq, automation lanes, the plugin rows, the param
@@ -369,6 +386,55 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
         eng3.send(aura_lib::audio::engine::ControlMsg::Shutdown);
     }
 
+    // EPOCH FNS: create + open, WITH THE ADOPT CASCADES DELIBERATELY INERT.
+    // `create_project_at` and `open_project_epoch` each republish their own
+    // swap block, and then BOTH `adopt_open_project` cascades republish
+    // again a few statements later, still inside the same command. On the
+    // registered main fixture below that shadows the swap republishes
+    // completely: deleting either one leaves this test green, so it would
+    // be pinning nothing. Here the seams are unregistered (this fixture
+    // runs before any `register_*`), both cascades bail at their first
+    // line, and the swap republish is the ONLY one in the command — which
+    // makes its deletion observable. Same technique the `ensure_project_
+    // epoch` fixture above already relies on.
+    {
+        let (cp4, session4, eng4) = fixture();
+        cp4.create_project(parent.to_str().unwrap(), "Unshadowed").expect("create project");
+        cp4.commit(TxMeta::user("add tracks"), |tx| {
+            aura_lib::control::ops::add_track_tx(tx, Some("A".into()), Some("audio".into()))?;
+            aura_lib::control::ops::add_track_tx(tx, Some("B".into()), Some("midi".into()))?;
+            Ok(())
+        })
+        .expect("add tracks");
+        // Save-As rather than leaning on the commit's own auto-persist: a
+        // `TrackAdd`'s `PersistEffect` does not write `project.json`, so the
+        // tracks would not be on disk for the open below to restore.
+        let populated_dir = {
+            let (_p, dir) = aura_lib::audio::project::create(&parent, "UnshadowedSaved", 48_000, 120.0)
+                .expect("mint dir");
+            cp4.save_project_as_epoch(&dir).expect("save as");
+            dir
+        };
+        // The swap CLEARS tracks and clips, so this is a real content change
+        // — the earlier `create_project` on a virgin session was not.
+        cp4.create_project(parent.to_str().unwrap(), "UnshadowedBlank").expect("create blank");
+        assert!(
+            session4.lock().store.tracks.is_empty(),
+            "the swap really cleared the tracks — otherwise nothing is being pinned"
+        );
+        assert_published_matches_live(&session4, "create_project_at swap (adopt cascades inert)");
+        // And the open brings them back, again as the command's only
+        // republish.
+        cp4.open_project_epoch(&populated_dir).expect("open populated project");
+        assert_eq!(
+            session4.lock().store.tracks.len(),
+            2,
+            "the open really restored the tracks — otherwise nothing is being pinned"
+        );
+        assert_published_matches_live(&session4, "open_project_epoch swap (adopt cascades inert)");
+        eng4.send(aura_lib::audio::engine::ControlMsg::Shutdown);
+    }
+
     // ===== THE MAIN FIXTURE ===============================================
     let (cp, session, eng) = fixture();
     // Register it in both adoption seams, so `create_project_at`'s and
@@ -676,6 +742,45 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
         assert!(!s.store.tracks.is_empty(), "the open really restored the tracks");
         assert!(!s.automation.lanes.is_empty(), "and the durable lane — otherwise the adopt sites sweep vacuously");
         assert!(!s.plugins.instances.is_empty(), "and the plugin row");
+    }
+
+    // ===== EPOCH FN 5: open with the automation file unreadable ===========
+    // `plugins::state::adopt_open_project`'s install republish is the last
+    // one still shadowed: `plugins::automation::adopt_open_project` runs
+    // right after it and republishes on both its `Ok` arms. Its `Err` arm
+    // does NOT — and that is a real production path, not a contrivance:
+    // `load_lanes` returns `Err` for a `project.json` whose `automation`
+    // field is not an array. Blank the document first so the plugin install
+    // is a genuine content change, then open with the field corrupted, and
+    // the plugin install's republish is the command's only one.
+    cp.create_project(parent.to_str().unwrap(), "SweepBlank2").expect("create second blank");
+    assert!(
+        session.lock().plugins.instances.is_empty(),
+        "the blank swap cleared the plugin doc — the install below must therefore change it"
+    );
+    {
+        let f = saved_dir.join("project.json");
+        let mut root: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&f).expect("read project.json")).expect("parse");
+        root.as_object_mut().expect("object").insert("automation".into(), serde_json::json!("nope"));
+        std::fs::write(&f, serde_json::to_vec_pretty(&root).unwrap()).expect("write project.json");
+    }
+    cp.open_project_epoch(&saved_dir).expect("open project with a corrupt automation field");
+    assert_published_matches_live(
+        &session,
+        "open_project_epoch with an unreadable automation field (plugins adopt unshadowed)",
+    );
+    {
+        let s = session.lock();
+        assert!(
+            !s.plugins.instances.is_empty(),
+            "the plugin install really ran — otherwise this step pins nothing"
+        );
+        assert!(
+            s.automation.lanes.is_empty(),
+            "and the automation adopt really took its non-republishing Err arm — if it \
+             had adopted lanes, its own republish would be shadowing the install again"
+        );
     }
 
     eng.send(aura_lib::audio::engine::ControlMsg::Shutdown);
