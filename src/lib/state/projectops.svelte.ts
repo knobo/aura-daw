@@ -9,6 +9,7 @@
 
 import { backend } from "../tauri";
 import { automation } from "./automation.svelte";
+import { modulation } from "./modulation.svelte";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { midi } from "./midi.svelte";
 import { plugins } from "./plugins.svelte";
@@ -203,6 +204,7 @@ class ProjectOpsStore {
     await project.reload();
     await midi.init();
     await automation.reload();
+    await modulation.reload();
     // reloadOpenParams BEFORE refresh: refresh()'s applyInstances closes the
     // param panel when the instance registry no longer lists the open
     // instance, which would otherwise race the re-pull it's meant to serve.

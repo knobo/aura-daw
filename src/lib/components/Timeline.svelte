@@ -10,7 +10,7 @@
   import { transport } from "../state/transport.svelte";
   import { view } from "../state/view.svelte";
   import { midi } from "../state/midi.svelte";
-  import { automation } from "../state/automation.svelte";
+  import { modulation } from "../state/modulation.svelte";
   import { loopjam } from "../state/loopjam.svelte";
   import { toasts } from "../state/toasts.svelte";
   import { clipSelection } from "../state/clip-selection.svelte";
@@ -29,7 +29,7 @@
   import HScrollbar from "./HScrollbar.svelte";
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
-  import AutomationLaneView from "./AutomationLaneView.svelte";
+  import ModulationLaneView from "./ModulationLaneView.svelte";
   import ImportDropZone from "./ImportDropZone.svelte";
   import LoopJamPanel from "./loopjam/LoopJamPanel.svelte";
   import type { TrackState } from "../types/ipc";
@@ -632,8 +632,14 @@
           {#each midi.clipsOf(track.id) as clip (clip.id)}
             <MidiClipView {clip} {track} />
           {/each}
-          {#if automation.isVisible(track.id)}
-            <AutomationLaneView {track} />
+          {#if modulation.hasVisible(track.id)}
+            <div class="lane-shade"></div>
+            {#each modulation.visibleBindingsFor(track.id) as binding (binding.id)}
+              {@const curve = modulation.curveOf(binding)}
+              {#if curve}
+                <ModulationLaneView {track} {binding} {curve} />
+              {/if}
+            {/each}
           {/if}
         </div>
       {/each}
@@ -959,6 +965,13 @@
   .lane.droptarget {
     box-shadow: inset 0 0 0 1px var(--cyan);
     background: rgba(82, 229, 255, 0.05);
+  }
+  .lane-shade {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+    background: color-mix(in srgb, var(--bg-0) 45%, transparent);
   }
 
   .empty {

@@ -8,7 +8,7 @@
    * inside one scroll container. Writes go through the store's rAF batch —
    * one plugin_set_param per frame regardless of drag rate.
    */
-  import { automation } from "../../state/automation.svelte";
+  import { modulation } from "../../state/modulation.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import type { PluginParamInfo } from "../../types/ipc";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
@@ -94,6 +94,24 @@
   function onEnum(p: PluginParamInfo, e: Event) {
     plugins.setParam(p.id, parseFloat((e.currentTarget as HTMLSelectElement).value));
   }
+  function pluginBound(paramId: number): boolean {
+    return (
+      modulation.bindingsFor({
+        kind: "pluginParam",
+        instanceId: plugins.openInstanceId,
+        paramId,
+      }).length > 0
+    );
+  }
+  function automateParam(p: PluginParamInfo) {
+    const inst = plugins.openInstance;
+    const n = p.max === p.min ? 0 : (p.value - p.min) / (p.max - p.min);
+    void modulation.pickTarget(
+      inst?.trackId ?? "",
+      { kind: "pluginParam", instanceId: plugins.openInstanceId, paramId: p.id },
+      n,
+    );
+  }
 </script>
 
 <div class="panel">
@@ -165,11 +183,10 @@
                   {/if}
                   <button
                     class="autobtn mono"
-                    class:on={!!automation.pluginLaneFor(plugins.openInstanceId, p.id)}
+                    class:on={pluginBound(p.id)}
                     title="Automate {p.name}"
-                    aria-pressed={!!automation.pluginLaneFor(plugins.openInstanceId, p.id)}
-                    onclick={() =>
-                      void automation.automatePluginParam(plugins.openInstanceId, p.id, p.value)}
+                    aria-pressed={pluginBound(p.id)}
+                    onclick={() => automateParam(p)}
                     >A</button
                   >
                 </div>

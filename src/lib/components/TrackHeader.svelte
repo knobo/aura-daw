@@ -8,13 +8,15 @@
   import { instruments } from "../state/instruments.svelte";
   import { plugins } from "../state/plugins.svelte";
   import { zyn } from "../state/zynpatches.svelte";
-  import { automation } from "../state/automation.svelte";
   import { openPluginParams } from "../state/plugin-panel";
+  import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
   import { formatDb } from "../utils/format";
   import Meter from "./Meter.svelte";
+  import LanePickerMenu from "./LanePickerMenu.svelte";
 
   let { track, index }: { track: TrackState; index: number } = $props();
+  let pickerOpen = $state(false);
 
   const gainPct = $derived(((track.gainDb + 60) / 72) * 100);
   const instrument = $derived(
@@ -62,7 +64,7 @@
   }
 </script>
 
-<div class="header" style:--track-color={track.color}>
+<div class="header" class:picking={pickerOpen} style:--track-color={track.color}>
   <div class="stripe"></div>
   <div class="body">
     <div class="row top">
@@ -121,13 +123,20 @@
           title="Solo"
           onclick={() => project.toggleSolo(track.id)}>S</button
         >
-        <button
-          class="tog auto"
-          class:on={automation.isVisible(track.id)}
-          title="Show gain automation lane"
-          aria-pressed={automation.isVisible(track.id)}
-          onclick={() => automation.toggleVisible(track.id)}>A</button
-        >
+        <span class="picker">
+          <button
+            class="tog auto"
+            class:on={modulation.hasVisible(track.id) || pickerOpen}
+            title="Show automation lanes"
+            aria-haspopup="menu"
+            aria-expanded={pickerOpen}
+            aria-pressed={modulation.hasVisible(track.id)}
+            onclick={() => (pickerOpen = !pickerOpen)}>A</button
+          >
+          {#if pickerOpen}
+            <LanePickerMenu {track} onclose={() => (pickerOpen = false)} />
+          {/if}
+        </span>
       </div>
 
       <div class="fader-wrap">
@@ -183,6 +192,9 @@
     height: var(--track-height);
     border-bottom: 1px solid rgba(96, 130, 190, 0.08);
     background: linear-gradient(to right, rgba(16, 20, 42, 0.35), rgba(10, 13, 23, 0.15));
+  }
+  .header.picking {
+    z-index: 20;
   }
   .stripe {
     width: 3px;
@@ -288,6 +300,9 @@
   .toggles {
     display: flex;
     gap: 3px;
+  }
+  .picker {
+    position: relative;
   }
   .tog {
     width: 20px;

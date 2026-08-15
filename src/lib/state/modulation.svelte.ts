@@ -11,12 +11,13 @@ import type {
   AutomationClip,
   AutomationPoint,
   Binding,
+  BindingMode,
   Curve,
   ModulationSnapshot,
   TargetRef,
 } from "../types/ipc";
 
-function targetsEqual(a: TargetRef, b: TargetRef): boolean {
+export function targetsEqual(a: TargetRef, b: TargetRef): boolean {
   if (a.kind !== b.kind) return false;
   switch (a.kind) {
     case "trackParam":
@@ -34,13 +35,144 @@ function targetsEqual(a: TargetRef, b: TargetRef): boolean {
   }
 }
 
+/** Curve 0..1 → native pan (−1 hard left .. +1 hard right). */
+export function panNativeOf(normalized: number): number {
+  return normalized * 2 - 1;
+}
+
+/** Native pan (−1..+1) → curve 0..1. */
+export function panNormalizedOf(native: number): number {
+  return (native + 1) / 2;
+}
+
+function curveIdOf(b: Binding): string | null {
+  return b.source.kind === "curve" ? b.source.curveId : null;
+}
+
+function defaultMode(target: TargetRef): BindingMode {
+  return target.kind === "trackParam" && target.param === "gain" ? "multiply" : "absolute";
+}
+
+function defaultName(target: TargetRef): string {
+  switch (target.kind) {
+    case "trackParam":
+    case "selfTrackParam":
+      return target.param;
+    case "pluginParam":
+      return `param ${target.paramId}`;
+    case "selfInstrumentParam":
+      return `param ${target.paramId}`;
+    case "macro":
+      return "macro";
+    case "port":
+      return target.portId;
+  }
+}
+
 class ModulationStore {
   curves = $state<Curve[]>([]);
   bindings = $state<Binding[]>([]);
   automationClips = $state<AutomationClip[]>([]);
+  /** Track id → binding ids whose overlays are shown. Reassigned, not
+   * mutated (same convention as PianoRoll's selection Set). Insertion
+   * order is paint order: last id is the top, editable overlay. */
+  visible = $state<Map<string, Set<string>>>(new Map());
 
   bindingsFor(target: TargetRef): Binding[] {
     return this.bindings.filter((b) => targetsEqual(b.target, target));
+  }
+
+  curveOf(binding: Binding): Curve | undefined {
+    const id = curveIdOf(binding);
+    return id ? this.curves.find((c) => c.id === id) : undefined;
+  }
+
+  visibleBindingsFor(trackId: string): Binding[] {
+    const ids = this.visible.get(trackId);
+    if (!ids) return [];
+    const out: Binding[] = [];
+    for (const id of ids) {
+      const b = this.bindings.find((x) => x.id === id);
+      if (b) out.push(b);
+    }
+    return out;
+  }
+
+  hasVisible(trackId: string): boolean {
+    return (this.visible.get(trackId)?.size ?? 0) > 0;
+  }
+
+  isBindingVisible(trackId: string, bindingId: string): boolean {
+    return this.visible.get(trackId)?.has(bindingId) ?? false;
+  }
+
+  show(trackId: string, bindingId: string) {
+    const next = new Map(this.visible);
+    const set = new Set(next.get(trackId));
+    set.delete(bindingId);
+    set.add(bindingId);
+    next.set(trackId, set);
+    this.visible = next;
+  }
+
+  hide(trackId: string, bindingId: string) {
+    const next = new Map(this.visible);
+    const set = new Set(next.get(trackId));
+    set.delete(bindingId);
+    if (set.size === 0) next.delete(trackId);
+    else next.set(trackId, set);
+    this.visible = next;
+  }
+
+  hideAll(trackId: string) {
+    if (!this.visible.has(trackId)) return;
+    const next = new Map(this.visible);
+    next.delete(trackId);
+    this.visible = next;
+  }
+
+  /**
+   * Header/picker pick: mint a curve+binding when the target has none,
+   * then show that overlay (bringing it to the front if already visible).
+   */
+  async pickTarget(
+    trackId: string,
+    target: TargetRef,
+    initialNormalized?: number,
+  ): Promise<Binding | undefined> {
+    const existing = this.bindingsFor(target)[0];
+    if (existing) {
+      const ids = [...(this.visible.get(trackId) ?? [])];
+      const top = ids[ids.length - 1];
+      if (this.isBindingVisible(trackId, existing.id) && top === existing.id) {
+        this.hide(trackId, existing.id);
+      } else {
+        this.show(trackId, existing.id);
+      }
+      return existing;
+    }
+    const value =
+      initialNormalized ??
+      (target.kind === "trackParam" && target.param === "gain" ? 1 : 0.5);
+    const before = new Set(this.curves.map((c) => c.id));
+    await this.commit({
+      id: "",
+      name: defaultName(target),
+      points: [{ tick: 0, value: Math.min(1, Math.max(0, value)) }],
+    });
+    const mintedCurve = this.curves.find((c) => !before.has(c.id));
+    if (!mintedCurve) return undefined;
+    const beforeB = new Set(this.bindings.map((b) => b.id));
+    await this.setBinding({
+      id: "",
+      source: { kind: "curve", curveId: mintedCurve.id },
+      target,
+      mode: defaultMode(target),
+      depth: 1,
+    });
+    const minted = this.bindings.find((b) => !beforeB.has(b.id));
+    if (minted) this.show(trackId, minted.id);
+    return minted;
   }
 
   async reload(): Promise<void> {
@@ -75,6 +207,40 @@ class ModulationStore {
     } catch (err) {
       console.error("[aura] modulation_set_binding failed:", err);
     }
+  }
+
+  /**
+   * Per-binding inflight barrier. Keyed by bindingId so two overlays on
+   * one track cannot steal each other's closing commit (the KNOWN EDGE
+   * in `automation.svelte.ts`: a store-wide / track-keyed barrier).
+   */
+  #inflight = new Map<string, Promise<unknown>>();
+
+  /** Commit from INSIDE an open gesture (a click-insert, an alt-click
+   * delete). Returns the barrier the gesture's closing commit — and its
+   * `gesture_end` — must wait for. */
+  commitInGesture(bindingId: string, curve: Curve): Promise<void> {
+    const done = this.commit(curve);
+    this.#inflight.set(bindingId, done);
+    return done;
+  }
+
+  /** The CLOSING commit of a gesture: the curve as the store now holds it.
+   *
+   * It must wait for this binding's `commitInGesture` barrier before
+   * READING. The store is only written when `modulation_set_curve`
+   * resolves, so a pointerup landing inside the insert's round-trip
+   * window would otherwise read the PRE-insert curve and commit that
+   * back. */
+  async commitLatest(bindingId: string): Promise<void> {
+    await this.#inflight.get(bindingId);
+    const binding = this.bindings.find((b) => b.id === bindingId);
+    const fromBinding = binding ? this.curveOf(binding) : undefined;
+    // A first-point insert may have minted the curve under an empty id
+    // (the binding already names the minted id). Fall back to the
+    // just-adopted curve if the binding is not in the store yet.
+    const curve = fromBinding ?? this.curves[this.curves.length - 1];
+    if (curve) await this.commitInGesture(bindingId, curve);
   }
 
   private adopt(snap: ModulationSnapshot) {

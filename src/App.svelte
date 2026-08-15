@@ -12,6 +12,7 @@
   import { instruments } from "./lib/state/instruments.svelte";
   import { plugins } from "./lib/state/plugins.svelte";
   import { automation } from "./lib/state/automation.svelte";
+  import { modulation } from "./lib/state/modulation.svelte";
   import { mcp } from "./lib/state/mcp.svelte";
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
   import { view } from "./lib/state/view.svelte";
@@ -53,6 +54,7 @@
     void instruments.refresh();
     void plugins.refresh();
     void automation.reload();
+    void modulation.reload();
     void mcp.init();
     exporter.init();
     void loopjam.init();

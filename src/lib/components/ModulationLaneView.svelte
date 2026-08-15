@@ -1,28 +1,29 @@
 <script lang="ts">
   /**
-   * Per-track automation overlay (scope ruling 8: an overlay INSIDE the
+   * One binding's automation overlay (scope ruling 8: an overlay INSIDE the
    * track's existing timeline row, not an added row — the left rail and the
    * lane column share `--track-height` and inserting a sub-row would
    * desynchronise them).
    *
-   * Values are LINEAR GAIN MULTIPLIERS in [0,1] applied on top of the fader
-   * (scope ruling 6): y=top is 1.0 (fader unchanged), y=bottom is 0.0
-   * (silence).
+   * Curve values are normalized [0,1] (R3). Gain is a linear multiplier on
+   * top of the fader (scope ruling 6): y=top is 1.0, y=bottom is 0.0. Pan
+   * uses the same 0..1 draw space (0 = hard left, 1 = hard right).
    *
    * Edit shape: pointerdown opens a gesture and either grabs an existing
    * point or inserts one; pointermove PREVIEWS locally (no invoke);
-   * pointerup commits ONCE through `automation_set` and closes the gesture
-   * (scope ruling 7). Alt/right-click deletes a point.
+   * pointerup commits ONCE through `modulation_set_curve` and closes the
+   * gesture (scope ruling 7). Alt/right-click deletes a point.
    */
-  import type { TrackState, AutomationLane } from "../types/ipc";
-  import { automation, TRACK_PARAM_GAIN, trackTarget } from "../state/automation.svelte";
+  import type { Binding, Curve, TrackState } from "../types/ipc";
+  import { modulation } from "../state/modulation.svelte";
   import { midi } from "../state/midi.svelte";
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { canvasPos } from "../utils/canvas-pos";
   import { deletePoint, hitTest, insertPoint, movePoint } from "../utils/automation-edit";
 
-  let { track }: { track: TrackState } = $props();
+  let { track, binding, curve }: { track: TrackState; binding: Binding; curve: Curve } =
+    $props();
 
   let canvas: HTMLCanvasElement | undefined = $state();
   let dragIndex = $state(-1);
@@ -34,20 +35,7 @@
   let gestureOpen = false;
   const HIT_RADIUS_PX = 6;
 
-  const lane = $derived(automation.gainLaneFor(track.id));
-
-  /** The lane this overlay edits, minted locally when the track has none
-   * yet. Empty id = "the backend mints one" (`automation_set`'s contract). */
-  function laneOrNew(): AutomationLane {
-    return (
-      lane ?? {
-        id: "",
-        targetNode: trackTarget(track.id),
-        paramId: TRACK_PARAM_GAIN,
-        points: [],
-      }
-    );
-  }
+  const live = $derived(modulation.curves.find((c) => c.id === curve.id) ?? curve);
 
   function xOfTick(tick: number): number {
     return view.xOf(midi.ticksToSamples(tick));
@@ -58,7 +46,7 @@
 
   $effect(() => {
     // touch the reactive inputs so the canvas repaints on any of them
-    void [lane?.points, view.viewStart, view.spp, view.width, canvas];
+    void [live.points, view.viewStart, view.spp, view.width, canvas];
     paint();
   });
 
@@ -75,10 +63,10 @@
     if (!ctx) return;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
-    const pts = lane?.points ?? [];
+    const pts = live.points ?? [];
     if (pts.length === 0) return;
 
-    ctx.strokeStyle = track.color ?? "var(--cyan)";
+    ctx.strokeStyle = strokeOf();
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     // hold before the first and after the last point (the compile contract)
@@ -86,12 +74,26 @@
     for (const p of pts) ctx.lineTo(xOfTick(p.tick), (1 - p.value) * h);
     ctx.lineTo(w, (1 - pts[pts.length - 1].value) * h);
     ctx.stroke();
-    ctx.fillStyle = track.color ?? "var(--cyan)";
+    ctx.fillStyle = strokeOf();
     for (const p of pts) {
       ctx.beginPath();
       ctx.arc(xOfTick(p.tick), (1 - p.value) * h, 3, 0, Math.PI * 2);
       ctx.fill();
     }
+  }
+
+  function strokeOf(): string {
+    const t = binding.target;
+    if (t.kind === "trackParam" && t.param === "pan") return "var(--violet)";
+    if (t.kind === "pluginParam") return "var(--cyan)";
+    return track.color ?? "var(--cyan)";
+  }
+
+  function labelOf(): string {
+    const t = binding.target;
+    if (t.kind === "trackParam") return t.param;
+    if (t.kind === "pluginParam") return "plugin param";
+    return "automation";
   }
 
   function domainAt(e: PointerEvent | MouseEvent) {
@@ -103,16 +105,16 @@
   function onPointerDown(e: PointerEvent) {
     if (!canvas) return;
     const { tick, value } = domainAt(e);
-    const l = laneOrNew();
+    const c = live;
     const tickPerPx = Math.max(1e-9, midi.samplesToTicks(view.spp) - midi.samplesToTicks(0));
     const valuePerPx = 1 / Math.max(1, canvas.clientHeight);
-    const hit = hitTest(l.points, tick, value, tickPerPx, valuePerPx, HIT_RADIUS_PX);
+    const hit = hitTest(c.points, tick, value, tickPerPx, valuePerPx, HIT_RADIUS_PX);
 
     if (e.button === 2 || e.altKey) {
       if (hit < 0) return;
       project.beginGesture("automation delete point");
-      void automation
-        .commitInGesture({ ...l, points: deletePoint(l.points, hit) })
+      void modulation
+        .commitInGesture(binding.id, { ...c, points: deletePoint(c.points, hit) })
         .then(() => project.endGesture()); // close only once the delete lands
       return;
     }
@@ -121,23 +123,23 @@
     gestureOpen = true;
     if (hit >= 0) {
       dragIndex = hit;
-      if (l.id) automation.preview(l.id, l.points);
+      if (c.id) modulation.preview(c.id, c.points);
     } else {
-      const points = insertPoint(l.points, { tick, value });
+      const points = insertPoint(c.points, { tick, value });
       dragIndex = points.findIndex((p) => p.tick === tick);
-      // an unminted lane must reach the backend before it can be previewed
-      void automation.commitInGesture({ ...l, points });
+      // an unminted curve must reach the backend before it can be previewed
+      void modulation.commitInGesture(binding.id, { ...c, points });
     }
   }
 
   function onPointerMove(e: PointerEvent) {
     if (dragIndex < 0 || !canvas) return;
-    const l = automation.gainLaneFor(track.id);
-    if (!l) return;
+    const c = modulation.curves.find((x) => x.id === live.id);
+    if (!c) return;
     const { tick, value } = domainAt(e);
-    const moved = movePoint(l.points, dragIndex, tick, value, 0, 1);
+    const moved = movePoint(c.points, dragIndex, tick, value, 0, 1);
     dragIndex = moved.index;
-    automation.preview(l.id, moved.points); // LOCAL only — no invoke per move
+    modulation.preview(c.id, moved.points); // LOCAL only — no invoke per move
   }
 
   function onPointerUp(e: PointerEvent) {
@@ -154,14 +156,14 @@
     // `commitLatest` WAITS for a click-insert's reply before reading the
     // store: reading now could commit the pre-insert point set back over the
     // point just drawn (see its doc comment). The gesture closes after it.
-    void automation.commitLatest(track.id).then(() => project.endGesture());
+    void modulation.commitLatest(binding.id).then(() => project.endGesture());
   }
 </script>
 
 <canvas
   bind:this={canvas}
   class="autolane"
-  aria-label="Gain automation for {track.name}"
+  aria-label="{labelOf()} automation for {track.name}"
   oncontextmenu={(e) => e.preventDefault()}
   onpointerdown={onPointerDown}
   onpointermove={onPointerMove}
@@ -176,7 +178,7 @@
     width: 100%;
     height: 100%;
     z-index: 3;
-    background: color-mix(in srgb, var(--bg-0) 45%, transparent);
+    background: transparent;
     cursor: crosshair;
   }
 </style>

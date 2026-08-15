@@ -70,6 +70,7 @@ beforeEach(() => {
   modulation.curves = [];
   modulation.bindings = [];
   modulation.automationClips = [];
+  modulation.visible = new Map();
 });
 
 describe("modulation store", () => {
