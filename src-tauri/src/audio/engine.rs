@@ -904,6 +904,7 @@ pub(crate) fn compile_track_ramps(
     modulation: &crate::modulation::ModulationDoc,
     store: &Store,
     plugins: &crate::control::session::PluginDoc,
+    midi_clips: &[crate::midi::MidiClip],
     slots: &HashMap<crate::ids::TrackId, usize>,
     n_slots: usize,
     map: &crate::midi::TempoMap,
@@ -919,7 +920,16 @@ pub(crate) fn compile_track_ramps(
         .collect()
     };
     let params = if !modulation.is_empty() {
-        overlay_modulation_ramps(&mut ramps, modulation, store, plugins, slots, n_slots, map)
+        overlay_modulation_ramps(
+            &mut ramps,
+            modulation,
+            store,
+            plugins,
+            midi_clips,
+            slots,
+            n_slots,
+            map,
+        )
     } else {
         Vec::new()
     };
@@ -931,6 +941,7 @@ fn overlay_modulation_ramps(
     modulation: &crate::modulation::ModulationDoc,
     store: &Store,
     plugins: &crate::control::session::PluginDoc,
+    midi_clips: &[crate::midi::MidiClip],
     slots: &HashMap<crate::ids::TrackId, usize>,
     n_slots: usize,
     map: &crate::midi::TempoMap,
@@ -960,6 +971,9 @@ fn overlay_modulation_ramps(
             .and_then(|ps| ps.iter().find(|p| p.id == idx))
             .map(|p| p.value as f32)
     };
+    let content_placements = |content_id: &str| {
+        crate::modulation::compile::placements_from_midi_clips(midi_clips, content_id)
+    };
     let ctx = crate::modulation::CompileCtx {
         n_slots,
         slot_of: &slot_of,
@@ -967,7 +981,7 @@ fn overlay_modulation_ramps(
         param_range: &param_range,
         param_value: &param_value,
         instrument_of: &instrument_of,
-        content_placements: &|_| Vec::new(),
+        content_placements: &content_placements,
     };
     let compiled = crate::modulation::compile(modulation, map, &ctx);
     for (i, spec) in compiled.tracks.iter().enumerate() {
@@ -1429,6 +1443,7 @@ impl Control {
             &session.modulation,
             &session.store,
             &session.plugins,
+            &session.midi.clips,
             slots,
             n_slots,
             &map,
@@ -3413,6 +3428,82 @@ mod tests {
             (writes[0].value - 0.25).abs() < 1e-5,
             "native value follows the curve: {}",
             writes[0].value
+        );
+    }
+
+    /// Task 10: `compile_automation` must feed real MidiClip placements into
+    /// `CompileCtx.content_placements`. A clip-envelope binding with an
+    /// empty closure is silent even when the clips sit on the session.
+    #[test]
+    fn a_clip_envelope_binding_compiles_from_midi_clip_placements() {
+        use crate::modulation::model::{
+            Binding, BindingMode, Curve, Domain, Range, Source, TargetRef, TrackParam,
+        };
+        use crate::plugins::automation::AutomationPoint;
+
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.tracks.push(test_track("t-2"));
+            s.midi.clips.push(crate::midi::MidiClip {
+                id: "c1".into(),
+                track_id: "t-1".into(),
+                name: "c1".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 960,
+                notes: Vec::new(),
+                next_note_id: 1,
+                content_id: "con".into(),
+                lane_id: crate::ids::LaneId::default_for_track("t-1"),
+                content_length_ticks: None,
+            });
+            s.midi.clips.push(crate::midi::MidiClip {
+                id: "c2".into(),
+                track_id: "t-2".into(),
+                name: "c2".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 960,
+                notes: Vec::new(),
+                next_note_id: 1,
+                content_id: "con".into(),
+                lane_id: crate::ids::LaneId::default_for_track("t-2"),
+                content_length_ticks: None,
+            });
+            s.modulation.curves.push(Curve {
+                id: "cur".into(),
+                name: "cur".into(),
+                length_ticks: Some(960),
+                points: vec![AutomationPoint { tick: 0, value: 0.4 }],
+            });
+            s.modulation.bindings.push(Binding {
+                id: "b".into(),
+                source: Source::ClipEnvelope {
+                    content_id: "con".into(),
+                    curve_id: "cur".into(),
+                },
+                target: TargetRef::SelfTrackParam { param: TrackParam::Gain },
+                mode: BindingMode::Multiply,
+                depth: 1.0,
+                range: Range::default(),
+                domain: Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            });
+        }
+        let (ramps, _) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
+        };
+        assert!(
+            ramps[0].gain.is_some(),
+            "the MidiClip on t-1 must drive t-1's gain via the clip envelope"
+        );
+        assert!(
+            ramps[1].gain.is_some(),
+            "the same content on t-2 must drive t-2's own gain"
         );
     }
 

@@ -55,11 +55,22 @@ export function panNormalizedOf(native: number): number {
 }
 
 function curveIdOf(b: Binding): string | null {
-  return b.source.kind === "curve" ? b.source.curveId : null;
+  if (b.source.kind === "curve" || b.source.kind === "clipEnvelope") return b.source.curveId;
+  return null;
 }
 
 function defaultMode(target: TargetRef): BindingMode {
-  return target.kind === "trackParam" && target.param === "gain" ? "multiply" : "absolute";
+  if ((target.kind === "trackParam" || target.kind === "selfTrackParam") && target.param === "gain") {
+    return "multiply";
+  }
+  return "absolute";
+}
+
+function defaultNormalized(target: TargetRef): number {
+  if ((target.kind === "trackParam" || target.kind === "selfTrackParam") && target.param === "gain") {
+    return 1;
+  }
+  return 0.5;
 }
 
 function defaultName(target: TargetRef): string {
@@ -95,6 +106,13 @@ class ModulationStore {
   bindingsFrom(trackId: string): Binding[] {
     return this.bindings.filter(
       (b) => b.source.kind === "automationTrack" && b.source.trackId === trackId,
+    );
+  }
+
+  /** Bindings whose source is a clip envelope on this content. */
+  clipEnvelopeBindings(contentId: string): Binding[] {
+    return this.bindings.filter(
+      (b) => b.source.kind === "clipEnvelope" && b.source.contentId === contentId,
     );
   }
 
@@ -179,9 +197,7 @@ class ModulationStore {
       }
       return existing;
     }
-    const value =
-      initialNormalized ??
-      (target.kind === "trackParam" && target.param === "gain" ? 1 : 0.5);
+    const value = initialNormalized ?? defaultNormalized(target);
     const before = new Set(this.curves.map((c) => c.id));
     await this.commit({
       id: "",
@@ -200,6 +216,50 @@ class ModulationStore {
     });
     const minted = this.bindings.find((b) => !beforeB.has(b.id));
     if (minted) this.show(trackId, minted.id);
+    return minted;
+  }
+
+  /**
+   * Piano-roll envelope: mint a content-keyed curve+binding when this
+   * content has none for `target`, then show it (one overlay per content).
+   */
+  async pickClipEnvelope(
+    contentId: string,
+    target: TargetRef,
+    initialNormalized?: number,
+    lengthTicks?: number,
+  ): Promise<Binding | undefined> {
+    const existing = this.clipEnvelopeBindings(contentId).find((b) => targetsEqual(b.target, target));
+    if (existing) {
+      const ids = [...(this.visible.get(contentId) ?? [])];
+      const top = ids[ids.length - 1];
+      if (this.isBindingVisible(contentId, existing.id) && top === existing.id) {
+        this.hide(contentId, existing.id);
+      } else {
+        this.show(contentId, existing.id);
+      }
+      return existing;
+    }
+    const value = initialNormalized ?? defaultNormalized(target);
+    const before = new Set(this.curves.map((c) => c.id));
+    await this.commit({
+      id: "",
+      name: defaultName(target),
+      ...(lengthTicks != null ? { lengthTicks } : {}),
+      points: [{ tick: 0, value: Math.min(1, Math.max(0, value)) }],
+    });
+    const mintedCurve = this.curves.find((c) => !before.has(c.id));
+    if (!mintedCurve) return undefined;
+    const beforeB = new Set(this.bindings.map((b) => b.id));
+    await this.setBinding({
+      id: "",
+      source: { kind: "clipEnvelope", contentId, curveId: mintedCurve.id },
+      target,
+      mode: defaultMode(target),
+      depth: 1,
+    });
+    const minted = this.bindings.find((b) => !beforeB.has(b.id));
+    if (minted) this.show(contentId, minted.id);
     return minted;
   }
 

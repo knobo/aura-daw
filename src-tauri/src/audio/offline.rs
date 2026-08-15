@@ -187,6 +187,7 @@ fn compile_track_ramps(
         modulation,
         store,
         plugins,
+        &midi.clips,
         slots,
         n_slots,
         &map,
@@ -987,6 +988,77 @@ mod tests {
             (outside - document).abs() < 1e-5,
             "past the clip the target is the document value {document}, not a held 0: {outside}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A 1-period envelope under a 4-period looping MidiClip: the bounce at
+    /// the same offset in "bar" 1 and "bar" 3 must match (design §11).
+    #[test]
+    fn a_clip_envelope_loops_the_same_shape_in_every_repeat() {
+        use crate::modulation::model::{
+            AutomationPoint, Binding, BindingMode, Curve, Domain, Range, Source, TargetRef,
+            TrackParam,
+        };
+        use crate::modulation::ModulationDoc;
+
+        const RATE: u32 = 48_000;
+        // 160 ticks/period × 4 periods × 25 samples/tick
+        const PERIOD: u64 = 160;
+        const LEN: u64 = PERIOD * 4 * 25;
+        let (dir, store, mut midi) = auto_bounce_harness(LEN, &[("a1", "audio")], &["a1"]);
+        midi.clips.push(crate::midi::MidiClip {
+            id: "mc".into(),
+            track_id: "a1".into(),
+            name: "mc".into(),
+            timeline_start_ticks: 0,
+            length_ticks: PERIOD * 4,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: "con".into(),
+            lane_id: crate::ids::LaneId::default_for_track("a1"),
+            content_length_ticks: Some(PERIOD),
+        });
+        let mut modulation = ModulationDoc::default();
+        modulation.curves.push(Curve {
+            id: "cur".into(),
+            name: "cur".into(),
+            length_ticks: Some(PERIOD),
+            points: vec![
+                AutomationPoint { tick: 0, value: 1.0 },
+                AutomationPoint { tick: 80, value: 0.0 },
+            ],
+        });
+        modulation.bindings.push(Binding {
+            id: "b".into(),
+            source: Source::ClipEnvelope { content_id: "con".into(), curve_id: "cur".into() },
+            target: TargetRef::SelfTrackParam { param: TrackParam::Gain },
+            mode: BindingMode::Multiply,
+            depth: 1.0,
+            range: Range::default(),
+            domain: Domain::Normalized,
+            range_snapshot: None,
+            enabled: true,
+        });
+
+        let mut og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &Default::default(),
+            &modulation,
+            None,
+            RATE,
+        );
+        let out = render(&mut og.graph, 0, LEN, RATE, 1.0, &mut |_, _| {});
+        // offset 40 ticks into the period = sample 1000; third repeat starts
+        // at tick 320 = sample 8000.
+        let bar1 = out[1_000 * 2].abs();
+        let bar3 = out[9_000 * 2].abs();
+        assert!(
+            (bar1 - bar3).abs() < 1e-4,
+            "bar 1 and bar 3 of a looping clip envelope must match: {bar1} vs {bar3}"
+        );
+        assert!(bar1 > 1e-4, "the sampled offset is mid-ramp, not silent: {bar1}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -191,3 +191,49 @@ describe("automation track routing", () => {
     );
   });
 });
+
+describe("clip envelopes", () => {
+  it("picking a clip envelope mints a content-keyed curve and binding", async () => {
+    const b = await modulation.pickClipEnvelope("con-1", { kind: "selfTrackParam", param: "gain" });
+    expect(b).toBeDefined();
+    expect(modulationSetCurve).toHaveBeenCalledTimes(1);
+    expect(modulationSetBinding).toHaveBeenCalledTimes(1);
+    expect(modulation.curves).toHaveLength(1);
+    expect(modulation.bindings).toHaveLength(1);
+    expect(modulation.bindings[0].source).toEqual({
+      kind: "clipEnvelope",
+      contentId: "con-1",
+      curveId: modulation.curves[0].id,
+    });
+    expect(modulation.bindings[0].target).toEqual({ kind: "selfTrackParam", param: "gain" });
+    expect(modulation.bindings[0].mode).toBe("multiply");
+    expect(modulation.clipEnvelopeBindings("con-1")).toHaveLength(1);
+    expect(modulation.clipEnvelopeBindings("other")).toHaveLength(0);
+    expect(modulation.curveOf(modulation.bindings[0])?.id).toBe(modulation.curves[0].id);
+  });
+
+  it("every placement of shared content sees the same envelope binding", async () => {
+    await modulation.pickClipEnvelope("shared", { kind: "selfTrackParam", param: "gain" });
+    expect(modulation.clipEnvelopeBindings("shared")).toHaveLength(1);
+    const again = await modulation.pickClipEnvelope("shared", {
+      kind: "selfTrackParam",
+      param: "gain",
+    });
+    expect(again?.id).toBe(modulation.clipEnvelopeBindings("shared")[0].id);
+    expect(modulation.bindings).toHaveLength(1);
+  });
+
+  it("a self-track pick on two contents stays independent", async () => {
+    await modulation.pickClipEnvelope("con-a", { kind: "selfTrackParam", param: "gain" });
+    await modulation.pickClipEnvelope("con-b", { kind: "selfTrackParam", param: "pan" });
+    expect(modulation.clipEnvelopeBindings("con-a")[0].target).toEqual({
+      kind: "selfTrackParam",
+      param: "gain",
+    });
+    expect(modulation.clipEnvelopeBindings("con-b")[0].target).toEqual({
+      kind: "selfTrackParam",
+      param: "pan",
+    });
+    expect(modulation.clipEnvelopeBindings("con-b")[0].mode).toBe("absolute");
+  });
+});

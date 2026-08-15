@@ -379,6 +379,8 @@ export interface MidiClip {
   lengthTicks: number;
   /** Content (loop/native) length in ticks; absent = same as lengthTicks. */
   contentLengthTicks?: number;
+  /** Content identity (ADR 0004). Clip envelopes are keyed by this. */
+  contentId?: string;
   /** Sorted by (tick, key). */
   notes: MidiNote[];
 }

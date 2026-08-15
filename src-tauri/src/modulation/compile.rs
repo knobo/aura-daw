@@ -35,6 +35,30 @@ pub struct Placement {
     pub content_length_ticks: u64,
 }
 
+impl Placement {
+    pub fn from_midi_clip(clip: &crate::midi::MidiClip) -> Self {
+        Self {
+            start_ticks: clip.timeline_start_ticks,
+            length_ticks: clip.length_ticks,
+            content_length_ticks: clip.effective_content_length_ticks(),
+        }
+    }
+}
+
+/// Every placement of `content_id` among `clips`, with the track it plays
+/// on. Shared content on two tracks yields two rows; a looping placement
+/// is one row whose `length_ticks` outruns `content_length_ticks`.
+pub fn placements_from_midi_clips(
+    clips: &[crate::midi::MidiClip],
+    content_id: &str,
+) -> Vec<(Placement, String)> {
+    clips
+        .iter()
+        .filter(|c| c.content_id.as_str() == content_id)
+        .map(|c| (Placement::from_midi_clip(c), c.track_id.as_str().to_string()))
+        .collect()
+}
+
 /// One binding's compiled source: breakpoints plus the spans during which it
 /// is ACTIVE. An empty `spans` means "always active" — a timeline curve.
 /// Outside its spans a binding contributes nothing, which is different from
@@ -831,5 +855,126 @@ mod tests {
         let slot_of = |t: &str| (t == "t1").then_some(0usize);
         let out = compile(&doc, &map(), &ctx(1, &slot_of));
         assert!(out.tracks[0].gain.is_none());
+    }
+
+    fn midi_clip(
+        id: &str,
+        track: &str,
+        content: &str,
+        start: u64,
+        length: u64,
+        content_len: Option<u64>,
+    ) -> crate::midi::MidiClip {
+        crate::midi::MidiClip {
+            id: id.into(),
+            track_id: track.into(),
+            name: id.into(),
+            timeline_start_ticks: start,
+            length_ticks: length,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: content.into(),
+            lane_id: crate::ids::LaneId::default_for_track(track),
+            content_length_ticks: content_len,
+        }
+    }
+
+    #[test]
+    fn a_clip_envelope_produces_the_same_shape_in_every_repeat() {
+        // a 1-bar envelope under a 4-bar looping placement: sample the compiled
+        // events at bar 1 and bar 3, assert equal values
+        let mut doc = ModulationDoc::default();
+        doc.curves.push(curve(
+            "cur",
+            Some(DEFAULT_PPQ as u64),
+            vec![(0, 0.0), (DEFAULT_PPQ / 2, 1.0)],
+        ));
+        doc.bindings.push(binding(
+            "b",
+            Source::ClipEnvelope { content_id: "con".into(), curve_id: "cur".into() },
+            TargetRef::SelfTrackParam { param: TrackParam::Gain },
+            BindingMode::Multiply,
+        ));
+        let clips = [midi_clip(
+            "c1",
+            "t1",
+            "con",
+            0,
+            (DEFAULT_PPQ as u64) * 4,
+            Some(DEFAULT_PPQ as u64),
+        )];
+        let slot_of = |t: &str| (t == "t1").then_some(0usize);
+        let placements = |id: &str| placements_from_midi_clips(&clips, id);
+        let mut c = ctx(1, &slot_of);
+        c.content_placements = &placements;
+        let out = compile(&doc, &map(), &c);
+        let gain = out.tracks[0].gain.as_ref().expect("the looping placement compiled");
+        let bar1 = value_at(gain, QUARTER / 4).unwrap();
+        let bar3 = value_at(gain, QUARTER * 2 + QUARTER / 4).unwrap();
+        assert!(
+            (bar1 - bar3).abs() < 1e-4,
+            "a 1-bar envelope under a 4-bar loop must read the same in bar 1 and bar 3: {bar1} vs {bar3}"
+        );
+    }
+
+    #[test]
+    fn every_placement_of_shared_content_gets_the_envelope() {
+        // two MidiClips with the same content_id, one envelope binding
+        let mut doc = ModulationDoc::default();
+        doc.curves.push(curve("cur", Some(DEFAULT_PPQ as u64), vec![(0, 0.25)]));
+        doc.bindings.push(binding(
+            "b",
+            Source::ClipEnvelope { content_id: "con".into(), curve_id: "cur".into() },
+            TargetRef::SelfTrackParam { param: TrackParam::Gain },
+            BindingMode::Multiply,
+        ));
+        let clips = [
+            midi_clip("c1", "t1", "con", 0, DEFAULT_PPQ as u64, None),
+            midi_clip("c2", "t1", "con", (DEFAULT_PPQ as u64) * 4, DEFAULT_PPQ as u64, None),
+            midi_clip("other", "t1", "other", (DEFAULT_PPQ as u64) * 8, DEFAULT_PPQ as u64, None),
+        ];
+        let slot_of = |t: &str| (t == "t1").then_some(0usize);
+        let placements = |id: &str| placements_from_midi_clips(&clips, id);
+        let mut c = ctx(1, &slot_of);
+        c.content_placements = &placements;
+        let out = compile(&doc, &map(), &c);
+        let gain = out.tracks[0].gain.as_ref().expect("shared content compiled");
+        let first = value_at(gain, QUARTER / 2).unwrap();
+        let second = value_at(gain, QUARTER * 4 + QUARTER / 2).unwrap();
+        let stranger = value_at(gain, QUARTER * 8 + QUARTER / 2).unwrap();
+        assert!((first - 0.25).abs() < 1e-4, "first placement of shared content: {first}");
+        assert!((second - 0.25).abs() < 1e-4, "second placement of shared content: {second}");
+        assert!(
+            (stranger - 1.0).abs() < 1e-4,
+            "a different content_id must not receive the envelope: {stranger}"
+        );
+    }
+
+    #[test]
+    fn a_self_track_target_resolves_per_placement() {
+        // the same content on two different tracks drives each one's own gain
+        let mut doc = ModulationDoc::default();
+        doc.curves.push(curve("cur", Some(DEFAULT_PPQ as u64), vec![(0, 0.5)]));
+        doc.bindings.push(binding(
+            "b",
+            Source::ClipEnvelope { content_id: "con".into(), curve_id: "cur".into() },
+            TargetRef::SelfTrackParam { param: TrackParam::Gain },
+            BindingMode::Multiply,
+        ));
+        let clips = [
+            midi_clip("c1", "t1", "con", 0, DEFAULT_PPQ as u64, None),
+            midi_clip("c2", "t2", "con", 0, DEFAULT_PPQ as u64, None),
+        ];
+        let slot_of = |t: &str| match t {
+            "t1" => Some(0usize),
+            "t2" => Some(1usize),
+            _ => None,
+        };
+        let placements = |id: &str| placements_from_midi_clips(&clips, id);
+        let mut c = ctx(2, &slot_of);
+        c.content_placements = &placements;
+        let out = compile(&doc, &map(), &c);
+        assert!(out.tracks[0].gain.is_some(), "the placement on t1 drives t1");
+        assert!(out.tracks[1].gain.is_some(), "the placement on t2 drives t2");
     }
 }
