@@ -101,15 +101,17 @@ class ClipClipboardStore {
           // AURA instance will ever see it (osclipboard.rs's measured
           // ceiling). The harm worth naming is not "this copy replaced the
           // old clipboard" (true of every copy, and read as boilerplate) —
-          // it is that if the cross-instance transfer fails, the OTHER
-          // window's clipboard ends up with NEITHER the old content NOR
-          // this one: not a truncated paste, an empty one. Same-instance
-          // paste is unaffected (it reads `this.payload`).
+          // it is that if the cross-instance transfer fails, the SYSTEM
+          // clipboard ends up with NEITHER the old content NOR this one:
+          // not a truncated paste, an empty one, and the loss reaches
+          // outside AURA — any other application that pastes afterwards
+          // gets nothing. Same-instance paste is unaffected (it reads
+          // `this.payload`).
           toasts.info(
             "COPY MAY NOT REACH ANOTHER WINDOW",
             `${audioIds.length + midiIds.length} clips is a lot of data for the OS clipboard — pasting HERE will work regardless, ` +
-              "but the transfer to another AURA window can fail silently, and if it does that window's clipboard ends up with " +
-              "nothing at all: not this copy, and not whatever was on it before.",
+              "but the transfer to another AURA window can fail silently, and if it does the system clipboard ends up with " +
+              "nothing at all, in any application: not this copy, and not whatever was on it before.",
           );
         }
       } catch (err) {
