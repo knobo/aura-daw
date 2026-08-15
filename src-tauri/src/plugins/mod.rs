@@ -180,12 +180,19 @@ pub struct PluginListResult {
 /// Scan LV2 + CLAP search paths. Runs on a blocking worker (the CLAP half
 /// dlopens bundles — see scan.rs crash-safety note); results are cached in
 /// the registry and returned.
+/// The command boundary is logged on BOTH sides on purpose. A scan that the
+/// UI shows as still running while the process sits idle has two very
+/// different causes — the blocking task never finished, or it finished and
+/// the response never reached the webview — and the pair of lines below is
+/// what tells them apart after the fact.
 #[tauri::command]
 pub async fn plugin_scan(state: State<'_, PluginState>) -> Result<Vec<PluginDescriptor>, String> {
+    log::info!("plugin scan: requested");
     let found = tauri::async_runtime::spawn_blocking(scan::scan_all)
         .await
         .map_err(|e| format!("plugin scan task failed: {e}"))?;
     state.registry.lock().scanned = Some(found.clone());
+    log::info!("plugin scan: returning {} descriptors to the webview", found.len());
     Ok(found)
 }
 

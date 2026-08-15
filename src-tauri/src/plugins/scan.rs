@@ -153,9 +153,24 @@ pub fn scan_lv2() -> Vec<PluginDescriptor> {
 /// Full scan: LV2 world (metadata-only, safe in-process) + CLAP standard
 /// paths through the sacrificial scan subprocess (crash containment —
 /// PHASE3-PLAN contract 8).
+/// Both halves are timed and counted because a scan that never comes back is
+/// otherwise undiagnosable: `livi` logs one line per plugin it finds, so the
+/// LV2 half is loud, while the CLAP half is silent unless a worker misbehaves
+/// — leaving "stopped after LV2" and "finished, response lost on the way to
+/// the webview" looking exactly alike from the log.
 pub fn scan_all() -> Vec<PluginDescriptor> {
+    let started = std::time::Instant::now();
     let mut out = scan_lv2();
+    let lv2 = out.len();
+    log::info!("plugin scan: lv2 half done — {lv2} plugins in {:?}", started.elapsed());
+
+    let clap_started = std::time::Instant::now();
     out.extend(super::scan_worker::scan_clap_subprocess(&clap_search_paths()));
+    log::info!(
+        "plugin scan: clap half done — {} plugins in {:?}",
+        out.len() - lv2,
+        clap_started.elapsed()
+    );
     out
 }
 
@@ -216,6 +231,41 @@ mod tests {
             assert_eq!(p.format, "clap");
             assert!(!p.name.is_empty());
         }
+    }
+
+    /// A `.clap` BUNDLE DIRECTORY holds the real libraries one level down —
+    /// Cardinal ships exactly this on Ubuntu (`/usr/lib/clap/Cardinal.clap/`
+    /// contains Cardinal, CardinalFX and CardinalSynth). Discovery must
+    /// therefore descend into a `.clap` directory and collect the libraries
+    /// inside, never hand the DIRECTORY itself to the loader: `dlopen` on a
+    /// directory fails with "cannot read file data: Is a directory", which
+    /// would drop three real plugins and log an error for each scan.
+    /// Hermetic — a fabricated layout, no installed plugins involved.
+    #[test]
+    fn clap_bundle_directories_yield_the_libraries_inside_them() {
+        let dir = std::env::temp_dir().join(format!(
+            "aura-clap-bundle-dir-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let bundle = dir.join("Cardinal.clap");
+        std::fs::create_dir_all(&bundle).unwrap();
+        // Contents are never loaded here — discovery is a filesystem walk.
+        for name in ["Cardinal.clap", "CardinalFX.clap", "CardinalSynth.clap"] {
+            std::fs::write(bundle.join(name), b"not really an ELF").unwrap();
+        }
+        // A plain sibling library, the common Linux layout.
+        std::fs::write(dir.join("Plain.clap"), b"not really an ELF").unwrap();
+
+        let found = find_clap_bundles(std::slice::from_ref(&dir));
+        assert!(!found.contains(&bundle), "the bundle DIRECTORY is not a loadable bundle");
+        for name in ["Cardinal.clap", "CardinalFX.clap", "CardinalSynth.clap"] {
+            assert!(found.contains(&bundle.join(name)), "{name} found inside the bundle dir");
+        }
+        assert!(found.contains(&dir.join("Plain.clap")), "plain sibling still found");
+        assert_eq!(found.len(), 4, "no duplicates, nothing else: {found:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
