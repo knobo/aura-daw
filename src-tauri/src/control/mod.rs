@@ -3693,32 +3693,61 @@ impl ControlPlane {
             }
         }
 
-        // Zyn upgrade path: build the three patched instances BEFORE the
-        // tracks so a failure leaves no half-bound state (None = PolySynth).
-        let zyn = try_seed_zyn_demo_instruments(&self.session);
+        // Zyn upgrade path: PREPARE the three patched instances BEFORE the
+        // tracks — all host I/O, all outside any lock/transaction
+        // (prepare-outside) — so a failure leaves no half-bound state (None
+        // = PolySynth) and touches NO session state at all (Task 10: R-3
+        // closed, see `try_seed_zyn_demo_instruments`'s doc).
+        let zyn = try_seed_zyn_demo_instruments();
+        self.seed_demo_project_commit(zyn)
+    }
 
-        // Task 7: one commit — 3x add_track_tx, the instrument bindings (if
-        // Zyn is available), and the 3 demo clips, all through the channel.
-        // `persist.project` (set only by the InstrumentId `Set`s below, same
-        // as the pre-Task-7 code's zyn-gated project::save) and
-        // `persist.midi` (set unconditionally by `MidiClipAdd`, same as the
-        // pre-Task-7 code's unconditional `save_into_project`) replace the
-        // manual saves; `commit` also emits `project://changed`, fixing this
-        // command's previously missing event.
+    /// The commit half of [`Self::seed_demo_project`], split out so tests
+    /// can drive it with a hand-built `zyn` fixture (the plugins tests'
+    /// `FormatStateBridge`-fixture pattern) instead of a real Zyn host —
+    /// `try_seed_zyn_demo_instruments` itself needs a live LV2 world plus
+    /// the zynaddsubfx-lv2 plugin, which CI doesn't have.
+    ///
+    /// Task 7 + Task 10: one commit — 3x add_track_tx, the Zyn rows (if
+    /// prepared, via `Op::PluginAdd`/`Op::PluginSetState`) and instrument
+    /// bindings, and the 3 demo clips, all through the channel. The demo's
+    /// plugin rows are now attributed, undoable in the same step as the
+    /// rest of the demo, persisted via `PersistEffect` (no manual save
+    /// needed), and cold-replayable from the journal. `persist.project`
+    /// (set only by the InstrumentId `Set`s below, same as the pre-Task-7
+    /// code's zyn-gated project::save) and `persist.midi` (set
+    /// unconditionally by `MidiClipAdd`, same as the pre-Task-7 code's
+    /// unconditional `save_into_project`) replace the manual saves;
+    /// `commit` also emits `project://changed`, fixing this command's
+    /// previously missing event.
+    fn seed_demo_project_commit(
+        &self,
+        zyn: Option<[PreparedZynInstance; 3]>,
+    ) -> Result<ProjectSnapshot, String> {
         self.commit(op::TxMeta::system("seed demo project"), |tx| {
             let pad = ops::add_track_tx(tx, Some("Demo Pad".into()), Some("midi".into()))?;
             let lead = ops::add_track_tx(tx, Some("Demo Lead".into()), Some("midi".into()))?;
             let bass = ops::add_track_tx(tx, Some("Demo Bass".into()), Some("midi".into()))?;
 
-            if let Some(ids) = &zyn {
-                for (track_id, instance_id) in
-                    [(&pad.id, &ids[0]), (&lead.id, &ids[1]), (&bass.id, &ids[2])]
+            if let Some(prepared) = &zyn {
+                for (track_id, p) in
+                    [(&pad.id, &prepared[0]), (&lead.id, &prepared[1]), (&bass.id, &prepared[2])]
                 {
+                    // `index: usize::MAX` — same "append" signal
+                    // `plugin_instantiate`'s command path uses; `apply_raw`
+                    // clamps it to the live length.
+                    tx.apply(op::Op::PluginAdd { row: p.row.clone(), index: usize::MAX })?;
+                    if let Some(state) = &p.state {
+                        tx.apply(op::Op::PluginSetState {
+                            instance: p.row.id.clone(),
+                            state: state.clone(),
+                        })?;
+                    }
                     tx.apply(op::Op::Set {
                         object: op::ObjectRef::Track(track_id.clone()),
                         path: op::PropPath::InstrumentId,
                         from: serde_json::Value::Null,
-                        to: serde_json::json!(format!("plugin:{instance_id}")),
+                        to: serde_json::json!(format!("plugin:{}", p.row.id)),
                     })?;
                 }
             }
@@ -3732,30 +3761,6 @@ impl ControlPlane {
             }
             Ok(())
         })?;
-
-        // Plugin instance + state blobs (not the `PersistEffect` machinery's
-        // job here — `try_seed_zyn_demo_instruments` writes the document
-        // rows DIRECTLY into `session.plugins`, bypassing `commit`/the op
-        // log, so `execute_persist`'s plugin branch never sees this write),
-        // so a save/open cycle replays the same demo through the same
-        // patches (zone P4 restore path). A no-op when there's no open
-        // project dir or no Zyn instances. Task 9: `persist_after_mutation`
-        // is gone — snapshot the doc under a short lock and write it
-        // directly (mirrors `execute_persist`'s own plugin branch).
-        if zyn.is_some() {
-            let dir = self.session.lock().store.project_dir.clone();
-            if let Some(d) = &dir {
-                let doc = self.session.lock().plugin_snapshot();
-                // `with_host_state: true` here always takes the `fresh`
-                // branch of the persist ladder for these brand-new
-                // instances, so there's nothing in `dirty_state` to clear
-                // (seed_demo writes rows directly, bypassing `apply_raw`
-                // entirely — see above).
-                if let Err(e) = crate::plugins::state::save_snapshot_into_project(d, &doc, true) {
-                    log::warn!("seed demo: persisting plugins failed: {e}");
-                }
-            }
-        }
         Ok(self.project_state())
     }
 
@@ -3818,21 +3823,54 @@ impl ControlPlane {
     }
 }
 
-/// Try to build the three Zyn demo instances (pad / lead / bass), each
-/// loaded with a stock bank patch. Returns their instance ids, or None when
-/// anything on the Zyn path is unavailable (plugin not installed, banks
-/// missing, no registered plugin registry) — the caller then keeps the
-/// PolySynth fallback, so a machine without plugins is never broken.
-/// Partial failures roll back (no orphan instances, no orphan rows).
+/// A Zyn demo instance PREPARED (host instantiate + patch load + captured
+/// post-load state) but not yet committed to the document — Task 10's
+/// prepare-outside handoff for [`try_seed_zyn_demo_instruments`]. `state` is
+/// already APST-encoded (`plugins::state::encode_state`), the exact bytes
+/// `Op::PluginSetState`'s arm expects on the wire.
 ///
-/// Task 9: writes the document rows DIRECTLY into `session.plugins`
-/// (bypassing `commit`/the op log), matching `seed_demo_project`'s own
-/// direct-session-mutation style for the rest of the demo's bootstrap —
-/// this pre-track-creation, best-effort batch is not itself a user-visible
-/// edit yet (no track references these ids until the caller binds them),
-/// so there is nothing meaningful to make undoable here.
-fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[String; 3]> {
-    use crate::plugins::{self, patches};
+/// Deviation from the plan's literal interface listing: the plan's sketch
+/// also carries a `params: Vec<ParamInfo>` field ("as instantiate_and_activate
+/// returned"). Dropped here — `Op::PluginAdd`'s own arm always folds in a
+/// `HostForward::Instantiate` (its doc: "idempotent by construction... the
+/// executor's has_instance check no-ops it and re-syncs params"), which is
+/// exactly the plan's own "Consumes" note for this task. Carrying a second,
+/// unused copy of the same params the host is about to re-supply would be a
+/// field nothing reads — worse than the plan's version, not a faithful copy
+/// of it.
+struct PreparedZynInstance {
+    row: crate::plugins::PluginInstanceInfo,
+    state: Option<Vec<u8>>,
+}
+
+/// Try to PREPARE the three Zyn demo instances (pad / lead / bass), each
+/// loaded with a stock bank patch. Returns `None` when anything on the Zyn
+/// path is unavailable (plugin not installed, banks missing, no registered
+/// plugin registry) — the caller then keeps the PolySynth fallback, so a
+/// machine without plugins is never broken. Partial failures roll back (host
+/// `unregister_instance` calls only — Task 10: this function touches NO
+/// session state, so there are no rows to retract).
+///
+/// Task 10 (R-3 closed): this function only PREPARES — instantiate + load
+/// patch + capture post-load state, all host I/O, all outside any
+/// lock/transaction (prepare-outside, same pattern `plugin_instantiate`'s
+/// command path uses). The caller (`seed_demo_project`) applies
+/// `Op::PluginAdd` + `Op::PluginSetState` per instance inside the demo's one
+/// channel transaction, so the demo's instruments are attributed, undoable
+/// in the same step as the rest of the demo, persisted via `PersistEffect`,
+/// and cold-replayable from the journal.
+fn try_seed_zyn_demo_instruments() -> Option<[PreparedZynInstance; 3]> {
+    try_seed_zyn_demo_instruments_with(crate::plugins::state::registered_state_bridge().map(|b| b.as_ref()))
+}
+
+/// [`try_seed_zyn_demo_instruments`] with an explicit bridge (test
+/// injection point — the `plugins::state` module's own `FormatStateBridge`/
+/// fake-bridge pattern, same reason `save_snapshot_into_project_with` and
+/// `reactivate_restored_with` take one).
+fn try_seed_zyn_demo_instruments_with(
+    bridge: Option<&dyn crate::plugins::state::HostStateBridge>,
+) -> Option<[PreparedZynInstance; 3]> {
+    use crate::plugins::{self, patches, state::encode_state};
     let registry = plugins::registered_registry()?;
     // Patches chosen to sit well together: soft pad chords, a plucked lead
     // that cuts through, and a round analog-style bass.
@@ -3854,10 +3892,13 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
             return None;
         }
     }
-    let mut ids: Vec<String> = Vec::with_capacity(3);
+    let mut prepared: Vec<PreparedZynInstance> = Vec::with_capacity(3);
     for patch in &wanted {
         match plugins::instantiate_and_activate(registry, &uid) {
-            Ok((info, params)) => {
+            // `_params`: the fresh instance's real ranges (`Op::PluginAdd`'s
+            // own `HostForward::Instantiate` re-derives and writes these
+            // back after commit — see `PreparedZynInstance`'s doc).
+            Ok((info, _params)) => {
                 if let Err(e) =
                     patches::load_zyn_patch(&info.id, std::path::Path::new(&patch.path))
                 {
@@ -3868,36 +3909,33 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
                         patch.name
                     );
                 }
-                {
-                    let mut s = session.lock();
-                    s.plugins.instances.push(info.clone());
-                    s.plugins.params.insert(info.id.clone(), params);
-                    // snapshot republish: direct-session plugin write that
-                    // bypasses `commit`/the op log (see this fn's doc).
-                    // Removed with this whole function in Task 10.
-                    s.republish_full();
-                }
-                ids.push(info.id);
+                // Capture the post-patch-load state from the LIVE host —
+                // this is what makes the following `Op::PluginSetState`'s
+                // computed inverse (a self-inverse, since a fresh instance
+                // has no `pending_state` yet — see that op's arm doc) an
+                // honest reflection of "nothing to undo to" rather than a
+                // stale/absent blob.
+                let state = bridge.and_then(|b| match b.save_state(&info.id) {
+                    Ok(Some(blob)) => Some(encode_state(&info.uid, &blob)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        log::warn!(
+                            "seed demo: capturing state for {} failed ({e}); patch stays \
+                             host-only for this instance",
+                            info.id
+                        );
+                        None
+                    }
+                });
+                prepared.push(PreparedZynInstance { row: info, state });
             }
             Err(e) => {
                 log::warn!("seed demo: Zyn instantiation failed ({e}); PolySynth fallback");
-                {
-                    // Session lock dropped BEFORE the host call below ([C1]:
-                    // never call a host while holding the session lock —
-                    // `unregister_instance` is fire-and-forget/non-blocking,
-                    // but this stays disciplined regardless).
-                    let mut s = session.lock();
-                    for id in &ids {
-                        s.plugins.instances.retain(|r| &r.id != id);
-                        s.plugins.params.remove(id);
-                    }
-                    // snapshot republish: the rollback arm of the same
-                    // direct-session write above. Removed in Task 10.
-                    s.republish_full();
-                }
-                for id in &ids {
+                // No session state to retract (this function touches none):
+                // just tear down whatever host instances already succeeded.
+                for p in &prepared {
                     if let Some(host) = plugins::lv2_host::try_global() {
-                        host.unregister_instance(id);
+                        host.unregister_instance(&p.row.id);
                     }
                 }
                 return None;
@@ -3908,7 +3946,7 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
         "seed demo: Zyn instances ready ({})",
         wanted.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
     );
-    ids.try_into().ok()
+    prepared.try_into().ok()
 }
 
 /// The ORIGINAL two-track demo content (v1: 16th-note arp + bass groove),
@@ -6580,10 +6618,16 @@ mod tests {
     }
 
     /// Demo v2's Zyn upgrade path (gated on zynaddsubfx-lv2 + banks): the
-    /// seeder's instance builder yields three ACTIVE patched Zyn instances,
+    /// seeder's PREPARE step (Task 10: `try_seed_zyn_demo_instruments`
+    /// touches no session state) yields three ACTIVE patched Zyn instances,
     /// and the demo arrangement bound to them renders non-silent audio
     /// through the real graph path. Machines without Zyn skip (the
     /// PolySynth fallback is covered by the test above).
+    ///
+    /// This test builds its OWN local session from the prepared rows
+    /// (mirroring what `Op::PluginAdd`'s arm would do to the document) —
+    /// it exercises the prepare half only, not the commit/op path, which is
+    /// `the_seed_demo_transaction_journals_its_plugin_rows`'s job.
     #[test]
     fn seeded_demo_zyn_instruments_bind_and_render() {
         use crate::audio::types::{Store, TrackState};
@@ -6594,14 +6638,22 @@ mod tests {
         crate::plugins::register_registry(Arc::new(Mutex::new(
             crate::plugins::PluginRegistry::default(),
         )));
+        let Some(prepared) = try_seed_zyn_demo_instruments() else {
+            eprintln!("skipping: ZynAddSubFX or its banks not installed");
+            return;
+        };
         let session = Arc::new(Mutex::new(Session::new(
             crate::audio::types::Store::default(),
             crate::midi::MidiStore::default(),
         )));
-        let Some(ids) = try_seed_zyn_demo_instruments(&session) else {
-            eprintln!("skipping: ZynAddSubFX or its banks not installed");
-            return;
-        };
+        {
+            let mut s = session.lock();
+            for p in &prepared {
+                s.plugins.instances.push(p.row.clone());
+                s.plugins.params.entry(p.row.id.clone()).or_default();
+            }
+        }
+        let ids: Vec<String> = prepared.iter().map(|p| p.row.id.clone()).collect();
         for id in &ids {
             let info = session
                 .lock()
@@ -6677,6 +6729,127 @@ mod tests {
                 host.unregister_instance(id);
             }
         }
+    }
+
+    fn fake_prepared_zyn(tag: &str) -> PreparedZynInstance {
+        let row = crate::plugins::PluginInstanceInfo {
+            id: format!("fake-zyn-{tag}"),
+            uid: "test:fake-zyn".into(),
+            name: format!("Fake Zyn {tag}"),
+            // Deliberately NOT "lv2"/"clap": `HostForward::Instantiate`'s
+            // executor `continue`s for any other format ("non-hosted
+            // format: stays 'stub', nothing to sync"), so this fixture
+            // never touches a real plugin host.
+            format: "test".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        let blob = crate::plugins::state::StateBlob {
+            kind: crate::plugins::state::KIND_OPAQUE,
+            data: vec![1, 2, 3, 4],
+        };
+        let state = Some(crate::plugins::state::encode_state(&row.uid, &blob));
+        PreparedZynInstance { row, state }
+    }
+
+    /// Task 10 (R-3 closed) — Step 1: the demo seed's Zyn bootstrap commits
+    /// through the channel as ops, not a direct session write. Drives
+    /// `seed_demo_project_commit` with a hand-built fixture (see
+    /// `fake_prepared_zyn`) instead of a real Zyn host — this test is about
+    /// the COMMIT half, not the PREPARE half (that's
+    /// `seeded_demo_zyn_instruments_bind_and_render`, gated on real Zyn).
+    #[test]
+    fn the_seed_demo_transaction_journals_its_plugin_rows() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("seed-zyn-journal");
+        cp.create_project(parent.to_str().unwrap(), "SeedZynJournal").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        let zyn = [fake_prepared_zyn("pad"), fake_prepared_zyn("lead"), fake_prepared_zyn("bass")];
+        let ids: Vec<String> = zyn.iter().map(|p| p.row.id.clone()).collect();
+        cp.seed_demo_project_commit(Some(zyn)).expect("seed commits");
+
+        // (a) the rows landed in the document, and via the op path: three
+        // `pluginAdd` + three `pluginSetState` lines in the journal's seed
+        // batch.
+        {
+            let s = cp.session().lock();
+            assert_eq!(s.plugins.instances.len(), 3, "all three Zyn rows registered");
+            for id in &ids {
+                assert!(
+                    s.plugins.instances.iter().any(|r| &r.id == id),
+                    "instance {id} present"
+                );
+            }
+            let bound = s
+                .store
+                .tracks
+                .iter()
+                .filter(|t| t.instrument_id.as_deref().is_some_and(|iid| ids.iter().any(|id| iid == format!("plugin:{id}"))))
+                .count();
+            assert_eq!(bound, 3, "all three demo tracks bound to their Zyn instance");
+        }
+        let text = std::fs::read_to_string(dir.join("journal.ndjson")).expect("journal exists");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad journal line {l:?}: {e}")))
+            .collect();
+        let seed_batch = lines
+            .iter()
+            .find(|l| {
+                l.get("ops")
+                    .and_then(|o| o.as_array())
+                    .is_some_and(|ops| ops.iter().any(|op| op["kind"] == "pluginAdd"))
+            })
+            .expect("a batch carrying pluginAdd ops exists");
+        let ops = seed_batch["ops"].as_array().unwrap();
+        let plugin_adds = ops.iter().filter(|op| op["kind"] == "pluginAdd").count();
+        let plugin_set_states = ops.iter().filter(|op| op["kind"] == "pluginSetState").count();
+        assert_eq!(plugin_adds, 3, "three pluginAdd ops in the seed batch: {ops:#?}");
+        assert_eq!(plugin_set_states, 3, "three pluginSetState ops in the seed batch: {ops:#?}");
+
+        // (b) ONE undo removes tracks, clips AND plugin rows — the demo is
+        // one step.
+        let label = cp.undo().unwrap();
+        assert!(label.is_some(), "the seed is undoable");
+        let s = cp.session().lock();
+        assert!(s.store.tracks.is_empty(), "undo removed the demo tracks");
+        assert!(s.midi.clips.is_empty(), "undo removed the demo clips");
+        // (c) no direct-write remains: plugins is empty after the undo (the
+        // grep-level "no direct write" assertion is Task 13's).
+        assert!(s.plugins.instances.is_empty(), "undo removed the plugin rows too");
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The plain (no Zyn) demo path stays green: when preparation returns
+    /// `None`, `seed_demo_project` still seeds the PolySynth demo exactly
+    /// as today, with no plugin rows at all. Drives `seed_demo_project_
+    /// commit(None)` directly rather than the public `seed_demo_project()`
+    /// — `try_seed_zyn_demo_instruments` reads the PROCESS-GLOBAL plugin
+    /// registry (`registered_registry`), which another `#[test]` in this
+    /// same binary (`seeded_demo_zyn_instruments_bind_and_render`) may have
+    /// already registered; on a machine that genuinely has zynaddsubfx-lv2
+    /// installed, calling the real `seed_demo_project()` here would then
+    /// seed real Zyn rows too — an environment-dependent flake this test
+    /// must not have.
+    #[test]
+    fn seed_demo_project_without_zyn_still_seeds_the_polysynth_demo() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("seed-no-zyn");
+        cp.create_project(parent.to_str().unwrap(), "SeedNoZyn").unwrap();
+
+        let snapshot = cp.seed_demo_project_commit(None).expect("seed commits without Zyn");
+        assert_eq!(snapshot.tracks.len(), 3, "three demo tracks seeded");
+        let s = cp.session().lock();
+        assert!(s.plugins.instances.is_empty(), "no plugin rows when preparation is None");
+        assert!(
+            s.store.tracks.iter().all(|t| t.instrument_id.is_none()),
+            "tracks stay unbound (PolySynth fallback) without Zyn"
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// Item-4 integration: a finished `stableAudioSfz` job whose result

@@ -3,7 +3,8 @@
 **Status: TOTAL.** Every mutation path that reaches the AURA document now
 goes through the one transaction channel (`Session::transact` →
 `Committer::commit_with_rebuild`), except the sanctioned epoch functions and
-the four carve-outs recorded below. Every declared read path is pure.
+the three carve-outs recorded below (R-3 CLOSED in Plan F Task 10). Every
+declared read path is pure.
 
 This document is the landed form of the 34-row inventory in
 `docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md`
@@ -57,7 +58,7 @@ wrapper/op/epoch function.
 | 24 | engine thread site 5: `ensure_project` — direct + emit | **epoch function** (carve-out 4); the engine now calls the ONE sanctioned epoch fn through an installed closure | `src-tauri/src/audio/engine.rs:1485`; closure installed at `src-tauri/src/lib.rs:95`; swap site `src-tauri/src/audio/project.rs:118` |
 | 25 | `open_project` — wholesale swap | **epoch boundary** (carve-out 4): sanctioned epoch fn, single-lock swap, eager adopt of midi/plugins/automation | `src-tauri/src/control/mod.rs:1759` (`open_project_epoch`), marker at `:1787` |
 | 26 | `save_project`/`save_project_as`/`create_project` (save-as wrote midi under the lock) | **snapshot mark / epoch boundaries** (carve-out 4), all I/O outside the lock | `src-tauri/src/control/mod.rs:1684` (`create_project_at`, marker `:1718`), `:1834` (`save_project_as_epoch`, marker `:1848`), `:1884` (`save_project_mark`, marker `:1893` — deliberately NOT an epoch bump) |
-| 27 | `seed_demo_project` — 3 direct `add_track`s + midi pushes + save under the lock | routed through ONE channel tx (tx-tier `add_track_tx` + `Set{InstrumentId}` + `MidiClipAdd`) | `src-tauri/src/control/mod.rs:1974` (see also residual R-3 below) |
+| 27 | `seed_demo_project` — 3 direct `add_track`s + midi pushes + save under the lock; Zyn plugin rows (R-3, CLOSED Plan F Task 10) | routed through ONE channel tx (tx-tier `add_track_tx` + `Set{InstrumentId}` + `MidiClipAdd` + `Op::PluginAdd`/`Op::PluginSetState`) | `src-tauri/src/control/mod.rs:1974` |
 | 28 | transport family (`transport_play/stop/set_loop/set_stop_at_end`) — direct store writes | transient transport ops through `commit_with` (§4.2's "auto-stop produces a transport op") | `src-tauri/src/control/mod.rs:1042` (`ControlPlane::transport`) |
 | 29 | device selection — `EngineHandle` direct | **CARVE-OUT (app config, not document)**: behind a `ControlPlane` method for attribution, no op | `src-tauri/src/control/mod.rs:1229`, `:1240` |
 | 30 | frontend stems demo materialization + track reorder (webview-only clips) | DELETED; the frontend calls the real backend split-stems import | `src/lib/state/split-stems.test.ts`, `src/lib/state/jobs.svelte.ts` |
@@ -269,10 +270,10 @@ than its narrowness suggests now that the log is ON.
 
 ## Residual documented non-op document writes
 
-Four sites still write document fields without an op. All four are
-documented at the site, all four are under the session lock, and none is
-a user-visible edit — recorded here so the totality claim stays honest
-rather than absolute-sounding.
+Three sites still write document fields without an op (R-3 CLOSED in Plan F
+Task 10 — see below). All three are documented at the site, all three are
+under the session lock, and none is a user-visible edit — recorded here so
+the totality claim stays honest rather than absolute-sounding.
 
 **R-1 — `ControlPlane::set_plugin_pending_state`**
 (`src-tauri/src/control/mod.rs:1465`). Seeds
@@ -289,18 +290,18 @@ persisted plugin rows / automation lanes into the session at an EPOCH
 boundary. Sanctioned by ruling 4 — an epoch is where the document is
 replaced wholesale, and nothing about that replacement is an op.
 
-**R-3 — `try_seed_zyn_demo_instruments`**
-(`src-tauri/src/control/mod.rs:2430`; the direct row push at `:2469`, its
-rollback at `:2483`). `seed_demo_project`'s best-effort Zyn bootstrap
-pushes three instance rows into `session.plugins.instances` directly,
-before the demo's single channel transaction runs; the rationale is stated
-on the function itself (`src-tauri/src/control/mod.rs:2776`,
-`try_seed_zyn_demo_instruments`): no track
-references those ids until the caller binds them, so there is nothing
-user-visible to undo yet.
-Recommended for Plan F: fold this into the seed transaction as
-`Op::PluginAdd`s so the demo's plugin rows are undoable like everything
-else.
+**R-3 — CLOSED in Plan F Task 10** — `try_seed_zyn_demo_instruments`
+(`src-tauri/src/control/mod.rs`) used to push three instance rows into
+`session.plugins.instances` directly, before the demo's single channel
+transaction ran, on the rationale that no track referenced those ids until
+the caller bound them so there was nothing user-visible to undo yet.
+`try_seed_zyn_demo_instruments` now only PREPARES (host instantiate + patch
+load + captured post-load state — prepare-outside, all outside any
+lock/transaction) and touches no session state at all; the seed's one
+commit applies `Op::PluginAdd` + `Op::PluginSetState` per instance, so the
+demo's plugin rows are attributed, undoable in the same step as the rest of
+the demo, persisted via `PersistEffect`, and cold-replayable from the
+journal like everything else.
 
 **R-4 — `Committer::execute_host_forward`'s `Instantiate` writeback**
 (`src-tauri/src/control/mod.rs`, `apply_instantiate_writeback`). After the
@@ -383,8 +384,8 @@ Every DOCUMENT-writing session-lock site in the tree is one of:
 channel itself), `Committer::commit_with_rebuild`/`execute_persist`/`execute_host_forward`
 (`src-tauri/src/control/mod.rs:324`/`:538` — effect execution and the
 `midi.dirty`/`dirty_state` persist bookkeeping), the five sanctioned epoch
-functions (rows 24-26), the adopt-install helpers (R-2), or the three
-recorded residuals R-1, R-3 and R-4.
+functions (rows 24-26), the adopt-install helpers (R-2), or the two
+recorded residuals R-1 and R-4 (R-3 CLOSED in Plan F Task 10).
 
 **Every `session.lock()` in `src-tauri/src/audio/engine.rs` is a documented
 read.** All six non-test sites carry an explicit `// read-only:` comment or

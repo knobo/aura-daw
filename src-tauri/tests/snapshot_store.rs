@@ -35,9 +35,13 @@
 //!   monotonic watermark can fail a comparison.
 //!
 //! WHAT THIS SWEEP DOES AND DOES NOT PIN — measured, not guessed. Every one
-//! of the twelve `// snapshot republish:` sites was deleted in turn and this
-//! test re-run. Eight of the twelve turn it RED at the exact step that lost
-//! the call. The four that do not, and what covers them instead:
+//! of the TEN `// snapshot republish:` sites was deleted in turn and this
+//! test re-run (Task 10: `try_seed_zyn_demo_instruments`'s two direct-write
+//! sites — the push and its rollback arm — died with the function itself;
+//! R-3 closed, the demo's Zyn bootstrap is ops in the seed transaction now,
+//! so there is nothing left there to republish). Eight of the ten turn it
+//! RED at the exact step that lost the call. The two that do not, and what
+//! covers them instead:
 //! * `Committer::apply_instantiate_writeback` (R-4, `control/mod.rs`) —
 //!   unreachable from here BY CONSTRUCTION: this sweep uses `format: "stub"`
 //!   rows precisely so no host round-trip happens, and that writeback only
@@ -53,9 +57,6 @@
 //!   site has no coverage at all while looking covered. Reaching it without
 //!   a host would need a host-injection seam in `plugins::state`, which is
 //!   production API surface this task deliberately does not add.
-//! * `try_seed_zyn_demo_instruments`'s two sites — environment-gated the
-//!   same way, and shadowed by the demo bootstrap's own later commits.
-//!   Deleted with the whole function in Task 10.
 //!
 //! Three sites USED to be unpinnable-looking and are not. They are each
 //! followed, inside the same command, by `plugins::automation::
@@ -385,9 +386,11 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
         eng2.send(aura_lib::audio::engine::ControlMsg::Shutdown);
     }
 
-    // EPOCH FN: seed demo — the demo bootstrap writes the document directly
-    // in several places (`try_seed_zyn_demo_instruments`'s plugin rows among
-    // them) as well as through commits; all of it must land in the image.
+    // EPOCH FN: seed demo — Task 10 (R-3 closed): the demo bootstrap no
+    // longer writes the document directly anywhere; every row (tracks,
+    // clips, and — when Zyn is available — plugin rows) lands through the
+    // seed's one commit, so this is really a plain commit-equivalence check
+    // now, kept for regression coverage of the whole seed path.
     {
         let (cp3, session3, eng3) = fixture();
         cp3.seed_demo_project().expect("seed demo project");
