@@ -26,6 +26,32 @@
 //!   rather than leaving a partially-applied document behind.
 //! * Nothing here auto-applies (ruling F-8). `open_project_epoch` uses the
 //!   reader for DETECTION only, and warns.
+//!
+//! TWO CARRY-FORWARDS THIS MODULE NAMES BUT DOES NOT OWN. Both are about the
+//! FILE rather than the parse, both were found by reading this module back,
+//! and they want ONE owner because one change closes both:
+//!
+//! 1. THE JOURNAL GROWS WITHOUT BOUND. It is append-only across every
+//!    session of a project, has no rotation and no cap, and auto-persist
+//!    means one line per non-transient commit forever. [`read_journal`] does
+//!    `read_to_string` of the whole thing, on the command thread, on every
+//!    project open.
+//! 2. `(epoch, rev)` IS NOT UNIQUE IN THE FILE. `Session::new` starts every
+//!    process at `epoch: 0`/`rev: 0`, so the coordinate space is
+//!    process-local while the file is not — see [`read_journal`]'s duplicate
+//!    note for what that does to the sort.
+//!
+//! WHY (2) IS NOT FIXED HERE, argued rather than asserted. The obvious patch
+//! — seed `session.epoch` above the journal's max when a project opens — is
+//! a change to the EPOCH PATH, not to the reader: it would put file I/O in
+//! front of a value the session lock's critical section depends on, and the
+//! epoch is consumed by C-1's sink guard, `execute_persist`'s skip check,
+//! `snapshot_mark`'s check and `VersionGraph::clear`. It is also only half a
+//! fix, because `rev` restarts too, and seeding THAT reaches into `Committed`
+//! and the version graph. Per-session journal SEGMENTS fix both this and (1),
+//! cost the reader only a directory listing, and leave the epoch path alone —
+//! which is why the recommendation is to give (1) and (2) the same owner and
+//! not to spend the epoch path's invariants on a reader's convenience.
 
 use std::path::Path;
 
@@ -67,15 +93,6 @@ impl JournalRecord {
             JournalRecord::Batch { epoch, .. } => *epoch,
             JournalRecord::Epoch { epoch, .. } => *epoch,
             JournalRecord::SaveMark { epoch } => *epoch,
-        }
-    }
-
-    /// `Some(rev)` for a batch; `None` for the two boundary records, which
-    /// carry no revision of their own (see [`read_journal`]'s sort rules).
-    pub fn rev(&self) -> Option<u64> {
-        match self {
-            JournalRecord::Batch { rev, .. } => Some(*rev),
-            _ => None,
         }
     }
 }
@@ -120,11 +137,6 @@ pub struct ReadReport {
 }
 
 impl ReadReport {
-    /// Every batch record, in order.
-    pub fn batches(&self) -> impl Iterator<Item = &JournalRecord> {
-        self.records.iter().filter(|r| matches!(r, JournalRecord::Batch { .. }))
-    }
-
     /// Total lines dropped for a reason that is NOT the torn tail.
     pub fn skipped(&self) -> usize {
         self.skipped_v1 + self.skipped_future + self.skipped_malformed
@@ -161,19 +173,37 @@ enum Class {
 ///   its own epoch regardless of where in the file it landed.
 /// * a `Batch` anchors at its own `rev`.
 /// * a `SaveMark` CARRIES NO REV. Its meaning is positional — "the snapshot
-///   caught up HERE" — so it anchors to the rev of the last batch that
-///   preceded it IN FILE ORDER within its epoch, with the highest class.
-///   That places it strictly after that batch and strictly before the next
+///   caught up HERE" — so it anchors to the HIGHEST rev among the batches
+///   that precede it in file order within its epoch, with the highest class.
+///   That places it after every batch already written and before the next
 ///   one, which is exactly what the mark asserts. A mark before any batch
 ///   in its epoch anchors at 0, i.e. right after the epoch record.
+///
+///   HIGHEST-SO-FAR, NOT LAST-SEEN, and the difference is the whole reason
+///   this module exists. If the file holds rev 5 then rev 3 then a mark, the
+///   snapshot the mark describes contains BOTH (the mark was written after
+///   both commits landed); anchoring on the last line seen would put the
+///   mark at 3 and hand rev 5 back as unsaved work to be re-applied. Pinned
+///   by `a_mark_anchors_past_a_higher_rev_that_arrived_out_of_file_order` —
+///   the literal last-seen rule leaves every other test in this module
+///   green.
 /// * file position last, via a STABLE sort: two records with an identical
 ///   key keep the order the file gave them.
 ///
 /// DUPLICATE `(epoch, rev)` PAIRS ARE NOT AN ERROR and are not deduplicated.
-/// They should not occur (a rev is minted once, under the session lock), but
-/// a reader that silently dropped one of a pair would be choosing which of
+/// A reader that silently dropped one of a pair would be choosing which of
 /// two mutations to forget, which is not a choice a recovery path may make
-/// on its own. They come back adjacent, in file order.
+/// on its own. They come back adjacent, in file order — the stable sort is
+/// the CONTRACT here, not an implementation detail.
+///
+/// THEY ARE ALSO ROUTINE, not hypothetical. A rev is minted once per
+/// process, under the session lock — but `journal.ndjson` is APPEND-ONLY
+/// ACROSS PROCESSES, while `Session::new` starts every process at `epoch: 0`
+/// and `rev: 0`. So the epoch namespace is process-local and the file is
+/// not: run AURA twice against the same project and the file carries two
+/// `(1, 1)`s, two `(1, 2)`s, and so on, belonging to different sessions.
+/// Sorted by `(epoch, rev)` they interleave. See [`unsaved_tail`] for what
+/// that costs and who owns the fix.
 ///
 /// GAPS IN `rev` ARE NORMAL, not damage: transient batches bump `rev` and
 /// are deliberately never journaled (round-2 §4.4), so a healthy journal is
@@ -211,6 +241,9 @@ pub fn parse_journal(text: &str) -> ReadReport {
                 let key = match &rec {
                     JournalRecord::Epoch { .. } => (epoch, 0, Class::Epoch),
                     JournalRecord::Batch { rev, .. } => {
+                        // HIGHEST so far, not last seen — see the fn doc:
+                        // a mark written after an out-of-order pair must not
+                        // anchor below the higher of the two.
                         let a = anchor.entry(epoch).or_insert(0);
                         *a = (*a).max(*rev);
                         (epoch, *rev, Class::Batch)
@@ -333,26 +366,73 @@ fn parse_line(line: &str) -> Result<JournalRecord, SkipReason> {
     Err(SkipReason::Malformed("neither a batch (`ops`) nor a boundary (`epochEvent`)".into()))
 }
 
-/// THE UNSAVED TAIL: the batches of the report's LAST epoch that come after
-/// that epoch's LAST save mark — or ALL of that epoch's batches when it has
-/// no mark at all. Empty means the on-disk snapshot is current with the log.
+/// THE UNSAVED TAIL: the batches of the report's LAST EPOCH THAT CONTAINS A
+/// BATCH, that come after that epoch's last save mark — or ALL of that
+/// epoch's batches when it has no mark at all. Empty means the on-disk
+/// snapshot is current with the log.
 ///
-/// Only the last epoch, because every earlier epoch describes a document
-/// that has since been swapped out; replaying its ops onto today's document
-/// would apply one project's edits to another (ruling 4, the same reason a
-/// swap clears the undo stacks).
+/// Only one epoch, because every earlier epoch describes a document that has
+/// since been swapped out; replaying its ops onto today's document would
+/// apply one project's edits to another (ruling 4, the same reason a swap
+/// clears the undo stacks).
+///
+/// WHY "LAST EPOCH THAT CONTAINS A BATCH" AND NOT "MAX EPOCH". Every epoch
+/// boundary APPENDS ITS OWN RECORD to the journal it is opening, so a file
+/// routinely ends in an epoch that has no batches yet. Under a plain
+/// max-epoch rule that empty epoch wins and the tail is empty — the detector
+/// reports "nothing unsaved" precisely when a document was just re-opened
+/// with unsaved work in its log, which is the one moment the answer matters.
+/// Fix round 1 shipped this predicate AND moved the only production caller
+/// ahead of its `epoch_boundary` call; either alone would do, and defence in
+/// depth is what a recovery path is for. Pinned by
+/// `the_tail_survives_the_epoch_record_an_open_appends_before_reading`.
 ///
 /// A MARK AT THE VERY END gives an empty tail — the normal, healthy case.
 /// A MARK IS NEVER "BEYOND THE END": it has no index into anything, only a
 /// position among records, so there is no out-of-range case to handle.
 ///
-/// KNOWN CONSEQUENCE of a mark whose neighbouring batch line is unreadable:
-/// the mark anchors to the last batch that DID parse, so the tail can begin
-/// one or more batches earlier than the truth and a replay would re-apply
-/// work already on disk. That is why nothing auto-applies (ruling F-8) —
-/// the tail is a detection signal, and a human decides.
+/// SAVED WORK IS NEVER RE-APPLIED, and that is a property of the anchoring
+/// rule rather than a hope. A batch enters the tail only if its rev exceeds
+/// the mark's anchor; the anchor is the MAXIMUM rev over the batches that
+/// precede the mark in file order; so no batch preceding the mark can exceed
+/// it. The rule is also right for a batch that arrives AFTER the mark
+/// carrying a LOWER rev, which out-of-order journaling produces: revs are
+/// minted under the session lock, so a lower rev is an earlier mutation, and
+/// the snapshot the mark describes was taken from a document that had already
+/// reached the higher one. A late LINE is not a late mutation — which is the
+/// whole reason this reader sorts by rev instead of trusting the file.
+/// An unreadable line can only LOWER the anchor, and a lower anchor admits
+/// only higher revs, i.e. mutations the snapshot had not reached. Pinned by
+/// `a_batch_written_before_the_mark_never_enters_the_tail_however_torn_the_file`.
+/// (Fix round 1 correction, ADR 0007: the previous version of this doc
+/// claimed the opposite, "the tail can begin earlier than the truth". That
+/// was inherited from an earlier last-seen anchoring rule and is false for
+/// the max-so-far rule this module actually ships.)
+///
+/// THE REAL RESIDUAL IS IN THE OTHER DIRECTION — WORK GOES MISSING, and it
+/// is survivable only because nothing auto-applies (ruling F-8): the tail is
+/// a detection signal, and a human decides.
+///
+/// * AN UNREADABLE BATCH LINE IS LOST, full stop: it is counted in
+///   `skipped_malformed` and can never be replayed, whether it was saved or
+///   not. The counter is the whole defence.
+/// * `ControlPlane::save_project_mark` releases the
+///   session lock, writes `project.json`, and only then calls
+///   `HistoryLog::snapshot_mark`. A commit that journals inside that window
+///   lands BEFORE the mark in file order and is classified as saved, even
+///   though the snapshot on disk predates it. Closing it means moving the
+///   mark under the same critical section as the snapshot — a change to the
+///   epoch/save path's locking, which is `save_project_mark`'s territory,
+///   not the reader's. Named here so the next person on that path knows the
+///   reader depends on it.
 pub fn unsaved_tail(report: &ReadReport) -> Vec<&JournalRecord> {
-    let Some(last_epoch) = report.records.iter().map(|r| r.epoch()).max() else {
+    let Some(last_epoch) = report
+        .records
+        .iter()
+        .filter(|r| matches!(r, JournalRecord::Batch { .. }))
+        .map(|r| r.epoch())
+        .max()
+    else {
         return vec![];
     };
     let in_epoch: Vec<&JournalRecord> =
@@ -377,6 +457,16 @@ pub fn unsaved_tail(report: &ReadReport) -> Vec<&JournalRecord> {
 /// unreadable one) is normal, not an error, so an I/O failure returns 0 after
 /// a debug line.
 ///
+/// **CALL IT BEFORE THE EPOCH BOUNDARY, NOT AFTER.**
+/// `HistoryLog::epoch_boundary` appends `{"epochEvent":"open","epoch":N}` to
+/// the very file this reads, and N is higher than anything already in it. Fix
+/// round 1's Critical: called after the boundary, this returned 0 on every
+/// re-open within a process run — the detector could not detect. (Plan defect
+/// #17: the plan's own step text said "after the adopt steps".) Reading needs
+/// neither the boundary nor the adopts. [`unsaved_tail`]'s
+/// last-epoch-with-a-batch rule now covers the same hole from the other side;
+/// keep BOTH.
+///
 /// WHAT A NON-ZERO COUNT ACTUALLY MEANS, stated precisely because the
 /// obvious reading is wrong for today's AURA: it means "the log records edits
 /// the user never explicitly saved", NOT "the files on disk are stale".
@@ -385,6 +475,14 @@ pub fn unsaved_tail(report: &ReadReport) -> Vec<&JournalRecord> {
 /// tail is expected on any project edited since its last Ctrl+S. The signal
 /// becomes a real staleness signal exactly when a persist FAILED (each one
 /// only warns) or when the process died between a commit and its persist.
+///
+/// AND IT COUNTS ACROSS PROCESS RUNS. The journal is append-only across
+/// sessions while `epoch`/`rev` restart at 0 in each one (see
+/// [`read_journal`]'s duplicate note), so on a project opened for the Nth
+/// time this count can span several sessions' batches sharing one epoch
+/// number. That is fine for a warning — "there is unsaved work in the log"
+/// stays true — and is exactly why the number must not be fed to
+/// [`replay_tail`] without a human in the loop.
 ///
 /// COST AND THREAD: runs on the calling command thread, holding NO lock, and
 /// parses the whole journal — which is append-only ACROSS SESSIONS and has no
@@ -590,12 +688,19 @@ mod tests {
         // is minted once, under the session lock). If it happens anyway, a
         // reader that dropped one would be choosing which mutation to
         // forget — so both survive, adjacent, in the order the file gave.
-        // 30 collisions, not 3 — and MEASURED, not assumed: swapping the
-        // implementation to `sort_unstable_by_key` does NOT turn this red at
-        // 30, 200 or 2000 identical keys (pdqsort leaves an all-equal run
-        // alone). So this test pins the OUTCOME "no duplicate is dropped or
-        // reordered", which is the contract; it does not, and cannot
-        // cheaply, pin the choice of a stable sort as such.
+        // Duplicates are ROUTINE, not hypothetical: `epoch`/`rev` restart at
+        // 0 in every process while the file is append-only across them, so
+        // any project opened twice has them (see `read_journal`'s doc). File
+        // order for equal keys is therefore the CONTRACT — it is what keeps
+        // one session's revisions in their own sequence instead of shuffled
+        // against another's.
+        //
+        // 30 collisions, not 3 — and MEASURED: swapping the implementation
+        // to `sort_unstable_by_key` does NOT turn this red at 30, 200 or
+        // 2000 identical keys (pdqsort leaves an all-equal run alone). The
+        // contract is pinned by outcome; the specific sort cannot be pinned
+        // cheaply, which is why `sort_by_key` (stable BY GUARANTEE, not by
+        // observed behaviour) is the one to keep.
         let mut lines: Vec<String> = (0..30).map(|i| batch_line(1, 1, &format!("dup-{i:02}"))).collect();
         lines.push(batch_line(2, 1, "later"));
         let r = parse_journal(&(lines.join("\n") + "\n"));
@@ -727,6 +832,132 @@ mod tests {
         text.push_str(&format!("{}\n", batch_line(2, 2, "e2-b")));
         let r = parse_journal(&text);
         assert_eq!(labels(&unsaved_tail(&r).into_iter().cloned().collect::<Vec<_>>()), vec!["e2-b"]);
+    }
+
+    /// FIX ROUND 1's CRITICAL, at the unit level. Every epoch boundary
+    /// appends its own record to the journal it opens, so a real file
+    /// routinely ENDS in an epoch that has no batches yet. A max-epoch rule
+    /// picks that empty epoch and reports "nothing unsaved" at exactly the
+    /// moment a document was re-opened with unsaved work in its log.
+    ///
+    /// The previous fixture hand-wrote journals ENDING IN BATCHES — an order
+    /// production never produces — which is why nothing caught it.
+    #[test]
+    fn the_tail_survives_the_epoch_record_an_open_appends_before_reading() {
+        let text = [
+            epoch_line("create", 1),
+            batch_line(1, 1, "e1-a"),
+            epoch_line("save", 1),
+            batch_line(2, 1, "unsaved-1"),
+            batch_line(3, 1, "unsaved-2"),
+            // ...and now the user re-opens the project. `epoch_boundary`
+            // appends THIS, to the file about to be read, with an epoch
+            // above everything already in it and no batches of its own.
+            epoch_line("open", 3),
+        ]
+        .join("\n")
+            + "\n";
+        let r = parse_journal(&text);
+        assert_eq!(
+            labels(&unsaved_tail(&r).into_iter().cloned().collect::<Vec<_>>()),
+            vec!["unsaved-1", "unsaved-2"],
+            "the re-open's own boundary record must not swallow the tail"
+        );
+        // Anti-vacuity: the trap really is in the fixture — the newest epoch
+        // in the file is 3, it is above the batches' epoch, and it is empty.
+        assert_eq!(r.records.iter().map(|r| r.epoch()).max(), Some(3));
+        assert!(
+            !r.records.iter().any(|x| x.epoch() == 3 && matches!(x, JournalRecord::Batch { .. })),
+            "and epoch 3 carries no batches, which is what made the max-epoch rule wrong"
+        );
+    }
+
+    /// The anchor is the HIGHEST rev seen so far in the epoch, not the last
+    /// one written. The two rules differ exactly in the out-of-order case
+    /// this module exists for — and the doc used to describe the wrong one.
+    #[test]
+    fn a_mark_anchors_past_a_higher_rev_that_arrived_out_of_file_order() {
+        // rev 5 reaches the file BEFORE rev 3 (two committers, journal mutex
+        // is the leaf). The mark is written after both landed, so both are
+        // saved; only rev 6 is unsaved.
+        let text = [
+            batch_line(1, 1, "a"),
+            batch_line(5, 1, "arrived-early"),
+            batch_line(3, 1, "arrived-late"),
+            epoch_line("save", 1),
+            batch_line(6, 1, "genuinely-unsaved"),
+        ]
+        .join("\n")
+            + "\n";
+        let r = parse_journal(&text);
+        assert_eq!(
+            labels(&unsaved_tail(&r).into_iter().cloned().collect::<Vec<_>>()),
+            vec!["genuinely-unsaved"],
+            "a last-seen anchor would sit at rev 3 and hand rev 5 back as unsaved work"
+        );
+    }
+
+    /// The invariant that makes the tail safe in the re-apply direction: a
+    /// batch whose rev the snapshot had already reached can never enter the
+    /// tail, because the anchor is the maximum rev over every batch
+    /// preceding the mark. Unreadable lines can only LOWER the anchor, and a
+    /// lower anchor admits only HIGHER revs — mutations the document had not
+    /// reached when the snapshot was taken.
+    #[test]
+    fn a_batch_written_before_the_mark_never_enters_the_tail_however_torn_the_file() {
+        let text = [
+            batch_line(1, 1, "saved-1").as_str(),
+            batch_line(9, 1, "saved-high").as_str(),
+            // The highest pre-mark rev is UNREADABLE — the worst case for
+            // the anchor.
+            r#"{"v":2,"rev":12,"epoch":1,"actor":"user","run":"r","label":"lost","ops":[{"kind":"noSuchOp"}]}"#,
+            batch_line(4, 1, "saved-low").as_str(),
+            epoch_line("save", 1).as_str(),
+            // Written after the mark but carrying a LOWER rev than one
+            // already in the file. Revs are minted under the session lock,
+            // so rev 7's mutation was in the document before rev 9's was —
+            // and the snapshot the mark describes was taken from a document
+            // that already had rev 9. A late-arriving LINE is not a late
+            // mutation: this one is SAVED, and classifying it by rev rather
+            // than by file position is exactly what L-4's sort is for.
+            batch_line(7, 1, "saved-but-journaled-late").as_str(),
+            batch_line(14, 1, "genuinely-after").as_str(),
+        ]
+        .join("\n")
+            + "\n";
+        let r = parse_journal(&text);
+        let tail = labels(&unsaved_tail(&r).into_iter().cloned().collect::<Vec<_>>());
+        assert_eq!(tail, vec!["genuinely-after"], "only what the document had not reached");
+        assert!(
+            !tail.iter().any(|l| l.starts_with("saved")),
+            "no batch the snapshot already contains is offered for re-application"
+        );
+        // The real residual, asserted rather than merely described: the
+        // unreadable batch is LOST — not saved, not in the tail, just
+        // counted. The counter is the whole defence.
+        assert_eq!(r.skipped_malformed, 1);
+        assert!(!labels(&r.records).iter().any(|l| l == "lost"));
+    }
+
+    #[test]
+    fn a_boundary_record_is_read_whatever_version_wrote_it() {
+        // The version gate is BATCH-ONLY on purpose: a boundary record's
+        // shape ({epochEvent, epoch}) has never changed, and refusing a v1
+        // save mark would move the tail's start BACKWARDS — the one
+        // direction that costs re-applied work.
+        let text = [
+            r#"{"v":1,"epochEvent":"save","epoch":1}"#.to_string(),
+            batch_line(2, 1, "after"),
+        ]
+        .join("\n")
+            + "\n";
+        let r = parse_journal(&text);
+        assert_eq!(labels(&r.records), vec!["save:1", "after"], "the v1 mark is a mark");
+        assert_eq!(r.skipped(), 0, "and is not counted as skipped");
+        assert_eq!(
+            labels(&unsaved_tail(&r).into_iter().cloned().collect::<Vec<_>>()),
+            vec!["after"]
+        );
     }
 
     #[test]

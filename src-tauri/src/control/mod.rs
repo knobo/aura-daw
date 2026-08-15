@@ -3369,6 +3369,19 @@ impl ControlPlane {
         // document (ruling 4), so both stacks are cleared and the journal
         // rotates onto the newly opened project's own file — appending, so
         // that project's earlier sessions stay in its log.
+        // Plan F Task 9: the journal now has a reader, and this is its only
+        // production call site — DETECTION ONLY (ruling F-8), no auto-apply,
+        // no event, no UI. No lock is held here.
+        //
+        // ORDER IS LOAD-BEARING, and it is NOT the plan's (plan defect #17,
+        // fix round 1): this must run BEFORE `epoch_boundary`, which appends
+        // this open's own `{"epochEvent":"open","epoch":N}` — with N above
+        // every epoch already in the file — to the file being read. After
+        // the boundary, the newest epoch holds no batches and the tail is
+        // always empty: File▸Open A, edit, File▸Open B, File▸Open A used to
+        // report nothing with two unsaved batches sitting on disk. Reading
+        // needs neither the boundary nor the adopts below.
+        replay::detect_unsaved_tail(&dir);
         self.committer.log().epoch_boundary(&dir, history::EpochEvent::Open, new_epoch);
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
@@ -3376,11 +3389,6 @@ impl ControlPlane {
             out.adopt_project(&dir);
         }
         self.adopt_modulation_from_dir(&dir);
-        // Plan F Task 9: the journal now has a reader, and this is its only
-        // production call site — DETECTION ONLY (ruling F-8), no auto-apply,
-        // no event, no UI. After the adopts, so the warning describes the
-        // document that is actually open; no lock is held here.
-        replay::detect_unsaved_tail(&dir);
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
         Ok(project)

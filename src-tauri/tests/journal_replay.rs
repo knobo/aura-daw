@@ -232,6 +232,70 @@ fn sentinel_note(tick: u32, key: u8) -> MidiNote {
 // The test
 // ---------------------------------------------------------------------------
 
+/// FIX ROUND 1's CRITICAL, through public API only: the detector must still
+/// detect after the project has been re-opened.
+///
+/// `open_project_epoch` appends its own `{"epochEvent":"open","epoch":N}` to
+/// the journal it is opening, with N above every epoch already in the file.
+/// A max-epoch tail rule then picks that batch-less epoch and reports
+/// "nothing unsaved" — on EVERY re-open within a process run, which is the
+/// ordinary File▸Open A / edit / File▸Open B / File▸Open A path. The unit
+/// fixtures could not see it because they hand-wrote journals ending in
+/// batches, an order production never produces.
+#[test]
+fn unsaved_work_is_still_detected_after_the_project_is_reopened() {
+    let (cp, _session, eng) = fixture();
+    let parent = tmp_parent("reopen");
+    let a = std::path::PathBuf::from(
+        cp.create_project(parent.to_str().unwrap(), "A").unwrap().path.unwrap(),
+    );
+    let b = std::path::PathBuf::from(
+        cp.create_project(parent.to_str().unwrap(), "B").unwrap().path.unwrap(),
+    );
+    cp.open_project_epoch(&a).unwrap();
+
+    // Two real edits, never saved.
+    let mut t = String::new();
+    cp.commit(TxMeta::user("add track"), |tx| {
+        t = ops::add_track_tx(tx, Some("Audio".into()), Some("audio".into()))?.id.to_string();
+        Ok(())
+    })
+    .unwrap();
+    cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+    assert_eq!(
+        aura_lib::control::replay::detect_unsaved_tail(&a),
+        2,
+        "two unsaved batches, before anything re-opens the project"
+    );
+
+    // The user goes to another project and comes back — the ordinary path.
+    cp.open_project_epoch(&b).unwrap();
+    cp.open_project_epoch(&a).unwrap();
+
+    assert_eq!(
+        aura_lib::control::replay::detect_unsaved_tail(&a),
+        2,
+        "the re-open's own boundary record must not swallow the tail"
+    );
+
+    // Anti-vacuity: the trap is really in the file. Its newest epoch is
+    // above the batches' epoch AND carries no batches of its own — which is
+    // exactly what made a max-epoch rule report zero here.
+    let report = read_journal(&a.join("journal.ndjson")).unwrap();
+    let newest = report.records.iter().map(|r| r.epoch()).max().unwrap();
+    let batch_epoch = report
+        .records
+        .iter()
+        .filter(|r| matches!(r, aura_lib::control::replay::JournalRecord::Batch { .. }))
+        .map(|r| r.epoch())
+        .max()
+        .unwrap();
+    assert!(newest > batch_epoch, "the re-open wrote a strictly newer epoch: {newest} > {batch_epoch}");
+
+    eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
 #[test]
 fn a_cold_tail_replay_reproduces_the_crashed_sessions_document_byte_identically() {
     let (cp, session_handle, eng) = fixture();
