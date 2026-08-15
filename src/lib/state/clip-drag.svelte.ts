@@ -39,7 +39,12 @@ interface MidiOrigin {
   id: string;
   startTicks: number;
   lengthTicks: number;
-  contentLengthTicks: number;
+  /** Original optional — `undefined` means "same as length". Cancel must
+   * write this back, not the pinned effective value, or a cancelled
+   * first-time resize silently establishes a loop length. */
+  contentLengthTicks: number | undefined;
+  /** Effective length at drag start, used only for the live preview. */
+  pinnedContentLengthTicks: number;
 }
 type Origin = AudioOrigin | MidiOrigin;
 
@@ -77,9 +82,8 @@ class ClipDragController {
             id: c.id,
             startTicks: c.timelineStartTicks,
             lengthTicks: c.lengthTicks,
-            // Pinned once, at drag start — the content length a first
-            // right-edge drag ESTABLISHES (MidiClipView's existing rule).
-            contentLengthTicks: midi.effectiveContentLengthTicks(c),
+            contentLengthTicks: c.contentLengthTicks,
+            pinnedContentLengthTicks: midi.effectiveContentLengthTicks(c),
           });
       }
     }
@@ -176,7 +180,7 @@ class ClipDragController {
       return {
         ...c,
         lengthTicks: Math.max(1, o.lengthTicks + deltaTicks),
-        contentLengthTicks: o.contentLengthTicks,
+        contentLengthTicks: o.pinnedContentLengthTicks,
       };
     });
   }
@@ -208,7 +212,7 @@ class ClipDragController {
                   clipId: c.id,
                   timelineStartTicks: c.timelineStartTicks,
                   lengthTicks: c.lengthTicks,
-                  contentLengthTicks: c.contentLengthTicks ?? o.contentLengthTicks,
+                  contentLengthTicks: c.contentLengthTicks ?? o.pinnedContentLengthTicks,
                 }
               : { kind: "midi", clipId: c.id, timelineStartTicks: c.timelineStartTicks },
           );
@@ -219,10 +223,29 @@ class ClipDragController {
           await backend.moveClips?.(placements);
         } catch (err) {
           console.error("[aura] move_clips failed:", err);
+          this.restore(origins, mode);
         }
       }
     }
     await backend.gestureEnd?.();
+  }
+
+  private restore(origins: Origin[], mode: "move" | "resize") {
+    if (mode === "resize") {
+      const byId = new Map(
+        origins.filter((o): o is MidiOrigin => o.kind === "midi").map((o) => [o.id, o]),
+      );
+      midi.clips = midi.clips.map((c) => {
+        const o = byId.get(c.id);
+        if (!o) return c;
+        return { ...c, lengthTicks: o.lengthTicks, contentLengthTicks: o.contentLengthTicks };
+      });
+      return;
+    }
+    for (const o of origins) {
+      if (o.kind === "audio") project.moveClip(o.id, o.startSamples);
+      else midi.moveClip(o.id, o.startTicks);
+    }
   }
 
   /** pointercancel / Escape: undo the local preview back to each origin's
@@ -238,23 +261,8 @@ class ClipDragController {
    * phantom length behind exactly like the phantom position the move-mode
    * fix above closed. */
   cancel() {
-    if (this.moved) {
-      if (this.mode === "resize") {
-        const byId = new Map(
-          this.origins.filter((o): o is MidiOrigin => o.kind === "midi").map((o) => [o.id, o]),
-        );
-        midi.clips = midi.clips.map((c) => {
-          const o = byId.get(c.id);
-          if (!o) return c;
-          return { ...c, lengthTicks: o.lengthTicks, contentLengthTicks: o.contentLengthTicks };
-        });
-      } else {
-        for (const o of this.origins) {
-          if (o.kind === "audio") project.moveClip(o.id, o.startSamples);
-          else midi.moveClip(o.id, o.startTicks);
-        }
-      }
-    }
+    if (!this.active) return;
+    if (this.moved) this.restore(this.origins, this.mode);
     this.active = false;
     this.moved = false;
     this.origins = [];

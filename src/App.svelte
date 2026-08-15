@@ -31,6 +31,7 @@
   import { generation } from "./lib/state/generation.svelte";
   import { clipEdges, edgeJump, gridStep } from "./lib/utils/timeline-nav";
   import { clipClipboard } from "./lib/state/clip-clipboard.svelte";
+  import { clipDrag } from "./lib/state/clip-drag.svelte";
   import { clipSelection } from "./lib/state/clip-selection.svelte";
   import TransportBar from "./lib/components/TransportBar.svelte";
   import Timeline from "./lib/components/Timeline.svelte";
@@ -186,6 +187,9 @@
         dir,
       );
       if (target !== null) void transport.seek(target);
+    } else if (e.key === "Escape" && clipDrag.active) {
+      e.preventDefault();
+      clipDrag.cancel();
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "c") {
       // Copy the timeline selection (multi-clip, audio + MIDI). Falls back
       // to the legacy single-clip stamp when nothing is multi-selected, so

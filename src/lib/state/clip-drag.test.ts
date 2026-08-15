@@ -231,6 +231,39 @@ describe("clipDrag group move", () => {
     expect(moveClips).not.toHaveBeenCalled();
     expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
   });
+
+  it("cancel of a first-time resize leaves contentLengthTicks unset, not the pinned effective value", () => {
+    clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
+    expect(midi.clips[0].contentLengthTicks).toBeUndefined();
+    clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
+    clipDrag.move(2500, true);
+    expect(midi.clips[0].contentLengthTicks).toBe(960);
+    clipDrag.cancel();
+    expect(midi.clips[0].contentLengthTicks).toBeUndefined();
+  });
+
+  it("a rejected moveClips restores the pre-drag positions", async () => {
+    moveClips.mockRejectedValueOnce(new Error("busy"));
+    clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(500, true);
+    expect(project.clips[0].timelineStartSamples).toBe(1500);
+    await clipDrag.end();
+    expect(project.clips[0].timelineStartSamples).toBe(1000);
+    expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
+  });
+
+  it("cancel is a no-op once the drag has already ended", async () => {
+    clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
+    clipDrag.begin({ kind: "audio", id: "a1" }, 0);
+    clipDrag.move(500, true);
+    await clipDrag.end();
+    gestureEnd.mockClear();
+    calls.length = 0;
+    clipDrag.cancel();
+    expect(gestureEnd).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
 });
 
 describe("clipDrag group resize (loop length)", () => {

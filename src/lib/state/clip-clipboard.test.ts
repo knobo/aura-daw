@@ -145,6 +145,48 @@ describe("clipClipboard.copy", () => {
   });
 
   /**
+   * paste() prefers a valid OS envelope over memory. Two rapid copies can
+   * both pass the seq check, then finish osClipboardWriteText out of
+   * order — the older write landing last makes the next paste apply the
+   * stale selection even though this.payload already holds the newer one.
+   */
+  it("does not let a slower earlier OS write be the envelope paste reads", async () => {
+    const older: AuraClipsPayload = { ...payload, anchorSamples: 1 };
+    const newer: AuraClipsPayload = { ...payload, anchorSamples: 2 };
+    let finishOlderWrite!: () => void;
+    let startedOlderWrite!: () => void;
+    const olderWriteGate = new Promise<void>((resolve) => {
+      finishOlderWrite = resolve;
+    });
+    const olderWriteStarted = new Promise<void>((resolve) => {
+      startedOlderWrite = resolve;
+    });
+    osClipboardWriteText
+      .mockImplementationOnce(async (t: string) => {
+        startedOlderWrite();
+        await olderWriteGate;
+        clipboardText = t;
+      })
+      .mockImplementationOnce(async (t: string) => {
+        clipboardText = t;
+      });
+    clipsCopy
+      .mockImplementationOnce(async () => older)
+      .mockImplementationOnce(async () => newer);
+
+    clipSelection.apply([{ kind: "audio", id: "a1" }], "replace");
+    const first = clipClipboard.copy();
+    await olderWriteStarted;
+    const second = clipClipboard.copy();
+    finishOlderWrite();
+    await Promise.all([first, second]);
+
+    expect(clipClipboard.payload).toEqual(newer);
+    const fromOs = JSON.parse(clipboardText.split("\n").slice(1).join("\n"));
+    expect(fromOs.anchorSamples).toBe(2);
+  });
+
+  /**
    * Fix round 1, minor 1: the size-risk guard must count UTF-8 BYTES, not
    * `.length`'s UTF-16 code units — a clip/track name is user text, and a
    * string of astral characters (surrogate pairs, 2 code units / 4 bytes
