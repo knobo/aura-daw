@@ -157,6 +157,11 @@
     // dragged" rule: if the clip has no explicit content length yet, this
     // drag's start-of-gesture placement length BECOMES the content length.
     dragOrigContentTicks = midi.effectiveContentLengthTicks(clip);
+    // Which half of the clip the gesture started in, decided by geometry
+    // rather than by e.target: the capture below retargets the following
+    // click/dblclick to this element, and the name tag is a 9px-tall hit
+    // target nobody can reliably hit anyway.
+    downOnHeader = e.clientY - rect.top <= HEADER_PX;
     (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
   }
   function onPointerMove(e: PointerEvent) {
@@ -189,8 +194,52 @@
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
     if (wasDragging) void midi.commitBounds(clip.id);
   }
-  function onKeydown(e: KeyboardEvent) {
+  // ── rename ──
+  // The clip body's double-click is already taken (piano roll), so the name
+  // strip along the top gets it instead — the band above the mini preview,
+  // which starts at 14px. Plus F2, the DAW-conventional key.
+  const HEADER_PX = 14;
+  let renaming = $state(false);
+  let draft = $state("");
+  let downOnHeader = false;
+  let inputEl: HTMLInputElement | undefined = $state();
+
+  function startRename() {
+    draft = clip.name;
+    renaming = true;
+  }
+
+  // The input is inserted after this flips, so focus it once it exists —
+  // `autofocus` is unreliable for an element that appears mid-session.
+  $effect(() => {
+    if (renaming && inputEl) {
+      inputEl.focus();
+      inputEl.select();
+    }
+  });
+
+  async function commitRename() {
+    if (!renaming) return;
+    renaming = false;
+    await midi.renameClip(clip.id, draft);
+  }
+
+  function onRenameKeydown(e: KeyboardEvent) {
+    e.stopPropagation(); // the clip's own handler moves/opens the clip
     if (e.key === "Enter") {
+      e.preventDefault();
+      void commitRename();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      renaming = false;
+    }
+  }
+
+  function onKeydown(e: KeyboardEvent) {
+    if (e.key === "F2") {
+      e.preventDefault();
+      startRename();
+    } else if (e.key === "Enter") {
       midi.open(clip.id);
     } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
       e.preventDefault();
@@ -212,17 +261,35 @@
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
     role="button"
-    aria-label="MIDI clip {clip.name} — double-click to edit, drag the right edge to loop"
+    aria-label="MIDI clip {clip.name} — double-click to edit, F2 to rename, drag the right edge to loop"
     tabindex="0"
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
-    ondblclick={() => midi.open(clip.id)}
+    ondblclick={() => (downOnHeader ? startRename() : midi.open(clip.id))}
     onkeydown={onKeydown}
   >
     <div bind:this={pulseEl} class="pulse"></div>
     <canvas bind:this={canvas} class="mini" style:left="{visL}px" style:width="{Math.max(1, Math.floor(visR - visL))}px"></canvas>
-    <span class="tag mono" style:left="{visL + 4}px">▦ {clip.name}</span>
+    {#if renaming}
+      <input
+        bind:this={inputEl}
+        class="tag rename mono"
+        style:left="{visL + 4}px"
+        value={draft}
+        oninput={(e) => (draft = e.currentTarget.value)}
+        onpointerdown={(e) => e.stopPropagation()}
+        onkeydown={onRenameKeydown}
+        onblur={() => void commitRename()}
+      />
+    {:else}
+      <!-- The strip is the affordance: it makes the whole name band show a
+           text cursor, so the rename target is the width of the clip rather
+           than the width of the label. Hit-testing is geometric (see
+           onPointerDown) — this element only carries the cursor. -->
+      <div class="namestrip" title="Double-click to rename"></div>
+      <span class="tag mono" style:left="{visL + 4}px">▦ {clip.name}</span>
+    {/if}
     <span class="count silk">{clip.notes.length}n</span>
   </div>
 {/if}
@@ -310,6 +377,28 @@
     border-radius: 3px;
     pointer-events: none;
     white-space: nowrap;
+  }
+  .namestrip {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 14px; /* HEADER_PX */
+    cursor: text;
+  }
+  .namestrip:hover {
+    background: rgba(255, 255, 255, 0.06);
+  }
+  .rename {
+    top: 2px;
+    width: 12ch;
+    pointer-events: auto; /* .tag turns them off; the input needs clicking */
+    border: 1px solid var(--clip-color);
+    outline: none;
+    font: inherit;
+    font-size: 9px;
+    color: var(--text);
+    background: rgba(5, 7, 13, 0.92);
   }
   .count {
     position: absolute;

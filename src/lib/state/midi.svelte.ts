@@ -11,6 +11,7 @@ import { backend } from "../tauri";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { project } from "./project.svelte";
 import { sampleAtTick, tickAtSample, type SectionRow } from "../sectionTable";
+import { toasts } from "./toasts.svelte";
 import { byTickKey } from "../utils/note-ops";
 import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent } from "../types/ipc";
 
@@ -151,8 +152,25 @@ class MidiStore {
       this.upsert(clip);
       return clip;
     } catch (err) {
+      // A double-click that produces no clip and no message reads as a dead
+      // UI; the console is not a user surface.
+      toasts.error("COULD NOT ADD MIDI CLIP", String(err));
       console.error("[aura] midi_add_clip failed:", err);
       return null;
+    }
+  }
+
+  /** Rename a clip. The backend trims and rejects empty names; this returns
+   *  false (with the reason toasted) rather than throwing at the caller. */
+  async renameClip(clipId: string, name: string): Promise<boolean> {
+    const previous = this.clips.find((c) => c.id === clipId)?.name;
+    if (name.trim() === previous) return true;
+    try {
+      this.upsert(await backend.midiRenameClip(clipId, name));
+      return true;
+    } catch (err) {
+      toasts.error("RENAME FAILED", String(err));
+      return false;
     }
   }
 

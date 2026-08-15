@@ -676,7 +676,10 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown midi clip: {id}"))?;
             let from_now = read_midi_prop(c, *path)?; // truth, not caller's `from`
             let applied = write_midi_prop(c, *path, to)?; // clamps LengthTicks like write_prop clamps Gain
-            effect.rebuild = true;
+            // Only the placement/content-length paths feed `append_from`'s
+            // pre-render (see the arm's doc above); `Name` is document-only,
+            // so a rename must not cost a full engine rebuild.
+            effect.rebuild = !matches!(path, PropPath::Name);
             effect.persist.midi = true;
             Ok(Op::Set {
                 object: ObjectRef::MidiClip(id.clone()),
@@ -983,7 +986,8 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         // Option<String> serializes as a JSON string or null, never a
         // wrapping object — same wire shape `write_prop` below accepts.
         PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
-        PropPath::TimelineStartSamples
+        PropPath::Name
+        | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
@@ -1040,7 +1044,8 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             t.instrument_id = v;
             Ok(serde_json::json!(t.instrument_id))
         }
-        PropPath::TimelineStartSamples
+        PropPath::Name
+        | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
@@ -1066,6 +1071,7 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
 /// atomically, never panic.
 fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<serde_json::Value, String> {
     match path {
+        PropPath::Name => Ok(serde_json::json!(c.name)),
         PropPath::TimelineStartTicks => Ok(serde_json::json!(c.timeline_start_ticks)),
         PropPath::LengthTicks => Ok(serde_json::json!(c.length_ticks)),
         PropPath::ContentLengthTicks => Ok(serde_json::json!(c.content_length_ticks)),
@@ -1101,6 +1107,14 @@ fn write_midi_prop(
     to: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     match path {
+        PropPath::Name => {
+            let v = to.as_str().ok_or("name: expected a string")?.trim();
+            if v.is_empty() {
+                return Err("name: must not be empty".into());
+            }
+            c.name = v.to_string();
+            Ok(serde_json::json!(c.name))
+        }
         PropPath::TimelineStartTicks => {
             let v = to.as_u64().ok_or("timelineStartTicks: expected a non-negative integer")?;
             c.timeline_start_ticks = v;
@@ -1165,6 +1179,7 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Name
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
@@ -1234,6 +1249,7 @@ fn write_transport_prop(
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Name
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
