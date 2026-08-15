@@ -157,6 +157,7 @@ pub fn run() {
             audio::list_output_devices,
             audio::select_input_device,
             audio::select_output_device,
+            audio::set_metronome,
             // ---- audio: recording ----
             audio::start_recording,
             audio::stop_recording,

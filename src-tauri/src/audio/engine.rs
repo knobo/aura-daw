@@ -109,6 +109,9 @@ pub enum ControlMsg {
         reply: Reply<Vec<String>>,
     },
     StopRecording { reply: Reply<Vec<Clip>> },
+    /// App-config click + count-in. No document op — same carve-out as the
+    /// input device. `count_in_bars` is 0/1/2/4.
+    SetMetronome { enabled: bool, gain: f32, count_in_bars: u8, reply: Reply<()> },
     /// Installs the narrow "document birth" closure `ensure_project` calls
     /// (Plan E Task 13, round-2 §4.5 carve-out) — bound over the
     /// `ControlPlane` `Arc`, so it can only be built AFTER `ControlPlane`
@@ -209,6 +212,8 @@ pub fn start(
                 param_writes: Vec::new(),
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
+                count_in_bars: 0,
+                pending_record: None,
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -542,6 +547,31 @@ impl OutputCb {
             }
         };
 
+        // Count-in: freeze the playhead, play clicks, let the control
+        // thread arm the take when `countin_left` hits zero.
+        let countin = self.shared.countin_left.load(Relaxed);
+        if countin > 0 {
+            out.fill(0.0);
+            let elapsed = self.shared.countin_elapsed.load(Relaxed);
+            let beat = self.shared.countin_beat.load(Relaxed);
+            let bar = self.shared.countin_beats_per_bar.load(Relaxed).max(1) as u8;
+            let gain = f32::from_bits(self.shared.metro_gain.load(Relaxed));
+            crate::audio::metronome::mix_count_in(
+                out,
+                self.channels,
+                elapsed,
+                beat,
+                bar,
+                gain.max(0.2),
+                self.rate,
+            );
+            let dec = frames.min(countin);
+            self.shared.countin_left.store(countin - dec, Relaxed);
+            self.shared.countin_elapsed.store(elapsed + dec, Relaxed);
+            self.was_playing = playing;
+            return;
+        }
+
         match (&mut self.graph, playing) {
             (Some(g), true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
@@ -562,6 +592,17 @@ impl OutputCb {
                 );
                 if dropped > 0 {
                     self.shared.xruns.fetch_add(dropped as u64, Relaxed);
+                }
+                if self.shared.metro_on.load(Relaxed) {
+                    let gain = f32::from_bits(self.shared.metro_gain.load(Relaxed));
+                    crate::audio::metronome::mix_clicks(
+                        out,
+                        self.channels,
+                        base,
+                        &g.clicks,
+                        gain,
+                        self.rate,
+                    );
                 }
             }
             // Monitoring while STOPPED: render ONLY the routed instrument,
@@ -849,6 +890,10 @@ struct Control {
     /// the hub to notice a selection that, being app config, commits nothing
     /// and therefore schedules no rebuild of its own.
     live_in_target: Option<String>,
+    /// Count-in length for the next take (app config). 0 = record immediately.
+    count_in_bars: u8,
+    /// A take waiting for `countin_left` to hit zero before capture arms.
+    pending_record: Option<(Option<Vec<String>>, HashMap<String, String>)>,
 }
 
 impl Control {
@@ -885,6 +930,7 @@ impl Control {
             self.headless_advance();
             self.pump_meter_frames();
             self.follow_live_in_target();
+            self.arm_pending_after_countin();
         }
     }
 
@@ -912,6 +958,12 @@ impl Control {
             }
             ControlMsg::StopRecording { reply } => {
                 let _ = reply.send(self.stop_recording());
+            }
+            ControlMsg::SetMetronome { enabled, gain, count_in_bars, reply } => {
+                self.shared.metro_on.store(enabled, Relaxed);
+                self.shared.metro_gain.store(gain.clamp(0.0, 1.0).to_bits(), Relaxed);
+                self.count_in_bars = count_in_bars.min(8);
+                let _ = reply.send(Ok(()));
             }
             ControlMsg::SetEnsureProject(f) => {
                 self.ensure_project_fn = Some(f);
@@ -1179,15 +1231,16 @@ impl Control {
                 // helper the offline bounce uses, so live and export agree
                 // on where the song ends (clip ends AND the final scheduled
                 // note-off).
-                self.shared
-                    .song_end
-                    .store(offline::song_end(&tracks), Relaxed);
+                let song_end = offline::song_end(&tracks);
+                self.shared.song_end.store(song_end, Relaxed);
+                let clicks = compile_clicks(&session, self.cache_rate, song_end);
                 let mut g = RtGraph::new(tracks, self.generation, params);
                 // RCU: the ramp table is attached BEFORE the graph is
                 // published, so the callback only ever sees a snapshot whose
                 // ramps already belong to it — and a retired graph keeps
                 // reading its own table, exactly like `params`.
                 g.set_gain_ramps(gain_ramps);
+                g.clicks = Arc::new(clicks);
                 Some(Box::new(g))
             };
             (graph, param_driver)
@@ -1467,6 +1520,13 @@ impl Control {
             return;
         }
         let frames = (elapsed.as_secs_f64() * self.engine_rate() as f64) as u64;
+        let countin = self.shared.countin_left.load(Relaxed);
+        if countin > 0 {
+            let dec = frames.min(countin);
+            self.shared.countin_left.store(countin - dec, Relaxed);
+            self.shared.countin_elapsed.fetch_add(dec, Relaxed);
+            return;
+        }
         if frames > 0 {
             let lp = self.shared.loop_spec();
             let pos = self.shared.position.load(Relaxed);
@@ -1575,6 +1635,29 @@ impl Control {
     }
 
     // -- recording ----------------------------------------------------------
+
+    fn clear_countin(&mut self) {
+        self.shared.countin_left.store(0, Relaxed);
+        self.shared.countin_elapsed.store(0, Relaxed);
+        self.pending_record = None;
+    }
+
+    /// When a count-in finishes, arm the take that was waiting. Temporarily
+    /// zeroes `count_in_bars` so `start_recording` does not re-enter the
+    /// pre-roll.
+    fn arm_pending_after_countin(&mut self) {
+        if self.pending_record.is_none() || self.shared.countin_left.load(Relaxed) > 0 {
+            return;
+        }
+        let (ids, returns) = self.pending_record.take().expect("checked");
+        let saved = self.count_in_bars;
+        self.count_in_bars = 0;
+        if let Err(e) = self.start_recording(ids, returns) {
+            log::warn!("audio: count-in ended but the take failed to arm: {e}");
+            self.shared.playing.store(false, Relaxed);
+        }
+        self.count_in_bars = saved;
+    }
 
     /// Open one cpal input stream + disk writer for a group of tracks that
     /// share a capture device. `device_id` `None` (or the empty string the
@@ -1688,7 +1771,8 @@ impl Control {
         // A MIDI-only take opens no device, so `self.writers` stays empty
         // for the whole take — the capture is the other half of "is a take
         // running".
-        if !self.writers.is_empty() || self.live_in_hub.capturing() {
+        if !self.writers.is_empty() || self.live_in_hub.capturing() || self.pending_record.is_some()
+        {
             return Err("already recording".to_string());
         }
 
@@ -1697,11 +1781,28 @@ impl Control {
         let live_in_target = self.live_in_hub.target_track();
         let (targets, midi_target) = {
             let session = self.session.lock(); // read-only: resolve/validate target track ids before recording starts
-            split_record_targets(&session.store, track_ids, live_in_target, &return_sources)?
+            split_record_targets(&session.store, track_ids.clone(), live_in_target, &return_sources)?
         };
 
         // A take needs a project dir whether it is audio or MIDI.
         self.ensure_project()?;
+
+        if self.count_in_bars > 0 && self.shared.countin_left.load(Relaxed) == 0 {
+            let (left, beat, beats_per_bar) = {
+                let session = self.session.lock();
+                count_in_plan(&session, self.shared.sample_rate.load(Relaxed), self.shared.position.load(Relaxed), self.count_in_bars)
+            };
+            if left > 0 {
+                self.shared.countin_left.store(left, Relaxed);
+                self.shared.countin_elapsed.store(0, Relaxed);
+                self.shared.countin_beat.store(beat, Relaxed);
+                self.shared.countin_beats_per_bar.store(beats_per_bar, Relaxed);
+                self.shared.playing.store(true, Relaxed);
+                self.pending_record = Some((track_ids, return_sources));
+                log::info!("audio: count-in {left} samples ({beat} / beat)");
+                return Ok(targets.into_iter().map(|t| t.track_id).chain(midi_target).collect());
+            }
+        }
 
         let start_pos = self.shared.position.load(Relaxed);
 
@@ -1824,6 +1925,14 @@ impl Control {
         // below. Either half alone counts as "recording" (ruling 8).
         let capture = self.live_in_hub.end_capture();
         let writers = std::mem::take(&mut self.writers);
+        if self.pending_record.take().is_some() || self.shared.countin_left.load(Relaxed) > 0 {
+            self.clear_countin();
+            self.shared.recording.store(false, Relaxed);
+            self.shared.playing.store(false, Relaxed);
+            if writers.is_empty() && capture.is_none() {
+                return Ok(Vec::new());
+            }
+        }
         if writers.is_empty() && capture.is_none() {
             return Err("not recording".to_string());
         }
@@ -2126,6 +2235,46 @@ fn split_record_targets(
         return Err("no armed tracks to record".to_string());
     }
     Ok((audio, midi))
+}
+
+fn compile_clicks(session: &Session, rate: u32, song_end: u64) -> Vec<crate::audio::metronome::Click> {
+    let tempo = match crate::midi::tempo::TempoMap::new(
+        session.midi.ppq,
+        session.midi.tempo_events.clone(),
+        rate.max(1),
+    ) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let meter = crate::midi::tempo::MeterMap::new(session.midi.meter_events.clone())
+        .unwrap_or_else(|_| crate::midi::tempo::MeterMap::default_map());
+    let pad = crate::audio::metronome::count_in_samples(&tempo, &meter, 0, 16);
+    let end = song_end.max(pad);
+    crate::audio::metronome::schedule(&tempo, &meter, end)
+}
+
+fn count_in_plan(session: &Session, rate: u32, at_sample: u64, bars: u8) -> (u64, u64, u32) {
+    let tempo = match crate::midi::tempo::TempoMap::new(
+        session.midi.ppq,
+        session.midi.tempo_events.clone(),
+        rate.max(1),
+    ) {
+        Ok(t) => t,
+        Err(_) => return (0, 0, 4),
+    };
+    let meter = crate::midi::tempo::MeterMap::new(session.midi.meter_events.clone())
+        .unwrap_or_else(|_| crate::midi::tempo::MeterMap::default_map());
+    let left = crate::audio::metronome::count_in_samples(&tempo, &meter, at_sample, bars);
+    let beat = crate::audio::metronome::beat_samples_at(&tempo, &meter, at_sample);
+    let at_tick = tempo.samples_to_tick(at_sample);
+    let beats = meter
+        .events()
+        .iter()
+        .rev()
+        .find(|e| e.tick <= at_tick)
+        .map(|e| e.num as u32)
+        .unwrap_or(4);
+    (left, beat, beats.max(1))
 }
 
 /// Decode a WAV file to interleaved f32 (int formats normalized to ±1.0).
@@ -2835,6 +2984,8 @@ mod tests {
             // otherwise race every other test that selects a routing target.
             live_in_hub: Arc::new(MidiInHub::new()),
             live_in_target: None,
+            count_in_bars: 0,
+            pending_record: None,
         };
         (ctl, session, tx)
     }
@@ -4266,6 +4417,29 @@ mod tests {
         session.lock().store.tracks.push(midi_track("m-1"));
         ctl.live_in_hub.begin_capture("m-1".into(), 0);
         assert_eq!(ctl.start_recording(None, HashMap::new()).unwrap_err(), "already recording");
+    }
+
+    #[test]
+    fn count_in_holds_the_take_until_the_pre_roll_elapses() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.ensure_project_fn = Some(Arc::new(|| Ok(PathBuf::from("/nonexistent"))));
+        ctl.live_in_hub.set_target_track(Some("m-1".into()));
+        ctl.count_in_bars = 1;
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+
+        let recorded = ctl.start_recording(None, HashMap::new()).unwrap();
+        assert_eq!(recorded, vec!["m-1".to_string()]);
+        assert!(ctl.pending_record.is_some());
+        assert_eq!(ctl.shared.countin_left.load(Relaxed), 96_000, "1 bar at 120 bpm 4/4");
+        assert!(ctl.writers.is_empty() && !ctl.live_in_hub.capturing());
+        assert!(ctl.shared.playing.load(Relaxed));
+
+        ctl.shared.countin_left.store(0, Relaxed);
+        ctl.arm_pending_after_countin();
+        assert!(ctl.pending_record.is_none());
+        assert!(ctl.live_in_hub.capturing(), "the MIDI take arms after count-in");
+        ctl.stop_recording().ok();
     }
 
     /// X1: a MIDI track with a return is an audio take on THAT device. A

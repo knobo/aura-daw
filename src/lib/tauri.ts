@@ -84,6 +84,7 @@ export interface Backend {
   ): Promise<TransportState>;
   /** Stop the transport when the playhead reaches the end of the material. */
   transportSetStopAtEnd(enabled: boolean): Promise<TransportState>;
+  setMetronome?(enabled: boolean, gain: number, countInBars: number): Promise<void>;
   getTransportState(): Promise<TransportState>;
 
   // devices
@@ -378,6 +379,9 @@ class TauriBackend implements Backend {
   }
   transportSetStopAtEnd(enabled: boolean) {
     return invoke<TransportState>("transport_set_stop_at_end", { enabled });
+  }
+  async setMetronome(enabled: boolean, gain: number, countInBars: number) {
+    await invoke("set_metronome", { enabled, gain, countInBars });
   }
   getTransportState() {
     return invoke<TransportState>("get_transport_state");

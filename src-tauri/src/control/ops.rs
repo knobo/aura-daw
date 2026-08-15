@@ -138,8 +138,16 @@ pub fn add_track_tx(
 
 /// Compose the live transport snapshot (store fields + RT atomics).
 pub fn transport_snapshot(store: &Store, shared: &SharedRt) -> TransportState {
+    let count_in = shared.countin_left.load(Relaxed);
+    let state = if shared.recording.load(Relaxed) {
+        "recording".into()
+    } else if shared.playing.load(Relaxed) || count_in > 0 {
+        "playing".into()
+    } else {
+        store.transport.state.clone()
+    };
     TransportState {
-        state: store.transport.state.clone(),
+        state,
         position_samples: shared.position.load(Relaxed),
         sample_rate: shared.sample_rate.load(Relaxed),
         tempo_bpm: store.transport.tempo_bpm,
@@ -148,6 +156,7 @@ pub fn transport_snapshot(store: &Store, shared: &SharedRt) -> TransportState {
         loop_end_samples: shared.loop_end.load(Relaxed),
         song_end_samples: shared.song_end.load(Relaxed),
         stop_at_end: shared.stop_at_end.load(Relaxed),
+        count_in_left_samples: count_in,
     }
 }
 

@@ -26,6 +26,13 @@
 
   const anyArmed = $derived(project.tracks.some((t) => t.armed));
 
+  $effect(() => {
+    const on = prefs.values.metronome;
+    const gain = prefs.values.metronomeGain;
+    const bars = Number(prefs.values.countInBars);
+    void backend.setMetronome?.(on, gain, Number.isFinite(bars) ? bars : 0);
+  });
+
   // rAF timecode — writes textContent directly, outside reactivity
   $effect(() => {
     let raf = 0;
@@ -46,7 +53,7 @@
   });
 
   async function toggleRecord() {
-    if (transport.isRecording) {
+    if (transport.isRecording || (transport.snap.countInLeftSamples ?? 0) > 0) {
       try {
         await backend.stopRecording();
       } catch (err) {
@@ -160,6 +167,29 @@
       title: "Follow the playhead",
       on: view.follow,
       onClick: () => (view.follow = !view.follow),
+    },
+    {
+      id: "click",
+      kind: "chip",
+      priority: 8,
+      cls: "clickchip",
+      label: "CLICK",
+      title: "Metronome — click on every beat while playing or recording",
+      on: prefs.values.metronome,
+      onClick: () => prefs.set("metronome", !prefs.values.metronome),
+    },
+    {
+      id: "countin",
+      kind: "chip",
+      priority: 8,
+      label: prefs.values.countInBars === "0" ? "COUNT" : `COUNT ${prefs.values.countInBars}`,
+      title: "Count-in bars before record (off / 1 / 2 / 4)",
+      on: prefs.values.countInBars !== "0",
+      onClick: () => {
+        const order = ["0", "1", "2", "4"] as const;
+        const i = order.indexOf(prefs.values.countInBars);
+        prefs.set("countInBars", order[(i + 1) % order.length]);
+      },
     },
     {
       id: "loop",
@@ -359,9 +389,16 @@
       <button
         class="tbtn rec"
         class:recording={transport.isRecording}
-        title={anyArmed ? "Record armed tracks" : "Arm a track first"}
+        title={
+          (transport.snap.countInLeftSamples ?? 0) > 0
+            ? "Counting in — click to cancel"
+            : anyArmed
+              ? "Record armed tracks"
+              : "Arm a track first"
+        }
         aria-label="Record"
-        disabled={!anyArmed && !transport.isRecording}
+        class:counting={(transport.snap.countInLeftSamples ?? 0) > 0}
+        disabled={!anyArmed && !transport.isRecording && !(transport.snap.countInLeftSamples ?? 0)}
         onclick={toggleRecord}
       >
         <svg viewBox="0 0 14 14" width="12" height="12"><circle cx="7" cy="7" r="4.2" fill="currentColor" /></svg>
@@ -515,6 +552,15 @@
   .tbtn.rec:disabled {
     opacity: 0.35;
     cursor: not-allowed;
+  }
+  .tbtn.rec.counting {
+    color: var(--accent);
+    border-color: var(--accent);
+    animation: countpulse 0.6s ease-in-out infinite alternate;
+  }
+  @keyframes countpulse {
+    from { box-shadow: 0 0 0 0 rgba(92, 242, 184, 0.0); }
+    to { box-shadow: 0 0 0 4px rgba(92, 242, 184, 0.25); }
   }
   .tbtn.rec.recording {
     color: var(--red);

@@ -87,6 +87,8 @@ export interface TransportState {
   songEndSamples: number;
   /** Stop the transport on reaching songEndSamples (ignored while looping/recording). */
   stopAtEnd: boolean;
+  /** Samples of count-in still to play before a take arms. 0 when idle. */
+  countInLeftSamples?: number;
 }
 
 // ── track-state.schema.json ─────────────────────────────────────────────────

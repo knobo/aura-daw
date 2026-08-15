@@ -34,6 +34,12 @@ export interface PrefValues {
   /** Absolute folders listed under the library panel's SAMPLES root. The
    * default library dir is supplied by the backend and is not stored here. */
   librarySampleFolders: string[];
+  /** Hear a click on every beat while playing or recording. */
+  metronome: boolean;
+  /** Linear click gain 0..1. */
+  metronomeGain: number;
+  /** Bars of click before a take arms. "0" = record immediately. */
+  countInBars: "0" | "1" | "2" | "4";
 }
 
 export type PrefId = keyof PrefValues;
@@ -126,6 +132,36 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     category: "library",
     label: "Sample folders",
     blurb: "Folders browsed under SAMPLES in the library panel. The default AURA library folder is always listed first.",
+  },
+  metronome: {
+    kind: "boolean",
+    default: false,
+    category: "editing",
+    label: "Metronome",
+    blurb: "Click on every beat while the transport is rolling. Also the CLICK chip in the transport bar.",
+  },
+  metronomeGain: {
+    kind: "number",
+    default: 0.35,
+    min: 0,
+    max: 1,
+    step: 0.05,
+    category: "editing",
+    label: "Metronome volume",
+    blurb: "How loud the click is, relative to the mix.",
+  },
+  countInBars: {
+    kind: "enum",
+    default: "0",
+    category: "editing",
+    label: "Count-in",
+    blurb: "Bars of click before a take starts recording. The playhead stays put.",
+    options: [
+      { value: "0", label: "OFF" },
+      { value: "1", label: "1 BAR" },
+      { value: "2", label: "2 BARS" },
+      { value: "4", label: "4 BARS" },
+    ],
   },
   mcpDefaultMode: {
     kind: "enum",

@@ -70,6 +70,21 @@ pub struct SharedRt {
     /// this shared value instead — see `dsp::ProcessBlock::steady` and
     /// `plugins::clap_host::ClapNode::process`.
     pub steady: AtomicU64,
+    /// Click track. Read by the RT callback; written from the control
+    /// thread when the user toggles CLICK or the volume. Not a graph
+    /// rebuild — the schedule lives on the snapshot, the enable/gain do not.
+    pub metro_on: AtomicBool,
+    /// Linear click gain, stored as f32 bits (same as ParamTable).
+    pub metro_gain: AtomicU32,
+    /// Samples of count-in still to play before a pending take arms.
+    /// The callback decrements this and freezes the playhead while > 0.
+    pub countin_left: AtomicU64,
+    /// Samples already played in the current count-in (click clock).
+    pub countin_elapsed: AtomicU64,
+    /// Count-in click period (one beat), samples. 0 = no period.
+    pub countin_beat: AtomicU64,
+    /// Beats in the bar the count-in started in (for downbeat accents).
+    pub countin_beats_per_bar: AtomicU32,
 }
 
 impl Default for SharedRt {
@@ -87,6 +102,12 @@ impl Default for SharedRt {
             park: AtomicU64::new(NO_PARK),
             xruns: AtomicU64::new(0),
             steady: AtomicU64::new(0),
+            metro_on: AtomicBool::new(false),
+            metro_gain: AtomicU32::new(0.35f32.to_bits()),
+            countin_left: AtomicU64::new(0),
+            countin_elapsed: AtomicU64::new(0),
+            countin_beat: AtomicU64::new(0),
+            countin_beats_per_bar: AtomicU32::new(4),
         }
     }
 }
@@ -321,6 +342,10 @@ pub struct RtGraph {
     /// that state — and a node-side ramp could never reach an audio-clip
     /// track at all.
     pub gain_ramps: Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>>,
+    /// Compiled click schedule for this snapshot (control-thread, tempo-map
+    /// driven). Empty when there is nothing to click. The RT mixer only
+    /// reads it when `SharedRt::metro_on` is set.
+    pub clicks: Arc<Vec<crate::audio::metronome::Click>>,
 }
 
 impl RtGraph {
@@ -340,7 +365,15 @@ impl RtGraph {
                 b
             })
             .collect();
-        Self { tracks, scratch, generation, params, meter_scratch, gain_ramps: Vec::new() }
+        Self {
+            tracks,
+            scratch,
+            generation,
+            params,
+            meter_scratch,
+            gain_ramps: Vec::new(),
+            clicks: Arc::new(Vec::new()),
+        }
     }
 
     /// Attach this rebuild's compiled gain ramps (`engine::rebuild`'s one

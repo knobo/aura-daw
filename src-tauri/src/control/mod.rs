@@ -1515,7 +1515,8 @@ impl ControlPlane {
                 // `request` is the "only blocking request-reply INTO the
                 // engine" case (b) describes — the reply is never held
                 // across the engine's own commit.)
-                if self.shared.recording.load(Relaxed) {
+                if self.shared.recording.load(Relaxed) || self.shared.countin_left.load(Relaxed) > 0
+                {
                     self.engine
                         .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
                 }

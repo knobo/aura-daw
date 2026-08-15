@@ -19,6 +19,7 @@ class TransportStore {
     loopEndSamples: 0,
     songEndSamples: 0,
     stopAtEnd: true,
+    countInLeftSamples: 0,
   });
 
   /** wall time (performance.now()) at which `snap` was captured */
