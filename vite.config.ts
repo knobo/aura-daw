@@ -1,7 +1,7 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import tailwindcss from "@tailwindcss/vite";
-import { DEV_WATCH_IGNORED } from "./src/lib/dev/watch-ignore";
+import { devWatchIgnored } from "./src/lib/dev/watch-ignore";
 
 // Tauri expects a fixed dev port; fail rather than pick a random one.
 const host = process.env.TAURI_DEV_HOST;
@@ -25,9 +25,10 @@ export default defineConfig({
           port: 1421,
         }
       : undefined,
-    // Patterns live in src/lib/dev/watch-ignore.ts so they can be tested
-    // against the real matcher — see watch-ignore.test.ts.
-    watch: { ignored: DEV_WATCH_IGNORED },
+    // Patterns live in src/lib/dev/watch-ignore.ts so they can be tested.
+    // `process.cwd()` is the root Vite serves by default, and the worktree
+    // rule depends on it — see that module.
+    watch: { ignored: devWatchIgnored(process.cwd()) },
   },
   // Env variables starting with these prefixes are exposed to the frontend.
   envPrefix: ["VITE_", "TAURI_ENV_"],
