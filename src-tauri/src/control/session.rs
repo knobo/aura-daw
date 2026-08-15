@@ -3,8 +3,11 @@
 //! (automation, plugin rows, sampler bank) move in during Plan E.
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
 use crate::audio::types::{Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
+use crate::control::snapshot::{charge_of, ChangeSet, SessionSnapshot};
 use crate::ids::TrackId;
 use crate::midi::MidiStore;
 use crate::plugins::automation::AutomationLane;
@@ -86,6 +89,16 @@ pub struct Session {
     /// lane view `automation_get` still reads.
     pub modulation: crate::modulation::ModulationDoc,
     pub plugins: PluginDoc,
+    /// The published snapshot (Plan F Task 5): ALWAYS equal (content-wise)
+    /// to the live document when no lock is held — updated inside
+    /// `transact` before the lock releases, and by `republish_full` at
+    /// every sanctioned non-op mutation site (the grep-gate's enumerated
+    /// writers, each marked `// snapshot republish:`). Bookkeeping
+    /// (`midi.dirty`, `midi.loaded_dir`, `plugins.dirty_state`) is OUTSIDE
+    /// this equivalence contract — see `SessionSnapshot`'s doc. The inner
+    /// Mutex is a LEAF below `session` in the lock order [C1] (held only
+    /// for a pointer clone/swap; never across I/O or another lock).
+    published: Arc<parking_lot::Mutex<Arc<SessionSnapshot>>>,
     pub(crate) rev: u64,
     /// Document-identity counter (fix round 1, Task 7 review finding 2):
     /// bumped exactly once, under the session lock, at every DOCUMENT-SWAP
@@ -110,15 +123,145 @@ pub struct Session {
 
 impl Session {
     pub fn new(store: Store, midi: MidiStore) -> Self {
-        Self {
+        let mut s = Self {
             store,
             midi,
             automation: AutomationDoc::default(),
             modulation: crate::modulation::ModulationDoc::default(),
             plugins: PluginDoc::default(),
+            published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
             rev: 0,
             epoch: 0,
+        };
+        // First publish: the placeholder above is never observable — the
+        // published image equals the live document from birth.
+        s.republish_full();
+        s
+    }
+
+    /// Capture against the previous published image, re-allocating only
+    /// `changed`, publish, and return the fresh image + its charge
+    /// (`charge_of`). Callers hold the session lock (or own the `Session`
+    /// outright) — `&mut self` makes a capture racing the document
+    /// impossible by construction.
+    pub fn capture_and_publish(&mut self, changed: &ChangeSet) -> (Arc<SessionSnapshot>, usize) {
+        // Leaf lock, pointer clone only — see `Session::published`'s doc.
+        let prev = self.published.lock().clone();
+        let next = Arc::new(SessionSnapshot::capture(self, &prev, changed));
+        let charge = charge_of(&next, changed);
+        *self.published.lock() = next.clone();
+        (next, charge)
+    }
+
+    /// `capture_and_publish(&ChangeSet::all())` — for epoch swaps and the
+    /// enumerated non-op writers (`// snapshot republish:` sites). Callers
+    /// hold the session lock already.
+    pub fn republish_full(&mut self) -> Arc<SessionSnapshot> {
+        self.capture_and_publish(&ChangeSet::all()).0
+    }
+
+    /// The live document revision. Read-only: `rev` advances ONLY inside
+    /// `transact`'s Ok arm, under the session lock, alongside the capture
+    /// that publishes it. Exposed for `tests/snapshot_store.rs`'s
+    /// equivalence sweep, which must compare the live `rev` against the
+    /// published image's — the field itself stays `pub(crate)` so nothing
+    /// outside the crate can bump it.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// The live document epoch — same read-only rationale as [`Self::rev`]
+    /// (`Tx::epoch` is the in-transaction reader; this is the out-of-band
+    /// one the equivalence sweep needs).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Handle for lock-free consumers (engine): clone the outer Arc once,
+    /// then read the inner slot per use. The inner Mutex is a LEAF below
+    /// `session` [C1] — hold it only for the pointer clone.
+    pub fn published_handle(&self) -> Arc<parking_lot::Mutex<Arc<SessionSnapshot>>> {
+        self.published.clone()
+    }
+
+    /// Materialize a scratch, standalone `Session` from an image (Task 7's
+    /// replay-only materialization, Task 8's rollback restore source, Task
+    /// 9's replay base). Bookkeeping fields default (`dirty=false`,
+    /// `loaded_dir=None`, `dirty_state` empty).
+    pub fn from_snapshot(snap: &SessionSnapshot) -> Session {
+        let mut store = Store::default();
+        store.transport = snap.transport.clone();
+        store.tracks = (*snap.tracks).clone();
+        store.clips = (*snap.clips).clone();
+        store.project_dir = snap.project_dir.clone();
+        store.project_name = snap.project_name.clone();
+        store.created_at = snap.created_at.clone();
+        let mut midi = MidiStore::default();
+        midi.ppq = snap.midi.ppq;
+        midi.tempo_events = (*snap.midi.tempo_events).clone();
+        midi.meter_events = (*snap.midi.meter_events).clone();
+        midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        // `loaded_dir: None` / `dirty: false` are `MidiStore::default()`'s.
+        let mut plugins = (*snap.plugins).clone();
+        // `dirty_state` is advisory in a snapshot (bookkeeping) — a scratch
+        // session starts with none.
+        plugins.dirty_state.clear();
+        let mut s = Session {
+            store,
+            midi,
+            automation: AutomationDoc { lanes: (*snap.automation).clone() },
+            plugins,
+            published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
+            rev: snap.rev,
+            epoch: snap.epoch,
+        };
+        s.republish_full();
+        s
+    }
+
+    /// Overwrite the LIVE document's content fields from an image (Task 8's
+    /// panic restore). `rev`/`epoch` are NOT taken from the image — the
+    /// caller decides (rollback keeps the live rev). Bookkeeping fields
+    /// (`midi.dirty`, `midi.loaded_dir`, `plugins.dirty_state`) are left as
+    /// they are — they describe the live persistence relationship, which a
+    /// content restore does not change.
+    pub fn restore_from_snapshot(&mut self, snap: &SessionSnapshot) {
+        self.store.transport = snap.transport.clone();
+        self.store.tracks = (*snap.tracks).clone();
+        self.store.clips = (*snap.clips).clone();
+        self.store.project_dir = snap.project_dir.clone();
+        self.store.project_name = snap.project_name.clone();
+        self.store.created_at = snap.created_at.clone();
+        self.midi.ppq = snap.midi.ppq;
+        self.midi.tempo_events = (*snap.midi.tempo_events).clone();
+        self.midi.meter_events = (*snap.midi.meter_events).clone();
+        self.midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        self.automation.lanes = (*snap.automation).clone();
+        let dirty_state = std::mem::take(&mut self.plugins.dirty_state);
+        let mut state_rev = std::mem::take(&mut self.plugins.state_rev);
+        let prev_state = std::mem::take(&mut self.plugins.pending_state);
+        self.plugins = (*snap.plugins).clone();
+        // `state_rev` keys the live plugin node cache and only ever moves
+        // FORWARD (its own doc): taking the image's copy would rewind it and
+        // leave the node built from the other blob rendering. So the live
+        // counter survives, and every instance whose blob this restore
+        // actually changed gets bumped past it — the restore is a state load
+        // as far as the node cache is concerned.
+        for (id, bytes) in &self.plugins.pending_state {
+            if prev_state.get(id) != Some(bytes) {
+                *state_rev.entry(id.clone()).or_insert(0) += 1;
+            }
         }
+        for id in prev_state.keys() {
+            if !self.plugins.pending_state.contains_key(id) {
+                *state_rev.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        self.plugins.state_rev = state_rev;
+        self.plugins.dirty_state = dirty_state; // live bookkeeping survives
+        // snapshot republish: the restored content is the document now — the
+        // published image must match it the moment the caller's lock drops.
+        self.republish_full();
     }
 
     /// Clone of the midi fields `midi::persist` persists — `ppq`,
@@ -167,10 +310,26 @@ impl Session {
                 let (ops, mut inverses) = fold_ops(ops, inverses);
                 inverses.reverse();
                 guard.rev += 1;
+                // Plan F Task 5: capture + publish INSIDE this same lock —
+                // the published image is never behind the live document at
+                // any lock release. Transient batches capture too (the
+                // engine's rebuild must see transport/sample-rate mirrors);
+                // their changeset is tiny by construction.
+                let changed = ChangeSet::from_ops(&ops);
+                let (snapshot, snapshot_charge) = guard.capture_and_publish(&changed);
                 // `epoch` is captured under this SAME lock, alongside `rev`
                 // — see `Session::epoch`'s doc for why `execute_persist`
                 // needs this to detect an interleaved document swap.
-                Ok(Committed { rev: guard.rev, epoch: guard.epoch, ops, inverses, effect, meta })
+                Ok(Committed {
+                    rev: guard.rev,
+                    epoch: guard.epoch,
+                    ops,
+                    inverses,
+                    effect,
+                    meta,
+                    snapshot,
+                    snapshot_charge,
+                })
             }
             Err(e) => {
                 // Rollback: run collected inverses in reverse — the same
@@ -369,6 +528,12 @@ pub struct Committed {
     pub inverses: Vec<Op>, // reverse order, ready to apply
     pub effect: EngineEffect,
     pub meta: TxMeta,
+    /// The image captured under the SAME lock as `rev`/`epoch` (Plan F
+    /// Task 5) — the exact published document this batch produced.
+    pub snapshot: Arc<SessionSnapshot>,
+    /// `charge_of` for this batch (own-created bytes) — Task 7 classifies
+    /// on it.
+    pub snapshot_charge: usize,
 }
 
 /// Applies `op` to `session`, returning the computed inverse, and folds its

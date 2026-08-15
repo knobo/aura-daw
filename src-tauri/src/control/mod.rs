@@ -23,6 +23,7 @@ pub mod op;
 pub mod ops;
 pub mod loopjam;
 pub mod session;
+pub mod snapshot;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -41,6 +42,7 @@ use crate::sidecars::jobs::{EventSink, JobManager};
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
 pub use ops::TrackMixChange;
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
+pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -2659,7 +2661,12 @@ impl ControlPlane {
     /// so this is how the wrapper hands it the real previous blob instead
     /// of a stale/absent one).
     pub fn set_plugin_pending_state(&self, instance_id: &str, bytes: Vec<u8>) {
-        self.session.lock().plugins.pending_state.insert(instance_id.to_string(), bytes);
+        let mut session = self.session.lock();
+        session.plugins.pending_state.insert(instance_id.to_string(), bytes);
+        // snapshot republish: R-1 — `pending_state` is document content
+        // (`SessionSnapshot::plugins` carries it), and this writer bypasses
+        // `transact` entirely, so nothing else would publish it.
+        session.republish_full();
     }
 
     /// Thin wrapper over `Committer::commit_with_rebuild` (Plan E Task 13
@@ -3046,9 +3053,17 @@ impl ControlPlane {
         let mut inverses: Vec<op::Op> = gesture.baselines.into_iter().map(|(_, op)| op).collect();
         inverses.reverse();
         let meta = op::TxMeta { actor: gesture.actor, run: gesture.run, label: gesture.label, transient: false };
-        let (rev, epoch) = {
+        let (rev, epoch, snapshot) = {
             let session = self.session.lock();
-            (session.rev, session.epoch)
+            // Plan F Task 5: NOT a fresh capture — this entry is synthesized
+            // from ops that ALREADY ran, each publishing its own image as a
+            // transient commit while the gesture was open. The current
+            // published image is exactly the document those ops produced, so
+            // read it (leaf lock, pointer clone) alongside `rev`/`epoch`
+            // under this same session lock rather than re-capturing an
+            // identical one.
+            let snapshot = session.published_handle().lock().clone();
+            (session.rev, session.epoch, snapshot)
         };
         let committed = session::Committed {
             rev,
@@ -3067,6 +3082,11 @@ impl ControlPlane {
             // `effect` field, which would silently do nothing on redo.
             effect: session::EngineEffect::default(),
             meta: meta.clone(),
+            snapshot,
+            // The gesture's transient commits each charged their own
+            // capture already; charging this synthesized entry again would
+            // double-count the same bytes in Task 7's accounting.
+            snapshot_charge: 0,
         };
         // Task 17: the direct sink. No drop-window — the gesture is
         // undoable the instant it closes.
@@ -3253,6 +3273,10 @@ impl ControlPlane {
             // `loaded_dir` is set correctly above, so it WOULD persist, and
             // dirty=true is only meant to block resync-from-disk, not writes).
             adopt_midi_dir(&mut session.midi, &dir);
+            // snapshot republish: document swap (create) — a non-op writer,
+            // so nothing captured this. Full re-derive before the guard
+            // drops, so the published image is never behind the live doc.
+            session.republish_full();
         }
         // ---- session lock released; host round-trips + rebuild + emit below ----
         // epoch boundary (Task 17): document birth — history and redo are
@@ -3324,6 +3348,10 @@ impl ControlPlane {
             // above, no separate re-acquisition.
             let bpm = session.store.transport.tempo_bpm;
             crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+            // snapshot republish: document swap (open) — a non-op writer,
+            // so nothing captured this. Full re-derive before the guard
+            // drops, so the published image is never behind the live doc.
+            session.republish_full();
         }
         // ---- session lock released; host round-trips + rebuild + emit below ----
         // epoch boundary (Task 17): document swap = history root. Undoing
@@ -3413,6 +3441,11 @@ impl ControlPlane {
             // silently destroyed both.
             let plugin_snapshot = session.plugin_snapshot();
             let automation_snapshot = session.automation.lanes.clone();
+            // snapshot republish: document swap (save-as) — project meta +
+            // the epoch bump are non-op writes; republish before the guard
+            // drops. (`midi.loaded_dir` above is bookkeeping, outside the
+            // equivalence contract — the epoch is what makes this a swap.)
+            session.republish_full();
             (project, midi_snapshot, plugin_snapshot, automation_snapshot)
         };
         // ---- session lock released; all disk I/O below ----
@@ -3816,6 +3849,10 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
                     let mut s = session.lock();
                     s.plugins.instances.push(info.clone());
                     s.plugins.params.insert(info.id.clone(), params);
+                    // snapshot republish: direct-session plugin write that
+                    // bypasses `commit`/the op log (see this fn's doc).
+                    // Removed with this whole function in Task 10.
+                    s.republish_full();
                 }
                 ids.push(info.id);
             }
@@ -3831,6 +3868,9 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
                         s.plugins.instances.retain(|r| &r.id != id);
                         s.plugins.params.remove(id);
                     }
+                    // snapshot republish: the rollback arm of the same
+                    // direct-session write above. Removed in Task 10.
+                    s.republish_full();
                 }
                 for id in &ids {
                     if let Some(host) = plugins::lv2_host::try_global() {

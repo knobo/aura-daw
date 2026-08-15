@@ -397,12 +397,23 @@ pub fn adopt_open_project(dir: &Path) {
     match load_lanes(dir) {
         Ok(Some(lanes)) => {
             let n = lanes.len();
-            session.lock().automation.lanes = lanes;
+            {
+                let mut s = session.lock();
+                s.automation.lanes = lanes;
+                // snapshot republish: adopt replaces the lane document
+                // outside `transact`; same lock as the write.
+                s.republish_full();
+            }
             if n > 0 {
                 log::info!("automation: adopted {n} lane(s) from {}", dir.display());
             }
         }
-        Ok(None) => session.lock().automation.lanes.clear(),
+        Ok(None) => {
+            let mut s = session.lock();
+            s.automation.lanes.clear();
+            // snapshot republish: the clear arm is a write too (I-7).
+            s.republish_full();
+        }
         Err(e) => log::warn!("automation: cannot restore from {}: {e}", dir.display()),
     }
 }

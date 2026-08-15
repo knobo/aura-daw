@@ -675,7 +675,7 @@ pub fn reactivate_restored_with(
                     };
                     r.status = "active".into();
                     s.plugins.params.insert(id.clone(), real_params);
-                    if snapshot.is_empty() {
+                    let applied = if snapshot.is_empty() {
                         Vec::new()
                     } else {
                         let params = s.plugins.params.get_mut(&id).expect("just inserted");
@@ -687,7 +687,15 @@ pub fn reactivate_restored_with(
                             }
                         }
                         applied
-                    }
+                    };
+                    // snapshot republish: `status` + the param mirror are
+                    // document content and this write-back bypasses
+                    // `transact`. Not in Task 5's brief enumeration — the
+                    // equivalence sweep's adopt step is what surfaces it;
+                    // same lock as the write, so no intermediate is ever
+                    // published.
+                    s.republish_full();
+                    applied
                 };
                 match format.as_str() {
                     "clap" => {
@@ -780,6 +788,11 @@ pub fn adopt_open_project(dir: &Path) {
         // `restore_into_session`), so the clear happens HERE, in both `Ok`
         // arms, under the SAME short lock as the install (I-7).
         s.plugins.dirty_state.clear();
+        // snapshot republish: the locked install replaced the plugin
+        // document wholesale, outside `transact`. Same short lock as the
+        // install — the published image can never observe the intermediate
+        // state. (`dirty_state` above is bookkeeping, outside the contract.)
+        s.republish_full();
         result
     };
     if restored == 0 && prior_hosted.is_empty() {
@@ -1514,6 +1527,24 @@ mod tests {
             "active",
             "restored Zyn re-activates through the unified host thread"
         );
+        // Plan F Task 5: the post-host writeback above is a document write
+        // outside `transact`, so it republishes. `tests/snapshot_store.rs`'s
+        // sweep cannot reach this site (it needs a real host), which makes
+        // this plugin-gated test the only place that site is exercised.
+        {
+            let s = fresh.lock();
+            let image = s.published_handle().lock().clone();
+            assert_eq!(
+                s.plugins.instances.iter().find(|r| r.id == info.id).map(|r| &r.status),
+                image.plugins.instances.iter().find(|r| r.id == info.id).map(|r| &r.status),
+                "the reactivation writeback must republish"
+            );
+            assert_eq!(
+                s.plugins.params.get(&info.id),
+                image.plugins.params.get(&info.id),
+                "including the real param mirror it just installed"
+            );
+        }
         // A real RT node builds from the restored registration (the loaded
         // blob is applied to it — audible-patch path).
         match super::super::lv2_host::global().make_node(&info.id, 48_000) {

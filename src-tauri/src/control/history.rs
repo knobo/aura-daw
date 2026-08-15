@@ -35,6 +35,14 @@
 //! precisely because it is the leaf: no other lock is held at that moment
 //! (this is the same "no I/O under the session lock" rule round-2 §4
 //! imposes, satisfied by construction rather than by review).
+//!
+//! Plan F Task 5 added one more leaf OUTSIDE this module:
+//! `Session::published`, the published-snapshot slot. It is taken from
+//! under `session` (that is the point — capture and publish happen in the
+//! same critical section as the `rev` bump) and, like the three here, never
+//! held across another acquisition or across I/O. It neither precedes nor
+//! follows the three above, because no path ever holds one of them and the
+//! published slot at the same time.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
