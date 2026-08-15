@@ -16,6 +16,7 @@ use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::transport::LoopSpec;
 use crate::ids::TrackId;
 use crate::midi::schedule::AbsNoteEvent;
+use crate::plugins::automation::AbsParamEvent;
 
 pub const FLAG_MUTE: u32 = 1 << 0;
 pub const FLAG_SOLO: u32 = 1 << 1;
@@ -304,6 +305,14 @@ impl RtTrack {
     }
 }
 
+/// One slot's compiled built-in-param ramps. `None` means the atomic
+/// (`ParamTable`) value is authoritative for that param.
+#[derive(Debug, Default, Clone)]
+pub struct TrackRamps {
+    pub gain: Option<Arc<Vec<AbsParamEvent>>>,
+    pub pan: Option<Arc<Vec<AbsParamEvent>>>,
+}
+
 pub struct RtGraph {
     pub tracks: Vec<RtTrack>,
     /// Preallocated stereo scratch for live-node rendering
@@ -329,19 +338,18 @@ pub struct RtGraph {
     /// entries in place and pushes copies, so a wide graph's meter output
     /// costs N pushes per callback, never an RT allocation.
     pub meter_scratch: Vec<RawMeterBlock>,
-    /// This snapshot's compiled track-gain automation, indexed BY SLOT —
+    /// This snapshot's compiled built-in-param automation, indexed BY SLOT —
     /// exactly like `ParamTable` (round-2 §2.4: per-graph, versioned with
-    /// the snapshot, so a retired graph keeps reading its own). `None` at a
-    /// slot means "no lane"; an EMPTY vec means "no automation at all",
-    /// which is what `new` leaves behind so every existing construction
-    /// site is unchanged.
+    /// the snapshot, so a retired graph keeps reading its own). An EMPTY
+    /// vec means "no automation at all", which is what `new` leaves behind
+    /// so every existing construction site is unchanged.
     ///
     /// Why here and not on the live node (Track D scope ruling 1): the
     /// registry reuses live nodes ACROSS rebuilds to keep voice and plugin
     /// state, so a ramp baked into a node could only change by discarding
     /// that state — and a node-side ramp could never reach an audio-clip
     /// track at all.
-    pub gain_ramps: Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>>,
+    pub track_ramps: Vec<TrackRamps>,
     /// Compiled click schedule for this snapshot (control-thread, tempo-map
     /// driven). Empty when there is nothing to click. The RT mixer only
     /// reads it when `SharedRt::metro_on` is set.
@@ -371,19 +379,25 @@ impl RtGraph {
             generation,
             params,
             meter_scratch,
-            gain_ramps: Vec::new(),
+            track_ramps: Vec::new(),
             clicks: Arc::new(Vec::new()),
         }
     }
 
-    /// Attach this rebuild's compiled gain ramps (`engine::rebuild`'s one
+    /// Attach this rebuild's compiled track ramps (`engine::rebuild`'s one
     /// call). CONTROL THREAD, before the graph is published — after
     /// publication the snapshot is immutable, RCU-style.
-    pub fn set_gain_ramps(
-        &mut self,
-        ramps: Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>>,
-    ) {
-        self.gain_ramps = ramps;
+    pub fn set_track_ramps(&mut self, ramps: Vec<TrackRamps>) {
+        self.track_ramps = ramps;
+    }
+
+    /// Shim: fill only the `gain` field so Track D's mixer tests keep
+    /// compiling. Pan stays `None` (atomic pan remains authoritative).
+    pub fn set_gain_ramps(&mut self, ramps: Vec<Option<Arc<Vec<AbsParamEvent>>>>) {
+        self.track_ramps = ramps
+            .into_iter()
+            .map(|gain| TrackRamps { gain, pan: None })
+            .collect();
     }
 }
 

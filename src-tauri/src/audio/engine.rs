@@ -39,7 +39,7 @@ use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
 use super::rt::{
     GraphPtr, GraphTables, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedGraphTables,
-    SharedRt, NO_PARK,
+    SharedRt, TrackRamps, NO_PARK,
 };
 use super::transport;
 use super::types::{derive_slots, Clip, MeterFrame, Store};
@@ -896,6 +896,75 @@ struct Control {
     pending_record: Option<(Option<Vec<String>>, HashMap<String, String>)>,
 }
 
+/// Compile v3 gain lanes plus any `ModulationDoc` track ramps into one
+/// slot-indexed table. Lane-only projects take the existing
+/// `compile_gain_ramps` path so Track D gain stays byte-identical.
+pub(crate) fn compile_track_ramps(
+    lanes: &[crate::plugins::automation::AutomationLane],
+    modulation: &crate::modulation::ModulationDoc,
+    store: &Store,
+    slots: &HashMap<crate::ids::TrackId, usize>,
+    n_slots: usize,
+    map: &crate::midi::TempoMap,
+) -> Vec<TrackRamps> {
+    let mut ramps: Vec<TrackRamps> = if lanes.is_empty() {
+        (0..n_slots).map(|_| TrackRamps::default()).collect()
+    } else {
+        crate::plugins::automation::compile_gain_ramps(lanes, map, n_slots, &|tid| {
+            slots.get(tid).copied()
+        })
+        .into_iter()
+        .map(|gain| TrackRamps { gain, pan: None })
+        .collect()
+    };
+    if !modulation.is_empty() {
+        overlay_modulation_ramps(&mut ramps, modulation, store, slots, n_slots, map);
+    }
+    ramps
+}
+
+fn overlay_modulation_ramps(
+    ramps: &mut [TrackRamps],
+    modulation: &crate::modulation::ModulationDoc,
+    store: &Store,
+    slots: &HashMap<crate::ids::TrackId, usize>,
+    n_slots: usize,
+    map: &crate::midi::TempoMap,
+) {
+    let slot_of = |tid: &str| slots.get(tid).copied();
+    let track_pan = |tid: &str| {
+        store.tracks.iter().find(|t| t.id.as_str() == tid).map(|t| t.pan as f32)
+    };
+    let instrument_of = |tid: &str| {
+        store
+            .tracks
+            .iter()
+            .find(|t| t.id.as_str() == tid)
+            .and_then(|t| t.instrument_id.clone())
+    };
+    let ctx = crate::modulation::CompileCtx {
+        n_slots,
+        slot_of: &slot_of,
+        track_pan: &track_pan,
+        param_range: &|_, _| None,
+        param_value: &|_, _| None,
+        instrument_of: &instrument_of,
+        content_placements: &|_| Vec::new(),
+    };
+    let compiled = crate::modulation::compile(modulation, map, &ctx);
+    for (i, spec) in compiled.tracks.iter().enumerate() {
+        if i >= ramps.len() {
+            break;
+        }
+        if let Some(gain) = &spec.gain {
+            ramps[i].gain = Some(Arc::new(gain.clone()));
+        }
+        if let Some(pan) = &spec.pan {
+            ramps[i].pan = Some(Arc::new(pan.clone()));
+        }
+    }
+}
+
 impl Control {
     fn run(&mut self) {
         loop {
@@ -1161,7 +1230,7 @@ impl Control {
             // tables (Task 6) — the meter fold resolves blocks under
             // whichever generation produced them, not the current tables.
             self.gen_maps.publish(self.generation, &slots);
-            let (gain_ramps, param_driver) =
+            let (track_ramps, param_driver) =
                 self.compile_automation(&session, &slots, store.tracks.len());
             let graph = if headless {
                 // Headless keeps its narrow scope [I5]: tables are enough
@@ -1239,7 +1308,7 @@ impl Control {
                 // published, so the callback only ever sees a snapshot whose
                 // ramps already belong to it — and a retired graph keeps
                 // reading its own table, exactly like `params`.
-                g.set_gain_ramps(gain_ramps);
+                g.set_track_ramps(track_ramps);
                 g.clicks = Arc::new(clicks);
                 Some(Box::new(g))
             };
@@ -1287,12 +1356,13 @@ impl Control {
         self.live_in_hub.refresh_target(self.generation, &self.tables);
     }
 
-    /// Track D: compile the session's automation lanes into this rebuild's
-    /// two products — a slot-indexed gain-ramp table for the graph, and the
-    /// control thread's plugin-param driver. CONTROL THREAD, called from
-    /// `rebuild` under the same session guard that derived `slots`: this is
-    /// where ticks become absolute samples, so nothing tick-shaped ever
-    /// crosses onto the RT thread (ARCHITECTURE §13/§15.1).
+    /// Compile the session's automation lanes AND `session.modulation` into
+    /// this rebuild's two products — a slot-indexed `TrackRamps` table for
+    /// the graph, and the control thread's plugin-param driver. CONTROL
+    /// THREAD, called from `rebuild` under the same session guard that
+    /// derived `slots`: this is where ticks become absolute samples, so
+    /// nothing tick-shaped ever crosses onto the RT thread
+    /// (ARCHITECTURE §13/§15.1).
     ///
     /// `n_slots` is the TRACK COUNT `ParamTable` was sized with, not
     /// `slots.len()`, so the ramp table and the param table index alike.
@@ -1308,16 +1378,16 @@ impl Control {
         session: &Session,
         slots: &HashMap<crate::ids::TrackId, usize>,
         n_slots: usize,
-    ) -> (
-        Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>>,
-        crate::plugins::automation::ParamAutomationDriver,
-    ) {
+    ) -> (Vec<TrackRamps>, crate::plugins::automation::ParamAutomationDriver) {
         use crate::plugins::automation as auto;
         // The overwhelmingly common case, and every structural commit in the
-        // suite goes through here: no lanes, so no tempo-event clone and no
-        // TempoMap build.
-        if session.automation.lanes.is_empty() {
-            return ((0..n_slots).map(|_| None).collect(), auto::ParamAutomationDriver::empty());
+        // suite goes through here: no lanes and no modulation, so no
+        // tempo-event clone and no TempoMap build.
+        if session.automation.lanes.is_empty() && session.modulation.is_empty() {
+            return (
+                (0..n_slots).map(|_| TrackRamps::default()).collect(),
+                auto::ParamAutomationDriver::empty(),
+            );
         }
         let map = crate::midi::TempoMap::new(
             session.midi.ppq,
@@ -1326,12 +1396,24 @@ impl Control {
         )
         .ok();
         let Some(map) = map else {
-            return ((0..n_slots).map(|_| None).collect(), auto::ParamAutomationDriver::empty());
+            return (
+                (0..n_slots).map(|_| TrackRamps::default()).collect(),
+                auto::ParamAutomationDriver::empty(),
+            );
         };
-        let ramps = auto::compile_gain_ramps(&session.automation.lanes, &map, n_slots, &|tid| {
-            slots.get(tid).copied()
-        });
-        let driver = auto::ParamAutomationDriver::new(&session.automation.lanes, &session.plugins, &map);
+        let ramps = compile_track_ramps(
+            &session.automation.lanes,
+            &session.modulation,
+            &session.store,
+            slots,
+            n_slots,
+            &map,
+        );
+        let driver = if session.automation.lanes.is_empty() {
+            auto::ParamAutomationDriver::empty()
+        } else {
+            auto::ParamAutomationDriver::new(&session.automation.lanes, &session.plugins, &map)
+        };
         (ramps, driver)
     }
 
@@ -3203,8 +3285,9 @@ mod tests {
             ctl.compile_automation(&s, &slots, s.store.tracks.len())
         };
         assert_eq!(ramps.len(), 2, "one entry per track slot, like ParamTable");
-        assert!(ramps[0].is_none(), "t-1 has no lane — an unautomated track must stay unramped");
-        let ev = ramps[1].as_ref().expect("t-2's lane compiled into ITS slot");
+        assert!(ramps[0].gain.is_none(), "t-1 has no lane — an unautomated track must stay unramped");
+        assert!(ramps[0].pan.is_none());
+        let ev = ramps[1].gain.as_ref().expect("t-2's lane compiled into ITS slot");
         assert_eq!(ev.first().map(|e| e.value), Some(1.0));
         assert_eq!(ev.last().map(|e| e.value), Some(0.0));
         assert!(
@@ -3221,7 +3304,7 @@ mod tests {
             ctl.compile_automation(&s, &slots, s.store.tracks.len())
         };
         assert_eq!(ramps.len(), 2, "still one entry per slot, just nothing in them");
-        assert!(ramps.iter().all(|r| r.is_none()));
+        assert!(ramps.iter().all(|r| r.gain.is_none() && r.pan.is_none()));
         assert!(driver.is_empty());
     }
 

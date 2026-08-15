@@ -20,7 +20,7 @@ use std::sync::Arc;
 use super::dsp::linear_resample;
 use super::engine::load_wav;
 use super::mixer;
-use super::rt::{ParamTable, RtClip, RtClipData, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO};
+use super::rt::{ParamTable, RtClip, RtClipData, RtGraph, RtTrack, TrackRamps, FLAG_MUTE, FLAG_SOLO};
 use super::sampler::SamplerBank;
 use super::transport::LoopSpec;
 use super::types::{derive_slots, Store};
@@ -51,9 +51,9 @@ pub struct OfflineGraph {
 /// order (round-2 §2.4) — this graph is exclusively owned, so there is no
 /// cross-generation aliasing concern to begin with.
 ///
-/// TRACK-GAIN automation is compiled here exactly as `Control::rebuild`
-/// compiles it (`Control::compile_automation`), so a bounce follows the same
-/// curves playback does.
+/// TRACK ramps (gain + pan) are compiled here exactly as `Control::rebuild`
+/// compiles them (`Control::compile_automation`), so a bounce follows the
+/// same curves playback does.
 ///
 /// KNOWN DIVERGENCE, PLUGIN-PARAM LANES ONLY (Track D). Plugin-param lanes
 /// are NOT evaluated by a bounce, and the value the export captures is
@@ -86,6 +86,7 @@ pub fn build_graph(
     midi: &MidiStore,
     plugins: &crate::control::session::PluginDoc,
     automation: &crate::control::session::AutomationDoc,
+    modulation: &crate::modulation::ModulationDoc,
     bank: Option<&SamplerBank>,
     rate: u32,
 ) -> OfflineGraph {
@@ -141,33 +142,50 @@ pub fn build_graph(
 
     let end_samples = song_end(&tracks);
     let mut graph = RtGraph::new(tracks, 0, params);
-    graph.set_gain_ramps(compile_gain_ramps(automation, midi, &slots, store.tracks.len(), rate));
+    // RCU: attach the table BEFORE the graph is handed to the renderer,
+    // matching `engine::rebuild` (Track D ruling 1).
+    graph.set_track_ramps(compile_track_ramps(
+        automation,
+        modulation,
+        midi,
+        store,
+        &slots,
+        store.tracks.len(),
+        rate,
+    ));
     OfflineGraph { graph, end_samples }
 }
 
-/// Compile this snapshot's TRACK-GAIN lanes into the slot-indexed ramp table
-/// — the offline twin of `engine::Control::compile_automation`, same rules:
-/// no lanes (or no usable tempo map) means an all-`None` table of exactly
+/// Compile this snapshot's track ramps — the offline twin of
+/// `engine::Control::compile_automation`, same rules: no lanes and no
+/// modulation (or no usable tempo map) means an empty table of exactly
 /// `n_slots` entries, and the table is sized by the TRACK COUNT, not by
 /// `slots.len()` — duplicate track ids collapse in the slot map, and a short
 /// table would silently unramp the highest slots.
-fn compile_gain_ramps(
+fn compile_track_ramps(
     automation: &crate::control::session::AutomationDoc,
+    modulation: &crate::modulation::ModulationDoc,
     midi: &MidiStore,
+    store: &Store,
     slots: &std::collections::HashMap<crate::ids::TrackId, usize>,
     n_slots: usize,
     rate: u32,
-) -> Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>> {
-    let none = || (0..n_slots).map(|_| None).collect();
-    if automation.lanes.is_empty() {
+) -> Vec<TrackRamps> {
+    let none = || (0..n_slots).map(|_| TrackRamps::default()).collect();
+    if automation.lanes.is_empty() && modulation.is_empty() {
         return none();
     }
     let Ok(map) = crate::midi::TempoMap::new(midi.ppq, midi.tempo_events.clone(), rate) else {
         return none();
     };
-    crate::plugins::automation::compile_gain_ramps(&automation.lanes, &map, n_slots, &|tid| {
-        slots.get(tid).copied()
-    })
+    super::engine::compile_track_ramps(
+        &automation.lanes,
+        modulation,
+        store,
+        slots,
+        n_slots,
+        &map,
+    )
 }
 
 /// Last audible sample of a track set: clip `start + len` and the last
@@ -279,7 +297,7 @@ mod tests {
         const RATE: u32 = 48_000;
         let (store, midi) = demo_project();
         let render_once = || {
-            let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
+            let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), &Default::default(), None, RATE);
             // Engine-rebuild parity: one (empty) clip track per store track
             // plus one LIVE track per audible midi track.
             let live = og.graph.tracks.iter().filter(|t| t.live.is_some()).count();
@@ -345,7 +363,7 @@ mod tests {
             loaded_dir: None,
             dirty: false,
         };
-        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
+        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), &Default::default(), None, RATE);
         // Region [24000, 44000): starts after note A's on (skipped) and
         // before note B's on at 30000 (audible).
         let (start, end) = (24_000u64, 44_000u64);
@@ -409,7 +427,7 @@ mod tests {
             lane_id: crate::ids::LaneId::default_for_track("a1"),
         });
         let midi = MidiStore { clips: vec![], ..MidiStore::default() };
-        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
+        let mut og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), &Default::default(), None, RATE);
         assert_eq!(og.end_samples, 600, "clip end = start + len");
         let out = render(&mut og.graph, 0, 700, RATE, 0.5, &mut |_, _| {});
         let center = 0.5 * std::f32::consts::FRAC_1_SQRT_2 * 0.5; // sample * pan * master
@@ -492,6 +510,7 @@ mod tests {
             &midi,
             &crate::control::session::PluginDoc::default(),
             &automation,
+            &Default::default(),
             None,
             RATE,
         );
@@ -538,9 +557,17 @@ mod tests {
                 ],
             }],
         };
-        let ramps = compile_gain_ramps(&automation, &midi, &slots, store.tracks.len(), 48_000);
+        let ramps = compile_track_ramps(
+            &automation,
+            &Default::default(),
+            &midi,
+            &store,
+            &slots,
+            store.tracks.len(),
+            48_000,
+        );
         assert_eq!(ramps.len(), 2, "one entry per TRACK");
-        assert!(ramps[1].is_some(), "slot 1's ramp survives");
+        assert!(ramps[1].gain.is_some(), "slot 1's ramp survives");
     }
 
     /// Finding 4: `build_graph` used to allocate a fixed 64-slot
@@ -559,7 +586,7 @@ mod tests {
             store.tracks.push(track(&format!("t{i}"), "audio"));
         }
         let midi = MidiStore::default();
-        let og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), None, RATE);
+        let og = build_graph(&store, &midi, &crate::control::session::PluginDoc::default(), &Default::default(), &Default::default(), None, RATE);
         assert_eq!(og.graph.tracks.len(), N, "one RtTrack per store track");
         assert_eq!(
             og.graph.params.len(),
@@ -572,5 +599,112 @@ mod tests {
         let last_slot = derive_slots(&store.tracks)[&store.tracks[N - 1].id];
         og.graph.params.set_gain_linear(last_slot, 0.25);
         assert_eq!(og.graph.params.gain[last_slot].load(std::sync::atomic::Ordering::Relaxed), 0.25f32.to_bits());
+    }
+
+    /// offline::build_graph compiles the same ramp table playback uses
+    /// (design §6.3), so a pan binding shapes the bounce.
+    #[test]
+    fn pan_automation_survives_a_bounce() {
+        use crate::modulation::model::{
+            Binding, BindingMode, Curve, Domain, Range, Source, TargetRef, TrackParam,
+        };
+        use crate::modulation::ModulationDoc;
+        use crate::plugins::automation::AutomationPoint;
+
+        const RATE: u32 = 48_000;
+        const LEN: u64 = 4_000; // ppq 960 @120bpm -> 25 samples/tick -> 160 ticks
+        let dir = std::env::temp_dir().join(format!(
+            "aura-offline-pan-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: RATE,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(dir.join("audio/c1.wav"), spec).unwrap();
+        for _ in 0..LEN {
+            w.write_sample(1.0f32).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut store = Store::default();
+        store.project_dir = Some(dir.clone());
+        store.tracks.push(track("a1", "audio"));
+        store.clips.push(crate::audio::types::Clip {
+            id: "c1".into(),
+            track_id: "a1".into(),
+            name: "c1".into(),
+            source_path: "audio/c1.wav".into(),
+            source_id: crate::ids::SourceId::default(),
+            source_channels: 1,
+            source_sample_rate: RATE,
+            source_length_samples: LEN,
+            timeline_start_samples: 0,
+            offset_samples: 0,
+            length_samples: LEN,
+            gain_db: 0.0,
+            fade_in_samples: 0,
+            fade_out_samples: 0,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("a1"),
+        });
+        let midi = MidiStore {
+            ppq: 960,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![],
+            loaded_dir: None,
+            dirty: false,
+        };
+        let mut modulation = ModulationDoc::default();
+        modulation.curves.push(Curve {
+            id: "cur".into(),
+            name: "cur".into(),
+            length_ticks: None,
+            points: vec![
+                AutomationPoint { tick: 0, value: 0.0 },
+                AutomationPoint { tick: 160, value: 1.0 },
+            ],
+        });
+        modulation.bindings.push(Binding {
+            id: "b".into(),
+            source: Source::Curve { curve_id: "cur".into() },
+            target: TargetRef::TrackParam {
+                track_id: "a1".into(),
+                param: TrackParam::Pan,
+            },
+            mode: BindingMode::Absolute,
+            depth: 1.0,
+            range: Range::default(),
+            domain: Domain::Normalized,
+            range_snapshot: None,
+            enabled: true,
+        });
+
+        let mut og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &Default::default(),
+            &modulation,
+            None,
+            RATE,
+        );
+        assert!(
+            og.graph.track_ramps.first().and_then(|t| t.pan.as_ref()).is_some(),
+            "build_graph must compile the pan binding into the ramp table"
+        );
+        let out = render(&mut og.graph, 0, LEN, RATE, 1.0, &mut |_, _| {});
+        let first_l = out[0].abs();
+        let first_r = out[1].abs();
+        let last_l = out[(LEN as usize - 1) * 2].abs();
+        let last_r = out[(LEN as usize - 1) * 2 + 1].abs();
+        assert!(first_l > first_r, "bounce starts left: L={first_l} R={first_r}");
+        assert!(last_r > last_l, "bounce ends right: L={last_l} R={last_r}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
