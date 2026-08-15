@@ -182,7 +182,17 @@ impl AutomationClip {
 /// `[0,1]`, points sorted by tick, duplicate ticks collapsed LAST-WINS —
 /// the batch semantics `plugins::automation::normalize_lane` established,
 /// kept identical so a migrated lane normalizes the way it always did.
+///
+/// This is the explicit normalize. [`normalize_curve_in_domain`] skips the
+/// `[0,1]` clamp when `domain` is [`Domain::Native`] — those points stay
+/// in the param's units until something asks to normalize (design §7).
 pub fn normalize_curve(curve: &mut Curve) -> Result<(), String> {
+    normalize_curve_in_domain(curve, Domain::Normalized)
+}
+
+/// Sort, last-wins, finite-check. Clamps to `[0,1]` unless `domain` is
+/// [`Domain::Native`].
+pub fn normalize_curve_in_domain(curve: &mut Curve, domain: Domain) -> Result<(), String> {
     if curve.id.is_empty() {
         return Err("curve id must not be empty".into());
     }
@@ -202,8 +212,10 @@ pub fn normalize_curve(curve: &mut Curve) -> Result<(), String> {
     }
     kept.reverse();
     curve.points = kept;
-    for p in curve.points.iter_mut() {
-        p.value = p.value.clamp(0.0, 1.0);
+    if domain != Domain::Native {
+        for p in curve.points.iter_mut() {
+            p.value = p.value.clamp(0.0, 1.0);
+        }
     }
     Ok(())
 }
@@ -342,6 +354,28 @@ mod tests {
                 AutomationPoint { tick: 480, value: 0.25 },
             ],
             "sorted by tick, duplicate ticks last-wins, values clamped to [0,1]"
+        );
+    }
+
+    #[test]
+    fn normalize_curve_in_domain_leaves_native_points_unclamped() {
+        let mut c = Curve {
+            id: "cur-1".into(),
+            name: "x".into(),
+            length_ticks: None,
+            points: vec![
+                AutomationPoint { tick: 480, value: 440.0 },
+                AutomationPoint { tick: 0, value: -1.0 },
+            ],
+        };
+        normalize_curve_in_domain(&mut c, Domain::Native).unwrap();
+        assert_eq!(
+            c.points,
+            vec![
+                AutomationPoint { tick: 0, value: -1.0 },
+                AutomationPoint { tick: 480, value: 440.0 },
+            ],
+            "native domain still sorts; values stay in the param's units"
         );
     }
 

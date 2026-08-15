@@ -199,8 +199,8 @@ pub fn save_into_project(dir: &Path, doc: &ModulationDoc) -> Result<(), String> 
     };
     let value = serde_json::to_value(&wire).map_err(|e| e.to_string())?;
 
-    // `update_project_v2` stamps schemaVersion 2 first; overwrite to 4 in
-    // the same edit so a v3 project is never left downgraded to 2.
+    // `update_project_v2` never stamps below the version already on disk;
+    // still force 4 here so a v3 project upgrades on the modulation write.
     crate::midi::persist::update_project_v2(dir, |obj| {
         obj.insert("modulation".into(), value);
         obj.insert("schemaVersion".into(), json!(4));
@@ -589,6 +589,74 @@ mod tests {
 
         let loaded = load_from_project(&dir).unwrap();
         assert_eq!(loaded.curves[0].points[1].value, 0.5);
+
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// A v3 plugin lane whose range was unknown stays `domain: native`
+    /// (points in the param's units). `ModulationSetCurve` must not clamp
+    /// those points to [0,1], and a save/load must keep 440.0 — after the
+    /// first save the file is v4, so open will not remigrate.
+    #[test]
+    fn native_curve_survives_set_curve_and_save_load() {
+        use crate::audio::types::Store;
+        use crate::control::op::{Op, TxMeta};
+        use crate::control::session::Session;
+        use crate::midi::MidiStore;
+
+        let parent = std::env::temp_dir().join(format!(
+            "aura-mod-native-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&parent).unwrap();
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+
+        let curve = Curve {
+            id: "cur-native".into(),
+            name: String::new(),
+            length_ticks: None,
+            points: vec![AutomationPoint { tick: 0, value: 440.0 }],
+        };
+        let binding = Binding {
+            id: "bnd-native".into(),
+            source: Source::Curve { curve_id: "cur-native".into() },
+            target: TargetRef::PluginParam {
+                instance_id: "inst-gone".into(),
+                param_id: 2,
+            },
+            mode: BindingMode::Absolute,
+            depth: 1.0,
+            range: Range::default(),
+            domain: Domain::Native,
+            range_snapshot: None,
+            enabled: true,
+        };
+
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        {
+            let mut g = m.lock();
+            g.modulation.bindings.push(binding);
+        }
+        Session::transact(&m, TxMeta::user("set native curve"), |tx| {
+            tx.apply(Op::ModulationSetCurve {
+                key: "cur-native".into(),
+                curve: Some(curve.clone()),
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert_eq!(
+                g.modulation.curves[0].points[0].value, 440.0,
+                "set_curve must not clamp a native-domain point to [0,1]"
+            );
+        }
+
+        save_into_project(&dir, &m.lock().modulation).unwrap();
+        let loaded = load_from_project(&dir).unwrap();
+        assert_eq!(loaded.curves[0].points[0].value, 440.0);
+        assert_eq!(loaded.bindings[0].domain, Domain::Native);
 
         let _ = fs::remove_dir_all(&parent);
     }

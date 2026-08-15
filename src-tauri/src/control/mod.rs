@@ -2301,7 +2301,8 @@ impl ControlPlane {
     ) -> Result<(), String> {
         if let Some(c) = curve.as_mut() {
             c.id = key.clone();
-            crate::modulation::normalize_curve(c)?;
+            let domain = self.session.lock().modulation.domain_of(&key);
+            crate::modulation::normalize_curve_in_domain(c, domain)?;
         }
         let to_apply = curve;
         let gesture_meta = meta.clone();

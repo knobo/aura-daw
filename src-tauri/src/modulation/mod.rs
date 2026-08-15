@@ -35,8 +35,8 @@ pub use compile::{
 pub use resolve::{plan_targets, resolve_target, ResolveCtx, ResolvedTarget, TargetPlan};
 
 pub use model::{
-    normalize_curve, validate_binding, AutomationClip, AutomationPoint, Binding, BindingMode,
-    Curve, Domain, Range, RangeSnapshot, Source, TargetRef, TrackParam,
+    normalize_curve, normalize_curve_in_domain, validate_binding, AutomationClip, AutomationPoint,
+    Binding, BindingMode, Curve, Domain, Range, RangeSnapshot, Source, TargetRef, TrackParam,
 };
 
 pub use commands::ModulationSnapshot;
@@ -70,5 +70,32 @@ impl ModulationDoc {
             self.automation_clips.iter().filter(|c| c.track_id == track_id).collect();
         v.sort_by_key(|c| c.timeline_start_ticks);
         v
+    }
+
+    /// Domain a curve should be treated as. Native is sticky until an
+    /// explicit [`normalize_curve`]: if any live binding that sources this
+    /// curve is [`Domain::Native`], the points stay in the param's units.
+    pub fn domain_of(&self, curve_id: &str) -> Domain {
+        let native = self.bindings.iter().any(|b| {
+            b.domain == Domain::Native && self.binding_sources_curve(b, curve_id)
+        });
+        if native {
+            Domain::Native
+        } else {
+            Domain::Normalized
+        }
+    }
+
+    fn binding_sources_curve(&self, b: &Binding, curve_id: &str) -> bool {
+        match &b.source {
+            Source::Curve { curve_id: id } | Source::ClipEnvelope { curve_id: id, .. } => {
+                id == curve_id
+            }
+            Source::AutomationTrack { track_id } => self
+                .automation_clips
+                .iter()
+                .any(|c| &c.track_id == track_id && c.curve_id == curve_id),
+            _ => false,
+        }
     }
 }

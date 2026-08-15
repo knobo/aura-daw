@@ -1240,6 +1240,36 @@ mod tests {
         let _ = fs::remove_dir_all(&parent);
     }
 
+    /// Design §7: writing always emits v4. Plugin persist goes through
+    /// `update_project_v2` and must not stamp `schemaVersion` back to 2.
+    #[test]
+    fn plugin_save_does_not_downgrade_v4_schema_version() {
+        let parent = tmp_parent("no-downgrade-v4");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+
+        let doc = crate::modulation::ModulationDoc {
+            curves: vec![crate::modulation::Curve {
+                id: "cur-a".into(),
+                name: String::new(),
+                length_ticks: None,
+                points: vec![],
+            }],
+            bindings: vec![],
+            automation_clips: vec![],
+        };
+        crate::modulation::save_into_project(&dir, &doc).unwrap();
+
+        save_snapshot_into_project(&dir, &PluginDoc::default(), false).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert_eq!(
+            raw["schemaVersion"], 4,
+            "plugin persist via update_project_v2 must write max(existing, 2)"
+        );
+        assert!(raw.get("modulation").is_some(), "modulation{{}} survives a plugin-only save");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
     #[test]
     fn corrupt_blob_restores_instance_without_state_and_keeps_file() {
         let parent = tmp_parent("corrupt");

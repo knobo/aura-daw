@@ -882,7 +882,8 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 Some(c) => {
                     let mut nc = c.clone();
                     nc.id = key.clone(); // the op's `key` is authoritative
-                    crate::modulation::normalize_curve(&mut nc)?;
+                    let domain = session.modulation.domain_of(&nc.id);
+                    crate::modulation::normalize_curve_in_domain(&mut nc, domain)?;
                     Some(nc)
                 }
                 None => None,
