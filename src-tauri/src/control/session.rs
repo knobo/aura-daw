@@ -313,6 +313,40 @@ impl Session {
 
     /// The ONLY way to mutate the document. Returns Err and leaves the
     /// session untouched if the closure fails (inverses rolled back).
+    ///
+    /// A closure that PANICS is contained rather than allowed to unwind out
+    /// (Plan F Task 8, ruling F-3, closing inventory L-5: an escaping panic
+    /// left the document half-mutated with no journal record — a permanent,
+    /// silent divergence of log from document). Containment is a
+    /// crash-consistency net, NOT a license: "validate before mutating,
+    /// never panic inside a `transact` closure" remains a binding project
+    /// rule, and every contained panic is logged at error level as a caller
+    /// bug. What changed is the CONSEQUENCE of breaking the rule, not the
+    /// rule.
+    ///
+    /// Why restore from the image instead of replaying the collected
+    /// inverses (which is what the Err arm does): the inverse ledger is only
+    /// as complete as the last [`Tx::apply`] that RETURNED. An unwind can
+    /// come from anywhere — including, in future code, from inside
+    /// `apply_raw` after it has mutated but before it has produced an
+    /// inverse — so replaying it is trusting a ledger the panic may have
+    /// truncated. The pre-transaction image is total: it describes the whole
+    /// document at a point the transaction had certainly not yet reached.
+    ///
+    /// Every lock the crate takes is `parking_lot`, which does NOT poison, so
+    /// a contained panic leaves no lock in a degraded state and every later
+    /// `lock()` behaves exactly as before — the channel stays open. (Under
+    /// `std::sync::Mutex` this design would instead hand every subsequent
+    /// caller a `PoisonError`, which is why the choice is load-bearing rather
+    /// than incidental.)
+    ///
+    /// RESIDUAL, deliberately not covered: the Err arm's own rollback carries
+    /// `expect("rollback must not fail")`. A panic THERE is outside this
+    /// containment and would leave the L-5 divergence it exists to close. It
+    /// is left alone because no test can reach it without a test-only hook —
+    /// every index on the apply path is `.min()`-clamped and every lookup
+    /// returns `Result` — and shipping an unreachable branch would only buy a
+    /// test that cannot fail.
     pub fn transact<F>(this: &parking_lot::Mutex<Session>, meta: TxMeta, f: F) -> Result<Committed, String>
     where
         F: FnOnce(&mut Tx<'_>) -> Result<(), String>,
@@ -325,8 +359,38 @@ impl Session {
         });
         let _reset = scopeguard(|| IN_TX.with(|t| t.set(false)));
         let mut guard = this.lock();
+        // Taken BEFORE the closure runs: by Task 5's equivalence invariant
+        // this IS the live document, and it is one Arc clone. Reading it
+        // afterwards would work today only because nothing reachable from a
+        // closure can publish; taking it up front does not depend on that.
+        let pre_tx = guard.published.lock().clone();
         let mut tx = Tx { session: &mut guard, ops: vec![], inverses: vec![], effect: EngineEffect::default() };
-        match f(&mut tx) {
+        // `AssertUnwindSafe` is not a formality here — `tx` holds `&mut
+        // Session`, so nothing in scope is `UnwindSafe` by inference. It is
+        // sound because NO state the closure may have left inconsistent is
+        // ever observed after the catch: `tx` (ops, inverses, effect) is
+        // dropped unread, and the document is overwritten wholesale from
+        // `pre_tx` before this function returns — under the SAME lock the
+        // closure ran under, so no other thread can observe the half-mutated
+        // document at all. The window is closed by the mutex, not by luck.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx)));
+        let closure_result = match outcome {
+            Ok(r) => r,
+            Err(payload) => {
+                let what = panic_payload_str(payload.as_ref());
+                drop(tx);
+                // `rev`/`epoch` are untouched: they advance only in the Ok
+                // arm, so no revision is consumed and no `Committed` exists
+                // — journal, history and the version graph all take their
+                // work from a `Committed` and therefore record nothing.
+                guard.restore_from_snapshot(&pre_tx);
+                log::error!(
+                    "transact: closure panicked; document restored — this is a bug in the caller: {what}"
+                );
+                return Err(format!("transaction panicked: {what}"));
+            }
+        };
+        match closure_result {
             Ok(()) => {
                 let (ops, inverses, effect) = (tx.ops, tx.inverses, tx.effect);
                 // Commit-time fold (round-2 §4): multiple property-addressed
@@ -377,6 +441,21 @@ impl Session {
 
 thread_local! {
     static IN_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Best-effort text for a caught panic payload. `panic!("literal")` boxes a
+/// `&'static str` and `panic!("{x}")` a `String`; anything else arrives via
+/// `panic_any` and is unreadable. Total by construction — the containment
+/// path must never itself panic, which is exactly what a
+/// `downcast::<String>().unwrap()` here would do.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    format!("<opaque panic payload: {:?}>", payload.type_id())
 }
 
 pub struct Tx<'s> {
@@ -1934,6 +2013,96 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_closure_leaves_the_document_and_the_channel_untouched() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let (gain_before, rev_before) = { let g = m.lock(); (g.store.tracks[0].gain_db, g.rev()) };
+
+        let r = Session::transact(&m, TxMeta::user("panics"), |tx| {
+            tx.apply(set_gain("t-1", -12.0))?;
+            assert_eq!(tx.store().tracks[0].gain_db, -12.0, "the op really landed before the panic");
+            panic!("mid-transaction bug");
+        });
+
+        let e = match r { Err(e) => e, Ok(_) => panic!("a panicking closure must return Err, not unwind out of transact") };
+        assert!(e.contains("panicked"), "error must name the panic, got {e:?}");
+        assert!(e.contains("mid-transaction bug"), "error must carry the payload, got {e:?}");
+
+        let g = m.lock();
+        assert_eq!(g.store.tracks[0].gain_db, gain_before, "document restored (L-5)");
+        assert_eq!(g.rev(), rev_before, "a panicking tx must not consume a revision");
+        drop(g);
+
+        // IN_TX was reset and the session mutex is usable: the channel still
+        // takes work. A stuck IN_TX would panic here instead of committing.
+        Session::transact(&m, TxMeta::user("after"), |tx| tx.apply(set_gain("t-1", -3.0)))
+            .expect("the channel still works after a contained panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, -3.0);
+    }
+
+    #[test]
+    fn a_panic_mid_batch_reverts_every_op_and_leaves_the_published_image_equal() {
+        let mut s = session_with_one_track("t-1");
+        s.store.tracks.push(test_track("t-2"));
+        s.midi.clips.push(test_midi_clip("mc-keep", "t-1"));
+        s.republish_full();
+        let m = parking_lot::Mutex::new(s);
+        let before = {
+            let g = m.lock();
+            (g.store.tracks.clone(), g.store.clips.clone(), g.midi.clips.clone())
+        };
+        let t2 = m.lock().store.tracks[1].clone();
+        let published = m.lock().published_handle();
+
+        let r = Session::transact(&m, TxMeta::user("three ops then die"), |tx| {
+            tx.apply(set_gain("t-1", -20.0))?;
+            tx.apply(Op::TrackRemove { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(Op::MidiClipAdd { clip: test_midi_clip("mc-new", "t-1"), index: 1 })?;
+            // Nothing half-mutated is EVER published: the lock-free engine
+            // reader (Task 6) sees only the pre-transaction image until the
+            // Ok arm's capture. Both halves are asserted so the comparison
+            // cannot be a value against itself.
+            let image = published.lock().clone();
+            assert_eq!(image.tracks.len(), 2, "published image still pre-tx");
+            assert_eq!(image.tracks[0].gain_db, 1.0, "published image still pre-tx");
+            assert_eq!(tx.store().tracks.len(), 1, "…while the LIVE document is mid-batch");
+            assert_eq!(tx.store().tracks[0].gain_db, -20.0, "…while the LIVE document is mid-batch");
+            panic!("after three ops, one structural");
+        });
+        assert!(matches!(&r, Err(e) if e.contains("panicked")), "must be contained as Err");
+
+        let g = m.lock();
+        assert_eq!(g.store.tracks, before.0, "the property op AND the structural op both reverted");
+        assert_eq!(g.store.clips, before.1);
+        assert_eq!(g.midi.clips, before.2, "the midi store reverted too");
+        // Equivalence (Task 5) is restored before the lock releases.
+        let image = published.lock().clone();
+        assert_eq!(image.tracks.as_ref(), &g.store.tracks, "published image equals the live document");
+        assert_eq!(image.clips.as_ref(), &g.store.clips);
+        assert_eq!(
+            image.midi.clips.iter().map(|c| (**c).clone()).collect::<Vec<_>>(),
+            g.midi.clips,
+            "published midi equals the live midi",
+        );
+        assert_eq!(image.rev, g.rev(), "the image claims the rev that is actually live");
+    }
+
+    #[test]
+    fn a_non_string_panic_payload_is_reported_and_still_restores() {
+        // `panic_any` with a foreign payload: the containment path must not
+        // itself panic trying to read it (a `downcast::<String>().unwrap()`
+        // would turn a caller bug into the abort this task exists to avoid).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let r = Session::transact(&m, TxMeta::user("exotic"), |tx| {
+            tx.apply(set_gain("t-1", -30.0))?;
+            std::panic::panic_any(42u32);
+        });
+        let e = match r { Err(e) => e, Ok(_) => panic!("must be contained") };
+        assert!(e.contains("panicked"), "got {e:?}");
+        assert_eq!(m.lock().store.tracks[0].gain_db, 1.0, "restored despite an unreadable payload");
+        Session::transact(&m, TxMeta::user("after"), |_| Ok(())).expect("channel still open");
+    }
+
+    #[test]
     fn remove_then_inverse_restores_row_byte_identically() {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let row = m.lock().store.tracks[0].clone();
@@ -1995,14 +2164,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "nested transact")]
-    fn nested_transact_panics_not_deadlocks() {
+    fn nested_transact_fails_loudly_and_does_not_deadlock() {
+        // The nested guard still panics rather than re-locking (which would
+        // deadlock on the non-reentrant session mutex). Since Task 8 the
+        // OUTER transact catches it, so the caller gets a loud Err instead
+        // of a dead process — the property under test is unchanged, its
+        // consequence is not.
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
         let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "outer".into(), transient: false };
-        let _ = Session::transact(&m, meta.clone(), |_tx| {
+        let r = Session::transact(&m, meta.clone(), |_tx| {
             let _ = Session::transact(&m, meta.clone(), |_| Ok(()));
             Ok(())
         });
+        assert!(
+            matches!(&r, Err(e) if e.contains("panicked") && e.contains("nested transact")),
+            "nested transact must surface as a contained Err naming itself",
+        );
+        Session::transact(&m, meta, |_| Ok(())).expect("channel still open");
     }
 
     #[test]
@@ -3387,5 +3565,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.lock().plugins.state_rev.get("p-1"), Some(&2), "undo needs a fresh node too");
+    }
+
+    #[test]
+    fn a_panic_after_a_plugin_state_write_rolls_the_blob_back_and_republishes_the_bumped_rev() {
+        // The one case where a contained panic does NOT leave the live
+        // document byte-identical to the pre-transaction image: rolling a
+        // state blob back retires the live plugin node, and `state_rev`
+        // only ever moves FORWARD. So the restore leaves a document the
+        // image does not describe, and MUST republish.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(test_plugin_row("p-1"));
+            g.plugins.pending_state.insert("p-1".into(), vec![0u8, 0, 0]);
+            g.plugins.state_rev.insert("p-1".into(), 7);
+            g.republish_full();
+        }
+        let published = m.lock().published_handle();
+
+        let r = Session::transact(&m, TxMeta::user("load patch then die"), |tx| {
+            tx.apply(Op::PluginSetState { instance: "p-1".into(), state: vec![9u8, 9, 9, 9] })?;
+            panic!("host went away mid-load");
+        });
+        assert!(matches!(&r, Err(e) if e.contains("panicked")), "must be contained");
+
+        let g = m.lock();
+        assert_eq!(
+            g.plugins.pending_state.get("p-1"),
+            Some(&vec![0u8, 0, 0]),
+            "the blob rolled back to the pre-transaction one",
+        );
+        assert_eq!(
+            g.plugins.state_rev.get("p-1"),
+            Some(&9),
+            "forward-only, once per blob CHANGE: 7 -> 8 for the write, 8 -> 9 for the rollback",
+        );
+        let image = published.lock().clone();
+        assert_eq!(
+            image.plugins.state_rev.get("p-1"),
+            Some(&9),
+            "and the published image carries it — a restore that skips the republish leaves 7 here",
+        );
+        assert_eq!(image.plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
     }
 }
