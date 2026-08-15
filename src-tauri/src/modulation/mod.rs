@@ -20,8 +20,14 @@
 //!
 //! Design: `docs/superpowers/specs/2026-08-15-modulation-system-design.md`.
 
+pub mod compile;
 pub mod model;
 pub mod resolve;
+
+pub use compile::{
+    compile, CompileCtx, CompiledModulation, ParamLaneSpec, Placement, TrackRampSpec,
+    MAX_EVENTS_PER_BINDING,
+};
 
 pub use resolve::{plan_targets, resolve_target, ResolveCtx, ResolvedTarget, TargetPlan};
 
