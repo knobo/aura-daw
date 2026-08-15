@@ -10,6 +10,7 @@
 
 import { backend } from "../tauri";
 import { midiIo } from "./midiio.svelte";
+import { modulation } from "./modulation.svelte";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
@@ -130,6 +131,7 @@ class ProjectStore {
   async removeTrack(trackId: string) {
     this.tracks = this.tracks.filter((t) => t.id !== trackId);
     this.clips = this.clips.filter((c) => c.trackId !== trackId);
+    modulation.dropTrack(trackId);
     await backend.removeTrack(trackId);
   }
 

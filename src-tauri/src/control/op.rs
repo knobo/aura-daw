@@ -98,6 +98,13 @@ pub enum Op {
         clips: Vec<crate::audio::types::Clip>,
         #[serde(default)]
         clip_indices: Vec<usize>,
+        /// Automation clips restored with this row (undo of TrackRemove on
+        /// an automation track). Fresh `add_track` leaves this empty.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        automation_clips: Vec<crate::modulation::AutomationClip>,
+        /// Bindings sourced from this automation track, same restore path.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        bindings: Vec<crate::modulation::Binding>,
     },
     /// Structural: remove a track. Payload kept so the inverse can restore
     /// identity + row byte-identically (gate test 2 arrives in Plan B).
@@ -442,6 +449,7 @@ mod tests {
         };
         let track_add = Op::TrackAdd {
             track: track.clone(), index: 0, clips: vec![clip.clone()], clip_indices: vec![0],
+            automation_clips: vec![], bindings: vec![],
         };
         let s = serde_json::to_string(&track_add).unwrap();
         // Print once to verify camelCase tag form: should be "trackAdd", and

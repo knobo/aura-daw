@@ -694,6 +694,8 @@ mod tests {
             index: 0,
             clips: vec![],
             clip_indices: vec![],
+            automation_clips: vec![],
+            bindings: vec![],
         }
     }
 

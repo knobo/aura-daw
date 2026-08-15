@@ -169,6 +169,16 @@ describe("automation track routing", () => {
     expect(modulation.bindings).toHaveLength(0);
   });
 
+  it("dropping a track locally removes its clips and sourced bindings", async () => {
+    await modulation.addTarget("auto", { kind: "trackParam", trackId: "t-1", param: "gain" });
+    await modulation.addClip("auto", 0, 3840);
+    await modulation.addTarget("other", { kind: "trackParam", trackId: "t-2", param: "gain" });
+    modulation.dropTrack("auto");
+    expect(modulation.clipsOn("auto")).toHaveLength(0);
+    expect(modulation.bindingsFrom("auto")).toHaveLength(0);
+    expect(modulation.bindingsFrom("other")).toHaveLength(1);
+  });
+
   it("adding a clip persists it on the automation track", async () => {
     const clip = await modulation.addClip("auto", 0, 3840);
     expect(clip).toBeDefined();

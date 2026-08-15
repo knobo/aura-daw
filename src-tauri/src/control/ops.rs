@@ -133,6 +133,8 @@ pub fn add_track_tx(
         index,
         clips: Vec::new(),
         clip_indices: Vec::new(),
+        automation_clips: Vec::new(),
+        bindings: Vec::new(),
     })?;
     Ok(track)
 }

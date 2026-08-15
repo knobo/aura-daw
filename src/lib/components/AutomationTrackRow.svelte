@@ -10,7 +10,8 @@
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { canvasPos } from "../utils/canvas-pos";
-  import { deletePoint, hitTest, insertPoint, movePoint } from "../utils/automation-edit";
+  import { deletePoint, hitTest, movePoint } from "../utils/automation-edit";
+  import { automationClipGesture } from "../utils/automation-clip-gesture";
 
   let { track }: { track: TrackState } = $props();
 
@@ -145,35 +146,34 @@
     const curve = curveOf(clip);
     const canvas = canvases.get(clip.id);
 
-    if (curve && canvas && (e.button === 2 || e.altKey || !nearRight)) {
+    if (curve && canvas) {
       const { tick, value } = localTickValue(clip, e, canvas);
       const tickPerPx = Math.max(1e-9, midi.samplesToTicks(view.spp) - midi.samplesToTicks(0));
       const valuePerPx = 1 / Math.max(1, canvas.clientHeight);
       const hit = hitTest(curve.points, tick, value, tickPerPx, valuePerPx, 6);
-      if (e.button === 2 || e.altKey) {
+      const mode = automationClipGesture({
+        nearRight,
+        hit,
+        erase: e.button === 2 || e.altKey,
+      });
+      if (mode === "ignore") return;
+      if (mode === "delete") {
         e.preventDefault();
-        if (hit < 0) return;
         project.beginGesture("automation delete point");
         void modulation
           .commitInGesture(clip.id, { ...curve, points: deletePoint(curve.points, hit) })
           .then(() => project.endGesture());
         return;
       }
-      if (hit >= 0 || !nearRight) {
+      if (mode === "point") {
         canvas.setPointerCapture(e.pointerId);
         project.beginGesture("automation edit");
         gestureOpen = true;
         dragMode = "point";
         dragClipId = clip.id;
         dragging = true;
-        if (hit >= 0) {
-          dragIndex = hit;
-          modulation.preview(curve.id, curve.points);
-        } else {
-          const points = insertPoint(curve.points, { tick, value });
-          dragIndex = points.findIndex((p) => p.tick === tick);
-          void modulation.commitInGesture(clip.id, { ...curve, points });
-        }
+        dragIndex = hit;
+        modulation.preview(curve.id, curve.points);
         return;
       }
     }

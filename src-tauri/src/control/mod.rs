@@ -2029,7 +2029,7 @@ impl ControlPlane {
             ops::new_track_row(&session.store, name, kind)?
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![] })
+            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })
         })?;
         Ok(track)
     }
@@ -4168,8 +4168,8 @@ mod tests {
         let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
         plane
             .commit(TxMeta::user("batch"), |tx| {
-                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![], clip_indices: vec![] })?;
-                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![], clip_indices: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
                 tx.apply(set_gain("t-1", 0.5))?;
                 Ok(())
             })

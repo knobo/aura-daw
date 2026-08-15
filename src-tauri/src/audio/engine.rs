@@ -903,10 +903,11 @@ pub(crate) fn compile_track_ramps(
     lanes: &[crate::plugins::automation::AutomationLane],
     modulation: &crate::modulation::ModulationDoc,
     store: &Store,
+    plugins: &crate::control::session::PluginDoc,
     slots: &HashMap<crate::ids::TrackId, usize>,
     n_slots: usize,
     map: &crate::midi::TempoMap,
-) -> Vec<TrackRamps> {
+) -> (Vec<TrackRamps>, Vec<crate::modulation::ParamLaneSpec>) {
     let mut ramps: Vec<TrackRamps> = if lanes.is_empty() {
         (0..n_slots).map(|_| TrackRamps::default()).collect()
     } else {
@@ -917,20 +918,23 @@ pub(crate) fn compile_track_ramps(
         .map(|gain| TrackRamps { gain, pan: None })
         .collect()
     };
-    if !modulation.is_empty() {
-        overlay_modulation_ramps(&mut ramps, modulation, store, slots, n_slots, map);
-    }
-    ramps
+    let params = if !modulation.is_empty() {
+        overlay_modulation_ramps(&mut ramps, modulation, store, plugins, slots, n_slots, map)
+    } else {
+        Vec::new()
+    };
+    (ramps, params)
 }
 
 fn overlay_modulation_ramps(
     ramps: &mut [TrackRamps],
     modulation: &crate::modulation::ModulationDoc,
     store: &Store,
+    plugins: &crate::control::session::PluginDoc,
     slots: &HashMap<crate::ids::TrackId, usize>,
     n_slots: usize,
     map: &crate::midi::TempoMap,
-) {
+) -> Vec<crate::modulation::ParamLaneSpec> {
     let slot_of = |tid: &str| slots.get(tid).copied();
     let track_pan = |tid: &str| {
         store.tracks.iter().find(|t| t.id.as_str() == tid).map(|t| t.pan as f32)
@@ -942,12 +946,26 @@ fn overlay_modulation_ramps(
             .find(|t| t.id.as_str() == tid)
             .and_then(|t| t.instrument_id.clone())
     };
+    let param_range = |inst: &str, idx: u32| {
+        plugins
+            .params
+            .get(inst)
+            .and_then(|ps| ps.iter().find(|p| p.id == idx))
+            .map(|p| (p.min as f32, p.max as f32))
+    };
+    let param_value = |inst: &str, idx: u32| {
+        plugins
+            .params
+            .get(inst)
+            .and_then(|ps| ps.iter().find(|p| p.id == idx))
+            .map(|p| p.value as f32)
+    };
     let ctx = crate::modulation::CompileCtx {
         n_slots,
         slot_of: &slot_of,
         track_pan: &track_pan,
-        param_range: &|_, _| None,
-        param_value: &|_, _| None,
+        param_range: &param_range,
+        param_value: &param_value,
         instrument_of: &instrument_of,
         content_placements: &|_| Vec::new(),
     };
@@ -963,6 +981,7 @@ fn overlay_modulation_ramps(
             ramps[i].pan = Some(Arc::new(pan.clone()));
         }
     }
+    compiled.params
 }
 
 impl Control {
@@ -1405,19 +1424,19 @@ impl Control {
                 auto::ParamAutomationDriver::empty(),
             );
         };
-        let ramps = compile_track_ramps(
+        let (ramps, param_specs) = compile_track_ramps(
             &session.automation.lanes,
             &session.modulation,
             &session.store,
+            &session.plugins,
             slots,
             n_slots,
             &map,
         );
-        let driver = if session.automation.lanes.is_empty() {
-            auto::ParamAutomationDriver::empty()
-        } else {
-            auto::ParamAutomationDriver::new(&session.automation.lanes, &session.plugins, &map)
-        };
+        let mut driver = auto::ParamAutomationDriver::from_param_specs(&param_specs, &session.plugins);
+        if !session.automation.lanes.is_empty() {
+            driver.merge_uncovered_lanes(&session.automation.lanes, &session.plugins, &map);
+        }
         (ramps, driver)
     }
 
@@ -3310,6 +3329,91 @@ mod tests {
         assert_eq!(ramps.len(), 2, "still one entry per slot, just nothing in them");
         assert!(ramps.iter().all(|r| r.gain.is_none() && r.pan.is_none()));
         assert!(driver.is_empty());
+    }
+
+    /// An automation-track binding on a plugin param must compile into the
+    /// live driver (Task 9 review). `lanes_from_doc` skips AutomationTrack
+    /// sources, so the driver has to ingest `CompiledModulation.params`.
+    #[test]
+    fn an_automation_track_plugin_param_binding_compiles_into_the_driver() {
+        use crate::modulation::model::{
+            AutomationClip, Binding, BindingMode, Curve, Domain, Range, Source, TargetRef,
+        };
+        use crate::plugins::automation::AutomationPoint;
+        use crate::plugins::descriptor::ParamInfo;
+
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            let mut auto = test_track("auto");
+            auto.kind = "automation".into();
+            s.store.tracks.push(auto);
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert(
+                "inst-1".into(),
+                vec![ParamInfo {
+                    id: 7,
+                    name: "cutoff".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    value: 0.5,
+                    steps: 0,
+                }],
+            );
+            s.modulation.curves.push(Curve {
+                id: "cur".into(),
+                name: "cur".into(),
+                length_ticks: Some(160),
+                points: vec![
+                    AutomationPoint { tick: 0, value: 0.25 },
+                    AutomationPoint { tick: 159, value: 0.25 },
+                ],
+            });
+            s.modulation.automation_clips.push(AutomationClip {
+                id: "acl".into(),
+                track_id: "auto".into(),
+                curve_id: "cur".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 160,
+                content_length_ticks: None,
+            });
+            s.modulation.bindings.push(Binding {
+                id: "b".into(),
+                source: Source::AutomationTrack { track_id: "auto".into() },
+                target: TargetRef::PluginParam { instance_id: "inst-1".into(), param_id: 7 },
+                mode: BindingMode::Absolute,
+                depth: 1.0,
+                range: Range::default(),
+                domain: Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            });
+        }
+        let (_, mut driver) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
+        };
+        assert!(!driver.is_empty(), "automation-track plugin binding must reach the driver");
+        let mut writes = Vec::new();
+        driver.tick(0, &mut writes);
+        assert_eq!(writes.len(), 1, "the driver emits at the clip start");
+        assert_eq!(writes[0].instance, "inst-1");
+        assert_eq!(writes[0].index, 7);
+        assert!(
+            (writes[0].value - 0.25).abs() < 1e-5,
+            "native value follows the curve: {}",
+            writes[0].value
+        );
     }
 
     /// Plan E Task 13's TDD step 1, at the real `Control` methods (not just

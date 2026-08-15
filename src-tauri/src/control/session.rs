@@ -448,7 +448,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.any_solo = Some(session.store.any_solo());
             Ok(inverse)
         }
-        Op::TrackAdd { track, index, clips, clip_indices } => {
+        Op::TrackAdd { track, index, clips, clip_indices, automation_clips, bindings } => {
             if session.store.tracks.iter().any(|t| t.id == track.id) {
                 return Err(format!("duplicate track id: {}", track.id));
             }
@@ -468,6 +468,20 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 }
             } else {
                 session.store.clips.extend(clips.iter().cloned());
+            }
+            if !automation_clips.is_empty() || !bindings.is_empty() {
+                for c in automation_clips {
+                    if session.modulation.automation_clips.iter().all(|x| x.id != c.id) {
+                        session.modulation.automation_clips.push(c.clone());
+                    }
+                }
+                for b in bindings {
+                    if session.modulation.bindings.iter().all(|x| x.id != b.id) {
+                        session.modulation.bindings.push(b.clone());
+                    }
+                }
+                effect.persist.modulation = true;
+                sync_derived_lanes(session);
             }
             // Structural: at most one Rebuild per transaction, however many
             // structural ops it contains — a plain flag naturally folds.
@@ -514,6 +528,33 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 i += 1;
                 keep
             });
+            // Automation clips and bindings sourced from this track leave
+            // with it (Task 9 review): compile expands `clips_on(track_id)`
+            // without checking the track still exists, so leaving them
+            // would keep driving targets after the row is gone.
+            let mut removed_auto_clips = Vec::new();
+            session.modulation.automation_clips.retain(|c| {
+                let keep = c.track_id != track.id.as_str();
+                if !keep {
+                    removed_auto_clips.push(c.clone());
+                }
+                keep
+            });
+            let mut removed_bindings = Vec::new();
+            session.modulation.bindings.retain(|b| {
+                let drop = matches!(
+                    &b.source,
+                    crate::modulation::Source::AutomationTrack { track_id } if track_id == track.id.as_str()
+                );
+                if drop {
+                    removed_bindings.push(b.clone());
+                }
+                !drop
+            });
+            if !removed_auto_clips.is_empty() || !removed_bindings.is_empty() {
+                effect.persist.modulation = true;
+                sync_derived_lanes(session);
+            }
             effect.rebuild = true;
             // Removing a track can flip the store-wide any_solo flag (the
             // removed row may have been the only soloed track) — recompute
@@ -523,6 +564,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.any_solo = Some(session.store.any_solo());
             Ok(Op::TrackAdd {
                 track: removed, index: pos, clips: removed_clips, clip_indices: removed_indices,
+                automation_clips: removed_auto_clips, bindings: removed_bindings,
             })
         }
         // Plan E Task 3 (inventory row 3): clip placement — the round-2
@@ -1634,6 +1676,7 @@ mod tests {
             tx.apply(Op::TrackAdd {
                 track: test_track("t-1"), index: 1,
                 clips: vec![], clip_indices: vec![],
+                automation_clips: vec![], bindings: vec![],
             })
         });
         assert!(r.is_err());
@@ -1737,7 +1780,7 @@ mod tests {
         let snapshot = { let g = m.lock(); (g.store.tracks.clone(), g.store.clips.clone()) };
         let new_row = test_track("t-2");
         let r = Session::transact(&m, TxMeta::user("mixed-fail"), |tx| {
-            tx.apply(Op::TrackAdd { track: new_row, index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(Op::TrackAdd { track: new_row, index: 1, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
             tx.apply(set_gain("t-2", 0.5))?;
             tx.apply(set_gain("ghost", 0.1))?;   // fails the batch
             Ok(())
@@ -1766,7 +1809,7 @@ mod tests {
         let t2 = test_track("t-2");
         let c = Session::transact(&m, TxMeta::user("fold-barrier"), |tx| {
             tx.apply(set_gain("t-1", 3.0))?;
-            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
             tx.apply(set_gain("t-1", 6.0))
         })
         .unwrap();
@@ -1787,7 +1830,7 @@ mod tests {
         let t2 = test_track("t-2");
         let c = Session::transact(&m, TxMeta::user("wiggle-barrier"), |tx| {
             tx.apply(set_gain("t-1", 3.0))?;
-            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(Op::TrackAdd { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
             tx.apply(set_gain("t-1", 1.0)) // back to original
         })
         .unwrap();
@@ -2530,6 +2573,61 @@ mod tests {
             timeline_start_ticks: 0,
             length_ticks: 3840,
             content_length_ticks: None,
+        }
+    }
+
+    #[test]
+    fn removing_an_automation_track_drops_its_clips_and_sourced_bindings() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-auto"));
+        {
+            let mut g = m.lock();
+            g.store.tracks[0].kind = "automation".into();
+            g.modulation.curves.push(test_curve(
+                "cur-1",
+                vec![AutomationPoint { tick: 0, value: 1.0 }],
+            ));
+            g.modulation.automation_clips.push(test_auto_clip("acl-1"));
+            let mut sourced = test_binding("b-auto", "cur-1");
+            sourced.source = crate::modulation::Source::AutomationTrack {
+                track_id: "t-auto".into(),
+            };
+            g.modulation.bindings.push(sourced);
+            g.modulation.bindings.push(test_binding("b-keep", "cur-1"));
+        }
+        let row = m.lock().store.tracks[0].clone();
+        let c = Session::transact(&m, TxMeta::user("remove"), |tx| {
+            tx.apply(Op::TrackRemove {
+                track: row,
+                index: 0,
+                clips: vec![],
+                clip_indices: vec![],
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert!(
+                g.modulation.automation_clips.is_empty(),
+                "automation clips on the removed track must leave with it"
+            );
+            assert_eq!(
+                g.modulation.bindings.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(),
+                vec!["b-keep"],
+                "only bindings sourced from the removed track are dropped"
+            );
+        }
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert_eq!(g.modulation.automation_clips.len(), 1);
+            assert_eq!(g.modulation.automation_clips[0].id, "acl-1");
+            assert_eq!(g.modulation.bindings.len(), 2);
         }
     }
 

@@ -150,6 +150,7 @@ pub fn build_graph(
         modulation,
         midi,
         store,
+        plugins,
         &slots,
         n_slots,
         rate,
@@ -169,6 +170,7 @@ fn compile_track_ramps(
     modulation: &crate::modulation::ModulationDoc,
     midi: &MidiStore,
     store: &Store,
+    plugins: &crate::control::session::PluginDoc,
     slots: &std::collections::HashMap<crate::ids::TrackId, usize>,
     n_slots: usize,
     rate: u32,
@@ -184,10 +186,12 @@ fn compile_track_ramps(
         &automation.lanes,
         modulation,
         store,
+        plugins,
         slots,
         n_slots,
         &map,
     )
+    .0
 }
 
 /// Last audible sample of a track set: clip `start + len` and the last
@@ -564,6 +568,7 @@ mod tests {
             &Default::default(),
             &midi,
             &store,
+            &crate::control::session::PluginDoc::default(),
             &slots,
             store.tracks.len(),
             48_000,

@@ -102,6 +102,14 @@ class ModulationStore {
     return this.automationClips.filter((c) => c.trackId === trackId);
   }
 
+  /** Local drop when a track is removed — the backend deletes the rows. */
+  dropTrack(trackId: string) {
+    this.automationClips = this.automationClips.filter((c) => c.trackId !== trackId);
+    this.bindings = this.bindings.filter(
+      (b) => !(b.source.kind === "automationTrack" && b.source.trackId === trackId),
+    );
+  }
+
   curveOf(binding: Binding): Curve | undefined {
     const id = curveIdOf(binding);
     return id ? this.curves.find((c) => c.id === id) : undefined;

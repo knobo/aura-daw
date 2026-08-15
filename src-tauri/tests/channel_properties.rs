@@ -413,6 +413,7 @@ fn resolve_one(
             }
             Some(Op::TrackAdd {
                 track: test_track(&id), index: alive.len() - 1, clips, clip_indices: vec![],
+                automation_clips: vec![], bindings: vec![],
             })
         }
         RawAction::Remove(pick, n_clips) => {
