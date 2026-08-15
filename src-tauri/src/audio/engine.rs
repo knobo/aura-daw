@@ -397,22 +397,20 @@ impl OutputCb {
                 // delivering the note-offs is not enough: a node left frozen
                 // mid-release resurrects that fragment the next time it is
                 // armed. The outgoing node therefore keeps the live-in
-                // channel until its release has had time to run. While
-                // PLAYING the graph renders it every block anyway, so one
-                // block — just enough to carry the note-offs — is the whole
-                // window, and monitoring on the new target is never deaf for
-                // longer than the gesture that caused it.
+                // channel until its release has had time to run. The window
+                // is unconditional: shortening it to one block while playing
+                // looks free (the graph renders every live node each block
+                // anyway) but ends the moment the transport stops, so a stop
+                // landing inside the window refreezes the outgoing node
+                // mid-decay and it replays that fragment on its next arm.
                 // PolySynth's release, applied to every instrument: a
                 // sampler or plugin with a longer tail is still cut short
                 // (bounded and silent, never a drone). Raising it only
                 // trades that for a longer deaf window on the new target —
                 // a per-node `release_tail()` on the processor trait is the
                 // real answer, and a separate cut.
-                self.live_in_release_left = if playing {
-                    frames
-                } else {
-                    (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames
-                };
+                self.live_in_release_left =
+                    (crate::midi::synth::RELEASE_SECS * self.rate as f32) as u64 + frames;
             }
             if !playing {
                 self.live_in_all_off = true;
@@ -1517,155 +1515,167 @@ impl Control {
     // -- recording ----------------------------------------------------------
 
     fn start_recording(&mut self, track_ids: Option<Vec<String>>) -> Result<Vec<String>, String> {
-        if self.writer.is_some() {
+        // A MIDI-only take opens no device, so `self.writer` stays None for
+        // the whole take — the capture is the other half of "is a take
+        // running".
+        if self.writer.is_some() || self.live_in_hub.capturing() {
             return Err("already recording".to_string());
         }
 
-        // Resolve target tracks (explicit list or armed flags).
-        let targets: Vec<String> = {
+        // Read the routing target BEFORE the session lock: the hub's own
+        // mutex must never be taken under it ([C1] ordering).
+        let live_in_target = self.live_in_hub.target_track();
+        let (targets, midi_target) = {
             let session = self.session.lock(); // read-only: resolve/validate target track ids before recording starts
-            let store = &session.store;
-            match track_ids {
-                Some(ids) => {
-                    for id in &ids {
-                        if !store.tracks.iter().any(|t| &t.id == id) {
-                            return Err(format!("unknown track: {id}"));
-                        }
-                    }
-                    ids
-                }
-                None => store.armed_track_ids(),
-            }
+            split_record_targets(&session.store, track_ids, live_in_target)?
         };
-        if targets.is_empty() {
-            return Err("no armed tracks to record".to_string());
-        }
 
+        // A take needs a project dir whether it is audio or MIDI.
         self.ensure_project()?;
 
-        // Input device + stream.
-        let host = cpal::default_host();
-        let device = match &self.sel_input {
-            Some(id) => host
-                .input_devices()
-                .map_err(|e| e.to_string())?
-                .find(|d| d.name().map(|n| &n == id).unwrap_or(false))
-                .ok_or_else(|| format!("unknown input device: {id}"))?,
-            None => host
-                .default_input_device()
-                .ok_or_else(|| "no default input device".to_string())?,
-        };
-        let cfg = device.default_input_config().map_err(|e| e.to_string())?;
-        if cfg.sample_format() != cpal::SampleFormat::F32 {
-            return Err(format!(
-                "unsupported input sample format {:?} (prototype supports f32)",
-                cfg.sample_format()
-            ));
-        }
-        let in_ch = cfg.channels().max(1) as usize;
-        let rec_ch = in_ch.min(2);
-        let rate = cfg.sample_rate().0;
         let start_pos = self.shared.position.load(Relaxed);
 
-        // Rings + writer specs. Slot resolution reads the CURRENT graph's
-        // tables, not the store — round-2 §2.4; lock order: session before
-        // tables [C1].
-        let (project_dir, take_no, slots, rec_generation) = {
-            let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
-            let store = &session.store;
-            let dir = store.project_dir.clone().ok_or("no project open")?;
-            let take_no = store.clips.len() + 1;
-            let tables = self.tables.lock();
-            let slots: Vec<usize> = targets
-                .iter()
-                .filter_map(|id| tables.slots.get(id.as_str()).copied())
-                .collect();
-            (dir, take_no, slots, tables.generation)
-        };
-        // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
-        // preallocated `RawMeterBlock` template per distinct chunk, plus the
-        // base-0 chunk (frame accounting [I3]) even if no recorded slot
-        // lands there. Built here (control thread) so `InputCb::capture`
-        // (RT) never allocates.
-        let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        chunk_lanes.entry(0).or_default();
-        for &slot in &slots {
-            let chunk_idx = slot / METER_CHUNK_SLOTS;
-            let lane = slot % METER_CHUNK_SLOTS;
-            chunk_lanes.entry(chunk_idx).or_default().push(lane);
+        if !targets.is_empty() {
+            // Input device + stream.
+            let host = cpal::default_host();
+            let device = match &self.sel_input {
+                Some(id) => host
+                    .input_devices()
+                    .map_err(|e| e.to_string())?
+                    .find(|d| d.name().map(|n| &n == id).unwrap_or(false))
+                    .ok_or_else(|| format!("unknown input device: {id}"))?,
+                None => host
+                    .default_input_device()
+                    .ok_or_else(|| "no default input device".to_string())?,
+            };
+            let cfg = device.default_input_config().map_err(|e| e.to_string())?;
+            if cfg.sample_format() != cpal::SampleFormat::F32 {
+                return Err(format!(
+                    "unsupported input sample format {:?} (prototype supports f32)",
+                    cfg.sample_format()
+                ));
+            }
+            let in_ch = cfg.channels().max(1) as usize;
+            let rec_ch = in_ch.min(2);
+            let rate = cfg.sample_rate().0;
+
+            // Rings + writer specs. Slot resolution reads the CURRENT graph's
+            // tables, not the store — round-2 §2.4; lock order: session before
+            // tables [C1].
+            let (project_dir, take_no, slots, rec_generation) = {
+                let session = self.session.lock(); // read-only: project dir + take numbering + slot resolution
+                let store = &session.store;
+                let dir = store.project_dir.clone().ok_or("no project open")?;
+                let take_no = store.clips.len() + 1;
+                let tables = self.tables.lock();
+                let slots: Vec<usize> = targets
+                    .iter()
+                    .filter_map(|id| tables.slots.get(id.as_str()).copied())
+                    .collect();
+                (dir, take_no, slots, tables.generation)
+            };
+            // Group the recorded slots by 64-slot chunk (Task 7 [I4]): one
+            // preallocated `RawMeterBlock` template per distinct chunk, plus the
+            // base-0 chunk (frame accounting [I3]) even if no recorded slot
+            // lands there. Built here (control thread) so `InputCb::capture`
+            // (RT) never allocates.
+            let mut chunk_lanes: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+            chunk_lanes.entry(0).or_default();
+            for &slot in &slots {
+                let chunk_idx = slot / METER_CHUNK_SLOTS;
+                let lane = slot % METER_CHUNK_SLOTS;
+                chunk_lanes.entry(chunk_idx).or_default().push(lane);
+            }
+            let mut blocks = Vec::with_capacity(chunk_lanes.len());
+            for (chunk_idx, lanes) in chunk_lanes {
+                let mut b = RawMeterBlock::new(rec_generation, 0, 0);
+                b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
+                blocks.push((b, lanes));
+            }
+
+            let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
+            let mut producers = Vec::with_capacity(targets.len());
+            let mut consumers = Vec::with_capacity(targets.len());
+            let mut specs = Vec::with_capacity(targets.len());
+            for (i, track_id) in targets.iter().enumerate() {
+                let clip_id = uuid::Uuid::new_v4().to_string();
+                // The take's wav is named by a freshly-minted SourceId (round-2
+                // §2.2) — the decode cache re-keys by source, not by clip.
+                // Waveform pyramid cache dirs stay keyed by clip id.
+                let source_id = crate::ids::SourceId::mint();
+                let rel = format!("audio/{source_id}.wav");
+                let (p, c) = rtrb::RingBuffer::new(capacity);
+                producers.push(p);
+                consumers.push(c);
+                specs.push(RecSpec {
+                    track_id: track_id.clone(),
+                    take_name: format!("Take {}", take_no + i),
+                    wav_path: project_dir.join(&rel),
+                    rel_path: rel,
+                    source_id,
+                    cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
+                    clip_id,
+                    start_pos,
+                });
+            }
+
+            let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
+
+            let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
+            let n_producers = producers.len();
+            let mut cb = InputCb {
+                producers,
+                owed: vec![0; n_producers],
+                meter_tx,
+                blocks,
+                in_ch,
+                rec_ch,
+                shared: self.shared.clone(),
+            };
+            let stream = device
+                .build_input_stream(
+                    &cfg.into(),
+                    move |data: &[f32], _| cb.capture(data),
+                    |e| log::warn!("input stream error: {e}"),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            stream.play().map_err(|e| e.to_string())?;
+
+            // Pin the generation the slots above were resolved against (Task 6
+            // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
+            // in its plain window must not lose its input meters. INVARIANT:
+            // pin only AFTER every fallible step above has succeeded (device
+            // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
+            // `stop_recording` is the only unpin, and it can only ever run once
+            // `self.writer`/`self.input` are actually populated. Pinning
+            // earlier and then returning `Err` from one of those `?`s would
+            // leak the pin: a generation stays exempt from pruning forever for
+            // a recording that never started (self-healing only on the NEXT
+            // successful recording, which is not good enough).
+            self.gen_maps.pin(rec_generation);
+
+            self.input = Some(InputBundle { _stream: stream, meter_rx });
+            self.writer = Some(writer);
+            log::info!(
+                "audio: recording {} track(s) @ {} Hz x{}ch",
+                targets.len(),
+                rate,
+                rec_ch
+            );
+        } // ruling 8: a take with only a MIDI target opens no device at all
+
+        // Arm the capture LAST among the fallible work: every `?` above
+        // returns without a take running, so a failed start never leaves the
+        // hub buffering into a recording that does not exist.
+        if let Some(t) = &midi_target {
+            self.live_in_hub.begin_capture(t.clone(), start_pos);
+            log::info!("audio: recording MIDI take on track {t}");
         }
-        let mut blocks = Vec::with_capacity(chunk_lanes.len());
-        for (chunk_idx, lanes) in chunk_lanes {
-            let mut b = RawMeterBlock::new(rec_generation, 0, 0);
-            b.base_slot = (chunk_idx * METER_CHUNK_SLOTS) as u32;
-            blocks.push((b, lanes));
-        }
 
-        let capacity = (rate as usize * rec_ch * REC_RING_SECS).max(48_000);
-        let mut producers = Vec::with_capacity(targets.len());
-        let mut consumers = Vec::with_capacity(targets.len());
-        let mut specs = Vec::with_capacity(targets.len());
-        for (i, track_id) in targets.iter().enumerate() {
-            let clip_id = uuid::Uuid::new_v4().to_string();
-            // The take's wav is named by a freshly-minted SourceId (round-2
-            // §2.2) — the decode cache re-keys by source, not by clip.
-            // Waveform pyramid cache dirs stay keyed by clip id.
-            let source_id = crate::ids::SourceId::mint();
-            let rel = format!("audio/{source_id}.wav");
-            let (p, c) = rtrb::RingBuffer::new(capacity);
-            producers.push(p);
-            consumers.push(c);
-            specs.push(RecSpec {
-                track_id: track_id.clone(),
-                take_name: format!("Take {}", take_no + i),
-                wav_path: project_dir.join(&rel),
-                rel_path: rel,
-                source_id,
-                cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
-                clip_id,
-                start_pos,
-            });
-        }
-
-        let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
-
-        let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
-        let n_producers = producers.len();
-        let mut cb = InputCb {
-            producers,
-            owed: vec![0; n_producers],
-            meter_tx,
-            blocks,
-            in_ch,
-            rec_ch,
-            shared: self.shared.clone(),
-        };
-        let stream = device
-            .build_input_stream(
-                &cfg.into(),
-                move |data: &[f32], _| cb.capture(data),
-                |e| log::warn!("input stream error: {e}"),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        stream.play().map_err(|e| e.to_string())?;
-
-        // Pin the generation the slots above were resolved against (Task 6
-        // [I2]) — a take spanning more rebuilds than `GenerationMaps` keeps
-        // in its plain window must not lose its input meters. INVARIANT:
-        // pin only AFTER every fallible step above has succeeded (device
-        // lookup, `recorder::spawn`, `build_input_stream`, `stream.play`) —
-        // `stop_recording` is the only unpin, and it can only ever run once
-        // `self.writer`/`self.input` are actually populated. Pinning
-        // earlier and then returning `Err` from one of those `?`s would
-        // leak the pin: a generation stays exempt from pruning forever for
-        // a recording that never started (self-healing only on the NEXT
-        // successful recording, which is not good enough).
-        self.gen_maps.pin(rec_generation);
-
-        self.input = Some(InputBundle { _stream: stream, meter_rx });
-        self.writer = Some(writer);
-        self.rec_track_ids = targets.clone();
+        let mut recorded = targets;
+        recorded.extend(midi_target);
+        self.rec_track_ids = recorded.clone();
         self.shared.recording.store(true, Relaxed);
         self.shared.playing.store(true, Relaxed);
         if let Err(e) = self.commit_start_recording_state() {
@@ -1675,18 +1685,12 @@ impl Control {
             "recording://state",
             serde_json::json!({
                 "recording": true,
-                "trackIds": targets,
+                "trackIds": recorded,
                 "startedAtSamples": start_pos,
                 "xruns": 0,
             }),
         );
-        log::info!(
-            "audio: recording {} track(s) @ {} Hz x{}ch",
-            targets.len(),
-            rate,
-            rec_ch
-        );
-        Ok(targets)
+        Ok(recorded)
     }
 
     /// The commit `start_recording` submits for the "recording" transport
@@ -1713,14 +1717,27 @@ impl Control {
     }
 
     fn stop_recording(&mut self) -> Result<Vec<Clip>, String> {
-        let writer = self.writer.take().ok_or("not recording")?;
+        // Disarm the capture unconditionally and first: after this line no
+        // further hardware note can join the take, whichever half fails
+        // below. Either half alone counts as "recording" (ruling 8).
+        let capture = self.live_in_hub.end_capture();
+        let writer = self.writer.take();
+        if writer.is_none() && capture.is_none() {
+            return Err("not recording".to_string());
+        }
         // Drop the input stream FIRST so the ring producers close and the
         // writer can drain to empty.
         self.input = None;
-        // Release the pin (Task 6 [I2]) — recording is over, so its
-        // generation no longer needs exemption from the plain window.
-        self.gen_maps.unpin();
-        let clips = writer.finish(Duration::from_secs(15))?;
+        let clips = match writer {
+            Some(w) => {
+                // Release the pin (Task 6 [I2]) — recording is over, so its
+                // generation no longer needs exemption from the plain
+                // window. Only the audio half ever pinned one.
+                self.gen_maps.unpin();
+                w.finish(Duration::from_secs(15))?
+            }
+            None => Vec::new(),
+        };
 
         self.shared.recording.store(false, Relaxed);
         self.shared.playing.store(false, Relaxed);
@@ -1755,7 +1772,40 @@ impl Control {
         // and saved unconditionally, even for zero clips; this is an
         // intentional narrowing (a commit that materially changes nothing
         // now does nothing), not an oversight.
-        if let Err(e) = self.commit_recording_finalize(&clips) {
+        // Prepare-outside: all the unbounded work for the MIDI half — the
+        // TempoMap build, the sample→tick conversion, the note pairing —
+        // happens HERE, before any commit, so the transaction stays a short
+        // apply. The session lock is held only for the reads.
+        let midi_clip = capture.and_then(|c| {
+            let session = self.session.lock(); // read-only: validate the target + read tempo/ppq/take number
+            // The target track can be deleted (or turned into an audio
+            // track) mid-take: validate BEFORE building the op, so the
+            // transaction can never fail on it and take the audio clips
+            // down with it. `transact` closures must not panic and must
+            // validate before mutating.
+            if !session.store.tracks.iter().any(|t| t.id.as_str() == c.track_id && t.kind == "midi") {
+                log::warn!("stop_recording: midi take dropped — track {} is gone", c.track_id);
+                return None;
+            }
+            let map = match crate::midi::tempo::TempoMap::new(
+                session.midi.ppq,
+                session.midi.tempo_events.clone(),
+                self.shared.sample_rate.load(Relaxed),
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::warn!("stop_recording: midi take dropped — tempo map: {e}");
+                    return None;
+                }
+            };
+            let name = format!("MIDI Take {}", session.midi.clips.len() + 1);
+            drop(session);
+            // `None` when nothing was played: an empty clip on the timeline
+            // would be worse than no take at all.
+            crate::midi::capture::take_clip(&c, &name, &map)
+        });
+
+        if let Err(e) = self.commit_recording_finalize(&clips, midi_clip.as_ref()) {
             log::warn!("stop_recording: finalize commit failed: {e}");
         }
         // Own, transient commit — same reasoning as `commit_auto_stop`/
@@ -1774,6 +1824,7 @@ impl Control {
                 "trackIds": track_ids,
                 "xruns": self.shared.xruns.load(Relaxed),
                 "clips": clips,
+                "midiClipId": midi_clip.as_ref().map(|c| c.id.to_string()),
             }),
         );
         Ok(clips)
@@ -1783,6 +1834,13 @@ impl Control {
     /// register the take's clips — split out so it's independently testable
     /// without a live input stream/disk writer (`clips` is exactly what
     /// `writer.finish` returned; this fn does no I/O of its own).
+    ///
+    /// Ruling 6, one take = one transaction: the audio `ClipAdd`s and the
+    /// MIDI `MidiClipAdd` ride HERE together, so a take is one undo entry —
+    /// undoing it removes the whole take, never half of it.
+    /// `TransportState` still rides its own transient commit (below).
+    /// `midi_clip` is prepared outside, already validated against the store;
+    /// this closure only applies it, and can therefore never panic on it.
     /// `emit_project_changed: true` — unlike the transient sites,
     /// registering new clips IS a document edit (mirrors the `set_track_
     /// instrument` precedent: routing a previously-raw write through
@@ -1801,7 +1859,11 @@ impl Control {
     /// ever un-registers clips; the state mirror is a separate, transient
     /// fact that was never meant to be undo-tracked in the first place
     /// (same reasoning as every other transport-family commit — Task 12).
-    fn commit_recording_finalize(&mut self, clips: &[Clip]) -> Result<Committed, String> {
+    fn commit_recording_finalize(
+        &mut self,
+        clips: &[Clip],
+        midi_clip: Option<&crate::midi::types::MidiClip>,
+    ) -> Result<Committed, String> {
         let committer = self.committer.clone();
         committer.commit_with_rebuild(
             op::TxMeta::engine("stop recording"),
@@ -1809,6 +1871,10 @@ impl Control {
                 for clip in clips {
                     let idx = tx.store().clips.len();
                     tx.apply(op::Op::ClipAdd { clip: clip.clone(), index: idx })?;
+                }
+                if let Some(mc) = midi_clip {
+                    let index = tx.midi().clips.len();
+                    tx.apply(op::Op::MidiClipAdd { clip: mc.clone(), index })?;
                 }
                 Ok(())
             },
@@ -1862,6 +1928,45 @@ impl Control {
         f()?;
         Ok(())
     }
+}
+
+/// Split a record request into the audio tracks that get a WAV writer and
+/// the (at most one) MIDI track that gets a captured take. Pure, so the
+/// whole policy is testable without a device, a project or a writer.
+///
+/// * explicit `requested` ids are validated against the store, and
+///   `kind: "midi"` ids are dropped from the AUDIO set (ruling 7) — they are
+///   recorded as MIDI when they are the routing target, never as a WAV;
+/// * `None` means "the armed tracks", audio ones only;
+/// * `midi_target` is the MIDI-in routing target, kept only when it still
+///   names an existing `kind: "midi"` track — the take is what makes the
+///   routing target a record target, so an audio track routed for
+///   monitoring never becomes a MIDI take;
+/// * an empty result on BOTH halves is the "no armed tracks to record"
+///   error, unchanged in wording (ruling 8: either half alone is a take).
+fn split_record_targets(
+    store: &Store,
+    requested: Option<Vec<String>>,
+    midi_target: Option<String>,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let is_midi =
+        |id: &str| store.tracks.iter().any(|t| t.id.as_str() == id && t.kind == "midi");
+    let audio: Vec<String> = match requested {
+        Some(ids) => {
+            for id in &ids {
+                if !store.tracks.iter().any(|t| &t.id == id) {
+                    return Err(format!("unknown track: {id}"));
+                }
+            }
+            ids.into_iter().filter(|id| !is_midi(id)).collect()
+        }
+        None => store.armed_track_ids().into_iter().filter(|id| !is_midi(id)).collect(),
+    };
+    let midi = midi_target.filter(|id| is_midi(id));
+    if audio.is_empty() && midi.is_none() {
+        return Err("no armed tracks to record".to_string());
+    }
+    Ok((audio, midi))
 }
 
 /// Decode a WAV file to interleaved f32 (int formats normalized to ±1.0).
@@ -2838,7 +2943,7 @@ mod tests {
             crate::audio::types::testutil::test_clip("c-2", "t-1"),
         ];
 
-        let clip_committed = ctl.commit_recording_finalize(&clips).unwrap();
+        let clip_committed = ctl.commit_recording_finalize(&clips, None).unwrap();
         assert!(
             matches!(clip_committed.meta.actor, crate::control::op::Actor::Engine),
             "got {:?}",
@@ -3474,5 +3579,377 @@ mod tests {
 
         handle.send(ControlMsg::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Task 10's leftover Minor A. The release window used to be shortened
+    /// to a single block while playing, on the reasoning that a playing
+    /// graph renders every live node every block anyway. It does — until
+    /// the transport stops. Stop within the window and the outgoing node is
+    /// frozen mid-release with nothing left to render it, and it serves the
+    /// fragment back on its next arm. The window is unconditional for
+    /// exactly this case.
+    #[test]
+    fn stopping_right_after_a_target_switch_still_finishes_the_outgoing_release() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
+        graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, Vec::new())))).unwrap();
+        target_slot_0(&cb, "t-1");
+        assert!(cb.live_in_hub.push(LiveMidiEvent::note_on(69, 110)));
+        shared.playing.store(true, Relaxed);
+
+        let mut out = vec![0.0f32; 512 * 2];
+        cb.render(&mut out);
+        assert!(peak(&out) > 0.02, "t-1 is sounding");
+
+        // Switch while playing, then stop one block later — inside the
+        // release window either way, but past the end of the one-block one.
+        retarget(&cb, Some("t-2"));
+        cb.render(&mut out);
+        shared.playing.store(false, Relaxed);
+        for _ in 0..20 {
+            cb.render(&mut out);
+        }
+
+        // Scanned block by block: t-1 is not rendered at all until t-2's own
+        // release window expires, so a single block after the re-arm would
+        // pass vacuously.
+        retarget(&cb, Some("t-1"));
+        let mut worst = 0.0f32;
+        for _ in 0..40 {
+            cb.render(&mut out);
+            worst = worst.max(peak(&out));
+        }
+        assert_eq!(worst, 0.0, "t-1 replayed a frozen release fragment on re-arm");
+    }
+
+    // -- Task 11: the take ------------------------------------------------
+
+    fn midi_track(id: &str) -> crate::audio::types::TrackState {
+        let mut t = crate::audio::types::testutil::test_track(id);
+        t.kind = "midi".into();
+        t
+    }
+
+    fn take_map() -> crate::midi::tempo::TempoMap {
+        crate::midi::tempo::TempoMap::new(
+            crate::midi::types::DEFAULT_PPQ,
+            vec![crate::midi::types::TempoEvent { tick: 0, bpm: 120.0 }],
+            48_000,
+        )
+        .unwrap()
+    }
+
+    /// A one-note take on `track`, built through the same
+    /// `midi::capture::take_clip` the engine uses.
+    fn take_clip_for(track: &str) -> crate::midi::types::MidiClip {
+        let capture = crate::audio::midi_in::Capture {
+            track_id: track.to_string(),
+            start_sample: 0,
+            end_sample: 48_000,
+            events: vec![
+                crate::audio::midi_in::CapturedEvent { sample: 0, on: true, key: 60, velocity: 100 },
+                crate::audio::midi_in::CapturedEvent { sample: 24_000, on: false, key: 60, velocity: 0 },
+            ],
+        };
+        crate::midi::capture::take_clip(&capture, "MIDI Take 1", &take_map())
+            .expect("a note was played")
+    }
+
+    #[test]
+    fn split_record_targets_keeps_audio_and_midi_apart() {
+        let mut store = Store::default();
+        store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        store.tracks.push(midi_track("m-1"));
+        store.tracks[0].armed = true;
+        store.tracks[1].armed = true;
+
+        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into())).unwrap();
+        assert_eq!(audio, vec!["a-1".to_string()], "an armed midi track is not a WAV target");
+        assert_eq!(midi.as_deref(), Some("m-1"));
+
+        let (audio, midi) =
+            split_record_targets(&store, Some(vec!["m-1".into()]), Some("m-1".into())).unwrap();
+        assert!(audio.is_empty(), "midi tracks never record audio, got {audio:?}");
+        assert_eq!(midi.as_deref(), Some("m-1"));
+
+        let (audio, midi) =
+            split_record_targets(&store, Some(vec!["a-1".into(), "m-1".into()]), Some("m-1".into()))
+                .unwrap();
+        assert_eq!(audio, vec!["a-1".to_string()]);
+        assert_eq!(midi.as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn split_record_targets_allows_a_midi_only_take() {
+        let mut store = Store::default();
+        store.tracks.push(midi_track("m-1"));
+        let (audio, midi) = split_record_targets(&store, None, Some("m-1".into())).unwrap();
+        assert!(audio.is_empty());
+        assert_eq!(midi.as_deref(), Some("m-1"));
+    }
+
+    #[test]
+    fn split_record_targets_errors_when_nothing_is_recordable() {
+        let store = Store::default();
+        let err = split_record_targets(&store, None, None).unwrap_err();
+        assert!(err.contains("no armed tracks"), "got {err}");
+
+        let mut store2 = Store::default();
+        store2.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        assert!(
+            split_record_targets(&store2, None, Some("a-1".into())).is_err(),
+            "an audio track as routing target is not a midi take"
+        );
+        assert!(
+            split_record_targets(&store2, None, Some("ghost".into())).is_err(),
+            "a routing target that no longer exists is not a midi take"
+        );
+    }
+
+    #[test]
+    fn split_record_targets_rejects_an_unknown_explicit_track() {
+        let store = Store::default();
+        let err = split_record_targets(&store, Some(vec!["ghost".into()]), None).unwrap_err();
+        assert!(err.contains("unknown track"), "got {err}");
+    }
+
+    /// The take is ONE `Actor::Engine`, NON-transient transaction (ruling 6) —
+    /// §4.4's "the op is the registration, never the recording itself" for MIDI.
+    #[test]
+    fn midi_take_registers_as_one_engine_transaction() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        let clip = take_clip_for("m-1");
+        let gen_before = ctl.generation;
+
+        let committed = ctl.commit_recording_finalize(&[], Some(&clip)).unwrap();
+        assert!(
+            matches!(committed.meta.actor, crate::control::op::Actor::Engine),
+            "got {:?}",
+            committed.meta.actor
+        );
+        assert!(!committed.meta.transient, "a take is a real document edit");
+        assert_eq!(committed.ops.len(), 1, "got {:?}", committed.ops);
+        assert!(matches!(&committed.ops[0], crate::control::op::Op::MidiClipAdd { .. }));
+        assert!(committed.effect.persist.midi, "MidiClipAdd persists the midi store");
+        assert_eq!(session.lock().midi.clips.len(), 1);
+        assert_eq!(ctl.generation, gen_before + 1, "exactly one rebuild");
+    }
+
+    #[test]
+    fn an_audio_and_a_midi_take_land_in_the_same_transaction() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(crate::audio::types::testutil::test_track("t-1"));
+        session.lock().store.tracks.push(midi_track("m-1"));
+        let clip = take_clip_for("m-1");
+        let committed = ctl
+            .commit_recording_finalize(
+                &[crate::audio::types::testutil::test_clip("c-1", "t-1")],
+                Some(&clip),
+            )
+            .unwrap();
+        assert_eq!(committed.ops.len(), 2, "one take, one transaction, one undo entry");
+        assert!(matches!(&committed.ops[0], crate::control::op::Op::ClipAdd { .. }));
+        assert!(matches!(&committed.ops[1], crate::control::op::Op::MidiClipAdd { .. }));
+    }
+
+    #[test]
+    fn finalize_without_a_midi_clip_is_unchanged() {
+        let (mut ctl, _session) = bare_control();
+        let clips = vec![crate::audio::types::testutil::test_clip("c-1", "t-1")];
+        let committed = ctl.commit_recording_finalize(&clips, None).unwrap();
+        assert!(
+            committed
+                .ops
+                .iter()
+                .all(|op| matches!(op, crate::control::op::Op::ClipAdd { .. })),
+            "got {:?}",
+            committed.ops
+        );
+    }
+
+    #[test]
+    fn stop_recording_with_neither_writer_nor_capture_still_errors() {
+        let (mut ctl, _session) = bare_control();
+        assert_eq!(ctl.stop_recording().unwrap_err(), "not recording");
+    }
+
+    /// The whole MIDI-only take, end to end through `stop_recording`: no
+    /// input device, no WAV writer, no disk — the capture buffer is the only
+    /// source, and the tick math goes through the same `TempoMap` playback
+    /// schedules from.
+    #[test]
+    fn a_midi_only_take_lands_a_clip_through_stop_recording() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+
+        ctl.shared.position.store(24_000, Relaxed);
+        ctl.live_in_hub.begin_capture("m-1".into(), 24_000);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+        ctl.shared.position.store(48_000, Relaxed);
+        ctl.live_in_hub.capture_event(false, 60, 0);
+        ctl.shared.position.store(72_000, Relaxed);
+        let undo_before = ctl.committer.log().depths().0;
+
+        let clips = ctl.stop_recording().expect("a capture alone is a recording");
+        assert_eq!(
+            ctl.committer.log().depths().0,
+            undo_before + 1,
+            "ruling 6: one take is ONE undo entry — the take must not be split \
+             across transactions, and the transient transport-state commit must \
+             not become one"
+        );
+        assert!(clips.is_empty(), "no audio target, no audio clips");
+        let midi = session.lock().midi.clips.clone();
+        assert_eq!(midi.len(), 1, "the take registered exactly one clip");
+        assert_eq!(midi[0].track_id.as_str(), "m-1");
+        assert_eq!(
+            midi[0].timeline_start_ticks, 960,
+            "placed where the take started, in ticks (one beat @120bpm/48k)"
+        );
+        assert_eq!(midi[0].notes.len(), 1);
+        assert_eq!(midi[0].notes[0].key, 60);
+        assert_eq!(midi[0].notes[0].tick, 0, "the note is relative to the clip start");
+        assert_eq!(midi[0].notes[0].length_ticks, 960, "one beat held");
+        assert!(!ctl.live_in_hub.capturing(), "stop disarms the capture");
+    }
+
+    /// Ruling 6 at the level that can actually break it: `stop_recording`
+    /// must hand BOTH halves to the SAME `commit_recording_finalize` call.
+    /// A midi-only take cannot tell the difference (there is no audio clip
+    /// to be separated from), so this drives a real disk writer — no audio
+    /// is ever pushed, the ring is abandoned immediately, and the writer
+    /// still returns one zero-length clip, which is all this needs.
+    #[test]
+    fn an_audio_and_a_midi_take_stop_into_one_undo_entry() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(crate::audio::types::testutil::test_track("a-1"));
+        session.lock().store.tracks.push(midi_track("m-1"));
+
+        let dir = std::env::temp_dir()
+            .join(format!("aura-take-tx-{}-{:?}", std::process::id(), std::thread::current().id()));
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(64);
+        drop(producer);
+        let spec = recorder::RecSpec {
+            track_id: "a-1".into(),
+            clip_id: uuid::Uuid::new_v4().to_string(),
+            source_id: crate::ids::SourceId::mint(),
+            take_name: "Take 1".into(),
+            wav_path: dir.join("audio/take.wav"),
+            rel_path: "audio/take.wav".into(),
+            cache_dir: dir.join("cache"),
+            start_pos: 0,
+        };
+        ctl.writer = Some(recorder::spawn(vec![spec], vec![consumer], 2, 48_000).unwrap());
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+
+        let undo_before = ctl.committer.log().depths().0;
+        let clips = ctl.stop_recording().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(clips.len(), 1, "the audio half produced its clip");
+        assert_eq!(session.lock().store.clips.len(), 1);
+        assert_eq!(session.lock().midi.clips.len(), 1, "the midi half produced its clip");
+        assert_eq!(
+            ctl.committer.log().depths().0,
+            undo_before + 1,
+            "ruling 6: one take is ONE undo entry — undoing it must never leave \
+             half the take on the timeline"
+        );
+    }
+
+    /// A take with nothing played registers NOTHING — an empty clip on the
+    /// timeline would be worse than no take at all.
+    #[test]
+    fn a_take_with_no_notes_registers_no_clip() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        let gen_before = ctl.generation;
+        ctl.stop_recording().expect("stop still succeeds");
+        assert!(session.lock().midi.clips.is_empty(), "nothing was played, nothing registers");
+        assert_eq!(ctl.generation, gen_before, "and nothing rebuilds");
+    }
+
+    /// Prepare-outside: the target track can be deleted mid-take, and the
+    /// validation happens BEFORE the op is built so the transaction can
+    /// never fail on it and take the audio clips down with it.
+    #[test]
+    fn a_take_whose_track_is_gone_is_dropped_without_losing_the_audio_clips() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+        ctl.shared.position.store(24_000, Relaxed);
+        ctl.live_in_hub.capture_event(false, 60, 0);
+        session.lock().store.tracks.clear();
+
+        ctl.stop_recording().expect("stop must not fail on a deleted target");
+        assert!(session.lock().midi.clips.is_empty(), "the take is dropped, not committed");
+    }
+
+    /// A take whose target is no longer a `kind: "midi"` track is dropped
+    /// too — `MidiClipAdd` on an audio track would be a malformed document.
+    #[test]
+    fn a_take_whose_track_became_audio_is_dropped() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        ctl.live_in_hub.capture_event(true, 60, 100);
+        session.lock().store.tracks[0].kind = "audio".into();
+        ctl.stop_recording().unwrap();
+        assert!(session.lock().midi.clips.is_empty());
+    }
+
+    /// The MIDI-only take through its REAL entry points: `start_recording`
+    /// opens no input device (ruling 8), arms the capture at the transport
+    /// position it started from, and reports the midi target in its reply;
+    /// `stop_recording` turns the notes played in between into the clip.
+    /// This is the only place the `begin_capture(target, start_pos)` wiring
+    /// is exercised — `stop_recording`-only tests arm the hub themselves and
+    /// would pass with that call deleted.
+    #[test]
+    fn start_recording_arms_a_midi_only_take_without_touching_a_device() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.ensure_project_fn = Some(Arc::new(|| Ok(PathBuf::from("/nonexistent"))));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.live_in_hub.set_target_track(Some("m-1".into()));
+        ctl.shared.position.store(24_000, Relaxed);
+
+        let recorded = ctl.start_recording(None).expect("a routing target alone is a take");
+        assert_eq!(recorded, vec!["m-1".to_string()], "the midi target is reported as recorded");
+        assert!(ctl.writer.is_none(), "no WAV writer for a midi-only take");
+        assert!(ctl.input.is_none(), "no input device opened");
+        assert!(ctl.live_in_hub.capturing(), "the capture is armed");
+        assert!(ctl.shared.recording.load(Relaxed) && ctl.shared.playing.load(Relaxed));
+
+        ctl.live_in_hub.capture_event(true, 64, 90);
+        ctl.shared.position.store(48_000, Relaxed);
+        ctl.live_in_hub.capture_event(false, 64, 0);
+
+        ctl.stop_recording().unwrap();
+        let midi = session.lock().midi.clips.clone();
+        assert_eq!(midi.len(), 1);
+        assert_eq!(
+            midi[0].timeline_start_ticks, 960,
+            "armed at the position the transport was at when recording started"
+        );
+        assert_eq!(midi[0].notes[0].key, 64);
+        assert_eq!(midi[0].notes[0].tick, 0);
+    }
+
+    /// A MIDI-only take opens no device, so `self.writer` stays `None` — the
+    /// "already recording" guard has to see the capture instead.
+    #[test]
+    fn start_recording_refuses_while_a_midi_capture_is_running() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.live_in_hub.begin_capture("m-1".into(), 0);
+        assert_eq!(ctl.start_recording(None).unwrap_err(), "already recording");
     }
 }

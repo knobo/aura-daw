@@ -157,6 +157,14 @@ fn render_live(
     // sub-block placement in this slice). Velocity 0 IS the note-off
     // convention on this path — see `AbsNoteEvent`'s use in
     // `playback::track_events`.
+    //
+    // The `EV_ALL_OFF` arm below is NOT what the engine's RT path sends:
+    // `OutputCb::render` expands a node-wide release into per-key note-offs
+    // for monitoring's own keys before the events get here, because this
+    // node also plays the track's clips and a node-wide release would cut a
+    // sounding clip note. Only the tests and the non-RT render path still
+    // reach this arm — do not "simplify" the engine expansion away on the
+    // strength of it.
     for ev in live_in_events {
         match ev.kind {
             EV_ALL_OFF => node.all_notes_off(),
@@ -520,6 +528,9 @@ pub fn render_live_input_only(
         // SAFETY: RCU discipline — exactly one graph snapshot is rendered at
         // a time, on this (the only RT) thread; see `LiveNodeCell`.
         let node = unsafe { live.node.rt_mut() };
+        // As in `render_impl`: the engine expands `EV_ALL_OFF` into per-key
+        // note-offs before the events reach here, so this arm is reached
+        // only by tests and the non-RT path.
         for ev in live_in.events {
             match ev.kind {
                 EV_ALL_OFF => node.all_notes_off(),
@@ -1013,6 +1024,10 @@ mod tests {
         assert!(peak(&out) > 0.02, "routed note is audible");
     }
 
+    /// Pins the mixer's `EV_ALL_OFF` arm, which the engine's RT path no
+    /// longer reaches — `OutputCb::render` expands a node-wide release into
+    /// per-key note-offs first, so monitoring never cuts a sounding clip
+    /// note. This is a primitive-level test, not a live contract.
     #[test]
     fn live_in_all_off_releases_the_routed_voice() {
         const RATE: u32 = 48_000;
