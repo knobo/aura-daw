@@ -28,7 +28,7 @@ described here only.
 | Automation audible (RT attach) + lane UI | **[track D]** `automation-audible-and-ui.md` |
 | Multi-clip selection, group drag, cross-track paste | **[track C]** `multi-clip-selection-and-paste.md` |
 | Cross-instance / OS-clipboard copy (incl. SMF fallback) | **[track C]** same doc, §cross-instance |
-| Metronome/click + count-in | **[inline]** engine-side click synth on the RT path, tempo-map-driven (section table already gives sample-exact beats); UI toggle + volume; count-in = N bars of click before record start. No document state beyond a project setting. |
+| Metronome/click + count-in | **[inline]** landing on `feat/metronome-count-in`: engine-side click (tempo-map schedule), CLICK chip + volume pref, count-in 0/1/2/4 bars before record. App prefs, not project.json. |
 | Quantize in the piano roll | **[inline]** command over the selection (note-ops already has the selection model): snap note starts (and optionally lengths) to grid with strength %; one `midi_set_notes` commit = one undo step. Backend-side math (thin renderer). |
 | Insert FX chains per track + sends/busses | **[plan G]** `insert-fx-sends-sidechain.md` — host CLAP/LV2 effects (do **not** write a stock FX suite). Sequence: G1 insert chain + PDC, G2 bus + sends, G3 sidechain listen-taps, G4 envelope-follower modulator (later, not Plan G). Round-2 rule still binds: **PDC before sends ship**. Needs its own research → plan → gates round (graph/mixer work). |
 | MIDI clock/start-stop out (Hydrogen sync) | **[track B]** slice 4 |

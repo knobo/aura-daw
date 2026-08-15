@@ -21,6 +21,7 @@
 pub mod dsp;
 pub mod engine;
 pub mod meters;
+pub mod metronome;
 pub mod midi_in;
 pub mod mixer;
 pub mod project;
@@ -308,6 +309,22 @@ pub fn select_input_device(
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<(), String> {
     control.select_input_device(device_id, control::op::TxMeta::user("select input device"))
+}
+
+/// Click track + count-in bars. App config, no document op.
+#[tauri::command]
+pub fn set_metronome(
+    enabled: bool,
+    gain: f32,
+    count_in_bars: u8,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    state.engine()?.request(|reply| ControlMsg::SetMetronome {
+        enabled,
+        gain,
+        count_in_bars,
+        reply,
+    })
 }
 
 #[tauri::command]

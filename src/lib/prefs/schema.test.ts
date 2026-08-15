@@ -32,7 +32,14 @@ describe("PREF_SCHEMA integrity", () => {
 
   it("declares the launch set", () => {
     expect(ids).toEqual(
-      expect.arrayContaining(["clipOpenAutoplay", "noteFlash", "uiZoom", "mcpDefaultMode"]),
+      expect.arrayContaining([
+        "clipOpenAutoplay",
+        "noteFlash",
+        "uiZoom",
+        "mcpDefaultMode",
+        "metronome",
+        "countInBars",
+      ]),
     );
     expect(PREF_SCHEMA.clipOpenAutoplay.default).toBe(false);
     expect(PREF_SCHEMA.mcpDefaultMode.default).toBe("confirmDestructive");

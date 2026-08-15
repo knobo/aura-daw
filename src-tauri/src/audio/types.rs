@@ -37,6 +37,14 @@ pub struct TransportState {
     /// Defaulted so projects written before this field still load.
     #[serde(default = "stop_at_end_default")]
     pub stop_at_end: bool,
+    /// Samples of count-in still to play before a take arms. Derived, not
+    /// persisted — `skip_serializing_if` keeps project.json unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub count_in_left_samples: u64,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 /// Auto-stop is on unless a project says otherwise: a transport that runs
@@ -57,6 +65,7 @@ impl Default for TransportState {
             loop_end_samples: 0,
             song_end_samples: 0,
             stop_at_end: true,
+            count_in_left_samples: 0,
         }
     }
 }
