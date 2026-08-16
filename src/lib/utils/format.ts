@@ -9,14 +9,17 @@ export function formatClock(samples: number, sampleRate: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
 }
 
-/** samples → "BBB.B.QQ" bars.beats.sixteenths (1-based) */
+/** samples → "BBB.B.QQ" bars.beats.divisions (1-based).
+ * `beatUnit` is the meter denominator (4 = quarter, 8 = eighth). */
 export function formatBarsBeats(
   samples: number,
   sampleRate: number,
   tempoBpm: number,
   beatsPerBar = 4,
+  beatUnit = 4,
 ): string {
-  const beatLen = (60 / tempoBpm) * sampleRate;
+  const den = beatUnit > 0 ? beatUnit : 4;
+  const beatLen = (60 / tempoBpm) * sampleRate * (4 / den);
   const totalBeats = Math.max(0, samples / beatLen);
   const bar = Math.floor(totalBeats / beatsPerBar) + 1;
   const beat = Math.floor(totalBeats % beatsPerBar) + 1;

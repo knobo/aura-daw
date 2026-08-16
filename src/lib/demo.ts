@@ -464,6 +464,7 @@ export class DemoBackend implements Backend {
   // phase 2 — midi / instruments / mcp
   private ppq = PPQ;
   private tempoEvents: TempoEvent[] = [{ tick: 0, bpm: TEMPO }];
+  private meterEvents = [{ tick: 0, num: 4, den: 4 }];
   private midiClips: MidiClip[] = [];
   private instruments: InstrumentInfo[] = DEMO_INSTRUMENTS.map((i) => ({ ...i }));
   private mcpPolicy: McpPolicy = { mode: "confirmDestructive", toolOverrides: {}, port: 41717 };
@@ -605,7 +606,7 @@ export class DemoBackend implements Backend {
       state: this.tState,
       positionSamples: Math.max(0, Math.round(this.position())),
       sampleRate: SR,
-      tempoBpm: TEMPO,
+      tempoBpm: this.tempoEvents[0]?.bpm ?? TEMPO,
       loopEnabled: this.loopEnabled,
       loopStartSamples: Math.round(this.loopStart),
       loopEndSamples: Math.round(this.loopEnd),
@@ -1340,8 +1341,8 @@ export class DemoBackend implements Backend {
       schemaVersion: 1,
       name: "Neon District",
       sampleRate: SR,
-      tempoBpm: TEMPO,
-      timeSignature: [4, 4],
+      tempoBpm: this.tempoEvents[0]?.bpm ?? TEMPO,
+      timeSignature: [this.meterEvents[0]?.num ?? 4, this.meterEvents[0]?.den ?? 4],
       tracks: this.tracks.map((t) => ({ ...t })),
       clips: this.clips.map((c) => ({ ...c })),
       transport: this.snapshot(),
@@ -1469,10 +1470,7 @@ export class DemoBackend implements Backend {
    * (round-2 §3.6) — one derivation, not two independently-drifting ones. */
   private tempoMapAdditiveFields() {
     return {
-      // The demo doesn't model a meter map (round-2's meter UI is
-      // deferred); the default is what a v3 project with no explicit
-      // signature change would carry.
-      meterMap: [{ tick: 0, num: 4, den: 4 }],
+      meterMap: this.meterEvents.map((m) => ({ ...m })),
       periodEvents: this.tempoEvents.map((e) => {
         const period = Math.round((60 / e.bpm) * SUPERTICKS_PER_SECOND);
         return { tick: e.tick, periodStart: period, periodEnd: period };
@@ -1518,12 +1516,13 @@ export class DemoBackend implements Backend {
 
   // ── phase 2: midi ──
 
-  async setTempoMap(ppq: number | null, events: TempoEvent[]) {
+  async setTempoMap(ppq: number | null, events: TempoEvent[], meter?: { tick: number; num: number; den: number }[] | null) {
     if (events.length === 0 || events[0].tick !== 0) {
       throw new Error("tempo map must start at tick 0");
     }
     if (ppq) this.ppq = ppq;
     this.tempoEvents = events.map((e) => ({ ...e }));
+    if (meter?.length) this.meterEvents = meter.map((m) => ({ ...m }));
     this.resyncAudio();
     return { ppq: this.ppq, events: [...this.tempoEvents], ...this.tempoMapAdditiveFields() };
   }

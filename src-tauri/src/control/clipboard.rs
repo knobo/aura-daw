@@ -1853,6 +1853,7 @@ mod tests {
             &cp,
             Some(480),
             vec![crate::midi::types::TempoEvent { tick: 0, bpm: 120.0 }],
+            None,
         )
         .unwrap();
         assert_eq!(cp.session().lock().midi.ppq, 480, "the op really moved the resolution");

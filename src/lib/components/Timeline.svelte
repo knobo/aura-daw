@@ -87,7 +87,7 @@
     ctx.clearRect(0, 0, w, h);
 
     const bar = project.samplesPerBar;
-    const beat = project.samplesPerBeat;
+    const beat = bar / Math.max(1, project.timeSignature[0]);
     const step = barStep();
     const beatPx = beat / spp;
 
@@ -141,7 +141,7 @@
     ctx.clearRect(0, 0, w, h);
 
     const bar = project.samplesPerBar;
-    const beat = project.samplesPerBeat;
+    const beat = bar / Math.max(1, project.timeSignature[0]);
     const step = barStep();
     const beatPx = beat / spp;
     const firstBar = Math.floor(start / bar);

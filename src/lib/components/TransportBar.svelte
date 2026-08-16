@@ -20,6 +20,7 @@
   import { formatBarsBeats, formatClock } from "../utils/format";
   import { computeVisible } from "../utils/toolbar-overflow";
   import ProjectMenu from "./project/ProjectMenu.svelte";
+  import TempoControl from "./TempoControl.svelte";
 
   let clockEl: HTMLSpanElement | undefined = $state();
   let barsEl: HTMLSpanElement | undefined = $state();
@@ -44,8 +45,9 @@
       barsEl.textContent = formatBarsBeats(
         pos,
         transport.snap.sampleRate,
-        transport.snap.tempoBpm,
+        project.tempoBpm,
         project.timeSignature[0],
+        project.timeSignature[1],
       );
     };
     raf = requestAnimationFrame(tick);
@@ -410,11 +412,7 @@
       <span class="bars" bind:this={barsEl}>001.1.1</span>
     </div>
 
-    <div class="tempo mono">
-      <span class="silk">tempo</span>
-      <span class="val">{project.tempoBpm.toFixed(1)}</span>
-      <span class="unit silk">bpm · {project.timeSignature[0]}/{project.timeSignature[1]}</span>
-    </div>
+    <TempoControl />
   </div>
 
   <div class="right" bind:this={rightEl}>
@@ -596,16 +594,6 @@
   .bars {
     font-size: 12px;
     color: var(--text-dim);
-  }
-
-  .tempo {
-    display: flex;
-    flex-direction: column;
-    line-height: 1.25;
-  }
-  .tempo .val {
-    font-size: 15px;
-    color: var(--text);
   }
 
   .right {

@@ -256,13 +256,13 @@ fn read_midi<R>(
 
 /// Pure core of `set_tempo_map` (round-2 §3.6, Gate C/D frontend exit
 /// condition): validates `events` against a nominal rate, builds the v3
-/// section table from the just-set tempo events + the store's CURRENT
-/// meter map (this command doesn't touch meter — no `set_meter_map`
-/// command exists yet, round-2's own text: "meter UI can wait"), and
-/// returns the full additive wire shape. Split out from the
-/// `#[tauri::command]` wrapper so it's testable without a `tauri::State`
-/// harness — the same pattern `sync_midi_store`/`assign_incoming_note_ids`
-/// already use in this file.
+/// section table from the just-set tempo events + the meter map, and
+/// returns the full additive wire shape. `meter = None` keeps the store's
+/// current map (the BPM slider must not flatten 3/4 back to 4/4). `Some`
+/// replaces it atomically through the same `Op::TempoSet`. Split out from
+/// the `#[tauri::command]` wrapper so it's testable without a
+/// `tauri::State` harness — the same pattern
+/// `sync_midi_store`/`assign_incoming_note_ids` already use in this file.
 pub(crate) fn build_tempo_map_state(
     ppq: u32,
     events: &[TempoEvent],
@@ -308,30 +308,20 @@ pub(crate) fn set_tempo_map_core(
     control: &ControlPlane,
     ppq: Option<u32>,
     events: Vec<TempoEvent>,
+    meter: Option<Vec<MeterEvent>>,
 ) -> Result<TempoMapState, String> {
-    let mut result: Option<TempoMapState> = None;
-    control.commit(TxMeta::user("set tempo map"), |tx| {
-        let resolved_ppq = ppq.unwrap_or(tx.midi().ppq);
-        // meter: the command's signature carries no meter field, so the
-        // current store's meter map travels through unchanged (read via
-        // `tx.midi()`, inside the same lock as the write below — no separate
-        // pre-tx read that could race a concurrent meter change).
-        let meter = tx.midi().meter_events.clone();
-        let built = build_tempo_map_state(resolved_ppq, &events, &meter)?;
-        tx.apply(Op::TempoSet { ppq: resolved_ppq, events: events.clone(), meter })?;
-        result = Some(built);
-        Ok(())
-    })?;
-    Ok(result.expect("commit only returns Ok after the closure ran to completion"))
+    let label = if meter.is_some() { "set time signature" } else { "set tempo" };
+    control.set_tempo_map(ppq, events, meter, TxMeta::user(label))
 }
 
 #[tauri::command]
 pub fn set_tempo_map(
     ppq: Option<u32>,
     events: Vec<TempoEvent>,
+    meter: Option<Vec<MeterEvent>>,
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<TempoMapState, String> {
-    set_tempo_map_core(&control, ppq, events)
+    set_tempo_map_core(&control, ppq, events, meter)
 }
 
 /// Core of `midi_add_clip` (see [`set_tempo_map_core`]'s doc for the split
@@ -1369,6 +1359,7 @@ mod tests {
             &cp,
             Some(960),
             vec![TempoEvent { tick: 0, bpm: 140.0 }, TempoEvent { tick: 1920, bpm: 100.0 }],
+            None,
         )
         .unwrap();
         assert_eq!(result.ppq, 960);
@@ -1388,12 +1379,85 @@ mod tests {
     #[test]
     fn set_tempo_map_core_preserves_the_stores_current_meter_map() {
         let (cp, _events) = test_control_plane();
-        // No `set_meter_map` command exists — `set_tempo_map`'s signature
-        // carries no meter field, so the store's current meter travels
-        // through `Op::TempoSet` unchanged (read via `tx.midi()`).
+        // Omitting `meter` keeps the store's current map — the transport
+        // bar's BPM slider must not flatten 3/4 back to 4/4.
         let default_meter = cp.project_state().meter_map;
-        set_tempo_map_core(&cp, Some(960), vec![TempoEvent { tick: 0, bpm: 90.0 }]).unwrap();
+        set_tempo_map_core(&cp, Some(960), vec![TempoEvent { tick: 0, bpm: 90.0 }], None).unwrap();
         assert_eq!(cp.project_state().meter_map, default_meter);
+    }
+
+    #[test]
+    fn set_tempo_map_core_writes_an_optional_meter_and_mirrors_it_on_project_changed() {
+        let (cp, events) = test_control_plane();
+        set_tempo_map_core(
+            &cp,
+            None,
+            vec![TempoEvent { tick: 0, bpm: 100.0 }],
+            Some(vec![MeterEvent { tick: 0, num: 3, den: 4 }]),
+        )
+        .unwrap();
+
+        let snap = cp.project_state();
+        assert_eq!(snap.meter_map, vec![MeterEvent { tick: 0, num: 3, den: 4 }]);
+        assert!((snap.transport.tempo_bpm - 100.0).abs() < 1e-6);
+
+        let last = events
+            .lock()
+            .iter()
+            .rev()
+            .find(|(name, _)| name == "project://changed")
+            .expect("TempoSet emits project://changed")
+            .1
+            .clone();
+        assert_eq!(
+            last.get("timeSignature").cloned().unwrap_or(serde_json::Value::Null),
+            serde_json::json!([3, 4]),
+            "project://changed must mirror the first meter event, not a hardcoded 4/4"
+        );
+    }
+
+    #[test]
+    fn set_tempo_map_core_folds_a_slider_gesture_into_one_tempo_set() {
+        let (cp, events) = test_control_plane();
+        cp.gesture_begin("set tempo".into()).unwrap();
+        set_tempo_map_core(&cp, None, vec![TempoEvent { tick: 0, bpm: 130.0 }], None).unwrap();
+        set_tempo_map_core(&cp, None, vec![TempoEvent { tick: 0, bpm: 140.0 }], None).unwrap();
+        assert!(
+            events.lock().iter().all(|(name, _)| name != "project://changed"),
+            "mid-gesture tempo writes must not emit project://changed"
+        );
+        cp.gesture_end().unwrap();
+        let batch = cp.take_last_gesture_batch().expect("gesture_end must produce a batch");
+        assert_eq!(batch.ops.len(), 1, "one folded TempoSet, not one per slider tick");
+        match &batch.ops[0] {
+            Op::TempoSet { events: ev, .. } => {
+                assert!((ev[0].bpm - 140.0).abs() < 1e-6, "last-forward bpm wins");
+            }
+            other => panic!("expected TempoSet, got {other:?}"),
+        }
+        match &batch.inverses[0] {
+            Op::TempoSet { events: ev, .. } => {
+                assert!((ev[0].bpm - 120.0).abs() < 1e-6, "inverse restores the pre-gesture 120");
+            }
+            other => panic!("expected TempoSet inverse, got {other:?}"),
+        }
+        let emits = events.lock().iter().filter(|(name, _)| name == "project://changed").count();
+        assert_eq!(emits, 1);
+    }
+
+    #[test]
+    fn set_tempo_map_core_rejects_a_malformed_meter_without_touching_the_store() {
+        let (cp, _events) = test_control_plane();
+        let before = cp.project_state().meter_map.clone();
+        let err = set_tempo_map_core(
+            &cp,
+            None,
+            vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            Some(vec![MeterEvent { tick: 0, num: 0, den: 4 }]),
+        )
+        .expect_err("num=0 is not a meter");
+        assert!(err.contains("meter"), "{err}");
+        assert_eq!(cp.project_state().meter_map, before);
     }
 
     #[test]
