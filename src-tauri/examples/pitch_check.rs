@@ -67,6 +67,15 @@ fn parse_note(s: &str) -> Option<i32> {
     Some((octave + 1) * 12 + step + accidental)
 }
 
+/// RMS as dBFS, floored so a digital-silence frame prints as a number
+/// rather than `-inf`.
+fn dbfs(rms: f32) -> f32 {
+    match rms > 1e-9 {
+        true => 20.0 * rms.log10(),
+        false => -180.0,
+    }
+}
+
 /// Middle value of a slice, without sorting the caller's data.
 fn median(v: &[f32]) -> f32 {
     if v.is_empty() {
@@ -202,8 +211,8 @@ fn main() -> Result<(), String> {
         ),
         false => println!("\nSing, hum, whistle or play a steady note for {secs} s.\n"),
     }
-    println!("   time   voiced   detected      note    error   clarity");
-    println!("  ─────────────────────────────────────────────────────");
+    println!("   time    level   voiced   detected      note    error   clarity");
+    println!("  ──────────────────────────────────────────────────────────────");
 
     let start = Instant::now();
     let mut all: Vec<PitchFrame> = Vec::new();
@@ -221,10 +230,16 @@ fn main() -> Result<(), String> {
                 true => 0.0,
                 false => voiced.len() as f32 / window.len() as f32,
             };
+            // RMS rides on every frame, voiced or not, so the level is known
+            // even when nothing is detected — which is the whole difference
+            // between "nothing reached the microphone" and "something did and
+            // the detector rejected it".
+            let level_db = dbfs(median(&window.iter().map(|f| f.rms).collect::<Vec<_>>()));
             if voiced.is_empty() {
                 println!(
-                    "  {:5.1}s   {:5.0}%          —         —        —         —",
+                    "  {:5.1}s  {:6.1}   {:5.0}%          —         —        —         —",
                     start.elapsed().as_secs_f32(),
+                    level_db,
                     frac * 100.0
                 );
             } else {
@@ -240,8 +255,9 @@ fn main() -> Result<(), String> {
                         .collect::<Vec<_>>(),
                 );
                 println!(
-                    "  {:5.1}s   {:5.0}%   {:8.2} Hz   {:>5}   {:+6.1}¢    {:5.2}",
+                    "  {:5.1}s  {:6.1}   {:5.0}%   {:8.2} Hz   {:>5}   {:+6.1}¢    {:5.2}",
                     start.elapsed().as_secs_f32(),
+                    level_db,
                     frac * 100.0,
                     hz,
                     note_name(near),
@@ -267,14 +283,46 @@ fn main() -> Result<(), String> {
         println!("\n  Nothing arrived. The device opened but produced no frames.");
         return Ok(());
     }
+    let rmss: Vec<f32> = all.iter().map(|f| f.rms).collect();
+    let peak = rmss.iter().cloned().fold(0.0, f32::max);
+    println!(
+        "  level           median {:.1} dBFS, peak {:.1} dBFS",
+        dbfs(median(&rmss)),
+        dbfs(peak)
+    );
     println!(
         "  voiced          {} ({:.1}%)",
         voiced.len(),
         100.0 * voiced.len() as f32 / all.len() as f32
     );
+
+    // Two failure modes that look identical in the voiced count alone. The
+    // gate's own absolute floor (`RMS_GATE_FLOOR`, 1e-4 == -80 dBFS) is the
+    // line that separates them.
+    if voiced.len() * 20 < all.len() {
+        println!();
+        if peak < 1e-4 {
+            println!("  Almost nothing was VOICED, and almost nothing ARRIVED: the peak");
+            println!("  level is under the gate's own floor (-80 dBFS). The microphone");
+            println!("  did not hear you. Check the input device, its gain, and whether");
+            println!("  something else holds the device open.");
+        } else if peak < 3e-3 {
+            println!(
+                "  Sound arrived but stayed quiet (peak {:.1} dBFS). The RMS gate is",
+                dbfs(peak)
+            );
+            println!("  relative to a decaying maximum, so a signal this close to the");
+            println!("  noise floor is gated out on purpose. Move closer or raise the gain.");
+        } else {
+            println!(
+                "  Sound ARRIVED at a usable level (peak {:.1} dBFS) but was not",
+                dbfs(peak)
+            );
+            println!("  judged periodic — the clarity threshold rejecting a breathy or");
+            println!("  noisy signal. That is the case worth looking at properly.");
+        }
+    }
     if voiced.is_empty() {
-        println!("\n  Nothing was voiced. Check the input level and that the");
-        println!("  right device is selected — the RMS gate is relative.");
         return Ok(());
     }
 
