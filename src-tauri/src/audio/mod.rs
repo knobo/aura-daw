@@ -18,6 +18,7 @@
 //! registered in the frozen `lib.rs`), the managed `AudioState`, and the
 //! `init` hook that starts the engine control thread.
 
+pub mod decimate;
 pub mod dsp;
 pub mod engine;
 pub mod meters;
