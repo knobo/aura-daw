@@ -47,8 +47,11 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
       — `c579003`, 9/9 module tests pass, 215/215 `audio::` green
 - [x] Task 4 — parity guard vs. `sidecars/hum_to_midi.py` — `c7e9555`, 2/2
       pass. Rust and sidecar agree to **3.3 cents**.
-- [ ] Task 5 — **InputHub** (`audio/engine.rs`) ← the risky one, resume here
-- [ ] Task 6 — commands, events, schemas (+ owner must register in `lib.rs`)
+- [x] Task 5 — **InputHub** (`audio/engine.rs`) — listen/record lifetime
+      split, rehearse-hold silence, 5/5 plan tests + 71/71 `audio::engine`
+      green. Hub is `listen_input` + per-take `inputs`; tests stub cpal.
+- [ ] Task 6 — commands, events, schemas (+ register additive commands in
+      `lib.rs` — owner is away; additive names only)
 - [ ] **Owner checkpoint** (spec R3): demonstrate detected pitch numerically
       before any UI is built
 
@@ -103,9 +106,9 @@ Always check `git status` before committing after running it.
 
 ## Open items needing the owner
 
-1. **`src-tauri/src/lib.rs` is FROZEN.** Task 6 needs five commands
-   registered there, Task 14 needs three more. Ask; do not edit, do not
-   work around.
+1. **`src-tauri/src/lib.rs` was FROZEN.** Owner later authorised additive
+   command registration (new names only). Task 6 may edit `lib.rs` for
+   the five new pitch commands; do not rename existing ones.
 2. **Speaker bleed is mitigated, not solved.** Without headphones the
    backing track is detected as pitch. The panel says so once, plainly.
 
@@ -140,6 +143,16 @@ with the commit sha and anything the next agent would be surprised by.
      tight enough to actually catch a drifted constant.
   3. Integration tests import **`aura_lib::`**, not `aura::` — the lib
      target is renamed in Cargo.toml. The plan said `aura::`.
+- 2026-08-16 — Task 5 done. Input stream lifetime is no longer tied to the
+  take: `set_listening` opens/closes a listen-only hub, a take on the same
+  device carries the analyser and drops the listen stream, and stop hands
+  the mic back. Rehearse-hold writes zeros for the held span (same sample
+  count) and `recording://state` grows an optional `rehearseSpans`. Tests
+  stub cpal via `stub_input` so they assert on hub presence without a
+  microphone. `InputCb::capture` stays RT-safe: pitch scratch is reserved
+  at open, `clear()` keeps capacity, surplus past 8192 frames is dropped.
+  `drain_pitch` is in place for Task 6's 60 Hz pump. Do not commit
+  `sidecars/__pycache__`.
 - 2026-08-16 — Task 1 done (`eb0d47b`). Two plan corrections came out of its
   review, both committed: the difference function must sum a full `w` terms per
   lag (`ae338c1`), and the detector's effective pitch floor is 65.04 Hz, not
