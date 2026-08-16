@@ -806,19 +806,23 @@ impl AuraAudioProcessor for ClapNode {
                 }
             }
             IoMode::Replace => {
+                // Flatten the strip's first two channels across plugin input
+                // ports (same contract as LV2): a stereo port takes L/R; two
+                // successive mono ports take L then R — not L into every 1-ch
+                // port. Extra channels beyond stereo stay silent.
                 let ch = io.channels;
+                let mut src = 0usize;
                 for chans in &mut self.in_bufs {
-                    let n = chans.len();
-                    if n == 0 {
-                        continue;
-                    }
-                    for i in 0..frames {
-                        let l = io.samples[i * ch];
-                        let r = if ch >= 2 { io.samples[i * ch + 1] } else { l };
-                        chans[0][i] = l;
-                        if n >= 2 {
-                            chans[1][i] = r;
+                    for c in chans.iter_mut() {
+                        for i in 0..frames {
+                            c[i] = match src {
+                                0 => io.samples[i * ch],
+                                1 if ch >= 2 => io.samples[i * ch + 1],
+                                1 => io.samples[i * ch], // mono strip → duplicate L
+                                _ => 0.0,
+                            };
                         }
+                        src += 1;
                     }
                 }
             }

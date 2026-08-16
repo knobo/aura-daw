@@ -608,6 +608,18 @@ impl Lv2Node {
         self.io_mode = mode;
     }
 
+    /// Test-only: peak of the plugin main audio outs after the last process.
+    #[cfg(test)]
+    fn main_out_peak_for_test(&self, frames: usize) -> f32 {
+        let mut m = 0.0f32;
+        for buf in &self.audio_out {
+            for s in buf.iter().take(frames) {
+                m = m.max(s.abs());
+            }
+        }
+        m
+    }
+
     /// RT-safe push into the block's MIDI sequence.
     #[inline]
     fn push_midi(&mut self, offset: u32, data: &[u8; 3]) -> bool {
@@ -1223,7 +1235,10 @@ mod tests {
         host.unregister_instance(&id);
     }
 
-    /// `IoMode::Replace` overwrites scratch; poison residual must not stick.
+    /// `IoMode::Replace` assigns main-out into scratch; `IoMode::Add` does
+    /// `+=`. Same pin as the CLAP Replace test (scratch peak vs main-out
+    /// peak) — do not feed a poisoned residual as audio-in (a linear EQ
+    /// would re-emit it and false-fail).
     #[test]
     fn lv2_node_replace_mode_does_not_add() {
         let Some(uri) = known_effect_uri() else {
@@ -1251,6 +1266,8 @@ mod tests {
 
         let frames = 256usize;
         let mut buf = vec![0.5f32; frames * 2];
+
+        // --- Replace: io peak must match plugin main-out peak (assign) ---
         {
             let mut io = ProcessBlock {
                 samples: &mut buf,
@@ -1260,28 +1277,35 @@ mod tests {
             };
             node.process(&mut io);
         }
-        let first = buf.clone();
-        for s in buf.iter_mut() {
-            *s += 100.0;
-        }
-        {
-            let mut io = ProcessBlock {
-                samples: &mut buf,
-                channels: 2,
-                sample_rate: 48_000,
-                steady: None,
-            };
-            node.process(&mut io);
-        }
-        let max_delta = first
-            .iter()
-            .zip(buf.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let replace_io = peak(&buf);
+        let replace_out = node.main_out_peak_for_test(frames);
         assert!(
-            max_delta < 1.0,
-            "Replace must overwrite (not +=): max |second-first|={max_delta}"
+            (replace_io - replace_out).abs() < 1e-5,
+            "Replace assigns main-out: io_peak={replace_io} main_out_peak={replace_out}; \
+             run_errors={}; uri={uri}",
+            node.run_errors()
         );
+
+        // --- Add: io peak ≈ residual + main-out (silence in) ---
+        node.set_io_mode(IoMode::Add);
+        buf.fill(0.5);
+        {
+            let mut io = ProcessBlock {
+                samples: &mut buf,
+                channels: 2,
+                sample_rate: 48_000,
+                steady: None,
+            };
+            node.process(&mut io);
+        }
+        let add_io = peak(&buf);
+        let add_out = node.main_out_peak_for_test(frames);
+        assert!(
+            (add_io - (0.5 + add_out)).abs() < 1e-4,
+            "Add does += : io_peak={add_io} expected ~{}; main_out={add_out}; uri={uri}",
+            0.5 + add_out
+        );
+
         drop(node);
         host.unregister_instance(&id);
     }
