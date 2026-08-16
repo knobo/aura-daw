@@ -1087,6 +1087,7 @@ mod tests {
             armed: false,
             color: "#7c9cff".into(),
             instrument_id: None,
+            inserts: Vec::new(),
         };
         t.instrument_id = Some(format!("plugin:{}", info.id));
         store.tracks.push(t);

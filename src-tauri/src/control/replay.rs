@@ -1134,6 +1134,7 @@ mod tests {
                 armed: false,
                 color: "#888888".into(),
                 instrument_id: None,
+                inserts: Vec::new(),
             },
             index,
             clips: vec![],

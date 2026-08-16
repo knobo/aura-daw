@@ -128,6 +128,20 @@ pub struct TrackState {
     /// otherwise the built-in `PolySynth` is the fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instrument_id: Option<String>,
+    /// Ordered insert-FX slots (Plan G1). Empty on pre-G1 files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inserts: Vec<InsertSlot>,
+}
+
+/// One insert-FX slot on a track. `id` is stable across reorder; `instance_id`
+/// names a `PluginInstanceInfo.id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InsertSlot {
+    pub id: String,
+    pub instance_id: String,
+    #[serde(default)]
+    pub bypassed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +329,7 @@ pub(crate) mod testutil {
             armed: false,
             color: "#7c9cff".into(),
             instrument_id: None,
+            inserts: Vec::new(),
         }
     }
 
@@ -400,5 +415,48 @@ mod tests {
         let v = serde_json::to_value(&m).unwrap();
         assert!(v["master"].get("peakL").is_some());
         assert!(v["master"].get("trackId").is_some());
+    }
+}
+
+#[cfg(test)]
+mod insert_slot_tests {
+    use super::*;
+
+    #[test]
+    fn insert_slot_wire_is_camel_case() {
+        let s = InsertSlot {
+            id: "slot-1".into(),
+            instance_id: "inst-1".into(),
+            bypassed: true,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""instanceId":"inst-1""#), "got: {json}");
+        assert!(json.contains(r#""bypassed":true"#), "got: {json}");
+        let back: InsertSlot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn missing_inserts_key_deserializes_as_empty() {
+        let v = serde_json::json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "name": "Vox",
+            "kind": "audio",
+            "gainDb": 0.0,
+            "pan": 0.0,
+            "muted": false,
+            "soloed": false,
+            "armed": false,
+            "color": "#7c9cff"
+        });
+        let t: TrackState = serde_json::from_value(v).unwrap();
+        assert!(t.inserts.is_empty(), "pre-G1 project.json must load");
+    }
+
+    #[test]
+    fn empty_inserts_are_omitted_from_the_wire() {
+        let t = testutil::test_track("t-1");
+        let v = serde_json::to_value(&t).unwrap();
+        assert!(v.get("inserts").is_none(), "skip_serializing_if empty keeps old files small");
     }
 }
