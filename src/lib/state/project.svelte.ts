@@ -11,6 +11,7 @@
 import { backend } from "../tauri";
 import { midiIo } from "./midiio.svelte";
 import { modulation } from "./modulation.svelte";
+import { toasts } from "./toasts.svelte";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
@@ -259,6 +260,20 @@ class ProjectStore {
     this.clips = this.clips.filter((c) => c.id !== clipId);
     if (this.selectedClipId === clipId) this.selectedClipId = null;
     await backend.removeClip(clipId);
+  }
+
+  /** Open a clip's source audio file in the OS's default application for its
+   * file type — "open in external editor" (double-click an audio clip on the
+   * timeline), the audio-clip analogue of `midi.open`'s double-click-opens-
+   * piano-roll. Optional: real backend only, same convention as `moveClip?`/
+   * `gestureBegin?` — the demo backend has no on-disk source to hand off. */
+  async openInExternalEditor(clipId: string): Promise<void> {
+    try {
+      await backend.openClipInExternalEditor?.(clipId);
+    } catch (err) {
+      console.error("[aura] open_clip_in_external_editor failed:", err);
+      toasts.error("COULD NOT OPEN EXTERNAL EDITOR", String(err));
+    }
   }
 }
 

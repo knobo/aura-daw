@@ -2648,6 +2648,31 @@ impl ControlPlane {
         Ok(())
     }
 
+    /// Absolute on-disk path for an audio clip's source file — "open in
+    /// external editor" (double-click an audio clip on the timeline, the
+    /// audio-clip analogue of the MIDI clip's double-click-opens-piano-roll).
+    /// Read-only: a plain re-lock, same shape as `set_track_instrument`'s
+    /// read-back, not a `commit` (nothing is mutated). Errors when the clip
+    /// is unknown, no project is open, or the source file is missing on disk
+    /// — a moved/deleted source must surface as an error, not a silent no-op.
+    pub fn clip_source_abs_path(&self, clip_id: &str) -> Result<PathBuf, String> {
+        let session = self.session.lock();
+        let clip = session
+            .store
+            .clips
+            .iter()
+            .find(|c| c.id == clip_id)
+            .ok_or_else(|| format!("unknown clip: {clip_id}"))?;
+        let path = session
+            .store
+            .abs_path(&clip.source_path)
+            .ok_or_else(|| "no project directory open".to_string())?;
+        if !path.is_file() {
+            return Err(format!("missing audio source: {}", path.display()));
+        }
+        Ok(path)
+    }
+
     /// Bind (or unbind, with `instrument_id: None`) a track's instrument
     /// through the transaction channel (`Op::Set`, `PropPath::InstrumentId`)
     /// — Plan E Task 3 (round-2 inventory row 2). `set_track_instrument`
@@ -4336,6 +4361,32 @@ pub fn remove_clip(clip_id: String, control: State<'_, Arc<ControlPlane>>) -> Re
     control.remove_clip(&clip_id, op::TxMeta::user("remove clip"))
 }
 
+/// Open an audio clip's source file in the OS's default application for its
+/// file type — "open in external editor" (double-click an audio clip on the
+/// timeline, mirroring the MIDI clip's double-click-opens-piano-roll).
+/// `tauri-plugin-shell` is already a dependency (sidecar `sh`/`python3`
+/// execution); this calls its `open` directly from Rust, so the plugin's
+/// JS-invoke scope validation (http(s)/mailto/tel only) never applies here —
+/// the path comes from the project's own clip table, not attacker-controlled
+/// IPC input. Needs registration in the frozen lib.rs, same as
+/// `import_audio_clip_split_stems`. Additive command.
+///
+/// `Shell::open` is deprecated in favor of `tauri-plugin-opener` (2.1.0+),
+/// but adding a new plugin crate means editing the frozen `Cargo.toml` /
+/// `lib.rs` plugin registration — out of scope for one command when the
+/// already-registered `tauri-plugin-shell` does the job.
+#[allow(deprecated)]
+#[tauri::command]
+pub fn open_clip_in_external_editor(
+    clip_id: String,
+    app: tauri::AppHandle,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    use tauri_plugin_shell::ShellExt;
+    let path = control.clip_source_abs_path(&clip_id)?;
+    app.shell().open(path.to_string_lossy(), None).map_err(|e| e.to_string())
+}
+
 /// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
 /// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. Returns the
 /// new gesture's id so a later `gesture_end` can refuse to close a
@@ -5037,6 +5088,72 @@ mod tests {
 
         assert!(plane.remove_clip("no-such-clip", TxMeta::user("remove clip")).is_err());
         assert!(plane.session().lock().store.clips.iter().any(|c| c.id == "c-1"), "an unknown-id removal leaves truth untouched");
+    }
+
+    /// A throwaway project dir for `clip_source_abs_path` tests — house
+    /// idiom (`import.rs`'s own `tmp_parent`): a uuid-tagged dir under the
+    /// system temp root, no dev-dep.
+    fn tmp_project_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "aura-control-test-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// "Open in external editor" (double-click an audio clip on the
+    /// timeline) resolves through `abs_path`: project-relative
+    /// `source_path` joined onto the open project's dir.
+    #[test]
+    fn clip_source_abs_path_resolves_relative_to_the_project_dir() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let dir = tmp_project_dir("resolve");
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        std::fs::write(dir.join("audio/x.wav"), b"not really audio").unwrap();
+        {
+            let mut session = plane.session().lock();
+            session.store.project_dir = Some(dir.clone());
+            session.store.clips.push(test_clip("c-1", "t-1")); // source_path: "audio/x.wav"
+        }
+
+        let got = plane.clip_source_abs_path("c-1").unwrap();
+        assert_eq!(got, dir.join("audio/x.wav"));
+    }
+
+    #[test]
+    fn clip_source_abs_path_rejects_unknown_clip_id() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        plane.session().lock().store.clips.push(test_clip("c-1", "t-1"));
+
+        let err = plane.clip_source_abs_path("no-such-clip").unwrap_err();
+        assert!(err.contains("no-such-clip"), "the error names the clip: {err}");
+    }
+
+    #[test]
+    fn clip_source_abs_path_rejects_no_open_project() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        plane.session().lock().store.clips.push(test_clip("c-1", "t-1"));
+        // Store::default() carries no project_dir.
+
+        let err = plane.clip_source_abs_path("c-1").unwrap_err();
+        assert!(err.contains("no project"), "the error explains why: {err}");
+    }
+
+    #[test]
+    fn clip_source_abs_path_rejects_a_missing_source_file() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let dir = tmp_project_dir("missing-source");
+        // Deliberately do NOT create `audio/x.wav`.
+        {
+            let mut session = plane.session().lock();
+            session.store.project_dir = Some(dir.clone());
+            session.store.clips.push(test_clip("c-1", "t-1"));
+        }
+
+        let err = plane.clip_source_abs_path("c-1").unwrap_err();
+        assert!(err.contains("missing audio source"), "the error explains why: {err}");
     }
 
     /// The inverse (`Op::ClipAdd`) must restore the clip byte-identically —

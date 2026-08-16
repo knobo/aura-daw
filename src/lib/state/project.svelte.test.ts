@@ -11,8 +11,9 @@ import type { Clip, TrackState } from "../types/ipc";
 
 const moveClip = vi.fn(() => Promise.resolve());
 const removeClip = vi.fn(() => Promise.resolve());
+const openClipInExternalEditor = vi.fn(() => Promise.resolve());
 const gestureBegin = vi.fn(() => Promise.resolve("gid-1"));
-const gestureEnd = vi.fn(() => Promise.resolve());
+const gestureEnd = vi.fn((_id?: string) => Promise.resolve());
 const setTrackArm = vi.fn(() => Promise.resolve());
 const midiSelectInputTrack = vi.fn(() => Promise.resolve());
 const addTrack = vi.fn();
@@ -23,6 +24,7 @@ vi.mock("../tauri", () => ({
     on: () => () => {},
     moveClip,
     removeClip,
+    openClipInExternalEditor,
     gestureBegin,
     gestureEnd,
     setTrackArm,
@@ -33,6 +35,11 @@ vi.mock("../tauri", () => ({
 
 const { project } = await import("./project.svelte");
 const { midiIo } = await import("./midiio.svelte");
+const { toasts } = await import("./toasts.svelte");
+
+function lastToast() {
+  return toasts.list[toasts.list.length - 1];
+}
 
 function testTrack(overrides: Partial<TrackState> = {}): TrackState {
   return {
@@ -72,6 +79,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   project.clips = [];
   project.selectedClipId = null;
+  toasts.list = [];
 });
 
 describe("commitClipMove", () => {
@@ -110,6 +118,30 @@ describe("removeClip", () => {
     await project.removeClip("c-1");
 
     expect(project.selectedClipId).toBeNull();
+  });
+});
+
+/**
+ * "Open in external editor" (double-click an audio clip on the timeline) —
+ * the audio-clip analogue of `midi.open`'s double-click-opens-piano-roll.
+ * A thin, error-swallowing wrapper over `backend.openClipInExternalEditor?`
+ * (optional: real backend only, same convention as `moveClip?`), reporting
+ * failures via a toast rather than throwing into the double-click handler.
+ */
+describe("openInExternalEditor", () => {
+  it("invokes backend.openClipInExternalEditor with the clip id", async () => {
+    await project.openInExternalEditor("c-1");
+
+    expect(openClipInExternalEditor).toHaveBeenCalledWith("c-1");
+  });
+
+  it("toasts instead of throwing when the backend call fails", async () => {
+    openClipInExternalEditor.mockRejectedValueOnce(new Error("missing audio source: audio/c-1.wav"));
+
+    await expect(project.openInExternalEditor("c-1")).resolves.toBeUndefined();
+
+    expect(lastToast().kind).toBe("error");
+    expect(lastToast().title).toBe("COULD NOT OPEN EXTERNAL EDITOR");
   });
 });
 

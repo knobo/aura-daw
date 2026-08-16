@@ -169,6 +169,11 @@ export interface Backend {
   osClipboardReadText?(): Promise<string>;
   /** Remove an audio clip from its track. */
   removeClip(clipId: string): Promise<void>;
+  /** Open a clip's source audio file in the OS's default application for its
+   * file type ("open in external editor" — double-click an audio clip on
+   * the timeline). Optional — real backend only, same convention as
+   * `libraryAudition?`: the demo backend has no on-disk source to open. */
+  openClipInExternalEditor?(clipId: string): Promise<void>;
 
   /** All automation lanes (points inline — per-project, not per-frame).
    * Optional: the demo backend has no automation. */
@@ -563,6 +568,9 @@ class TauriBackend implements Backend {
   }
   async removeClip(clipId: string) {
     await invoke("remove_clip", { clipId });
+  }
+  async openClipInExternalEditor(clipId: string) {
+    await invoke("open_clip_in_external_editor", { clipId });
   }
   automationGet() {
     return invoke<AutomationLane[]>("automation_get");
