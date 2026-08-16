@@ -38,7 +38,7 @@ use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock, METER_CHUNK_SLOTS
 use super::midi_in::{self, LiveMidiEvent, MidiInHub, LIVE_IN_RING_SLOTS, MAX_LIVE_IN_PER_BLOCK};
 use super::mixer;
 use super::offline;
-use super::pitch::{PitchAnalyzer, PitchFrame};
+use super::pitch::{PitchAnalyzer, PitchFrame, PitchFrameBatch, PitchState};
 use super::recorder::{self, DiskWriter, RecSpec};
 use super::rt::{
     GraphPtr, GraphTables, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedGraphTables,
@@ -79,6 +79,12 @@ pub trait EventSink: Send + 'static {
 /// Return `false` when the subscriber is gone so it gets dropped.
 pub trait MeterSink: Send + 'static {
     fn send_frame(&self, frame: &MeterFrame) -> bool;
+}
+
+/// One live-pitch subscription (a Tauri `Channel<PitchFrameBatch>`).
+/// Return `false` when the subscriber is gone so it gets dropped.
+pub trait PitchSink: Send + 'static {
+    fn send_batch(&self, batch: &PitchFrameBatch) -> bool;
 }
 
 pub type Reply<T> = Sender<Result<T, String>>;
@@ -129,6 +135,14 @@ pub enum ControlMsg {
     /// exactly once at startup; the engine thread never touches project
     /// fields itself, only calls this closure.
     SetEnsureProject(Arc<dyn Fn() -> Result<PathBuf, String> + Send + Sync>),
+    /// Open or close the listen-only input hub (owner ruling R6).
+    SetListening { on: bool, reply: Reply<()> },
+    /// Momentary rehearse-hold: the take writes silence, analysis keeps running.
+    SetRehearseHold { enabled: bool, reply: Reply<()> },
+    /// Choose the MIDI track whose clips are the target melody (`None` clears).
+    SetPitchReference { track_id: Option<String>, reply: Reply<()> },
+    /// Live pitch frames, batched on the same 60 Hz tick as meters.
+    SubscribePitch(Box<dyn PitchSink>),
     Shutdown,
 }
 
@@ -233,6 +247,10 @@ pub fn start(
                 rehearse_spans: Vec::new(),
                 #[cfg(test)]
                 stub_input: false,
+                pitch_sinks: Vec::new(),
+                reference_track_id: None,
+                last_pitch_state: None,
+                pitch_scratch: Vec::new(),
             };
             if let Err(e) = ctl.open_output() {
                 log::warn!("audio: no output stream ({e}); running headless");
@@ -305,6 +323,9 @@ struct InputBundle {
     /// `sync_input_hub` compares to decide whether a rebuild is needed.
     device_key: String,
     wants: InputWants,
+    /// Capture sample rate of this stream. 0 only on test stubs that never
+    /// opened a device.
+    rate: u32,
 }
 
 /// Drain-buffer capacity: a block's `MAX_LIVE_IN_PER_BLOCK` popped events,
@@ -1056,6 +1077,18 @@ struct Control {
     /// on the device).
     #[cfg(test)]
     stub_input: bool,
+    /// Live pitch subscribers (Tauri channels). Drained and dropped when
+    /// `send_batch` returns false.
+    pitch_sinks: Vec<Box<dyn PitchSink>>,
+    /// MIDI track whose clips are the target melody. Stored here so the
+    /// panel's picker has somewhere to put its choice (Task 6); scoring
+    /// reads it in Phase 3.
+    reference_track_id: Option<String>,
+    /// Last `pitch://state` emitted, so we do not spam identical payloads.
+    last_pitch_state: Option<PitchState>,
+    /// Reused scratch for `pump_pitch_frames` so the tick allocates nothing
+    /// steady-state after the first drain.
+    pitch_scratch: Vec<PitchFrame>,
 }
 
 /// Compile v3 gain lanes plus any `ModulationDoc` track ramps into one
@@ -1195,6 +1228,7 @@ impl Control {
             self.drain_rt_events();
             self.drive_param_automation();
             self.headless_advance();
+            self.pump_pitch_frames();
             self.pump_meter_frames();
             self.follow_live_in_target();
             self.arm_pending_after_countin();
@@ -1239,6 +1273,22 @@ impl Control {
             ControlMsg::SetEnsureProject(f) => {
                 self.ensure_project_fn = Some(f);
             }
+            ControlMsg::SetListening { on, reply } => {
+                let r = self.set_listening(on);
+                self.emit_pitch_state();
+                let _ = reply.send(r);
+            }
+            ControlMsg::SetRehearseHold { enabled, reply } => {
+                self.set_rehearse_hold(enabled);
+                self.emit_pitch_state();
+                let _ = reply.send(Ok(()));
+            }
+            ControlMsg::SetPitchReference { track_id, reply } => {
+                self.reference_track_id = track_id;
+                self.emit_pitch_state();
+                let _ = reply.send(Ok(()));
+            }
+            ControlMsg::SubscribePitch(sink) => self.pitch_sinks.push(sink),
             ControlMsg::Shutdown => return false,
         }
         true
@@ -2148,9 +2198,7 @@ impl Control {
     }
 
     /// Drain pitch frames from whichever stream currently carries the
-    /// analyser into `out`. Called every control tick (Task 6 wires this
-    /// into the 60 Hz pump).
-    #[allow(dead_code)]
+    /// analyser into `out`. Called every control tick.
     fn drain_pitch(&mut self, out: &mut Vec<PitchFrame>) {
         let rx = self
             .listen_input
@@ -2162,6 +2210,64 @@ impl Control {
                 out.push(f);
             }
         }
+    }
+
+    fn pitch_device_rate(&self) -> u32 {
+        self.listen_input
+            .as_ref()
+            .map(|h| h.rate)
+            .or_else(|| {
+                self.inputs
+                    .iter()
+                    .find(|i| i.pitch_rx.is_some())
+                    .map(|i| i.rate)
+            })
+            .unwrap_or(0)
+    }
+
+    fn current_pitch_state(&self) -> PitchState {
+        PitchState {
+            listening: self.wants_listening,
+            rehearse_hold: self.rehearse.load(Relaxed),
+            reference_track_id: self.reference_track_id.clone(),
+            device_rate: self.pitch_device_rate(),
+        }
+    }
+
+    fn emit_pitch_state(&mut self) {
+        let state = self.current_pitch_state();
+        if self.last_pitch_state.as_ref() == Some(&state) {
+            return;
+        }
+        self.last_pitch_state = Some(state.clone());
+        if let Ok(payload) = serde_json::to_value(&state) {
+            self.events.emit("pitch://state", payload);
+        }
+    }
+
+    /// Drain the pitch ring and push one batch per 60 Hz tick — the same
+    /// cadence as meters, not a second timer (plan task 6). Called BEFORE
+    /// `pump_meter_frames` so both share `last_frame`.
+    fn pump_pitch_frames(&mut self) {
+        let mut scratch = std::mem::take(&mut self.pitch_scratch);
+        self.drain_pitch(&mut scratch);
+        if self.pitch_sinks.is_empty() {
+            scratch.clear();
+            self.pitch_scratch = scratch;
+            return;
+        }
+        if self.last_frame.elapsed() < FRAME_INTERVAL {
+            self.pitch_scratch = scratch;
+            return;
+        }
+        let batch = PitchFrameBatch {
+            frames: std::mem::take(&mut scratch),
+            device_rate: self.pitch_device_rate(),
+            listening: self.wants_listening,
+            rehearse_hold: self.rehearse.load(Relaxed),
+        };
+        self.pitch_scratch = scratch;
+        self.pitch_sinks.retain(|s| s.send_batch(&batch));
     }
 
     /// Resolve a capture device and its config, or say why not. Split out of
@@ -2224,6 +2330,7 @@ impl Control {
                 listening: true,
                 recording: false,
             },
+            rate: 48_000,
         }
     }
 
@@ -2272,6 +2379,7 @@ impl Control {
                 listening: true,
                 recording: false,
             },
+            rate,
         })
     }
 
@@ -2383,6 +2491,7 @@ impl Control {
                     listening: with_pitch,
                     recording: true,
                 },
+                rate,
             },
             writer,
             rec_generation,
@@ -2501,6 +2610,7 @@ impl Control {
         if let Err(e) = self.sync_input_hub() {
             log::warn!("audio: pitch listen unavailable during take: {e}");
         }
+        self.emit_pitch_state();
 
         // Arm the capture LAST among the fallible work: every `?` above
         // returns without a take running, so a failed start never leaves the
@@ -2590,6 +2700,7 @@ impl Control {
         if let Err(e) = self.sync_input_hub() {
             log::warn!("audio: pitch listen could not resume after the take: {e}");
         }
+        self.emit_pitch_state();
         // A writer failure (disk full, a WAV header that would not close,
         // the 15 s drain timeout) is reported, but only after everything it
         // does NOT own has been salvaged. It used to return early, which
@@ -3655,6 +3766,10 @@ mod tests {
             // Headless tests have no microphone; the hub ownership tests
             // still need to open and close a bundle.
             stub_input: true,
+            pitch_sinks: Vec::new(),
+            reference_track_id: None,
+            last_pitch_state: None,
+            pitch_scratch: Vec::new(),
         };
         (ctl, session, tx)
     }
@@ -4721,6 +4836,7 @@ mod tests {
                 listening: with_pitch,
                 recording: true,
             },
+            rate: 48_000,
         }
     }
 

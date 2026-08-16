@@ -39,6 +39,28 @@ pub struct PitchFrame {
     pub voiced: bool,
 }
 
+/// One 60 Hz batch of live pitch frames, pushed over the Tauri `Channel`
+/// passed to `pitch_subscribe`. Mode flags ride here so the UI does not
+/// have to wait for `pitch://state` to learn that a hold started.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PitchFrameBatch {
+    pub frames: Vec<PitchFrame>,
+    pub device_rate: u32,
+    pub listening: bool,
+    pub rehearse_hold: bool,
+}
+
+/// Payload of the `pitch://state` app event.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PitchState {
+    pub listening: bool,
+    pub rehearse_hold: bool,
+    pub reference_track_id: Option<String>,
+    pub device_rate: u32,
+}
+
 /// Turns a stream of 8 kHz mono samples into 100 Hz `PitchFrame`s.
 /// Pure and synchronous — the thread that drives it is the engine's concern.
 ///

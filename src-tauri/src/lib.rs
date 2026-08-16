@@ -185,6 +185,12 @@ pub fn run() {
             // ---- audio: metering / waveforms ----
             audio::subscribe_meters,
             audio::get_waveform_tile,
+            // ---- audio: pitch coach (additive; new names only) ----
+            audio::pitch_listen_start,
+            audio::pitch_listen_stop,
+            audio::pitch_subscribe,
+            audio::set_rehearse_hold,
+            audio::pitch_set_reference,
             // ---- audio: tracks ----
             audio::add_track,
             audio::remove_track,

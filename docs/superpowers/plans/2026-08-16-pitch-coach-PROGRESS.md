@@ -47,11 +47,13 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
       — `c579003`, 9/9 module tests pass, 215/215 `audio::` green
 - [x] Task 4 — parity guard vs. `sidecars/hum_to_midi.py` — `c7e9555`, 2/2
       pass. Rust and sidecar agree to **3.3 cents**.
-- [x] Task 5 — **InputHub** (`audio/engine.rs`) — listen/record lifetime
-      split, rehearse-hold silence, 5/5 plan tests + 71/71 `audio::engine`
-      green. Hub is `listen_input` + per-take `inputs`; tests stub cpal.
-- [ ] Task 6 — commands, events, schemas (+ register additive commands in
-      `lib.rs` — owner is away; additive names only)
+- [x] Task 5 — **InputHub** (`audio/engine.rs`) — `fc3b60e`. Listen/record
+      lifetime split, rehearse-hold silence, 5/5 plan tests + 71/71
+      `audio::engine` green. Hub is `listen_input` + per-take `inputs`.
+- [x] Task 6 — commands, events, schemas + `lib.rs` registration (additive
+      names only). `pitch_listen_{start,stop}`, `pitch_subscribe`,
+      `set_rehearse_hold`, `pitch_set_reference`; `pitch://state`; schemas
+      stay open (D-06). 227/227 `audio::` green.
 - [ ] **Owner checkpoint** (spec R3): demonstrate detected pitch numerically
       before any UI is built
 
@@ -143,7 +145,13 @@ with the commit sha and anything the next agent would be surprised by.
      tight enough to actually catch a drifted constant.
   3. Integration tests import **`aura_lib::`**, not `aura::` — the lib
      target is renamed in Cargo.toml. The plan said `aura::`.
-- 2026-08-16 — Task 5 done. Input stream lifetime is no longer tied to the
+- 2026-08-16 — Task 6 done. Five additive commands registered in `lib.rs`
+  next to `subscribe_meters`. Frames batch on the existing 60 Hz
+  `last_frame` tick (`pump_pitch_frames` runs just before
+  `pump_meter_frames`). New schemas are draft-07 and do not set
+  `additionalProperties: false`. `recording://state` gained optional
+  `rehearseSpans`. Frontend types/bindings are Task 7.
+- 2026-08-16 — Task 5 done (`fc3b60e`). Input stream lifetime is no longer tied to the
   take: `set_listening` opens/closes a listen-only hub, a take on the same
   device carries the analyser and drops the listen stream, and stop hands
   the mic back. Rehearse-hold writes zeros for the held span (same sample
