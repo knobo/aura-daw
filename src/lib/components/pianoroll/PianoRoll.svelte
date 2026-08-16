@@ -18,6 +18,7 @@
   import { project } from "../../state/project.svelte";
   import { transport } from "../../state/transport.svelte";
   import { instruments } from "../../state/instruments.svelte";
+  import { launch } from "../../state/launch.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { openPluginParams } from "../../state/plugin-panel";
   import { openStudio, ui } from "../../state/ui.svelte";
@@ -51,6 +52,7 @@
   const color = $derived(track?.color ?? "#5cf2b8");
   const instrument = $derived(instruments.byId(track?.instrumentId));
   const pluginInst = $derived(plugins.instanceForRef(track?.instrumentId));
+  const usedLauncher = $derived(clip ? launch.driveMap(clip.id) : null);
 
   // ── local edit state ──
   let working = $state<MidiNote[]>([]);
@@ -884,20 +886,28 @@
 
       <button
         class="inst mono"
-        title={pluginInst
-          ? `Plugin: ${pluginInst.name} (${pluginInst.format}, ${pluginInst.status}) — open params`
-          : instrument
-            ? `Instrument: ${instrument.name}`
-            : "No instrument — open the browser"}
+        class:launch={!!usedLauncher}
+        title={usedLauncher
+          ? `Uses launcher ${usedLauncher.name} — open the launch map`
+          : pluginInst
+            ? `Plugin: ${pluginInst.name} (${pluginInst.format}, ${pluginInst.status}) — open params`
+            : instrument
+              ? `Instrument: ${instrument.name}`
+              : "No instrument — open the browser"}
         onclick={() => {
-          if (pluginInst) {
+          if (usedLauncher) {
+            launch.selectMap(usedLauncher.id);
+            launch.panelOpen = true;
+          } else if (pluginInst) {
             void openPluginParams(pluginInst.id);
           } else {
             ui.dock = "instruments";
           }
         }}
       >
-        {#if pluginInst}
+        {#if usedLauncher}
+          ▶ {usedLauncher.name}
+        {:else if pluginInst}
           ⚡ {pluginInst.name}
         {:else}
           ⌁ {instrument ? instrument.name : "no instrument"}
@@ -1072,6 +1082,10 @@
     cursor: pointer;
   }
   .inst:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+  }
+  .inst.launch {
     color: var(--cyan);
     border-color: var(--cyan-dim);
   }
