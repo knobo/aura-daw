@@ -488,16 +488,42 @@ mod tests {
 
     /// Breath and bleed sit far below the loud reference; the relative RMS
     /// gate is what stops them being drawn as notes.
+    ///
+    /// CORRECTED during Task 3. The original assertion was `voiced == 0`,
+    /// which no correct implementation can satisfy: `push` carries a full
+    /// analysis frame of history across the call boundary, so the first
+    /// windows after the level drop still literally CONTAIN the loud tone
+    /// (measured: frames 0-3 at rms 0.71 down to 0.40) and the 5-tap median
+    /// holds voicing one frame past that (frame 4). Frames 5-99 were gated
+    /// correctly. The property that matters is the quiet STEADY STATE, so
+    /// the test now bounds voicing to a settling window instead.
     #[test]
     fn quiet_signal_below_the_relative_gate_is_unvoiced() {
+        /// Worst case: the carried-over frame is one hop short of full, so
+        /// `frame_len / hop` (5) windows can still hold the loud tail, and
+        /// the median reports while 3 of the last MEDIAN_TAPS are voiced —
+        /// 3 more. 10 leaves margin and still asserts over 90 frames.
+        const SETTLE_FRAMES: usize = 10;
+
         let mut a = PitchAnalyzer::new();
         let mut out = Vec::new();
         a.push(&sine_8k(220.0, TARGET_SR as usize), 0, 48_000, &mut out);
+        // Guard against an always-unvoiced stub.
+        assert!(out.iter().any(|f| f.voiced), "the loud reference must itself be voiced");
+
         out.clear();
         let quiet: Vec<f32> = sine_8k(220.0, TARGET_SR as usize).iter().map(|s| s * 0.005).collect();
         a.push(&quiet, TARGET_SR as u64, 48_000, &mut out);
-        let voiced = out.iter().filter(|f| f.voiced).count();
-        assert_eq!(voiced, 0, "a signal 46 dB below the loud reference must be gated out");
+
+        let voiced: Vec<usize> =
+            out.iter().enumerate().filter(|(_, f)| f.voiced).map(|(i, _)| i).collect();
+        assert!(
+            voiced.iter().all(|&i| i < SETTLE_FRAMES),
+            "a signal 46 dB below the loud reference must be gated out once the \
+             analysis window has moved past the loud tail; voiced frames were \
+             {voiced:?} of {}",
+            out.len()
+        );
     }
 
     /// A single-frame octave blip is exactly what the median filter and the
@@ -587,7 +613,7 @@ Expected: FAIL.
 2. **Loud reference:** track a decaying maximum of frame RMS — `loud = loud.max(rms)` then `loud *= 0.9995` each frame (the sidecar uses a 95th percentile of the whole file, which is not available online; a decaying max is the streaming equivalent and must be commented as such). Gate: `rms > (loud * RMS_GATE_REL).max(1e-4)`.
 3. Voiced if the detector returned `Some`, aperiodicity `< YIN_THRESHOLD`, and the RMS gate passes.
 4. **Median filter:** push the MIDI value (or `None`) into the 5-tap history; the reported value is the median of the voiced entries. Fewer than 3 voiced entries in the window → report unvoiced.
-5. **Jump limiter:** if the median moved more than `MAX_JUMP_SEMITONES` from the last accepted value, mark this frame unvoiced and remember the candidate; if the next frame agrees with the candidate within 1 semitone, accept the jump (this is what lets a real leap through while killing a one-frame blip).
+5. **Jump limiter:** if the median moved more than `MAX_JUMP_SEMITONES` from the last accepted value, mark this frame unvoiced and remember the candidate; if the next frame agrees with the candidate within 1 semitone, accept the jump (this is what lets a real leap through while killing a one-frame blip). When the median itself goes unvoiced — a gap long enough to empty the 5-tap window, i.e. a real breath — drop the last-accepted reference, so the next phrase is not rate-limited against the note before the breath.
 6. **Timestamp:** `sample = start_of_this_window_in_device_samples + half_window_in_device_samples`, i.e. the centre of the analysis window, expressed in device-rate samples. Emit `hz`, `midi = hz_to_midi(hz)`, `clarity = 1.0 - aperiodicity`, `rms`, `voiced`.
 
 An unvoiced frame is still emitted (with `voiced: false`) — the UI needs it to break the trail rather than interpolate across a breath.
@@ -595,7 +621,7 @@ An unvoiced frame is still emitted (with `voiced: false`) — the UI needs it to
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cd src-tauri && cargo test audio::pitch`
-Expected: PASS, 8 tests.
+Expected: PASS, 9 tests (the step-1 block defines nine, not eight).
 
 - [ ] **Step 5: Commit**
 
