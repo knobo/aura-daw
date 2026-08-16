@@ -353,6 +353,9 @@ impl LaunchRuntime {
             .spawn(move || {
                 let mut last = 0u64;
                 let mut was_playing = false;
+                let mut play_started = Instant::now();
+                let mut last_onset: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
                     let playing = shared.playing.load(Relaxed);
@@ -363,14 +366,26 @@ impl LaunchRuntime {
                         continue;
                     }
                     if pos < last {
+                        let ms = play_started.elapsed().as_millis();
+                        launch_trace(format!(
+                            "drive wrap/seek pos={pos} last={last} since_play_ms={ms}"
+                        ));
+                        // A seek right after Play (clip-edit loop arming)
+                        // must not forget the onset we just fired, or the
+                        // same note retriggers. A later loop wrap may.
+                        if ms > 80 {
+                            last_onset.clear();
+                        }
                         last = pos;
                         continue;
                     }
-                    // Play-edge or a long seek: do not scan from 0 (or from
-                    // a stale last) and fire every note behind the playhead.
+                    let mut just_started = false;
                     if !was_playing {
                         last = pos.saturating_sub(1);
                         was_playing = true;
+                        just_started = true;
+                        play_started = Instant::now();
+                        launch_trace(format!("drive play-edge pos={pos} last={last}"));
                     }
                     let launchers = runtime().maps();
                     if launchers.iter().all(|m| m.drive_clip_ids.is_empty()) {
@@ -396,7 +411,21 @@ impl LaunchRuntime {
                         for clip in clips.iter().filter(|c| {
                             launcher.drive_clip_ids.iter().any(|id| id == c.id.as_str())
                         }) {
-                            for ev in crate::midi::schedule::clip_drive_events(clip, &tempo_map) {
+                            let evs = crate::midi::schedule::clip_drive_events(clip, &tempo_map);
+                            if just_started && launch_trace_enabled() {
+                                let ons: Vec<_> = evs
+                                    .iter()
+                                    .filter(|e| e.velocity > 0)
+                                    .map(|e| format!("{}@{}", e.key, e.sample))
+                                    .collect();
+                                launch_trace(format!(
+                                    "drive clip={} notes={} ons=[{}]",
+                                    clip.id,
+                                    clip.notes.len(),
+                                    ons.join(",")
+                                ));
+                            }
+                            for ev in evs {
                                 if ev.sample <= last || ev.sample > pos {
                                     continue;
                                 }
@@ -413,20 +442,37 @@ impl LaunchRuntime {
                                         && released.insert(b.id.clone())
                                     {
                                         launch_trace(format!(
-                                            "drive release clip={} note={} -> {}",
-                                            clip.id, ev.key, b.id
+                                            "drive release clip={} note={} sample={} -> {}",
+                                            clip.id, ev.key, ev.sample, b.id
                                         ));
                                         runtime().enqueue_release(b.id.clone());
                                     }
                                     continue;
                                 }
                                 if !fired.insert(b.id.clone()) {
+                                    launch_trace(format!(
+                                        "drive skip tick-dup clip={} note={} sample={} last={} pos={} -> {}",
+                                        clip.id, ev.key, ev.sample, last, pos, b.id
+                                    ));
                                     continue;
                                 }
-                                launch_trace(format!(
-                                    "drive clip={} note={} -> {}",
-                                    clip.id, ev.key, b.id
-                                ));
+                                if last_onset.get(&b.id) == Some(&ev.sample) {
+                                    launch_trace(format!(
+                                        "drive skip same-onset clip={} note={} sample={} last={} pos={} -> {}",
+                                        clip.id, ev.key, ev.sample, last, pos, b.id
+                                    ));
+                                    continue;
+                                }
+                                last_onset.insert(b.id.clone(), ev.sample);
+                                log::info!(
+                                    "launch: drive clip={} note={} sample={} last={} pos={} -> {}",
+                                    clip.id,
+                                    ev.key,
+                                    ev.sample,
+                                    last,
+                                    pos,
+                                    b.id
+                                );
                                 runtime().enqueue_fire(b.clone(), FireOrigin::Drive);
                             }
                         }
