@@ -13,7 +13,8 @@ import { project } from "./project.svelte";
 import { sampleAtTick, tickAtSample, type SectionRow } from "../sectionTable";
 import { toasts } from "./toasts.svelte";
 import { byTickKey } from "../utils/note-ops";
-import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent } from "../types/ipc";
+import { clampTempo, isValidMeter, quartersPerBar } from "../utils/tempo";
+import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent, TempoMapState } from "../types/ipc";
 
 export interface MidiRegion {
   clipId: string;
@@ -71,9 +72,9 @@ class MidiStore {
     return tickAtSample(this.sectionTable, project.sampleRate, this.ppq, samples);
   }
 
-  /** Ticks per bar at the project time signature. */
+  /** Ticks per bar at the project time signature (`num * 4 / den` quarters). */
   get ticksPerBar(): number {
-    return this.ppq * project.timeSignature[0];
+    return this.ppq * quartersPerBar(project.timeSignature[0], project.timeSignature[1]);
   }
 
   /** Effective content (loop) length: explicit, else the placement length —
@@ -88,6 +89,36 @@ class MidiStore {
     if (snap.tempoEvents?.length) this.tempoEvents = snap.tempoEvents;
     this.sectionTable = snap.sectionTable ?? [];
     this.clips = snap.midiClips ?? [];
+    if (snap.tempoEvents?.[0]) project.tempoBpm = snap.tempoEvents[0].bpm;
+    const meter = snap.meterMap?.[0];
+    if (meter) project.timeSignature = [meter.num, meter.den];
+  }
+
+  applyTempoMap(state: TempoMapState) {
+    this.ppq = state.ppq;
+    if (state.events.length) this.tempoEvents = state.events;
+    this.sectionTable = state.sectionTable ?? [];
+    if (state.events[0]) project.tempoBpm = state.events[0].bpm;
+    const meter = state.meterMap?.[0];
+    if (meter) project.timeSignature = [meter.num, meter.den];
+  }
+
+  /** Replace the project with one constant tempo. One undo step. */
+  async setTempo(bpm: number): Promise<void> {
+    const clamped = clampTempo(bpm);
+    project.tempoBpm = clamped;
+    const state = await backend.setTempoMap(null, [{ tick: 0, bpm: clamped }]);
+    this.applyTempoMap(state);
+  }
+
+  /** Replace the project with one constant meter. Keeps the current tempo map. */
+  async setMeter(num: number, den: number): Promise<void> {
+    if (!isValidMeter(num, den)) return;
+    const events = this.tempoEvents.length
+      ? this.tempoEvents.map((e) => ({ ...e }))
+      : [{ tick: 0, bpm: project.tempoBpm }];
+    const state = await backend.setTempoMap(null, events, [{ tick: 0, num, den }]);
+    this.applyTempoMap(state);
   }
 
   async init() {

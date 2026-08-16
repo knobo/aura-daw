@@ -33,6 +33,7 @@ import type {
   LoopJamStatus,
   McpPolicy,
   McpStatus,
+  MeterEvent,
   MeterFrame,
   MidiClip,
   MidiInputStatus,
@@ -216,7 +217,11 @@ export interface Backend {
   redo?(): Promise<HistoryStep>;
 
   // midi (all musical positions are integer ticks at the project ppq)
-  setTempoMap(ppq: number | null, events: TempoEvent[]): Promise<TempoMapState>;
+  setTempoMap(
+    ppq: number | null,
+    events: TempoEvent[],
+    meter?: MeterEvent[] | null,
+  ): Promise<TempoMapState>;
   midiAddClip(
     trackId: string,
     name: string | null,
@@ -587,8 +592,8 @@ class TauriBackend implements Backend {
     return invoke<ProjectSnapshot>("seed_demo_project");
   }
 
-  setTempoMap(ppq: number | null, events: TempoEvent[]) {
-    return invoke<TempoMapState>("set_tempo_map", { ppq, events });
+  setTempoMap(ppq: number | null, events: TempoEvent[], meter?: MeterEvent[] | null) {
+    return invoke<TempoMapState>("set_tempo_map", { ppq, events, meter: meter ?? null });
   }
   midiAddClip(trackId: string, name: string | null, timelineStartTicks: number, lengthTicks: number) {
     return invoke<MidiClip>("midi_add_clip", { trackId, name, timelineStartTicks, lengthTicks });

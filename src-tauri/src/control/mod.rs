@@ -326,7 +326,14 @@ impl Committer {
             modified_at: None,
             sample_rate,
             tempo_bpm: transport.tempo_bpm,
-            time_signature: Some((4, 4)),
+            time_signature: Some(
+                session
+                    .midi
+                    .meter_events
+                    .first()
+                    .map(|e| (e.num, e.den))
+                    .unwrap_or((4, 4)),
+            ),
             tracks: s.tracks.clone(),
             clips: s.clips.clone(),
             transport: Some(transport),
@@ -931,6 +938,14 @@ impl CoalesceKey {
                 target: CoalesceTarget::ModulationKey(key.clone()),
                 path: None,
             }),
+            // Transport-bar tempo/meter slider: one TempoSet per project,
+            // so a drag folds to one undo. Kind is distinct from a
+            // transport `Set` against `ObjectRef::Transport`.
+            op::Op::TempoSet { .. } => Some(Self {
+                kind: "tempoSet",
+                target: CoalesceTarget::Object(op::ObjectRef::Transport),
+                path: None,
+            }),
             _ => None,
         }
     }
@@ -1257,6 +1272,29 @@ fn set_prop(track_id: &str, path: op::PropPath, to: serde_json::Value) -> op::Op
 /// at each of `set_track_mix`'s two call sites (the gesture-transient path
 /// and the plain non-gesture path) without fighting the borrow/move rules
 /// of sharing ONE closure value across a branch that may or may not run.
+fn apply_tempo_map(
+    tx: &mut session::Tx<'_>,
+    ppq: Option<u32>,
+    events: &[crate::midi::types::TempoEvent],
+    meter: &Option<Vec<crate::midi::types::MeterEvent>>,
+) -> Result<(), String> {
+    let resolved_ppq = ppq.unwrap_or(tx.midi().ppq);
+    let meter = match meter {
+        Some(m) => {
+            crate::midi::tempo::MeterMap::new(m.clone())?;
+            m.clone()
+        }
+        None => tx.midi().meter_events.clone(),
+    };
+    // Validate the tempo map before apply so a bad bpm cannot land.
+    crate::midi::build_tempo_map_state(resolved_ppq, events, &meter)?;
+    tx.apply(op::Op::TempoSet {
+        ppq: resolved_ppq,
+        events: events.to_vec(),
+        meter,
+    })
+}
+
 fn apply_mix_changes(changes: &[TrackMixChange], tx: &mut session::Tx<'_>) -> Result<(), String> {
     for c in changes {
         if let Some(g) = c.gain_db {
@@ -2622,6 +2660,43 @@ impl ControlPlane {
         self.committer.commit_with_rebuild(meta, f, emit_project_changed, || {
             self.engine.send(ControlMsg::Rebuild)
         })
+    }
+
+    /// Replace the project tempo map (and optionally the meter). Gesture-
+    /// aware in the same shape as [`Self::set_track_mix`]: a transport-bar
+    /// slider drag opened with `gesture_begin` folds every tick into one
+    /// `Op::TempoSet`. Outside a gesture this is one history entry.
+    pub fn set_tempo_map(
+        &self,
+        ppq: Option<u32>,
+        events: Vec<crate::midi::types::TempoEvent>,
+        meter: Option<Vec<crate::midi::types::MeterEvent>>,
+        meta: op::TxMeta,
+    ) -> Result<crate::midi::TempoMapState, String> {
+        let gesture_meta = meta.clone();
+        let events_g = events.clone();
+        let meter_g = meter.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_with(
+                gesture_meta.transient(),
+                |tx| apply_tempo_map(tx, ppq, &events_g, &meter_g),
+                false,
+            )
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| apply_tempo_map(tx, ppq, &events, &meter))?;
+            }
+        }
+        let session = self.session.lock();
+        crate::midi::build_tempo_map_state(
+            session.midi.ppq,
+            &session.midi.tempo_events,
+            &session.midi.meter_events,
+        )
     }
 
     /// The commit shape every gesture-folding caller uses (`set_track_mix`,

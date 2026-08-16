@@ -11,6 +11,7 @@
 import { backend } from "../tauri";
 import { midiIo } from "./midiio.svelte";
 import { modulation } from "./modulation.svelte";
+import { quartersPerBar } from "../utils/tempo";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
@@ -39,7 +40,7 @@ class ProjectStore {
     return (60 / this.tempoBpm) * this.sampleRate;
   }
   get samplesPerBar(): number {
-    return this.samplesPerBeat * this.timeSignature[0];
+    return this.samplesPerBeat * quartersPerBar(this.timeSignature[0], this.timeSignature[1]);
   }
 
   clipsOf(trackId: string): Clip[] {
@@ -67,6 +68,8 @@ class ProjectStore {
     this.projectDir = snap.projectDir ?? null;
     this.sampleRate = snap.transport.sampleRate;
     this.tempoBpm = snap.transport.tempoBpm;
+    const meter = snap.meterMap?.[0];
+    if (meter) this.timeSignature = [meter.num, meter.den];
     this.tracks = snap.tracks;
     this.clips = snap.clips;
   }
