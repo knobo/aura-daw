@@ -7,21 +7,33 @@ snapshots, the journal reader, the version graph, or `engine::rebuild`.
 Branch `plan-f-history` is **kept** so task SHAs cited in the handoff
 still resolve.
 
-Pitch Coach **phase 1** (YIN, InputHub, listen/rehearse commands) is in
-**[PR #49](https://github.com/knobo/aura-daw/pull/49)** on `feat/pitch-coach`.
-Owner checkpoint before any panel: listen, sing a known pitch, read the
-frames. Phase 2 is the panel; phase 3 is scoring.
+## Plan G1 — plan written; implement it; do not start G2
+
+The G1 implementation plan is
+**`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`**
+(product decision: `docs/backlog/insert-fx-sends-sidechain.md`). It is
+insert FX chains + PDC only: per-track ordered insert list, lift
+`isInstrument` for insert slots, mixer walk source→inserts→fader, bypass,
+PDC in the same slice, offline bounce on the same schedule.
+
+Implement G1 from that plan (subagent-driven, task-by-task). Do **not**
+start G2 (bus+sends), G3 (sidechain), or G4 (envelope-follower). Do not
+write a stock FX suite. Do not bump `OP_FORMAT_VERSION`.
+
+Pitch Coach **phase 1** (YIN, InputHub, listen/rehearse commands) is
+**merged** (`84b0313`, PR #49). Owner checkpoint before any panel: listen,
+sing a known pitch, read the frames. Phase 2 is the panel; phase 3 is scoring.
 
 The five parallel tracks (A–E / F) are all landed. What remains is
 named below: owner ear-checks, Plan F carry-forwards, Track D/B leftovers,
-modulation design §8, and Plan G. Do not re-open a closed Plan F item.
+modulation design §8, and **implementing Plan G1**. Do not re-open a closed
+Plan F item. Do not start G2.
 
 **In flight — do not start these, other agents own them:**
-- **PR #42** `feat/midi-launch-map` (open, CONFLICTING with the Plan F
-  squash — rebase onto `origin/main` before more work).
-- `feat/pitch-coach` (worktree, tasks 2–4 recorded done).
-- `feat/external-audio-editor` (worktree, one commit ahead of pre-Plan-F
-  main).
+- `feat/external-audio-editor` (worktree; double-click-to-open landed as
+  PR #48 — check that worktree before overlapping).
+- Plan G1 implementation (this file's current job once the plan PR
+  merges). Do **not** start G2.
 
 Read this file, then pick a leftover and do the work. Reply to the user
 in Norwegian — they write Norwegian; the repo documentation is English.
@@ -475,12 +487,12 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
   (PR #38), piano-roll quantize is **[done]** (PR #32) — and the
   biggest remaining Tier-1 architecture item — **insert FX chains +
   sends/busses, Plan G**, product decision in
-  `docs/backlog/insert-fx-sends-sidechain.md`: host already-scanned
-  CLAP/LV2 effects, do not write a stock FX suite; G1 inserts+PDC, G2
-  bus+sends, G3 sidechain taps, G4 envelope-follower later. Still needs
-  its own research → plan → gates round because it touches the RT graph
-  invariants round-2 §8 reserves for the node-graph round, and is bound
-  by the standing "PDC before sends ship" rule), and Tier 2 (months — time-stretch, pattern
+  `docs/backlog/insert-fx-sends-sidechain.md`; **G1 plan written** at
+  `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md` (implement
+  that; do **not** start G2). Host already-scanned CLAP/LV2 effects, do
+  not write a stock FX suite; G1 inserts+PDC, G2 bus+sends, G3 sidechain
+  taps, G4 envelope-follower later. Bound by the standing "PDC before
+  sends ship" rule), and Tier 2 (months — time-stretch, pattern
   instancing, takes/comping, stems export, freeze/bounce, external
   instrument tracks, two-instance coexistence). **Start here** for
   anything not already a landed track above. Plan F is landed; do not
@@ -502,8 +514,9 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
   `docs/backlog/automation-audible-and-ui.md`, `docs/backlog/library-and-browser.md`
   — Tracks B/C/D/E's own docs, read in full before starting that track.
 - `docs/backlog/insert-fx-sends-sidechain.md` — Plan G product decision
-  (inserts / sends / sidechain / what we will not write). Read before
-  opening the graph-compiler plan round.
+  (inserts / sends / sidechain / what we will not write).
+- `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md` — **G1
+  implementation plan (written).** Implement that. Do not start G2.
 - `docs/backlog/external-instrument-return.md` — MIDI-out's missing
   half: per-track audio return, visible freeze clips, PipeWire as a
   helper. Read before adding "hidden tracks" or a PW graph orchestrator.

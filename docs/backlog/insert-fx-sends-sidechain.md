@@ -9,7 +9,7 @@ still needs its own research → plan → gates round (round-2 §8, PDC-before-
 sends). This doc freezes *what* we host and in which order, so the next
 agent does not invent a stock FX suite or ship sends without PDC.
 
-Status: **decision recorded, not started.**
+Status: **G1 plan in `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`.** Decision recorded. Do not start G2/G3/G4 until G1 lands.
 
 ## What AURA has today
 
