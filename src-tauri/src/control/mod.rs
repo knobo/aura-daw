@@ -593,9 +593,10 @@ impl Committer {
     /// snapshot this fn would take belongs to a DIFFERENT document than the
     /// one `p` describes; persisting it would be silent data loss either way
     /// (corrupting the new document, or dropping this commit's edit — see
-    /// `Session::epoch`'s doc). Direct test callers of this fn (that don't
-    /// go through `commit_with_rebuild`) should pass the session's current
-    /// epoch.
+    /// `Session::epoch`'s doc). (Plan F, 2026-08-14, ruling F-6): this is
+    /// a skip, not a flush of the outgoing project. Direct test callers of
+    /// this fn (that don't go through `commit_with_rebuild`) should pass
+    /// the session's current epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
         let (
             dir,

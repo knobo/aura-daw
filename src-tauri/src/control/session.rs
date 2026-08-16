@@ -116,8 +116,10 @@ pub struct Session {
     /// longer the one this commit's `PersistEffect` describes — silently
     /// writing it would either corrupt the NEW document (e.g. persist a
     /// stale in-memory edit into a project just opened) or silently drop the
-    /// commit's own edit (its target document already moved on). The new
-    /// epoch's own swap/save owns durability from that point forward.
+    /// commit's own edit (its target document already moved on).
+    /// (Plan F, 2026-08-14, ruling F-6): the new epoch does NOT flush the
+    /// outgoing document's pending persist. `open_project_epoch` drops that
+    /// in-flight write with a warn. Ctrl+S (M-2) is the recovery path.
     pub(crate) epoch: u64,
 }
 

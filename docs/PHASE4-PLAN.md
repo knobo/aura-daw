@@ -49,6 +49,9 @@ migration, and its exit gate is the one that turns the op log on.
   test 4 (Figma invariant — reads mutate nothing) passes; **only then
   does the op log/journal turn on.** This gate is the round's whole
   point; it does not get negotiated down.
+  (Plan F, 2026-08-14, marked correction M-5): the Figma invariant
+  replays ops through its *own* commits. The shipped Ctrl+Z path is
+  covered by `tests/journal_and_history.rs`.
 - **Gate F:** delete-then-undo rides version retention; replay-only
   nodes reproduce byte-identical state (seeded PRNG, minted-id
   payloads); eviction respects the floor/ceiling; janitor keeps drops
@@ -111,8 +114,9 @@ so they aren't lost between sub-plan hand-offs:
   can mis-target); make clip restore positional or define canonical clip
   order (gate test 2 will fail on interleaved clip vecs otherwise); delete
   dead `ops::apply_track_mix`; add the clamp round-trip test (999→24).
-- Standing caveat: `transact` has no panic rollback — transaction
-  closures must stay non-panicking until Plan F's snapshot rollback.
+- Standing caveat: `transact` has no panic rollback — **LIFTED (Plan F
+  Task 8)**. Closures must still not panic (ruling F-3: containment, not
+  license).
 - Op wire form: `ObjectRef` ids are raw Strings; typed id families must
   serialize transparently or bump OP_FORMAT_VERSION.
 - Clip carriage is asymmetric by design: `TrackAdd.clips` authoritative,
@@ -287,15 +291,11 @@ Other carry-forwards, not new rulings but confirmed still true:
   shipped section table; this one needs a position-aware refactor across
   four call sites — out of Task 9's reach, flagged inline in
   `project.svelte.ts` and here.
-- Standing from Plan A/B, unchanged: snapshot-rebuild deferral
-  (`engine::rebuild` still holds the session lock for the whole graph
-  build — needs Plan F); no panic rollback in `transact` (Plan F);
-  `fold_ops` coalescing constraint before `Committed.ops` is ever
-  persisted (Gate E); the op log stays dark — none of this plan's tempo/
-  meter/content work is `Session::transact`-routed, `set_tempo_map` and
-  the MIDI clip commands remain outside the A-slice channel exactly as
-  before this plan, binding for Plan E's side-channel inventory (§4.5) to
-  close.
+- Standing from Plan A/B: snapshot-rebuild deferral **LIFTED (Plan F
+  Task 6)**; no panic rollback **LIFTED (Plan F Task 8)**. Historical
+  remainder of this bullet (`fold_ops` before Gate E; the op log stays
+  dark; tempo/meter/content still outside the A-slice channel) was
+  Plan C/D's state — Plan E closed the channel, the log is ON.
 
 ## Plan E handoff (2026-08-14, subagent-driven session, external review layer)
 
@@ -314,6 +314,9 @@ note-ops mid-flight)). **Gate E is CLOSED**: the Figma invariant (§7 test 4
 — reads mutate nothing, a scripted mixed session over every op family, undo
 through new commits, a pure-reader sweep, redo, byte-identical canonical
 snapshot) is green against the code exactly as Tasks 1-16 left it —
+(Plan F, 2026-08-14, marked correction M-5: that undo is the *test's own*
+commits, not the shipped Ctrl+Z path; `tests/journal_and_history.rs` is
+what covers the product undo/redo commands) —
 provably so, because the commit that adds the test, `73bb9a7`, touches
 **zero production files** (`src-tauri/tests/figma_invariant.rs` only, 748
 insertions). The 34-row side-channel inventory closes total, recorded in
@@ -527,22 +530,19 @@ plan document:
   NOT re-create the clip re-mints from the current watermark, so re-added
   notes get fresh ids: ADR 0001 behaving as designed, the same asymmetry
   scope ruling 3 masks for the watermark itself.
-- **The journal is write-only until Plan F.** `JournalWriter` appends
-  `journal.ndjson`; nothing in the product reads it back. Plan F's
-  version-graph retention is what gives the journal a reader.
-- **Undo is bounded at 200 entries, bottom-eviction.** In-memory `Vec`,
-  cleared at epochs (scope ruling 9) — Plan F replaces the storage
-  substrate, not the exposure.
-- **Snapshot-rebuild deferral STILL standing** (from the Plan A handoff,
-  reconfirmed unchanged by every subsequent plan): `engine::rebuild`
-  still holds the session lock across the entire graph build. Plan E's
-  Task 13 gave the engine a `Committer` that submits instead of holding
-  the lock for writes, but rebuild-the-read-side is untouched — it needs
-  Plan F's copy-on-write session store to read an immutable view without
-  the live document lock.
-- **No panic rollback in `transact`** (Plan F). Every closure in this
-  plan validates before mutating, per the standing constraint; the
-  constraint itself does not lift until Plan F's snapshot rollback lands.
+- **The journal is write-only until Plan F.** **LIFTED (Plan F Task 9).**
+  `control/replay.rs` reads `journal.ndjson` (sort by `(epoch, rev)`,
+  save-mark tail, open-time detection). No auto-apply (ruling F-8).
+- **Undo is bounded at 200 entries, bottom-eviction.** Unchanged
+  (ruling F-2). Storage substrate is now the version graph; exposure
+  is still the 200-deep stack.
+- **Snapshot-rebuild deferral STILL standing.** **LIFTED (Plan F Task 6).**
+  `rebuild` assembly and `ensure_loaded` read the published
+  `SessionSnapshot`; the remaining `session.lock()` sites are short
+  (param/slot compile, meter fold, transport snapshot, recording
+  resolution). See the Plan F handoff and the inventory grep-gate.
+- **No panic rollback in `transact`.** **LIFTED (Plan F Task 8).**
+  `catch_unwind` + restore from the pre-tx published image.
 - **Host-GUI plugin tweaks are uncaptured** until a host-state poll
   lands: a user twiddling a plugin's own native GUI (not AURA's param
   UI) produces no op today — `Op::Set{Plugin, Param}` only fires through
@@ -622,6 +622,87 @@ collected here so a future round doesn't have to re-mine the ledger:
 - A stale line-number citation in a doc comment (516 vs. 508);
   `tempoBpm` required-vs-conditional tension pre-existing in the v2
   schema (Task 15).
+
+## Plan F handoff (2026-08-16, history storage, `plan-f-history`, PR #23)
+
+Plan F (history storage — round-2 §6, ADR 0005) is **IMPLEMENTED** on
+branch `plan-f-history` (**PR #23**). Plan document:
+`docs/superpowers/plans/2026-08-14-plan-f-history-storage.md`. Tasks 1–13
+landed on that branch (rebased onto `origin/main` including Track F).
+
+**What landed.** A published `SessionSnapshot` (per-clip `Arc<MidiClip>`)
+is captured inside `transact` and at every `// snapshot republish:` site.
+`engine::rebuild` assembles from that image with the session lock released
+(phase 2 still takes a short lock for param values / slots). A version
+graph retains materialized images or replay-only ops at the measured 64 KB
+line, with a janitor off-RT. `transact` contains panicking closures
+(restore from the pre-tx image). The journal has a reader: `(epoch, rev)`
+sort, save-mark tail, open-time *detection* only. Undo/redo is async,
+epoch-guarded, gesture-auto-close, and serialized (`history_gate`). R-3
+closed: demo Zyn bootstrap is `PluginAdd`/`PluginSetState` in the seed tx.
+MIDI placement offsets (`transpose_semitones` / `velocity_offset`) are
+`Set` ops applied at schedule time, never `MidiSetNotes`.
+
+**Lifted carry-forwards** (from Plan A/E, with the task that lifted them):
+snapshot rebuild (Task 6), panic rollback (Task 8), journal reader (Task 9),
+R-3 (Task 10), L-4 (Tasks 9+11), L-5 (Task 8).
+
+### Scope rulings (carried from the plan doc, per ADR 0007)
+
+1. **F-1 — COW store at clip/row granularity.** The live document keeps
+   its landed `Vec` shapes. Per-clip `Arc<MidiClip>` sharing is the
+   version substrate. The within-clip summarising B-tree is deferred to
+   the round that adds a note-delta op — that is the trigger.
+2. **F-2 — User-visible undo depth does not change.** `UNDO_STACK_LIMIT`
+   stays 200. Version graph: `VER_BUDGET_BYTES` = 512 MiB, `VER_STEPS_FLOOR`
+   = 200.
+3. **F-3 — Panic rollback is containment, not license.** `catch_unwind`;
+   restore from the pre-tx published snapshot; closures must still not panic.
+4. **F-4 — L-4's fix is ordered consumption, not a commit-sequence lock.**
+   Reader sorts by `(epoch, rev)`; undo stack is rev-ordered. File order
+   remains unordered by documented rule.
+5. **F-5 — Journal reader requires `v == 2` on batch lines.** v1 lines are
+   skipped with a warn (counted, never silent).
+6. **F-6 — I-1 is option (b):** Save-As writes plugin/automation/modulation
+   into the new dir. Option (a) (flush outgoing persist before every epoch
+   swap) is deferred. Residual: `open_project_epoch` drops an in-flight
+   persist for the project being closed (warn). Ctrl+S recovers.
+7. **F-7 — Undo/redo auto-close an open gesture** rather than refuse.
+8. **F-8 — Cold replay is detection + primitive + fidelity tests.** No
+   auto-apply, no recovery UI. Torn tails are skipped, not trusted.
+9. **F-9 — L-2 is benign for tail replay.** Minting is deterministic from
+   the persisted watermark. Pinned by
+   `a_cold_tail_replay_reproduces_the_crashed_sessions_document_byte_identically`.
+10. **F-10 — Replay-only nodes store ops + inverses verbatim.** No landed
+    op re-mints object ids on replay. Random ops do not exist yet; when
+    they land, §6's seeded-PRNG constraint binds them.
+11. **F-11 — The version graph is linear-by-rev within an epoch.** Undo
+    and redo are forward commits; no DAG in this plan.
+12. **F-12 — R-3 closes fully.** Demo Zyn bootstrap is ops inside the one
+    seed transaction, including state blobs.
+
+### New carry-forwards
+
+- **(a) Live-document B-tree migration** — ruling F-1. Trigger: the round
+  that adds a note-delta op (point edit stops being whole-clip replace).
+- **(b) I-1 option-(a) residual** — ruling F-6. Epoch functions do not
+  flush the outgoing document's pending persist before a swap.
+- **(c) No auto-apply of journal tails** — ruling F-8. Detection only.
+- **(d) Seeded-PRNG constraint** binds future random ops — ruling F-10.
+- **(e) Version-graph product surface unbuilt on purpose** — no browse UI,
+  no `history_stats` command. Substrate + tests only.
+
+Also recorded from the review follow-up on this branch: `ChangeSet::from_ops`
+flags modulation+automation on `TrackAdd`/`TrackRemove` and on
+`Modulation*`/`AutomationClipSet`; `midi.dirty` clears only when the live
+V3 snapshot still matches the bytes written; undo/redo is serialized;
+a failed dirty flush skips the journal save mark.
+
+### Flakes (already named; not new)
+
+`midi_out` under parallel lib runs; `apply_hum_clip_commits_synchronously_and_announces_project_changed`
+can see `rev + 2` when an engine sample-rate commit races the assertion.
+Re-run in isolation before believing a failure.
 
 ## Track D handoff (2026-08-14, subagent-driven session, external review layer)
 

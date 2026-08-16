@@ -1601,7 +1601,7 @@ re-deriving it.
 
 **Steps:**
 
-- [ ] **Step 1: `docs/SIDE-CHANNEL-INVENTORY.md`** (each edit marked
+- [x] **Step 1: `docs/SIDE-CHANNEL-INVENTORY.md`** (each edit marked
   "(Plan F, 2026-08-14)"): R-3 → CLOSED (Task 10; the direct-push
   paragraphs replaced by the op-path description); L-2 → append ruling
   F-9's determinism argument and the byte-identical replay test name;
@@ -1609,14 +1609,14 @@ re-deriving it.
   file order remains unordered BY DOCUMENTED RULE); L-5 → CLOSED (Task 8);
   the grep-gate section gains the snapshot-republish sites (`// snapshot
   republish:` markers) and drops R-3's row from the residuals.
-- [ ] **Step 2: Re-run the grep gate**
+- [x] **Step 2: Re-run the grep gate**
   (`grep -rn '\.lock()' src-tauri/src --include=*.rs`) and re-verify the
   inventory's engine claim: after Task 6, `engine.rs`'s rebuild/
   ensure_loaded no longer appear as session-lock read sites — update the
   "Every `session.lock()` in engine.rs" paragraph's site list to the
   survivors (meter fold, transport snapshot, recording resolution) with
   fresh line anchors.
-- [ ] **Step 3: `docs/PHASE4-PLAN.md`** — append a "Plan F handoff"
+- [x] **Step 3: `docs/PHASE4-PLAN.md`** — append a "Plan F handoff"
   section after the Plan E handoff, same conventions: scope rulings
   F-1..F-12 verbatim, the carry-forwards Plan F lifted (snapshot rebuild,
   panic rollback, journal reader, R-3) each marked lifted with its task,
@@ -1629,16 +1629,16 @@ re-deriving it.
   file: one sentence at the Gate E claim noting the Figma invariant
   replays ops through its own commits, and `tests/journal_and_history.rs`
   is what covers the shipped Ctrl+Z path.
-- [ ] **Step 4: `next-prompt.md`** — rewrite Track A's section to
+- [x] **Step 4: `next-prompt.md`** — rewrite Track A's section to
   "landed" state (mirroring how Plan E's landing was recorded): what
   landed, the new baseline counts, the engine.rs sequencing note resolved
   (B/D may now rebase on the snapshot-rebuild), pointers to the handoff.
-- [ ] **Step 5: `docs/adr/0005-history-storage.md`** — under Consequences,
+- [x] **Step 5: `docs/adr/0005-history-storage.md`** — under Consequences,
   one marked note: "Implementation (Plan F, 2026-08-14): landed at
   per-clip Arc granularity with the within-clip tree deferred to the
   note-delta-op round — see the Plan F handoff, ruling F-1." (The ADR's
   decision text itself is not rewritten.)
-- [ ] **Step 6: Final full suites, final counts in README/CONTRIBUTING
+- [x] **Step 6: Final full suites, final counts in README/CONTRIBUTING
   (dated), commit** —
   `git commit -m "docs: Plan F close-out — inventory corrections, handoff, next-prompt (ADR 0007)"`
 

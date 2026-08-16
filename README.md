@@ -406,8 +406,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 890 tests (856 lib + 34 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after Plan F Task 12): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets
-npm test                      # 409 frontend unit tests (counted 2026-08-16; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize
+cd src-tauri && cargo test    # 890 tests (856 lib + 34 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after Plan F close-out): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets
+npm test                      # 440 frontend unit tests (counted 2026-08-16 after Plan F close-out + rebase onto main; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

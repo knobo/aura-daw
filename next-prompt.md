@@ -1,4 +1,8 @@
-# Next: Plan F (history storage) — and the post-Plan-E tracks
+# Next: post-Plan-F tracks
+
+Plan F (history storage) is **LANDED** on `plan-f-history` (PR #23).
+Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching
+snapshots, the journal reader, the version graph, or `engine::rebuild`.
 
 Read this file, then pick a track and do the work. Reply to the user in
 Norwegian — they write Norwegian; the repo documentation is English.
@@ -47,36 +51,34 @@ follow-up PR #18, `fix/plan-e-followup`:
 - **I-4's two caveats** — journal line order vs `rev` order under
   concurrency, and a panicking `transact` diverging log from document.
   → recorded as L-4/L-5 in `docs/SIDE-CHANNEL-INVENTORY.md` in PR
-  #18 (records, not fixes — the structural fix is Track A's).
+  #18; **both CLOSED by Plan F** (L-4: reader sorts by `(epoch, rev)`,
+  undo stack is rev-ordered; L-5: `catch_unwind` + snapshot restore).
 - **M-3** — the transient/redo invariant was a comment checked by nothing.
   → fixed in PR #18 (a `debug_assert!` in the commit path).
 
-**Still open, deliberately HELD for the owner with the context** (do NOT
-fix these blind — read the report's entry first):
+**Held review findings** (do NOT re-open a closed item; remaining
+unowned notes are M-8 and owner ear-checks — read the report first):
 
-- **I-1** `save_project_as_epoch` writes only project.json + midi, so
+- ~~**I-1** `save_project_as_epoch` writes only project.json + midi, so
   Save-As silently drops plugin `.state` blobs and automation chunks —
   and **I-7** a new/opened project inherits the previous project's plugin
-  rows when `project.json` has no `plugins` key. These two are the
-  branch's real data-loss surface. **Owner: the epoch/persist path — take
-  them together, they interact (see also R-3).**
+  rows when `project.json` has no `plugins` key.~~ → **closed by Plan F
+  Tasks 1–2** (I-1 option (b): Save-As writes plugin/automation/
+  modulation into the new dir; I-7: adopt-on-open clears when the file
+  has no `plugins` key). Residual: option (a) — flush outgoing persist
+  before an epoch swap — is deferred (ruling F-6).
 - ~~**I-3** `execute_host_forward` writes `status`/`params` with no op, no
   epoch guard, and no inventory residual (with **M-6**).~~ → **closed by
   Track D** (`061786b`): epoch guard + residual R-4 + the grep-gate
   enumeration corrected.
-- **I-6** `undo`/`redo` are sync Tauri commands and can block the UI
-  thread on plugin re-instantiation + disk I/O. **Owner: Track A** (it
-  owns undo/redo's substrate; `async` + `spawn_blocking`, mirroring
-  `seed_demo_project`).
-- **C-1 residual, found while fixing C-1 and deliberately NOT fixed**:
-  `undo`/`redo` pop an entry, commit, then push it back via `push_redo`/
-  `push_undo_unchanged`. An epoch boundary landing between the pop and the
-  push RESURRECTS that entry onto the new document's stack — the same
-  class as C-1, at the entry-MIGRATION path rather than the recording one.
-  The commit itself is now correctly dropped by C-1's guard, so the
-  journal half is closed; the stack half needs `Committed.epoch` plumbed
-  through `undo`/`redo`. **Bundle with I-6** — it restructures exactly
-  that code, and doing both at once is one edit instead of two.
+- ~~**I-6** `undo`/`redo` are sync Tauri commands and can block the UI
+  thread on plugin re-instantiation + disk I/O.~~ → **closed by Plan F
+  Task 4** (`async` + `spawn_blocking`, epoch-guarded, serialized by
+  `history_gate`).
+- ~~**C-1 residual** — `undo`/`redo` pop an entry, commit, then push it
+  back; an epoch between pop and push resurrects it onto the new
+  stack.~~ → **closed by Plan F Task 4** (`Committed.epoch` plumbed
+  through undo/redo; mismatch drops the entry).
 - ~~**I-8** inventory row 13 claims the per-knob `project.json` rewrite is
   closed; only its position moved off the lock, the frequency is
   unchanged.~~ → **closed by Track D** (`7ef1f70`/`feec7e9`/`bb20280`):
@@ -84,11 +86,9 @@ fix these blind — read the report's entry first):
   transient commit still runs its full `EngineEffect`), so a knob or lane
   drag is one undo entry and one `project.json` write; row 13's wording
   corrected.
-- **Minors M-1, M-2, M-4, M-5, M-7, M-8** (dirty_state clear race,
-  Ctrl+S cannot recover a failed auto-persist, undo during an open
-  gesture bypasses the fold, the Gate E precision sentence, `VecDeque`
-  for the undo stack, the Figma oracle's omitted derived fields) —
-  recorded in the report, unowned, all cheap. **M-9 is RESOLVED** by the
+- ~~**Minors M-1, M-2, M-4, M-5, M-7**~~ → **closed by Plan F**
+  (Tasks 3 / 4 / 11 / 13). **M-8** (Figma oracle omitted derived
+  fields) is still recorded, unowned. **M-9 is RESOLVED** by the
   review itself (`ClapNode::reset` verified to leave `steady_fallback`
   alone); close that ledger item.
 - ~~**M-3 (frontend)** undo/redo re-pull misses automation and plugin
@@ -249,16 +249,17 @@ if you worked on this repo before Plan E:
   journal file. Additive `#[serde(default)]` fields on an op or on
   `TxMeta` stay non-breaking; anything else (renaming a field, changing a
   variant's shape, removing a path) needs a version bump AND a reader that
-  understands both shapes. The v1→v2 bump shipped WITHOUT a dual-shape
-  reader on purpose, because the journal is still write-only — that
-  freedom ends the moment Track A gives it a reader, and after that a
-  change of this kind costs a migration.
+  understands both shapes. Plan F's journal reader (`control/replay.rs`)
+  requires `v == 2` on batch lines (ruling F-5); v1 lines are skipped
+  with a warn. A change of this kind now costs a migration.
 - **Thin renderer** (ADR 0006) still holds: no new authoritative state,
   business logic, or time math lands frontend-side. Every frontend change
   is op emission, gesture emission, or UI/chrome.
 - **Frozen command/event names stay frozen**; bodies become wrappers; new
   commands are additive (the same rule that shaped every Plan E task).
-- **`transact` closures must not panic** — no panic rollback until Plan F.
+- **`transact` closures must not panic.** Plan F landed panic
+  *containment* (`catch_unwind` + restore from the pre-tx snapshot;
+  ruling F-3) — that is a crash-consistency net, not a license.
   Validate before mutating, every time, exactly as every landed op arm
   does.
 - **The M-3 redo invariant**: a transient write must never touch a
@@ -271,8 +272,9 @@ if you worked on this repo before Plan E:
   unless the batch is a mid-gesture fold) — so a violation now fails the
   test suite instead of waiting to be noticed.
 - **Undo is bounded**: 200 entries, in-memory, bottom-eviction, cleared at
-  epochs (project open/create/save-as). The journal itself is unbounded
-  and append-only but currently has no reader (see Track A).
+  epochs (project open/create/save-as). The journal is unbounded and
+  append-only; Plan F added a reader (detection + primitive, no
+  auto-apply — ruling F-8).
 - **Foreground timeout-guarded test runs** and the **dated-count
   convention**: any task that changes test counts updates README.md +
   CONTRIBUTING.md in the same commit, with the date.
@@ -282,76 +284,37 @@ if you worked on this repo before Plan E:
 
 ## 3. The five parallel-safe tracks
 
-All five are independently startable in separate worktrees right now
-(subject to each track's own prerequisites, noted below). Cross-track
-conflicts are called out explicitly — read the conflict notes for any pair
-you plan to run truly concurrently.
+Track A is **LANDED** (2026-08-16). The other four were already landed —
+see each section. Cross-track notes below stay as the historical
+sequencing record.
 
-### Track A — Plan F: history storage (round-2 §6, ADR 0005)
+### Track A — Plan F: history storage — LANDED 2026-08-16
 
-**The backend-core track.** Round-2 §6: copy-on-write B-tree session
-store, version-graph retention, replay-only nodes at a 64 KB threshold
-(per `benches/bulkbench/RESULTS.md`), placement-offset routing, a janitor
-thread for off-RT eviction. This is what finally lifts the snapshot-rebuild
-deferral that's been a carry-forward since the Plan A handoff
-(`engine::rebuild` still holds the session lock across the whole graph
-build) and gives the journal (write-only since Task 17) an actual reader.
+**Done, branch `plan-f-history`, PR #23** (13 tasks, plan
+`docs/superpowers/plans/2026-08-14-plan-f-history-storage.md`). Full
+handoff — rulings F-1..F-12, lifted carry-forwards, new carry-forwards —
+is **`docs/PHASE4-PLAN.md`'s "Plan F handoff"**; read that before touching
+`SessionSnapshot`, `engine::rebuild`, the journal reader, or the version
+graph. Implementation note on ADR 0005 (per-clip Arc, tree deferred) is
+under Consequences.
 
-**Convention**: author the plan doc FIRST, just-in-time, per
-`docs/PHASE4-PLAN.md`'s stated convention ("Detailed, bite-sized task plans
-live in `docs/superpowers/plans/` and are written just-in-time — each
-sub-plan is authored when its predecessor lands, against the tree as it
-then exists, not speculatively"). Do not start implementation before the
-plan document exists. Use `superpowers:writing-plans`; Plan E's own
-document
-(`docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md`) is
-the template for shape (global constraints, scope rulings decided and
-recorded up front, per-task Files/Interfaces/Steps/commit, self-review,
-execution note).
+What landed: published snapshot + lock-free rebuild assembly, version
+graph (64 KB replay-only, janitor), panic rollback in `transact`, journal
+reader (detection only), rev-ordered undo stack, R-3 closed, MIDI
+placement offsets. The Plan A `engine.rs` sequencing note is **resolved**
+— Tracks B/D may now rebase on the snapshot-rebuild; assembly no longer
+holds the session lock.
 
-**Footprint**: `src-tauri/src/control/history.rs`'s successor (today's
-`History` — bounded `Vec` undo/redo, the 350ms same-key merge — becomes
-the exposure layer over the new store), a new COW session store module,
-`src-tauri/src/audio/engine.rs`'s `rebuild` (reads an immutable snapshot
-instead of holding the session lock — this is the payoff).
+Carry-forwards for later rounds live in the handoff: live-document B-tree
+(trigger = note-delta op), I-1 option-(a) residual, no auto-apply of
+journal tails, seeded-PRNG for future random ops, version-graph product
+surface unbuilt.
 
-**Consumes**: the journal format (**v2**, `OP_FORMAT_VERSION` load-bearing
-— see §2 above; the freedom to reshape it without a dual-shape reader ends
-the moment this track ships a replayer), the undo bound (200 entries —
-Plan F may change the retention policy but must not silently change
-user-visible undo depth without a ruling), and the recorded replay
-limitations R-3/L-2/L-4/L-5 from `docs/SIDE-CHANNEL-INVENTORY.md` (R-3:
-`seed_demo`'s Zyn bootstrap rows outside an op — fold into Plan F's seed
-transaction; L-2: `MidiSetNotes` mint sentinels re-mint on replay; L-4:
-journal FILE order is not `rev` order under concurrent committers, so this
-track's reader MUST sort by `(epoch, rev)` — the structural fix, a
-commit-sequence lock or out-of-order buffering in `record_commit`, is this
-track's to make; L-5: a panicking `transact` closure diverges log from
-document permanently, which is the strongest argument for the panic
-rollback this track is also the right home for). **L-1 is closed** by PR
-#18 — `PluginRemove.params` is now read on apply.
-
-**Prerequisites**: branch straight from `origin/main` — it already contains
-Plan E's full channel rewrite (PR #12 merged, squash `27911d8`), so
-`Session`'s shape (plugins/automation moved in, the `Committer`, the
-journal/history layer) is present from the start. No separate merge step
-needed.
-
-**Conflicts**: with Track B and Track D in `engine.rs` — see their
-sections. Both have LANDED (PR #21, PR #20), so Track A rebases onto them
-rather than sequencing with them. Track B's engine footprint is THREE
-places, not the "one line" the plan predicted — count on all three when
-planning the `rebuild` rewrite: the hub read at `engine.rs:1070`
-(before the session lock is taken), the `append_from_with_input`
-target-track argument at `:1159` (sourced from the hub, not the
-session, so a snapshot-based read does not change its value), and
-`follow_live_in_target` (`:1221`), called from the engine loop at
-`:880`, which rebuilds when the routing target changes and then
-re-resolves it. Track A's `engine.rs` touch is the `rebuild` function
-specifically; sequence with B/D if running genuinely concurrently
-(smallest safe unit: land A's `rebuild` change first, since B and D both
-build on top of "how does the engine read the document" more than they
-change it).
+Baseline after this track: **890 backend (856 lib + 34 integration, plus
+2 `#[ignore]`) + 440 frontend**, measured on `plan-f-history` 2026-08-16
+after rebasing onto main (Track F + recent-projects). Known flakes:
+`midi_out` under parallel lib runs;
+`apply_hum_clip_commits_synchronously_and_announces_project_changed`.
 
 ### Track B — MIDI slice 2: routing, recording, clock/sync out — LANDED 2026-08-15
 
@@ -539,11 +502,13 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
   anything not already one of the five tracks above.
 - `docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md` —
   Plan E's own plan doc (scope rulings, non-goals, all 18 tasks).
-- `docs/SIDE-CHANNEL-INVENTORY.md` — the landed inventory, carve-outs, and
-  recorded replay limitations (L-1/L-2/L-3) that Track A consumes.
-- `docs/PHASE4-PLAN.md` — orchestration; "Plan E handoff" section has
-  every scope ruling, mid-flight ruling, and deferred-minor from the
-  ledger, verbatim.
+- `docs/SIDE-CHANNEL-INVENTORY.md` — the landed inventory, carve-outs,
+  and replay limitations. L-4/L-5/R-3 are CLOSED (Plan F); L-2 is
+  documented benign (ruling F-9).
+- `docs/PHASE4-PLAN.md` — orchestration; "Plan F handoff" is the current
+  history-storage state (F-1..F-12, new carry-forwards). "Plan E handoff"
+  still has every earlier scope ruling, mid-flight ruling, and
+  deferred-minor from that ledger, verbatim.
 - `.superpowers/sdd/2026-08-14-plan-e-side-channel-totality/progress.md` —
   the full SDD ledger (gitignored) if you need more detail than the
   handoff section carries — every `Ruling:` and `minor (deferred):` line

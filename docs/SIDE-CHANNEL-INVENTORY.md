@@ -3,7 +3,7 @@
 **Status: TOTAL.** Every mutation path that reaches the AURA document now
 goes through the one transaction channel (`Session::transact` →
 `Committer::commit_with_rebuild`), except the sanctioned epoch functions and
-the three carve-outs recorded below (R-3 CLOSED in Plan F Task 10). Every
+the two carve-outs recorded below (R-3 CLOSED in Plan F Task 10). Every
 declared read path is pure.
 
 This document is the landed form of the 34-row inventory in
@@ -231,6 +231,15 @@ get fresh ids. That is ADR 0001 behaving as designed (ids are never reused
 and never resurrect a deleted note's identity), the same asymmetry ruling 3
 masks for the watermark itself.
 
+(Plan F, 2026-08-14, ruling F-9): tail replay is still benign. Minting is
+deterministic from the clip's persisted `next_note_id` watermark, and that
+watermark is part of the on-disk snapshot the tail replays from. Replaying
+the same op sequence from the same base reproduces the same minted ids.
+Pinned by `tests/journal_replay.rs::
+a_cold_tail_replay_reproduces_the_crashed_sessions_document_byte_identically`
+— byte-identical documents, no id normalization. If a future op breaks
+this, that test is the signal that L-2 stopped being benign.
+
 **L-3 — replay is faithful only against a COMPLETE log.** An unrecorded
 mutation that attaches content to an object an earlier op created is lost
 on redo: `Op::TrackAdd` replays with its ORIGINAL (empty) `clips`, so a
@@ -238,42 +247,33 @@ clip added later by an unlogged path never comes back. This is the reason
 `History::record` takes EVERY non-transient commit, with no exceptions
 beyond `TxMeta.transient`.
 
-**L-4 — journal FILE order is not `rev` order under concurrency; a reader
-must sort by `(epoch, rev)`.** Commits are serialized only for the
-duration of `Session::transact`. The effect phase — and therefore the
-`record_commit` call at the end of it — is not: the engine control
-thread's `Committer` and a command thread's are explicitly designed to run
-in parallel and share ONE `HistoryLog`, and the slower one's effect phase
-can include host round-trips and disk I/O. Two committers can therefore
-reach the sink in the opposite order to their `rev`s. Two consequences:
-the journal's line order is not `rev` order, so a replayer applying lines
-top-to-bottom (the obvious reader, and the only one the format documents)
-can diverge from the document the log describes; and the undo stack's
-order likewise need not be reverse-commit order, so a Ctrl+Z can apply an
-older batch's inverse on top of a newer batch's write. Every line carries
-both `epoch` and `rev`, so a reader has what it needs — it must USE them.
-The structural fix (serialize the record step under a commit-sequence
-lock, or buffer out-of-order revs in `record_commit`) is Plan F's.
+**L-4 — CLOSED (Plan F, 2026-08-14, ruling F-4; Tasks 9 + 11).** Journal
+FILE order is still not `rev` order under concurrency — that is now a
+documented format rule, not a bug: "line order is not rev order; consumers
+must sort." The reader (`control/replay.rs`) sorts by `(epoch, rev)`. The
+undo stack is rev-ordered (`HistoryEntry.rev`, `History::record` inserts
+in rev order, `VecDeque` eviction at the low end). A commit-sequence lock
+and out-of-order buffering in `record_commit` were both rejected (they
+couple command latency to plugin I/O, and transient commits make rev gaps
+ordinary). File order remains unordered BY DOCUMENTED RULE.
 
-**L-5 — a PANICKING `transact` closure diverges the log from the document,
-permanently.** `record_commit` runs only on the `Ok` path and
-`Session::transact` has no panic rollback (a standing carry-forward), so a
-closure that panics mid-way leaves the document mutated with no op record
-at all — not a lost edit, a SILENT one. Nothing later reconciles it: the
-journal simply does not contain what happened, so any replay of that log
-produces a different document, and no `(epoch, rev)` gap marks the spot.
-This is the same class as L-3, arrived at from the other direction, and it
-is the reason the "no panic rollback in `transact`" item is worth more
-than its narrowness suggests now that the log is ON.
+**L-5 — CLOSED (Plan F, 2026-08-14, ruling F-3; Task 8).**
+`Session::transact` wraps the closure in `catch_unwind`. On panic it
+restores the live document from the pre-transaction published snapshot and
+returns `Err("transaction panicked: …")`. The log never records a half-
+applied batch. Containment is a crash-consistency net, not a license —
+closures must still not panic. Residual: a panic inside the Err arm's
+`expect("rollback must not fail")` is outside this net.
 
 ---
 
 ## Residual documented non-op document writes
 
-Three sites still write document fields without an op (R-3 CLOSED in Plan F
-Task 10 — see below). All three are documented at the site, all three are
-under the session lock, and none is a user-visible edit — recorded here so
-the totality claim stays honest rather than absolute-sounding.
+Two sites still write document fields without an op (R-3 CLOSED in Plan F
+Task 10 — see below). Both are documented at the site, both are under the
+session lock, and neither is a user-visible edit — recorded here so the
+totality claim stays honest rather than absolute-sounding. (Plan F,
+2026-08-14.)
 
 **R-1 — `ControlPlane::set_plugin_pending_state`**
 (`src-tauri/src/control/mod.rs:1465`). Seeds
@@ -290,18 +290,14 @@ persisted plugin rows / automation lanes into the session at an EPOCH
 boundary. Sanctioned by ruling 4 — an epoch is where the document is
 replaced wholesale, and nothing about that replacement is an op.
 
-**R-3 — CLOSED in Plan F Task 10** — `try_seed_zyn_demo_instruments`
-(`src-tauri/src/control/mod.rs`) used to push three instance rows into
-`session.plugins.instances` directly, before the demo's single channel
-transaction ran, on the rationale that no track referenced those ids until
-the caller bound them so there was nothing user-visible to undo yet.
-`try_seed_zyn_demo_instruments` now only PREPARES (host instantiate + patch
-load + captured post-load state — prepare-outside, all outside any
-lock/transaction) and touches no session state at all; the seed's one
-commit applies `Op::PluginAdd` + `Op::PluginSetState` per instance, so the
-demo's plugin rows are attributed, undoable in the same step as the rest of
-the demo, persisted via `PersistEffect`, and cold-replayable from the
-journal like everything else.
+**R-3 — CLOSED (Plan F, 2026-08-14, Task 10, ruling F-12).** The demo's
+Zyn bootstrap is no longer a direct session push. `try_seed_zyn_demo_instruments`
+only PREPARES (host instantiate + patch load + captured post-load state —
+prepare-outside, no session lock). The seed's one commit applies
+`Op::PluginAdd` + `Op::PluginSetState` per instance. Persistence rides
+`PersistEffect`; the demo is one undoable step including its instruments;
+a cold journal replay reconstructs the plugins. The old direct-push
+paragraphs are retired.
 
 **R-4 — `Committer::execute_host_forward`'s `Instantiate` writeback**
 (`src-tauri/src/control/mod.rs`, `apply_instantiate_writeback`). After the
@@ -317,6 +313,15 @@ plugin instantiate and every undo-of-a-remove. What the write now has is an
 EPOCH GUARD, the same one `execute_persist` uses: a document swapped between
 the commit and the host's return is a different document, and this commit's
 host result is not about it.
+
+**F-6 residual (Plan F, 2026-08-14) — outgoing persist on open is dropped.**
+I-1 landed as option (b): Save-As writes plugin/automation/modulation into
+the new dir. Option (a) — epoch functions flush the *outgoing* document's
+pending persist before the swap — was deferred. `open_project_epoch` still
+writes nothing for the project being closed; an in-flight persist for that
+document is skipped with a warn (`execute_persist`'s epoch guard). Ctrl+S
+(M-2) is the user recovery path. The epoch-guard comment must not be read
+as "the new epoch saves the old project."
 
 ---
 
@@ -382,15 +387,37 @@ grep -rn '\.lock()' src-tauri/src --include=*.rs
 Every DOCUMENT-writing session-lock site in the tree is one of:
 `src-tauri/src/control/session.rs` (`Session::transact`/`apply_raw` — the
 channel itself), `Committer::commit_with_rebuild`/`execute_persist`/`execute_host_forward`
-(`src-tauri/src/control/mod.rs:324`/`:538` — effect execution and the
+(`src-tauri/src/control/mod.rs` — effect execution and the
 `midi.dirty`/`dirty_state` persist bookkeeping), the five sanctioned epoch
-functions (rows 24-26), the adopt-install helpers (R-2), or the two
-recorded residuals R-1 and R-4 (R-3 CLOSED in Plan F Task 10).
+functions (rows 24-26), the adopt-install helpers (R-2), the snapshot-
+republish sites listed below, or the two recorded residuals R-1 and R-4
+(R-3 CLOSED in Plan F Task 10).
 
-**Every `session.lock()` in `src-tauri/src/audio/engine.rs` is a documented
-read.** All six non-test sites carry an explicit `// read-only:` comment or
-are a `transport_snapshot` read: `:780`, `:1004`, `:1119`, `:1217`, `:1257`,
-`:1305`. The engine's five WRITE sites do not take the session lock
-themselves at all — they go through `Committer::commit_with_rebuild`
-(`:751`, `:1233`, `:1431`, `:1537`, `:1562`), which is the whole point of
-Task 13's split.
+**Snapshot republish sites** (Plan F, 2026-08-14, Task 5). Every sanctioned
+non-op writer that mutates the live document outside `transact` is marked
+`// snapshot republish:` and must call `republish_full` under the same
+lock as the write. Grep gate: `rg -n 'snapshot republish:' src-tauri/src`.
+Current sites (re-counted 2026-08-16 on `plan-f-history`):
+
+* `control/mod.rs` — R-4 instantiate writeback; R-1 pending-state seed;
+  modulation adopt; create/open/save-as epoch swaps
+* `control/session.rs` — panic restore
+* `audio/project.rs` — `ensure_default_project` document birth
+* `plugins/state.rs` — adopt install + I-7 clear
+* `plugins/automation.rs` — adopt replace + I-7 clear
+
+**Every production `session.lock()` in `src-tauri/src/audio/engine.rs` is a
+documented short read** (Plan F, 2026-08-14, Task 6). `rebuild`'s graph
+*assembly* and `ensure_loaded` no longer take the session lock — they read
+the published `SessionSnapshot`. Survivors (re-anchored 2026-08-16):
+
+* `:1377` — rebuild PHASE 2 only: param VALUES + slot map + automation
+  compile (short; no clip assembly, no decode)
+* `:1716` — meter fold (display order)
+* `:1821` — `transport_snapshot` (store.transport + RT atomics)
+* `:1909`, `:1998`, `:2007`, `:2224` — recording resolution (project dir,
+  take numbering, target validation, tempo/ppq)
+
+The engine's WRITE sites still do not take the session lock themselves —
+they go through `Committer::commit_with_rebuild`. `:184` is
+`published_handle()` at control-thread start, not a live-document read.
