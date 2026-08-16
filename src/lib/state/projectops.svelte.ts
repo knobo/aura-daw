@@ -3,11 +3,13 @@
  * menu and the Ctrl+S/O/N shortcuts. Owns the name dialog ("new" creates a
  * blank project, "saveAs" materializes an unsaved session — the backend
  * refuses saveAs once a project is open), the unsaved-changes confirmation,
- * and the store re-pull after the open project changes. Desktop (Tauri) only;
- * demo mode gets an informational toast.
+ * the store re-pull after the open project changes, and restoring the last
+ * adopted project on desktop boot. Desktop (Tauri) only; demo mode gets an
+ * informational toast (restore is silent there).
  */
 
 import { backend } from "../tauri";
+import { readLastProjectDir, writeLastProjectDir } from "../utils/last-project";
 import { automation } from "./automation.svelte";
 import { modulation } from "./modulation.svelte";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
@@ -162,6 +164,25 @@ class ProjectOpsStore {
   }
 
   /**
+   * Re-open the last adopted project. Silent on success and when there is
+   * nothing to restore (demo, no stored path, a project already open).
+   * Failure toasts the same way Open does; the stored path is kept so a
+   * transient miss does not forget the project.
+   */
+  async restoreLast() {
+    if (!this.available) return;
+    if (project.projectDir) return;
+    const path = readLastProjectDir();
+    if (!path) return;
+    try {
+      await backend.openProject(path);
+      await this.adopt();
+    } catch (err) {
+      toasts.error("OPEN FAILED", String(err));
+    }
+  }
+
+  /**
    * Undo / redo the last history step (Plan E Task 17). Thin: the backend
    * owns the stacks — this store only invokes and reports. The optional-
    * method pattern (Task 4's precedent) keeps the demo backend, which has
@@ -220,6 +241,7 @@ class ProjectOpsStore {
     // whatever project just got adopted).
     clipEditLoop.reset();
     await this.repull();
+    if (project.projectDir) writeLastProjectDir(project.projectDir);
   }
 }
 

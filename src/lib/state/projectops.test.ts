@@ -5,7 +5,8 @@
  * TransportBar project menu and the Ctrl+S/O/N shortcuts drive.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { LAST_PROJECT_KEY, readLastProjectDir, writeLastProjectDir } from "../utils/last-project";
 
 const invokes = {
   saveProject: vi.fn(() => Promise.resolve()),
@@ -62,6 +63,17 @@ const { projectops } = await import("./projectops.svelte");
 
 function lastToast() {
   return toasts.list[toasts.list.length - 1];
+}
+
+function fakeStorage(initial: Record<string, string> = {}) {
+  const map = new Map(Object.entries(initial));
+  return {
+    getItem: (key: string) => (map.has(key) ? (map.get(key) as string) : null),
+    setItem: (key: string, value: string) => {
+      map.set(key, value);
+    },
+    map,
+  };
 }
 
 beforeEach(() => {
@@ -349,5 +361,107 @@ describe("undo / redo (Plan E Task 17)", () => {
     expect(invokes.automationGet).toHaveBeenCalledTimes(1);
     expect(invokes.modulationGet).toHaveBeenCalledTimes(1);
     expect(invokes.pluginList).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("remember / restore last project", () => {
+  let storage: ReturnType<typeof fakeStorage>;
+
+  beforeEach(() => {
+    storage = fakeStorage();
+    vi.stubGlobal("localStorage", storage);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("openViaPicker remembers the adopted project dir", async () => {
+    projectops.pickDirectory = async () => "/p/Other.aura";
+
+    await projectops.openViaPicker();
+
+    expect(readLastProjectDir()).toBe("/home/u/Music/AURA/Loaded.aura");
+  });
+
+  it("creating a project remembers the adopted project dir", async () => {
+    projectops.dialog = { mode: "new", name: "Fresh", parentDir: "/home/u/Music/AURA" };
+
+    await projectops.submitDialog();
+
+    expect(readLastProjectDir()).toBe("/home/u/Music/AURA/Loaded.aura");
+  });
+
+  it("save-as remembers the adopted project dir", async () => {
+    projectops.dialog = { mode: "saveAs", name: "First", parentDir: "/p" };
+
+    await projectops.submitDialog();
+
+    expect(readLastProjectDir()).toBe("/home/u/Music/AURA/Loaded.aura");
+  });
+
+  it("opening a new untitled dialog does not clear a remembered path", async () => {
+    writeLastProjectDir("/p/Song.aura");
+
+    await projectops.openNewDialog();
+
+    expect(readLastProjectDir()).toBe("/p/Song.aura");
+  });
+
+  it("restoreLast opens the remembered path and adopts it", async () => {
+    writeLastProjectDir("/p/Song.aura");
+
+    await projectops.restoreLast();
+
+    expect(invokes.openProject).toHaveBeenCalledWith("/p/Song.aura");
+    expect(invokes.getProjectState).toHaveBeenCalled();
+    expect(project.projectDir).toBe("/home/u/Music/AURA/Loaded.aura");
+    expect(toasts.list).toHaveLength(0);
+  });
+
+  it("restoreLast is a silent no-op when nothing is remembered", async () => {
+    await projectops.restoreLast();
+
+    expect(invokes.openProject).not.toHaveBeenCalled();
+    expect(toasts.list).toHaveLength(0);
+  });
+
+  it("restoreLast is a silent no-op in the browser demo", async () => {
+    writeLastProjectDir("/p/Song.aura");
+    mockBackend.mode = "demo";
+
+    await projectops.restoreLast();
+
+    expect(invokes.openProject).not.toHaveBeenCalled();
+    expect(toasts.list).toHaveLength(0);
+  });
+
+  it("restoreLast is a no-op when a project is already open", async () => {
+    writeLastProjectDir("/p/Other.aura");
+    project.projectDir = "/p/Song.aura";
+
+    await projectops.restoreLast();
+
+    expect(invokes.openProject).not.toHaveBeenCalled();
+  });
+
+  it("restoreLast toasts when the remembered project cannot be opened", async () => {
+    writeLastProjectDir("/p/Gone.aura");
+    invokes.openProject.mockRejectedValueOnce(new Error("no such project"));
+
+    await projectops.restoreLast();
+
+    expect(lastToast().kind).toBe("error");
+    expect(lastToast().title).toBe("OPEN FAILED");
+    expect(project.projectDir).toBeNull();
+  });
+
+  it("a failed restore keeps the remembered path for the next launch", async () => {
+    writeLastProjectDir("/p/Gone.aura");
+    invokes.openProject.mockRejectedValueOnce(new Error("no such project"));
+
+    await projectops.restoreLast();
+
+    expect(storage.map.get(LAST_PROJECT_KEY)).toBe("/p/Gone.aura");
   });
 });
