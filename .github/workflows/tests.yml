@@ -48,4 +48,12 @@ jobs:
 
       - name: cargo test
         working-directory: src-tauri
-        run: cargo test --locked
+        # --test-threads=1: several midi_out tests spawn real background
+        # threads and race under default parallel execution (flaky locally
+        # too, independent of CI) — see docs/backlog/ci-hardening.md.
+        # --skip: these two need a real ALSA sequencer device
+        # (/dev/snd/seq), which this runner doesn't have — see the same doc.
+        run: |
+          cargo test --locked -- --test-threads=1 \
+            --skip select_nonexistent_port_is_graceful_err \
+            --skip opening_a_nonexistent_output_port_is_a_graceful_error
