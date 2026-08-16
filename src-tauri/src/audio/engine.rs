@@ -1253,8 +1253,27 @@ impl Control {
                 {
                     Err("cannot change input device during a take".to_string())
                 } else {
+                    let prev = self.sel_input.clone();
                     self.sel_input = device_id;
-                    self.sync_input_hub()
+                    match self.sync_input_hub() {
+                        Ok(()) => {
+                            self.emit_pitch_state();
+                            Ok(())
+                        }
+                        Err(e) => {
+                            self.sel_input = prev;
+                            if let Err(restore_err) = self.sync_input_hub() {
+                                log::warn!(
+                                    "audio: could not restore previous input after failed switch: {restore_err}"
+                                );
+                                if self.listen_input.is_none() {
+                                    self.wants_listening = false;
+                                }
+                            }
+                            self.emit_pitch_state();
+                            Err(e)
+                        }
+                    }
                 };
                 let _ = reply.send(res);
             }
@@ -1912,10 +1931,16 @@ impl Control {
     }
 
     fn pump_meter_frames(&mut self) {
-        if self.sinks.is_empty() || self.last_frame.elapsed() < FRAME_INTERVAL {
+        if self.last_frame.elapsed() < FRAME_INTERVAL {
             return;
         }
+        // Always advance the shared 60 Hz clock, even with no meter
+        // subscriber — `pump_pitch_frames` (called just before this)
+        // shares `last_frame` and would otherwise fire every 2 ms tick.
         self.last_frame = Instant::now();
+        if self.sinks.is_empty() {
+            return;
+        }
         // Display order comes from the session (Task 6: the fold itself now
         // resolves generation -> slot -> track, so this is just display
         // order, no slots needed here).
@@ -2133,17 +2158,26 @@ impl Control {
                 Ok(())
             }
             _ => {
-                // Drop first: the old stream must release the device before
-                // the new one asks for it.
-                self.listen_input = None;
+                // Hold the previous stream until the new one is open so a
+                // failed open does not leave `wants_listening` with no mic.
+                // Exclusive same-device rebuilds may fail-and-restore,
+                // which is the conservative outcome (keep the live stream).
+                let previous = self.listen_input.take();
                 let device = (!key.is_empty()).then_some(key.as_str());
-                let hub = self.open_listen_stream(device)?;
-                self.listen_input = Some(hub);
-                log::info!(
-                    "audio: pitch listen stream open on {}",
-                    if key.is_empty() { "<default>" } else { &key }
-                );
-                Ok(())
+                match self.open_listen_stream(device) {
+                    Ok(hub) => {
+                        self.listen_input = Some(hub);
+                        log::info!(
+                            "audio: pitch listen stream open on {}",
+                            if key.is_empty() { "<default>" } else { &key }
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.listen_input = previous;
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -2247,12 +2281,19 @@ impl Control {
 
     /// Drain the pitch ring and push one batch per 60 Hz tick — the same
     /// cadence as meters, not a second timer (plan task 6). Called BEFORE
-    /// `pump_meter_frames` so both share `last_frame`.
+    /// `pump_meter_frames` so both share `last_frame` (meters always
+    /// advances the clock, even with no meter subscriber).
     fn pump_pitch_frames(&mut self) {
         let mut scratch = std::mem::take(&mut self.pitch_scratch);
         self.drain_pitch(&mut scratch);
         if self.pitch_sinks.is_empty() {
-            scratch.clear();
+            // Keep a short trail so a late `pitch_subscribe` still sees
+            // recent frames rather than a dark first tick.
+            const HOLD: usize = 100;
+            if scratch.len() > HOLD {
+                let drop_n = scratch.len() - HOLD;
+                scratch.drain(..drop_n);
+            }
             self.pitch_scratch = scratch;
             return;
         }
@@ -2307,9 +2348,10 @@ impl Control {
             decimator: Decimator::new(rate),
             analyzer: PitchAnalyzer::new(),
             tx,
-            // 8× covers a device as slow as 1 kHz upsampling to 8 kHz, so
-            // `process` never grows this on the RT thread.
-            dec_buf: Vec::with_capacity(PITCH_TAP_MAX_FRAMES * 8),
+            // 8× covers a device as slow as 1 kHz upsampling to 8 kHz
+            // (`Decimator` clamps below that). +8 is phase-accumulator slack
+            // so `process` never grows this on the RT thread.
+            dec_buf: Vec::with_capacity(PITCH_TAP_MAX_FRAMES * 8 + 8),
             frame_buf: Vec::with_capacity(PITCH_TAP_MAX_FRAMES),
         };
         (tap, rx)
@@ -2351,9 +2393,11 @@ impl Control {
             producers: Vec::new(),
             owed: Vec::new(),
             meter_tx,
-            // No recorded slots to stamp: the base-0 chunk alone keeps the
-            // frame accounting that `MeterAccum` expects.
-            blocks: vec![(RawMeterBlock::new(self.generation, 0, 0), Vec::new())],
+            // No meter blocks: a listen-only `base_slot == 0` chunk is
+            // still folded into frame/master accounting and would dilute
+            // output RMS by ~3 dB. Input metering on a listening hub is
+            // a later job (dedicated slot, out of the output denominator).
+            blocks: Vec::new(),
             in_ch,
             rec_ch: in_ch.min(2),
             rate,
@@ -2586,6 +2630,19 @@ impl Control {
                             writer.stop.store(true, Relaxed);
                             let _ = writer.finish(Duration::from_secs(2));
                         }
+                        // `listen_input` was taken before any group opened.
+                        // Restore the hub (warn, do not mask the take-start
+                        // error) so `wants_listening` is not left true with
+                        // no stream.
+                        if let Err(hub_err) = self.sync_input_hub() {
+                            log::warn!(
+                                "audio: pitch listen could not resume after failed take start: {hub_err}"
+                            );
+                            if self.listen_input.is_none() {
+                                self.wants_listening = false;
+                            }
+                        }
+                        self.emit_pitch_state();
                         return Err(e);
                     }
                 }
@@ -2607,6 +2664,10 @@ impl Control {
         // microphone to the listener — reopen it if it is still wanted.
         // Never fatal: a take must not fail because the tuner could not.
         self.rehearse_spans.clear();
+        // Spans are relative to THIS take. A hold still down (or one that
+        // opened during listen/playback) must start at this take's origin,
+        // not the previous take's stop or a pre-take transport position.
+        self.rehearse_open = self.rehearse.load(Relaxed).then_some(start_pos);
         if let Err(e) = self.sync_input_hub() {
             log::warn!("audio: pitch listen unavailable during take: {e}");
         }
@@ -5069,19 +5130,156 @@ mod tests {
         );
     }
 
+    /// Hold across stop → seek → start → stop. Spans must be relative to
+    /// *this* take, not the previous take's stop position.
+    #[test]
+    fn a_hold_across_takes_reports_spans_relative_to_each_take() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        ctl.ensure_project_fn = Some(Arc::new(|| Ok(PathBuf::from("/nonexistent"))));
+        ctl.live_in_hub.attach_shared(ctl.shared.clone());
+        ctl.live_in_hub.set_target_track(Some("m-1".into()));
+
+        ctl.shared.position.store(0, Relaxed);
+        ctl.set_rehearse_hold(true);
+        ctl.start_recording(None, HashMap::new()).expect("take A");
+        assert_eq!(ctl.rehearse_open, Some(0), "held at arm time starts at 0");
+        ctl.shared.position.store(48_000, Relaxed);
+        ctl.stop_recording().ok();
+        assert_eq!(
+            ctl.rehearse_open,
+            Some(48_000),
+            "still held: reopen at the stop so the flag stays consistent"
+        );
+
+        ctl.shared.position.store(0, Relaxed);
+        ctl.start_recording(None, HashMap::new()).expect("take B");
+        assert_eq!(
+            ctl.rehearse_open,
+            Some(0),
+            "a new take must reset the open hold to this take's start"
+        );
+        assert!(
+            ctl.rehearse_spans.is_empty(),
+            "previous take's spans must not leak into the next"
+        );
+        ctl.shared.position.store(48_000, Relaxed);
+        assert_eq!(
+            ctl.take_rehearse_spans(48_000),
+            vec![(0, 48_000)],
+            "the second take was silent for its entire length"
+        );
+        ctl.stop_recording().ok();
+    }
+
+    /// A failed take start must not leave `wants_listening` true with no
+    /// listen stream (the listen hub is dropped before `open_capture_group`).
+    #[test]
+    fn failed_take_start_restores_the_listen_stream() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.tracks.push(midi_track("m-1"));
+        session.lock().store.tracks[0].armed = true;
+        ctl.ensure_project_fn = Some(Arc::new(|| Ok(PathBuf::from("/nonexistent"))));
+        ctl.set_listening(true).expect("stub hub");
+        assert!(ctl.listen_input.is_some());
+        assert!(ctl.wants_listening);
+
+        let mut returns = HashMap::new();
+        returns.insert("m-1".into(), "aura-x1-no-such-input".into());
+        let err = ctl.start_recording(None, returns).unwrap_err();
+        assert!(
+            err.contains("unknown input device: aura-x1-no-such-input"),
+            "must fail on the return device, got {err}"
+        );
+        assert!(
+            ctl.listen_input.is_some(),
+            "failed take start must restore the listen hub"
+        );
+        assert!(ctl.wants_listening, "listen intent survives a failed take");
+        assert!(ctl.writers.is_empty() && ctl.inputs.is_empty());
+    }
+
+    /// Listen-only capture must not push `base_slot == 0` meter blocks:
+    /// `MeterAccum` would fold them into the output RMS denominator.
+    #[test]
+    fn listen_only_capture_does_not_push_meter_blocks() {
+        let shared = Arc::new(SharedRt::default());
+        let (meter_tx, mut meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
+        let (tap, _pitch_rx) = Control::build_pitch_tap(48_000);
+        let mut cb = InputCb {
+            producers: Vec::new(),
+            owed: Vec::new(),
+            meter_tx,
+            blocks: Vec::new(),
+            in_ch: 1,
+            rec_ch: 1,
+            rate: 48_000,
+            shared,
+            pitch: Some(tap),
+            rehearse: Arc::new(AtomicBool::new(false)),
+        };
+        cb.capture(&[0.5f32; 64]);
+        assert!(
+            meter_rx.pop().is_err(),
+            "listen-only must not contribute meter blocks"
+        );
+    }
+
+    /// `SelectInput` must emit `pitch://state` so `deviceRate` is not stale.
+    #[test]
+    fn select_input_emits_pitch_state() {
+        let (mut ctl, _session) = bare_control();
+        ctl.set_listening(true).expect("stub hub");
+        ctl.last_pitch_state = None;
+        let (tx, rx) = bounded(1);
+        ctl.handle(ControlMsg::SelectInput {
+            device_id: Some("mic-2".into()),
+            reply: tx,
+        });
+        assert!(rx.recv().unwrap().is_ok());
+        let state = ctl.last_pitch_state.expect("must emit pitch://state");
+        assert!(state.listening);
+        assert_eq!(ctl.sel_input.as_deref(), Some("mic-2"));
+        assert_eq!(state.device_rate, 48_000, "stub hub reports 48 kHz");
+    }
+
+    /// A failed device switch must not leave listening-with-no-stream.
+    #[test]
+    fn failed_select_input_restores_listen_stream() {
+        let (mut ctl, _session) = bare_control();
+        ctl.set_listening(true).expect("stub hub");
+        assert!(ctl.listen_input.is_some());
+        ctl.stub_input = false;
+        let (tx, rx) = bounded(1);
+        ctl.handle(ControlMsg::SelectInput {
+            device_id: Some("aura-no-such-input".into()),
+            reply: tx,
+        });
+        assert!(rx.recv().unwrap().is_err());
+        assert_eq!(
+            ctl.sel_input, None,
+            "failed switch must restore the previous device"
+        );
+        assert!(
+            ctl.listen_input.is_some() || !ctl.wants_listening,
+            "must not claim listening with no stream"
+        );
+    }
+
     /// Listening without a take: pitch frames flow and no writer exists.
     #[test]
     fn pitch_frames_are_produced_while_listening_without_recording() {
         let shared = Arc::new(SharedRt::default());
         let (meter_tx, _meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let (tap, mut pitch_rx) = Control::build_pitch_tap(48_000);
-        // A listen-only callback: NO producers at all, which is what
-        // "no take" means down here.
+        // A listen-only callback: NO producers and NO meter blocks, which
+        // is what "no take" means down here (meter blocks would dilute
+        // output RMS).
         let mut cb = InputCb {
             producers: Vec::new(),
             owed: Vec::new(),
             meter_tx,
-            blocks: vec![(RawMeterBlock::new(1, 0, 0), Vec::new())],
+            blocks: Vec::new(),
             in_ch: 1,
             rec_ch: 1,
             rate: 48_000,

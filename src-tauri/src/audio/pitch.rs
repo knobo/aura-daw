@@ -181,12 +181,14 @@ impl PitchAnalyzer {
         let mut vals = [0.0f32; MEDIAN_TAPS];
         let mut n = 0;
         for v in self.hist.iter().flatten() {
-            vals[n] = *v;
-            n += 1;
+            if v.is_finite() {
+                vals[n] = *v;
+                n += 1;
+            }
         }
         let smoothed = if n >= MEDIAN_MIN_VOICED {
             let s = &mut vals[..n];
-            s.sort_by(|a, b| a.partial_cmp(b).expect("MIDI values are finite"));
+            s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             Some(s[n / 2])
         } else {
             None
@@ -232,15 +234,28 @@ impl PitchAnalyzer {
         let sample = (start_device + half_window_device).max(0) as u64;
 
         let (voiced, midi, hz) = match accepted {
-            Some(m) => (true, m, midi_to_hz(m)),
-            None => (false, 0.0, 0.0),
+            Some(m) if m.is_finite() => (true, m, midi_to_hz(m)),
+            _ => (false, 0.0, 0.0),
         };
+        // Cap so a reserved RT `frame_buf` cannot grow. Tests use
+        // `Vec::new()` (capacity 0) and must still be allowed to grow.
+        const MAX_FRAMES: usize = 2048;
+        if out.len() >= MAX_FRAMES {
+            return;
+        }
         out.push(PitchFrame {
             sample,
             hz,
             midi,
-            clarity: (1.0 - aperiodicity).clamp(0.0, 1.0),
-            rms,
+            clarity: {
+                let c = 1.0 - aperiodicity;
+                if c.is_finite() {
+                    c.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            },
+            rms: if rms.is_finite() { rms } else { 0.0 },
             voiced,
         });
     }
@@ -427,6 +442,18 @@ mod tests {
         assert!(
             elapsed < 1.0,
             "10 s of audio took {elapsed:.3} s to analyse"
+        );
+    }
+
+    #[test]
+    fn nan_samples_do_not_panic_and_are_unvoiced() {
+        let mut a = PitchAnalyzer::new();
+        let mut out = Vec::new();
+        a.push(&vec![f32::NAN; TARGET_SR as usize], 0, 48_000, &mut out);
+        assert!(
+            out.iter()
+                .all(|f| !f.voiced && f.hz.is_finite() && f.midi.is_finite()),
+            "NaN input must emit finite unvoiced frames"
         );
     }
 

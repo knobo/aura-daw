@@ -60,6 +60,14 @@ impl Yin {
         let w = self.window();
         let tau_max = self.tau_max;
         let tau_min = self.tau_min;
+        // NaN/Inf on the capture path must be unvoiced, never a panic.
+        // An empty search range (pathological `sr`) is the same.
+        if tau_min > tau_max
+            || frame.len() < self.frame_len()
+            || frame[..self.frame_len()].iter().any(|s| !s.is_finite())
+        {
+            return (None, 1.0);
+        }
 
         // Difference function. The caller passes `frame_len() = w + tau_max`
         // samples, so `j + tau` reaches at most `w - 1 + tau_max` — the last
@@ -106,11 +114,15 @@ impl Yin {
             }
             tau += 1;
         }
-        let tau_est = tau_est.unwrap_or_else(|| {
-            (tau_min..=tau_max)
-                .min_by(|&a, &b| self.cmnd[a].partial_cmp(&self.cmnd[b]).unwrap())
-                .unwrap()
-        });
+        let Some(tau_est) = tau_est.or_else(|| {
+            (tau_min..=tau_max).min_by(|&a, &b| {
+                self.cmnd[a]
+                    .partial_cmp(&self.cmnd[b])
+                    .unwrap_or(std::cmp::Ordering::Greater)
+            })
+        }) else {
+            return (None, 1.0);
+        };
         let aperiodicity = self.cmnd[tau_est];
 
         // Parabolic interpolation around the chosen minimum for a
@@ -284,6 +296,17 @@ mod tests {
             "frame_len must be w + tau_max, as pitch_track's frame_len — the \
              lookahead that keeps every lag summing the same number of terms"
         );
+    }
+
+    #[test]
+    fn nan_input_is_unvoiced_and_does_not_panic() {
+        let mut y = Yin::new(TARGET_SR);
+        let w = y.frame_len();
+        let (f0, ap) = y.detect(&vec![f32::NAN; w]);
+        assert!(f0.is_none(), "NaN must be unvoiced");
+        assert!(ap.is_finite());
+        let (f0, _) = y.detect(&vec![f32::INFINITY; w]);
+        assert!(f0.is_none(), "Inf must be unvoiced");
     }
 
     #[test]

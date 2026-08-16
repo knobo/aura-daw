@@ -9,6 +9,11 @@
 
 use super::yin::TARGET_SR;
 
+/// Floor/ceiling for `in_rate`. Below 1 kHz the 8× reserved `dec_buf`
+/// would grow on the RT thread; 0 would make `step` infinite and hang.
+const MIN_IN_RATE: u32 = 1_000;
+const MAX_IN_RATE: u32 = 192_000;
+
 /// Low-pass tap count. 63 taps at a 0.4 * `TARGET_SR` cutoff gives enough
 /// stopband attenuation to keep content above the 4 kHz output Nyquist from
 /// folding into the vocal range (see `rejects_content_above_the_output_nyquist`).
@@ -47,8 +52,10 @@ pub struct Decimator {
 
 impl Decimator {
     /// `in_rate` is the device rate. Any rate is accepted; the ratio need
-    /// not be an integer.
+    /// not be an integer. Pathological rates are clamped so `process` cannot
+    /// hang or grow an RT-reserved `out`.
     pub fn new(in_rate: u32) -> Self {
+        let in_rate = in_rate.clamp(MIN_IN_RATE, MAX_IN_RATE);
         let hp_a = 1.0 / (1.0 + 2.0 * std::f32::consts::PI * 80.0 / in_rate as f32);
 
         // Windowed-sinc low-pass, cutoff 0.4 * TARGET_SR, Hamming window.
@@ -86,9 +93,17 @@ impl Decimator {
     }
 
     /// Push interleaved input, appending decimated mono 8 kHz samples to
-    /// `out`. Never allocates beyond `out`'s own growth.
+    /// `out`. Output per call is bounded by 8× input frames (the 1 kHz
+    /// floor), so an RT-reserved `dec_buf` does not grow.
     pub fn process(&mut self, input: &[f32], channels: usize, out: &mut Vec<f32>) {
         let channels = channels.max(1);
+        let in_frames = input.len() / channels;
+        let start_len = out.len();
+        // After the 1 kHz floor, at most 8 output samples per input frame.
+        // This is a hang/growth guard, not a reserved-capacity contract —
+        // tests append into a growing `Vec` across many `process` calls.
+        let max_len = start_len.saturating_add(in_frames.saturating_mul(8).saturating_add(2));
+
         for frame in input.chunks_exact(channels) {
             let mono = frame.iter().sum::<f32>() / channels as f32;
 
@@ -99,7 +114,9 @@ impl Decimator {
 
             // Shift the FIR history and convolve.
             self.history.copy_within(1.., 0);
-            *self.history.last_mut().unwrap() = hp;
+            if let Some(slot) = self.history.last_mut() {
+                *slot = hp;
+            }
             let filtered: f32 = self
                 .history
                 .iter()
@@ -128,6 +145,9 @@ impl Decimator {
             self.pos += self.step;
             while self.pos >= 1.0 {
                 self.pos -= 1.0;
+                if out.len() >= max_len {
+                    break;
+                }
                 let t = 1.0 - (self.pos / self.step) as f32;
                 out.push(self.prev_filtered + (filtered - self.prev_filtered) * t);
             }
@@ -215,6 +235,34 @@ mod tests {
         assert!(
             peak <= 1.2,
             "channel sum must average, not add; peak {peak}"
+        );
+    }
+
+    #[test]
+    fn zero_in_rate_does_not_hang_or_grow_unbounded() {
+        let mut d = Decimator::new(0);
+        let mut out = Vec::new();
+        d.process(&[0.1; 64], 1, &mut out);
+        assert!(out.len() <= 64 * 8 + 2, "clamped rate must bound output");
+    }
+
+    #[test]
+    fn process_does_not_grow_an_rt_reserved_buffer() {
+        // Same reserve the capture path uses: 8× + phase slack at 1 kHz.
+        let mut d = Decimator::new(1_000);
+        let n = 256;
+        let cap = n * 8 + 8;
+        let mut out = Vec::with_capacity(cap);
+        d.process(&vec![0.1; n], 1, &mut out);
+        assert!(
+            out.len() <= cap,
+            "8× reserve must cover a 1 kHz upsample; got {}",
+            out.len()
+        );
+        assert_eq!(
+            out.capacity(),
+            cap,
+            "process must not grow a reserved buffer"
         );
     }
 

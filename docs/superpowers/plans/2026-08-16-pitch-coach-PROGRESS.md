@@ -36,7 +36,7 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
 - [x] Pre-existing red test on main fixed by the owner in PR #45, merged in
 - [x] Implementation plan written and self-reviewed
 
-**Phase 1 — backend.** In progress; the pure-DSP half is done.
+**Phase 1 — backend.** PR #49 review fixes landed; owner checkpoint still open.
 
 - [x] Task 1 — YIN detector (`audio/yin.rs`) — `eb0d47b`, 799 tests green
 - [x] Task 2 — decimation to 8 kHz (`audio/decimate.rs`) — `190316a`, 5/5
@@ -107,6 +107,18 @@ them is the owner's call, not an agent's.
 Also: `cargo fmt` without a path argument reformats the whole crate here.
 Always check `git status` before committing after running it.
 
+## Review follow-ups (PR #49)
+
+Merge-blocker bugs from the review are fixed on this branch. Left open:
+
+- **Issue 6 (follow-up, not this PR):** spec §3.2 wants YIN / RMS gate /
+  median / jump limiter on a dedicated non-RT pitch thread. The callback
+  still runs the full chain. Move `PitchAnalyzer` off `InputCb::capture`
+  (`decimate → rtrb<f32> → worker → rtrb<PitchFrame>`).
+- **Issue 7:** `pitch_listen_start` mid-take that already owns the pitch
+  device sets `wants_listening` but does not attach a `PitchTap`. Listen
+  stays dark until stop.
+
 ## Open items needing the owner
 
 1. **`src-tauri/src/lib.rs` was FROZEN.** Owner later authorised additive
@@ -131,6 +143,14 @@ with the commit sha and anything the next agent would be surprised by.
 
 ## Log
 
+- 2026-08-16 — PR #49 review merge-blockers fixed (Issues 1–5, 8). Failed
+  take-start restores the listen hub; listen-only capture no longer pushes
+  `base_slot == 0` meter blocks; NaN on the capture path is unvoiced (no
+  `unwrap`/`expect`); `rehearse_open` resets to this take's start; 
+  `SelectInput` emits `pitch://state` and restores the previous stream (or
+  clears `wants_listening`) on open failure; pitch batches stay at ~60 Hz
+  with no meter subscriber. **Issue 6 is still open** — do not move YIN
+  off the callback in this PR. Issue 7 (listen-on mid-take) also remains.
 - 2026-08-16 — spec committed `4e9d684`; merged `origin/main` (`d0866ad`,
   the transport fix) into the branch; baseline green; plan written.
 - 2026-08-16 — Tasks 2 (review), 3 and 4 done. Three things the next agent
