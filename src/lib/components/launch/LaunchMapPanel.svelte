@@ -14,6 +14,7 @@
 
   function onTitleDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    if ((e.target as HTMLElement).closest("button")) return;
     drag = { dx: e.clientX - pos.x, dy: e.clientY - pos.y };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
@@ -104,7 +105,17 @@
     >
       <span class="titlelab mono">MIDI LAUNCH</span>
       <span class="sub silk">{launch.bindings.length} marking{launch.bindings.length === 1 ? "" : "s"}</span>
-      <button class="x mono" title="Close" onclick={() => launch.closePanel()}>×</button>
+      <button
+        class="x mono"
+        type="button"
+        title="Close"
+        aria-label="Close MIDI launch"
+        onpointerdown={(e) => {
+          e.stopPropagation();
+          e.preventDefault();
+          launch.closePanel();
+        }}>×</button
+      >
     </div>
 
     <div class="hint silk">
@@ -254,13 +265,16 @@
     flex: 1;
   }
   .x {
-    width: 22px;
-    height: 22px;
-    font-size: 16px;
+    position: relative;
+    z-index: 1;
+    width: 28px;
+    height: 28px;
+    font-size: 18px;
     color: var(--text-dim);
     background: transparent;
     border: 0;
     cursor: pointer;
+    flex: none;
   }
   .x:hover {
     color: var(--text);
