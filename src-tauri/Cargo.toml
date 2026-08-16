@@ -10,6 +10,19 @@ rust-version = "1.77"
 # Agents 2/3/4 must NOT edit this file. If you need another crate,
 # report the request; do not add it yourself.
 
+[features]
+default = ["lv2"]
+# LV2 hosting. Off => CLAP-only, and `plugins::lv2_host` resolves to the
+# no-op stub in `lv2_host_stub.rs` (every entry point returns the same
+# "not compiled in" error) so no call site needs a cfg.
+#
+# WHY this is a feature at all: `livi` -> `lilv-sys 0.2.1`, which has NO
+# build script — just `#[link(name = "lilv-0")]`. It expects the SYSTEM
+# lilv at link time, which exists on Linux (`apt install liblilv-dev`) and
+# not on Windows. The Windows release build therefore runs with
+# `--no-default-features`; see .github/workflows/release-windows.yml.
+lv2 = ["dep:livi"]
+
 [lib]
 name = "aura_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
@@ -76,7 +89,7 @@ clack-extensions = { version = "0.1", features = [
 # atom-sequence MIDI + worker — exactly ZynAddSubFX's required feature set).
 # Verified on this machine: Zyn instantiates AND renders audio through
 # livi 0.7. LV2 state save/restore needs raw-lilv work on top (zone P4).
-livi = "0.7"
+livi = { version = "0.7", optional = true }
 walkdir = "2"      # CLAP search-path scanning
 
 # OS clipboard text slot for cross-instance clip copy/paste (Track C). Not

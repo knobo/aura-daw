@@ -28,6 +28,12 @@ pub mod automation;
 pub mod clap_host;
 pub mod descriptor;
 pub mod host;
+#[cfg(feature = "lv2")]
+pub mod lv2_host;
+/// Without the `lv2` feature (Windows: no system lilv to link) the stub takes
+/// the module's place, so every LV2 call site below compiles unchanged.
+#[cfg(not(feature = "lv2"))]
+#[path = "lv2_host_stub.rs"]
 pub mod lv2_host;
 pub mod patches;
 pub mod scan;

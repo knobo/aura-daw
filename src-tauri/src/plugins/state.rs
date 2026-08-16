@@ -46,7 +46,10 @@
 //! that state is lost on save/reopen until a later round adds a periodic
 //! host-state poll.
 
+// Only the raw-lilv `state:interface` glue below needs these.
+#[cfg(feature = "lv2")]
 use std::collections::HashMap;
+#[cfg(feature = "lv2")]
 use std::ffi::{c_void, CString};
 use std::fs;
 use std::io::Write as _;
@@ -834,14 +837,32 @@ pub fn adopt_open_project(dir: &Path) {
 // ---------------------------------------------------------------------------
 // LV2 state:interface — raw lilv on top of livi (ARCHITECTURE §15.2 note)
 // ---------------------------------------------------------------------------
+//
+// Everything that touches a `livi` handle is behind `feature = "lv2"`. The
+// pure-data half — [`Lv2Property`] and the [`encode_lv2_props`] /
+// [`decode_lv2_props`] payload codec — stays unconditional: it is just bytes,
+// `plugins::patches` edits blobs with it, and a `KIND_LV2_PROPS` blob written
+// on Linux must still decode (and re-encode losslessly) on a build that
+// cannot host the plugin it came from.
 
-pub const LV2_STATE_INTERFACE_URI: &str = "http://lv2plug.in/ns/ext/state#interface";
-const LV2_STATE_SUCCESS: u32 = 0;
-const LV2_STATE_ERR_UNKNOWN: u32 = 1;
+/// Flags from state.h, passed to the plugin's save/restore. The codec below
+/// only ever round-trips `Lv2Property::flags` as an opaque `u32`, so these
+/// live with the FFI half.
+#[cfg(feature = "lv2")]
 const LV2_STATE_IS_POD: u32 = 1;
+#[cfg(feature = "lv2")]
 const LV2_STATE_IS_PORTABLE: u32 = 2;
 
+#[cfg(feature = "lv2")]
+pub const LV2_STATE_INTERFACE_URI: &str = "http://lv2plug.in/ns/ext/state#interface";
+#[cfg(feature = "lv2")]
+const LV2_STATE_SUCCESS: u32 = 0;
+#[cfg(feature = "lv2")]
+const LV2_STATE_ERR_UNKNOWN: u32 = 1;
+
+#[cfg(feature = "lv2")]
 type StateHandle = *mut c_void;
+#[cfg(feature = "lv2")]
 type StoreFn = unsafe extern "C" fn(
     handle: StateHandle,
     key: u32,
@@ -850,6 +871,7 @@ type StoreFn = unsafe extern "C" fn(
     ty: u32,
     flags: u32,
 ) -> u32;
+#[cfg(feature = "lv2")]
 type RetrieveFn = unsafe extern "C" fn(
     handle: StateHandle,
     key: u32,
@@ -860,6 +882,7 @@ type RetrieveFn = unsafe extern "C" fn(
 
 /// `LV2_State_Interface` from state.h (livi/lilv expose no typed wrapper;
 /// this is the raw extension-data layout, fetched per instance).
+#[cfg(feature = "lv2")]
 #[repr(C)]
 pub struct Lv2StateInterface {
     save: unsafe extern "C" fn(
@@ -888,12 +911,14 @@ pub struct Lv2Property {
     pub value: Vec<u8>,
 }
 
+#[cfg(feature = "lv2")]
 struct SaveCtx<'a> {
     features: &'a livi::Features,
     props: Vec<Lv2Property>,
     error: Option<String>,
 }
 
+#[cfg(feature = "lv2")]
 unsafe extern "C" fn store_cb(
     handle: StateHandle,
     key: u32,
@@ -924,12 +949,14 @@ unsafe extern "C" fn store_cb(
     LV2_STATE_SUCCESS
 }
 
+#[cfg(feature = "lv2")]
 struct RestoreCtx {
     /// key urid -> (type urid, flags, value bytes). Values stay alive (and
     /// unmoved) for the whole restore call.
     by_key: HashMap<u32, (u32, u32, Vec<u8>)>,
 }
 
+#[cfg(feature = "lv2")]
 unsafe extern "C" fn retrieve_cb(
     handle: StateHandle,
     key: u32,
@@ -955,6 +982,7 @@ unsafe extern "C" fn retrieve_cb(
     }
 }
 
+#[cfg(feature = "lv2")]
 fn state_interface(
     instance: &livi::Instance,
 ) -> Option<std::ptr::NonNull<Lv2StateInterface>> {
@@ -973,6 +1001,7 @@ fn state_interface(
 /// `Ok(None)` when the plugin implements no state interface (callers fall
 /// back to the param snapshot). MUST run on the thread owning the instance
 /// (the plugin main thread — lilv thread affinity, contract 2).
+#[cfg(feature = "lv2")]
 pub fn save_lv2_state(
     instance: &livi::Instance,
     features: &livi::Features,
@@ -1002,6 +1031,7 @@ pub fn save_lv2_state(
 
 /// Restore previously saved properties into an LV2 instance. Same threading
 /// contract as [`save_lv2_state`].
+#[cfg(feature = "lv2")]
 pub fn restore_lv2_state(
     instance: &mut livi::Instance,
     features: &livi::Features,
@@ -1097,6 +1127,7 @@ pub fn decode_lv2_props(bytes: &[u8]) -> Result<Vec<Lv2Property>, String> {
 }
 
 /// Convenience for the LV2 host bridge: full state -> APST-ready blob.
+#[cfg(feature = "lv2")]
 pub fn lv2_state_blob(
     instance: &livi::Instance,
     features: &livi::Features,
@@ -1106,6 +1137,7 @@ pub fn lv2_state_blob(
 }
 
 /// Convenience for the LV2 host bridge: APST blob -> instance.
+#[cfg(feature = "lv2")]
 pub fn apply_lv2_state_blob(
     instance: &mut livi::Instance,
     features: &livi::Features,
@@ -1767,6 +1799,7 @@ mod tests {
     /// properties, they round-trip through the APST payload encoding, and a
     /// SECOND instance accepts the restore. Skips cleanly when
     /// zynaddsubfx-lv2 is not installed.
+    #[cfg(feature = "lv2")]
     #[test]
     fn zyn_state_saves_and_restores_via_raw_lilv() {
         const ZYN_URI: &str = "http://zynaddsubfx.sourceforge.net";
