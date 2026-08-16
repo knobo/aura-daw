@@ -210,37 +210,97 @@ fn main() -> Result<(), String> {
 
     let hzs: Vec<f32> = voiced.iter().map(|f| f.hz).collect();
     let med = median(&hzs);
-    let ref_hz = target.unwrap_or_else(|| midi_to_hz(hz_to_midi(med).round()));
-    let errs: Vec<f32> = hzs.iter().map(|h| cents_between(*h, ref_hz)).collect();
-    let abs: Vec<f32> = errs.iter().map(|c| c.abs()).collect();
-    let mean = errs.iter().sum::<f32>() / errs.len() as f32;
-    let within = |c: f32| abs.iter().filter(|e| **e <= c).count() as f32 / abs.len() as f32;
 
+    // How far the voiced pitch ranged. A held note stays inside a couple of
+    // hundred cents; a glissando does not, and against a glissando any
+    // statistic relative to ONE target note measures "how much of the time
+    // were you elsewhere" — a real number that answers no question anyone
+    // asked. So the fixed-target block below is printed only when the run
+    // was actually steady, and the nearest-note block always is.
+    let midis: Vec<f32> = voiced.iter().map(|f| f.midi).collect();
+    let lo = midis.iter().cloned().fold(f32::MAX, f32::min);
+    let hi = midis.iter().cloned().fold(f32::MIN, f32::max);
+    let span_cents = (hi - lo) * 100.0;
+    let steady = span_cents <= 150.0;
+
+    // Time from the first voiced frame to the last: the part of the run
+    // where you were actually making a sound. Leading silence while you
+    // reach for the microphone should not read as a detector failure.
+    let first = all.iter().position(|f| f.voiced).unwrap_or(0);
+    let last = all.iter().rposition(|f| f.voiced).unwrap_or(0);
+    let singing = &all[first..=last];
+    let voiced_singing = singing.iter().filter(|f| f.voiced).count();
+
+    println!(
+        "  voiced (singing) {} of {} ({:.1}%) — from first sound to last",
+        voiced_singing,
+        singing.len(),
+        100.0 * voiced_singing as f32 / singing.len() as f32
+    );
+    println!(
+        "  range           {:.2}..{:.2} Hz  ({} .. {}, {:.0}¢ wide)",
+        hzs.iter().cloned().fold(f32::MAX, f32::min),
+        hzs.iter().cloned().fold(f32::MIN, f32::max),
+        note_name(lo.round() as i32),
+        note_name(hi.round() as i32),
+        span_cents
+    );
     println!(
         "  median pitch    {:.2} Hz  ({}, {:+.1}¢)",
         med,
         note_name(hz_to_midi(med).round() as i32),
         cents_between(med, midi_to_hz(hz_to_midi(med).round()))
     );
+
+    // Tuning accuracy that does not care WHAT you sang: how far each frame
+    // sits from the nearest semitone. Meaningful for a slide as well as a
+    // held note, and it is what says whether the detector is landing on
+    // notes at all.
+    let near: Vec<f32> = voiced
+        .iter()
+        .map(|f| cents_between(f.hz, midi_to_hz(f.midi.round())))
+        .collect();
+    let near_abs: Vec<f32> = near.iter().map(|c| c.abs()).collect();
     println!(
-        "  reference       {:.2} Hz  ({})",
-        ref_hz,
-        note_name(hz_to_midi(ref_hz).round() as i32)
+        "  to nearest note median {:.1}¢, worst {:.1}¢",
+        median(&near_abs),
+        near_abs.iter().cloned().fold(0.0, f32::max)
     );
-    println!(
-        "  error           mean {mean:+.1}¢, median {:+.1}¢",
-        median(&errs)
-    );
-    println!(
-        "  |error|         median {:.1}¢, worst {:.1}¢",
-        median(&abs),
-        abs.iter().cloned().fold(0.0, f32::max)
-    );
-    println!(
-        "  within          {:.0}% ≤ 25¢, {:.0}% ≤ 50¢",
-        within(25.0) * 100.0,
-        within(50.0) * 100.0
-    );
+
+    match (steady, target) {
+        (true, _) => {
+            let ref_hz = target.unwrap_or_else(|| midi_to_hz(hz_to_midi(med).round()));
+            let errs: Vec<f32> = hzs.iter().map(|h| cents_between(*h, ref_hz)).collect();
+            let abs: Vec<f32> = errs.iter().map(|c| c.abs()).collect();
+            let mean = errs.iter().sum::<f32>() / errs.len() as f32;
+            let within = |c: f32| abs.iter().filter(|e| **e <= c).count() as f32 / abs.len() as f32;
+            println!(
+                "  reference       {:.2} Hz  ({})",
+                ref_hz,
+                note_name(hz_to_midi(ref_hz).round() as i32)
+            );
+            println!(
+                "  error           mean {mean:+.1}¢, median {:+.1}¢",
+                median(&errs)
+            );
+            println!(
+                "  |error|         median {:.1}¢, worst {:.1}¢",
+                median(&abs),
+                abs.iter().cloned().fold(0.0, f32::max)
+            );
+            println!(
+                "  within          {:.0}% ≤ 25¢, {:.0}% ≤ 50¢",
+                within(25.0) * 100.0,
+                within(50.0) * 100.0
+            );
+        }
+        (false, Some(_)) => {
+            println!("  reference       skipped — the pitch moved {span_cents:.0}¢, so error");
+            println!("                  against one target note would only measure how");
+            println!("                  long you spent away from it. Hold a note to get it.");
+        }
+        (false, None) => {}
+    }
     println!(
         "  clarity         median {:.2}",
         median(&voiced.iter().map(|f| f.clarity).collect::<Vec<_>>())
