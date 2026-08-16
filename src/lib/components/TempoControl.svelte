@@ -52,12 +52,13 @@
     e.preventDefault();
     if (!wheelEnd) openGesture("set tempo");
     else clearTimeout(wheelEnd);
+    const wheelToken = token;
     const next = nudgeTempo(project.tempoBpm, e.deltaY, e.shiftKey);
     if (open) draft = next.toFixed(1);
     void midi.setTempo(next);
     wheelEnd = setTimeout(() => {
       wheelEnd = null;
-      closeGesture();
+      void wheelToken?.then((id) => project.endGesture(id));
     }, 250);
   }
 

@@ -592,7 +592,8 @@ class TauriBackend implements Backend {
     return invoke<string>("gesture_begin", { label });
   }
   async gestureEnd(id?: string) {
-    await invoke("gesture_end", { id: id ?? null });
+    if (id == null) return;
+    await invoke("gesture_end", { id });
   }
   seedDemoProject() {
     return invoke<ProjectSnapshot>("seed_demo_project");

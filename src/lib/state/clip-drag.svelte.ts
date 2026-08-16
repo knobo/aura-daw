@@ -190,6 +190,8 @@ class ClipDragController {
    * `commitClipMove` follows), awaited, then close the gesture. */
   async end(): Promise<void> {
     if (!this.active) return;
+    const idp = this.gestureId;
+    this.gestureId = undefined;
     const moved = this.moved;
     const origins = this.origins;
     const mode = this.mode;
@@ -228,9 +230,8 @@ class ClipDragController {
         }
       }
     }
-    const id = await this.gestureId;
-    this.gestureId = undefined;
-    await backend.gestureEnd?.(id);
+    const id = await idp;
+    if (id) await backend.gestureEnd?.(id);
   }
 
   private restore(origins: Origin[], mode: "move" | "resize") {
@@ -265,13 +266,14 @@ class ClipDragController {
    * fix above closed. */
   async cancel(): Promise<void> {
     if (!this.active) return;
+    const idp = this.gestureId;
+    this.gestureId = undefined;
     if (this.moved) this.restore(this.origins, this.mode);
     this.active = false;
     this.moved = false;
     this.origins = [];
-    const id = await this.gestureId;
-    this.gestureId = undefined;
-    await backend.gestureEnd?.(id);
+    const id = await idp;
+    if (id) await backend.gestureEnd?.(id);
   }
 }
 

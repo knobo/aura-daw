@@ -214,6 +214,7 @@ class ProjectStore {
    * gesture. Omitting the id keeps the old close-whatever contract.
    * Safe to call even without a matching `beginGesture`. */
   endGesture(id?: string) {
+    if (id == null) return;
     void backend.gestureEnd?.(id);
   }
 

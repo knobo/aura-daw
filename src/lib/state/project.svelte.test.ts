@@ -190,6 +190,11 @@ describe("beginGesture / endGesture", () => {
     project.endGesture("gid-1");
     expect(gestureEnd).toHaveBeenCalledWith("gid-1");
   });
+
+  it("endGesture without a token is a no-op, not close-whatever", () => {
+    project.endGesture();
+    expect(gestureEnd).not.toHaveBeenCalled();
+  });
 });
 
 /**

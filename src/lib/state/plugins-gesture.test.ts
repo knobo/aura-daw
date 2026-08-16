@@ -76,4 +76,19 @@ describe("plugin knob gesture", () => {
     expect(pluginSetParam).toHaveBeenCalledTimes(1);
     expect(pluginSetParam.mock.calls[0][1]).toEqual([{ id: 7, value: 0.75 }]);
   });
+
+  it("a late first-knob end does not close a second knob's token", async () => {
+    gestureBegin
+      .mockResolvedValueOnce("gid-a")
+      .mockResolvedValueOnce("gid-b");
+    plugins.beginParamGesture();
+    plugins.setParam(7, 0.2);
+    const closingA = plugins.endParamGesture();
+    plugins.beginParamGesture();
+    resolveSet?.();
+    await closingA;
+    expect(gestureEnd).toHaveBeenCalledTimes(1);
+    expect(gestureEnd).toHaveBeenCalledWith("gid-a");
+    expect(gestureEnd).not.toHaveBeenCalledWith("gid-b");
+  });
 });

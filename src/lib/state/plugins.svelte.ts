@@ -239,14 +239,15 @@ class PluginsStore {
    * `gesture_end` gets its own undo entry and its own project.json write —
    * the two things the gesture exists to collapse. */
   async endParamGesture(): Promise<void> {
+    const idp = this.paramGesture;
+    this.paramGesture = undefined;
     if (this.rafId != null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
     await this.flushParamQueue();
-    const id = await this.paramGesture;
-    this.paramGesture = undefined;
-    project.endGesture(id);
+    const id = await idp;
+    if (id) project.endGesture(id);
   }
 
   private flushParamQueue(): Promise<void> {
