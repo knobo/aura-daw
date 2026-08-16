@@ -160,6 +160,11 @@ pub fn append_from(
     if rate != 0 && !midi.clips.is_empty() {
         match TempoMap::new(midi.ppq, (*midi.tempo_events).clone(), rate) {
             Ok(map) => {
+                let drive: HashSet<String> = crate::midi::launch::all_drive_clip_ids(
+                    &crate::midi::launch::runtime().maps(),
+                )
+                .into_iter()
+                .collect();
                 for t in tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = slots.get(&t.id) else { continue };
                     // A freeze return is an audio clip on this MIDI track.
@@ -168,7 +173,12 @@ pub fn append_from(
                     if audio_clips.iter().any(|c| c.track_id == t.id) {
                         continue;
                     }
-                    let events = track_events(midi.clips.iter().map(|c| &**c), t.id.as_str(), &map);
+                    let events = track_events_excluding(
+                        midi.clips.iter().map(|c| &**c),
+                        t.id.as_str(),
+                        &drive,
+                        &map,
+                    );
                     if events.is_empty() {
                         continue;
                     }
@@ -211,6 +221,11 @@ pub fn append_from_with_input(
     if rate != 0 && !midi.clips.is_empty() {
         match TempoMap::new(midi.ppq, (*midi.tempo_events).clone(), rate) {
             Ok(map) => {
+                let drive: HashSet<String> = crate::midi::launch::all_drive_clip_ids(
+                    &crate::midi::launch::runtime().maps(),
+                )
+                .into_iter()
+                .collect();
                 for t in tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = slots.get(&t.id) else { continue };
                     // A freeze return is an audio clip on this MIDI track.
@@ -219,7 +234,12 @@ pub fn append_from_with_input(
                     if audio_clips.iter().any(|c| c.track_id == t.id) {
                         continue;
                     }
-                    let events = track_events(midi.clips.iter().map(|c| &**c), t.id.as_str(), &map);
+                    let events = track_events_excluding(
+                        midi.clips.iter().map(|c| &**c),
+                        t.id.as_str(),
+                        &drive,
+                        &map,
+                    );
                     if events.is_empty() {
                         continue;
                     }
