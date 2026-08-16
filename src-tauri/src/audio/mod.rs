@@ -18,12 +18,14 @@
 //! registered in the frozen `lib.rs`), the managed `AudioState`, and the
 //! `init` hook that starts the engine control thread.
 
+pub mod decimate;
 pub mod dsp;
 pub mod engine;
 pub mod meters;
 pub mod metronome;
 pub mod midi_in;
 pub mod mixer;
+pub mod pitch;
 pub mod project;
 pub mod recorder;
 pub mod rt;
@@ -35,6 +37,7 @@ pub mod transport;
 pub mod types;
 pub mod waveform;
 pub mod offline;
+pub mod yin;
 
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
@@ -50,6 +53,7 @@ use engine::{ControlMsg, EngineHandle};
 use rt::{GraphTables, SharedGraphTables, SharedRt};
 use sampler::{InstrumentInfo, SamplerBank};
 
+pub use pitch::{PitchFrame, PitchFrameBatch, PitchState};
 pub use types::{
     AudioDevice, Clip, MeterFrame, Project, Store, TrackMeter, TrackState, TransportState,
 };
@@ -378,6 +382,67 @@ pub fn subscribe_meters(
         .engine()?
         .send(ControlMsg::Subscribe(Box::new(ChannelMeterSink(channel))));
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pitch Coach — listen / subscribe / rehearse (plan task 6)
+// ---------------------------------------------------------------------------
+
+/// Open the input hub for live pitch without starting a take (owner ruling R6).
+#[tauri::command]
+pub fn pitch_listen_start(state: State<'_, AudioState>) -> Result<(), String> {
+    state
+        .engine()?
+        .request(|reply| ControlMsg::SetListening { on: true, reply })
+}
+
+/// Close the listen-only hub. A running take keeps the microphone.
+#[tauri::command]
+pub fn pitch_listen_stop(state: State<'_, AudioState>) -> Result<(), String> {
+    state
+        .engine()?
+        .request(|reply| ControlMsg::SetListening { on: false, reply })
+}
+
+/// Frontend subscribes with a Tauri IPC `Channel<PitchFrameBatch>`; the
+/// engine control thread pushes one batch per 60 Hz meter tick.
+#[tauri::command]
+pub fn pitch_subscribe(
+    channel: Channel<PitchFrameBatch>,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    state
+        .engine()?
+        .send(ControlMsg::SubscribePitch(Box::new(ChannelPitchSink(channel))));
+    Ok(())
+}
+
+/// Momentary rehearse-hold: the take writes silence for the held span.
+#[tauri::command]
+pub fn set_rehearse_hold(enabled: bool, state: State<'_, AudioState>) -> Result<(), String> {
+    state
+        .engine()?
+        .request(|reply| ControlMsg::SetRehearseHold { enabled, reply })
+}
+
+/// Store the MIDI track that holds the target melody and re-emit `pitch://state`.
+#[tauri::command]
+pub fn pitch_set_reference(
+    track_id: Option<String>,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    state
+        .engine()?
+        .request(|reply| ControlMsg::SetPitchReference { track_id, reply })
+}
+
+/// Pitch-batch bridge (control thread -> Tauri IPC channel).
+struct ChannelPitchSink(Channel<PitchFrameBatch>);
+
+impl engine::PitchSink for ChannelPitchSink {
+    fn send_batch(&self, batch: &PitchFrameBatch) -> bool {
+        self.0.send(batch.clone()).is_ok()
+    }
 }
 
 /// Binary waveform tile fetch (zero-JSON path). Returns a raw AWTF payload
@@ -728,4 +793,48 @@ pub async fn save_project(control: State<'_, Arc<ControlPlane>>) -> Result<(), S
     tauri::async_runtime::spawn_blocking(move || cp.save_project_mark().map(|_| ()))
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod pitch_ipc_tests {
+    use super::{PitchFrame, PitchFrameBatch};
+
+    #[test]
+    fn pitch_frame_batch_serializes_camel_case() {
+        let b = PitchFrameBatch {
+            frames: vec![PitchFrame {
+                sample: 480,
+                hz: 220.0,
+                midi: 57.0,
+                clarity: 0.9,
+                rms: 0.2,
+                voiced: true,
+            }],
+            device_rate: 48_000,
+            listening: true,
+            rehearse_hold: false,
+        };
+        let v = serde_json::to_value(&b).unwrap();
+        assert!(v.get("deviceRate").is_some(), "wire field must be deviceRate");
+        assert!(v.get("rehearseHold").is_some());
+        let f = &v["frames"][0];
+        for key in ["sample", "hz", "midi", "clarity", "rms", "voiced"] {
+            assert!(f.get(key).is_some(), "frame missing {key}");
+        }
+    }
+
+    #[test]
+    fn new_pitch_schemas_stay_open_for_extension() {
+        // D-06: new schemas must not close themselves to additive evolution.
+        for name in ["pitch-frame", "pitch-state"] {
+            let path = format!("../docs/ipc-schemas/{name}.schema.json");
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["$schema"], "http://json-schema.org/draft-07/schema#");
+            assert!(
+                v.get("additionalProperties") != Some(&serde_json::Value::Bool(false)),
+                "{name} must not set additionalProperties: false (D-06)"
+            );
+        }
+    }
 }

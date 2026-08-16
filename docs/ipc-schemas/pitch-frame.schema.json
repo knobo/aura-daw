@@ -1,0 +1,66 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "aura:ipc/pitch-frame.schema.json",
+  "title": "PitchFrameBatch",
+  "description": "One 60 Hz batch of live pitch frames, pushed over the Tauri Channel passed to pitch_subscribe. Mirrors Rust struct audio::pitch::PitchFrameBatch. Mode flags ride on the batch so the UI does not have to wait for pitch://state to learn that a hold started.",
+  "type": "object",
+  "properties": {
+    "frames": {
+      "description": "Pitch frames produced since the previous batch, in arrival order. May be empty when listening is on but nothing has been analysed yet.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/pitchFrame" }
+    },
+    "deviceRate": {
+      "description": "Capture sample rate of the input that produced these frames. 0 when no stream is open.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "listening": {
+      "description": "True while the user has asked for live pitch (listen toggle or open panel).",
+      "type": "boolean"
+    },
+    "rehearseHold": {
+      "description": "True while rehearse-hold is down: the take writes silence, analysis keeps running.",
+      "type": "boolean"
+    }
+  },
+  "required": ["frames", "deviceRate", "listening", "rehearseHold"],
+  "$defs": {
+    "pitchFrame": {
+      "title": "PitchFrame",
+      "description": "One 10 ms analysis hop. Unvoiced frames are still emitted so the trail breaks on a breath.",
+      "type": "object",
+      "properties": {
+        "sample": {
+          "description": "Transport sample position at the centre of the analysis window, in device-rate samples.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "hz": {
+          "description": "Detected fundamental in Hz. Meaningful only when voiced is true.",
+          "type": "number"
+        },
+        "midi": {
+          "description": "Continuous MIDI note number (69 + 12*log2(hz/440)). Meaningful only when voiced is true.",
+          "type": "number"
+        },
+        "clarity": {
+          "description": "1.0 - YIN aperiodicity, in [0, 1].",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "rms": {
+          "description": "RMS of the analysis window (linear, full scale = 1.0).",
+          "type": "number",
+          "minimum": 0
+        },
+        "voiced": {
+          "description": "True when the detector, RMS gate, median and jump limiter all agree this hop is a note.",
+          "type": "boolean"
+        }
+      },
+      "required": ["sample", "hz", "midi", "clarity", "rms", "voiced"]
+    }
+  }
+}

@@ -7,6 +7,11 @@ snapshots, the journal reader, the version graph, or `engine::rebuild`.
 Branch `plan-f-history` is **kept** so task SHAs cited in the handoff
 still resolve.
 
+Pitch Coach **phase 1** (YIN, InputHub, listen/rehearse commands) is in
+**[PR #49](https://github.com/knobo/aura-daw/pull/49)** on `feat/pitch-coach`.
+Owner checkpoint before any panel: listen, sing a known pitch, read the
+frames. Phase 2 is the panel; phase 3 is scoring.
+
 The five parallel tracks (A–E / F) are all landed. What remains is
 named below: owner ear-checks, Plan F carry-forwards, Track D/B leftovers,
 modulation design §8, and Plan G. Do not re-open a closed Plan F item.

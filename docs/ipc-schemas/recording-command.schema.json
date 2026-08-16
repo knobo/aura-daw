@@ -48,6 +48,18 @@
           "description": "Present on the stop notification: finalized clip(s) created by the take.",
           "type": "array",
           "items": { "$ref": "aura:ipc/clip.schema.json" }
+        },
+        "rehearseSpans": {
+          "description": "Optional. Regions of the take written as silence because rehearse-hold was down. Sample-aligned; the WAV is still one contiguous take.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "startSample": { "type": "integer", "minimum": 0 },
+              "endSample": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["startSample", "endSample"]
+          }
         }
       },
       "required": ["recording", "trackIds"],

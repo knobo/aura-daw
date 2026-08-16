@@ -1,0 +1,27 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "aura:ipc/pitch-state.schema.json",
+  "title": "PitchState",
+  "description": "Payload of the pitch://state app event. Emitted whenever listening, rehearse-hold, the reference track, or the capture rate changes. Mirrors Rust struct audio::pitch::PitchState.",
+  "type": "object",
+  "properties": {
+    "listening": {
+      "description": "True while the user has asked for live pitch (listen toggle or open Pitch Coach panel). Not set by track arm.",
+      "type": "boolean"
+    },
+    "rehearseHold": {
+      "description": "True while the rehearse-hold key or button is down.",
+      "type": "boolean"
+    },
+    "referenceTrackId": {
+      "description": "MIDI track whose clips are the target melody, or null when none is chosen.",
+      "type": ["string", "null"]
+    },
+    "deviceRate": {
+      "description": "Capture sample rate of the open input, or 0 when the hub is closed.",
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": ["listening", "rehearseHold", "referenceTrackId", "deviceRate"]
+}
