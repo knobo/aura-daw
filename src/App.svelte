@@ -48,18 +48,26 @@
 
   onMount(() => {
     prefs.init(); // restore persisted preferences before anything paints or boots
-    void transport.init();
-    void project.init();
-    void midi.init();
-    void instruments.refresh();
-    void plugins.refresh();
-    void automation.reload();
-    void modulation.reload();
-    void mcp.init();
-    exporter.init();
-    void loopjam.init();
-    generation.init(); // adopt jobs an agent starts over MCP
-    void startMeterStream();
+    void (async () => {
+      // Wait out the empty-session snapshot before reopening the last
+      // project — a parallel restore would race project.init() and could
+      // paint the blank slate over the adopted one.
+      await Promise.all([
+        transport.init(),
+        project.init(),
+        midi.init(),
+        instruments.refresh(),
+        plugins.refresh(),
+        automation.reload(),
+        modulation.reload(),
+        mcp.init(),
+        loopjam.init(),
+      ]);
+      exporter.init();
+      generation.init(); // adopt jobs an agent starts over MCP
+      void startMeterStream();
+      await projectops.restoreLast();
+    })();
     return () => {
       stopMeterStream();
       generation.dispose();
