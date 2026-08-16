@@ -1517,6 +1517,10 @@ impl ControlPlane {
     ///   session lock, via `tx.store()` inside the transaction closure —
     ///   fix round 1; a `self.session.lock()` taken and dropped BEFORE the
     ///   transaction would only preserve the value in the race-free case).
+    ///   The same decision also skips the post-commit `playing` store:
+    ///   `transport_snapshot` prefers that RT atomic over the store label,
+    ///   so arming it on the guard path would report `"playing"` even
+    ///   though the document (and a running take) still own `"recording"`.
     /// * `Stop` preserves ordering, not atomicity: `StopRecording`'s engine
     ///   round-trip is sent BEFORE the "stopped" Set commits (restored,
     ///   fix round 1) so a reader can't observe "stopped" while the take
@@ -1535,6 +1539,12 @@ impl ControlPlane {
         match action {
             TransportAction::Play => {
                 let meta = op::TxMeta::user("transport play").transient();
+                // Captured inside the commit so the RT write below follows
+                // the same in-transaction decision as the document guard —
+                // a post-commit re-read of the store would reopen a window
+                // where Stop could land and this Play would then arm
+                // playback after the take had already finished.
+                let mut arm_playing = true;
                 self.commit_with(
                     meta,
                     |tx| {
@@ -1555,6 +1565,7 @@ impl ControlPlane {
                         // VALUE semantics (state stays "recording") without
                         // reproducing the old code's non-atomic check.
                         if tx.store().transport.state == "recording" {
+                            arm_playing = false;
                             return Ok(());
                         }
                         tx.apply(op::Op::Set {
@@ -1566,7 +1577,9 @@ impl ControlPlane {
                     },
                     false,
                 )?;
-                self.shared.playing.store(true, Relaxed);
+                if arm_playing {
+                    self.shared.playing.store(true, Relaxed);
+                }
             }
             TransportAction::Stop => {
                 // Stopping while recording finalizes the take (DAW
@@ -5590,6 +5603,54 @@ mod tests {
         // itself is untouched. That's the VALUE guarantee ("recording"
         // survives); it is a distinct claim from atomicity (checked above).
         assert_eq!(plane.session().lock().rev, rev_before + 1, "an empty transient commit still bumps rev");
+    }
+
+    /// After count-in (#38), `transport_snapshot` prefers the RT `playing`
+    /// atomic over the store label. The recording guard's empty commit is
+    /// not enough on its own: Play must also leave that atomic alone, or
+    /// the returned snapshot says `"playing"` while the document still
+    /// says `"recording"`.
+    #[test]
+    fn transport_play_does_not_arm_playing_atomic_while_recording() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        plane.session().lock().store.transport.state = "recording".into();
+        assert!(!plane.shared.playing.load(Relaxed), "harness starts stopped");
+        assert!(!plane.shared.recording.load(Relaxed), "this fixture is store-only");
+
+        let snap = plane.transport(TransportAction::Play).unwrap();
+
+        assert_eq!(
+            plane.session().lock().store.transport.state,
+            "recording",
+            "document guard still holds"
+        );
+        assert!(
+            !plane.shared.playing.load(Relaxed),
+            "Play must not arm the RT playing flag while recording owns the label"
+        );
+        assert!(!plane.shared.recording.load(Relaxed));
+        assert_eq!(snap.state, "recording");
+    }
+
+    /// A live take already has both RT flags set (`start_recording` writes
+    /// them together). Play is a no-op for the document and must not
+    /// *clear* `playing` — the take is still rolling.
+    #[test]
+    fn transport_play_does_not_disarm_an_already_rolling_take() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&[]);
+        plane.session().lock().store.transport.state = "recording".into();
+        plane.shared.recording.store(true, Relaxed);
+        plane.shared.playing.store(true, Relaxed);
+
+        let snap = plane.transport(TransportAction::Play).unwrap();
+
+        assert_eq!(snap.state, "recording");
+        assert!(plane.shared.recording.load(Relaxed));
+        assert!(
+            plane.shared.playing.load(Relaxed),
+            "Play must leave an already-rolling take's playing flag set"
+        );
+        assert_eq!(plane.session().lock().store.transport.state, "recording");
     }
 
     /// `TransportAction::SetLoop`'s three Sets (`LoopEnabled`,
