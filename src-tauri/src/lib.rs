@@ -216,6 +216,7 @@ pub fn run() {
             midi::midi_add_clip,
             midi::midi_set_notes,
             midi::midi_set_clip_bounds,
+            midi::midi_set_clip_placement,
             midi::midi_rename_clip,
             midi::midi_remove_clip,
             midi::midi_get_clips,

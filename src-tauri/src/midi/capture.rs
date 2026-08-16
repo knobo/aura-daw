@@ -116,6 +116,8 @@ pub fn take_clip(capture: &Capture, name: &str, map: &TempoMap) -> Option<MidiCl
         content_id: ContentId::mint(),
         lane_id: LaneId::default_for_track(&capture.track_id),
         content_length_ticks: None,
+        transpose_semitones: 0,
+        velocity_offset: 0,
     })
 }
 

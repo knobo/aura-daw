@@ -53,6 +53,9 @@ open question until measured.
 
 ## Consequences
 
+- Implementation (Plan F, 2026-08-14): landed at per-clip Arc granularity
+  with the within-clip tree deferred to the note-delta-op round — see the
+  Plan F handoff, ruling F-1.
 - Deep undo on million-event material costs O(changed nodes), and the
   falsifier-driven "weighted mean" threshold is replaced by decidable caps.
 - Delete-then-undo (gate test 2) preserves identity and inbound references by

@@ -158,6 +158,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 
@@ -186,6 +188,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t1"),
             content_length_ticks: Some(3840), // content: 1 bar
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         // A region inside the CONTENT (1 bar) succeeds even though the
         // PLACEMENT is 2 bars.

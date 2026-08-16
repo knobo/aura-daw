@@ -1112,6 +1112,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("m1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             }],
             loaded_dir: None,
             dirty: false,
@@ -1120,11 +1122,11 @@ mod tests {
         let mut nodes = LiveNodeRegistry::default();
         let mut tracks: Vec<RtTrack> = Vec::new();
         let slots = crate::audio::types::derive_slots(&store.tracks);
-        append_from(&midi, &store, &doc, &slots, 48_000, None, &mut nodes, &mut tracks);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &mut nodes, &mut tracks);
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             nodes.key_of("m1"),
-            Some(format!("plugin:{}@48000#0", info.id).as_str()),
+            Some(format!("plugin:{}@48000#0!active", info.id).as_str()),
             "plugin node keyed by instance + rate + state revision"
         );
 

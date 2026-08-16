@@ -3,8 +3,11 @@
 //! (automation, plugin rows, sampler bank) move in during Plan E.
 use std::collections::HashMap;
 
+use std::sync::Arc;
+
 use crate::audio::types::{Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
+use crate::control::snapshot::{charge_of, ChangeSet, SessionSnapshot};
 use crate::ids::TrackId;
 use crate::midi::MidiStore;
 use crate::plugins::automation::AutomationLane;
@@ -86,6 +89,16 @@ pub struct Session {
     /// lane view `automation_get` still reads.
     pub modulation: crate::modulation::ModulationDoc,
     pub plugins: PluginDoc,
+    /// The published snapshot (Plan F Task 5): ALWAYS equal (content-wise)
+    /// to the live document when no lock is held — updated inside
+    /// `transact` before the lock releases, and by `republish_full` at
+    /// every sanctioned non-op mutation site (the grep-gate's enumerated
+    /// writers, each marked `// snapshot republish:`). Bookkeeping
+    /// (`midi.dirty`, `midi.loaded_dir`, `plugins.dirty_state`) is OUTSIDE
+    /// this equivalence contract — see `SessionSnapshot`'s doc. The inner
+    /// Mutex is a LEAF below `session` in the lock order [C1] (held only
+    /// for a pointer clone/swap; never across I/O or another lock).
+    published: Arc<parking_lot::Mutex<Arc<SessionSnapshot>>>,
     pub(crate) rev: u64,
     /// Document-identity counter (fix round 1, Task 7 review finding 2):
     /// bumped exactly once, under the session lock, at every DOCUMENT-SWAP
@@ -103,22 +116,169 @@ pub struct Session {
     /// longer the one this commit's `PersistEffect` describes — silently
     /// writing it would either corrupt the NEW document (e.g. persist a
     /// stale in-memory edit into a project just opened) or silently drop the
-    /// commit's own edit (its target document already moved on). The new
-    /// epoch's own swap/save owns durability from that point forward.
+    /// commit's own edit (its target document already moved on).
+    /// (Plan F, 2026-08-14, ruling F-6): the new epoch does NOT flush the
+    /// outgoing document's pending persist. `open_project_epoch` drops that
+    /// in-flight write with a warn. Ctrl+S (M-2) is the recovery path.
     pub(crate) epoch: u64,
+    /// Serializes persist I/O (snapshot + write + dirty-clear) across every
+    /// `Committer` on this session. Taken BEFORE the session lock in persist
+    /// paths; never hold the session lock when acquiring this — the clone
+    /// of this `Arc` is taken under a brief session lock, then that guard
+    /// drops, then this mutex is locked.
+    pub(crate) persist_gate: Arc<parking_lot::Mutex<()>>,
 }
 
 impl Session {
     pub fn new(store: Store, midi: MidiStore) -> Self {
-        Self {
+        let mut s = Self {
             store,
             midi,
             automation: AutomationDoc::default(),
             modulation: crate::modulation::ModulationDoc::default(),
             plugins: PluginDoc::default(),
+            published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
             rev: 0,
             epoch: 0,
+            persist_gate: Arc::new(parking_lot::Mutex::new(())),
+        };
+        // First publish: the placeholder above is never observable — the
+        // published image equals the live document from birth.
+        s.republish_full();
+        s
+    }
+
+    /// Capture against the previous published image, re-allocating only
+    /// `changed`, publish, and return the fresh image + its charge
+    /// (`charge_of`). Callers hold the session lock (or own the `Session`
+    /// outright) — `&mut self` makes a capture racing the document
+    /// impossible by construction.
+    pub fn capture_and_publish(&mut self, changed: &ChangeSet) -> (Arc<SessionSnapshot>, usize) {
+        // Leaf lock, pointer clone only — see `Session::published`'s doc.
+        let prev = self.published.lock().clone();
+        let next = Arc::new(SessionSnapshot::capture(self, &prev, changed));
+        let charge = charge_of(&next, changed);
+        *self.published.lock() = next.clone();
+        (next, charge)
+    }
+
+    /// `capture_and_publish(&ChangeSet::all())` — for epoch swaps and the
+    /// enumerated non-op writers (`// snapshot republish:` sites). Callers
+    /// hold the session lock already.
+    pub fn republish_full(&mut self) -> Arc<SessionSnapshot> {
+        self.capture_and_publish(&ChangeSet::all()).0
+    }
+
+    /// The live document revision. Read-only: `rev` advances ONLY inside
+    /// `transact`'s Ok arm, under the session lock, alongside the capture
+    /// that publishes it. Exposed for `tests/snapshot_store.rs`'s
+    /// equivalence sweep, which must compare the live `rev` against the
+    /// published image's — the field itself stays `pub(crate)` so nothing
+    /// outside the crate can bump it.
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+
+    /// The live document epoch — same read-only rationale as [`Self::rev`]
+    /// (`Tx::epoch` is the in-transaction reader; this is the out-of-band
+    /// one the equivalence sweep needs).
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Handle for lock-free consumers (engine): clone the outer Arc once,
+    /// then read the inner slot per use. The inner Mutex is a LEAF below
+    /// `session` [C1] — hold it only for the pointer clone.
+    pub fn published_handle(&self) -> Arc<parking_lot::Mutex<Arc<SessionSnapshot>>> {
+        self.published.clone()
+    }
+
+    /// Materialize a scratch, standalone `Session` from an image (Task 7's
+    /// replay-only materialization, Task 8's rollback restore source, Task
+    /// 9's replay base). Bookkeeping fields default (`dirty=false`,
+    /// `loaded_dir=None`, `dirty_state` empty) — EXCEPT `plugins.state_rev`,
+    /// which is carried whole from the image rather than defaulted: it keys
+    /// the live plugin node cache, and a scratch session has no live nodes,
+    /// so there is nothing to retire and nothing that could observe a rewind.
+    /// (`restore_from_snapshot`, which overwrites the LIVE document, is the
+    /// opposite case and must never take the image's copy — see its doc.)
+    pub fn from_snapshot(snap: &SessionSnapshot) -> Session {
+        let mut store = Store::default();
+        store.transport = snap.transport.clone();
+        store.tracks = (*snap.tracks).clone();
+        store.clips = (*snap.clips).clone();
+        store.project_dir = snap.project_dir.clone();
+        store.project_name = snap.project_name.clone();
+        store.created_at = snap.created_at.clone();
+        let mut midi = MidiStore::default();
+        midi.ppq = snap.midi.ppq;
+        midi.tempo_events = (*snap.midi.tempo_events).clone();
+        midi.meter_events = (*snap.midi.meter_events).clone();
+        midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        // `loaded_dir: None` / `dirty: false` are `MidiStore::default()`'s.
+        let mut plugins = (*snap.plugins).clone();
+        // `dirty_state` is advisory in a snapshot (bookkeeping) — a scratch
+        // session starts with none.
+        plugins.dirty_state.clear();
+        let mut s = Session {
+            store,
+            midi,
+            automation: AutomationDoc { lanes: (*snap.automation).clone() },
+            modulation: (*snap.modulation).clone(),
+            plugins,
+            published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
+            rev: snap.rev,
+            epoch: snap.epoch,
+            persist_gate: Arc::new(parking_lot::Mutex::new(())),
+        };
+        s.republish_full();
+        s
+    }
+
+    /// Overwrite the LIVE document's content fields from an image (Task 8's
+    /// panic restore). `rev`/`epoch` are NOT taken from the image — the
+    /// caller decides (rollback keeps the live rev). Bookkeeping fields
+    /// (`midi.dirty`, `midi.loaded_dir`, `plugins.dirty_state`) are left as
+    /// they are — they describe the live persistence relationship, which a
+    /// content restore does not change.
+    pub fn restore_from_snapshot(&mut self, snap: &SessionSnapshot) {
+        self.store.transport = snap.transport.clone();
+        self.store.tracks = (*snap.tracks).clone();
+        self.store.clips = (*snap.clips).clone();
+        self.store.project_dir = snap.project_dir.clone();
+        self.store.project_name = snap.project_name.clone();
+        self.store.created_at = snap.created_at.clone();
+        self.midi.ppq = snap.midi.ppq;
+        self.midi.tempo_events = (*snap.midi.tempo_events).clone();
+        self.midi.meter_events = (*snap.midi.meter_events).clone();
+        self.midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        self.automation.lanes = (*snap.automation).clone();
+        self.modulation = (*snap.modulation).clone();
+        let dirty_state = std::mem::take(&mut self.plugins.dirty_state);
+        let mut state_rev = std::mem::take(&mut self.plugins.state_rev);
+        let prev_state = std::mem::take(&mut self.plugins.pending_state);
+        self.plugins = (*snap.plugins).clone();
+        // `state_rev` keys the live plugin node cache and only ever moves
+        // FORWARD (its own doc): taking the image's copy would rewind it and
+        // leave the node built from the other blob rendering. So the live
+        // counter survives, and every instance whose blob this restore
+        // actually changed gets bumped past it — the restore is a state load
+        // as far as the node cache is concerned.
+        for (id, bytes) in &self.plugins.pending_state {
+            if prev_state.get(id) != Some(bytes) {
+                *state_rev.entry(id.clone()).or_insert(0) += 1;
+            }
         }
+        for id in prev_state.keys() {
+            if !self.plugins.pending_state.contains_key(id) {
+                *state_rev.entry(id.clone()).or_insert(0) += 1;
+            }
+        }
+        self.plugins.state_rev = state_rev;
+        self.plugins.dirty_state = dirty_state; // live bookkeeping survives
+        // snapshot republish: the restored content is the document now — the
+        // published image must match it the moment the caller's lock drops.
+        self.republish_full();
     }
 
     /// Clone of the midi fields `midi::persist` persists — `ppq`,
@@ -142,8 +302,36 @@ impl Session {
         self.plugins.clone()
     }
 
+    /// Apply already-committed ops to a SCRATCH session — the version
+    /// graph's replay step (Plan F Task 7).
+    ///
+    /// Deliberately NOT a `transact`: there is nothing to journal (these ops
+    /// are already in the log), nothing to publish (a scratch session has no
+    /// readers), no `rev` to bump (the caller knows which revision it is
+    /// rebuilding) and no effect to execute (each op executed its own when
+    /// it was first committed). The computed inverses and effects are
+    /// discarded for exactly that reason.
+    ///
+    /// ONLY for a session nothing else can see. Applying ops to the LIVE
+    /// document this way would mutate it outside the one door, leaving the
+    /// published image behind and the log with no record.
+    pub(crate) fn apply_replay(&mut self, ops: &[Op]) -> Result<(), String> {
+        let mut discarded = EngineEffect::default();
+        for op in ops {
+            apply_raw(self, op, &mut discarded)?;
+        }
+        Ok(())
+    }
+
     /// The ONLY way to mutate the document. Returns Err and leaves the
     /// session untouched if the closure fails (inverses rolled back).
+    ///
+    /// A panicking closure is contained and the document restored from the
+    /// pre-tx published image — the inverse ledger can be truncated mid-
+    /// apply, so it is not the restore source. Closures must still not
+    /// panic; this only changes the consequence. Restore is from
+    /// `parking_lot` state (no poison). `panic = "abort"` would delete
+    /// containment; `Cargo.toml` sets no such key.
     pub fn transact<F>(this: &parking_lot::Mutex<Session>, meta: TxMeta, f: F) -> Result<Committed, String>
     where
         F: FnOnce(&mut Tx<'_>) -> Result<(), String>,
@@ -154,10 +342,50 @@ impl Session {
             }
             t.set(true);
         });
+        // Drop-based, and STILL LOAD-BEARING after Task 8: containment
+        // returns normally, but a panic in the Ok arm or in the Err arm's
+        // rollback still unwinds past here, and only this resets the flag.
         let _reset = scopeguard(|| IN_TX.with(|t| t.set(false)));
         let mut guard = this.lock();
+        // Taken BEFORE the closure runs: by Task 5's equivalence invariant
+        // this IS the live document, and it is one Arc clone. Reading it
+        // after the catch would rely on no PRODUCTION path publishing during
+        // the closure — true today, but `published_handle()` is `pub` and the
+        // slot behind it is assignable, so that is a property of the callers
+        // rather than of the type. Taking it up front does not depend on it.
+        let pre_tx = guard.published.lock().clone();
         let mut tx = Tx { session: &mut guard, ops: vec![], inverses: vec![], effect: EngineEffect::default() };
-        match f(&mut tx) {
+        // `AssertUnwindSafe` is not a formality here — `tx` holds `&mut
+        // Session`, so nothing in scope is `UnwindSafe` by inference. It is
+        // sound because NO state the closure may have left inconsistent is
+        // ever observed after the catch: `tx` (ops, inverses, effect) is
+        // dropped unread, and the document is overwritten wholesale from
+        // `pre_tx` before this function returns — under the SAME lock the
+        // closure ran under, so no other thread can observe the half-mutated
+        // document at all. The window is closed by the mutex, not by luck.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&mut tx)));
+        let closure_result = match outcome {
+            Ok(r) => r,
+            Err(payload) => {
+                let what = panic_payload_str(payload.as_ref());
+                drop(tx);
+                // `rev`/`epoch` are untouched: they advance only in the Ok
+                // arm, so no revision is consumed and no `Committed` exists
+                // — journal, history and the version graph all take their
+                // work from a `Committed` and therefore record nothing.
+                // Not total in one place, by design: `plugins.dirty_state`
+                // entries a half-applied op set survive, because they
+                // describe the live persistence relationship rather than
+                // document content (see `restore_from_snapshot`). The cost
+                // is a redundant state write, never a lost one.
+                guard.restore_from_snapshot(&pre_tx);
+                log::error!(
+                    "transact: closure panicked; document restored — this is a bug in the caller: {what}"
+                );
+                return Err(format!("transaction panicked: {what}"));
+            }
+        };
+        match closure_result {
             Ok(()) => {
                 let (ops, inverses, effect) = (tx.ops, tx.inverses, tx.effect);
                 // Commit-time fold (round-2 §4): multiple property-addressed
@@ -167,10 +395,26 @@ impl Session {
                 let (ops, mut inverses) = fold_ops(ops, inverses);
                 inverses.reverse();
                 guard.rev += 1;
+                // Plan F Task 5: capture + publish INSIDE this same lock —
+                // the published image is never behind the live document at
+                // any lock release. Transient batches capture too (the
+                // engine's rebuild must see transport/sample-rate mirrors);
+                // their changeset is tiny by construction.
+                let changed = ChangeSet::from_ops(&ops);
+                let (snapshot, snapshot_charge) = guard.capture_and_publish(&changed);
                 // `epoch` is captured under this SAME lock, alongside `rev`
                 // — see `Session::epoch`'s doc for why `execute_persist`
                 // needs this to detect an interleaved document swap.
-                Ok(Committed { rev: guard.rev, epoch: guard.epoch, ops, inverses, effect, meta })
+                Ok(Committed {
+                    rev: guard.rev,
+                    epoch: guard.epoch,
+                    ops,
+                    inverses,
+                    effect,
+                    meta,
+                    snapshot,
+                    snapshot_charge,
+                })
             }
             Err(e) => {
                 // Rollback: run collected inverses in reverse — the same
@@ -192,6 +436,21 @@ impl Session {
 
 thread_local! {
     static IN_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Best-effort text for a caught panic payload. `panic!("literal")` boxes a
+/// `&'static str` and `panic!("{x}")` a `String`; anything else arrives via
+/// `panic_any` and is unreadable. Total by construction — the containment
+/// path must never itself panic, which is exactly what a
+/// `downcast::<String>().unwrap()` here would do.
+fn panic_payload_str(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    format!("<opaque panic payload: {:?}>", payload.type_id())
 }
 
 pub struct Tx<'s> {
@@ -229,6 +488,18 @@ impl Tx<'_> {
     /// Same as [`Tx::store`], for the MIDI store.
     pub fn midi(&self) -> &MidiStore {
         &self.session.midi
+    }
+
+    /// The document epoch this transaction runs under — read inside the
+    /// closure, under the SAME lock `apply` writes through, so an undo can
+    /// refuse to apply an entry popped under a DIFFERENT document (C-1
+    /// residual, `ControlPlane::commit_replay`). Read-only, like
+    /// [`Tx::store`]/[`Tx::midi`], and for the same TOCTOU reason: reading
+    /// `session.epoch` through a separate lock outside the closure leaves
+    /// exactly the window the check exists to close — an epoch function can
+    /// swap the document between that read and this transaction's writes.
+    pub fn epoch(&self) -> u64 {
+        self.session.epoch
     }
 }
 
@@ -357,6 +628,12 @@ pub struct Committed {
     pub inverses: Vec<Op>, // reverse order, ready to apply
     pub effect: EngineEffect,
     pub meta: TxMeta,
+    /// The image captured under the SAME lock as `rev`/`epoch` (Plan F
+    /// Task 5) — the exact published document this batch produced.
+    pub snapshot: Arc<SessionSnapshot>,
+    /// `charge_of` for this batch (own-created bytes) — Task 7 classifies
+    /// on it.
+    pub snapshot_charge: usize,
 }
 
 /// Applies `op` to `session`, returning the computed inverse, and folds its
@@ -1175,6 +1452,8 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::TransportState
         | PropPath::LoopEnabled
         | PropPath::LoopStartSamples
@@ -1233,6 +1512,8 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::TransportState
         | PropPath::LoopEnabled
         | PropPath::LoopStartSamples
@@ -1257,6 +1538,8 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         PropPath::TimelineStartTicks => Ok(serde_json::json!(c.timeline_start_ticks)),
         PropPath::LengthTicks => Ok(serde_json::json!(c.length_ticks)),
         PropPath::ContentLengthTicks => Ok(serde_json::json!(c.content_length_ticks)),
+        PropPath::TransposeSemitones => Ok(serde_json::json!(c.transpose_semitones)),
+        PropPath::VelocityOffset => Ok(serde_json::json!(c.velocity_offset)),
         PropPath::Gain
         | PropPath::Pan
         | PropPath::Muted
@@ -1319,6 +1602,18 @@ fn write_midi_prop(
             c.content_length_ticks = v;
             Ok(serde_json::json!(c.content_length_ticks))
         }
+        PropPath::TransposeSemitones => {
+            let v = to.as_i64().ok_or("transposeSemitones: expected an integer")?;
+            let v = i16::try_from(v).map_err(|_| "transposeSemitones: out of i16 range")?;
+            c.transpose_semitones = v;
+            Ok(serde_json::json!(c.transpose_semitones))
+        }
+        PropPath::VelocityOffset => {
+            let v = to.as_i64().ok_or("velocityOffset: expected an integer")?;
+            let v = i16::try_from(v).map_err(|_| "velocityOffset: out of i16 range")?;
+            c.velocity_offset = v;
+            Ok(serde_json::json!(c.velocity_offset))
+        }
         PropPath::Gain
         | PropPath::Pan
         | PropPath::Muted
@@ -1368,6 +1663,8 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -1438,6 +1735,8 @@ fn write_transport_prop(
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -1731,6 +2030,148 @@ mod tests {
     }
 
     #[test]
+    fn a_panicking_closure_leaves_the_document_and_the_channel_untouched() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let (gain_before, rev_before) = { let g = m.lock(); (g.store.tracks[0].gain_db, g.rev()) };
+
+        let r = Session::transact(&m, TxMeta::user("panics"), |tx| {
+            tx.apply(set_gain("t-1", -12.0))?;
+            assert_eq!(tx.store().tracks[0].gain_db, -12.0, "the op really landed before the panic");
+            panic!("mid-transaction bug");
+        });
+
+        let e = match r { Err(e) => e, Ok(_) => panic!("a panicking closure must return Err, not unwind out of transact") };
+        assert!(e.contains("panicked"), "error must name the panic, got {e:?}");
+        assert!(e.contains("mid-transaction bug"), "error must carry the payload, got {e:?}");
+
+        let g = m.lock();
+        assert_eq!(g.store.tracks[0].gain_db, gain_before, "document restored (L-5)");
+        assert_eq!(g.rev(), rev_before, "a panicking tx must not consume a revision");
+        drop(g);
+
+        // IN_TX was reset and the session mutex is usable: the channel still
+        // takes work. A stuck IN_TX would panic here instead of committing.
+        Session::transact(&m, TxMeta::user("after"), |tx| tx.apply(set_gain("t-1", -3.0)))
+            .expect("the channel still works after a contained panic");
+        assert_eq!(m.lock().store.tracks[0].gain_db, -3.0);
+    }
+
+    #[test]
+    fn a_panic_mid_batch_reverts_every_op_and_leaves_the_published_image_equal() {
+        // Covers ALL SIX document field families a `transact` closure can
+        // reach — tracks, clips, midi clips, transport, tempo/meter and
+        // automation — because "the restore is total" is this task's
+        // load-bearing claim and each family is a separate line in
+        // `restore_from_snapshot` that can be dropped independently.
+        // (`project_dir`/`project_name`/`created_at` are the remaining
+        // three: no op writes them, so a closure cannot half-apply them and
+        // there is nothing here for a test to pin.)
+        let mut s = session_with_one_track("t-1");
+        s.store.tracks.push(test_track("t-2"));
+        s.midi.clips.push(test_midi_clip("mc-keep", "t-1"));
+        s.automation.lanes.push(test_lane("a-keep", vec![AutomationPoint { tick: 0, value: 0.25 }]));
+        s.republish_full();
+        let m = parking_lot::Mutex::new(s);
+        let before = {
+            let g = m.lock();
+            (
+                g.store.tracks.clone(),
+                g.store.clips.clone(),
+                g.midi.clips.clone(),
+                serde_json::to_value(&g.store.transport).unwrap(),
+                (g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()),
+                g.automation.lanes.clone(),
+            )
+        };
+        let t2 = m.lock().store.tracks[1].clone();
+        let published = m.lock().published_handle();
+
+        let r = Session::transact(&m, TxMeta::user("six ops then die"), |tx| {
+            tx.apply(set_gain("t-1", -20.0))?;
+            tx.apply(Op::TrackRemove { track: t2.clone(), index: 1, clips: vec![], clip_indices: vec![] })?;
+            tx.apply(Op::MidiClipAdd { clip: test_midi_clip("mc-new", "t-1"), index: 1 })?;
+            tx.apply(Op::Set {
+                object: ObjectRef::Transport,
+                path: PropPath::LoopEnabled,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(true),
+            })?;
+            tx.apply(Op::TempoSet {
+                ppq: 480,
+                events: vec![crate::midi::types::TempoEvent { tick: 0, bpm: 143.0 }],
+                meter: vec![crate::midi::types::MeterEvent { tick: 0, num: 7, den: 8 }],
+            })?;
+            tx.apply(Op::AutomationSetLane {
+                key: "a-keep".into(),
+                lane: Some(test_lane("a-keep", vec![AutomationPoint { tick: 960, value: 0.9 }])),
+            })?;
+            // Nothing half-mutated is EVER published: the lock-free engine
+            // reader (Task 6) sees only the pre-transaction image until the
+            // Ok arm's capture. Both halves are asserted so the comparison
+            // cannot be a value against itself.
+            let image = published.lock().clone();
+            assert_eq!(image.tracks.len(), 2, "published image still pre-tx");
+            assert_eq!(image.tracks[0].gain_db, 1.0, "published image still pre-tx");
+            assert_eq!(tx.store().tracks.len(), 1, "…while the LIVE document is mid-batch");
+            assert_eq!(tx.store().tracks[0].gain_db, -20.0, "…while the LIVE document is mid-batch");
+            assert!(!image.transport.loop_enabled, "published transport still pre-tx");
+            assert!(tx.store().transport.loop_enabled, "…while the LIVE transport is mid-batch");
+            panic!("after six ops, one structural");
+        });
+        assert!(matches!(&r, Err(e) if e.contains("panicked")), "must be contained as Err");
+
+        let g = m.lock();
+        assert_eq!(g.store.tracks, before.0, "the property op AND the structural op both reverted");
+        assert_eq!(g.store.clips, before.1);
+        assert_eq!(g.midi.clips, before.2, "the midi store reverted too");
+        assert_eq!(
+            serde_json::to_value(&g.store.transport).unwrap(),
+            before.3,
+            "transport reverted (Task 11 must not break this)",
+        );
+        assert_eq!(
+            (g.midi.ppq, g.midi.tempo_events.clone(), g.midi.meter_events.clone()),
+            before.4,
+            "tempo and meter reverted",
+        );
+        assert_eq!(g.automation.lanes, before.5, "automation lanes reverted");
+        // Equivalence (Task 5) is restored before the lock releases.
+        let image = published.lock().clone();
+        assert_eq!(image.tracks.as_ref(), &g.store.tracks, "published image equals the live document");
+        assert_eq!(image.clips.as_ref(), &g.store.clips);
+        assert_eq!(
+            image.midi.clips.iter().map(|c| (**c).clone()).collect::<Vec<_>>(),
+            g.midi.clips,
+            "published midi equals the live midi",
+        );
+        assert_eq!(
+            serde_json::to_value(&image.transport).unwrap(),
+            serde_json::to_value(&g.store.transport).unwrap(),
+            "published transport equals the live transport",
+        );
+        assert_eq!(image.automation.as_ref(), &g.automation.lanes, "published automation equals the live lanes");
+        assert_eq!(image.midi.tempo_events.as_ref(), &g.midi.tempo_events);
+        assert_eq!(image.midi.meter_events.as_ref(), &g.midi.meter_events);
+        assert_eq!(image.rev, g.rev(), "the image claims the rev that is actually live");
+    }
+
+    #[test]
+    fn a_non_string_panic_payload_is_reported_and_still_restores() {
+        // `panic_any` with a foreign payload: the containment path must not
+        // itself panic trying to read it (a `downcast::<String>().unwrap()`
+        // would turn a caller bug into the abort this task exists to avoid).
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let r = Session::transact(&m, TxMeta::user("exotic"), |tx| {
+            tx.apply(set_gain("t-1", -30.0))?;
+            std::panic::panic_any(42u32);
+        });
+        let e = match r { Err(e) => e, Ok(_) => panic!("must be contained") };
+        assert!(e.contains("panicked"), "got {e:?}");
+        assert_eq!(m.lock().store.tracks[0].gain_db, 1.0, "restored despite an unreadable payload");
+        Session::transact(&m, TxMeta::user("after"), |_| Ok(())).expect("channel still open");
+    }
+
+    #[test]
     fn remove_then_inverse_restores_row_byte_identically() {
         let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
         let row = m.lock().store.tracks[0].clone();
@@ -1792,14 +2233,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "nested transact")]
-    fn nested_transact_panics_not_deadlocks() {
+    fn nested_transact_fails_loudly_and_does_not_deadlock() {
+        // The nested guard still panics rather than re-locking (which would
+        // deadlock on the non-reentrant session mutex). Since Task 8 the
+        // OUTER transact catches it, so the caller gets a loud Err instead
+        // of a dead process — the property under test is unchanged, its
+        // consequence is not.
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
         let meta = TxMeta { actor: Actor::User, run: "r".into(), label: "outer".into(), transient: false };
-        let _ = Session::transact(&m, meta.clone(), |_tx| {
+        let r = Session::transact(&m, meta.clone(), |_tx| {
             let _ = Session::transact(&m, meta.clone(), |_| Ok(()));
             Ok(())
         });
+        assert!(
+            matches!(&r, Err(e) if e.contains("panicked") && e.contains("nested transact")),
+            "nested transact must surface as a contained Err naming itself",
+        );
+        Session::transact(&m, meta, |_| Ok(())).expect("channel still open");
     }
 
     #[test]
@@ -1972,6 +2422,8 @@ mod tests {
             content_id: ContentId::mint(),
             lane_id: LaneId::default_for_track(track_id),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 
@@ -3184,5 +3636,48 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.lock().plugins.state_rev.get("p-1"), Some(&2), "undo needs a fresh node too");
+    }
+
+    #[test]
+    fn a_panic_after_a_plugin_state_write_rolls_the_blob_back_and_republishes_the_bumped_rev() {
+        // The one case where a contained panic does NOT leave the live
+        // document byte-identical to the pre-transaction image: rolling a
+        // state blob back retires the live plugin node, and `state_rev`
+        // only ever moves FORWARD. So the restore leaves a document the
+        // image does not describe, and MUST republish.
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        {
+            let mut g = m.lock();
+            g.plugins.instances.push(test_plugin_row("p-1"));
+            g.plugins.pending_state.insert("p-1".into(), vec![0u8, 0, 0]);
+            g.plugins.state_rev.insert("p-1".into(), 7);
+            g.republish_full();
+        }
+        let published = m.lock().published_handle();
+
+        let r = Session::transact(&m, TxMeta::user("load patch then die"), |tx| {
+            tx.apply(Op::PluginSetState { instance: "p-1".into(), state: vec![9u8, 9, 9, 9] })?;
+            panic!("host went away mid-load");
+        });
+        assert!(matches!(&r, Err(e) if e.contains("panicked")), "must be contained");
+
+        let g = m.lock();
+        assert_eq!(
+            g.plugins.pending_state.get("p-1"),
+            Some(&vec![0u8, 0, 0]),
+            "the blob rolled back to the pre-transaction one",
+        );
+        assert_eq!(
+            g.plugins.state_rev.get("p-1"),
+            Some(&9),
+            "forward-only, once per blob CHANGE: 7 -> 8 for the write, 8 -> 9 for the rollback",
+        );
+        let image = published.lock().clone();
+        assert_eq!(
+            image.plugins.state_rev.get("p-1"),
+            Some(&9),
+            "and the published image carries it — a restore that skips the republish leaves 7 here",
+        );
+        assert_eq!(image.plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
     }
 }

@@ -567,14 +567,9 @@ fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream()
     let after_swap = journal_lines(&dir).len();
 
     // ...and only now does the overtaken commit reach the sink.
-    f.log.record_commit(
-        committed.rev,
-        stale_epoch,
-        &committed.meta,
-        &committed.ops,
-        &committed.inverses,
-        aura_lib::control::HistoryMode::Record,
-    );
+    let versions_after_swap = f.log.version_stats();
+    assert_eq!(versions_after_swap.nodes, 0, "the swap drained the version graph too");
+    f.log.record_commit(&committed, aura_lib::control::HistoryMode::Record);
     assert_eq!(
         f.log.depths(),
         (0, 0),
@@ -586,16 +581,17 @@ fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream()
         "a stale-epoch commit must not write a line into the NEW document's journal"
     );
 
-    // The gesture sink is the same sink and gets the same guard.
-    f.log.record_gesture(
-        committed.rev,
-        stale_epoch,
-        &committed.meta,
-        &committed.ops,
-        &committed.inverses,
+    assert_eq!(
+        f.log.version_stats(),
+        versions_after_swap,
+        "...nor a version node onto the NEW document's chain"
     );
+
+    // The gesture sink is the same sink and gets the same guard.
+    f.log.record_gesture(&committed);
     assert_eq!(f.log.depths(), (0, 0), "same for a gesture batch");
     assert_eq!(journal_lines(&dir).len(), after_swap, "same for a gesture batch");
+    assert_eq!(f.log.version_stats(), versions_after_swap, "same for a gesture batch");
 
     // The guard is a stale-epoch guard, not a mute button: a commit at the
     // LIVE epoch still records, in both streams.
@@ -610,6 +606,67 @@ fn a_commit_whose_sink_call_lands_after_a_document_swap_reaches_neither_stream()
     assert!(live.epoch > stale_epoch, "the swap really did move the epoch");
     assert_eq!(f.log.depths(), (1, 0), "the live document still records normally");
     assert_eq!(journal_lines(&dir).len(), after_swap + 1);
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// M-4: Ctrl+Z with the pointer still down. `undo` used to go straight to
+/// the history stacks, so the open gesture's folded (transient, un-recorded)
+/// writes were invisible to it: the undo skipped past the whole drag to the
+/// step BEFORE it, and the drag's own value then landed as a separate step
+/// whenever the pointer finally came up. `undo` now closes the gesture
+/// first (F-7's auto-close, the same one `gesture_begin` uses), so the drag
+/// is a finished, undoable step by the time the pop happens.
+#[test]
+fn undo_mid_gesture_closes_the_gesture_first_and_undoes_its_fold() {
+    let f = fixture();
+    let parent = tmp_parent("undo-mid-gesture");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let t = add_track(&f.cp, "Audio");
+    let (undo_before, _) = f.log.depths();
+
+    f.cp.gesture_begin("fader".into()).unwrap();
+    for db in [-2.0, -4.0, -8.0] {
+        f.cp.set_track_mix(
+            vec![TrackMixChange { track_id: t.clone(), gain_db: Some(db), ..TrackMixChange::new(t.clone()) }],
+            TxMeta::user("set track gain"),
+        )
+        .unwrap();
+    }
+    assert_eq!(gain_of(&f.cp, &t), -8.0);
+    assert_eq!(
+        f.log.depths().0,
+        undo_before,
+        "mid-gesture folds are transient — the drag is not yet a history step"
+    );
+
+    // Ctrl+Z, pointer still down.
+    let label = f.cp.undo().unwrap();
+    assert_eq!(label.as_deref(), Some("fader"), "the undo consumed the GESTURE's own step");
+    assert_eq!(gain_of(&f.cp, &t), 0.0, "the gain is back at its pre-gesture baseline");
+    assert_eq!(
+        f.log.depths(),
+        (undo_before, 1),
+        "exactly ONE entry was created by the close and consumed by the undo"
+    );
+
+    // The gesture really is closed: the next mix commit is its OWN history
+    // step, not another fold into a still-open gesture.
+    f.cp.set_track_mix(
+        vec![TrackMixChange { track_id: t.clone(), gain_db: Some(-1.0), ..TrackMixChange::new(t.clone()) }],
+        TxMeta::user("set track gain"),
+    )
+    .unwrap();
+    assert_eq!(
+        f.log.depths(),
+        (undo_before + 1, 0),
+        "a fresh, non-transient edit — so the gesture was closed, not left open"
+    );
+
+    // A late pointerup is still the no-op it always was.
+    f.cp.gesture_end().unwrap();
+    assert_eq!(f.log.depths(), (undo_before + 1, 0), "the trailing gesture_end changes nothing");
 
     f.eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);

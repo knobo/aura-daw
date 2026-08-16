@@ -14,8 +14,10 @@
 //! STATE (voices, plugin instances) survives graph swaps because successive
 //! snapshots share the node cell through [`LiveNodeRegistry`].
 //!
-//! `engine.rs::rebuild` holds the session lock directly (store + midi behind
-//! one guard) and calls [`append_from`] with both fields; everything else
+//! `engine.rs::rebuild` calls [`append_from`] with a published
+//! [`MidiSnapshot`] and that same image's track list, holding NO session
+//! lock (Plan F Task 6 — CORRECTION to this doc's previous claim that it
+//! "holds the session lock directly", ADR 0007); everything else
 //! lives here. Cross-cutting callers that don't already hold a session
 //! handle (e.g. [`super::notify_project_opened`]) reach it through a
 //! process-global registered by `MidiState::shared()` during app setup
@@ -30,13 +32,14 @@ use crate::audio::dsp::LiveInstrument;
 use crate::audio::rt::{LiveNodeCell, LiveSource, RtTrack, MAX_LIVE_BLOCK};
 use crate::audio::sampler::SamplerBank;
 use crate::audio::sampler_engine::SamplerNode;
-use crate::audio::types::{Store, TrackState};
+use crate::audio::types::TrackState;
+use crate::control::snapshot::MidiSnapshot;
 use crate::control::Session;
 
 use super::schedule::{self, AbsNoteEvent};
 use super::synth::PolySynth;
 use super::tempo::TempoMap;
-use super::MidiStore;
+use super::types::MidiClip;
 
 use crate::audio::dsp::AudioProcessor;
 
@@ -132,16 +135,20 @@ impl LiveNodeRegistry {
 // ---------------------------------------------------------------------------
 
 /// Core of the engine's `rebuild` live-track step (called from
-/// `audio::engine::Control::rebuild` with the session lock held, on the
-/// engine control thread — never the RT thread). Appends one live `RtTrack`
-/// per audible midi track. `bank` = None means "no sampler instruments
-/// available" (instrument-bound tracks fall back to PolySynth). `slots` is
-/// the CURRENT rebuild's derived slot map (round-2 §2.4,
-/// `types::derive_slots`) — every mixer track has an entry. Automation
-/// tracks are absent by design (no slot); midi rows are never that kind.
+/// `audio::engine::Control::rebuild` on the engine control thread — never
+/// the RT thread, and since Plan F Task 6 with NO session lock held: the
+/// document arrives as an immutable published image). Appends one live
+/// `RtTrack` per audible midi track. `bank` = None means "no sampler
+/// instruments available" (instrument-bound tracks fall back to PolySynth).
+/// `slots` is the slot map derived from the SAME image as `tracks`
+/// (round-2 §2.4, `types::derive_slots`). Automation tracks are absent by
+/// design (no slot). A freeze return is an audio clip on the same MIDI
+/// track — those rows skip the internal instrument so the take is not doubled.
+#[allow(clippy::too_many_arguments)]
 pub fn append_from(
-    midi: &MidiStore,
-    store: &Store,
+    midi: &MidiSnapshot,
+    tracks: &[TrackState],
+    audio_clips: &[crate::audio::types::Clip],
     plugins: &crate::control::session::PluginDoc,
     slots: &HashMap<crate::ids::TrackId, usize>,
     rate: u32,
@@ -151,17 +158,17 @@ pub fn append_from(
 ) {
     let mut live_ids: HashSet<String> = HashSet::new();
     if rate != 0 && !midi.clips.is_empty() {
-        match TempoMap::new(midi.ppq, midi.tempo_events.clone(), rate) {
+        match TempoMap::new(midi.ppq, (*midi.tempo_events).clone(), rate) {
             Ok(map) => {
-                for t in store.tracks.iter().filter(|t| t.kind == "midi") {
+                for t in tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = slots.get(&t.id) else { continue };
                     // A freeze return is an audio clip on this MIDI track.
                     // Playing the internal instrument on top of it would
                     // double the take (and track-mute would silence both).
-                    if store.clips.iter().any(|c| c.track_id == t.id) {
+                    if audio_clips.iter().any(|c| c.track_id == t.id) {
                         continue;
                     }
-                    let events = track_events(midi, t.id.as_str(), &map);
+                    let events = track_events(midi.clips.iter().map(|c| &**c), t.id.as_str(), &map);
                     if events.is_empty() {
                         continue;
                     }
@@ -189,8 +196,9 @@ pub fn append_from(
 /// `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn append_from_with_input(
-    midi: &MidiStore,
-    store: &Store,
+    midi: &MidiSnapshot,
+    tracks: &[TrackState],
+    audio_clips: &[crate::audio::types::Clip],
     plugins: &crate::control::session::PluginDoc,
     slots: &HashMap<crate::ids::TrackId, usize>,
     rate: u32,
@@ -201,17 +209,17 @@ pub fn append_from_with_input(
 ) {
     let mut live_ids: HashSet<String> = HashSet::new();
     if rate != 0 && !midi.clips.is_empty() {
-        match TempoMap::new(midi.ppq, midi.tempo_events.clone(), rate) {
+        match TempoMap::new(midi.ppq, (*midi.tempo_events).clone(), rate) {
             Ok(map) => {
-                for t in store.tracks.iter().filter(|t| t.kind == "midi") {
+                for t in tracks.iter().filter(|t| t.kind == "midi") {
                     let Some(&slot) = slots.get(&t.id) else { continue };
                     // A freeze return is an audio clip on this MIDI track.
                     // Playing the internal instrument on top of it would
                     // double the take (and track-mute would silence both).
-                    if store.clips.iter().any(|c| c.track_id == t.id) {
+                    if audio_clips.iter().any(|c| c.track_id == t.id) {
                         continue;
                     }
-                    let events = track_events(midi, t.id.as_str(), &map);
+                    let events = track_events(midi.clips.iter().map(|c| &**c), t.id.as_str(), &map);
                     if events.is_empty() {
                         continue;
                     }
@@ -234,12 +242,11 @@ pub fn append_from_with_input(
     // from the clip-driven loop (never push a second `RtTrack` for it).
     if let Some(target_id) = live_in_target {
         if !live_ids.contains(target_id) {
-            if let Some(t) = store
-                .tracks
+            if let Some(t) = tracks
                 .iter()
                 .find(|t| t.id.as_str() == target_id && t.kind == "midi")
             {
-                if store.clips.iter().any(|c| c.track_id == t.id) {
+                if audio_clips.iter().any(|c| c.track_id == t.id) {
                     // Frozen return: no live node to monitor through.
                 } else if let Some(&slot) = slots.get(&t.id) {
                     let node = node_for_track(t, plugins, bank, rate, nodes);
@@ -262,24 +269,33 @@ pub fn append_from_with_input(
 
 /// All of a track's clip notes as absolute-sample note edges, merged and
 /// sorted (offs before ons at equal positions).
-pub fn track_events(midi: &MidiStore, track_id: &str, map: &TempoMap) -> Vec<AbsNoteEvent> {
-    track_events_excluding(midi, track_id, &std::collections::HashSet::new(), map)
+///
+/// Takes the clips as an iterator rather than a document type so the two
+/// shapes a clip list comes in — a live `MidiStore`'s inline `Vec<MidiClip>`
+/// (`midi_out`, under its own try_lock) and a published image's
+/// `Vec<Arc<MidiClip>>` (`append_from`) — both reach it without either side
+/// cloning the list.
+pub fn track_events<'a>(
+    clips: impl IntoIterator<Item = &'a MidiClip>,
+    track_id: &str,
+    map: &TempoMap,
+) -> Vec<AbsNoteEvent> {
+    track_events_excluding(clips, track_id, &HashSet::new(), map)
 }
 
 /// Same as [`track_events`], but skipping any clip whose id is in `exclude`
 /// — used by hardware MIDI-out routing (`midi_out`) so a clip with its own
 /// output override is never ALSO sent out via its track's route (a clip
 /// route always wins; see `midi_out`'s module doc).
-pub fn track_events_excluding(
-    midi: &MidiStore,
+pub fn track_events_excluding<'a>(
+    clips: impl IntoIterator<Item = &'a MidiClip>,
     track_id: &str,
     exclude: &HashSet<String>,
     map: &TempoMap,
 ) -> Vec<AbsNoteEvent> {
     let mut events: Vec<AbsNoteEvent> = Vec::new();
-    for c in midi
-        .clips
-        .iter()
+    for c in clips
+        .into_iter()
         .filter(|c| c.track_id == track_id && !c.notes.is_empty() && !exclude.contains(c.id.as_str()))
     {
         events.extend(schedule::clip_events(c, map));
@@ -306,7 +322,22 @@ fn node_for_track(
             // load has to retire the cached node rather than let it keep
             // rendering the old sound. See `PluginDoc::state_rev`.
             let rev = plugins.state_rev.get(pid).copied().unwrap_or(0);
-            let key = format!("plugin:{pid}@{rate}#{rev}");
+            // ...and so is the row's STATUS, because `live_node_for` branches
+            // on it: a still-"stub" row yields a silent `StubPluginNode`. A
+            // rebuild assembling from an image captured before the
+            // instantiation writeback flipped the row to "active" would
+            // otherwise cache that stub under a key the activation's own
+            // queued rebuild recomputes IDENTICALLY — so the track would stay
+            // silent for the rest of the session, with no rebuild able to
+            // converge it. The window is real and wide (the image is captured
+            // before `ensure_loaded`'s decode; `plugins::state::
+            // adopt_open_project` does its blob I/O with no session lock).
+            let status = plugins
+                .instances
+                .iter()
+                .find(|r| r.id == pid)
+                .map_or("absent", |r| r.status.as_str());
+            let key = format!("plugin:{pid}@{rate}#{rev}!{status}");
             if let Some(cell) = nodes
                 .resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(plugins, pid, rate))
             {
@@ -348,9 +379,10 @@ mod tests {
     use crate::audio::mixer;
     use crate::audio::rt::{ParamTable, RtGraph};
     use crate::audio::transport::LoopSpec;
-    use crate::audio::types::TrackState;
+    use crate::audio::types::{Store, TrackState};
     use crate::ids::NoteId;
-    use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent, DEFAULT_PPQ};
+    use crate::midi::types::{MeterEvent, MidiNote, TempoEvent, DEFAULT_PPQ};
+    use crate::midi::MidiStore;
 
     fn midi_store_with(clips: Vec<MidiClip>) -> MidiStore {
         MidiStore {
@@ -390,6 +422,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 
@@ -434,7 +468,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 1, "only the midi track renders");
         assert_eq!(out[0].slot, slots["m1"]);
         let live = out[0].live.as_ref().expect("live source attached");
@@ -461,7 +495,7 @@ mod tests {
         let midi = midi_store_with(vec![]); // brand-new project: nothing to play
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from_with_input(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out, Some("m1"));
+        append_from_with_input(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out, Some("m1"));
         assert_eq!(out.len(), 1, "the monitored track renders live with no clips");
         assert!(out[0].live.as_ref().unwrap().events.is_empty());
         assert_eq!(nodes.key_of("m1"), Some("synth@48000"));
@@ -478,7 +512,7 @@ mod tests {
         ])]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from_with_input(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out, Some("m1"));
+        append_from_with_input(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out, Some("m1"));
         assert_eq!(out.len(), 1, "one RtTrack per track, never two");
         assert!(!out[0].live.as_ref().unwrap().events.is_empty(), "scheduled events survive");
     }
@@ -492,7 +526,7 @@ mod tests {
         for target in [Some("a1"), Some("ghost"), None] {
             let mut nodes = LiveNodeRegistry::default();
             let mut out = Vec::new();
-            append_from_with_input(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out, target);
+            append_from_with_input(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out, target);
             assert!(out.is_empty(), "target {target:?} must not create a live track");
         }
     }
@@ -509,7 +543,7 @@ mod tests {
         ]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert!(out.is_empty());
         assert!(nodes.is_empty(), "no nodes retained for non-live tracks");
     }
@@ -525,13 +559,13 @@ mod tests {
         ]);
         let overridden = midi.clips[1].id.to_string();
 
-        let all = track_events(&midi, "m1", &TempoMap::from_v1(120.0, 48_000).unwrap());
+        let all = track_events(midi.clips.iter(), "m1", &TempoMap::from_v1(120.0, 48_000).unwrap());
         assert!(all.iter().any(|e| e.key == 60), "both clips present without exclusion");
         assert!(all.iter().any(|e| e.key == 62));
 
         let mut exclude = HashSet::new();
         exclude.insert(overridden);
-        let filtered = track_events_excluding(&midi, "m1", &exclude, &TempoMap::from_v1(120.0, 48_000).unwrap());
+        let filtered = track_events_excluding(midi.clips.iter(), "m1", &exclude, &TempoMap::from_v1(120.0, 48_000).unwrap());
         assert!(filtered.iter().any(|e| e.key == 60), "the non-overridden clip's notes still come through");
         assert!(!filtered.iter().any(|e| e.key == 62), "the overridden clip's notes are excluded");
     }
@@ -551,23 +585,23 @@ mod tests {
         )]);
         let mut nodes = LiveNodeRegistry::default();
         let mut out1 = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out1);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out1);
         let cell1 = out1[0].live.as_ref().unwrap().node.clone();
         let mut out2 = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out2);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out2);
         let cell2 = out2[0].live.as_ref().unwrap().node.clone();
         assert!(Arc::ptr_eq(&cell1, &cell2), "rebuild reuses the same node");
 
         // Rate change -> new key -> new node.
         let mut out3 = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 44_100, None, &mut nodes, &mut out3);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 44_100, None, &mut nodes, &mut out3);
         let cell3 = out3[0].live.as_ref().unwrap().node.clone();
         assert!(!Arc::ptr_eq(&cell1, &cell3), "rate change replaces the node");
 
         // Track gone -> registry pruned.
         let empty = midi_store_with(vec![]);
         let mut out4 = Vec::new();
-        append_from(&empty, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out4);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&empty), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out4);
         assert!(out4.is_empty());
         assert!(nodes.is_empty(), "stale nodes pruned");
     }
@@ -616,7 +650,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(nodes.key_of("sampled"), Some("sampler:inst-330@48000"));
         assert_eq!(nodes.key_of("fallback"), Some("synth@48000"));
@@ -663,7 +697,7 @@ mod tests {
             let bank = SamplerBank::default();
             let mut nodes = LiveNodeRegistry::default();
             let mut out = Vec::new();
-            append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
+            append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
             assert_eq!(out.len(), 1, "track still renders ({id})");
             let mono = mono_of(&render_graph(out, 24_000, RATE));
             let f = estimate_freq(&mono[1000..20_000], RATE, 100.0, 800.0);
@@ -749,7 +783,7 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, RATE, Some(&bank), &mut nodes, &mut out);
         assert_eq!(out.len(), 1);
         let live = out[0].live.as_ref().unwrap();
         assert_eq!(live.events[0].sample, 24_000, "tick placement preserved");
@@ -801,23 +835,81 @@ mod tests {
 
         let mut nodes = LiveNodeRegistry::default();
         let mut out = Vec::new();
-        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut out);
-        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0"));
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0!stub"));
 
         // Rebuilding with the SAME revision reuses the node (instantiation is
         // expensive — that reuse is the whole point of the registry).
         out.clear();
-        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut out);
-        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0"), "no needless rebuild");
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        assert_eq!(nodes.key_of("m1"), Some("plugin:zyn-1@48000#0!stub"), "no needless rebuild");
 
         // A patch load bumps the instance's state revision (Op::PluginSetState).
         doc.state_rev.insert("zyn-1".into(), 1);
         out.clear();
-        append_from(&midi, &store, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, RATE, None, &mut nodes, &mut out);
         assert_eq!(
             nodes.key_of("m1"),
-            Some("plugin:zyn-1@48000#1"),
+            Some("plugin:zyn-1@48000#1!stub"),
             "the node is rebuilt, so the loaded patch reaches the RT instance"
+        );
+    }
+
+    /// THE CONVERGENCE CASE (Task 6 review). Phase 1 of a rebuild reads the
+    /// published image with no session lock, so it can assemble from a
+    /// document captured BEFORE `apply_instantiate_writeback` flipped the
+    /// instance row from "stub" to "active" — caching the silent stub node.
+    /// The activation queues its own rebuild to fix that; if `status` is not
+    /// in the key, that rebuild computes the same key and gets the SAME stub
+    /// back out of the cache, and the track is silent for the rest of the
+    /// session. No later rebuild can converge it, because convergence is
+    /// exactly what the cache defeats.
+    #[test]
+    fn an_activation_retires_the_stub_node_the_pre_activation_rebuild_cached() {
+        const RATE: u32 = 48_000;
+        let mut store = Store::default();
+        let mut t = track("m1", "midi");
+        t.instrument_id = Some("plugin:zyn-1".into());
+        store.tracks.push(t);
+        let slots = crate::audio::types::derive_slots(&store.tracks);
+        let midi = midi_store_with(vec![clip(
+            "m1",
+            0,
+            960,
+            vec![MidiNote { tick: 0, length_ticks: 960, key: 69, velocity: 100, channel: 0, note_id: NoteId(0) }],
+        )]);
+        let mut doc = crate::control::session::PluginDoc::default();
+        doc.instances.push(crate::plugins::descriptor::PluginInstanceInfo {
+            id: "zyn-1".into(),
+            uid: "lv2:http://zynaddsubfx.sourceforge.net".into(),
+            name: "ZynAddSubFX".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: Some("m1".into()),
+        });
+
+        // Rebuild 1: from the PRE-activation image — a silent stub.
+        let mut nodes = LiveNodeRegistry::default();
+        let mut out = Vec::new();
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        let stub_key = nodes.key_of("m1").unwrap().to_string();
+        let stub_node = Arc::as_ptr(&out[0].live.as_ref().expect("a live node").node);
+        assert!(stub_key.starts_with("plugin:zyn-1@"), "the stub row really resolved to a plugin node");
+
+        // The writeback lands: the row is active. The rebuild it queues must
+        // NOT be served the cached stub.
+        doc.instances[0].status = "active".into();
+        out.clear();
+        append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, RATE, None, &mut nodes, &mut out);
+        assert_ne!(
+            nodes.key_of("m1"),
+            Some(stub_key.as_str()),
+            "an activation must retire the cached stub, not re-key onto it"
+        );
+        assert_ne!(
+            Arc::as_ptr(&out[0].live.as_ref().expect("a live node").node),
+            stub_node,
+            "the track must get a DIFFERENT node — the same Arc back is the silent-forever bug"
         );
     }
 }

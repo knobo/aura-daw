@@ -139,7 +139,17 @@ pub fn build_graph(
     // Midi tracks as LIVE instrument nodes — a private registry, so the
     // cells are fresh (deterministic voice state) and exclusively ours.
     let mut nodes = LiveNodeRegistry::default();
-    append_from(midi, store, plugins, &slots, rate, bank, &mut nodes, &mut tracks);
+    append_from(
+        &crate::control::snapshot::MidiSnapshot::from_store(midi),
+        &store.tracks,
+        &store.clips,
+        plugins,
+        &slots,
+        rate,
+        bank,
+        &mut nodes,
+        &mut tracks,
+    );
 
     let end_samples = song_end(&tracks);
     let mut graph = RtGraph::new(tracks, 0, params);
@@ -366,6 +376,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("m1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             }],
             loaded_dir: None,
             dirty: false,
@@ -1017,6 +1029,8 @@ mod tests {
             content_id: "con".into(),
             lane_id: crate::ids::LaneId::default_for_track("a1"),
             content_length_ticks: Some(PERIOD),
+            transpose_semitones: 0,
+            velocity_offset: 0,
         });
         let mut modulation = ModulationDoc::default();
         modulation.curves.push(Curve {

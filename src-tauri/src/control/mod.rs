@@ -21,8 +21,11 @@ pub mod export;
 pub mod history;
 pub mod op;
 pub mod ops;
+pub mod replay;
 pub mod loopjam;
 pub mod session;
+pub mod snapshot;
+pub mod vergraph;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
@@ -41,6 +44,8 @@ use crate::sidecars::jobs::{EventSink, JobManager};
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
 pub use ops::TrackMixChange;
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
+pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
+pub use vergraph::{VersionGraph, VersionNode, VersionStats};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -182,6 +187,10 @@ pub struct ControlPlane {
     /// have this unset and the MIDI-out routing/port/clock methods error
     /// rather than panic.
     midi_out: std::sync::OnceLock<Arc<crate::midi_out::MidiOut>>,
+    /// Serializes undo/redo pop→commit→push. `spawn_blocking` lets two
+    /// Ctrl+Z keydowns run at once; without this gate they can pop two
+    /// entries and apply inverses out of order (I-6).
+    history_gate: Mutex<()>,
 }
 
 /// The commit core, shareable with the engine control thread (Plan E Task
@@ -484,6 +493,8 @@ impl Committer {
                     | op::PropPath::TimelineStartTicks
                     | op::PropPath::LengthTicks
                     | op::PropPath::ContentLengthTicks
+                    | op::PropPath::TransposeSemitones
+                    | op::PropPath::VelocityOffset
                     | op::PropPath::TransportState
                     | op::PropPath::LoopEnabled
                     | op::PropPath::LoopStartSamples
@@ -532,14 +543,7 @@ impl Committer {
         // outcome, and it must produce neither a phantom undo step nor an
         // empty journal line.
         if !committed.meta.transient {
-            self.log.record_commit(
-                committed.rev,
-                committed.epoch,
-                &committed.meta,
-                &committed.ops,
-                &committed.inverses,
-                history_mode,
-            );
+            self.log.record_commit(&committed, history_mode);
         }
         // Full-Project payload (the frozen contract) + rev/label/actor as
         // additive fields (D-06). `project_changed_payload` serializes to a
@@ -589,10 +593,13 @@ impl Committer {
     /// snapshot this fn would take belongs to a DIFFERENT document than the
     /// one `p` describes; persisting it would be silent data loss either way
     /// (corrupting the new document, or dropping this commit's edit — see
-    /// `Session::epoch`'s doc). Direct test callers of this fn (that don't
-    /// go through `commit_with_rebuild`) should pass the session's current
-    /// epoch.
+    /// `Session::epoch`'s doc). (Plan F, 2026-08-14, ruling F-6): this is
+    /// a skip, not a flush of the outgoing project. Direct test callers of
+    /// this fn (that don't go through `commit_with_rebuild`) should pass
+    /// the session's current epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
+        let persist_gate = self.session.lock().persist_gate.clone();
+        let _persist = persist_gate.lock();
         let (
             dir,
             epoch_now,
@@ -641,7 +648,7 @@ impl Committer {
                 log::warn!("midi persist failed: {e}");
                 self.session.lock().midi.dirty = true; // M-5 semantics preserved
             } else {
-                self.session.lock().midi.dirty = false;
+                self.clear_midi_dirty_if_unchanged(&m);
             }
         }
         if let Some(pr) = project_snapshot {
@@ -686,11 +693,11 @@ impl Committer {
                     // Clear `dirty_state` for whichever ids' pending bytes
                     // just landed on disk (Task 9 review round 1,
                     // Critical-2) — a short, separate re-lock, no disk I/O
-                    // under it.
-                    let mut s = self.session.lock();
-                    for id in cleared {
-                        s.plugins.dirty_state.remove(&id);
-                    }
+                    // under it. M-1 (Task 3, whole-branch review): guarded
+                    // against a `PluginSetState` landing between the
+                    // snapshot above and this re-lock — see
+                    // `clear_dirty_state_matching`'s doc.
+                    self.clear_dirty_state_matching(&cleared, &doc);
                 }
                 Ok(_) => {}
                 Err(e) => log::warn!("plugins persist failed: {e}"),
@@ -734,6 +741,63 @@ impl Committer {
         let entry = s.plugins.params.entry(instance.to_string()).or_default();
         if entry.is_empty() {
             *entry = params;
+        }
+        // snapshot republish: R-4 — `status` and the param mirror are
+        // document content, and this writeback is a carve-out that bypasses
+        // `transact` (see this fn's doc), so nothing else would publish it.
+        // Same lock as the writes, so the intermediate is never observable.
+        // The structural twin of `plugins::state::reactivate_restored_with`'s
+        // post-host writeback, which republishes for the same reason.
+        s.republish_full();
+    }
+
+    /// Clear `dirty_state` ONLY for ids whose live pending bytes still equal
+    /// the bytes this persist actually wrote (M-1, whole-branch review): a
+    /// concurrent `PluginSetState` landing between the snapshot (taken under
+    /// the FIRST session lock of the persist call this helper closes out)
+    /// and this re-lock must keep its dirty flag, or its bytes would
+    /// silently never persist — the same `PluginRemove`/`PluginSetState`
+    /// hazard Task 9's Critical-2 fixed one level down (a fresher write
+    /// beating a merely-existing file); this closes the analogous window
+    /// one level UP, between "bytes chosen to write" and "flag cleared".
+    /// Called from `execute_persist`, `save_project_mark`'s M-2 flush, and
+    /// `save_project_as_epoch`'s Save-As write — every site that calls
+    /// `plugins::state::save_snapshot_into_project` and then wants to clear
+    /// the ids it returned.
+    ///
+    /// Returns `true` when every written id still matches. A mismatch
+    /// re-inserts the id: a later persist may already have cleared dirty,
+    /// and leaving it false after a stale write would never flush again.
+    fn clear_dirty_state_matching(&self, written: &[String], snapshot: &session::PluginDoc) -> bool {
+        let mut s = self.session.lock();
+        let mut all_matched = true;
+        for id in written {
+            if s.plugins.pending_state.get(id) == snapshot.pending_state.get(id) {
+                s.plugins.dirty_state.remove(id);
+            } else {
+                s.plugins.dirty_state.insert(id.clone());
+                all_matched = false;
+            }
+        }
+        all_matched
+    }
+
+    /// Clear `midi.dirty` only when the live store still matches the
+    /// snapshot that just landed on disk. A `MidiSetNotes` between the
+    /// write and this re-lock must keep the flag, or the newer notes
+    /// never persist (same window `clear_dirty_state_matching` closes
+    /// for plugin blobs).
+    ///
+    /// Returns `true` on match. Mismatch re-dirties: a stale writer can
+    /// overwrite newer bytes after a later persist already cleared the flag.
+    fn clear_midi_dirty_if_unchanged(&self, written: &crate::midi::persist::V3Data) -> bool {
+        let mut s = self.session.lock();
+        if &s.midi_snapshot() == written {
+            s.midi.dirty = false;
+            true
+        } else {
+            s.midi.dirty = true;
+            false
         }
     }
 
@@ -1456,6 +1520,7 @@ impl ControlPlane {
             last_gesture_batch: Mutex::new(None),
             midi_input: std::sync::OnceLock::new(),
             midi_out: std::sync::OnceLock::new(),
+            history_gate: Mutex::new(()),
         }
     }
 
@@ -2637,7 +2702,12 @@ impl ControlPlane {
     /// so this is how the wrapper hands it the real previous blob instead
     /// of a stale/absent one).
     pub fn set_plugin_pending_state(&self, instance_id: &str, bytes: Vec<u8>) {
-        self.session.lock().plugins.pending_state.insert(instance_id.to_string(), bytes);
+        let mut session = self.session.lock();
+        session.plugins.pending_state.insert(instance_id.to_string(), bytes);
+        // snapshot republish: R-1 — `pending_state` is document content
+        // (`SessionSnapshot::plugins` carries it), and this writer bypasses
+        // `transact` entirely, so nothing else would publish it.
+        session.republish_full();
     }
 
     /// Thin wrapper over `Committer::commit_with_rebuild` (Plan E Task 13
@@ -2786,8 +2856,27 @@ impl ControlPlane {
     ///
     /// On a failed commit the entry goes back on the undo stack untouched:
     /// a rejected undo must not silently consume a history step.
+    ///
+    /// M-4 — AN OPEN GESTURE IS CLOSED FIRST. Ctrl+Z with the pointer still
+    /// down used to walk straight past the drag: its writes are transient
+    /// folds that have reached no history entry yet, so the pop found the
+    /// step BEFORE the gesture, undid that, and the drag's own value then
+    /// landed as a separate step whenever the pointer finally came up. The
+    /// auto-close is F-7's — the very same `end()` + `close_gesture` pair
+    /// `gesture_begin` uses for a stale gesture — so the drag becomes the
+    /// finished, undoable step it already looks like to the user, and the
+    /// undo consumes THAT.
+    ///
+    /// LOCK ORDER is unchanged and unnested: `close_gesture` takes (and
+    /// releases) the gesture and session locks before `pop_undo` is called;
+    /// `pop_undo`/`push_*` take `epoch` -> `history` with NO session lock
+    /// held (`commit_replay` returns before the push).
     pub fn undo(&self) -> Result<Option<String>, String> {
-        let Some(entry) = self.committer.log().pop_undo() else { return Ok(None) };
+        if let Some(g) = self.gesture.end() {
+            self.close_gesture(g);
+        }
+        let _gate = self.history_gate.lock();
+        let Some((entry, popped_epoch)) = self.committer.log().pop_undo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
             run: entry.run.clone(),
@@ -2795,14 +2884,14 @@ impl ControlPlane {
             transient: false,
         };
         let ops = entry.inverses.clone();
-        match self.commit_replay(meta, ops) {
+        match self.commit_replay(meta, ops, popped_epoch) {
             Ok(()) => {
                 let label = entry.label.clone();
-                self.committer.log().push_redo(entry);
+                self.committer.log().push_redo(entry, popped_epoch);
                 Ok(Some(label))
             }
             Err(e) => {
-                self.committer.log().push_undo_unchanged(entry);
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
                 Err(e)
             }
         }
@@ -2813,8 +2902,20 @@ impl ControlPlane {
     /// no new history entry, and the same entry migrates back onto the undo
     /// stack (via `push_undo_unchanged`, which does NOT clear the redo
     /// stack — only a genuinely new edit does that).
+    ///
+    /// Closes an open gesture first for [`Self::undo`]'s reason (M-4). The
+    /// visible consequence differs from undo's: the close records a fresh
+    /// edit, and a fresh edit CLEARS the redo stack (`History::record`), so
+    /// a redo pressed mid-drag now finds nothing and returns `Ok(None)`
+    /// instead of replaying a future the drag has already invalidated —
+    /// which is the same answer it would have given a moment later, once
+    /// the pointer came up.
     pub fn redo(&self) -> Result<Option<String>, String> {
-        let Some(entry) = self.committer.log().pop_redo() else { return Ok(None) };
+        if let Some(g) = self.gesture.end() {
+            self.close_gesture(g);
+        }
+        let _gate = self.history_gate.lock();
+        let Some((entry, popped_epoch)) = self.committer.log().pop_redo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
             run: entry.run.clone(),
@@ -2822,14 +2923,14 @@ impl ControlPlane {
             transient: false,
         };
         let ops = entry.ops.clone();
-        match self.commit_replay(meta, ops) {
+        match self.commit_replay(meta, ops, popped_epoch) {
             Ok(()) => {
                 let label = entry.label.clone();
-                self.committer.log().push_undo_unchanged(entry);
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
                 Ok(Some(label))
             }
             Err(e) => {
-                self.committer.log().push_redo(entry);
+                self.committer.log().push_redo(entry, popped_epoch);
                 Err(e)
             }
         }
@@ -2837,11 +2938,40 @@ impl ControlPlane {
 
     /// Apply a recorded op list through the normal commit path in
     /// `HistoryMode::Replay` — shared by [`Self::undo`] and [`Self::redo`].
-    fn commit_replay(&self, meta: op::TxMeta, ops: Vec<op::Op>) -> Result<(), String> {
+    ///
+    /// `expected_epoch`: the epoch the entry was POPPED under
+    /// (`HistoryLog::pop_undo`). The closure checks it FIRST, before any
+    /// `tx.apply`, under the same session lock the writes go through — the
+    /// dangerous half of the C-1 residual. `record_commit`'s guard drops a
+    /// stale journal line and a stale history entry, but it runs after the
+    /// effect phase: by then a stale undo's inverses have already been
+    /// APPLIED. Re-opening the same project is routine and keeps every id,
+    /// so those inverses apply CLEANLY against the wrong revision instead of
+    /// failing loudly. Checking inside the closure is what makes "nothing
+    /// applied" true rather than "nothing recorded".
+    ///
+    /// The mismatch returns `Err` — it never panics (a `transact` closure
+    /// must not: `Session::transact` holds the session lock across it) — and
+    /// on the `Err` path `transact` rolls back the inverses collected so
+    /// far, which here is none: the check is the closure's first statement,
+    /// so nothing was applied to roll back.
+    fn commit_replay(
+        &self,
+        meta: op::TxMeta,
+        ops: Vec<op::Op>,
+        expected_epoch: u64,
+    ) -> Result<(), String> {
         self.committer
             .commit_with_rebuild_mode(
                 meta,
                 |tx| {
+                    if tx.epoch() != expected_epoch {
+                        return Err(format!(
+                            "document changed under undo/redo (epoch {expected_epoch} -> {}) — \
+                             nothing applied",
+                            tx.epoch()
+                        ));
+                    }
                     for op in ops {
                         tx.apply(op)?;
                     }
@@ -2859,6 +2989,12 @@ impl ControlPlane {
     /// without a second round trip.
     pub fn history_depths(&self) -> (usize, usize) {
         self.committer.log().depths()
+    }
+
+    /// What the version graph currently retains (Plan F Task 7). Reported
+    /// alongside the undo depths by Task 11's browsing surface.
+    pub fn version_stats(&self) -> vergraph::VersionStats {
+        self.committer.log().version_stats()
     }
 
     // ---- gestures (Plan E Task 14) ---------------------------------------
@@ -2966,10 +3102,20 @@ impl ControlPlane {
         let mut inverses: Vec<op::Op> = gesture.baselines.into_iter().map(|(_, op)| op).collect();
         inverses.reverse();
         let meta = op::TxMeta { actor: gesture.actor, run: gesture.run, label: gesture.label, transient: false };
-        let (rev, epoch) = {
+        let (rev, epoch, snapshot) = {
             let session = self.session.lock();
-            (session.rev, session.epoch)
+            // Plan F Task 5: NOT a fresh capture — this entry is synthesized
+            // from ops that ALREADY ran, each publishing its own image as a
+            // transient commit while the gesture was open. The current
+            // published image is exactly the document those ops produced, so
+            // read it (leaf lock, pointer clone) alongside `rev`/`epoch`
+            // under this same session lock rather than re-capturing an
+            // identical one.
+            let snapshot = session.published_handle().lock().clone();
+            (session.rev, session.epoch, snapshot)
         };
+        let snapshot_charge =
+            snapshot::charge_of(&snapshot, &snapshot::ChangeSet::from_ops(&ops));
         let committed = session::Committed {
             rev,
             epoch,
@@ -2987,16 +3133,20 @@ impl ControlPlane {
             // `effect` field, which would silently do nothing on redo.
             effect: session::EngineEffect::default(),
             meta: meta.clone(),
+            // CORRECTION to this field's Task 5 comment, which said 0 to
+            // avoid double-counting the transient folds' own captures. The
+            // folds are TRANSIENT, so none of them ever reached
+            // `record_commit` and none of them has a version node: this
+            // synthesized batch is the drag's ONLY node, and a charge of 0
+            // would make the graph's budget blind to the image it retains.
+            // Charged from the NET ops, which is exactly the own-created
+            // work the last fold's capture did.
+            snapshot_charge,
+            snapshot,
         };
         // Task 17: the direct sink. No drop-window — the gesture is
         // undoable the instant it closes.
-        self.committer.log().record_gesture(
-            committed.rev,
-            committed.epoch,
-            &committed.meta,
-            &committed.ops,
-            &committed.inverses,
-        );
+        self.committer.log().record_gesture(&committed);
         *self.last_gesture_batch.lock() = Some(committed);
 
         // I-8: the whole drag's persist, once, here — never once per folded
@@ -3107,6 +3257,10 @@ impl ControlPlane {
         let mut s = self.session.lock();
         s.modulation = doc;
         s.automation.lanes = crate::modulation::compat::lanes_from_doc(&s.modulation);
+        // snapshot republish: adopt writes the graph and the derived lane
+        // view AFTER the epoch swap's publish. Without this, rebuild and
+        // the Plan F equivalence sweep see an empty automation half.
+        s.republish_full();
     }
 
     /// Shared body: `create_project`/`create_project_epoch`'s only
@@ -3173,6 +3327,10 @@ impl ControlPlane {
             // `loaded_dir` is set correctly above, so it WOULD persist, and
             // dirty=true is only meant to block resync-from-disk, not writes).
             adopt_midi_dir(&mut session.midi, &dir);
+            // snapshot republish: document swap (create) — a non-op writer,
+            // so nothing captured this. Full re-derive before the guard
+            // drops, so the published image is never behind the live doc.
+            session.republish_full();
         }
         // ---- session lock released; host round-trips + rebuild + emit below ----
         // epoch boundary (Task 17): document birth — history and redo are
@@ -3244,6 +3402,10 @@ impl ControlPlane {
             // above, no separate re-acquisition.
             let bpm = session.store.transport.tempo_bpm;
             crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+            // snapshot republish: document swap (open) — a non-op writer,
+            // so nothing captured this. Full re-derive before the guard
+            // drops, so the published image is never behind the live doc.
+            session.republish_full();
         }
         // ---- session lock released; host round-trips + rebuild + emit below ----
         // epoch boundary (Task 17): document swap = history root. Undoing
@@ -3251,6 +3413,19 @@ impl ControlPlane {
         // document (ruling 4), so both stacks are cleared and the journal
         // rotates onto the newly opened project's own file — appending, so
         // that project's earlier sessions stay in its log.
+        // Plan F Task 9: the journal now has a reader, and this is its only
+        // production call site — DETECTION ONLY (ruling F-8), no auto-apply,
+        // no event, no UI. No lock is held here.
+        //
+        // ORDER IS LOAD-BEARING, and it is NOT the plan's (plan defect #17,
+        // fix round 1): this must run BEFORE `epoch_boundary`, which appends
+        // this open's own `{"epochEvent":"open","epoch":N}` — with N above
+        // every epoch already in the file — to the file being read. After
+        // the boundary, the newest epoch holds no batches and the tail is
+        // always empty: File▸Open A, edit, File▸Open B, File▸Open A used to
+        // report nothing with two unsaved batches sitting on disk. Reading
+        // needs neither the boundary nor the adopts below.
+        replay::detect_unsaved_tail(&dir);
         self.committer.log().epoch_boundary(&dir, history::EpochEvent::Open, new_epoch);
         crate::plugins::state::adopt_open_project(&dir);
         crate::plugins::automation::adopt_open_project(&dir);
@@ -3293,6 +3468,8 @@ impl ControlPlane {
     /// the lock drops — no disk I/O ever runs while the session lock is
     /// held.
     pub fn save_project_as_epoch(&self, dir: &Path) -> Result<Project, String> {
+        let persist_gate = self.session.lock().persist_gate.clone();
+        let _persist = persist_gate.lock();
         let name = dir
             .file_stem()
             .and_then(|s| s.to_str())
@@ -3302,7 +3479,7 @@ impl ControlPlane {
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
         let new_epoch;
-        let (project, midi_snapshot) = {
+        let (project, midi_snapshot, plugin_snapshot, automation_snapshot, modulation_snapshot) = {
             let mut session = self.session.lock();
             session.store.project_dir = Some(dir.to_path_buf());
             session.store.project_name = Some(name);
@@ -3320,7 +3497,26 @@ impl ControlPlane {
             session.midi.loaded_dir = Some(dir.to_path_buf());
             let project = project::from_store(&session.store, position, rate)?;
             let midi_snapshot = session.midi_snapshot();
-            (project, midi_snapshot)
+            // I-1 fix (ruling F-6): the plugin doc + automation lanes are
+            // snapshotted under this SAME short lock as the midi snapshot
+            // above — the actual writes happen below, after the guard
+            // drops (round-2 §4: no disk I/O under the session lock), using
+            // the SAME helpers `execute_persist` calls. Before this fix,
+            // Save-As wrote project.json + midi only: the new dir got no
+            // `plugins[]`/state blobs and no `automation[]`/chunks, so the
+            // next COLD OPEN of the Save-As'd project saw nothing on disk
+            // and (after Task 1's I-7 adopt-clear fix) actively cleared
+            // whatever plugins/automation the session had — a Save-As that
+            // silently destroyed both.
+            let plugin_snapshot = session.plugin_snapshot();
+            let automation_snapshot = session.automation.lanes.clone();
+            let modulation_snapshot = session.modulation.clone();
+            // snapshot republish: document swap (save-as) — project meta +
+            // the epoch bump are non-op writes; republish before the guard
+            // drops. (`midi.loaded_dir` above is bookkeeping, outside the
+            // equivalence contract — the epoch is what makes this a swap.)
+            session.republish_full();
+            (project, midi_snapshot, plugin_snapshot, automation_snapshot, modulation_snapshot)
         };
         // ---- session lock released; all disk I/O below ----
         // epoch boundary (Task 17): the session just acquired an identity.
@@ -3331,14 +3527,44 @@ impl ControlPlane {
         self.committer.log().epoch_boundary(dir, history::EpochEvent::SaveAs, new_epoch);
         project::save(dir, &project)?;
         match crate::midi::persist::save_snapshot_into_project(dir, &midi_snapshot) {
-            Ok(()) => self.session.lock().midi.dirty = false,
+            Ok(()) => {
+                self.committer.clear_midi_dirty_if_unchanged(&midi_snapshot);
+            }
             Err(e) => {
                 self.session.lock().midi.dirty = true;
                 log::warn!("save_project_as_epoch: persisting midi failed: {e}");
             }
         }
-        let modulation = self.session.lock().modulation.clone();
-        if let Err(e) = crate::modulation::persist::save_into_project(dir, &modulation) {
+        // I-1 fix: plugin state blobs + `plugins[]`, same helper and
+        // `with_host_state: false` reasoning `execute_persist` uses —
+        // `pending_state` is already kept current by the op arms that
+        // produced it, and Save-As must not round-trip live hosts. A failed
+        // write here is degraded, not aborted (project.json + midi already
+        // landed) — same `log::warn!`-not-fail policy as `execute_persist`.
+        match crate::plugins::state::save_snapshot_into_project(dir, &plugin_snapshot, false) {
+            Ok(cleared) if !cleared.is_empty() => {
+                // Mirrors execute_persist's post-write re-lock (:581-596):
+                // clear `dirty_state` for whichever ids' pending bytes just
+                // landed on disk — now through `clear_dirty_state_matching`
+                // (M-1, Task 3), which keeps a concurrent `PluginSetState`'s
+                // dirty flag set if its bytes moved on since this snapshot.
+                self.committer.clear_dirty_state_matching(&cleared, &plugin_snapshot);
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("save_project_as_epoch: persisting plugin state failed: {e}"),
+        }
+        // Track F: a v4 write drops `automation[]`. Persist the graph when
+        // it has content; if the session still only has Track D lanes
+        // (I-1 tests, leftover facade-less state), migrate them first so
+        // Save-As cannot stamp an empty `modulation{}` over live lanes.
+        let modulation_to_write = if !modulation_snapshot.is_empty() {
+            modulation_snapshot
+        } else if !automation_snapshot.is_empty() {
+            crate::modulation::persist::migrate_v3_lanes(&automation_snapshot, &|_, _| None)
+        } else {
+            modulation_snapshot
+        };
+        if let Err(e) = crate::modulation::persist::save_into_project(dir, &modulation_to_write) {
             log::warn!("save_project_as_epoch: persisting modulation failed: {e}");
         }
         (self.emit)(
@@ -3357,27 +3583,93 @@ impl ControlPlane {
     /// command is now a one-line delegate (its frozen `Result<(), String>`
     /// shape discards the returned `Project`).
     pub fn save_project_mark(&self) -> Result<Project, String> {
+        let persist_gate = self.session.lock().persist_gate.clone();
+        let _persist = persist_gate.lock();
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
-        let (project, dir, epoch, modulation) = {
+        let (project, dir, epoch, midi_snapshot, plugin_snapshot, modulation) = {
             let session = self.session.lock();
             let dir = session.store.project_dir.clone().ok_or("no project open")?;
             let project = project::from_store(&session.store, position, rate)?;
-            (project, dir, session.epoch, session.modulation.clone())
+            // M-2 (Task 3, whole-branch review): a prior auto-persist
+            // (`execute_persist`) can fail and leave `midi.dirty`/
+            // `plugins.dirty_state` set with nothing actually written —
+            // Ctrl+S (this fn) is the user's explicit "save now" and, with
+            // the journal ON, the mark it records below claims durability
+            // for the whole document; it must recover any dirty stores
+            // first, not just write `project.json`. Snapshots taken under
+            // this SAME lock as the project snapshot above, written below
+            // after the lock drops (round-2 §4: no disk I/O under the
+            // session lock) — same helpers, same warn-not-fail policy, same
+            // `clear_dirty_state_matching` guard `execute_persist` uses.
+            // Automation is deliberately NOT covered here: lanes carry no
+            // dirty flag today (an automation persist is an all-or-nothing
+            // lane write, unlike midi/plugins' incremental dirty tracking),
+            // so there is nothing for a failed auto-persist to have left
+            // set — a future automation dirty flag would need the same
+            // treatment added here.
+            let midi_snapshot = session.midi.dirty.then(|| session.midi_snapshot());
+            let plugin_snapshot =
+                (!session.plugins.dirty_state.is_empty()).then(|| session.plugin_snapshot());
+            (project, dir, session.epoch, midi_snapshot, plugin_snapshot, session.modulation.clone())
         };
+        project::save(&dir, &project)?;
+        let mut flush_ok = true;
+        if let Some(m) = midi_snapshot {
+            if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
+                log::warn!("save_project_mark: midi persist failed: {e}");
+                self.session.lock().midi.dirty = true;
+                flush_ok = false;
+            } else if !self.committer.clear_midi_dirty_if_unchanged(&m) {
+                flush_ok = false;
+            }
+        }
+        if let Some(doc) = plugin_snapshot {
+            match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
+                Ok(cleared) if !cleared.is_empty() => {
+                    if !self.committer.clear_dirty_state_matching(&cleared, &doc) {
+                        flush_ok = false;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("save_project_mark: plugins persist failed: {e}");
+                    flush_ok = false;
+                }
+            }
+        }
         // epoch boundary: no document swap here (same project, same
         // in-memory content) — so history is NOT cleared and the journal is
         // NOT rotated. Task 17 journals a "save" MARK record instead: it
         // tells a replay where the on-disk snapshot caught up with the log,
         // which is the whole difference between a snapshot mark and an
-        // epoch (ruling 4).
-        project::save(&dir, &project)?;
+        // epoch (ruling 4). Position kept exactly here — after
+        // `project::save`, before the emit — even though the dirty-store
+        // flush above may now also have run: a save mark that also flushed
+        // dirty stores is still one mark.
         // Task 7: an explicit save is the one-way v4 upgrade. The file
         // stays v3 `automation[]` until this write (or an edit persist).
-        if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation) {
+        // Same migrate-if-lanes-only rule as Save-As: an empty graph must
+        // not wipe leftover Track D lanes.
+        let modulation_to_write = if !modulation.is_empty() {
+            modulation
+        } else {
+            let lanes = self.session.lock().automation.lanes.clone();
+            if lanes.is_empty() {
+                crate::modulation::ModulationDoc::default()
+            } else {
+                crate::modulation::persist::migrate_v3_lanes(&lanes, &|_, _| None)
+            }
+        };
+        if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation_to_write) {
             log::warn!("save_project: modulation persist failed: {e}");
+            flush_ok = false;
         }
-        self.committer.log().snapshot_mark(epoch);
+        if flush_ok {
+            self.committer.log().snapshot_mark(epoch);
+        } else {
+            log::warn!("save_project_mark: skipping journal mark — a dirty-store flush failed");
+        }
         (self.emit)(
             "project://changed",
             serde_json::to_value(&project).unwrap_or_default(),
@@ -3483,32 +3775,61 @@ impl ControlPlane {
             }
         }
 
-        // Zyn upgrade path: build the three patched instances BEFORE the
-        // tracks so a failure leaves no half-bound state (None = PolySynth).
-        let zyn = try_seed_zyn_demo_instruments(&self.session);
+        // Zyn upgrade path: PREPARE the three patched instances BEFORE the
+        // tracks — all host I/O, all outside any lock/transaction
+        // (prepare-outside) — so a failure leaves no half-bound state (None
+        // = PolySynth) and touches NO session state at all (Task 10: R-3
+        // closed, see `try_seed_zyn_demo_instruments`'s doc).
+        let zyn = try_seed_zyn_demo_instruments();
+        self.seed_demo_project_commit(zyn)
+    }
 
-        // Task 7: one commit — 3x add_track_tx, the instrument bindings (if
-        // Zyn is available), and the 3 demo clips, all through the channel.
-        // `persist.project` (set only by the InstrumentId `Set`s below, same
-        // as the pre-Task-7 code's zyn-gated project::save) and
-        // `persist.midi` (set unconditionally by `MidiClipAdd`, same as the
-        // pre-Task-7 code's unconditional `save_into_project`) replace the
-        // manual saves; `commit` also emits `project://changed`, fixing this
-        // command's previously missing event.
+    /// The commit half of [`Self::seed_demo_project`], split out so tests
+    /// can drive it with a hand-built `zyn` fixture (the plugins tests'
+    /// `FormatStateBridge`-fixture pattern) instead of a real Zyn host —
+    /// `try_seed_zyn_demo_instruments` itself needs a live LV2 world plus
+    /// the zynaddsubfx-lv2 plugin, which CI doesn't have.
+    ///
+    /// Task 7 + Task 10: one commit — 3x add_track_tx, the Zyn rows (if
+    /// prepared, via `Op::PluginAdd`/`Op::PluginSetState`) and instrument
+    /// bindings, and the 3 demo clips, all through the channel. The demo's
+    /// plugin rows are now attributed, undoable in the same step as the
+    /// rest of the demo, persisted via `PersistEffect` (no manual save
+    /// needed), and cold-replayable from the journal. `persist.project`
+    /// (set only by the InstrumentId `Set`s below, same as the pre-Task-7
+    /// code's zyn-gated project::save) and `persist.midi` (set
+    /// unconditionally by `MidiClipAdd`, same as the pre-Task-7 code's
+    /// unconditional `save_into_project`) replace the manual saves;
+    /// `commit` also emits `project://changed`, fixing this command's
+    /// previously missing event.
+    fn seed_demo_project_commit(
+        &self,
+        zyn: Option<[PreparedZynInstance; 3]>,
+    ) -> Result<ProjectSnapshot, String> {
         self.commit(op::TxMeta::system("seed demo project"), |tx| {
             let pad = ops::add_track_tx(tx, Some("Demo Pad".into()), Some("midi".into()))?;
             let lead = ops::add_track_tx(tx, Some("Demo Lead".into()), Some("midi".into()))?;
             let bass = ops::add_track_tx(tx, Some("Demo Bass".into()), Some("midi".into()))?;
 
-            if let Some(ids) = &zyn {
-                for (track_id, instance_id) in
-                    [(&pad.id, &ids[0]), (&lead.id, &ids[1]), (&bass.id, &ids[2])]
+            if let Some(prepared) = &zyn {
+                for (track_id, p) in
+                    [(&pad.id, &prepared[0]), (&lead.id, &prepared[1]), (&bass.id, &prepared[2])]
                 {
+                    // `index: usize::MAX` — same "append" signal
+                    // `plugin_instantiate`'s command path uses; `apply_raw`
+                    // clamps it to the live length.
+                    tx.apply(op::Op::PluginAdd { row: p.row.clone(), index: usize::MAX })?;
+                    if let Some(state) = &p.state {
+                        tx.apply(op::Op::PluginSetState {
+                            instance: p.row.id.clone(),
+                            state: state.clone(),
+                        })?;
+                    }
                     tx.apply(op::Op::Set {
                         object: op::ObjectRef::Track(track_id.clone()),
                         path: op::PropPath::InstrumentId,
                         from: serde_json::Value::Null,
-                        to: serde_json::json!(format!("plugin:{instance_id}")),
+                        to: serde_json::json!(format!("plugin:{}", p.row.id)),
                     })?;
                 }
             }
@@ -3522,30 +3843,6 @@ impl ControlPlane {
             }
             Ok(())
         })?;
-
-        // Plugin instance + state blobs (not the `PersistEffect` machinery's
-        // job here — `try_seed_zyn_demo_instruments` writes the document
-        // rows DIRECTLY into `session.plugins`, bypassing `commit`/the op
-        // log, so `execute_persist`'s plugin branch never sees this write),
-        // so a save/open cycle replays the same demo through the same
-        // patches (zone P4 restore path). A no-op when there's no open
-        // project dir or no Zyn instances. Task 9: `persist_after_mutation`
-        // is gone — snapshot the doc under a short lock and write it
-        // directly (mirrors `execute_persist`'s own plugin branch).
-        if zyn.is_some() {
-            let dir = self.session.lock().store.project_dir.clone();
-            if let Some(d) = &dir {
-                let doc = self.session.lock().plugin_snapshot();
-                // `with_host_state: true` here always takes the `fresh`
-                // branch of the persist ladder for these brand-new
-                // instances, so there's nothing in `dirty_state` to clear
-                // (seed_demo writes rows directly, bypassing `apply_raw`
-                // entirely — see above).
-                if let Err(e) = crate::plugins::state::save_snapshot_into_project(d, &doc, true) {
-                    log::warn!("seed demo: persisting plugins failed: {e}");
-                }
-            }
-        }
         Ok(self.project_state())
     }
 
@@ -3608,21 +3905,54 @@ impl ControlPlane {
     }
 }
 
-/// Try to build the three Zyn demo instances (pad / lead / bass), each
-/// loaded with a stock bank patch. Returns their instance ids, or None when
-/// anything on the Zyn path is unavailable (plugin not installed, banks
-/// missing, no registered plugin registry) — the caller then keeps the
-/// PolySynth fallback, so a machine without plugins is never broken.
-/// Partial failures roll back (no orphan instances, no orphan rows).
+/// A Zyn demo instance PREPARED (host instantiate + patch load + captured
+/// post-load state) but not yet committed to the document — Task 10's
+/// prepare-outside handoff for [`try_seed_zyn_demo_instruments`]. `state` is
+/// already APST-encoded (`plugins::state::encode_state`), the exact bytes
+/// `Op::PluginSetState`'s arm expects on the wire.
 ///
-/// Task 9: writes the document rows DIRECTLY into `session.plugins`
-/// (bypassing `commit`/the op log), matching `seed_demo_project`'s own
-/// direct-session-mutation style for the rest of the demo's bootstrap —
-/// this pre-track-creation, best-effort batch is not itself a user-visible
-/// edit yet (no track references these ids until the caller binds them),
-/// so there is nothing meaningful to make undoable here.
-fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[String; 3]> {
-    use crate::plugins::{self, patches};
+/// Deviation from the plan's literal interface listing: the plan's sketch
+/// also carries a `params: Vec<ParamInfo>` field ("as instantiate_and_activate
+/// returned"). Dropped here — `Op::PluginAdd`'s own arm always folds in a
+/// `HostForward::Instantiate` (its doc: "idempotent by construction... the
+/// executor's has_instance check no-ops it and re-syncs params"), which is
+/// exactly the plan's own "Consumes" note for this task. Carrying a second,
+/// unused copy of the same params the host is about to re-supply would be a
+/// field nothing reads — worse than the plan's version, not a faithful copy
+/// of it.
+struct PreparedZynInstance {
+    row: crate::plugins::PluginInstanceInfo,
+    state: Option<Vec<u8>>,
+}
+
+/// Try to PREPARE the three Zyn demo instances (pad / lead / bass), each
+/// loaded with a stock bank patch. Returns `None` when anything on the Zyn
+/// path is unavailable (plugin not installed, banks missing, no registered
+/// plugin registry) — the caller then keeps the PolySynth fallback, so a
+/// machine without plugins is never broken. Partial failures roll back (host
+/// `unregister_instance` calls only — Task 10: this function touches NO
+/// session state, so there are no rows to retract).
+///
+/// Task 10 (R-3 closed): this function only PREPARES — instantiate + load
+/// patch + capture post-load state, all host I/O, all outside any
+/// lock/transaction (prepare-outside, same pattern `plugin_instantiate`'s
+/// command path uses). The caller (`seed_demo_project`) applies
+/// `Op::PluginAdd` + `Op::PluginSetState` per instance inside the demo's one
+/// channel transaction, so the demo's instruments are attributed, undoable
+/// in the same step as the rest of the demo, persisted via `PersistEffect`,
+/// and cold-replayable from the journal.
+fn try_seed_zyn_demo_instruments() -> Option<[PreparedZynInstance; 3]> {
+    try_seed_zyn_demo_instruments_with(crate::plugins::state::registered_state_bridge().map(|b| b.as_ref()))
+}
+
+/// [`try_seed_zyn_demo_instruments`] with an explicit bridge (test
+/// injection point — the `plugins::state` module's own `FormatStateBridge`/
+/// fake-bridge pattern, same reason `save_snapshot_into_project_with` and
+/// `reactivate_restored_with` take one).
+fn try_seed_zyn_demo_instruments_with(
+    bridge: Option<&dyn crate::plugins::state::HostStateBridge>,
+) -> Option<[PreparedZynInstance; 3]> {
+    use crate::plugins::{self, patches, state::encode_state};
     let registry = plugins::registered_registry()?;
     // Patches chosen to sit well together: soft pad chords, a plucked lead
     // that cuts through, and a round analog-style bass.
@@ -3644,10 +3974,13 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
             return None;
         }
     }
-    let mut ids: Vec<String> = Vec::with_capacity(3);
+    let mut prepared: Vec<PreparedZynInstance> = Vec::with_capacity(3);
     for patch in &wanted {
         match plugins::instantiate_and_activate(registry, &uid) {
-            Ok((info, params)) => {
+            // `_params`: the fresh instance's real ranges (`Op::PluginAdd`'s
+            // own `HostForward::Instantiate` re-derives and writes these
+            // back after commit — see `PreparedZynInstance`'s doc).
+            Ok((info, _params)) => {
                 if let Err(e) =
                     patches::load_zyn_patch(&info.id, std::path::Path::new(&patch.path))
                 {
@@ -3658,29 +3991,33 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
                         patch.name
                     );
                 }
-                {
-                    let mut s = session.lock();
-                    s.plugins.instances.push(info.clone());
-                    s.plugins.params.insert(info.id.clone(), params);
-                }
-                ids.push(info.id);
+                // Capture the post-patch-load state from the LIVE host —
+                // this is what makes the following `Op::PluginSetState`'s
+                // computed inverse (a self-inverse, since a fresh instance
+                // has no `pending_state` yet — see that op's arm doc) an
+                // honest reflection of "nothing to undo to" rather than a
+                // stale/absent blob.
+                let state = bridge.and_then(|b| match b.save_state(&info.id) {
+                    Ok(Some(blob)) => Some(encode_state(&info.uid, &blob)),
+                    Ok(None) => None,
+                    Err(e) => {
+                        log::warn!(
+                            "seed demo: capturing state for {} failed ({e}); patch stays \
+                             host-only for this instance",
+                            info.id
+                        );
+                        None
+                    }
+                });
+                prepared.push(PreparedZynInstance { row: info, state });
             }
             Err(e) => {
                 log::warn!("seed demo: Zyn instantiation failed ({e}); PolySynth fallback");
-                {
-                    // Session lock dropped BEFORE the host call below ([C1]:
-                    // never call a host while holding the session lock —
-                    // `unregister_instance` is fire-and-forget/non-blocking,
-                    // but this stays disciplined regardless).
-                    let mut s = session.lock();
-                    for id in &ids {
-                        s.plugins.instances.retain(|r| &r.id != id);
-                        s.plugins.params.remove(id);
-                    }
-                }
-                for id in &ids {
+                // No session state to retract (this function touches none):
+                // just tear down whatever host instances already succeeded.
+                for p in &prepared {
                     if let Some(host) = plugins::lv2_host::try_global() {
-                        host.unregister_instance(id);
+                        host.unregister_instance(&p.row.id);
                     }
                 }
                 return None;
@@ -3691,7 +4028,7 @@ fn try_seed_zyn_demo_instruments(session: &Arc<Mutex<Session>>) -> Option<[Strin
         "seed demo: Zyn instances ready ({})",
         wanted.iter().map(|p| p.name.as_str()).collect::<Vec<_>>().join(", ")
     );
-    ids.try_into().ok()
+    prepared.try_into().ok()
 }
 
 /// The ORIGINAL two-track demo content (v1: 16th-note arp + bass groove),
@@ -3760,6 +4097,8 @@ pub fn demo_seed_clips(
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         c.ensure_note_ids().expect("demo notes never collide");
         c
@@ -3860,6 +4199,8 @@ pub fn demo_seed_clips_v2(
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         c.ensure_note_ids().expect("demo notes never collide");
         c
@@ -4009,20 +4350,43 @@ pub struct HistoryStep {
 
 /// Undo the most recent history step (Plan E Task 17) — thin delegate over
 /// [`ControlPlane::undo`]. Additive command.
+///
+/// I-6 — ASYNC ON PURPOSE, exactly like `seed_demo_project` below and for
+/// the same reason: a sync `#[tauri::command]` runs on the MAIN thread, and
+/// on Linux the WebKitGTK webview shares the GTK main loop. An undo is a
+/// full commit and can be arbitrarily heavy — undoing a `PluginRemove`
+/// RE-INSTANTIATES the plugin and reloads its state (the seconds-long Zyn
+/// case) — so running it there freezes the window for the whole duration.
+/// `spawn_blocking` moves it off both the main thread and the async runtime.
+///
+/// ASYNC IS INVISIBLE ON THE WIRE: the command name, its (empty) payload and
+/// the [`HistoryStep`] it resolves to are byte-identical; the frontend's
+/// `invoke` was already promise-based.
 #[tauri::command]
-pub fn undo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
-    let label = control.undo()?;
-    let (undo_depth, redo_depth) = control.history_depths();
-    Ok(HistoryStep { label, undo_depth, redo_depth })
+pub async fn undo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let label = cp.undo()?;
+        let (undo_depth, redo_depth) = cp.history_depths();
+        Ok(HistoryStep { label, undo_depth, redo_depth })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Redo the most recently undone step (Plan E Task 17) — thin delegate over
-/// [`ControlPlane::redo`]. Additive command.
+/// [`ControlPlane::redo`]. Additive command, async for [`undo`]'s reason
+/// (I-6) and with the same unchanged wire shape.
 #[tauri::command]
-pub fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
-    let label = control.redo()?;
-    let (undo_depth, redo_depth) = control.history_depths();
-    Ok(HistoryStep { label, undo_depth, redo_depth })
+pub async fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let label = cp.redo()?;
+        let (undo_depth, redo_depth) = cp.history_depths();
+        Ok(HistoryStep { label, undo_depth, redo_depth })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Import an audio file as a clip (STUB until zone B lands).
@@ -4470,9 +4834,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cp.history_depths().0, undo_before, "mid-gesture commits are transient");
+        let versions_mid_gesture = cp.version_stats();
         cp.gesture_end().unwrap();
 
         assert_eq!(cp.history_depths().0, undo_before + 1, "the whole drag is ONE step");
+        // ...and ONE version node, charged. The mid-gesture folds are
+        // transient, so they leave no node of their own — which is exactly
+        // why this synthesized batch's charge may not be zero: it is the
+        // only node the whole drag produces (Plan F Task 7).
+        let versions = cp.version_stats();
+        assert_eq!(
+            versions.nodes,
+            versions_mid_gesture.nodes + 1,
+            "a closed gesture is one version node, and its transient folds were none"
+        );
+        assert!(
+            versions.retained_bytes > versions_mid_gesture.retained_bytes,
+            "and it charges the image it retains"
+        );
         let batch = cp.take_last_gesture_batch().expect("gesture synthesized a batch");
         assert_eq!(batch.ops.len(), 1, "folded to one net Set: {:?}", batch.ops);
         assert!(
@@ -4765,9 +5144,23 @@ mod tests {
             status: "stub".into(),
             track_id: None,
         };
+        // Through the op, not a direct push: that is what production does
+        // (the commit lands the stub row and publishes it), and it is what
+        // makes the published image EQUAL to the live document on entry —
+        // so the only divergence the assertions below can detect is the
+        // writeback's own.
         let epoch = {
-            let mut s = cp.session().lock();
-            s.plugins.instances.push(row);
+            let m = cp.session();
+            session::Session::transact(m, op::TxMeta::user("add plugin"), |tx| {
+                tx.apply(op::Op::PluginAdd { row: row.clone(), index: 0 })
+            })
+            .expect("plugin add commits");
+            let s = m.lock();
+            let image = s.published_handle().lock().clone();
+            assert_eq!(
+                image.plugins.instances[0].status, "stub",
+                "precondition: the image starts equal to the live document"
+            );
             s.epoch
         };
         let params = vec![crate::plugins::ParamInfo {
@@ -4780,6 +5173,20 @@ mod tests {
         assert_eq!(s.plugins.instances[0].status, "active");
         assert_eq!(s.plugins.params["inst-1"].len(), 1);
         assert_eq!(s.plugins.params["inst-1"][0].value, 0.25);
+        // Plan F Task 5: the writeback is a document write outside
+        // `transact`, so it republishes — without this the published slot
+        // (which `engine::rebuild` reads) would describe a freshly
+        // instantiated plugin as a stub with an empty param mirror until
+        // some unrelated commit happened to refresh it.
+        let image = s.published_handle().lock().clone();
+        assert_eq!(
+            image.plugins.instances[0].status, s.plugins.instances[0].status,
+            "the instantiate writeback must republish"
+        );
+        assert_eq!(
+            image.plugins.params.get("inst-1"), s.plugins.params.get("inst-1"),
+            "including the real param mirror it just installed"
+        );
     }
 
     #[test]
@@ -6272,7 +6679,7 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&midi, &store, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
@@ -6297,10 +6704,16 @@ mod tests {
     }
 
     /// Demo v2's Zyn upgrade path (gated on zynaddsubfx-lv2 + banks): the
-    /// seeder's instance builder yields three ACTIVE patched Zyn instances,
+    /// seeder's PREPARE step (Task 10: `try_seed_zyn_demo_instruments`
+    /// touches no session state) yields three ACTIVE patched Zyn instances,
     /// and the demo arrangement bound to them renders non-silent audio
     /// through the real graph path. Machines without Zyn skip (the
     /// PolySynth fallback is covered by the test above).
+    ///
+    /// This test builds its OWN local session from the prepared rows
+    /// (mirroring what `Op::PluginAdd`'s arm would do to the document) —
+    /// it exercises the prepare half only, not the commit/op path, which is
+    /// `the_seed_demo_transaction_journals_its_plugin_rows`'s job.
     #[test]
     fn seeded_demo_zyn_instruments_bind_and_render() {
         use crate::audio::types::{Store, TrackState};
@@ -6311,14 +6724,22 @@ mod tests {
         crate::plugins::register_registry(Arc::new(Mutex::new(
             crate::plugins::PluginRegistry::default(),
         )));
+        let Some(prepared) = try_seed_zyn_demo_instruments() else {
+            eprintln!("skipping: ZynAddSubFX or its banks not installed");
+            return;
+        };
         let session = Arc::new(Mutex::new(Session::new(
             crate::audio::types::Store::default(),
             crate::midi::MidiStore::default(),
         )));
-        let Some(ids) = try_seed_zyn_demo_instruments(&session) else {
-            eprintln!("skipping: ZynAddSubFX or its banks not installed");
-            return;
-        };
+        {
+            let mut s = session.lock();
+            for p in &prepared {
+                s.plugins.instances.push(p.row.clone());
+                s.plugins.params.entry(p.row.id.clone()).or_default();
+            }
+        }
+        let ids: Vec<String> = prepared.iter().map(|p| p.row.id.clone()).collect();
         for id in &ids {
             let info = session
                 .lock()
@@ -6359,12 +6780,12 @@ mod tests {
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
         let doc = session.lock().plugin_snapshot();
-        crate::midi::playback::append_from(&midi, &store, &doc, &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3);
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(
                 nodes.key_of(track),
-                Some(format!("plugin:{inst}@48000#0").as_str()),
+                Some(format!("plugin:{inst}@48000#0!active").as_str()),
                 "track {track} resolved to its Zyn node (not the fallback)"
             );
         }
@@ -6394,6 +6815,127 @@ mod tests {
                 host.unregister_instance(id);
             }
         }
+    }
+
+    fn fake_prepared_zyn(tag: &str) -> PreparedZynInstance {
+        let row = crate::plugins::PluginInstanceInfo {
+            id: format!("fake-zyn-{tag}"),
+            uid: "test:fake-zyn".into(),
+            name: format!("Fake Zyn {tag}"),
+            // Deliberately NOT "lv2"/"clap": `HostForward::Instantiate`'s
+            // executor `continue`s for any other format ("non-hosted
+            // format: stays 'stub', nothing to sync"), so this fixture
+            // never touches a real plugin host.
+            format: "test".into(),
+            status: "stub".into(),
+            track_id: None,
+        };
+        let blob = crate::plugins::state::StateBlob {
+            kind: crate::plugins::state::KIND_OPAQUE,
+            data: vec![1, 2, 3, 4],
+        };
+        let state = Some(crate::plugins::state::encode_state(&row.uid, &blob));
+        PreparedZynInstance { row, state }
+    }
+
+    /// Task 10 (R-3 closed) — Step 1: the demo seed's Zyn bootstrap commits
+    /// through the channel as ops, not a direct session write. Drives
+    /// `seed_demo_project_commit` with a hand-built fixture (see
+    /// `fake_prepared_zyn`) instead of a real Zyn host — this test is about
+    /// the COMMIT half, not the PREPARE half (that's
+    /// `seeded_demo_zyn_instruments_bind_and_render`, gated on real Zyn).
+    #[test]
+    fn the_seed_demo_transaction_journals_its_plugin_rows() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("seed-zyn-journal");
+        cp.create_project(parent.to_str().unwrap(), "SeedZynJournal").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        let zyn = [fake_prepared_zyn("pad"), fake_prepared_zyn("lead"), fake_prepared_zyn("bass")];
+        let ids: Vec<String> = zyn.iter().map(|p| p.row.id.clone()).collect();
+        cp.seed_demo_project_commit(Some(zyn)).expect("seed commits");
+
+        // (a) the rows landed in the document, and via the op path: three
+        // `pluginAdd` + three `pluginSetState` lines in the journal's seed
+        // batch.
+        {
+            let s = cp.session().lock();
+            assert_eq!(s.plugins.instances.len(), 3, "all three Zyn rows registered");
+            for id in &ids {
+                assert!(
+                    s.plugins.instances.iter().any(|r| &r.id == id),
+                    "instance {id} present"
+                );
+            }
+            let bound = s
+                .store
+                .tracks
+                .iter()
+                .filter(|t| t.instrument_id.as_deref().is_some_and(|iid| ids.iter().any(|id| iid == format!("plugin:{id}"))))
+                .count();
+            assert_eq!(bound, 3, "all three demo tracks bound to their Zyn instance");
+        }
+        let text = std::fs::read_to_string(dir.join("journal.ndjson")).expect("journal exists");
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("bad journal line {l:?}: {e}")))
+            .collect();
+        let seed_batch = lines
+            .iter()
+            .find(|l| {
+                l.get("ops")
+                    .and_then(|o| o.as_array())
+                    .is_some_and(|ops| ops.iter().any(|op| op["kind"] == "pluginAdd"))
+            })
+            .expect("a batch carrying pluginAdd ops exists");
+        let ops = seed_batch["ops"].as_array().unwrap();
+        let plugin_adds = ops.iter().filter(|op| op["kind"] == "pluginAdd").count();
+        let plugin_set_states = ops.iter().filter(|op| op["kind"] == "pluginSetState").count();
+        assert_eq!(plugin_adds, 3, "three pluginAdd ops in the seed batch: {ops:#?}");
+        assert_eq!(plugin_set_states, 3, "three pluginSetState ops in the seed batch: {ops:#?}");
+
+        // (b) ONE undo removes tracks, clips AND plugin rows — the demo is
+        // one step.
+        let label = cp.undo().unwrap();
+        assert!(label.is_some(), "the seed is undoable");
+        let s = cp.session().lock();
+        assert!(s.store.tracks.is_empty(), "undo removed the demo tracks");
+        assert!(s.midi.clips.is_empty(), "undo removed the demo clips");
+        // (c) no direct-write remains: plugins is empty after the undo (the
+        // grep-level "no direct write" assertion is Task 13's).
+        assert!(s.plugins.instances.is_empty(), "undo removed the plugin rows too");
+
+        drop(s);
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// The plain (no Zyn) demo path stays green: when preparation returns
+    /// `None`, `seed_demo_project` still seeds the PolySynth demo exactly
+    /// as today, with no plugin rows at all. Drives `seed_demo_project_
+    /// commit(None)` directly rather than the public `seed_demo_project()`
+    /// — `try_seed_zyn_demo_instruments` reads the PROCESS-GLOBAL plugin
+    /// registry (`registered_registry`), which another `#[test]` in this
+    /// same binary (`seeded_demo_zyn_instruments_bind_and_render`) may have
+    /// already registered; on a machine that genuinely has zynaddsubfx-lv2
+    /// installed, calling the real `seed_demo_project()` here would then
+    /// seed real Zyn rows too — an environment-dependent flake this test
+    /// must not have.
+    #[test]
+    fn seed_demo_project_without_zyn_still_seeds_the_polysynth_demo() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("seed-no-zyn");
+        cp.create_project(parent.to_str().unwrap(), "SeedNoZyn").unwrap();
+
+        let snapshot = cp.seed_demo_project_commit(None).expect("seed commits without Zyn");
+        assert_eq!(snapshot.tracks.len(), 3, "three demo tracks seeded");
+        let s = cp.session().lock();
+        assert!(s.plugins.instances.is_empty(), "no plugin rows when preparation is None");
+        assert!(
+            s.store.tracks.iter().all(|t| t.instrument_id.is_none()),
+            "tracks stay unbound (PolySynth fallback) without Zyn"
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     /// Item-4 integration: a finished `stableAudioSfz` job whose result
@@ -6527,6 +7069,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track_id),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 
@@ -6644,6 +7188,61 @@ mod tests {
         );
         let mtime_after = std::fs::metadata(&project_json).unwrap().modified().unwrap();
         assert_eq!(mtime_before, mtime_after, "project.json was never touched by the skipped persist");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// C-1 RESIDUAL, the dangerous half — the sibling of the persist skip
+    /// above, at the undo door. `HistoryLog::record_commit`'s guard drops a
+    /// stale journal line and a stale history entry, but it runs AFTER the
+    /// effect phase: by then a stale undo's inverses have already been
+    /// applied to the document. Re-opening the same project is routine and
+    /// keeps every id, so those inverses apply CLEANLY against the wrong
+    /// revision instead of failing loudly.
+    ///
+    /// Staged exactly like the persist test: bump `session.epoch` directly,
+    /// standing in for an epoch function's swap block — which really does
+    /// bump it under the session lock BEFORE calling
+    /// `HistoryLog::epoch_boundary`, so this IS the window in which the pop
+    /// reports the old epoch while `Tx` already runs under the new one.
+    /// Evidence the guard fired: `commit_replay` returns Err AND the gain
+    /// never moved — "nothing applied", not merely "nothing recorded".
+    #[test]
+    fn an_undo_whose_document_swapped_after_the_pop_applies_nothing() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("undo-epoch-skip");
+        cp.create_project(parent.to_str().unwrap(), "UndoEpochSkip").unwrap();
+
+        let id =
+            cp.add_track(Some("Audio".into()), None, TxMeta::user("add track")).unwrap().id.to_string();
+        cp.set_track_mix(
+            vec![TrackMixChange { gain_db: Some(-6.0), ..TrackMixChange::new(id.clone()) }],
+            TxMeta::user("set track gain"),
+        )
+        .unwrap();
+        let gain = || cp.session().lock().store.tracks.iter().find(|t| t.id == id).unwrap().gain_db;
+        assert_eq!(gain(), -6.0);
+        let depths_before = cp.history_depths();
+        assert_eq!(depths_before, (2, 0), "the add and the gain are two undoable steps");
+
+        // The document swaps out from under the undo, after it popped.
+        cp.session().lock().epoch += 1;
+
+        let err = cp.undo().expect_err("an undo against a swapped document must fail, not apply");
+        assert!(err.contains("document changed"), "the failure must name the reason, got {err:?}");
+        assert_eq!(gain(), -6.0, "NOTHING was applied to the swapped-in document");
+        assert_eq!(
+            cp.history_depths(),
+            depths_before,
+            "a rejected undo consumes no history step — the entry went back untouched"
+        );
+
+        // The guard is a staleness check, not a mute button: once the
+        // epochs agree again the very same entry undoes normally.
+        cp.session().lock().epoch -= 1;
+        assert_eq!(cp.undo().unwrap().as_deref(), Some("set track gain"));
+        assert_eq!(gain(), 0.0);
+        assert_eq!(cp.history_depths(), (1, 1));
 
         let _ = std::fs::remove_dir_all(&parent);
     }
@@ -6856,6 +7455,420 @@ mod tests {
         let err = cp.save_project_as(parent.to_str().unwrap(), "Other").unwrap_err();
         assert!(err.contains("already open"), "clear message: {err}");
         assert!(!parent.join("Other.aura").exists(), "no dir left behind");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// I-1: before this fix, `save_project_as_epoch` wrote ONLY
+    /// project.json + the midi snapshot — plugin state blobs and automation
+    /// lanes were silently left behind. Combined with Task 1's I-7
+    /// adopt-clear fix, the very next COLD OPEN of the Save-As'd project
+    /// would see no `plugins`/`automation` fields on disk and actively
+    /// CLEAR whatever the session had — a Save-As that destroys plugin
+    /// state and automation. Ruling F-6: both are snapshotted under the
+    /// same short lock the midi snapshot already uses, and written after
+    /// the lock drops via the same helpers `execute_persist` calls.
+    #[test]
+    fn save_as_carries_plugin_rows_state_blobs_and_automation_into_the_new_dir() {
+        let (cp, _events, _engine) = recording_control_plane();
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![]);
+            s.plugins.pending_state.insert(
+                "inst-1".into(),
+                crate::plugins::state::encode_state(
+                    "lv2:urn:test:synth",
+                    &crate::plugins::state::StateBlob {
+                        kind: crate::plugins::state::KIND_OPAQUE,
+                        data: vec![7u8; 16],
+                    },
+                ),
+            );
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.automation.lanes.push(crate::plugins::automation::AutomationLane {
+                id: "track:t-1:gain".into(),
+                target_node: "track:t-1".into(),
+                param_id: 0,
+                points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+            });
+        }
+
+        let parent = cp_tmp_parent("saveas-plugins-automation");
+        cp.save_project_as(parent.to_str().unwrap(), "PluginsAuto").unwrap();
+        let dir = parent.join("PluginsAuto.aura");
+
+        let pj: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("project.json")).unwrap(),
+        )
+        .unwrap();
+        let rows = pj
+            .get("plugins")
+            .and_then(|v| v.as_array())
+            .expect("plugins[] must be written by Save-As (I-1)");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], "inst-1");
+        assert!(dir.join("plugins").join("inst-1.state").exists(), "state blob must land");
+
+        // Track F: Save-As upgrades to v4 `modulation{}` (and drops
+        // `automation[]`). The I-1 contract is that the lane data lands,
+        // not that the retired key survives.
+        let loaded = crate::modulation::persist::load_from_project(&dir)
+            .expect("modulation{} must be written by Save-As (I-1)");
+        assert_eq!(loaded.bindings.len(), 1, "gain lane migrated into a binding");
+        assert_eq!(loaded.bindings[0].id, "track:t-1:gain");
+        assert_eq!(loaded.curves.len(), 1);
+        assert!(!loaded.curves[0].points.is_empty(), "curve points must land");
+
+        assert!(
+            !cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "dirty_state cleared for the id whose pending bytes just landed on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// I-1 end-to-end: a Save-As'd project's plugins + automation survive a
+    /// COLD OPEN. `ControlPlane::open_project_epoch`'s own adopt step
+    /// (`plugins::state`/`plugins::automation::adopt_open_project`) reaches
+    /// its session through a process-global, first-registration-wins
+    /// `OnceLock` shared by the WHOLE test binary — `state.rs`'s and
+    /// `automation.rs`'s own registered-session tests already document that
+    /// as a "pre-existing, accepted risk" for tests WITHIN their own module
+    /// (each serializes against its own siblings via a private
+    /// `TEST_SESSION_LOCK`, but nothing stops a DIFFERENT module's
+    /// registered-session test from running concurrently against that same
+    /// global — confirmed here: an earlier version of this test that also
+    /// registered against the global flaked under the full parallel suite,
+    /// clobbered mid-test by one of those other modules' tests). So this
+    /// test instead drives the exact same UNDERLYING restore primitives
+    /// `adopt_open_project` calls — `plugins::state::restore_into_session`
+    /// (disk -> a session it's handed directly, no global) and
+    /// `plugins::automation::load_lanes` — against `cp.session()` itself,
+    /// with no process-global involved at all: a deterministic, race-free
+    /// exercise of the SAME disk-round-trip contract, without the
+    /// mid-air-shared-global hazard the plain `open_project_epoch` route
+    /// would reintroduce.
+    #[test]
+    fn save_as_then_cold_open_round_trips_plugins_and_automation() {
+        let (cp, _events, _engine) = recording_control_plane();
+
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![]);
+            s.plugins.pending_state.insert(
+                "inst-1".into(),
+                crate::plugins::state::encode_state(
+                    "lv2:urn:test:synth",
+                    &crate::plugins::state::StateBlob {
+                        kind: crate::plugins::state::KIND_OPAQUE,
+                        data: vec![7u8; 16],
+                    },
+                ),
+            );
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.automation.lanes.push(crate::plugins::automation::AutomationLane {
+                id: "track:t-1:gain".into(),
+                target_node: "track:t-1".into(),
+                param_id: 0,
+                points: vec![crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 }],
+            });
+        }
+
+        let parent = cp_tmp_parent("saveas-cold-open-roundtrip");
+        cp.save_project_as(parent.to_str().unwrap(), "RoundTrip").unwrap();
+        let saved_dir = parent.join("RoundTrip.aura");
+
+        // "Cold open" — blank the in-memory session the way a fresh app
+        // process (nothing adopted yet) would look, WITHOUT going through
+        // `open_project_epoch`'s process-global-dependent adopt step (see
+        // this test's doc comment for why).
+        {
+            let mut s = cp.session().lock();
+            s.plugins = session::PluginDoc::default();
+            s.automation.lanes.clear();
+        }
+        assert!(cp.session().lock().plugins.instances.is_empty(), "sanity: session blanked");
+        assert!(cp.session().lock().automation.lanes.is_empty(), "sanity: session blanked");
+
+        // The actual restore under test: the SAME primitives
+        // `open_project_epoch`'s adopt step calls
+        // (`plugins::state::read_restored_rows`/`install_restored_rows` via
+        // `restore_into_session`, and `automation::load_lanes`), driven
+        // directly against `cp.session()` — reads back exactly what
+        // `save_project_as_epoch`'s I-1 fix just wrote.
+        {
+            let mut s = cp.session().lock();
+            crate::plugins::state::restore_into_session(&saved_dir, &mut s).unwrap();
+        }
+        let doc = crate::modulation::persist::load_from_project(&saved_dir)
+            .expect("modulation{} present after Save-As (I-1)");
+        let lanes = crate::modulation::compat::lanes_from_doc(&doc);
+        {
+            let mut s = cp.session().lock();
+            s.modulation = doc;
+            s.automation.lanes = lanes;
+        }
+
+        let s = cp.session().lock();
+        assert_eq!(
+            s.plugins.instances.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["inst-1"],
+            "plugin instance round-tripped through Save-As + cold open"
+        );
+        let pending = s.plugins.pending_state.get("inst-1").expect("pending_state present");
+        let (uid, blob) = crate::plugins::state::decode_state(pending).unwrap();
+        assert_eq!(uid, "lv2:urn:test:synth");
+        assert_eq!(blob.data, vec![7u8; 16], "state blob bytes round-tripped");
+        assert_eq!(s.automation.lanes.len(), 1, "automation lane round-tripped");
+        assert_eq!(s.automation.lanes[0].id, "track:t-1:gain");
+        assert_eq!(s.automation.lanes[0].points, vec![crate::plugins::automation::AutomationPoint {
+            tick: 0,
+            value: 1.0
+        }]);
+        drop(s);
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// M-2 (Task 3, whole-branch review): before this fix, `save_project_
+    /// mark` (Ctrl+S) wrote ONLY `project.json` — a midi edit left dirty by
+    /// a prior FAILED auto-persist (mirrors M-5's own scenario: `midi.dirty`
+    /// stuck `true` with the edit never reaching disk) survived the save
+    /// untouched, so the journal's mark record then claimed durability the
+    /// snapshot didn't have. The edit here is added directly to
+    /// `session.midi.clips` (bypassing `commit`, same direct-drive sanction
+    /// `persist_effect_writes_midi_after_the_lock_and_before_the_emit` uses)
+    /// so nothing auto-persists it first; `midi.dirty` is forced `true` to
+    /// stand in for the failed auto-persist. `save_project_mark` must flush
+    /// it and clear the flag.
+    #[test]
+    fn save_project_mark_flushes_a_failed_midi_autopersist() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("save-mark-midi");
+        cp.create_project(parent.to_str().unwrap(), "SaveMarkMidi").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        {
+            let mut session = cp.session().lock();
+            let mut clip = dummy_midi_clip("t-1");
+            clip.notes.push(crate::midi::MidiNote {
+                tick: 0,
+                length_ticks: 480,
+                key: 60,
+                velocity: 100,
+                channel: 0,
+                note_id: crate::ids::NoteId(1),
+            });
+            session.midi.clips.push(clip);
+            // Stands in for a prior FAILED auto-persist (M-5's own
+            // scenario) — the edit is in memory, but nothing on disk
+            // reflects it yet.
+            session.midi.dirty = true;
+        }
+
+        cp.save_project_mark().unwrap();
+
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert_eq!(
+            raw["content"].as_array().unwrap().len(),
+            1,
+            "M-2: Ctrl+S flushes the midi edit a failed auto-persist left behind"
+        );
+        let ev_ref = raw["content"][0]["eventsRef"]
+            .as_str()
+            .expect("events chunk ref written for a clip with notes");
+        assert!(dir.join(ev_ref).exists(), "AMEV chunk file exists on disk after save_project_mark");
+        assert!(!cp.session().lock().midi.dirty, "M-2: save_project_mark clears the recovered dirty flag");
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// M-2 (Task 3): same recovery, for plugin state — a `dirty_state` id
+    /// left over from a failed auto-persist must flush on Ctrl+S, mirroring
+    /// `save_as_carries_plugin_rows_state_blobs_and_automation_into_the_new_dir`'s
+    /// setup but against an already-open project (`save_project_mark`, not
+    /// Save-As).
+    #[test]
+    fn save_project_mark_flushes_dirty_plugin_state() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("save-mark-plugins");
+        cp.create_project(parent.to_str().unwrap(), "SaveMarkPlugins").unwrap();
+        let dir = cp.session().lock().store.project_dir.clone().unwrap();
+
+        {
+            let mut s = cp.session().lock();
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert("inst-1".into(), vec![]);
+            s.plugins.pending_state.insert(
+                "inst-1".into(),
+                crate::plugins::state::encode_state(
+                    "lv2:urn:test:synth",
+                    &crate::plugins::state::StateBlob {
+                        kind: crate::plugins::state::KIND_OPAQUE,
+                        data: vec![7u8; 16],
+                    },
+                ),
+            );
+            // Stands in for a failed auto-persist: bytes are pending, the
+            // flag is set, nothing has landed on disk yet.
+            s.plugins.dirty_state.insert("inst-1".into());
+        }
+
+        cp.save_project_mark().unwrap();
+
+        assert!(
+            dir.join("plugins").join("inst-1.state").exists(),
+            "M-2: Ctrl+S flushes the pending plugin state blob"
+        );
+        assert!(
+            cp.session().lock().plugins.dirty_state.is_empty(),
+            "M-2: save_project_mark clears dirty_state once the bytes landed on disk"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// M-1 (Task 3, whole-branch review): a `PluginSetState` landing between
+    /// the snapshot `execute_persist`/`save_project_mark`/`save_project_as_
+    /// epoch` take and their post-write re-lock must NOT have its dirty flag
+    /// cleared just because SOME earlier bytes for that id were written —
+    /// `clear_dirty_state_matching` must compare live pending bytes against
+    /// the snapshot's, not just check the id off a list.
+    #[test]
+    fn a_concurrent_set_state_between_snapshot_and_clear_stays_dirty() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let snapshot = {
+            let mut s = cp.session().lock();
+            s.plugins.pending_state.insert("inst-1".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.plugin_snapshot()
+        };
+        // The concurrent SetState: live pending bytes move on to something
+        // the snapshot above never saw — standing in for a `PluginSetState`
+        // landing in the window between the snapshot and this call.
+        cp.session().lock().plugins.pending_state.insert("inst-1".into(), vec![9, 9, 9]);
+
+        cp.committer().clear_dirty_state_matching(&["inst-1".to_string()], &snapshot);
+
+        assert!(
+            cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "M-1: a concurrent SetState after the snapshot keeps the id dirty"
+        );
+    }
+
+    /// M-1's complementary case: when nothing raced the snapshot, live
+    /// pending bytes still match what was written, and the helper clears
+    /// the flag exactly like the pre-M-1 unconditional `remove` did.
+    #[test]
+    fn matching_pending_bytes_clear_the_dirty_flag() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let snapshot = {
+            let mut s = cp.session().lock();
+            s.plugins.pending_state.insert("inst-1".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.insert("inst-1".into());
+            s.plugin_snapshot()
+        };
+
+        cp.committer().clear_dirty_state_matching(&["inst-1".to_string()], &snapshot);
+
+        assert!(
+            !cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "M-1: matching pending bytes clear the dirty flag"
+        );
+    }
+
+    /// Review #23 follow-up: a stale persist can overwrite newer bytes and
+    /// leave dirty already-false (the newer writer cleared it). Mismatch
+    /// must re-dirty so the next flush rewrites the live document.
+    #[test]
+    fn clear_midi_dirty_re_dirties_when_live_moved_and_flag_was_clear() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let written = {
+            let mut s = cp.session().lock();
+            s.midi.clips.push(dummy_midi_clip("t-1"));
+            s.midi.dirty = false;
+            s.midi_snapshot()
+        };
+        {
+            let mut s = cp.session().lock();
+            s.midi.clips[0].name = "moved-on".into();
+            s.midi.dirty = false;
+        }
+
+        let matched = cp.committer().clear_midi_dirty_if_unchanged(&written);
+        assert!(!matched, "live bytes moved on");
+        assert!(
+            cp.session().lock().midi.dirty,
+            "stale write must re-dirty so the live document flushes again"
+        );
+    }
+
+    /// Same hole on plugin blobs: dirty already cleared by a later persist,
+    /// then a stale write's compare must put the id back.
+    #[test]
+    fn clear_dirty_state_re_dirties_when_live_moved_and_flag_was_clear() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let snapshot = {
+            let mut s = cp.session().lock();
+            s.plugins.pending_state.insert("inst-1".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.clear();
+            s.plugin_snapshot()
+        };
+        cp.session().lock().plugins.pending_state.insert("inst-1".into(), vec![9, 9, 9]);
+
+        let matched = cp.committer().clear_dirty_state_matching(&["inst-1".to_string()], &snapshot);
+        assert!(!matched, "live pending bytes moved on");
+        assert!(
+            cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "stale plugin write must re-dirty the id"
+        );
+    }
+
+    /// Persist I/O is serialized: a holder of `persist_gate` blocks
+    /// `execute_persist` until it drops. Without the gate, two writers can
+    /// snapshot under the session lock and interleave their disk writes.
+    #[test]
+    fn persist_gate_blocks_execute_persist_until_released() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("persist-gate");
+        cp.create_project(parent.to_str().unwrap(), "PersistGate").unwrap();
+        let epoch = cp.session().lock().epoch;
+        let gate = cp.session().lock().persist_gate.clone();
+        let held = gate.lock();
+        let committer = cp.committer().clone();
+        let handle = std::thread::spawn(move || {
+            committer.execute_persist(
+                &session::PersistEffect { midi: true, ..session::PersistEffect::default() },
+                epoch,
+            );
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!handle.is_finished(), "execute_persist must wait on persist_gate");
+        drop(held);
+        handle.join().expect("persist thread");
         let _ = std::fs::remove_dir_all(&parent);
     }
 }

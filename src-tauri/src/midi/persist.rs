@@ -65,7 +65,7 @@ fn mint_content_id(clip_id: &str) -> crate::ids::ContentId {
 /// math authority, this struct is a control-plane cache of display values
 /// quantized losslessly through `crate::time::{period_from_bpm,
 /// bpm_from_period}`'s proven idempotence (Task 2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct V3Data {
     pub ppq: u32,
     pub tempo_events: Vec<TempoEvent>,
@@ -96,6 +96,10 @@ struct PersistedClip {
     /// an old project resaves byte-diff-free.
     #[serde(default)]
     content_length_ticks: Option<u64>,
+    #[serde(default)]
+    transpose_semitones: i16,
+    #[serde(default)]
+    velocity_offset: i16,
 }
 
 /// v3 content row (round-2 §5, ADR 0004): the note payload half of the
@@ -127,6 +131,10 @@ struct PersistedPlacement {
     name: String,
     timeline_start_ticks: u64,
     length_ticks: u64,
+    #[serde(default)]
+    transpose_semitones: i16,
+    #[serde(default)]
+    velocity_offset: i16,
 }
 
 /// v3 lane row: resolves a `LaneId` to its `TrackId`.
@@ -213,14 +221,21 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
             live_chunks.push(chunk_name);
         }
         content_rows.push(content);
-        placement_rows.push(json!({
+        let mut placement = json!({
             "id": clip.id,
             "contentId": clip.content_id,
             "laneId": clip.lane_id,
             "name": clip.name,
             "timelineStartTicks": clip.timeline_start_ticks,
             "lengthTicks": clip.length_ticks,
-        }));
+        });
+        if clip.transpose_semitones != 0 {
+            placement["transposeSemitones"] = json!(clip.transpose_semitones);
+        }
+        if clip.velocity_offset != 0 {
+            placement["velocityOffset"] = json!(clip.velocity_offset);
+        }
+        placement_rows.push(placement);
         // One row per DISTINCT lane actually referenced — today that's one
         // per track-with-a-clip (every clip on a track shares that
         // track's default lane, by construction: `LaneId::default_for_
@@ -395,6 +410,8 @@ fn parse_clips_legacy(dir: &Path, root: &Value, ppq: u32) -> Result<Vec<MidiClip
             content_id,
             lane_id,
             content_length_ticks: row.content_length_ticks,
+            transpose_semitones: row.transpose_semitones,
+            velocity_offset: row.velocity_offset,
         });
     }
     Ok(clips)
@@ -468,6 +485,8 @@ fn parse_clips_v3_native(dir: &Path, root: &Value, ppq: u32) -> Result<Vec<MidiC
             content_id: placement.content_id.into(),
             lane_id: placement.lane_id.into(),
             content_length_ticks: content.content_length_ticks,
+            transpose_semitones: placement.transpose_semitones,
+            velocity_offset: placement.velocity_offset,
         });
     }
     Ok(clips)
@@ -633,6 +652,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track(track),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 

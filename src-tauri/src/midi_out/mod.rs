@@ -1115,7 +1115,7 @@ fn run_thread(
                     for (scope, target) in &mine {
                         let events = match scope {
                             RouteScope::Track(track_id) => crate::midi::playback::track_events_excluding(
-                                &guard.midi,
+                                guard.midi.clips.iter(),
                                 track_id,
                                 &overridden_clips,
                                 &map,
@@ -1891,6 +1891,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("t-1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             }],
             loaded_dir: None,
             dirty: false,
@@ -2005,6 +2007,8 @@ mod tests {
                     content_id: crate::ids::ContentId::mint(),
                     lane_id: crate::ids::LaneId::default_for_track("t-1"),
                     content_length_ticks: None,
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
                 },
                 MidiClip {
                     id: overridden_clip_id.clone(),
@@ -2017,6 +2021,8 @@ mod tests {
                     content_id: crate::ids::ContentId::mint(),
                     lane_id: crate::ids::LaneId::default_for_track("t-1"),
                     content_length_ticks: None,
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
                 },
             ],
             loaded_dir: None,
@@ -2100,6 +2106,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("t-1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             }],
             loaded_dir: None,
             dirty: false,
@@ -2539,6 +2547,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("t-1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             }],
             loaded_dir: None,
             dirty: false,

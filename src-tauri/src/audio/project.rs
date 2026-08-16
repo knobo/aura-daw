@@ -132,6 +132,9 @@ pub fn ensure_default_project(
         session.store.project_dir = Some(dir);
         session.store.project_name = Some(project.name.clone());
         session.store.created_at = project.created_at.clone();
+        // snapshot republish: document swap (ensure) — project meta + the
+        // epoch bump are non-op writes; republish before the guard drops.
+        session.republish_full();
     }
     Ok(Some(project))
 }

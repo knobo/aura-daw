@@ -59,10 +59,16 @@ stops working the moment the new one is generated. Full client setup:
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 729 tests (700 lib + 29 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-15 on main; Track F adds modulation tests — re-measure after rebase)
+cd src-tauri && cargo test   # 900 tests (866 lib + 34 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after review follow-up)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
+
+`midi_out::tests` is **known flaky as a module**, not as individual tests:
+its cases share a process-global hub and open real ALSA virtual ports, so
+under a parallel run any one of them can lose the race. Three distinct names
+have flaked so far; re-run the module in isolation before believing a failure
+there (`cargo test --lib midi_out::tests`).
 
 Some tests are **gated** and skip politely when their requirements are absent:
 

@@ -489,8 +489,11 @@ struct RestoredRow {
 /// Read (from `<dir>/project.json` + `<dir>/plugins/*.state`) everything
 /// [`install_restored_rows`] needs — PURE disk I/O, no `Session`, no lock
 /// of any kind. `Ok(None)` when the project carries no `plugins` field at
-/// all (pre-persistence project — the caller must NOT clear the document
-/// then).
+/// all (pre-persistence project). What "the caller must NOT clear the
+/// document then" means now DEPENDS on the caller: [`restore_into_session`]'s
+/// non-epoch callers still must not (see its own doc comment); the epoch
+/// caller, [`adopt_open_project`], instead treats `Ok(None)` as an explicit
+/// empty row set and DOES clear — I-7.
 fn read_restored_rows(dir: &Path) -> Result<Option<Vec<RestoredRow>>, String> {
     let Some(rows) = load_rows(dir)? else { return Ok(None) };
     let mut out = Vec::with_capacity(rows.len());
@@ -606,7 +609,11 @@ fn install_restored_rows(
 ///
 /// Returns `(restored_count, prior_hosted)` — see [`install_restored_rows`].
 /// Projects WITHOUT a `plugins` field leave the document untouched
-/// (`(0, vec![])`).
+/// (`(0, vec![])`) — this is a RESTORE primitive, not an epoch function, so
+/// (unlike [`adopt_open_project`]'s `Ok(None)` arm — I-7) it must NOT clear
+/// on the caller's behalf: a caller reaching for `restore_into_session`
+/// outside the project-open seam has no guarantee "no `plugins` field"
+/// means anything about what should currently be in `session.plugins`.
 pub fn restore_into_session(
     dir: &Path,
     session: &mut Session,
@@ -668,7 +675,7 @@ pub fn reactivate_restored_with(
                     };
                     r.status = "active".into();
                     s.plugins.params.insert(id.clone(), real_params);
-                    if snapshot.is_empty() {
+                    let applied = if snapshot.is_empty() {
                         Vec::new()
                     } else {
                         let params = s.plugins.params.get_mut(&id).expect("just inserted");
@@ -680,7 +687,21 @@ pub fn reactivate_restored_with(
                             }
                         }
                         applied
-                    }
+                    };
+                    // snapshot republish: `status` + the param mirror are
+                    // document content and this write-back bypasses
+                    // `transact`; same lock as the write, so no intermediate
+                    // is ever published. COVERAGE GAP, stated where the
+                    // decision is: the only test that reaches this line is
+                    // `zyn_state_roundtrips_through_real_project_save_open`,
+                    // which SKIPS when zynaddsubfx-lv2 is absent — so on a
+                    // host-less machine this republish is unguarded while
+                    // appearing pinned. `tests/snapshot_store.rs` cannot
+                    // reach it (its rows are `format: "stub"` by design), and
+                    // reaching it host-free would mean adding a host-
+                    // injection seam to this module.
+                    s.republish_full();
+                    applied
                 };
                 match format.as_str() {
                     "clap" => {
@@ -742,9 +763,22 @@ pub fn reactivate_restored_with(
 /// host call).
 pub fn adopt_open_project(dir: &Path) {
     let Some(session) = crate::midi::playback::registered_store() else { return };
+    // `Ok(None)` (no `plugins` field) is treated as an explicit EMPTY row
+    // set, not "leave the document alone" (I-7): this function only ever
+    // runs at the exact moment a project is (re)adopted — never
+    // speculatively — so "no `plugins` field" genuinely means "this (now
+    // open) project has none", the same reasoning
+    // `automation::adopt_open_project` already applies to its own `Ok(None)`
+    // arm. Before this fix, the early return here skipped
+    // `install_restored_rows` entirely, so the OUTGOING project's
+    // `instances`/`params`/`pending_state`/`dirty_state` survived into the
+    // freshly (re)opened document and got written into ITS `project.json`
+    // by the next plugin persist — cross-project file contamination. `Err`
+    // stays a true "leave alone": an unreadable file is not evidence the
+    // project has no plugins.
     let rows = match read_restored_rows(dir) {
         Ok(Some(r)) => r,
-        Ok(None) => return, // no `plugins` field — document untouched
+        Ok(None) => Vec::new(),
         Err(e) => {
             log::warn!("plugins: cannot restore from {}: {e}", dir.display());
             return;
@@ -752,7 +786,20 @@ pub fn adopt_open_project(dir: &Path) {
     };
     let (restored, prior_hosted) = {
         let mut s = session.lock();
-        install_restored_rows(&mut s, rows)
+        let result = install_restored_rows(&mut s, rows);
+        // A stale dirty id from the OUTGOING project must not mark the
+        // freshly-adopted document dirty. `install_restored_rows` itself
+        // deliberately leaves `dirty_state` untouched (it's a restore
+        // primitive shared with non-epoch callers, e.g.
+        // `restore_into_session`), so the clear happens HERE, in both `Ok`
+        // arms, under the SAME short lock as the install (I-7).
+        s.plugins.dirty_state.clear();
+        // snapshot republish: the locked install replaced the plugin
+        // document wholesale, outside `transact`. Same short lock as the
+        // install — the published image can never observe the intermediate
+        // state. (`dirty_state` above is bookkeeping, outside the contract.)
+        s.republish_full();
+        result
     };
     if restored == 0 && prior_hosted.is_empty() {
         return;
@@ -1090,6 +1137,75 @@ mod tests {
         Session::new(Store::default(), MidiStore::default())
     }
 
+    /// Serializes this module's own tests that touch the process-global
+    /// registered session (`midi::playback::register_store`/
+    /// `registered_store` is a first-registration-wins `OnceLock` shared by
+    /// the WHOLE test binary — see
+    /// `adopt_open_project_end_to_end_with_a_registered_session_does_not_
+    /// deadlock`'s doc comment). Held for the duration of each such test via
+    /// `register_test_session`'s returned guard, so THIS module's
+    /// registered-session tests don't race each other; cross-file races with
+    /// other test modules that also touch the global (e.g.
+    /// `midi::mod::midi_purity_fixture`) remain the pre-existing, accepted
+    /// risk that comment already documents.
+    static TEST_SESSION_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Register a fresh session for tests exercising the PRODUCTION
+    /// `registered_store()` path — extracted from
+    /// `adopt_open_project_end_to_end_with_a_registered_session_does_not_
+    /// deadlock`, the original registered-session fixture (do not build a
+    /// parallel one). Returns the ACTUALLY-registered session — first
+    /// registration wins, so some OTHER test file may already have won the
+    /// race — plus a guard the caller must hold for the rest of the test to
+    /// serialize against this module's other registered-session tests.
+    fn register_test_session() -> (Arc<Mutex<Session>>, parking_lot::MutexGuard<'static, ()>) {
+        let guard = TEST_SESSION_LOCK.lock();
+        let session = Arc::new(Mutex::new(new_session()));
+        crate::midi::playback::register_store(session.clone());
+        // First registration wins: use whichever session actually holds the
+        // global (ours, or one registered by another test in this binary).
+        let registered =
+            crate::midi::playback::registered_store().expect("a session is registered").clone();
+        (registered, guard)
+    }
+
+    /// Minimal `PluginInstanceInfo` for tests that only need a row to exist
+    /// — field shape copied from `read_restored_rows`'s own construction
+    /// (~:505).
+    fn test_row(id: &str) -> PluginInstanceInfo {
+        PluginInstanceInfo {
+            id: id.into(),
+            uid: "lv2:urn:test:synth".into(),
+            name: "TestSynth".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None,
+        }
+    }
+
+    /// A real, freshly-created project dir whose `project.json` has no
+    /// `plugins` key at all (pre-persistence shape — `read_restored_rows`
+    /// must return `Ok(None)` for it).
+    fn temp_project_dir_without_plugins_field() -> PathBuf {
+        let parent = tmp_parent("no-plugins-field");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let raw: Value = serde_json::from_slice(&fs::read(dir.join("project.json")).unwrap()).unwrap();
+        assert!(
+            raw.get("plugins").is_none(),
+            "fixture precondition: a freshly created project has no `plugins` field"
+        );
+        dir
+    }
+
+    /// A project dir whose `project.json` is present but not valid JSON —
+    /// `read_restored_rows` must return `Err`, not `Ok(None)`.
+    fn temp_project_dir_with_corrupt_project_json() -> PathBuf {
+        let parent = tmp_parent("corrupt-project-json");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        fs::write(dir.join("project.json"), b"{not valid json").unwrap();
+        dir
+    }
+
     /// Test-only doc-level "instantiate": mints a `"stub"` row + an empty
     /// param entry directly into `session.plugins`, mirroring the retired
     /// `PluginRegistry::instantiate`'s pure (no host call) semantics — these
@@ -1417,6 +1533,24 @@ mod tests {
             "active",
             "restored Zyn re-activates through the unified host thread"
         );
+        // Plan F Task 5: the post-host writeback above is a document write
+        // outside `transact`, so it republishes. `tests/snapshot_store.rs`'s
+        // sweep cannot reach this site (it needs a real host), which makes
+        // this plugin-gated test the only place that site is exercised.
+        {
+            let s = fresh.lock();
+            let image = s.published_handle().lock().clone();
+            assert_eq!(
+                s.plugins.instances.iter().find(|r| r.id == info.id).map(|r| &r.status),
+                image.plugins.instances.iter().find(|r| r.id == info.id).map(|r| &r.status),
+                "the reactivation writeback must republish"
+            );
+            assert_eq!(
+                s.plugins.params.get(&info.id),
+                image.plugins.params.get(&info.id),
+                "including the real param mirror it just installed"
+            );
+        }
         // A real RT node builds from the restored registration (the loaded
         // blob is applied to it — audible-patch path).
         match super::super::lv2_host::global().make_node(&info.id, 48_000) {
@@ -1721,12 +1855,7 @@ mod tests {
         })
         .unwrap();
 
-        let session = Arc::new(Mutex::new(new_session()));
-        crate::midi::playback::register_store(session.clone());
-        // First registration wins: use whichever session actually holds the
-        // global (ours, or one registered by another test in this binary).
-        let registered =
-            crate::midi::playback::registered_store().expect("a session is registered");
+        let (registered, _guard) = register_test_session();
 
         // THE regression check: this call chain used to deadlock. If it
         // hangs, this test times out instead of failing cleanly — that IS
@@ -1746,6 +1875,70 @@ mod tests {
         assert_eq!(s.midi.loaded_dir.as_deref(), Some(dir.as_path()), "midi side ALSO synced");
         drop(s);
         let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// I-7: `create_project_at`/`open_project_epoch` adopt a project whose
+    /// `project.json` has no `plugins` key at all (a fresh project, or one
+    /// predating plugin persistence) — `read_restored_rows` returns
+    /// `Ok(None)` for that. Before this fix, `adopt_open_project` early-
+    /// returned on `Ok(None)` WITHOUT ever calling `install_restored_rows`,
+    /// so the PREVIOUS project's `instances`/`params`/`pending_state`/
+    /// `dirty_state` survived in `session.plugins` and got written into the
+    /// new project's `project.json` by the next plugin persist —
+    /// cross-project file contamination. `automation::adopt_open_project`
+    /// already treats `Ok(None)` as "clear" for the same reason: an epoch
+    /// adopt runs only at the exact moment a project is (re)adopted, so "no
+    /// `plugins` field" genuinely means "this (now open) project has none".
+    #[test]
+    fn adopting_a_project_without_a_plugins_field_clears_the_previous_sessions_rows() {
+        // Previous session left a row + params + a pending blob + a dirty id.
+        let (session, _guard) = register_test_session();
+        {
+            let mut s = session.lock();
+            s.plugins.instances.push(test_row("inst-old"));
+            s.plugins.params.insert("inst-old".into(), vec![]);
+            s.plugins.pending_state.insert("inst-old".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.insert("inst-old".into());
+        }
+        // A fresh project dir whose project.json has NO `plugins` key.
+        let dir = temp_project_dir_without_plugins_field();
+        adopt_open_project(&dir);
+        let s = session.lock();
+        assert!(s.plugins.instances.is_empty(), "rows must not leak across projects (I-7)");
+        assert!(s.plugins.params.is_empty());
+        assert!(s.plugins.pending_state.is_empty());
+        assert!(s.plugins.dirty_state.is_empty(), "stale dirty ids must not survive the swap");
+        drop(s);
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// I-7 companion: an `Err` from `read_restored_rows` (unreadable/corrupt
+    /// `project.json`) is NOT evidence the project has no plugins — the
+    /// document must be left alone, exactly as before this fix.
+    #[test]
+    fn an_unreadable_plugins_file_leaves_the_document_alone() {
+        let (session, _guard) = register_test_session();
+        {
+            // The registered session is a process-global (first-registration
+            // -wins `OnceLock`), so another of this module's registered-
+            // session tests may have left rows in it before this one got the
+            // `TEST_SESSION_LOCK` guard above — start from a known baseline
+            // so the `len() == 1` assertion below is order-independent.
+            let mut s = session.lock();
+            s.plugins.instances.clear();
+            s.plugins.params.clear();
+            s.plugins.pending_state.clear();
+            s.plugins.dirty_state.clear();
+            s.plugins.instances.push(test_row("inst-old"));
+        }
+        let dir = temp_project_dir_with_corrupt_project_json(); // invalid JSON -> read error
+        adopt_open_project(&dir);
+        assert_eq!(
+            session.lock().plugins.instances.len(),
+            1,
+            "Err is not evidence of an empty project - leave alone, as today"
+        );
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 
     /// Critical-2: a SECOND `PluginSetState` for the same instance (the

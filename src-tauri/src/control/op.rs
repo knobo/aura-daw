@@ -21,6 +21,14 @@
 /// That window closes permanently the moment Plan F ships a replayer.
 /// After that, a change of this kind costs a migration.
 ///
+/// CORRECTION (ADR 0007, Plan F Task 9): the window IS CLOSED. The paragraph
+/// above is kept as the record of why version 2 shipped without a dual-shape
+/// reader, but `control::replay` now reads this format back, and its reader
+/// gates on this constant: a batch line at any other version is skipped and
+/// counted, never guessed at. From here, a breaking change to any `Op`
+/// variant's wire form needs a bump AND a reader that understands both
+/// shapes.
+///
 /// The same bump covers L-1 (`Op::PluginRemove::params` is now actually
 /// read on apply) — two format edits under one version, while the format
 /// is one day old, instead of two migrations later.
@@ -294,6 +302,13 @@ pub enum PropPath {
     /// `null` (mirrors `MidiClip::content_length_ticks: Option<u64>`);
     /// `null` clears back to "same as `LengthTicks`".
     ContentLengthTicks,
+    /// MidiClip: placement transpose in semitones (wire: JSON integer).
+    /// Plan F Task 12 — the RESULTS.md 5.4× lever: transpose-class
+    /// gestures MUST address this field, never rewrite notes.
+    TransposeSemitones,
+    /// MidiClip: placement velocity offset (wire: JSON integer). Same
+    /// routing rule as `TransposeSemitones`.
+    VelocityOffset,
     /// Transport: `"playing"|"stopped"|"recording"` (wire: JSON string).
     /// Plan E Task 12 (inventory rows 28-29): the property-addressed mirror
     /// of `ControlPlane::transport`'s direct `session.store.transport.state`
@@ -564,6 +579,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t-2"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         let midi_clip_add = Op::MidiClipAdd { clip: midi_clip.clone(), index: 0 };
         let s = serde_json::to_string(&midi_clip_add).unwrap();

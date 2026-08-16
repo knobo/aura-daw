@@ -58,8 +58,14 @@ pub fn clip_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
             if off_s <= on_s {
                 off_s = on_s + 1;
             }
-            out.push(AbsNoteEvent { sample: on_s, key: n.key, velocity: n.velocity });
-            out.push(AbsNoteEvent { sample: off_s, key: n.key, velocity: 0 });
+            let key = (n.key as i32 + clip.transpose_semitones as i32).clamp(0, 127) as u8;
+            let velocity = if n.velocity == 0 {
+                0
+            } else {
+                (n.velocity as i32 + clip.velocity_offset as i32).clamp(1, 127) as u8
+            };
+            out.push(AbsNoteEvent { sample: on_s, key, velocity });
+            out.push(AbsNoteEvent { sample: off_s, key, velocity: 0 });
         }
     }
     // Offs before ons at the same sample position so retriggers of the same
@@ -110,6 +116,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t1"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 

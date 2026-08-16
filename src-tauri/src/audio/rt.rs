@@ -461,9 +461,19 @@ pub struct GraphTables {
 /// simplest and cheap enough — this is control-side only, never touched by
 /// an RT thread.
 ///
-/// LOCK ORDER: session before tables, never the reverse [C1]. `rebuild`
-/// publishes a fresh `GraphTables` INSIDE the session-lock scope it already
-/// holds while reading the store — that is load-bearing, not style:
+/// LOCK ORDER: session before tables, never the reverse [C1]. Plan F Task 5
+/// added a THIRD lock below both: `Session::published`'s inner mutex is a
+/// LEAF — it is taken only for a pointer clone or swap, never across I/O and
+/// never while any other lock is acquired inside its scope, so it can be
+/// taken from under the session lock (which `capture_and_publish` does, by
+/// design) and orders after tables too. Nothing ever takes session or tables
+/// while holding it — `engine::rebuild` (Task 6) reads the leaf and RELEASES
+/// it before acquiring session, so its two acquisitions are sequential, not
+/// nested. `rebuild` publishes a fresh `GraphTables` INSIDE the session-lock
+/// scope it holds while reading the store's PARAM VALUES AND SLOT MAP (Task
+/// 6 shrank that read to exactly this; the graph assembly moved out from
+/// under the lock, onto the published image) — publishing there is
+/// load-bearing, not style:
 /// publishing after the lock is released opens a window where a commit
 /// transacts against a newer document revision, resolves its param writes
 /// through the OLD tables (because the new ones aren't published yet), and
