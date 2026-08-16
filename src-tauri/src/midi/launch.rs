@@ -11,14 +11,18 @@ use serde::{Deserialize, Serialize};
 pub const ECHO_WINDOW_MS: u64 = 80;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum LaunchTarget {
     Region {
+        #[serde(alias = "start_ticks")]
         start_ticks: u64,
+        #[serde(alias = "length_ticks")]
         length_ticks: u64,
+        #[serde(alias = "track_ids")]
         track_ids: Vec<String>,
     },
     Clip {
+        #[serde(alias = "clip_id")]
         clip_id: String,
     },
 }
@@ -479,6 +483,39 @@ mod tests {
             channel: None,
             target: LaunchTarget::Clip { clip_id: clip_id.into() },
         }
+    }
+
+    #[test]
+    fn target_round_trips_the_frontend_camel_case_shape() {
+        let region: LaunchTarget = serde_json::from_str(
+            r#"{"kind":"region","startTicks":480,"lengthTicks":960,"trackIds":["t1"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            region,
+            LaunchTarget::Region {
+                start_ticks: 480,
+                length_ticks: 960,
+                track_ids: vec!["t1".into()],
+            }
+        );
+        let clip: LaunchTarget = serde_json::from_str(r#"{"kind":"clip","clipId":"c-1"}"#).unwrap();
+        assert_eq!(clip, LaunchTarget::Clip { clip_id: "c-1".into() });
+        let wire = serde_json::to_value(&region).unwrap();
+        assert_eq!(wire["startTicks"], 480);
+        assert!(wire.get("start_ticks").is_none());
+        let from_disk: LaunchTarget = serde_json::from_str(
+            r#"{"kind":"region","start_ticks":1,"length_ticks":2,"track_ids":["t"]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            from_disk,
+            LaunchTarget::Region {
+                start_ticks: 1,
+                length_ticks: 2,
+                track_ids: vec!["t".into()],
+            }
+        );
     }
 
     #[test]
