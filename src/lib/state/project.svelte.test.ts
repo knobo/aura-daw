@@ -11,7 +11,7 @@ import type { Clip, TrackState } from "../types/ipc";
 
 const moveClip = vi.fn(() => Promise.resolve());
 const removeClip = vi.fn(() => Promise.resolve());
-const gestureBegin = vi.fn(() => Promise.resolve());
+const gestureBegin = vi.fn(() => Promise.resolve("gid-1"));
 const gestureEnd = vi.fn(() => Promise.resolve());
 const setTrackArm = vi.fn(() => Promise.resolve());
 const midiSelectInputTrack = vi.fn(() => Promise.resolve());
@@ -181,14 +181,19 @@ describe("addTrack", () => {
 });
 
 describe("beginGesture / endGesture", () => {
-  it("beginGesture invokes backend.gestureBegin with the given label", () => {
-    project.beginGesture("gain drag");
+  it("beginGesture invokes backend.gestureBegin with the given label and returns the id", async () => {
+    await expect(project.beginGesture("gain drag")).resolves.toBe("gid-1");
     expect(gestureBegin).toHaveBeenCalledWith("gain drag");
   });
 
-  it("endGesture invokes backend.gestureEnd", () => {
+  it("endGesture forwards the token so a stale end cannot close another gesture", () => {
+    project.endGesture("gid-1");
+    expect(gestureEnd).toHaveBeenCalledWith("gid-1");
+  });
+
+  it("endGesture without a token is a no-op, not close-whatever", () => {
     project.endGesture();
-    expect(gestureEnd).toHaveBeenCalledWith();
+    expect(gestureEnd).not.toHaveBeenCalled();
   });
 });
 

@@ -33,7 +33,18 @@
    * follows would close it a second time — and early, leaving the delete's
    * commit outside the bracket with its own undo entry and its own persist. */
   let gestureOpen = false;
+  let token: Promise<string | undefined> | undefined;
   const HIT_RADIUS_PX = 6;
+
+  function openGesture(label: string) {
+    token = project.beginGesture(label);
+    return token;
+  }
+  function closeGesture() {
+    const idp = token;
+    token = undefined;
+    void idp?.then((id) => project.endGesture(id));
+  }
 
   const live = $derived(modulation.curves.find((c) => c.id === curve.id) ?? curve);
 
@@ -112,14 +123,15 @@
 
     if (e.button === 2 || e.altKey) {
       if (hit < 0) return;
-      project.beginGesture("automation delete point");
+      const gid = openGesture("automation delete point");
       void modulation
         .commitInGesture(binding.id, { ...c, points: deletePoint(c.points, hit) })
-        .then(() => project.endGesture()); // close only once the delete lands
+        .then(async () => project.endGesture(await gid)); // close only once the delete lands
+      token = undefined;
       return;
     }
     canvas.setPointerCapture(e.pointerId);
-    project.beginGesture("automation edit");
+    openGesture("automation edit");
     gestureOpen = true;
     if (hit >= 0) {
       dragIndex = hit;
@@ -150,13 +162,15 @@
     if (!gestureOpen) return; // the delete path owns (and closes) its own
     gestureOpen = false;
     if (!wasDragging) {
-      project.endGesture();
+      closeGesture();
       return;
     }
     // `commitLatest` WAITS for a click-insert's reply before reading the
     // store: reading now could commit the pre-insert point set back over the
     // point just drawn (see its doc comment). The gesture closes after it.
-    void modulation.commitLatest(binding.id).then(() => project.endGesture());
+    const gid = token;
+    token = undefined;
+    void modulation.commitLatest(binding.id).then(async () => project.endGesture(await gid));
   }
 </script>
 

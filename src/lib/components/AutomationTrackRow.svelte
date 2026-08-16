@@ -125,6 +125,12 @@
   let dragIndex = -1;
   let hoverEdge = $state(false);
   let gestureOpen = false;
+  let token: Promise<string | undefined> | undefined;
+
+  function openGesture(label: string) {
+    token = project.beginGesture(label);
+    return token;
+  }
 
   function localTickValue(clip: AutomationClip, e: PointerEvent, el: HTMLElement) {
     const p = canvasPos(el, e.clientX, e.clientY);
@@ -159,15 +165,16 @@
       if (mode === "ignore") return;
       if (mode === "delete") {
         e.preventDefault();
-        project.beginGesture("automation delete point");
+        const gid = openGesture("automation delete point");
         void modulation
           .commitInGesture(clip.id, { ...curve, points: deletePoint(curve.points, hit) })
-          .then(() => project.endGesture());
+          .then(async () => project.endGesture(await gid));
+        token = undefined;
         return;
       }
       if (mode === "point") {
         canvas.setPointerCapture(e.pointerId);
-        project.beginGesture("automation edit");
+        openGesture("automation edit");
         gestureOpen = true;
         dragMode = "point";
         dragClipId = clip.id;
@@ -245,7 +252,11 @@
       if (!gestureOpen) return;
       gestureOpen = false;
       const curve = curveOf(clip);
-      if (curve) void modulation.commitInGesture(clip.id, curve).then(() => project.endGesture());
+      if (curve) {
+        const gid = token;
+        token = undefined;
+        void modulation.commitInGesture(clip.id, curve).then(async () => project.endGesture(await gid));
+      }
       dragIndex = -1;
       return;
     }

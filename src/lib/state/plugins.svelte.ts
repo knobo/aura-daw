@@ -205,6 +205,9 @@ class PluginsStore {
   private pending = new Map<number, number>();
   private rafId: number | null = null;
   private inFlight = false;
+  /** Token for the open knob-drag gesture; awaited at end so a late
+   * close cannot shut a fader that began while we flushed. */
+  private paramGesture: Promise<string | undefined> | undefined;
 
   /** Optimistic local + queued backend write; called at input-event rate. */
   setParam(paramId: number, value: number) {
@@ -227,7 +230,7 @@ class PluginsStore {
   /** Open a knob-drag gesture boundary — call on `pointerdown` of a param
    * fader, before the first `setParam` of the drag (I-8). */
   beginParamGesture() {
-    project.beginGesture("plugin param drag");
+    this.paramGesture = project.beginGesture("plugin param drag");
   }
 
   /** Close a knob-drag gesture: cancel the pending rAF, flush whatever is
@@ -236,12 +239,15 @@ class PluginsStore {
    * `gesture_end` gets its own undo entry and its own project.json write —
    * the two things the gesture exists to collapse. */
   async endParamGesture(): Promise<void> {
+    const idp = this.paramGesture;
+    this.paramGesture = undefined;
     if (this.rafId != null) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
     await this.flushParamQueue();
-    project.endGesture();
+    const id = await idp;
+    if (id) project.endGesture(id);
   }
 
   private flushParamQueue(): Promise<void> {

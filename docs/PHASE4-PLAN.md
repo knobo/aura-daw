@@ -878,17 +878,18 @@ instantiation per automated instance, seeded from the live one's
   `instantiate` and `save_state`. The fix is a fire-and-forget sibling to
   `set_params` (post, don't `run`) plus a driver that uses it — a
   `clap_host` API change deliberately kept out of Task 9's diff.
-- **A GESTURE TOKEN, so `gesture_end` closes the gesture it meant to.**
-  The most valuable thing to come out of this track, and bigger than this
-  track. `gesture_end` takes **no identifier** — it closes "whatever is
-  open", and is deliberately a no-op when nothing is
+- ~~**A GESTURE TOKEN, so `gesture_end` closes the gesture it meant to.**~~
+  → **closed on `fix/gesture-end-id`** (`gesture_begin` returns the run
+  id; `gesture_end(id)` no-ops on mismatch). Historical record of why it
+  existed: `gesture_end` used to take **no identifier** — it closed
+  "whatever is open", and was deliberately a no-op when nothing is
   (`control/mod.rs:2072`, contract stated at `:2067-2071`). Its sibling
   `gesture_begin` (`:2060`) auto-closes a stale open gesture before opening
-  the new one. Together those two facts mean: **any `endGesture()` fired
+  the new one. Together those two facts meant: **any `endGesture()` fired
   from a promise continuation can close a DIFFERENT gesture — one that
   began while it was awaiting.** No component-local flag can fix this; the
   flag Track D added to `AutomationLaneView` fixes only that component's
-  own pairing. Three live instances:
+  own pairing. Three live instances (all now pass the token):
   - `src/lib/state/plugins.svelte.ts:243-244` (Track D's own, Task 3):
     `await this.flushParamQueue(); project.endGesture();`. Release a plugin
     knob — that awaits a rAF plus one IPC round trip — and press a track
@@ -904,14 +905,8 @@ instantiation per automated instance, seeded from the live one's
     `.then(() => project.endGesture())` still closes whatever is open when
     it fires, which may be a gesture a later pointerdown opened.
 
-  **Durable fix to record:** `gesture_begin` returns an id and
-  `gesture_end(id)` no-ops on mismatch — an ADDITIVE parameter change to a
-  frozen-name command, so it stays inside the binding rules. All three
-  instances need a second gesture to begin inside a sub-100 ms window, and
-  the worst outcome is an extra undo entry plus an extra `project.json`
-  write — never data loss — which is why it is recorded rather than
-  rushed. **Owner: whoever owns the gesture IPC model. Tracks A and C
-  inherit this** — both drive gestures from async paths.
+  That is the bug the token closed. The three call sites now hold the
+  id across the await; a mismatched `gesture_end` is a no-op.
 - **Per-lane commit barriers in the automation store** (accepted and open):
   `#inflight` is ONE field on a singleton store, so it is the last commit
   issued from inside any gesture, not "this lane's". Two simultaneous

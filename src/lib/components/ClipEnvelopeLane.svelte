@@ -32,7 +32,18 @@
   let pickerOpen = $state(false);
   let dragIndex = $state(-1);
   let gestureOpen = false;
+  let token: Promise<string | undefined> | undefined;
   const HIT_RADIUS_PX = 6;
+
+  function openGesture(label: string) {
+    token = project.beginGesture(label);
+    return token;
+  }
+  function closeGesture() {
+    const idp = token;
+    token = undefined;
+    void idp?.then((id) => project.endGesture(id));
+  }
   const ENV_H = 56;
 
   const envelopes = $derived(modulation.clipEnvelopeBindings(contentId));
@@ -126,14 +137,15 @@
 
     if (e.button === 2 || e.altKey) {
       if (hit < 0) return;
-      project.beginGesture("clip envelope delete point");
+      const gid = openGesture("clip envelope delete point");
       void modulation
         .commitInGesture(binding.id, { ...c, points: deletePoint(c.points, hit) })
-        .then(() => project.endGesture());
+        .then(async () => project.endGesture(await gid));
+      token = undefined;
       return;
     }
     canvas.setPointerCapture(e.pointerId);
-    project.beginGesture("clip envelope edit");
+    openGesture("clip envelope edit");
     gestureOpen = true;
     if (hit >= 0) {
       dragIndex = hit;
@@ -163,10 +175,12 @@
     if (!gestureOpen) return;
     gestureOpen = false;
     if (!wasDragging || !binding) {
-      project.endGesture();
+      closeGesture();
       return;
     }
-    void modulation.commitLatest(binding.id).then(() => project.endGesture());
+    const gid = token;
+    token = undefined;
+    void modulation.commitLatest(binding.id).then(async () => project.endGesture(await gid));
   }
 </script>
 

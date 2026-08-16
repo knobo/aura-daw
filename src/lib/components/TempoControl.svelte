@@ -22,9 +22,19 @@
     open = true;
   }
 
+  let token: Promise<string | undefined> | undefined;
+  function openGesture(label: string) {
+    token = project.beginGesture(label);
+  }
+  function closeGesture() {
+    const idp = token;
+    token = undefined;
+    void idp?.then((id) => project.endGesture(id));
+  }
+
   function close() {
     open = false;
-    project.endGesture();
+    closeGesture();
   }
 
   function commitDraft() {
@@ -40,20 +50,21 @@
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
-    if (!wheelEnd) project.beginGesture("set tempo");
+    if (!wheelEnd) openGesture("set tempo");
     else clearTimeout(wheelEnd);
+    const wheelToken = token;
     const next = nudgeTempo(project.tempoBpm, e.deltaY, e.shiftKey);
     if (open) draft = next.toFixed(1);
     void midi.setTempo(next);
     wheelEnd = setTimeout(() => {
       wheelEnd = null;
-      project.endGesture();
+      void wheelToken?.then((id) => project.endGesture(id));
     }, 250);
   }
 
   function onSliderDown(e: PointerEvent) {
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-    project.beginGesture("set tempo");
+    openGesture("set tempo");
   }
 
   function onSliderInput(e: Event) {
@@ -63,7 +74,7 @@
   }
 
   function onSliderUp() {
-    project.endGesture();
+    closeGesture();
   }
 
   function onKeydown(e: KeyboardEvent) {

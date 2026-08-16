@@ -37,8 +37,18 @@
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
     void modulation.setDepth(b, v);
   }
+  let token: Promise<string | undefined> | undefined;
+  function openGesture(label: string) {
+    token = project.beginGesture(label);
+  }
+  function closeGesture() {
+    const idp = token;
+    token = undefined;
+    void idp?.then((id) => project.endGesture(id));
+  }
+
   function onDepthDown() {
-    project.beginGesture("depth drag");
+    openGesture("depth drag");
   }
 
   const gainPct = $derived(((track.gainDb + 60) / 72) * 100);
@@ -77,13 +87,13 @@
    * itself (`onGain`/`onPan` above) is unchanged — the coalescing happens
    * backend-side, not by throttling these calls. */
   function onGainPointerDown() {
-    project.beginGesture("gain drag");
+    openGesture("gain drag");
   }
   function onPanPointerDown() {
-    project.beginGesture("pan drag");
+    openGesture("pan drag");
   }
   function onGestureEnd() {
-    project.endGesture();
+    closeGesture();
   }
 </script>
 

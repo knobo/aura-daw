@@ -15,8 +15,8 @@ const pluginSetParam = vi.fn(
       resolveSet = res;
     }),
 );
-const gestureBegin = vi.fn(() => Promise.resolve());
-const gestureEnd = vi.fn(() => Promise.resolve());
+const gestureBegin = vi.fn(() => Promise.resolve("gid-plugin"));
+const gestureEnd = vi.fn((_id?: string) => Promise.resolve());
 const calls: string[] = [];
 
 vi.mock("../tauri", () => ({
@@ -33,9 +33,9 @@ vi.mock("../tauri", () => ({
       calls.push("gestureBegin");
       return gestureBegin(...(a as []));
     },
-    gestureEnd: () => {
+    gestureEnd: (id?: string) => {
       calls.push("gestureEnd");
-      return gestureEnd();
+      return gestureEnd(id);
     },
   },
 }));
@@ -72,7 +72,23 @@ describe("plugin knob gesture", () => {
     resolveSet?.();
     await closing;
     expect(calls).toEqual(["gestureBegin", "setParam", "gestureEnd"]);
+    expect(gestureEnd).toHaveBeenCalledWith("gid-plugin");
     expect(pluginSetParam).toHaveBeenCalledTimes(1);
     expect(pluginSetParam.mock.calls[0][1]).toEqual([{ id: 7, value: 0.75 }]);
+  });
+
+  it("a late first-knob end does not close a second knob's token", async () => {
+    gestureBegin
+      .mockResolvedValueOnce("gid-a")
+      .mockResolvedValueOnce("gid-b");
+    plugins.beginParamGesture();
+    plugins.setParam(7, 0.2);
+    const closingA = plugins.endParamGesture();
+    plugins.beginParamGesture();
+    resolveSet?.();
+    await closingA;
+    expect(gestureEnd).toHaveBeenCalledTimes(1);
+    expect(gestureEnd).toHaveBeenCalledWith("gid-a");
+    expect(gestureEnd).not.toHaveBeenCalledWith("gid-b");
   });
 });

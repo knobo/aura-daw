@@ -191,11 +191,11 @@ class LibraryStore {
         // One gesture = one undo entry, even though the stamp is up to three
         // commands (add + bounds + notes). `fold_ops` keeps non-Set ops in
         // the same batch, and a closed gesture becomes one HistoryEntry.
-        project.beginGesture("drag midi clip");
+        const gid = await project.beginGesture("drag midi clip");
         try {
           await midi.stampClipTo(payload.clipId, trackId, midi.samplesToTicks(atSamples));
         } finally {
-          project.endGesture();
+          project.endGesture(gid);
         }
         return;
       }
