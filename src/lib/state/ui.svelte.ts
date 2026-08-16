@@ -5,6 +5,9 @@ import { prefs } from "../prefs/prefs.svelte";
 
 export type DockTab = "" | "generate" | "hum" | "library" | "instruments" | "plugins" | "mcp";
 
+/** The bottom region shows one of these at a time. */
+export type BottomPanel = "roll" | "pitch";
+
 export const ui = $state({
   /** "WEBGPU" | "CANVAS2D" | "" until the first painter reports in */
   rendererKind: "",
@@ -12,6 +15,9 @@ export const ui = $state({
   dock: "" as DockTab,
   /** AI Studio: preselected job kind when opened from elsewhere. */
   studioKind: "aceStepGenerate",
+  /** Which bottom panel is showing. Both share `rollHeight` and the same
+   * top-edge resize handle, so switching tabs does not resize the app. */
+  bottomPanel: "roll" as BottomPanel,
   /** Piano roll panel height, CSS px. User-dragged (top edge); session only. */
   rollHeight: 340,
   /** Right dock width, CSS px. User-dragged (left edge); session only. */

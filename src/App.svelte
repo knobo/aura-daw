@@ -38,6 +38,7 @@
   import Timeline from "./lib/components/Timeline.svelte";
   import MasterBar from "./lib/components/MasterBar.svelte";
   import PianoRoll from "./lib/components/pianoroll/PianoRoll.svelte";
+  import PitchCoach from "./lib/components/pitch/PitchCoach.svelte";
   import Dock from "./lib/components/Dock.svelte";
   import McpConfirmDialog from "./lib/components/mcp/McpConfirmDialog.svelte";
   import PreferencesDialog from "./lib/components/prefs/PreferencesDialog.svelte";
@@ -47,6 +48,8 @@
   import { launch } from "./lib/state/launch.svelte";
   import LaunchMapPanel from "./lib/components/launch/LaunchMapPanel.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
+  import { backend } from "./lib/tauri";
+  import { rehearseKeyMatches } from "./lib/components/pitch/panel-logic";
 
   onMount(() => {
     prefs.init(); // restore persisted preferences before anything paints or boots
@@ -97,6 +100,25 @@
     const tag = el.tagName;
     if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true;
     return el.isContentEditable === true;
+  }
+
+  /** Rehearse-hold is live while a take is running or the coach is open. */
+  function rehearseArmed(): boolean {
+    return transport.isRecording || ui.bottomPanel === "pitch";
+  }
+
+  /** Edge-triggered, so a stray blur or keyup cannot spam the engine. */
+  let rehearseHeld = false;
+  function setRehearse(on: boolean) {
+    if (rehearseHeld === on) return;
+    rehearseHeld = on;
+    void backend.setRehearseHold(on).catch((err) => console.warn("[aura] set_rehearse_hold failed:", err));
+  }
+
+  /** Release on keyup — and on blur, since a window that loses focus
+   * mid-hold never delivers the keyup and the take would stay silent. */
+  function onKeyup(e: KeyboardEvent) {
+    if (rehearseKeyMatches(prefs.values.pitchRehearseKey, e.key)) setRehearse(false);
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -156,6 +178,16 @@
     }
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    // Rehearse-hold (ruling R5) before the dock shortcuts, because its
+    // default key is also the hum dock's. It only claims the key where the
+    // hold means something — mid-take, or with the Pitch Coach open — so
+    // "h" still opens the hum dock everywhere else. `e.repeat` is dropped:
+    // auto-repeat would re-send a hold that is already down.
+    if (rehearseArmed() && !e.repeat && rehearseKeyMatches(prefs.values.pitchRehearseKey, e.key)) {
+      e.preventDefault();
+      setRehearse(true);
+      return;
+    }
     // piano roll owns its own keys while hovered/focused
     if ((e.target as HTMLElement)?.closest?.(".roll")) return;
     if (e.code === "Space") {
@@ -251,7 +283,11 @@
   }
 </script>
 
-<svelte:window onkeydown={onKeydown} />
+<svelte:window
+  onkeydown={onKeydown}
+  onkeyup={onKeyup}
+  onblur={() => setRehearse(false)}
+/>
 
 <div class="app">
   <TransportBar />
@@ -259,7 +295,11 @@
     <Timeline />
     <Dock />
   </div>
-  <PianoRoll />
+  {#if ui.bottomPanel === "pitch"}
+    <PitchCoach />
+  {:else}
+    <PianoRoll />
+  {/if}
   <MasterBar />
 </div>
 
