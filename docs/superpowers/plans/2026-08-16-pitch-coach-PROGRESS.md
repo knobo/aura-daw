@@ -80,11 +80,30 @@ documentation and all commits are English.
       70 Hz that were room rumble. That was the acoustic path, not the
       detector; at 0.35 it is half a cent.
 
-      **What this does NOT settle:** a synthetic tone is a far easier signal
-      than a voice, which brings harmonics, vibrato and breath. The voice
-      run is still worth doing — humming or whistling is enough, and the
-      numbers to read there are the voiced fraction and "to nearest note",
-      not tuning accuracy.
+      **Whistle run, same session.** ~811 Hz (G#5) held for ten unbroken
+      seconds: every 500 ms window between 810.1 and 813.6 Hz, clarity 0.98,
+      81 % voiced with the gaps falling exactly where the owner drew breath.
+      The reported -40 cents against G#5 is the WHISTLER, not the detector —
+      811 Hz genuinely is 40 cents flat of 830.6 Hz, and reporting that is
+      the entire product.
+
+      Two lessons for whoever builds the panel:
+
+      * "Distance to nearest note" saturates near 50 cents for anyone
+        sitting midway between two semitones, which is where a person who
+        cannot hit a pitch lives. It reads as a failure and is not one.
+        `pitch_check` therefore also reports the jitter of the longest
+        unbroken voiced run — the detector measured against itself. On a
+        synthetic tone that is 0.1 cents, which is the measurement floor to
+        compare any voice run against.
+      * The note LABEL flips across a semitone boundary while the underlying
+        pitch barely moves (G5 at 795 Hz, G#5 at 811 Hz, from one 500 ms
+        window to the next). Phase 2 should draw the midi float, never the
+        rounded label, or the trail will strobe for exactly the users this
+        feature exists for.
+
+      **What none of this settles:** both runs were near-pure tones. A sung
+      voice brings harmonics and vibrato, which is the harder case.
 
       The plan's checkpoint text said to drive the running app. That is not
       possible: the five pitch commands are registered in `lib.rs`, but

@@ -322,10 +322,48 @@ fn main() -> Result<(), String> {
         cents_between(med, midi_to_hz(hz_to_midi(med).round()))
     );
 
+    // How steadily the detector held its reading through the longest
+    // unbroken voiced stretch. THIS is the number that answers "does it
+    // follow me" for someone who cannot hit a pitch: it measures the
+    // detector against itself, so sitting 40 cents flat of every note in
+    // equal temperament costs nothing. Median absolute deviation from that
+    // stretch's own median.
+    let mut best: (usize, usize) = (0, 0);
+    let mut run_start = None;
+    for (i, f) in all.iter().enumerate() {
+        match (f.voiced, run_start) {
+            (true, None) => run_start = Some(i),
+            (false, Some(st)) => {
+                if i - st > best.1 - best.0 {
+                    best = (st, i);
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = run_start {
+        if all.len() - st > best.1 - best.0 {
+            best = (st, all.len());
+        }
+    }
+    if best.1 > best.0 {
+        let run: Vec<f32> = all[best.0..best.1].iter().map(|f| f.midi).collect();
+        let mid = median(&run);
+        let dev: Vec<f32> = run.iter().map(|m| (m - mid).abs() * 100.0).collect();
+        println!(
+            "  steadiest run   {:.1} s, jitter median {:.1} cents, worst {:.1}",
+            run.len() as f32 / 100.0,
+            median(&dev),
+            dev.iter().cloned().fold(0.0, f32::max)
+        );
+    }
+
     // Tuning accuracy that does not care WHAT you sang: how far each frame
     // sits from the nearest semitone. Meaningful for a slide as well as a
-    // held note, and it is what says whether the detector is landing on
-    // notes at all.
+    // held note — but it saturates near 50 cents for anyone sitting midway
+    // between two semitones, which is not a detector fault and is why the
+    // jitter above is the better read of "is it tracking me".
     let near: Vec<f32> = voiced
         .iter()
         .map(|f| cents_between(f.hz, midi_to_hz(f.midi.round())))
