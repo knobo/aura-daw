@@ -102,8 +102,31 @@ documentation and all commits are English.
         rounded label, or the trail will strobe for exactly the users this
         feature exists for.
 
-      **What none of this settles:** both runs were near-pure tones. A sung
-      voice brings harmonics and vibrato, which is the harder case.
+      **Voice run — the case that actually tests the detector.** A sustained
+      open vowel at ~100 Hz (G2), 15 s, input at -32 dBFS:
+
+      | | |
+      |---|---|
+      | voiced | 100 % from first sound to last (1312 frames) |
+      | longest unbroken run | 13.1 s — the whole vocalisation, no dropouts |
+      | detected range | 92.4 .. 101.9 Hz |
+      | jitter | median 9.6 cents over that run |
+      | clarity | median 0.99 |
+
+      **No octave errors in 1312 frames.** That is the result worth keeping:
+      a ~100 Hz vowel carries strong harmonics at 200/300/400 Hz, which is
+      exactly where YIN reports the wrong octave, and the detected range
+      never leaves 92-102 Hz. The 9.6 cents of jitter is the VOICE — the
+      synthetic tone through the identical chain reads 0.1 cents, and ~10
+      cents is ordinary human variation on a held vowel.
+
+      Practical note for whoever runs this next: an open "aaaa" is the test.
+      A closed-lip hum loses most of its energy before it reaches the
+      microphone — an earlier attempt at one came back 0.3 % voiced with the
+      level barely above the room floor, which read as a detector failure
+      and was not one.
+
+      **What none of this settles:** one voice, one vowel, one room.
 
       The plan's checkpoint text said to drive the running app. That is not
       possible: the five pitch commands are registered in `lib.rs`, but
