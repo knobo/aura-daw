@@ -130,11 +130,14 @@
       }
       return;
     }
-    if ((e.key === "Delete" || e.key === "Backspace") && launch.selectedId) {
+    if (e.key === "Delete" || e.key === "Backspace") {
+      // Own the key so a leftover window handler cannot steal Backspace
+      // from a rename field, the piano roll, or a clip delete.
+      e.stopPropagation();
       const tag = (e.target as HTMLElement)?.tagName;
       if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+      if (!launch.selectedId) return;
       e.preventDefault();
-      e.stopPropagation();
       void launch.remove(launch.selectedId);
     }
   }
