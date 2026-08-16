@@ -37,7 +37,7 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
 
 **Phase 1 — backend.** Not started.
 
-- [ ] Task 1 — YIN detector (`audio/yin.rs`)
+- [x] Task 1 — YIN detector (`audio/yin.rs`) — `eb0d47b`, 799 tests green
 - [ ] Task 2 — decimation to 8 kHz (`audio/decimate.rs`)
 - [ ] Task 3 — pitch frames: gating, smoothing, timestamps (`audio/pitch.rs`)
 - [ ] Task 4 — parity guard vs. `sidecars/hum_to_midi.py`
@@ -102,3 +102,9 @@ with the commit sha and anything the next agent would be surprised by.
 
 - 2026-08-16 — spec committed `4e9d684`; merged `origin/main` (`d0866ad`,
   the transport fix) into the branch; baseline green; plan written.
+- 2026-08-16 — Task 1 done (`eb0d47b`). Two plan corrections came out of its
+  review, both committed: the difference function must sum a full `w` terms per
+  lag (`ae338c1`), and the detector's effective pitch floor is 65.04 Hz, not
+  `FMIN` (`93c7d3d`). The second is a real, documented property — `tau_max`
+  truncates, so a tone at exactly 65 Hz is unreachable, and the Python sidecar
+  behaves identically. Parity with the sidecar outranks widening the range.
