@@ -17,6 +17,7 @@ import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { midi } from "./midi.svelte";
 import { plugins } from "./plugins.svelte";
 import { project } from "./project.svelte";
+import { launch } from "./launch.svelte";
 import { toasts } from "./toasts.svelte";
 
 export interface ProjectDialogState {
@@ -250,6 +251,7 @@ class ProjectOpsStore {
   private async repull() {
     await project.reload();
     await midi.init();
+    await launch.reload();
     await automation.reload();
     await modulation.reload();
     // reloadOpenParams BEFORE refresh: refresh()'s applyInstances closes the

@@ -35,13 +35,27 @@ class LaunchStore {
 
   togglePanel() {
     this.panelOpen = !this.panelOpen;
-    if (!this.panelOpen) this.learningId = null;
+    if (!this.panelOpen) this.stopLearn();
+  }
+
+  closePanel() {
+    this.panelOpen = false;
+    this.stopLearn();
+  }
+
+  stopLearn() {
+    this.learningId = null;
+    void backend.launchLearnArm?.(null);
   }
 
   async init() {
     await this.reload();
     backend.on?.("launch://changed", (list) => {
       this.bindings = list;
+    });
+    // Undo/open go through project://changed, not launch://changed.
+    backend.on?.("project://changed", () => {
+      void this.reload();
     });
   }
 
@@ -115,7 +129,7 @@ class LaunchStore {
     const gone = this.bindings.find((b) => b.id === id);
     this.bindings = this.bindings.filter((b) => b.id !== id);
     if (this.selectedId === id) this.selectedId = null;
-    if (this.learningId === id) this.learningId = null;
+    if (this.learningId === id) this.stopLearn();
     if (gone && backend.launchSet) {
       try {
         await backend.launchSet(null, id);
@@ -126,33 +140,45 @@ class LaunchStore {
   }
 
   beginLearn(id: string) {
-    this.learningId = this.learningId === id ? null : id;
+    if (this.learningId === id) {
+      this.stopLearn();
+      return;
+    }
+    this.learningId = id;
     this.selectedId = id;
-    void backend.launchLearnArm?.(this.learningId);
-    if (this.learningId) this.pollLearn();
+    void backend.launchLearnArm?.(id);
+    this.pollLearn();
   }
 
   async applyLearn(note: number, channel: number | null) {
     const id = this.learningId;
     if (!id) return;
-    this.learningId = null;
-    void backend.launchLearnArm?.(null);
+    this.stopLearn();
     await this.update(id, { note, channel });
   }
 
+  /** In-memory only — used while a timeline handle is dragged. */
+  patchLocal(id: string, patch: Partial<Pick<LaunchBinding, "name" | "note" | "channel" | "target">>) {
+    const i = this.bindings.findIndex((b) => b.id === id);
+    if (i < 0) return;
+    const next = { ...this.bindings[i], ...patch };
+    this.bindings = this.bindings.map((b) => (b.id === id ? next : b));
+  }
+
   private pollLearn() {
+    const armed = this.learningId;
     const tick = async () => {
-      if (!this.learningId) return;
+      if (!this.learningId || this.learningId !== armed) return;
       try {
         const got = await backend.launchLearnTake?.();
-        if (got) {
+        if (got && this.learningId === armed) {
           await this.applyLearn(got.note, got.channel);
           return;
         }
       } catch {
         /* demo / old backend */
       }
-      if (this.learningId) setTimeout(tick, 80);
+      if (this.learningId === armed) setTimeout(tick, 80);
     };
     void tick();
   }

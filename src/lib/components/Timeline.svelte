@@ -603,6 +603,7 @@
     if (!b || b.target.kind !== "region") return;
     resize = { id, edge, startTicks: b.target.startTicks, lengthTicks: b.target.lengthTicks };
     launch.selectedId = id;
+    void backend.gestureBegin?.("resize launch");
     try {
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     } catch {
@@ -620,20 +621,30 @@
     if (resize.edge === "start") {
       const end = resize.startTicks + resize.lengthTicks;
       const start = Math.min(snapped, end - 1);
-      void launch.update(resize.id, {
+      launch.patchLocal(resize.id, {
         target: { ...b.target, startTicks: start, lengthTicks: end - start },
       });
     } else {
       const start = resize.startTicks;
       const end = Math.max(snapped, start + 1);
-      void launch.update(resize.id, {
+      launch.patchLocal(resize.id, {
         target: { ...b.target, lengthTicks: end - start },
       });
     }
   }
 
   function onHandleUp() {
+    const r = resize;
     resize = null;
+    if (!r) return;
+    const b = launch.bindings.find((x) => x.id === r.id);
+    void (async () => {
+      try {
+        if (b) await launch.update(r.id, { target: b.target });
+      } finally {
+        await backend.gestureEnd?.();
+      }
+    })();
   }
 </script>
 

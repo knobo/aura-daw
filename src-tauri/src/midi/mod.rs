@@ -223,6 +223,7 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
             midi.clips = v2.clips;
             midi.launch_bindings = v2.launch_bindings;
             crate::midi::launch::runtime().set_bindings(midi.launch_bindings.clone());
+            crate::midi::launch::runtime().clear_armed();
         }
         Ok(None) => {
             if midi.loaded_dir.is_some() {
@@ -233,6 +234,7 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
                 midi.clips = d0.clips;
                 midi.launch_bindings = d0.launch_bindings;
                 crate::midi::launch::runtime().set_bindings(midi.launch_bindings.clone());
+                crate::midi::launch::runtime().clear_armed();
             }
         }
         Err(e) => {

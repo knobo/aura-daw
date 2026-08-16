@@ -1583,6 +1583,14 @@ impl ControlPlane {
         ops::transport_snapshot(&self.session.lock().store, &self.shared)
     }
 
+    pub fn emit_launch_changed(&self) {
+        let list = self.session.lock().midi.launch_bindings.clone();
+        (self.emit)(
+            "launch://changed",
+            serde_json::to_value(&list).unwrap_or_default(),
+        );
+    }
+
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
     /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
     pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {

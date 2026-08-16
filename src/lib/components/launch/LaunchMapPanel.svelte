@@ -70,9 +70,9 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.stopPropagation();
-      if (launch.learningId) launch.learningId = null;
+      if (launch.learningId) launch.stopLearn();
       else if (launch.selectedId) launch.selectedId = null;
-      else launch.panelOpen = false;
+      else launch.closePanel();
       return;
     }
     if ((e.key === "Delete" || e.key === "Backspace") && launch.selectedId) {
@@ -103,7 +103,7 @@
     >
       <span class="titlelab mono">MIDI LAUNCH</span>
       <span class="sub silk">{launch.bindings.length} marking{launch.bindings.length === 1 ? "" : "s"}</span>
-      <button class="x mono" title="Close" onclick={() => (launch.panelOpen = false)}>×</button>
+      <button class="x mono" title="Close" onclick={() => launch.closePanel()}>×</button>
     </div>
 
     <div class="hint silk">

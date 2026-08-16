@@ -84,18 +84,16 @@ pub enum IncomingDecision {
 }
 
 /// Process-wide launch runtime: binding snapshot, echo ring, learn arm,
-/// last-fired suppress set. The MIDI-in callback consults this; the
-/// control plane owns the document copy and pushes snapshots here.
+/// and a held-pad debounce. MIDI-out loopback is filtered by the echo
+/// window — a clip cannot start itself that way. The fire callback runs
+/// on a worker thread so the midir callback never waits on transport.
 pub struct LaunchRuntime {
     bindings: Mutex<Vec<LaunchBinding>>,
     echo: Mutex<Vec<EchoNote>>,
-    /// Trigger (note, channel-or-0xff-for-any) of the last fired clip that
-    /// would self-trigger, held until a different fire or an explicit clear.
-    suppressed: Mutex<Option<(u8, u8)>>,
     learning: Mutex<Option<String>>,
     armed: Mutex<Option<(u8, u8)>>,
     origin: Instant,
-    fire: Mutex<Option<Arc<dyn Fn(LaunchBinding) + Send + Sync>>>,
+    fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<LaunchBinding>>>,
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
 }
@@ -105,11 +103,10 @@ impl Default for LaunchRuntime {
         Self {
             bindings: Mutex::new(Vec::new()),
             echo: Mutex::new(Vec::new()),
-            suppressed: Mutex::new(None),
             learning: Mutex::new(None),
             armed: Mutex::new(None),
             origin: Instant::now(),
-            fire: Mutex::new(None),
+            fire_tx: Mutex::new(None),
             last_learn: Mutex::new(None),
             gen: AtomicU64::new(0),
         }
@@ -140,7 +137,15 @@ impl LaunchRuntime {
     }
 
     pub fn install_fire(&self, f: Arc<dyn Fn(LaunchBinding) + Send + Sync>) {
-        *self.fire.lock().unwrap() = Some(f);
+        let (tx, rx) = std::sync::mpsc::sync_channel(8);
+        let _ = std::thread::Builder::new()
+            .name("aura-launch-fire".into())
+            .spawn(move || {
+                while let Ok(b) = rx.recv() {
+                    f(b);
+                }
+            });
+        *self.fire_tx.lock().unwrap() = Some(tx);
     }
 
     pub fn record_out(&self, note: u8, channel: u8) {
@@ -151,8 +156,7 @@ impl LaunchRuntime {
         echo.retain(|e| e.at_ms >= cutoff);
     }
 
-    pub fn clear_suppress(&self) {
-        *self.suppressed.lock().unwrap() = None;
+    pub fn clear_armed(&self) {
         *self.armed.lock().unwrap() = None;
     }
 
@@ -178,11 +182,6 @@ impl LaunchRuntime {
             return IncomingDecision::Echo;
         }
         drop(echo);
-        if let Some((n, ch)) = *self.suppressed.lock().unwrap() {
-            if n == note && (ch == 0xff || ch == channel) {
-                return IncomingDecision::Suppressed;
-            }
-        }
         if *self.armed.lock().unwrap() == Some((note, channel)) {
             return IncomingDecision::Suppressed;
         }
@@ -193,9 +192,9 @@ impl LaunchRuntime {
         }
     }
 
-    /// MIDI-in callback: decide, and if it's a Fire, invoke the installed
-    /// callback (off-RT; the midir thread). Returns true when the note is
-    /// consumed as a launch / learn / echo / suppress.
+    /// MIDI-in callback: decide, and if it's a Fire, enqueue the binding
+    /// for the worker (never run transport on this thread). Returns true
+    /// when the note is consumed as a launch / learn / echo / debounce.
     pub fn on_incoming(&self, on: bool, note: u8, channel: u8) -> bool {
         match self.decide(on, note, channel) {
             IncomingDecision::Pass => false,
@@ -203,12 +202,8 @@ impl LaunchRuntime {
             IncomingDecision::Echo | IncomingDecision::Suppressed => true,
             IncomingDecision::Fire(b) => {
                 *self.armed.lock().unwrap() = Some((note, channel));
-                if let LaunchTarget::Clip { .. } = &b.target {
-                    let ch = b.channel.unwrap_or(0xff);
-                    *self.suppressed.lock().unwrap() = Some((b.note, ch));
-                }
-                if let Some(f) = self.fire.lock().unwrap().clone() {
-                    f(b);
+                if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
+                    let _ = tx.try_send(b);
                 }
                 true
             }
@@ -231,6 +226,7 @@ impl crate::control::ControlPlane {
             tx.apply(crate::control::op::Op::LaunchBindingSet { id, binding })?;
             Ok(())
         })?;
+        self.emit_launch_changed();
         Ok(self.launch_bindings())
     }
 
@@ -451,10 +447,32 @@ mod tests {
     }
 
     #[test]
-    fn firing_a_clip_suppresses_its_trigger() {
+    fn clip_retrigger_after_note_off() {
         let rt = LaunchRuntime::default();
         rt.set_bindings(vec![clip("c", 60, "clip-1")]);
         assert!(rt.on_incoming(true, 60, 0));
-        assert_eq!(rt.decide(true, 60, 1), IncomingDecision::Suppressed);
+        assert_eq!(rt.decide(true, 60, 0), IncomingDecision::Suppressed);
+        rt.on_incoming(false, 60, 0);
+        assert!(
+            matches!(rt.decide(true, 60, 0), IncomingDecision::Fire(_)),
+            "the same pad must be able to fire again after note-off"
+        );
+    }
+
+    #[test]
+    fn fire_runs_on_a_worker_not_the_caller() {
+        let rt = LaunchRuntime::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let caller = std::thread::current().id();
+        rt.install_fire(std::sync::Arc::new(move |b| {
+            let _ = tx.send((std::thread::current().id(), b.id.clone()));
+        }));
+        rt.set_bindings(vec![region("a", 60, None)]);
+        rt.on_incoming(true, 60, 0);
+        let (tid, id) = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("worker should fire");
+        assert_eq!(id, "a");
+        assert_ne!(tid, caller, "launch_fire must not run on the midir/caller thread");
     }
 }
