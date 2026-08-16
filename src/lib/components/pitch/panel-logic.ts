@@ -59,10 +59,17 @@ export function rehearseKeyMatches(pref: string, key: string): boolean {
  * the target is `reference_melody`'s call in Rust (ADR 0006, ruling R4), and
  * the lane dims the ambiguous ones from phase 3 on.
  */
-export function targetNotesFor(clips: MidiClip[], toSamples: (ticks: number) => number): TargetNote[] {
+export function targetNotesFor(
+  clips: MidiClip[],
+  toSamples: (ticks: number) => number,
+  /** `midi.effectiveContentLengthTicks` — the store documents itself as the
+   * single accessor every content-relative reader goes through, so the loop
+   * rule is taken by injection rather than inlined here a second time. */
+  effectiveContentLength: (clip: MidiClip) => number = (c) => Math.max(1, c.contentLengthTicks ?? c.lengthTicks),
+): TargetNote[] {
   const out: TargetNote[] = [];
   for (const clip of clips) {
-    const contentTicks = Math.max(1, clip.contentLengthTicks ?? clip.lengthTicks);
+    const contentTicks = Math.max(1, effectiveContentLength(clip));
     const repeats = Math.max(1, Math.ceil(clip.lengthTicks / contentTicks));
     const transpose = clip.transposeSemitones ?? 0;
     for (let rep = 0; rep < repeats; rep++) {
@@ -81,7 +88,12 @@ export function targetNotesFor(clips: MidiClip[], toSamples: (ticks: number) => 
       }
     }
   }
-  return out;
+  // Sorted by start, and the sort is part of the contract: the panel walks
+  // this list with a cursor instead of rescanning it per frame, and clips
+  // arrive in track order, not timeline order — two clips out of order
+  // would make the cursor skip every note of the earlier one.
+  out.sort((a, b) => a.startSample - b.startSample);
+  return out.map((n, i) => ({ ...n, noteId: i }));
 }
 
 /** Median of a non-empty array; the mean of the middle pair when even. */

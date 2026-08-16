@@ -48,8 +48,8 @@
   import { launch } from "./lib/state/launch.svelte";
   import LaunchMapPanel from "./lib/components/launch/LaunchMapPanel.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
-  import { backend } from "./lib/tauri";
   import { rehearseKeyMatches } from "./lib/components/pitch/panel-logic";
+  import { releaseRehearse, setRehearseSource } from "./lib/state/rehearse.svelte";
 
   onMount(() => {
     prefs.init(); // restore persisted preferences before anything paints or boots
@@ -107,18 +107,23 @@
     return transport.isRecording || ui.bottomPanel === "pitch";
   }
 
-  /** Edge-triggered, so a stray blur or keyup cannot spam the engine. */
-  let rehearseHeld = false;
-  function setRehearse(on: boolean) {
-    if (rehearseHeld === on) return;
-    rehearseHeld = on;
-    void backend.setRehearseHold(on).catch((err) => console.warn("[aura] set_rehearse_hold failed:", err));
-  }
+  /** True while THIS window's key is the source of a rehearse hold. The
+   * button is the other source; `rehearse.svelte.ts` counts them. */
+  let rehearseKeyDown = false;
 
-  /** Release on keyup — and on blur, since a window that loses focus
-   * mid-hold never delivers the keyup and the take would stay silent. */
-  function onKeyup(e: KeyboardEvent) {
-    if (rehearseKeyMatches(prefs.values.pitchRehearseKey, e.key)) setRehearse(false);
+  /**
+   * Release on keyup — and on blur, since a window that loses focus
+   * mid-hold never delivers the keyup and the take would stay silent.
+   *
+   * Deliberately does NOT re-test the preference: change the rehearse key
+   * (or set it to OFF) in the Preferences dialog while the key is physically
+   * held and a preference-matching release never comes, so the engine keeps
+   * writing silence into a running take. What went down is what comes up.
+   */
+  function onKeyup(_e: KeyboardEvent) {
+    if (!rehearseKeyDown) return;
+    rehearseKeyDown = false;
+    setRehearseSource("key", false);
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -183,9 +188,20 @@
     // hold means something — mid-take, or with the Pitch Coach open — so
     // "h" still opens the hum dock everywhere else. `e.repeat` is dropped:
     // auto-repeat would re-send a hold that is already down.
-    if (rehearseArmed() && !e.repeat && rehearseKeyMatches(prefs.values.pitchRehearseKey, e.key)) {
+    if (
+      rehearseArmed() &&
+      !e.repeat &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      !e.altKey &&
+      rehearseKeyMatches(prefs.values.pitchRehearseKey, e.key)
+    ) {
+      // Unmodified only: Cmd+H is Hide on macOS, and Ctrl/Alt+H belong to
+      // whatever claims them — none of the branches above claim "h", so
+      // without this they would all start a hold and be preventDefault()ed.
       e.preventDefault();
-      setRehearse(true);
+      rehearseKeyDown = true;
+      setRehearseSource("key", true);
       return;
     }
     // piano roll owns its own keys while hovered/focused
@@ -286,7 +302,10 @@
 <svelte:window
   onkeydown={onKeydown}
   onkeyup={onKeyup}
-  onblur={() => setRehearse(false)}
+  onblur={() => {
+    rehearseKeyDown = false;
+    releaseRehearse();
+  }}
 />
 
 <div class="app">

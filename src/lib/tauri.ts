@@ -114,6 +114,8 @@ export interface Backend {
   // `pitch://state`; none of these four set frontend state optimistically.
   pitchListenStart(): Promise<void>;
   pitchListenStop(): Promise<void>;
+  /** The returned `Unsubscribe` also tells the engine — see the note on
+   * `pitch_unsubscribe`; a muted channel is invisible to Rust. */
   subscribePitch(onBatch: (batch: PitchFrameBatch) => void): Promise<Unsubscribe>;
   setRehearseHold(enabled: boolean): Promise<void>;
   /** MIDI track holding the target melody; `null` clears it. */
@@ -482,10 +484,16 @@ class TauriBackend implements Backend {
     const channel = new Channel<PitchFrameBatch>();
     channel.onmessage = onBatch;
     await invoke("pitch_subscribe", { channel });
-    // Same shape as subscribeMeters: the engine holds the sink until it
-    // fails to send, so unsubscribing is muting this end, not a command.
+    // NOT the meter shape. `subscribeMeters` only mutes its end, which is
+    // safe there because it is subscribed once for the app's lifetime; the
+    // pitch panel subscribes on every open, and a muted channel still
+    // accepts sends, so the engine has to be told or one sink per visit
+    // accumulates for the rest of the session.
     return () => {
       channel.onmessage = () => {};
+      void invoke("pitch_unsubscribe", { channelId: channel.id }).catch((err) =>
+        console.warn("[aura] pitch_unsubscribe failed:", err),
+      );
     };
   }
   async setRehearseHold(enabled: boolean) {

@@ -49,6 +49,11 @@
   /** No target sounding: the trail is information, not a verdict. */
   const NO_TARGET_COLOR = "#8fa3c4";
 
+  /** Seconds of history the tuner shows. */
+  const TUNER_WINDOW_S = 3;
+  /** How long the big reading survives silence before it goes to "—". */
+  const TUNER_STALE_S = 1;
+
   // Canvas `font` does not resolve `var(--font-mono)` — an unparsable font
   // string is ignored outright and every label silently falls back to 10px
   // sans. These mirror the two stacks in app.css.
@@ -64,7 +69,11 @@
   /** Reference notes as sample spans. Reactive: clips change rarely. */
   const targets = $derived(
     pitchMode.referenceTrackId
-      ? targetNotesFor(midi.clipsOf(pitchMode.referenceTrackId), (t) => midi.ticksToSamples(t))
+      ? targetNotesFor(
+          midi.clipsOf(pitchMode.referenceTrackId),
+          (t) => midi.ticksToSamples(t),
+          (c) => midi.effectiveContentLengthTicks(c),
+        )
       : [],
   );
   const range = $derived<LaneRange>(autoFitRange(targets, 60));
@@ -121,10 +130,18 @@
     return ctx;
   }
 
-  /** Frame sample positions shifted by the user's round-trip compensation. */
+  /**
+   * Frame positions shifted by the user's round-trip compensation.
+   *
+   * Scaled by the PROJECT rate, not `pitchMode.deviceRate`.
+   * `PitchFrame.sample` is anchored to the engine's transport position and
+   * only offset within one callback buffer, so it lives in the project
+   * sample domain — the same one as `transport.positionAt` and
+   * `midi.ticksToSamples`. A 44.1 kHz microphone in a 48 kHz project would
+   * otherwise make every offset ~8% short.
+   */
   function latencyShift(): number {
-    const rate = pitchMode.deviceRate || project.sampleRate || 48000;
-    return (prefs.values.pitchLatencyOffsetMs / 1000) * rate;
+    return (prefs.values.pitchLatencyOffsetMs / 1000) * (project.sampleRate || 48000);
   }
 
   /**
@@ -148,10 +165,22 @@
     return null;
   }
 
-  /** The target note sounding at `sample`, or null. */
-  function targetAt(sample: number): number | null {
-    for (const n of targets) {
-      if (sample >= n.startSample && sample < n.endSample) return n.key;
+  /**
+   * The target note sounding at `sample`, or null.
+   *
+   * `from` is a cursor into `targets`, which is sorted by start: both the
+   * frames and the notes advance monotonically through a draw, so each pass
+   * walks the list once instead of rescanning it per frame. Rescanning cost
+   * ~900k comparisons per pass on a three-minute melody with a full ring,
+   * twice per rAF tick — the panel dropped frames on exactly the material
+   * it exists for.
+   */
+  function targetAt(sample: number, from: { i: number }): number | null {
+    while (from.i < targets.length && targets[from.i].endSample <= sample) from.i++;
+    for (let j = from.i; j < targets.length; j++) {
+      const n = targets[j];
+      if (n.startSample > sample) break; // sorted: nothing later can contain it
+      if (sample < n.endSample) return n.key;
     }
     return null;
   }
@@ -186,7 +215,10 @@
     const position = transport.positionAt(now);
 
     // Steadiness over the last second of frames — the header's number.
-    const rate = pitchMode.deviceRate || project.sampleRate || 48000;
+    // `rate` is the PROJECT rate throughout: frame positions are transport
+    // positions, so every samples↔seconds conversion below uses it. The
+    // capture rate is a fact about the microphone and only gets printed.
+    const rate = project.sampleRate || 48000;
     if (now - steadyAt >= STEADY_MS) {
       steadyAt = now;
       const next = stabilityCents(frames.slice(-100));
@@ -246,14 +278,15 @@
     // hit fill: the part of each bar the singer was inside the tolerance for
     const shift = latencyShift();
     ctx.fillStyle = "rgba(82, 229, 255, 0.35)";
+    const fillCursor = { i: 0 };
     for (const f of frames) {
       if (!f.voiced) continue;
       const sample = f.sample + shift;
-      const key = targetAt(sample);
+      const x = xOf(sample);
+      if (x < -2 || x > w + 2) continue; // cull BEFORE the note lookup
+      const key = targetAt(sample, fillCursor);
       if (key === null) continue;
       if (bandFor(centsToTarget(f.midi, key), tolerance) !== "in") continue;
-      const x = xOf(sample);
-      if (x < -2 || x > w + 2) continue;
       const y = yOfKey(key, lane, h) - rowH / 2;
       ctx.fillRect(x, y, Math.max(1, (rate / 100 / spp) * 1.2), rowH);
     }
@@ -263,6 +296,7 @@
     ctx.lineWidth = 2;
     ctx.lineJoin = "round";
     ctx.lineCap = "round";
+    const trailCursor = { i: 0 };
     for (const segment of trailSegments(frames)) {
       let prevBand: string | null = null;
       ctx.beginPath();
@@ -271,7 +305,7 @@
         const sample = f.sample + shift;
         const x = xOf(sample);
         if (x < -20 || x > w + 20) continue;
-        const key = targetAt(sample);
+        const key = targetAt(sample, trailCursor);
         const band = key === null ? "none" : bandFor(centsToTarget(f.midi, key), tolerance);
         // Game mode parks an in-tolerance point on the target line. Never
         // mix the two within a frame: snapped is legible, unsnapped is
@@ -344,8 +378,28 @@
     rate: number,
   ) {
     drawGround(ctx, w, h);
-    const voiced = frames.filter((f) => f.voiced);
-    const last = voiced.length ? voiced[voiced.length - 1] : null;
+
+    // A TIME window of raw frames — unvoiced included. Filtering to voiced
+    // and indexing by array position would splice three notes sung across
+    // twenty seconds into one continuous 1.5-second trace joined by jumps
+    // that never happened, which is the error `trailSegments` exists to
+    // prevent in the lane.
+    const newest = frames.length ? frames[frames.length - 1].sample : 0;
+    const spanSamples = TUNER_WINDOW_S * rate;
+    const windowStart = newest - spanSamples;
+    const window: PitchFrame[] = [];
+    for (let i = frames.length - 1; i >= 0; i--) {
+      if (frames[i].sample < windowStart) break;
+      window.push(frames[i]);
+    }
+    window.reverse();
+
+    // The big reading goes stale rather than lying: after the singer stops,
+    // holding the last voiced frame on screen shows a confident "247.3 Hz"
+    // for the whole 30 s the ring keeps it.
+    const newestVoiced = lastVoicedOf(frames);
+    const last =
+      newestVoiced && newest - newestVoiced.sample <= TUNER_STALE_S * rate ? newestVoiced : null;
 
     if (!pitchMode.listening) {
       ctx.fillStyle = "rgba(95, 108, 133, 1)";
@@ -379,20 +433,21 @@
     const ribbonH = Math.max(28, h - ribbonTop - 18);
     const midY = ribbonTop + ribbonH / 2;
 
-    // Last 3 seconds, centred on the run's own mean and scaled to the run's
-    // own swing — this is a steadiness view, not a pitch view, and a fixed
-    // scale either clips a wobble or flattens a hold. The floor keeps a
-    // genuinely steady note from being amplified into noise; the printed
-    // span at the bottom says what the height is worth.
-    const window = voiced.slice(-300);
+    // Centred on the window's own mean and scaled to its own swing — this is
+    // a steadiness view, not a pitch view, and a fixed scale either clips a
+    // wobble or flattens a hold. The floor keeps a genuinely steady note
+    // from being amplified into noise; the printed span says what the
+    // height is worth.
+    const sung = window.filter((f) => f.voiced);
     let spanCents = 0;
     let centre = 0;
-    if (window.length > 1) {
-      centre = window.reduce((a, f) => a + f.midi, 0) / window.length;
+    if (sung.length > 1) {
+      centre = sung.reduce((a, f) => a + f.midi, 0) / sung.length;
       let swing = 0;
-      for (const f of window) swing = Math.max(swing, Math.abs(f.midi - centre));
+      for (const f of sung) swing = Math.max(swing, Math.abs(f.midi - centre));
       spanCents = Math.max(25, Math.ceil((swing * 100) / 25) * 25);
     }
+    const xOfSample = (sample: number) => ((sample - windowStart) / spanSamples) * w;
 
     // The ribbon, behind the line: a band as wide as the steadiness reading,
     // on the same cents scale as the line inside it. Steady reads as a thin
@@ -407,17 +462,25 @@
       ctx.fillRect(0, midY - halfPx - 1, w, halfPx * 2 + 2);
     }
 
+    // One stroke per unbroken voiced run, positioned in TIME: a breath is a
+    // gap in the line, exactly as it is in the lane.
     if (spanCents) {
       ctx.strokeStyle = "#52e5ff";
       ctx.lineWidth = 1.5;
-      ctx.beginPath();
-      window.forEach((f, i) => {
-        const x = (i / (window.length - 1)) * w;
-        const y = midY - ((f.midi - centre) * 100 * (ribbonH / 2)) / spanCents;
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      });
-      ctx.stroke();
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      for (const segment of trailSegments(window)) {
+        ctx.beginPath();
+        segment.forEach((f, i) => {
+          const x = xOfSample(f.sample);
+          const y = midY - ((f.midi - centre) * 100 * (ribbonH / 2)) / spanCents;
+          if (i === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+        // A single-frame run is a dot, and a zero-length path draws nothing.
+        if (segment.length === 1) ctx.lineTo(xOfSample(segment[0].sample) + 0.5, midY);
+        ctx.stroke();
+      }
     }
 
     ctx.strokeStyle = "rgba(96, 130, 190, 0.25)";
@@ -430,7 +493,14 @@
     ctx.fillStyle = "#39435c";
     ctx.font = `9px ${MONO}`;
     const scale = spanCents ? ` · ±${spanCents}¢ SHOWN` : "";
-    ctx.fillText(`LAST ${(window.length / 100).toFixed(1)}s${scale} · ${rate ? `${rate} Hz` : "NO INPUT"}`, cx, h - 6);
+    const sungS = (sung.length / 100).toFixed(1);
+    ctx.fillText(
+      `LAST ${TUNER_WINDOW_S}s · ${sungS}s SUNG${scale} · ${
+        pitchMode.deviceRate ? `${pitchMode.deviceRate} Hz IN` : "NO INPUT"
+      }`,
+      cx,
+      h - 6,
+    );
   }
 </script>
 

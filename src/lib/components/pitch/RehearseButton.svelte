@@ -8,20 +8,18 @@
    * the button must not leave the take silently discarding audio — that is
    * the difference between a rehearsal and a lost verse.
    */
-  import { backend } from "../../tauri";
   import { pitchMode } from "../../state/pitch.svelte";
+  import { setRehearseSource } from "../../state/rehearse.svelte";
 
-  let held = $state(false);
-
-  async function set(on: boolean) {
-    if (held === on) return;
-    held = on;
-    try {
-      await backend.setRehearseHold(on);
-    } catch (err) {
-      console.warn("[aura] set_rehearse_hold failed:", err);
-      held = false;
-    }
+  /**
+   * The button is one of two sources for a single engine-side hold; the key
+   * in App.svelte is the other. Both go through `setRehearseSource`, which
+   * counts them — a private flag here would let releasing the button end a
+   * hold the key is still asserting, and the take would start writing real
+   * audio mid-rehearsal.
+   */
+  function set(on: boolean) {
+    setRehearseSource("button", on);
   }
 </script>
 
@@ -32,12 +30,12 @@
   title="Hold to rehearse: the transport rolls, the take records silence"
   onpointerdown={(e) => {
     e.preventDefault();
-    void set(true);
+    set(true);
   }}
-  onpointerup={() => void set(false)}
-  onpointercancel={() => void set(false)}
-  onpointerleave={() => void set(false)}
-  onblur={() => void set(false)}
+  onpointerup={() => set(false)}
+  onpointercancel={() => set(false)}
+  onpointerleave={() => set(false)}
+  onblur={() => set(false)}
 >
   REHEARSE
 </button>

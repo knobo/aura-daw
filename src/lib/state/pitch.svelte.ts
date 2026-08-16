@@ -28,6 +28,10 @@ let lastVoiced: PitchFrame | null = null;
 
 let unsubscribeChannel: (() => void) | null = null;
 let unsubscribeState: (() => void) | null = null;
+/** Bumped by every stop, so a start that resolves late knows it is stale. */
+let generation = 0;
+/** True between the subscribe call and its resolution. */
+let starting = false;
 
 /**
  * Live mode flags. `listening`, `rehearseHold` and `deviceRate` ride on
@@ -110,15 +114,33 @@ export function resetPitchBus(): void {
  *
  * This does NOT open the microphone: `pitch_listen_start` does, and the
  * mic opens only on an explicit listen toggle or an open panel (R6).
+ *
+ * `generation` is what makes a stop that lands mid-`await` safe: the panel
+ * can be unmounted (double-click the tab, an HMR remount) before
+ * `subscribePitch` resolves, and without this the late resolution would
+ * install a channel handler and an event listener that nothing owns, with
+ * the bus then driving `pitchMode` from a panel that is gone.
  */
 export async function startPitchStream(): Promise<void> {
-  if (unsubscribeChannel) return;
+  if (unsubscribeChannel || starting) return;
+  const mine = ++generation;
+  starting = true;
+  let off: (() => void) | null = null;
   try {
-    unsubscribeChannel = await backend.subscribePitch(ingestBatch);
+    off = await backend.subscribePitch(ingestBatch);
   } catch (err) {
     console.warn("[aura] pitch_subscribe failed:", err);
     return;
+  } finally {
+    starting = false;
   }
+  if (mine !== generation) {
+    // Stopped while we were awaiting: undo the subscription we just made
+    // rather than leaving it live and unowned.
+    off();
+    return;
+  }
+  unsubscribeChannel = off;
   unsubscribeState = backend.on("pitch://state", (state) => {
     pitchMode.listening = state.listening;
     pitchMode.rehearseHold = state.rehearseHold;
@@ -129,6 +151,8 @@ export async function startPitchStream(): Promise<void> {
 
 /** Stop consuming batches and clear the ring. */
 export function stopPitchStream(): void {
+  // Bumping the generation cancels an in-flight start (see above).
+  generation++;
   unsubscribeChannel?.();
   unsubscribeChannel = null;
   unsubscribeState?.();

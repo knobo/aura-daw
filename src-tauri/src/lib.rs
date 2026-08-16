@@ -189,6 +189,7 @@ pub fn run() {
             audio::pitch_listen_start,
             audio::pitch_listen_stop,
             audio::pitch_subscribe,
+            audio::pitch_unsubscribe,
             audio::set_rehearse_hold,
             audio::pitch_set_reference,
             // ---- audio: tracks ----

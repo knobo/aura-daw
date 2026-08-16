@@ -3,7 +3,7 @@
  * by the owner driving the app; everything a test can reach lives in
  * `panel-logic.ts` so it is reachable without a canvas.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { laneScrollFor, rehearseKeyMatches, stabilityCents, targetNotesFor } from "./panel-logic";
 import type { MidiClip, PitchFrame } from "../../types/ipc";
 
@@ -106,6 +106,22 @@ describe("targetNotesFor", () => {
   it("gives every note a distinct id across clips, so redraws stay keyed", () => {
     const notes = targetNotesFor([clip(), clip({ id: "c2", timelineStartTicks: 960 })], toSamples);
     expect(new Set(notes.map((n) => n.noteId)).size).toBe(notes.length);
+  });
+
+  it("sorts by start across clips, since the panel walks it with a cursor", () => {
+    const late = clip({ id: "late", timelineStartTicks: 3840 });
+    const early = clip({ id: "early", timelineStartTicks: 0 });
+    const notes = targetNotesFor([late, early], toSamples);
+    expect(notes.map((n) => n.startSample)).toEqual([0, 3840]);
+    expect(notes.map((n) => n.noteId)).toEqual([0, 1]);
+  });
+
+  it("takes the content length by injection, so one loop rule stays in the store", () => {
+    const effective = vi.fn(() => 480);
+    const notes = targetNotesFor([clip({ lengthTicks: 960 })], toSamples, effective);
+    expect(effective).toHaveBeenCalled();
+    // content 480 across a 960 placement is two repeats, not one.
+    expect(notes.map((n) => n.startSample)).toEqual([0, 480]);
   });
 
   it("returns nothing for no clips", () => {

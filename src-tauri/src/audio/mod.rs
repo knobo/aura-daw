@@ -418,6 +418,20 @@ pub fn pitch_subscribe(
     Ok(())
 }
 
+/// Drop a pitch subscription. `channel_id` is the `id` of the `Channel`
+/// handed to `pitch_subscribe` — a JS `Channel` exposes it as `.id`.
+///
+/// This exists because closing the JS end of a channel is invisible to the
+/// engine: a `Channel` whose `onmessage` has been cleared still accepts
+/// sends, so without this every open/close of the Pitch Coach would leave a
+/// live sink behind and the engine would ship one more batch per 60 Hz tick
+/// for the rest of the session.
+#[tauri::command]
+pub fn pitch_unsubscribe(channel_id: u32, state: State<'_, AudioState>) -> Result<(), String> {
+    state.engine()?.send(ControlMsg::UnsubscribePitch(channel_id));
+    Ok(())
+}
+
 /// Momentary rehearse-hold: the take writes silence for the held span.
 #[tauri::command]
 pub fn set_rehearse_hold(enabled: bool, state: State<'_, AudioState>) -> Result<(), String> {
@@ -443,6 +457,9 @@ struct ChannelPitchSink(Channel<PitchFrameBatch>);
 impl engine::PitchSink for ChannelPitchSink {
     fn send_batch(&self, batch: &PitchFrameBatch) -> bool {
         self.0.send(batch.clone()).is_ok()
+    }
+    fn id(&self) -> u32 {
+        self.0.id()
     }
 }
 
