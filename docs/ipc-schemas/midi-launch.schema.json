@@ -53,6 +53,10 @@
         "driveClipIds": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "playMode": {
+          "description": "How a drive-clip note plays a scene. gate = while the note is held; oneShot = play the scene to its end. Absent = gate.",
+          "enum": ["gate", "oneShot"]
         }
       },
       "required": ["id", "name"]

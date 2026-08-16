@@ -69,7 +69,9 @@ loops it, and plays (first match across every launcher). Notes from a
 clip that uses a launcher only fire **that** launcher's map — they do
 **not** steal the arrangement loop or move the playhead. The scene
 plays on a shadow playhead; the transport bar shows **▶ scene name**
-while it sounds. Launched tracks stay **audible through mute/solo** so
+while it sounds. Each launcher has a play mode: **GATE** (default —
+the scene lasts as long as the MIDI note) or **ONE-SHOT** (the note
+triggers, the scene plays to its marked end). Launched tracks stay **audible through mute/solo** so
 a soloed launcher clip does not silence the scene. AURA does **not**
 feed its own clip notes back into hardware launch: hardware input only,
 plus an echo window on MIDI-out loopback, so a clip cannot start itself.

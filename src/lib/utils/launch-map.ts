@@ -11,7 +11,13 @@ export type { LaunchBinding, LaunchMap, LaunchTarget };
 export const DEFAULT_LAUNCH_MAP_ID = "default";
 
 export function defaultLaunchMap(): LaunchMap {
-  return { id: DEFAULT_LAUNCH_MAP_ID, name: "Launcher 1", bindings: [], driveClipIds: [] };
+  return {
+    id: DEFAULT_LAUNCH_MAP_ID,
+    name: "Launcher 1",
+    bindings: [],
+    driveClipIds: [],
+    playMode: "gate",
+  };
 }
 
 export function nextLauncherName(existing: { name: string }[]): string {

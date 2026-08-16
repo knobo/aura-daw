@@ -90,12 +90,15 @@ export interface LaunchBinding {
   target: LaunchTarget;
 }
 
+export type LaunchPlayMode = "gate" | "oneShot";
+
 /** One named launcher: its note map plus the clips that drive it. */
 export interface LaunchMap {
   id: string;
   name: string;
   bindings: LaunchBinding[];
   driveClipIds: string[];
+  playMode?: LaunchPlayMode;
 }
 
 export interface LaunchSnapshot {
@@ -112,6 +115,7 @@ export interface LaunchFired {
   trackIds: string[];
   startSamples: number;
   endSamples: number;
+  playing?: boolean;
 }
 
 // ── transport-state.schema.json ─────────────────────────────────────────────

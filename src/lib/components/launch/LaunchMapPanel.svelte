@@ -283,6 +283,20 @@
     <div class="foot">
       <button
         class="act mono"
+        class:on={(launch.activeMap.playMode ?? "gate") === "gate"}
+        title="Gate — the scene sounds only while the MIDI note is held"
+        onclick={() => void launch.setPlayMode("gate")}
+      >GATE</button
+      >
+      <button
+        class="act mono"
+        class:on={(launch.activeMap.playMode ?? "gate") === "oneShot"}
+        title="One-shot — the note triggers the scene, which then plays to its end"
+        onclick={() => void launch.setPlayMode("oneShot")}
+      >ONE-SHOT</button
+      >
+      <button
+        class="act mono"
         class:on={launch.marking}
         aria-pressed={launch.marking}
         title={launch.marking

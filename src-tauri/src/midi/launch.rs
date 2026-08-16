@@ -48,6 +48,18 @@ impl LaunchBinding {
 
 pub const DEFAULT_MAP_ID: &str = "default";
 
+/// How a drive-clip note plays a scene.
+///
+/// * `Gate` — sound while the MIDI note is held; note-off cuts the scene.
+/// * `OneShot` — the note is a trigger; the scene plays to its end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum LaunchPlayMode {
+    #[default]
+    Gate,
+    OneShot,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchMap {
@@ -57,6 +69,8 @@ pub struct LaunchMap {
     pub bindings: Vec<LaunchBinding>,
     #[serde(default)]
     pub drive_clip_ids: Vec<String>,
+    #[serde(default)]
+    pub play_mode: LaunchPlayMode,
 }
 
 impl LaunchMap {
@@ -66,6 +80,7 @@ impl LaunchMap {
             name: name.into(),
             bindings: Vec::new(),
             drive_clip_ids: Vec::new(),
+            play_mode: LaunchPlayMode::Gate,
         }
     }
 
@@ -169,6 +184,11 @@ pub enum FireOrigin {
     Drive,
 }
 
+pub enum FireCmd {
+    Start(LaunchBinding, FireOrigin),
+    Release(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IncomingDecision {
     Pass,
@@ -199,11 +219,12 @@ pub struct LaunchRuntime {
     learning: Mutex<Option<String>>,
     armed: Mutex<Option<(u8, u8)>>,
     origin: Instant,
-    fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<(LaunchBinding, FireOrigin)>>>,
+    fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<FireCmd>>>,
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
     drive_started: AtomicBool,
     audible_tracks: Mutex<Vec<String>>,
+    overlay_id: Mutex<Option<String>>,
 }
 
 impl Default for LaunchRuntime {
@@ -219,6 +240,7 @@ impl Default for LaunchRuntime {
             gen: AtomicU64::new(0),
             drive_started: AtomicBool::new(false),
             audible_tracks: Mutex::new(Vec::new()),
+            overlay_id: Mutex::new(None),
         }
     }
 }
@@ -260,13 +282,13 @@ impl LaunchRuntime {
         self.last_learn.lock().unwrap().take()
     }
 
-    pub fn install_fire(&self, f: Arc<dyn Fn(LaunchBinding, FireOrigin) + Send + Sync>) {
+    pub fn install_fire(&self, f: Arc<dyn Fn(FireCmd) + Send + Sync>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let _ = std::thread::Builder::new()
             .name("aura-launch-fire".into())
             .spawn(move || {
-                while let Ok((b, origin)) = rx.recv() {
-                    f(b, origin);
+                while let Ok(cmd) = rx.recv() {
+                    f(cmd);
                 }
             });
         *self.fire_tx.lock().unwrap() = Some(tx);
@@ -282,6 +304,15 @@ impl LaunchRuntime {
 
     pub fn clear_audible_tracks(&self) {
         self.audible_tracks.lock().unwrap().clear();
+        *self.overlay_id.lock().unwrap() = None;
+    }
+
+    pub fn set_overlay_id(&self, id: Option<String>) {
+        *self.overlay_id.lock().unwrap() = id;
+    }
+
+    pub fn overlay_id(&self) -> Option<String> {
+        self.overlay_id.lock().unwrap().clone()
     }
 
     pub fn record_out(&self, note: u8, channel: u8) {
@@ -342,6 +373,8 @@ impl LaunchRuntime {
                         last = pos;
                         continue;
                     };
+                    let mut fired = std::collections::HashSet::new();
+                    let mut released = std::collections::HashSet::new();
                     for launcher in &launchers {
                         if launcher.drive_clip_ids.is_empty() {
                             continue;
@@ -350,7 +383,7 @@ impl LaunchRuntime {
                             launcher.drive_clip_ids.iter().any(|id| id == c.id.as_str())
                         }) {
                             for ev in crate::midi::schedule::clip_events(clip, &tempo_map) {
-                                if ev.velocity == 0 || ev.sample <= last || ev.sample > pos {
+                                if ev.sample <= last || ev.sample > pos {
                                     continue;
                                 }
                                 let Some(b) = resolve(&launcher.bindings, ev.key, 0) else {
@@ -360,6 +393,21 @@ impl LaunchRuntime {
                                     if clip_id == clip.id.as_str() {
                                         continue;
                                     }
+                                }
+                                if ev.velocity == 0 {
+                                    if launcher.play_mode == LaunchPlayMode::Gate
+                                        && released.insert(b.id.clone())
+                                    {
+                                        launch_trace(format!(
+                                            "drive release clip={} note={} -> {}",
+                                            clip.id, ev.key, b.id
+                                        ));
+                                        runtime().enqueue_release(b.id.clone());
+                                    }
+                                    continue;
+                                }
+                                if !fired.insert(b.id.clone()) {
+                                    continue;
                                 }
                                 launch_trace(format!(
                                     "drive clip={} note={} -> {}",
@@ -409,7 +457,13 @@ impl LaunchRuntime {
 
     pub fn enqueue_fire(&self, b: LaunchBinding, origin: FireOrigin) {
         if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
-            let _ = tx.try_send((b, origin));
+            let _ = tx.try_send(FireCmd::Start(b, origin));
+        }
+    }
+
+    pub fn enqueue_release(&self, id: String) {
+        if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
+            let _ = tx.try_send(FireCmd::Release(id));
         }
     }
 
@@ -539,6 +593,11 @@ impl crate::control::ControlPlane {
             FireOrigin::Drive => {
                 // Keep the arrangement loop and playhead on the clip.
                 // The scene plays on a shadow playhead; UI only gets an indicator.
+                if self.drive_overlay_is(id) {
+                    launch_trace(format!("drive skip, already playing {id}"));
+                    return Ok(());
+                }
+                runtime().set_overlay_id(Some(id.to_string()));
                 self.arm_drive_launch(&track_ids, start, end);
             }
             FireOrigin::Hardware => {
@@ -561,8 +620,27 @@ impl crate::control::ControlPlane {
             track_ids,
             start_samples: start,
             end_samples: end,
+            playing: true,
         });
         Ok(())
+    }
+
+    pub fn stop_drive_launch(&self, id: &str) {
+        if !self.drive_overlay_is(id) {
+            return;
+        }
+        launch_trace(format!("drive stop {id}"));
+        self.clear_launch_audible();
+        self.emit_launch_fired(LaunchFired {
+            id: id.to_string(),
+            name: String::new(),
+            origin: FireOrigin::Drive,
+            follow_view: false,
+            track_ids: Vec::new(),
+            start_samples: 0,
+            end_samples: 0,
+            playing: false,
+        });
     }
 }
 
@@ -576,6 +654,12 @@ pub struct LaunchFired {
     pub track_ids: Vec<String>,
     pub start_samples: u64,
     pub end_samples: u64,
+    #[serde(default = "launch_playing_default")]
+    pub playing: bool,
+}
+
+fn launch_playing_default() -> bool {
+    true
 }
 
 #[tauri::command]
@@ -849,6 +933,17 @@ mod tests {
     }
 
     #[test]
+    fn launch_map_missing_play_mode_defaults_to_gate() {
+        let m: LaunchMap = serde_json::from_str(r#"{"id":"x","name":"Drums"}"#).unwrap();
+        assert_eq!(m.play_mode, LaunchPlayMode::Gate);
+        let one: LaunchMap = serde_json::from_str(
+            r#"{"id":"x","name":"Drums","playMode":"oneShot"}"#,
+        )
+        .unwrap();
+        assert_eq!(one.play_mode, LaunchPlayMode::OneShot);
+    }
+
+    #[test]
     fn migrate_prefers_named_maps() {
         let named = vec![LaunchMap::named("drums", "Drums")];
         let maps = migrate_legacy_maps(Some(named.clone()), vec![region("a", 60, None)], vec![]);
@@ -860,8 +955,10 @@ mod tests {
         let rt = LaunchRuntime::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let caller = std::thread::current().id();
-        rt.install_fire(std::sync::Arc::new(move |b, _origin| {
-            let _ = tx.send((std::thread::current().id(), b.id.clone()));
+        rt.install_fire(std::sync::Arc::new(move |cmd| {
+            if let FireCmd::Start(b, _) = cmd {
+                let _ = tx.send((std::thread::current().id(), b.id.clone()));
+            }
         }));
         rt.set_bindings(vec![region("a", 60, None)]);
         rt.on_incoming(true, 60, 0);

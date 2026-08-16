@@ -1085,6 +1085,7 @@ mod tests {
                 },
             }],
             drive_clip_ids: vec!["clip-1".into()],
+            play_mode: crate::midi::launch::LaunchPlayMode::Gate,
         }];
         save_into_project(&dir, &midi).unwrap();
         let raw: Value =

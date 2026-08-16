@@ -87,11 +87,15 @@ class LaunchStore {
       this.accept(snap);
     });
     backend.on?.("launch://fired", (ev: LaunchFired) => {
-      if (ev.origin === "drive") {
-        this.overlay = { id: ev.id, name: ev.name };
-      } else {
+      if (ev.origin !== "drive") {
         this.overlay = null;
+        return;
       }
+      if (ev.playing === false) {
+        if (this.overlay?.id === ev.id) this.overlay = null;
+        return;
+      }
+      this.overlay = { id: ev.id, name: ev.name };
     });
     backend.on?.("transport://state", (s) => {
       if (s.state === "stopped") this.overlay = null;
@@ -165,12 +169,21 @@ class LaunchStore {
       name: name ?? nextLauncherName(this.maps),
       bindings: [],
       driveClipIds: [],
+      playMode: "gate",
     };
     this.maps = [...this.maps, map];
     this.activeMapId = map.id;
     this.selectedId = null;
     await this.persistMap(map);
     return map;
+  }
+
+  async setPlayMode(mode: "gate" | "oneShot") {
+    const map = this.activeMap;
+    if ((map.playMode ?? "gate") === mode) return;
+    const next = { ...map, playMode: mode };
+    this.maps = this.maps.map((m) => (m.id === map.id ? next : m));
+    await this.persistMap(next);
   }
 
   async renameMap(id: string, name: string) {

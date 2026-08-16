@@ -1634,7 +1634,14 @@ impl ControlPlane {
         self.shared.arm_launch(start, end);
     }
 
+    pub fn drive_overlay_is(&self, id: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.shared.launch_on.load(Relaxed)
+            && crate::midi::launch::runtime().overlay_id().as_deref() == Some(id)
+    }
+
     pub fn clear_drive_overlay(&self) {
+        crate::midi::launch::runtime().set_overlay_id(None);
         self.shared.clear_launch();
     }
 
