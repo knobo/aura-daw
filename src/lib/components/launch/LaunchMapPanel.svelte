@@ -260,14 +260,16 @@
               <option value={ch}>{ch + 1}</option>
             {/each}
           </select>
-          <span
+          <button
+            type="button"
             class="tgt silk"
             title="Jump the playhead to this marking"
             onpointerdown={(e) => e.stopPropagation()}
+            ondblclick={(e) => e.stopPropagation()}
             onclick={(e) => {
               e.stopPropagation();
               launch.focus(b.id);
-            }}>{targetLabel(b)}</span
+            }}>{targetLabel(b)}</button
           >
           <div class="acts">
             <button
@@ -492,6 +494,15 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--text-dim);
+    background: transparent;
+    border: 0;
+    padding: 0;
+    text-align: left;
+    font: inherit;
+    cursor: pointer;
+  }
+  .tgt:hover {
+    color: var(--cyan);
   }
   .acts {
     display: flex;
