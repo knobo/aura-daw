@@ -125,6 +125,14 @@ pub struct MidiClip {
     /// pinned to whatever `length_ticks` was at that moment.
     #[serde(default)]
     pub content_length_ticks: Option<u64>,
+    /// Placement transpose in semitones (round-2 §5; Plan F Task 12).
+    /// Applied at schedule/bounce time; note CONTENT is never rewritten.
+    #[serde(default)]
+    pub transpose_semitones: i16,
+    /// Placement velocity offset, added to each note at schedule time,
+    /// result clamped to 1..=127. Stored notes stay as written.
+    #[serde(default)]
+    pub velocity_offset: i16,
 }
 
 /// Serde default for [`MidiClip::next_note_id`] (and, imported,
@@ -231,6 +239,8 @@ mod tests {
             notes: vec![], next_note_id: 1,
             content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         let a = clip.mint_note_id();
         let b = clip.mint_note_id();
@@ -253,6 +263,8 @@ mod tests {
             next_note_id: 6,
             content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         clip.ensure_note_ids().unwrap();
         assert_eq!(clip.notes[0].note_id.0, 6, "unassigned got minted");
@@ -269,6 +281,8 @@ mod tests {
             notes: vec![], next_note_id: 1,
             content_id: ContentId::mint(), lane_id: LaneId::default_for_track("t-1"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         assert_eq!(clip.effective_content_length_ticks(), 3840, "absent -> placement length");
         clip.content_length_ticks = Some(960);

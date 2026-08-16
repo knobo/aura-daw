@@ -892,6 +892,8 @@ impl ControlPlane {
                             content_id: crate::ids::ContentId::mint(),
                             lane_id,
                             content_length_ticks,
+                            transpose_semitones: 0,
+                            velocity_offset: 0,
                         };
                         // Ids minted BEFORE the apply, so the op the journal
                         // records carries the final ones — the exact

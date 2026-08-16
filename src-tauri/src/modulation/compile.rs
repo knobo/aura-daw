@@ -876,6 +876,8 @@ mod tests {
             content_id: content.into(),
             lane_id: crate::ids::LaneId::default_for_track(track),
             content_length_ticks: content_len,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 

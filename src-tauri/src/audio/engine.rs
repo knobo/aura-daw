@@ -3517,6 +3517,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("t-2"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             });
             s.republish_full();
         }
@@ -3772,6 +3774,8 @@ mod tests {
                 content_id: "con".into(),
                 lane_id: crate::ids::LaneId::default_for_track("t-1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             });
             s.midi.clips.push(crate::midi::MidiClip {
                 id: "c2".into(),
@@ -3784,6 +3788,8 @@ mod tests {
                 content_id: "con".into(),
                 lane_id: crate::ids::LaneId::default_for_track("t-2"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             });
             s.modulation.curves.push(Curve {
                 id: "cur".into(),
@@ -3872,6 +3878,8 @@ mod tests {
                 content_id: "con".into(),
                 lane_id: crate::ids::LaneId::default_for_track("t-1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             });
             s.modulation.curves.push(Curve {
                 id: "cur".into(),

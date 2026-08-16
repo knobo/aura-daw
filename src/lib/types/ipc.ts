@@ -379,6 +379,10 @@ export interface MidiClip {
   lengthTicks: number;
   /** Content (loop/native) length in ticks; absent = same as lengthTicks. */
   contentLengthTicks?: number;
+  /** Placement transpose in semitones; 0/absent = none. */
+  transposeSemitones?: number;
+  /** Placement velocity offset; 0/absent = none. */
+  velocityOffset?: number;
   /** Content identity (ADR 0004). Clip envelopes are keyed by this. */
   contentId?: string;
   /** Sorted by (tick, key). */

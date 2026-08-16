@@ -375,6 +375,8 @@ mod tests {
                 content_id: crate::ids::ContentId::mint(),
                 lane_id: crate::ids::LaneId::default_for_track("m1"),
                 content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
             }],
             loaded_dir: None,
             dirty: false,
@@ -1026,6 +1028,8 @@ mod tests {
             content_id: "con".into(),
             lane_id: crate::ids::LaneId::default_for_track("a1"),
             content_length_ticks: Some(PERIOD),
+            transpose_semitones: 0,
+            velocity_offset: 0,
         });
         let mut modulation = ModulationDoc::default();
         modulation.curves.push(Curve {

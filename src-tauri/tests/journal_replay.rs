@@ -220,6 +220,8 @@ fn midi_clip(id: &str, track_id: &str) -> MidiClip {
         content_id: ContentId::mint(),
         lane_id: LaneId::default_for_track(track_id),
         content_length_ticks: None,
+        transpose_semitones: 0,
+        velocity_offset: 0,
     }
 }
 

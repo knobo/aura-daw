@@ -1213,6 +1213,8 @@ mod tests {
             content_id: ContentId::default(),
             lane_id: LaneId::default_for_track("t-1"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         // noteId 0 = the mint sentinel — the exact case ruling F-9 is about.
         let sentinel = MidiNote { tick: 0, length_ticks: 120, key: 60, velocity: 100, channel: 0, note_id: crate::ids::NoteId(0) };

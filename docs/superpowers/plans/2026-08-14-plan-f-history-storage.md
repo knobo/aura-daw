@@ -1559,7 +1559,7 @@ pub velocity_offset: i16,
   closure via `tx.midi()`). `tauri.ts`: `midiSetClipPlacement(...)`
   binding, same style as `midi_set_clip_bounds`'s.
 
-- [ ] **Step 1: Failing tests:**
+- [x] **Step 1: Failing tests:**
 
 ```rust
 #[test]
@@ -1578,11 +1578,11 @@ fn velocity_offset_clamps_at_schedule_time_only() {
 }
 ```
 
-- [ ] **Step 2: RED → implement** (types → op paths → apply arm →
+- [x] **Step 2: RED → implement** (types → op paths → apply arm →
   playback → command → binding, in that order, compiling at each stage).
-- [ ] **Step 3: Full suites; counts** (backend +3; frontend +1 if a
+- [x] **Step 3: Full suites; counts** (backend +3; frontend +1 if a
   binding test exists — README/CONTRIBUTING both).
-- [ ] **Step 4: Commit** —
+- [x] **Step 4: Commit** —
   `git commit -m "feat(midi): placement transpose/velocity offsets — ops, playback, additive command (round-2 §5/§6 routing lever)"`
 
 ---

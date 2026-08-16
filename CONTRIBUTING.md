@@ -59,7 +59,7 @@ stops working the moment the new one is generated. Full client setup:
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 887 tests (853 lib + 34 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after merging main + Track F onto plan-f-history)
+cd src-tauri && cargo test   # 890 tests (856 lib + 34 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after Plan F Task 12)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```

@@ -1572,6 +1572,19 @@ export class DemoBackend implements Backend {
     return { ...clip };
   }
 
+  async midiSetClipPlacement(
+    clipId: string,
+    transposeSemitones: number | null,
+    velocityOffset: number | null,
+  ): Promise<MidiClip> {
+    const clip = this.midiClips.find((c) => c.id === clipId);
+    if (!clip) throw new Error(`unknown MIDI clip: ${clipId}`);
+    if (transposeSemitones !== null) clip.transposeSemitones = transposeSemitones;
+    if (velocityOffset !== null) clip.velocityOffset = velocityOffset;
+    this.resyncAudio();
+    return { ...clip };
+  }
+
   async midiRenameClip(clipId: string, name: string): Promise<MidiClip> {
     const clip = this.midiClips.find((c) => c.id === clipId);
     if (!clip) throw new Error(`unknown MIDI clip: ${clipId}`);

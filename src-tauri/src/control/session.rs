@@ -1478,6 +1478,8 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::TransportState
         | PropPath::LoopEnabled
         | PropPath::LoopStartSamples
@@ -1536,6 +1538,8 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::TransportState
         | PropPath::LoopEnabled
         | PropPath::LoopStartSamples
@@ -1560,6 +1564,8 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         PropPath::TimelineStartTicks => Ok(serde_json::json!(c.timeline_start_ticks)),
         PropPath::LengthTicks => Ok(serde_json::json!(c.length_ticks)),
         PropPath::ContentLengthTicks => Ok(serde_json::json!(c.content_length_ticks)),
+        PropPath::TransposeSemitones => Ok(serde_json::json!(c.transpose_semitones)),
+        PropPath::VelocityOffset => Ok(serde_json::json!(c.velocity_offset)),
         PropPath::Gain
         | PropPath::Pan
         | PropPath::Muted
@@ -1622,6 +1628,18 @@ fn write_midi_prop(
             c.content_length_ticks = v;
             Ok(serde_json::json!(c.content_length_ticks))
         }
+        PropPath::TransposeSemitones => {
+            let v = to.as_i64().ok_or("transposeSemitones: expected an integer")?;
+            let v = i16::try_from(v).map_err(|_| "transposeSemitones: out of i16 range")?;
+            c.transpose_semitones = v;
+            Ok(serde_json::json!(c.transpose_semitones))
+        }
+        PropPath::VelocityOffset => {
+            let v = to.as_i64().ok_or("velocityOffset: expected an integer")?;
+            let v = i16::try_from(v).map_err(|_| "velocityOffset: out of i16 range")?;
+            c.velocity_offset = v;
+            Ok(serde_json::json!(c.velocity_offset))
+        }
         PropPath::Gain
         | PropPath::Pan
         | PropPath::Muted
@@ -1671,6 +1689,8 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -1741,6 +1761,8 @@ fn write_transport_prop(
         | PropPath::TimelineStartTicks
         | PropPath::LengthTicks
         | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -2426,6 +2448,8 @@ mod tests {
             content_id: ContentId::mint(),
             lane_id: LaneId::default_for_track(track_id),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         }
     }
 

@@ -226,6 +226,8 @@ pub fn import_smf(bytes: &[u8], target_ppq: u32) -> Result<ImportedMidi, String>
             // clip's actual track). Placeholder value here on purpose.
             lane_id: crate::ids::LaneId::default_for_track(""),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         clip.ensure_note_ids().expect("freshly imported notes never collide");
         clips.push(clip);
@@ -312,6 +314,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         let bytes = export_smf(960, &tempo, &[clip.clone()]).unwrap();
         let imp = import_smf(&bytes, 960).unwrap();
@@ -339,6 +343,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         let bytes =
             export_smf(960, &[TempoEvent { tick: 0, bpm: 120.0 }], &[clip]).unwrap();
@@ -359,6 +365,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         // Export at 480 ppq, import at 960 -> ticks double.
         let bytes = export_smf(480, &[TempoEvent { tick: 0, bpm: 120.0 }], &[clip]).unwrap();
@@ -381,6 +389,8 @@ mod tests {
             content_id: crate::ids::ContentId::mint(),
             lane_id: crate::ids::LaneId::default_for_track("t"),
             content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
         };
         // No tempo events at all -> import synthesizes 120 bpm at tick 0.
         let bytes = export_smf(960, &[], &[clip]).unwrap();

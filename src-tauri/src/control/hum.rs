@@ -223,6 +223,8 @@ fn commit_hum_clip(
         content_id: crate::ids::ContentId::mint(),
         lane_id,
         content_length_ticks: None,
+        transpose_semitones: 0,
+        velocity_offset: 0,
     };
     clip.ensure_note_ids()?;
     let index = tx.midi().clips.len();

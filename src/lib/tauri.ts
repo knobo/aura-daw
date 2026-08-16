@@ -235,6 +235,11 @@ export interface Backend {
     lengthTicks: number,
     contentLengthTicks: number | null,
   ): Promise<MidiClip>;
+  midiSetClipPlacement(
+    clipId: string,
+    transposeSemitones: number | null,
+    velocityOffset: number | null,
+  ): Promise<MidiClip>;
   midiRenameClip(clipId: string, name: string): Promise<MidiClip>;
   /** Remove a MIDI clip from its track. */
   midiRemoveClip(clipId: string): Promise<void>;
@@ -612,6 +617,17 @@ class TauriBackend implements Backend {
       timelineStartTicks,
       lengthTicks,
       contentLengthTicks,
+    });
+  }
+  midiSetClipPlacement(
+    clipId: string,
+    transposeSemitones: number | null,
+    velocityOffset: number | null,
+  ) {
+    return invoke<MidiClip>("midi_set_clip_placement", {
+      clipId,
+      transposeSemitones,
+      velocityOffset,
     });
   }
   midiRenameClip(clipId: string, name: string) {

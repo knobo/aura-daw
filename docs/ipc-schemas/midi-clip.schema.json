@@ -41,6 +41,14 @@
           "description": "Content (loop/native) length in ticks — ADR 0004's content half of the placement/content split; lengthTicks stays the placement length. Absent means \"same as lengthTicks\" (pre-looping semantics). When lengthTicks > contentLengthTicks the content repeats to fill the placement; when shorter, content is cropped. Additive (D-06).",
           "type": "integer", "minimum": 1, "maximum": 18446744073709551615
         },
+        "transposeSemitones": {
+          "description": "Placement transpose in semitones (Plan F Task 12; round-2 §5). Applied at schedule/bounce time; note CONTENT is never rewritten. Absent/0 = none. Additive (D-06).",
+          "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0
+        },
+        "velocityOffset": {
+          "description": "Placement velocity offset (Plan F Task 12). Added to each note at schedule time, result clamped to 1..=127. Stored notes stay as written. Absent/0 = none. Additive (D-06).",
+          "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0
+        },
         "notes": { "type": "array", "items": { "$ref": "#/$defs/note" } }
       },
       "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks", "notes"]
@@ -71,6 +79,14 @@
         "nextNoteId": {
           "description": "Persisted note-id watermark (round-2 §2.1, C-1): the durable authority for the clip's next-minted note id — written unconditionally (even for an emptied clip, which writes no eventsRef) so the watermark survives independently of the AMEV chunk. Loaded as max(row, chunk). Additive (D-06).",
           "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 1
+        },
+        "transposeSemitones": {
+          "description": "Placement transpose in semitones (Plan F Task 12). Written only when nonzero so an old project resaves byte-diff-free. Additive (D-06).",
+          "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0
+        },
+        "velocityOffset": {
+          "description": "Placement velocity offset (Plan F Task 12). Written only when nonzero. Additive (D-06).",
+          "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0
         }
       },
       "required": ["id", "trackId", "name", "timelineStartTicks", "lengthTicks"]
@@ -112,7 +128,15 @@
         "laneId": { "description": "Joins to a persistedLaneRow's id.", "type": "string" },
         "name": { "type": "string" },
         "timelineStartTicks": { "type": "integer", "minimum": 0 },
-        "lengthTicks": { "type": "integer", "minimum": 1 }
+        "lengthTicks": { "type": "integer", "minimum": 1 },
+        "transposeSemitones": {
+          "description": "Placement transpose in semitones (Plan F Task 12; round-2 §5 placement table). Written only when nonzero so a never-transposed project resaves byte-diff-free. Additive (D-06).",
+          "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0
+        },
+        "velocityOffset": {
+          "description": "Placement velocity offset (Plan F Task 12). Written only when nonzero. Additive (D-06).",
+          "type": "integer", "minimum": -32768, "maximum": 32767, "default": 0
+        }
       },
       "required": ["id", "contentId", "laneId", "name", "timelineStartTicks", "lengthTicks"]
     },
