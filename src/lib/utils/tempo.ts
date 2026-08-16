@@ -40,3 +40,10 @@ export function quartersPerBar(num: number, den: number): number {
   if (den <= 0) return num;
   return (num * 4) / den;
 }
+
+/** One wheel tick from `current`. `deltaY < 0` is up / faster. */
+export function nudgeTempo(current: number, deltaY: number, fine: boolean): number {
+  const step = fine ? 0.1 : 1;
+  const dir = deltaY < 0 ? step : -step;
+  return clampTempo(current + dir);
+}

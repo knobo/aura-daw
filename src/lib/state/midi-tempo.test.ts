@@ -70,6 +70,52 @@ describe("setTempo", () => {
     expect(setTempoMap).toHaveBeenCalledWith(null, [{ tick: 0, bpm: 40 }]);
     expect(project.tempoBpm).toBe(40);
   });
+
+  it("edits event 0 and keeps later tempo-map entries", async () => {
+    midi.tempoEvents = [
+      { tick: 0, bpm: 120 },
+      { tick: 1920, bpm: 90 },
+    ];
+    await midi.setTempo(140);
+    expect(setTempoMap).toHaveBeenCalledWith(null, [
+      { tick: 0, bpm: 140 },
+      { tick: 1920, bpm: 90 },
+    ]);
+  });
+
+  it("ignores a slower earlier setTempo reply", async () => {
+    let releaseSlow: (s: TempoMapState) => void = () => {};
+    setTempoMap
+      .mockImplementationOnce(
+        () =>
+          new Promise<TempoMapState>((resolve) => {
+            releaseSlow = resolve;
+          }),
+      )
+      .mockImplementationOnce(async (_ppq, events) => ({
+        ppq: 960,
+        events: events.map((e: { tick: number; bpm: number }) => ({ ...e })),
+        meterMap: [{ tick: 0, num: 4, den: 4 }],
+        periodEvents: [],
+        sectionTable: [{ startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 254016000 }],
+        sectionTableRuleVersion: 1,
+      }));
+
+    const slow = midi.setTempo(80);
+    await midi.setTempo(160);
+    expect(project.tempoBpm).toBe(160);
+
+    releaseSlow({
+      ppq: 960,
+      events: [{ tick: 0, bpm: 80 }],
+      meterMap: [{ tick: 0, num: 4, den: 4 }],
+      periodEvents: [],
+      sectionTable: [],
+      sectionTableRuleVersion: 1,
+    });
+    await slow;
+    expect(project.tempoBpm).toBe(160);
+  });
 });
 
 describe("setMeter", () => {
@@ -118,6 +164,7 @@ describe("bar length follows the denominator", () => {
     project.timeSignature = [6, 8];
     midi.ppq = 960;
     expect(project.samplesPerBar).toBe(72_000);
+    expect(project.samplesPerBeat).toBe(12_000);
     expect(midi.ticksPerBar).toBe(2880);
   });
 });

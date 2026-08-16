@@ -12,6 +12,7 @@ import {
   parseTempo,
   isValidMeter,
   quartersPerBar,
+  nudgeTempo,
   TEMPO_MIN,
   TEMPO_MAX,
 } from "./tempo";
@@ -55,6 +56,14 @@ describe("isValidMeter", () => {
     expect(isValidMeter(0, 4)).toBe(false);
     expect(isValidMeter(4, 3)).toBe(false);
     expect(isValidMeter(4.5, 4)).toBe(false);
+  });
+});
+
+describe("nudgeTempo", () => {
+  it("steps ±1 from the given current value, not from a value already stepped", () => {
+    expect(nudgeTempo(120, -1, false)).toBe(121);
+    expect(nudgeTempo(120, 1, false)).toBe(119);
+    expect(nudgeTempo(120, -1, true)).toBe(120.1);
   });
 });
 

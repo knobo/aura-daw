@@ -45,7 +45,7 @@
       barsEl.textContent = formatBarsBeats(
         pos,
         transport.snap.sampleRate,
-        transport.snap.tempoBpm,
+        project.tempoBpm,
         project.timeSignature[0],
         project.timeSignature[1],
       );

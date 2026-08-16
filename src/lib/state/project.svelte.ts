@@ -11,7 +11,6 @@
 import { backend } from "../tauri";
 import { midiIo } from "./midiio.svelte";
 import { modulation } from "./modulation.svelte";
-import { quartersPerBar } from "../utils/tempo";
 import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
@@ -37,10 +36,11 @@ class ProjectStore {
    * argument through each of them, a UI-shaped refactor this task's own
    * scope didn't reach. Recorded per ADR 0007 — not a silent gap. */
   get samplesPerBeat(): number {
-    return (60 / this.tempoBpm) * this.sampleRate;
+    const den = this.timeSignature[1] || 4;
+    return (60 / this.tempoBpm) * this.sampleRate * (4 / den);
   }
   get samplesPerBar(): number {
-    return this.samplesPerBeat * quartersPerBar(this.timeSignature[0], this.timeSignature[1]);
+    return this.samplesPerBeat * this.timeSignature[0];
   }
 
   clipsOf(trackId: string): Clip[] {

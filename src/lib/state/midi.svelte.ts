@@ -103,11 +103,17 @@ class MidiStore {
     if (meter) project.timeSignature = [meter.num, meter.den];
   }
 
-  /** Replace the project with one constant tempo. One undo step. */
+  private tempoWriteGen = 0;
+
+  /** Edit the first tempo event. Later map entries stay. */
   async setTempo(bpm: number): Promise<void> {
     const clamped = clampTempo(bpm);
     project.tempoBpm = clamped;
-    const state = await backend.setTempoMap(null, [{ tick: 0, bpm: clamped }]);
+    const rest = this.tempoEvents.slice(1).map((e) => ({ ...e }));
+    const events = [{ tick: this.tempoEvents[0]?.tick ?? 0, bpm: clamped }, ...rest];
+    const gen = ++this.tempoWriteGen;
+    const state = await backend.setTempoMap(null, events);
+    if (gen !== this.tempoWriteGen) return;
     this.applyTempoMap(state);
   }
 
@@ -117,7 +123,9 @@ class MidiStore {
     const events = this.tempoEvents.length
       ? this.tempoEvents.map((e) => ({ ...e }))
       : [{ tick: 0, bpm: project.tempoBpm }];
+    const gen = ++this.tempoWriteGen;
     const state = await backend.setTempoMap(null, events, [{ tick: 0, num, den }]);
+    if (gen !== this.tempoWriteGen) return;
     this.applyTempoMap(state);
   }
 

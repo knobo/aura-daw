@@ -6,11 +6,12 @@
    */
   import { project } from "../state/project.svelte";
   import { midi } from "../state/midi.svelte";
-  import { COMMON_METERS, TEMPO_MAX, TEMPO_MIN, parseTempo } from "../utils/tempo";
+  import { COMMON_METERS, TEMPO_MAX, TEMPO_MIN, nudgeTempo, parseTempo } from "../utils/tempo";
 
   let open = $state(false);
   let draft = $state("");
   let inputEl: HTMLInputElement | undefined = $state();
+  let wheelEnd: ReturnType<typeof setTimeout> | null = null;
 
   const fill = $derived(
     (project.tempoBpm - TEMPO_MIN) / (TEMPO_MAX - TEMPO_MIN),
@@ -23,6 +24,7 @@
 
   function close() {
     open = false;
+    project.endGesture();
   }
 
   function commitDraft() {
@@ -38,14 +40,15 @@
 
   function onWheel(e: WheelEvent) {
     e.preventDefault();
-    const step = e.shiftKey ? 0.1 : 1;
-    const dir = e.deltaY < 0 ? step : -step;
-    void midi.setTempo(project.tempoBpm + dir);
-    if (open) draft = clampShown(project.tempoBpm + dir);
-  }
-
-  function clampShown(bpm: number): string {
-    return Math.min(TEMPO_MAX, Math.max(TEMPO_MIN, bpm)).toFixed(1);
+    if (!wheelEnd) project.beginGesture("set tempo");
+    else clearTimeout(wheelEnd);
+    const next = nudgeTempo(project.tempoBpm, e.deltaY, e.shiftKey);
+    if (open) draft = next.toFixed(1);
+    void midi.setTempo(next);
+    wheelEnd = setTimeout(() => {
+      wheelEnd = null;
+      project.endGesture();
+    }, 250);
   }
 
   function onSliderDown(e: PointerEvent) {
@@ -115,6 +118,7 @@
           spellcheck="false"
           bind:value={draft}
           onblur={() => {
+            if (!open) return;
             const parsed = parseTempo(draft);
             if (parsed != null) void midi.setTempo(parsed);
           }}

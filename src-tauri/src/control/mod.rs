@@ -1267,11 +1267,7 @@ fn set_prop(track_id: &str, path: op::PropPath, to: serde_json::Value) -> op::Op
     }
 }
 
-/// `set_track_mix`'s per-tx body, factored into a free function (Plan E
-/// Task 14 fix round 1) so it can be rebuilt as a fresh `|tx| ...` closure
-/// at each of `set_track_mix`'s two call sites (the gesture-transient path
-/// and the plain non-gesture path) without fighting the borrow/move rules
-/// of sharing ONE closure value across a branch that may or may not run.
+/// Validate then emit one `TempoSet` (optional meter already resolved).
 fn apply_tempo_map(
     tx: &mut session::Tx<'_>,
     ppq: Option<u32>,
@@ -1295,6 +1291,11 @@ fn apply_tempo_map(
     })
 }
 
+/// `set_track_mix`'s per-tx body, factored into a free function (Plan E
+/// Task 14 fix round 1) so it can be rebuilt as a fresh `|tx| ...` closure
+/// at each of `set_track_mix`'s two call sites (the gesture-transient path
+/// and the plain non-gesture path) without fighting the borrow/move rules
+/// of sharing ONE closure value across a branch that may or may not run.
 fn apply_mix_changes(changes: &[TrackMixChange], tx: &mut session::Tx<'_>) -> Result<(), String> {
     for c in changes {
         if let Some(g) = c.gain_db {
@@ -2677,11 +2678,9 @@ impl ControlPlane {
         let events_g = events.clone();
         let meter_g = meter.clone();
         let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
-            self.commit_with(
-                gesture_meta.transient(),
-                |tx| apply_tempo_map(tx, ppq, &events_g, &meter_g),
-                false,
-            )
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                apply_tempo_map(tx, ppq, &events_g, &meter_g)
+            })
         });
         match gesture_result {
             Some(result) => {
