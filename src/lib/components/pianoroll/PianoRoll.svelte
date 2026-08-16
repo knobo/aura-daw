@@ -39,6 +39,7 @@
     type MarqueeMode,
   } from "../../utils/note-ops";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
+  import ClipEnvelopeLane from "../ClipEnvelopeLane.svelte";
   import type { MidiNote } from "../../types/ipc";
 
   const KEY_H = 14; // CSS px per pitch row
@@ -1003,6 +1004,17 @@
         onpointerleave={onVelUp}
       ></canvas>
     </div>
+
+    {#if clip.contentId && track}
+      <ClipEnvelopeLane
+        contentId={clip.contentId}
+        {track}
+        {tpp}
+        {scrollTick}
+        contentLengthTicks={midi.effectiveContentLengthTicks(clip)}
+        keysWidth={KEYS_W}
+      />
+    {/if}
 
     <footer class="hints silk">
       draw · drag to move · edge-drag resize · dbl-click delete · shift-drag select (+ctrl add, +alt

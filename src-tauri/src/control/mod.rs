@@ -586,7 +586,15 @@ impl Committer {
     /// go through `commit_with_rebuild`) should pass the session's current
     /// epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
-        let (dir, epoch_now, midi_snapshot, project_snapshot, automation_snapshot, plugin_snapshot) = {
+        let (
+            dir,
+            epoch_now,
+            midi_snapshot,
+            project_snapshot,
+            automation_snapshot,
+            modulation_snapshot,
+            plugin_snapshot,
+        ) = {
             let s = self.session.lock();
             (
                 s.store.project_dir.clone(),
@@ -605,6 +613,7 @@ impl Committer {
                 // below, after the guard drops — round-2 §4: no disk I/O
                 // under the session lock.
                 p.automation.then(|| s.automation.lanes.clone()),
+                p.modulation.then(|| s.modulation.clone()),
                 // Plan E Task 9: plugin doc snapshot, taken under this SAME
                 // short lock — the actual write (state blobs + `plugins[]`
                 // dirty-ladder + clearing `dirty_state` for whichever ids
@@ -638,7 +647,19 @@ impl Committer {
                 Err(e) => log::warn!("project snapshot build failed: {e}"),
             }
         }
-        if let Some(lanes) = automation_snapshot {
+        // Persist policy (Task 7): `session.modulation` is the source of
+        // truth. `modulation::persist::save_into_project` is one-way — it
+        // writes `modulation{}` at schemaVersion 4 and DROPS `automation[]`.
+        // Writing both paths in one persist would let the old lane save
+        // undo the v4 upgrade (or the reverse). So: when a modulation
+        // snapshot is present, skip the old `automation[]` write. A leftover
+        // persist.automation-only effect (tests poking the old flag, any
+        // arm not yet routed through the facade) still uses the lane path.
+        if let Some(doc) = modulation_snapshot {
+            if let Err(e) = crate::modulation::persist::save_into_project(&dir, &doc) {
+                log::warn!("modulation persist failed: {e}");
+            }
+        } else if let Some(lanes) = automation_snapshot {
             if let Err(e) = crate::plugins::automation::save_into_project(&dir, &lanes) {
                 log::warn!("automation persist failed: {e}");
             }
@@ -853,6 +874,8 @@ enum CoalesceTarget {
     Object(op::ObjectRef),
     /// `AutomationLane::id` — lanes have a string id, not a struct key.
     AutomationLane(String),
+    /// Modulation graph keys (`Curve::id` / `Binding::id` / `AutomationClip::id`).
+    ModulationKey(String),
 }
 
 /// The coalescing key a gesture folds by: the op's discriminant + the
@@ -891,6 +914,21 @@ impl CoalesceKey {
             op::Op::AutomationSetLane { key, .. } => Some(Self {
                 kind: "automationSetLane",
                 target: CoalesceTarget::AutomationLane(key.clone()),
+                path: None,
+            }),
+            op::Op::ModulationSetCurve { key, .. } => Some(Self {
+                kind: "modulationSetCurve",
+                target: CoalesceTarget::ModulationKey(key.clone()),
+                path: None,
+            }),
+            op::Op::ModulationSetBinding { key, .. } => Some(Self {
+                kind: "modulationSetBinding",
+                target: CoalesceTarget::ModulationKey(key.clone()),
+                path: None,
+            }),
+            op::Op::AutomationClipSet { key, .. } => Some(Self {
+                kind: "automationClipSet",
+                target: CoalesceTarget::ModulationKey(key.clone()),
                 path: None,
             }),
             _ => None,
@@ -1307,6 +1345,41 @@ fn adopt_midi_dir(midi: &mut crate::midi::MidiStore, dir: &std::path::Path) {
     midi.dirty = false;
 }
 
+/// Open-path load of the modulation document.
+///
+/// A v4 `modulation{}` file is decoded as-is. A still-v3 `automation[]`
+/// file is remigrated with the live plugin param table when that table
+/// has rows (so plugin points normalize and `rangeSnapshot` is recorded);
+/// otherwise `load_from_project`'s in-memory migrate (`|_, _| None`) is
+/// acceptable — plugin points stay `domain: native`.
+fn load_modulation_for_open(
+    dir: &Path,
+    params: &std::collections::HashMap<String, Vec<crate::plugins::ParamInfo>>,
+) -> crate::modulation::ModulationDoc {
+    let still_v3 = std::fs::read(dir.join("project.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|v| v.get("modulation").is_none() && v.get("automation").is_some());
+    if still_v3 && !params.is_empty() {
+        if let Ok(Some(lanes)) = crate::plugins::automation::load_lanes(dir) {
+            let lookup = |inst: &str, id: u32| {
+                params.get(inst).and_then(|ps| {
+                    ps.iter().find(|p| p.id == id).and_then(|p| {
+                        let min = p.min as f32;
+                        let max = p.max as f32;
+                        (max > min && min.is_finite() && max.is_finite()).then_some((min, max))
+                    })
+                })
+            };
+            return crate::modulation::persist::migrate_v3_lanes(&lanes, &lookup);
+        }
+    }
+    crate::modulation::persist::load_from_project(dir).unwrap_or_else(|e| {
+        log::warn!("modulation: cannot load from {}: {e}", dir.display());
+        crate::modulation::ModulationDoc::default()
+    })
+}
+
 impl ControlPlane {
     pub fn new(
         session: Arc<Mutex<Session>>,
@@ -1401,6 +1474,11 @@ impl ControlPlane {
     /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
     pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {
         self.session.lock().automation.lanes.clone()
+    }
+
+    /// Track F: the modulation document. PURE session-lock read — no disk.
+    pub fn modulation_doc(&self) -> crate::modulation::ModulationDoc {
+        self.session.lock().modulation.clone()
     }
 
     /// Latest 60 Hz meter frame (None until the engine has pumped one).
@@ -1951,7 +2029,7 @@ impl ControlPlane {
             ops::new_track_row(&session.store, name, kind)?
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![] })
+            tx.apply(op::Op::TrackAdd { track: track.clone(), index, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })
         })?;
         Ok(track)
     }
@@ -2206,6 +2284,130 @@ impl ControlPlane {
             None => {
                 self.commit(meta, |tx| {
                     tx.apply(op::Op::AutomationSetLane { key: key.clone(), lane: to_apply.clone() })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete when `curve` is `None`) one curve through the
+    /// transaction channel — Track F, same gesture-aware shape as
+    /// `set_automation_lane`.
+    pub fn set_curve(
+        &self,
+        key: String,
+        mut curve: Option<crate::modulation::Curve>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if let Some(c) = curve.as_mut() {
+            c.id = key.clone();
+            let domain = self.session.lock().modulation.domain_of(&key);
+            crate::modulation::normalize_curve_in_domain(c, domain)?;
+        }
+        let to_apply = curve;
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::ModulationSetCurve {
+                    key: key.clone(),
+                    curve: to_apply.clone(),
+                })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::ModulationSetCurve {
+                        key: key.clone(),
+                        curve: to_apply.clone(),
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete when `binding` is `None`) one binding through the
+    /// transaction channel — Track F.
+    pub fn set_binding(
+        &self,
+        key: String,
+        mut binding: Option<crate::modulation::Binding>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if let Some(b) = binding.as_mut() {
+            b.id = key.clone();
+            crate::modulation::validate_binding(b)?;
+        }
+        let to_apply = binding;
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::ModulationSetBinding {
+                    key: key.clone(),
+                    binding: to_apply.clone(),
+                })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::ModulationSetBinding {
+                        key: key.clone(),
+                        binding: to_apply.clone(),
+                    })
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert (or delete when `clip` is `None`) one automation clip through
+    /// the transaction channel — Track F.
+    pub fn set_automation_clip(
+        &self,
+        key: String,
+        mut clip: Option<crate::modulation::AutomationClip>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        if let Some(c) = clip.as_mut() {
+            c.id = key.clone();
+            if c.id.is_empty() {
+                return Err("automation clip id must not be empty".into());
+            }
+            if c.track_id.is_empty() {
+                return Err("automation clip trackId must not be empty".into());
+            }
+            if c.curve_id.is_empty() {
+                return Err("automation clip curveId must not be empty".into());
+            }
+        }
+        let to_apply = clip;
+        let gesture_meta = meta.clone();
+        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| {
+                tx.apply(op::Op::AutomationClipSet {
+                    key: key.clone(),
+                    clip: to_apply.clone(),
+                })
+            })
+        });
+        match gesture_result {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| {
+                    tx.apply(op::Op::AutomationClipSet {
+                        key: key.clone(),
+                        clip: to_apply.clone(),
+                    })
                 })?;
             }
         }
@@ -2807,6 +3009,19 @@ impl ControlPlane {
         self.create_project_at(&parent, &name)
     }
 
+    /// Load `session.modulation` from `dir` and refresh the derived lane
+    /// view. After plugin adopt so a v3 file can remigrate with live
+    /// param ranges; if the plugin table is still empty,
+    /// `load_from_project`'s in-memory migrate (`|_, _| None`) is what
+    /// we keep — plugin points stay `domain: native`.
+    fn adopt_modulation_from_dir(&self, dir: &Path) {
+        let params = self.session.lock().plugins.params.clone();
+        let doc = load_modulation_for_open(dir, &params);
+        let mut s = self.session.lock();
+        s.modulation = doc;
+        s.automation.lanes = crate::modulation::compat::lanes_from_doc(&s.modulation);
+    }
+
     /// Shared body: `create_project`/`create_project_epoch`'s only
     /// difference is where `dir` comes from. Sequencing matches the epoch
     /// contract: (1) short lock — swap store fields + reset midi to blank
@@ -2884,6 +3099,7 @@ impl ControlPlane {
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
         }
+        self.adopt_modulation_from_dir(&dir);
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)(
             "project://changed",
@@ -2954,6 +3170,7 @@ impl ControlPlane {
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
         }
+        self.adopt_modulation_from_dir(&dir);
         self.engine.send(ControlMsg::Rebuild);
         (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
         Ok(project)
@@ -3033,6 +3250,10 @@ impl ControlPlane {
                 log::warn!("save_project_as_epoch: persisting midi failed: {e}");
             }
         }
+        let modulation = self.session.lock().modulation.clone();
+        if let Err(e) = crate::modulation::persist::save_into_project(dir, &modulation) {
+            log::warn!("save_project_as_epoch: persisting modulation failed: {e}");
+        }
         (self.emit)(
             "project://changed",
             serde_json::to_value(&project).unwrap_or_default(),
@@ -3051,11 +3272,11 @@ impl ControlPlane {
     pub fn save_project_mark(&self) -> Result<Project, String> {
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
-        let (project, dir, epoch) = {
+        let (project, dir, epoch, modulation) = {
             let session = self.session.lock();
             let dir = session.store.project_dir.clone().ok_or("no project open")?;
             let project = project::from_store(&session.store, position, rate)?;
-            (project, dir, session.epoch)
+            (project, dir, session.epoch, session.modulation.clone())
         };
         // epoch boundary: no document swap here (same project, same
         // in-memory content) — so history is NOT cleared and the journal is
@@ -3064,6 +3285,11 @@ impl ControlPlane {
         // which is the whole difference between a snapshot mark and an
         // epoch (ruling 4).
         project::save(&dir, &project)?;
+        // Task 7: an explicit save is the one-way v4 upgrade. The file
+        // stays v3 `automation[]` until this write (or an edit persist).
+        if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation) {
+            log::warn!("save_project: modulation persist failed: {e}");
+        }
         self.committer.log().snapshot_mark(epoch);
         (self.emit)(
             "project://changed",
@@ -3943,8 +4169,8 @@ mod tests {
         let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
         plane
             .commit(TxMeta::user("batch"), |tx| {
-                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![], clip_indices: vec![] })?;
-                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![], clip_indices: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-2"), index: 1, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
+                tx.apply(Op::TrackAdd { track: test_track("t-3"), index: 2, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] })?;
                 tx.apply(set_gain("t-1", 0.5))?;
                 Ok(())
             })
@@ -6350,16 +6576,20 @@ mod tests {
             })
             .unwrap();
         assert!(committed.effect.persist.automation);
+        assert!(committed.effect.persist.modulation, "facade also persists the modulation document");
         assert!(committed.effect.rebuild, "Track D: a lane edit rebuilds (see session.rs's arm doc)");
 
         // By the time `commit` returned above, the write already happened
         // (persist runs synchronously inside `commit`, before the event
         // emit) — read it back right away, no waiting.
+        // Task 7: modulation save is authoritative (drops automation[]).
         let after: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("project.json")).unwrap()).unwrap();
-        let rows = after["automation"].as_array().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["paramId"], 3);
+        assert_eq!(after["schemaVersion"], 4);
+        assert!(after.get("automation").is_none(), "modulation save drops automation[]");
+        let bindings = after["modulation"]["bindings"].as_array().unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0]["id"], "a-1");
         assert_eq!(cp.automation_lanes().len(), 1, "session.automation reflects the commit too");
 
         let _ = std::fs::remove_dir_all(&parent);

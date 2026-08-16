@@ -6,12 +6,14 @@ and the research dossiers in `docs/research/`.
 **Numbering:** `NNNN-<slug>.md`, monotonically increasing, never reused.
 **Status convention:** every ADR carries `Proposed` / `Accepted` /
 `Superseded (by NNNN)`. Acceptance is the owner's call, recorded by
-editing the Status line, not by the authors. **All seven below were
+editing the Status line, not by the authors. **ADRs 0001–0007 were
 Accepted by the owner on 2026-08-13**, together with the resolution of
 the six open owner decisions from the round-2 consistency review
 (WebView arranger continues under the thin-renderer rule; the full
 side-channel migration, the v3 format migration, and the MAX_TRACKS
 removal are all in the round; retention caps set from measurement).
+**ADR 0008 was Accepted on 2026-08-15** with the Track F modulation
+design (owner rulings R1–R5).
 
 | # | ADR | One line |
 |---|---|---|
@@ -22,3 +24,4 @@ removal are all in the round; retention caps set from measurement).
 | 0005 | [History storage](0005-history-storage.md) | Summarising COW B-tree in memory, version-graph retention over limbo refcounts, replay-only nodes for bulk/scattered ops, janitor thread. |
 | 0006 | [UI stack posture](0006-ui-stack-posture.md) | Tauri now; thin-renderer rule; one texture-targeting renderer interface (WebGL2 Linux ceiling); three measurements gate the render architecture. |
 | 0007 | [Evidence policy](0007-evidence-policy.md) | Benches live in `benches/`, measured claims cite them, corrections to dossiers are marked, never silent. |
+| 0008 | [Modulation graph](0008-modulation-graph.md) | Tagged `TargetRef` now (reserved `port` arm); step toward ports, not a detour; path in design §8. |

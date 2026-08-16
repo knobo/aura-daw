@@ -491,6 +491,9 @@ struct ExportSnapshot {
     /// Automation lanes (Track D close-out) — without them a bounce ignored
     /// the gain curves playback obeys.
     automation: crate::control::session::AutomationDoc,
+    /// Track F modulation graph — pan (and future) ramps. Empty for v3
+    /// projects; `build_graph` still compiles the lane table in that case.
+    modulation: crate::modulation::ModulationDoc,
     rate: u32,
     loop_region: (u64, u64),
 }
@@ -550,6 +553,7 @@ impl ControlPlane {
                 automation: crate::control::session::AutomationDoc {
                     lanes: session.automation.lanes.clone(),
                 },
+                modulation: session.modulation.clone(),
                 rate: self.shared.sample_rate.load(Relaxed),
                 loop_region: (
                     self.shared.loop_start.load(Relaxed),
@@ -633,7 +637,7 @@ fn do_export(
     // guard is held only while the graph is built, never during the render.
     let mut og = {
         let bank = crate::audio::sampler::registered_bank().map(|b| b.lock());
-        offline::build_graph(&snap.store, &snap.midi, &snap.plugins, &snap.automation, bank.as_deref(), snap.rate)
+        offline::build_graph(&snap.store, &snap.midi, &snap.plugins, &snap.automation, &snap.modulation, bank.as_deref(), snap.rate)
     };
 
     let tail = (plan.tail_seconds * snap.rate as f64).round() as u64;

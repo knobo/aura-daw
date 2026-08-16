@@ -39,10 +39,10 @@ use super::offline;
 use super::recorder::{self, DiskWriter, RecSpec};
 use super::rt::{
     GraphPtr, GraphTables, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedGraphTables,
-    SharedRt, NO_PARK,
+    SharedRt, TrackRamps, NO_PARK,
 };
 use super::transport;
-use super::types::{derive_slots, Clip, MeterFrame, Store};
+use super::types::{derive_slots, mixer_slot_count, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
@@ -896,6 +896,111 @@ struct Control {
     pending_record: Option<(Option<Vec<String>>, HashMap<String, String>)>,
 }
 
+/// Compile v3 gain lanes plus any `ModulationDoc` track ramps into one
+/// slot-indexed table. Lane-only projects take the existing
+/// `compile_gain_ramps` path so Track D gain stays byte-identical.
+pub(crate) fn compile_track_ramps(
+    lanes: &[crate::plugins::automation::AutomationLane],
+    modulation: &crate::modulation::ModulationDoc,
+    store: &Store,
+    plugins: &crate::control::session::PluginDoc,
+    midi_clips: &[crate::midi::MidiClip],
+    slots: &HashMap<crate::ids::TrackId, usize>,
+    n_slots: usize,
+    map: &crate::midi::TempoMap,
+) -> (Vec<TrackRamps>, Vec<crate::modulation::ParamLaneSpec>) {
+    let mut ramps: Vec<TrackRamps> = if lanes.is_empty() {
+        (0..n_slots).map(|_| TrackRamps::default()).collect()
+    } else {
+        crate::plugins::automation::compile_gain_ramps(lanes, map, n_slots, &|tid| {
+            slots.get(tid).copied()
+        })
+        .into_iter()
+        .map(|gain| TrackRamps { gain, pan: None })
+        .collect()
+    };
+    let params = if !modulation.is_empty() {
+        overlay_modulation_ramps(
+            &mut ramps,
+            modulation,
+            store,
+            plugins,
+            midi_clips,
+            slots,
+            n_slots,
+            map,
+        )
+    } else {
+        Vec::new()
+    };
+    (ramps, params)
+}
+
+fn overlay_modulation_ramps(
+    ramps: &mut [TrackRamps],
+    modulation: &crate::modulation::ModulationDoc,
+    store: &Store,
+    plugins: &crate::control::session::PluginDoc,
+    midi_clips: &[crate::midi::MidiClip],
+    slots: &HashMap<crate::ids::TrackId, usize>,
+    n_slots: usize,
+    map: &crate::midi::TempoMap,
+) -> Vec<crate::modulation::ParamLaneSpec> {
+    let slot_of = |tid: &str| slots.get(tid).copied();
+    let track_pan = |tid: &str| {
+        store.tracks.iter().find(|t| t.id.as_str() == tid).map(|t| t.pan as f32)
+    };
+    let instrument_of = |tid: &str| {
+        store
+            .tracks
+            .iter()
+            .find(|t| t.id.as_str() == tid)
+            .and_then(|t| t.instrument_id.as_deref())
+            // PluginDoc.params is keyed by the bare instance id; the track
+            // stores the `plugin:<id>` ref (set_track_instrument).
+            .and_then(|id| id.strip_prefix("plugin:").map(str::to_string))
+    };
+    let param_range = |inst: &str, idx: u32| {
+        plugins
+            .params
+            .get(inst)
+            .and_then(|ps| ps.iter().find(|p| p.id == idx))
+            .map(|p| (p.min as f32, p.max as f32))
+    };
+    let param_value = |inst: &str, idx: u32| {
+        plugins
+            .params
+            .get(inst)
+            .and_then(|ps| ps.iter().find(|p| p.id == idx))
+            .map(|p| p.value as f32)
+    };
+    let content_placements = |content_id: &str| {
+        crate::modulation::compile::placements_from_midi_clips(midi_clips, content_id)
+    };
+    let ctx = crate::modulation::CompileCtx {
+        n_slots,
+        slot_of: &slot_of,
+        track_pan: &track_pan,
+        param_range: &param_range,
+        param_value: &param_value,
+        instrument_of: &instrument_of,
+        content_placements: &content_placements,
+    };
+    let compiled = crate::modulation::compile(modulation, map, &ctx);
+    for (i, spec) in compiled.tracks.iter().enumerate() {
+        if i >= ramps.len() {
+            break;
+        }
+        if let Some(gain) = &spec.gain {
+            ramps[i].gain = Some(Arc::new(gain.clone()));
+        }
+        if let Some(pan) = &spec.pan {
+            ramps[i].pan = Some(Arc::new(pan.clone()));
+        }
+    }
+    compiled.params
+}
+
 impl Control {
     fn run(&mut self) {
         loop {
@@ -1131,13 +1236,16 @@ impl Control {
             let session = self.session.lock(); // read-only: derive_slots/param seeding for the rebuild graph, session lock released after this block
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
-            // Task 7: sized to THIS rebuild's track count, not a fixed cap.
-            let params = Arc::new(ParamTable::with_slots(store.tracks.len()));
-            for (i, t) in store.tracks.iter().enumerate() {
-                params.set_gain_linear(i, mixer::db_to_linear(t.gain_db));
-                params.set_pan(i, t.pan as f32);
-                params.set_flag(i, super::rt::FLAG_MUTE, t.muted);
-                params.set_flag(i, super::rt::FLAG_SOLO, t.soloed);
+            // Sized to mixer slots, not store track count: automation tracks
+            // take no slot (design §3.6) and must not shift later rows.
+            let n_slots = mixer_slot_count(&store.tracks);
+            let params = Arc::new(ParamTable::with_slots(n_slots));
+            for t in store.tracks.iter() {
+                let Some(&slot) = slots.get(&t.id) else { continue };
+                params.set_gain_linear(slot, mixer::db_to_linear(t.gain_db));
+                params.set_pan(slot, t.pan as f32);
+                params.set_flag(slot, super::rt::FLAG_MUTE, t.muted);
+                params.set_flag(slot, super::rt::FLAG_SOLO, t.soloed);
             }
             params.any_solo.store(store.any_solo(), Relaxed);
             // PUBLISH UNDER THE SESSION LOCK [C1]: this is load-bearing, not
@@ -1161,8 +1269,8 @@ impl Control {
             // tables (Task 6) — the meter fold resolves blocks under
             // whichever generation produced them, not the current tables.
             self.gen_maps.publish(self.generation, &slots);
-            let (gain_ramps, param_driver) =
-                self.compile_automation(&session, &slots, store.tracks.len());
+            let (track_ramps, param_driver) =
+                self.compile_automation(&session, &slots, n_slots);
             let graph = if headless {
                 // Headless keeps its narrow scope [I5]: tables are enough
                 // to serve knob writes and recording resolution with no
@@ -1173,9 +1281,9 @@ impl Control {
                 // change this refactor must not smuggle in.
                 None
             } else {
-                let mut tracks = Vec::with_capacity(store.tracks.len());
+                let mut tracks = Vec::with_capacity(n_slots);
                 for t in &store.tracks {
-                    let slot = slots[&t.id];
+                    let Some(&slot) = slots.get(&t.id) else { continue };
                     let clips = store
                         .clips
                         .iter()
@@ -1239,7 +1347,7 @@ impl Control {
                 // published, so the callback only ever sees a snapshot whose
                 // ramps already belong to it — and a retired graph keeps
                 // reading its own table, exactly like `params`.
-                g.set_gain_ramps(gain_ramps);
+                g.set_track_ramps(track_ramps);
                 g.clicks = Arc::new(clicks);
                 Some(Box::new(g))
             };
@@ -1287,15 +1395,17 @@ impl Control {
         self.live_in_hub.refresh_target(self.generation, &self.tables);
     }
 
-    /// Track D: compile the session's automation lanes into this rebuild's
-    /// two products — a slot-indexed gain-ramp table for the graph, and the
-    /// control thread's plugin-param driver. CONTROL THREAD, called from
-    /// `rebuild` under the same session guard that derived `slots`: this is
-    /// where ticks become absolute samples, so nothing tick-shaped ever
-    /// crosses onto the RT thread (ARCHITECTURE §13/§15.1).
+    /// Compile the session's automation lanes AND `session.modulation` into
+    /// this rebuild's two products — a slot-indexed `TrackRamps` table for
+    /// the graph, and the control thread's plugin-param driver. CONTROL
+    /// THREAD, called from `rebuild` under the same session guard that
+    /// derived `slots`: this is where ticks become absolute samples, so
+    /// nothing tick-shaped ever crosses onto the RT thread
+    /// (ARCHITECTURE §13/§15.1).
     ///
-    /// `n_slots` is the TRACK COUNT `ParamTable` was sized with, not
-    /// `slots.len()`, so the ramp table and the param table index alike.
+    /// `n_slots` is the MIXER-SLOT COUNT `ParamTable` was sized with, not
+    /// `slots.len()` (duplicate ids collapse in the map) and not
+    /// `store.tracks.len()` (automation tracks take no slot).
     ///
     /// The `TempoMap` can fail to build — a zero `ppq`, an empty or
     /// non-monotonic `tempo_events`, a zero rate — and then nothing is
@@ -1308,16 +1418,16 @@ impl Control {
         session: &Session,
         slots: &HashMap<crate::ids::TrackId, usize>,
         n_slots: usize,
-    ) -> (
-        Vec<Option<Arc<Vec<crate::plugins::automation::AbsParamEvent>>>>,
-        crate::plugins::automation::ParamAutomationDriver,
-    ) {
+    ) -> (Vec<TrackRamps>, crate::plugins::automation::ParamAutomationDriver) {
         use crate::plugins::automation as auto;
         // The overwhelmingly common case, and every structural commit in the
-        // suite goes through here: no lanes, so no tempo-event clone and no
-        // TempoMap build.
-        if session.automation.lanes.is_empty() {
-            return ((0..n_slots).map(|_| None).collect(), auto::ParamAutomationDriver::empty());
+        // suite goes through here: no lanes and no modulation, so no
+        // tempo-event clone and no TempoMap build.
+        if session.automation.lanes.is_empty() && session.modulation.is_empty() {
+            return (
+                (0..n_slots).map(|_| TrackRamps::default()).collect(),
+                auto::ParamAutomationDriver::empty(),
+            );
         }
         let map = crate::midi::TempoMap::new(
             session.midi.ppq,
@@ -1326,12 +1436,25 @@ impl Control {
         )
         .ok();
         let Some(map) = map else {
-            return ((0..n_slots).map(|_| None).collect(), auto::ParamAutomationDriver::empty());
+            return (
+                (0..n_slots).map(|_| TrackRamps::default()).collect(),
+                auto::ParamAutomationDriver::empty(),
+            );
         };
-        let ramps = auto::compile_gain_ramps(&session.automation.lanes, &map, n_slots, &|tid| {
-            slots.get(tid).copied()
-        });
-        let driver = auto::ParamAutomationDriver::new(&session.automation.lanes, &session.plugins, &map);
+        let (ramps, param_specs) = compile_track_ramps(
+            &session.automation.lanes,
+            &session.modulation,
+            &session.store,
+            &session.plugins,
+            &session.midi.clips,
+            slots,
+            n_slots,
+            &map,
+        );
+        let mut driver = auto::ParamAutomationDriver::from_param_specs(&param_specs, &session.plugins);
+        if !session.automation.lanes.is_empty() {
+            driver.merge_uncovered_lanes(&session.automation.lanes, &session.plugins, &map);
+        }
         (ramps, driver)
     }
 
@@ -3203,8 +3326,9 @@ mod tests {
             ctl.compile_automation(&s, &slots, s.store.tracks.len())
         };
         assert_eq!(ramps.len(), 2, "one entry per track slot, like ParamTable");
-        assert!(ramps[0].is_none(), "t-1 has no lane — an unautomated track must stay unramped");
-        let ev = ramps[1].as_ref().expect("t-2's lane compiled into ITS slot");
+        assert!(ramps[0].gain.is_none(), "t-1 has no lane — an unautomated track must stay unramped");
+        assert!(ramps[0].pan.is_none());
+        let ev = ramps[1].gain.as_ref().expect("t-2's lane compiled into ITS slot");
         assert_eq!(ev.first().map(|e| e.value), Some(1.0));
         assert_eq!(ev.last().map(|e| e.value), Some(0.0));
         assert!(
@@ -3221,8 +3345,266 @@ mod tests {
             ctl.compile_automation(&s, &slots, s.store.tracks.len())
         };
         assert_eq!(ramps.len(), 2, "still one entry per slot, just nothing in them");
-        assert!(ramps.iter().all(|r| r.is_none()));
+        assert!(ramps.iter().all(|r| r.gain.is_none() && r.pan.is_none()));
         assert!(driver.is_empty());
+    }
+
+    /// An automation-track binding on a plugin param must compile into the
+    /// live driver (Task 9 review). `lanes_from_doc` skips AutomationTrack
+    /// sources, so the driver has to ingest `CompiledModulation.params`.
+    #[test]
+    fn an_automation_track_plugin_param_binding_compiles_into_the_driver() {
+        use crate::modulation::model::{
+            AutomationClip, Binding, BindingMode, Curve, Domain, Range, Source, TargetRef,
+        };
+        use crate::plugins::automation::AutomationPoint;
+        use crate::plugins::descriptor::ParamInfo;
+
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            let mut auto = test_track("auto");
+            auto.kind = "automation".into();
+            s.store.tracks.push(auto);
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: None,
+            });
+            s.plugins.params.insert(
+                "inst-1".into(),
+                vec![ParamInfo {
+                    id: 7,
+                    name: "cutoff".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    value: 0.5,
+                    steps: 0,
+                }],
+            );
+            s.modulation.curves.push(Curve {
+                id: "cur".into(),
+                name: "cur".into(),
+                length_ticks: Some(160),
+                points: vec![
+                    AutomationPoint { tick: 0, value: 0.25 },
+                    AutomationPoint { tick: 159, value: 0.25 },
+                ],
+            });
+            s.modulation.automation_clips.push(AutomationClip {
+                id: "acl".into(),
+                track_id: "auto".into(),
+                curve_id: "cur".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 160,
+                content_length_ticks: None,
+            });
+            s.modulation.bindings.push(Binding {
+                id: "b".into(),
+                source: Source::AutomationTrack { track_id: "auto".into() },
+                target: TargetRef::PluginParam { instance_id: "inst-1".into(), param_id: 7 },
+                mode: BindingMode::Absolute,
+                depth: 1.0,
+                range: Range::default(),
+                domain: Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            });
+        }
+        let (_, mut driver) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
+        };
+        assert!(!driver.is_empty(), "automation-track plugin binding must reach the driver");
+        let mut writes = Vec::new();
+        driver.tick(0, &mut writes);
+        assert_eq!(writes.len(), 1, "the driver emits at the clip start");
+        assert_eq!(writes[0].instance, "inst-1");
+        assert_eq!(writes[0].index, 7);
+        assert!(
+            (writes[0].value - 0.25).abs() < 1e-5,
+            "native value follows the curve: {}",
+            writes[0].value
+        );
+    }
+
+    /// Task 10: `compile_automation` must feed real MidiClip placements into
+    /// `CompileCtx.content_placements`. A clip-envelope binding with an
+    /// empty closure is silent even when the clips sit on the session.
+    #[test]
+    fn a_clip_envelope_binding_compiles_from_midi_clip_placements() {
+        use crate::modulation::model::{
+            Binding, BindingMode, Curve, Domain, Range, Source, TargetRef, TrackParam,
+        };
+        use crate::plugins::automation::AutomationPoint;
+
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.tracks.push(test_track("t-2"));
+            s.midi.clips.push(crate::midi::MidiClip {
+                id: "c1".into(),
+                track_id: "t-1".into(),
+                name: "c1".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 960,
+                notes: Vec::new(),
+                next_note_id: 1,
+                content_id: "con".into(),
+                lane_id: crate::ids::LaneId::default_for_track("t-1"),
+                content_length_ticks: None,
+            });
+            s.midi.clips.push(crate::midi::MidiClip {
+                id: "c2".into(),
+                track_id: "t-2".into(),
+                name: "c2".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 960,
+                notes: Vec::new(),
+                next_note_id: 1,
+                content_id: "con".into(),
+                lane_id: crate::ids::LaneId::default_for_track("t-2"),
+                content_length_ticks: None,
+            });
+            s.modulation.curves.push(Curve {
+                id: "cur".into(),
+                name: "cur".into(),
+                length_ticks: Some(960),
+                points: vec![AutomationPoint { tick: 0, value: 0.4 }],
+            });
+            s.modulation.bindings.push(Binding {
+                id: "b".into(),
+                source: Source::ClipEnvelope {
+                    content_id: "con".into(),
+                    curve_id: "cur".into(),
+                },
+                target: TargetRef::SelfTrackParam { param: TrackParam::Gain },
+                mode: BindingMode::Multiply,
+                depth: 1.0,
+                range: Range::default(),
+                domain: Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            });
+        }
+        let (ramps, _) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
+        };
+        assert!(
+            ramps[0].gain.is_some(),
+            "the MidiClip on t-1 must drive t-1's gain via the clip envelope"
+        );
+        assert!(
+            ramps[1].gain.is_some(),
+            "the same content on t-2 must drive t-2's own gain"
+        );
+    }
+
+    /// Clip-envelope `selfInstrumentParam` must resolve through the track's
+    /// `plugin:<id>` ref to the BARE instance id `PluginDoc.params` is
+    /// keyed by. Returning the ref verbatim makes `param_range` miss and
+    /// the whole group compiles to nothing.
+    #[test]
+    fn a_clip_envelope_self_instrument_param_compiles_into_the_driver() {
+        use crate::modulation::model::{
+            Binding, BindingMode, Curve, Domain, Range, Source, TargetRef,
+        };
+        use crate::plugins::automation::AutomationPoint;
+        use crate::plugins::descriptor::ParamInfo;
+
+        let (mut ctl, session) = bare_control();
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            t.instrument_id = Some("plugin:inst-1".into());
+            s.store.tracks.push(t);
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "lv2:urn:test:synth".into(),
+                name: "TestSynth".into(),
+                format: "lv2".into(),
+                status: "active".into(),
+                track_id: Some("t-1".into()),
+            });
+            s.plugins.params.insert(
+                "inst-1".into(),
+                vec![ParamInfo {
+                    id: 7,
+                    name: "cutoff".into(),
+                    min: 0.0,
+                    max: 1.0,
+                    default: 0.5,
+                    value: 0.5,
+                    steps: 0,
+                }],
+            );
+            s.midi.clips.push(crate::midi::MidiClip {
+                id: "c1".into(),
+                track_id: "t-1".into(),
+                name: "c1".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 960,
+                notes: Vec::new(),
+                next_note_id: 1,
+                content_id: "con".into(),
+                lane_id: crate::ids::LaneId::default_for_track("t-1"),
+                content_length_ticks: None,
+            });
+            s.modulation.curves.push(Curve {
+                id: "cur".into(),
+                name: "cur".into(),
+                length_ticks: Some(960),
+                points: vec![AutomationPoint { tick: 0, value: 0.25 }],
+            });
+            s.modulation.bindings.push(Binding {
+                id: "b".into(),
+                source: Source::ClipEnvelope {
+                    content_id: "con".into(),
+                    curve_id: "cur".into(),
+                },
+                target: TargetRef::SelfInstrumentParam { param_id: 7 },
+                mode: BindingMode::Absolute,
+                depth: 1.0,
+                range: Range::default(),
+                domain: Domain::Normalized,
+                range_snapshot: None,
+                enabled: true,
+            });
+        }
+        let (_, mut driver) = {
+            let s = session.lock();
+            let slots = derive_slots(&s.store.tracks);
+            ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
+        };
+        assert!(
+            !driver.is_empty(),
+            "selfInstrumentParam must reach the driver — range lookup uses the bare instance id"
+        );
+        let mut writes = Vec::new();
+        driver.tick(0, &mut writes);
+        assert_eq!(writes.len(), 1, "the driver emits at the clip start");
+        assert_eq!(
+            writes[0].instance, "inst-1",
+            "must be the bare instance id, not plugin:inst-1"
+        );
+        assert_eq!(writes[0].index, 7);
+        assert!(
+            (writes[0].value - 0.25).abs() < 1e-5,
+            "native value follows the curve: {}",
+            writes[0].value
+        );
     }
 
     /// Plan E Task 13's TDD step 1, at the real `Control` methods (not just

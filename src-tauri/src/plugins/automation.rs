@@ -663,6 +663,58 @@ impl ParamAutomationDriver {
         Self { lanes: compiled }
     }
 
+    /// Build from already-compiled modulation param lanes (automation-track
+    /// and clip-envelope sources — `lanes_from_doc` skips those). Events
+    /// are native host units.
+    pub fn from_param_specs(
+        specs: &[crate::modulation::ParamLaneSpec],
+        plugins: &crate::control::session::PluginDoc,
+    ) -> Self {
+        let mut compiled = Vec::new();
+        for spec in specs {
+            if spec.events.is_empty() {
+                continue;
+            }
+            let Some(row) = plugins.instances.iter().find(|r| r.id == spec.instance) else {
+                continue;
+            };
+            compiled.push(CompiledParamLane {
+                instance: spec.instance.clone(),
+                format: row.format.clone(),
+                index: spec.index,
+                events: spec.events.clone(),
+                cursor: RampCursor::new(),
+                last_emitted: None,
+                ticks_held: 0,
+            });
+        }
+        compiled.sort_by(|a, b| a.instance.cmp(&b.instance));
+        Self { lanes: compiled }
+    }
+
+    /// Append v3/compat lanes whose (instance, index) is not already
+    /// covered by compiled modulation specs — compiled wins (it is the
+    /// expansion that knows about clips and spans).
+    pub fn merge_uncovered_lanes(
+        &mut self,
+        lanes: &[AutomationLane],
+        plugins: &crate::control::session::PluginDoc,
+        map: &TempoMap,
+    ) {
+        let covered: std::collections::HashSet<(String, u32)> = self
+            .lanes
+            .iter()
+            .map(|l| (l.instance.clone(), l.index))
+            .collect();
+        let extra = Self::new(lanes, plugins, map);
+        for lane in extra.lanes {
+            if !covered.contains(&(lane.instance.clone(), lane.index)) {
+                self.lanes.push(lane);
+            }
+        }
+        self.lanes.sort_by(|a, b| a.instance.cmp(&b.instance));
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lanes.is_empty()
     }

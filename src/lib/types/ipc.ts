@@ -93,7 +93,7 @@ export interface TransportState {
 
 // ── track-state.schema.json ─────────────────────────────────────────────────
 
-export type TrackKind = "audio" | "midi" | "bus";
+export type TrackKind = "audio" | "midi" | "automation" | "bus";
 
 export interface TrackState {
   id: string;
@@ -379,6 +379,8 @@ export interface MidiClip {
   lengthTicks: number;
   /** Content (loop/native) length in ticks; absent = same as lengthTicks. */
   contentLengthTicks?: number;
+  /** Content identity (ADR 0004). Clip envelopes are keyed by this. */
+  contentId?: string;
   /** Sorted by (tick, key). */
   notes: MidiNote[];
 }
@@ -627,6 +629,74 @@ export interface AutomationLane {
   targetNode: string;
   paramId: number;
   points: AutomationPoint[];
+}
+
+// ── modulation (modulation::model / commands) ──────────────────────────────
+
+export type TrackParam = "gain" | "pan" | "mute" | "send0" | "send1";
+export type BindingMode = "absolute" | "add" | "multiply";
+export type Domain = "normalized" | "native";
+
+export type Source =
+  | { kind: "curve"; curveId: string }
+  | { kind: "automationTrack"; trackId: string }
+  | { kind: "clipEnvelope"; contentId: string; curveId: string }
+  | { kind: "lfo"; modulatorId: string }
+  | { kind: "macro"; macroId: string }
+  | { kind: "midiCc"; modulatorId: string }
+  | { kind: "envFollower"; modulatorId: string };
+
+export type TargetRef =
+  | { kind: "trackParam"; trackId: string; param: TrackParam }
+  | { kind: "pluginParam"; instanceId: string; paramId: number }
+  | { kind: "selfTrackParam"; param: TrackParam }
+  | { kind: "selfInstrumentParam"; paramId: number }
+  | { kind: "macro"; macroId: string }
+  | { kind: "port"; nodeId: string; portId: string };
+
+export interface Range {
+  min: number;
+  max: number;
+}
+
+export interface RangeSnapshot {
+  min: number;
+  max: number;
+}
+
+export interface Curve {
+  id: string;
+  name: string;
+  lengthTicks?: number | null;
+  points: AutomationPoint[];
+}
+
+export interface Binding {
+  id: string;
+  source: Source;
+  target: TargetRef;
+  mode: BindingMode;
+  depth: number;
+  range?: Range;
+  domain?: Domain;
+  rangeSnapshot?: RangeSnapshot | null;
+  enabled?: boolean;
+}
+
+export interface AutomationClip {
+  id: string;
+  trackId: string;
+  curveId: string;
+  timelineStartTicks: number;
+  lengthTicks: number;
+  contentLengthTicks?: number | null;
+}
+
+/** Full modulation document returned by every modulation_* command (D-03). */
+export interface ModulationSnapshot {
+  curves: Curve[];
+  bindings: Binding[];
+  automationClips: AutomationClip[];
 }
 
 // ── mcp-policy.schema.json (phase 2) ───────────────────────────────────────

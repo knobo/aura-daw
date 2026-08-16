@@ -137,9 +137,9 @@ struct PersistedLane {
     track_id: String,
 }
 
-/// Write the midi store's state into `<dir>/project.json` (upgrading it to
-/// schemaVersion 3 — round-2 §3.3/§0.1 O-9) and the AMEV chunks under
-/// `<dir>/events/`.
+/// Write the midi store's state into `<dir>/project.json` (schemaVersion at
+/// least 3 — round-2 §3.3/§0.1 O-9; never stamped below the version already
+/// on disk) and the AMEV chunks under `<dir>/events/`.
 pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
     save_snapshot_into_project(
         dir,
@@ -251,7 +251,7 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
         .collect();
 
     let obj = root.as_object_mut().expect("checked above");
-    obj.insert("schemaVersion".into(), json!(3));
+    stamp_schema_version(obj, 3);
     obj.insert("ppq".into(), json!(midi.ppq));
     obj.insert("tempoMap".into(), serde_json::to_value(&period_events).unwrap());
     obj.insert("meterMap".into(), serde_json::to_value(&midi.meter_events).unwrap());
@@ -538,8 +538,9 @@ fn rescale(t: u32, from_ppq: u32, to_ppq: u32) -> u32 {
 /// backup, same rule as [`save_into_project`]) because
 /// `audio::project::save` only preserves unknown fields on v2 files — a
 /// plugin/automation save into a v1 project would otherwise be dropped by
-/// the next typed v1-path save. Other fields are preserved untouched, so
-/// the midi, audio and P4 writers can interleave freely.
+/// the next typed v1-path save. A file already at v3/v4 keeps that version
+/// (`max(existing, 2)`). Other fields are preserved untouched, so the
+/// midi, audio and P4 writers can interleave freely.
 pub fn update_project_v2(
     dir: &Path,
     apply: impl FnOnce(&mut serde_json::Map<String, Value>) -> Result<(), String>,
@@ -558,9 +559,17 @@ pub fn update_project_v2(
             .map_err(|e| format!("write {V1_BACKUP}: {e}"))?;
     }
     let obj = root.as_object_mut().expect("checked above");
-    obj.insert("schemaVersion".into(), json!(2));
+    stamp_schema_version(obj, 2);
     apply(obj)?;
     atomic_write_json(dir, &root)
+}
+
+/// Never stamp `schemaVersion` below what's already on disk. Each writer
+/// has a floor (midi = 3, additive v2 fields = 2); a later writer must
+/// not undo an earlier upgrade (design §7: writing always emits v4).
+fn stamp_schema_version(obj: &mut serde_json::Map<String, Value>, writer_floor: u64) {
+    let existing = obj.get("schemaVersion").and_then(Value::as_u64).unwrap_or(0);
+    obj.insert("schemaVersion".into(), json!(existing.max(writer_floor)));
 }
 
 /// Atomic project.json write: tmp + fsync + rename (same discipline as
@@ -975,6 +984,40 @@ mod tests {
         let before = fs::read(dir.join(PROJECT_FILE)).unwrap();
         assert!(update_project_v2(&dir, |_| Err("nope".into())).is_err());
         assert_eq!(fs::read(dir.join(PROJECT_FILE)).unwrap(), before);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// Design §7: writing always emits v4. A midi-only save after a
+    /// modulation persist must not stamp `schemaVersion` back to 3.
+    #[test]
+    fn midi_save_does_not_downgrade_v4_schema_version() {
+        let parent = tmp_parent("no-downgrade-v4");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+
+        let doc = crate::modulation::ModulationDoc {
+            curves: vec![crate::modulation::Curve {
+                id: "cur-a".into(),
+                name: String::new(),
+                length_ticks: None,
+                points: vec![],
+            }],
+            bindings: vec![],
+            automation_clips: vec![],
+        };
+        crate::modulation::save_into_project(&dir, &doc).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        assert_eq!(raw["schemaVersion"], 4);
+        assert!(raw.get("modulation").is_some());
+
+        save_into_project(&dir, &store_with(vec![])).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        assert_eq!(
+            raw["schemaVersion"], 4,
+            "midi persist must write max(existing, 3), not hard-stamp 3"
+        );
+        assert!(raw.get("modulation").is_some(), "modulation{{}} survives a midi-only save");
         let _ = fs::remove_dir_all(&parent);
     }
 }

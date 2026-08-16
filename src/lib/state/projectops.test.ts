@@ -37,6 +37,9 @@ const invokes = {
     }),
   ),
   automationGet: vi.fn(() => Promise.resolve([])),
+  modulationGet: vi.fn(() =>
+    Promise.resolve({ curves: [], bindings: [], automationClips: [] }),
+  ),
   pluginList: vi.fn(() =>
     Promise.resolve({ plugins: [], scanned: true, instances: [] }),
   ),
@@ -336,6 +339,7 @@ describe("undo / redo (Plan E Task 17)", () => {
     plugins.openInstanceId = "inst-1";
     await projectops.undo();
     expect(invokes.automationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.modulationGet).toHaveBeenCalledTimes(1);
     expect(invokes.pluginList).toHaveBeenCalledTimes(1);
     expect(invokes.pluginGetParams).toHaveBeenCalledWith("inst-1");
   });
@@ -343,6 +347,7 @@ describe("undo / redo (Plan E Task 17)", () => {
   it("re-pulls them after a redo too", async () => {
     await projectops.redo();
     expect(invokes.automationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.modulationGet).toHaveBeenCalledTimes(1);
     expect(invokes.pluginList).toHaveBeenCalledTimes(1);
   });
 });

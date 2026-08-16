@@ -14,7 +14,6 @@
 //! scratch, which is then mixed through the same gain/pan/mute path as clips.
 
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
 
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
@@ -22,7 +21,7 @@ use super::midi_in::{LiveMidiEvent, EV_ALL_OFF, EV_NOTE_ON};
 use super::rt::{RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
-use crate::plugins::automation::{AbsParamEvent, RampCursor};
+use crate::plugins::automation::{value_at, AbsParamEvent, RampCursor};
 
 /// Hardware MIDI-in events for THIS block, already drained from the hub ring
 /// by the RT output callback. Delivered to the node at block offset 0
@@ -110,6 +109,16 @@ impl TrackAccum {
     }
 }
 
+/// Lerp a block-boundary `(gl, gr)` pair. `last` is `frames - 1` (or 0).
+#[inline]
+fn lerp_pan(gl0: f32, gr0: f32, gl1: f32, gr1: f32, i: usize, last: usize) -> (f32, f32) {
+    if last == 0 {
+        return (gl0, gr0);
+    }
+    let t = i as f32 / last as f32;
+    (gl0 + (gl1 - gl0) * t, gr0 + (gr1 - gr0) * t)
+}
+
 /// Mix one post-fader stereo sample into the interleaved output.
 #[inline]
 fn mix_out(out: &mut [f32], frame: usize, out_ch: usize, l: f32, r: f32) {
@@ -140,16 +149,18 @@ fn render_live(
     sample_rate: u32,
     discontinuity: bool,
     steady_base: Option<u64>,
-    mix: (f32, f32, f32, bool),
+    mix: (f32, f32, f32, f32, f32, bool),
     ramp: &[AbsParamEvent],
     acc: &mut TrackAccum,
     live_in_events: &[LiveMidiEvent],
+    block_frames: usize,
 ) {
     let Some(live) = &tr.live else { return };
     // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
     // time, on this (the only RT) thread; see `LiveNodeCell`.
     let node = unsafe { live.node.rt_mut() };
-    let (gain, gl, gr, on) = mix;
+    let (gain, gl0, gr0, gl1, gr1, on) = mix;
+    let pan_last = block_frames.saturating_sub(1);
     if discontinuity {
         node.all_notes_off();
     }
@@ -230,6 +241,7 @@ fn render_live(
         }
         for i in 0..run {
             let g = gain * ramp_cursor.value(ramp, pos + i as u64).unwrap_or(1.0);
+            let (gl, gr) = lerp_pan(gl0, gr0, gl1, gr1, f + i, pan_last);
             let mut l = scratch[i * 2] * g * gl;
             let mut r = scratch[i * 2 + 1] * g * gr;
             if !on {
@@ -375,8 +387,8 @@ fn render_impl(
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
-    let RtGraph { tracks, scratch, meter_scratch, gain_ramps, .. } = graph;
-    let gain_ramps: &[Option<Arc<Vec<AbsParamEvent>>>] = gain_ramps;
+    let RtGraph { tracks, scratch, meter_scratch, track_ramps, .. } = graph;
+    let track_ramps: &[super::rt::TrackRamps] = track_ramps;
 
     // Reset this callback's chunk templates in place (Task 7: preallocated
     // at BUILD time on the control thread; `render` never grows this Vec).
@@ -393,17 +405,37 @@ fn render_impl(
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
         let on = audible(flags & FLAG_MUTE != 0, flags & FLAG_SOLO != 0, any_solo);
-        let (gl, gr) = pan_gains(pan);
+        let (gl_atomic, gr_atomic) = pan_gains(pan);
         let mut acc = TrackAccum::default();
 
         // Track D: this snapshot's compiled gain automation for the slot.
         // RT-safe: a slice read + an index walk, no allocation, no locks.
-        let ramp: &[AbsParamEvent] = gain_ramps
-            .get(tr.slot)
-            .and_then(|r| r.as_ref())
+        let ramps = track_ramps.get(tr.slot);
+        let ramp: &[AbsParamEvent] = ramps
+            .and_then(|t| t.gain.as_ref())
             .map(|a| a.as_slice())
             .unwrap_or(&[]);
         let mut clip_ramp = RampCursor::new();
+
+        // Pan is evaluated at the block's first and last frame, converted
+        // through `pan_gains`, then `(gl, gr)` is lerped across the block.
+        // `pan_gains` is two trig calls; per-sample evaluation would cost
+        // ~3M sin/cos per second at 32 tracks for a difference nobody can
+        // hear (design §6.1). Deliberate divergence from gain's per-sample
+        // `RampCursor` — do not "fix" it.
+        let pan_ramp = ramps.and_then(|t| t.pan.as_ref());
+        let (gl0, gr0, gl1, gr1) = match pan_ramp {
+            Some(events) if !events.is_empty() => {
+                let first = frame_pos(base_pos, 0, lp);
+                let last = frame_pos(base_pos, frames.saturating_sub(1) as u64, lp);
+                let p0 = value_at(events, first).unwrap_or(pan);
+                let p1 = value_at(events, last).unwrap_or(pan);
+                let (a, b) = (pan_gains(p0), pan_gains(p1));
+                (a.0, a.1, b.0, b.1)
+            }
+            _ => (gl_atomic, gr_atomic, gl_atomic, gr_atomic),
+        };
+        let pan_last = frames.saturating_sub(1);
 
         if !tr.clips.is_empty() {
             for i in 0..frames {
@@ -416,6 +448,7 @@ fn render_impl(
                     r += s[1];
                 }
                 let g = gain * clip_ramp.value(ramp, pos).unwrap_or(1.0);
+                let (gl, gr) = lerp_pan(gl0, gr0, gl1, gr1, i, pan_last);
                 l *= g * gl;
                 r *= g * gr;
                 if !on {
@@ -439,10 +472,11 @@ fn render_impl(
             sample_rate,
             discontinuity,
             steady_base,
-            (gain, gl, gr, on),
+            (gain, gl0, gr0, gl1, gr1, on),
             ramp,
             &mut acc,
             live_in_events,
+            frames,
         );
 
         let chunk_idx = tr.slot / METER_CHUNK_SLOTS;
@@ -604,6 +638,7 @@ mod tests {
     use super::super::rt::ParamTable;
     use super::super::rt::RtClipData;
     use super::super::rt::RtTrack;
+    use std::sync::Arc;
 
     fn clip(start: u64, offset: u64, len: u64, data: Vec<f32>, channels: u16) -> RtClip {
         RtClip {
@@ -1222,5 +1257,86 @@ mod tests {
             peak(&out) < peak(&control_out),
             "the closing ramp must leave the live path quieter than the unramped control"
         );
+    }
+
+    // ---- Task 6: per-track pan ramps (block-boundary lerp of (gl, gr)) ----
+
+    #[test]
+    fn a_pan_ramp_moves_energy_from_left_to_right_across_the_block() {
+        use crate::plugins::automation::AbsParamEvent;
+        use super::super::rt::TrackRamps;
+        // Native pan 0.0 (center) -> 1.0 (hard right). First frames keep
+        // more energy in L than the last; last frames are louder in R.
+        // Block-boundary lerp of (gl, gr) stays within 1 dB of constant
+        // power on this sweep (a hard-L→hard-R lerp would not — the chord
+        // dips ~3 dB; that is why the table is not per-sample pan_gains).
+        const N: usize = 1024;
+        let data = Arc::new(RtClipData { channels: 1, data: vec![1.0; N] });
+        let clip = RtClip {
+            start: 0, offset: 0, len: N as u64, gain: 1.0,
+            fade_in: 0, fade_out: 0, samples: data,
+        };
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(0, vec![clip])],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        let ev = Arc::new(vec![
+            AbsParamEvent { sample: 0, value: 0.0 },
+            AbsParamEvent { sample: (N as u64) - 1, value: 1.0 },
+        ]);
+        g.set_track_ramps(vec![TrackRamps { gain: None, pan: Some(ev) }]);
+
+        let mut out = vec![0.0f32; N * 2];
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+
+        let first_l: f32 = out[..16].iter().step_by(2).map(|s| s.abs()).sum();
+        let first_r: f32 = out[1..16].iter().step_by(2).map(|s| s.abs()).sum();
+        let last = &out[(N - 8) * 2..];
+        let last_l: f32 = last.iter().step_by(2).map(|s| s.abs()).sum();
+        let last_r: f32 = last.iter().skip(1).step_by(2).map(|s| s.abs()).sum();
+        assert!(first_l > last_l, "first frames louder in L than the last: {first_l} vs {last_l}");
+        assert!(last_r > last_l, "last frames louder in R: L={last_l} R={last_r}");
+        assert!(last_r > first_r, "energy moved right: first R={first_r} last R={last_r}");
+        assert!(first_l >= first_r * 0.9, "start is left-of-or-at center: L={first_l} R={first_r}");
+
+        for (i, frame) in out.chunks_exact(2).enumerate() {
+            let e = frame[0] * frame[0] + frame[1] * frame[1];
+            let db = 10.0 * e.max(1e-12).log10();
+            assert!(
+                db.abs() < 1.0,
+                "frame {i}: energy {e} is {db} dB off unity (constant-power)"
+            );
+        }
+    }
+
+    #[test]
+    fn pan_ramp_absent_leaves_the_atomic_pan_authoritative() {
+        // no ramp => byte-identical output to today's path
+        const N: usize = 256;
+        let data = Arc::new(RtClipData { channels: 1, data: vec![1.0; N] });
+        let clip = RtClip {
+            start: 0, offset: 0, len: N as u64, gain: 1.0,
+            fade_in: 0, fade_out: 0, samples: data,
+        };
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(0, vec![clip])],
+            1,
+            Arc::new(ParamTable::with_slots(1)),
+        );
+        g.params.set_pan(0, 0.4);
+        let mut out = vec![0.0f32; N * 2];
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        let (gl, gr) = pan_gains(0.4);
+        for (i, frame) in out.chunks_exact(2).enumerate() {
+            assert_eq!(
+                frame[0], gl,
+                "frame {i} L must be the atomic pan, not a defaulted ramp"
+            );
+            assert_eq!(
+                frame[1], gr,
+                "frame {i} R must be the atomic pan, not a defaulted ramp"
+            );
+        }
     }
 }

@@ -1,7 +1,26 @@
-# Next: Plan F (history storage) — and four parallel-safe post-Plan-E tracks
+# Next: Plan F (history storage) — and the post-Plan-E tracks
 
 Read this file, then pick a track and do the work. Reply to the user in
 Norwegian — they write Norwegian; the repo documentation is English.
+
+## Track F (modulation system) — LANDED; path to the finished system
+
+Track F is **IMPLEMENTED** on branch `modulation-system` (11 tasks, design
++ plan under `docs/superpowers/`). Full handoff — per-task commits,
+controller rulings under R5, non-goals held, divergences — is
+**`docs/PHASE4-PLAN.md`'s "Track F handoff"** section. The decision record
+is **ADR 0008** (`docs/adr/0008-modulation-graph.md`).
+
+**The ordered path to the finished modulation system** (ports, modulators,
+macros, curve shapes, recording, sample-accurate plugin params, lazy
+expansion, per-voice modulation) is **design §8** — do not restate it
+here; open:
+
+→ [`docs/superpowers/specs/2026-08-15-modulation-system-design.md` §8](docs/superpowers/specs/2026-08-15-modulation-system-design.md#8-the-path-to-the-finished-system)
+
+R2 requires that path to stay findable in local files (design, this file,
+ADR 0008). When a later round ships any item from §8, update the handoff
+and re-point if the section moves.
 
 ## Post-merge whole-branch review findings (read first)
 
@@ -184,13 +203,14 @@ is a standing merge-conflict point. Marked correction (ADR 0007): this
 section previously said **506 backend + 206 frontend**, which was already
 stale when written — the real count at `3340aa8` (Track D's branch base,
 verified in a worktree) was **527 backend + 206 frontend**. Known points
-since: **538 + 234** after Track E (`a98d7ff`), and **566 backend (537
-lib + 29 integration) + 258 frontend** on `automation-audible`
-2026-08-15 (Track D, PR #20, includes Track E via a merge), and **662
-backend (633 lib + 29 integration) + 271 frontend** on `midi-slice-2`
-2026-08-15 (Track B, PR #21, includes both E and D via a merge). Doc-tests
-report 0 and are not a test target — do not add them to the count. Run
-both suites before writing the first line of a track:
+since: **538 + 234** after Track E (`a98d7ff`); **566 backend (537 lib +
+29 integration) + 258 frontend** on `automation-audible` 2026-08-15
+(Track D, PR #20); **662 backend (633 lib + 29 integration) + 271
+frontend** on `midi-slice-2` 2026-08-15 (Track B, PR #21); and **731
+backend (702 lib + 29 integration) + 299 frontend** on
+`modulation-system` 2026-08-16 (Track F). Doc-tests report 0 and are not a
+test target — do not add them to the count. Run both suites before writing
+the first line of a track:
 
 ```
 timeout 900 cargo test --manifest-path src-tauri/Cargo.toml
@@ -444,8 +464,31 @@ Still open and named there: the **owner's ear check** (nobody has heard it
 yet), **plugin-param automation in a bounce**, the **non-blocking CLAP
 param path**, and holding a knob against a flat automated param.
 
+**Superseded for the document model by Track F** (below): lanes become
+curve+binding pairs under `session.modulation` / project v4; the lane IPC
+remains as a compatibility facade. Track D's engine rulings 1, 2, 6 and
+gesture rulings 4/7 still stand.
+
 Baseline after this track: **566 backend (537 lib + 29 integration) + 258
-frontend**, measured on `automation-audible` 2026-08-15.
+frontend**, measured on `automation-audible` 2026-08-15 (superseded by
+Track F's 731 + 299).
+
+### Track F — Modulation system — LANDED 2026-08-16
+
+**Done, branch `modulation-system`** (11 tasks, design
+`docs/superpowers/specs/2026-08-15-modulation-system-design.md`, plan
+`docs/superpowers/plans/2026-08-15-modulation-system.md`, **ADR 0008**).
+Full handoff — controller rulings, non-goals, divergences — is
+**`docs/PHASE4-PLAN.md`'s "Track F handoff"**; read that before touching
+modulation, automation lanes, or project v4.
+
+What the user can do now: several curves per track (gain, pan, plugin
+params), an automation-track kind routed to many targets, and clip
+envelopes that loop with MIDI content. What is *not* done yet is the
+finished graph — **path is design §8** (linked at the top of this file).
+
+Baseline after this track: **731 backend (702 lib + 29 integration) + 299
+frontend**, measured on `modulation-system` 2026-08-16.
 
 ### Track E — Library & browser panel — LANDED 2026-08-14
 
