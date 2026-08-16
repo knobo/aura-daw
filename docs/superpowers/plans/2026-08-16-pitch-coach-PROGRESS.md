@@ -19,6 +19,7 @@ documentation and all commits are English.
 |---|---|
 | On `main` | squash `84b0313` (PR #49) |
 | Worktree | stale — `/home/knobo/prog/dav/.claude/worktrees/pitch-coach` |
+| In flight | `feat/pitch-rt-thread` — review follow-ups 6 + 7, worktree `.claude/worktrees/pitch-rt` |
 | Next | owner ear-check (R3), then Phase 2 from `origin/main` |
 
 ## Status
@@ -105,15 +106,15 @@ Always check `git status` before committing after running it.
 
 ## Review follow-ups (PR #49)
 
-Merge-blocker bugs from the review are fixed on this branch. Left open:
+Merge-blocker bugs from the review are fixed on `main`. Issues 6 and 7
+are done on `feat/pitch-rt-thread` (see the log below); nothing from the
+review is left open.
 
-- **Issue 6 (follow-up, not this PR):** spec §3.2 wants YIN / RMS gate /
-  median / jump limiter on a dedicated non-RT pitch thread. The callback
-  still runs the full chain. Move `PitchAnalyzer` off `InputCb::capture`
-  (`decimate → rtrb<f32> → worker → rtrb<PitchFrame>`).
-- **Issue 7:** `pitch_listen_start` mid-take that already owns the pitch
-  device sets `wants_listening` but does not attach a `PitchTap`. Listen
-  stays dark until stop.
+- ~~**Issue 6:** spec §3.2 wants YIN / RMS gate / median / jump limiter on
+  a dedicated non-RT pitch thread.~~ Done — `audio/pitch_thread.rs`.
+- ~~**Issue 7:** `pitch_listen_start` mid-take that already owns the pitch
+  device sets `wants_listening` but does not attach a `PitchTap`.~~ Done —
+  the take carries a dormant tap and the shared flag wakes it.
 
 ## Open items needing the owner
 
@@ -139,6 +140,30 @@ with the commit sha and anything the next agent would be surprised by.
 
 ## Log
 
+- 2026-08-16 — Review follow-ups 6 and 7 done on `feat/pitch-rt-thread`
+  (`007d346`, `af9b1ea`). Four things the next agent should know:
+  1. **The capture callback no longer detects anything.** `audio/pitch_thread.rs`
+     owns the split: `PitchTap` (decimate, hand over) on the RT side,
+     `PitchWorker` (YIN, gate, median, jump limiter) on a worker thread.
+     Two rings, not one — the samples ring plus a descriptor ring carrying
+     each chunk's device position and rate, because `PitchAnalyzer::push`
+     anchors its timestamps to those. Samples are written BEFORE the
+     descriptor, and a chunk that does not fit anywhere is dropped whole;
+     a half-written chunk would mistime every frame after it.
+  2. **`PitchWorker::pump` is synchronous on purpose.** Tests drive the
+     whole chain without a thread. `spawn_pitch_worker` is production's
+     entry point, and the handle joins the thread on drop — an
+     `InputBundle` declares it after `_stream`, so the callback stops
+     before the worker is joined.
+  3. **Taps are gated on a shared `Control::pitch_active` flag**, not on
+     their own existence. A take on the pitch device now carries a tap
+     whether or not anyone was listening when it started, and
+     `set_listening` is what wakes it. That is the whole of issue 7: a
+     recording stream cannot be rebuilt mid-take without losing audio.
+     A dormant tap costs one relaxed atomic load per capture buffer.
+  4. **`SAMPLE_RING_SLOTS` must hold one maximal chunk** (`a_maximal_chunk_always_fits`).
+     Shrink it and any device the decimator upsamples from goes
+     permanently dark instead of dropping a few frames.
 - 2026-08-16 — PR #49 review merge-blockers fixed (Issues 1–5, 8). Failed
   take-start restores the listen hub; listen-only capture no longer pushes
   `base_slot == 0` meter blocks; NaN on the capture path is unvoiced (no
