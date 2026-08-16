@@ -576,13 +576,16 @@ impl OutputCb {
             return;
         }
 
-        match (&mut self.graph, playing) {
-            (Some(g), true) => {
+        let overlay = self.shared.launch_overlay();
+        let overlay_on = overlay.is_some();
+        match (&mut self.graph, playing, overlay_on) {
+            (Some(g), true, _) | (Some(g), false, true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                let overlay = self.shared.launch_overlay();
+                // Overlay-only (stopped + preview) still renders launched
+                // tracks so a double-click audition does not need Play.
                 let dropped = mixer::render_rt_launch(
                     g,
                     base,
@@ -599,7 +602,7 @@ impl OutputCb {
                 if dropped > 0 {
                     self.shared.xruns.fetch_add(dropped as u64, Relaxed);
                 }
-                if self.shared.metro_on.load(Relaxed) {
+                if playing && self.shared.metro_on.load(Relaxed) {
                     let gain = f32::from_bits(self.shared.metro_gain.load(Relaxed));
                     crate::audio::metronome::mix_clicks(
                         out,
@@ -613,7 +616,7 @@ impl OutputCb {
             }
             // Monitoring while STOPPED: render ONLY the routed instrument,
             // never the frozen clip slice under the parked playhead.
-            (Some(g), false) if live_in.is_some() => {
+            (Some(g), false, false) if live_in.is_some() => {
                 let dropped = mixer::render_live_input_only(
                     g,
                     base,
@@ -643,6 +646,8 @@ impl OutputCb {
             let next = transport::advance(base, frames, &lp);
             self.shared.position.store(next, Relaxed);
             self.next_pos = next;
+        }
+        if overlay_on {
             self.shared.advance_launch(frames);
         }
         self.was_playing = playing;

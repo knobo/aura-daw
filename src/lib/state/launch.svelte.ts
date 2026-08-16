@@ -87,7 +87,7 @@ class LaunchStore {
       this.accept(snap);
     });
     backend.on?.("launch://fired", (ev: LaunchFired) => {
-      if (ev.origin !== "drive") {
+      if (ev.origin === "hardware") {
         this.overlay = null;
         return;
       }
@@ -220,6 +220,17 @@ class LaunchStore {
     if (!backend.launchGet) return;
     try {
       this.accept(await backend.launchGet());
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  /** Audition a scene on the shadow playhead — loop and playhead stay put. */
+  async preview(id: string) {
+    this.selectedId = id;
+    if (!backend.launchFire) return;
+    try {
+      await backend.launchFire(id, true);
     } catch (err) {
       this.error = String(err);
     }

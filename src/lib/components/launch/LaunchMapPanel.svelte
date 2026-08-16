@@ -42,7 +42,11 @@
   }
 
   function onRowClick(id: string) {
-    launch.focus(id);
+    launch.selectedId = id;
+  }
+
+  function onRowDblClick(id: string) {
+    void launch.preview(id);
   }
 
   function onNoteChange(id: string, raw: string) {
@@ -214,11 +218,14 @@
           class="row"
           class:on={launch.selectedId === b.id}
           class:learn={launch.learningId === b.id}
+          class:play={launch.overlay?.id === b.id}
           role="row"
           tabindex="0"
+          title="Click to select · double-click to audition (loop stays put)"
           onclick={() => onRowClick(b.id)}
+          ondblclick={() => onRowDblClick(b.id)}
           onkeydown={(e) => {
-            if (e.key === "Enter") onRowClick(b.id);
+            if (e.key === "Enter") launch.focus(b.id);
           }}
         >
           <input
@@ -226,6 +233,7 @@
             value={b.name}
             aria-label="Binding name"
             onpointerdown={(e) => e.stopPropagation()}
+            ondblclick={(e) => e.stopPropagation()}
             onchange={(e) => void launch.update(b.id, { name: e.currentTarget.value.trim() || b.name })}
           />
           <select
@@ -233,6 +241,7 @@
             value={b.note}
             aria-label="MIDI note"
             onpointerdown={(e) => e.stopPropagation()}
+            ondblclick={(e) => e.stopPropagation()}
             onchange={(e) => onNoteChange(b.id, e.currentTarget.value)}
           >
             {#each MIDI_NOTES as n (n.note)}
@@ -251,7 +260,15 @@
               <option value={ch}>{ch + 1}</option>
             {/each}
           </select>
-          <span class="tgt silk" title={targetLabel(b)}>{targetLabel(b)}</span>
+          <span
+            class="tgt silk"
+            title="Jump the playhead to this marking"
+            onpointerdown={(e) => e.stopPropagation()}
+            onclick={(e) => {
+              e.stopPropagation();
+              launch.focus(b.id);
+            }}>{targetLabel(b)}</span
+          >
           <div class="acts">
             <button
               class="mini mono"
@@ -455,6 +472,10 @@
   }
   .row.learn {
     border-color: var(--amber);
+  }
+  .row.play {
+    border-color: var(--cyan);
+    background: rgba(82, 229, 255, 0.1);
   }
   .name,
   .note,

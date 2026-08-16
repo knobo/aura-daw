@@ -182,6 +182,8 @@ pub fn clip_would_self_trigger(
 pub enum FireOrigin {
     Hardware,
     Drive,
+    /// UI audition: same as Drive (no seek/loop) but always restarts.
+    Preview,
 }
 
 pub enum FireCmd {
@@ -600,6 +602,10 @@ impl crate::control::ControlPlane {
                 runtime().set_overlay_id(Some(id.to_string()));
                 self.arm_drive_launch(&track_ids, start, end);
             }
+            FireOrigin::Preview => {
+                runtime().set_overlay_id(Some(id.to_string()));
+                self.arm_drive_launch(&track_ids, start, end);
+            }
             FireOrigin::Hardware => {
                 self.clear_drive_overlay();
                 self.apply_launch_audible(&track_ids);
@@ -732,9 +738,14 @@ pub fn launch_set_map(
 #[tauri::command]
 pub fn launch_fire(
     id: String,
+    bypass: Option<bool>,
     control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<(), String> {
-    control.launch_fire(&id)
+    if bypass.unwrap_or(false) {
+        control.launch_fire_from(&id, FireOrigin::Preview)
+    } else {
+        control.launch_fire(&id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

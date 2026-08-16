@@ -105,7 +105,7 @@ export interface LaunchSnapshot {
   maps: LaunchMap[];
 }
 
-export type LaunchFireOrigin = "hardware" | "drive";
+export type LaunchFireOrigin = "hardware" | "drive" | "preview";
 
 export interface LaunchFired {
   id: string;

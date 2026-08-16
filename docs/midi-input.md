@@ -55,8 +55,9 @@ delete (you always keep at least one).
 
 With the window open, drag a rectangle across one or more lanes — that
 marks a region on the **active** launcher and binds it to the next free
-MIDI note (starting at C3). Click a row to jump the playhead to the
-marking so you can resize it.
+MIDI note (starting at C3). Click a row to select it. Double-click to
+audition the scene without moving the loop or playhead. Click the
+target text to jump the playhead there for editing.
 
 To make a MIDI clip **use** a launcher (the clip's notes fire that map
 instead of the track instrument): select the clip and click **USE**, or
