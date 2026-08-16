@@ -3256,11 +3256,9 @@ impl ControlPlane {
         self.last_gesture_batch.lock().take()
     }
 
-    /// Test-only accessor to the shared session lock, for tests that need
-    /// to assert on/mutate store state directly around a `commit`-driven
-    /// call (Task 7 brief).
-    #[cfg(test)]
-    pub fn session(&self) -> &Arc<Mutex<Session>> {
+    /// Shared session lock. Used by crate-internal modules (MIDI launch)
+    /// and by tests that assert on store state around a `commit`.
+    pub(crate) fn session(&self) -> &Arc<Mutex<Session>> {
         &self.session
     }
 

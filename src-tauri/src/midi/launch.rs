@@ -241,7 +241,9 @@ impl crate::control::ControlPlane {
                 .find(|b| b.id == id)
                 .ok_or_else(|| format!("unknown launch binding: {id}"))?;
             let (start_ticks, length_ticks) = match &b.target {
-                LaunchTarget::Region { start_ticks, length_ticks, .. } => (*start_ticks, *length_ticks),
+                LaunchTarget::Region { start_ticks, length_ticks, .. } => {
+                    (start_ticks.clone(), length_ticks.clone())
+                }
                 LaunchTarget::Clip { clip_id } => {
                     let c = s
                         .midi
