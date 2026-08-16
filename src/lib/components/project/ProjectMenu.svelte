@@ -60,7 +60,6 @@
           <button
             role="menuitem"
             class="recent"
-            class:current
             disabled={current}
             title={path}
             onclick={() => run(() => void projectops.requestOpenRecent(path))}
@@ -132,6 +131,8 @@
     justify-content: space-between;
     align-items: baseline;
     gap: 14px;
+    min-width: 0;
+    max-width: 100%;
     background: transparent;
     border: none;
     border-radius: 4px;
@@ -166,10 +167,11 @@
     text-transform: none;
   }
   .rname {
+    flex: 1;
+    min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
   }
   .dir {
     padding: 6px 9px 4px;
