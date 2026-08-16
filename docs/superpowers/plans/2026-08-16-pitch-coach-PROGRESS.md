@@ -17,9 +17,9 @@ documentation and all commits are English.
 
 | | |
 |---|---|
-| On `main` | squash `84b0313` (PR #49) |
-| Worktree | stale — `/home/knobo/prog/dav/.claude/worktrees/pitch-coach` |
-| Next | owner ear-check (R3), then Phase 2 from `origin/main` |
+| On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
+| Worktrees | both stale after PR #54 merged — `pitch-coach`, `pitch-rt` |
+| Next | **Phase 2, Task 7**, from `origin/main` |
 
 ## Status
 
@@ -32,7 +32,8 @@ documentation and all commits are English.
 - [x] Pre-existing red test on main fixed by the owner in PR #45, merged in
 - [x] Implementation plan written and self-reviewed
 
-**Phase 1 — backend.** PR #49 review fixes landed; owner checkpoint still open.
+**Phase 1 — backend. DONE.** PR #49, plus PR #54 for the two review
+follow-ups and the R3 instrument.
 
 - [x] Task 1 — YIN detector (`audio/yin.rs`) — `eb0d47b`, 799 tests green
 - [x] Task 2 — decimation to 8 kHz (`audio/decimate.rs`) — `190316a`, 5/5
@@ -52,11 +53,123 @@ documentation and all commits are English.
       `set_rehearse_hold`, `pitch_set_reference`; `pitch://state`; schemas
       stay open (D-06). 227/227 `audio::` green.
 - [ ] **Owner checkpoint** (spec R3): demonstrate detected pitch numerically
-      before any UI is built
+      before any UI is built. **Run it with:**
 
-**Phase 2 — panel.** Not started. Tasks 7–11.
+      ```sh
+      cargo run --manifest-path src-tauri/Cargo.toml --example pitch_check -- 15 A3 --tone=0.35
+      ```
 
-**Phase 3 — scoring.** Not started. Tasks 12–16.
+      **Measured 2026-08-16**, speaker -> microphone, 44.1 kHz stereo input:
+
+      | | |
+      |---|---|
+      | target | 220.00 Hz (A3) |
+      | median detected | 220.02 Hz (+0.2 cents) |
+      | \|error\| | median 0.4 cents |
+      | within | 100 % <= 25 cents |
+      | voiced | 100 % from first sound to last |
+      | clarity | median 1.00 |
+      | frame rate | 99-100 Hz |
+
+      `--tone` plays the target out of the speakers so nothing has to be
+      sung: the owner cannot reliably hit a pitch, and scoring a run against
+      a note a person is aiming at mixes their error with the detector's
+      with no way to separate them. Level matters — at the default 0.1 the
+      same run came back 55 % voiced with readings at exactly half the
+      target (YIN's sub-harmonic under poor SNR) and detections down at
+      70 Hz that were room rumble. That was the acoustic path, not the
+      detector; at 0.35 it is half a cent.
+
+      **Whistle run, same session.** ~811 Hz (G#5) held for ten unbroken
+      seconds: every 500 ms window between 810.1 and 813.6 Hz, clarity 0.98,
+      81 % voiced with the gaps falling exactly where the owner drew breath.
+      The reported -40 cents against G#5 is the WHISTLER, not the detector —
+      811 Hz genuinely is 40 cents flat of 830.6 Hz, and reporting that is
+      the entire product.
+
+      Two lessons for whoever builds the panel:
+
+      * "Distance to nearest note" saturates near 50 cents for anyone
+        sitting midway between two semitones, which is where a person who
+        cannot hit a pitch lives. It reads as a failure and is not one.
+        `pitch_check` therefore also reports the jitter of the longest
+        unbroken voiced run — the detector measured against itself. On a
+        synthetic tone that is 0.1 cents, which is the measurement floor to
+        compare any voice run against.
+      * The note LABEL flips across a semitone boundary while the underlying
+        pitch barely moves (G5 at 795 Hz, G#5 at 811 Hz, from one 500 ms
+        window to the next). Phase 2 should draw the midi float, never the
+        rounded label, or the trail will strobe for exactly the users this
+        feature exists for.
+
+      **Voice run — the case that actually tests the detector.** A sustained
+      open vowel at ~100 Hz (G2), 15 s, input at -32 dBFS:
+
+      | | |
+      |---|---|
+      | voiced | 100 % from first sound to last (1312 frames) |
+      | longest unbroken run | 13.1 s — the whole vocalisation, no dropouts |
+      | detected range | 92.4 .. 101.9 Hz |
+      | jitter | median 9.6 cents over that run |
+      | clarity | median 0.99 |
+
+      **No octave errors in 1312 frames.** That is the result worth keeping:
+      a ~100 Hz vowel carries strong harmonics at 200/300/400 Hz, which is
+      exactly where YIN reports the wrong octave, and the detected range
+      never leaves 92-102 Hz. The 9.6 cents of jitter is the VOICE — the
+      synthetic tone through the identical chain reads 0.1 cents, and ~10
+      cents is ordinary human variation on a held vowel.
+
+      Practical note for whoever runs this next: an open "aaaa" is the test.
+      A closed-lip hum loses most of its energy before it reaches the
+      microphone — an earlier attempt at one came back 0.3 % voiced with the
+      level barely above the room floor, which read as a detector failure
+      and was not one.
+
+      **What none of this settles:** one voice, one vowel, one room.
+
+      The plan's checkpoint text said to drive the running app. That is not
+      possible: the five pitch commands are registered in `lib.rs`, but
+      `src/lib/tauri.ts` has no bindings (that is Task 7, phase 2),
+      `withGlobalTauri` is unset so `window.__TAURI__` does not exist in
+      devtools, and no MCP tool exposes them. `examples/pitch_check.rs` opens
+      the default capture device and runs the real `PitchTap` +
+      `PitchWorker`, printing Hz, nearest note, cents error, voiced fraction
+      and clarity. It does NOT exercise the Tauri command layer or the 60 Hz
+      batching — that is phase 2's to prove.
+
+**Phase 2 — panel.** Not started. Tasks 7–11: wire types + backend
+bindings, the non-reactive frame bus, lane drawing helpers, preferences,
+the panel itself. **Start at Task 7.**
+
+**Phase 3 — scoring.** Not started. Tasks 12–16: shared repeat-expansion
+helper, scoring, pitch track on disk, the report, docs + PR.
+
+### What phase 2 must not get wrong
+
+Both of these came out of actually running the detector against a voice
+(see the log), not out of reading the plan:
+
+- **Draw the `midi` float, never the rounded note name.** The label flips
+  across a semitone boundary while the pitch barely moves — G2 to G#2 on a
+  0.9 Hz change, seen on both a whistle and a held vowel. Drawing the label
+  makes the trail strobe for exactly the users this feature exists for.
+- **Do not make "distance to the nearest note" the headline number.** It
+  saturates near 50 cents for anyone sitting midway between two semitones,
+  which is where a person who cannot hit a pitch lives. It reads as a
+  failure and is not one. Stability — how steadily the reading holds — is
+  the honest measure of whether the detector is tracking someone.
+
+### Still open, beyond the numbered tasks
+
+- **The Tauri command layer is unproven.** `pitch_check` exercises the
+  detector, not `pitch_listen_start` / `pitch_subscribe` / the 60 Hz
+  batching in `Control`. Nothing has ever driven those end to end. Task 7
+  is the first thing that will.
+- **One voice, one vowel, one room.** No woman's voice, no falsetto, no
+  vibrato, no backing track under it.
+- **Speaker bleed is mitigated, not solved** (see below). The panel says so
+  once, plainly.
 
 ## Decisions already made (do not relitigate)
 
@@ -105,22 +218,28 @@ Always check `git status` before committing after running it.
 
 ## Review follow-ups (PR #49)
 
-Merge-blocker bugs from the review are fixed on this branch. Left open:
+Merge-blocker bugs from the review are fixed on `main`. Issues 6 and 7
+are done on `feat/pitch-rt-thread` (see the log below); nothing from the
+review is left open.
 
-- **Issue 6 (follow-up, not this PR):** spec §3.2 wants YIN / RMS gate /
-  median / jump limiter on a dedicated non-RT pitch thread. The callback
-  still runs the full chain. Move `PitchAnalyzer` off `InputCb::capture`
-  (`decimate → rtrb<f32> → worker → rtrb<PitchFrame>`).
-- **Issue 7:** `pitch_listen_start` mid-take that already owns the pitch
-  device sets `wants_listening` but does not attach a `PitchTap`. Listen
-  stays dark until stop.
+- ~~**Issue 6:** spec §3.2 wants YIN / RMS gate / median / jump limiter on
+  a dedicated non-RT pitch thread.~~ Done — `audio/pitch_thread.rs`.
+- ~~**Issue 7:** `pitch_listen_start` mid-take that already owns the pitch
+  device sets `wants_listening` but does not attach a `PitchTap`.~~ Done —
+  the take carries a dormant tap and the shared flag wakes it.
 
 ## Open items needing the owner
 
-1. **`src-tauri/src/lib.rs` was FROZEN.** Owner later authorised additive
+1. **R3 is answered on substance; the box is the owner's to tick.** Three
+   runs, recorded under the checkpoint above: a synthetic tone at 0.4
+   cents, a whistle held 10 s, and — the one that matters — a sustained
+   vowel at ~100 Hz with **no octave errors in 1312 frames**. A vowel
+   carries strong harmonics at 200/300/400 Hz, which is where YIN reports
+   the wrong octave, and the detected range never left 92–102 Hz.
+2. **`src-tauri/src/lib.rs` was FROZEN.** Owner later authorised additive
    command registration (new names only). Task 6 may edit `lib.rs` for
    the five new pitch commands; do not rename existing ones.
-2. **Speaker bleed is mitigated, not solved.** Without headphones the
+3. **Speaker bleed is mitigated, not solved.** Without headphones the
    backing track is detected as pitch. The panel says so once, plainly.
 
 ## Conventions
@@ -139,6 +258,37 @@ with the commit sha and anything the next agent would be surprised by.
 
 ## Log
 
+- 2026-08-16 — Review follow-ups 6 and 7 done on `feat/pitch-rt-thread`
+  (`007d346`, `af9b1ea`). Five things the next agent should know:
+  1. **The capture callback no longer detects anything.** `audio/pitch_thread.rs`
+     owns the split: `PitchTap` (decimate, hand over) on the RT side,
+     `PitchWorker` (YIN, gate, median, jump limiter) on a worker thread.
+     Two rings, not one — the samples ring plus a descriptor ring carrying
+     each chunk's device position and rate, because `PitchAnalyzer::push`
+     anchors its timestamps to those. Samples are written BEFORE the
+     descriptor, and a chunk that does not fit anywhere is dropped whole;
+     a half-written chunk would mistime every frame after it.
+  2. **`PitchWorker::pump` is synchronous on purpose.** Tests drive the
+     whole chain without a thread. `spawn_pitch_worker` is production's
+     entry point, and the handle joins the thread on drop — an
+     `InputBundle` declares it after `_stream`, so the callback stops
+     before the worker is joined.
+  3. **Taps are gated on a shared `Control::pitch_active` flag**, not on
+     their own existence. A take on the pitch device now carries a tap
+     whether or not anyone was listening when it started, and
+     `set_listening` is what wakes it. That is the whole of issue 7: a
+     recording stream cannot be rebuilt mid-take without losing audio.
+     A dormant tap costs one relaxed atomic load per capture buffer.
+  4. **`SAMPLE_RING_SLOTS` must hold one maximal chunk** (`a_maximal_chunk_always_fits`).
+     Shrink it and any device the decimator upsamples from goes
+     permanently dark instead of dropping a few frames.
+  5. **A dropped chunk owes the analyser a reset.** Dropping whole keeps
+     the two rings aligned; it does NOT keep the detector aligned, because
+     it carries most of an analysis frame across the hole and then
+     timestamps the splice at the new position. Found by rewriting the
+     alignment test to feed a staircase instead of a steady tone — against
+     a steady tone a desync is invisible, which is why the first version of
+     that test passed while the bug was there.
 - 2026-08-16 — PR #49 review merge-blockers fixed (Issues 1–5, 8). Failed
   take-start restores the listen hub; listen-only capture no longer pushes
   `base_slot == 0` meter blocks; NaN on the capture path is unvoiced (no

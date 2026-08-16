@@ -32,13 +32,13 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use parking_lot::Mutex;
 
-use super::decimate::Decimator;
 use super::dsp::linear_resample;
 use super::meters::{GenerationMaps, MeterAccum, RawMeterBlock, METER_CHUNK_SLOTS};
 use super::midi_in::{self, LiveMidiEvent, MidiInHub, LIVE_IN_RING_SLOTS, MAX_LIVE_IN_PER_BLOCK};
 use super::mixer;
 use super::offline;
-use super::pitch::{PitchAnalyzer, PitchFrame, PitchFrameBatch, PitchState};
+use super::pitch::{PitchFrame, PitchFrameBatch, PitchState};
+use super::pitch_thread::{pitch_channel, spawn_pitch_worker, PitchTap, PitchWorkerHandle};
 use super::recorder::{self, DiskWriter, RecSpec};
 use super::rt::{
     GraphPtr, GraphTables, ParamTable, RtClip, RtClipData, RtGraph, RtTrack, SharedGraphTables,
@@ -61,9 +61,10 @@ const REC_RING_SECS: usize = 2;
 /// nothing control-side.
 const METER_RING_SLOTS: usize = 64 * 8;
 
-/// Pitch-frame ring slots. Frames arrive at 100 Hz and the control thread
-/// drains every tick, so this is seconds of headroom against a control-thread
-/// stall — and overflow only ever drops a pixel of the trail, never audio.
+/// Pitch-frame ring slots for the STUB bundles tests build. The real chain
+/// sizes its own rings in [`super::pitch_thread`]; this only has to be big
+/// enough that a test never overflows it.
+#[cfg(test)]
 const PITCH_RING_SLOTS: usize = 512;
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,7 @@ pub fn start(
                 pending_record: None,
                 listen_input: None,
                 wants_listening: false,
+                pitch_active: Arc::new(AtomicBool::new(false)),
                 rehearse: Arc::new(AtomicBool::new(false)),
                 rehearse_open: None,
                 rehearse_spans: Vec::new(),
@@ -315,6 +317,10 @@ struct InputBundle {
     /// Production always holds the stream: dropping it is what releases the
     /// device (see `sync_input_hub`).
     _stream: Option<cpal::Stream>,
+    /// The analysis thread fed by this stream's tap. Declared after
+    /// `_stream` so drop order is stream (callback stops) → worker (joins)
+    /// → rings. Dropping this joins the thread; it is never read otherwise.
+    _pitch_worker: Option<PitchWorkerHandle>,
     meter_rx: rtrb::Consumer<RawMeterBlock>,
     /// Present only on the bundle that owns the microphone — at most one,
     /// even during a multi-device take (X1). `None` on the others.
@@ -757,9 +763,6 @@ struct InputCb {
     blocks: Vec<(RawMeterBlock, Vec<usize>)>,
     in_ch: usize,
     rec_ch: usize,
-    /// Device capture rate, needed to express pitch-frame timestamps in
-    /// device samples.
-    rate: u32,
     shared: Arc<SharedRt>,
     /// Live pitch analysis, present only on the input that owns the
     /// microphone. `None` on a take's other capture devices.
@@ -771,26 +774,6 @@ struct InputCb {
     /// showing me my pitch".
     rehearse: Arc<AtomicBool>,
 }
-
-/// The live pitch chain hanging off one input callback: decimate to 8 kHz,
-/// analyse, push frames to the control thread.
-///
-/// Every buffer here is preallocated at stream-open on the control thread.
-/// `Vec::clear` keeps capacity, so `capture` reuses these forever and never
-/// allocates in steady state — the `Vec`s are not an RT violation, which is
-/// worth stating because they look like one.
-struct PitchTap {
-    decimator: Decimator,
-    analyzer: PitchAnalyzer,
-    tx: rtrb::Producer<PitchFrame>,
-    dec_buf: Vec<f32>,
-    frame_buf: Vec<PitchFrame>,
-}
-
-/// Input frames a `PitchTap`'s scratch buffers are sized for. Well above any
-/// plausible cpal buffer, so a large period never forces a reallocation on
-/// the RT thread.
-const PITCH_TAP_MAX_FRAMES: usize = 8192;
 
 impl InputCb {
     fn capture(&mut self, data: &[f32]) {
@@ -822,26 +805,11 @@ impl InputCb {
         }
 
         // Live pitch, BEFORE the fan-out so rehearse-hold cannot silence it.
-        // Bounded work on preallocated buffers: `clear` keeps capacity, the
-        // decimator and analyser own all their state, and a full ring just
-        // drops frames (the UI is a 100 Hz trail; a dropped frame is a
-        // pixel, not a corrupted take). A period larger than
-        // `PITCH_TAP_MAX_FRAMES` is not a real device — drop the surplus
-        // rather than let `Vec::push` grow on the RT thread.
+        // Decimation only: the detector runs on the pitch worker thread
+        // (spec §3.2). Dormant unless the user is listening, in which case a
+        // relaxed atomic load is the whole cost.
         if let Some(p) = self.pitch.as_mut() {
-            p.dec_buf.clear();
-            p.frame_buf.clear();
-            let max_samples = PITCH_TAP_MAX_FRAMES.saturating_mul(in_ch);
-            let pitch_data = if data.len() > max_samples {
-                &data[..max_samples]
-            } else {
-                data
-            };
-            p.decimator.process(pitch_data, in_ch, &mut p.dec_buf);
-            p.analyzer.push(&p.dec_buf, pos, self.rate, &mut p.frame_buf);
-            for f in p.frame_buf.iter() {
-                let _ = p.tx.push(*f);
-            }
+            p.process(data, in_ch, pos);
         }
 
         // Rehearse-hold: commit silence, not audio, for this buffer. Read
@@ -1072,6 +1040,14 @@ struct Control {
     /// `inputs` because that `Vec` belongs to the take (one entry per
     /// capture device, X1) and is cleared wholesale by `stop_recording`.
     listen_input: Option<InputBundle>,
+    /// Whether any tap should be analysing right now. Shared with every
+    /// `PitchTap`, including the dormant one a take on the pitch device
+    /// carries: flipping this is how listening starts mid-take without
+    /// rebuilding a recording stream (PR #49 issue 7). Mirrors
+    /// `wants_listening`, and every site that clears one must clear the
+    /// other: `set_listening`, the `SelectInput` restore-failure path, and
+    /// the `start_recording` group-open-failure path.
+    pitch_active: Arc<AtomicBool>,
     /// Whether the user wants live pitch at all (owner ruling R6: an
     /// explicit listen toggle or an open panel — never track arm).
     wants_listening: bool,
@@ -1280,6 +1256,7 @@ impl Control {
                                 );
                                 if self.listen_input.is_none() {
                                     self.wants_listening = false;
+                                    self.pitch_active.store(false, Relaxed);
                                 }
                             }
                             self.emit_pitch_state();
@@ -2135,6 +2112,15 @@ impl Control {
             .any(|i| i.wants.recording && i.device_key == key)
     }
 
+    /// Which capture group, if any, carries the live-pitch tap: the one on
+    /// the pitch device. Deliberately NOT conditional on whether the user is
+    /// listening at take start — the tap rides along dormant so listening can
+    /// start mid-take without rebuilding a recording stream (PR #49 issue 7).
+    fn pitch_group_key<'a>(&self, groups: impl IntoIterator<Item = &'a String>) -> Option<String> {
+        let key = self.pitch_device_key();
+        groups.into_iter().find(|k| **k == key).cloned()
+    }
+
     /// Should a listen-only stream exist right now? Pure policy, split from
     /// [`Control::sync_input_hub`] so the transitions are testable without an
     /// audio device: wanting to listen is not the same as owning a stream,
@@ -2204,6 +2190,10 @@ impl Control {
             // exists — the next sync would silently do nothing.
             self.wants_listening = false;
         }
+        // Every tap reads this, including the dormant one a take on the pitch
+        // device carries: this store is what starts and stops the analysis,
+        // whichever stream owns the microphone.
+        self.pitch_active.store(self.wants_listening, Relaxed);
         r
     }
 
@@ -2271,9 +2261,23 @@ impl Control {
             .unwrap_or(0)
     }
 
+    /// Is there anything anywhere that can actually analyse right now? The
+    /// listen stream carries a tap, and so does a take on the pitch device —
+    /// but a take whose worker thread failed to spawn does NOT, and while
+    /// that take runs it owns the device, so no listen stream can be opened
+    /// to make up for it (`listen_stream_wanted`).
+    fn pitch_tap_present(&self) -> bool {
+        self.listen_input.as_ref().is_some_and(|h| h.pitch_rx.is_some())
+            || self.inputs.iter().any(|i| i.pitch_rx.is_some())
+    }
+
     fn current_pitch_state(&self) -> PitchState {
         PitchState {
-            listening: self.wants_listening,
+            // Intent AND capability. Reporting bare intent would light up a
+            // panel over a trail that can never draw, with nothing to tell
+            // the user why — the failure `spawn_pitch_worker` is fallible to
+            // avoid, reintroduced one layer up.
+            listening: self.wants_listening && self.pitch_tap_present(),
             rehearse_hold: self.rehearse.load(Relaxed),
             reference_track_id: self.reference_track_id.clone(),
             device_rate: self.pitch_device_rate(),
@@ -2316,7 +2320,10 @@ impl Control {
         let batch = PitchFrameBatch {
             frames: std::mem::take(&mut scratch),
             device_rate: self.pitch_device_rate(),
-            listening: self.wants_listening,
+            // Same rule as `current_pitch_state`: the flag rides on the
+            // batch so the UI does not have to wait for `pitch://state`,
+            // and the two must not disagree.
+            listening: self.wants_listening && self.pitch_tap_present(),
             rehearse_hold: self.rehearse.load(Relaxed),
         };
         self.pitch_scratch = scratch;
@@ -2352,21 +2359,17 @@ impl Control {
         Ok((device, cfg))
     }
 
-    /// Build the pitch chain for a stream, with every buffer preallocated
-    /// here on the control thread (see [`PitchTap`]).
-    fn build_pitch_tap(rate: u32) -> (PitchTap, rtrb::Consumer<PitchFrame>) {
-        let (tx, rx) = rtrb::RingBuffer::new(PITCH_RING_SLOTS);
-        let tap = PitchTap {
-            decimator: Decimator::new(rate),
-            analyzer: PitchAnalyzer::new(),
-            tx,
-            // 8× covers a device as slow as 1 kHz upsampling to 8 kHz
-            // (`Decimator` clamps below that). +8 is phase-accumulator slack
-            // so `process` never grows this on the RT thread.
-            dec_buf: Vec::with_capacity(PITCH_TAP_MAX_FRAMES * 8 + 8),
-            frame_buf: Vec::with_capacity(PITCH_TAP_MAX_FRAMES),
-        };
-        (tap, rx)
+    /// Build the pitch chain for a stream and start its analysis thread.
+    /// Every buffer is preallocated here on the control thread; the returned
+    /// handle joins the thread when the bundle holding it is dropped (see
+    /// [`super::pitch_thread`]).
+    fn build_pitch_tap(
+        rate: u32,
+        active: Arc<AtomicBool>,
+    ) -> Result<(PitchTap, PitchWorkerHandle, rtrb::Consumer<PitchFrame>), String> {
+        let (tap, worker, rx) = pitch_channel(rate, active);
+        let handle = spawn_pitch_worker(worker).map_err(|e| e.to_string())?;
+        Ok((tap, handle, rx))
     }
 
     /// Stream-less listen bundle used by tests (no cpal device) and by
@@ -2377,6 +2380,7 @@ impl Control {
         let (_tx, pitch_rx) = rtrb::RingBuffer::new(PITCH_RING_SLOTS);
         InputBundle {
             _stream: None,
+            _pitch_worker: None,
             meter_rx,
             pitch_rx: Some(pitch_rx),
             device_key: device_key.to_string(),
@@ -2399,7 +2403,10 @@ impl Control {
         let (device, cfg) = self.resolve_input_device(device_id)?;
         let in_ch = cfg.channels().max(1) as usize;
         let rate = cfg.sample_rate().0;
-        let (pitch, pitch_rx) = Self::build_pitch_tap(rate);
+        // Fatal here: a listen stream with no analyser is a stream that
+        // exists only to be dark.
+        let (pitch, pitch_worker, pitch_rx) =
+            Self::build_pitch_tap(rate, self.pitch_active.clone())?;
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let mut cb = InputCb {
             producers: Vec::new(),
@@ -2412,7 +2419,6 @@ impl Control {
             blocks: Vec::new(),
             in_ch,
             rec_ch: in_ch.min(2),
-            rate,
             shared: self.shared.clone(),
             pitch: Some(pitch),
             rehearse: self.rehearse.clone(),
@@ -2428,6 +2434,7 @@ impl Control {
         stream.play().map_err(|e| e.to_string())?;
         Ok(InputBundle {
             _stream: Some(stream),
+            _pitch_worker: Some(pitch_worker),
             meter_rx,
             pitch_rx: Some(pitch_rx),
             device_key: device_id.unwrap_or_default().to_string(),
@@ -2509,12 +2516,22 @@ impl Control {
         let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let n_producers = producers.len();
-        let (pitch, pitch_rx) = match with_pitch {
-            true => {
-                let (tap, rx) = Self::build_pitch_tap(rate);
-                (Some(tap), Some(rx))
-            }
-            false => (None, None),
+        // NOT fatal here: a take must not fail because the tuner could not
+        // start. It loses live pitch for its duration, loudly.
+        let (pitch, pitch_worker, pitch_rx) = match with_pitch {
+            true => match Self::build_pitch_tap(rate, self.pitch_active.clone()) {
+                Ok((tap, worker, rx)) => (Some(tap), Some(worker), Some(rx)),
+                Err(e) => {
+                    // The take goes on without live pitch — it must not fail
+                    // because the tuner could not start. `pitch_tap_present`
+                    // is what stops this being silent: with no tap anywhere,
+                    // `pitch://state` reports `listening: false` for as long
+                    // as this take owns the device.
+                    log::warn!("audio: live pitch unavailable for this take: {e}");
+                    (None, None, None)
+                }
+            },
+            false => (None, None, None),
         };
         let mut cb = InputCb {
             producers,
@@ -2523,7 +2540,6 @@ impl Control {
             blocks,
             in_ch,
             rec_ch,
-            rate,
             shared: self.shared.clone(),
             pitch,
             rehearse: self.rehearse.clone(),
@@ -2540,6 +2556,7 @@ impl Control {
         Ok((
             InputBundle {
                 _stream: Some(stream),
+                _pitch_worker: pitch_worker,
                 meter_rx,
                 pitch_rx,
                 device_key: device_id.unwrap_or_default().to_string(),
@@ -2618,11 +2635,13 @@ impl Control {
             // its own group carries the analyser instead (one stream per
             // device), and if it does not, `sync_input_hub` below reopens it.
             self.listen_input = None;
-            let pitch_key = self.pitch_device_key();
-            let pitch_group = self
-                .wants_listening
-                .then(|| by_device.keys().find(|k| **k == pitch_key).cloned())
-                .flatten();
+            // Not gated on `wants_listening`: the tap rides along dormant so
+            // opening the panel mid-take wakes it (issue 7). A dormant tap
+            // costs one relaxed atomic load per capture buffer on the RT
+            // side; the take also carries the chain's rings (~525 KB) and a
+            // worker thread that backs off to 20 wake-ups a second while the
+            // flag is clear.
+            let pitch_group = self.pitch_group_key(by_device.keys());
 
             let mut groups: Vec<(InputBundle, DiskWriter)> = Vec::new();
             let mut rec_generation = None;
@@ -2652,6 +2671,7 @@ impl Control {
                             );
                             if self.listen_input.is_none() {
                                 self.wants_listening = false;
+                                self.pitch_active.store(false, Relaxed);
                             }
                         }
                         self.emit_pitch_state();
@@ -3833,6 +3853,7 @@ mod tests {
             pending_record: None,
             listen_input: None,
             wants_listening: false,
+            pitch_active: Arc::new(AtomicBool::new(false)),
             rehearse: Arc::new(AtomicBool::new(false)),
             rehearse_open: None,
             rehearse_spans: Vec::new(),
@@ -4849,7 +4870,6 @@ mod tests {
             blocks: vec![(b, vec![0])],
             in_ch: 1,
             rec_ch: 1,
-            rate: 48_000,
             shared: shared.clone(),
             pitch: None,
             rehearse: Arc::new(AtomicBool::new(false)),
@@ -4885,6 +4905,18 @@ mod tests {
 
     // ---- Pitch Coach input hub (plan task 5) ----------------------------
 
+    use super::super::pitch_thread::PitchWorker;
+
+    /// What [`listening_input_cb`] hands back: the callback, the record
+    /// consumer, the rehearse flag, and — when a tap was asked for — the
+    /// pitch worker with its frame consumer.
+    type ListeningCb = (
+        InputCb,
+        rtrb::Consumer<f32>,
+        Arc<AtomicBool>,
+        Option<(PitchWorker, rtrb::Consumer<PitchFrame>)>,
+    );
+
     fn tone_48k(hz: f32, n: usize) -> Vec<f32> {
         (0..n)
             .map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / 48_000.0).sin())
@@ -4904,6 +4936,7 @@ mod tests {
         };
         InputBundle {
             _stream: None,
+            _pitch_worker: None,
             meter_rx,
             pitch_rx,
             device_key: device_key.to_string(),
@@ -4916,24 +4949,18 @@ mod tests {
     }
 
     /// An `InputCb` wired the way a listening take is, with a roomy ring so
-    /// nothing overflows: returns the callback, the record consumer, and the
-    /// rehearse flag.
-    fn listening_input_cb(
-        shared: &Arc<SharedRt>,
-        with_pitch: bool,
-    ) -> (
-        InputCb,
-        rtrb::Consumer<f32>,
-        Arc<AtomicBool>,
-        Option<rtrb::Consumer<PitchFrame>>,
-    ) {
+    /// nothing overflows: returns the callback, the record consumer, the
+    /// rehearse flag, and (when a tap was asked for) the pitch worker plus
+    /// its frame consumer. The worker is handed back UNSPAWNED so tests drive
+    /// it with `pump()` and stay deterministic.
+    fn listening_input_cb(shared: &Arc<SharedRt>, with_pitch: bool) -> ListeningCb {
         let (producer, consumer) = rtrb::RingBuffer::new(1 << 16);
         let (meter_tx, _meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let rehearse = Arc::new(AtomicBool::new(false));
-        let (pitch, pitch_rx) = match with_pitch {
+        let (pitch, pitch_out) = match with_pitch {
             true => {
-                let (t, rx) = Control::build_pitch_tap(48_000);
-                (Some(t), Some(rx))
+                let (t, worker, rx) = pitch_channel(48_000, Arc::new(AtomicBool::new(true)));
+                (Some(t), Some((worker, rx)))
             }
             false => (None, None),
         };
@@ -4946,12 +4973,11 @@ mod tests {
             blocks: vec![(b, vec![0])],
             in_ch: 1,
             rec_ch: 1,
-            rate: 48_000,
             shared: shared.clone(),
             pitch,
             rehearse: rehearse.clone(),
         };
-        (cb, consumer, rehearse, pitch_rx)
+        (cb, consumer, rehearse, pitch_out)
     }
 
     /// Listening is a policy decision the control thread makes; opening the
@@ -5087,14 +5113,15 @@ mod tests {
     #[test]
     fn rehearse_hold_still_analyses_the_real_signal() {
         let shared = Arc::new(SharedRt::default());
-        let (mut cb, _consumer, rehearse, mut pitch_rx) = listening_input_cb(&shared, true);
-        let pitch_rx = pitch_rx.as_mut().expect("tap requested");
+        let (mut cb, _consumer, rehearse, pitch_out) = listening_input_cb(&shared, true);
+        let (mut worker, mut pitch_rx) = pitch_out.expect("tap requested");
 
         rehearse.store(true, Relaxed);
         let tone = tone_48k(220.0, 24_000);
         for chunk in tone.chunks(512) {
             cb.capture(chunk);
         }
+        worker.pump();
 
         let mut voiced = 0;
         while let Ok(f) = pitch_rx.pop() {
@@ -5213,13 +5240,18 @@ mod tests {
         assert!(ctl.writers.is_empty() && ctl.inputs.is_empty());
     }
 
-    /// Listen-only capture must not push `base_slot == 0` meter blocks:
-    /// `MeterAccum` would fold them into the output RMS denominator.
+    /// Issue 7. A take on the pitch device owns the microphone and its stream
+    /// cannot be rebuilt without losing audio, so the tap has to be there from
+    /// the start — dormant — and `set_listening` has to be what wakes it.
+    /// Before this, opening the panel mid-take set the flag and nothing else:
+    /// listening stayed dark until the take stopped.
     #[test]
-    fn listen_only_capture_does_not_push_meter_blocks() {
-        let shared = Arc::new(SharedRt::default());
-        let (meter_tx, mut meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
-        let (tap, _pitch_rx) = Control::build_pitch_tap(48_000);
+    fn listen_started_mid_take_wakes_the_takes_tap() {
+        let (mut ctl, _session) = bare_control();
+        let shared = ctl.shared.clone();
+        // The take's own capture stream, carrying the dormant tap.
+        let (tap, mut worker, mut frames) = pitch_channel(48_000, ctl.pitch_active.clone());
+        let (meter_tx, _meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let mut cb = InputCb {
             producers: Vec::new(),
             owed: Vec::new(),
@@ -5227,7 +5259,131 @@ mod tests {
             blocks: Vec::new(),
             in_ch: 1,
             rec_ch: 1,
-            rate: 48_000,
+            shared,
+            pitch: Some(tap),
+            rehearse: ctl.rehearse.clone(),
+        };
+        ctl.inputs.push(fake_bundle_on("", true));
+
+        let tone = tone_48k(220.0, 24_000);
+        for chunk in tone.chunks(512) {
+            cb.capture(chunk);
+        }
+        worker.pump();
+        assert!(
+            frames.pop().is_err(),
+            "a dormant tap must analyse nothing while listening is off"
+        );
+
+        ctl.set_listening(true).expect("no second stream to open");
+        assert!(
+            ctl.listen_input.is_none(),
+            "the take owns the mic; a second stream on it would be wrong"
+        );
+        for chunk in tone.chunks(512) {
+            cb.capture(chunk);
+        }
+        worker.pump();
+        let mut voiced = 0;
+        while let Ok(f) = frames.pop() {
+            if f.voiced {
+                voiced += 1;
+            }
+        }
+        assert!(voiced > 0, "listen started mid-take must not stay dark");
+    }
+
+    /// The other half of issue 7: the take that captures the pitch device
+    /// carries the tap whether or not the user was listening when it started.
+    #[test]
+    fn a_take_on_the_pitch_device_carries_the_tap_even_when_not_listening() {
+        let (mut ctl, _session) = bare_control();
+        ctl.sel_input = Some("mic".into());
+        let groups = ["line-in".to_string(), "mic".to_string()];
+        assert!(!ctl.wants_listening, "nobody is listening yet");
+        assert_eq!(
+            ctl.pitch_group_key(groups.iter()),
+            Some("mic".to_string()),
+            "the group on the pitch device must carry the tap regardless"
+        );
+
+        ctl.sel_input = Some("usb".into());
+        assert_eq!(
+            ctl.pitch_group_key(groups.iter()),
+            None,
+            "no group captures the pitch device: nothing to attach to"
+        );
+    }
+
+    /// A take on the pitch device whose tap could not be built (the worker
+    /// thread failed to spawn) leaves nothing that can analyse, and the take
+    /// owns the device so no listen stream can be opened either. Reporting
+    /// `listening: true` there would be a lie the UI cannot see through: an
+    /// enabled panel over a permanently dark trail, until the take stops.
+    #[test]
+    fn pitch_state_does_not_claim_to_listen_with_no_tap() {
+        let (mut ctl, _session) = bare_control();
+        ctl.inputs.push(fake_bundle_on("", false));
+        ctl.set_listening(true).expect("no second stream to open");
+
+        assert!(ctl.wants_listening, "the intent is still recorded");
+        assert!(
+            ctl.listen_input.is_none(),
+            "the take owns the device; no listen stream is possible"
+        );
+        assert!(
+            !ctl.current_pitch_state().listening,
+            "nothing can analyse, so the state must not claim to be listening"
+        );
+    }
+
+    /// The mirror: with a tap present, the state reports what it should.
+    #[test]
+    fn pitch_state_reports_listening_when_a_tap_exists() {
+        let (mut ctl, _session) = bare_control();
+        ctl.set_listening(true).expect("stub hub");
+        assert!(ctl.current_pitch_state().listening);
+    }
+
+    /// A listen that could not open a device must leave every tap dormant —
+    /// otherwise a take's tap would analyse into a ring nobody drains.
+    #[test]
+    fn a_failed_listen_leaves_the_taps_dormant() {
+        let (mut ctl, _session) = bare_control();
+        ctl.stub_input = false;
+        ctl.sel_input = Some("aura-no-such-input".into());
+        assert!(ctl.set_listening(true).is_err(), "device must not exist");
+        assert!(
+            !ctl.pitch_active.load(Relaxed),
+            "no stream means no analysis"
+        );
+    }
+
+    /// Listening on and off must move the shared flag every tap reads.
+    #[test]
+    fn set_listening_drives_the_shared_tap_flag() {
+        let (mut ctl, _session) = bare_control();
+        assert!(!ctl.pitch_active.load(Relaxed));
+        ctl.set_listening(true).expect("stub hub");
+        assert!(ctl.pitch_active.load(Relaxed), "listening must wake taps");
+        ctl.set_listening(false).expect("close");
+        assert!(!ctl.pitch_active.load(Relaxed), "stopping must idle them");
+    }
+
+    /// Listen-only capture must not push `base_slot == 0` meter blocks:
+    /// `MeterAccum` would fold them into the output RMS denominator.
+    #[test]
+    fn listen_only_capture_does_not_push_meter_blocks() {
+        let shared = Arc::new(SharedRt::default());
+        let (meter_tx, mut meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
+        let (tap, _worker, _pitch_rx) = pitch_channel(48_000, Arc::new(AtomicBool::new(true)));
+        let mut cb = InputCb {
+            producers: Vec::new(),
+            owed: Vec::new(),
+            meter_tx,
+            blocks: Vec::new(),
+            in_ch: 1,
+            rec_ch: 1,
             shared,
             pitch: Some(tap),
             rehearse: Arc::new(AtomicBool::new(false)),
@@ -5285,7 +5441,8 @@ mod tests {
     fn pitch_frames_are_produced_while_listening_without_recording() {
         let shared = Arc::new(SharedRt::default());
         let (meter_tx, _meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
-        let (tap, mut pitch_rx) = Control::build_pitch_tap(48_000);
+        let (tap, mut worker, mut pitch_rx) =
+            pitch_channel(48_000, Arc::new(AtomicBool::new(true)));
         // A listen-only callback: NO producers and NO meter blocks, which
         // is what "no take" means down here (meter blocks would dilute
         // output RMS).
@@ -5296,7 +5453,6 @@ mod tests {
             blocks: Vec::new(),
             in_ch: 1,
             rec_ch: 1,
-            rate: 48_000,
             shared: shared.clone(),
             pitch: Some(tap),
             rehearse: Arc::new(AtomicBool::new(false)),
@@ -5305,6 +5461,7 @@ mod tests {
         for chunk in tone_48k(220.0, 48_000).chunks(512) {
             cb.capture(chunk);
         }
+        worker.pump();
 
         let mut voiced = Vec::new();
         while let Ok(f) = pitch_rx.pop() {

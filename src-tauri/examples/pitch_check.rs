@@ -1,0 +1,484 @@
+//! The Pitch Coach phase 1 checkpoint (spec R3), with no UI in the way.
+//!
+//! Opens the default capture device, runs the real live chain — the same
+//! [`PitchTap`] the audio callback drives and the same [`PitchWorker`] the
+//! engine spawns — and prints what it hears: detected Hz, the nearest note,
+//! the error in cents, and how much of the take was voiced at all.
+//!
+//! ```sh
+//! cargo run --example pitch_check                  # 10 s, nearest note
+//! cargo run --example pitch_check -- 20 A3         # 20 s against a named target
+//! cargo run --example pitch_check -- 10 220        # or a target in Hz
+//! cargo run --example pitch_check -- 15 A3 --tone  # play the target, sing nothing
+//! ```
+//!
+//! `--tone` plays the target through the default output while capturing, so
+//! the microphone hears a frequency we already know exactly. That is the
+//! honest way to measure the DETECTOR: score a run against a note a person
+//! is trying to hit and the error is theirs and the detector's mixed
+//! together, with no way to tell which is which. It needs speakers, not
+//! headphones — the bleed the panel warns about is the point here.
+//!
+//! What this does NOT cover: the Tauri command layer. `pitch_listen_start`,
+//! `pitch_subscribe` and the 60 Hz batching in `Control` are not exercised
+//! here — this is the detector against a real microphone and a real voice,
+//! which is what R3 asks to see before any panel is built.
+
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use aura_lib::audio::pitch::PitchFrame;
+use aura_lib::audio::pitch_thread::{pitch_channel, spawn_pitch_worker};
+use aura_lib::audio::yin::{cents_between, hz_to_midi, midi_to_hz};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
+const NOTE_NAMES: [&str; 12] = [
+    "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+];
+
+/// MIDI number -> `A3`-style name. MIDI 60 is C4, so the octave is
+/// `midi / 12 - 1`.
+fn note_name(midi: i32) -> String {
+    let pc = midi.rem_euclid(12) as usize;
+    format!("{}{}", NOTE_NAMES[pc], midi.div_euclid(12) - 1)
+}
+
+/// `A3`, `C#4`, `Bb2` -> MIDI number.
+fn parse_note(s: &str) -> Option<i32> {
+    let b = s.as_bytes();
+    let step = match b.first()?.to_ascii_uppercase() {
+        b'C' => 0,
+        b'D' => 2,
+        b'E' => 4,
+        b'F' => 5,
+        b'G' => 7,
+        b'A' => 9,
+        b'B' => 11,
+        _ => return None,
+    };
+    let mut i = 1;
+    let mut accidental = 0;
+    while i < b.len() && (b[i] == b'#' || b[i] == b'b') {
+        accidental += if b[i] == b'#' { 1 } else { -1 };
+        i += 1;
+    }
+    let octave: i32 = s[i..].parse().ok()?;
+    Some((octave + 1) * 12 + step + accidental)
+}
+
+/// RMS as dBFS, floored so a digital-silence frame prints as a number
+/// rather than `-inf`.
+fn dbfs(rms: f32) -> f32 {
+    match rms > 1e-9 {
+        true => 20.0 * rms.log10(),
+        false => -180.0,
+    }
+}
+
+/// Middle value of a slice, without sorting the caller's data.
+fn median(v: &[f32]) -> f32 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    s[s.len() / 2]
+}
+
+fn main() -> Result<(), String> {
+    const USAGE: &str = "usage: pitch_check [seconds] [note|hz] [--tone[=level]]";
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (flags, positional): (Vec<&String>, Vec<&String>) =
+        args.iter().partition(|a| a.starts_with("--"));
+    if let Some(bad) = flags.iter().find(|f| !f.starts_with("--tone")) {
+        return Err(format!("unknown option {bad:?}\n{USAGE}"));
+    }
+    if positional.len() > 2 {
+        return Err(format!("too many arguments\n{USAGE}"));
+    }
+
+    // Parsed by POSITION, and a position that does not parse is an error
+    // rather than a silent default: `pitch_check A3` used to run a full
+    // ten-second measurement with the target quietly ignored, which is the
+    // worst outcome — it looks like it worked.
+    let secs: u64 = match positional.first() {
+        None => 10,
+        Some(a) => a.parse().map_err(|_| {
+            format!("first argument is the duration in seconds, got {a:?}\n{USAGE}")
+        })?,
+    };
+    if secs == 0 {
+        return Err(format!("a zero-second run measures nothing\n{USAGE}"));
+    }
+    let target: Option<f32> = match positional.get(1) {
+        None => None,
+        Some(a) => Some(
+            parse_note(a)
+                .map(|m| midi_to_hz(m as f32))
+                .or_else(|| a.parse::<f32>().ok().filter(|hz| *hz > 0.0))
+                .ok_or_else(|| {
+                    format!("second argument is a note or a frequency, got {a:?}\n{USAGE}")
+                })?,
+        ),
+    };
+
+    let play_tone = args.iter().any(|a| a.starts_with("--tone"));
+    // `--tone` alone is -20 dBFS; `--tone=0.3` is louder. The first run of
+    // this against a laptop speaker in a noisy room came back 55 % voiced
+    // with octave-down readings at exactly half the target — the signature
+    // of YIN under a poor signal-to-noise ratio, not of a broken detector.
+    // The fix for that is level, so level is a knob.
+    let level: f32 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--tone=")?.parse().ok())
+        .unwrap_or(0.1f32)
+        .clamp(0.0, 0.9);
+    if play_tone && target.is_none() {
+        return Err("--tone needs a target note or frequency to play".into());
+    }
+
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .ok_or("no default input device")?;
+    let name = device.name().unwrap_or_else(|_| "<unnamed>".into());
+    let cfg = device.default_input_config().map_err(|e| e.to_string())?;
+    if cfg.sample_format() != cpal::SampleFormat::F32 {
+        return Err(format!(
+            "unsupported input sample format {:?} (the engine is f32-only too)",
+            cfg.sample_format()
+        ));
+    }
+    let rate = cfg.sample_rate().0;
+    let channels = cfg.channels().max(1) as usize;
+
+    let active = Arc::new(AtomicBool::new(true));
+    let (mut tap, worker, mut frames_rx) = pitch_channel(rate, active);
+    let _worker = spawn_pitch_worker(worker).map_err(|e| e.to_string())?;
+
+    // The callback owns the tap, exactly as `InputCb` does. `pos` stands in
+    // for the transport position the engine passes.
+    let mut pos = 0u64;
+    let stream = device
+        .build_input_stream(
+            &cfg.into(),
+            move |data: &[f32], _| {
+                tap.process(data, channels, pos);
+                pos += (data.len() / channels) as u64;
+            },
+            |e| eprintln!("input stream error: {e}"),
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+    stream.play().map_err(|e| e.to_string())?;
+
+    // Optional reference tone out of the speakers. Held at -20 dBFS: loud
+    // enough to sit well above a room's noise floor, quiet enough not to be
+    // unpleasant for however long the run lasts.
+    let out_stream = match play_tone {
+        false => None,
+        true => {
+            let hz = target.expect("checked above");
+            let out = host
+                .default_output_device()
+                .ok_or("no default output device")?;
+            let ocfg = out.default_output_config().map_err(|e| e.to_string())?;
+            if ocfg.sample_format() != cpal::SampleFormat::F32 {
+                return Err(format!(
+                    "unsupported output sample format {:?}",
+                    ocfg.sample_format()
+                ));
+            }
+            let och = ocfg.channels().max(1) as usize;
+            let step = 2.0 * std::f32::consts::PI * hz / ocfg.sample_rate().0 as f32;
+            let mut phase = 0.0f32;
+            let s = out
+                .build_output_stream(
+                    &ocfg.into(),
+                    move |data: &mut [f32], _| {
+                        for frame in data.chunks_mut(och) {
+                            let v = phase.sin() * level;
+                            phase = (phase + step) % (2.0 * std::f32::consts::PI);
+                            frame.iter_mut().for_each(|x| *x = v);
+                        }
+                    },
+                    |e| eprintln!("output stream error: {e}"),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            s.play().map_err(|e| e.to_string())?;
+            Some(s)
+        }
+    };
+
+    println!("device : {name}");
+    println!("format : {rate} Hz, {channels} ch");
+    match target {
+        Some(hz) => println!(
+            "target : {:.2} Hz ({})",
+            hz,
+            note_name(hz_to_midi(hz).round() as i32)
+        ),
+        None => println!("target : nearest note to whatever you sing"),
+    }
+    match play_tone {
+        true => println!(
+            "\nPlaying the target through the speakers for {secs} s. Sing nothing —\n\
+             the microphone just has to hear it. Level {level:.2} — turn the\n\
+             speakers up, or pass --tone=0.3, if it comes back patchy.\n"
+        ),
+        false => println!("\nSing, hum, whistle or play a steady note for {secs} s.\n"),
+    }
+    println!("   time    level   voiced   detected      note    error   clarity");
+    println!("  ──────────────────────────────────────────────────────────────");
+
+    let start = Instant::now();
+    let mut all: Vec<PitchFrame> = Vec::new();
+    let mut window: Vec<PitchFrame> = Vec::new();
+    let mut last_line = Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        while let Ok(f) = frames_rx.pop() {
+            all.push(f);
+            window.push(f);
+        }
+        if last_line.elapsed() >= Duration::from_millis(500) {
+            last_line = Instant::now();
+            let voiced: Vec<f32> = window.iter().filter(|f| f.voiced).map(|f| f.hz).collect();
+            let frac = match window.is_empty() {
+                true => 0.0,
+                false => voiced.len() as f32 / window.len() as f32,
+            };
+            // RMS rides on every frame, voiced or not, so the level is known
+            // even when nothing is detected — which is the whole difference
+            // between "nothing reached the microphone" and "something did and
+            // the detector rejected it".
+            let level_db = dbfs(median(&window.iter().map(|f| f.rms).collect::<Vec<_>>()));
+            if voiced.is_empty() {
+                println!(
+                    "  {:5.1}s  {:6.1}   {:5.0}%          —         —        —         —",
+                    start.elapsed().as_secs_f32(),
+                    level_db,
+                    frac * 100.0
+                );
+            } else {
+                let hz = median(&voiced);
+                let midi = hz_to_midi(hz);
+                let near = midi.round() as i32;
+                let cents = cents_between(hz, midi_to_hz(near as f32));
+                let clarity = median(
+                    &window
+                        .iter()
+                        .filter(|f| f.voiced)
+                        .map(|f| f.clarity)
+                        .collect::<Vec<_>>(),
+                );
+                println!(
+                    "  {:5.1}s  {:6.1}   {:5.0}%   {:8.2} Hz   {:>5}   {:+6.1}¢    {:5.2}",
+                    start.elapsed().as_secs_f32(),
+                    level_db,
+                    frac * 100.0,
+                    hz,
+                    note_name(near),
+                    cents,
+                    clarity
+                );
+            }
+            window.clear();
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stream);
+    drop(out_stream);
+
+    let voiced: Vec<&PitchFrame> = all.iter().filter(|f| f.voiced).collect();
+    println!("\n  ── summary ──────────────────────────────────────────");
+    println!(
+        "  frames          {} ({:.0} Hz)",
+        all.len(),
+        all.len() as f32 / secs as f32
+    );
+    if all.is_empty() {
+        println!("\n  Nothing arrived. The device opened but produced no frames.");
+        return Ok(());
+    }
+    let rmss: Vec<f32> = all.iter().map(|f| f.rms).collect();
+    let peak = rmss.iter().cloned().fold(0.0, f32::max);
+    println!(
+        "  level           median {:.1} dBFS, peak {:.1} dBFS",
+        dbfs(median(&rmss)),
+        dbfs(peak)
+    );
+    println!(
+        "  voiced          {} ({:.1}%)",
+        voiced.len(),
+        100.0 * voiced.len() as f32 / all.len() as f32
+    );
+
+    // Two failure modes that look identical in the voiced count alone. The
+    // gate's own absolute floor (`RMS_GATE_FLOOR`, 1e-4 == -80 dBFS) is the
+    // line that separates them.
+    if voiced.len() * 20 < all.len() {
+        println!();
+        if peak < 1e-4 {
+            println!("  Almost nothing was VOICED, and almost nothing ARRIVED: the peak");
+            println!("  level is under the gate's own floor (-80 dBFS). The microphone");
+            println!("  did not hear you. Check the input device, its gain, and whether");
+            println!("  something else holds the device open.");
+        } else if peak < 3e-3 {
+            println!(
+                "  Sound arrived but stayed quiet (peak {:.1} dBFS). The RMS gate is",
+                dbfs(peak)
+            );
+            println!("  relative to a decaying maximum, so a signal this close to the");
+            println!("  noise floor is gated out on purpose. Move closer or raise the gain.");
+        } else {
+            println!(
+                "  Sound ARRIVED at a usable level (peak {:.1} dBFS) but was not",
+                dbfs(peak)
+            );
+            println!("  judged periodic — the clarity threshold rejecting a breathy or");
+            println!("  noisy signal. That is the case worth looking at properly.");
+        }
+    }
+    if voiced.is_empty() {
+        return Ok(());
+    }
+
+    let hzs: Vec<f32> = voiced.iter().map(|f| f.hz).collect();
+    let med = median(&hzs);
+
+    // How far the voiced pitch ranged. A held note stays inside a couple of
+    // hundred cents; a glissando does not, and against a glissando any
+    // statistic relative to ONE target note measures "how much of the time
+    // were you elsewhere" — a real number that answers no question anyone
+    // asked. So the fixed-target block below is printed only when the run
+    // was actually steady, and the nearest-note block always is.
+    let midis: Vec<f32> = voiced.iter().map(|f| f.midi).collect();
+    let lo = midis.iter().cloned().fold(f32::MAX, f32::min);
+    let hi = midis.iter().cloned().fold(f32::MIN, f32::max);
+    let span_cents = (hi - lo) * 100.0;
+    let steady = span_cents <= 150.0;
+
+    // Time from the first voiced frame to the last: the part of the run
+    // where you were actually making a sound. Leading silence while you
+    // reach for the microphone should not read as a detector failure.
+    let first = all.iter().position(|f| f.voiced).unwrap_or(0);
+    let last = all.iter().rposition(|f| f.voiced).unwrap_or(0);
+    let singing = &all[first..=last];
+    let voiced_singing = singing.iter().filter(|f| f.voiced).count();
+
+    println!(
+        "  voiced (singing) {} of {} ({:.1}%) — from first sound to last",
+        voiced_singing,
+        singing.len(),
+        100.0 * voiced_singing as f32 / singing.len() as f32
+    );
+    println!(
+        "  range           {:.2}..{:.2} Hz  ({} .. {}, {:.0}¢ wide)",
+        hzs.iter().cloned().fold(f32::MAX, f32::min),
+        hzs.iter().cloned().fold(f32::MIN, f32::max),
+        note_name(lo.round() as i32),
+        note_name(hi.round() as i32),
+        span_cents
+    );
+    println!(
+        "  median pitch    {:.2} Hz  ({}, {:+.1}¢)",
+        med,
+        note_name(hz_to_midi(med).round() as i32),
+        cents_between(med, midi_to_hz(hz_to_midi(med).round()))
+    );
+
+    // How steadily the detector held its reading through the longest
+    // unbroken voiced stretch. THIS is the number that answers "does it
+    // follow me" for someone who cannot hit a pitch: it measures the
+    // detector against itself, so sitting 40 cents flat of every note in
+    // equal temperament costs nothing. Median absolute deviation from that
+    // stretch's own median.
+    let mut best: (usize, usize) = (0, 0);
+    let mut run_start = None;
+    for (i, f) in all.iter().enumerate() {
+        match (f.voiced, run_start) {
+            (true, None) => run_start = Some(i),
+            (false, Some(st)) => {
+                if i - st > best.1 - best.0 {
+                    best = (st, i);
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(st) = run_start {
+        if all.len() - st > best.1 - best.0 {
+            best = (st, all.len());
+        }
+    }
+    if best.1 > best.0 {
+        let run: Vec<f32> = all[best.0..best.1].iter().map(|f| f.midi).collect();
+        let mid = median(&run);
+        let dev: Vec<f32> = run.iter().map(|m| (m - mid).abs() * 100.0).collect();
+        println!(
+            "  steadiest run   {:.1} s, jitter median {:.1} cents, worst {:.1}",
+            run.len() as f32 / 100.0,
+            median(&dev),
+            dev.iter().cloned().fold(0.0, f32::max)
+        );
+    }
+
+    // Tuning accuracy that does not care WHAT you sang: how far each frame
+    // sits from the nearest semitone. Meaningful for a slide as well as a
+    // held note — but it saturates near 50 cents for anyone sitting midway
+    // between two semitones, which is not a detector fault and is why the
+    // jitter above is the better read of "is it tracking me".
+    let near: Vec<f32> = voiced
+        .iter()
+        .map(|f| cents_between(f.hz, midi_to_hz(f.midi.round())))
+        .collect();
+    let near_abs: Vec<f32> = near.iter().map(|c| c.abs()).collect();
+    println!(
+        "  to nearest note median {:.1}¢, worst {:.1}¢",
+        median(&near_abs),
+        near_abs.iter().cloned().fold(0.0, f32::max)
+    );
+
+    match (steady, target) {
+        (true, _) => {
+            let ref_hz = target.unwrap_or_else(|| midi_to_hz(hz_to_midi(med).round()));
+            let errs: Vec<f32> = hzs.iter().map(|h| cents_between(*h, ref_hz)).collect();
+            let abs: Vec<f32> = errs.iter().map(|c| c.abs()).collect();
+            let mean = errs.iter().sum::<f32>() / errs.len() as f32;
+            let within = |c: f32| abs.iter().filter(|e| **e <= c).count() as f32 / abs.len() as f32;
+            println!(
+                "  reference       {:.2} Hz  ({})",
+                ref_hz,
+                note_name(hz_to_midi(ref_hz).round() as i32)
+            );
+            println!(
+                "  error           mean {mean:+.1}¢, median {:+.1}¢",
+                median(&errs)
+            );
+            println!(
+                "  |error|         median {:.1}¢, worst {:.1}¢",
+                median(&abs),
+                abs.iter().cloned().fold(0.0, f32::max)
+            );
+            println!(
+                "  within          {:.0}% ≤ 25¢, {:.0}% ≤ 50¢",
+                within(25.0) * 100.0,
+                within(50.0) * 100.0
+            );
+        }
+        (false, Some(_)) => {
+            println!("  reference       skipped — the pitch moved {span_cents:.0}¢, so error");
+            println!("                  against one target note would only measure how");
+            println!("                  long you spent away from it. Hold a note to get it.");
+        }
+        (false, None) => {}
+    }
+    println!(
+        "  clarity         median {:.2}",
+        median(&voiced.iter().map(|f| f.clarity).collect::<Vec<_>>())
+    );
+    Ok(())
+}

@@ -56,10 +56,24 @@ whichever client config holds the token) after the restart — the old token
 stops working the moment the new one is generated. Full client setup:
 [docs/mcp-usage.md](docs/mcp-usage.md).
 
+## Checking the pitch detector
+
+```sh
+cargo run --manifest-path src-tauri/Cargo.toml --example pitch_check -- 15 A3 --tone=0.35
+cargo run --manifest-path src-tauri/Cargo.toml --example pitch_check -- 15   # sing/hum/whistle instead
+```
+
+Opens the default capture device and runs the live pitch chain — the same
+`PitchTap` the audio callback drives and the same `PitchWorker` the engine
+spawns — printing input level, detected pitch, cents error, voiced fraction
+and clarity. `--tone` plays the target out of the speakers so nothing has to
+be sung, which is the only way to measure the *detector* rather than the
+singer. It does not exercise the Tauri command layer.
+
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 1002 tests (966 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after HostForward insert restore)
+cd src-tauri && cargo test   # 1018 tests (982 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after HostForward insert restore + the pitch worker thread)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
