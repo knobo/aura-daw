@@ -267,6 +267,38 @@ pub enum Op {
         id: String,
         map: Option<crate::midi::launch::LaunchMap>,
     },
+    /// Plan G1: append/insert one insert-FX slot on a track. Inverse is
+    /// `InsertRemove` with store-truth index. Additive; does not bump
+    /// `OP_FORMAT_VERSION`.
+    InsertAdd {
+        track_id: crate::ids::TrackId,
+        slot: crate::audio::types::InsertSlot,
+        index: usize,
+    },
+    /// Plan G1: remove one insert-FX slot by `slot.id` (store truth wins
+    /// over advisory `index`). Inverse is `InsertAdd` at the store-truth
+    /// position.
+    InsertRemove {
+        track_id: crate::ids::TrackId,
+        slot: crate::audio::types::InsertSlot,
+        index: usize,
+    },
+    /// Plan G1: move one slot on a track. `from` is advisory; store truth
+    /// is the current position of `slot_id`. Inverse swaps the applied
+    /// `from`/`to` so undo restores order.
+    InsertReorder {
+        track_id: crate::ids::TrackId,
+        slot_id: String,
+        from: usize,
+        to: usize,
+    },
+    /// Plan G1: set a slot's bypass flag (rebuild in G1 — G-5). Inverse
+    /// carries the previous store-truth bool.
+    InsertSetBypass {
+        track_id: crate::ids::TrackId,
+        slot_id: String,
+        bypassed: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

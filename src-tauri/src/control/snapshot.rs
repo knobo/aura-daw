@@ -137,7 +137,9 @@ impl ChangeSet {
     /// · MidiClipAdd/MidiClipRemove→midi_structure
     /// · MidiSetNotes{clip,..}→midi_clips.insert(clip)
     /// · LaunchBindingSet/LaunchDriveSet/LaunchMapSet→launch_maps
-    /// · AutomationSetLane→automation · PluginAdd/PluginRemove/PluginSetState→plugins
+    /// · AutomationSetLane→automation · PluginAdd/PluginSetState→plugins
+    /// · PluginRemove→plugins+tracks (G-10 insert sweep)
+    /// · InsertAdd/Remove/Reorder/SetBypass→tracks
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
         for op in ops {
@@ -195,8 +197,18 @@ impl ChangeSet {
                     cs.modulation = true;
                     cs.automation = true; // sync_derived_lanes rewrites lanes
                 }
-                Op::PluginAdd { .. } | Op::PluginRemove { .. } | Op::PluginSetState { .. } => {
-                    cs.plugins = true
+                Op::PluginAdd { .. } | Op::PluginSetState { .. } => cs.plugins = true,
+                // G-10: PluginRemove also sweeps insert slots off TrackState.
+                Op::PluginRemove { .. } => {
+                    cs.plugins = true;
+                    cs.tracks = true;
+                }
+                // Plan G1: insert list lives on TrackState (not PluginDoc).
+                Op::InsertAdd { .. }
+                | Op::InsertRemove { .. }
+                | Op::InsertReorder { .. }
+                | Op::InsertSetBypass { .. } => {
+                    cs.tracks = true;
                 }
             }
         }
@@ -760,13 +772,44 @@ mod tests {
         assert_eq!(c, ChangeSet { modulation: true, automation: true, ..Default::default() });
         let c = cs(&[Op::AutomationClipSet { key: "acl-x".into(), clip: None }]);
         assert_eq!(c, ChangeSet { modulation: true, automation: true, ..Default::default() });
-        // PluginAdd / PluginRemove / PluginSetState → plugins
+        // PluginAdd / PluginSetState → plugins; PluginRemove also tracks (G-10)
         let c = cs(&[Op::PluginAdd { row: row.clone(), index: 0 }]);
         assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });
         let c = cs(&[Op::PluginRemove { row, index: 0, state: None, params: vec![] }]);
-        assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });
+        assert_eq!(c, ChangeSet { plugins: true, tracks: true, ..Default::default() });
         let c = cs(&[Op::PluginSetState { instance: "p-x".into(), state: vec![1] }]);
         assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });
+        // Plan G1 insert ops → tracks (membership is on TrackState)
+        let slot = crate::audio::types::InsertSlot {
+            id: "s-x".into(),
+            instance_id: "p-x".into(),
+            bypassed: false,
+        };
+        let c = cs(&[Op::InsertAdd {
+            track_id: "t-x".into(),
+            slot: slot.clone(),
+            index: 0,
+        }]);
+        assert_eq!(c, ChangeSet { tracks: true, ..Default::default() });
+        let c = cs(&[Op::InsertRemove {
+            track_id: "t-x".into(),
+            slot,
+            index: 0,
+        }]);
+        assert_eq!(c, ChangeSet { tracks: true, ..Default::default() });
+        let c = cs(&[Op::InsertReorder {
+            track_id: "t-x".into(),
+            slot_id: "s-x".into(),
+            from: 1,
+            to: 0,
+        }]);
+        assert_eq!(c, ChangeSet { tracks: true, ..Default::default() });
+        let c = cs(&[Op::InsertSetBypass {
+            track_id: "t-x".into(),
+            slot_id: "s-x".into(),
+            bypassed: true,
+        }]);
+        assert_eq!(c, ChangeSet { tracks: true, ..Default::default() });
         // And the epoch path: `all()` re-derives everything, including every
         // clip's content (never trusts reuse-by-id across a document swap).
         assert!(ChangeSet::all().midi_clips_all);

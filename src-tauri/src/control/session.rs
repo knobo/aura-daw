@@ -1345,6 +1345,13 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                     session.plugins.dirty_state.remove(&removed.id);
                 }
             }
+            // G-10: a journal replay of PluginRemove alone must not leave a
+            // dangling instanceId on any track's insert list. Inverse shape
+            // is unchanged — slots are not restored by PluginAdd (G-7: the
+            // insert ops own membership; remove_track composes both).
+            for t in session.store.tracks.iter_mut() {
+                t.inserts.retain(|s| s.instance_id != removed.id);
+            }
             effect.host_forward.push(HostForward::Destroy { instance: removed.id.clone() });
             Ok(Op::PluginAdd { row: removed, index: pos })
         }
@@ -1565,6 +1572,133 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.persist.midi = true;
             effect.rebuild = true;
             Ok(Op::LaunchMapSet { id: id.clone(), map: previous })
+        }
+        // Plan G1: insert-FX membership on TrackState (G-1/G-4/G-7/G-8).
+        Op::InsertAdd { track_id, slot, index } => {
+            let track_idx = session
+                .store
+                .tracks
+                .iter()
+                .position(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            {
+                let track = &session.store.tracks[track_idx];
+                if track.kind != "audio" && track.kind != "midi" {
+                    return Err(format!(
+                        "inserts are only legal on audio|midi tracks, not {}",
+                        track.kind
+                    ));
+                }
+                if slot.id.is_empty() {
+                    return Err("insert slot id must not be empty".into());
+                }
+                if slot.instance_id.is_empty() {
+                    return Err("insert instance_id must not be empty".into());
+                }
+                if track.inserts.iter().any(|s| s.id == slot.id) {
+                    return Err(format!("duplicate insert slot id: {}", slot.id));
+                }
+            }
+            // G-7: one instance, one slot — anywhere in the session, including
+            // instrument binding `plugin:<id>`.
+            let as_instrument = format!("plugin:{}", slot.instance_id);
+            for t in &session.store.tracks {
+                if t.inserts.iter().any(|s| s.instance_id == slot.instance_id) {
+                    return Err(format!(
+                        "duplicate insert instance_id: {} already used as an insert",
+                        slot.instance_id
+                    ));
+                }
+                if t.instrument_id.as_deref() == Some(as_instrument.as_str()) {
+                    return Err(format!(
+                        "duplicate insert instance_id: {} already used as instrument",
+                        slot.instance_id
+                    ));
+                }
+            }
+            let track = &mut session.store.tracks[track_idx];
+            let idx = (*index).min(track.inserts.len());
+            track.inserts.insert(idx, slot.clone());
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::InsertRemove {
+                track_id: track_id.clone(),
+                slot: slot.clone(),
+                index: idx,
+            })
+        }
+        Op::InsertRemove { track_id, slot, .. } => {
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let pos = track
+                .inserts
+                .iter()
+                .position(|s| s.id == slot.id)
+                .ok_or_else(|| format!("unknown insert slot: {}", slot.id))?;
+            let removed = track.inserts.remove(pos);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::InsertAdd {
+                track_id: track_id.clone(),
+                slot: removed,
+                index: pos,
+            })
+        }
+        Op::InsertReorder { track_id, slot_id, to, .. } => {
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let from = track
+                .inserts
+                .iter()
+                .position(|s| &s.id == slot_id)
+                .ok_or_else(|| format!("unknown insert slot: {slot_id}"))?;
+            if track.inserts.is_empty() {
+                return Err(format!("unknown insert slot: {slot_id}"));
+            }
+            let dest = (*to).min(track.inserts.len() - 1);
+            if from != dest {
+                let slot = track.inserts.remove(from);
+                track.inserts.insert(dest, slot);
+            }
+            effect.rebuild = true;
+            effect.persist.project = true;
+            // Inverse swaps the applied from/to so undo restores order.
+            Ok(Op::InsertReorder {
+                track_id: track_id.clone(),
+                slot_id: slot_id.clone(),
+                from: dest,
+                to: from,
+            })
+        }
+        Op::InsertSetBypass { track_id, slot_id, bypassed } => {
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let slot = track
+                .inserts
+                .iter_mut()
+                .find(|s| &s.id == slot_id)
+                .ok_or_else(|| format!("unknown insert slot: {slot_id}"))?;
+            let previous = slot.bypassed;
+            slot.bypassed = *bypassed;
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::InsertSetBypass {
+                track_id: track_id.clone(),
+                slot_id: slot_id.clone(),
+                bypassed: previous,
+            })
         }
         _ => Err("op not yet supported".into()),
     }
@@ -3946,5 +4080,200 @@ mod tests {
             "and the published image carries it — a restore that skips the republish leaves 7 here",
         );
         assert_eq!(image.plugins.pending_state.get("p-1"), Some(&vec![0u8, 0, 0]));
+    }
+
+    // ---- Plan G1 Task 2: insert channel ops ----
+
+    fn slot(id: &str, instance: &str) -> crate::audio::types::InsertSlot {
+        crate::audio::types::InsertSlot {
+            id: id.into(),
+            instance_id: instance.into(),
+            bypassed: false,
+        }
+    }
+
+    /// Local wrappers so insert tests can say `commit` / `commit_err` while
+    /// the real door remains `Session::transact`.
+    fn commit(
+        m: &parking_lot::Mutex<Session>,
+        f: impl FnOnce(&mut Tx<'_>) -> Result<(), String>,
+    ) -> Committed {
+        Session::transact(m, TxMeta::user("test"), f).expect("commit should succeed")
+    }
+
+    fn commit_err(
+        m: &parking_lot::Mutex<Session>,
+        f: impl FnOnce(&mut Tx<'_>) -> Result<(), String>,
+    ) -> String {
+        match Session::transact(m, TxMeta::user("test"), f) {
+            Err(e) => e,
+            Ok(_) => panic!("commit should fail"),
+        }
+    }
+
+    #[test]
+    fn insert_add_appends_and_inverse_removes() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let c = commit(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: usize::MAX,
+            })
+        });
+        assert!(c.effect.rebuild, "REBUILD PIN: mixer reads inserts");
+        assert_eq!(m.lock().store.tracks[0].inserts[0].id, "s-1");
+        match &c.inverses[0] {
+            Op::InsertRemove { slot, .. } => assert_eq!(slot.id, "s-1"),
+            other => panic!("expected InsertRemove, got {other:?}"),
+        }
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(m.lock().store.tracks[0].inserts.is_empty(), "undo removes the slot");
+    }
+
+    #[test]
+    fn insert_add_rejects_unknown_track_duplicate_slot_and_automation_kind() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "nope".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        })
+        .contains("unknown track"));
+        commit(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        });
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-1", "p-2"),
+                index: 0,
+            })
+        })
+        .contains("duplicate"));
+        // automation track: same fixture, mutate kind (no second session type)
+        let m2 = parking_lot::Mutex::new(session_with_one_track("t-a"));
+        m2.lock().store.tracks[0].kind = "automation".into();
+        assert!(commit_err(&m2, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "t-a".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        })
+        .contains("automation"));
+    }
+
+    #[test]
+    fn insert_reorder_is_a_rebuild_and_undo_restores_order() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        commit(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-a", "p-a"),
+                index: 0,
+            })?;
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-b", "p-b"),
+                index: 1,
+            })
+        });
+        let c = commit(&m, |tx| {
+            tx.apply(Op::InsertReorder {
+                track_id: "t-1".into(),
+                slot_id: "s-b".into(),
+                from: 1,
+                to: 0,
+            })
+        });
+        let ids: Vec<String> =
+            m.lock().store.tracks[0].inserts.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, ["s-b", "s-a"]);
+        assert!(c.effect.rebuild);
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        let ids: Vec<String> =
+            m.lock().store.tracks[0].inserts.iter().map(|s| s.id.clone()).collect();
+        assert_eq!(ids, ["s-a", "s-b"], "undo restores order; slot ids unchanged");
+    }
+
+    #[test]
+    fn insert_set_bypass_is_a_rebuild_and_keeps_the_slot() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        commit(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        });
+        let c = commit(&m, |tx| {
+            tx.apply(Op::InsertSetBypass {
+                track_id: "t-1".into(),
+                slot_id: "s-1".into(),
+                bypassed: true,
+            })
+        });
+        assert!(m.lock().store.tracks[0].inserts[0].bypassed);
+        assert!(c.effect.rebuild, "G-5: bypass is a rebuild in G1");
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(!m.lock().store.tracks[0].inserts[0].bypassed);
+    }
+
+    #[test]
+    fn plugin_remove_sweeps_dangling_insert_slots() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        // Seed a plugin row so PluginRemove is legal.
+        commit(&m, |tx| {
+            tx.apply(Op::PluginAdd {
+                row: crate::plugins::PluginInstanceInfo {
+                    id: "p-1".into(),
+                    uid: "clap:/x.clap#fx".into(),
+                    name: "Fx".into(),
+                    format: "clap".into(),
+                    status: "stub".into(),
+                    track_id: Some("t-1".into()),
+                },
+                index: usize::MAX,
+            })?;
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        });
+        // Clone outside the tx — `transact` already holds the session mutex.
+        let row = m.lock().plugins.instances[0].clone();
+        commit(&m, |tx| {
+            tx.apply(Op::PluginRemove {
+                row,
+                index: 0,
+                state: None,
+                params: vec![],
+            })
+        });
+        assert!(
+            m.lock().store.tracks[0].inserts.is_empty(),
+            "G-10: PluginRemove must not leave a dangling instanceId"
+        );
+    }
+
+    #[test]
+    fn changeset_from_insert_ops_flags_tracks() {
+        use crate::control::snapshot::ChangeSet;
+        let add = Op::InsertAdd {
+            track_id: "t-1".into(),
+            slot: slot("s-1", "p-1"),
+            index: 0,
+        };
+        let cs = ChangeSet::from_ops(&[add]);
+        assert!(cs.tracks, "insert list is on TrackState");
+        assert!(!cs.plugins, "InsertAdd does not touch PluginDoc; PluginAdd beside it does");
     }
 }
