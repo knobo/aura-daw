@@ -199,8 +199,12 @@
       <button
         class="act mono"
         class:on={launch.marking}
-        title="Draw a new region — clips will not move while this is on"
-        onclick={() => launch.toggleMarking()}>MARK</button
+        aria-pressed={launch.marking}
+        title={launch.marking
+          ? "MARK is on — drag across lanes to draw a region. Click to turn off."
+          : "MARK is off — click to draw a new region (clips will not move)."}
+        onclick={() => launch.toggleMarking()}
+      >{launch.marking ? "MARK ON" : "MARK OFF"}</button
       >
       <button
         class="act mono"
@@ -359,9 +363,9 @@
     cursor: pointer;
   }
   .act.on {
-    color: var(--amber);
+    color: #1a1408;
     border-color: var(--amber);
-    background: rgba(255, 200, 87, 0.1);
+    background: var(--amber);
   }
   .act:disabled {
     opacity: 0.35;
