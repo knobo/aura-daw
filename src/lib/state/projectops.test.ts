@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LAST_PROJECT_KEY, readLastProjectDir, writeLastProjectDir } from "../utils/last-project";
+import { readLastProjectDir, readRecentProjectDirs, writeLastProjectDir } from "../utils/last-project";
 
 const invokes = {
   saveProject: vi.fn(() => Promise.resolve()),
@@ -87,6 +87,8 @@ beforeEach(() => {
   toasts.list = [];
   projectops.dialog = null;
   projectops.confirm = null;
+  projectops.pendingRecent = null;
+  projectops.recent = [];
   projectops.pickDirectory = async () => null;
   projectops.defaultParentDir = async () => "/home/u/Music/AURA";
   clipEditLoop.reset();
@@ -462,6 +464,76 @@ describe("remember / restore last project", () => {
 
     await projectops.restoreLast();
 
-    expect(storage.map.get(LAST_PROJECT_KEY)).toBe("/p/Gone.aura");
+    expect(readLastProjectDir()).toBe("/p/Gone.aura");
+  });
+
+  it("remembers a history of adopted dirs, newest first", async () => {
+    const snap = {
+      projectName: "Loaded",
+      transport: { sampleRate: 48000, tempoBpm: 120 },
+      tracks: [],
+      clips: [],
+      ppq: 960,
+      tempoEvents: [{ tick: 0, bpm: 120 }],
+      midiClips: [],
+    };
+    let dir = "/p/A.aura";
+    invokes.getProjectState.mockImplementation(() =>
+      Promise.resolve({ ...snap, projectDir: dir }),
+    );
+    projectops.pickDirectory = async () => "/p/A.aura";
+    await projectops.openViaPicker();
+    dir = "/p/B.aura";
+    projectops.pickDirectory = async () => "/p/B.aura";
+    await projectops.openViaPicker();
+
+    expect(readRecentProjectDirs()).toEqual(["/p/B.aura", "/p/A.aura"]);
+    expect(projectops.recent).toEqual(["/p/B.aura", "/p/A.aura"]);
+  });
+
+  it("requestOpenRecent opens that path and adopts it", async () => {
+    await projectops.requestOpenRecent("/p/Song.aura");
+
+    expect(invokes.openProject).toHaveBeenCalledWith("/p/Song.aura");
+    expect(invokes.getProjectState).toHaveBeenCalled();
+    expect(lastToast().title).toBe("PROJECT OPENED");
+  });
+
+  it("requestOpenRecent asks for confirmation when the session has content", () => {
+    midi.clips = [{ id: "mc" } as (typeof midi.clips)[number]];
+
+    void projectops.requestOpenRecent("/p/Song.aura");
+
+    expect(projectops.confirm).toBe("recent");
+    expect(projectops.pendingRecent).toBe("/p/Song.aura");
+    expect(invokes.openProject).not.toHaveBeenCalled();
+  });
+
+  it("proceedConfirmed opens the pending recent path", async () => {
+    midi.clips = [{ id: "mc" } as (typeof midi.clips)[number]];
+    void projectops.requestOpenRecent("/p/Song.aura");
+
+    await projectops.proceedConfirmed(false);
+
+    expect(invokes.openProject).toHaveBeenCalledWith("/p/Song.aura");
+    expect(projectops.confirm).toBeNull();
+    expect(projectops.pendingRecent).toBeNull();
+  });
+
+  it("requestOpenRecent is a no-op when that project is already open", async () => {
+    project.projectDir = "/p/Song.aura";
+
+    await projectops.requestOpenRecent("/p/Song.aura");
+
+    expect(invokes.openProject).not.toHaveBeenCalled();
+  });
+
+  it("refreshRecent loads stored history into the store", () => {
+    writeLastProjectDir("/p/A.aura");
+    writeLastProjectDir("/p/B.aura");
+
+    projectops.refreshRecent();
+
+    expect(projectops.recent).toEqual(["/p/B.aura", "/p/A.aura"]);
   });
 });
