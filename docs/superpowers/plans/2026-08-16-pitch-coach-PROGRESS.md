@@ -164,6 +164,13 @@ with the commit sha and anything the next agent would be surprised by.
   4. **`SAMPLE_RING_SLOTS` must hold one maximal chunk** (`a_maximal_chunk_always_fits`).
      Shrink it and any device the decimator upsamples from goes
      permanently dark instead of dropping a few frames.
+  5. **A dropped chunk owes the analyser a reset.** Dropping whole keeps
+     the two rings aligned; it does NOT keep the detector aligned, because
+     it carries most of an analysis frame across the hole and then
+     timestamps the splice at the new position. Found by rewriting the
+     alignment test to feed a staircase instead of a steady tone — against
+     a steady tone a desync is invisible, which is why the first version of
+     that test passed while the bug was there.
 - 2026-08-16 — PR #49 review merge-blockers fixed (Issues 1–5, 8). Failed
   take-start restores the listen hub; listen-only capture no longer pushes
   `base_slot == 0` meter blocks; NaN on the capture path is unvoiced (no
