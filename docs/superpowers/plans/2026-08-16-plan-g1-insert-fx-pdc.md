@@ -77,7 +77,7 @@ Recorded up front so a task implementer does not re-litigate them. Same job Plan
 
 # Phase G1a — Document + channel
 
-## Task 1: InsertSlot on TrackState
+## Task 1: InsertSlot on TrackState — LANDED PR #52 (`5c338ff`)
 
 **Files:**
 - Modify: `src-tauri/src/audio/types.rs` (`InsertSlot`, `TrackState.inserts`, `testutil::test_track`)
@@ -104,7 +104,7 @@ pub struct InsertSlot {
 pub inserts: Vec<InsertSlot>,
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `src-tauri/src/audio/types.rs`:
 
@@ -153,12 +153,12 @@ mod insert_slot_tests {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [x] **Step 2: Run the test to verify it fails**
 
 Run: `cd src-tauri && cargo test audio::types::insert_slot_tests`
 Expected: FAIL — `InsertSlot` does not exist / `TrackState` has no `inserts`.
 
-- [ ] **Step 3: Write the implementation**
+- [x] **Step 3: Write the implementation**
 
 Add `InsertSlot` next to `TrackState` in `types.rs`. Add the field with the serde attrs above. Put `inserts: Vec::new()` on **every** struct literal the compiler names — do not add `Default` to `TrackState` to hide missing fields. Update `testutil::test_track` so new tests inherit an empty list.
 
@@ -182,12 +182,12 @@ In `track-state.schema.json` add (not required, so old files validate):
 
 Do not add `instrumentId` to the schema in this task (it is already a known additive gap).
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cd src-tauri && cargo test`
 Expected: PASS — baseline plus the three new tests. Every `TrackState {` site compiles.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src-tauri/src src-tauri/tests docs/ipc-schemas/track-state.schema.json

@@ -17,13 +17,9 @@ documentation and all commits are English.
 
 | | |
 |---|---|
-| Worktree | `/home/knobo/prog/dav/.claude/worktrees/pitch-coach` |
-| Branch | `feat/pitch-coach` |
-| Branched from | `origin/main` @ `6af46dd` (Plan F; rebased) |
-| PR | [#49](https://github.com/knobo/aura-daw/pull/49) |
-| Baseline at merge | 792 Rust tests pass, 440 frontend tests pass, 0 failures |
-
-Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
+| On `main` | squash `84b0313` (PR #49) |
+| Worktree | stale — `/home/knobo/prog/dav/.claude/worktrees/pitch-coach` |
+| Next | owner ear-check (R3), then Phase 2 from `origin/main` |
 
 ## Status
 

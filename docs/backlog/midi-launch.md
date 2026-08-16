@@ -1,6 +1,8 @@
 # MIDI launch map
 
-**v0.1 (PR #42, 2026-08-16) is the shipped cut.** Mark regions or clips,
+**v0.1 is on `main`** (PR #42 squash `92f0d03`, follow-up PR #50
+`1b38821`: play-from-0, overlay all-notes-off, Delete only on the
+panel). Mark regions or clips,
 bind them to notes, fire them from hardware or from a MIDI clip that
 *uses* a named launcher. Drive playback does not steal the arrangement
 loop or playhead (shadow playhead). GATE vs ONE-SHOT per launcher.
@@ -35,5 +37,5 @@ playheads (small fixed cap, not one `launch_pos`), mixer sums launched
 tracks at each voice's position. Cut-off when the cap is hit: oldest
 voice dies first. Hardware pads and drive clips share the same mode.
 
-Do **not** start this until v0.1 is on `main` and has been used for a
-bit. The single-voice overlay is the whole of the current engine hook.
+Do **not** start this until v0.1 has been used for a bit. The
+single-voice overlay is the whole of the current engine hook.
