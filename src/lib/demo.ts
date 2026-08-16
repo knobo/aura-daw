@@ -36,6 +36,8 @@ import {
   type PluginListResult,
   type PluginParamChange,
   type PluginParamInfo,
+  type PitchFrame,
+  type PitchFrameBatch,
   type Project,
   type ProjectSnapshot,
   type SidecarEvent,
@@ -456,6 +458,14 @@ export class DemoBackend implements Backend {
 
   private meterSubs = new Set<(f: MeterFrame) => void>();
   private meterTimer: ReturnType<typeof setInterval> | null = null;
+
+  // pitch coach (browser mock — see the "pitch coach" section below)
+  private pitchSubs = new Set<(b: PitchFrameBatch) => void>();
+  private pitchTimer: ReturnType<typeof setInterval> | null = null;
+  private pitchListening = false;
+  private pitchRehearseHold = false;
+  private pitchReferenceTrackId: string | null = null;
+  private pitchNextSample = 0;
   private meterSeq = 0;
 
   private jobs = new Map<string, DemoJob>();
@@ -1235,6 +1245,90 @@ export class DemoBackend implements Backend {
       },
     };
     for (const cb of this.meterSubs) cb(frame);
+  }
+
+  // ── pitch coach ──
+  //
+  // The browser has no microphone here (all audio is Rust — ADR 0006), so
+  // this synthesizes a singer: a slowly wandering pitch with vibrato and
+  // breath gaps, timestamped like the real backend. It exists so the lane
+  // can be developed under `vite dev`; it is NOT a detector, and nothing
+  // about its accuracy says anything about the real one.
+
+  async pitchListenStart(): Promise<void> {
+    this.pitchListening = true;
+    this.pitchNextSample = Math.max(0, Math.round(this.position()));
+    if (!this.pitchTimer) this.pitchTimer = setInterval(() => this.tickPitch(), 1000 / 60);
+    this.emitPitchState();
+  }
+
+  async pitchListenStop(): Promise<void> {
+    this.pitchListening = false;
+    if (this.pitchTimer) {
+      clearInterval(this.pitchTimer);
+      this.pitchTimer = null;
+    }
+    this.emitPitchState();
+  }
+
+  async subscribePitch(onBatch: (b: PitchFrameBatch) => void): Promise<Unsubscribe> {
+    this.pitchSubs.add(onBatch);
+    return () => {
+      this.pitchSubs.delete(onBatch);
+    };
+  }
+
+  async setRehearseHold(enabled: boolean): Promise<void> {
+    this.pitchRehearseHold = enabled;
+    this.emitPitchState();
+  }
+
+  async pitchSetReference(trackId: string | null): Promise<void> {
+    this.pitchReferenceTrackId = trackId;
+    this.emitPitchState();
+  }
+
+  private emitPitchState() {
+    this.emit("pitch://state", {
+      listening: this.pitchListening,
+      rehearseHold: this.pitchRehearseHold,
+      referenceTrackId: this.pitchReferenceTrackId,
+      deviceRate: this.pitchListening ? SR : 0,
+    });
+  }
+
+  private tickPitch() {
+    const hop = Math.round(SR / 100); // 10 ms, the real frame rate
+    // While rolling, the frames follow the transport; while stopped, they
+    // keep advancing on their own so tuner mode still has something to
+    // draw. Either way a wild jump re-anchors instead of emitting a burst.
+    const end = this.tState === "stopped" ? this.pitchNextSample + hop * 6 : Math.round(this.position());
+    if (end < this.pitchNextSample || end - this.pitchNextSample > SR) this.pitchNextSample = end;
+
+    const frames: PitchFrame[] = [];
+    for (; this.pitchNextSample <= end; this.pitchNextSample += hop) {
+      const t = this.pitchNextSample / SR;
+      // A2-ish drift with vibrato: the wobble the lane has to survive.
+      const midi = 57 + 2.5 * Math.sin(t * 0.7) + 0.35 * Math.sin(t * 5.5);
+      // Breaths: roughly one gap every few seconds, ~250 ms long.
+      const voiced = noise(0x51ce, Math.floor(t * 4)) > 0.18;
+      frames.push({
+        sample: this.pitchNextSample,
+        hz: voiced ? 440 * Math.pow(2, (midi - 69) / 12) : 0,
+        midi: voiced ? midi : 0,
+        clarity: voiced ? 0.93 : 0.1,
+        rms: voiced ? 0.18 : 0.002,
+        voiced,
+      });
+    }
+
+    const batch: PitchFrameBatch = {
+      frames,
+      deviceRate: SR,
+      listening: this.pitchListening,
+      rehearseHold: this.pitchRehearseHold,
+    };
+    for (const cb of this.pitchSubs) cb(batch);
   }
 
   // ── waveform tiles (AWTF wire format) ──
