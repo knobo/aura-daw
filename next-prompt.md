@@ -7,36 +7,38 @@ snapshots, the journal reader, the version graph, or `engine::rebuild`.
 Branch `plan-f-history` is **kept** so task SHAs cited in the handoff
 still resolve.
 
-## Plan G1 — plan written; implement it; do not start G2
+## Plan G1 — Task 1 landed; continue at Task 2
 
 The G1 implementation plan is
 **`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`**
-(product decision: `docs/backlog/insert-fx-sends-sidechain.md`). It is
-insert FX chains + PDC only: per-track ordered insert list, lift
-`isInstrument` for insert slots, mixer walk source→inserts→fader, bypass,
-PDC in the same slice, offline bounce on the same schedule.
+(product decision: `docs/backlog/insert-fx-sends-sidechain.md`).
+Insert FX chains + PDC only. Do **not** start G2/G3/G4. Do not write a
+stock FX suite. Do not bump `OP_FORMAT_VERSION`.
 
-Implement G1 from that plan (subagent-driven, task-by-task). Do **not**
-start G2 (bus+sends), G3 (sidechain), or G4 (envelope-follower). Do not
-write a stock FX suite. Do not bump `OP_FORMAT_VERSION`.
+**Task 1 is MERGED** (`5c338ff`, PR #52): `InsertSlot` on
+`TrackState.inserts`, empty-default for pre-G1 files. **Next: Task 2**
+— channel ops (`InsertAdd`/`Remove`/`Reorder`/`Bypass`), `apply_raw`,
+`ChangeSet`. Branch from `origin/main`. Subagent-driven, task-by-task.
 
-Pitch Coach **phase 1** (YIN, InputHub, listen/rehearse commands) is
-**merged** (`84b0313`, PR #49). Owner checkpoint before any panel: listen,
-sing a known pitch, read the frames. Phase 2 is the panel; phase 3 is scoring.
+Pitch Coach **phase 1** is **merged** (`84b0313`, PR #49). Owner
+checkpoint before any panel (spec R3): listen, sing a known pitch, read
+the frames. Phase 2 is the panel; phase 3 is scoring. Progress:
+`docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md`.
+
+Also landed this session (do not restart): **#47** gesture tokens,
+**#48** external audio editor, **#42** + **#50** MIDI launch v0.1
+(hardware GATE and sustain still open — `docs/backlog/midi-launch.md`).
 
 The five parallel tracks (A–E / F) are all landed. What remains is
 named below: owner ear-checks, Plan F carry-forwards, Track D/B leftovers,
-modulation design §8, and **implementing Plan G1**. Do not re-open a closed
+modulation design §8, and **G1 from Task 2**. Do not re-open a closed
 Plan F item. Do not start G2.
 
-**In flight — do not start these, other agents own them:**
-- `feat/external-audio-editor` (worktree; double-click-to-open landed as
-  PR #48 — check that worktree before overlapping).
-- Plan G1 implementation (this file's current job once the plan PR
-  merges). Do **not** start G2.
+**Nothing is in flight.** No open PRs at handoff. Stale worktrees for
+merged branches can be ignored.
 
-Read this file, then pick a leftover and do the work. Reply to the user
-in Norwegian — they write Norwegian; the repo documentation is English.
+Read this file, then continue G1 Task 2. Reply to the user in Norwegian
+— they write Norwegian; the repo documentation is English.
 
 ## Track F (modulation system) — LANDED; path to the finished system
 
@@ -155,7 +157,7 @@ unowned notes are M-8 and owner ear-checks — read the report first):
   value. Intended scope (automation overrides the knob), but say so
   plainly.
 - ~~**`gesture_end` has no id — it closes whatever is open.**~~ →
-  **closed on `fix/gesture-end-id`**: `gesture_begin` returns the
+  **closed by PR #47** (`a93cfa7`): `gesture_begin` returns the
   gesture's run id; `gesture_end(id)` no-ops on mismatch (omitting `id`
   keeps the old close-whatever contract). Async callers (plugin knobs,
   library stamp, lane/envelope delete+commit, clip-drag, faders, tempo)
