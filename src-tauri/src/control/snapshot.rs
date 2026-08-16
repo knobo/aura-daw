@@ -593,7 +593,7 @@ mod tests {
         let c = cs(&[set(ObjectRef::Plugin("p-x".into()), PropPath::Param { index: 0 })]);
         assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });
         // TrackAdd / TrackRemove → tracks + clips
-        let c = cs(&[Op::TrackAdd { track: t.clone(), index: 0, clips: vec![], clip_indices: vec![] }]);
+        let c = cs(&[Op::TrackAdd { track: t.clone(), index: 0, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] }]);
         assert_eq!(c, ChangeSet { tracks: true, clips: true, ..Default::default() });
         let c = cs(&[Op::TrackRemove { track: t, index: 0, clips: vec![], clip_indices: vec![] }]);
         assert_eq!(c, ChangeSet { tracks: true, clips: true, ..Default::default() });

@@ -1071,7 +1071,7 @@ mod tests {
         };
         let cases: Vec<(Op, Vec<&str>)> = vec![
             (
-                Op::TrackAdd { track: track("t-x"), index: 0, clips: vec![clip.clone()], clip_indices: vec![0] },
+                Op::TrackAdd { track: track("t-x"), index: 0, clips: vec![clip.clone()], clip_indices: vec![0], automation_clips: vec![], bindings: vec![] },
                 vec!["t-x", "c-x"],
             ),
             (

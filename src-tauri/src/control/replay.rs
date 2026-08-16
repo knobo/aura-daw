@@ -1138,6 +1138,8 @@ mod tests {
             index,
             clips: vec![],
             clip_indices: vec![],
+            automation_clips: vec![],
+            bindings: vec![],
         };
         let batch = |rev: u64, label: &str, ops: Vec<Op>| JournalRecord::Batch {
             v: OP_FORMAT_VERSION,

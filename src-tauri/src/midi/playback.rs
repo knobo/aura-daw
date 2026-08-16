@@ -541,13 +541,13 @@ mod tests {
         ]);
         let overridden = midi.clips[1].id.to_string();
 
-        let all = track_events(&midi, "m1", &TempoMap::from_v1(120.0, 48_000).unwrap());
+        let all = track_events(midi.clips.iter(), "m1", &TempoMap::from_v1(120.0, 48_000).unwrap());
         assert!(all.iter().any(|e| e.key == 60), "both clips present without exclusion");
         assert!(all.iter().any(|e| e.key == 62));
 
         let mut exclude = HashSet::new();
         exclude.insert(overridden);
-        let filtered = track_events_excluding(&midi, "m1", &exclude, &TempoMap::from_v1(120.0, 48_000).unwrap());
+        let filtered = track_events_excluding(midi.clips.iter(), "m1", &exclude, &TempoMap::from_v1(120.0, 48_000).unwrap());
         assert!(filtered.iter().any(|e| e.key == 60), "the non-overridden clip's notes still come through");
         assert!(!filtered.iter().any(|e| e.key == 62), "the overridden clip's notes are excluded");
     }
