@@ -1,0 +1,59 @@
+name: Tests
+
+on:
+  pull_request:
+
+jobs:
+  frontend:
+    name: Frontend (vitest, svelte-check, build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Unit tests (vitest)
+        run: npm test
+
+      - name: Type check (svelte-check)
+        run: npx svelte-check --tsconfig ./tsconfig.json
+
+      - name: Production build
+        run: npm run build
+
+  rust:
+    name: Rust (cargo test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libasound2-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev liblilv-dev ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: cargo test
+        working-directory: src-tauri
+        # --test-threads=1: several midi_out tests spawn real background
+        # threads and race under default parallel execution (flaky locally
+        # too, independent of CI) — see docs/backlog/ci-hardening.md.
+        # --skip: these two need a real ALSA sequencer device
+        # (/dev/snd/seq), which this runner doesn't have — see the same doc.
+        run: |
+          cargo test --locked -- --test-threads=1 \
+            --skip select_nonexistent_port_is_graceful_err \
+            --skip opening_a_nonexistent_output_port_is_a_graceful_error
