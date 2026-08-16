@@ -30,6 +30,8 @@ class LaunchStore {
   learningId = $state<string | null>(null);
   /** Draw a new region on the timeline; clips stop capturing the pointer. */
   marking = $state(false);
+  /** Drive-clip scene currently sounding on the shadow playhead. */
+  overlay = $state<{ id: string; name: string } | null>(null);
   error = $state<string | null>(null);
 
   get activeMap(): LaunchMap {
@@ -85,9 +87,14 @@ class LaunchStore {
       this.accept(snap);
     });
     backend.on?.("launch://fired", (ev: LaunchFired) => {
-      // A drive clip jumps the playhead to the scene. Keep the viewport
-      // on the clip so editing does not follow that seek.
-      if (!ev.followView) view.follow = false;
+      if (ev.origin === "drive") {
+        this.overlay = { id: ev.id, name: ev.name };
+      } else {
+        this.overlay = null;
+      }
+    });
+    backend.on?.("transport://state", (s) => {
+      if (s.state === "stopped") this.overlay = null;
     });
     // Undo/open go through project://changed, not launch://changed.
     backend.on?.("project://changed", () => {

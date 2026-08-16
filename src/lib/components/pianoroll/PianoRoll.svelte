@@ -906,7 +906,7 @@
         }}
       >
         {#if usedLauncher}
-          ▶ {usedLauncher.name}
+          ▶ {launch.overlay ? `${usedLauncher.name} · playing ${launch.overlay.name}` : usedLauncher.name}
         {:else if pluginInst}
           ⚡ {pluginInst.name}
         {:else}

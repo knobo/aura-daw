@@ -24,6 +24,14 @@ pub const FLAG_SOLO: u32 = 1 << 1;
 /// track is soloed or this one is muted.
 pub const FLAG_LAUNCH: u32 = 1 << 2;
 
+/// One-shot shadow playhead for a drive-clip launch. Launched tracks
+/// render at `pos` instead of the arrangement playhead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchPlayhead {
+    pub pos: u64,
+    pub discontinuity: bool,
+}
+
 /// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
 /// legitimate park target, so absence needs a value outside the timeline.)
 pub const NO_PARK: u64 = u64::MAX;
@@ -89,6 +97,13 @@ pub struct SharedRt {
     pub countin_beat: AtomicU64,
     /// Beats in the bar the count-in started in (for downbeat accents).
     pub countin_beats_per_bar: AtomicU32,
+    /// Shadow playhead for a drive-clip launch. The main transport (loop,
+    /// seek, FOLLOW) is left alone; launched tracks render at `launch_pos`.
+    pub launch_on: AtomicBool,
+    pub launch_pos: AtomicU64,
+    pub launch_start: AtomicU64,
+    pub launch_end: AtomicU64,
+    pub launch_discont: AtomicBool,
 }
 
 impl Default for SharedRt {
@@ -112,6 +127,11 @@ impl Default for SharedRt {
             countin_elapsed: AtomicU64::new(0),
             countin_beat: AtomicU64::new(0),
             countin_beats_per_bar: AtomicU32::new(4),
+            launch_on: AtomicBool::new(false),
+            launch_pos: AtomicU64::new(0),
+            launch_start: AtomicU64::new(0),
+            launch_end: AtomicU64::new(0),
+            launch_discont: AtomicBool::new(false),
         }
     }
 }
@@ -123,6 +143,44 @@ impl SharedRt {
             enabled: self.loop_enabled.load(Ordering::Relaxed),
             start: self.loop_start.load(Ordering::Relaxed),
             end: self.loop_end.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn arm_launch(&self, start: u64, end: u64) {
+        let end = end.max(start.saturating_add(1));
+        self.launch_start.store(start, Ordering::Relaxed);
+        self.launch_end.store(end, Ordering::Relaxed);
+        self.launch_pos.store(start, Ordering::Relaxed);
+        self.launch_discont.store(true, Ordering::Relaxed);
+        self.launch_on.store(true, Ordering::Relaxed);
+    }
+
+    pub fn clear_launch(&self) {
+        self.launch_on.store(false, Ordering::Relaxed);
+    }
+
+    pub fn launch_overlay(&self) -> Option<LaunchPlayhead> {
+        if !self.launch_on.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(LaunchPlayhead {
+            pos: self.launch_pos.load(Ordering::Relaxed),
+            discontinuity: self.launch_discont.swap(false, Ordering::Relaxed),
+        })
+    }
+
+    pub fn advance_launch(&self, frames: u64) {
+        if !self.launch_on.load(Ordering::Relaxed) {
+            return;
+        }
+        let pos = self.launch_pos.load(Ordering::Relaxed);
+        let end = self.launch_end.load(Ordering::Relaxed);
+        let next = pos.saturating_add(frames);
+        if next >= end {
+            self.launch_on.store(false, Ordering::Relaxed);
+            self.launch_pos.store(end, Ordering::Relaxed);
+        } else {
+            self.launch_pos.store(next, Ordering::Relaxed);
         }
     }
 }

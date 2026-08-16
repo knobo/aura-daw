@@ -1622,10 +1622,20 @@ impl ControlPlane {
 
     pub fn clear_launch_audible(&self) {
         crate::midi::launch::runtime().clear_audible_tracks();
+        self.shared.clear_launch();
         let tables = self.tables.lock();
         for slot in 0..tables.params.len() {
             tables.params.set_flag(slot, FLAG_LAUNCH, false);
         }
+    }
+
+    pub fn arm_drive_launch(&self, track_ids: &[String], start: u64, end: u64) {
+        self.apply_launch_audible(track_ids);
+        self.shared.arm_launch(start, end);
+    }
+
+    pub fn clear_drive_overlay(&self) {
+        self.shared.clear_launch();
     }
 
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no

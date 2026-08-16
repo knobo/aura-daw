@@ -18,7 +18,9 @@ use std::sync::atomic::Ordering::Relaxed;
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::midi_in::{LiveMidiEvent, EV_ALL_OFF, EV_NOTE_ON};
-use super::rt::{RtClip, RtGraph, RtTrack, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
+use super::rt::{
+    LaunchPlayhead, RtClip, RtGraph, RtTrack, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK,
+};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
 use crate::plugins::automation::{value_at, AbsParamEvent, RampCursor};
@@ -301,7 +303,19 @@ pub fn render(
     discontinuity: bool,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
-    render_impl(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, None, None, meter_tx)
+    render_impl(
+        graph,
+        base_pos,
+        lp,
+        out,
+        out_ch,
+        sample_rate,
+        discontinuity,
+        None,
+        None,
+        None,
+        meter_tx,
+    )
 }
 
 /// Like [`render`], but carries the engine-global `steady_time` base for
@@ -334,6 +348,7 @@ pub fn render_rt(
         discontinuity,
         Some(steady_base),
         None,
+        None,
         meter_tx,
     )
 }
@@ -353,6 +368,23 @@ pub fn render_rt_with_input(
     live_in: Option<LiveInBlock<'_>>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
+    render_rt_launch(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, steady_base, live_in, None, meter_tx)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_rt_launch(
+    graph: &mut RtGraph,
+    base_pos: u64,
+    lp: &LoopSpec,
+    out: &mut [f32],
+    out_ch: usize,
+    sample_rate: u32,
+    discontinuity: bool,
+    steady_base: u64,
+    live_in: Option<LiveInBlock<'_>>,
+    launch: Option<LaunchPlayhead>,
+    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
+) -> u32 {
     render_impl(
         graph,
         base_pos,
@@ -363,6 +395,7 @@ pub fn render_rt_with_input(
         discontinuity,
         Some(steady_base),
         live_in,
+        launch,
         meter_tx,
     )
 }
@@ -378,6 +411,7 @@ fn render_impl(
     discontinuity: bool,
     steady_base: Option<u64>,
     live_in: Option<LiveInBlock<'_>>,
+    launch: Option<LaunchPlayhead>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
     let out_ch = out_ch.max(1);
@@ -410,12 +444,19 @@ fn render_impl(
         let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
+        let launching = flags & FLAG_LAUNCH != 0 && launch.is_some();
         let on = audible_with_launch(
             flags & FLAG_MUTE != 0,
             flags & FLAG_SOLO != 0,
             any_solo,
-            flags & FLAG_LAUNCH != 0,
+            launching,
         );
+        let (track_base, track_lp, track_disc) = if launching {
+            let ov = launch.unwrap();
+            (ov.pos, &LoopSpec::OFF, ov.discontinuity)
+        } else {
+            (base_pos, lp, discontinuity)
+        };
         let (gl_atomic, gr_atomic) = pan_gains(pan);
         let mut acc = TrackAccum::default();
 
@@ -437,8 +478,8 @@ fn render_impl(
         let pan_ramp = ramps.and_then(|t| t.pan.as_ref());
         let (gl0, gr0, gl1, gr1) = match pan_ramp {
             Some(events) if !events.is_empty() => {
-                let first = frame_pos(base_pos, 0, lp);
-                let last = frame_pos(base_pos, frames.saturating_sub(1) as u64, lp);
+                let first = frame_pos(track_base, 0, track_lp);
+                let last = frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp);
                 let p0 = value_at(events, first).unwrap_or(pan);
                 let p1 = value_at(events, last).unwrap_or(pan);
                 let (a, b) = (pan_gains(p0), pan_gains(p1));
@@ -450,7 +491,7 @@ fn render_impl(
 
         if !tr.clips.is_empty() {
             for i in 0..frames {
-                let pos = frame_pos(base_pos, i as u64, lp);
+                let pos = frame_pos(track_base, i as u64, track_lp);
                 let mut l = 0.0f32;
                 let mut r = 0.0f32;
                 for clip in &tr.clips {
@@ -475,13 +516,13 @@ fn render_impl(
         render_live(
             tr,
             scratch,
-            base_pos,
-            lp,
+            track_base,
+            track_lp,
             out,
             out_ch,
             frames,
             sample_rate,
-            discontinuity,
+            track_disc,
             steady_base,
             (gain, gl0, gr0, gl1, gr1, on),
             ramp,
@@ -715,6 +756,37 @@ mod tests {
         assert!(
             audible_with_launch(true, false, false, true),
             "launch target bypasses its own mute"
+        );
+    }
+
+    #[test]
+    fn launch_overlay_plays_the_scene_not_the_arrangement_playhead() {
+        let mut g = one_track_graph(0, clip(100, 0, 4, vec![1.0; 4], 1));
+        g.params.set_flag(0, FLAG_LAUNCH, true);
+        g.params.set_pan(0, -1.0);
+        let mut silent = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut silent, 2);
+        assert!(
+            silent.iter().all(|s| *s == 0.0),
+            "without overlay the clip is off the arrangement playhead"
+        );
+        let mut out = vec![0.0f32; 8];
+        render_rt_launch(
+            &mut g,
+            0,
+            &LoopSpec::OFF,
+            &mut out,
+            2,
+            48_000,
+            false,
+            0,
+            None,
+            Some(LaunchPlayhead { pos: 100, discontinuity: true }),
+            None,
+        );
+        assert!(
+            (out[0] - 1.0).abs() < 1e-5,
+            "overlay hears the scene at its own position"
         );
     }
 

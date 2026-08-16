@@ -582,7 +582,8 @@ impl OutputCb {
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                let dropped = mixer::render_rt_with_input(
+                let overlay = self.shared.launch_overlay();
+                let dropped = mixer::render_rt_launch(
                     g,
                     base,
                     &lp,
@@ -592,6 +593,7 @@ impl OutputCb {
                     discontinuity,
                     steady_base,
                     live_in,
+                    overlay,
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -641,6 +643,7 @@ impl OutputCb {
             let next = transport::advance(base, frames, &lp);
             self.shared.position.store(next, Relaxed);
             self.next_pos = next;
+            self.shared.advance_launch(frames);
         }
         self.was_playing = playing;
     }

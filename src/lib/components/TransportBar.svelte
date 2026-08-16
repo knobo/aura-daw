@@ -227,9 +227,11 @@
       kind: "chip",
       priority: 10,
       cls: "launchchip",
-      label: "LAUNCH",
-      title: "MIDI launch map — mark regions, bind notes, fire clips (k)",
-      on: launch.panelOpen,
+      label: launch.overlay ? `▶ ${launch.overlay.name}` : "LAUNCH",
+      title: launch.overlay
+        ? `Playing ${launch.overlay.name} (arrangement loop unchanged)`
+        : "MIDI launch map — mark regions, bind notes, fire clips (k)",
+      on: launch.panelOpen || !!launch.overlay,
       onClick: () => launch.togglePanel(),
     },
     {

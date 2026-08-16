@@ -189,9 +189,13 @@
     </div>
 
     <div class="hint silk">
-      {launch.marking
-        ? "MARK is on — drag across any lanes (clips will not move)"
-        : "Each launcher is its own note map. Right-click a MIDI clip and pick Use launcher."}
+      {#if launch.overlay}
+        playing {launch.overlay.name} — arrangement loop and playhead stay on the clip
+      {:else if launch.marking}
+        MARK is on — drag across any lanes (clips will not move)
+      {:else}
+        Each launcher is its own note map. Right-click a MIDI clip and pick Use launcher.
+      {/if}
     </div>
 
     <div class="list" role="table" aria-label="Launch bindings">

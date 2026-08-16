@@ -66,14 +66,13 @@ different — that binds the clip *as a target* so hardware can start it.
 
 A matching note-on on the selected **midi in** port seeks to the marking,
 loops it, and plays (first match across every launcher). Notes from a
-clip that uses a launcher only fire **that** launcher's map. The
-launched tracks stay **audible through mute/solo** so a soloed launcher
-clip does not silence the scene. A drive-clip fire also turns **FOLLOW**
-off so the timeline does not jump away from the clip you are editing
-(turn FOLLOW back on in the transport bar if you want the playhead
-chased). AURA does **not** feed its own clip notes back into hardware
-launch: hardware input only, plus an echo window on MIDI-out loopback,
-so a clip cannot start itself.
+clip that uses a launcher only fire **that** launcher's map — they do
+**not** steal the arrangement loop or move the playhead. The scene
+plays on a shadow playhead; the transport bar shows **▶ scene name**
+while it sounds. Launched tracks stay **audible through mute/solo** so
+a soloed launcher clip does not silence the scene. AURA does **not**
+feed its own clip notes back into hardware launch: hardware input only,
+plus an echo window on MIDI-out loopback, so a clip cannot start itself.
 
 Launch decisions log at `info` (`launch: fire id=…`). For every hardware
 and drive hit, start with `AURA_LAUNCH_TRACE=1` in the environment.

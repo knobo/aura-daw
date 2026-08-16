@@ -532,17 +532,27 @@ impl crate::control::ControlPlane {
         let start = map.tick_to_samples(start_ticks);
         let end = map.tick_to_samples(start_ticks.saturating_add(length_ticks)).max(start + 1);
         runtime().set_audible_tracks(track_ids.clone());
-        self.apply_launch_audible(&track_ids);
         log::info!(
             "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
         );
-        self.transport(crate::control::TransportAction::SetLoop {
-            enabled: true,
-            start_samples: start,
-            end_samples: end,
-        })?;
-        self.transport(crate::control::TransportAction::Seek { position_samples: start })?;
-        self.transport(crate::control::TransportAction::Play)?;
+        match origin {
+            FireOrigin::Drive => {
+                // Keep the arrangement loop and playhead on the clip.
+                // The scene plays on a shadow playhead; UI only gets an indicator.
+                self.arm_drive_launch(&track_ids, start, end);
+            }
+            FireOrigin::Hardware => {
+                self.clear_drive_overlay();
+                self.apply_launch_audible(&track_ids);
+                self.transport(crate::control::TransportAction::SetLoop {
+                    enabled: true,
+                    start_samples: start,
+                    end_samples: end,
+                })?;
+                self.transport(crate::control::TransportAction::Seek { position_samples: start })?;
+                self.transport(crate::control::TransportAction::Play)?;
+            }
+        }
         self.emit_launch_fired(LaunchFired {
             id: id.to_string(),
             name,
