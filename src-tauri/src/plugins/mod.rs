@@ -44,6 +44,23 @@ use tauri::{AppHandle, Manager, State};
 use crate::audio::dsp::LiveInstrument;
 pub use descriptor::{ParamInfo, PluginDescriptor, PluginInstanceInfo};
 
+/// How a hosted plugin node mixes its main output into the process block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IoMode {
+    /// Instrument contract: silence inputs, `+=` main out (default).
+    #[default]
+    Add,
+    /// Effect contract: copy `io.samples` into inputs, assign main out.
+    Replace,
+}
+
+/// Port-negotiation role for CLAP/LV2 host instantiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRole {
+    Instrument,
+    Effect,
+}
+
 // ---------------------------------------------------------------------------
 // Registry (LIVE-only control-plane state; engine reads via the registered
 // global). Plan E Task 9 (round-2 inventory rows 12-15): the DOCUMENT half
@@ -257,6 +274,63 @@ pub fn instantiate_and_activate(
     Ok((info, params))
 }
 
+/// Plan G1: insert-FX path — same prepare-outside host half as
+/// [`instantiate_and_activate`], with the instrument/effect gate inverted.
+/// Instruments stay on the instrument slot; effects go through here via
+/// [`clap_host::instantiate_effect`] / [`lv2_host::Lv2Host::register_instance_effect`].
+pub fn instantiate_and_activate_effect(
+    registry: &Arc<Mutex<PluginRegistry>>,
+    uid: &str,
+) -> Result<(PluginInstanceInfo, Vec<ParamInfo>), String> {
+    let desc = {
+        let reg = registry.lock();
+        let known = reg.scanned.as_ref().ok_or("no plugin scan yet — call plugin_scan first")?;
+        known
+            .iter()
+            .find(|d| d.uid == uid)
+            .cloned()
+            .ok_or_else(|| format!("unknown plugin uid: {uid}"))?
+    };
+    if desc.is_instrument {
+        return Err(format!(
+            "{} is an instrument; insert slots host effects only",
+            desc.name
+        ));
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let hosted = match desc.format.as_str() {
+        "lv2" => lv2_host::global().register_instance_effect(&id, &desc.uid),
+        "clap" => clap_host::instantiate_effect(&id, &desc.uid),
+        _ => Ok(Vec::new()),
+    };
+    let params = hosted?;
+    let status = if desc.format == "lv2" || desc.format == "clap" { "active" } else { "stub" };
+    let info = PluginInstanceInfo {
+        id,
+        uid: desc.uid.clone(),
+        name: desc.name.clone(),
+        format: desc.format.clone(),
+        status: status.into(),
+        track_id: None,
+    };
+    Ok((info, params))
+}
+
+/// Report hosted-instance latency in samples (0 when unknown / no ext).
+/// Dispatches by format on the document row's format when known; otherwise
+/// probes CLAP then LV2 host maps.
+pub fn latency_of(instance_id: &str) -> usize {
+    if clap_host::has_instance(instance_id).unwrap_or(false) {
+        return clap_host::latency_samples(instance_id);
+    }
+    if let Some(host) = lv2_host::try_global() {
+        if host.has_instance(instance_id).unwrap_or(false) {
+            return host.latency_samples(instance_id);
+        }
+    }
+    0
+}
+
 /// Destroy a just-instantiated (not-yet-committed) host instance — the
 /// orphan-cleanup half of `plugin_instantiate`'s prepare-outside pattern.
 fn destroy_orphan(format: &str, id: &str) {
@@ -376,6 +450,104 @@ pub fn plugin_set_param(
         .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))
 }
 
+/// Plan G1: add an effect as an insert slot on a track. Prepare-outside
+/// (same shape as `plugin_instantiate`): host instantiate first, then one
+/// commit with `PluginAdd` + `InsertAdd`. Orphan host cleanup on commit failure.
+#[tauri::command]
+pub async fn insert_add(
+    track_id: String,
+    uid: String,
+    index: Option<usize>,
+    state: State<'_, PluginState>,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<crate::audio::types::InsertSlot, String> {
+    let registry = state.registry.clone();
+    let control = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        {
+            let session = control.session().lock();
+            let t = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            if t.kind != "audio" && t.kind != "midi" {
+                return Err(format!(
+                    "inserts are only legal on audio|midi tracks, not {}",
+                    t.kind
+                ));
+            }
+        }
+        let (info, _params) = instantiate_and_activate_effect(&registry, &uid)?;
+        let slot = crate::audio::types::InsertSlot {
+            id: uuid::Uuid::new_v4().to_string(),
+            instance_id: info.id.clone(),
+            bypassed: false,
+        };
+        let mut row = info.clone();
+        row.track_id = Some(track_id.clone());
+        let idx = index.unwrap_or(usize::MAX);
+        match control.insert_add(
+            &track_id,
+            row,
+            slot,
+            idx,
+            crate::control::op::TxMeta::user("insert add"),
+        ) {
+            Ok(slot_out) => Ok(slot_out),
+            Err(e) => {
+                destroy_orphan(&info.format, &info.id);
+                Err(e)
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("insert add task failed: {e}"))?
+}
+
+/// Plan G1: remove one insert slot and its plugin instance in one transaction.
+#[tauri::command]
+pub fn insert_remove(
+    track_id: String,
+    slot_id: String,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.insert_remove(&track_id, &slot_id, crate::control::op::TxMeta::user("insert remove"))
+}
+
+/// Plan G1: reorder one insert slot on a track.
+#[tauri::command]
+pub fn insert_reorder(
+    track_id: String,
+    slot_id: String,
+    to_index: usize,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.insert_reorder(
+        &track_id,
+        &slot_id,
+        to_index,
+        crate::control::op::TxMeta::user("insert reorder"),
+    )
+}
+
+/// Plan G1: set bypass on one insert slot.
+#[tauri::command]
+pub fn insert_set_bypass(
+    track_id: String,
+    slot_id: String,
+    bypassed: bool,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.insert_set_bypass(
+        &track_id,
+        &slot_id,
+        bypassed,
+        crate::control::op::TxMeta::user("insert set bypass"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,6 +606,37 @@ mod tests {
         assert!(
             instantiate_and_activate(&reg, "clap:/x.clap#fx").is_err(),
             "effects rejected in v1"
+        );
+    }
+
+    #[test]
+    fn instantiate_effect_rejects_instruments_and_unknown_uids() {
+        let reg = Arc::new(Mutex::new(scanned_registry()));
+        assert!(
+            instantiate_and_activate_effect(&reg, "lv2:urn:test:synth").is_err(),
+            "instruments stay on the instrument slot"
+        );
+        assert!(instantiate_and_activate_effect(&reg, "lv2:urn:nope").is_err());
+        // The *gate* accepts an effect uid. The host call is Task 4; this test
+        // only asserts we no longer bounce !is_instrument before looking up.
+        // With the fake scanned "TestFx", the function must get past the
+        // is_instrument check and fail at the host (or succeed once Task 4 lands).
+        let err = instantiate_and_activate_effect(&reg, "clap:/x.clap#fx").err();
+        if let Some(e) = err {
+            assert!(
+                !e.contains("v1 hosts instruments"),
+                "effect rejection must not use the instrument-only message, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn instantiate_still_rejects_effects_on_the_instrument_path() {
+        let reg = Arc::new(Mutex::new(scanned_registry()));
+        let err = instantiate_and_activate(&reg, "clap:/x.clap#fx").unwrap_err();
+        assert!(
+            err.contains("effect") || err.contains("instruments"),
+            "plugin_instantiate stays instrument-only, got: {err}"
         );
     }
 }

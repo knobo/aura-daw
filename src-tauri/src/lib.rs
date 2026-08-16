@@ -297,6 +297,10 @@ pub fn run() {
             plugins::plugin_remove,
             plugins::plugin_get_params,
             plugins::plugin_set_param,
+            plugins::insert_add,
+            plugins::insert_remove,
+            plugins::insert_reorder,
+            plugins::insert_set_bypass,
             plugins::patches::zyn_list_patches,
             plugins::patches::zyn_load_patch,
             // ---- automation groundwork (phase 3, zone P4) ----

@@ -42,7 +42,7 @@ use crate::midi::synth::BlockNoteEvent;
 
 use super::descriptor::ParamInfo;
 use super::host::{plugin_main, MainCtx};
-use super::ParamChange;
+use super::{HostRole, IoMode, ParamChange};
 
 /// Max note events buffered per block (mirror of the other live nodes).
 const MAX_NODE_EVENTS: usize = 256;
@@ -183,7 +183,12 @@ impl ClapWorld {
             .ok_or_else(|| format!("clap: unknown instance {instance_id}"))
     }
 
-    fn instantiate(&mut self, instance_id: &str, uid: &str) -> Result<Vec<ParamInfo>, String> {
+    fn instantiate(
+        &mut self,
+        instance_id: &str,
+        uid: &str,
+        role: HostRole,
+    ) -> Result<Vec<ParamInfo>, String> {
         let (path, clap_id) = parse_clap_uid(uid)?;
         let entry = self.entry(&path)?.clone();
         let c_id = CString::new(clap_id.clone()).map_err(|_| "bad plugin id".to_string())?;
@@ -196,14 +201,17 @@ impl ClapWorld {
         )
         .map_err(|e| format!("{clap_id}: instantiation failed: {e}"))?;
 
-        let layout = negotiate_ports(&mut instance, &clap_id)?;
+        let layout = negotiate_ports(&mut instance, &clap_id, role)?;
         let (params, cookies) = enumerate_params(&mut instance);
 
         self.hosted.insert(
             instance_id.to_string(),
             Hosted { instance, layout, params: params.clone(), cookies, param_tx: None, node_out: false },
         );
-        log::info!("clap: instantiated {clap_id} as {instance_id} ({} params)", params.len());
+        log::info!(
+            "clap: instantiated {clap_id} as {instance_id} ({role:?}, {} params)",
+            params.len()
+        );
         Ok(params)
     }
 
@@ -224,14 +232,18 @@ impl ClapWorld {
             .activate(|_, _| (), config)
             .map_err(|e| format!("clap: activation failed for {instance_id}: {e}"))?;
 
-        // Latency ext: read + log (PDC lands with the graph compiler round).
-        if let Some(lat) = hosted.instance.plugin_shared_handle().get_extension::<PluginLatency>()
+        // Latency ext: read at activate; stored on the node for PDC (Task 5+).
+        let reported_latency = if let Some(lat) =
+            hosted.instance.plugin_shared_handle().get_extension::<PluginLatency>()
         {
-            let samples = lat.get(&mut hosted.instance.plugin_handle());
+            let samples = lat.get(&mut hosted.instance.plugin_handle()) as usize;
             if samples > 0 {
-                log::info!("clap: {instance_id} reports {samples} samples latency (uncompensated in v1)");
+                log::info!("clap: {instance_id} reports {samples} samples latency");
             }
-        }
+            samples
+        } else {
+            0
+        };
 
         let (param_tx, param_rx) = rtrb::RingBuffer::new(PARAM_RING_CAP);
         hosted.param_tx = Some(param_tx);
@@ -262,6 +274,8 @@ impl ClapWorld {
             errors: 0,
             layout,
             instance_id: instance_id.to_string(),
+            io_mode: IoMode::Add,
+            reported_latency,
         })
     }
 
@@ -392,12 +406,14 @@ impl ClapWorld {
     }
 }
 
-/// Audio + note port negotiation: v1 hosts mono/stereo-out instruments with
-/// a note input (mono is up-mixed — the node always delivers stereo to the
-/// graph); anything else is rejected politely (clear error, no crash).
+/// Audio + note port negotiation split by [`HostRole`]:
+/// * Instrument — mono/stereo main out + ≥1 note input (today's path).
+/// * Effect — mono/stereo main out + ≥1 audio input (channels in {1,2});
+///   note ports optional.
 fn negotiate_ports(
     instance: &mut PluginInstance<AuraClapHost>,
     clap_id: &str,
+    role: HostRole,
 ) -> Result<PortLayout, String> {
     let audio_ext = instance
         .plugin_shared_handle()
@@ -444,6 +460,42 @@ fn negotiate_ports(
         inputs.push(ch);
     }
 
+    if role == HostRole::Effect {
+        if inputs.is_empty() {
+            return Err(format!(
+                "{clap_id}: no audio input — not hostable as an effect"
+            ));
+        }
+        for (i, &ch) in inputs.iter().enumerate() {
+            if ch != 1 && ch != 2 {
+                return Err(format!(
+                    "{clap_id}: input port {i} has {ch} channels; v1 hosts mono/stereo only"
+                ));
+            }
+        }
+        // Note ports optional for effects — record dialect when present.
+        let (note_port, midi_dialect) = match note_ext {
+            Some(note_ext) if note_ext.count(&mut handle, true) > 0 => {
+                let mut nbuf = NotePortInfoBuffer::new();
+                let midi_dialect = match note_ext.get(&mut handle, 0, true, &mut nbuf) {
+                    Some(info) if info.supported_dialects.supports(NoteDialect::Clap) => false,
+                    Some(info) if info.supported_dialects.supports(NoteDialect::Midi) => true,
+                    _ => false,
+                };
+                (0u16, midi_dialect)
+            }
+            _ => (0u16, false),
+        };
+        return Ok(PortLayout {
+            inputs,
+            outputs,
+            main_out,
+            note_port,
+            midi_dialect,
+        });
+    }
+
+    // HostRole::Instrument — today's path, verbatim.
     let note_ext = note_ext.ok_or_else(|| {
         format!("{clap_id}: no note-ports extension — not hostable as an instrument")
     })?;
@@ -500,15 +552,48 @@ fn enumerate_params(
 // Control-facing API (thin wrappers posting onto the plugin main thread)
 // ---------------------------------------------------------------------------
 
-/// Instantiate `uid` under `instance_id`. Returns the real parameter list
-/// (registry mirror). Fails politely on unloadable bundles / non-stereo /
-/// note-less plugins.
+/// Instantiate `uid` under `instance_id` as an **instrument**
+/// ([`HostRole::Instrument`]). Returns the real parameter list (registry
+/// mirror). Fails politely on unloadable bundles / non-stereo / note-less
+/// plugins.
 pub fn instantiate(instance_id: &str, uid: &str) -> Result<Vec<ParamInfo>, String> {
     let (id, uid) = (instance_id.to_string(), uid.to_string());
     plugin_main().run(move |ctx| {
         ensure_ticker(ctx);
-        world(ctx).instantiate(&id, &uid)
+        world(ctx).instantiate(&id, &uid, HostRole::Instrument)
     })?
+}
+
+/// Instantiate `uid` under `instance_id` as an **effect**
+/// ([`HostRole::Effect`]): requires audio in + mono/stereo main out; note
+/// ports optional.
+pub fn instantiate_effect(instance_id: &str, uid: &str) -> Result<Vec<ParamInfo>, String> {
+    let (id, uid) = (instance_id.to_string(), uid.to_string());
+    plugin_main().run(move |ctx| {
+        ensure_ticker(ctx);
+        world(ctx).instantiate(&id, &uid, HostRole::Effect)
+    })?
+}
+
+/// Latency reported by the CLAP latency extension on the hosted main-thread
+/// instance. 0 when the extension is missing or the instance is unknown.
+pub fn latency_samples(instance_id: &str) -> usize {
+    let id = instance_id.to_string();
+    plugin_main()
+        .run(move |ctx| {
+            let Some(hosted) = world(ctx).hosted.get_mut(&id) else {
+                return 0usize;
+            };
+            match hosted
+                .instance
+                .plugin_shared_handle()
+                .get_extension::<PluginLatency>()
+            {
+                Some(lat) => lat.get(&mut hosted.instance.plugin_handle()) as usize,
+                None => 0,
+            }
+        })
+        .unwrap_or(0)
 }
 
 /// Destroy an instance (deferred while its node is still out).
@@ -570,14 +655,15 @@ struct ParamCmd {
     cookie: usize,
 }
 
-/// A live CLAP instrument node. Owns the started audio processor plus every
-/// buffer `process` needs — preallocated at activation on the plugin main
-/// thread; the RT path never allocates or locks (§2.1).
+/// A live CLAP instrument/effect node. Owns the started audio processor plus
+/// every buffer `process` needs — preallocated at activation on the plugin
+/// main thread; the RT path never allocates or locks (§2.1).
 pub struct ClapNode {
     proc: Option<PluginAudioProcessor<AuraClapHost>>,
     in_ports: AudioPorts,
     out_ports: AudioPorts,
-    /// Silent input feeds, per port per channel (instruments only).
+    /// Input feeds, per port per channel. Silence under [`IoMode::Add`];
+    /// filled from `io.samples` under [`IoMode::Replace`].
     in_bufs: Vec<Vec<Vec<f32>>>,
     out_bufs: Vec<Vec<Vec<f32>>>,
     ev_in: EventBuffer,
@@ -600,6 +686,9 @@ pub struct ClapNode {
     errors: u64,
     layout: PortLayout,
     instance_id: String,
+    io_mode: IoMode,
+    /// CLAP latency extension samples, captured at activate.
+    reported_latency: usize,
 }
 
 impl ClapNode {
@@ -629,11 +718,32 @@ impl ClapNode {
         self.errors
     }
 
+    /// Select instrument (Add) vs effect (Replace) IO. Control-thread only
+    /// (called when the node is built / before it enters the RT graph).
+    pub fn set_io_mode(&mut self, mode: IoMode) {
+        self.io_mode = mode;
+    }
+
     /// Test-only introspection of the fix-round-1 fallback accumulator
     /// (compiled out of every non-test build — zero RT-path cost).
     #[cfg(test)]
     pub(crate) fn steady_fallback_for_test(&self) -> u64 {
         self.steady_fallback
+    }
+
+    /// Test-only: peak of the plugin main-out buffers after the last process.
+    #[cfg(test)]
+    pub(crate) fn main_out_peak_for_test(&self, frames: usize) -> f32 {
+        let Some(chans) = self.out_bufs.get(self.layout.main_out) else {
+            return 0.0;
+        };
+        let mut m = 0.0f32;
+        for c in chans {
+            for s in c.iter().take(frames) {
+                m = m.max(s.abs());
+            }
+        }
+        m
     }
 }
 
@@ -643,8 +753,10 @@ impl AuraAudioProcessor for ClapNode {
         // carries the rate; a rate change builds a new node).
     }
 
-    /// ADDS the plugin's main stereo output into the zeroed scratch. §2.1:
-    /// all buffers preallocated; event buffers are cleared, not shrunk.
+    /// Instrument ([`IoMode::Add`]): silence inputs, ADD main out into the
+    /// zeroed scratch. Effect ([`IoMode::Replace`]): de-interleave
+    /// `io.samples` into inputs, ASSIGN main out. §2.1: all buffers
+    /// preallocated; event buffers are cleared, not shrunk.
     fn process(&mut self, io: &mut ProcessBlock<'_>) {
         let frames = io.frames().min(MAX_LIVE_BLOCK);
         if frames == 0 || io.channels < 2 {
@@ -683,15 +795,52 @@ impl AuraAudioProcessor for ClapNode {
         }
         self.n_notes = 0;
 
+        // 1b. Feed inputs: silence (Add) or de-interleaved `io.samples`
+        //     (Replace). Mono plugin ports take L; stereo takes L/R.
+        match self.io_mode {
+            IoMode::Add => {
+                for chans in &mut self.in_bufs {
+                    for c in chans {
+                        c[..frames].fill(0.0);
+                    }
+                }
+            }
+            IoMode::Replace => {
+                // Flatten the strip's first two channels across plugin input
+                // ports (same contract as LV2): a stereo port takes L/R; two
+                // successive mono ports take L then R — not L into every 1-ch
+                // port. Extra channels beyond stereo stay silent.
+                let ch = io.channels;
+                let mut src = 0usize;
+                for chans in &mut self.in_bufs {
+                    for c in chans.iter_mut() {
+                        for i in 0..frames {
+                            c[i] = match src {
+                                0 => io.samples[i * ch],
+                                1 if ch >= 2 => io.samples[i * ch + 1],
+                                1 => io.samples[i * ch], // mono strip → duplicate L
+                                _ => 0.0,
+                            };
+                        }
+                        src += 1;
+                    }
+                }
+            }
+        }
+
         // 2. Audio buffers (cheap wrappers over the preallocated storage).
+        // Silence is constant; Replace feeds variable audio from the strip.
+        let inputs_constant = self.io_mode == IoMode::Add;
         let in_audio = self.in_ports.with_input_buffers(self.in_bufs.iter_mut().map(|chans| {
             AudioPortBuffer {
                 latency: 0,
-                channels: AudioPortBufferType::f32_input_only(
-                    chans
-                        .iter_mut()
-                        .map(|c| InputChannel::constant(&mut c[..frames])),
-                ),
+                channels: AudioPortBufferType::f32_input_only(chans.iter_mut().map(|c| {
+                    if inputs_constant {
+                        InputChannel::constant(&mut c[..frames])
+                    } else {
+                        InputChannel::variable(&mut c[..frames])
+                    }
+                })),
             }
         }));
         let mut out_audio =
@@ -742,19 +891,30 @@ impl AuraAudioProcessor for ClapNode {
             None,
         ) {
             Ok(_status) => {
-                // 4. Mix the main output into the interleaved stereo
-                //    scratch (mono ports feed both channels).
+                // 4. Main out → interleaved stereo: Add (+=) or Replace (=).
+                //    Mono plugin ports feed both L/R.
                 if let Some(chans) = self.out_bufs.get(self.layout.main_out) {
+                    let replace = self.io_mode == IoMode::Replace;
                     if chans.len() >= 2 {
                         let (l, r) = (&chans[0], &chans[1]);
                         for i in 0..frames {
-                            io.samples[i * 2] += l[i];
-                            io.samples[i * 2 + 1] += r[i];
+                            if replace {
+                                io.samples[i * 2] = l[i];
+                                io.samples[i * 2 + 1] = r[i];
+                            } else {
+                                io.samples[i * 2] += l[i];
+                                io.samples[i * 2 + 1] += r[i];
+                            }
                         }
                     } else if let Some(m) = chans.first() {
                         for i in 0..frames {
-                            io.samples[i * 2] += m[i];
-                            io.samples[i * 2 + 1] += m[i];
+                            if replace {
+                                io.samples[i * 2] = m[i];
+                                io.samples[i * 2 + 1] = m[i];
+                            } else {
+                                io.samples[i * 2] += m[i];
+                                io.samples[i * 2 + 1] += m[i];
+                            }
                         }
                     }
                 }
@@ -765,6 +925,10 @@ impl AuraAudioProcessor for ClapNode {
 
     fn reset(&mut self) {
         self.pending_all_off = true;
+    }
+
+    fn latency_samples(&self) -> usize {
+        self.reported_latency
     }
 }
 
@@ -1032,6 +1196,103 @@ mod tests {
         } else {
             eprintln!("note: no CLAP effect installed; negotiation-reject case skipped");
         }
+    }
+
+    /// Effect-host path (`HostRole::Effect`): a real stereo FX instantiates
+    /// when present. Skips cleanly with no installed non-Cardinal CLAP effect.
+    #[test]
+    fn instantiate_effect_accepts_a_stereo_fx_when_installed() {
+        let Some(fx) = installed()
+            .into_iter()
+            .find(|d| !d.is_instrument && !d.uid.to_lowercase().contains("cardinal"))
+        else {
+            eprintln!("note: no CLAP effect installed; effect-host path skipped");
+            return;
+        };
+        let id = format!("fx-{}", uuid::Uuid::new_v4());
+        let params = instantiate_effect(&id, &fx.uid).expect("effect must host as HostRole::Effect");
+        let _ = params;
+        let lat = latency_samples(&id);
+        // just a number; 0 is legal
+        let _ = lat;
+        remove(&id).expect("remove");
+    }
+
+    /// `IoMode::Replace` assigns plugin main-out into `io.samples`;
+    /// `IoMode::Add` does `+=`. Pins both modes against a real effect when
+    /// one is installed (main-out peak vs interleaved scratch).
+    #[test]
+    fn clap_node_replace_mode_copies_input_and_does_not_add() {
+        let Some(fx) = installed()
+            .into_iter()
+            .find(|d| !d.is_instrument && !d.uid.to_lowercase().contains("cardinal"))
+        else {
+            eprintln!("note: no CLAP effect installed; replace-mode pin skipped");
+            return;
+        };
+        let id = format!("fx-{}", uuid::Uuid::new_v4());
+        instantiate_effect(&id, &fx.uid).expect("instantiate effect");
+        let id2 = id.clone();
+        let mut node = plugin_main()
+            .run(move |ctx| world(ctx).activate_node(&id2, 48_000))
+            .expect("main thread responded")
+            .expect("activate");
+
+        let frames = 256usize;
+        let mut buf = vec![0.5f32; frames * 2];
+
+        // --- Replace: io peak must match plugin main-out peak (assign) ---
+        node.set_io_mode(IoMode::Replace);
+        {
+            let mut io = ProcessBlock {
+                samples: &mut buf,
+                channels: 2,
+                sample_rate: 48_000,
+                steady: None,
+            };
+            node.process(&mut io);
+        }
+        let replace_io = peak(&buf);
+        let replace_out = node.main_out_peak_for_test(frames);
+        assert!(
+            (replace_io - replace_out).abs() < 1e-5,
+            "Replace assigns main-out: io_peak={replace_io} main_out_peak={replace_out}; \
+             errors={}; fx={}",
+            node.process_errors(),
+            fx.name
+        );
+        // Residual must not be input+processed (would be ~1.0 for unity FX).
+        assert!(
+            replace_io < 0.9,
+            "Replace must not leave input+processed (~1.0); got {replace_io}; fx={}",
+            fx.name
+        );
+
+        // --- Add: io peak ≈ residual + main-out (silence in) ---
+        node.set_io_mode(IoMode::Add);
+        buf.fill(0.5);
+        {
+            let mut io = ProcessBlock {
+                samples: &mut buf,
+                channels: 2,
+                sample_rate: 48_000,
+                steady: None,
+            };
+            node.process(&mut io);
+        }
+        let add_io = peak(&buf);
+        let add_out = node.main_out_peak_for_test(frames);
+        // residual 0.5 + silence-fed plugin out.
+        assert!(
+            (add_io - (0.5 + add_out)).abs() < 1e-4,
+            "Add does += : io_peak={add_io} expected ~{}; main_out={add_out}; fx={}",
+            0.5 + add_out,
+            fx.name
+        );
+
+        drop(node);
+        plugin_main().run(|_| ()).unwrap();
+        remove(&id).expect("remove");
     }
 
     /// THE seam test (CLAP flavor of contract 7): a midi track bound to

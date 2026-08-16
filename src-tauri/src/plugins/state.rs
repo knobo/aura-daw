@@ -662,8 +662,11 @@ pub fn reactivate_restored_with(
             .collect()
     };
     for (id, uid, format, snapshot) in stubs {
+        let as_effect = session.lock().instance_is_insert(&id);
         let hosted = match format.as_str() {
+            "clap" if as_effect => super::clap_host::instantiate_effect(&id, &uid),
             "clap" => super::clap_host::instantiate(&id, &uid),
+            _ if as_effect => super::lv2_host::global().register_instance_effect(&id, &uid),
             _ => super::lv2_host::global().register_instance(&id, &uid),
         };
         match hosted {
