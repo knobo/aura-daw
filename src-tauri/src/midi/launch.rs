@@ -2,9 +2,9 @@
 //! guards so a clip AURA itself is playing cannot start itself via
 //! MIDI-out loopback.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -96,6 +96,8 @@ pub struct LaunchRuntime {
     fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<LaunchBinding>>>,
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
+    drive_clips: Mutex<Vec<String>>,
+    drive_started: AtomicBool,
 }
 
 impl Default for LaunchRuntime {
@@ -109,6 +111,8 @@ impl Default for LaunchRuntime {
             fire_tx: Mutex::new(None),
             last_learn: Mutex::new(None),
             gen: AtomicU64::new(0),
+            drive_clips: Mutex::new(Vec::new()),
+            drive_started: AtomicBool::new(false),
         }
     }
 }
@@ -158,6 +162,75 @@ impl LaunchRuntime {
 
     pub fn clear_armed(&self) {
         *self.armed.lock().unwrap() = None;
+    }
+
+    pub fn set_drive_clips(&self, ids: Vec<String>) {
+        *self.drive_clips.lock().unwrap() = ids;
+    }
+
+    /// Watch the transport and fire launch bindings from clips marked as
+    /// launch-map instruments. Note-on then immediate note-off so a
+    /// sequencer pulse does not latch `armed`.
+    pub fn attach_drive(
+        &self,
+        shared: Arc<crate::audio::rt::SharedRt>,
+        session: Arc<parking_lot::Mutex<crate::control::Session>>,
+    ) {
+        if self.drive_started.swap(true, Relaxed) {
+            return;
+        }
+        let _ = std::thread::Builder::new()
+            .name("aura-launch-drive".into())
+            .spawn(move || {
+                let mut last = 0u64;
+                loop {
+                    std::thread::sleep(Duration::from_millis(8));
+                    let playing = shared.playing.load(Relaxed);
+                    let pos = shared.position.load(Relaxed);
+                    if !playing || pos < last {
+                        last = pos;
+                        continue;
+                    }
+                    let drive = runtime().drive_clips.lock().unwrap().clone();
+                    if drive.is_empty() {
+                        last = pos;
+                        continue;
+                    }
+                    let (clips, ppq, tempo) = {
+                        let s = session.lock();
+                        let clips: Vec<_> = s
+                            .midi
+                            .clips
+                            .iter()
+                            .filter(|c| drive.iter().any(|id| id == c.id.as_str()))
+                            .cloned()
+                            .collect();
+                        (clips, s.midi.ppq, s.midi.tempo_events.clone())
+                    };
+                    let Ok(map) = crate::midi::TempoMap::new(ppq, tempo, shared.sample_rate.load(Relaxed).max(1)) else {
+                        last = pos;
+                        continue;
+                    };
+                    let bindings = runtime().bindings();
+                    for clip in &clips {
+                        for ev in crate::midi::schedule::clip_events(clip, &map) {
+                            if ev.velocity == 0 || ev.sample <= last || ev.sample > pos {
+                                continue;
+                            }
+                            if let Some(b) = resolve(&bindings, ev.key, 0) {
+                                if let LaunchTarget::Clip { clip_id } = &b.target {
+                                    if clip_id == clip.id.as_str() {
+                                        continue;
+                                    }
+                                }
+                            }
+                            runtime().on_incoming(true, ev.key, 0);
+                            runtime().on_incoming(false, ev.key, 0);
+                        }
+                    }
+                    last = pos;
+                }
+            });
     }
 
     pub fn decide(&self, on: bool, note: u8, channel: u8) -> IncomingDecision {
@@ -211,7 +284,22 @@ impl LaunchRuntime {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchSnapshot {
+    pub bindings: Vec<LaunchBinding>,
+    pub drive_clip_ids: Vec<String>,
+}
+
 impl crate::control::ControlPlane {
+    pub fn launch_snapshot(&self) -> LaunchSnapshot {
+        let s = self.session().lock();
+        LaunchSnapshot {
+            bindings: s.midi.launch_bindings.clone(),
+            drive_clip_ids: s.midi.launch_drive_clip_ids.clone(),
+        }
+    }
+
     pub fn launch_bindings(&self) -> Vec<LaunchBinding> {
         self.session().lock().midi.launch_bindings.clone()
     }
@@ -221,13 +309,27 @@ impl crate::control::ControlPlane {
         id: String,
         binding: Option<LaunchBinding>,
         meta: crate::control::op::TxMeta,
-    ) -> Result<Vec<LaunchBinding>, String> {
+    ) -> Result<LaunchSnapshot, String> {
         self.commit(meta, |tx| {
             tx.apply(crate::control::op::Op::LaunchBindingSet { id, binding })?;
             Ok(())
         })?;
         self.emit_launch_changed();
-        Ok(self.launch_bindings())
+        Ok(self.launch_snapshot())
+    }
+
+    pub fn set_launch_drive(
+        &self,
+        clip_id: String,
+        on: bool,
+        meta: crate::control::op::TxMeta,
+    ) -> Result<LaunchSnapshot, String> {
+        self.commit(meta, |tx| {
+            tx.apply(crate::control::op::Op::LaunchDriveSet { clip_id, on })?;
+            Ok(())
+        })?;
+        self.emit_launch_changed();
+        Ok(self.launch_snapshot())
     }
 
     pub fn launch_fire(&self, id: &str) -> Result<(), String> {
@@ -278,8 +380,8 @@ impl crate::control::ControlPlane {
 #[tauri::command]
 pub fn launch_get(
     control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
-) -> Result<Vec<LaunchBinding>, String> {
-    Ok(control.launch_bindings())
+) -> Result<LaunchSnapshot, String> {
+    Ok(control.launch_snapshot())
 }
 
 #[tauri::command]
@@ -287,7 +389,7 @@ pub fn launch_set(
     binding: Option<LaunchBinding>,
     id: Option<String>,
     control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
-) -> Result<Vec<LaunchBinding>, String> {
+) -> Result<LaunchSnapshot, String> {
     match (binding, id) {
         (None, Some(id)) => control.set_launch_binding(
             id,
@@ -307,6 +409,15 @@ pub fn launch_set(
         }
         (None, None) => Err("launch_set needs a binding or an id to delete".into()),
     }
+}
+
+#[tauri::command]
+pub fn launch_set_drive(
+    clip_id: String,
+    on: bool,
+    control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
+) -> Result<LaunchSnapshot, String> {
+    control.set_launch_drive(clip_id, on, crate::control::op::TxMeta::user("set launch drive"))
 }
 
 #[tauri::command]

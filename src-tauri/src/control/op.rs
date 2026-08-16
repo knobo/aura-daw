@@ -253,6 +253,9 @@ pub enum Op {
         id: String,
         binding: Option<crate::midi::launch::LaunchBinding>,
     },
+    /// Toggle whether a MIDI clip's notes drive the launch map (instead of
+    /// the track instrument). Inverse flips `on`.
+    LaunchDriveSet { clip_id: String, on: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

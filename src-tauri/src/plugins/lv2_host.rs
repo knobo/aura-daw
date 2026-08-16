@@ -787,6 +787,7 @@ mod tests {
                 velocity_offset: 0,
             }],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

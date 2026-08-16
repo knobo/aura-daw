@@ -90,6 +90,11 @@ export interface LaunchBinding {
   target: LaunchTarget;
 }
 
+export interface LaunchSnapshot {
+  bindings: LaunchBinding[];
+  driveClipIds: string[];
+}
+
 // ── transport-state.schema.json ─────────────────────────────────────────────
 
 export type TransportMode = "stopped" | "playing" | "recording";
@@ -922,7 +927,7 @@ export interface AuraEventMap {
   "export://done": ExportDoneEvent;
   "export://error": ExportErrorEvent;
   "loopjam://state": LoopJamStatus;
-  "launch://changed": LaunchBinding[];
+  "launch://changed": LaunchSnapshot;
 }
 
 export type AuraEventName = keyof AuraEventMap;

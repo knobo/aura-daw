@@ -9,7 +9,9 @@ import {
   overlayBox,
   parseMidiNoteName,
   regionFromMarquee,
+  resizeRegion,
   resolveLaunch,
+  shiftRegion,
   type LaunchBinding,
 } from "./launch-map";
 
@@ -219,5 +221,44 @@ describe("overlayBox", () => {
   it("returns null when the target is gone", () => {
     const b = region("c", 60, { target: { kind: "clip", clipId: "missing" } });
     expect(overlayBox(b, tracks, [], ticksToSamples)).toBeNull();
+  });
+});
+
+describe("shiftRegion", () => {
+  const tracks = [{ id: "a" }, { id: "b" }, { id: "c" }];
+  const t = {
+    kind: "region" as const,
+    startTicks: 480,
+    lengthTicks: 960,
+    trackIds: ["a", "b"],
+  };
+
+  it("moves in time and keeps length", () => {
+    expect(shiftRegion(t, 480, 0, tracks)).toEqual({
+      ...t,
+      startTicks: 960,
+    });
+  });
+
+  it("clamps time at zero", () => {
+    expect(shiftRegion(t, -10_000, 0, tracks).startTicks).toBe(0);
+  });
+
+  it("slides the lane block and refuses to drop a member off the list", () => {
+    expect(shiftRegion(t, 0, 1, tracks).trackIds).toEqual(["b", "c"]);
+    expect(shiftRegion(t, 0, 8, tracks).trackIds).toEqual(["b", "c"]);
+    expect(shiftRegion(t, 0, -1, tracks).trackIds).toEqual(["a", "b"]);
+  });
+});
+
+describe("resizeRegion", () => {
+  it("moves the start edge without passing the end", () => {
+    expect(resizeRegion(480, 960, "start", 720)).toEqual({ startTicks: 720, lengthTicks: 720 });
+    expect(resizeRegion(480, 960, "start", 10_000)).toEqual({ startTicks: 1439, lengthTicks: 1 });
+  });
+
+  it("moves the end edge without collapsing", () => {
+    expect(resizeRegion(480, 960, "end", 2000)).toEqual({ startTicks: 480, lengthTicks: 1520 });
+    expect(resizeRegion(480, 960, "end", 100)).toEqual({ startTicks: 480, lengthTicks: 1 });
   });
 });

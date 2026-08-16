@@ -83,7 +83,7 @@ export function marqueeClipHits(
 
 /** Elements inside the lane area that own the pointer themselves, so a
  * pointerdown on them must NOT also start a marquee. */
-const MARQUEE_IGNORE = ".clip, .mclip, button, .autolane";
+const MARQUEE_IGNORE = ".clip, .mclip, button, .autolane, .launchmark";
 
 /** Whether a pointerdown on `target` should begin a marquee band.
  *

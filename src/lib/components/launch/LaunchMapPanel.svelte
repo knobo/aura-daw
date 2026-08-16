@@ -71,6 +71,7 @@
     if (e.key === "Escape") {
       e.stopPropagation();
       if (launch.learningId) launch.stopLearn();
+      else if (launch.marking) launch.marking = false;
       else if (launch.selectedId) launch.selectedId = null;
       else launch.closePanel();
       return;
@@ -107,7 +108,9 @@
     </div>
 
     <div class="hint silk">
-      Drag across lanes to mark a region · click a row to jump there · Learn waits for a MIDI note
+      {launch.marking
+        ? "MARK is on — drag across any lanes (clips will not move)"
+        : "MARK to draw a new region · drag a marking to move it · edges resize"}
     </div>
 
     <div class="list" role="table" aria-label="Launch bindings">
@@ -119,7 +122,7 @@
         <span></span>
       </div>
       {#if launch.bindings.length === 0}
-        <div class="empty silk">no markings yet — drag a rectangle on the timeline</div>
+        <div class="empty silk">no markings yet — press MARK and drag across lanes</div>
       {/if}
       {#each launch.bindings as b (b.id)}
         <div
@@ -195,12 +198,18 @@
     <div class="foot">
       <button
         class="act mono"
+        class:on={launch.marking}
+        title="Draw a new region — clips will not move while this is on"
+        onclick={() => launch.toggleMarking()}>MARK</button
+      >
+      <button
+        class="act mono"
         disabled={!midi.selectedClipId}
         title="Map the selected MIDI clip to a free note"
         onclick={() => void mapSelectedClip()}>MAP CLIP</button
       >
       <span class="footnote silk">
-        {launch.learningId ? "play a note on your controller…" : "open + drag lanes to add"}
+        {launch.learningId ? "play a note on your controller…" : launch.marking ? "drag across lanes…" : "MARK to add · drag a marking to move"}
       </span>
     </div>
     {#if launch.error}
@@ -348,6 +357,11 @@
     border: 1px solid var(--cyan-dim);
     color: var(--cyan);
     cursor: pointer;
+  }
+  .act.on {
+    color: var(--amber);
+    border-color: var(--amber);
+    background: rgba(255, 200, 87, 0.1);
   }
   .act:disabled {
     opacity: 0.35;

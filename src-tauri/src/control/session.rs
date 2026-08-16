@@ -293,6 +293,7 @@ impl Session {
             meter_events: self.midi.meter_events.clone(),
             clips: self.midi.clips.clone(),
             launch_bindings: self.midi.launch_bindings.clone(),
+            launch_drive_clip_ids: self.midi.launch_drive_clip_ids.clone(),
         }
     }
 
@@ -1469,6 +1470,18 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             crate::midi::launch::runtime().set_bindings(session.midi.launch_bindings.clone());
             effect.persist.midi = true;
             Ok(Op::LaunchBindingSet { id: id.clone(), binding: previous })
+        }
+        Op::LaunchDriveSet { clip_id, on } => {
+            let had = session.midi.launch_drive_clip_ids.iter().any(|id| id == clip_id);
+            if *on && !had {
+                session.midi.launch_drive_clip_ids.push(clip_id.clone());
+            } else if !*on && had {
+                session.midi.launch_drive_clip_ids.retain(|id| id != clip_id);
+            }
+            crate::midi::launch::runtime().set_drive_clips(session.midi.launch_drive_clip_ids.clone());
+            effect.persist.midi = true;
+            effect.rebuild = true;
+            Ok(Op::LaunchDriveSet { clip_id: clip_id.clone(), on: had })
         }
         _ => Err("op not yet supported".into()),
     }

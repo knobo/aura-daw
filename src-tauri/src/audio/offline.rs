@@ -297,6 +297,7 @@ mod tests {
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![arp, groove],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -381,6 +382,7 @@ mod tests {
                 velocity_offset: 0,
             }],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -513,6 +515,7 @@ mod tests {
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -681,6 +684,7 @@ mod tests {
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -790,6 +794,7 @@ mod tests {
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

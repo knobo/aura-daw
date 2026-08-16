@@ -34,7 +34,7 @@
   import ImportDropZone from "./ImportDropZone.svelte";
   import LoopJamPanel from "./loopjam/LoopJamPanel.svelte";
   import { launch } from "../state/launch.svelte";
-  import { overlayBox, regionFromMarquee } from "../utils/launch-map";
+  import { overlayBox, regionFromMarquee, resizeRegion, shiftRegion } from "../utils/launch-map";
   import type { TrackState } from "../types/ipc";
 
   const TRACK_PALETTE = ["#52e5ff", "#ff4fd8", "#ffc857", "#9d7bff", "#5cf2b8", "#ff8b5c"];
@@ -479,7 +479,7 @@
 
   function onLanesPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
-    if (!startsMarquee(e.target as HTMLElement)) return;
+    if (!launch.marking && !startsMarquee(e.target as HTMLElement)) return;
     if (!lanesEl) return;
     const p = canvasPos(lanesEl, e.clientX, e.clientY);
     const mode = selectionModeFor(e);
@@ -511,7 +511,7 @@
     }
     if (!marquee) return;
     marquee = { ...marquee, x1: p.x, y1: p.y };
-    if (launch.panelOpen) return;
+    if (launch.marking) return;
     const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
     const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
     const n = project.tracks.length;
@@ -530,10 +530,8 @@
   }
 
   function onLanesPointerUp(e: PointerEvent) {
-    // With the launch panel open a finished marquee IS a new marking, not
-    // a clip selection — that's the "draw the region while the list is
-    // visible" gesture.
-    if (launch.panelOpen && marquee) {
+    // MARK mode: a finished marquee is a new region, even over clips.
+    if (launch.marking && marquee) {
       const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
       const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
       const n = project.tracks.length;
@@ -587,23 +585,54 @@
       .filter((x): x is { binding: (typeof launch.bindings)[number]; box: NonNullable<ReturnType<typeof overlayBox>> } => x !== null);
   });
 
-  let resize: { id: string; edge: "start" | "end"; startTicks: number; lengthTicks: number } | null =
-    $state(null);
+  type MarkDrag = {
+    id: string;
+    mode: "move" | "resize";
+    edge?: "start" | "end";
+    startTicks: number;
+    lengthTicks: number;
+    trackIds: string[];
+    originX: number;
+    originY: number;
+    moved: boolean;
+  };
+  let markDrag: MarkDrag | null = $state(null);
 
-  function onMarkPointerDown(id: string, e: PointerEvent) {
-    e.stopPropagation();
-    launch.selectedId = id;
-    launch.focus(id);
+  function persistMarkDrag() {
+    const d = markDrag;
+    markDrag = null;
+    if (!d) return;
+    const b = launch.bindings.find((x) => x.id === d.id);
+    void (async () => {
+      try {
+        if (d.moved && b) await launch.update(d.id, { target: b.target });
+      } finally {
+        await backend.gestureEnd?.();
+      }
+    })();
   }
 
-  function onHandleDown(id: string, edge: "start" | "end", e: PointerEvent) {
+  function onMarkPointerDown(id: string, e: PointerEvent) {
+    if (e.button !== 0) return;
     e.stopPropagation();
-    e.preventDefault();
-    const b = launch.bindings.find((x) => x.id === id);
-    if (!b || b.target.kind !== "region") return;
-    resize = { id, edge, startTicks: b.target.startTicks, lengthTicks: b.target.lengthTicks };
     launch.selectedId = id;
-    void backend.gestureBegin?.("resize launch");
+    const b = launch.bindings.find((x) => x.id === id);
+    if (!b || b.target.kind !== "region") {
+      launch.focus(id);
+      return;
+    }
+    const p = lanesEl ? canvasPos(lanesEl, e.clientX, e.clientY) : { x: 0, y: 0 };
+    markDrag = {
+      id,
+      mode: "move",
+      startTicks: b.target.startTicks,
+      lengthTicks: b.target.lengthTicks,
+      trackIds: [...b.target.trackIds],
+      originX: p.x,
+      originY: p.y,
+      moved: false,
+    };
+    void backend.gestureBegin?.("move launch");
     try {
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     } catch {
@@ -611,40 +640,72 @@
     }
   }
 
-  function onHandleMove(e: PointerEvent) {
-    if (!resize || !lanesEl) return;
-    const b = launch.bindings.find((x) => x.id === resize!.id);
+  function onMarkPointerMove(e: PointerEvent) {
+    if (!markDrag || !lanesEl) return;
+    const b = launch.bindings.find((x) => x.id === markDrag!.id);
     if (!b || b.target.kind !== "region") return;
-    const { x } = canvasPos(lanesEl, e.clientX, e.clientY);
-    const tick = Math.max(0, Math.round(midi.samplesToTicks(view.samplesAt(x))));
-    const snapped = view.snap ? Math.round(tick / midi.ppq) * midi.ppq : tick;
-    if (resize.edge === "start") {
-      const end = resize.startTicks + resize.lengthTicks;
-      const start = Math.min(snapped, end - 1);
-      launch.patchLocal(resize.id, {
-        target: { ...b.target, startTicks: start, lengthTicks: end - start },
-      });
-    } else {
-      const start = resize.startTicks;
-      const end = Math.max(snapped, start + 1);
-      launch.patchLocal(resize.id, {
-        target: { ...b.target, lengthTicks: end - start },
-      });
+    const p = canvasPos(lanesEl, e.clientX, e.clientY);
+    if (!markDrag.moved && !movedPastMarqueeSlop(p.x - markDrag.originX, p.y - markDrag.originY)) {
+      return;
     }
+    markDrag = { ...markDrag, moved: true };
+    if (markDrag.mode === "resize" && markDrag.edge) {
+      const tick = Math.max(0, Math.round(midi.samplesToTicks(view.samplesAt(p.x))));
+      const snapped = view.snap ? Math.round(tick / midi.ppq) * midi.ppq : tick;
+      const next = resizeRegion(markDrag.startTicks, markDrag.lengthTicks, markDrag.edge, snapped);
+      launch.patchLocal(markDrag.id, { target: { ...b.target, ...next } });
+      return;
+    }
+    const originTick = midi.samplesToTicks(view.samplesAt(markDrag.originX));
+    const nowTick = midi.samplesToTicks(view.samplesAt(p.x));
+    let deltaTicks = Math.round(nowTick - originTick);
+    if (view.snap) deltaTicks = Math.round(deltaTicks / midi.ppq) * midi.ppq;
+    const originLane = laneIndexAt(markDrag.originY, project.tracks.length);
+    const nowLane = laneIndexAt(p.y, project.tracks.length);
+    launch.patchLocal(markDrag.id, {
+      target: shiftRegion(
+        {
+          kind: "region",
+          startTicks: markDrag.startTicks,
+          lengthTicks: markDrag.lengthTicks,
+          trackIds: markDrag.trackIds,
+        },
+        deltaTicks,
+        nowLane - originLane,
+        project.tracks,
+      ),
+    });
   }
 
-  function onHandleUp() {
-    const r = resize;
-    resize = null;
-    if (!r) return;
-    const b = launch.bindings.find((x) => x.id === r.id);
-    void (async () => {
-      try {
-        if (b) await launch.update(r.id, { target: b.target });
-      } finally {
-        await backend.gestureEnd?.();
-      }
-    })();
+  function onMarkPointerUp() {
+    if (markDrag && !markDrag.moved) launch.focus(markDrag.id);
+    persistMarkDrag();
+  }
+
+  function onHandleDown(id: string, edge: "start" | "end", e: PointerEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    const b = launch.bindings.find((x) => x.id === id);
+    if (!b || b.target.kind !== "region") return;
+    const p = lanesEl ? canvasPos(lanesEl, e.clientX, e.clientY) : { x: 0, y: 0 };
+    markDrag = {
+      id,
+      mode: "resize",
+      edge,
+      startTicks: b.target.startTicks,
+      lengthTicks: b.target.lengthTicks,
+      trackIds: [...b.target.trackIds],
+      originX: p.x,
+      originY: p.y,
+      moved: false,
+    };
+    launch.selectedId = id;
+    void backend.gestureBegin?.("resize launch");
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic */
+    }
   }
 </script>
 
@@ -733,6 +794,7 @@
 
     <div
       class="lanes"
+      class:marking={launch.marking}
       id="timeline-lanes"
       bind:this={lanesEl}
       role="presentation"
@@ -823,12 +885,15 @@
           class:clip={mark.binding.target.kind === "clip"}
           role="button"
           tabindex="0"
-          title="{mark.binding.name} — {mark.binding.note}"
+          title="{mark.binding.name} — drag to move, edges to resize"
           style:left="{left}px"
           style:top="{top}px"
           style:width="{width}px"
           style:height="{height}px"
           onpointerdown={(e) => onMarkPointerDown(mark.binding.id, e)}
+          onpointermove={onMarkPointerMove}
+          onpointerup={onMarkPointerUp}
+          onpointercancel={onMarkPointerUp}
         >
           <span class="launchlab mono">{mark.binding.name}</span>
           {#if launch.selectedId === mark.binding.id && mark.binding.target.kind === "region"}
@@ -837,16 +902,16 @@
               role="separator"
               aria-label="Resize launch start"
               onpointerdown={(e) => onHandleDown(mark.binding.id, "start", e)}
-              onpointermove={onHandleMove}
-              onpointerup={onHandleUp}
+              onpointermove={onMarkPointerMove}
+              onpointerup={onMarkPointerUp}
             ></div>
             <div
               class="launchhandle end"
               role="separator"
               aria-label="Resize launch end"
               onpointerdown={(e) => onHandleDown(mark.binding.id, "end", e)}
-              onpointermove={onHandleMove}
-              onpointerup={onHandleUp}
+              onpointermove={onMarkPointerMove}
+              onpointerup={onMarkPointerUp}
             ></div>
           {/if}
         </div>
@@ -1125,6 +1190,14 @@
     position: relative;
     overflow: hidden;
   }
+  .lanes.marking {
+    cursor: crosshair;
+  }
+  .lanes.marking :global(.clip),
+  .lanes.marking :global(.mclip),
+  .lanes.marking :global(.launchmark) {
+    pointer-events: none;
+  }
   .grid {
     position: absolute;
     top: 0;
@@ -1255,7 +1328,10 @@
     border: 1px solid rgba(255, 200, 87, 0.45);
     background: rgba(255, 200, 87, 0.08);
     pointer-events: auto;
-    cursor: pointer;
+    cursor: grab;
+  }
+  .launchmark:active {
+    cursor: grabbing;
   }
   .launchmark.clip {
     border-style: dashed;

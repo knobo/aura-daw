@@ -41,6 +41,7 @@ import type {
   MidiOutputStatus,
   MidiPortInfo,
   LaunchBinding,
+  LaunchSnapshot,
   OpenSidecarEvent,
   PluginDescriptor,
   PluginInstanceInfo,
@@ -361,9 +362,10 @@ export interface Backend {
   midiOutputStatus?(): Promise<MidiOutputStatus>;
 
   // ── MIDI launch map (note → region/clip) ──
-  launchGet?(): Promise<LaunchBinding[]>;
+  launchGet?(): Promise<LaunchSnapshot>;
   /** Upsert `binding`, or delete `id` when `binding` is null. */
-  launchSet?(binding: LaunchBinding | null, id?: string | null): Promise<LaunchBinding[]>;
+  launchSet?(binding: LaunchBinding | null, id?: string | null): Promise<LaunchSnapshot>;
+  launchSetDrive?(clipId: string, on: boolean): Promise<LaunchSnapshot>;
   launchFire?(id: string): Promise<void>;
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
@@ -828,10 +830,13 @@ class TauriBackend implements Backend {
   }
 
   launchGet() {
-    return invoke<LaunchBinding[]>("launch_get");
+    return invoke<LaunchSnapshot>("launch_get");
   }
   launchSet(binding: LaunchBinding | null, id?: string | null) {
-    return invoke<LaunchBinding[]>("launch_set", { binding, id: id ?? null });
+    return invoke<LaunchSnapshot>("launch_set", { binding, id: id ?? null });
+  }
+  launchSetDrive(clipId: string, on: boolean) {
+    return invoke<LaunchSnapshot>("launch_set_drive", { clipId, on });
   }
   async launchFire(id: string) {
     await invoke("launch_fire", { id });

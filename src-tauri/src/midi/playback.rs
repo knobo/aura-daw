@@ -391,6 +391,7 @@ mod tests {
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips,
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         }

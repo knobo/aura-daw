@@ -187,3 +187,48 @@ export const MIDI_NOTES: { note: number; name: string }[] = Array.from(
   { length: 128 },
   (_, note) => ({ note, name: midiNoteName(note) }),
 );
+
+export type RegionTarget = Extract<LaunchTarget, { kind: "region" }>;
+
+/** Shift a region in time and/or across lanes. Time is clamped at 0;
+ * the lane set slides as a block and the shift is reduced so every
+ * member stays on an existing track. */
+export function shiftRegion(
+  target: RegionTarget,
+  deltaTicks: number,
+  deltaLanes: number,
+  tracks: { id: string }[],
+): RegionTarget {
+  const startTicks = Math.max(0, target.startTicks + deltaTicks);
+  if (tracks.length === 0) {
+    return { ...target, startTicks };
+  }
+  const index = new Map(tracks.map((t, i) => [t.id, i]));
+  const lanes = target.trackIds.map((id) => index.get(id)).filter((i): i is number => i !== undefined);
+  if (lanes.length === 0) {
+    return { ...target, startTicks };
+  }
+  const lo = Math.min(...lanes);
+  const hi = Math.max(...lanes);
+  let shift = deltaLanes;
+  if (lo + shift < 0) shift = -lo;
+  if (hi + shift > tracks.length - 1) shift = tracks.length - 1 - hi;
+  const trackIds = lanes
+    .map((i) => tracks[i + shift]?.id)
+    .filter((id): id is string => !!id);
+  return { kind: "region", startTicks, lengthTicks: target.lengthTicks, trackIds };
+}
+
+export function resizeRegion(
+  startTicks: number,
+  lengthTicks: number,
+  edge: "start" | "end",
+  toTick: number,
+): { startTicks: number; lengthTicks: number } {
+  const end = startTicks + lengthTicks;
+  if (edge === "start") {
+    const start = Math.max(0, Math.min(toTick, end - 1));
+    return { startTicks: start, lengthTicks: end - start };
+  }
+  return { startTicks, lengthTicks: Math.max(1, toTick - startTicks) };
+}

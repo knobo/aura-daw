@@ -1584,10 +1584,16 @@ impl ControlPlane {
     }
 
     pub fn emit_launch_changed(&self) {
-        let list = self.session.lock().midi.launch_bindings.clone();
+        let snap = {
+            let s = self.session.lock();
+            crate::midi::launch::LaunchSnapshot {
+                bindings: s.midi.launch_bindings.clone(),
+                drive_clip_ids: s.midi.launch_drive_clip_ids.clone(),
+            }
+        };
         (self.emit)(
             "launch://changed",
-            serde_json::to_value(&list).unwrap_or_default(),
+            serde_json::to_value(&snap).unwrap_or_default(),
         );
     }
 
@@ -3378,6 +3384,7 @@ impl ControlPlane {
             session.midi.tempo_events = d0.tempo_events;
             session.midi.clips = d0.clips;
             session.midi.launch_bindings = d0.launch_bindings;
+            session.midi.launch_drive_clip_ids = d0.launch_drive_clip_ids;
             crate::midi::launch::runtime().set_bindings(Vec::new());
             // Finding 2: a stale `dirty = true` left over from a prior
             // auto-persist failure (M-5) must not survive into this fresh
@@ -6894,6 +6901,7 @@ mod tests {
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -6995,6 +7003,7 @@ mod tests {
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

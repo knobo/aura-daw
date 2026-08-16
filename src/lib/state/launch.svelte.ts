@@ -21,8 +21,11 @@ import {
 class LaunchStore {
   panelOpen = $state(false);
   bindings = $state<LaunchBinding[]>([]);
+  driveClipIds = $state<string[]>([]);
   selectedId = $state<string | null>(null);
   learningId = $state<string | null>(null);
+  /** Draw a new region on the timeline; clips stop capturing the pointer. */
+  marking = $state(false);
   error = $state<string | null>(null);
 
   get selected(): LaunchBinding | null {
@@ -35,12 +38,21 @@ class LaunchStore {
 
   togglePanel() {
     this.panelOpen = !this.panelOpen;
-    if (!this.panelOpen) this.stopLearn();
+    if (!this.panelOpen) {
+      this.stopLearn();
+      this.marking = false;
+    }
   }
 
   closePanel() {
     this.panelOpen = false;
+    this.marking = false;
     this.stopLearn();
+  }
+
+  toggleMarking() {
+    this.marking = !this.marking;
+    if (this.marking) this.panelOpen = true;
   }
 
   stopLearn() {
@@ -50,8 +62,8 @@ class LaunchStore {
 
   async init() {
     await this.reload();
-    backend.on?.("launch://changed", (list) => {
-      this.bindings = list;
+    backend.on?.("launch://changed", (snap) => {
+      this.accept(snap);
     });
     // Undo/open go through project://changed, not launch://changed.
     backend.on?.("project://changed", () => {
@@ -59,10 +71,32 @@ class LaunchStore {
     });
   }
 
+  private accept(snap: { bindings: LaunchBinding[]; driveClipIds: string[] }) {
+    this.bindings = snap.bindings;
+    this.driveClipIds = snap.driveClipIds;
+  }
+
+  drives(clipId: string): boolean {
+    return this.driveClipIds.includes(clipId);
+  }
+
+  async toggleDrive(clipId: string) {
+    const on = !this.drives(clipId);
+    this.driveClipIds = on
+      ? [...this.driveClipIds, clipId]
+      : this.driveClipIds.filter((id) => id !== clipId);
+    if (!backend.launchSetDrive) return;
+    try {
+      this.accept(await backend.launchSetDrive(clipId, on));
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
   async reload() {
     if (!backend.launchGet) return;
     try {
-      this.bindings = await backend.launchGet();
+      this.accept(await backend.launchGet());
     } catch (err) {
       this.error = String(err);
     }
@@ -186,7 +220,7 @@ class LaunchStore {
   private async persist(binding: LaunchBinding) {
     if (!backend.launchSet) return;
     try {
-      this.bindings = await backend.launchSet(binding);
+      this.accept(await backend.launchSet(binding));
     } catch (err) {
       this.error = String(err);
     }

@@ -60,6 +60,7 @@ fn v2_multi_tempo_project_migrates_and_resaves_as_v3() {
         meter_events: v3.meter_events.clone(),
         clips: v3.clips.clone(),
         launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
         loaded_dir: None,
         dirty: false,
     };
@@ -112,6 +113,7 @@ fn v2_project_with_clips_migrates_clips_into_content_and_placements() {
         meter_events: v3.meter_events.clone(),
         clips: v3.clips.clone(),
         launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
         loaded_dir: None,
         dirty: false,
     };

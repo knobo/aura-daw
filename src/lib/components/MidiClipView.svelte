@@ -147,6 +147,7 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    if (launch.marking) return;
     // The × button (main's clip-delete) lives INSIDE the clip, so its
     // pointerdown must not select, must not move the anchor and must not
     // open a drag — otherwise deleting one clip silently collapses a
@@ -339,11 +340,22 @@
     {#if override}
       <span class="routedot" title="MIDI output override: {override.portId}, channel {override.channel + 1}">⇥</span>
     {/if}
+    {#if launch.drives(clip.id)}
+      <span class="routedot" title="This clip drives the MIDI launch map">▶</span>
+    {/if}
     {#if menuOpen}
       <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (menuOpen = false)}></div>
       <div class="clipmenu" style:left="{visL + 4}px" role="menu">
         <button type="button" role="menuitem" onclick={openMidiOutputPicker}>MIDI output…</button>
         <button type="button" role="menuitem" onclick={() => void mapToNote()}>Map to MIDI note…</button>
+        <button
+          type="button"
+          role="menuitem"
+          onclick={() => {
+            menuOpen = false;
+            void launch.toggleDrive(clip.id);
+          }}
+        >{launch.drives(clip.id) ? "Launch map instrument ✓" : "Launch map as instrument"}</button>
       </div>
     {/if}
     {#if pickerOpen}

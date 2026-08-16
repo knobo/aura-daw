@@ -91,6 +91,9 @@ pub struct MidiStore {
     /// Note → region/clip launch map (document state). Empty on a project
     /// that has never marked anything.
     pub launch_bindings: Vec<crate::midi::launch::LaunchBinding>,
+    /// MIDI clips whose notes drive the launch map instead of the track
+    /// instrument. Empty by default.
+    pub launch_drive_clip_ids: Vec<String>,
     /// Project dir this store was last synced with (None = in-memory only).
     pub loaded_dir: Option<PathBuf>,
     /// Set when the last auto-persist (Plan E Task 7: the `PersistEffect`
@@ -110,6 +113,7 @@ impl Default for MidiStore {
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: Vec::new(),
             launch_bindings: Vec::new(),
+            launch_drive_clip_ids: Vec::new(),
             loaded_dir: None,
             dirty: false,
         }
@@ -222,7 +226,9 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
             midi.meter_events = v2.meter_events;
             midi.clips = v2.clips;
             midi.launch_bindings = v2.launch_bindings;
+            midi.launch_drive_clip_ids = v2.launch_drive_clip_ids;
             crate::midi::launch::runtime().set_bindings(midi.launch_bindings.clone());
+            crate::midi::launch::runtime().set_drive_clips(midi.launch_drive_clip_ids.clone());
             crate::midi::launch::runtime().clear_armed();
         }
         Ok(None) => {
@@ -233,7 +239,9 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
                 midi.meter_events = d0.meter_events;
                 midi.clips = d0.clips;
                 midi.launch_bindings = d0.launch_bindings;
+                midi.launch_drive_clip_ids = d0.launch_drive_clip_ids;
                 crate::midi::launch::runtime().set_bindings(midi.launch_bindings.clone());
+                crate::midi::launch::runtime().set_drive_clips(midi.launch_drive_clip_ids.clone());
                 crate::midi::launch::runtime().clear_armed();
             }
         }

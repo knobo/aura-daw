@@ -115,6 +115,7 @@ describe("startsMarquee", () => {
     expect(startsMarquee(targetIn([".clip", ".lane"]))).toBe(false);
     expect(startsMarquee(targetIn([".mclip", ".lane"]))).toBe(false);
     expect(startsMarquee(targetIn(["button", ".lane"]))).toBe(false);
+    expect(startsMarquee(targetIn([".launchmark", ".lanes"]))).toBe(false);
   });
 
   it("starts on empty lane background, and never on a null target", () => {

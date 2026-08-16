@@ -83,6 +83,11 @@
       "type": "array",
       "items": { "$ref": "aura:ipc/midi-launch.schema.json" }
     },
+    "launchDriveClipIds": {
+      "description": "MIDI clips whose notes drive the launch map instead of the track instrument. Additive (D-06).",
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "midiClips": {
       "description": "v2 legacy conflated MIDI clip rows (midi-clip.schema.json #/$defs/persistedClipLegacy). Present only on a file that has never been re-saved since its v2->v3 upgrade; persist.rs removes this key unconditionally on every v3 save (`obj.remove(\"midiClips\")`) and never writes it again.",
       "type": "array",

@@ -14,6 +14,7 @@
   import { ui } from "../state/ui.svelte";
   import { clipSelection } from "../state/clip-selection.svelte";
   import { clipDrag } from "../state/clip-drag.svelte";
+  import { launch } from "../state/launch.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildPeakColumns } from "../render/tiles";
   import { createPainter, hexToRgba, type WaveformPainter } from "../render/painter";
@@ -91,6 +92,7 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    if (launch.marking) return;
     if ((e.target as HTMLElement).closest("button")) return;
     const ref = { kind: "audio", id: clip.id } as const;
     const mode = selectionModeFor(e);

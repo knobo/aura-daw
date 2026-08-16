@@ -123,6 +123,7 @@ pub fn run() {
             // attach it to the control plane so the MIDI-out routing/port/
             // clock methods can reach it.
             let midi_out = app.state::<Arc<midi_out::MidiOut>>().inner().clone();
+            crate::midi::launch::runtime().attach_drive(midi_out_shared.clone(), midi_out_session.clone());
             midi_out.attach(midi_out_session, midi_out_shared);
             control_plane.attach_midi_out(midi_out);
 
@@ -254,6 +255,7 @@ pub fn run() {
             // ---- MIDI launch map (note → region/clip) ----
             midi::launch::launch_get,
             midi::launch::launch_set,
+            midi::launch::launch_set_drive,
             midi::launch::launch_fire,
             midi::launch::launch_learn_arm,
             midi::launch::launch_learn_take,
