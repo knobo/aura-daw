@@ -194,6 +194,9 @@ pub fn run() {
             osclipboard::os_clipboard_write_text,
             osclipboard::os_clipboard_read_text,
             control::remove_clip,
+            // Additive: "open in external editor" (double-click an audio
+            // clip on the timeline).
+            control::open_clip_in_external_editor,
             control::gesture_begin,
             control::gesture_end,
             // ---- control plane: undo/redo (Plan E Task 17, additive) ----

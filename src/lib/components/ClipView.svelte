@@ -3,7 +3,9 @@
    * One clip on the timeline. Pointer-drag with beat snapping (Alt bypasses),
    * a tile-fed waveform canvas that renders only its visible span (WebGPU
    * with Canvas2D fallback), selection, and the "AI Split Stems" magic
-   * button + processing scan overlay.
+   * button + processing scan overlay. Double-click opens the clip's source
+   * file in the OS's default external editor (e.g. Audacity), mirroring
+   * MidiClipView's double-click-opens-piano-roll.
    */
   import type { Clip, TrackState } from "../types/ipc";
   import { project } from "../state/project.svelte";
@@ -123,6 +125,16 @@
     void clipDrag.end();
   }
 
+  // ── open in external editor ──
+  // Double-click hands the clip's source file off to the OS's default app
+  // for its file type — the audio-clip analogue of MidiClipView's
+  // double-click-opens-piano-roll.
+  function onDblClick(e: MouseEvent) {
+    e.stopPropagation();
+    if ((e.target as HTMLElement).closest("button")) return;
+    void project.openInExternalEditor(clip.id);
+  }
+
   function onKeydown(e: KeyboardEvent) {
     const beat = project.samplesPerBeat;
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
@@ -148,12 +160,13 @@
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
     role="button"
-    aria-label="Clip {clip.name}"
+    aria-label="Clip {clip.name} — double-click to open in external editor"
     tabindex="0"
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
     onpointercancel={() => clipDrag.cancel()}
+    ondblclick={onDblClick}
     onkeydown={onKeydown}
   >
     <canvas bind:this={canvas} class="wave" style:left="{visL}px" style:width="{visW}px"></canvas>

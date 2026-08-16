@@ -432,11 +432,11 @@
       void modulation.addClip(track.id, Math.max(0, startTicks), 2 * midi.ticksPerBar);
       return;
     }
+    if ((e.target as HTMLElement).closest(".mclip, .clip")) return;
     if (track.kind !== "midi") {
       toasts.info("NOT A MIDI LANE", `"${track.name}" is an audio track — midi clips need a midi lane`);
       return;
     }
-    if ((e.target as HTMLElement).closest(".mclip, .clip")) return;
     const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
     const samples = view.snapSamples(Math.max(0, view.samplesAt(e.clientX - rect.left)));
     const startTicks = Math.round(midi.samplesToTicks(samples) / midi.ppq) * midi.ppq;
