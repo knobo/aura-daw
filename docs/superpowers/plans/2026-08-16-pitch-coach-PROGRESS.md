@@ -160,6 +160,8 @@ follow-ups and the R3 instrument.
       the prefs suite. `NumberDef.unit` grew an `"ms"` case.
 - [x] Task 11 — the panel — `7cc1aa5`. 547 frontend tests green,
       `svelte-check` clean, `npm run build` green.
+- [x] Review round on PR #58 — `a590136`. Nine findings, all fixed; the
+      branch is no longer frontend-only (see the log).
 
 **Phase 3 — scoring.** Not started. Tasks 12–16: shared repeat-expansion
 helper, scoring, pitch track on disk, the report, docs + PR.
@@ -281,6 +283,31 @@ with the commit sha and anything the next agent would be surprised by.
 
 ## Log
 
+- 2026-08-16 — **PR #58 reviewed and fixed** (`a590136`). Rust 1020
+  (984 lib + 36 integration), frontend 564. Four things worth carrying
+  forward:
+  1. **`pitch_unsubscribe` exists now** — additive, keyed on
+     `Channel::id()`. It had to: `pitch_subscribe` appends a sink and the
+     engine only retires one when `send_batch` fails, which a live Tauri
+     `Channel` never does no matter how dead its JS end is. Every open of
+     the panel leaked a sink. Anything else that subscribes per-mount
+     (rather than once for the app's lifetime, like meters) needs the same
+     treatment — `subscribeMeters`' mute-only unsubscribe is NOT a pattern
+     to copy.
+  2. **`PitchFrame.sample` is a PROJECT sample position**, not device-rate.
+     It is anchored to `shared.position` and only offset within one
+     callback buffer. The old doc comment and schema said "device-rate
+     samples" and the panel believed them, which made the latency offset
+     ~8% short on a 44.1 kHz mic in a 48 kHz project. Both now say so.
+  3. **Rehearse-hold is refcounted** in `state/rehearse.svelte.ts`. Two
+     controls, one engine boolean: with a flag per control, releasing one
+     while the other is down ended the hold and the take started writing
+     real audio mid-rehearsal.
+  4. **The full Rust suite is only trustworthy single-threaded on this
+     box.** Three parallel runs failed a DIFFERENT set each time
+     (`midi_out::tests::*`, `mcp::server::tests::read_meters_hears_the_headless_engine`
+     — a 3 s deadline), each passing in isolation; `--test-threads=1` is
+     1020/1020. Load average was 5–6 with 4 GB free.
 - 2026-08-16 — **Phase 2 complete** on `feat/pitch-coach-panel`
   (`c757b8c`, `60d7ca3`, `514866b`, `809b3b5`, `7cc1aa5`). 547 frontend
   tests, `svelte-check` 0 errors, `npm run build` green. `cargo test` was
