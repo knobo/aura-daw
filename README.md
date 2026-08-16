@@ -406,8 +406,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 907 tests (873 lib + 34 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after #47 + external editor): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, clip source path for external editor
-npm test                      # 460 frontend unit tests (counted 2026-08-16 after #47 + external editor; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + open-in-external-editor toast
+cd src-tauri && cargo test    # 938 tests (904 lib + 34 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after #47 + MIDI launch review): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map
+npm test                      # 488 frontend unit tests (counted 2026-08-16 after #47 + MIDI launch review; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + launch map
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

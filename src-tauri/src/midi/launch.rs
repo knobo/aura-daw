@@ -3,17 +3,21 @@
 //! MIDI-out loopback.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-
+use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 
 pub const ECHO_WINDOW_MS: u64 = 80;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum LaunchTarget {
     Region {
         #[serde(alias = "start_ticks")]
@@ -109,11 +113,15 @@ pub fn migrate_legacy_maps(
 }
 
 pub fn all_bindings(maps: &[LaunchMap]) -> Vec<LaunchBinding> {
-    maps.iter().flat_map(|m| m.bindings.iter().cloned()).collect()
+    maps.iter()
+        .flat_map(|m| m.bindings.iter().cloned())
+        .collect()
 }
 
 pub fn all_drive_clip_ids(maps: &[LaunchMap]) -> Vec<String> {
-    maps.iter().flat_map(|m| m.drive_clip_ids.iter().cloned()).collect()
+    maps.iter()
+        .flat_map(|m| m.drive_clip_ids.iter().cloned())
+        .collect()
 }
 
 pub fn ensure_maps(maps: &mut Vec<LaunchMap>) {
@@ -160,8 +168,28 @@ pub fn drive_event_in_window(sample: u64, last: u64, pos: u64) -> bool {
     }
 }
 
-pub fn find_binding<'a>(maps: &'a [LaunchMap], id: &str) -> Option<(&'a LaunchMap, &'a LaunchBinding)> {
-    maps.iter().find_map(|m| m.bindings.iter().find(|b| b.id == id).map(|b| (m, b)))
+/// Play-edge window: `[last, pos]` so a note at sample 0 fires.
+/// `last = pos.saturating_sub(1)` plus the half-open window is empty at 0.
+pub fn drive_in_window(sample: u64, last: u64, pos: u64, play_edge: bool) -> bool {
+    if play_edge {
+        sample >= last && sample <= pos
+    } else {
+        drive_event_in_window(sample, last, pos)
+    }
+}
+
+/// Clip-as-instrument: match the written key only. Binding `channel` is a
+/// hardware MIDI-in filter; a drive clip must still fire `channel: Some(n)`.
+pub fn resolve_drive<'a>(bindings: &'a [LaunchBinding], key: u8) -> Option<&'a LaunchBinding> {
+    bindings.iter().find(|b| b.note == key)
+}
+
+pub fn find_binding<'a>(
+    maps: &'a [LaunchMap],
+    id: &str,
+) -> Option<(&'a LaunchMap, &'a LaunchBinding)> {
+    maps.iter()
+        .find_map(|m| m.bindings.iter().find(|b| b.id == id).map(|b| (m, b)))
 }
 
 /// Map that owns `binding_id`, else the named map, else the first map.
@@ -181,7 +209,11 @@ pub struct EchoNote {
     pub at_ms: u64,
 }
 
-pub fn resolve<'a>(bindings: &'a [LaunchBinding], note: u8, channel: u8) -> Option<&'a LaunchBinding> {
+pub fn resolve<'a>(
+    bindings: &'a [LaunchBinding],
+    note: u8,
+    channel: u8,
+) -> Option<&'a LaunchBinding> {
     bindings.iter().find(|b| b.matches(note, channel))
 }
 
@@ -202,9 +234,9 @@ pub fn clip_would_self_trigger(
     trigger_note: u8,
     trigger_channel: Option<u8>,
 ) -> bool {
-    notes.iter().any(|(key, ch)| {
-        *key == trigger_note && trigger_channel.map(|c| c == *ch).unwrap_or(true)
-    })
+    notes
+        .iter()
+        .any(|(key, ch)| *key == trigger_note && trigger_channel.map(|c| c == *ch).unwrap_or(true))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,17 +317,17 @@ impl LaunchRuntime {
     }
 
     pub fn set_maps(&self, maps: Vec<LaunchMap>) {
-        *self.maps.lock().unwrap() = maps;
+        *self.maps.lock() = maps;
         self.gen.fetch_add(1, Relaxed);
     }
 
     pub fn maps(&self) -> Vec<LaunchMap> {
-        self.maps.lock().unwrap().clone()
+        self.maps.lock().clone()
     }
 
     /// Test/helper: write bindings onto the first launcher (created if needed).
     pub fn set_bindings(&self, bindings: Vec<LaunchBinding>) {
-        let mut maps = self.maps.lock().unwrap();
+        let mut maps = self.maps.lock();
         if maps.is_empty() {
             maps.push(LaunchMap::default_map());
         }
@@ -304,16 +336,16 @@ impl LaunchRuntime {
     }
 
     pub fn bindings(&self) -> Vec<LaunchBinding> {
-        all_bindings(&self.maps.lock().unwrap())
+        all_bindings(&self.maps.lock())
     }
 
     pub fn set_learning(&self, id: Option<String>) {
-        *self.learning.lock().unwrap() = id;
-        *self.last_learn.lock().unwrap() = None;
+        *self.learning.lock() = id;
+        *self.last_learn.lock() = None;
     }
 
     pub fn take_learn(&self) -> Option<(u8, u8)> {
-        self.last_learn.lock().unwrap().take()
+        self.last_learn.lock().take()
     }
 
     pub fn install_fire(&self, f: Arc<dyn Fn(FireCmd) + Send + Sync>) {
@@ -325,52 +357,56 @@ impl LaunchRuntime {
                     f(cmd);
                 }
             });
-        *self.fire_tx.lock().unwrap() = Some(tx);
+        *self.fire_tx.lock() = Some(tx);
     }
 
     pub fn set_audible_tracks(&self, ids: Vec<String>) {
-        *self.audible_tracks.lock().unwrap() = ids;
+        *self.audible_tracks.lock() = ids;
     }
 
     pub fn audible_tracks(&self) -> Vec<String> {
-        self.audible_tracks.lock().unwrap().clone()
+        self.audible_tracks.lock().clone()
     }
 
     pub fn clear_audible_tracks(&self) {
-        self.audible_tracks.lock().unwrap().clear();
-        *self.overlay_id.lock().unwrap() = None;
+        self.audible_tracks.lock().clear();
+        *self.overlay_id.lock() = None;
     }
 
     pub fn set_overlay_id(&self, id: Option<String>) {
-        *self.overlay_id.lock().unwrap() = id;
+        *self.overlay_id.lock() = id;
     }
 
     pub fn overlay_id(&self) -> Option<String> {
-        self.overlay_id.lock().unwrap().clone()
+        self.overlay_id.lock().clone()
     }
 
     pub fn set_drive_focus(&self, id: Option<String>) {
-        *self.drive_focus.lock().unwrap() = id;
+        *self.drive_focus.lock() = id;
     }
 
     pub fn drive_focus(&self) -> Option<String> {
-        self.drive_focus.lock().unwrap().clone()
+        self.drive_focus.lock().clone()
     }
 
     pub fn record_out(&self, note: u8, channel: u8) {
         let at = self.now_ms();
-        let mut echo = self.echo.lock().unwrap();
-        echo.push(EchoNote { note, channel, at_ms: at });
+        let mut echo = self.echo.lock();
+        echo.push(EchoNote {
+            note,
+            channel,
+            at_ms: at,
+        });
         let cutoff = at.saturating_sub(ECHO_WINDOW_MS * 4);
         echo.retain(|e| e.at_ms >= cutoff);
     }
 
     pub fn clear_armed(&self) {
-        *self.armed.lock().unwrap() = None;
+        *self.armed.lock() = None;
     }
 
     pub fn set_drive_clips(&self, ids: Vec<String>) {
-        let mut maps = self.maps.lock().unwrap();
+        let mut maps = self.maps.lock();
         if maps.is_empty() {
             maps.push(LaunchMap::default_map());
         }
@@ -410,6 +446,7 @@ impl LaunchRuntime {
                     if !playing {
                         last = pos;
                         was_playing = false;
+                        last_onset.clear();
                         continue;
                     }
                     if pos < last {
@@ -440,7 +477,8 @@ impl LaunchRuntime {
                     }
                     let mut just_started = false;
                     if !was_playing {
-                        last = pos.saturating_sub(1);
+                        // Inclusive of the stop/seek sample. Do not
+                        // saturating_sub(1): at pos 0 that empties the window.
                         was_playing = true;
                         just_started = true;
                         play_started = Instant::now();
@@ -498,10 +536,10 @@ impl LaunchRuntime {
                                 ));
                             }
                             for ev in evs {
-                                if !drive_event_in_window(ev.sample, last, pos) {
+                                if !drive_in_window(ev.sample, last, pos, just_started) {
                                     continue;
                                 }
-                                let Some(b) = resolve(&launcher.bindings, ev.key, 0) else {
+                                let Some(b) = resolve_drive(&launcher.bindings, ev.key) else {
                                     continue;
                                 };
                                 if let LaunchTarget::Clip { clip_id } = &b.target {
@@ -556,30 +594,34 @@ impl LaunchRuntime {
 
     pub fn decide(&self, on: bool, note: u8, channel: u8) -> IncomingDecision {
         if !on {
-            let mut armed = self.armed.lock().unwrap();
+            let mut armed = self.armed.lock();
             if *armed == Some((note, channel)) {
                 *armed = None;
             }
             return IncomingDecision::Pass;
         }
-        if self.learning.lock().unwrap().is_some() {
-            *self.last_learn.lock().unwrap() = Some((note, channel));
+        if self.learning.lock().is_some() {
+            *self.last_learn.lock() = Some((note, channel));
             return IncomingDecision::Learn { note, channel };
         }
         let now = self.now_ms();
-        let echo = self.echo.lock().unwrap();
+        let echo = self.echo.lock();
         if incoming_is_echo(
             &echo,
-            EchoNote { note, channel, at_ms: now },
+            EchoNote {
+                note,
+                channel,
+                at_ms: now,
+            },
             ECHO_WINDOW_MS,
         ) {
             return IncomingDecision::Echo;
         }
         drop(echo);
-        if *self.armed.lock().unwrap() == Some((note, channel)) {
+        if *self.armed.lock() == Some((note, channel)) {
             return IncomingDecision::Suppressed;
         }
-        let maps = self.maps.lock().unwrap();
+        let maps = self.maps.lock();
         let bindings = all_bindings(&maps);
         match resolve(&bindings, note, channel).cloned() {
             Some(b) => IncomingDecision::Fire(b),
@@ -588,13 +630,13 @@ impl LaunchRuntime {
     }
 
     pub fn enqueue_fire(&self, b: LaunchBinding, origin: FireOrigin) {
-        if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
+        if let Some(tx) = self.fire_tx.lock().as_ref() {
             let _ = tx.try_send(FireCmd::Start(b, origin));
         }
     }
 
     pub fn enqueue_release(&self, id: String) {
-        if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
+        if let Some(tx) = self.fire_tx.lock().as_ref() {
             let _ = tx.try_send(FireCmd::Release(id));
         }
     }
@@ -608,11 +650,8 @@ impl LaunchRuntime {
             IncomingDecision::Learn { .. } => true,
             IncomingDecision::Echo | IncomingDecision::Suppressed => true,
             IncomingDecision::Fire(b) => {
-                *self.armed.lock().unwrap() = Some((note, channel));
-                launch_trace(format!(
-                    "hardware note={} ch={} -> {}",
-                    note, channel, b.id
-                ));
+                *self.armed.lock() = Some((note, channel));
+                launch_trace(format!("hardware note={} ch={} -> {}", note, channel, b.id));
                 self.enqueue_fire(b, FireOrigin::Hardware);
                 true
             }
@@ -642,7 +681,11 @@ impl crate::control::ControlPlane {
         meta: crate::control::op::TxMeta,
     ) -> Result<LaunchSnapshot, String> {
         self.commit(meta, |tx| {
-            tx.apply(crate::control::op::Op::LaunchBindingSet { map_id, id, binding })?;
+            tx.apply(crate::control::op::Op::LaunchBindingSet {
+                map_id,
+                id,
+                binding,
+            })?;
             Ok(())
         })?;
         self.emit_launch_changed();
@@ -657,7 +700,11 @@ impl crate::control::ControlPlane {
         meta: crate::control::op::TxMeta,
     ) -> Result<LaunchSnapshot, String> {
         self.commit(meta, |tx| {
-            tx.apply(crate::control::op::Op::LaunchDriveSet { map_id, clip_id, on })?;
+            tx.apply(crate::control::op::Op::LaunchDriveSet {
+                map_id,
+                clip_id,
+                on,
+            })?;
             Ok(())
         })?;
         self.emit_launch_changed();
@@ -702,7 +749,11 @@ impl crate::control::ControlPlane {
                         .iter()
                         .find(|c| c.id.as_str() == clip_id)
                         .ok_or_else(|| format!("launch clip is gone: {clip_id}"))?;
-                    (c.timeline_start_ticks, c.length_ticks, vec![c.track_id.to_string()])
+                    (
+                        c.timeline_start_ticks,
+                        c.length_ticks,
+                        vec![c.track_id.to_string()],
+                    )
                 }
             };
             (
@@ -716,7 +767,9 @@ impl crate::control::ControlPlane {
         };
         let map = crate::midi::TempoMap::new(ppq, events, rate.max(1))?;
         let start = map.tick_to_samples(start_ticks);
-        let end = map.tick_to_samples(start_ticks.saturating_add(length_ticks)).max(start + 1);
+        let end = map
+            .tick_to_samples(start_ticks.saturating_add(length_ticks))
+            .max(start + 1);
         runtime().set_audible_tracks(track_ids.clone());
         log::info!(
             "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
@@ -740,7 +793,9 @@ impl crate::control::ControlPlane {
                     start_samples: start,
                     end_samples: end,
                 })?;
-                self.transport(crate::control::TransportAction::Seek { position_samples: start })?;
+                self.transport(crate::control::TransportAction::Seek {
+                    position_samples: start,
+                })?;
                 self.transport(crate::control::TransportAction::Play)?;
             }
         }
@@ -928,7 +983,9 @@ mod tests {
             name: id.into(),
             note,
             channel: None,
-            target: LaunchTarget::Clip { clip_id: clip_id.into() },
+            target: LaunchTarget::Clip {
+                clip_id: clip_id.into(),
+            },
         }
     }
 
@@ -958,7 +1015,12 @@ mod tests {
             }
         );
         let clip: LaunchTarget = serde_json::from_str(r#"{"kind":"clip","clipId":"c-1"}"#).unwrap();
-        assert_eq!(clip, LaunchTarget::Clip { clip_id: "c-1".into() });
+        assert_eq!(
+            clip,
+            LaunchTarget::Clip {
+                clip_id: "c-1".into()
+            }
+        );
         let wire = serde_json::to_value(&region).unwrap();
         assert_eq!(wire["startTicks"], 480);
         assert!(wire.get("start_ticks").is_none());
@@ -1007,20 +1069,36 @@ mod tests {
 
     #[test]
     fn echo_window_filters_loopback() {
-        let sent = [EchoNote { note: 60, channel: 0, at_ms: 1000 }];
+        let sent = [EchoNote {
+            note: 60,
+            channel: 0,
+            at_ms: 1000,
+        }];
         assert!(incoming_is_echo(
             &sent,
-            EchoNote { note: 60, channel: 0, at_ms: 1040 },
+            EchoNote {
+                note: 60,
+                channel: 0,
+                at_ms: 1040
+            },
             80
         ));
         assert!(!incoming_is_echo(
             &sent,
-            EchoNote { note: 60, channel: 0, at_ms: 1090 },
+            EchoNote {
+                note: 60,
+                channel: 0,
+                at_ms: 1090
+            },
             80
         ));
         assert!(!incoming_is_echo(
             &sent,
-            EchoNote { note: 61, channel: 0, at_ms: 1010 },
+            EchoNote {
+                note: 61,
+                channel: 0,
+                at_ms: 1010
+            },
             80
         ));
     }
@@ -1042,7 +1120,13 @@ mod tests {
         let rt = LaunchRuntime::default();
         rt.set_bindings(vec![region("a", 60, None)]);
         rt.set_learning(Some("a".into()));
-        assert_eq!(rt.decide(true, 72, 3), IncomingDecision::Learn { note: 72, channel: 3 });
+        assert_eq!(
+            rt.decide(true, 72, 3),
+            IncomingDecision::Learn {
+                note: 72,
+                channel: 3
+            }
+        );
         assert_eq!(rt.take_learn(), Some((72, 3)));
     }
 
@@ -1098,7 +1182,13 @@ mod tests {
             !drive_clip_eligible("c2", "t-live", &drive, &live, Some("c1")),
             "clip-editor focus plays only that clip"
         );
-        assert!(drive_clip_eligible("c1", "t-live", &drive, &live, Some("c1")));
+        assert!(drive_clip_eligible(
+            "c1",
+            "t-live",
+            &drive,
+            &live,
+            Some("c1")
+        ));
         assert!(!drive_clip_eligible("other", "t-live", &drive, &live, None));
     }
 
@@ -1106,10 +1196,8 @@ mod tests {
     fn launch_map_missing_play_mode_defaults_to_gate() {
         let m: LaunchMap = serde_json::from_str(r#"{"id":"x","name":"Drums"}"#).unwrap();
         assert_eq!(m.play_mode, LaunchPlayMode::Gate);
-        let one: LaunchMap = serde_json::from_str(
-            r#"{"id":"x","name":"Drums","playMode":"oneShot"}"#,
-        )
-        .unwrap();
+        let one: LaunchMap =
+            serde_json::from_str(r#"{"id":"x","name":"Drums","playMode":"oneShot"}"#).unwrap();
         assert_eq!(one.play_mode, LaunchPlayMode::OneShot);
     }
 
@@ -1136,6 +1224,162 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("worker should fire");
         assert_eq!(id, "a");
-        assert_ne!(tid, caller, "launch_fire must not run on the midir/caller thread");
+        assert_ne!(
+            tid, caller,
+            "launch_fire must not run on the midir/caller thread"
+        );
+    }
+
+    #[test]
+    fn play_edge_includes_sample_zero() {
+        assert!(
+            drive_in_window(0, 0, 0, true),
+            "play from 0 must include the downbeat"
+        );
+        assert!(
+            !drive_event_in_window(0, 0, 0),
+            "half-open (last, pos] is empty at 0 — that is why play-edge is inclusive"
+        );
+    }
+
+    #[test]
+    fn resolve_drive_ignores_binding_channel() {
+        let b = [region("kick", 60, Some(2))];
+        assert!(
+            resolve(&b, 60, 0).is_none(),
+            "hardware resolve still honours channel"
+        );
+        assert_eq!(
+            resolve_drive(&b, 60).unwrap().id,
+            "kick",
+            "clip-as-instrument matches the written key only"
+        );
+    }
+
+    fn clip_note_at_tick_zero() -> crate::midi::types::MidiClip {
+        use crate::ids::NoteId;
+        use crate::midi::types::{MidiClip, MidiNote};
+        MidiClip {
+            id: "drive-1".into(),
+            track_id: "t1".into(),
+            name: "Drive".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: vec![MidiNote {
+                tick: 0,
+                length_ticks: 120,
+                key: 60,
+                velocity: 100,
+                channel: 2,
+                note_id: NoteId(1),
+            }],
+            next_note_id: 2,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        }
+    }
+
+    fn drive_tick(
+        rt: &LaunchRuntime,
+        last: &mut u64,
+        was_playing: &mut bool,
+        last_onset: &mut std::collections::HashMap<String, u64>,
+        playing: bool,
+        pos: u64,
+        events: &[crate::midi::schedule::AbsNoteEvent],
+        bindings: &[LaunchBinding],
+    ) {
+        if !playing {
+            *last = pos;
+            *was_playing = false;
+            last_onset.clear();
+            return;
+        }
+        let play_edge = !*was_playing;
+        *was_playing = true;
+        for ev in events.iter().filter(|e| e.velocity > 0) {
+            if !drive_in_window(ev.sample, *last, pos, play_edge) {
+                continue;
+            }
+            let Some(b) = resolve_drive(bindings, ev.key) else {
+                continue;
+            };
+            if last_onset.get(&b.id) == Some(&ev.sample) {
+                continue;
+            }
+            last_onset.insert(b.id.clone(), ev.sample);
+            rt.enqueue_fire(b.clone(), FireOrigin::Drive);
+        }
+        *last = pos;
+    }
+
+    #[test]
+    fn play_from_zero_enqueues_again_after_stop() {
+        let rt = LaunchRuntime::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.install_fire(std::sync::Arc::new(move |cmd| {
+            if let FireCmd::Start(b, FireOrigin::Drive) = cmd {
+                let _ = tx.send(b.id);
+            }
+        }));
+        let map = crate::midi::TempoMap::from_v1(120.0, 48_000).unwrap();
+        let evs = crate::midi::schedule::clip_drive_events(&clip_note_at_tick_zero(), &map);
+        assert_eq!(
+            evs.iter().find(|e| e.velocity > 0).map(|e| e.sample),
+            Some(0),
+            "tick 0 is sample 0 at 120 bpm / 48 kHz"
+        );
+        // channel: Some(2) must still match a drive note (key only).
+        let bindings = vec![region("kick", 60, Some(2))];
+        let mut last = 0u64;
+        let mut was_playing = false;
+        let mut last_onset = std::collections::HashMap::new();
+
+        drive_tick(
+            &rt,
+            &mut last,
+            &mut was_playing,
+            &mut last_onset,
+            true,
+            0,
+            &evs,
+            &bindings,
+        );
+        drive_tick(
+            &rt,
+            &mut last,
+            &mut was_playing,
+            &mut last_onset,
+            false,
+            0,
+            &evs,
+            &bindings,
+        );
+        drive_tick(
+            &rt,
+            &mut last,
+            &mut was_playing,
+            &mut last_onset,
+            true,
+            0,
+            &evs,
+            &bindings,
+        );
+
+        let first = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("play from 0 must enqueue a fire");
+        let second = rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("stop/play must enqueue the same downbeat again");
+        assert_eq!(first, "kick");
+        assert_eq!(second, "kick");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly two fires — one per play edge"
+        );
     }
 }
