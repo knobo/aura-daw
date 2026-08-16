@@ -17,10 +17,9 @@ documentation and all commits are English.
 
 | | |
 |---|---|
-| On `main` | squash `84b0313` (PR #49) |
-| Worktree | stale — `/home/knobo/prog/dav/.claude/worktrees/pitch-coach` |
-| In flight | `feat/pitch-rt-thread` — review follow-ups 6 + 7, worktree `.claude/worktrees/pitch-rt` |
-| Next | owner ear-check (R3), then Phase 2 from `origin/main` |
+| On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
+| Worktrees | both stale after PR #54 merged — `pitch-coach`, `pitch-rt` |
+| Next | **Phase 2, Task 7**, from `origin/main` |
 
 ## Status
 
@@ -33,7 +32,8 @@ documentation and all commits are English.
 - [x] Pre-existing red test on main fixed by the owner in PR #45, merged in
 - [x] Implementation plan written and self-reviewed
 
-**Phase 1 — backend.** PR #49 review fixes landed; owner checkpoint still open.
+**Phase 1 — backend. DONE.** PR #49, plus PR #54 for the two review
+follow-ups and the R3 instrument.
 
 - [x] Task 1 — YIN detector (`audio/yin.rs`) — `eb0d47b`, 799 tests green
 - [x] Task 2 — decimation to 8 kHz (`audio/decimate.rs`) — `190316a`, 5/5
@@ -138,9 +138,38 @@ documentation and all commits are English.
       and clarity. It does NOT exercise the Tauri command layer or the 60 Hz
       batching — that is phase 2's to prove.
 
-**Phase 2 — panel.** Not started. Tasks 7–11.
+**Phase 2 — panel.** Not started. Tasks 7–11: wire types + backend
+bindings, the non-reactive frame bus, lane drawing helpers, preferences,
+the panel itself. **Start at Task 7.**
 
-**Phase 3 — scoring.** Not started. Tasks 12–16.
+**Phase 3 — scoring.** Not started. Tasks 12–16: shared repeat-expansion
+helper, scoring, pitch track on disk, the report, docs + PR.
+
+### What phase 2 must not get wrong
+
+Both of these came out of actually running the detector against a voice
+(see the log), not out of reading the plan:
+
+- **Draw the `midi` float, never the rounded note name.** The label flips
+  across a semitone boundary while the pitch barely moves — G2 to G#2 on a
+  0.9 Hz change, seen on both a whistle and a held vowel. Drawing the label
+  makes the trail strobe for exactly the users this feature exists for.
+- **Do not make "distance to the nearest note" the headline number.** It
+  saturates near 50 cents for anyone sitting midway between two semitones,
+  which is where a person who cannot hit a pitch lives. It reads as a
+  failure and is not one. Stability — how steadily the reading holds — is
+  the honest measure of whether the detector is tracking someone.
+
+### Still open, beyond the numbered tasks
+
+- **The Tauri command layer is unproven.** `pitch_check` exercises the
+  detector, not `pitch_listen_start` / `pitch_subscribe` / the 60 Hz
+  batching in `Control`. Nothing has ever driven those end to end. Task 7
+  is the first thing that will.
+- **One voice, one vowel, one room.** No woman's voice, no falsetto, no
+  vibrato, no backing track under it.
+- **Speaker bleed is mitigated, not solved** (see below). The panel says so
+  once, plainly.
 
 ## Decisions already made (do not relitigate)
 
@@ -201,10 +230,16 @@ review is left open.
 
 ## Open items needing the owner
 
-1. **`src-tauri/src/lib.rs` was FROZEN.** Owner later authorised additive
+1. **R3 is answered on substance; the box is the owner's to tick.** Three
+   runs, recorded under the checkpoint above: a synthetic tone at 0.4
+   cents, a whistle held 10 s, and — the one that matters — a sustained
+   vowel at ~100 Hz with **no octave errors in 1312 frames**. A vowel
+   carries strong harmonics at 200/300/400 Hz, which is where YIN reports
+   the wrong octave, and the detected range never left 92–102 Hz.
+2. **`src-tauri/src/lib.rs` was FROZEN.** Owner later authorised additive
    command registration (new names only). Task 6 may edit `lib.rs` for
    the five new pitch commands; do not rename existing ones.
-2. **Speaker bleed is mitigated, not solved.** Without headphones the
+3. **Speaker bleed is mitigated, not solved.** Without headphones the
    backing track is detected as pitch. The panel says so once, plainly.
 
 ## Conventions
