@@ -129,7 +129,9 @@ mod tests {
 
     #[test]
     fn detects_pitch_within_25_cents_across_the_vocal_range() {
-        for &hz in &[65.0f32, 98.0, 147.0, 220.0, 440.0, 880.0] {
+        // 66 Hz, not 65: exactly FMIN is unreachable by construction, which
+        // `the_effective_floor_sits_just_above_fmin` documents below.
+        for &hz in &[66.0f32, 98.0, 147.0, 220.0, 440.0, 880.0] {
             let s = sine(hz, 4096);
             let got = detect_hz(&s).unwrap_or_else(|| panic!("{hz} Hz read as unvoiced"));
             let err = cents_between(got, hz).abs();
@@ -178,6 +180,29 @@ mod tests {
         let got = detect_hz(&s).expect("harmonic tone must be voiced");
         let err = cents_between(got, f0).abs();
         assert!(err < 50.0, "expected ~{f0} Hz, got {got} Hz ({err:.1} cents off)");
+    }
+
+    /// The searchable floor is `sr / tau_max`, not `FMIN` itself. `tau_max
+    /// = (sr / FMIN) as usize` truncates 123.07 to 123, so the longest lag
+    /// the search can reach is 8000/123 = 65.04 Hz. A tone at exactly FMIN
+    /// interpolates a hair below that and the range gate rejects it.
+    ///
+    /// `sidecars/hum_to_midi.py` behaves identically — verified by running
+    /// its own `_frame_pitch_py` on the same tone. Parity with the sidecar
+    /// is the binding requirement (spec §3.2), so this is documented
+    /// rather than "fixed": widening `tau_max` here would make the live
+    /// detector and hum-to-MIDI disagree at the bottom of the range, which
+    /// is the one thing copying the constants exists to prevent.
+    ///
+    /// Musically this costs nothing — 65 Hz is C2, below any sung note
+    /// this feature targets.
+    #[test]
+    fn the_effective_floor_sits_just_above_fmin() {
+        let tau_max = (TARGET_SR as f32 / FMIN) as usize;
+        let floor = TARGET_SR as f32 / tau_max as f32;
+        assert!(floor > FMIN, "the floor {floor} must sit just above FMIN {FMIN}");
+        assert!(detect_hz(&sine(FMIN, 4096)).is_none(), "exactly FMIN is unreachable");
+        assert!(detect_hz(&sine(floor + 0.5, 4096)).is_some(), "just above the floor is reachable");
     }
 
     #[test]
