@@ -115,7 +115,8 @@ fn tmp_parent(name: &str) -> std::path::PathBuf {
 /// loaders the real open path uses: `project::load` for the store,
 /// `midi::persist::load_from_project` for the MIDI document (what
 /// `adopt_midi_from_dir` wraps — that wrapper is `pub(crate)`), and
-/// `automation::load_lanes` for the lanes.
+/// `modulation::persist::load_from_project` + the lane facade (what
+/// `adopt_modulation_from_dir` wraps after Track F).
 fn load_cold(dir: &Path) -> Session {
     let (project, dir) = aura_lib::audio::project::load(dir).expect("project loads");
     let mut store = Store::default();
@@ -139,9 +140,9 @@ fn load_cold(dir: &Path) -> Session {
         midi.clips = v3.clips;
     }
     let mut s = Session::new(store, midi);
-    if let Some(lanes) = aura_lib::plugins::automation::load_lanes(&dir).expect("lanes load") {
-        s.automation.lanes = lanes;
-    }
+    let doc = aura_lib::modulation::persist::load_from_project(&dir).expect("modulation loads");
+    s.automation.lanes = aura_lib::modulation::compat::lanes_from_doc(&doc);
+    s.modulation = doc;
     s
 }
 
@@ -351,7 +352,7 @@ fn a_cold_tail_replay_reproduces_the_crashed_sessions_document_byte_identically(
             lane: Some(AutomationLane {
                 id: "lane-1".into(),
                 target_node: format!("track:{t1}"),
-                param_id: 3,
+                param_id: 0,
                 points: vec![
                     AutomationPoint { tick: 0, value: 0.1 },
                     AutomationPoint { tick: 960, value: 0.9 },
@@ -410,7 +411,7 @@ fn a_cold_tail_replay_reproduces_the_crashed_sessions_document_byte_identically(
             lane: Some(AutomationLane {
                 id: "lane-2".into(),
                 target_node: format!("track:{t2}"),
-                param_id: 7,
+                param_id: 0,
                 points: vec![AutomationPoint { tick: 480, value: 0.42 }],
             }),
         })
