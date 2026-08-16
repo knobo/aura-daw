@@ -3,13 +3,14 @@
  * menu and the Ctrl+S/O/N shortcuts. Owns the name dialog ("new" creates a
  * blank project, "saveAs" materializes an unsaved session — the backend
  * refuses saveAs once a project is open), the unsaved-changes confirmation,
- * the store re-pull after the open project changes, and restoring the last
- * adopted project on desktop boot. Desktop (Tauri) only; demo mode gets an
- * informational toast (restore is silent there).
+ * the store re-pull after the open project changes, the recent-projects
+ * history, and restoring the last adopted project on desktop boot. Desktop
+ * (Tauri) only; demo mode gets an informational toast (restore is silent
+ * there).
  */
 
 import { backend } from "../tauri";
-import { readLastProjectDir, writeLastProjectDir } from "../utils/last-project";
+import { readLastProjectDir, readRecentProjectDirs, writeLastProjectDir } from "../utils/last-project";
 import { automation } from "./automation.svelte";
 import { modulation } from "./modulation.svelte";
 import { clipEditLoop } from "./clip-edit-loop.svelte";
@@ -28,7 +29,11 @@ class ProjectOpsStore {
   /** Name/location dialog (null = closed). */
   dialog = $state<ProjectDialogState | null>(null);
   /** Pending action awaiting the unsaved-changes confirmation. */
-  confirm = $state<"new" | "open" | null>(null);
+  confirm = $state<"new" | "open" | "recent" | null>(null);
+  /** Path for a pending `confirm === "recent"` open. */
+  pendingRecent = $state<string | null>(null);
+  /** Newest-first history, hydrated from localStorage. */
+  recent = $state<string[]>([]);
   busy = $state(false);
 
   /** Seam for tests / non-Tauri: native directory picker. */
@@ -104,7 +109,9 @@ class ProjectOpsStore {
   /** Confirmation answer: optionally save first, then run the pending action. */
   async proceedConfirmed(saveFirst: boolean) {
     const action = this.confirm;
+    const recentPath = this.pendingRecent;
     this.confirm = null;
+    this.pendingRecent = null;
     if (saveFirst) {
       const saved = await this.save();
       // Finding 3: save() may have FAILED (already toasted "SAVE FAILED"
@@ -116,10 +123,29 @@ class ProjectOpsStore {
     }
     if (action === "new") await this.openNewDialog();
     else if (action === "open") await this.openViaPicker();
+    else if (action === "recent" && recentPath) await this.openAt(recentPath);
   }
 
   cancelConfirm() {
     this.confirm = null;
+    this.pendingRecent = null;
+  }
+
+  /** Load stored history into the reactive list the project menu reads. */
+  refreshRecent() {
+    this.recent = readRecentProjectDirs();
+  }
+
+  /** Open a path from the recent-projects menu. */
+  async requestOpenRecent(path: string) {
+    if (this.demoOnly()) return;
+    if (project.projectDir === path) return;
+    if (this.hasContent()) {
+      this.confirm = "recent";
+      this.pendingRecent = path;
+      return;
+    }
+    await this.openAt(path);
   }
 
   async openNewDialog() {
@@ -154,10 +180,14 @@ class ProjectOpsStore {
   async openViaPicker() {
     const path = await this.pickDirectory();
     if (!path) return;
+    await this.openAt(path);
+  }
+
+  private async openAt(path: string, opts: { silent?: boolean } = {}) {
     try {
       await backend.openProject(path);
       await this.adopt();
-      toasts.success("PROJECT OPENED", path);
+      if (!opts.silent) toasts.success("PROJECT OPENED", path);
     } catch (err) {
       toasts.error("OPEN FAILED", String(err));
     }
@@ -170,16 +200,12 @@ class ProjectOpsStore {
    * transient miss does not forget the project.
    */
   async restoreLast() {
+    this.refreshRecent();
     if (!this.available) return;
     if (project.projectDir) return;
     const path = readLastProjectDir();
     if (!path) return;
-    try {
-      await backend.openProject(path);
-      await this.adopt();
-    } catch (err) {
-      toasts.error("OPEN FAILED", String(err));
-    }
+    await this.openAt(path, { silent: true });
   }
 
   /**
@@ -241,7 +267,10 @@ class ProjectOpsStore {
     // whatever project just got adopted).
     clipEditLoop.reset();
     await this.repull();
-    if (project.projectDir) writeLastProjectDir(project.projectDir);
+    if (project.projectDir) {
+      writeLastProjectDir(project.projectDir);
+      this.refreshRecent();
+    }
   }
 }
 

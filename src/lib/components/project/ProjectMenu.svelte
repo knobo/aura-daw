@@ -1,14 +1,26 @@
 <script lang="ts">
   /**
-   * The TransportBar PROJECT block, now a menu: New / Open / Save plus the
-   * open project's path. Actions live in the projectops store; this is only
-   * the affordance.
+   * The TransportBar PROJECT block: New / Open / Save, recent history, and
+   * Preferences. Actions live in the projectops store; this is only the
+   * affordance.
    */
   import { prefs } from "../../prefs/prefs.svelte";
   import { project } from "../../state/project.svelte";
   import { projectops } from "../../state/projectops.svelte";
+  import { recentProjectLabel } from "../../utils/last-project";
 
   let open = $state(false);
+
+  const recent = $derived(
+    projectops.available
+      ? projectops.recent.slice(0, prefs.values.recentProjectsMax)
+      : [],
+  );
+
+  function toggle() {
+    if (!open) projectops.refreshRecent();
+    open = !open;
+  }
 
   function run(action: () => void) {
     open = false;
@@ -20,10 +32,10 @@
   <button
     class="projbtn"
     class:open
-    title="Project menu — new / open / save"
+    title="Project menu — new / open / save / recent"
     aria-haspopup="menu"
     aria-expanded={open}
-    onclick={() => (open = !open)}
+    onclick={toggle}
   >
     <span class="silk">project ▾</span>
     <span class="pname">{project.name}</span>
@@ -41,6 +53,23 @@
       <button role="menuitem" onclick={() => run(() => void projectops.save())}>
         SAVE <span class="kbd">ctrl+s</span>
       </button>
+      {#if recent.length}
+        <div class="sect silk">RECENT</div>
+        {#each recent as path (path)}
+          {@const current = path === project.projectDir}
+          <button
+            role="menuitem"
+            class="recent"
+            class:current
+            disabled={current}
+            title={path}
+            onclick={() => run(() => void projectops.requestOpenRecent(path))}
+          >
+            <span class="rname">{recentProjectLabel(path)}</span>
+            {#if current}<span class="kbd">open</span>{/if}
+          </button>
+        {/each}
+      {/if}
       <button role="menuitem" onclick={() => run(() => (prefs.dialogOpen = true))}>
         PREFERENCES… <span class="kbd">ctrl+,</span>
       </button>
@@ -90,7 +119,8 @@
     top: calc(100% + 6px);
     left: 0;
     z-index: 90;
-    min-width: 190px;
+    min-width: 220px;
+    max-width: 320px;
     display: flex;
     flex-direction: column;
     padding: 5px;
@@ -111,14 +141,35 @@
     color: var(--text-dim);
     cursor: pointer;
   }
-  .menu button:hover {
+  .menu button:hover:not(:disabled) {
     background: rgba(82, 229, 255, 0.09);
     color: var(--cyan);
+  }
+  .menu button:disabled {
+    cursor: default;
+    opacity: 0.55;
   }
   .kbd {
     font-size: 9px;
     letter-spacing: 0.08em;
     color: var(--text-faint);
+  }
+  .sect {
+    padding: 8px 9px 2px;
+    border-top: 1px solid var(--glass-border);
+    margin-top: 4px;
+    font-size: 8px;
+    letter-spacing: 0.2em;
+  }
+  .recent {
+    letter-spacing: 0.04em;
+    text-transform: none;
+  }
+  .rname {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
   .dir {
     padding: 6px 9px 4px;
@@ -130,6 +181,6 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    max-width: 260px;
+    max-width: 300px;
   }
 </style>

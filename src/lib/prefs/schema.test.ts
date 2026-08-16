@@ -44,6 +44,16 @@ describe("PREF_SCHEMA integrity", () => {
     expect(PREF_SCHEMA.clipOpenAutoplay.default).toBe(false);
     expect(PREF_SCHEMA.mcpDefaultMode.default).toBe("confirmDestructive");
   });
+
+  it("declares how many recent projects the menu shows", () => {
+    const def = PREF_SCHEMA.recentProjectsMax;
+    expect(def.kind).toBe("number");
+    expect(def.category).toBe("interface");
+    expect(def.default).toBe(8);
+    expect(def.min).toBe(1);
+    expect(def.max).toBe(20);
+    expect(def.step).toBe(1);
+  });
 });
 
 describe("coercePref", () => {

@@ -29,6 +29,9 @@ export interface PrefValues {
   noteFlash: boolean;
   /** Interface zoom factor (CSS `zoom` on the shell). */
   uiZoom: number;
+  /** How many recent projects the project menu lists. Stored history is
+   * capped separately at 20; this only changes how many rows are shown. */
+  recentProjectsMax: number;
   /** MCP policy mode pushed to the agent server at startup. */
   mcpDefaultMode: McpPolicyMode;
   /** Absolute folders listed under the library panel's SAMPLES root. The
@@ -124,6 +127,16 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     category: "interface",
     label: "Interface zoom",
     blurb: "Scale the whole interface. Also Ctrl/Cmd + and −.",
+  },
+  recentProjectsMax: {
+    kind: "number",
+    default: 8,
+    min: 1,
+    max: 20,
+    step: 1,
+    category: "interface",
+    label: "Recent projects",
+    blurb: "How many recently opened projects the project menu lists.",
   },
   librarySampleFolders: {
     kind: "pathList",
