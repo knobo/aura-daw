@@ -38,7 +38,10 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
 **Phase 1 — backend.** Not started.
 
 - [x] Task 1 — YIN detector (`audio/yin.rs`) — `eb0d47b`, 799 tests green
-- [ ] Task 2 — decimation to 8 kHz (`audio/decimate.rs`)
+- [~] Task 2 — decimation to 8 kHz (`audio/decimate.rs`) — implemented and
+      committed `190316a`, 5/5 module tests pass. **Task review not yet run.**
+      Resume here: generate the review package over `7302d4e..190316a` and
+      dispatch the task reviewer.
 - [ ] Task 3 — pitch frames: gating, smoothing, timestamps (`audio/pitch.rs`)
 - [ ] Task 4 — parity guard vs. `sidecars/hum_to_midi.py`
 - [ ] Task 5 — **InputHub** (`audio/engine.rs`) ← the risky one
@@ -75,6 +78,25 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
   plan draft put it in the panel; that was an ADR 0006 violation and was
   removed. Phase 2 draws every note of the reference track; phase 3 dims
   the ones the backend flagged.
+
+## Environment warning (read before running the suite)
+
+This box is under memory pressure: **swap is fully consumed (15/15 GB)** and
+other worktrees run `cargo test` concurrently. A full `cargo test` therefore
+fails *differently each run*, always in unrelated ALSA MIDI-loopback tests
+(`midi_out::tests::*`) or `plugins::host::tests::plugin_main_thread_slots_and_tickers`.
+Do not chase those as regressions without first confirming the machine is
+quiet. Verify a task with its own module tests (`cargo test audio::<mod>`),
+which are deterministic, and treat a full-suite run as valid only when no
+other agent is building.
+
+Root filesystem was at 100% during Task 2; the implementer freed this
+worktree's own `target/` and it is now at 82% (133 GB free). Roughly 194 GB
+of stale `target/` directories remain across the other worktrees — cleaning
+them is the owner's call, not an agent's.
+
+Also: `cargo fmt` without a path argument reformats the whole crate here.
+Always check `git status` before committing after running it.
 
 ## Open items needing the owner
 
