@@ -71,6 +71,53 @@ export interface MidiOutputStatus {
   routes: MidiRouteStatus[];
 }
 
+// ── MIDI launch map (note → region or clip) ────────────────────────────────
+// Document state: persisted on the project, undoable. A binding fires when
+// hardware MIDI-in matches `note` (+ optional channel). Regions cover one
+// or more lanes over a tick range; clips launch a single MIDI clip.
+
+export type LaunchTarget =
+  | { kind: "region"; startTicks: number; lengthTicks: number; trackIds: string[] }
+  | { kind: "clip"; clipId: string };
+
+export interface LaunchBinding {
+  id: string;
+  name: string;
+  /** MIDI key 0..=127. */
+  note: number;
+  /** 0..=15, or null = any channel. */
+  channel: number | null;
+  target: LaunchTarget;
+}
+
+export type LaunchPlayMode = "gate" | "oneShot";
+
+/** One named launcher: its note map plus the clips that drive it. */
+export interface LaunchMap {
+  id: string;
+  name: string;
+  bindings: LaunchBinding[];
+  driveClipIds: string[];
+  playMode?: LaunchPlayMode;
+}
+
+export interface LaunchSnapshot {
+  maps: LaunchMap[];
+}
+
+export type LaunchFireOrigin = "hardware" | "drive" | "preview";
+
+export interface LaunchFired {
+  id: string;
+  name: string;
+  origin: LaunchFireOrigin;
+  followView: boolean;
+  trackIds: string[];
+  startSamples: number;
+  endSamples: number;
+  playing?: boolean;
+}
+
 // ── transport-state.schema.json ─────────────────────────────────────────────
 
 export type TransportMode = "stopped" | "playing" | "recording";
@@ -903,6 +950,8 @@ export interface AuraEventMap {
   "export://done": ExportDoneEvent;
   "export://error": ExportErrorEvent;
   "loopjam://state": LoopJamStatus;
+  "launch://changed": LaunchSnapshot;
+  "launch://fired": LaunchFired;
 }
 
 export type AuraEventName = keyof AuraEventMap;

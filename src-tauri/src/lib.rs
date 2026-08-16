@@ -123,8 +123,28 @@ pub fn run() {
             // attach it to the control plane so the MIDI-out routing/port/
             // clock methods can reach it.
             let midi_out = app.state::<Arc<midi_out::MidiOut>>().inner().clone();
+            crate::midi::launch::runtime().attach_drive(midi_out_shared.clone(), midi_out_session.clone());
             midi_out.attach(midi_out_session, midi_out_shared);
             control_plane.attach_midi_out(midi_out);
+
+            // MIDI launch: hardware note-on → seek/loop/play. Installed
+            // here so the midir callback can fire without knowing the
+            // control plane. The callback is the midir thread, not RT.
+            {
+                let cp = control_plane.clone();
+                crate::midi::launch::runtime().install_fire(std::sync::Arc::new(move |cmd| {
+                    match cmd {
+                        crate::midi::launch::FireCmd::Start(b, origin) => {
+                            if let Err(e) = cp.launch_fire_from(&b.id, origin) {
+                                log::warn!("launch fire {}: {e}", b.id);
+                            }
+                        }
+                        crate::midi::launch::FireCmd::Release(id) => {
+                            cp.stop_drive_launch(&id);
+                        }
+                    }
+                }));
+            }
 
             // Plan E Task 13: the engine's narrow "document birth" closure,
             // installable only now that `ControlPlane` exists — bound over
@@ -239,6 +259,15 @@ pub fn run() {
             midi_out::midi_set_track_route,
             midi_out::midi_set_track_return,
             midi_out::midi_set_clip_route,
+            // ---- MIDI launch map (note → region/clip) ----
+            midi::launch::launch_get,
+            midi::launch::launch_set,
+            midi::launch::launch_set_drive,
+            midi::launch::launch_set_drive_focus,
+            midi::launch::launch_set_map,
+            midi::launch::launch_fire,
+            midi::launch::launch_learn_arm,
+            midi::launch::launch_learn_take,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,

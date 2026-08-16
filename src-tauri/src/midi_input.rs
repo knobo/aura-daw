@@ -162,6 +162,7 @@ struct NoteEvent {
     on: bool,
     key: u8,
     velocity: u8,
+    channel: u8,
 }
 
 /// Parse zero-or-one note event out of a raw MIDI message. Honors MIDI
@@ -195,7 +196,12 @@ fn parse_note_event(running_status: &mut Option<u8>, message: &[u8]) -> Option<N
     }
     let key = data[0] & 0x7F;
     let velocity = data[1] & 0x7F;
-    Some(NoteEvent { on: kind == 0x90 && velocity > 0, key, velocity })
+    Some(NoteEvent {
+        on: kind == 0x90 && velocity > 0,
+        key,
+        velocity,
+        channel: status & 0x0F,
+    })
 }
 
 /// Built-in "you can hear it" tone for live keyboard monitoring: a single
@@ -290,6 +296,13 @@ fn handle_incoming(
     let Some(ev) = parse_note_event(running_status, message) else {
         return;
     };
+
+    // Launch map consumes matching notes (and echoes / learn) so a pad
+    // that fires a region is not also played as a musical note — and so a
+    // clip cannot start itself via MIDI-out loopback.
+    if crate::midi::launch::runtime().on_incoming(ev.on, ev.key, ev.channel) {
+        return;
+    }
 
     // Capture is independent of the monitor toggle (recording must not
     // depend on whether the operator can currently hear it). No-op when no
@@ -801,17 +814,17 @@ mod tests {
     fn parse_note_on_and_off() {
         let mut rs = None;
         let on = parse_note_event(&mut rs, &[0x90, 60, 100]).unwrap();
-        assert_eq!(on, NoteEvent { on: true, key: 60, velocity: 100 });
+        assert_eq!(on, NoteEvent { on: true, key: 60, velocity: 100, channel: 0 });
 
         let off = parse_note_event(&mut rs, &[0x80, 60, 64]).unwrap();
-        assert_eq!(off, NoteEvent { on: false, key: 60, velocity: 64 });
+        assert_eq!(off, NoteEvent { on: false, key: 60, velocity: 64, channel: 0 });
     }
 
     #[test]
     fn parse_velocity_zero_note_on_is_treated_as_off() {
         let mut rs = None;
         let ev = parse_note_event(&mut rs, &[0x91, 64, 0]).unwrap(); // channel 2
-        assert_eq!(ev, NoteEvent { on: false, key: 64, velocity: 0 });
+        assert_eq!(ev, NoteEvent { on: false, key: 64, velocity: 0, channel: 1 });
     }
 
     #[test]
@@ -829,21 +842,21 @@ mod tests {
         let mut rs = None;
         // First message carries an explicit status byte...
         let first = parse_note_event(&mut rs, &[0x90, 60, 100]).unwrap();
-        assert_eq!(first, NoteEvent { on: true, key: 60, velocity: 100 });
+        assert_eq!(first, NoteEvent { on: true, key: 60, velocity: 100, channel: 0 });
         assert_eq!(rs, Some(0x90));
 
         // ...a second message with NO status byte (data only) reuses it.
         let second = parse_note_event(&mut rs, &[64, 90]).unwrap();
-        assert_eq!(second, NoteEvent { on: true, key: 64, velocity: 90 });
+        assert_eq!(second, NoteEvent { on: true, key: 64, velocity: 90, channel: 0 });
 
         // A note-off arrives with its own explicit status, updating rs...
         let off = parse_note_event(&mut rs, &[0x80, 60, 0]).unwrap();
-        assert_eq!(off, NoteEvent { on: false, key: 60, velocity: 0 });
+        assert_eq!(off, NoteEvent { on: false, key: 60, velocity: 0, channel: 0 });
         assert_eq!(rs, Some(0x80));
 
         // ...and a further data-only message now runs against THAT status.
         let off2 = parse_note_event(&mut rs, &[64, 0]).unwrap();
-        assert_eq!(off2, NoteEvent { on: false, key: 64, velocity: 0 });
+        assert_eq!(off2, NoteEvent { on: false, key: 64, velocity: 0, channel: 0 });
     }
 
     #[test]

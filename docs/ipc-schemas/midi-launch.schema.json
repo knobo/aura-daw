@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura:ipc/midi-launch.schema.json",
+  "title": "LaunchBinding",
+  "description": "One MIDI launch mapping: a hardware note (optional channel) fires a marked region or a MIDI clip. Emitter contract — no additionalProperties:false (D-06).",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "format": "uuid" },
+    "name": { "type": "string" },
+    "note": { "description": "MIDI key 0..=127.", "type": "integer", "minimum": 0, "maximum": 127 },
+    "channel": {
+      "description": "0..=15, or null = any channel.",
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "maximum": 15
+    },
+    "target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "region" },
+            "startTicks": { "type": "integer", "minimum": 0 },
+            "lengthTicks": { "type": "integer", "minimum": 1 },
+            "trackIds": { "type": "array", "items": { "type": "string" }, "minItems": 1 }
+          },
+          "required": ["kind", "startTicks", "lengthTicks", "trackIds"]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "kind": { "const": "clip" },
+            "clipId": { "type": "string" }
+          },
+          "required": ["kind", "clipId"]
+        }
+      ]
+    }
+  },
+  "required": ["id", "name", "note", "channel", "target"],
+  "$defs": {
+    "launchMap": {
+      "title": "LaunchMap",
+      "description": "One named launcher: its note map plus the MIDI clips that drive it.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "bindings": {
+          "type": "array",
+          "items": { "$ref": "aura:ipc/midi-launch.schema.json" }
+        },
+        "driveClipIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "playMode": {
+          "description": "How a drive-clip note plays a scene. gate = while the note is held; oneShot = play the scene to its end. Absent = gate.",
+          "enum": ["gate", "oneShot"]
+        }
+      },
+      "required": ["id", "name"]
+    }
+  }
+}

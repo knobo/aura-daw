@@ -40,6 +40,9 @@ import type {
   MidiNote,
   MidiOutputStatus,
   MidiPortInfo,
+  LaunchBinding,
+  LaunchMap,
+  LaunchSnapshot,
   OpenSidecarEvent,
   PluginDescriptor,
   PluginInstanceInfo,
@@ -358,6 +361,17 @@ export interface Backend {
    * `portId: null` to fall back to the track's routing. */
   midiSetClipRoute?(clipId: string, portId: string | null, channel?: number): Promise<void>;
   midiOutputStatus?(): Promise<MidiOutputStatus>;
+
+  // ── MIDI launch map (note → region/clip) ──
+  launchGet?(): Promise<LaunchSnapshot>;
+  /** Upsert `binding`, or delete `id` when `binding` is null. */
+  launchSet?(binding: LaunchBinding | null, id?: string | null, mapId?: string | null): Promise<LaunchSnapshot>;
+  launchSetDrive?(clipId: string, on: boolean, mapId?: string | null): Promise<LaunchSnapshot>;
+  launchSetDriveFocus?(clipId: string | null): Promise<void>;
+  launchSetMap?(id: string, map: LaunchMap | null): Promise<LaunchSnapshot>;
+  launchFire?(id: string, bypass?: boolean): Promise<void>;
+  launchLearnArm?(id: string | null): Promise<void>;
+  launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -816,6 +830,31 @@ class TauriBackend implements Backend {
   }
   midiOutputStatus() {
     return invoke<MidiOutputStatus>("midi_output_status");
+  }
+
+  launchGet() {
+    return invoke<LaunchSnapshot>("launch_get");
+  }
+  launchSet(binding: LaunchBinding | null, id?: string | null, mapId?: string | null) {
+    return invoke<LaunchSnapshot>("launch_set", { binding, id: id ?? null, mapId: mapId ?? null });
+  }
+  launchSetDrive(clipId: string, on: boolean, mapId?: string | null) {
+    return invoke<LaunchSnapshot>("launch_set_drive", { clipId, on, mapId: mapId ?? null });
+  }
+  async launchSetDriveFocus(clipId: string | null) {
+    await invoke("launch_set_drive_focus", { clipId });
+  }
+  launchSetMap(id: string, map: LaunchMap | null) {
+    return invoke<LaunchSnapshot>("launch_set_map", { id, map });
+  }
+  async launchFire(id: string, bypass?: boolean) {
+    await invoke("launch_fire", { id, bypass: bypass ?? false });
+  }
+  async launchLearnArm(id: string | null) {
+    await invoke("launch_learn_arm", { id });
+  }
+  launchLearnTake() {
+    return invoke<{ note: number; channel: number } | null>("launch_learn_take");
   }
 
   libraryScan(dir: string) {

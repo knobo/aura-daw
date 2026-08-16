@@ -388,6 +388,7 @@ impl NoteOutEngine {
             } else {
                 out.push(OutMsg::three(0x90 | snap.channel, ev.key, ev.velocity));
                 self.sounding[ev.key as usize] = true;
+                crate::midi::launch::runtime().record_out(ev.key, snap.channel);
             }
             self.notes_sent += 1;
             self.cursor += 1;
@@ -1097,13 +1098,19 @@ fn run_thread(
 
                     // Any clip with its OWN route (on any port) is excluded
                     // from its track's route — a clip override always wins.
-                    let overridden_clips: HashSet<String> = all_routes
+                    let mut overridden_clips: HashSet<String> = all_routes
                         .keys()
                         .filter_map(|s| match s {
                             RouteScope::Clip(id) => Some(id.clone()),
                             RouteScope::Track(_) => None,
                         })
                         .collect();
+                    let drive_ids: HashSet<String> = crate::midi::launch::all_drive_clip_ids(
+                        &guard.midi.launch_maps,
+                    )
+                    .into_iter()
+                    .collect();
+                    overridden_clips.extend(drive_ids.iter().cloned());
 
                     let mine: Vec<(RouteScope, RouteTarget)> = all_routes
                         .iter()
@@ -1120,13 +1127,19 @@ fn run_thread(
                                 &overridden_clips,
                                 &map,
                             ),
-                            RouteScope::Clip(clip_id) => guard
-                                .midi
-                                .clips
-                                .iter()
-                                .find(|c| c.id.as_str() == clip_id.as_str())
-                                .map(|c| crate::midi::schedule::clip_events(c, &map))
-                                .unwrap_or_default(),
+                            RouteScope::Clip(clip_id) => {
+                                if drive_ids.contains(clip_id) {
+                                    Vec::new()
+                                } else {
+                                    guard
+                                        .midi
+                                        .clips
+                                        .iter()
+                                        .find(|c| c.id.as_str() == clip_id.as_str())
+                                        .map(|c| crate::midi::schedule::clip_events(c, &map))
+                                        .unwrap_or_default()
+                                }
+                            }
                         };
                         new_snapshots.insert(
                             scope.clone(),
@@ -1894,6 +1907,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -2025,6 +2039,7 @@ mod tests {
                     velocity_offset: 0,
                 },
             ],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -2109,6 +2124,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -2550,6 +2566,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

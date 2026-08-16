@@ -46,6 +46,44 @@ If you don't see your device in the list, check `aconnect -l` (or
 `amidi -l`) at the shell to confirm ALSA sees it at all — AURA only lists
 what ALSA-seq reports.
 
+## Launch marked regions and MIDI clips
+
+Open the **LAUNCH** chip (or press `k`) to get the launch-map window. The
+window lists **launchers** — each is its own note map. Add another with
+**+** (a drum kit vs a scene map), double-click a tab to rename, **×** to
+delete (you always keep at least one).
+
+With the window open, drag a rectangle across one or more lanes — that
+marks a region on the **active** launcher and binds it to the next free
+MIDI note (starting at C3). Click a row to select it. Double-click to
+audition the scene without moving the loop or playhead. Click the
+target text to jump the playhead there for editing.
+
+Clips whose track no longer exists do **not** drive a launcher. In the
+piano roll, **▶ play** plays that clip once (no loop) and only that
+clip's notes fire the launcher.
+
+To make a MIDI clip **use** a launcher (the clip's notes fire that map
+instead of the track instrument): select the clip and click **USE**, or
+right-click and pick a launcher. **USE ON CLIP** in the launch window
+does the same for the active launcher. **Map to MIDI note…** is
+different — that binds the clip *as a target* so hardware can start it.
+
+A matching note-on on the selected **midi in** port seeks to the marking,
+loops it, and plays (first match across every launcher). Notes from a
+clip that uses a launcher only fire **that** launcher's map — they do
+**not** steal the arrangement loop or move the playhead. The scene
+plays on a shadow playhead; the transport bar shows **▶ scene name**
+while it sounds. Each launcher has a play mode: **GATE** (default —
+the scene lasts as long as the MIDI note) or **ONE-SHOT** (the note
+triggers, the scene plays to its marked end). Launched tracks stay **audible through mute/solo** so
+a soloed launcher clip does not silence the scene. AURA does **not**
+feed its own clip notes back into hardware launch: hardware input only,
+plus an echo window on MIDI-out loopback, so a clip cannot start itself.
+
+Launch decisions log at `info` (`launch: fire id=…`). For every hardware
+and drive hit, start with `AURA_LAUNCH_TRACE=1` in the environment.
+
 ## Play a track's own instrument (arm it)
 
 Click the **R** (arm) button on a **MIDI track**. From then on your

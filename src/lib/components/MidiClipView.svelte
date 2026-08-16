@@ -8,6 +8,7 @@
   import type { MidiClip, TrackState } from "../types/ipc";
   import { midi } from "../state/midi.svelte";
   import { midiIo } from "../state/midiio.svelte";
+  import { launch } from "../state/launch.svelte";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
   import { prefs } from "../prefs/prefs.svelte";
@@ -146,6 +147,7 @@
 
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
+    if (launch.marking) return;
     // The × button (main's clip-delete) lives INSIDE the clip, so its
     // pointerdown must not select, must not move the anchor and must not
     // open a drag — otherwise deleting one clip silently collapses a
@@ -229,18 +231,38 @@
   // the override so the clip falls back to its track's routing.
   let menuOpen = $state(false);
   let pickerOpen = $state(false);
+  let launcherOpen = $state(false);
   const override = $derived(midiIo.clipOverride(clip.id));
+  const usedLauncher = $derived(launch.driveMap(clip.id));
 
   function onContextMenu(e: MouseEvent) {
     e.preventDefault();
     e.stopPropagation();
     pickerOpen = false;
+    launcherOpen = false;
     menuOpen = true;
+  }
+
+  function openLauncherPicker() {
+    menuOpen = false;
+    launcherOpen = true;
+  }
+
+  function pickLauncher(mapId: string | null) {
+    launcherOpen = false;
+    void launch.setClipLauncher(clip.id, mapId);
   }
 
   function openMidiOutputPicker() {
     menuOpen = false;
     pickerOpen = true;
+  }
+
+  async function mapToNote() {
+    menuOpen = false;
+    launch.panelOpen = true;
+    const b = await launch.mapClip(clip.id);
+    if (b) launch.focus(b.id);
   }
 
   function selectOverridePort(portId: string) {
@@ -318,6 +340,17 @@
     {/if}
     {#if selected}
       <button
+        class="use-launch mono"
+        type="button"
+        title={usedLauncher ? `Using ${usedLauncher.name} — click to change` : "Use a launcher — this clip's notes fire that map"}
+        onclick={(e) => {
+          e.stopPropagation();
+          launcherOpen = !launcherOpen;
+          menuOpen = false;
+          pickerOpen = false;
+        }}>{usedLauncher ? `▶ ${usedLauncher.name}` : "USE"}</button
+      >
+      <button
         class="del"
         title="Delete clip"
         aria-label="Delete clip {clip.name}"
@@ -331,10 +364,36 @@
     {#if override}
       <span class="routedot" title="MIDI output override: {override.portId}, channel {override.channel + 1}">⇥</span>
     {/if}
+    {#if usedLauncher}
+      <span class="routedot" title="This clip uses launcher {usedLauncher.name}">▶</span>
+    {/if}
     {#if menuOpen}
       <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (menuOpen = false)}></div>
       <div class="clipmenu" style:left="{visL + 4}px" role="menu">
         <button type="button" role="menuitem" onclick={openMidiOutputPicker}>MIDI output…</button>
+        <button type="button" role="menuitem" onclick={openLauncherPicker}
+          >{usedLauncher ? `Using ${usedLauncher.name}…` : "Use launcher…"}</button
+        >
+        <button type="button" role="menuitem" onclick={() => void mapToNote()}>Map to MIDI note…</button>
+      </div>
+    {/if}
+    {#if launcherOpen}
+      <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (launcherOpen = false)}></div>
+      <div class="clipmenu" style:left="{visL + 4}px" role="menu">
+        <button
+          type="button"
+          role="menuitem"
+          class:picked={!usedLauncher}
+          onclick={() => pickLauncher(null)}>Don't use launcher</button
+        >
+        {#each launch.maps as m (m.id)}
+          <button
+            type="button"
+            role="menuitem"
+            class:picked={usedLauncher?.id === m.id}
+            onclick={() => pickLauncher(m.id)}>{usedLauncher?.id === m.id ? `✓ ${m.name}` : m.name}</button
+          >
+        {/each}
       </div>
     {/if}
     {#if pickerOpen}
@@ -478,6 +537,29 @@
     color: color-mix(in srgb, var(--clip-color) 60%, var(--text-faint));
   }
 
+  .use-launch {
+    position: absolute;
+    top: 1px;
+    right: 22px;
+    height: 12px;
+    line-height: 12px;
+    border: 1px solid color-mix(in srgb, var(--clip-color) 40%, transparent);
+    background: rgba(5, 7, 13, 0.55);
+    color: var(--cyan);
+    font-size: 8px;
+    letter-spacing: 0.08em;
+    padding: 0 5px;
+    cursor: pointer;
+    border-radius: 3px;
+    z-index: 1;
+    max-width: 46%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .use-launch:hover {
+    border-color: var(--cyan);
+  }
   .del {
     position: absolute;
     top: 1px;
@@ -533,6 +615,9 @@
   }
   .clipmenu button:hover {
     background: color-mix(in srgb, var(--clip-color) 25%, transparent);
+  }
+  .clipmenu button.picked {
+    color: var(--cyan);
   }
   .midipicker {
     position: absolute;

@@ -296,6 +296,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![arp, groove],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -379,6 +380,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -510,6 +512,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -677,6 +680,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -785,6 +789,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

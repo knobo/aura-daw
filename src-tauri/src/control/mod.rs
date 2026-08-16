@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
-use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_MUTE, FLAG_SOLO};
+use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO};
+use crate::ids::TrackId;
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
@@ -1583,6 +1584,67 @@ impl ControlPlane {
         ops::transport_snapshot(&self.session.lock().store, &self.shared)
     }
 
+    pub fn emit_launch_changed(&self) {
+        let snap = {
+            let s = self.session.lock();
+            crate::midi::launch::LaunchSnapshot {
+                maps: {
+                    let mut maps = s.midi.launch_maps.clone();
+                    crate::midi::launch::ensure_maps(&mut maps);
+                    maps
+                },
+            }
+        };
+        (self.emit)(
+            "launch://changed",
+            serde_json::to_value(&snap).unwrap_or_default(),
+        );
+    }
+
+    pub fn emit_launch_fired(&self, fired: crate::midi::launch::LaunchFired) {
+        (self.emit)(
+            "launch://fired",
+            serde_json::to_value(&fired).unwrap_or_default(),
+        );
+    }
+
+    pub fn apply_launch_audible(&self, track_ids: &[String]) {
+        let tables = self.tables.lock();
+        for slot in 0..tables.params.len() {
+            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+        }
+        for id in track_ids {
+            if let Some(&slot) = tables.slots.get(&TrackId::from(id.as_str())) {
+                tables.params.set_flag(slot, FLAG_LAUNCH, true);
+            }
+        }
+    }
+
+    pub fn clear_launch_audible(&self) {
+        crate::midi::launch::runtime().clear_audible_tracks();
+        self.shared.clear_launch();
+        let tables = self.tables.lock();
+        for slot in 0..tables.params.len() {
+            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+        }
+    }
+
+    pub fn arm_drive_launch(&self, track_ids: &[String], start: u64, end: u64) {
+        self.apply_launch_audible(track_ids);
+        self.shared.arm_launch(start, end);
+    }
+
+    pub fn drive_overlay_is(&self, id: &str) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.shared.launch_on.load(Relaxed)
+            && crate::midi::launch::runtime().overlay_id().as_deref() == Some(id)
+    }
+
+    pub fn clear_drive_overlay(&self) {
+        crate::midi::launch::runtime().set_overlay_id(None);
+        self.shared.clear_launch();
+    }
+
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
     /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
     pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {
@@ -1738,6 +1800,7 @@ impl ControlPlane {
                     false,
                 )?;
                 self.shared.playing.store(false, Relaxed);
+                self.clear_launch_audible();
             }
             TransportAction::Seek { position_samples } => {
                 // Pure RT atomic — position is engine state, not document
@@ -3248,11 +3311,9 @@ impl ControlPlane {
         self.last_gesture_batch.lock().take()
     }
 
-    /// Test-only accessor to the shared session lock, for tests that need
-    /// to assert on/mutate store state directly around a `commit`-driven
-    /// call (Task 7 brief).
-    #[cfg(test)]
-    pub fn session(&self) -> &Arc<Mutex<Session>> {
+    /// Shared session lock. Used by crate-internal modules (MIDI launch)
+    /// and by tests that assert on store state around a `commit`.
+    pub(crate) fn session(&self) -> &Arc<Mutex<Session>> {
         &self.session
     }
 
@@ -3371,6 +3432,8 @@ impl ControlPlane {
             session.midi.ppq = d0.ppq;
             session.midi.tempo_events = d0.tempo_events;
             session.midi.clips = d0.clips;
+            session.midi.launch_maps = d0.launch_maps;
+            crate::midi::launch::runtime().set_maps(Vec::new());
             // Finding 2: a stale `dirty = true` left over from a prior
             // auto-persist failure (M-5) must not survive into this fresh
             // project — otherwise the first midi mutation here persists a
@@ -6885,6 +6948,7 @@ mod tests {
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -6985,6 +7049,7 @@ mod tests {
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

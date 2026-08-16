@@ -78,6 +78,21 @@
       "type": "array",
       "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedLaneRow" }
     },
+    "launchMaps": {
+      "description": "Named MIDI launchers. Each launcher is a note→region/clip map plus the clips whose notes drive that map. Additive (D-06). Empty/absent projects load as one default launcher. persist.rs writes this key; launchBindings/launchDriveClipIds are read-only legacy.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-launch.schema.json#/$defs/launchMap" }
+    },
+    "launchBindings": {
+      "description": "LEGACY read path: flat MIDI launch map from before named launchers. persist.rs migrates this (plus launchDriveClipIds) into launchMaps[0] when launchMaps is absent or empty. Never written on save.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-launch.schema.json" }
+    },
+    "launchDriveClipIds": {
+      "description": "LEGACY read path: clips that drove the single launch map. Migrated into launchMaps[0].driveClipIds. Never written on save.",
+      "type": "array",
+      "items": { "type": "string" }
+    },
     "midiClips": {
       "description": "v2 legacy conflated MIDI clip rows (midi-clip.schema.json #/$defs/persistedClipLegacy). Present only on a file that has never been re-saved since its v2->v3 upgrade; persist.rs removes this key unconditionally on every v3 save (`obj.remove(\"midiClips\")`) and never writes it again.",
       "type": "array",

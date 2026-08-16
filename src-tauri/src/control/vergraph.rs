@@ -351,7 +351,9 @@ fn replay_pays_off(replay_charge: usize, image_charge: usize) -> bool {
 /// replay-only — the dangerous direction, since replay-only is the side
 /// that can cost 2x.
 pub fn ops_bytes(ops: &[Op]) -> usize {
-    use super::snapshot::{clip_heap, midi_clip_heap, track_heap};
+    use super::snapshot::{
+        clip_heap, launch_binding_heap, launch_map_heap, midi_clip_heap, track_heap,
+    };
     use std::mem::size_of;
     let mut bytes = std::mem::size_of_val(ops);
     for op in ops {
@@ -408,6 +410,11 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             }
             Op::ModulationSetBinding { key, .. } => key.len(),
             Op::AutomationClipSet { key, .. } => key.len(),
+            Op::LaunchBindingSet { map_id, id, binding } => {
+                map_id.len() + id.len() + binding.as_ref().map_or(0, launch_binding_heap)
+            }
+            Op::LaunchDriveSet { map_id, clip_id, .. } => map_id.len() + clip_id.len(),
+            Op::LaunchMapSet { id, map } => id.len() + map.as_ref().map_or(0, launch_map_heap),
         };
     }
     bytes
