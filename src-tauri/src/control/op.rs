@@ -247,6 +247,12 @@ pub enum Op {
         #[serde(with = "b64")]
         state: Vec<u8>,
     },
+    /// Upsert/delete one MIDI launch binding by `id`. `None` deletes
+    /// (no-op if absent). Additive; does not bump `OP_FORMAT_VERSION`.
+    LaunchBindingSet {
+        id: String,
+        binding: Option<crate::midi::launch::LaunchBinding>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

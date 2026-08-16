@@ -12,6 +12,7 @@
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { resetUiZoom, ui, toggleDock, zoomUiIn, zoomUiOut } from "../state/ui.svelte";
+  import { launch } from "../state/launch.svelte";
   import { prefs } from "../prefs/prefs.svelte";
   import { mcp } from "../state/mcp.svelte";
   import { exporter } from "../state/exporter.svelte";
@@ -220,6 +221,16 @@
       title: "Flash notes at the moment they play",
       on: prefs.values.noteFlash,
       onClick: () => prefs.set("noteFlash", !prefs.values.noteFlash),
+    },
+    {
+      id: "launch",
+      kind: "chip",
+      priority: 10,
+      cls: "launchchip",
+      label: "LAUNCH",
+      title: "MIDI launch map — mark regions, bind notes, fire clips (k)",
+      on: launch.panelOpen,
+      onClick: () => launch.togglePanel(),
     },
     {
       id: "export",
@@ -669,6 +680,12 @@
     color: #5cf2b8;
     border-color: rgba(92, 242, 184, 0.45);
     box-shadow: 0 0 10px rgba(92, 242, 184, 0.2);
+  }
+  .chip.launchchip:hover,
+  .chip.launchchip.on {
+    color: var(--amber);
+    border-color: rgba(255, 200, 87, 0.5);
+    box-shadow: 0 0 10px rgba(255, 200, 87, 0.22);
   }
   .chip.busychip {
     animation: chip-busy 1s ease-in-out infinite;

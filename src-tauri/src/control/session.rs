@@ -292,6 +292,7 @@ impl Session {
             tempo_events: self.midi.tempo_events.clone(),
             meter_events: self.midi.meter_events.clone(),
             clips: self.midi.clips.clone(),
+            launch_bindings: self.midi.launch_bindings.clone(),
         }
     }
 
@@ -1423,6 +1424,51 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 from: serde_json::json!(applied), // the inverse's `from`: value we just wrote
                 to: serde_json::json!(from_now),  // the inverse's `to`: value to restore
             })
+        }
+        Op::LaunchBindingSet { id, binding } => {
+            let pos = session.midi.launch_bindings.iter().position(|b| &b.id == id);
+            let mut incoming = binding.clone();
+            if let Some(b) = incoming.as_mut() {
+                b.id = id.clone();
+                if b.note > 127 {
+                    return Err("launch note must be 0..=127".into());
+                }
+                if let Some(ch) = b.channel {
+                    if ch > 15 {
+                        return Err("launch channel must be 0..=15".into());
+                    }
+                }
+                match &b.target {
+                    crate::midi::launch::LaunchTarget::Region { length_ticks, track_ids, .. } => {
+                        if *length_ticks < 1 {
+                            return Err("launch region length must be >= 1 tick".into());
+                        }
+                        if track_ids.is_empty() {
+                            return Err("launch region needs at least one track".into());
+                        }
+                    }
+                    crate::midi::launch::LaunchTarget::Clip { clip_id } => {
+                        if clip_id.is_empty() {
+                            return Err("launch clip target is empty".into());
+                        }
+                    }
+                }
+            }
+            let previous = match pos {
+                Some(idx) => match incoming.take() {
+                    Some(nb) => Some(std::mem::replace(&mut session.midi.launch_bindings[idx], nb)),
+                    None => Some(session.midi.launch_bindings.remove(idx)),
+                },
+                None => {
+                    if let Some(nb) = incoming.take() {
+                        session.midi.launch_bindings.push(nb);
+                    }
+                    None
+                }
+            };
+            crate::midi::launch::runtime().set_bindings(session.midi.launch_bindings.clone());
+            effect.persist.midi = true;
+            Ok(Op::LaunchBindingSet { id: id.clone(), binding: previous })
         }
         _ => Err("op not yet supported".into()),
     }
@@ -3082,6 +3128,36 @@ mod tests {
             assert_eq!(g.modulation.automation_clips[0].id, "acl-1");
             assert_eq!(g.modulation.bindings.len(), 2);
         }
+    }
+
+    #[test]
+    fn launch_binding_set_upserts_and_its_inverse_restores() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        let binding = crate::midi::launch::LaunchBinding {
+            id: "lb-1".into(),
+            name: "Scene 1".into(),
+            note: 60,
+            channel: None,
+            target: crate::midi::launch::LaunchTarget::Region {
+                start_ticks: 0,
+                length_ticks: 960,
+                track_ids: vec!["t-1".into()],
+            },
+        };
+        let c = Session::transact(&m, TxMeta::user("set launch"), |tx| {
+            tx.apply(Op::LaunchBindingSet { id: "lb-1".into(), binding: Some(binding.clone()) })
+        })
+        .unwrap();
+        assert_eq!(m.lock().midi.launch_bindings.len(), 1);
+        assert!(c.effect.persist.midi);
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(m.lock().midi.launch_bindings.is_empty(), "undo removes the binding");
     }
 
     #[test]

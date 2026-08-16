@@ -46,6 +46,19 @@ If you don't see your device in the list, check `aconnect -l` (or
 `amidi -l`) at the shell to confirm ALSA sees it at all — AURA only lists
 what ALSA-seq reports.
 
+## Launch marked regions and MIDI clips
+
+Open the **LAUNCH** chip (or press `k`) to get the launch-map window. With
+that window open, drag a rectangle across one or more lanes — that marks a
+region and binds it to the next free MIDI note (starting at C3). Click a
+row to jump the playhead to the marking so you can resize it. Right-click
+a MIDI clip and choose **Map to MIDI note…** to bind the clip itself.
+
+A matching note-on on the selected **midi in** port seeks to the marking,
+loops it, and plays. AURA does **not** feed its own clip notes back into
+the launch mapper: hardware input only, plus an echo window on MIDI-out
+loopback, so a clip cannot start itself.
+
 ## Play a track's own instrument (arm it)
 
 Click the **R** (arm) button on a **MIDI track**. From then on your

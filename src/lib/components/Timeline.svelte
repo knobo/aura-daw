@@ -33,6 +33,8 @@
   import AutomationTrackRow from "./AutomationTrackRow.svelte";
   import ImportDropZone from "./ImportDropZone.svelte";
   import LoopJamPanel from "./loopjam/LoopJamPanel.svelte";
+  import { launch } from "../state/launch.svelte";
+  import { overlayBox, regionFromMarquee } from "../utils/launch-map";
   import type { TrackState } from "../types/ipc";
 
   const TRACK_PALETTE = ["#52e5ff", "#ff4fd8", "#ffc857", "#9d7bff", "#5cf2b8", "#ff8b5c"];
@@ -509,6 +511,7 @@
     }
     if (!marquee) return;
     marquee = { ...marquee, x1: p.x, y1: p.y };
+    if (launch.panelOpen) return;
     const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
     const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
     const n = project.tracks.length;
@@ -527,6 +530,32 @@
   }
 
   function onLanesPointerUp(e: PointerEvent) {
+    // With the launch panel open a finished marquee IS a new marking, not
+    // a clip selection — that's the "draw the region while the list is
+    // visible" gesture.
+    if (launch.panelOpen && marquee) {
+      const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
+      const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
+      const n = project.tracks.length;
+      const region = regionFromMarquee({
+        startSamples: s0,
+        endSamples: s1,
+        laneLo: laneIndexAt(Math.min(marquee.y0, marquee.y1), n),
+        laneHi: laneIndexAt(Math.max(marquee.y0, marquee.y1), n),
+        tracks: project.tracks,
+        samplesToTicks: (s) => midi.samplesToTicks(s),
+        snapTicks: view.snap ? midi.ppq : undefined,
+      });
+      if (region) void launch.createRegion(region.startTicks, region.lengthTicks, region.trackIds);
+      pendingMarquee = null;
+      marquee = null;
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        /* not captured */
+      }
+      return;
+    }
     // A press that never crossed slop is a click on empty lane: drop the
     // selection, same as the old immediate-replace clear, but without
     // eating the following dblclick.
@@ -540,6 +569,71 @@
     } catch {
       /* not captured */
     }
+  }
+
+  const launchMarks = $derived.by(() => {
+    if (!launch.panelOpen) return [];
+    return launch.bindings
+      .map((b) => {
+        const box = overlayBox(
+          b,
+          project.tracks,
+          midi.clips,
+          (t) => midi.ticksToSamples(t),
+        );
+        if (!box) return null;
+        return { binding: b, box };
+      })
+      .filter((x): x is { binding: (typeof launch.bindings)[number]; box: NonNullable<ReturnType<typeof overlayBox>> } => x !== null);
+  });
+
+  let resize: { id: string; edge: "start" | "end"; startTicks: number; lengthTicks: number } | null =
+    $state(null);
+
+  function onMarkPointerDown(id: string, e: PointerEvent) {
+    e.stopPropagation();
+    launch.selectedId = id;
+    launch.focus(id);
+  }
+
+  function onHandleDown(id: string, edge: "start" | "end", e: PointerEvent) {
+    e.stopPropagation();
+    e.preventDefault();
+    const b = launch.bindings.find((x) => x.id === id);
+    if (!b || b.target.kind !== "region") return;
+    resize = { id, edge, startTicks: b.target.startTicks, lengthTicks: b.target.lengthTicks };
+    launch.selectedId = id;
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic */
+    }
+  }
+
+  function onHandleMove(e: PointerEvent) {
+    if (!resize || !lanesEl) return;
+    const b = launch.bindings.find((x) => x.id === resize!.id);
+    if (!b || b.target.kind !== "region") return;
+    const { x } = canvasPos(lanesEl, e.clientX, e.clientY);
+    const tick = Math.max(0, Math.round(midi.samplesToTicks(view.samplesAt(x))));
+    const snapped = view.snap ? Math.round(tick / midi.ppq) * midi.ppq : tick;
+    if (resize.edge === "start") {
+      const end = resize.startTicks + resize.lengthTicks;
+      const start = Math.min(snapped, end - 1);
+      void launch.update(resize.id, {
+        target: { ...b.target, startTicks: start, lengthTicks: end - start },
+      });
+    } else {
+      const start = resize.startTicks;
+      const end = Math.max(snapped, start + 1);
+      void launch.update(resize.id, {
+        target: { ...b.target, lengthTicks: end - start },
+      });
+    }
+  }
+
+  function onHandleUp() {
+    resize = null;
   }
 </script>
 
@@ -707,9 +801,49 @@
         ></div>
       {/if}
       <ImportDropZone />
+      {#each launchMarks as mark (mark.binding.id)}
+        {@const left = view.xOf(mark.box.startSamples)}
+        {@const width = Math.max(4, (mark.box.endSamples - mark.box.startSamples) / view.spp)}
+        {@const top = mark.box.laneLo * TRACK_HEIGHT_PX}
+        {@const height = (mark.box.laneHi - mark.box.laneLo + 1) * TRACK_HEIGHT_PX}
+        <div
+          class="launchmark"
+          class:sel={launch.selectedId === mark.binding.id}
+          class:clip={mark.binding.target.kind === "clip"}
+          role="button"
+          tabindex="0"
+          title="{mark.binding.name} — {mark.binding.note}"
+          style:left="{left}px"
+          style:top="{top}px"
+          style:width="{width}px"
+          style:height="{height}px"
+          onpointerdown={(e) => onMarkPointerDown(mark.binding.id, e)}
+        >
+          <span class="launchlab mono">{mark.binding.name}</span>
+          {#if launch.selectedId === mark.binding.id && mark.binding.target.kind === "region"}
+            <div
+              class="launchhandle start"
+              role="separator"
+              aria-label="Resize launch start"
+              onpointerdown={(e) => onHandleDown(mark.binding.id, "start", e)}
+              onpointermove={onHandleMove}
+              onpointerup={onHandleUp}
+            ></div>
+            <div
+              class="launchhandle end"
+              role="separator"
+              aria-label="Resize launch end"
+              onpointerdown={(e) => onHandleDown(mark.binding.id, "end", e)}
+              onpointermove={onHandleMove}
+              onpointerup={onHandleUp}
+            ></div>
+          {/if}
+        </div>
+      {/each}
       {#if marqueeRect && marqueeRect.width > 2}
         <div
           class="marquee"
+          class:launching={launch.panelOpen}
           style:left="{marqueeRect.left}px"
           style:top="{marqueeRect.top}px"
           style:width="{marqueeRect.width}px"
@@ -1098,6 +1232,50 @@
     border: 1px solid var(--cyan-dim);
     pointer-events: none;
     z-index: 3;
+  }
+  .marquee.launching {
+    background: rgba(255, 200, 87, 0.1);
+    border-color: rgba(255, 200, 87, 0.55);
+  }
+  .launchmark {
+    position: absolute;
+    z-index: 2;
+    box-sizing: border-box;
+    border: 1px solid rgba(255, 200, 87, 0.45);
+    background: rgba(255, 200, 87, 0.08);
+    pointer-events: auto;
+    cursor: pointer;
+  }
+  .launchmark.clip {
+    border-style: dashed;
+  }
+  .launchmark.sel {
+    border-color: var(--amber);
+    background: rgba(255, 200, 87, 0.16);
+    box-shadow: inset 0 0 12px rgba(255, 200, 87, 0.12);
+  }
+  .launchlab {
+    position: absolute;
+    top: 3px;
+    left: 6px;
+    font-size: 9px;
+    letter-spacing: 0.12em;
+    color: var(--amber);
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  .launchhandle {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 8px;
+    cursor: ew-resize;
+  }
+  .launchhandle.start {
+    left: 0;
+  }
+  .launchhandle.end {
+    right: 0;
   }
 
   .playhead {

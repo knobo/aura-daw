@@ -3371,6 +3371,8 @@ impl ControlPlane {
             session.midi.ppq = d0.ppq;
             session.midi.tempo_events = d0.tempo_events;
             session.midi.clips = d0.clips;
+            session.midi.launch_bindings = d0.launch_bindings;
+            crate::midi::launch::runtime().set_bindings(Vec::new());
             // Finding 2: a stale `dirty = true` left over from a prior
             // auto-persist failure (M-5) must not survive into this fresh
             // project — otherwise the first midi mutation here persists a
@@ -6885,6 +6887,7 @@ mod tests {
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -6985,6 +6988,7 @@ mod tests {
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: vec![pad, lead, groove],
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

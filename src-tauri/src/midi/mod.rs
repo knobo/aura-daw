@@ -43,6 +43,7 @@
 pub mod amt;
 pub mod capture;
 pub mod events;
+pub mod launch;
 pub mod midifile;
 pub mod persist;
 pub mod playback;
@@ -87,6 +88,9 @@ pub struct MidiStore {
     /// `[{tick:0,num:4,den:4}]` for stores that never loaded a v3 file.
     pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
+    /// Note → region/clip launch map (document state). Empty on a project
+    /// that has never marked anything.
+    pub launch_bindings: Vec<crate::midi::launch::LaunchBinding>,
     /// Project dir this store was last synced with (None = in-memory only).
     pub loaded_dir: Option<PathBuf>,
     /// Set when the last auto-persist (Plan E Task 7: the `PersistEffect`
@@ -105,6 +109,7 @@ impl Default for MidiStore {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: Vec::new(),
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         }
@@ -216,6 +221,8 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
             midi.tempo_events = v2.tempo_events;
             midi.meter_events = v2.meter_events;
             midi.clips = v2.clips;
+            midi.launch_bindings = v2.launch_bindings;
+            crate::midi::launch::runtime().set_bindings(midi.launch_bindings.clone());
         }
         Ok(None) => {
             if midi.loaded_dir.is_some() {
@@ -224,6 +231,8 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
                 midi.tempo_events = d0.tempo_events;
                 midi.meter_events = d0.meter_events;
                 midi.clips = d0.clips;
+                midi.launch_bindings = d0.launch_bindings;
+                crate::midi::launch::runtime().set_bindings(midi.launch_bindings.clone());
             }
         }
         Err(e) => {

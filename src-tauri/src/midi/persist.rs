@@ -71,6 +71,7 @@ pub struct V3Data {
     pub tempo_events: Vec<TempoEvent>,
     pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
+    pub launch_bindings: Vec<super::launch::LaunchBinding>,
 }
 
 /// Persisted clip row (midi-clip.schema.json `$defs/persistedClip`) — the
@@ -155,6 +156,7 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
             ppq: midi.ppq,
             tempo_events: midi.tempo_events.clone(),
             meter_events: midi.meter_events.clone(),
+            launch_bindings: midi.launch_bindings.clone(),
             clips: midi.clips.clone(),
         },
     )
@@ -280,6 +282,10 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
     obj.insert("content".into(), Value::Array(content_rows));
     obj.insert("placements".into(), Value::Array(placement_rows));
     obj.insert("lanes".into(), Value::Array(lane_rows));
+    obj.insert(
+        "launchBindings".into(),
+        serde_json::to_value(&midi.launch_bindings).unwrap(),
+    );
     obj.remove("midiClips"); // v3 stops writing the v2 key; still read forever (see load_from_project)
 
     atomic_write_json(dir, &root)?;
@@ -366,7 +372,11 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
     } else {
         parse_clips_legacy(dir, &root, ppq)?
     };
-    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips }))
+    let launch_bindings = match root.get("launchBindings") {
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("launchBindings: {e}"))?,
+        None => Vec::new(),
+    };
+    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips, launch_bindings }))
 }
 
 /// The v2/legacy `midiClips` shape — one row IS the placement+content
@@ -500,6 +510,7 @@ pub fn v1_migration_defaults(tempo_bpm: f64) -> V3Data {
         meter_events: default_meter_events(),
         tempo_events: vec![TempoEvent { tick: 0, bpm: tempo_bpm }],
         clips: Vec::new(),
+        launch_bindings: Vec::new(),
     }
 }
 
@@ -634,6 +645,7 @@ mod tests {
             ],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips,
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         }

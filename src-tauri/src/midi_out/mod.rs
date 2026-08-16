@@ -388,6 +388,7 @@ impl NoteOutEngine {
             } else {
                 out.push(OutMsg::three(0x90 | snap.channel, ev.key, ev.velocity));
                 self.sounding[ev.key as usize] = true;
+                crate::midi::launch::runtime().record_out(ev.key, snap.channel);
             }
             self.notes_sent += 1;
             self.cursor += 1;
@@ -1894,6 +1895,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -2025,6 +2027,7 @@ mod tests {
                     velocity_offset: 0,
                 },
             ],
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -2109,6 +2112,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };
@@ -2550,6 +2554,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
+            launch_bindings: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

@@ -8,6 +8,7 @@
   import type { MidiClip, TrackState } from "../types/ipc";
   import { midi } from "../state/midi.svelte";
   import { midiIo } from "../state/midiio.svelte";
+  import { launch } from "../state/launch.svelte";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
   import { prefs } from "../prefs/prefs.svelte";
@@ -243,6 +244,13 @@
     pickerOpen = true;
   }
 
+  async function mapToNote() {
+    menuOpen = false;
+    launch.panelOpen = true;
+    const b = await launch.mapClip(clip.id);
+    if (b) launch.focus(b.id);
+  }
+
   function selectOverridePort(portId: string) {
     void midiIo.setClipRoute(clip.id, portId || null, override?.channel ?? 0);
   }
@@ -335,6 +343,7 @@
       <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (menuOpen = false)}></div>
       <div class="clipmenu" style:left="{visL + 4}px" role="menu">
         <button type="button" role="menuitem" onclick={openMidiOutputPicker}>MIDI output…</button>
+        <button type="button" role="menuitem" onclick={() => void mapToNote()}>Map to MIDI note…</button>
       </div>
     {/if}
     {#if pickerOpen}

@@ -44,6 +44,8 @@
   import ExportDialog from "./lib/components/export/ExportDialog.svelte";
   import ProjectDialog from "./lib/components/project/ProjectDialog.svelte";
   import { projectops } from "./lib/state/projectops.svelte";
+  import { launch } from "./lib/state/launch.svelte";
+  import LaunchMapPanel from "./lib/components/launch/LaunchMapPanel.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
 
   onMount(() => {
@@ -62,6 +64,7 @@
         modulation.reload(),
         mcp.init(),
         loopjam.init(),
+        launch.init(),
       ]);
       exporter.init();
       generation.init(); // adopt jobs an agent starts over MCP
@@ -236,6 +239,11 @@
       view.snap = !view.snap;
     } else if (!e.metaKey && !e.ctrlKey && !e.altKey && dockTabForKey(e.key)) {
       toggleDock(dockTabForKey(e.key)!);
+    } else if (e.key.toLowerCase() === "k" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      launch.togglePanel();
+    } else if ((e.key === "Delete" || e.key === "Backspace") && launch.panelOpen && launch.selectedId) {
+      e.preventDefault();
+      void launch.remove(launch.selectedId);
     } else if (e.key.toLowerCase() === "c" && !e.metaKey && !e.ctrlKey && !e.altKey) {
       // The library's CLIPS root is a destination in its own right, so it
       // gets its own key rather than "open the library, now find the tab".
@@ -262,6 +270,7 @@
 <ExportDialog />
 <ProjectDialog />
 <PreferencesDialog />
+<LaunchMapPanel />
 <Toasts />
 
 <style>

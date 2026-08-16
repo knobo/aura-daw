@@ -40,6 +40,7 @@ import type {
   MidiNote,
   MidiOutputStatus,
   MidiPortInfo,
+  LaunchBinding,
   OpenSidecarEvent,
   PluginDescriptor,
   PluginInstanceInfo,
@@ -358,6 +359,14 @@ export interface Backend {
    * `portId: null` to fall back to the track's routing. */
   midiSetClipRoute?(clipId: string, portId: string | null, channel?: number): Promise<void>;
   midiOutputStatus?(): Promise<MidiOutputStatus>;
+
+  // ── MIDI launch map (note → region/clip) ──
+  launchGet?(): Promise<LaunchBinding[]>;
+  /** Upsert `binding`, or delete `id` when `binding` is null. */
+  launchSet?(binding: LaunchBinding | null, id?: string | null): Promise<LaunchBinding[]>;
+  launchFire?(id: string): Promise<void>;
+  launchLearnArm?(id: string | null): Promise<void>;
+  launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -816,6 +825,22 @@ class TauriBackend implements Backend {
   }
   midiOutputStatus() {
     return invoke<MidiOutputStatus>("midi_output_status");
+  }
+
+  launchGet() {
+    return invoke<LaunchBinding[]>("launch_get");
+  }
+  launchSet(binding: LaunchBinding | null, id?: string | null) {
+    return invoke<LaunchBinding[]>("launch_set", { binding, id: id ?? null });
+  }
+  async launchFire(id: string) {
+    await invoke("launch_fire", { id });
+  }
+  async launchLearnArm(id: string | null) {
+    await invoke("launch_learn_arm", { id });
+  }
+  launchLearnTake() {
+    return invoke<{ note: number; channel: number } | null>("launch_learn_take");
   }
 
   libraryScan(dir: string) {

@@ -546,6 +546,7 @@ impl ControlPlane {
                     tempo_events: m.tempo_events.clone(),
                     meter_events: m.meter_events.clone(),
                     clips: m.clips.clone(),
+                    launch_bindings: Vec::new(),
                     loaded_dir: None,
                     dirty: false,
                 },
