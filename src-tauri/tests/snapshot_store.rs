@@ -197,6 +197,7 @@ fn live_json(s: &Session) -> serde_json::Value {
         &s.midi.tempo_events,
         &s.midi.meter_events,
         &s.midi.clips.iter().collect::<Vec<_>>(),
+        &s.midi.launch_maps,
         &s.automation.lanes,
         &s.modulation,
         &s.plugins.instances,
@@ -220,6 +221,7 @@ fn image_json(snap: &SessionSnapshot) -> serde_json::Value {
         &snap.midi.tempo_events,
         &snap.midi.meter_events,
         &snap.midi.clips.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
+        &snap.midi.launch_maps,
         &snap.automation,
         &snap.modulation,
         &snap.plugins.instances,
@@ -242,6 +244,7 @@ fn doc_json(
     tempo_events: &[TempoEvent],
     meter_events: &[MeterEvent],
     midi_clips: &[&MidiClip],
+    launch_maps: &[aura_lib::midi::launch::LaunchMap],
     automation: &[AutomationLane],
     modulation: &aura_lib::modulation::ModulationDoc,
     plugin_rows: &[PluginInstanceInfo],
@@ -278,6 +281,7 @@ fn doc_json(
         "tempoEvents": tempo_events,
         "meterEvents": meter_events,
         "midiClips": midi_clips,
+        "launchMaps": launch_maps,
         "automation": automation,
         "modulation": {
             "curves": &modulation.curves,
@@ -576,6 +580,44 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
     })
     .expect("tempo set");
     assert_published_matches_live(&session, "Op::TempoSet");
+
+    // Launch* — named launchers live on the midi document and the image.
+    cp.commit(TxMeta::user("add launcher"), |tx| {
+        tx.apply(Op::LaunchMapSet {
+            id: "default".into(),
+            map: Some(aura_lib::midi::launch::LaunchMap::default_map()),
+        })
+    })
+    .expect("launch map set");
+    assert_published_matches_live(&session, "Op::LaunchMapSet");
+    cp.commit(TxMeta::user("set launch binding"), |tx| {
+        tx.apply(Op::LaunchBindingSet {
+            map_id: "default".into(),
+            id: "lb-sweep".into(),
+            binding: Some(aura_lib::midi::launch::LaunchBinding {
+                id: "lb-sweep".into(),
+                name: "Scene 1".into(),
+                note: 60,
+                channel: None,
+                target: aura_lib::midi::launch::LaunchTarget::Region {
+                    start_ticks: 0,
+                    length_ticks: 960,
+                    track_ids: vec![audio_track.clone()],
+                },
+            }),
+        })
+    })
+    .expect("launch binding set");
+    assert_published_matches_live(&session, "Op::LaunchBindingSet");
+    cp.commit(TxMeta::user("drive launch"), |tx| {
+        tx.apply(Op::LaunchDriveSet {
+            map_id: "default".into(),
+            clip_id: "mc-sweep".into(),
+            on: true,
+        })
+    })
+    .expect("launch drive set");
+    assert_published_matches_live(&session, "Op::LaunchDriveSet");
 
     // AutomationSetLane (upsert)
     cp.commit(TxMeta::user("automation"), |tx| {

@@ -58,6 +58,7 @@ pub struct MidiSnapshot {
     pub tempo_events: Arc<Vec<TempoEvent>>,
     pub meter_events: Arc<Vec<MeterEvent>>,
     pub clips: Arc<Vec<Arc<MidiClip>>>,
+    pub launch_maps: Arc<Vec<crate::midi::launch::LaunchMap>>,
 }
 
 impl MidiSnapshot {
@@ -74,6 +75,7 @@ impl MidiSnapshot {
             tempo_events: Arc::new(midi.tempo_events.clone()),
             meter_events: Arc::new(midi.meter_events.clone()),
             clips: Arc::new(midi.clips.iter().cloned().map(Arc::new).collect()),
+            launch_maps: Arc::new(midi.launch_maps.clone()),
         }
     }
 }
@@ -89,6 +91,7 @@ pub struct ChangeSet {
     pub midi_meta: bool,      // ppq / tempo_events / meter_events
     pub midi_structure: bool, // clip list add/remove (re-derive whole list)
     pub midi_clips: BTreeSet<ClipId>, // per-clip content rewrites
+    pub launch_maps: bool,    // named launchers + bindings + drive clips
     pub automation: bool,
     pub modulation: bool,
     pub plugins: bool,
@@ -114,6 +117,7 @@ impl ChangeSet {
             midi_meta: true,
             midi_structure: true,
             midi_clips: BTreeSet::new(),
+            launch_maps: true,
             automation: true,
             modulation: true,
             plugins: true,
@@ -132,6 +136,7 @@ impl ChangeSet {
     /// · ClipAdd/ClipRemove→clips · TempoSet→midi_meta+transport (bpm mirror)
     /// · MidiClipAdd/MidiClipRemove→midi_structure
     /// · MidiSetNotes{clip,..}→midi_clips.insert(clip)
+    /// · LaunchBindingSet/LaunchDriveSet/LaunchMapSet→launch_maps
     /// · AutomationSetLane→automation · PluginAdd/PluginRemove/PluginSetState→plugins
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
@@ -174,6 +179,11 @@ impl ChangeSet {
                 }
                 Op::MidiSetNotes { clip, .. } => {
                     cs.midi_clips.insert(clip.clone());
+                }
+                Op::LaunchBindingSet { .. }
+                | Op::LaunchDriveSet { .. }
+                | Op::LaunchMapSet { .. } => {
+                    cs.launch_maps = true;
                 }
                 Op::AutomationSetLane { .. } => {
                     cs.automation = true;
@@ -219,6 +229,7 @@ impl SessionSnapshot {
                 tempo_events: Arc::new(Vec::new()),
                 meter_events: Arc::new(Vec::new()),
                 clips: Arc::new(Vec::new()),
+                launch_maps: Arc::new(Vec::new()),
             },
             automation: Arc::new(Vec::new()),
             modulation: Arc::new(crate::modulation::ModulationDoc::default()),
@@ -278,6 +289,11 @@ impl SessionSnapshot {
                 )
             } else {
                 prev.midi.clips.clone()
+            },
+            launch_maps: if changed.launch_maps {
+                Arc::new(session.midi.launch_maps.clone())
+            } else {
+                prev.midi.launch_maps.clone()
             },
         };
         Self {
@@ -356,6 +372,10 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     if changed.midi_meta {
         charge += next.midi.tempo_events.len() * size_of::<TempoEvent>();
         charge += next.midi.meter_events.len() * size_of::<MeterEvent>();
+    }
+    if changed.launch_maps {
+        charge += next.midi.launch_maps.len() * size_of::<crate::midi::launch::LaunchMap>();
+        charge += next.midi.launch_maps.iter().map(launch_map_heap).sum::<usize>();
     }
     if changed.midi_list_rederives() {
         // The list itself: a Vec of pointers.
@@ -450,6 +470,26 @@ pub(crate) fn automation_clip_heap(c: &crate::modulation::AutomationClip) -> usi
         + c.id.len()
         + c.track_id.len()
         + c.curve_id.len()
+}
+
+pub(crate) fn launch_map_heap(m: &crate::midi::launch::LaunchMap) -> usize {
+    m.id.len()
+        + m.name.len()
+        + m.drive_clip_ids.iter().map(String::len).sum::<usize>()
+        + m.bindings.iter().map(launch_binding_heap).sum::<usize>()
+}
+
+pub(crate) fn launch_binding_heap(b: &crate::midi::launch::LaunchBinding) -> usize {
+    b.id.len() + b.name.len() + launch_target_heap(&b.target)
+}
+
+fn launch_target_heap(t: &crate::midi::launch::LaunchTarget) -> usize {
+    match t {
+        crate::midi::launch::LaunchTarget::Region { track_ids, .. } => {
+            track_ids.iter().map(String::len).sum()
+        }
+        crate::midi::launch::LaunchTarget::Clip { clip_id } => clip_id.len(),
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +731,21 @@ mod tests {
         // MidiSetNotes → midi_clips.insert(clip)
         let c = cs(&[Op::MidiSetNotes { clip: "mc-x".into(), notes: vec![] }]);
         assert_eq!(c, ChangeSet { midi_clips: clip_ids(&["mc-x"]), ..Default::default() });
+        // Launch* → launch_maps
+        let c = cs(&[Op::LaunchBindingSet {
+            map_id: String::new(),
+            id: "lb-x".into(),
+            binding: None,
+        }]);
+        assert_eq!(c, ChangeSet { launch_maps: true, ..Default::default() });
+        let c = cs(&[Op::LaunchDriveSet {
+            map_id: String::new(),
+            clip_id: "mc-x".into(),
+            on: true,
+        }]);
+        assert_eq!(c, ChangeSet { launch_maps: true, ..Default::default() });
+        let c = cs(&[Op::LaunchMapSet { id: "default".into(), map: None }]);
+        assert_eq!(c, ChangeSet { launch_maps: true, ..Default::default() });
         // AutomationSetLane → automation + modulation
         let c = cs(&[Op::AutomationSetLane { key: "a-x".into(), lane: None }]);
         assert_eq!(
@@ -830,6 +885,60 @@ mod tests {
             assert_eq!(
                 published.midi.clips.iter().find(|c| c.id == "mc-a").unwrap().notes.len(),
                 2
+            );
+        }
+    }
+
+    /// Launch maps are document content: a restore must put them back, and
+    /// the published image must carry them so a later rebuild sees the same
+    /// drive-clip set the live store has.
+    #[test]
+    fn restore_from_snapshot_round_trips_launch_maps() {
+        let m = two_clip_session();
+        Session::transact(&m, TxMeta::user("add launcher"), |tx| {
+            tx.apply(Op::LaunchMapSet {
+                id: "default".into(),
+                map: Some(crate::midi::launch::LaunchMap::default_map()),
+            })?;
+            tx.apply(Op::LaunchBindingSet {
+                map_id: "default".into(),
+                id: "lb-1".into(),
+                binding: Some(crate::midi::launch::LaunchBinding {
+                    id: "lb-1".into(),
+                    name: "Scene".into(),
+                    note: 60,
+                    channel: None,
+                    target: crate::midi::launch::LaunchTarget::Clip {
+                        clip_id: "mc-a".into(),
+                    },
+                }),
+            })?;
+            tx.apply(Op::LaunchDriveSet {
+                map_id: "default".into(),
+                clip_id: "mc-a".into(),
+                on: true,
+            })
+        })
+        .unwrap();
+        let with_maps = m.lock().published_handle().lock().clone();
+        assert_eq!(with_maps.midi.launch_maps.len(), 1);
+        assert_eq!(with_maps.midi.launch_maps[0].drive_clip_ids, vec!["mc-a".to_string()]);
+
+        Session::transact(&m, TxMeta::user("clear drive"), |tx| {
+            tx.apply(Op::LaunchDriveSet {
+                map_id: "default".into(),
+                clip_id: "mc-a".into(),
+                on: false,
+            })
+        })
+        .unwrap();
+        {
+            let mut g = m.lock();
+            g.restore_from_snapshot(&with_maps);
+            assert_eq!(g.midi.launch_maps[0].drive_clip_ids, vec!["mc-a".to_string()]);
+            assert_eq!(
+                g.published_handle().lock().midi.launch_maps[0].drive_clip_ids,
+                vec!["mc-a".to_string()]
             );
         }
     }

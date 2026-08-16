@@ -215,6 +215,7 @@ impl Session {
         midi.tempo_events = (*snap.midi.tempo_events).clone();
         midi.meter_events = (*snap.midi.meter_events).clone();
         midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        midi.launch_maps = (*snap.midi.launch_maps).clone();
         // `loaded_dir: None` / `dirty: false` are `MidiStore::default()`'s.
         let mut plugins = (*snap.plugins).clone();
         // `dirty_state` is advisory in a snapshot (bookkeeping) — a scratch
@@ -252,6 +253,8 @@ impl Session {
         self.midi.tempo_events = (*snap.midi.tempo_events).clone();
         self.midi.meter_events = (*snap.midi.meter_events).clone();
         self.midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        self.midi.launch_maps = (*snap.midi.launch_maps).clone();
+        crate::midi::launch::runtime().set_maps(self.midi.launch_maps.clone());
         self.automation.lanes = (*snap.automation).clone();
         self.modulation = (*snap.modulation).clone();
         let dirty_state = std::mem::take(&mut self.plugins.dirty_state);
