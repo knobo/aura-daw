@@ -32,6 +32,9 @@ pub struct LaunchPlayhead {
     pub discontinuity: bool,
     /// When true (stopped preview), only FLAG_LAUNCH tracks render.
     pub exclusive: bool,
+    /// Overlay just reached its marked end — FLAG_LAUNCH tracks must
+    /// all-notes-off; they render at the arrangement playhead.
+    pub ended: bool,
 }
 
 /// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
@@ -106,6 +109,9 @@ pub struct SharedRt {
     pub launch_start: AtomicU64,
     pub launch_end: AtomicU64,
     pub launch_discont: AtomicBool,
+    /// Set when the overlay playhead crosses `launch_end`. Consumed by the
+    /// next mixer block so FLAG_LAUNCH tracks all-notes-off.
+    pub launch_ended: AtomicBool,
 }
 
 impl Default for SharedRt {
@@ -134,6 +140,7 @@ impl Default for SharedRt {
             launch_start: AtomicU64::new(0),
             launch_end: AtomicU64::new(0),
             launch_discont: AtomicBool::new(false),
+            launch_ended: AtomicBool::new(false),
         }
     }
 }
@@ -154,11 +161,16 @@ impl SharedRt {
         self.launch_end.store(end, Ordering::Relaxed);
         self.launch_pos.store(start, Ordering::Relaxed);
         self.launch_discont.store(true, Ordering::Relaxed);
+        self.launch_ended.store(false, Ordering::Relaxed);
         self.launch_on.store(true, Ordering::Relaxed);
     }
 
     pub fn clear_launch(&self) {
         self.launch_on.store(false, Ordering::Relaxed);
+    }
+
+    pub fn take_launch_ended(&self) -> bool {
+        self.launch_ended.swap(false, Ordering::Relaxed)
     }
 
     pub fn launch_overlay(&self) -> Option<LaunchPlayhead> {
@@ -169,6 +181,7 @@ impl SharedRt {
             pos: self.launch_pos.load(Ordering::Relaxed),
             discontinuity: self.launch_discont.swap(false, Ordering::Relaxed),
             exclusive: false,
+            ended: false,
         })
     }
 
@@ -181,6 +194,7 @@ impl SharedRt {
         let next = pos.saturating_add(frames);
         if next >= end {
             self.launch_on.store(false, Ordering::Relaxed);
+            self.launch_ended.store(true, Ordering::Relaxed);
             self.launch_pos.store(end, Ordering::Relaxed);
         } else {
             self.launch_pos.store(next, Ordering::Relaxed);
@@ -365,7 +379,11 @@ pub struct RtTrack {
 impl RtTrack {
     /// Clip-only track (audio tracks; also keeps tests terse).
     pub fn clips(slot: usize, clips: Vec<RtClip>) -> Self {
-        Self { slot, clips, live: None }
+        Self {
+            slot,
+            clips,
+            live: None,
+        }
     }
 }
 

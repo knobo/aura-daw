@@ -445,8 +445,9 @@ fn render_impl(
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
         let flagged = flags & FLAG_LAUNCH != 0;
-        let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive);
-        let overlaying = flagged && launch.is_some();
+        let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive && !ov.ended);
+        let overlaying = flagged && launch.is_some_and(|ov| !ov.ended);
+        let ending = flagged && launch.is_some_and(|ov| ov.ended);
         let on = if exclusive && !flagged {
             false
         } else {
@@ -460,6 +461,8 @@ fn render_impl(
         let (track_base, track_lp, track_disc) = if overlaying {
             let ov = launch.unwrap();
             (ov.pos, &LoopSpec::OFF, ov.discontinuity)
+        } else if ending {
+            (base_pos, lp, true)
         } else {
             (base_pos, lp, discontinuity)
         };
@@ -787,7 +790,7 @@ mod tests {
             false,
             0,
             None,
-            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false }),
+            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false, ended: false }),
             None,
         );
         assert!(
@@ -811,7 +814,7 @@ mod tests {
             false,
             0,
             None,
-            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true }),
+            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true, ended: false }),
             None,
         );
         assert!(
@@ -829,7 +832,7 @@ mod tests {
             false,
             0,
             None,
-            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true }),
+            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true, ended: false }),
             None,
         );
         assert!((out[0] - 1.0).abs() < 1e-5, "launched track still plays");

@@ -576,10 +576,22 @@ impl OutputCb {
             return;
         }
 
-        let overlay = self.shared.launch_overlay().map(|mut ov| {
-            ov.exclusive = !playing;
-            ov
-        });
+        let overlay_ended = self.shared.take_launch_ended();
+        let overlay = self
+            .shared
+            .launch_overlay()
+            .map(|mut ov| {
+                ov.exclusive = !playing;
+                ov
+            })
+            .or_else(|| {
+                overlay_ended.then_some(crate::audio::rt::LaunchPlayhead {
+                    pos: base,
+                    discontinuity: true,
+                    exclusive: false,
+                    ended: true,
+                })
+            });
         let overlay_on = overlay.is_some();
         match (&mut self.graph, playing, overlay_on) {
             (Some(g), true, _) | (Some(g), false, true) => {
