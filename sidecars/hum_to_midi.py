@@ -597,14 +597,65 @@ def run_self_test():
     return 1 if failures else 0
 
 
+def run_pitch_track(input_path):
+    """Print the per-frame pitch track as NDJSON, one object per 10 ms frame:
+
+        {"t": <window start, seconds>, "hz": <float|null>,
+         "midi": <float|null>, "rms": <float>}
+
+    `hz` is raw out of `pitch_track`; `midi` is that value after
+    `median_filter_track`, i.e. the stage `analyze` actually segments. Both
+    are emitted because the Rust comparison needs the smoothed stage, but the
+    raw one is what shows whether a disagreement came from detection or from
+    smoothing.
+
+    A diagnostic surface, not part of the job protocol — nothing in the app
+    calls it. It exists so `src-tauri/tests/pitch_sidecar_parity.rs` can hold
+    the Rust live detector to THIS file's behaviour: the live trainer and
+    hum-to-MIDI must never disagree about what the singer sang, which is the
+    whole reason the Rust port copies these constants verbatim.
+
+    Raw means before `analyze`'s median filter and segmentation — the frames
+    exactly as `pitch_track` produced them.
+    """
+    if not os.path.isfile(input_path):
+        return fail("input file not found: %s" % input_path)
+    try:
+        sr, samples = read_wav(input_path)
+    except ValueError as e:
+        return fail("bad WAV: %s" % e)
+    if not samples:
+        return fail("WAV contains no samples")
+    raw = pitch_track(resample_linear(samples, sr, TARGET_SR), TARGET_SR)
+    # Exactly `analyze`'s next two steps, so `midi` is the stage that gets
+    # segmented into notes.
+    smoothed = median_filter_track(
+        [(t, hz_to_midi(f0) if f0 is not None else None, rms)
+         for (t, f0, rms) in raw])
+    for (t, f0, rms), (_, midi, _) in zip(raw, smoothed):
+        _NDJSON.write(json.dumps({
+            "t": round(t, 6),
+            "hz": (round(f0, 4) if f0 is not None else None),
+            "midi": (round(midi, 6) if midi is not None else None),
+            "rms": round(rms, 6),
+        }) + "\n")
+    _NDJSON.flush()
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="AURA hum-to-MIDI sidecar")
     p.add_argument("--params-json", default=None)
     p.add_argument("--simulate", action="store_true")
     p.add_argument("--self-test", action="store_true")
+    p.add_argument("--pitch-track", default=None, metavar="WAV",
+                   help="print the raw per-frame pitch track as NDJSON and "
+                        "exit (diagnostic; see run_pitch_track)")
     args = p.parse_args()
     if args.self_test:
         return run_self_test()
+    if args.pitch_track:
+        return run_pitch_track(args.pitch_track)
     if args.params_json is None:
         return fail("--params-json is required")
     try:
