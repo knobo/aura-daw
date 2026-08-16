@@ -53,7 +53,21 @@ documentation and all commits are English.
       `set_rehearse_hold`, `pitch_set_reference`; `pitch://state`; schemas
       stay open (D-06). 227/227 `audio::` green.
 - [ ] **Owner checkpoint** (spec R3): demonstrate detected pitch numerically
-      before any UI is built
+      before any UI is built. **Run it with:**
+
+      ```sh
+      cargo run --manifest-path src-tauri/Cargo.toml --example pitch_check -- 15 A3
+      ```
+
+      The plan's checkpoint text said to drive the running app. That is not
+      possible: the five pitch commands are registered in `lib.rs`, but
+      `src/lib/tauri.ts` has no bindings (that is Task 7, phase 2),
+      `withGlobalTauri` is unset so `window.__TAURI__` does not exist in
+      devtools, and no MCP tool exposes them. `examples/pitch_check.rs` opens
+      the default capture device and runs the real `PitchTap` +
+      `PitchWorker`, printing Hz, nearest note, cents error, voiced fraction
+      and clarity. It does NOT exercise the Tauri command layer or the 60 Hz
+      batching — that is phase 2's to prove.
 
 **Phase 2 — panel.** Not started. Tasks 7–11.
 
