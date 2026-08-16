@@ -87,9 +87,16 @@
   pub struct Yin { /* preallocated buffers */ }
   impl Yin {
       pub fn new(sr: u32) -> Self;
-      /// Analysis window length in samples (`2 * tau_max`).
+      /// Integration window in samples (`2 * tau_max`) — the number of
+      /// terms summed per lag.
       pub fn window(&self) -> usize;
-      /// `frame.len()` must equal `self.window()`.
+      /// Samples `detect` must be given: `window() + tau_max`. The extra
+      /// `tau_max` is lookahead, so EVERY lag sums the same `window()`
+      /// terms. Letting the term count shrink with `tau` biases the
+      /// difference function downward at large lags — an octave-down error
+      /// on exactly the low male voice this is for.
+      pub fn frame_len(&self) -> usize;
+      /// `frame.len()` must be at least `self.frame_len()`.
       /// Returns `(f0_hz, aperiodicity)`; `f0_hz` is `None` when unvoiced.
       pub fn detect(&mut self, frame: &[f32]) -> (Option<f32>, f32);
   }
@@ -116,8 +123,8 @@ mod tests {
 
     fn detect_hz(signal: &[f32]) -> Option<f32> {
         let mut y = Yin::new(TARGET_SR);
-        let w = y.window();
-        y.detect(&signal[..w]).0
+        let n = y.frame_len();
+        y.detect(&signal[..n]).0
     }
 
     #[test]
@@ -133,7 +140,10 @@ mod tests {
     #[test]
     fn silence_and_noise_are_unvoiced() {
         let mut y = Yin::new(TARGET_SR);
-        let w = y.window();
+        let w = y.frame_len();
+        // Guard against a stub: this same detector must still find a real
+        // tone, so "unvoiced" below cannot be an always-None shortcut.
+        assert!(y.detect(&sine(220.0, 4096)[..w]).0.is_some(), "harness sanity");
         assert_eq!(y.detect(&vec![0.0; w]).0, None, "silence must be unvoiced");
 
         // Deterministic pseudo-noise: no rand dependency, no Math.random.
@@ -181,6 +191,12 @@ mod tests {
         let y = Yin::new(TARGET_SR);
         let tau_max = (TARGET_SR as f32 / FMIN) as usize;
         assert_eq!(y.window(), 2 * tau_max, "window must be 2 * tau_max, as hum_to_midi.py");
+        assert_eq!(
+            y.frame_len(),
+            2 * tau_max + tau_max,
+            "frame_len must be w + tau_max, as pitch_track's frame_len — the \
+             lookahead that keeps every lag summing the same number of terms"
+        );
     }
 
     #[test]
@@ -205,7 +221,7 @@ Expected: FAIL — `unimplemented!()` panics in every test.
 Port `_frame_pitch_py` from `sidecars/hum_to_midi.py:200-235`. The algorithm, in order:
 
 1. `tau_min = max(2, sr / FMAX)`, `tau_max = sr / FMIN`, `w = 2 * tau_max`.
-2. Difference function `d[tau] = sum over j in 0..w of (x[j] - x[j+tau])^2` for `tau` in `0..=tau_max`. Guard: the caller passes exactly `w` samples, so index `j + tau` must be bounded — compute over `j in 0..w-tau` and treat that as the sidecar does.
+2. Difference function `d[tau] = sum over j in 0..w of (x[j] - x[j+tau])^2` for `tau` in `1..=tau_max`, with `d[0] = 1.0`. The caller passes `frame_len() = w + tau_max` samples, so `j + tau` reaches at most `w - 1 + tau_max`, the last valid index — **every lag sums exactly `w` terms**. Do not shorten the sum to `0..w-tau`: a term count that shrinks with `tau` makes `d[tau]` fall off at large lags, which CMNDF's normalization then reads as a better period, producing octave-down errors on low voices. This matches `_frame_pitch_py` and `pitch_track`'s `frame_len = w + tau_max` exactly.
 3. Cumulative mean normalized difference: `cmnd[0] = 1.0`; running sum `s += d[tau]`; `cmnd[tau] = d[tau] * tau / s` (guard `s == 0` → `cmnd[tau] = 1.0`).
 4. Absolute threshold: walk `tau` from `tau_min` to `tau_max`, and on the first `cmnd[tau] < YIN_THRESHOLD`, descend to the local minimum (`while cmnd[tau+1] < cmnd[tau] { tau += 1 }`) and take it. If no `tau` crosses the threshold, take the global minimum over `tau_min..=tau_max` and report its `cmnd` as the aperiodicity — the caller's gate rejects it.
 5. Parabolic interpolation around the chosen `tau` using `cmnd[tau-1]`, `cmnd[tau]`, `cmnd[tau+1]` (skip when `tau` is at either edge).
@@ -283,8 +299,8 @@ mod tests {
         let mut out = Vec::new();
         d.process(&sine(220.0, 48_000, 48_000), 1, &mut out);
         let mut y = crate::audio::yin::Yin::new(TARGET_SR);
-        let w = y.window();
-        let f0 = y.detect(&out[out.len() / 2..out.len() / 2 + w]).0.expect("voiced");
+        let n = y.frame_len();
+        let f0 = y.detect(&out[out.len() / 2..out.len() / 2 + n]).0.expect("voiced");
         assert!(crate::audio::yin::cents_between(f0, 220.0).abs() < 25.0, "got {f0} Hz");
     }
 
@@ -538,11 +554,11 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement**
 
-`PitchAnalyzer` holds: a `Yin`, an input ring `Vec<f32>` of at least `window + hop`, a write cursor, the loud-reference tracker, a `[Option<f32>; MEDIAN_TAPS]` history, the last accepted MIDI value, and the running frame index.
+`PitchAnalyzer` holds: a `Yin`, an input ring `Vec<f32>` of at least `frame_len + hop`, a write cursor, the loud-reference tracker, a `[Option<f32>; MEDIAN_TAPS]` history, the last accepted MIDI value, and the running frame index.
 
 `push` loop, per completed hop:
 
-1. Copy the newest `window` samples into a scratch buffer, call `yin.detect`.
+1. Copy the newest `yin.frame_len()` samples into a scratch buffer and call `yin.detect`. Note `frame_len` is `window + tau_max`: the trailing `tau_max` samples are lookahead for the difference function, not signal being measured. RMS and the timestamp are therefore taken over the leading `window()` samples only, matching `pitch_track`'s `frame[:w]`.
 2. **Loud reference:** track a decaying maximum of frame RMS — `loud = loud.max(rms)` then `loud *= 0.9995` each frame (the sidecar uses a 95th percentile of the whole file, which is not available online; a decaying max is the streaming equivalent and must be commented as such). Gate: `rms > (loud * RMS_GATE_REL).max(1e-4)`.
 3. Voiced if the detector returned `Some`, aperiodicity `< YIN_THRESHOLD`, and the RMS gate passes.
 4. **Median filter:** push the MIDI value (or `None`) into the 5-tap history; the reported value is the median of the voiced entries. Fewer than 3 voiced entries in the window → report unvoiced.
