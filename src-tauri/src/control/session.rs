@@ -179,6 +179,16 @@ impl Session {
         self.rev
     }
 
+    /// True when `instance_id` is referenced from any track's insert list.
+    /// Host restore (`HostForward::Instantiate`, project-open reactivate)
+    /// uses this to pick Effect vs Instrument negotiation — G-7: one
+    /// instance is never both.
+    pub fn instance_is_insert(&self, instance_id: &str) -> bool {
+        self.store.tracks.iter().any(|t| {
+            t.inserts.iter().any(|s| s.instance_id == instance_id)
+        })
+    }
+
     /// The live document epoch — same read-only rationale as [`Self::rev`]
     /// (`Tx::epoch` is the in-transaction reader; this is the out-of-band
     /// one the equivalence sweep needs).
@@ -4277,6 +4287,35 @@ mod tests {
             "G-10 sweep mutates TrackState.inserts — project.json must rewrite"
         );
         assert!(c.effect.persist.plugins, "PluginRemove still persists PluginDoc");
+    }
+
+    #[test]
+    fn instance_is_insert_follows_slot_membership() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        assert!(
+            !m.lock().instance_is_insert("p-1"),
+            "no slot yet"
+        );
+        commit(&m, |tx| {
+            tx.apply(Op::PluginAdd {
+                row: crate::plugins::PluginInstanceInfo {
+                    id: "p-1".into(),
+                    uid: "clap:/x.clap#fx".into(),
+                    name: "Fx".into(),
+                    format: "clap".into(),
+                    status: "stub".into(),
+                    track_id: Some("t-1".into()),
+                },
+                index: usize::MAX,
+            })?;
+            tx.apply(Op::InsertAdd {
+                track_id: "t-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        });
+        assert!(m.lock().instance_is_insert("p-1"), "slot names p-1");
+        assert!(!m.lock().instance_is_insert("p-other"), "other ids stay false");
     }
 
     #[test]

@@ -825,9 +825,13 @@ impl Committer {
                     }
                 }
                 HostForward::Instantiate { instance } => {
-                    let row = {
+                    let (row, as_effect) = {
                         let s = self.session.lock();
-                        s.plugins.instances.iter().find(|r| &r.id == instance).cloned()
+                        let row = s.plugins.instances.iter().find(|r| &r.id == instance).cloned();
+                        let as_effect = row
+                            .as_ref()
+                            .is_some_and(|r| s.instance_is_insert(&r.id));
+                        (row, as_effect)
                     };
                     let Some(row) = row else { continue }; // row vanished meanwhile
                     // Idempotent by construction (doc on `HostForward::
@@ -835,9 +839,15 @@ impl Committer {
                     // (the prepare-outside fresh-instantiate path), re-sync
                     // params via a plain read instead of re-instantiating —
                     // re-registering a live id would reset its voice state.
+                    // Insert membership (already applied) picks Effect vs
+                    // Instrument — undo/replay/open of insert FX must not
+                    // re-negotiate as a note-port instrument.
                     let hosted = match row.format.as_str() {
                         "clap" => match clap_host::has_instance(instance) {
                             Ok(true) => clap_host::get_params(instance),
+                            Ok(false) if as_effect => {
+                                clap_host::instantiate_effect(instance, &row.uid)
+                            }
                             Ok(false) => clap_host::instantiate(instance, &row.uid),
                             Err(e) => Err(e),
                         },
@@ -845,6 +855,9 @@ impl Committer {
                             let host = lv2_host::global();
                             match host.has_instance(instance) {
                                 Ok(true) => host.get_params(instance),
+                                Ok(false) if as_effect => {
+                                    host.register_instance_effect(instance, &row.uid)
+                                }
                                 Ok(false) => host.register_instance(instance, &row.uid),
                                 Err(e) => Err(e),
                             }
@@ -5285,6 +5298,89 @@ mod tests {
         let s = plane.session().lock();
         assert!(s.plugins.instances.is_empty(), "undo removes the PluginAdd");
         assert!(s.store.tracks[0].inserts.is_empty(), "undo removes the InsertAdd");
+    }
+
+    /// Review bug (PR #55): `HostForward::Instantiate` used the instrument
+    /// host, so an insert FX never came back live after undo / replay.
+    #[test]
+    fn plugin_add_of_an_insert_rehosts_as_effect() {
+        let fx = crate::plugins::scan_worker::scan_clap_subprocess(
+            &crate::plugins::scan::clap_search_paths(),
+        )
+        .into_iter()
+        .find(|d| !d.is_instrument && !d.uid.to_lowercase().contains("cardinal"));
+        let Some(fx) = fx else {
+            eprintln!("note: no CLAP effect installed; insert re-host skipped");
+            return;
+        };
+        let id = format!("ins-{}", uuid::Uuid::new_v4());
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        let mut row = fx_row(&id, "t-1");
+        row.uid = fx.uid.clone();
+        row.format = "clap".into();
+        row.name = fx.name.clone();
+        plane
+            .commit(TxMeta::user("insert add"), |tx| {
+                tx.apply(Op::PluginAdd {
+                    row: row.clone(),
+                    index: usize::MAX,
+                })?;
+                tx.apply(Op::InsertAdd {
+                    track_id: "t-1".into(),
+                    slot: crate::audio::types::InsertSlot {
+                        id: "s-1".into(),
+                        instance_id: id.clone(),
+                        bypassed: false,
+                    },
+                    index: usize::MAX,
+                })
+            })
+            .unwrap();
+        let live = crate::plugins::clap_host::has_instance(&id).unwrap_or(false);
+        let _ = crate::plugins::clap_host::remove(&id);
+        assert!(
+            live,
+            "HostForward::Instantiate must host an insert as Effect (uid={})",
+            fx.uid
+        );
+    }
+
+    /// Same hole on project-open: `reactivate_restored` used to call the
+    /// instrument instantiate path for every stub clap/lv2 row.
+    #[test]
+    fn reactivate_restored_hosts_an_insert_as_effect() {
+        let fx = crate::plugins::scan_worker::scan_clap_subprocess(
+            &crate::plugins::scan::clap_search_paths(),
+        )
+        .into_iter()
+        .find(|d| !d.is_instrument && !d.uid.to_lowercase().contains("cardinal"));
+        let Some(fx) = fx else {
+            eprintln!("note: no CLAP effect installed; insert reactivate skipped");
+            return;
+        };
+        let id = format!("re-{}", uuid::Uuid::new_v4());
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        {
+            let mut s = plane.session().lock();
+            let mut row = fx_row(&id, "t-1");
+            row.uid = fx.uid.clone();
+            row.format = "clap".into();
+            row.name = fx.name.clone();
+            s.plugins.instances.push(row);
+            s.store.tracks[0].inserts.push(crate::audio::types::InsertSlot {
+                id: "s-1".into(),
+                instance_id: id.clone(),
+                bypassed: false,
+            });
+        }
+        crate::plugins::state::reactivate_restored(plane.session());
+        let live = crate::plugins::clap_host::has_instance(&id).unwrap_or(false);
+        let _ = crate::plugins::clap_host::remove(&id);
+        assert!(
+            live,
+            "reactivate_restored must host an insert as Effect (uid={})",
+            fx.uid
+        );
     }
 
     /// Plan G1 Task 3 / G-10: remove_track must PluginRemove insert instances.
