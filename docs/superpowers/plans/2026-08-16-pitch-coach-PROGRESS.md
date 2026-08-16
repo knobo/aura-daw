@@ -19,7 +19,8 @@ documentation and all commits are English.
 |---|---|
 | Worktree | `/home/knobo/prog/dav/.claude/worktrees/pitch-coach` |
 | Branch | `feat/pitch-coach` |
-| Branched from | `origin/main` @ `bcdc481`, merged `origin/main` @ `d0866ad` |
+| Branched from | `origin/main` @ `6af46dd` (Plan F; rebased) |
+| PR | [#49](https://github.com/knobo/aura-daw/pull/49) |
 | Baseline at merge | 792 Rust tests pass, 440 frontend tests pass, 0 failures |
 
 Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
@@ -145,6 +146,9 @@ with the commit sha and anything the next agent would be surprised by.
      tight enough to actually catch a drifted constant.
   3. Integration tests import **`aura_lib::`**, not `aura::` — the lib
      target is renamed in Cargo.toml. The plan said `aura::`.
+- 2026-08-16 — Rebased onto `origin/main` `6af46dd` (Plan F) with no
+  conflicts. Snapshot `rebuild` and InputHub both present. Pushed
+  `feat/pitch-coach`; PR #49. Task 5 `c039cc4`, Task 6 `736c4c8`.
 - 2026-08-16 — Task 6 done. Five additive commands registered in `lib.rs`
   next to `subscribe_meters`. Frames batch on the existing 60 Hz
   `last_frame` tick (`pump_pitch_frames` runs just before
