@@ -38,26 +38,40 @@ impl Yin {
         }
     }
 
-    /// Analysis window length in samples (`2 * tau_max`).
+    /// Integration window in samples (`2 * tau_max`) — the number of terms
+    /// summed per lag.
     pub fn window(&self) -> usize {
         2 * self.tau_max
     }
 
-    /// `frame.len()` must equal `self.window()`.
+    /// Samples `detect` must be given: `window() + tau_max`. The extra
+    /// `tau_max` is lookahead, so EVERY lag sums the same `window()` terms.
+    /// Letting the term count shrink with `tau` biases the difference
+    /// function downward at large lags — an octave-down error on exactly
+    /// the low male voice this is for.
+    pub fn frame_len(&self) -> usize {
+        self.window() + self.tau_max
+    }
+
+    /// `frame.len()` must be at least `self.frame_len()`.
     /// Returns `(f0_hz, aperiodicity)`; `f0_hz` is `None` when unvoiced.
     pub fn detect(&mut self, frame: &[f32]) -> (Option<f32>, f32) {
-        debug_assert_eq!(frame.len(), self.window());
+        debug_assert!(frame.len() >= self.frame_len());
         let w = self.window();
         let tau_max = self.tau_max;
         let tau_min = self.tau_min;
 
-        // Difference function. The caller passes exactly `w` samples (not
-        // `w + tau_max` like the sidecar's streaming frames), so `j + tau`
-        // is bounded by summing over `0..w - tau` instead of the full `0..w`.
+        // Difference function. The caller passes `frame_len() = w + tau_max`
+        // samples, so `j + tau` reaches at most `w - 1 + tau_max` — the last
+        // valid index — and every lag sums the full `w` terms. Do not
+        // shorten this to `0..w-tau`: a shrinking term count makes `d[tau]`
+        // fall off at large lags, which CMNDF's normalization then reads as
+        // a better period (octave-down bias). Matches `_frame_pitch_py` /
+        // `pitch_track`'s `frame_len = w + tau_max` exactly.
         self.d[0] = 1.0;
         for tau in 1..=tau_max {
             let mut acc = 0.0f32;
-            for j in 0..(w - tau) {
+            for j in 0..w {
                 let diff = frame[j] - frame[j + tau];
                 acc += diff * diff;
             }
@@ -146,13 +160,15 @@ mod tests {
 
     fn detect_hz(signal: &[f32]) -> Option<f32> {
         let mut y = Yin::new(TARGET_SR);
-        let w = y.window();
-        y.detect(&signal[..w]).0
+        let n = y.frame_len();
+        y.detect(&signal[..n]).0
     }
 
     #[test]
     fn detects_pitch_within_25_cents_across_the_vocal_range() {
-        for &hz in &[65.0f32, 98.0, 147.0, 220.0, 440.0, 880.0] {
+        // 66 Hz, not 65: exactly FMIN is unreachable by construction, which
+        // `the_effective_floor_sits_just_above_fmin` documents below.
+        for &hz in &[66.0f32, 98.0, 147.0, 220.0, 440.0, 880.0] {
             let s = sine(hz, 4096);
             let got = detect_hz(&s).unwrap_or_else(|| panic!("{hz} Hz read as unvoiced"));
             let err = cents_between(got, hz).abs();
@@ -166,7 +182,13 @@ mod tests {
     #[test]
     fn silence_and_noise_are_unvoiced() {
         let mut y = Yin::new(TARGET_SR);
-        let w = y.window();
+        let w = y.frame_len();
+        // Guard against a stub: this same detector must still find a real
+        // tone, so "unvoiced" below cannot be an always-None shortcut.
+        assert!(
+            y.detect(&sine(220.0, 4096)[..w]).0.is_some(),
+            "harness sanity"
+        );
         assert_eq!(y.detect(&vec![0.0; w]).0, None, "silence must be unvoiced");
 
         // Deterministic pseudo-noise: no rand dependency, no Math.random.
@@ -209,6 +231,38 @@ mod tests {
         );
     }
 
+    /// The searchable floor is `sr / tau_max`, not `FMIN` itself. `tau_max
+    /// = (sr / FMIN) as usize` truncates 123.07 to 123, so the longest lag
+    /// the search can reach is 8000/123 = 65.04 Hz. A tone at exactly FMIN
+    /// interpolates a hair below that and the range gate rejects it.
+    ///
+    /// `sidecars/hum_to_midi.py` behaves identically — verified by running
+    /// its own `_frame_pitch_py` on the same tone. Parity with the sidecar
+    /// is the binding requirement (spec §3.2), so this is documented
+    /// rather than "fixed": widening `tau_max` here would make the live
+    /// detector and hum-to-MIDI disagree at the bottom of the range, which
+    /// is the one thing copying the constants exists to prevent.
+    ///
+    /// Musically this costs nothing — 65 Hz is C2, below any sung note
+    /// this feature targets.
+    #[test]
+    fn the_effective_floor_sits_just_above_fmin() {
+        let tau_max = (TARGET_SR as f32 / FMIN) as usize;
+        let floor = TARGET_SR as f32 / tau_max as f32;
+        assert!(
+            floor > FMIN,
+            "the floor {floor} must sit just above FMIN {FMIN}"
+        );
+        assert!(
+            detect_hz(&sine(FMIN, 4096)).is_none(),
+            "exactly FMIN is unreachable"
+        );
+        assert!(
+            detect_hz(&sine(floor + 0.5, 4096)).is_some(),
+            "just above the floor is reachable"
+        );
+    }
+
     #[test]
     fn out_of_range_pitches_are_rejected() {
         assert_eq!(detect_hz(&sine(40.0, 4096)), None, "below FMIN");
@@ -223,6 +277,12 @@ mod tests {
             y.window(),
             2 * tau_max,
             "window must be 2 * tau_max, as hum_to_midi.py"
+        );
+        assert_eq!(
+            y.frame_len(),
+            2 * tau_max + tau_max,
+            "frame_len must be w + tau_max, as pitch_track's frame_len — the \
+             lookahead that keeps every lag summing the same number of terms"
         );
     }
 
