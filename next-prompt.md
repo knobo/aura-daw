@@ -13,7 +13,9 @@ Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-in
 `OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
 Pitch Coach phase 1).
 
-**Nothing is in flight.** PR #54 (pitch RT) merged as `f451a5a`. Stale
+**In flight:** Pitch Coach **phase 2** (Tasks 7–11) on
+`feat/pitch-coach-panel`, worktree `.claude/worktrees/pitch-phase2` —
+open PR. It touches only `src/` plus the two test-count docs. Stale
 worktrees for merged branches can be ignored — but keep the branches
 `feat/pitch-coach` and `plan-f-history`, whose squashed SHAs are cited in
 the handoffs.
@@ -29,7 +31,7 @@ this file (marked correction, ADR 0007) if they do.
 |---|---|
 | G1 Tasks 2–4 — insert ops, commands, `HostRole::Effect`, HostForward restore | PR #55 `118ae23`. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | G1 Task 1 — `InsertSlot` on `TrackState.inserts` | PR #52 `5c338ff` |
-| Pitch Coach phase 1 | PR #49 `84b0313` + PR #54 `f451a5a` (detection off the RT callback, listen mid-take, `pitch_check`). R3 answered with numbers. **Next: phase 2, Task 7.** [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
+| Pitch Coach phase 1 | PR #49 `84b0313` + PR #54 `f451a5a` (detection off the RT callback, listen mid-take, `pitch_check`). R3 answered with numbers. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Gesture tokens | PR #47 |
 | External audio editor | PR #48 |
 | MIDI launch v0.1 | PR #42 + #50. Hardware GATE / sustain still open: [`midi-launch.md`](docs/backlog/midi-launch.md) |
@@ -39,15 +41,15 @@ this file (marked correction, ADR 0007) if they do.
 
 - **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
 - **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
-- **Pitch Coach phase 2** — an alternative to G1 if the owner points a
-  session at it. Start at **Task 7** (wire types + backend bindings);
-  nothing has ever driven `pitch_listen_start` / `pitch_subscribe` end to
-  end, so Task 7 is also the first proof of the command layer. Read
+- **Pitch Coach phase 3** — scoring, Tasks 12–16, once phase 2's PR is in.
+  Task 12 (the shared repeat-expansion helper) also replaces
+  `panel-logic.targetNotesFor`, which expands repeats frontend-side today.
+  Read
   [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md)
-  first — it carries two findings that phase 2 must not get wrong (draw the
-  midi float, never the rounded note name; do not headline
-  distance-to-nearest-note).
-- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames.
+  first. **The panel has never run against the real engine** — only against
+  `DemoBackend`'s synthetic singer in a browser. That ear-check is the
+  first thing to do with the phase 2 branch.
+- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **New:** the Pitch Coach panel (phase 2) needs an ear-check against a real microphone in a Tauri build.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):
