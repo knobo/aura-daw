@@ -41,6 +41,7 @@ import type {
   MidiOutputStatus,
   MidiPortInfo,
   LaunchBinding,
+  LaunchMap,
   LaunchSnapshot,
   OpenSidecarEvent,
   PluginDescriptor,
@@ -364,8 +365,9 @@ export interface Backend {
   // ── MIDI launch map (note → region/clip) ──
   launchGet?(): Promise<LaunchSnapshot>;
   /** Upsert `binding`, or delete `id` when `binding` is null. */
-  launchSet?(binding: LaunchBinding | null, id?: string | null): Promise<LaunchSnapshot>;
-  launchSetDrive?(clipId: string, on: boolean): Promise<LaunchSnapshot>;
+  launchSet?(binding: LaunchBinding | null, id?: string | null, mapId?: string | null): Promise<LaunchSnapshot>;
+  launchSetDrive?(clipId: string, on: boolean, mapId?: string | null): Promise<LaunchSnapshot>;
+  launchSetMap?(id: string, map: LaunchMap | null): Promise<LaunchSnapshot>;
   launchFire?(id: string): Promise<void>;
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
@@ -832,11 +834,14 @@ class TauriBackend implements Backend {
   launchGet() {
     return invoke<LaunchSnapshot>("launch_get");
   }
-  launchSet(binding: LaunchBinding | null, id?: string | null) {
-    return invoke<LaunchSnapshot>("launch_set", { binding, id: id ?? null });
+  launchSet(binding: LaunchBinding | null, id?: string | null, mapId?: string | null) {
+    return invoke<LaunchSnapshot>("launch_set", { binding, id: id ?? null, mapId: mapId ?? null });
   }
-  launchSetDrive(clipId: string, on: boolean) {
-    return invoke<LaunchSnapshot>("launch_set_drive", { clipId, on });
+  launchSetDrive(clipId: string, on: boolean, mapId?: string | null) {
+    return invoke<LaunchSnapshot>("launch_set_drive", { clipId, on, mapId: mapId ?? null });
+  }
+  launchSetMap(id: string, map: LaunchMap | null) {
+    return invoke<LaunchSnapshot>("launch_set_map", { id, map });
   }
   async launchFire(id: string) {
     await invoke("launch_fire", { id });

@@ -37,5 +37,25 @@
       ]
     }
   },
-  "required": ["id", "name", "note", "channel", "target"]
+  "required": ["id", "name", "note", "channel", "target"],
+  "$defs": {
+    "launchMap": {
+      "title": "LaunchMap",
+      "description": "One named launcher: its note map plus the MIDI clips that drive it.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "bindings": {
+          "type": "array",
+          "items": { "$ref": "aura:ipc/midi-launch.schema.json" }
+        },
+        "driveClipIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      },
+      "required": ["id", "name"]
+    }
+  }
 }

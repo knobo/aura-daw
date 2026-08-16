@@ -71,8 +71,7 @@ pub struct V3Data {
     pub tempo_events: Vec<TempoEvent>,
     pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
-    pub launch_bindings: Vec<super::launch::LaunchBinding>,
-    pub launch_drive_clip_ids: Vec<String>,
+    pub launch_maps: Vec<super::launch::LaunchMap>,
 }
 
 /// Persisted clip row (midi-clip.schema.json `$defs/persistedClip`) — the
@@ -157,8 +156,7 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
             ppq: midi.ppq,
             tempo_events: midi.tempo_events.clone(),
             meter_events: midi.meter_events.clone(),
-            launch_bindings: midi.launch_bindings.clone(),
-            launch_drive_clip_ids: midi.launch_drive_clip_ids.clone(),
+            launch_maps: midi.launch_maps.clone(),
             clips: midi.clips.clone(),
         },
     )
@@ -285,12 +283,8 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
     obj.insert("placements".into(), Value::Array(placement_rows));
     obj.insert("lanes".into(), Value::Array(lane_rows));
     obj.insert(
-        "launchBindings".into(),
-        serde_json::to_value(&midi.launch_bindings).unwrap(),
-    );
-    obj.insert(
-        "launchDriveClipIds".into(),
-        serde_json::to_value(&midi.launch_drive_clip_ids).unwrap(),
+        "launchMaps".into(),
+        serde_json::to_value(&midi.launch_maps).unwrap(),
     );
     obj.remove("midiClips"); // v3 stops writing the v2 key; still read forever (see load_from_project)
 
@@ -378,15 +372,22 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
     } else {
         parse_clips_legacy(dir, &root, ppq)?
     };
-    let launch_bindings = match root.get("launchBindings") {
+    let maps = match root.get("launchMaps") {
+        Some(v) => Some(
+            serde_json::from_value(v.clone()).map_err(|e| format!("launchMaps: {e}"))?,
+        ),
+        None => None,
+    };
+    let legacy_bindings = match root.get("launchBindings") {
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("launchBindings: {e}"))?,
         None => Vec::new(),
     };
-    let launch_drive_clip_ids = match root.get("launchDriveClipIds") {
+    let legacy_drive = match root.get("launchDriveClipIds") {
         Some(v) => serde_json::from_value(v.clone()).map_err(|e| format!("launchDriveClipIds: {e}"))?,
         None => Vec::new(),
     };
-    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips, launch_bindings, launch_drive_clip_ids }))
+    let launch_maps = super::launch::migrate_legacy_maps(maps, legacy_bindings, legacy_drive);
+    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips, launch_maps }))
 }
 
 /// The v2/legacy `midiClips` shape — one row IS the placement+content
@@ -520,8 +521,7 @@ pub fn v1_migration_defaults(tempo_bpm: f64) -> V3Data {
         meter_events: default_meter_events(),
         tempo_events: vec![TempoEvent { tick: 0, bpm: tempo_bpm }],
         clips: Vec::new(),
-        launch_bindings: Vec::new(),
-        launch_drive_clip_ids: Vec::new(),
+        launch_maps: Vec::new(),
     }
 }
 
@@ -656,8 +656,7 @@ mod tests {
             ],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips,
-            launch_bindings: Vec::new(),
-            launch_drive_clip_ids: Vec::new(),
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         }
@@ -1063,6 +1062,60 @@ mod tests {
             "midi persist must write max(existing, 3), not hard-stamp 3"
         );
         assert!(raw.get("modulation").is_some(), "modulation{{}} survives a midi-only save");
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn launch_maps_round_trip_and_legacy_bindings_migrate() {
+        let parent = tmp_parent("launch-maps");
+        let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();
+        let mut midi = store_with(vec![]);
+        midi.launch_maps = vec![crate::midi::launch::LaunchMap {
+            id: "drums".into(),
+            name: "Drums".into(),
+            bindings: vec![crate::midi::launch::LaunchBinding {
+                id: "lb-1".into(),
+                name: "Kick".into(),
+                note: 36,
+                channel: None,
+                target: crate::midi::launch::LaunchTarget::Region {
+                    start_ticks: 0,
+                    length_ticks: 960,
+                    track_ids: vec!["t1".into()],
+                },
+            }],
+            drive_clip_ids: vec!["clip-1".into()],
+        }];
+        save_into_project(&dir, &midi).unwrap();
+        let raw: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        assert!(raw.get("launchMaps").is_some());
+        assert!(raw.get("launchBindings").is_none(), "legacy key is not rewritten");
+        let loaded = load_from_project(&dir).unwrap().unwrap();
+        assert_eq!(loaded.launch_maps, midi.launch_maps);
+
+        let mut root: Value =
+            serde_json::from_slice(&fs::read(dir.join(PROJECT_FILE)).unwrap()).unwrap();
+        root.as_object_mut().unwrap().remove("launchMaps");
+        root.as_object_mut().unwrap().insert(
+            "launchBindings".into(),
+            json!([{
+                "id": "old",
+                "name": "Scene 1",
+                "note": 60,
+                "channel": null,
+                "target": { "kind": "clip", "clipId": "c-1" }
+            }]),
+        );
+        root.as_object_mut()
+            .unwrap()
+            .insert("launchDriveClipIds".into(), json!(["c-1"]));
+        fs::write(dir.join(PROJECT_FILE), serde_json::to_vec_pretty(&root).unwrap()).unwrap();
+        let migrated = load_from_project(&dir).unwrap().unwrap();
+        assert_eq!(migrated.launch_maps.len(), 1);
+        assert_eq!(migrated.launch_maps[0].id, crate::midi::launch::DEFAULT_MAP_ID);
+        assert_eq!(migrated.launch_maps[0].bindings[0].id, "old");
+        assert_eq!(migrated.launch_maps[0].drive_clip_ids, vec!["c-1".to_string()]);
         let _ = fs::remove_dir_all(&parent);
     }
 }

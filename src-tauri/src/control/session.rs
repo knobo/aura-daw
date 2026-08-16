@@ -292,8 +292,7 @@ impl Session {
             tempo_events: self.midi.tempo_events.clone(),
             meter_events: self.midi.meter_events.clone(),
             clips: self.midi.clips.clone(),
-            launch_bindings: self.midi.launch_bindings.clone(),
-            launch_drive_clip_ids: self.midi.launch_drive_clip_ids.clone(),
+            launch_maps: self.midi.launch_maps.clone(),
         }
     }
 
@@ -1426,8 +1425,12 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 to: serde_json::json!(from_now),  // the inverse's `to`: value to restore
             })
         }
-        Op::LaunchBindingSet { id, binding } => {
-            let pos = session.midi.launch_bindings.iter().position(|b| &b.id == id);
+        Op::LaunchBindingSet { map_id, id, binding } => {
+            crate::midi::launch::ensure_maps(&mut session.midi.launch_maps);
+            let mi = crate::midi::launch::map_index_for_binding(&session.midi.launch_maps, map_id, id)
+                .ok_or_else(|| format!("unknown launcher: {map_id}"))?;
+            let resolved_map = session.midi.launch_maps[mi].id.clone();
+            let pos = session.midi.launch_maps[mi].bindings.iter().position(|b| &b.id == id);
             let mut incoming = binding.clone();
             if let Some(b) = incoming.as_mut() {
                 b.id = id.clone();
@@ -1457,31 +1460,108 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             }
             let previous = match pos {
                 Some(idx) => match incoming.take() {
-                    Some(nb) => Some(std::mem::replace(&mut session.midi.launch_bindings[idx], nb)),
-                    None => Some(session.midi.launch_bindings.remove(idx)),
+                    Some(nb) => Some(std::mem::replace(
+                        &mut session.midi.launch_maps[mi].bindings[idx],
+                        nb,
+                    )),
+                    None => Some(session.midi.launch_maps[mi].bindings.remove(idx)),
                 },
                 None => {
                     if let Some(nb) = incoming.take() {
-                        session.midi.launch_bindings.push(nb);
+                        session.midi.launch_maps[mi].bindings.push(nb);
                     }
                     None
                 }
             };
-            crate::midi::launch::runtime().set_bindings(session.midi.launch_bindings.clone());
+            crate::midi::launch::runtime().set_maps(session.midi.launch_maps.clone());
             effect.persist.midi = true;
-            Ok(Op::LaunchBindingSet { id: id.clone(), binding: previous })
+            Ok(Op::LaunchBindingSet {
+                map_id: resolved_map,
+                id: id.clone(),
+                binding: previous,
+            })
         }
-        Op::LaunchDriveSet { clip_id, on } => {
-            let had = session.midi.launch_drive_clip_ids.iter().any(|id| id == clip_id);
-            if *on && !had {
-                session.midi.launch_drive_clip_ids.push(clip_id.clone());
-            } else if !*on && had {
-                session.midi.launch_drive_clip_ids.retain(|id| id != clip_id);
+        Op::LaunchDriveSet { map_id, clip_id, on } => {
+            crate::midi::launch::ensure_maps(&mut session.midi.launch_maps);
+            let mi = crate::midi::launch::map_index(&session.midi.launch_maps, map_id)
+                .ok_or_else(|| format!("unknown launcher: {map_id}"))?;
+            let resolved_map = session.midi.launch_maps[mi].id.clone();
+            let prev_map = session
+                .midi
+                .launch_maps
+                .iter()
+                .find(|m| m.drive_clip_ids.iter().any(|id| id == clip_id))
+                .map(|m| m.id.clone());
+            if *on {
+                for m in &mut session.midi.launch_maps {
+                    m.drive_clip_ids.retain(|id| id != clip_id);
+                }
+                session.midi.launch_maps[mi].drive_clip_ids.push(clip_id.clone());
+            } else if prev_map.as_deref() == Some(resolved_map.as_str()) {
+                session.midi.launch_maps[mi]
+                    .drive_clip_ids
+                    .retain(|id| id != clip_id);
             }
-            crate::midi::launch::runtime().set_drive_clips(session.midi.launch_drive_clip_ids.clone());
+            crate::midi::launch::runtime().set_maps(session.midi.launch_maps.clone());
             effect.persist.midi = true;
             effect.rebuild = true;
-            Ok(Op::LaunchDriveSet { clip_id: clip_id.clone(), on: had })
+            let inverse = if *on {
+                match prev_map {
+                    Some(pid) if pid == resolved_map => Op::LaunchDriveSet {
+                        map_id: resolved_map,
+                        clip_id: clip_id.clone(),
+                        on: true,
+                    },
+                    Some(pid) => Op::LaunchDriveSet {
+                        map_id: pid,
+                        clip_id: clip_id.clone(),
+                        on: true,
+                    },
+                    None => Op::LaunchDriveSet {
+                        map_id: resolved_map,
+                        clip_id: clip_id.clone(),
+                        on: false,
+                    },
+                }
+            } else {
+                Op::LaunchDriveSet {
+                    map_id: resolved_map.clone(),
+                    clip_id: clip_id.clone(),
+                    on: prev_map.as_deref() == Some(resolved_map.as_str()),
+                }
+            };
+            Ok(inverse)
+        }
+        Op::LaunchMapSet { id, map } => {
+            let pos = session.midi.launch_maps.iter().position(|m| &m.id == id);
+            let previous = match (pos, map.clone()) {
+                (Some(idx), Some(mut nm)) => {
+                    nm.id = id.clone();
+                    if nm.name.trim().is_empty() {
+                        return Err("launcher name is empty".into());
+                    }
+                    Some(std::mem::replace(&mut session.midi.launch_maps[idx], nm))
+                }
+                (None, Some(mut nm)) => {
+                    nm.id = id.clone();
+                    if nm.name.trim().is_empty() {
+                        return Err("launcher name is empty".into());
+                    }
+                    session.midi.launch_maps.push(nm);
+                    None
+                }
+                (Some(idx), None) => {
+                    if session.midi.launch_maps.len() <= 1 {
+                        return Err("cannot delete the last launcher".into());
+                    }
+                    Some(session.midi.launch_maps.remove(idx))
+                }
+                (None, None) => None,
+            };
+            crate::midi::launch::runtime().set_maps(session.midi.launch_maps.clone());
+            effect.persist.midi = true;
+            effect.rebuild = true;
+            Ok(Op::LaunchMapSet { id: id.clone(), map: previous })
         }
         _ => Err("op not yet supported".into()),
     }
@@ -3158,10 +3238,14 @@ mod tests {
             },
         };
         let c = Session::transact(&m, TxMeta::user("set launch"), |tx| {
-            tx.apply(Op::LaunchBindingSet { id: "lb-1".into(), binding: Some(binding.clone()) })
+            tx.apply(Op::LaunchBindingSet {
+                map_id: String::new(),
+                id: "lb-1".into(),
+                binding: Some(binding.clone()),
+            })
         })
         .unwrap();
-        assert_eq!(m.lock().midi.launch_bindings.len(), 1);
+        assert_eq!(m.lock().midi.launch_maps[0].bindings.len(), 1);
         assert!(c.effect.persist.midi);
         Session::transact(&m, TxMeta::user("undo"), |tx| {
             for op in c.inverses.clone() {
@@ -3170,7 +3254,97 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert!(m.lock().midi.launch_bindings.is_empty(), "undo removes the binding");
+        assert!(
+            m.lock().midi.launch_maps[0].bindings.is_empty(),
+            "undo removes the binding"
+        );
+    }
+
+    #[test]
+    fn launch_drive_moves_between_maps_and_undo_restores() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        Session::transact(&m, TxMeta::user("add launchers"), |tx| {
+            tx.apply(Op::LaunchMapSet {
+                id: "default".into(),
+                map: Some(crate::midi::launch::LaunchMap::default_map()),
+            })?;
+            tx.apply(Op::LaunchMapSet {
+                id: "drums".into(),
+                map: Some(crate::midi::launch::LaunchMap::named("drums", "Drums")),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        Session::transact(&m, TxMeta::user("drive default"), |tx| {
+            tx.apply(Op::LaunchDriveSet {
+                map_id: "default".into(),
+                clip_id: "clip-1".into(),
+                on: true,
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().midi.launch_maps[0].drive_clip_ids, vec!["clip-1".to_string()]);
+        let c = Session::transact(&m, TxMeta::user("move drive"), |tx| {
+            tx.apply(Op::LaunchDriveSet {
+                map_id: "drums".into(),
+                clip_id: "clip-1".into(),
+                on: true,
+            })
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert!(g.midi.launch_maps[0].drive_clip_ids.is_empty());
+            assert_eq!(
+                g.midi.launch_maps.iter().find(|x| x.id == "drums").unwrap().drive_clip_ids,
+                vec!["clip-1".to_string()]
+            );
+        }
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        {
+            let g = m.lock();
+            assert_eq!(g.midi.launch_maps[0].drive_clip_ids, vec!["clip-1".to_string()]);
+            assert!(
+                g.midi
+                    .launch_maps
+                    .iter()
+                    .find(|x| x.id == "drums")
+                    .unwrap()
+                    .drive_clip_ids
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn launch_map_set_cannot_delete_the_last_launcher() {
+        let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
+        Session::transact(&m, TxMeta::user("ensure"), |tx| {
+            tx.apply(Op::LaunchMapSet {
+                id: "default".into(),
+                map: Some(crate::midi::launch::LaunchMap::default_map()),
+            })?;
+            Ok(())
+        })
+        .unwrap();
+        let err = match Session::transact(&m, TxMeta::user("delete last"), |tx| {
+            tx.apply(Op::LaunchMapSet {
+                id: "default".into(),
+                map: None,
+            })?;
+            Ok(())
+        }) {
+            Ok(_) => panic!("expected delete last to fail"),
+            Err(e) => e,
+        };
+        assert!(err.contains("last launcher"), "{err}");
     }
 
     #[test]

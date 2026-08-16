@@ -78,13 +78,18 @@
       "type": "array",
       "items": { "$ref": "aura:ipc/midi-clip.schema.json#/$defs/persistedLaneRow" }
     },
+    "launchMaps": {
+      "description": "Named MIDI launchers. Each launcher is a note→region/clip map plus the clips whose notes drive that map. Additive (D-06). Empty/absent projects load as one default launcher. persist.rs writes this key; launchBindings/launchDriveClipIds are read-only legacy.",
+      "type": "array",
+      "items": { "$ref": "aura:ipc/midi-launch.schema.json#/$defs/launchMap" }
+    },
     "launchBindings": {
-      "description": "MIDI launch map: hardware note-on → a marked region (one or more lanes over a tick range) or a MIDI clip. Additive (D-06). Empty/absent on a project that has never marked anything.",
+      "description": "LEGACY read path: flat MIDI launch map from before named launchers. persist.rs migrates this (plus launchDriveClipIds) into launchMaps[0] when launchMaps is absent or empty. Never written on save.",
       "type": "array",
       "items": { "$ref": "aura:ipc/midi-launch.schema.json" }
     },
     "launchDriveClipIds": {
-      "description": "MIDI clips whose notes drive the launch map instead of the track instrument. Additive (D-06).",
+      "description": "LEGACY read path: clips that drove the single launch map. Migrated into launchMaps[0].driveClipIds. Never written on save.",
       "type": "array",
       "items": { "type": "string" }
     },

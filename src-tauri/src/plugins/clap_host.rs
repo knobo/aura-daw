@@ -1115,8 +1115,7 @@ mod tests {
                 transpose_semitones: 0,
                 velocity_offset: 0,
             }],
-            launch_bindings: Vec::new(),
-            launch_drive_clip_ids: Vec::new(),
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         };

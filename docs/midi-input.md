@@ -48,16 +48,28 @@ what ALSA-seq reports.
 
 ## Launch marked regions and MIDI clips
 
-Open the **LAUNCH** chip (or press `k`) to get the launch-map window. With
-that window open, drag a rectangle across one or more lanes — that marks a
-region and binds it to the next free MIDI note (starting at C3). Click a
-row to jump the playhead to the marking so you can resize it. Right-click
-a MIDI clip and choose **Map to MIDI note…** to bind the clip itself.
+Open the **LAUNCH** chip (or press `k`) to get the launch-map window. The
+window lists **launchers** — each is its own note map. Add another with
+**+** (a drum kit vs a scene map), double-click a tab to rename, **×** to
+delete (you always keep at least one).
+
+With the window open, drag a rectangle across one or more lanes — that
+marks a region on the **active** launcher and binds it to the next free
+MIDI note (starting at C3). Click a row to jump the playhead to the
+marking so you can resize it.
+
+To make a MIDI clip **use** a launcher (the clip's notes fire that map
+instead of the track instrument): select the clip and click **USE**, or
+right-click and pick a launcher. **USE ON CLIP** in the launch window
+does the same for the active launcher. **Map to MIDI note…** is
+different — that binds the clip *as a target* so hardware can start it.
 
 A matching note-on on the selected **midi in** port seeks to the marking,
-loops it, and plays. AURA does **not** feed its own clip notes back into
-the launch mapper: hardware input only, plus an echo window on MIDI-out
-loopback, so a clip cannot start itself.
+loops it, and plays (first match across every launcher). Notes from a
+clip that uses a launcher only fire **that** launcher's map. AURA does
+**not** feed its own clip notes back into hardware launch: hardware
+input only, plus an echo window on MIDI-out loopback, so a clip cannot
+start itself.
 
 ## Play a track's own instrument (arm it)
 

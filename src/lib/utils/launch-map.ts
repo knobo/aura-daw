@@ -4,9 +4,26 @@
  * the backend mapper can share one rule set.
  */
 
-import type { LaunchBinding, LaunchTarget } from "../types/ipc";
+import type { LaunchBinding, LaunchMap, LaunchTarget } from "../types/ipc";
 
-export type { LaunchBinding, LaunchTarget };
+export type { LaunchBinding, LaunchMap, LaunchTarget };
+
+export const DEFAULT_LAUNCH_MAP_ID = "default";
+
+export function defaultLaunchMap(): LaunchMap {
+  return { id: DEFAULT_LAUNCH_MAP_ID, name: "Launcher 1", bindings: [], driveClipIds: [] };
+}
+
+export function nextLauncherName(existing: { name: string }[]): string {
+  let n = existing.length + 1;
+  const used = new Set(existing.map((m) => m.name));
+  while (used.has(`Launcher ${n}`)) n++;
+  return `Launcher ${n}`;
+}
+
+export function driveMapId(maps: LaunchMap[], clipId: string): string | null {
+  return maps.find((m) => m.driveClipIds.includes(clipId))?.id ?? null;
+}
 
 const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"] as const;
 

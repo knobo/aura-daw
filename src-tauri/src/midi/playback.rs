@@ -390,8 +390,7 @@ mod tests {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips,
-            launch_bindings: Vec::new(),
-            launch_drive_clip_ids: Vec::new(),
+            launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,
         }

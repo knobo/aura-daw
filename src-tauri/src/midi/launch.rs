@@ -44,6 +44,88 @@ impl LaunchBinding {
     }
 }
 
+pub const DEFAULT_MAP_ID: &str = "default";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchMap {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub bindings: Vec<LaunchBinding>,
+    #[serde(default)]
+    pub drive_clip_ids: Vec<String>,
+}
+
+impl LaunchMap {
+    pub fn named(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            bindings: Vec::new(),
+            drive_clip_ids: Vec::new(),
+        }
+    }
+
+    pub fn default_map() -> Self {
+        Self::named(DEFAULT_MAP_ID, "Launcher 1")
+    }
+}
+
+pub fn migrate_legacy_maps(
+    maps: Option<Vec<LaunchMap>>,
+    bindings: Vec<LaunchBinding>,
+    drive_clip_ids: Vec<String>,
+) -> Vec<LaunchMap> {
+    if let Some(maps) = maps {
+        if !maps.is_empty() {
+            return maps;
+        }
+    }
+    if bindings.is_empty() && drive_clip_ids.is_empty() {
+        return vec![LaunchMap::default_map()];
+    }
+    let mut m = LaunchMap::default_map();
+    m.bindings = bindings;
+    m.drive_clip_ids = drive_clip_ids;
+    vec![m]
+}
+
+pub fn all_bindings(maps: &[LaunchMap]) -> Vec<LaunchBinding> {
+    maps.iter().flat_map(|m| m.bindings.iter().cloned()).collect()
+}
+
+pub fn all_drive_clip_ids(maps: &[LaunchMap]) -> Vec<String> {
+    maps.iter().flat_map(|m| m.drive_clip_ids.iter().cloned()).collect()
+}
+
+pub fn ensure_maps(maps: &mut Vec<LaunchMap>) {
+    if maps.is_empty() {
+        maps.push(LaunchMap::default_map());
+    }
+}
+
+pub fn map_index(maps: &[LaunchMap], map_id: &str) -> Option<usize> {
+    if map_id.is_empty() {
+        return if maps.is_empty() { None } else { Some(0) };
+    }
+    maps.iter().position(|m| m.id == map_id)
+}
+
+pub fn find_binding<'a>(maps: &'a [LaunchMap], id: &str) -> Option<(&'a LaunchMap, &'a LaunchBinding)> {
+    maps.iter().find_map(|m| m.bindings.iter().find(|b| b.id == id).map(|b| (m, b)))
+}
+
+/// Map that owns `binding_id`, else the named map, else the first map.
+pub fn map_index_for_binding(maps: &[LaunchMap], map_id: &str, binding_id: &str) -> Option<usize> {
+    if !map_id.is_empty() {
+        return map_index(maps, map_id);
+    }
+    maps.iter()
+        .position(|m| m.bindings.iter().any(|b| b.id == binding_id))
+        .or_else(|| if maps.is_empty() { None } else { Some(0) })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EchoNote {
     pub note: u8,
@@ -92,7 +174,7 @@ pub enum IncomingDecision {
 /// window — a clip cannot start itself that way. The fire callback runs
 /// on a worker thread so the midir callback never waits on transport.
 pub struct LaunchRuntime {
-    bindings: Mutex<Vec<LaunchBinding>>,
+    maps: Mutex<Vec<LaunchMap>>,
     echo: Mutex<Vec<EchoNote>>,
     learning: Mutex<Option<String>>,
     armed: Mutex<Option<(u8, u8)>>,
@@ -100,14 +182,13 @@ pub struct LaunchRuntime {
     fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<LaunchBinding>>>,
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
-    drive_clips: Mutex<Vec<String>>,
     drive_started: AtomicBool,
 }
 
 impl Default for LaunchRuntime {
     fn default() -> Self {
         Self {
-            bindings: Mutex::new(Vec::new()),
+            maps: Mutex::new(Vec::new()),
             echo: Mutex::new(Vec::new()),
             learning: Mutex::new(None),
             armed: Mutex::new(None),
@@ -115,7 +196,6 @@ impl Default for LaunchRuntime {
             fire_tx: Mutex::new(None),
             last_learn: Mutex::new(None),
             gen: AtomicU64::new(0),
-            drive_clips: Mutex::new(Vec::new()),
             drive_started: AtomicBool::new(false),
         }
     }
@@ -126,13 +206,27 @@ impl LaunchRuntime {
         u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
+    pub fn set_maps(&self, maps: Vec<LaunchMap>) {
+        *self.maps.lock().unwrap() = maps;
+        self.gen.fetch_add(1, Relaxed);
+    }
+
+    pub fn maps(&self) -> Vec<LaunchMap> {
+        self.maps.lock().unwrap().clone()
+    }
+
+    /// Test/helper: write bindings onto the first launcher (created if needed).
     pub fn set_bindings(&self, bindings: Vec<LaunchBinding>) {
-        *self.bindings.lock().unwrap() = bindings;
+        let mut maps = self.maps.lock().unwrap();
+        if maps.is_empty() {
+            maps.push(LaunchMap::default_map());
+        }
+        maps[0].bindings = bindings;
         self.gen.fetch_add(1, Relaxed);
     }
 
     pub fn bindings(&self) -> Vec<LaunchBinding> {
-        self.bindings.lock().unwrap().clone()
+        all_bindings(&self.maps.lock().unwrap())
     }
 
     pub fn set_learning(&self, id: Option<String>) {
@@ -169,7 +263,11 @@ impl LaunchRuntime {
     }
 
     pub fn set_drive_clips(&self, ids: Vec<String>) {
-        *self.drive_clips.lock().unwrap() = ids;
+        let mut maps = self.maps.lock().unwrap();
+        if maps.is_empty() {
+            maps.push(LaunchMap::default_map());
+        }
+        maps[0].drive_clip_ids = ids;
     }
 
     /// Watch the transport and fire launch bindings from clips marked as
@@ -195,41 +293,42 @@ impl LaunchRuntime {
                         last = pos;
                         continue;
                     }
-                    let drive = runtime().drive_clips.lock().unwrap().clone();
-                    if drive.is_empty() {
+                    let launchers = runtime().maps();
+                    if launchers.iter().all(|m| m.drive_clip_ids.is_empty()) {
                         last = pos;
                         continue;
                     }
                     let (clips, ppq, tempo) = {
                         let s = session.lock();
-                        let clips: Vec<_> = s
-                            .midi
-                            .clips
-                            .iter()
-                            .filter(|c| drive.iter().any(|id| id == c.id.as_str()))
-                            .cloned()
-                            .collect();
-                        (clips, s.midi.ppq, s.midi.tempo_events.clone())
+                        (s.midi.clips.clone(), s.midi.ppq, s.midi.tempo_events.clone())
                     };
-                    let Ok(map) = crate::midi::TempoMap::new(ppq, tempo, shared.sample_rate.load(Relaxed).max(1)) else {
+                    let Ok(tempo_map) =
+                        crate::midi::TempoMap::new(ppq, tempo, shared.sample_rate.load(Relaxed).max(1))
+                    else {
                         last = pos;
                         continue;
                     };
-                    let bindings = runtime().bindings();
-                    for clip in &clips {
-                        for ev in crate::midi::schedule::clip_events(clip, &map) {
-                            if ev.velocity == 0 || ev.sample <= last || ev.sample > pos {
-                                continue;
-                            }
-                            if let Some(b) = resolve(&bindings, ev.key, 0) {
+                    for launcher in &launchers {
+                        if launcher.drive_clip_ids.is_empty() {
+                            continue;
+                        }
+                        for clip in clips.iter().filter(|c| {
+                            launcher.drive_clip_ids.iter().any(|id| id == c.id.as_str())
+                        }) {
+                            for ev in crate::midi::schedule::clip_events(clip, &tempo_map) {
+                                if ev.velocity == 0 || ev.sample <= last || ev.sample > pos {
+                                    continue;
+                                }
+                                let Some(b) = resolve(&launcher.bindings, ev.key, 0) else {
+                                    continue;
+                                };
                                 if let LaunchTarget::Clip { clip_id } = &b.target {
                                     if clip_id == clip.id.as_str() {
                                         continue;
                                     }
                                 }
+                                runtime().enqueue_fire(b.clone());
                             }
-                            runtime().on_incoming(true, ev.key, 0);
-                            runtime().on_incoming(false, ev.key, 0);
                         }
                     }
                     last = pos;
@@ -262,10 +361,17 @@ impl LaunchRuntime {
         if *self.armed.lock().unwrap() == Some((note, channel)) {
             return IncomingDecision::Suppressed;
         }
-        let bindings = self.bindings.lock().unwrap();
+        let maps = self.maps.lock().unwrap();
+        let bindings = all_bindings(&maps);
         match resolve(&bindings, note, channel).cloned() {
             Some(b) => IncomingDecision::Fire(b),
             None => IncomingDecision::Pass,
+        }
+    }
+
+    pub fn enqueue_fire(&self, b: LaunchBinding) {
+        if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
+            let _ = tx.try_send(b);
         }
     }
 
@@ -279,9 +385,7 @@ impl LaunchRuntime {
             IncomingDecision::Echo | IncomingDecision::Suppressed => true,
             IncomingDecision::Fire(b) => {
                 *self.armed.lock().unwrap() = Some((note, channel));
-                if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
-                    let _ = tx.try_send(b);
-                }
+                self.enqueue_fire(b);
                 true
             }
         }
@@ -291,31 +395,26 @@ impl LaunchRuntime {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchSnapshot {
-    pub bindings: Vec<LaunchBinding>,
-    pub drive_clip_ids: Vec<String>,
+    pub maps: Vec<LaunchMap>,
 }
 
 impl crate::control::ControlPlane {
     pub fn launch_snapshot(&self) -> LaunchSnapshot {
         let s = self.session().lock();
-        LaunchSnapshot {
-            bindings: s.midi.launch_bindings.clone(),
-            drive_clip_ids: s.midi.launch_drive_clip_ids.clone(),
-        }
-    }
-
-    pub fn launch_bindings(&self) -> Vec<LaunchBinding> {
-        self.session().lock().midi.launch_bindings.clone()
+        let mut maps = s.midi.launch_maps.clone();
+        ensure_maps(&mut maps);
+        LaunchSnapshot { maps }
     }
 
     pub fn set_launch_binding(
         &self,
+        map_id: String,
         id: String,
         binding: Option<LaunchBinding>,
         meta: crate::control::op::TxMeta,
     ) -> Result<LaunchSnapshot, String> {
         self.commit(meta, |tx| {
-            tx.apply(crate::control::op::Op::LaunchBindingSet { id, binding })?;
+            tx.apply(crate::control::op::Op::LaunchBindingSet { map_id, id, binding })?;
             Ok(())
         })?;
         self.emit_launch_changed();
@@ -324,12 +423,27 @@ impl crate::control::ControlPlane {
 
     pub fn set_launch_drive(
         &self,
+        map_id: String,
         clip_id: String,
         on: bool,
         meta: crate::control::op::TxMeta,
     ) -> Result<LaunchSnapshot, String> {
         self.commit(meta, |tx| {
-            tx.apply(crate::control::op::Op::LaunchDriveSet { clip_id, on })?;
+            tx.apply(crate::control::op::Op::LaunchDriveSet { map_id, clip_id, on })?;
+            Ok(())
+        })?;
+        self.emit_launch_changed();
+        Ok(self.launch_snapshot())
+    }
+
+    pub fn set_launch_map(
+        &self,
+        id: String,
+        map: Option<LaunchMap>,
+        meta: crate::control::op::TxMeta,
+    ) -> Result<LaunchSnapshot, String> {
+        self.commit(meta, |tx| {
+            tx.apply(crate::control::op::Op::LaunchMapSet { id, map })?;
             Ok(())
         })?;
         self.emit_launch_changed();
@@ -340,11 +454,7 @@ impl crate::control::ControlPlane {
         let rate = self.transport_state().sample_rate;
         let (start_ticks, length_ticks, ppq, events) = {
             let s = self.session().lock();
-            let b = s
-                .midi
-                .launch_bindings
-                .iter()
-                .find(|b| b.id == id)
+            let (_, b) = find_binding(&s.midi.launch_maps, id)
                 .ok_or_else(|| format!("unknown launch binding: {id}"))?;
             let (start_ticks, length_ticks) = match &b.target {
                 LaunchTarget::Region { start_ticks, length_ticks, .. } => {
@@ -392,10 +502,13 @@ pub fn launch_get(
 pub fn launch_set(
     binding: Option<LaunchBinding>,
     id: Option<String>,
+    map_id: Option<String>,
     control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<LaunchSnapshot, String> {
+    let map_id = map_id.unwrap_or_default();
     match (binding, id) {
         (None, Some(id)) => control.set_launch_binding(
+            map_id,
             id,
             None,
             crate::control::op::TxMeta::user("remove launch"),
@@ -406,6 +519,7 @@ pub fn launch_set(
             }
             let key = b.id.clone();
             control.set_launch_binding(
+                map_id,
                 key,
                 Some(b),
                 crate::control::op::TxMeta::user("set launch"),
@@ -419,9 +533,29 @@ pub fn launch_set(
 pub fn launch_set_drive(
     clip_id: String,
     on: bool,
+    map_id: Option<String>,
     control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
 ) -> Result<LaunchSnapshot, String> {
-    control.set_launch_drive(clip_id, on, crate::control::op::TxMeta::user("set launch drive"))
+    control.set_launch_drive(
+        map_id.unwrap_or_default(),
+        clip_id,
+        on,
+        crate::control::op::TxMeta::user("set launch drive"),
+    )
+}
+
+#[tauri::command]
+pub fn launch_set_map(
+    id: String,
+    map: Option<LaunchMap>,
+    control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
+) -> Result<LaunchSnapshot, String> {
+    let label = if map.is_some() {
+        "set launcher"
+    } else {
+        "remove launcher"
+    };
+    control.set_launch_map(id, map, crate::control::op::TxMeta::user(label))
 }
 
 #[tauri::command]
@@ -607,6 +741,31 @@ mod tests {
             matches!(rt.decide(true, 60, 0), IncomingDecision::Fire(_)),
             "the same pad must be able to fire again after note-off"
         );
+    }
+
+    #[test]
+    fn migrate_legacy_bindings_become_the_default_launcher() {
+        let maps = migrate_legacy_maps(None, vec![region("a", 60, None)], vec!["c1".into()]);
+        assert_eq!(maps.len(), 1);
+        assert_eq!(maps[0].id, DEFAULT_MAP_ID);
+        assert_eq!(maps[0].name, "Launcher 1");
+        assert_eq!(maps[0].bindings[0].id, "a");
+        assert_eq!(maps[0].drive_clip_ids, vec!["c1".to_string()]);
+    }
+
+    #[test]
+    fn migrate_empty_legacy_still_gives_a_default_launcher() {
+        assert_eq!(
+            migrate_legacy_maps(None, vec![], vec![]),
+            vec![LaunchMap::default_map()]
+        );
+    }
+
+    #[test]
+    fn migrate_prefers_named_maps() {
+        let named = vec![LaunchMap::named("drums", "Drums")];
+        let maps = migrate_legacy_maps(Some(named.clone()), vec![region("a", 60, None)], vec![]);
+        assert_eq!(maps, named);
     }
 
     #[test]

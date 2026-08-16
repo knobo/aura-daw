@@ -61,11 +61,32 @@
     void launch.update(id, { channel: ch });
   }
 
+  let renameId = $state<string | null>(null);
+  let renameDraft = $state("");
+
   async function mapSelectedClip() {
     const id = midi.selectedClipId;
     if (!id) return;
     const b = await launch.mapClip(id);
     if (b) launch.focus(b.id);
+  }
+
+  async function useSelectedClip() {
+    const id = midi.selectedClipId;
+    if (!id) return;
+    await launch.setClipLauncher(id, launch.activeMap.id);
+  }
+
+  function startRename(id: string, name: string) {
+    renameId = id;
+    renameDraft = name;
+  }
+
+  function commitRename() {
+    const id = renameId;
+    const name = renameDraft;
+    renameId = null;
+    if (id) void launch.renameMap(id, name);
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -104,7 +125,7 @@
       onpointerup={onTitleUp}
     >
       <span class="titlelab mono">MIDI LAUNCH</span>
-      <span class="sub silk">{launch.bindings.length} marking{launch.bindings.length === 1 ? "" : "s"}</span>
+      <span class="sub silk">{launch.activeMap.name} · {launch.bindings.length} marking{launch.bindings.length === 1 ? "" : "s"}</span>
       <button
         class="x mono"
         type="button"
@@ -118,10 +139,59 @@
       >
     </div>
 
+    <div class="maps" role="tablist" aria-label="Launchers">
+      {#each launch.maps as m (m.id)}
+        {#if renameId === m.id}
+          <input
+            class="maptab mapname mono"
+            class:on={true}
+            value={renameDraft}
+            aria-label="Launcher name"
+            onpointerdown={(e) => e.stopPropagation()}
+            oninput={(e) => (renameDraft = e.currentTarget.value)}
+            onkeydown={(e) => {
+              if (e.key === "Enter") commitRename();
+              if (e.key === "Escape") renameId = null;
+            }}
+            onblur={commitRename}
+          />
+        {:else}
+          <button
+            class="maptab mono"
+            class:on={launch.activeMapId === m.id}
+            role="tab"
+            type="button"
+            aria-selected={launch.activeMapId === m.id}
+            title={m.driveClipIds.length ? `${m.driveClipIds.length} clip${m.driveClipIds.length === 1 ? "" : "s"} use this launcher` : "No clips use this launcher"}
+            ondblclick={(e) => {
+              e.stopPropagation();
+              startRename(m.id, m.name);
+            }}
+            onclick={() => launch.selectMap(m.id)}
+          >{m.name}</button>
+        {/if}
+      {/each}
+      <button
+        class="maptab add mono"
+        type="button"
+        title="New launcher"
+        aria-label="New launcher"
+        onclick={() => void launch.createMap()}>+</button
+      >
+      <button
+        class="maptab danger mono"
+        type="button"
+        title="Delete this launcher"
+        aria-label="Delete this launcher"
+        disabled={launch.maps.length <= 1}
+        onclick={() => void launch.removeMap(launch.activeMap.id)}>×</button
+      >
+    </div>
+
     <div class="hint silk">
       {launch.marking
         ? "MARK is on — drag across any lanes (clips will not move)"
-        : "MARK to draw a new region · drag a marking to move it · edges resize"}
+        : "Each launcher is its own note map. Right-click a MIDI clip and pick Use launcher."}
     </div>
 
     <div class="list" role="table" aria-label="Launch bindings">
@@ -220,7 +290,16 @@
       <button
         class="act mono"
         disabled={!midi.selectedClipId}
-        title="Map the selected MIDI clip to a free note"
+        title="Selected clip's notes fire this launcher"
+        onclick={() => void useSelectedClip()}
+      >{midi.selectedClipId && launch.driveMap(midi.selectedClipId)?.id === launch.activeMap.id
+        ? "USING THIS"
+        : "USE ON CLIP"}</button
+      >
+      <button
+        class="act mono"
+        disabled={!midi.selectedClipId}
+        title="Map the selected MIDI clip to a free note (hardware launches the clip)"
         onclick={() => void mapSelectedClip()}>MAP CLIP</button
       >
       <span class="footnote silk">
@@ -237,7 +316,7 @@
   .win {
     position: fixed;
     z-index: 40;
-    width: 520px;
+    width: 560px;
     max-height: min(70vh, 640px);
     display: flex;
     flex-direction: column;
@@ -278,6 +357,50 @@
   }
   .x:hover {
     color: var(--text);
+  }
+  .maps {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 8px 10px 0;
+    align-items: center;
+  }
+  .maptab {
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    padding: 4px 8px;
+    background: transparent;
+    border: 1px solid var(--glass-border);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .maptab.on {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+    background: rgba(82, 229, 255, 0.08);
+  }
+  .maptab.add,
+  .maptab.danger {
+    width: 26px;
+    padding: 4px 0;
+  }
+  .maptab.danger:disabled {
+    opacity: 0.3;
+    cursor: default;
+  }
+  .maptab.danger:not(:disabled):hover {
+    color: var(--red);
+    border-color: var(--red);
+  }
+  .mapname {
+    width: 9em;
+    background: var(--bg-2);
+    border: 0;
+    color: var(--text);
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0;
+    padding: 0;
   }
   .hint {
     padding: 8px 12px 4px;

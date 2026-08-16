@@ -250,12 +250,23 @@ pub enum Op {
     /// Upsert/delete one MIDI launch binding by `id`. `None` deletes
     /// (no-op if absent). Additive; does not bump `OP_FORMAT_VERSION`.
     LaunchBindingSet {
+        #[serde(default)]
+        map_id: String,
         id: String,
         binding: Option<crate::midi::launch::LaunchBinding>,
     },
-    /// Toggle whether a MIDI clip's notes drive the launch map (instead of
-    /// the track instrument). Inverse flips `on`.
-    LaunchDriveSet { clip_id: String, on: bool },
+    /// Toggle whether a MIDI clip's notes drive a named launcher.
+    LaunchDriveSet {
+        #[serde(default)]
+        map_id: String,
+        clip_id: String,
+        on: bool,
+    },
+    /// Upsert/delete one named launcher (`None` deletes).
+    LaunchMapSet {
+        id: String,
+        map: Option<crate::midi::launch::LaunchMap>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

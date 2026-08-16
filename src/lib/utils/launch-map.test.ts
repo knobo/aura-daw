@@ -12,6 +12,9 @@ import {
   resizeRegion,
   resolveLaunch,
   shiftRegion,
+  defaultLaunchMap,
+  driveMapId,
+  nextLauncherName,
   type LaunchBinding,
 } from "./launch-map";
 
@@ -173,6 +176,22 @@ describe("bindingFocusSamples", () => {
       bindingFocusSamples(b, [{ id: "clip-1", timelineStartTicks: 240 }], ticksToSamples),
     ).toBe(480);
     expect(bindingFocusSamples(b, [], ticksToSamples)).toBeNull();
+  });
+});
+
+describe("nextLauncherName", () => {
+  it("numbers launchers from the existing list", () => {
+    expect(nextLauncherName([])).toBe("Launcher 1");
+    expect(nextLauncherName([{ name: "Launcher 1" }])).toBe("Launcher 2");
+    expect(nextLauncherName([{ name: "Drums" }])).toBe("Launcher 2");
+  });
+});
+
+describe("driveMapId", () => {
+  it("returns the launcher that lists the clip, or null", () => {
+    const drums = { ...defaultLaunchMap(), id: "drums", name: "Drums", driveClipIds: ["c1"] };
+    expect(driveMapId([defaultLaunchMap(), drums], "c1")).toBe("drums");
+    expect(driveMapId([defaultLaunchMap(), drums], "other")).toBeNull();
   });
 });
 

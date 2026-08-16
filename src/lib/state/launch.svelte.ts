@@ -1,8 +1,7 @@
 /**
- * MIDI launch map store: the list of note→region/clip bindings, the
- * floating panel, and "jump the timeline to this marking". Document-shaped
- * — mutations go through `launch_set` when the backend has it; demo mode
- * keeps the list in memory.
+ * MIDI launchers: named note→region/clip maps, plus which clips drive
+ * each map. Mutations go through `launch_set` / `launch_set_map` when
+ * the backend has them; demo mode keeps the list in memory.
  */
 
 import { backend } from "../tauri";
@@ -12,21 +11,33 @@ import { view } from "./view.svelte";
 import {
   bindingFocusSamples,
   clipWouldSelfTrigger,
+  defaultLaunchMap,
+  driveMapId,
   nextBindingName,
   nextFreeNote,
+  nextLauncherName,
   type LaunchBinding,
+  type LaunchMap,
   type LaunchTarget,
 } from "../utils/launch-map";
 
 class LaunchStore {
   panelOpen = $state(false);
-  bindings = $state<LaunchBinding[]>([]);
-  driveClipIds = $state<string[]>([]);
+  maps = $state<LaunchMap[]>([defaultLaunchMap()]);
+  activeMapId = $state(defaultLaunchMap().id);
   selectedId = $state<string | null>(null);
   learningId = $state<string | null>(null);
   /** Draw a new region on the timeline; clips stop capturing the pointer. */
   marking = $state(false);
   error = $state<string | null>(null);
+
+  get activeMap(): LaunchMap {
+    return this.maps.find((m) => m.id === this.activeMapId) ?? this.maps[0] ?? defaultLaunchMap();
+  }
+
+  get bindings(): LaunchBinding[] {
+    return this.activeMap.bindings;
+  }
 
   get selected(): LaunchBinding | null {
     return this.bindings.find((b) => b.id === this.selectedId) ?? null;
@@ -34,6 +45,13 @@ class LaunchStore {
 
   get learning(): boolean {
     return this.learningId !== null;
+  }
+
+  selectMap(id: string) {
+    if (!this.maps.some((m) => m.id === id)) return;
+    this.activeMapId = id;
+    this.selectedId = null;
+    this.stopLearn();
   }
 
   togglePanel() {
@@ -71,23 +89,102 @@ class LaunchStore {
     });
   }
 
-  private accept(snap: { bindings: LaunchBinding[]; driveClipIds: string[] }) {
-    this.bindings = snap.bindings;
-    this.driveClipIds = snap.driveClipIds;
+  private accept(snap: { maps?: LaunchMap[]; bindings?: LaunchBinding[]; driveClipIds?: string[] }) {
+    if (snap.maps && snap.maps.length > 0) {
+      this.maps = snap.maps;
+    } else if (snap.bindings || snap.driveClipIds) {
+      const fallback = defaultLaunchMap();
+      fallback.bindings = snap.bindings ?? [];
+      fallback.driveClipIds = snap.driveClipIds ?? [];
+      this.maps = [fallback];
+    } else {
+      this.maps = [defaultLaunchMap()];
+    }
+    if (!this.maps.some((m) => m.id === this.activeMapId)) {
+      this.activeMapId = this.maps[0].id;
+    }
+    if (this.selectedId && !this.bindings.some((b) => b.id === this.selectedId)) {
+      this.selectedId = null;
+    }
   }
 
   drives(clipId: string): boolean {
-    return this.driveClipIds.includes(clipId);
+    return driveMapId(this.maps, clipId) !== null;
   }
 
-  async toggleDrive(clipId: string) {
-    const on = !this.drives(clipId);
-    this.driveClipIds = on
-      ? [...this.driveClipIds, clipId]
-      : this.driveClipIds.filter((id) => id !== clipId);
+  driveMap(clipId: string): LaunchMap | null {
+    const id = driveMapId(this.maps, clipId);
+    return id ? (this.maps.find((m) => m.id === id) ?? null) : null;
+  }
+
+  /** Assign the clip to `mapId`, or detach it when `mapId` is null. */
+  async setClipLauncher(clipId: string, mapId: string | null) {
+    const current = driveMapId(this.maps, clipId);
+    if (current === mapId || (mapId === null && current === null)) return;
+    const target = mapId ?? current;
+    if (!target) return;
+    this.maps = this.maps.map((m) => ({
+      ...m,
+      driveClipIds:
+        m.id === mapId
+          ? m.driveClipIds.includes(clipId)
+            ? m.driveClipIds
+            : [...m.driveClipIds, clipId]
+          : m.driveClipIds.filter((id) => id !== clipId),
+    }));
     if (!backend.launchSetDrive) return;
     try {
-      this.accept(await backend.launchSetDrive(clipId, on));
+      this.accept(await backend.launchSetDrive(clipId, mapId !== null, target));
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  async toggleDrive(clipId: string, mapId?: string) {
+    const current = driveMapId(this.maps, clipId);
+    const target = mapId ?? this.activeMap.id;
+    await this.setClipLauncher(clipId, current === target ? null : target);
+  }
+
+  async createMap(name?: string): Promise<LaunchMap> {
+    const map: LaunchMap = {
+      id: crypto.randomUUID(),
+      name: name ?? nextLauncherName(this.maps),
+      bindings: [],
+      driveClipIds: [],
+    };
+    this.maps = [...this.maps, map];
+    this.activeMapId = map.id;
+    this.selectedId = null;
+    await this.persistMap(map);
+    return map;
+  }
+
+  async renameMap(id: string, name: string) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    const map = this.maps.find((m) => m.id === id);
+    if (!map || map.name === trimmed) return;
+    const next = { ...map, name: trimmed };
+    this.maps = this.maps.map((m) => (m.id === id ? next : m));
+    await this.persistMap(next);
+  }
+
+  async removeMap(id: string) {
+    if (this.maps.length <= 1) {
+      this.error = "cannot delete the last launcher";
+      return;
+    }
+    const gone = this.maps.find((m) => m.id === id);
+    if (!gone) return;
+    this.maps = this.maps.filter((m) => m.id !== id);
+    if (this.activeMapId === id) this.activeMapId = this.maps[0].id;
+    if (this.selectedId && !this.bindings.some((b) => b.id === this.selectedId)) {
+      this.selectedId = null;
+    }
+    if (!backend.launchSetMap) return;
+    try {
+      this.accept(await backend.launchSetMap(id, null));
     } catch (err) {
       this.error = String(err);
     }
@@ -121,7 +218,9 @@ class LaunchStore {
       channel: null,
       target,
     };
-    this.bindings = [...this.bindings, binding];
+    this.maps = this.maps.map((m) =>
+      m.id === this.activeMap.id ? { ...m, bindings: [...m.bindings, binding] } : m,
+    );
     this.selectedId = binding.id;
     await this.persist(binding);
     return binding;
@@ -152,21 +251,25 @@ class LaunchStore {
   }
 
   async update(id: string, patch: Partial<Pick<LaunchBinding, "name" | "note" | "channel" | "target">>) {
-    const i = this.bindings.findIndex((b) => b.id === id);
-    if (i < 0) return;
-    const next = { ...this.bindings[i], ...patch };
-    this.bindings = this.bindings.map((b) => (b.id === id ? next : b));
+    const current = this.bindings.find((b) => b.id === id);
+    if (!current) return;
+    const next = { ...current, ...patch };
+    this.maps = this.maps.map((m) =>
+      m.id === this.activeMap.id ? { ...m, bindings: m.bindings.map((b) => (b.id === id ? next : b)) } : m,
+    );
     await this.persist(next);
   }
 
   async remove(id: string) {
     const gone = this.bindings.find((b) => b.id === id);
-    this.bindings = this.bindings.filter((b) => b.id !== id);
+    this.maps = this.maps.map((m) =>
+      m.id === this.activeMap.id ? { ...m, bindings: m.bindings.filter((b) => b.id !== id) } : m,
+    );
     if (this.selectedId === id) this.selectedId = null;
     if (this.learningId === id) this.stopLearn();
     if (gone && backend.launchSet) {
       try {
-        await backend.launchSet(null, id);
+        this.accept(await backend.launchSet(null, id, this.activeMap.id));
       } catch (err) {
         this.error = String(err);
       }
@@ -193,10 +296,12 @@ class LaunchStore {
 
   /** In-memory only — used while a timeline handle is dragged. */
   patchLocal(id: string, patch: Partial<Pick<LaunchBinding, "name" | "note" | "channel" | "target">>) {
-    const i = this.bindings.findIndex((b) => b.id === id);
-    if (i < 0) return;
-    const next = { ...this.bindings[i], ...patch };
-    this.bindings = this.bindings.map((b) => (b.id === id ? next : b));
+    const current = this.bindings.find((b) => b.id === id);
+    if (!current) return;
+    const next = { ...current, ...patch };
+    this.maps = this.maps.map((m) =>
+      m.id === this.activeMap.id ? { ...m, bindings: m.bindings.map((b) => (b.id === id ? next : b)) } : m,
+    );
   }
 
   private pollLearn() {
@@ -220,7 +325,16 @@ class LaunchStore {
   private async persist(binding: LaunchBinding) {
     if (!backend.launchSet) return;
     try {
-      this.accept(await backend.launchSet(binding));
+      this.accept(await backend.launchSet(binding, binding.id, this.activeMap.id));
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  private async persistMap(map: LaunchMap) {
+    if (!backend.launchSetMap) return;
+    try {
+      this.accept(await backend.launchSetMap(map.id, map));
     } catch (err) {
       this.error = String(err);
     }

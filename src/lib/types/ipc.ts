@@ -90,9 +90,16 @@ export interface LaunchBinding {
   target: LaunchTarget;
 }
 
-export interface LaunchSnapshot {
+/** One named launcher: its note map plus the clips that drive it. */
+export interface LaunchMap {
+  id: string;
+  name: string;
   bindings: LaunchBinding[];
   driveClipIds: string[];
+}
+
+export interface LaunchSnapshot {
+  maps: LaunchMap[];
 }
 
 // ── transport-state.schema.json ─────────────────────────────────────────────
