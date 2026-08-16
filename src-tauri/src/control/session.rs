@@ -121,6 +121,12 @@ pub struct Session {
     /// outgoing document's pending persist. `open_project_epoch` drops that
     /// in-flight write with a warn. Ctrl+S (M-2) is the recovery path.
     pub(crate) epoch: u64,
+    /// Serializes persist I/O (snapshot + write + dirty-clear) across every
+    /// `Committer` on this session. Taken BEFORE the session lock in persist
+    /// paths; never hold the session lock when acquiring this — the clone
+    /// of this `Arc` is taken under a brief session lock, then that guard
+    /// drops, then this mutex is locked.
+    pub(crate) persist_gate: Arc<parking_lot::Mutex<()>>,
 }
 
 impl Session {
@@ -134,6 +140,7 @@ impl Session {
             published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
             rev: 0,
             epoch: 0,
+            persist_gate: Arc::new(parking_lot::Mutex::new(())),
         };
         // First publish: the placeholder above is never observable — the
         // published image equals the live document from birth.
@@ -222,6 +229,7 @@ impl Session {
             published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
             rev: snap.rev,
             epoch: snap.epoch,
+            persist_gate: Arc::new(parking_lot::Mutex::new(())),
         };
         s.republish_full();
         s

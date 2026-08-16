@@ -437,6 +437,8 @@ export type ClipboardClip =
       lengthTicks: number;
       contentLengthTicks: number | null;
       notes: MidiNote[];
+      transposeSemitones?: number;
+      velocityOffset?: number;
     };
 
 export interface AuraClipsPayload {

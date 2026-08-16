@@ -310,9 +310,9 @@ Carry-forwards for later rounds live in the handoff: live-document B-tree
 journal tails, seeded-PRNG for future random ops, version-graph product
 surface unbuilt.
 
-Baseline after this track: **890 backend (856 lib + 34 integration, plus
-2 `#[ignore]`) + 440 frontend**, measured on `plan-f-history` 2026-08-16
-after rebasing onto main (Track F + recent-projects). Known flakes:
+Baseline after this track: **900 backend (866 lib + 34 integration, plus
+2 `#[ignore]`) + 456 frontend**, measured on `plan-f-history` 2026-08-16
+after the PR #23 review follow-up (rebased onto main). Known flakes:
 `midi_out` under parallel lib runs;
 `apply_hum_clip_commits_synchronously_and_announces_project_changed`.
 

@@ -110,6 +110,10 @@ pub enum ClipboardClip {
         /// By VALUE, with every `note_id` zeroed to the mint sentinel —
         /// a copy mints fresh ids (round-2 §2.1, ADR 0001).
         notes: Vec<crate::midi::types::MidiNote>,
+        #[serde(default)]
+        transpose_semitones: i16,
+        #[serde(default)]
+        velocity_offset: i16,
     },
 }
 
@@ -262,6 +266,8 @@ impl ControlPlane {
                 length_ticks: c.length_ticks,
                 content_length_ticks: c.content_length_ticks,
                 notes,
+                transpose_semitones: c.transpose_semitones,
+                velocity_offset: c.velocity_offset,
             });
         }
 
@@ -829,6 +835,8 @@ impl ControlPlane {
                         mut length_ticks,
                         mut content_length_ticks,
                         mut notes,
+                        transpose_semitones,
+                        velocity_offset,
                         ..
                     } => {
                         // Ticks are ppq-relative, so the rescale has to use
@@ -892,8 +900,8 @@ impl ControlPlane {
                             content_id: crate::ids::ContentId::mint(),
                             lane_id,
                             content_length_ticks,
-                            transpose_semitones: 0,
-                            velocity_offset: 0,
+                            transpose_semitones,
+                            velocity_offset,
                         };
                         // Ids minted BEFORE the apply, so the op the journal
                         // records carries the final ones — the exact
@@ -1269,6 +1277,50 @@ mod tests {
         );
     }
 
+    /// Placement offsets are first-class clip fields; copy/paste must
+    /// carry them. A v1 payload that omits them still decodes as 0.
+    #[test]
+    fn copy_paste_preserves_midi_placement_offsets() {
+        let cp = plane();
+        let src_id = {
+            cp.commit(TxMeta::user("seed"), |tx| {
+                let mut c = crate::control::tests::dummy_midi_clip("t-2");
+                c.transpose_semitones = 7;
+                c.velocity_offset = -12;
+                tx.apply(Op::MidiClipAdd { clip: c, index: 0 })
+            })
+            .unwrap();
+            cp.session().lock().midi.clips[0].id.to_string()
+        };
+        let payload = cp.clips_copy(vec![], vec![src_id]).unwrap();
+        match &payload.clips[0] {
+            ClipboardClip::Midi { transpose_semitones, velocity_offset, .. } => {
+                assert_eq!(*transpose_semitones, 7);
+                assert_eq!(*velocity_offset, -12);
+            }
+            _ => panic!("expected midi"),
+        }
+        let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
+        assert_eq!(pasted.transpose_semitones, 7);
+        assert_eq!(pasted.velocity_offset, -12);
+    }
+
+    #[test]
+    fn old_clipboard_midi_payload_defaults_offsets_to_zero() {
+        let json = r#"{
+            "kind":"midi","name":"riff","sourceTrackId":"t-2","sourceTrackName":"T2",
+            "offsetFromAnchorTicks":0,"lengthTicks":960,"contentLengthTicks":null,"notes":[]
+        }"#;
+        let clip: ClipboardClip = serde_json::from_str(json).unwrap();
+        match clip {
+            ClipboardClip::Midi { transpose_semitones, velocity_offset, .. } => {
+                assert_eq!(transpose_semitones, 0);
+                assert_eq!(velocity_offset, 0);
+            }
+            _ => panic!("expected midi"),
+        }
+    }
+
     /// Requirement 3: paste onto NEW tracks — one fresh track per distinct
     /// source track, in the SAME transaction, so undo removes the tracks too.
     #[test]
@@ -1439,7 +1491,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![],
-                },
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+},
             ],
         };
 
@@ -1521,7 +1576,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![note(0, 480, 5), note(480, 480, 5)],
-                },
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+},
                 ClipboardClip::Midi {
                     name: "good".into(),
                     source_track_id: "t-2".into(),
@@ -1530,7 +1588,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![note(0, 480, 0)],
-                },
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+},
             ],
         );
 
@@ -1560,7 +1621,10 @@ mod tests {
                 length_ticks: 960,
                 content_length_ticks: None,
                 notes: vec![note(0, 240, 7), note(240, 240, 9)],
-            }],
+            
+                transpose_semitones: 0,
+                velocity_offset: 0,
+}],
         );
 
         let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
@@ -1596,7 +1660,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![note(0, 480, 0), poisoned],
-                },
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+},
                 ClipboardClip::Midi {
                     name: "good".into(),
                     source_track_id: "t-2".into(),
@@ -1605,7 +1672,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![note(0, 480, 0)],
-                },
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+},
             ],
         );
 
@@ -1645,7 +1715,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![bad],
-                }],
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+}],
             );
 
             let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
@@ -1830,7 +1903,10 @@ mod tests {
                 length_ticks: 480,
                 content_length_ticks: Some(240),
                 notes: vec![note(120, 240, 0)],
-            }],
+            
+                transpose_semitones: 0,
+                velocity_offset: 0,
+}],
         );
 
         let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
@@ -1870,7 +1946,10 @@ mod tests {
                 length_ticks: 960,
                 content_length_ticks: Some(960),
                 notes: vec![note(480, 480, 0)],
-            }],
+            
+                transpose_semitones: 0,
+                velocity_offset: 0,
+}],
         );
 
         let pasted = cp.clips_paste(paste_req(payload, 0, false)).unwrap().midi_clips.remove(0);
@@ -1963,7 +2042,10 @@ mod tests {
             length_ticks: 960,
             content_length_ticks: None,
             notes: vec![],
-        });
+        
+            transpose_semitones: 0,
+            velocity_offset: 0,
+});
 
         let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
         assert_eq!(res.skipped.len(), 1, "{:?}", res.skipped);
@@ -2076,7 +2158,10 @@ mod tests {
                 length_ticks: 960,
                 content_length_ticks: None,
                 notes: vec![],
-            }],
+            
+                transpose_semitones: 0,
+                velocity_offset: 0,
+}],
         };
 
         let res = cp.clips_paste(paste_req(payload, 0, false)).unwrap();
@@ -2202,7 +2287,10 @@ mod tests {
                     length_ticks: 960,
                     content_length_ticks: None,
                     notes: vec![],
-                },
+                
+                    transpose_semitones: 0,
+                    velocity_offset: 0,
+},
             ],
         };
 

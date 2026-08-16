@@ -598,6 +598,8 @@ impl Committer {
     /// this fn (that don't go through `commit_with_rebuild`) should pass
     /// the session's current epoch.
     pub(crate) fn execute_persist(&self, p: &session::PersistEffect, committed_epoch: u64) {
+        let persist_gate = self.session.lock().persist_gate.clone();
+        let _persist = persist_gate.lock();
         let (
             dir,
             epoch_now,
@@ -762,13 +764,22 @@ impl Committer {
     /// `save_project_as_epoch`'s Save-As write — every site that calls
     /// `plugins::state::save_snapshot_into_project` and then wants to clear
     /// the ids it returned.
-    fn clear_dirty_state_matching(&self, written: &[String], snapshot: &session::PluginDoc) {
+    ///
+    /// Returns `true` when every written id still matches. A mismatch
+    /// re-inserts the id: a later persist may already have cleared dirty,
+    /// and leaving it false after a stale write would never flush again.
+    fn clear_dirty_state_matching(&self, written: &[String], snapshot: &session::PluginDoc) -> bool {
         let mut s = self.session.lock();
+        let mut all_matched = true;
         for id in written {
             if s.plugins.pending_state.get(id) == snapshot.pending_state.get(id) {
                 s.plugins.dirty_state.remove(id);
+            } else {
+                s.plugins.dirty_state.insert(id.clone());
+                all_matched = false;
             }
         }
+        all_matched
     }
 
     /// Clear `midi.dirty` only when the live store still matches the
@@ -776,10 +787,17 @@ impl Committer {
     /// write and this re-lock must keep the flag, or the newer notes
     /// never persist (same window `clear_dirty_state_matching` closes
     /// for plugin blobs).
-    fn clear_midi_dirty_if_unchanged(&self, written: &crate::midi::persist::V3Data) {
+    ///
+    /// Returns `true` on match. Mismatch re-dirties: a stale writer can
+    /// overwrite newer bytes after a later persist already cleared the flag.
+    fn clear_midi_dirty_if_unchanged(&self, written: &crate::midi::persist::V3Data) -> bool {
         let mut s = self.session.lock();
         if &s.midi_snapshot() == written {
             s.midi.dirty = false;
+            true
+        } else {
+            s.midi.dirty = true;
+            false
         }
     }
 
@@ -3450,6 +3468,8 @@ impl ControlPlane {
     /// the lock drops — no disk I/O ever runs while the session lock is
     /// held.
     pub fn save_project_as_epoch(&self, dir: &Path) -> Result<Project, String> {
+        let persist_gate = self.session.lock().persist_gate.clone();
+        let _persist = persist_gate.lock();
         let name = dir
             .file_stem()
             .and_then(|s| s.to_str())
@@ -3507,7 +3527,9 @@ impl ControlPlane {
         self.committer.log().epoch_boundary(dir, history::EpochEvent::SaveAs, new_epoch);
         project::save(dir, &project)?;
         match crate::midi::persist::save_snapshot_into_project(dir, &midi_snapshot) {
-            Ok(()) => self.committer.clear_midi_dirty_if_unchanged(&midi_snapshot),
+            Ok(()) => {
+                self.committer.clear_midi_dirty_if_unchanged(&midi_snapshot);
+            }
             Err(e) => {
                 self.session.lock().midi.dirty = true;
                 log::warn!("save_project_as_epoch: persisting midi failed: {e}");
@@ -3561,6 +3583,8 @@ impl ControlPlane {
     /// command is now a one-line delegate (its frozen `Result<(), String>`
     /// shape discards the returned `Project`).
     pub fn save_project_mark(&self) -> Result<Project, String> {
+        let persist_gate = self.session.lock().persist_gate.clone();
+        let _persist = persist_gate.lock();
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
         let (project, dir, epoch, midi_snapshot, plugin_snapshot, modulation) = {
@@ -3596,14 +3620,16 @@ impl ControlPlane {
                 log::warn!("save_project_mark: midi persist failed: {e}");
                 self.session.lock().midi.dirty = true;
                 flush_ok = false;
-            } else {
-                self.committer.clear_midi_dirty_if_unchanged(&m);
+            } else if !self.committer.clear_midi_dirty_if_unchanged(&m) {
+                flush_ok = false;
             }
         }
         if let Some(doc) = plugin_snapshot {
             match crate::plugins::state::save_snapshot_into_project(&dir, &doc, false) {
                 Ok(cleared) if !cleared.is_empty() => {
-                    self.committer.clear_dirty_state_matching(&cleared, &doc);
+                    if !self.committer.clear_dirty_state_matching(&cleared, &doc) {
+                        flush_ok = false;
+                    }
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -7772,5 +7798,77 @@ mod tests {
             !cp.session().lock().plugins.dirty_state.contains("inst-1"),
             "M-1: matching pending bytes clear the dirty flag"
         );
+    }
+
+    /// Review #23 follow-up: a stale persist can overwrite newer bytes and
+    /// leave dirty already-false (the newer writer cleared it). Mismatch
+    /// must re-dirty so the next flush rewrites the live document.
+    #[test]
+    fn clear_midi_dirty_re_dirties_when_live_moved_and_flag_was_clear() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let written = {
+            let mut s = cp.session().lock();
+            s.midi.clips.push(dummy_midi_clip("t-1"));
+            s.midi.dirty = false;
+            s.midi_snapshot()
+        };
+        {
+            let mut s = cp.session().lock();
+            s.midi.clips[0].name = "moved-on".into();
+            s.midi.dirty = false;
+        }
+
+        let matched = cp.committer().clear_midi_dirty_if_unchanged(&written);
+        assert!(!matched, "live bytes moved on");
+        assert!(
+            cp.session().lock().midi.dirty,
+            "stale write must re-dirty so the live document flushes again"
+        );
+    }
+
+    /// Same hole on plugin blobs: dirty already cleared by a later persist,
+    /// then a stale write's compare must put the id back.
+    #[test]
+    fn clear_dirty_state_re_dirties_when_live_moved_and_flag_was_clear() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let snapshot = {
+            let mut s = cp.session().lock();
+            s.plugins.pending_state.insert("inst-1".into(), vec![1, 2, 3]);
+            s.plugins.dirty_state.clear();
+            s.plugin_snapshot()
+        };
+        cp.session().lock().plugins.pending_state.insert("inst-1".into(), vec![9, 9, 9]);
+
+        let matched = cp.committer().clear_dirty_state_matching(&["inst-1".to_string()], &snapshot);
+        assert!(!matched, "live pending bytes moved on");
+        assert!(
+            cp.session().lock().plugins.dirty_state.contains("inst-1"),
+            "stale plugin write must re-dirty the id"
+        );
+    }
+
+    /// Persist I/O is serialized: a holder of `persist_gate` blocks
+    /// `execute_persist` until it drops. Without the gate, two writers can
+    /// snapshot under the session lock and interleave their disk writes.
+    #[test]
+    fn persist_gate_blocks_execute_persist_until_released() {
+        let (cp, _events, _engine) = recording_control_plane();
+        let parent = cp_tmp_parent("persist-gate");
+        cp.create_project(parent.to_str().unwrap(), "PersistGate").unwrap();
+        let epoch = cp.session().lock().epoch;
+        let gate = cp.session().lock().persist_gate.clone();
+        let held = gate.lock();
+        let committer = cp.committer().clone();
+        let handle = std::thread::spawn(move || {
+            committer.execute_persist(
+                &session::PersistEffect { midi: true, ..session::PersistEffect::default() },
+                epoch,
+            );
+        });
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(!handle.is_finished(), "execute_persist must wait on persist_gate");
+        drop(held);
+        handle.join().expect("persist thread");
+        let _ = std::fs::remove_dir_all(&parent);
     }
 }
