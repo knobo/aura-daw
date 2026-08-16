@@ -3433,7 +3433,7 @@ impl ControlPlane {
         let rate = self.shared.sample_rate.load(Relaxed);
         let position = self.shared.position.load(Relaxed);
         let new_epoch;
-        let (project, midi_snapshot, plugin_snapshot, automation_snapshot) = {
+        let (project, midi_snapshot, plugin_snapshot, automation_snapshot, modulation_snapshot) = {
             let mut session = self.session.lock();
             session.store.project_dir = Some(dir.to_path_buf());
             session.store.project_name = Some(name);
@@ -3464,12 +3464,13 @@ impl ControlPlane {
             // silently destroyed both.
             let plugin_snapshot = session.plugin_snapshot();
             let automation_snapshot = session.automation.lanes.clone();
+            let modulation_snapshot = session.modulation.clone();
             // snapshot republish: document swap (save-as) — project meta +
             // the epoch bump are non-op writes; republish before the guard
             // drops. (`midi.loaded_dir` above is bookkeeping, outside the
             // equivalence contract — the epoch is what makes this a swap.)
             session.republish_full();
-            (project, midi_snapshot, plugin_snapshot, automation_snapshot)
+            (project, midi_snapshot, plugin_snapshot, automation_snapshot, modulation_snapshot)
         };
         // ---- session lock released; all disk I/O below ----
         // epoch boundary (Task 17): the session just acquired an identity.
@@ -3504,13 +3505,18 @@ impl ControlPlane {
             Ok(_) => {}
             Err(e) => log::warn!("save_project_as_epoch: persisting plugin state failed: {e}"),
         }
-        // I-1 fix: automation lanes + AMEV point chunks, same helper
-        // `execute_persist` calls.
-        if let Err(e) = crate::plugins::automation::save_into_project(dir, &automation_snapshot) {
-            log::warn!("save_project_as_epoch: persisting automation failed: {e}");
-        }
-        let modulation = self.session.lock().modulation.clone();
-        if let Err(e) = crate::modulation::persist::save_into_project(dir, &modulation) {
+        // Track F: a v4 write drops `automation[]`. Persist the graph when
+        // it has content; if the session still only has Track D lanes
+        // (I-1 tests, leftover facade-less state), migrate them first so
+        // Save-As cannot stamp an empty `modulation{}` over live lanes.
+        let modulation_to_write = if !modulation_snapshot.is_empty() {
+            modulation_snapshot
+        } else if !automation_snapshot.is_empty() {
+            crate::modulation::persist::migrate_v3_lanes(&automation_snapshot, &|_, _| None)
+        } else {
+            modulation_snapshot
+        };
+        if let Err(e) = crate::modulation::persist::save_into_project(dir, &modulation_to_write) {
             log::warn!("save_project_as_epoch: persisting modulation failed: {e}");
         }
         (self.emit)(
@@ -3584,7 +3590,21 @@ impl ControlPlane {
         // `project::save`, before the emit — even though the dirty-store
         // flush above may now also have run: a save mark that also flushed
         // dirty stores is still one mark.
-        if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation) {
+        // Task 7: an explicit save is the one-way v4 upgrade. The file
+        // stays v3 `automation[]` until this write (or an edit persist).
+        // Same migrate-if-lanes-only rule as Save-As: an empty graph must
+        // not wipe leftover Track D lanes.
+        let modulation_to_write = if !modulation.is_empty() {
+            modulation
+        } else {
+            let lanes = self.session.lock().automation.lanes.clone();
+            if lanes.is_empty() {
+                crate::modulation::ModulationDoc::default()
+            } else {
+                crate::modulation::persist::migrate_v3_lanes(&lanes, &|_, _| None)
+            }
+        };
+        if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation_to_write) {
             log::warn!("save_project: modulation persist failed: {e}");
         }
         self.committer.log().snapshot_mark(epoch);
@@ -7428,14 +7448,15 @@ mod tests {
         assert_eq!(rows[0]["id"], "inst-1");
         assert!(dir.join("plugins").join("inst-1.state").exists(), "state blob must land");
 
-        let auto_rows = pj
-            .get("automation")
-            .and_then(|v| v.as_array())
-            .expect("automation[] must be written by Save-As (I-1)");
-        assert_eq!(auto_rows.len(), 1);
-        assert_eq!(auto_rows[0]["id"], "track:t-1:gain");
-        let pref = auto_rows[0]["pointsRef"].as_str().expect("chunk ref for a lane with points");
-        assert!(dir.join(pref).exists(), "automation point chunk must land");
+        // Track F: Save-As upgrades to v4 `modulation{}` (and drops
+        // `automation[]`). The I-1 contract is that the lane data lands,
+        // not that the retired key survives.
+        let loaded = crate::modulation::persist::load_from_project(&dir)
+            .expect("modulation{} must be written by Save-As (I-1)");
+        assert_eq!(loaded.bindings.len(), 1, "gain lane migrated into a binding");
+        assert_eq!(loaded.bindings[0].id, "track:t-1:gain");
+        assert_eq!(loaded.curves.len(), 1);
+        assert!(!loaded.curves[0].points.is_empty(), "curve points must land");
 
         assert!(
             !cp.session().lock().plugins.dirty_state.contains("inst-1"),
@@ -7526,10 +7547,14 @@ mod tests {
             let mut s = cp.session().lock();
             crate::plugins::state::restore_into_session(&saved_dir, &mut s).unwrap();
         }
-        let lanes = crate::plugins::automation::load_lanes(&saved_dir)
-            .unwrap()
-            .expect("automation[] present after Save-As (I-1)");
-        cp.session().lock().automation.lanes = lanes;
+        let doc = crate::modulation::persist::load_from_project(&saved_dir)
+            .expect("modulation{} present after Save-As (I-1)");
+        let lanes = crate::modulation::compat::lanes_from_doc(&doc);
+        {
+            let mut s = cp.session().lock();
+            s.modulation = doc;
+            s.automation.lanes = lanes;
+        }
 
         let s = cp.session().lock();
         assert_eq!(
