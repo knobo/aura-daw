@@ -576,7 +576,10 @@ impl OutputCb {
             return;
         }
 
-        let overlay = self.shared.launch_overlay();
+        let overlay = self.shared.launch_overlay().map(|mut ov| {
+            ov.exclusive = !playing;
+            ov
+        });
         let overlay_on = overlay.is_some();
         match (&mut self.graph, playing, overlay_on) {
             (Some(g), true, _) | (Some(g), false, true) => {

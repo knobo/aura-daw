@@ -39,6 +39,7 @@ class ClipEditLoopStore {
   /** Track whose manual mute we lifted for solo mode (mute wins over solo). */
   private unmutedId: string | null = null;
   private playOnceEnd = 0;
+  private playOnceStarted = false;
   private loopBeforePlay: { enabled: boolean; start: number; end: number } | null = null;
 
   get active(): boolean {
@@ -78,6 +79,7 @@ class ClipEditLoopStore {
       return;
     }
     this.playOnce = true;
+    this.playOnceStarted = false;
     this.playOnceEnd = endSamples;
     this.loopBeforePlay = {
       enabled: transport.snap.loopEnabled,
@@ -88,11 +90,13 @@ class ClipEditLoopStore {
     await transport.setLoop(false, 0, 0);
     await transport.seek(startSamples);
     await transport.play();
+    this.playOnceStarted = this.playOnce;
   }
 
   async stopThisClip() {
     const was = this.playOnce;
     this.playOnce = false;
+    this.playOnceStarted = false;
     this.playOnceEnd = 0;
     await backend.launchSetDriveFocus?.(null);
     if (was && transport.isPlaying) await transport.pause();
@@ -105,7 +109,7 @@ class ClipEditLoopStore {
 
   /** Call from the piano roll while play-once is armed. */
   tickPlayOnce(positionSamples: number) {
-    if (!this.playOnce) return;
+    if (!this.playOnce || !this.playOnceStarted) return;
     if (!transport.isPlaying || positionSamples >= this.playOnceEnd) {
       void this.stopThisClip();
     }
@@ -139,6 +143,7 @@ class ClipEditLoopStore {
     this.trackId = null;
     this.unmutedId = null;
     this.playOnce = false;
+    this.playOnceStarted = false;
     this.playOnceEnd = 0;
     this.loopBeforePlay = null;
     void backend.launchSetDriveFocus?.(null);

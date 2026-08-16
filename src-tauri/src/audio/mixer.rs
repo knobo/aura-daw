@@ -444,14 +444,20 @@ fn render_impl(
         let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
-        let launching = flags & FLAG_LAUNCH != 0 && launch.is_some();
-        let on = audible_with_launch(
-            flags & FLAG_MUTE != 0,
-            flags & FLAG_SOLO != 0,
-            any_solo,
-            launching,
-        );
-        let (track_base, track_lp, track_disc) = if launching {
+        let flagged = flags & FLAG_LAUNCH != 0;
+        let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive);
+        let overlaying = flagged && launch.is_some();
+        let on = if exclusive && !flagged {
+            false
+        } else {
+            audible_with_launch(
+                flags & FLAG_MUTE != 0,
+                flags & FLAG_SOLO != 0,
+                any_solo,
+                flagged,
+            )
+        };
+        let (track_base, track_lp, track_disc) = if overlaying {
             let ov = launch.unwrap();
             (ov.pos, &LoopSpec::OFF, ov.discontinuity)
         } else {
@@ -781,13 +787,52 @@ mod tests {
             false,
             0,
             None,
-            Some(LaunchPlayhead { pos: 100, discontinuity: true }),
+            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false }),
             None,
         );
         assert!(
             (out[0] - 1.0).abs() < 1e-5,
             "overlay hears the scene at its own position"
         );
+    }
+
+    #[test]
+    fn exclusive_overlay_silences_tracks_without_the_launch_flag() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_pan(0, -1.0);
+        let mut out = vec![0.0f32; 8];
+        render_rt_launch(
+            &mut g,
+            0,
+            &LoopSpec::OFF,
+            &mut out,
+            2,
+            48_000,
+            false,
+            0,
+            None,
+            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true }),
+            None,
+        );
+        assert!(
+            out.iter().all(|s| *s == 0.0),
+            "parked arrangement must stay silent during stopped preview"
+        );
+        g.params.set_flag(0, FLAG_LAUNCH, true);
+        render_rt_launch(
+            &mut g,
+            0,
+            &LoopSpec::OFF,
+            &mut out,
+            2,
+            48_000,
+            false,
+            0,
+            None,
+            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true }),
+            None,
+        );
+        assert!((out[0] - 1.0).abs() < 1e-5, "launched track still plays");
     }
 
     // ---- clip sampling ----

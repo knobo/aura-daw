@@ -241,9 +241,6 @@
       toggleDock(dockTabForKey(e.key)!);
     } else if (e.key.toLowerCase() === "k" && !e.metaKey && !e.ctrlKey && !e.altKey) {
       launch.togglePanel();
-    } else if ((e.key === "Delete" || e.key === "Backspace") && launch.panelOpen && launch.selectedId) {
-      e.preventDefault();
-      void launch.remove(launch.selectedId);
     } else if (e.key.toLowerCase() === "c" && !e.metaKey && !e.ctrlKey && !e.altKey) {
       // The library's CLIPS root is a destination in its own right, so it
       // gets its own key rather than "open the library, now find the tab".

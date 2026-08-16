@@ -150,6 +150,16 @@ pub fn drive_clip_eligible(
     }
 }
 
+/// Drive poller window: half-open `(last, pos]` when time moves forward,
+/// or the two wrap halves `(last, +inf) ∪ (0, pos]` after a loop wrap.
+pub fn drive_event_in_window(sample: u64, last: u64, pos: u64) -> bool {
+    if pos >= last {
+        sample > last && sample <= pos
+    } else {
+        sample > last || sample <= pos
+    }
+}
+
 pub fn find_binding<'a>(maps: &'a [LaunchMap], id: &str) -> Option<(&'a LaunchMap, &'a LaunchBinding)> {
     maps.iter().find_map(|m| m.bindings.iter().find(|b| b.id == id).map(|b| (m, b)))
 }
@@ -184,10 +194,9 @@ pub fn incoming_is_echo(recent: &[EchoNote], incoming: EchoNote, window_ms: u64)
     })
 }
 
-/// A clip that contains its own trigger note would retrigger if those notes
-/// were fed back into the mapper. The mapper never listens to clip playback
-/// internally — this is the *document* half of the guard, used to suppress
-/// the trigger key while that clip is the last thing we launched.
+/// True when the clip contains its own trigger note. Used for a UI warning;
+/// the live guards are the same-clip target skip, the echo window, and
+/// hardware `armed`.
 pub fn clip_would_self_trigger(
     notes: &[(u8, u8)],
     trigger_note: u8,
@@ -369,8 +378,7 @@ impl LaunchRuntime {
     }
 
     /// Watch the transport and fire launch bindings from clips marked as
-    /// launch-map instruments. Note-on then immediate note-off so a
-    /// sequencer pulse does not latch `armed`.
+    /// launch-map instruments. Hardware `armed` is not involved.
     pub fn attach_drive(
         &self,
         shared: Arc<crate::audio::rt::SharedRt>,
@@ -387,8 +395,16 @@ impl LaunchRuntime {
                 let mut play_started = Instant::now();
                 let mut last_onset: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
+                let mut overlay_was_on = false;
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
+                    let overlay_on = shared.launch_on.load(Relaxed);
+                    if overlay_was_on && !overlay_on {
+                        if let Some(id) = runtime().overlay_id() {
+                            runtime().enqueue_release(id);
+                        }
+                    }
+                    overlay_was_on = overlay_on;
                     let playing = shared.playing.load(Relaxed);
                     let pos = shared.position.load(Relaxed);
                     if !playing {
@@ -401,14 +417,26 @@ impl LaunchRuntime {
                         launch_trace(format!(
                             "drive wrap/seek pos={pos} last={last} since_play_ms={ms}"
                         ));
-                        // A seek right after Play (clip-edit loop arming)
-                        // must not forget the onset we just fired, or the
-                        // same note retriggers. A later loop wrap may.
-                        if ms > 80 {
-                            last_onset.clear();
+                        // Clip-edit seek right after Play must not
+                        // retrigger. A later loop wrap may.
+                        if ms <= 80 {
+                            last = pos;
+                            continue;
                         }
-                        last = pos;
-                        continue;
+                        last_onset.clear();
+                        // Fall through and scan the wrap halves.
+                    } else {
+                        let seek_gap = u64::from(shared.sample_rate.load(Relaxed).max(1))
+                            .saturating_mul(80)
+                            / 1000;
+                        if pos.saturating_sub(last) > seek_gap.max(1) {
+                            launch_trace(format!(
+                                "drive forward-seek pos={pos} last={last} gap={}",
+                                pos - last
+                            ));
+                            last = pos.saturating_sub(1);
+                            continue;
+                        }
                     }
                     let mut just_started = false;
                     if !was_playing {
@@ -470,7 +498,7 @@ impl LaunchRuntime {
                                 ));
                             }
                             for ev in evs {
-                                if ev.sample <= last || ev.sample > pos {
+                                if !drive_event_in_window(ev.sample, last, pos) {
                                     continue;
                                 }
                                 let Some(b) = resolve(&launcher.bindings, ev.key, 0) else {
@@ -696,11 +724,7 @@ impl crate::control::ControlPlane {
         match origin {
             FireOrigin::Drive => {
                 // Keep the arrangement loop and playhead on the clip.
-                // The scene plays on a shadow playhead; UI only gets an indicator.
-                if self.drive_overlay_is(id) {
-                    launch_trace(format!("drive skip, already playing {id}"));
-                    return Ok(());
-                }
+                // Retrigger rewinds the single overlay (v0.1 has no overlap).
                 runtime().set_overlay_id(Some(id.to_string()));
                 self.arm_drive_launch(&track_ids, start, end);
             }
@@ -734,7 +758,7 @@ impl crate::control::ControlPlane {
     }
 
     pub fn stop_drive_launch(&self, id: &str) {
-        if !self.drive_overlay_is(id) {
+        if runtime().overlay_id().as_deref() != Some(id) {
             return;
         }
         launch_trace(format!("drive stop {id}"));
@@ -906,6 +930,17 @@ mod tests {
             channel: None,
             target: LaunchTarget::Clip { clip_id: clip_id.into() },
         }
+    }
+
+    #[test]
+    fn drive_window_is_half_open_forward_and_wraps() {
+        assert!(drive_event_in_window(10, 0, 10));
+        assert!(!drive_event_in_window(0, 0, 10));
+        assert!(!drive_event_in_window(11, 0, 10));
+        assert!(drive_event_in_window(990, 980, 10), "wrap tail");
+        assert!(drive_event_in_window(5, 980, 10), "wrap start");
+        assert!(!drive_event_in_window(11, 980, 10));
+        assert!(!drive_event_in_window(500, 980, 10));
     }
 
     #[test]

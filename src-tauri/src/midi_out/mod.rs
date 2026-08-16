@@ -1098,13 +1098,19 @@ fn run_thread(
 
                     // Any clip with its OWN route (on any port) is excluded
                     // from its track's route — a clip override always wins.
-                    let overridden_clips: HashSet<String> = all_routes
+                    let mut overridden_clips: HashSet<String> = all_routes
                         .keys()
                         .filter_map(|s| match s {
                             RouteScope::Clip(id) => Some(id.clone()),
                             RouteScope::Track(_) => None,
                         })
                         .collect();
+                    let drive_ids: HashSet<String> = crate::midi::launch::all_drive_clip_ids(
+                        &guard.midi.launch_maps,
+                    )
+                    .into_iter()
+                    .collect();
+                    overridden_clips.extend(drive_ids.iter().cloned());
 
                     let mine: Vec<(RouteScope, RouteTarget)> = all_routes
                         .iter()
@@ -1121,13 +1127,19 @@ fn run_thread(
                                 &overridden_clips,
                                 &map,
                             ),
-                            RouteScope::Clip(clip_id) => guard
-                                .midi
-                                .clips
-                                .iter()
-                                .find(|c| c.id.as_str() == clip_id.as_str())
-                                .map(|c| crate::midi::schedule::clip_events(c, &map))
-                                .unwrap_or_default(),
+                            RouteScope::Clip(clip_id) => {
+                                if drive_ids.contains(clip_id) {
+                                    Vec::new()
+                                } else {
+                                    guard
+                                        .midi
+                                        .clips
+                                        .iter()
+                                        .find(|c| c.id.as_str() == clip_id.as_str())
+                                        .map(|c| crate::midi::schedule::clip_events(c, &map))
+                                        .unwrap_or_default()
+                                }
+                            }
                         };
                         new_snapshots.insert(
                             scope.clone(),

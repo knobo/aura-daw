@@ -30,6 +30,8 @@ pub const FLAG_LAUNCH: u32 = 1 << 2;
 pub struct LaunchPlayhead {
     pub pos: u64,
     pub discontinuity: bool,
+    /// When true (stopped preview), only FLAG_LAUNCH tracks render.
+    pub exclusive: bool,
 }
 
 /// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
@@ -166,6 +168,7 @@ impl SharedRt {
         Some(LaunchPlayhead {
             pos: self.launch_pos.load(Ordering::Relaxed),
             discontinuity: self.launch_discont.swap(false, Ordering::Relaxed),
+            exclusive: false,
         })
     }
 

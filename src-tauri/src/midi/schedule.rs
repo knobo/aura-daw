@@ -20,6 +20,16 @@ pub struct AbsNoteEvent {
     pub velocity: u8,
 }
 
+fn clip_note_key_vel(clip: &MidiClip, n: &crate::midi::types::MidiNote) -> (u8, u8) {
+    let key = (n.key as i32 + clip.transpose_semitones as i32).clamp(0, 127) as u8;
+    let velocity = if n.velocity == 0 {
+        0
+    } else {
+        (n.velocity as i32 + clip.velocity_offset as i32).clamp(1, 127) as u8
+    };
+    (key, velocity)
+}
+
 /// Expand a clip's notes into absolute-sample note-on/off edges, sorted by
 /// (sample, offs-before-ons). Rules:
 ///
@@ -58,12 +68,7 @@ pub fn clip_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
             if off_s <= on_s {
                 off_s = on_s + 1;
             }
-            let key = (n.key as i32 + clip.transpose_semitones as i32).clamp(0, 127) as u8;
-            let velocity = if n.velocity == 0 {
-                0
-            } else {
-                (n.velocity as i32 + clip.velocity_offset as i32).clamp(1, 127) as u8
-            };
+            let (key, velocity) = clip_note_key_vel(clip, n);
             out.push(AbsNoteEvent { sample: on_s, key, velocity });
             out.push(AbsNoteEvent { sample: off_s, key, velocity: 0 });
         }
@@ -98,8 +103,9 @@ pub fn clip_drive_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
         if off_s <= on_s {
             off_s = on_s + 1;
         }
-        out.push(AbsNoteEvent { sample: on_s, key: n.key, velocity: n.velocity });
-        out.push(AbsNoteEvent { sample: off_s, key: n.key, velocity: 0 });
+        let (key, velocity) = clip_note_key_vel(clip, n);
+        out.push(AbsNoteEvent { sample: on_s, key, velocity });
+        out.push(AbsNoteEvent { sample: off_s, key, velocity: 0 });
     }
     out.sort_by_key(|e| (e.sample, e.velocity));
     out
@@ -206,6 +212,18 @@ mod tests {
             ],
             "one written note → one on/off, even when the placement loops the content"
         );
+    }
+
+    #[test]
+    fn drive_events_apply_transpose_and_velocity_offset() {
+        let mut c = clip(0, 1920, vec![note(0, 480, 60, 100)]);
+        c.transpose_semitones = 2;
+        c.velocity_offset = -10;
+        let ev = clip_drive_events(&c, &map_120());
+        assert_eq!(ev[0].key, 62);
+        assert_eq!(ev[0].velocity, 90);
+        assert_eq!(ev[1].key, 62);
+        assert_eq!(ev[1].velocity, 0);
     }
 
     #[test]
