@@ -23,6 +23,10 @@ described here only.
   (ImportDropZone) with WAV/MP3/FLAC/OGG/AAC/M4A decode (symphonia).
 - Hardware MIDI input + output (PR #17 slice 1, owner-verified with an
   LPK25; PR #21 slice 2: routing, recording, clock/sync, note-out).
+- MIDI launch map **v0.1** (PR #42): named launchers, GATE/ONE-SHOT,
+  clip-as-instrument, shadow playhead so the arrangement loop stays put.
+  Follow-up (sustain / overlapping voices) is in `midi-launch.md`, not
+  this cut.
 
 ## Tier 1 — usable for finishing real music (weeks)
 
@@ -53,6 +57,9 @@ described here only.
   the same MIDI track. The rest of the product cut is still open.
 - Two-instance coexistence (fixed MCP port 41717 collides today — dynamic
   port + discovery needed before "copy between instances" is fully real).
+- MIDI launch **sustain**: overlapping voices so retriggering a scene
+  does not cut the previous one (`midi-launch.md`). Third play mode
+  after GATE/ONE-SHOT. Wait until v0.1 has been used.
 
 ## Sequencing notes
 
