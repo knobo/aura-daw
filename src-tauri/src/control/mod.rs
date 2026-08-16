@@ -2656,17 +2656,23 @@ impl ControlPlane {
     /// is unknown, no project is open, or the source file is missing on disk
     /// — a moved/deleted source must surface as an error, not a silent no-op.
     pub fn clip_source_abs_path(&self, clip_id: &str) -> Result<PathBuf, String> {
-        let session = self.session.lock();
-        let clip = session
-            .store
-            .clips
-            .iter()
-            .find(|c| c.id == clip_id)
-            .ok_or_else(|| format!("unknown clip: {clip_id}"))?;
-        let path = session
-            .store
-            .abs_path(&clip.source_path)
-            .ok_or_else(|| "no project directory open".to_string())?;
+        let (rel, dir) = {
+            let session = self.session.lock();
+            let clip = session
+                .store
+                .clips
+                .iter()
+                .find(|c| c.id == clip_id)
+                .ok_or_else(|| format!("unknown clip: {clip_id}"))?;
+            let rel = crate::audio::project::normalize_source_path(&clip.source_path)?;
+            let dir = session
+                .store
+                .project_dir
+                .clone()
+                .ok_or_else(|| "no project directory open".to_string())?;
+            (rel, dir)
+        };
+        let path = dir.join(rel);
         if !path.is_file() {
             return Err(format!("missing audio source: {}", path.display()));
         }
@@ -4361,20 +4367,9 @@ pub fn remove_clip(clip_id: String, control: State<'_, Arc<ControlPlane>>) -> Re
     control.remove_clip(&clip_id, op::TxMeta::user("remove clip"))
 }
 
-/// Open an audio clip's source file in the OS's default application for its
-/// file type — "open in external editor" (double-click an audio clip on the
-/// timeline, mirroring the MIDI clip's double-click-opens-piano-roll).
-/// `tauri-plugin-shell` is already a dependency (sidecar `sh`/`python3`
-/// execution); this calls its `open` directly from Rust, so the plugin's
-/// JS-invoke scope validation (http(s)/mailto/tel only) never applies here —
-/// the path comes from the project's own clip table, not attacker-controlled
-/// IPC input. Needs registration in the frozen lib.rs, same as
-/// `import_audio_clip_split_stems`. Additive command.
-///
-/// `Shell::open` is deprecated in favor of `tauri-plugin-opener` (2.1.0+),
-/// but adding a new plugin crate means editing the frozen `Cargo.toml` /
-/// `lib.rs` plugin registration — out of scope for one command when the
-/// already-registered `tauri-plugin-shell` does the job.
+/// Open an audio clip's source file in the OS default app. Additive,
+/// read-only: errors if the clip, project, or source is missing, or if
+/// `source_path` is not project-relative.
 #[allow(deprecated)]
 #[tauri::command]
 pub fn open_clip_in_external_editor(
@@ -5154,6 +5149,36 @@ mod tests {
 
         let err = plane.clip_source_abs_path("c-1").unwrap_err();
         assert!(err.contains("missing audio source"), "the error explains why: {err}");
+    }
+
+    #[test]
+    fn clip_source_abs_path_rejects_an_absolute_source_path() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let dir = tmp_project_dir("abs-source");
+        {
+            let mut session = plane.session().lock();
+            session.store.project_dir = Some(dir);
+            let mut clip = test_clip("c-1", "t-1");
+            clip.source_path = "/etc/passwd".into();
+            session.store.clips.push(clip);
+        }
+        let err = plane.clip_source_abs_path("c-1").unwrap_err();
+        assert!(err.contains("absolute"), "the error names the escape: {err}");
+    }
+
+    #[test]
+    fn clip_source_abs_path_rejects_a_dotdot_source_path() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        let dir = tmp_project_dir("dotdot-source");
+        {
+            let mut session = plane.session().lock();
+            session.store.project_dir = Some(dir);
+            let mut clip = test_clip("c-1", "t-1");
+            clip.source_path = "../secret.wav".into();
+            session.store.clips.push(clip);
+        }
+        let err = plane.clip_source_abs_path("c-1").unwrap_err();
+        assert!(err.contains("escapes"), "the error names the escape: {err}");
     }
 
     /// The inverse (`Op::ClipAdd`) must restore the clip byte-identically —

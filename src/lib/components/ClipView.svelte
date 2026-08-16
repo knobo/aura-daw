@@ -129,7 +129,9 @@
   // Double-click hands the clip's source file off to the OS's default app
   // for its file type — the audio-clip analogue of MidiClipView's
   // double-click-opens-piano-roll.
-  function onDblClick() {
+  function onDblClick(e: MouseEvent) {
+    e.stopPropagation();
+    if ((e.target as HTMLElement).closest("button")) return;
     void project.openInExternalEditor(clip.id);
   }
 
