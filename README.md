@@ -406,7 +406,7 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # PENDING tests (PENDING lib + 36 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after HostForward insert restore + the pitch worker thread): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map
+cd src-tauri && cargo test    # 1018 tests (982 lib + 36 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after HostForward insert restore + the pitch worker thread): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map
 npm test                      # 488 frontend unit tests (counted 2026-08-16 after #47 + MIDI launch review; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + launch map
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
