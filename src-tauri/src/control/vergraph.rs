@@ -415,6 +415,18 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             }
             Op::LaunchDriveSet { map_id, clip_id, .. } => map_id.len() + clip_id.len(),
             Op::LaunchMapSet { id, map } => id.len() + map.as_ref().map_or(0, launch_map_heap),
+            // Plan G1: charge payload string heaps (+ InsertSlot fields).
+            // Indices / bools live in the enum slot already counted by
+            // `size_of_val(ops)`.
+            Op::InsertAdd { track_id, slot, .. } | Op::InsertRemove { track_id, slot, .. } => {
+                track_id.as_str().len() + slot.id.len() + slot.instance_id.len()
+            }
+            Op::InsertReorder { track_id, slot_id, .. } => {
+                track_id.as_str().len() + slot_id.len()
+            }
+            Op::InsertSetBypass { track_id, slot_id, .. } => {
+                track_id.as_str().len() + slot_id.len()
+            }
         };
     }
     bytes

@@ -41,6 +41,11 @@ pub trait AudioProcessor: Send {
     /// In-place, RT-safe.
     fn process(&mut self, io: &mut ProcessBlock<'_>);
     fn reset(&mut self);
+    /// Processing latency in samples (PDC). Default 0 for processors that
+    /// introduce none; plugin hosts override from the format's latency report.
+    fn latency_samples(&self) -> usize {
+        0
+    }
 }
 
 /// A live, in-graph instrument node (phase 3, ARCHITECTURE §15): renders
@@ -213,7 +218,8 @@ mod tests {
         st.set_ratio(1.5, 0.5);
         assert_eq!(st.time_ratio(), 1.5);
         assert_eq!(st.pitch_ratio(), 0.5);
-        assert_eq!(st.latency_samples(), 0);
+        assert_eq!(TimeStretcher::latency_samples(&st), 0);
+        assert_eq!(AudioProcessor::latency_samples(&st), 0);
 
         let mut buf = vec![0.1f32, -0.2, 0.3, -0.4];
         let orig = buf.clone();
@@ -230,6 +236,12 @@ mod tests {
         assert!(!e.bypassed());
         e.set_bypassed(true);
         assert!(e.bypassed());
+    }
+
+    #[test]
+    fn audio_processor_default_latency_is_zero() {
+        let e = NullEffect::default();
+        assert_eq!(e.latency_samples(), 0);
     }
 
     #[test]
