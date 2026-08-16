@@ -1044,7 +1044,9 @@ struct Control {
     /// `PitchTap`, including the dormant one a take on the pitch device
     /// carries: flipping this is how listening starts mid-take without
     /// rebuilding a recording stream (PR #49 issue 7). Mirrors
-    /// `wants_listening`; `set_listening` is the only writer.
+    /// `wants_listening`, and every site that clears one must clear the
+    /// other: `set_listening`, the `SelectInput` restore-failure path, and
+    /// the `start_recording` group-open-failure path.
     pitch_active: Arc<AtomicBool>,
     /// Whether the user wants live pitch at all (owner ruling R6: an
     /// explicit listen toggle or an open panel — never track arm).
@@ -2347,9 +2349,10 @@ impl Control {
     fn build_pitch_tap(
         rate: u32,
         active: Arc<AtomicBool>,
-    ) -> (PitchTap, PitchWorkerHandle, rtrb::Consumer<PitchFrame>) {
+    ) -> Result<(PitchTap, PitchWorkerHandle, rtrb::Consumer<PitchFrame>), String> {
         let (tap, worker, rx) = pitch_channel(rate, active);
-        (tap, spawn_pitch_worker(worker), rx)
+        let handle = spawn_pitch_worker(worker).map_err(|e| e.to_string())?;
+        Ok((tap, handle, rx))
     }
 
     /// Stream-less listen bundle used by tests (no cpal device) and by
@@ -2383,8 +2386,10 @@ impl Control {
         let (device, cfg) = self.resolve_input_device(device_id)?;
         let in_ch = cfg.channels().max(1) as usize;
         let rate = cfg.sample_rate().0;
+        // Fatal here: a listen stream with no analyser is a stream that
+        // exists only to be dark.
         let (pitch, pitch_worker, pitch_rx) =
-            Self::build_pitch_tap(rate, self.pitch_active.clone());
+            Self::build_pitch_tap(rate, self.pitch_active.clone())?;
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let mut cb = InputCb {
             producers: Vec::new(),
@@ -2494,11 +2499,16 @@ impl Control {
         let writer = recorder::spawn(specs, consumers, rec_ch as u16, rate)?;
         let (meter_tx, meter_rx) = rtrb::RingBuffer::new(METER_RING_SLOTS);
         let n_producers = producers.len();
+        // NOT fatal here: a take must not fail because the tuner could not
+        // start. It loses live pitch for its duration, loudly.
         let (pitch, pitch_worker, pitch_rx) = match with_pitch {
-            true => {
-                let (tap, worker, rx) = Self::build_pitch_tap(rate, self.pitch_active.clone());
-                (Some(tap), Some(worker), Some(rx))
-            }
+            true => match Self::build_pitch_tap(rate, self.pitch_active.clone()) {
+                Ok((tap, worker, rx)) => (Some(tap), Some(worker), Some(rx)),
+                Err(e) => {
+                    log::warn!("audio: live pitch unavailable for this take: {e}");
+                    (None, None, None)
+                }
+            },
             false => (None, None, None),
         };
         let mut cb = InputCb {
@@ -2604,8 +2614,11 @@ impl Control {
             // device), and if it does not, `sync_input_hub` below reopens it.
             self.listen_input = None;
             // Not gated on `wants_listening`: the tap rides along dormant so
-            // opening the panel mid-take wakes it (issue 7). Its cost while
-            // dormant is one relaxed atomic load per capture buffer.
+            // opening the panel mid-take wakes it (issue 7). A dormant tap
+            // costs one relaxed atomic load per capture buffer on the RT
+            // side; the take also carries the chain's rings (~525 KB) and a
+            // worker thread that backs off to 20 wake-ups a second while the
+            // flag is clear.
             let pitch_group = self.pitch_group_key(by_device.keys());
 
             let mut groups: Vec<(InputBundle, DiskWriter)> = Vec::new();

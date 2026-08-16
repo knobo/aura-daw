@@ -23,6 +23,12 @@
 //! see always has its samples already behind it. A chunk that does not fit in
 //! either ring is dropped WHOLE — never half-written — so the two rings can
 //! not drift out of step.
+//!
+//! Dropping whole keeps the RINGS aligned, but not the detector: it carries
+//! most of an analysis frame across a `push`, so without more it would splice
+//! samples from either side of the hole and timestamp the result at the new
+//! position. A drop therefore also owes the worker a reset, exactly as
+//! switching the tap on does — see `pending_reset`.
 
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::Arc;
@@ -51,10 +57,17 @@ const CHUNK_RING_SLOTS: usize = 512;
 /// Analysed frames waiting for the 60 Hz control tick.
 const FRAME_RING_SLOTS: usize = 512;
 
-/// How long the worker sleeps when there is nothing to analyse. Frames are
-/// consumed by a 60 Hz tick (16.7 ms), so this is well inside the budget and
-/// costs 200 wake-ups a second when idle.
+/// How long the worker sleeps when there is nothing to analyse but the tap
+/// is live. Frames are consumed by a 60 Hz tick (16.7 ms), so this is well
+/// inside the budget.
 const POLL: Duration = Duration::from_millis(5);
+
+/// The same, while the tap is dormant. A take on the pitch device carries a
+/// worker for its whole length even if the panel is never opened, so that
+/// case backs off to 20 wake-ups a second instead of 200. Waking on the
+/// off→on edge can therefore lag by up to this long — invisible, because the
+/// tap has been filling a ring that holds seconds, so nothing is lost.
+const POLL_DORMANT: Duration = Duration::from_millis(50);
 
 /// Describes the samples that precede it in the sample ring.
 #[derive(Clone, Copy, Debug)]
@@ -90,7 +103,10 @@ pub struct PitchTap {
     /// filter state and tell the worker to reset the analyser.
     was_active: bool,
     /// A reset is owed to the worker but has not been attached to a chunk
-    /// yet (the resampler can swallow a short buffer whole).
+    /// yet — either the tap has just been switched on, or a chunk was
+    /// dropped and the samples either side of the hole are not contiguous.
+    /// Sticky until a chunk actually carries it (a short buffer can be
+    /// swallowed whole by the resampler).
     pending_reset: bool,
     device_rate: u32,
 }
@@ -138,9 +154,15 @@ impl PitchTap {
         // trail a few pixels; desynchronising them would corrupt every frame
         // that follows.
         if self.chunks_tx.slots() == 0 || self.samples_tx.slots() < len {
+            // The hole this leaves is not silence, it is missing time. Owe
+            // the worker a reset so the detector does not carry its
+            // half-finished frame across it and report the result at a
+            // position those samples never occupied.
+            self.pending_reset = true;
             return;
         }
         let Ok(slot) = self.samples_tx.write_chunk_uninit(len) else {
+            self.pending_reset = true;
             return;
         };
         slot.fill_from_iter(self.dec_buf.iter().copied());
@@ -164,6 +186,8 @@ pub struct PitchWorker {
     /// requirement here — just no reason to churn.
     scratch: Vec<f32>,
     frames: Vec<PitchFrame>,
+    /// The tap's flag, read only to decide how hard to poll.
+    active: Arc<AtomicBool>,
 }
 
 impl PitchWorker {
@@ -174,9 +198,16 @@ impl PitchWorker {
         while let Ok(chunk) = self.chunks_rx.pop() {
             let len = chunk.len as usize;
             let Ok(read) = self.samples_rx.read_chunk(len) else {
-                // Cannot happen: samples are written before the descriptor
-                // that describes them. Stop rather than analyse a short read
-                // as if it were a whole chunk.
+                // Unreachable with this wiring — samples are written before
+                // the descriptor that describes them. If it ever does happen,
+                // the ring and the descriptors have lost their
+                // correspondence, and carrying on is the exact failure this
+                // module exists to prevent: the NEXT descriptor would be
+                // analysed against THIS chunk's samples. Throw both away and
+                // start the detector over instead.
+                while self.samples_rx.pop().is_ok() {}
+                while self.chunks_rx.pop().is_ok() {}
+                self.analyzer.reset();
                 break;
             };
             self.scratch.clear();
@@ -214,16 +245,25 @@ pub struct PitchWorkerHandle {
 }
 
 impl Drop for PitchWorkerHandle {
+    /// Runs on the engine control thread — on every listen toggle, device
+    /// rebuild, take start and take stop — so it must not wait out a poll
+    /// interval. The unpark is what keeps the join immediate.
     fn drop(&mut self) {
         self.stop.store(true, Relaxed);
         if let Some(j) = self.join.take() {
+            j.thread().unpark();
             let _ = j.join();
         }
     }
 }
 
 /// Run a worker on its own thread until the returned handle is dropped.
-pub fn spawn_pitch_worker(mut worker: PitchWorker) -> PitchWorkerHandle {
+///
+/// Fallible on purpose. A worker that never starts is a stream whose pitch
+/// ring nobody ever fills — live pitch would be silently and permanently
+/// dark for it, with `pitch://state` still claiming to be listening — so the
+/// caller has to see this rather than have it swallowed.
+pub fn spawn_pitch_worker(mut worker: PitchWorker) -> std::io::Result<PitchWorkerHandle> {
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
     let join = std::thread::Builder::new()
@@ -231,12 +271,21 @@ pub fn spawn_pitch_worker(mut worker: PitchWorker) -> PitchWorkerHandle {
         .spawn(move || {
             while !flag.load(Relaxed) {
                 if worker.pump() == 0 {
-                    std::thread::sleep(POLL);
+                    // `park_timeout`, not `sleep`: dropping the handle
+                    // unparks, so a stop is immediate instead of waiting out
+                    // the poll. Spurious wake-ups just pump again.
+                    let idle = match worker.active.load(Relaxed) {
+                        true => POLL,
+                        false => POLL_DORMANT,
+                    };
+                    std::thread::park_timeout(idle);
                 }
             }
-        })
-        .ok();
-    PitchWorkerHandle { stop, join }
+        })?;
+    Ok(PitchWorkerHandle {
+        stop,
+        join: Some(join),
+    })
 }
 
 /// Build both halves of the chain plus the frame consumer the control thread
@@ -269,6 +318,7 @@ pub fn pitch_channel(
         frames_tx,
         scratch: Vec::with_capacity(SAMPLE_RING_SLOTS),
         frames: Vec::with_capacity(256),
+        active: tap.active.clone(),
     };
     (tap, worker, frames_rx)
 }
@@ -425,18 +475,71 @@ mod tests {
         }
     }
 
+    /// A phase-continuous staircase: `block` device samples of each note in
+    /// turn, so a frame's pitch identifies WHICH samples produced it.
+    fn staircase(n: usize, block: usize, notes: &[f32]) -> Vec<f32> {
+        let mut phase = 0.0f32;
+        (0..n)
+            .map(|i| {
+                let hz = notes[(i / block) % notes.len()];
+                let s = phase.sin();
+                phase += 2.0 * std::f32::consts::PI * hz / RATE as f32;
+                s
+            })
+            .collect()
+    }
+
     /// A worker that falls far behind drops whole chunks. What must never
-    /// happen is a chunk analysed against another chunk's samples — that
+    /// happen is a chunk analysed against ANOTHER chunk's samples — that
     /// would mistime every frame after it, silently and forever.
+    ///
+    /// Two things this test has to get right, both of which an earlier
+    /// version got wrong:
+    ///
+    /// * The feed must actually overflow the descriptor ring — 600 buffers
+    ///   against `CHUNK_RING_SLOTS` (512) — while staying inside the sample
+    ///   ring, so it is the descriptor guard under test and not the other one.
+    /// * The signal must carry identity. Against a steady tone every frame
+    ///   looks the same whichever samples produced it, so a desync is
+    ///   invisible; a staircase makes the detected note say where the samples
+    ///   came from. The pump between the rounds is what would expose orphaned
+    ///   samples to the NEXT round's descriptors.
     #[test]
     fn a_backed_up_ring_drops_whole_chunks_and_stays_aligned() {
-        let (mut tap, mut worker, mut frames, _active) = chain(true);
-        // Far more than SAMPLE_RING_SLOTS holds, with nothing pumping.
-        let end = feed(&mut tap, 220.0, RATE as usize * 4, 0);
-        worker.pump();
+        const BUFFERS: usize = 600;
+        const BLOCK: usize = RATE as usize; // one second per note
+        /// A3 and D4 — five semitones apart, so a desync of even a fraction
+        /// of a block lands outside the tolerance below.
+        const NOTES: [f32; 2] = [220.0, 293.665];
+        const MIDI: [f32; 2] = [57.0, 62.0];
+        /// The median filter and the jump limiter need a few frames to
+        /// follow a leap; frames this close after a boundary are not asserted.
+        const SETTLE: u64 = RATE as u64 / 5; // 200 ms
 
-        let got = drain(&mut frames);
-        assert!(!got.is_empty(), "the chunks that did fit are analysed");
+        let (mut tap, mut worker, mut frames, _active) = chain(true);
+        let sig = staircase(BUFFERS * 512 * 2, BLOCK, &NOTES);
+        let mut pos = 0u64;
+        let mut analysed = 0;
+        let mut got = Vec::new();
+        // Two rounds with a pump between them: round one backs the rings up,
+        // and round two is where samples orphaned by a dropped descriptor
+        // would surface.
+        for round in sig.chunks(BUFFERS * 512) {
+            for buf in round.chunks(512) {
+                tap.process(buf, 1, pos);
+                pos += buf.len() as u64;
+            }
+            analysed += worker.pump();
+            got.extend(drain(&mut frames));
+        }
+        assert!(
+            analysed < BUFFERS * 2,
+            "the descriptor ring must actually have overflowed, or this test \
+             is vacuous: {analysed} of {} chunks were analysed",
+            BUFFERS * 2
+        );
+
+        let mut checked = 0;
         let mut prev = 0u64;
         for f in &got {
             assert!(f.hz.is_finite() && f.midi.is_finite());
@@ -446,12 +549,28 @@ mod tests {
                 f.sample
             );
             assert!(
-                f.sample <= end,
+                f.sample <= pos,
                 "frame at {} is past everything fed",
                 f.sample
             );
             prev = f.sample;
+            if !f.voiced || f.sample % (BLOCK as u64) < SETTLE {
+                continue;
+            }
+            let want = MIDI[(f.sample as usize / BLOCK) % MIDI.len()];
+            assert!(
+                (f.midi - want).abs() < 1.0,
+                "frame at {} reports {:.2} but {want} was being sung there — \
+                 a dropped descriptor left its samples in the ring",
+                f.sample,
+                f.midi
+            );
+            checked += 1;
         }
+        assert!(
+            checked > 100,
+            "only {checked} frames were actually asserted on"
+        );
     }
 
     /// The sample ring has to hold one MAXIMAL chunk. If it cannot, a device
@@ -461,9 +580,12 @@ mod tests {
     fn a_maximal_chunk_always_fits() {
         let active = Arc::new(AtomicBool::new(true));
         // The worst case the tap admits: a full `PITCH_TAP_MAX_FRAMES`
-        // buffer from a device slow enough that 8 kHz is an UPsample.
-        let slow = 4_000;
-        let (mut tap, mut worker, _frames) = pitch_channel(slow, active);
+        // buffer from the slowest device rate the decimator accepts, which
+        // is the largest 8 kHz output any single buffer can produce.
+        // `Decimator` clamps `in_rate` at 1 kHz, so that rate is where the
+        // 8× upsample — and the largest chunk the tap can emit — lives.
+        let slowest = 1_000;
+        let (mut tap, mut worker, _frames) = pitch_channel(slowest, active);
         tap.process(&vec![0.5f32; PITCH_TAP_MAX_FRAMES], 1, 0);
         assert_eq!(
             worker.pump(),
@@ -477,7 +599,7 @@ mod tests {
     #[test]
     fn the_spawned_worker_analyses_without_being_pumped() {
         let (mut tap, worker, mut frames, _active) = chain(true);
-        let handle = spawn_pitch_worker(worker);
+        let handle = spawn_pitch_worker(worker).expect("spawn");
         feed(&mut tap, 220.0, RATE as usize / 2, 0);
 
         let mut got = Vec::new();
