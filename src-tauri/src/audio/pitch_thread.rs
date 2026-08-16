@@ -132,17 +132,29 @@ impl PitchTap {
         }
 
         let channels = channels.max(1);
+        // `dec_buf` is reserved for one `PITCH_TAP_MAX_FRAMES` buffer, which
+        // is well past any real period. A larger one is handed over in
+        // several chunks rather than truncated: dropping the tail would
+        // splice the analyser across the hole, which is the one thing this
+        // module promises not to do, and it would do it on every buffer.
         let max_samples = PITCH_TAP_MAX_FRAMES.saturating_mul(channels);
-        // A period larger than `PITCH_TAP_MAX_FRAMES` is not a real device —
-        // drop the surplus rather than let `Vec::push` grow on the RT thread.
-        let data = if input.len() > max_samples {
-            &input[..max_samples]
-        } else {
-            input
-        };
+        let mut at = 0usize;
+        while at < input.len() {
+            let take = max_samples.min(input.len() - at);
+            // Whole frames only, so a chunk boundary never lands mid-frame.
+            let take = (take / channels).max(1) * channels;
+            let end = (at + take).min(input.len());
+            let start = start_sample + (at / channels) as u64;
+            self.hand_over(&input[at..end], channels, start);
+            at = end;
+        }
+    }
 
+    /// One chunk, sized to fit the reserved buffers: decimate, then publish
+    /// samples and descriptor together or not at all.
+    fn hand_over(&mut self, input: &[f32], channels: usize, start_sample: u64) {
         self.dec_buf.clear();
-        self.decimator.process(data, channels, &mut self.dec_buf);
+        self.decimator.process(input, channels, &mut self.dec_buf);
         let len = self.dec_buf.len();
         if len == 0 {
             return;
@@ -570,6 +582,37 @@ mod tests {
         assert!(
             checked > 100,
             "only {checked} frames were actually asserted on"
+        );
+    }
+
+    /// A period above `PITCH_TAP_MAX_FRAMES` is not a real device, but
+    /// discarding its tail would splice the analyser across the hole — the
+    /// one thing this module promises not to do. Process it whole instead.
+    #[test]
+    fn an_oversize_buffer_is_processed_whole() {
+        let (mut tap, mut worker, mut frames, _active) = chain(true);
+        let n = PITCH_TAP_MAX_FRAMES * 2 + 137;
+        tap.process(&tone(220.0, n), 1, 0);
+        worker.pump();
+
+        let got = drain(&mut frames);
+        let last = got.last().expect("frames");
+        assert!(
+            last.sample > PITCH_TAP_MAX_FRAMES as u64,
+            "the last frame is at {} — nothing past the truncation point was \
+             analysed at all",
+            last.sample
+        );
+        // The analyser legitimately holds back its unfinished frame, which
+        // is one `frame_len` at 8 kHz (~39 ms). 50 ms covers that with
+        // margin and still fails hard on truncation, which would leave the
+        // second half of the buffer — 170 ms — unanalysed.
+        let held = n as u64 - last.sample;
+        assert!(
+            held < RATE as u64 / 20,
+            "{held} samples ({:.0} ms) were left unanalysed at the end of the \
+             buffer — more than one analysis frame, so the tail was dropped",
+            held as f32 * 1000.0 / RATE as f32
         );
     }
 

@@ -87,22 +87,41 @@ fn median(v: &[f32]) -> f32 {
 }
 
 fn main() -> Result<(), String> {
+    const USAGE: &str = "usage: pitch_check [seconds] [note|hz] [--tone[=level]]";
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let secs: u64 = args.first().and_then(|s| s.parse().ok()).unwrap_or(10);
-    // A target is optional: with none, every frame is scored against
-    // whichever note it is nearest, which is what you want when checking
-    // "does it track my voice" rather than "am I in tune".
-    let target: Option<f32> = args.get(1).and_then(|s| {
-        parse_note(s)
-            .map(|m| midi_to_hz(m as f32))
-            .or_else(|| s.parse::<f32>().ok())
-    });
-    if args.len() > 1 && target.is_none() {
-        return Err(format!(
-            "could not read a note or a frequency from {:?}",
-            args[1]
-        ));
+    let (flags, positional): (Vec<&String>, Vec<&String>) =
+        args.iter().partition(|a| a.starts_with("--"));
+    if let Some(bad) = flags.iter().find(|f| !f.starts_with("--tone")) {
+        return Err(format!("unknown option {bad:?}\n{USAGE}"));
     }
+    if positional.len() > 2 {
+        return Err(format!("too many arguments\n{USAGE}"));
+    }
+
+    // Parsed by POSITION, and a position that does not parse is an error
+    // rather than a silent default: `pitch_check A3` used to run a full
+    // ten-second measurement with the target quietly ignored, which is the
+    // worst outcome — it looks like it worked.
+    let secs: u64 = match positional.first() {
+        None => 10,
+        Some(a) => a.parse().map_err(|_| {
+            format!("first argument is the duration in seconds, got {a:?}\n{USAGE}")
+        })?,
+    };
+    if secs == 0 {
+        return Err(format!("a zero-second run measures nothing\n{USAGE}"));
+    }
+    let target: Option<f32> = match positional.get(1) {
+        None => None,
+        Some(a) => Some(
+            parse_note(a)
+                .map(|m| midi_to_hz(m as f32))
+                .or_else(|| a.parse::<f32>().ok().filter(|hz| *hz > 0.0))
+                .ok_or_else(|| {
+                    format!("second argument is a note or a frequency, got {a:?}\n{USAGE}")
+                })?,
+        ),
+    };
 
     let play_tone = args.iter().any(|a| a.starts_with("--tone"));
     // `--tone` alone is -20 dBFS; `--tone=0.3` is louder. The first run of

@@ -224,7 +224,7 @@ with the commit sha and anything the next agent would be surprised by.
 ## Log
 
 - 2026-08-16 — Review follow-ups 6 and 7 done on `feat/pitch-rt-thread`
-  (`007d346`, `af9b1ea`). Four things the next agent should know:
+  (`007d346`, `af9b1ea`). Five things the next agent should know:
   1. **The capture callback no longer detects anything.** `audio/pitch_thread.rs`
      owns the split: `PitchTap` (decimate, hand over) on the RT side,
      `PitchWorker` (YIN, gate, median, jump limiter) on a worker thread.

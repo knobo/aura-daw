@@ -2261,9 +2261,23 @@ impl Control {
             .unwrap_or(0)
     }
 
+    /// Is there anything anywhere that can actually analyse right now? The
+    /// listen stream carries a tap, and so does a take on the pitch device —
+    /// but a take whose worker thread failed to spawn does NOT, and while
+    /// that take runs it owns the device, so no listen stream can be opened
+    /// to make up for it (`listen_stream_wanted`).
+    fn pitch_tap_present(&self) -> bool {
+        self.listen_input.as_ref().is_some_and(|h| h.pitch_rx.is_some())
+            || self.inputs.iter().any(|i| i.pitch_rx.is_some())
+    }
+
     fn current_pitch_state(&self) -> PitchState {
         PitchState {
-            listening: self.wants_listening,
+            // Intent AND capability. Reporting bare intent would light up a
+            // panel over a trail that can never draw, with nothing to tell
+            // the user why — the failure `spawn_pitch_worker` is fallible to
+            // avoid, reintroduced one layer up.
+            listening: self.wants_listening && self.pitch_tap_present(),
             rehearse_hold: self.rehearse.load(Relaxed),
             reference_track_id: self.reference_track_id.clone(),
             device_rate: self.pitch_device_rate(),
@@ -2306,7 +2320,10 @@ impl Control {
         let batch = PitchFrameBatch {
             frames: std::mem::take(&mut scratch),
             device_rate: self.pitch_device_rate(),
-            listening: self.wants_listening,
+            // Same rule as `current_pitch_state`: the flag rides on the
+            // batch so the UI does not have to wait for `pitch://state`,
+            // and the two must not disagree.
+            listening: self.wants_listening && self.pitch_tap_present(),
             rehearse_hold: self.rehearse.load(Relaxed),
         };
         self.pitch_scratch = scratch;
@@ -2505,6 +2522,11 @@ impl Control {
             true => match Self::build_pitch_tap(rate, self.pitch_active.clone()) {
                 Ok((tap, worker, rx)) => (Some(tap), Some(worker), Some(rx)),
                 Err(e) => {
+                    // The take goes on without live pitch — it must not fail
+                    // because the tuner could not start. `pitch_tap_present`
+                    // is what stops this being silent: with no tap anywhere,
+                    // `pitch://state` reports `listening: false` for as long
+                    // as this take owns the device.
                     log::warn!("audio: live pitch unavailable for this take: {e}");
                     (None, None, None)
                 }
@@ -5291,6 +5313,36 @@ mod tests {
             None,
             "no group captures the pitch device: nothing to attach to"
         );
+    }
+
+    /// A take on the pitch device whose tap could not be built (the worker
+    /// thread failed to spawn) leaves nothing that can analyse, and the take
+    /// owns the device so no listen stream can be opened either. Reporting
+    /// `listening: true` there would be a lie the UI cannot see through: an
+    /// enabled panel over a permanently dark trail, until the take stops.
+    #[test]
+    fn pitch_state_does_not_claim_to_listen_with_no_tap() {
+        let (mut ctl, _session) = bare_control();
+        ctl.inputs.push(fake_bundle_on("", false));
+        ctl.set_listening(true).expect("no second stream to open");
+
+        assert!(ctl.wants_listening, "the intent is still recorded");
+        assert!(
+            ctl.listen_input.is_none(),
+            "the take owns the device; no listen stream is possible"
+        );
+        assert!(
+            !ctl.current_pitch_state().listening,
+            "nothing can analyse, so the state must not claim to be listening"
+        );
+    }
+
+    /// The mirror: with a tap present, the state reports what it should.
+    #[test]
+    fn pitch_state_reports_listening_when_a_tap_exists() {
+        let (mut ctl, _session) = bare_control();
+        ctl.set_listening(true).expect("stub hub");
+        assert!(ctl.current_pitch_state().listening);
     }
 
     /// A listen that could not open a device must leave every tap dormant —
