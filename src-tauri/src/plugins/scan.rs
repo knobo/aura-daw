@@ -17,17 +17,41 @@ use super::descriptor::{clap_uid, lv2_uid, PluginDescriptor};
 // Search paths
 // ---------------------------------------------------------------------------
 
-/// Standard CLAP search paths (Linux, per clap entry.h) plus `$CLAP_PATH`
-/// (colon-separated). Scanned recursively for `*.clap` files.
+/// Standard CLAP search paths per clap `entry.h`, plus `$CLAP_PATH`.
+///
+/// The roots and the `CLAP_PATH` separator are both platform-specific (`:`
+/// on Unix, `;` on Windows — a Windows path starts `C:\`, so splitting on
+/// `:` there would shred every entry). This matters more on Windows than
+/// anywhere else: that build has no LV2 (see the `lv2` feature), so CLAP is
+/// the ONLY format it can find, and an empty search path means an empty
+/// plugin list.
 pub fn clap_search_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".clap"));
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(home) = dirs::home_dir() {
+            paths.push(home.join(".clap"));
+        }
+        paths.push(PathBuf::from("/usr/lib/clap"));
+        paths.push(PathBuf::from("/usr/local/lib/clap"));
     }
-    paths.push(PathBuf::from("/usr/lib/clap"));
-    paths.push(PathBuf::from("/usr/local/lib/clap"));
+    #[cfg(target_os = "windows")]
+    {
+        // Per clap entry.h: the per-user root is
+        // %LOCALAPPDATA%\Programs\Common\CLAP, the system one
+        // %COMMONPROGRAMFILES%\CLAP.
+        if let Some(local) = dirs::data_local_dir() {
+            paths.push(local.join("Programs").join("Common").join("CLAP"));
+        }
+        for var in ["CommonProgramFiles", "CommonProgramFiles(x86)"] {
+            if let Some(dir) = std::env::var_os(var) {
+                paths.push(PathBuf::from(dir).join("CLAP"));
+            }
+        }
+    }
     if let Ok(env) = std::env::var("CLAP_PATH") {
-        paths.extend(env.split(':').filter(|s| !s.is_empty()).map(PathBuf::from));
+        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        paths.extend(env.split(sep).filter(|s| !s.is_empty()).map(PathBuf::from));
     }
     paths.retain(|p| p.is_dir());
     paths.dedup();
@@ -127,6 +151,7 @@ pub fn scan_clap_bundles_in_process(bundles: &[PathBuf]) -> Vec<PluginDescriptor
 /// `/usr/lib/lv2`). Only plugins livi can host are listed (livi filters by
 /// its supported feature set — urid/options/bufsize/worker — which covers
 /// ZynAddSubFX & friends).
+#[cfg(feature = "lv2")]
 pub fn scan_lv2() -> Vec<PluginDescriptor> {
     let world = livi::World::new();
     world
@@ -148,6 +173,13 @@ pub fn scan_lv2() -> Vec<PluginDescriptor> {
             }
         })
         .collect()
+}
+
+/// No-op twin for builds without the `lv2` feature: nothing to enumerate, so
+/// no `"lv2"` descriptor can reach the UI and the format is simply absent.
+#[cfg(not(feature = "lv2"))]
+pub fn scan_lv2() -> Vec<PluginDescriptor> {
+    Vec::new()
 }
 
 /// Full scan: LV2 world (metadata-only, safe in-process) + CLAP standard
