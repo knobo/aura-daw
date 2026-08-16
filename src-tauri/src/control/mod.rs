@@ -187,6 +187,10 @@ pub struct ControlPlane {
     /// have this unset and the MIDI-out routing/port/clock methods error
     /// rather than panic.
     midi_out: std::sync::OnceLock<Arc<crate::midi_out::MidiOut>>,
+    /// Serializes undo/redo pop→commit→push. `spawn_blocking` lets two
+    /// Ctrl+Z keydowns run at once; without this gate they can pop two
+    /// entries and apply inverses out of order (I-6).
+    history_gate: Mutex<()>,
 }
 
 /// The commit core, shareable with the engine control thread (Plan E Task
@@ -1497,6 +1501,7 @@ impl ControlPlane {
             last_gesture_batch: Mutex::new(None),
             midi_input: std::sync::OnceLock::new(),
             midi_out: std::sync::OnceLock::new(),
+            history_gate: Mutex::new(()),
         }
     }
 
@@ -2851,6 +2856,7 @@ impl ControlPlane {
         if let Some(g) = self.gesture.end() {
             self.close_gesture(g);
         }
+        let _gate = self.history_gate.lock();
         let Some((entry, popped_epoch)) = self.committer.log().pop_undo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
@@ -2889,6 +2895,7 @@ impl ControlPlane {
         if let Some(g) = self.gesture.end() {
             self.close_gesture(g);
         }
+        let _gate = self.history_gate.lock();
         let Some((entry, popped_epoch)) = self.committer.log().pop_redo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
@@ -3582,10 +3589,12 @@ impl ControlPlane {
             (project, dir, session.epoch, midi_snapshot, plugin_snapshot, session.modulation.clone())
         };
         project::save(&dir, &project)?;
+        let mut flush_ok = true;
         if let Some(m) = midi_snapshot {
             if let Err(e) = crate::midi::persist::save_snapshot_into_project(&dir, &m) {
                 log::warn!("save_project_mark: midi persist failed: {e}");
                 self.session.lock().midi.dirty = true;
+                flush_ok = false;
             } else {
                 self.committer.clear_midi_dirty_if_unchanged(&m);
             }
@@ -3596,7 +3605,10 @@ impl ControlPlane {
                     self.committer.clear_dirty_state_matching(&cleared, &doc);
                 }
                 Ok(_) => {}
-                Err(e) => log::warn!("save_project_mark: plugins persist failed: {e}"),
+                Err(e) => {
+                    log::warn!("save_project_mark: plugins persist failed: {e}");
+                    flush_ok = false;
+                }
             }
         }
         // epoch boundary: no document swap here (same project, same
@@ -3624,8 +3636,13 @@ impl ControlPlane {
         };
         if let Err(e) = crate::modulation::persist::save_into_project(&dir, &modulation_to_write) {
             log::warn!("save_project: modulation persist failed: {e}");
+            flush_ok = false;
         }
-        self.committer.log().snapshot_mark(epoch);
+        if flush_ok {
+            self.committer.log().snapshot_mark(epoch);
+        } else {
+            log::warn!("save_project_mark: skipping journal mark — a dirty-store flush failed");
+        }
         (self.emit)(
             "project://changed",
             serde_json::to_value(&project).unwrap_or_default(),

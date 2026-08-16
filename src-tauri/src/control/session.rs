@@ -316,50 +316,12 @@ impl Session {
     /// The ONLY way to mutate the document. Returns Err and leaves the
     /// session untouched if the closure fails (inverses rolled back).
     ///
-    /// A closure that PANICS is contained rather than allowed to unwind out
-    /// (Plan F Task 8, ruling F-3, closing inventory L-5: an escaping panic
-    /// left the document half-mutated with no journal record — a permanent,
-    /// silent divergence of log from document). Containment is a
-    /// crash-consistency net, NOT a license: "validate before mutating,
-    /// never panic inside a `transact` closure" remains a binding project
-    /// rule, and every contained panic is logged at error level as a caller
-    /// bug. What changed is the CONSEQUENCE of breaking the rule, not the
-    /// rule.
-    ///
-    /// Why restore from the image instead of replaying the collected
-    /// inverses (which is what the Err arm does): the inverse ledger is only
-    /// as complete as the last [`Tx::apply`] that RETURNED. An unwind can
-    /// come from anywhere — including, in future code, from inside
-    /// `apply_raw` after it has mutated but before it has produced an
-    /// inverse — so replaying it is trusting a ledger the panic may have
-    /// truncated. The pre-transaction image is total: it describes the whole
-    /// document at a point the transaction had certainly not yet reached.
-    ///
-    /// Every lock REACHABLE FROM A CLOSURE is `parking_lot`, which does NOT
-    /// poison, so a contained panic leaves no lock in a degraded state and
-    /// every later `lock()` behaves exactly as before — the channel stays
-    /// open. Scoped deliberately, because the crate is NOT uniformly
-    /// `parking_lot`: `midi_input`'s `MidiInputManager.inner` and
-    /// `ConnShared.recent_status` are `std::sync::Mutex`es. They are off this
-    /// path today (reached only from `ControlPlane::select_midi_input_*`,
-    /// never from inside a transaction) and MUST STAY OFF IT — a closure that
-    /// consulted the MIDI-input manager, which is exactly the TOCTOU-avoiding
-    /// read [`Tx::store`]'s doc encourages, would on a contained panic poison
-    /// that mutex for the rest of the session.
-    ///
-    /// Containment also depends on unwinding: a future `panic = "abort"` in
-    /// any profile deletes this feature silently, since `catch_unwind` never
-    /// runs. `Cargo.toml` sets no `panic` key in either profile.
-    ///
-    /// RESIDUAL, deliberately not covered: the Err arm's own rollback carries
-    /// `expect("rollback must not fail")`. A panic THERE is outside this
-    /// containment and re-opens L-5 for the closure-returned-`Err` path (not
-    /// for the panic path, which never reaches that arm). Reaching it needs a
-    /// test-only seam — `apply_raw` has no arithmetic, no `unwrap`/`expect`,
-    /// and every index is `.min()`-clamped or comes from a position search in
-    /// the same function — and the FIX is cheap without one (`pre_tx` is in
-    /// scope: log, `restore_from_snapshot(&pre_tx)`, break). What is missing
-    /// is coverage, not code, which is why nothing was shipped blind here.
+    /// A panicking closure is contained and the document restored from the
+    /// pre-tx published image — the inverse ledger can be truncated mid-
+    /// apply, so it is not the restore source. Closures must still not
+    /// panic; this only changes the consequence. Restore is from
+    /// `parking_lot` state (no poison). `panic = "abort"` would delete
+    /// containment; `Cargo.toml` sets no such key.
     pub fn transact<F>(this: &parking_lot::Mutex<Session>, meta: TxMeta, f: F) -> Result<Committed, String>
     where
         F: FnOnce(&mut Tx<'_>) -> Result<(), String>,

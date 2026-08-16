@@ -124,24 +124,10 @@ pub struct ReplayPlan {
 }
 
 impl ReplayPlan {
-    /// Rebuild the document at [`Self::rev`]. Scratch session, no locks, no
-    /// journal, no effects — `Session::apply_replay` is a bare `apply_raw`
-    /// loop, and the effect descriptions it produces are discarded (the ops
-    /// already ran, once, when they were committed).
-    ///
-    /// THE RESULT'S `transport` IS THE REPLAY BASE'S, NOT THE TARGET REV'S,
-    /// and a caller MUST NOT restore it (fix round 1, I-2). Transport writes
-    /// (play/stop/loop/stop-at-end/sample-rate, recording start and stop)
-    /// commit TRANSIENTLY: they bump `rev` but leave no version node, so the
-    /// chain has gaps and no `apply_replay` step ever carries their ops. A
-    /// replay-only rev therefore reproduces CONTENT faithfully and transport
-    /// only as of the nearest materialized ancestor. Restoring it through
-    /// `Session::restore_from_snapshot` (which does write `store.transport`)
-    /// would silently rewind loop points, stop-at-end and recording state.
-    /// Fixing it properly means either recording transient batches as
-    /// something, or replaying the journal rather than the graph — a
-    /// question for the round that owns transport-in-history, not a
-    /// paper-over here.
+    /// Rebuild the document at [`Self::rev`]. Scratch session, no locks.
+    /// The result's `transport` is the replay BASE's — transient transport
+    /// commits leave no version node, so do not restore it onto the live
+    /// session.
     pub fn run(self) -> Option<SessionSnapshot> {
         let mut scratch = super::session::Session::from_snapshot(&self.base);
         for ops in &self.steps {
@@ -340,58 +326,11 @@ impl VersionGraph {
     }
 }
 
-/// Is storing ops + inverses actually cheaper than keeping the image?
-///
-/// THE MEASUREMENT THAT FORCES THIS GUARD (Task 7, and it contradicts a
-/// premise of RESULTS.md §6's rule as written — ADR 0007 correction). Every
-/// landed op that carries bulk content carries it BY VALUE: `MidiSetNotes`
-/// holds the whole new note vector and its inverse holds the whole old one;
-/// `MidiClipAdd` holds the entire clip. A materialized node, by contrast,
-/// holds an Arc-SHARED image whose own-created bytes are one copy of that
-/// same content. So for exactly the op class the 64 KB threshold targets,
-/// the replay-only representation costs ~2x what it saves.
-///
-/// MEASURED, on Track C's multi-clip paste shape (20 clips x 200 notes, one
-/// `MidiClipAdd` per clip; `size_of::<Op>() = 248`, `MidiNote = 16`,
-/// `MidiClip = 184`). At the finding, charging no row heap on the ops side:
-/// ops 68 960 B, ops + inverses 137 920 B, against an image own-created
-/// charge of 67 680 B — **2.038x**. Under the parity accounting this file
-/// ships (row `String` heap on both sides): ops **70 020 B**, ops + inverses
-/// **140 040 B**, against **68 740 B** — **2.037x**. MARKED CORRECTION (ADR
-/// 0007, Task 7 re-review): this row previously read 69 810 / 139 620 /
-/// 68 530, which is not reproducible from the shipped code. The fixture's
-/// row heap is 1 060 B under the helpers as they stand — lane_id 36 x 20 =
-/// 720, ids 90, track_ids 60, names 190 — and that is what the figures
-/// above use. The ratio and the conclusion are unchanged. The ops halves
-/// are `ops_bytes`'
-/// actual output; the IMAGE half of BOTH rows is a HAND-COMPUTED PROXY, not
-/// `charge_of`'s output — the real thing would add the list of pointers,
-/// 20 x `size_of::<Arc<MidiClip>>()` = 160 B, which moves neither the ratio
-/// nor which side of the 64 KB threshold the image lands on.
-/// The pathology is SCALE-INVARIANT: replay is
-/// ~2x content and the image ~1x content at any size, so no threshold VALUE
-/// separates the classes — only this guard does.
-///
-/// It is not a mechanism-killer either: a single gain nudge on a 300-clip
-/// project charges ~70 KB of image against ~500 B of ops, a ~140x
-/// replay-only win, and this guard fires there.
-///
-/// So the threshold decides WHETHER to consider replay-only, and this
-/// decides whether it would pay. Without the guard the mechanism is a
-/// memory pessimization on the one class it was built for, which no
-/// eviction budget can make correct.
-///
-/// BOTH SIDES ARE WEIGHED BY THE SAME RULES (fix round 1): `charge_of` and
-/// [`ops_bytes`] share `snapshot::{track,clip,midi_clip}_heap`, so a row's
-/// `String` heap counts on both sides and no future tightening of one can
-/// silently move this decision boundary. Plugin rows are charged at their
-/// slot on both sides.
-///
-/// The route to making replay-only pay off is named rather than left to be
-/// rediscovered: the undo stack ALREADY retains these same op vectors for
-/// the newest 200 entries, so a node sharing them (`Arc<Vec<Op>>` on both
-/// `HistoryEntry` and `VersionNode`) would cost ~0 while shared. That is a
-/// change to `HistoryEntry`'s shape and belongs to the round that owns it.
+/// Store ops+inverses only when that is cheaper than keeping the image.
+/// Whole-clip ops carry content by value on both sides of the inverse, so
+/// replay-only is ~2× the image; a small Set against a large document is
+/// the opposite. The 64 KB threshold decides whether to consider
+/// replay-only; this comparison decides whether it would pay.
 fn replay_pays_off(replay_charge: usize, image_charge: usize) -> bool {
     replay_charge < image_charge
 }
