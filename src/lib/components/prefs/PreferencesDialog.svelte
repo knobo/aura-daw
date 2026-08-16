@@ -36,7 +36,10 @@
   /** The number control's visible value — percent for "%" defs, raw otherwise. */
   function numberLabel(def: PrefDef, value: number): string {
     if (def.kind !== "number") return String(value);
-    return def.unit === "%" ? `${Math.round(value * 100)}%` : String(value);
+    if (def.unit === "%") return `${Math.round(value * 100)}%`;
+    // A signed offset reads as an offset only with its sign shown.
+    if (def.unit === "ms") return `${value > 0 ? "+" : ""}${value} ms`;
+    return String(value);
   }
 
   /** Append a folder to a pathList preference (no-op when cancelled or a

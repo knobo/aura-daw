@@ -7,7 +7,14 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { PREF_CATEGORIES, PREF_SCHEMA, coercePref, schemaDefaults, type PrefId } from "./schema";
+import {
+  PREF_CATEGORIES,
+  PREF_SCHEMA,
+  TOLERANCE_CENTS,
+  coercePref,
+  schemaDefaults,
+  type PrefId,
+} from "./schema";
 
 const ids = Object.keys(PREF_SCHEMA) as PrefId[];
 
@@ -53,6 +60,35 @@ describe("PREF_SCHEMA integrity", () => {
     expect(def.min).toBe(1);
     expect(def.max).toBe(20);
     expect(def.step).toBe(1);
+  });
+
+  it("declares the pitch coach preferences with usable defaults", () => {
+    expect(PREF_SCHEMA.pitchTolerance.default).toBe("standard");
+    expect(PREF_SCHEMA.pitchLatencyOffsetMs.default).toBe(0);
+    expect(PREF_SCHEMA.pitchLaneFollow.default).toBe("fixed");
+    expect(PREF_SCHEMA.pitchTrailSnap.default).toBe(false);
+    expect(PREF_SCHEMA.pitchRehearseKey.default).toBe("h");
+  });
+
+  it("maps every tolerance option to a cents value", () => {
+    const ids = PREF_SCHEMA.pitchTolerance.options.map((o) => o.value);
+    expect(ids).toEqual(["forgiving", "standard", "strict", "pro"]);
+    for (const id of ids) expect(TOLERANCE_CENTS[id]).toBeGreaterThan(0);
+    expect(TOLERANCE_CENTS.standard).toBe(50);
+  });
+
+  it("lets the latency offset run negative, since the correction can go either way", () => {
+    const def = PREF_SCHEMA.pitchLatencyOffsetMs;
+    expect(def.min).toBe(-50);
+    expect(def.max).toBe(50);
+    expect(coercePref(def, -37)).toBe(-37);
+    expect(coercePref(def, -900)).toBe(-50);
+  });
+
+  it("offers OFF as a rehearse key, so the hold can be disabled entirely", () => {
+    const values = PREF_SCHEMA.pitchRehearseKey.options.map((o) => o.value);
+    expect(values).toContain("none");
+    expect(coercePref(PREF_SCHEMA.pitchRehearseKey, "none")).toBe("none");
   });
 });
 
