@@ -6623,7 +6623,7 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
@@ -6724,7 +6724,7 @@ mod tests {
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
         let doc = session.lock().plugin_snapshot();
-        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &doc, &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &mut nodes, &mut out);
         assert_eq!(out.len(), 3);
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(

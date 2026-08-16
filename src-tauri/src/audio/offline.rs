@@ -142,6 +142,7 @@ pub fn build_graph(
     append_from(
         &crate::control::snapshot::MidiSnapshot::from_store(midi),
         &store.tracks,
+        &store.clips,
         plugins,
         &slots,
         rate,

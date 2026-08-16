@@ -215,6 +215,7 @@ impl Session {
             store,
             midi,
             automation: AutomationDoc { lanes: (*snap.automation).clone() },
+            modulation: (*snap.modulation).clone(),
             plugins,
             published: Arc::new(parking_lot::Mutex::new(Arc::new(SessionSnapshot::empty()))),
             rev: snap.rev,
@@ -242,6 +243,7 @@ impl Session {
         self.midi.meter_events = (*snap.midi.meter_events).clone();
         self.midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
         self.automation.lanes = (*snap.automation).clone();
+        self.modulation = (*snap.modulation).clone();
         let dirty_state = std::mem::take(&mut self.plugins.dirty_state);
         let mut state_rev = std::mem::take(&mut self.plugins.state_rev);
         let prev_state = std::mem::take(&mut self.plugins.pending_state);

@@ -450,6 +450,15 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
                     + params.len() * size_of::<crate::plugins::ParamInfo>()
             }
             Op::PluginSetState { instance, state, .. } => instance.len() + state.len(),
+            Op::ModulationSetCurve { key, curve } => {
+                key.len()
+                    + curve.as_ref().map_or(0, |c| {
+                        c.points.len()
+                            * size_of::<crate::plugins::automation::AutomationPoint>()
+                    })
+            }
+            Op::ModulationSetBinding { key, .. } => key.len(),
+            Op::AutomationClipSet { key, .. } => key.len(),
         };
     }
     bytes

@@ -42,6 +42,10 @@ pub struct SessionSnapshot {
     pub clips: Arc<Vec<Clip>>, // audio placements
     pub midi: MidiSnapshot,
     pub automation: Arc<Vec<AutomationLane>>,
+    /// Track F graph. Captured wholesale (the doc is small relative to
+    /// MIDI content); a later round can split it per-curve if charge
+    /// accounting needs it.
+    pub modulation: Arc<crate::modulation::ModulationDoc>,
     pub plugins: Arc<PluginDoc>,
 }
 
@@ -86,6 +90,7 @@ pub struct ChangeSet {
     pub midi_structure: bool, // clip list add/remove (re-derive whole list)
     pub midi_clips: BTreeSet<ClipId>, // per-clip content rewrites
     pub automation: bool,
+    pub modulation: bool,
     pub plugins: bool,
     pub project_meta: bool, // dir/name/created_at
     /// Set ONLY by [`ChangeSet::all`] (never by `from_ops`): forces every
@@ -110,6 +115,7 @@ impl ChangeSet {
             midi_structure: true,
             midi_clips: BTreeSet::new(),
             automation: true,
+            modulation: true,
             plugins: true,
             project_meta: true,
             midi_clips_all: true,
@@ -163,7 +169,13 @@ impl ChangeSet {
                 Op::MidiSetNotes { clip, .. } => {
                     cs.midi_clips.insert(clip.clone());
                 }
-                Op::AutomationSetLane { .. } => cs.automation = true,
+                Op::AutomationSetLane { .. } => {
+                    cs.automation = true;
+                    cs.modulation = true; // facade writes the graph too
+                }
+                Op::ModulationSetCurve { .. }
+                | Op::ModulationSetBinding { .. }
+                | Op::AutomationClipSet { .. } => cs.modulation = true,
                 Op::PluginAdd { .. } | Op::PluginRemove { .. } | Op::PluginSetState { .. } => {
                     cs.plugins = true
                 }
@@ -200,6 +212,7 @@ impl SessionSnapshot {
                 clips: Arc::new(Vec::new()),
             },
             automation: Arc::new(Vec::new()),
+            modulation: Arc::new(crate::modulation::ModulationDoc::default()),
             plugins: Arc::new(PluginDoc::default()),
         }
     }
@@ -281,6 +294,11 @@ impl SessionSnapshot {
             } else {
                 prev.automation.clone()
             },
+            modulation: if changed.modulation {
+                Arc::new(session.modulation.clone())
+            } else {
+                prev.modulation.clone()
+            },
             plugins: if changed.plugins {
                 Arc::new(session.plugins.clone())
             } else {
@@ -344,6 +362,12 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     }
     if changed.automation {
         charge += next.automation.len() * size_of::<AutomationLane>();
+    }
+    if changed.modulation {
+        charge += size_of::<crate::modulation::ModulationDoc>();
+        charge += next.modulation.curves.len()
+            + next.modulation.bindings.len()
+            + next.modulation.automation_clips.len();
     }
     if changed.plugins {
         charge += next.plugins.instances.len() * size_of::<crate::plugins::PluginInstanceInfo>();
@@ -624,7 +648,10 @@ mod tests {
         assert_eq!(c, ChangeSet { midi_clips: clip_ids(&["mc-x"]), ..Default::default() });
         // AutomationSetLane → automation
         let c = cs(&[Op::AutomationSetLane { key: "a-x".into(), lane: None }]);
-        assert_eq!(c, ChangeSet { automation: true, ..Default::default() });
+        assert_eq!(
+            c,
+            ChangeSet { automation: true, modulation: true, ..Default::default() }
+        );
         // PluginAdd / PluginRemove / PluginSetState → plugins
         let c = cs(&[Op::PluginAdd { row: row.clone(), index: 0 }]);
         assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });
