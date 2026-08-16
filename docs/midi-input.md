@@ -59,6 +59,10 @@ MIDI note (starting at C3). Click a row to select it. Double-click to
 audition the scene without moving the loop or playhead. Click the
 target text to jump the playhead there for editing.
 
+Clips whose track no longer exists do **not** drive a launcher. In the
+piano roll, **▶ play** plays that clip once (no loop) and only that
+clip's notes fire the launcher.
+
 To make a MIDI clip **use** a launcher (the clip's notes fire that map
 instead of the track instrument): select the clip and click **USE**, or
 right-click and pick a launcher. **USE ON CLIP** in the launch window

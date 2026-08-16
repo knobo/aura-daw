@@ -129,6 +129,27 @@ pub fn map_index(maps: &[LaunchMap], map_id: &str) -> Option<usize> {
     maps.iter().position(|m| m.id == map_id)
 }
 
+/// A drive clip only sounds when it still sits on a live track, and when
+/// a clip-editor "play this clip" focus is set, only that clip.
+pub fn drive_clip_eligible(
+    clip_id: &str,
+    track_id: &str,
+    drive_ids: &[String],
+    live_tracks: &std::collections::HashSet<String>,
+    focus: Option<&str>,
+) -> bool {
+    if !drive_ids.iter().any(|id| id == clip_id) {
+        return false;
+    }
+    if !live_tracks.contains(track_id) {
+        return false;
+    }
+    match focus {
+        Some(id) => clip_id == id,
+        None => true,
+    }
+}
+
 pub fn find_binding<'a>(maps: &'a [LaunchMap], id: &str) -> Option<(&'a LaunchMap, &'a LaunchBinding)> {
     maps.iter().find_map(|m| m.bindings.iter().find(|b| b.id == id).map(|b| (m, b)))
 }
@@ -227,6 +248,7 @@ pub struct LaunchRuntime {
     drive_started: AtomicBool,
     audible_tracks: Mutex<Vec<String>>,
     overlay_id: Mutex<Option<String>>,
+    drive_focus: Mutex<Option<String>>,
 }
 
 impl Default for LaunchRuntime {
@@ -243,6 +265,7 @@ impl Default for LaunchRuntime {
             drive_started: AtomicBool::new(false),
             audible_tracks: Mutex::new(Vec::new()),
             overlay_id: Mutex::new(None),
+            drive_focus: Mutex::new(None),
         }
     }
 }
@@ -315,6 +338,14 @@ impl LaunchRuntime {
 
     pub fn overlay_id(&self) -> Option<String> {
         self.overlay_id.lock().unwrap().clone()
+    }
+
+    pub fn set_drive_focus(&self, id: Option<String>) {
+        *self.drive_focus.lock().unwrap() = id;
+    }
+
+    pub fn drive_focus(&self) -> Option<String> {
+        self.drive_focus.lock().unwrap().clone()
     }
 
     pub fn record_out(&self, note: u8, channel: u8) {
@@ -392,9 +423,15 @@ impl LaunchRuntime {
                         last = pos;
                         continue;
                     }
-                    let (clips, ppq, tempo) = {
+                    let (clips, ppq, tempo, live_tracks) = {
                         let s = session.lock();
-                        (s.midi.clips.clone(), s.midi.ppq, s.midi.tempo_events.clone())
+                        let live_tracks: std::collections::HashSet<String> = s
+                            .store
+                            .tracks
+                            .iter()
+                            .map(|t| t.id.to_string())
+                            .collect();
+                        (s.midi.clips.clone(), s.midi.ppq, s.midi.tempo_events.clone(), live_tracks)
                     };
                     let Ok(tempo_map) =
                         crate::midi::TempoMap::new(ppq, tempo, shared.sample_rate.load(Relaxed).max(1))
@@ -402,6 +439,7 @@ impl LaunchRuntime {
                         last = pos;
                         continue;
                     };
+                    let focus = runtime().drive_focus();
                     let mut fired = std::collections::HashSet::new();
                     let mut released = std::collections::HashSet::new();
                     for launcher in &launchers {
@@ -409,7 +447,13 @@ impl LaunchRuntime {
                             continue;
                         }
                         for clip in clips.iter().filter(|c| {
-                            launcher.drive_clip_ids.iter().any(|id| id == c.id.as_str())
+                            drive_clip_eligible(
+                                c.id.as_str(),
+                                c.track_id.as_str(),
+                                &launcher.drive_clip_ids,
+                                &live_tracks,
+                                focus.as_deref(),
+                            )
                         }) {
                             let evs = crate::midi::schedule::clip_drive_events(clip, &tempo_map);
                             if just_started && launch_trace_enabled() {
@@ -780,6 +824,11 @@ pub fn launch_set_drive(
 }
 
 #[tauri::command]
+pub fn launch_set_drive_focus(clip_id: Option<String>) {
+    runtime().set_drive_focus(clip_id);
+}
+
+#[tauri::command]
 pub fn launch_set_map(
     id: String,
     map: Option<LaunchMap>,
@@ -999,6 +1048,23 @@ mod tests {
             migrate_legacy_maps(None, vec![], vec![]),
             vec![LaunchMap::default_map()]
         );
+    }
+
+    #[test]
+    fn orphaned_drive_clips_are_not_eligible() {
+        let drive = vec!["c1".into(), "c2".into()];
+        let live: std::collections::HashSet<String> = ["t-live".into()].into_iter().collect();
+        assert!(
+            !drive_clip_eligible("c1", "t-gone", &drive, &live, None),
+            "clip whose track is gone must not fire"
+        );
+        assert!(drive_clip_eligible("c1", "t-live", &drive, &live, None));
+        assert!(
+            !drive_clip_eligible("c2", "t-live", &drive, &live, Some("c1")),
+            "clip-editor focus plays only that clip"
+        );
+        assert!(drive_clip_eligible("c1", "t-live", &drive, &live, Some("c1")));
+        assert!(!drive_clip_eligible("other", "t-live", &drive, &live, None));
     }
 
     #[test]

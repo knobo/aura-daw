@@ -367,6 +367,7 @@ export interface Backend {
   /** Upsert `binding`, or delete `id` when `binding` is null. */
   launchSet?(binding: LaunchBinding | null, id?: string | null, mapId?: string | null): Promise<LaunchSnapshot>;
   launchSetDrive?(clipId: string, on: boolean, mapId?: string | null): Promise<LaunchSnapshot>;
+  launchSetDriveFocus?(clipId: string | null): Promise<void>;
   launchSetMap?(id: string, map: LaunchMap | null): Promise<LaunchSnapshot>;
   launchFire?(id: string, bypass?: boolean): Promise<void>;
   launchLearnArm?(id: string | null): Promise<void>;
@@ -839,6 +840,9 @@ class TauriBackend implements Backend {
   }
   launchSetDrive(clipId: string, on: boolean, mapId?: string | null) {
     return invoke<LaunchSnapshot>("launch_set_drive", { clipId, on, mapId: mapId ?? null });
+  }
+  async launchSetDriveFocus(clipId: string | null) {
+    await invoke("launch_set_drive_focus", { clipId });
   }
   launchSetMap(id: string, map: LaunchMap | null) {
     return invoke<LaunchSnapshot>("launch_set_map", { id, map });

@@ -54,6 +54,11 @@
   const pluginInst = $derived(plugins.instanceForRef(track?.instrumentId));
   const usedLauncher = $derived(clip ? launch.driveMap(clip.id) : null);
 
+  $effect(() => {
+    if (!clipEditLoop.playOnce) return;
+    clipEditLoop.tickPlayOnce(transport.snap.positionSamples);
+  });
+
   // ── local edit state ──
   let working = $state<MidiNote[]>([]);
   let selection = $state<Set<number>>(new Set());
@@ -924,6 +929,20 @@
           </button>
         {/each}
       </div>
+
+      <button
+        class="chip mono"
+        class:on={clipEditLoop.playOnce}
+        title="Play this clip once — other clips do not drive the launcher"
+        onclick={() => {
+          if (!clip) return;
+          const start = midi.ticksToSamples(clip.timelineStartTicks);
+          const end = midi.ticksToSamples(clip.timelineStartTicks + midi.effectiveContentLengthTicks(clip));
+          void clipEditLoop.playThisClip(clip.id, start, end);
+        }}
+      >
+        {clipEditLoop.playOnce ? "■ stop" : "▶ play"}
+      </button>
 
       <button
         class="chip mono"

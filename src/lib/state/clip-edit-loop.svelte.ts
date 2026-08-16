@@ -9,6 +9,7 @@
  */
 
 import { prefs } from "../prefs/prefs.svelte";
+import { backend } from "../tauri";
 import { project } from "./project.svelte";
 import { transport } from "./transport.svelte";
 
@@ -30,11 +31,15 @@ interface Snapshot {
 class ClipEditLoopStore {
   /** Solo choice (exclusive solo vs full mix); remembered across opens. */
   solo = $state(true);
+  /** Piano-roll Play is running (this clip only, once through). */
+  playOnce = $state(false);
 
   private snapshot: Snapshot | null = null;
   private trackId: string | null = null;
   /** Track whose manual mute we lifted for solo mode (mute wins over solo). */
   private unmutedId: string | null = null;
+  private playOnceEnd = 0;
+  private loopBeforePlay: { enabled: boolean; start: number; end: number } | null = null;
 
   get active(): boolean {
     return this.snapshot !== null;
@@ -66,11 +71,52 @@ class ClipEditLoopStore {
     else await this.restoreSolo();
   }
 
+  async playThisClip(clipId: string, startSamples: number, endSamples: number) {
+    if (endSamples <= startSamples) return;
+    if (this.playOnce && transport.isPlaying) {
+      await this.stopThisClip();
+      return;
+    }
+    this.playOnce = true;
+    this.playOnceEnd = endSamples;
+    this.loopBeforePlay = {
+      enabled: transport.snap.loopEnabled,
+      start: transport.snap.loopStartSamples,
+      end: transport.snap.loopEndSamples,
+    };
+    await backend.launchSetDriveFocus?.(clipId);
+    await transport.setLoop(false, 0, 0);
+    await transport.seek(startSamples);
+    await transport.play();
+  }
+
+  async stopThisClip() {
+    const was = this.playOnce;
+    this.playOnce = false;
+    this.playOnceEnd = 0;
+    await backend.launchSetDriveFocus?.(null);
+    if (was && transport.isPlaying) await transport.pause();
+    const loop = this.loopBeforePlay;
+    this.loopBeforePlay = null;
+    if (was && loop) {
+      await transport.setLoop(loop.enabled, loop.start, loop.end);
+    }
+  }
+
+  /** Call from the piano roll while play-once is armed. */
+  tickPlayOnce(positionSamples: number) {
+    if (!this.playOnce) return;
+    if (!transport.isPlaying || positionSamples >= this.playOnceEnd) {
+      void this.stopThisClip();
+    }
+  }
+
   async exit() {
     const snap = this.snapshot;
     if (!snap) return;
     this.snapshot = null;
     this.trackId = null;
+    await this.stopThisClip();
     await this.restoreSolo(snap);
     await transport.setLoop(snap.loopEnabled, snap.loopStartSamples, snap.loopEndSamples);
     if (!snap.wasPlaying) {
@@ -92,6 +138,10 @@ class ClipEditLoopStore {
     this.snapshot = null;
     this.trackId = null;
     this.unmutedId = null;
+    this.playOnce = false;
+    this.playOnceEnd = 0;
+    this.loopBeforePlay = null;
+    void backend.launchSetDriveFocus?.(null);
   }
 
   private async applyExclusiveSolo(trackId: string) {
