@@ -705,6 +705,40 @@ pub fn set_track_instrument(
                     "unknown plugin instance: {pid} (plugin_instantiate first)"
                 ));
             }
+            // Plan G1 Task 3 / R6: mirror ControlPlane gates (effect / insert).
+            // ControlPlane::set_track_instrument also enforces these; keep the
+            // wrapper checks so the command path fails before commit.
+            let uid = {
+                let session = state.session.lock();
+                for t in &session.store.tracks {
+                    if t.inserts.iter().any(|s| s.instance_id == pid) {
+                        return Err(format!(
+                            "plugin instance {pid} is already an insert; cannot bind as instrument"
+                        ));
+                    }
+                }
+                session
+                    .plugins
+                    .instances
+                    .iter()
+                    .find(|r| r.id == pid)
+                    .map(|r| r.uid.clone())
+            };
+            if let Some(uid) = uid {
+                if let Some(reg) = crate::plugins::registered_registry() {
+                    let reg = reg.lock();
+                    if let Some(scanned) = reg.scanned.as_ref() {
+                        if let Some(desc) = scanned.iter().find(|d| d.uid == uid) {
+                            if !desc.is_instrument {
+                                return Err(format!(
+                                    "{} is an effect; cannot bind as instrument",
+                                    desc.name
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
         } else if state.samplers.lock().compiled(id).is_none() {
             return Err(format!("unknown instrument: {id} (load it first)"));
         }

@@ -2238,7 +2238,12 @@ impl ControlPlane {
     /// (controller ruling 2) — the removed row may have been the only
     /// soloed track.
     pub fn remove_track(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
-        let (track, clip_ids) = {
+        // Capture insert-instance rows (blob + params) BEFORE the commit —
+        // same prepare pattern as `plugin_remove`. After TrackRemove the
+        // slots leave with the row; PluginRemove then drops the instances
+        // (G-10 sweep is a no-op). Undo applies inverses in reverse:
+        // PluginAdds then TrackAdd (with inserts).
+        let (track, clip_ids, insert_removes) = {
             let session = self.session.lock();
             let track = session
                 .store
@@ -2254,12 +2259,152 @@ impl ControlPlane {
                 .filter(|c| c.track_id.as_str() == id)
                 .map(|c| c.id.to_string())
                 .collect();
-            (track, clip_ids)
+            let mut insert_removes = Vec::new();
+            for slot in &track.inserts {
+                let Some(row) =
+                    session.plugins.instances.iter().find(|r| r.id == slot.instance_id).cloned()
+                else {
+                    continue;
+                };
+                let blob = crate::plugins::state::registered_state_bridge()
+                    .and_then(|b| b.save_state(&row.id).ok().flatten())
+                    .map(|blob| crate::plugins::state::encode_state(&row.uid, &blob));
+                let params = session.plugins.params.get(&row.id).cloned().unwrap_or_default();
+                insert_removes.push((row, blob, params));
+            }
+            (track, clip_ids, insert_removes)
         };
         self.commit(meta, |tx| {
-            tx.apply(op::Op::TrackRemove { track, index: 0, clips: vec![], clip_indices: vec![] })
+            tx.apply(op::Op::TrackRemove {
+                track,
+                index: 0,
+                clips: vec![],
+                clip_indices: vec![],
+            })?;
+            for (row, state, params) in insert_removes {
+                tx.apply(op::Op::PluginRemove {
+                    row,
+                    index: 0,
+                    state,
+                    params,
+                })?;
+            }
+            Ok(())
         })?;
         self.clear_midi_routing_for(id, &clip_ids);
+        Ok(())
+    }
+
+    /// Plan G1: document half of insert-add — `PluginAdd` then `InsertAdd`
+    /// in one commit. Host instantiate is prepare-outside (the Tauri
+    /// command); callers pass the already-built row + slot.
+    pub fn insert_add(
+        &self,
+        track_id: &str,
+        row: crate::plugins::PluginInstanceInfo,
+        slot: crate::audio::types::InsertSlot,
+        index: usize,
+        meta: op::TxMeta,
+    ) -> Result<crate::audio::types::InsertSlot, String> {
+        let out = slot.clone();
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::PluginAdd {
+                row,
+                index: usize::MAX,
+            })?;
+            tx.apply(op::Op::InsertAdd {
+                track_id: track_id.into(),
+                slot,
+                index,
+            })
+        })?;
+        Ok(out)
+    }
+
+    /// Plan G1: remove one insert slot and its plugin instance in one commit.
+    pub fn insert_remove(
+        &self,
+        track_id: &str,
+        slot_id: &str,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let (slot, row, blob, params) = {
+            let session = self.session.lock();
+            let track = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let slot = track
+                .inserts
+                .iter()
+                .find(|s| s.id == slot_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown insert slot: {slot_id}"))?;
+            let row = session
+                .plugins
+                .instances
+                .iter()
+                .find(|r| r.id == slot.instance_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown plugin instance: {}", slot.instance_id))?;
+            let blob = crate::plugins::state::registered_state_bridge()
+                .and_then(|b| b.save_state(&row.id).ok().flatten())
+                .map(|blob| crate::plugins::state::encode_state(&row.uid, &blob));
+            let params = session.plugins.params.get(&row.id).cloned().unwrap_or_default();
+            (slot, row, blob, params)
+        };
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::InsertRemove {
+                track_id: track_id.into(),
+                slot,
+                index: 0,
+            })?;
+            tx.apply(op::Op::PluginRemove {
+                row,
+                index: 0,
+                state: blob,
+                params,
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G1: reorder one insert slot on a track.
+    pub fn insert_reorder(
+        &self,
+        track_id: &str,
+        slot_id: &str,
+        to_index: usize,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::InsertReorder {
+                track_id: track_id.into(),
+                slot_id: slot_id.into(),
+                from: 0,
+                to: to_index,
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G1: set bypass on one insert slot.
+    pub fn insert_set_bypass(
+        &self,
+        track_id: &str,
+        slot_id: &str,
+        bypassed: bool,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::InsertSetBypass {
+                track_id: track_id.into(),
+                slot_id: slot_id.into(),
+                bypassed,
+            })
+        })?;
         Ok(())
     }
 
@@ -2747,12 +2892,21 @@ impl ControlPlane {
     /// — Plan E Task 3 (round-2 inventory row 2). `set_track_instrument`
     /// (audio/mod.rs) is a thin wrapper over this, keeping its own
     /// track-kind/plugin-existence validation ahead of the call.
+    ///
+    /// Plan G1 Task 3 / R6: a `plugin:<id>` ref is rejected when the instance
+    /// is already an insert (G-7) or its scanned descriptor is `!is_instrument`.
+    /// No uid-suffix heuristic; if the scan cache is absent, G-7 still applies.
     pub fn set_track_instrument(
         &self,
         track_id: &str,
         instrument_id: Option<String>,
         meta: op::TxMeta,
     ) -> Result<TrackState, String> {
+        if let Some(ref id) = instrument_id {
+            if let Some(pid) = id.strip_prefix("plugin:") {
+                self.reject_effect_as_instrument(pid)?;
+            }
+        }
         self.commit(meta, |tx| {
             tx.apply(op::Op::Set {
                 object: op::ObjectRef::Track(track_id.into()),
@@ -2771,6 +2925,41 @@ impl ControlPlane {
             .find(|t| t.id == track_id)
             .cloned()
             .ok_or_else(|| format!("unknown track: {track_id}"))
+    }
+
+    /// G-7 + R6: refuse binding an insert/effect instance as instrument.
+    fn reject_effect_as_instrument(&self, instance_id: &str) -> Result<(), String> {
+        let session = self.session.lock();
+        for t in &session.store.tracks {
+            if t.inserts.iter().any(|s| s.instance_id == instance_id) {
+                return Err(format!(
+                    "plugin instance {instance_id} is already an insert; cannot bind as instrument"
+                ));
+            }
+        }
+        let uid = session
+            .plugins
+            .instances
+            .iter()
+            .find(|r| r.id == instance_id)
+            .map(|r| r.uid.clone());
+        drop(session);
+        if let Some(uid) = uid {
+            if let Some(reg) = crate::plugins::registered_registry() {
+                let reg = reg.lock();
+                if let Some(scanned) = reg.scanned.as_ref() {
+                    if let Some(desc) = scanned.iter().find(|d| d.uid == uid) {
+                        if !desc.is_instrument {
+                            return Err(format!(
+                                "{} is an effect; cannot bind as instrument",
+                                desc.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- plugin document reads (Task 9) ----------------------------------
@@ -5053,6 +5242,147 @@ mod tests {
         assert_eq!(updated.instrument_id, Some("plugin:x".to_string()));
         assert_eq!(plane.session().lock().store.tracks[0].instrument_id, Some("plugin:x".to_string()));
         assert_eq!(engine_rx.try_iter().filter(|m| matches!(m, ControlMsg::Rebuild)).count(), 1);
+    }
+
+    fn fx_row(id: &str, track: &str) -> crate::plugins::PluginInstanceInfo {
+        crate::plugins::PluginInstanceInfo {
+            id: id.into(),
+            uid: "clap:/x.clap#fx".into(),
+            name: "Fx".into(),
+            format: "clap".into(),
+            status: "stub".into(),
+            track_id: Some(track.into()),
+        }
+    }
+
+    /// Plan G1 Task 3: PluginAdd + InsertAdd in one commit undo as a unit.
+    #[test]
+    fn insert_add_is_one_transaction_plugin_plus_slot() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        plane
+            .commit(TxMeta::user("insert add"), |tx| {
+                tx.apply(Op::PluginAdd { row: fx_row("p-1", "t-1"), index: usize::MAX })?;
+                tx.apply(Op::InsertAdd {
+                    track_id: "t-1".into(),
+                    slot: crate::audio::types::InsertSlot {
+                        id: "s-1".into(),
+                        instance_id: "p-1".into(),
+                        bypassed: false,
+                    },
+                    index: usize::MAX,
+                })
+            })
+            .unwrap();
+        {
+            let s = plane.session().lock();
+            assert_eq!(
+                s.plugins.instances.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+                ["p-1"]
+            );
+            assert_eq!(s.store.tracks[0].inserts[0].instance_id, "p-1");
+        }
+        plane.undo().unwrap();
+        let s = plane.session().lock();
+        assert!(s.plugins.instances.is_empty(), "undo removes the PluginAdd");
+        assert!(s.store.tracks[0].inserts.is_empty(), "undo removes the InsertAdd");
+    }
+
+    /// Plan G1 Task 3 / G-10: remove_track must PluginRemove insert instances.
+    #[test]
+    fn remove_track_composes_plugin_remove_for_insert_instances() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        plane
+            .commit(TxMeta::user("seed inserts"), |tx| {
+                tx.apply(Op::PluginAdd { row: fx_row("p-1", "t-1"), index: usize::MAX })?;
+                tx.apply(Op::PluginAdd { row: fx_row("p-2", "t-1"), index: usize::MAX })?;
+                tx.apply(Op::InsertAdd {
+                    track_id: "t-1".into(),
+                    slot: crate::audio::types::InsertSlot {
+                        id: "s-1".into(),
+                        instance_id: "p-1".into(),
+                        bypassed: false,
+                    },
+                    index: 0,
+                })?;
+                tx.apply(Op::InsertAdd {
+                    track_id: "t-1".into(),
+                    slot: crate::audio::types::InsertSlot {
+                        id: "s-2".into(),
+                        instance_id: "p-2".into(),
+                        bypassed: false,
+                    },
+                    index: 1,
+                })
+            })
+            .unwrap();
+        plane.remove_track("t-1", TxMeta::user("remove track")).unwrap();
+        assert!(
+            plane.session().lock().plugins.instances.is_empty(),
+            "G-10: remove_track must PluginRemove insert instances so they do not leak"
+        );
+        plane.undo().unwrap();
+        let s = plane.session().lock();
+        assert_eq!(s.store.tracks[0].id.as_str(), "t-1");
+        assert_eq!(s.store.tracks[0].inserts.len(), 2, "TrackAdd restores slots");
+        assert_eq!(s.plugins.instances.len(), 2, "undo restores the PluginAdds");
+    }
+
+    /// Plan G1 Task 3 / R6: effect instances cannot occupy the instrument slot.
+    /// Seeds the global scan cache so uid → descriptor.is_instrument is available.
+    #[test]
+    fn set_track_instrument_rejects_an_effect_instance() {
+        // Seed scanned descriptors (same shape as plugins::tests::scanned_registry).
+        let seed = vec![
+            crate::plugins::PluginDescriptor {
+                uid: "lv2:urn:test:synth".into(),
+                format: "lv2".into(),
+                name: "TestSynth".into(),
+                vendor: None,
+                version: None,
+                path: None,
+                is_instrument: true,
+                audio_inputs: 0,
+                audio_outputs: 2,
+                has_note_input: true,
+                categories: vec![],
+            },
+            crate::plugins::PluginDescriptor {
+                uid: "clap:/x.clap#fx".into(),
+                format: "clap".into(),
+                name: "TestFx".into(),
+                vendor: None,
+                version: None,
+                path: Some("/x.clap".into()),
+                is_instrument: false,
+                audio_inputs: 2,
+                audio_outputs: 2,
+                has_note_input: false,
+                categories: vec![],
+            },
+        ];
+        if let Some(reg) = crate::plugins::registered_registry() {
+            reg.lock().scanned = Some(seed);
+        } else {
+            let reg = Arc::new(parking_lot::Mutex::new(crate::plugins::PluginRegistry {
+                scanned: Some(seed),
+            }));
+            crate::plugins::register_registry(reg);
+        }
+
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        plane
+            .commit(TxMeta::user("seed fx"), |tx| {
+                tx.apply(Op::PluginAdd { row: fx_row("p-fx", "t-1"), index: usize::MAX })
+            })
+            .unwrap();
+        let err = plane
+            .set_track_instrument("t-1", Some("plugin:p-fx".into()), TxMeta::user("bind fx as inst"))
+            .unwrap_err();
+        assert!(
+            err.contains("effect") || err.contains("insert"),
+            "an effect instance cannot occupy the instrument slot, got: {err}"
+        );
+        assert_eq!(plane.session().lock().store.tracks[0].instrument_id, None);
     }
 
     /// Controller ruling 2: removing the only soloed track through the
