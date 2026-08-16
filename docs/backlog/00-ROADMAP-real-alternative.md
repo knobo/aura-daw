@@ -39,7 +39,7 @@ described here only.
 | Cross-instance / OS-clipboard copy (incl. SMF fallback) | **[done]** PR #22 — owner two-instance check owed; SMF is export-only |
 | Metronome/click + count-in | **[done]** PR #38 — engine-side click, CLICK chip + volume pref, count-in 0/1/2/4 bars. App prefs, not project.json. |
 | Quantize in the piano roll | **[done]** PR #32 — Q / Shift+Q over the selection; one `midi_set_notes` = one undo. |
-| Insert FX chains per track + sends/busses | **[plan G]** `insert-fx-sends-sidechain.md` — host CLAP/LV2 effects (do **not** write a stock FX suite). Sequence: G1 insert chain + PDC, G2 bus + sends, G3 sidechain listen-taps, G4 envelope-follower modulator (later, not Plan G). Round-2 rule still binds: **PDC before sends ship**. Decision recorded, **not started**. Needs its own research → plan → gates round (graph/mixer work). |
+| Insert FX chains per track + sends/busses | **[plan G]** G1 implementation plan: `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`. Product decision: `insert-fx-sends-sidechain.md` — host CLAP/LV2 effects (do **not** write a stock FX suite). Sequence: G1 insert chain + PDC (**plan written, not implemented**), G2 bus + sends, G3 sidechain listen-taps, G4 envelope-follower modulator (later, not Plan G). Round-2 rule still binds: **PDC before sends ship**. Do **not** start G2. |
 | MIDI clock/start-stop out (Hydrogen sync) | **[done]** PR #21 slice 4 — owner Hydrogen ear check owed |
 
 ## Tier 2 — competitive (months)
