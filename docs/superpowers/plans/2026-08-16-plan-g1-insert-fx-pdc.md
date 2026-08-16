@@ -196,7 +196,7 @@ git commit -m "feat(inserts): InsertSlot on TrackState, empty-default for old pr
 
 ---
 
-## Task 2: Channel ops, apply_raw, ChangeSet
+## Task 2: Channel ops, apply_raw, ChangeSet — LANDED PR #55 (`118ae23`)
 
 **Files:**
 - Modify: `src-tauri/src/control/op.rs` (four new `Op` arms at the end of the enum, before the closing `}`)
@@ -402,7 +402,7 @@ git commit -m "feat(inserts): InsertAdd/Remove/Reorder/SetBypass ops, PluginRemo
 
 ---
 
-## Task 3: Commands, effect instantiate gate, lib.rs registration
+## Task 3: Commands, effect instantiate gate, lib.rs registration — LANDED PR #55 (`118ae23`)
 
 **Files:**
 - Modify: `src-tauri/src/plugins/mod.rs` (`instantiate_and_activate_effect`, `insert_add` / `insert_remove` / `insert_reorder` / `insert_set_bypass`)
@@ -618,7 +618,7 @@ git commit -m "feat(inserts): insert_add/remove/reorder/bypass commands, instrum
 
 # Phase G1b — Host audio-in + mixer walk
 
-## Task 4: Host negotiation for effects + latency_samples
+## Task 4: Host negotiation for effects + latency_samples — LANDED PR #55 (`118ae23`)
 
 **Files:**
 - Modify: `src-tauri/src/audio/dsp.rs` (`AudioProcessor::latency_samples` default 0)

@@ -10,8 +10,9 @@ sends). This doc freezes *what* we host and in which order, so the next
 agent does not invent a stock FX suite or ship sends without PDC.
 
 Status: **G1 plan in `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`.**
-Task 1 landed (PR #52, `5c338ff` — `InsertSlot` on `TrackState`).
-Continue at Task 2. Do not start G2/G3/G4 until G1 lands.
+Tasks 1–4 landed (PR #52 + PR #55 `118ae23`). Continue at Task 5
+(mixer strip). Do not start G2/G3/G4 until G1 lands. Handoff:
+`docs/handoff/g1-insert-fx.md`.
 
 ## What AURA has today
 
@@ -19,18 +20,18 @@ The mixer is still a **linear track list**: clips + one live instrument
 node → gain/pan/mute → master (`audio::mixer`). That is a degenerate
 graph, which is the intended prototype shape (`SCALABILITY.md` §1).
 
-Plugin hosting is live, but **instruments only**:
+Plugin hosting is live for instruments **and** (since PR #55) insert
+effects on the document/host path. The mixer still does not walk a
+chain (Task 5):
 
-- CLAP (clack) and LV2 (livi) instantiate on MIDI tracks behind
-  `LiveInstrument`.
+- CLAP (clack) and LV2 (livi) instantiate instruments on MIDI tracks
+  behind `LiveInstrument`. `insert_add` instantiates effects onto
+  `TrackState.inserts` (`HostRole::Effect`).
 - `plugin_scan` already discovers effects (Calf, LSP, Zam, etc.).
-- The browser / load path **rejects** `!isInstrument` (demo data even
-  carries a fake compressor so that rejection is tested).
-- `dsp::Effect` exists as a placeholder trait; nothing implements it
-  and the mixer never walks a chain.
-- CLAP latency extension is **read and logged**. No compensating delay
-  lines. PDC is explicitly deferred to the graph-compiler round
-  (`clap_host.rs`, `PHASE3-PLAN.md` §6).
+- The instrument load path still **rejects** `!isInstrument`.
+- `dsp::Effect` exists; the mixer does not yet walk inserts.
+- CLAP/LV2 `latency_samples()` exist on the host. No compensating
+  delay lines yet (Task 6).
 - `track.kind: "bus"` is reserved in the schema and rejected at
   `add_track` (`control::ops`).
 
