@@ -54,6 +54,7 @@ use crate::midi::synth::BlockNoteEvent;
 use super::descriptor::ParamInfo;
 use super::host::{plugin_main, MainCtx};
 use super::state::StateBlob;
+use super::{HostRole, IoMode};
 
 /// Byte capacity of each preallocated atom sequence (MIDI in / atom out).
 /// One 3-byte MIDI event occupies 24 padded bytes -> ~340 events per block.
@@ -84,7 +85,8 @@ struct Lv2World {
 
 struct WorldInner {
     /// Kept alive for the lilv objects `plugin` handles borrow from.
-    _world: livi::World,
+    /// Also used to build URI nodes for latency-port designation lookup.
+    world: livi::World,
     features: Arc<livi::Features>,
     instances: HashMap<String, HostInstance>,
 }
@@ -104,6 +106,8 @@ struct HostInstance {
     /// Last blob applied via [`Lv2Host::load_state`]; re-applied to every
     /// future RT node so restored patches actually sound.
     loaded_blob: Option<StateBlob>,
+    /// Control-output port index for `lv2:latency` (or name fallback).
+    latency_port: Option<livi::PortIndex>,
 }
 
 /// The slot's world, built on first use (PLUGIN MAIN THREAD ONLY).
@@ -126,7 +130,7 @@ fn world_mut(ctx: &mut MainCtx) -> &mut WorldInner {
             world.iter_plugins().len()
         );
         slot.inner = Some(WorldInner {
-            _world: world,
+            world,
             features,
             instances: HashMap::new(),
         });
@@ -169,8 +173,8 @@ pub fn try_global() -> Option<&'static Lv2Host> {
 }
 
 impl Lv2Host {
-    /// Register `instance_id` against `uid` (`"lv2:<uri>"` or a bare URI).
-    /// Returns the plugin's real control-port parameter list.
+    /// Register `instance_id` against `uid` (`"lv2:<uri>"` or a bare URI) as
+    /// an **instrument**. Returns the plugin's real control-port parameter list.
     pub fn register_instance(
         &self,
         instance_id: &str,
@@ -178,7 +182,49 @@ impl Lv2Host {
     ) -> Result<Vec<ParamInfo>, String> {
         let uri = uid.strip_prefix("lv2:").unwrap_or(uid).to_string();
         let instance_id = instance_id.to_string();
-        plugin_main().run(move |ctx| register(world_mut(ctx), instance_id, &uri))?
+        plugin_main().run(move |ctx| {
+            register(world_mut(ctx), instance_id, &uri, HostRole::Instrument)
+        })?
+    }
+
+    /// Register as an **effect** ([`HostRole::Effect`]): requires ≥1 audio
+    /// input and ≥1 audio output.
+    pub fn register_instance_effect(
+        &self,
+        instance_id: &str,
+        uid: &str,
+    ) -> Result<Vec<ParamInfo>, String> {
+        let uri = uid.strip_prefix("lv2:").unwrap_or(uid).to_string();
+        let instance_id = instance_id.to_string();
+        plugin_main()
+            .run(move |ctx| register(world_mut(ctx), instance_id, &uri, HostRole::Effect))?
+    }
+
+    /// Latency from the control-output port with `lv2:latency` designation
+    /// (or a port named `latency`). 0 when unknown / no such port.
+    pub fn latency_samples(&self, instance_id: &str) -> usize {
+        let instance_id = instance_id.to_string();
+        plugin_main()
+            .run(move |ctx| {
+                let Some(inner) = ctx.slot_mut::<Lv2World>(SLOT).inner.as_mut() else {
+                    return 0usize;
+                };
+                let Some(inst) = inner.instances.get_mut(&instance_id) else {
+                    return 0;
+                };
+                let Some(port) = inst.latency_port else {
+                    return 0;
+                };
+                // Prefer a live shadow control-output value when present;
+                // otherwise 0 (plugins typically write latency on first run).
+                if let Some(shadow) = inst.shadow.as_ref() {
+                    if let Some(v) = shadow.control_output(port) {
+                        return v.max(0.0).round() as usize;
+                    }
+                }
+                0
+            })
+            .unwrap_or(0)
     }
 
     /// Fire-and-forget: drop the host-side registration.
@@ -289,24 +335,77 @@ fn register(
     inner: &mut WorldInner,
     instance_id: String,
     uri: &str,
+    role: HostRole,
 ) -> Result<Vec<ParamInfo>, String> {
-    let plugin = inner._world.plugin_by_uri(uri).ok_or_else(|| {
+    let plugin = inner.world.plugin_by_uri(uri).ok_or_else(|| {
         format!(
             "LV2 plugin not available: {uri} (not installed, or its required \
              features are unsupported by the host)"
         )
     })?;
     let counts = *plugin.port_counts();
-    if counts.audio_outputs == 0 {
-        return Err(format!("{uri}: no audio outputs — cannot host as an instrument"));
+    match role {
+        HostRole::Instrument => {
+            if counts.audio_outputs == 0 {
+                return Err(format!(
+                    "{uri}: no audio outputs — cannot host as an instrument"
+                ));
+            }
+        }
+        HostRole::Effect => {
+            if counts.audio_inputs == 0 {
+                return Err(format!(
+                    "{uri}: no audio inputs — not hostable as an effect"
+                ));
+            }
+            match counts.audio_outputs {
+                1 | 2 => {}
+                0 => {
+                    return Err(format!(
+                        "{uri}: no audio outputs — not hostable as an effect"
+                    ))
+                }
+                n => {
+                    return Err(format!(
+                        "{uri}: v1 hosts mono/stereo-out effects only ({n} audio outs)"
+                    ))
+                }
+            }
+        }
     }
+    let latency_port = find_latency_port(&inner.world, &plugin);
     let params = control_port_params(&plugin);
     let values = params.iter().map(|p| (p.id, p.value as f32)).collect();
     inner.instances.insert(
         instance_id,
-        HostInstance { plugin, values, param_tx: None, shadow: None, loaded_blob: None },
+        HostInstance {
+            plugin,
+            values,
+            param_tx: None,
+            shadow: None,
+            loaded_blob: None,
+            latency_port,
+        },
     );
     Ok(params)
+}
+
+/// Locate the control-output latency port: `lv2:latency` designation first,
+/// then a port named/symbolled `latency` (case-insensitive).
+fn find_latency_port(world: &livi::World, plugin: &livi::Plugin) -> Option<livi::PortIndex> {
+    let lilv_world = world.raw();
+    let latency_uri = lilv_world.new_uri("http://lv2plug.in/ns/lv2core#latency");
+    if let Some(port) = plugin.raw().port_by_designation(None, &latency_uri) {
+        return Some(livi::PortIndex(port.index()));
+    }
+    plugin
+        .ports_with_type(livi::PortType::ControlOutput)
+        .find(|p| {
+            p.name.eq_ignore_ascii_case("latency")
+                || p.symbol.eq_ignore_ascii_case("latency")
+                || p.symbol.to_ascii_lowercase().contains("latency")
+        })
+        .map(|p| p.index)
 }
 
 /// Real `ParamInfo` list from the plugin's control-input ports
@@ -366,7 +465,8 @@ fn make_node(
     }
     let (param_tx, param_rx) = rtrb::RingBuffer::new(PARAM_RING_CAPACITY);
     inst.param_tx = Some(param_tx);
-    let node = Lv2Node::new(instance, features, param_rx);
+    let latency_port = inst.latency_port;
+    let node = Lv2Node::new(instance, features, param_rx, latency_port);
     log::info!(
         "lv2 host: node ready for instance {instance_id} ({} @ {rate} Hz)",
         inst.plugin.uri()
@@ -432,7 +532,7 @@ fn midi_for_event(ev: &BlockNoteEvent) -> [u8; 3] {
 /// MIDI CC 123 "All Notes Off" (channel 0) — release, not kill.
 const ALL_NOTES_OFF: [u8; 3] = [0xB0, 123, 0];
 
-/// A live LV2 instrument node behind the §15.1 seam. Built fully
+/// A live LV2 instrument/effect node behind the §15.1 seam. Built fully
 /// preallocated on the plugin main thread; `process`/`queue_event`/
 /// `all_notes_off` run on the RT thread under the §2.1 contract.
 pub struct Lv2Node {
@@ -451,6 +551,9 @@ pub struct Lv2Node {
     param_rx: rtrb::Consumer<ParamChange>,
     dropped_events: u64,
     run_errors: u64,
+    io_mode: IoMode,
+    /// Control-output port reporting latency (if any).
+    latency_port: Option<livi::PortIndex>,
 }
 
 /// `lv2_raw::LV2Urid` (a plain `u32`) — livi exposes it only through
@@ -464,6 +567,7 @@ impl Lv2Node {
         instance: livi::Instance,
         features: &std::sync::Arc<livi::Features>,
         param_rx: rtrb::Consumer<ParamChange>,
+        latency_port: Option<livi::PortIndex>,
     ) -> Self {
         let counts = instance.port_counts();
         let buffers = |n: usize| vec![vec![0.0f32; MAX_LIVE_BLOCK]; n];
@@ -484,6 +588,8 @@ impl Lv2Node {
             dropped_events: 0,
             run_errors: 0,
             instance,
+            io_mode: IoMode::Add,
+            latency_port,
         }
     }
 
@@ -495,6 +601,11 @@ impl Lv2Node {
     /// Failed `run` calls (counted, never logged, on the RT path).
     pub fn run_errors(&self) -> u64 {
         self.run_errors
+    }
+
+    /// Select instrument (Add) vs effect (Replace) IO. Control-thread only.
+    pub fn set_io_mode(&mut self, mode: IoMode) {
+        self.io_mode = mode;
     }
 
     /// RT-safe push into the block's MIDI sequence.
@@ -516,8 +627,9 @@ impl AudioProcessor for Lv2Node {
         // rate, so a rate change rebuilds the node through the host).
     }
 
-    /// RT: connect preallocated ports, run the plugin, ADD its output into
-    /// the zeroed stereo scratch. No alloc/lock/syscall; errors counted.
+    /// RT: connect preallocated ports, run the plugin, then either ADD
+    /// (instrument) or ASSIGN (effect) the main outs into the scratch.
+    /// No alloc/lock/syscall; errors counted.
     fn process(&mut self, io: &mut ProcessBlock<'_>) {
         let frames = io.frames().min(MAX_LIVE_BLOCK);
         if frames == 0 {
@@ -528,6 +640,36 @@ impl AudioProcessor for Lv2Node {
         while let Ok((id, value)) = self.param_rx.pop() {
             self.instance.set_control_input(livi::PortIndex(id as usize), value);
         }
+
+        // Feed audio inputs: silence (Add) or de-interleaved `io.samples`
+        // (Replace). LV2 audio ports are mono; stereo plugins have 2 ports.
+        match self.io_mode {
+            IoMode::Add => {
+                for buf in &mut self.audio_in {
+                    buf[..frames].fill(0.0);
+                }
+            }
+            IoMode::Replace => {
+                let ch = io.channels.max(1);
+                match self.audio_in.len() {
+                    0 => {}
+                    1 => {
+                        for i in 0..frames {
+                            self.audio_in[0][i] = io.samples[i * ch];
+                        }
+                    }
+                    _ => {
+                        for i in 0..frames {
+                            let l = io.samples[i * ch];
+                            let r = if ch >= 2 { io.samples[i * ch + 1] } else { l };
+                            self.audio_in[0][i] = l;
+                            self.audio_in[1][i] = r;
+                        }
+                    }
+                }
+            }
+        }
+
         let Self { instance, atom_in, atom_out, audio_in, audio_out, cv_in, cv_out, .. } = self;
         let ports = livi::EmptyPortConnections::new()
             .with_audio_inputs(audio_in.iter().map(|b| &b[..frames]))
@@ -541,10 +683,10 @@ impl AudioProcessor for Lv2Node {
         // documented in-process v1 risk.
         let ok = unsafe { instance.run(frames, ports) }.is_ok();
         if ok {
-            // ADD into the scratch (contract: the node sums, the mixer owns
-            // gain/pan). Mono plugins are center-duplicated; >2 outs take
-            // the first stereo pair.
+            // Mono plugins are center-duplicated; >2 outs take the first
+            // stereo pair. Add (+=) vs Replace (=) by io_mode.
             let ch = io.channels;
+            let replace = self.io_mode == IoMode::Replace;
             let (li, ri) = match self.audio_out.len() {
                 0 => {
                     self.consume_block();
@@ -558,8 +700,15 @@ impl AudioProcessor for Lv2Node {
                 let r = self.audio_out[ri][i];
                 let base = i * ch;
                 if ch >= 2 {
-                    io.samples[base] += l;
-                    io.samples[base + 1] += r;
+                    if replace {
+                        io.samples[base] = l;
+                        io.samples[base + 1] = r;
+                    } else {
+                        io.samples[base] += l;
+                        io.samples[base + 1] += r;
+                    }
+                } else if replace {
+                    io.samples[base] = 0.5 * (l + r);
                 } else {
                     io.samples[base] += 0.5 * (l + r);
                 }
@@ -572,6 +721,16 @@ impl AudioProcessor for Lv2Node {
 
     fn reset(&mut self) {
         self.all_notes_off();
+    }
+
+    fn latency_samples(&self) -> usize {
+        let Some(port) = self.latency_port else {
+            return 0;
+        };
+        self.instance
+            .control_output(port)
+            .map(|v| v.max(0.0).round() as usize)
+            .unwrap_or(0)
     }
 }
 
@@ -1021,5 +1180,109 @@ mod tests {
             crate::plugins::live_node_for(&doc, "orphan-lv2", 48_000).is_none(),
             "unresolvable active LV2 instance -> None (PolySynth fallback upstream)"
         );
+    }
+
+    /// Known open LV2 effects (Zam / Calf). First installed URI wins; skip
+    /// cleanly when none of the candidates are available on the machine.
+    fn known_effect_uri() -> Option<&'static str> {
+        const CANDIDATES: &[&str] = &[
+            "urn:zamaudio:ZaMaximX2",
+            "urn:zamaudio:ZamComp",
+            "urn:zamaudio:ZamEQ2",
+            "http://calf.sourceforge.net/plugins/Compressor",
+            "http://calf.sourceforge.net/plugins/Filter",
+        ];
+        let host = global();
+        for uri in CANDIDATES {
+            let id = format!("probe-{}", uuid::Uuid::new_v4());
+            match host.register_instance_effect(&id, &format!("lv2:{uri}")) {
+                Ok(_) => {
+                    host.unregister_instance(&id);
+                    return Some(*uri);
+                }
+                Err(_) => {}
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn register_instance_effect_accepts_a_known_fx_when_installed() {
+        let Some(uri) = known_effect_uri() else {
+            eprintln!("note: no known LV2 effect installed; effect-host path skipped");
+            return;
+        };
+        let host = global();
+        let id = format!("fx-{}", uuid::Uuid::new_v4());
+        let params = host
+            .register_instance_effect(&id, &format!("lv2:{uri}"))
+            .expect("effect must host as HostRole::Effect");
+        let _ = params;
+        let lat = host.latency_samples(&id);
+        let _ = lat;
+        host.unregister_instance(&id);
+    }
+
+    /// `IoMode::Replace` overwrites scratch; poison residual must not stick.
+    #[test]
+    fn lv2_node_replace_mode_does_not_add() {
+        let Some(uri) = known_effect_uri() else {
+            eprintln!("note: no known LV2 effect installed; replace-mode pin skipped");
+            return;
+        };
+        let host = global();
+        let id = format!("fx-{}", uuid::Uuid::new_v4());
+        host.register_instance_effect(&id, &format!("lv2:{uri}"))
+            .expect("register effect");
+        let id2 = id.clone();
+        let mut node = plugin_main()
+            .run(move |ctx| {
+                let WorldInner { features, instances, .. } = world_mut(ctx);
+                let inst = instances.get_mut(&id2).expect("registered");
+                // SAFETY: third-party plugin code on the plugin main thread.
+                let instance = unsafe { inst.plugin.instantiate(features.clone(), 48_000.0) }
+                    .expect("instantiate");
+                let (_tx, rx) = rtrb::RingBuffer::new(PARAM_RING_CAPACITY);
+                let mut n = Lv2Node::new(instance, features, rx, inst.latency_port);
+                n.set_io_mode(IoMode::Replace);
+                n
+            })
+            .expect("main thread");
+
+        let frames = 256usize;
+        let mut buf = vec![0.5f32; frames * 2];
+        {
+            let mut io = ProcessBlock {
+                samples: &mut buf,
+                channels: 2,
+                sample_rate: 48_000,
+                steady: None,
+            };
+            node.process(&mut io);
+        }
+        let first = buf.clone();
+        for s in buf.iter_mut() {
+            *s += 100.0;
+        }
+        {
+            let mut io = ProcessBlock {
+                samples: &mut buf,
+                channels: 2,
+                sample_rate: 48_000,
+                steady: None,
+            };
+            node.process(&mut io);
+        }
+        let max_delta = first
+            .iter()
+            .zip(buf.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_delta < 1.0,
+            "Replace must overwrite (not +=): max |second-first|={max_delta}"
+        );
+        drop(node);
+        host.unregister_instance(&id);
     }
 }

@@ -44,6 +44,23 @@ use tauri::{AppHandle, Manager, State};
 use crate::audio::dsp::LiveInstrument;
 pub use descriptor::{ParamInfo, PluginDescriptor, PluginInstanceInfo};
 
+/// How a hosted plugin node mixes its main output into the process block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IoMode {
+    /// Instrument contract: silence inputs, `+=` main out (default).
+    #[default]
+    Add,
+    /// Effect contract: copy `io.samples` into inputs, assign main out.
+    Replace,
+}
+
+/// Port-negotiation role for CLAP/LV2 host instantiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostRole {
+    Instrument,
+    Effect,
+}
+
 // ---------------------------------------------------------------------------
 // Registry (LIVE-only control-plane state; engine reads via the registered
 // global). Plan E Task 9 (round-2 inventory rows 12-15): the DOCUMENT half
@@ -259,9 +276,8 @@ pub fn instantiate_and_activate(
 
 /// Plan G1: insert-FX path — same prepare-outside host half as
 /// [`instantiate_and_activate`], with the instrument/effect gate inverted.
-/// Instruments stay on the instrument slot; effects go through here.
-/// Host negotiation for effects lands in Task 4; until then a real effect
-/// may fail the host call (accepted).
+/// Instruments stay on the instrument slot; effects go through here via
+/// [`clap_host::instantiate_effect`] / [`lv2_host::Lv2Host::register_instance_effect`].
 pub fn instantiate_and_activate_effect(
     registry: &Arc<Mutex<PluginRegistry>>,
     uid: &str,
@@ -283,8 +299,8 @@ pub fn instantiate_and_activate_effect(
     }
     let id = uuid::Uuid::new_v4().to_string();
     let hosted = match desc.format.as_str() {
-        "lv2" => lv2_host::global().register_instance(&id, &desc.uid),
-        "clap" => clap_host::instantiate(&id, &desc.uid),
+        "lv2" => lv2_host::global().register_instance_effect(&id, &desc.uid),
+        "clap" => clap_host::instantiate_effect(&id, &desc.uid),
         _ => Ok(Vec::new()),
     };
     let params = hosted?;
@@ -298,6 +314,21 @@ pub fn instantiate_and_activate_effect(
         track_id: None,
     };
     Ok((info, params))
+}
+
+/// Report hosted-instance latency in samples (0 when unknown / no ext).
+/// Dispatches by format on the document row's format when known; otherwise
+/// probes CLAP then LV2 host maps.
+pub fn latency_of(instance_id: &str) -> usize {
+    if clap_host::has_instance(instance_id).unwrap_or(false) {
+        return clap_host::latency_samples(instance_id);
+    }
+    if let Some(host) = lv2_host::try_global() {
+        if host.has_instance(instance_id).unwrap_or(false) {
+            return host.latency_samples(instance_id);
+        }
+    }
+    0
 }
 
 /// Destroy a just-instantiated (not-yet-committed) host instance — the
