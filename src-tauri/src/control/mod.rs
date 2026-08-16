@@ -6935,6 +6935,7 @@ mod tests {
                 armed: false,
                 color: "#7c9cff".into(),
                 instrument_id: None,
+                inserts: Vec::new(),
             });
         }
         let slots = derive_slots(&store.tracks);
@@ -7040,6 +7041,7 @@ mod tests {
                 armed: false,
                 color: "#7c9cff".into(),
                 instrument_id: Some(format!("plugin:{}", ids[slot])),
+                inserts: Vec::new(),
             });
         }
         let slots = derive_slots(&store.tracks);

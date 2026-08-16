@@ -757,6 +757,7 @@ mod tests {
             armed: false,
             color: "#7c9cff".into(),
             instrument_id,
+            inserts: Vec::new(),
         }
     }
 

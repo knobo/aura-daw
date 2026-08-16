@@ -463,6 +463,7 @@ mod tests {
             armed: false,
             color: "#7c9cff".into(),
             instrument_id: None,
+            inserts: Vec::new(),
         };
         let clip = crate::audio::types::Clip {
             id: "c-1".into(),

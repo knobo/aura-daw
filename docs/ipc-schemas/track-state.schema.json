@@ -49,6 +49,19 @@
       "description": "UI accent color as lowercase hex \"#rrggbb\".",
       "type": "string",
       "pattern": "^#[0-9a-f]{6}$"
+    },
+    "inserts": {
+      "description": "Ordered insert-FX slots. Slot id is a stable UUID; instanceId names a PluginInstanceInfo.id. Absent means empty.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "instanceId"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "instanceId": { "type": "string" },
+          "bypassed": { "type": "boolean", "default": false }
+        }
+      }
     }
   },
   "required": ["id", "name", "kind", "gainDb", "pan", "muted", "soloed", "armed", "color"],

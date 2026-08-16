@@ -90,6 +90,7 @@ pub(crate) fn new_track_row(
         armed: false,
         color: TRACK_COLORS[n % TRACK_COLORS.len()].into(),
         instrument_id: None,
+        inserts: Vec::new(),
     };
     Ok((track, n))
 }

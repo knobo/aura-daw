@@ -3859,6 +3859,7 @@ mod tests {
             armed: false,
             color: "#7c9cff".into(),
             instrument_id: None,
+            inserts: Vec::new(),
         }
     }
 
@@ -4726,6 +4727,7 @@ mod tests {
                 armed: false,
                 color: "#7c9cff".into(),
                 instrument_id: None,
+                inserts: Vec::new(),
             });
         }
         // Rebuild derives slots + publishes tables (round-2 §2.4). The
@@ -5569,6 +5571,7 @@ mod tests {
                 armed: false,
                 color: "#7c9cff".into(),
                 instrument_id: None,
+                inserts: Vec::new(),
             });
             let mut c1 = test_clip("c1", "t1");
             c1.source_id = sid.clone();
@@ -5662,6 +5665,7 @@ mod tests {
                 armed: false,
                 color: "#7c9cff".into(),
                 instrument_id: None,
+                inserts: Vec::new(),
             });
             let mut c1 = test_clip("c1", "t1");
             c1.source_id = sid.clone();
