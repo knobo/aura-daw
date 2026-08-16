@@ -35,16 +35,19 @@ Run everything from the worktree. Do **not** `cd` to `/home/knobo/prog/dav`.
 - [x] Pre-existing red test on main fixed by the owner in PR #45, merged in
 - [x] Implementation plan written and self-reviewed
 
-**Phase 1 — backend.** Not started.
+**Phase 1 — backend.** In progress; the pure-DSP half is done.
 
 - [x] Task 1 — YIN detector (`audio/yin.rs`) — `eb0d47b`, 799 tests green
-- [~] Task 2 — decimation to 8 kHz (`audio/decimate.rs`) — implemented and
-      committed `190316a`, 5/5 module tests pass. **Task review not yet run.**
-      Resume here: generate the review package over `7302d4e..190316a` and
-      dispatch the task reviewer.
-- [ ] Task 3 — pitch frames: gating, smoothing, timestamps (`audio/pitch.rs`)
-- [ ] Task 4 — parity guard vs. `sidecars/hum_to_midi.py`
-- [ ] Task 5 — **InputHub** (`audio/engine.rs`) ← the risky one
+- [x] Task 2 — decimation to 8 kHz (`audio/decimate.rs`) — `190316a`, 5/5
+      module tests pass. Reviewed inline (no reviewer agent dispatched): the
+      fractional-phase interpolation is correct — `t = 1 - pos/step` is the
+      right fraction of the `[prev, current]` interval — filter state
+      persists across chunks, and `process` allocates nothing.
+- [x] Task 3 — pitch frames: gating, smoothing, timestamps (`audio/pitch.rs`)
+      — `c579003`, 9/9 module tests pass, 215/215 `audio::` green
+- [x] Task 4 — parity guard vs. `sidecars/hum_to_midi.py` — `c7e9555`, 2/2
+      pass. Rust and sidecar agree to **3.3 cents**.
+- [ ] Task 5 — **InputHub** (`audio/engine.rs`) ← the risky one, resume here
 - [ ] Task 6 — commands, events, schemas (+ owner must register in `lib.rs`)
 - [ ] **Owner checkpoint** (spec R3): demonstrate detected pitch numerically
       before any UI is built
@@ -124,6 +127,19 @@ with the commit sha and anything the next agent would be surprised by.
 
 - 2026-08-16 — spec committed `4e9d684`; merged `origin/main` (`d0866ad`,
   the transport fix) into the branch; baseline green; plan written.
+- 2026-08-16 — Tasks 2 (review), 3 and 4 done. Three things the next agent
+  should know:
+  1. **The live median is causal; the sidecar's is centred.** The live pitch
+     track therefore lags `hum_to_midi.py` by exactly the median half-kernel
+     — 2 frames, 20 ms. This is not a bug and must not be "fixed": a live
+     detector cannot look ahead. It is asserted in
+     `tests/pitch_sidecar_parity.rs`, and Phase 2 should not be surprised
+     when the trail sits 20 ms behind on fast vibrato.
+  2. With that lag accounted for the two detectors agree to **3.3 cents**,
+     not the 30 the plan budgeted. The tolerance is now 10 cents, which is
+     tight enough to actually catch a drifted constant.
+  3. Integration tests import **`aura_lib::`**, not `aura::` — the lib
+     target is renamed in Cargo.toml. The plan said `aura::`.
 - 2026-08-16 — Task 1 done (`eb0d47b`). Two plan corrections came out of its
   review, both committed: the difference function must sum a full `w` terms per
   lag (`ae338c1`), and the detector's effective pitch floor is 65.04 Hz, not

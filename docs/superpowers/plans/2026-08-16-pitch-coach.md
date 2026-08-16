@@ -639,8 +639,27 @@ git commit -m "feat(pitch): frame gating, median smoothing and window-centred ti
 - Test: that file
 
 **Interfaces:**
-- Consumes: `aura::audio::{yin, decimate, pitch}`.
+- Consumes: `aura_lib::audio::{yin, decimate, pitch}` — the lib target is
+  named `aura_lib`, not `aura` (Cargo.toml `[lib] name`); integration tests
+  must use that path.
 - Produces: nothing consumed by later tasks. This is a guard, not a component.
+
+**Corrections from executing it (see commit `c7e9555`):**
+
+- Compare the sidecar's **median-smoothed** track, not its raw one. The
+  Rust analyser smooths before it reports, so comparing against raw
+  `pitch_track` output measures the smoother, not the detector.
+- The live median is **causal**; the sidecar's `median_filter_track` is
+  **centred**. The live track therefore lags by exactly the half-kernel
+  (`MEDIAN_TAPS / 2` = 2 frames = 20 ms). Align by that shift. Measured
+  worst-case disagreement by shift: `[29.3, 15.4, 3.3, 13.7, 26.6]` cents —
+  a clean minimum at 2.
+- With the lag removed the tolerance is **10 cents, not 30**. 30 would have
+  passed at *any* alignment and so tested nothing; 10 fails at every
+  alignment but the right one.
+- A second test sweeps the alignment and asserts the minimum sits at the
+  half-kernel, so adding another smoothing stage to the live path fails
+  loudly instead of hiding inside the tolerance.
 
 **Why this exists:** the spec's whole argument for copying the sidecar's constants is that the live trainer and hum-to-MIDI must never disagree about what the singer sang. That claim needs a test, or it is just a comment.
 
@@ -696,7 +715,7 @@ Expected: FAIL on the `todo!`.
 
 - [ ] **Step 3: Implement**
 
-Check whether `sidecars/hum_to_midi.py` already exposes a raw pitch-track mode. If it does not, add a `--pitch-track` flag that prints one NDJSON object per frame (`{"t": <seconds>, "hz": <float|null>, "rms": <float>}`) by calling the existing `pitch_track(samples, sr)` and returning early — an additive flag that changes no existing behaviour, with the existing `--self-test` still passing.
+Check whether `sidecars/hum_to_midi.py` already exposes a raw pitch-track mode. It does not (checked), so add a `--pitch-track` flag that prints one NDJSON object per frame (`{"t": <seconds>, "hz": <float|null>, "midi": <float|null>, "rms": <float>}`) by calling the existing `pitch_track(samples, sr)` and returning early — an additive flag that changes no existing behaviour, with the existing `--self-test` still passing. `midi` is the value after `median_filter_track`, which is the stage the Rust side must be compared against; `hz` is raw, and is what tells you whether a disagreement came from detection or from smoothing.
 
 Write the WAV with `hound` (already a dependency) into `std::env::temp_dir()`, and delete it at the end of the test.
 
