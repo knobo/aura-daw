@@ -1349,8 +1349,18 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             // dangling instanceId on any track's insert list. Inverse shape
             // is unchanged — slots are not restored by PluginAdd (G-7: the
             // insert ops own membership; remove_track composes both).
+            // When any slot is dropped, project.json must rewrite too —
+            // plugins persist is a different file (PluginDoc only).
+            let mut swept = false;
             for t in session.store.tracks.iter_mut() {
+                let before = t.inserts.len();
                 t.inserts.retain(|s| s.instance_id != removed.id);
+                if t.inserts.len() != before {
+                    swept = true;
+                }
+            }
+            if swept {
+                effect.persist.project = true;
             }
             effect.host_forward.push(HostForward::Destroy { instance: removed.id.clone() });
             Ok(Op::PluginAdd { row: removed, index: pos })
@@ -4250,7 +4260,7 @@ mod tests {
         });
         // Clone outside the tx — `transact` already holds the session mutex.
         let row = m.lock().plugins.instances[0].clone();
-        commit(&m, |tx| {
+        let c = commit(&m, |tx| {
             tx.apply(Op::PluginRemove {
                 row,
                 index: 0,
@@ -4262,6 +4272,11 @@ mod tests {
             m.lock().store.tracks[0].inserts.is_empty(),
             "G-10: PluginRemove must not leave a dangling instanceId"
         );
+        assert!(
+            c.effect.persist.project,
+            "G-10 sweep mutates TrackState.inserts — project.json must rewrite"
+        );
+        assert!(c.effect.persist.plugins, "PluginRemove still persists PluginDoc");
     }
 
     #[test]
