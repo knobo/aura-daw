@@ -11,6 +11,14 @@ User-facing: `docs/midi-input.md` § Launch. Trace: `AURA_LAUNCH_TRACE=1`.
 
 ## Not in v0.1 — next
 
+### Hardware GATE
+
+Drive clips honour GATE (note-off cuts the scene) vs ONE-SHOT (plays to
+the marked end). Hardware pads do **not**: a matching note-on seeks,
+loops, and plays the region; note-off only clears the held-pad debounce.
+Hardware GATE (hold the pad to keep the scene, lift to stop) is not in
+v0.1.
+
 ### Sustain (overlapping voices)
 
 Today ONE-SHOT restarts the single shadow playhead, and GATE cuts on
