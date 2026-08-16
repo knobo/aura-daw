@@ -1160,25 +1160,34 @@ impl GestureState {
     /// and handed back to the caller to finish committing — `GestureState`
     /// has no `ControlPlane` handle of its own to synthesize/emit the
     /// auto-closed batch.
-    fn begin(&self, label: String, actor: op::Actor) -> Option<OpenGesture> {
+    fn begin(&self, label: String, actor: op::Actor) -> (String, Option<OpenGesture>) {
         let mut guard = self.0.lock();
         let stale = guard.take();
+        let run = uuid::Uuid::new_v4().to_string();
         *guard = Some(OpenGesture {
             actor,
-            run: uuid::Uuid::new_v4().to_string(),
+            run: run.clone(),
             baselines: Vec::new(),
             last: Vec::new(),
             label,
             persist: session::PersistEffect::default(),
             epoch: 0,
         });
-        stale
+        (run, stale)
     }
 
     /// Closes the open gesture (if any), handing it back to the caller to
-    /// synthesize/commit. `None` if nothing was open.
-    fn end(&self) -> Option<OpenGesture> {
-        self.0.lock().take()
+    /// synthesize/commit. `None` if nothing was open. When `id` is `Some`
+    /// and does not match the open gesture's run id, leaves it open —
+    /// a late end from a different begin must not close this one.
+    fn end(&self, id: Option<&str>) -> Option<OpenGesture> {
+        let mut guard = self.0.lock();
+        if let (Some(want), Some(g)) = (id, guard.as_ref()) {
+            if g.run != want {
+                return None;
+            }
+        }
+        guard.take()
     }
 
     /// Runs `f` — a commit — with THIS mutex held across the WHOLE
@@ -2872,7 +2881,7 @@ impl ControlPlane {
     /// `pop_undo`/`push_*` take `epoch` -> `history` with NO session lock
     /// held (`commit_replay` returns before the push).
     pub fn undo(&self) -> Result<Option<String>, String> {
-        if let Some(g) = self.gesture.end() {
+        if let Some(g) = self.gesture.end(None) {
             self.close_gesture(g);
         }
         let _gate = self.history_gate.lock();
@@ -2911,7 +2920,7 @@ impl ControlPlane {
     /// which is the same answer it would have given a moment later, once
     /// the pointer came up.
     pub fn redo(&self) -> Result<Option<String>, String> {
-        if let Some(g) = self.gesture.end() {
+        if let Some(g) = self.gesture.end(None) {
             self.close_gesture(g);
         }
         let _gate = self.history_gate.lock();
@@ -3011,11 +3020,12 @@ impl ControlPlane {
     /// wired, a webview reload mid-drag, ...) can never wedge the channel
     /// shut for good. Always `Actor::User` — gestures are a frontend-only
     /// concept today; no MCP tool opens one.
-    pub fn gesture_begin(&self, label: String) -> Result<(), String> {
-        if let Some(stale) = self.gesture.begin(label, op::Actor::User) {
+    pub fn gesture_begin(&self, label: String) -> Result<String, String> {
+        let (id, stale) = self.gesture.begin(label, op::Actor::User);
+        if let Some(stale) = stale {
             self.close_gesture(stale);
         }
-        Ok(())
+        Ok(id)
     }
 
     /// Closes the open gesture, synthesizing and committing its one
@@ -3024,7 +3034,18 @@ impl ControlPlane {
     /// matching `pointerdown`, or a double-fire, must never error the IPC
     /// channel.
     pub fn gesture_end(&self) -> Result<(), String> {
-        if let Some(g) = self.gesture.end() {
+        if let Some(g) = self.gesture.end(None) {
+            self.close_gesture(g);
+        }
+        Ok(())
+    }
+
+    /// Close the open gesture only if `id` is the one `gesture_begin`
+    /// returned for it. A mismatch is a no-op — not an error — so a late
+    /// `end` from a promise continuation cannot close a different gesture
+    /// that began while it was awaiting (Track D leftover).
+    pub fn gesture_end_id(&self, id: &str) -> Result<(), String> {
+        if let Some(g) = self.gesture.end(Some(id)) {
             self.close_gesture(g);
         }
         Ok(())
@@ -4316,21 +4337,25 @@ pub fn remove_clip(clip_id: String, control: State<'_, Arc<ControlPlane>>) -> Re
 }
 
 /// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
-/// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. The frontend
-/// calls this on `pointerdown` of a fader/pan control; matching mid-gesture
-/// `set_track_mix` calls fold backend-side until `gesture_end` closes the
-/// boundary.
+/// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. Returns the
+/// new gesture's id so a later `gesture_end` can refuse to close a
+/// different one. Matching mid-gesture `set_track_mix` calls fold
+/// backend-side until that matching end.
 #[tauri::command]
-pub fn gesture_begin(label: String, control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+pub fn gesture_begin(label: String, control: State<'_, Arc<ControlPlane>>) -> Result<String, String> {
     control.gesture_begin(label)
 }
 
 /// Close the open gesture boundary (Plan E Task 14) — thin delegate over
-/// [`ControlPlane::gesture_end`]. The frontend calls this on `pointerup`/
-/// `pointercancel`; a no-op (never an error) if nothing is open.
+/// [`ControlPlane::gesture_end`] / [`ControlPlane::gesture_end_id`].
+/// `id` is additive: omitted (or `null`) closes whatever is open (the
+/// old contract); a mismatch is a no-op, never an error.
 #[tauri::command]
-pub fn gesture_end(control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
-    control.gesture_end()
+pub fn gesture_end(id: Option<String>, control: State<'_, Arc<ControlPlane>>) -> Result<(), String> {
+    match id.as_deref() {
+        Some(id) => control.gesture_end_id(id),
+        None => control.gesture_end(),
+    }
 }
 
 /// What `undo`/`redo` hand back: the label of the step that moved (or
@@ -5697,6 +5722,50 @@ mod tests {
         let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
         assert!(plane.gesture_end().is_ok());
         assert!(plane.take_last_gesture_batch().is_none());
+    }
+
+    /// Track D leftover: a late `gesture_end` from a promise continuation
+    /// must not close a different gesture that began while it was awaiting.
+    /// `gesture_begin` returns the open gesture's id; `gesture_end_id`
+    /// no-ops on mismatch and leaves the live drag's batch intact.
+    #[test]
+    fn gesture_end_with_a_stale_id_does_not_close_the_open_gesture() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+
+        let first = plane.gesture_begin("plugin param drag".into()).unwrap();
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-3.0), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+
+        // Fader starts while the knob's end is still in flight: begin
+        // auto-closes the plugin gesture (its edits are already folded).
+        let second = plane.gesture_begin("gain drag".into()).unwrap();
+        let closed = plane.take_last_gesture_batch().expect("auto-close commits the stale gesture");
+        assert_eq!(closed.meta.label, "plugin param drag");
+        assert_ne!(first, second, "each begin mints its own id");
+
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-6.0), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+
+        // The knob's late end must not close the fader.
+        plane.gesture_end_id(&first).unwrap();
+        assert!(
+            plane.take_last_gesture_batch().is_none(),
+            "a stale gesture_end must not synthesize a batch"
+        );
+
+        plane.gesture_end_id(&second).unwrap();
+        let batch = plane
+            .take_last_gesture_batch()
+            .expect("matching end closes the open gesture");
+        assert_eq!(batch.meta.label, "gain drag");
     }
 
     /// `take_last_gesture_batch` is a single slot, not a queue (documented

@@ -1,14 +1,22 @@
 # Next: after Plan F
 
-Plan F (history storage) is **IMPLEMENTED** on `plan-f-history` (**PR #23**,
-CI green, mergeable). After that PR merges, `origin/main` is the baseline
-for new work. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before
-touching snapshots, the journal reader, the version graph, or
-`engine::rebuild`.
+Plan F (history storage) is **IMPLEMENTED and MERGED** as squash `6af46dd`
+(**PR #23**, 2026-08-16). `origin/main` is the baseline for new work.
+Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching
+snapshots, the journal reader, the version graph, or `engine::rebuild`.
+Branch `plan-f-history` is **kept** so task SHAs cited in the handoff
+still resolve.
 
 The five parallel tracks (A–E / F) are all landed. What remains is
 named below: owner ear-checks, Plan F carry-forwards, Track D/B leftovers,
 modulation design §8, and Plan G. Do not re-open a closed Plan F item.
+
+**In flight — do not start these, other agents own them:**
+- **PR #42** `feat/midi-launch-map` (open, CONFLICTING with the Plan F
+  squash — rebase onto `origin/main` before more work).
+- `feat/pitch-coach` (worktree, tasks 2–4 recorded done).
+- `feat/external-audio-editor` (worktree, one commit ahead of pre-Plan-F
+  main).
 
 Read this file, then pick a leftover and do the work. Reply to the user
 in Norwegian — they write Norwegian; the repo documentation is English.
@@ -122,39 +130,29 @@ unowned notes are M-8 and owner ear-checks — read the report first):
   sibling to `set_params` plus a driver that uses it. **Owner: the
   plugin-host path.**
 - **An automated plugin param is PINNED for the whole playthrough**, not
-  just while a knob is held. The "A" button is the only way to create a
-  plugin-param lane and it mints a single-point (flat) lane, and the lane
-  editor draws track gain only — so there is no way to give a plugin param
-  a curve yet. Turn that param in the plugin's own GUI during playback and
-  it snaps back within ~0.5 s and stays, while AURA's panel still shows the
-  new value. Intended scope (automation overrides the knob), but say so
-  plainly. Follow-ups that change it: a curve editor for plugin params, and
-  write/touch/latch modes.
-- **`gesture_end` has no id — it closes whatever is open.** Tracks A and
-  C landed without this fix; it is still open. Any `endGesture()` fired
-  from a promise continuation can
-  close a gesture that began while it was awaiting; `gesture_begin`
-  auto-closes a stale one, so the two compose into a real regression.
-  Live example, Track D's own: release a plugin knob (awaits a rAF + one
-  IPC round trip) and press a track fader inside that window — the pending
-  `endGesture()` closes the FADER's gesture, and the rest of that drag
-  commits unbracketed, one undo entry and one `project.json` write per rAF
-  batch. That is the I-8 regression inside I-8's own fix. Two more
-  instances (`library.svelte.ts`, the automation delete path) are listed
-  in the handoff. Fix to make: `gesture_begin` returns an id,
-  `gesture_end(id)` no-ops on mismatch — additive, so it stays inside the
-  frozen-command rules. Worst case is an extra undo entry and an extra
-  persist, never data loss. **If your track drives gestures from an async
-  path, read the handoff entry before writing that code.**
+  just while a knob is held. Track F shipped the curve editor (lane
+  picker + overlay), so a plugin param *can* have a drawn curve now —
+  the remaining gap is write/touch/latch, not "no way to draw". Turn
+  that param in the plugin's own GUI during playback and it snaps back
+  within ~0.5 s and stays, while AURA's panel still shows the new
+  value. Intended scope (automation overrides the knob), but say so
+  plainly.
+- ~~**`gesture_end` has no id — it closes whatever is open.**~~ →
+  **closed on `fix/gesture-end-id`**: `gesture_begin` returns the
+  gesture's run id; `gesture_end(id)` no-ops on mismatch (omitting `id`
+  keeps the old close-whatever contract). Async callers (plugin knobs,
+  library stamp, lane/envelope delete+commit, clip-drag, faders, tempo)
+  hold the token across the await.
 - **No DOM test environment exists** (no jsdom/testing-library), so nothing
   inside a `.svelte` file is covered by any test. Both of Track D's real
   frontend bugs lived in event handlers and both were found by reading.
   Move async-ordering logic into a store where it can be tested.
-- **Two UI minors, deliberately left open** by the whole-track review:
-  `movePoint` silently deletes a neighbour on a tick collision
-  (`automation-edit.ts:57-66`), and `.tog.auto.on` is byte-identical to
-  `.tog.arm.on` in `TrackHeader.svelte`, so an automation-visible track
-  reads as armed.
+- ~~**Two UI minors** — `movePoint` deleted a neighbour on a tick
+  collision, and `.tog.auto.on` was byte-identical to `.tog.arm.on`.~~
+  → **closed by PR #32** (`feat/lowhanging-fl-fruits`): a colliding
+  drag keeps the neighbour's tick; automation-visible is magenta, ARM
+  stays red. Piano-roll **Q / Shift+Q** (quantize) landed in the same
+  PR.
 
 This file is written for a **fresh session after `/clear`**. Everything
 it asserts was checked against the `plan-f-history` tree at write time
@@ -168,12 +166,12 @@ The project is **AURA**, an AI-native DAW: Tauri v2 + Svelte 5 around a
 lock-free real-time Rust engine (`src-tauri/`), local AI sidecars, and an
 embedded MCP server so agents mutate the session alongside the user.
 
-**Plan F (history storage) is IMPLEMENTED on `plan-f-history` (PR #23).**
-Tasks 1–13 plus the persist/clipboard review follow-up. CI green,
-`MERGEABLE`. After merge, a fresh session branching from `origin/main`
-gets the published `SessionSnapshot`, lock-free rebuild assembly, version
-graph, panic rollback, journal reader (detection only), and placement
-offsets. Full handoff: `docs/PHASE4-PLAN.md`'s **"Plan F handoff"**.
+**Plan F (history storage) is MERGED** (`6af46dd`, PR #23). Tasks 1–13
+plus the persist/clipboard review follow-up. A fresh session branching
+from `origin/main` gets the published `SessionSnapshot`, lock-free
+rebuild assembly, version graph, panic rollback, journal reader
+(detection only), and placement offsets. Full handoff:
+`docs/PHASE4-PLAN.md`'s **"Plan F handoff"**.
 
 Plan E is already on `main` (squash `27911d8`, PR #12). Its follow-up
 PR #18 is also merged. Branch `plan-e-side-channels` is **kept** so SHAs
@@ -187,9 +185,9 @@ Track B's prerequisite. Tracks B/C/D/E/F have their own landed PRs
 do about those merges.
 
 **Baseline to verify at the start of any leftover**: MEASURE IT, don't
-trust this line. Current measured count on `plan-f-history` 2026-08-16
-(after the PR #23 review follow-up, rebased onto main): **900 backend
-(866 lib + 34 integration, plus 2 `#[ignore]`) + 456 frontend**.
+trust this line. Current measured count on `fix/gesture-end-id` 2026-08-16 (after the
+gesture-token leftover, on top of Plan F's 900): **901 backend
+(867 lib + 34 integration, plus 2 `#[ignore]`) + 456 frontend**.
 Doc-tests report 0 and are not a test target. Run both suites before
 writing the first line of a leftover:
 
@@ -468,8 +466,9 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
   index the owner asked for ("hva mangler for å være et reelt alternativ
   og faktisk brukandes til å lage gode ting?"). Lists what's already
   differentiating (landed), Tier 1 (weeks — includes Tracks B/C/D/E plus
-  smaller **inline** items: metronome/click+count-in, piano-roll quantize,
-  and the biggest single Tier-1 architecture item — **insert FX chains +
+  smaller **inline** items — metronome/click+count-in is **[done]**
+  (PR #38), piano-roll quantize is **[done]** (PR #32) — and the
+  biggest remaining Tier-1 architecture item — **insert FX chains +
   sends/busses, Plan G**, product decision in
   `docs/backlog/insert-fx-sends-sidechain.md`: host already-scanned
   CLAP/LV2 effects, do not write a stock FX suite; G1 inserts+PDC, G2

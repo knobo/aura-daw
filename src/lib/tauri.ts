@@ -194,12 +194,13 @@ export interface Backend {
    * backend-side into one history-bound batch; `gestureEnd` closes the
    * boundary. Optional — real-engine only, same convention as `moveClip?`;
    * the demo backend has no history to fold into. */
-  gestureBegin?(label: string): Promise<void>;
+  gestureBegin?(label: string): Promise<string>;
   /** Close the open gesture boundary (see `gestureBegin`) — call on
-   * `pointerup`/`pointercancel`. Safe to call even when nothing is open
-   * (a stray event without a matching `gestureBegin`); the backend treats
-   * it as a no-op. */
-  gestureEnd?(): Promise<void>;
+   * `pointerup`/`pointercancel`. Pass the id `gestureBegin` returned;
+   * a mismatch is a no-op so a late end cannot close a different
+   * gesture. Omitting the id keeps the old "close whatever is open"
+   * contract. Safe to call even when nothing is open. */
+  gestureEnd?(id?: string): Promise<void>;
 
   /**
    * Seed an empty session with the built-in demo song so the first press of
@@ -588,10 +589,10 @@ class TauriBackend implements Backend {
     return invoke<HistoryStep>("redo");
   }
   async gestureBegin(label: string) {
-    await invoke("gesture_begin", { label });
+    return invoke<string>("gesture_begin", { label });
   }
-  async gestureEnd() {
-    await invoke("gesture_end");
+  async gestureEnd(id?: string) {
+    await invoke("gesture_end", { id: id ?? null });
   }
   seedDemoProject() {
     return invoke<ProjectSnapshot>("seed_demo_project");

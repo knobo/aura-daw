@@ -63,6 +63,7 @@ class ClipDragController {
   private minStartSamples = 0;
   private minStartTicks = 0;
   private startClientX = 0;
+  private gestureId: Promise<string | undefined> | undefined;
 
   /** Snapshot the drag: every selected clip's origin, plus the anchor's.
    * When the anchor is NOT part of the selection, the drag is that clip
@@ -122,7 +123,7 @@ class ClipDragController {
     this.mode = mode;
     this.moved = false;
     this.active = true;
-    void backend.gestureBegin?.(mode === "resize" ? "resize clips" : "move clips");
+    this.gestureId = backend.gestureBegin?.(mode === "resize" ? "resize clips" : "move clips");
   }
 
   /** The one delta pair the whole group moves by. Pure given the snapshot. */
@@ -227,7 +228,9 @@ class ClipDragController {
         }
       }
     }
-    await backend.gestureEnd?.();
+    const id = await this.gestureId;
+    this.gestureId = undefined;
+    await backend.gestureEnd?.(id);
   }
 
   private restore(origins: Origin[], mode: "move" | "resize") {
@@ -260,13 +263,15 @@ class ClipDragController {
    * the clip), so those need restoring too, or a cancelled resize leaves a
    * phantom length behind exactly like the phantom position the move-mode
    * fix above closed. */
-  cancel() {
+  async cancel(): Promise<void> {
     if (!this.active) return;
     if (this.moved) this.restore(this.origins, this.mode);
     this.active = false;
     this.moved = false;
     this.origins = [];
-    void backend.gestureEnd?.();
+    const id = await this.gestureId;
+    this.gestureId = undefined;
+    await backend.gestureEnd?.(id);
   }
 }
 

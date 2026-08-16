@@ -14,24 +14,29 @@ described here only.
 - The Plan E core: one mutation channel, full undo/redo (Ctrl+Z), a
   persisted journal, attribution (user/agent/engine/system), MCP agents
   mutating alongside the user.
+- Plan F history storage (PR #23): published `SessionSnapshot`, lock-free
+  rebuild assembly, version graph, panic rollback, journal reader
+  (detection only).
+- Modulation graph (PR #39): several curves per track, automation tracks,
+  clip envelopes. Finished-system path is design §8.
 - Universal sample import: drag-and-drop from a file manager
   (ImportDropZone) with WAV/MP3/FLAC/OGG/AAC/M4A decode (symphonia).
-- Hardware MIDI input slice 1: port select + activity + audible monitoring
-  (PR #17, owner-verified with an LPK25).
+- Hardware MIDI input + output (PR #17 slice 1, owner-verified with an
+  LPK25; PR #21 slice 2: routing, recording, clock/sync, note-out).
 
 ## Tier 1 — usable for finishing real music (weeks)
 
 | Item | Status / doc |
 |---|---|
-| Library & browser panel with audition preview | **[track E]** `library-and-browser.md` |
-| MIDI recording from hardware (quantize on capture optional) | **[track B]** `hardware-midi-io.md` slice 2-3 |
-| Automation audible (RT attach) + lane UI | **[track D]** `automation-audible-and-ui.md` |
-| Multi-clip selection, group drag, cross-track paste | **[track C]** `multi-clip-selection-and-paste.md` |
-| Cross-instance / OS-clipboard copy (incl. SMF fallback) | **[track C]** same doc, §cross-instance |
-| Metronome/click + count-in | **[inline]** landing on `feat/metronome-count-in`: engine-side click (tempo-map schedule), CLICK chip + volume pref, count-in 0/1/2/4 bars before record. App prefs, not project.json. |
-| Quantize in the piano roll | **[inline]** command over the selection (note-ops already has the selection model): snap note starts (and optionally lengths) to grid with strength %; one `midi_set_notes` commit = one undo step. Backend-side math (thin renderer). |
-| Insert FX chains per track + sends/busses | **[plan G]** `insert-fx-sends-sidechain.md` — host CLAP/LV2 effects (do **not** write a stock FX suite). Sequence: G1 insert chain + PDC, G2 bus + sends, G3 sidechain listen-taps, G4 envelope-follower modulator (later, not Plan G). Round-2 rule still binds: **PDC before sends ship**. Needs its own research → plan → gates round (graph/mixer work). |
-| MIDI clock/start-stop out (Hydrogen sync) | **[track B]** slice 4 |
+| Library & browser panel with audition preview | **[done]** PR #19 — leftovers in `library-and-browser.md` |
+| MIDI recording from hardware (quantize on capture optional) | **[done]** PR #21 — owner ear checks + loop-record still owed; `hardware-midi-io.md` |
+| Automation audible (RT attach) + lane UI | **[done]** PR #20 — owner ear check + plugin-param bounce still owed; `automation-audible-and-ui.md` |
+| Multi-clip selection, group drag, cross-track paste | **[done]** PR #22 — batch delete/nudge still open; `multi-clip-selection-and-paste.md` |
+| Cross-instance / OS-clipboard copy (incl. SMF fallback) | **[done]** PR #22 — owner two-instance check owed; SMF is export-only |
+| Metronome/click + count-in | **[done]** PR #38 — engine-side click, CLICK chip + volume pref, count-in 0/1/2/4 bars. App prefs, not project.json. |
+| Quantize in the piano roll | **[done]** PR #32 — Q / Shift+Q over the selection; one `midi_set_notes` = one undo. |
+| Insert FX chains per track + sends/busses | **[plan G]** `insert-fx-sends-sidechain.md` — host CLAP/LV2 effects (do **not** write a stock FX suite). Sequence: G1 insert chain + PDC, G2 bus + sends, G3 sidechain listen-taps, G4 envelope-follower modulator (later, not Plan G). Round-2 rule still binds: **PDC before sends ship**. Decision recorded, **not started**. Needs its own research → plan → gates round (graph/mixer work). |
+| MIDI clock/start-stop out (Hydrogen sync) | **[done]** PR #21 slice 4 — owner Hydrogen ear check owed |
 
 ## Tier 2 — competitive (months)
 
@@ -44,16 +49,23 @@ described here only.
 - External instrument tracks (MIDI out + audio return; track B slice 6)
   — product cut in `external-instrument-return.md`: per-track return
   source, visible freeze clips, PipeWire one-click link. No hidden
-  tracks.
+  tracks. **X1 slice landed** (PR #37): record an external return onto
+  the same MIDI track. The rest of the product cut is still open.
 - Two-instance coexistence (fixed MCP port 41717 collides today — dynamic
   port + discovery needed before "copy between instances" is fully real).
 
 ## Sequencing notes
 
-- Tracks B/C/D/E are parallel-safe post-PR-#12 (see next-prompt.md's
-  track map for file footprints; B and D overlap in engine.rs).
+- Tracks A–F are all landed (PRs #23 / #21 / #22 / #20 / #19 / #39). Do
+  not restart them. Leftovers live in each handoff / this table, not as
+  a sixth parallel track. See `next-prompt.md`.
 - The FX/bus item should be planned like the core rounds were (research →
   plan doc → gates), not improvised — it touches the RT graph invariants
   round-2 §8 reserves for the node-graph round. Product cut is in
   `insert-fx-sends-sidechain.md` (host plugins, PDC in G1, no stock DSP).
-- Plan F (history storage, round-2 §6) runs beneath all of this as track A.
+- Plan F (history storage, round-2 §6) is landed (PR #23). Do not start
+  another history-storage track. Carry-forwards: live-document B-tree
+  (trigger = note-delta op), I-1 option-(a) residual, no auto-apply of
+  journal tails, version-graph product surface unbuilt.
+- In flight elsewhere (do not start): PR #42 launch map, `feat/pitch-coach`,
+  `feat/external-audio-editor`.

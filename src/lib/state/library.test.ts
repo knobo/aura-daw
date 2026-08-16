@@ -82,8 +82,8 @@ const invokes = {
       notes: [],
     }),
   ),
-  gestureBegin: vi.fn(async (_label: string) => {}),
-  gestureEnd: vi.fn(async () => {}),
+  gestureBegin: vi.fn(async (_label: string) => "gid-lib"),
+  gestureEnd: vi.fn(async (_id?: string) => {}),
   getProjectState: vi.fn(() =>
     Promise.resolve({
       projectName: "Untitled",
@@ -278,6 +278,7 @@ describe("dropOnTrack — project clips", () => {
     expect(invokes.midiAddClip).toHaveBeenCalledTimes(1);
     expect(invokes.midiSetNotes).toHaveBeenCalledTimes(1);
     expect(invokes.gestureEnd).toHaveBeenCalledTimes(1);
+    expect(invokes.gestureEnd).toHaveBeenCalledWith("gid-lib");
   });
 
   it("closes the gesture even when the stamp fails", async () => {
@@ -289,6 +290,7 @@ describe("dropOnTrack — project clips", () => {
 
     await library.dropOnTrack({ kind: "projectMidiClip", clipId: "k1" }, "m1", 0);
     expect(invokes.gestureEnd).toHaveBeenCalledTimes(1);
+    expect(invokes.gestureEnd).toHaveBeenCalledWith("gid-lib");
   });
 
   it("refuses a MIDI clip on an audio track and an audio clip on a MIDI track", async () => {

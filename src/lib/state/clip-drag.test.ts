@@ -8,8 +8,9 @@ import type { Clip, MidiClip } from "../types/ipc";
 const calls: string[] = [];
 const gestureBegin = vi.fn(async () => {
   calls.push("gestureBegin");
+  return "gid-drag";
 });
-const gestureEnd = vi.fn(async () => {
+const gestureEnd = vi.fn(async (_id?: string) => {
   calls.push("gestureEnd");
 });
 const moveClips = vi.fn(async (_placements: unknown) => {
@@ -20,7 +21,7 @@ vi.mock("../tauri", () => ({
   backend: {
     on: () => () => {},
     gestureBegin: (...a: unknown[]) => gestureBegin(...(a as [])),
-    gestureEnd: () => gestureEnd(),
+    gestureEnd: (id?: string) => gestureEnd(id),
     moveClips: (p: unknown) => moveClips(p as never),
     getProjectState: () =>
       Promise.resolve({ ppq: 960, tempoEvents: [{ tick: 0, bpm: 120 }], midiClips: [] }),
@@ -198,7 +199,7 @@ describe("clipDrag group move", () => {
     expect(midi.clips[0].lengthTicks % 240).toBe(0);
   });
 
-  it("cancel restores every previewed position and sends no moveClips", () => {
+  it("cancel restores every previewed position and sends no moveClips", async () => {
     clipSelection.apply(
       [
         { kind: "audio", id: "a1" },
@@ -211,34 +212,35 @@ describe("clipDrag group move", () => {
     // preview applied — confirms there is something to undo
     expect(project.clips[0].timelineStartSamples).toBe(1500);
     expect(midi.clips[0].timelineStartTicks).toBe(420);
-    clipDrag.cancel();
+    await clipDrag.cancel();
     expect(project.clips[0].timelineStartSamples).toBe(1000);
     expect(midi.clips[0].timelineStartTicks).toBe(400);
     expect(moveClips).not.toHaveBeenCalled();
     expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
+    expect(gestureEnd).toHaveBeenCalledWith("gid-drag");
   });
 
-  it("cancel restores a resize's length preview too, not just position", () => {
+  it("cancel restores a resize's length preview too, not just position", async () => {
     clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
     clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
     clipDrag.move(2500, true); // +2500 samples = +100 ticks
     // preview applied — confirms there is something to undo
     expect(midi.clips[0].lengthTicks).toBe(1060);
     expect(midi.clips[0].contentLengthTicks).toBe(960);
-    clipDrag.cancel();
+    await clipDrag.cancel();
     expect(midi.clips[0].lengthTicks).toBe(960);
     expect(midi.clips[0].timelineStartTicks).toBe(400);
     expect(moveClips).not.toHaveBeenCalled();
     expect(calls).toEqual(["gestureBegin", "gestureEnd"]);
   });
 
-  it("cancel of a first-time resize leaves contentLengthTicks unset, not the pinned effective value", () => {
+  it("cancel of a first-time resize leaves contentLengthTicks unset, not the pinned effective value", async () => {
     clipSelection.apply([{ kind: "midi", id: "m1" }], "replace");
     expect(midi.clips[0].contentLengthTicks).toBeUndefined();
     clipDrag.begin({ kind: "midi", id: "m1" }, 0, "resize");
     clipDrag.move(2500, true);
     expect(midi.clips[0].contentLengthTicks).toBe(960);
-    clipDrag.cancel();
+    await clipDrag.cancel();
     expect(midi.clips[0].contentLengthTicks).toBeUndefined();
   });
 

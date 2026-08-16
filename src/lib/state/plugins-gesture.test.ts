@@ -15,8 +15,8 @@ const pluginSetParam = vi.fn(
       resolveSet = res;
     }),
 );
-const gestureBegin = vi.fn(() => Promise.resolve());
-const gestureEnd = vi.fn(() => Promise.resolve());
+const gestureBegin = vi.fn(() => Promise.resolve("gid-plugin"));
+const gestureEnd = vi.fn((_id?: string) => Promise.resolve());
 const calls: string[] = [];
 
 vi.mock("../tauri", () => ({
@@ -33,9 +33,9 @@ vi.mock("../tauri", () => ({
       calls.push("gestureBegin");
       return gestureBegin(...(a as []));
     },
-    gestureEnd: () => {
+    gestureEnd: (id?: string) => {
       calls.push("gestureEnd");
-      return gestureEnd();
+      return gestureEnd(id);
     },
   },
 }));
@@ -72,6 +72,7 @@ describe("plugin knob gesture", () => {
     resolveSet?.();
     await closing;
     expect(calls).toEqual(["gestureBegin", "setParam", "gestureEnd"]);
+    expect(gestureEnd).toHaveBeenCalledWith("gid-plugin");
     expect(pluginSetParam).toHaveBeenCalledTimes(1);
     expect(pluginSetParam.mock.calls[0][1]).toEqual([{ id: 7, value: 0.75 }]);
   });
