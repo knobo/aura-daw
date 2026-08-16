@@ -1388,6 +1388,14 @@ impl Control {
                 params.set_flag(slot, super::rt::FLAG_MUTE, t.muted);
                 params.set_flag(slot, super::rt::FLAG_SOLO, t.soloed);
             }
+            let launch_ids = crate::midi::launch::runtime().audible_tracks();
+            for t in store.tracks.iter() {
+                if !launch_ids.iter().any(|id| id == t.id.as_str()) {
+                    continue;
+                }
+                let Some(&slot) = slots.get(&t.id) else { continue };
+                params.set_flag(slot, super::rt::FLAG_LAUNCH, true);
+            }
             params.any_solo.store(store.any_solo(), Relaxed);
             // THE [C1] PUBLISH SITE — still under `session`, see above.
             *self.tables.lock() = GraphTables {

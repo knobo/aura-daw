@@ -132,8 +132,8 @@ pub fn run() {
             // control plane. The callback is the midir thread, not RT.
             {
                 let cp = control_plane.clone();
-                crate::midi::launch::runtime().install_fire(std::sync::Arc::new(move |b| {
-                    if let Err(e) = cp.launch_fire(&b.id) {
+                crate::midi::launch::runtime().install_fire(std::sync::Arc::new(move |b, origin| {
+                    if let Err(e) = cp.launch_fire_from(&b.id, origin) {
                         log::warn!("launch fire {}: {e}", b.id);
                     }
                 }));

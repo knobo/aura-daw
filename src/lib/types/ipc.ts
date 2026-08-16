@@ -102,6 +102,18 @@ export interface LaunchSnapshot {
   maps: LaunchMap[];
 }
 
+export type LaunchFireOrigin = "hardware" | "drive";
+
+export interface LaunchFired {
+  id: string;
+  name: string;
+  origin: LaunchFireOrigin;
+  followView: boolean;
+  trackIds: string[];
+  startSamples: number;
+  endSamples: number;
+}
+
 // ── transport-state.schema.json ─────────────────────────────────────────────
 
 export type TransportMode = "stopped" | "playing" | "recording";
@@ -935,6 +947,7 @@ export interface AuraEventMap {
   "export://error": ExportErrorEvent;
   "loopjam://state": LoopJamStatus;
   "launch://changed": LaunchSnapshot;
+  "launch://fired": LaunchFired;
 }
 
 export type AuraEventName = keyof AuraEventMap;

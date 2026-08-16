@@ -8,6 +8,7 @@ import { backend } from "../tauri";
 import { midi } from "./midi.svelte";
 import { transport } from "./transport.svelte";
 import { view } from "./view.svelte";
+import type { LaunchFired } from "../types/ipc";
 import {
   bindingFocusSamples,
   clipWouldSelfTrigger,
@@ -82,6 +83,11 @@ class LaunchStore {
     await this.reload();
     backend.on?.("launch://changed", (snap) => {
       this.accept(snap);
+    });
+    backend.on?.("launch://fired", (ev: LaunchFired) => {
+      // A drive clip jumps the playhead to the scene. Keep the viewport
+      // on the clip so editing does not follow that seek.
+      if (!ev.followView) view.follow = false;
     });
     // Undo/open go through project://changed, not launch://changed.
     backend.on?.("project://changed", () => {

@@ -20,6 +20,9 @@ use crate::plugins::automation::AbsParamEvent;
 
 pub const FLAG_MUTE: u32 = 1 << 0;
 pub const FLAG_SOLO: u32 = 1 << 1;
+/// Track is a live launch target — mixer must hear it even if another
+/// track is soloed or this one is muted.
+pub const FLAG_LAUNCH: u32 = 1 << 2;
 
 /// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
 /// legitimate park target, so absence needs a value outside the timeline.)

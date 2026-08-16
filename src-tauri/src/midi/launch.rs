@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+
+
 use serde::{Deserialize, Serialize};
 
 pub const ECHO_WINDOW_MS: u64 = 80;
@@ -160,6 +162,13 @@ pub fn clip_would_self_trigger(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FireOrigin {
+    Hardware,
+    Drive,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum IncomingDecision {
     Pass,
@@ -167,6 +176,17 @@ pub enum IncomingDecision {
     Echo,
     Suppressed,
     Fire(LaunchBinding),
+}
+
+pub fn launch_trace_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("AURA_LAUNCH_TRACE").is_some())
+}
+
+pub fn launch_trace(msg: impl std::fmt::Display) {
+    if launch_trace_enabled() {
+        log::info!("launch: {msg}");
+    }
 }
 
 /// Process-wide launch runtime: binding snapshot, echo ring, learn arm,
@@ -179,10 +199,11 @@ pub struct LaunchRuntime {
     learning: Mutex<Option<String>>,
     armed: Mutex<Option<(u8, u8)>>,
     origin: Instant,
-    fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<LaunchBinding>>>,
+    fire_tx: Mutex<Option<std::sync::mpsc::SyncSender<(LaunchBinding, FireOrigin)>>>,
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
     drive_started: AtomicBool,
+    audible_tracks: Mutex<Vec<String>>,
 }
 
 impl Default for LaunchRuntime {
@@ -197,6 +218,7 @@ impl Default for LaunchRuntime {
             last_learn: Mutex::new(None),
             gen: AtomicU64::new(0),
             drive_started: AtomicBool::new(false),
+            audible_tracks: Mutex::new(Vec::new()),
         }
     }
 }
@@ -238,16 +260,28 @@ impl LaunchRuntime {
         self.last_learn.lock().unwrap().take()
     }
 
-    pub fn install_fire(&self, f: Arc<dyn Fn(LaunchBinding) + Send + Sync>) {
+    pub fn install_fire(&self, f: Arc<dyn Fn(LaunchBinding, FireOrigin) + Send + Sync>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(8);
         let _ = std::thread::Builder::new()
             .name("aura-launch-fire".into())
             .spawn(move || {
-                while let Ok(b) = rx.recv() {
-                    f(b);
+                while let Ok((b, origin)) = rx.recv() {
+                    f(b, origin);
                 }
             });
         *self.fire_tx.lock().unwrap() = Some(tx);
+    }
+
+    pub fn set_audible_tracks(&self, ids: Vec<String>) {
+        *self.audible_tracks.lock().unwrap() = ids;
+    }
+
+    pub fn audible_tracks(&self) -> Vec<String> {
+        self.audible_tracks.lock().unwrap().clone()
+    }
+
+    pub fn clear_audible_tracks(&self) {
+        self.audible_tracks.lock().unwrap().clear();
     }
 
     pub fn record_out(&self, note: u8, channel: u8) {
@@ -327,7 +361,11 @@ impl LaunchRuntime {
                                         continue;
                                     }
                                 }
-                                runtime().enqueue_fire(b.clone());
+                                launch_trace(format!(
+                                    "drive clip={} note={} -> {}",
+                                    clip.id, ev.key, b.id
+                                ));
+                                runtime().enqueue_fire(b.clone(), FireOrigin::Drive);
                             }
                         }
                     }
@@ -369,9 +407,9 @@ impl LaunchRuntime {
         }
     }
 
-    pub fn enqueue_fire(&self, b: LaunchBinding) {
+    pub fn enqueue_fire(&self, b: LaunchBinding, origin: FireOrigin) {
         if let Some(tx) = self.fire_tx.lock().unwrap().as_ref() {
-            let _ = tx.try_send(b);
+            let _ = tx.try_send((b, origin));
         }
     }
 
@@ -385,7 +423,11 @@ impl LaunchRuntime {
             IncomingDecision::Echo | IncomingDecision::Suppressed => true,
             IncomingDecision::Fire(b) => {
                 *self.armed.lock().unwrap() = Some((note, channel));
-                self.enqueue_fire(b);
+                launch_trace(format!(
+                    "hardware note={} ch={} -> {}",
+                    note, channel, b.id
+                ));
+                self.enqueue_fire(b, FireOrigin::Hardware);
                 true
             }
         }
@@ -451,15 +493,22 @@ impl crate::control::ControlPlane {
     }
 
     pub fn launch_fire(&self, id: &str) -> Result<(), String> {
+        self.launch_fire_from(id, FireOrigin::Hardware)
+    }
+
+    pub fn launch_fire_from(&self, id: &str, origin: FireOrigin) -> Result<(), String> {
         let rate = self.transport_state().sample_rate;
-        let (start_ticks, length_ticks, ppq, events) = {
+        let (start_ticks, length_ticks, ppq, events, track_ids, name) = {
             let s = self.session().lock();
             let (_, b) = find_binding(&s.midi.launch_maps, id)
                 .ok_or_else(|| format!("unknown launch binding: {id}"))?;
-            let (start_ticks, length_ticks) = match &b.target {
-                LaunchTarget::Region { start_ticks, length_ticks, .. } => {
-                    (start_ticks.clone(), length_ticks.clone())
-                }
+            let name = b.name.clone();
+            let (start_ticks, length_ticks, track_ids) = match &b.target {
+                LaunchTarget::Region {
+                    start_ticks,
+                    length_ticks,
+                    track_ids,
+                } => (start_ticks.clone(), length_ticks.clone(), track_ids.clone()),
                 LaunchTarget::Clip { clip_id } => {
                     let c = s
                         .midi
@@ -467,7 +516,7 @@ impl crate::control::ControlPlane {
                         .iter()
                         .find(|c| c.id.as_str() == clip_id)
                         .ok_or_else(|| format!("launch clip is gone: {clip_id}"))?;
-                    (c.timeline_start_ticks, c.length_ticks)
+                    (c.timeline_start_ticks, c.length_ticks, vec![c.track_id.to_string()])
                 }
             };
             (
@@ -475,11 +524,18 @@ impl crate::control::ControlPlane {
                 length_ticks,
                 s.midi.ppq,
                 s.midi.tempo_events.clone(),
+                track_ids,
+                name,
             )
         };
         let map = crate::midi::TempoMap::new(ppq, events, rate.max(1))?;
         let start = map.tick_to_samples(start_ticks);
         let end = map.tick_to_samples(start_ticks.saturating_add(length_ticks)).max(start + 1);
+        runtime().set_audible_tracks(track_ids.clone());
+        self.apply_launch_audible(&track_ids);
+        log::info!(
+            "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
+        );
         self.transport(crate::control::TransportAction::SetLoop {
             enabled: true,
             start_samples: start,
@@ -487,8 +543,29 @@ impl crate::control::ControlPlane {
         })?;
         self.transport(crate::control::TransportAction::Seek { position_samples: start })?;
         self.transport(crate::control::TransportAction::Play)?;
+        self.emit_launch_fired(LaunchFired {
+            id: id.to_string(),
+            name,
+            origin,
+            follow_view: matches!(origin, FireOrigin::Hardware),
+            track_ids,
+            start_samples: start,
+            end_samples: end,
+        });
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchFired {
+    pub id: String,
+    pub name: String,
+    pub origin: FireOrigin,
+    pub follow_view: bool,
+    pub track_ids: Vec<String>,
+    pub start_samples: u64,
+    pub end_samples: u64,
 }
 
 #[tauri::command]
@@ -773,7 +850,7 @@ mod tests {
         let rt = LaunchRuntime::default();
         let (tx, rx) = std::sync::mpsc::channel();
         let caller = std::thread::current().id();
-        rt.install_fire(std::sync::Arc::new(move |b| {
+        rt.install_fire(std::sync::Arc::new(move |b, _origin| {
             let _ = tx.send((std::thread::current().id(), b.id.clone()));
         }));
         rt.set_bindings(vec![region("a", 60, None)]);

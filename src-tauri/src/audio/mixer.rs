@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering::Relaxed;
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::midi_in::{LiveMidiEvent, EV_ALL_OFF, EV_NOTE_ON};
-use super::rt::{RtClip, RtGraph, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
+use super::rt::{RtClip, RtGraph, RtTrack, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
 use crate::plugins::automation::{value_at, AbsParamEvent, RampCursor};
@@ -51,9 +51,15 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
 
 /// Solo/mute resolution: when any track is soloed only soloed tracks sound;
 /// mute always silences its own track (mute wins over its own solo).
+/// `launch` is a live launch target — it stays audible through both.
 #[inline]
 pub fn audible(muted: bool, soloed: bool, any_solo: bool) -> bool {
-    !muted && (!any_solo || soloed)
+    audible_with_launch(muted, soloed, any_solo, false)
+}
+
+#[inline]
+pub fn audible_with_launch(muted: bool, soloed: bool, any_solo: bool, launch: bool) -> bool {
+    launch || (!muted && (!any_solo || soloed))
 }
 
 /// Sample a clip at absolute timeline position `pos` (engine samples).
@@ -404,7 +410,12 @@ fn render_impl(
         let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
-        let on = audible(flags & FLAG_MUTE != 0, flags & FLAG_SOLO != 0, any_solo);
+        let on = audible_with_launch(
+            flags & FLAG_MUTE != 0,
+            flags & FLAG_SOLO != 0,
+            any_solo,
+            flags & FLAG_LAUNCH != 0,
+        );
         let (gl_atomic, gr_atomic) = pan_gains(pan);
         let mut acc = TrackAccum::default();
 
@@ -555,7 +566,12 @@ pub fn render_live_input_only(
         let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
-        let on = audible(flags & FLAG_MUTE != 0, flags & FLAG_SOLO != 0, any_solo);
+        let on = audible_with_launch(
+            flags & FLAG_MUTE != 0,
+            flags & FLAG_SOLO != 0,
+            any_solo,
+            flags & FLAG_LAUNCH != 0,
+        );
         let (gl, gr) = pan_gains(pan);
         let mut acc = TrackAccum::default();
 
@@ -692,6 +708,14 @@ mod tests {
         assert!(!audible(false, false, true), "other track soloed");
         assert!(audible(false, true, true), "soloed track plays");
         assert!(!audible(true, true, true), "mute wins over own solo");
+        assert!(
+            audible_with_launch(false, false, true, true),
+            "launch target plays while another track is soloed"
+        );
+        assert!(
+            audible_with_launch(true, false, false, true),
+            "launch target bypasses its own mute"
+        );
     }
 
     // ---- clip sampling ----

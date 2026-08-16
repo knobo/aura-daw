@@ -36,7 +36,8 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
-use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_MUTE, FLAG_SOLO};
+use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO};
+use crate::ids::TrackId;
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
@@ -1600,6 +1601,33 @@ impl ControlPlane {
         );
     }
 
+    pub fn emit_launch_fired(&self, fired: crate::midi::launch::LaunchFired) {
+        (self.emit)(
+            "launch://fired",
+            serde_json::to_value(&fired).unwrap_or_default(),
+        );
+    }
+
+    pub fn apply_launch_audible(&self, track_ids: &[String]) {
+        let tables = self.tables.lock();
+        for slot in 0..tables.params.len() {
+            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+        }
+        for id in track_ids {
+            if let Some(&slot) = tables.slots.get(&TrackId::from(id.as_str())) {
+                tables.params.set_flag(slot, FLAG_LAUNCH, true);
+            }
+        }
+    }
+
+    pub fn clear_launch_audible(&self) {
+        crate::midi::launch::runtime().clear_audible_tracks();
+        let tables = self.tables.lock();
+        for slot in 0..tables.params.len() {
+            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+        }
+    }
+
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
     /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
     pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {
@@ -1755,6 +1783,7 @@ impl ControlPlane {
                     false,
                 )?;
                 self.shared.playing.store(false, Relaxed);
+                self.clear_launch_audible();
             }
             TransportAction::Seek { position_samples } => {
                 // Pure RT atomic — position is engine state, not document
