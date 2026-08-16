@@ -52,7 +52,7 @@ pub struct SessionSnapshot {
 /// Per-pattern granularity (ruling F-1): the clip LIST re-allocates on
 /// structural change (a Vec of pointers — cheap), but each clip's content
 /// is its own Arc, reused untouched across versions that didn't edit it.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct MidiSnapshot {
     pub ppq: u32,
     pub tempo_events: Arc<Vec<TempoEvent>>,
@@ -127,7 +127,8 @@ impl ChangeSet {
     /// Set{Track,_}→tracks · Set{Clip,_}→clips · Set{MidiClip,_}→that clip
     /// (placement fields live on the row, so the row's Arc re-derives)
     /// · Set{Transport,_}→transport · Set{Plugin,_}→plugins
-    /// · TrackAdd/TrackRemove→tracks+clips (TrackRemove carries clips)
+    /// · TrackAdd/TrackRemove→tracks+clips+modulation+automation
+///   (`apply_raw` writes the graph and re-derives lanes)
     /// · ClipAdd/ClipRemove→clips · TempoSet→midi_meta+transport (bpm mirror)
     /// · MidiClipAdd/MidiClipRemove→midi_structure
     /// · MidiSetNotes{clip,..}→midi_clips.insert(clip)
@@ -150,6 +151,11 @@ impl ChangeSet {
                 Op::TrackAdd { .. } | Op::TrackRemove { .. } => {
                     cs.tracks = true;
                     cs.clips = true; // a track op carries/removes its clips
+                    // apply_raw also writes session.modulation and, when
+                    // that set is non-empty, sync_derived_lanes. Always
+                    // re-derive: a no-op is one Arc.
+                    cs.modulation = true;
+                    cs.automation = true;
                 }
                 Op::ClipAdd { .. } | Op::ClipRemove { .. } => cs.clips = true,
                 Op::TempoSet { .. } => {
@@ -175,7 +181,10 @@ impl ChangeSet {
                 }
                 Op::ModulationSetCurve { .. }
                 | Op::ModulationSetBinding { .. }
-                | Op::AutomationClipSet { .. } => cs.modulation = true,
+                | Op::AutomationClipSet { .. } => {
+                    cs.modulation = true;
+                    cs.automation = true; // sync_derived_lanes rewrites lanes
+                }
                 Op::PluginAdd { .. } | Op::PluginRemove { .. } | Op::PluginSetState { .. } => {
                     cs.plugins = true
                 }
@@ -362,12 +371,18 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     }
     if changed.automation {
         charge += next.automation.len() * size_of::<AutomationLane>();
+        charge += next.automation.iter().map(automation_lane_heap).sum::<usize>();
     }
     if changed.modulation {
         charge += size_of::<crate::modulation::ModulationDoc>();
-        charge += next.modulation.curves.len()
-            + next.modulation.bindings.len()
-            + next.modulation.automation_clips.len();
+        charge += next.modulation.curves.iter().map(curve_heap).sum::<usize>();
+        charge += next.modulation.bindings.iter().map(binding_heap).sum::<usize>();
+        charge += next
+            .modulation
+            .automation_clips
+            .iter()
+            .map(automation_clip_heap)
+            .sum::<usize>();
     }
     if changed.plugins {
         charge += next.plugins.instances.len() * size_of::<crate::plugins::PluginInstanceInfo>();
@@ -405,6 +420,36 @@ pub(crate) fn clip_heap(c: &Clip) -> usize {
 
 pub(crate) fn midi_clip_heap(c: &MidiClip) -> usize {
     c.id.as_str().len() + c.track_id.as_str().len() + c.name.len() + c.lane_id.as_str().len()
+}
+
+pub(crate) fn automation_lane_heap(l: &AutomationLane) -> usize {
+    use crate::plugins::automation::AutomationPoint;
+    use std::mem::size_of;
+    l.id.len()
+        + l.target_node.len()
+        + l.points.len() * size_of::<AutomationPoint>()
+}
+
+pub(crate) fn curve_heap(c: &crate::modulation::Curve) -> usize {
+    use crate::plugins::automation::AutomationPoint;
+    use std::mem::size_of;
+    size_of::<crate::modulation::Curve>()
+        + c.id.len()
+        + c.name.len()
+        + c.points.len() * size_of::<AutomationPoint>()
+}
+
+pub(crate) fn binding_heap(b: &crate::modulation::Binding) -> usize {
+    use std::mem::size_of;
+    size_of::<crate::modulation::Binding>() + b.id.len()
+}
+
+pub(crate) fn automation_clip_heap(c: &crate::modulation::AutomationClip) -> usize {
+    use std::mem::size_of;
+    size_of::<crate::modulation::AutomationClip>()
+        + c.id.len()
+        + c.track_id.len()
+        + c.curve_id.len()
 }
 
 #[cfg(test)]
@@ -618,11 +663,11 @@ mod tests {
         // Set{Plugin,_} → plugins
         let c = cs(&[set(ObjectRef::Plugin("p-x".into()), PropPath::Param { index: 0 })]);
         assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });
-        // TrackAdd / TrackRemove → tracks + clips
+        // TrackAdd / TrackRemove → tracks + clips + modulation + automation
         let c = cs(&[Op::TrackAdd { track: t.clone(), index: 0, clips: vec![], clip_indices: vec![], automation_clips: vec![], bindings: vec![] }]);
-        assert_eq!(c, ChangeSet { tracks: true, clips: true, ..Default::default() });
+        assert_eq!(c, ChangeSet { tracks: true, clips: true, modulation: true, automation: true, ..Default::default() });
         let c = cs(&[Op::TrackRemove { track: t, index: 0, clips: vec![], clip_indices: vec![] }]);
-        assert_eq!(c, ChangeSet { tracks: true, clips: true, ..Default::default() });
+        assert_eq!(c, ChangeSet { tracks: true, clips: true, modulation: true, automation: true, ..Default::default() });
         // ClipAdd / ClipRemove → clips
         let c = cs(&[Op::ClipAdd { clip: clip.clone(), index: 0 }]);
         assert_eq!(c, ChangeSet { clips: true, ..Default::default() });
@@ -646,12 +691,19 @@ mod tests {
         // MidiSetNotes → midi_clips.insert(clip)
         let c = cs(&[Op::MidiSetNotes { clip: "mc-x".into(), notes: vec![] }]);
         assert_eq!(c, ChangeSet { midi_clips: clip_ids(&["mc-x"]), ..Default::default() });
-        // AutomationSetLane → automation
+        // AutomationSetLane → automation + modulation
         let c = cs(&[Op::AutomationSetLane { key: "a-x".into(), lane: None }]);
         assert_eq!(
             c,
             ChangeSet { automation: true, modulation: true, ..Default::default() }
         );
+        // Modulation* / AutomationClipSet → modulation + automation (derived lanes)
+        let c = cs(&[Op::ModulationSetCurve { key: "cur-x".into(), curve: None }]);
+        assert_eq!(c, ChangeSet { modulation: true, automation: true, ..Default::default() });
+        let c = cs(&[Op::ModulationSetBinding { key: "b-x".into(), binding: None }]);
+        assert_eq!(c, ChangeSet { modulation: true, automation: true, ..Default::default() });
+        let c = cs(&[Op::AutomationClipSet { key: "acl-x".into(), clip: None }]);
+        assert_eq!(c, ChangeSet { modulation: true, automation: true, ..Default::default() });
         // PluginAdd / PluginRemove / PluginSetState → plugins
         let c = cs(&[Op::PluginAdd { row: row.clone(), index: 0 }]);
         assert_eq!(c, ChangeSet { plugins: true, ..Default::default() });

@@ -641,7 +641,7 @@ impl Committer {
                 log::warn!("midi persist failed: {e}");
                 self.session.lock().midi.dirty = true; // M-5 semantics preserved
             } else {
-                self.session.lock().midi.dirty = false;
+                self.clear_midi_dirty_if_unchanged(&m);
             }
         }
         if let Some(pr) = project_snapshot {
@@ -763,6 +763,18 @@ impl Committer {
             if s.plugins.pending_state.get(id) == snapshot.pending_state.get(id) {
                 s.plugins.dirty_state.remove(id);
             }
+        }
+    }
+
+    /// Clear `midi.dirty` only when the live store still matches the
+    /// snapshot that just landed on disk. A `MidiSetNotes` between the
+    /// write and this re-lock must keep the flag, or the newer notes
+    /// never persist (same window `clear_dirty_state_matching` closes
+    /// for plugin blobs).
+    fn clear_midi_dirty_if_unchanged(&self, written: &crate::midi::persist::V3Data) {
+        let mut s = self.session.lock();
+        if &s.midi_snapshot() == written {
+            s.midi.dirty = false;
         }
     }
 
@@ -3487,7 +3499,7 @@ impl ControlPlane {
         self.committer.log().epoch_boundary(dir, history::EpochEvent::SaveAs, new_epoch);
         project::save(dir, &project)?;
         match crate::midi::persist::save_snapshot_into_project(dir, &midi_snapshot) {
-            Ok(()) => self.session.lock().midi.dirty = false,
+            Ok(()) => self.committer.clear_midi_dirty_if_unchanged(&midi_snapshot),
             Err(e) => {
                 self.session.lock().midi.dirty = true;
                 log::warn!("save_project_as_epoch: persisting midi failed: {e}");
@@ -3575,7 +3587,7 @@ impl ControlPlane {
                 log::warn!("save_project_mark: midi persist failed: {e}");
                 self.session.lock().midi.dirty = true;
             } else {
-                self.session.lock().midi.dirty = false;
+                self.committer.clear_midi_dirty_if_unchanged(&m);
             }
         }
         if let Some(doc) = plugin_snapshot {

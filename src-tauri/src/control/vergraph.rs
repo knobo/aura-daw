@@ -420,8 +420,18 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             Op::Set { object, from, to, .. } => {
                 objectref_heap(object) + json_bytes(from) + json_bytes(to)
             }
-            Op::TrackAdd { track, clips, clip_indices, .. }
-            | Op::TrackRemove { track, clips, clip_indices, .. } => {
+            Op::TrackAdd { track, clips, clip_indices, automation_clips, bindings, .. } => {
+                track_heap(track)
+                    + clips.len() * size_of::<crate::audio::types::Clip>()
+                    + clips.iter().map(clip_heap).sum::<usize>()
+                    + clip_indices.len() * size_of::<usize>()
+                    + automation_clips
+                        .iter()
+                        .map(super::snapshot::automation_clip_heap)
+                        .sum::<usize>()
+                    + bindings.iter().map(super::snapshot::binding_heap).sum::<usize>()
+            }
+            Op::TrackRemove { track, clips, clip_indices, .. } => {
                 track_heap(track)
                     + clips.len() * size_of::<crate::audio::types::Clip>()
                     + clips.iter().map(clip_heap).sum::<usize>()

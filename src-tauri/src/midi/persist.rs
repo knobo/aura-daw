@@ -65,7 +65,7 @@ fn mint_content_id(clip_id: &str) -> crate::ids::ContentId {
 /// math authority, this struct is a control-plane cache of display values
 /// quantized losslessly through `crate::time::{period_from_bpm,
 /// bpm_from_period}`'s proven idempotence (Task 2).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct V3Data {
     pub ppq: u32,
     pub tempo_events: Vec<TempoEvent>,

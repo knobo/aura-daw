@@ -198,6 +198,7 @@ fn live_json(s: &Session) -> serde_json::Value {
         &s.midi.meter_events,
         &s.midi.clips.iter().collect::<Vec<_>>(),
         &s.automation.lanes,
+        &s.modulation,
         &s.plugins.instances,
         &s.plugins.params,
         &s.plugins.pending_state,
@@ -220,6 +221,7 @@ fn image_json(snap: &SessionSnapshot) -> serde_json::Value {
         &snap.midi.meter_events,
         &snap.midi.clips.iter().map(|c| c.as_ref()).collect::<Vec<_>>(),
         &snap.automation,
+        &snap.modulation,
         &snap.plugins.instances,
         &snap.plugins.params,
         &snap.plugins.pending_state,
@@ -241,6 +243,7 @@ fn doc_json(
     meter_events: &[MeterEvent],
     midi_clips: &[&MidiClip],
     automation: &[AutomationLane],
+    modulation: &aura_lib::modulation::ModulationDoc,
     plugin_rows: &[PluginInstanceInfo],
     plugin_params: &std::collections::HashMap<String, Vec<aura_lib::plugins::ParamInfo>>,
     pending_state: &std::collections::HashMap<String, Vec<u8>>,
@@ -276,6 +279,11 @@ fn doc_json(
         "meterEvents": meter_events,
         "midiClips": midi_clips,
         "automation": automation,
+        "modulation": {
+            "curves": &modulation.curves,
+            "bindings": &modulation.bindings,
+            "automationClips": &modulation.automation_clips,
+        },
         "plugins": plugin_rows,
         "pluginParams": params,
         "pendingState": pending,
@@ -658,6 +666,72 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
     })
     .expect("automation durable");
     assert_published_matches_live(&session, "Op::AutomationSetLane (durable re-add)");
+
+    // ModulationSetCurve — flags both modulation and derived automation.
+    cp.commit(TxMeta::user("set curve"), |tx| {
+        tx.apply(Op::ModulationSetCurve {
+            key: "cur-sweep".into(),
+            curve: Some(aura_lib::modulation::Curve {
+                id: "cur-sweep".into(),
+                name: "sweep".into(),
+                length_ticks: None,
+                points: vec![
+                    AutomationPoint { tick: 0, value: 0.0 },
+                    AutomationPoint { tick: 480, value: 1.0 },
+                ],
+            }),
+        })
+    })
+    .expect("set curve");
+    assert_published_matches_live(&session, "Op::ModulationSetCurve");
+
+    // TrackRemove of a track that still owns an automation clip (no
+    // prior clip-delete). from_ops must flag modulation+automation.
+    let auto_track = {
+        let mut id = String::new();
+        cp.commit(TxMeta::system("add auto track"), |tx| {
+            let t = aura_lib::control::ops::add_track_tx(
+                tx,
+                Some("Auto".into()),
+                Some("automation".into()),
+            )?;
+            id = t.id.to_string();
+            Ok(())
+        })
+        .expect("add auto track");
+        id
+    };
+    cp.commit(TxMeta::user("place auto clip"), |tx| {
+        tx.apply(Op::AutomationClipSet {
+            key: "acl-sweep".into(),
+            clip: Some(aura_lib::modulation::AutomationClip {
+                id: "acl-sweep".into(),
+                track_id: auto_track.clone(),
+                curve_id: "cur-sweep".into(),
+                timeline_start_ticks: 0,
+                length_ticks: 1920,
+                content_length_ticks: None,
+            }),
+        })
+    })
+    .expect("place auto clip");
+    assert_published_matches_live(&session, "Op::AutomationClipSet");
+    let doomed_auto = cp
+        .project_state()
+        .tracks
+        .into_iter()
+        .find(|t| t.id == auto_track)
+        .expect("auto track exists");
+    cp.commit(TxMeta::system("remove auto track"), |tx| {
+        tx.apply(Op::TrackRemove {
+            track: doomed_auto,
+            index: 0,
+            clips: vec![],
+            clip_indices: vec![],
+        })
+    })
+    .expect("remove auto track");
+    assert_published_matches_live(&session, "Op::TrackRemove (still owned automation clip)");
 
     // MidiClipRemove
     cp.commit(TxMeta::user("remove midi clip"), |tx| {
