@@ -1,11 +1,17 @@
-# Next: post-Plan-F tracks
+# Next: after Plan F
 
-Plan F (history storage) is **LANDED** on `plan-f-history` (PR #23).
-Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching
-snapshots, the journal reader, the version graph, or `engine::rebuild`.
+Plan F (history storage) is **IMPLEMENTED** on `plan-f-history` (**PR #23**,
+CI green, mergeable). After that PR merges, `origin/main` is the baseline
+for new work. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before
+touching snapshots, the journal reader, the version graph, or
+`engine::rebuild`.
 
-Read this file, then pick a track and do the work. Reply to the user in
-Norwegian — they write Norwegian; the repo documentation is English.
+The five parallel tracks (A–E / F) are all landed. What remains is
+named below: owner ear-checks, Plan F carry-forwards, Track D/B leftovers,
+modulation design §8, and Plan G. Do not re-open a closed Plan F item.
+
+Read this file, then pick a leftover and do the work. Reply to the user
+in Norwegian — they write Norwegian; the repo documentation is English.
 
 ## Track F (modulation system) — LANDED; path to the finished system
 
@@ -51,8 +57,9 @@ follow-up PR #18, `fix/plan-e-followup`:
 - **I-4's two caveats** — journal line order vs `rev` order under
   concurrency, and a panicking `transact` diverging log from document.
   → recorded as L-4/L-5 in `docs/SIDE-CHANNEL-INVENTORY.md` in PR
-  #18; **both CLOSED by Plan F** (L-4: reader sorts by `(epoch, rev)`,
-  undo stack is rev-ordered; L-5: `catch_unwind` + snapshot restore).
+  #18; **both CLOSED by Plan F** (PR #23). L-4: reader sorts by
+  `(epoch, rev)`, undo stack is rev-ordered. L-5: `catch_unwind` +
+  snapshot restore.
 - **M-3** — the transient/redo invariant was a comment checked by nothing.
   → fixed in PR #18 (a `debug_assert!` in the commit path).
 
@@ -123,8 +130,9 @@ unowned notes are M-8 and owner ear-checks — read the report first):
   new value. Intended scope (automation overrides the knob), but say so
   plainly. Follow-ups that change it: a curve editor for plugin params, and
   write/touch/latch modes.
-- **`gesture_end` has no id — it closes whatever is open. TRACKS A AND C
-  INHERIT THIS.** Any `endGesture()` fired from a promise continuation can
+- **`gesture_end` has no id — it closes whatever is open.** Tracks A and
+  C landed without this fix; it is still open. Any `endGesture()` fired
+  from a promise continuation can
   close a gesture that began while it was awaiting; `gesture_begin`
   auto-closes a stale one, so the two compose into a real regression.
   Live example, Track D's own: release a plugin knob (awaits a rAF + one
@@ -148,10 +156,11 @@ unowned notes are M-8 and owner ear-checks — read the report first):
   `.tog.arm.on` in `TrackHeader.svelte`, so an automation-visible track
   reads as armed.
 
-This file is written for a **fresh session after `/clear`**: it assumes no
-memory of the Plan E conversation. Everything it asserts is checked against
-git/README at write time (2026-08-14) — trust files over this file if they
-disagree, and update this file (marked correction, ADR 0007) if they do.
+This file is written for a **fresh session after `/clear`**. Everything
+it asserts was checked against the `plan-f-history` tree at write time
+(2026-08-16, after PR #23's review follow-up). Trust files over this
+file if they disagree, and update this file (marked correction, ADR
+0007) if they do.
 
 ## 1. State of the world
 
@@ -159,58 +168,30 @@ The project is **AURA**, an AI-native DAW: Tauri v2 + Svelte 5 around a
 lock-free real-time Rust engine (`src-tauri/`), local AI sidecars, and an
 embedded MCP server so agents mutate the session alongside the user.
 
-**Plan E (the side-channel totality) is IMPLEMENTED, Gate E is CLOSED, and
-PR #12 is MERGED.** The owner ordered the merge; `main` now carries
-squash commit `27911d8` ("Plan E — the side-channel totality; Gate E
-closed, op log ON"). Branch `plan-e-side-channels` is **kept** (not
-deleted) so every SHA cited in this file and in `docs/PHASE4-PLAN.md`'s
-"Plan E handoff" section still resolves — the branch's own history is the
-task-by-task record; `27911d8` is just its squashed shape on `main`. A
-post-merge whole-branch review is running as a follow-up; nothing in this
-file depends on its outcome. **`main` now contains Plan A + B + C+D +
-Plan E's full channel rewrite — a fresh session branching from
-`origin/main` today gets the whole channel, undo/redo, and the journal for
-free.** Full handoff (every scope ruling, every mid-flight ruling, every
-carry-forward, the deferred-minors roll-up): `docs/PHASE4-PLAN.md`'s
-**"Plan E handoff"** section, appended after the "Plan C/D handoff"
-section, same conventions. The landed side-channel inventory (34 rows, all
-closed, plus residual carve-outs R-1..R-3 and recorded replay limitations
-L-1..L-5, of which L-1 is now closed and L-4/L-5 were added by the
-post-merge follow-up PR #18): `docs/SIDE-CHANNEL-INVENTORY.md`.
+**Plan F (history storage) is IMPLEMENTED on `plan-f-history` (PR #23).**
+Tasks 1–13 plus the persist/clipboard review follow-up. CI green,
+`MERGEABLE`. After merge, a fresh session branching from `origin/main`
+gets the published `SessionSnapshot`, lock-free rebuild assembly, version
+graph, panic rollback, journal reader (detection only), and placement
+offsets. Full handoff: `docs/PHASE4-PLAN.md`'s **"Plan F handoff"**.
 
-**Also open: PR #17**, `midi-input-ports` — hardware MIDI input slice 1
-(port list/select + activity indicator + live monitoring, `midir`,
-owner-verified end-to-end with an LPK25). It has been updated with
-post-merge `origin/main` (conflict-free, suites green) and is **cleanly
-mergeable now** (`gh pr view 17` — `mergeStateStatus: CLEAN`), but is
-**still OPEN** — verify its status before starting Track B, which needs it
-merged. (Historical: PR #17 was merged as `3340aa8`, which is the base
-Track B's slice 2 branched from.)
+Plan E is already on `main` (squash `27911d8`, PR #12). Its follow-up
+PR #18 is also merged. Branch `plan-e-side-channels` is **kept** so SHAs
+cited in the Plan E handoff still resolve. The landed inventory is
+`docs/SIDE-CHANNEL-INVENTORY.md`: R-3/L-4/L-5 CLOSED (Plan F); residuals
+are R-1, R-4, and the F-6 outgoing-persist skip.
 
-Main also carries **PR #9** (timeline/piano-roll horizontal scrollbars),
-**PR #10** (interface-zoom preference), **PR #11** (piano-roll note
-selection + copy/paste ops, all three folded into PR #12's diff via its
-own mid-flight merge, commit `f886306`), plus **PR #13** (preferences
-system), **PR #14** (prefs slider commit-on-release), **PR #15** (sidecar/
-MCP setup docs), and **PR #16** (adaptive top-bar overflow) — all merged
-independently of Plan E, before or around the same time as PR #12. Nothing
-further to do about any of them; they're why the frontend baseline moved
-past Plan E's own count (see below).
+**PR #17** (`midi-input-ports`) is **merged** (`3340aa8`) — that was
+Track B's prerequisite. Tracks B/C/D/E/F have their own landed PRs
+(#21/#22/#20/library-browser/`modulation-system`). Nothing further to
+do about those merges.
 
-**Baseline to verify at the start of any track**: MEASURE IT, don't trust
-this line — several tracks are in flight and each moves the number, so it
-is a standing merge-conflict point. Marked correction (ADR 0007): this
-section previously said **506 backend + 206 frontend**, which was already
-stale when written — the real count at `3340aa8` (Track D's branch base,
-verified in a worktree) was **527 backend + 206 frontend**. Known points
-since: **538 + 234** after Track E (`a98d7ff`); **566 backend (537 lib +
-29 integration) + 258 frontend** on `automation-audible` 2026-08-15
-(Track D, PR #20); **662 backend (633 lib + 29 integration) + 271
-frontend** on `midi-slice-2` 2026-08-15 (Track B, PR #21); and **731
-backend (702 lib + 29 integration) + 299 frontend** on
-`modulation-system` 2026-08-16 (Track F). Doc-tests report 0 and are not a
-test target — do not add them to the count. Run both suites before writing
-the first line of a track:
+**Baseline to verify at the start of any leftover**: MEASURE IT, don't
+trust this line. Current measured count on `plan-f-history` 2026-08-16
+(after the PR #23 review follow-up, rebased onto main): **900 backend
+(866 lib + 34 integration, plus 2 `#[ignore]`) + 456 frontend**.
+Doc-tests report 0 and are not a test target. Run both suites before
+writing the first line of a leftover:
 
 ```
 timeout 900 cargo test --manifest-path src-tauri/Cargo.toml
@@ -282,11 +263,10 @@ if you worked on this repo before Plan E:
   fix) — if a track adds a new gesture-shaped commit path, follow this
   order or reintroduce the TOCTOU that fix closed.
 
-## 3. The five parallel-safe tracks
+## 3. The five tracks (all landed)
 
-Track A is **LANDED** (2026-08-16). The other four were already landed —
-see each section. Cross-track notes below stay as the historical
-sequencing record.
+Historical record. Do not restart these. Leftovers live in each
+"Still owed" / carry-forward list, not as a sixth parallel track.
 
 ### Track A — Plan F: history storage — LANDED 2026-08-16
 
@@ -301,9 +281,9 @@ under Consequences.
 What landed: published snapshot + lock-free rebuild assembly, version
 graph (64 KB replay-only, janitor), panic rollback in `transact`, journal
 reader (detection only), rev-ordered undo stack, R-3 closed, MIDI
-placement offsets. The Plan A `engine.rs` sequencing note is **resolved**
-— Tracks B/D may now rebase on the snapshot-rebuild; assembly no longer
-holds the session lock.
+placement offsets (including clipboard copy/paste), persist_gate +
+re-dirty on a stale write. The Plan A `engine.rs` sequencing note is
+**resolved** — assembly no longer holds the session lock.
 
 Carry-forwards for later rounds live in the handoff: live-document B-tree
 (trigger = note-delta op), I-1 option-(a) residual, no auto-apply of
@@ -499,7 +479,8 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
   by the standing "PDC before sends ship" rule), and Tier 2 (months — time-stretch, pattern
   instancing, takes/comping, stems export, freeze/bounce, external
   instrument tracks, two-instance coexistence). **Start here** for
-  anything not already one of the five tracks above.
+  anything not already a landed track above. Plan F is landed; do not
+  start another history-storage track.
 - `docs/superpowers/plans/2026-08-14-plan-e-side-channel-totality.md` —
   Plan E's own plan doc (scope rulings, non-goals, all 18 tasks).
 - `docs/SIDE-CHANNEL-INVENTORY.md` — the landed inventory, carve-outs,
@@ -527,7 +508,7 @@ Baseline after this track: 538 backend + 234 frontend tests, all green
 
 ---
 
-*Working note, committed on the PR branch for session continuity. When any
-track lands, update the relevant section of this file (or, once a track's
-own follow-on work is substantial, split it into its own next-prompt-style
-pointer) so the next fresh session isn't reading stale status.*
+*Working note. When a leftover lands, update the relevant section of
+this file (marked correction, ADR 0007) so the next fresh session isn't
+reading stale status. After PR #23 merges, this file is the post-Plan-F
+briefing on `main`.*
