@@ -37,9 +37,13 @@ use super::pitch::{PitchAnalyzer, PitchFrame};
 /// the RT thread.
 pub const PITCH_TAP_MAX_FRAMES: usize = 8192;
 
-/// 8 kHz samples the worker may fall behind by: one full second. The worker
-/// wakes every [`POLL`] ms, so this is roughly 500× the slack it needs.
-const SAMPLE_RING_SLOTS: usize = 8192;
+/// 8 kHz samples the worker may fall behind by. Sized to hold one MAXIMAL
+/// chunk — the same bound `dec_buf` is reserved to — because a chunk that
+/// cannot fit is dropped, and a device the decimator upsamples from would
+/// then never produce a single frame rather than merely dropping a few. That
+/// bound also buys ~8 seconds of slack at 8 kHz, far more than the [`POLL`]
+/// interval needs.
+const SAMPLE_RING_SLOTS: usize = PITCH_TAP_MAX_FRAMES * 8 + 8;
 
 /// Chunk descriptors in flight. One per capture buffer.
 const CHUNK_RING_SLOTS: usize = 512;
@@ -281,7 +285,14 @@ mod tests {
             .collect()
     }
 
-    fn chain(on: bool) -> (PitchTap, PitchWorker, rtrb::Consumer<PitchFrame>, Arc<AtomicBool>) {
+    fn chain(
+        on: bool,
+    ) -> (
+        PitchTap,
+        PitchWorker,
+        rtrb::Consumer<PitchFrame>,
+        Arc<AtomicBool>,
+    ) {
         let active = Arc::new(AtomicBool::new(on));
         let (tap, worker, frames) = pitch_channel(RATE, active.clone());
         (tap, worker, frames, active)
@@ -331,7 +342,10 @@ mod tests {
         feed(&mut tap, 220.0, RATE as usize, 0);
         worker.pump();
 
-        let voiced: Vec<_> = drain(&mut frames).into_iter().filter(|f| f.voiced).collect();
+        let voiced: Vec<_> = drain(&mut frames)
+            .into_iter()
+            .filter(|f| f.voiced)
+            .collect();
         assert!(!voiced.is_empty(), "a steady 220 Hz tone must be voiced");
         for f in &voiced {
             assert!((f.midi - 57.0).abs() < 0.5, "A3 is MIDI 57, got {}", f.midi);
@@ -426,10 +440,36 @@ mod tests {
         let mut prev = 0u64;
         for f in &got {
             assert!(f.hz.is_finite() && f.midi.is_finite());
-            assert!(f.sample >= prev, "timestamps went backwards at {}", f.sample);
-            assert!(f.sample <= end, "frame at {} is past everything fed", f.sample);
+            assert!(
+                f.sample >= prev,
+                "timestamps went backwards at {}",
+                f.sample
+            );
+            assert!(
+                f.sample <= end,
+                "frame at {} is past everything fed",
+                f.sample
+            );
             prev = f.sample;
         }
+    }
+
+    /// The sample ring has to hold one MAXIMAL chunk. If it cannot, a device
+    /// whose rate the decimator upsamples from never fits — and the chain
+    /// does not degrade, it goes permanently dark on that device.
+    #[test]
+    fn a_maximal_chunk_always_fits() {
+        let active = Arc::new(AtomicBool::new(true));
+        // The worst case the tap admits: a full `PITCH_TAP_MAX_FRAMES`
+        // buffer from a device slow enough that 8 kHz is an UPsample.
+        let slow = 4_000;
+        let (mut tap, mut worker, _frames) = pitch_channel(slow, active);
+        tap.process(&vec![0.5f32; PITCH_TAP_MAX_FRAMES], 1, 0);
+        assert_eq!(
+            worker.pump(),
+            1,
+            "a chunk the tap is willing to produce must fit in the ring"
+        );
     }
 
     /// The thread is the only part `pump` tests cannot cover: it must pick
