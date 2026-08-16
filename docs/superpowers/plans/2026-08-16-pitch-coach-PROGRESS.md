@@ -56,8 +56,35 @@ documentation and all commits are English.
       before any UI is built. **Run it with:**
 
       ```sh
-      cargo run --manifest-path src-tauri/Cargo.toml --example pitch_check -- 15 A3
+      cargo run --manifest-path src-tauri/Cargo.toml --example pitch_check -- 15 A3 --tone=0.35
       ```
+
+      **Measured 2026-08-16**, speaker -> microphone, 44.1 kHz stereo input:
+
+      | | |
+      |---|---|
+      | target | 220.00 Hz (A3) |
+      | median detected | 220.02 Hz (+0.2 cents) |
+      | \|error\| | median 0.4 cents |
+      | within | 100 % <= 25 cents |
+      | voiced | 100 % from first sound to last |
+      | clarity | median 1.00 |
+      | frame rate | 99-100 Hz |
+
+      `--tone` plays the target out of the speakers so nothing has to be
+      sung: the owner cannot reliably hit a pitch, and scoring a run against
+      a note a person is aiming at mixes their error with the detector's
+      with no way to separate them. Level matters — at the default 0.1 the
+      same run came back 55 % voiced with readings at exactly half the
+      target (YIN's sub-harmonic under poor SNR) and detections down at
+      70 Hz that were room rumble. That was the acoustic path, not the
+      detector; at 0.35 it is half a cent.
+
+      **What this does NOT settle:** a synthetic tone is a far easier signal
+      than a voice, which brings harmonics, vibrato and breath. The voice
+      run is still worth doing — humming or whistling is enough, and the
+      numbers to read there are the voiced fraction and "to nearest note",
+      not tuning accuracy.
 
       The plan's checkpoint text said to drive the running app. That is not
       possible: the five pitch commands are registered in `lib.rs`, but

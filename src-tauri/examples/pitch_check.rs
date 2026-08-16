@@ -6,10 +6,18 @@
 //! the error in cents, and how much of the take was voiced at all.
 //!
 //! ```sh
-//! cargo run --example pitch_check              # 10 s, nearest note
-//! cargo run --example pitch_check -- 20 A3     # 20 s against a named target
-//! cargo run --example pitch_check -- 10 220    # or a target in Hz
+//! cargo run --example pitch_check                  # 10 s, nearest note
+//! cargo run --example pitch_check -- 20 A3         # 20 s against a named target
+//! cargo run --example pitch_check -- 10 220        # or a target in Hz
+//! cargo run --example pitch_check -- 15 A3 --tone  # play the target, sing nothing
 //! ```
+//!
+//! `--tone` plays the target through the default output while capturing, so
+//! the microphone hears a frequency we already know exactly. That is the
+//! honest way to measure the DETECTOR: score a run against a note a person
+//! is trying to hit and the error is theirs and the detector's mixed
+//! together, with no way to tell which is which. It needs speakers, not
+//! headphones — the bleed the panel warns about is the point here.
 //!
 //! What this does NOT cover: the Tauri command layer. `pitch_listen_start`,
 //! `pitch_subscribe` and the 60 Hz batching in `Control` are not exercised
@@ -87,6 +95,21 @@ fn main() -> Result<(), String> {
         ));
     }
 
+    let play_tone = args.iter().any(|a| a.starts_with("--tone"));
+    // `--tone` alone is -20 dBFS; `--tone=0.3` is louder. The first run of
+    // this against a laptop speaker in a noisy room came back 55 % voiced
+    // with octave-down readings at exactly half the target — the signature
+    // of YIN under a poor signal-to-noise ratio, not of a broken detector.
+    // The fix for that is level, so level is a knob.
+    let level: f32 = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--tone=")?.parse().ok())
+        .unwrap_or(0.1f32)
+        .clamp(0.0, 0.9);
+    if play_tone && target.is_none() {
+        return Err("--tone needs a target note or frequency to play".into());
+    }
+
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -122,6 +145,45 @@ fn main() -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     stream.play().map_err(|e| e.to_string())?;
 
+    // Optional reference tone out of the speakers. Held at -20 dBFS: loud
+    // enough to sit well above a room's noise floor, quiet enough not to be
+    // unpleasant for however long the run lasts.
+    let out_stream = match play_tone {
+        false => None,
+        true => {
+            let hz = target.expect("checked above");
+            let out = host
+                .default_output_device()
+                .ok_or("no default output device")?;
+            let ocfg = out.default_output_config().map_err(|e| e.to_string())?;
+            if ocfg.sample_format() != cpal::SampleFormat::F32 {
+                return Err(format!(
+                    "unsupported output sample format {:?}",
+                    ocfg.sample_format()
+                ));
+            }
+            let och = ocfg.channels().max(1) as usize;
+            let step = 2.0 * std::f32::consts::PI * hz / ocfg.sample_rate().0 as f32;
+            let mut phase = 0.0f32;
+            let s = out
+                .build_output_stream(
+                    &ocfg.into(),
+                    move |data: &mut [f32], _| {
+                        for frame in data.chunks_mut(och) {
+                            let v = phase.sin() * level;
+                            phase = (phase + step) % (2.0 * std::f32::consts::PI);
+                            frame.iter_mut().for_each(|x| *x = v);
+                        }
+                    },
+                    |e| eprintln!("output stream error: {e}"),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            s.play().map_err(|e| e.to_string())?;
+            Some(s)
+        }
+    };
+
     println!("device : {name}");
     println!("format : {rate} Hz, {channels} ch");
     match target {
@@ -132,7 +194,14 @@ fn main() -> Result<(), String> {
         ),
         None => println!("target : nearest note to whatever you sing"),
     }
-    println!("\nSing or play a steady note for {secs} s.\n");
+    match play_tone {
+        true => println!(
+            "\nPlaying the target through the speakers for {secs} s. Sing nothing —\n\
+             the microphone just has to hear it. Level {level:.2} — turn the\n\
+             speakers up, or pass --tone=0.3, if it comes back patchy.\n"
+        ),
+        false => println!("\nSing, hum, whistle or play a steady note for {secs} s.\n"),
+    }
     println!("   time   voiced   detected      note    error   clarity");
     println!("  ─────────────────────────────────────────────────────");
 
@@ -185,6 +254,7 @@ fn main() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(20));
     }
     drop(stream);
+    drop(out_stream);
 
     let voiced: Vec<&PitchFrame> = all.iter().filter(|f| f.voiced).collect();
     println!("\n  ── summary ──────────────────────────────────────────");
