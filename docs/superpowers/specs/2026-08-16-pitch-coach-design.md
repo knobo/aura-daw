@@ -123,8 +123,21 @@ stream per device and refcounts its consumers:
   on a stereo interface is on one mic either way.
 
 The hub opens when at least one consumer wants it, and closes when none do.
-`start_recording` no longer opens a stream; it attaches record sinks to a
-hub that may already be running, opening one first if not.
+
+**The stream is rebuilt whenever the consumer set changes, not mutated in
+place.** Attaching record sinks to a running cpal callback would need a
+command ring into the callback plus a retire ring back out (the
+`GraphPtr`/`retire_tx` pattern `OutputCb` already uses) so the RT thread
+never allocates or drops. That is the correct mechanism and also the most
+expensive change to the most sensitive file in the repo. Since every
+transition — listen on/off, record start/stop — happens on the control
+thread and never per block, closing and reopening the stream is equivalent
+in behaviour and far cheaper to get right.
+
+The accepted cost is a few milliseconds of pitch blackout at record start,
+where today there is a full stream open anyway. If that blip proves
+annoying in use, the command-ring version is the upgrade path and nothing
+above it has to change.
 
 **Invariants that must not regress** (each gets a test):
 
