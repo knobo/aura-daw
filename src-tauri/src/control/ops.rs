@@ -142,7 +142,12 @@ pub fn add_track_tx(
 /// Compose the live transport snapshot (store fields + RT atomics).
 pub fn transport_snapshot(store: &Store, shared: &SharedRt) -> TransportState {
     let count_in = shared.countin_left.load(Relaxed);
-    let state = if shared.recording.load(Relaxed) {
+    let state = if shared.recording.load(Relaxed)
+        || store.transport.state == "recording"
+    {
+        // Document "recording" wins over the playing atomic: Play still
+        // sets playing=true even when it refuses to overwrite the label
+        // (`transport_play_does_not_downgrade_recording_state`).
         "recording".into()
     } else if shared.playing.load(Relaxed) || count_in > 0 {
         "playing".into()
