@@ -788,7 +788,14 @@ fn published_snapshot_tracks_the_live_document_across_every_op_family_and_epoch_
         let f = saved_dir.join("project.json");
         let mut root: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&f).expect("read project.json")).expect("parse");
-        root.as_object_mut().expect("object").insert("automation".into(), serde_json::json!("nope"));
+        let obj = root.as_object_mut().expect("object");
+        // Track F writes `modulation{}` and drops `automation[]`. Corrupt
+        // both so adopt cannot fall back to the v4 graph (that would fill
+        // the lanes and re-shadow the plugin-install republish this step
+        // pins). `automation: "nope"` is still the Err arm `load_lanes`
+        // takes; removing `modulation` is what makes the v4 loader miss.
+        obj.insert("automation".into(), serde_json::json!("nope"));
+        obj.remove("modulation");
         std::fs::write(&f, serde_json::to_vec_pretty(&root).unwrap()).expect("write project.json");
     }
     cp.open_project_epoch(&saved_dir).expect("open project with a corrupt automation field");

@@ -3217,6 +3217,10 @@ impl ControlPlane {
         let mut s = self.session.lock();
         s.modulation = doc;
         s.automation.lanes = crate::modulation::compat::lanes_from_doc(&s.modulation);
+        // snapshot republish: adopt writes the graph and the derived lane
+        // view AFTER the epoch swap's publish. Without this, rebuild and
+        // the Plan F equivalence sweep see an empty automation half.
+        s.republish_full();
     }
 
     /// Shared body: `create_project`/`create_project_epoch`'s only
