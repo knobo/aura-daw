@@ -352,13 +352,25 @@ impl LaunchRuntime {
             .name("aura-launch-drive".into())
             .spawn(move || {
                 let mut last = 0u64;
+                let mut was_playing = false;
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
                     let playing = shared.playing.load(Relaxed);
                     let pos = shared.position.load(Relaxed);
-                    if !playing || pos < last {
+                    if !playing {
+                        last = pos;
+                        was_playing = false;
+                        continue;
+                    }
+                    if pos < last {
                         last = pos;
                         continue;
+                    }
+                    // Play-edge or a long seek: do not scan from 0 (or from
+                    // a stale last) and fire every note behind the playhead.
+                    if !was_playing {
+                        last = pos.saturating_sub(1);
+                        was_playing = true;
                     }
                     let launchers = runtime().maps();
                     if launchers.iter().all(|m| m.drive_clip_ids.is_empty()) {
@@ -384,7 +396,7 @@ impl LaunchRuntime {
                         for clip in clips.iter().filter(|c| {
                             launcher.drive_clip_ids.iter().any(|id| id == c.id.as_str())
                         }) {
-                            for ev in crate::midi::schedule::clip_events(clip, &tempo_map) {
+                            for ev in crate::midi::schedule::clip_drive_events(clip, &tempo_map) {
                                 if ev.sample <= last || ev.sample > pos {
                                     continue;
                                 }

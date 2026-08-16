@@ -49,6 +49,23 @@
     void launch.preview(id);
   }
 
+  function playScene(id: string) {
+    launch.selectedId = id;
+    void launch.preview(id);
+  }
+
+  function startNameEdit(id: string, name: string) {
+    editNameId = id;
+    editNameDraft = name;
+  }
+
+  function commitNameEdit() {
+    const id = editNameId;
+    const name = editNameDraft.trim();
+    editNameId = null;
+    if (id && name) void launch.update(id, { name });
+  }
+
   function onNoteChange(id: string, raw: string) {
     const note = Number(raw);
     if (!Number.isInteger(note) || note < 0 || note > 127) return;
@@ -67,6 +84,8 @@
 
   let renameId = $state<string | null>(null);
   let renameDraft = $state("");
+  let editNameId = $state<string | null>(null);
+  let editNameDraft = $state("");
 
   async function mapSelectedClip() {
     const id = midi.selectedClipId;
@@ -96,10 +115,19 @@
   function onKeydown(e: KeyboardEvent) {
     if (e.key === "Escape") {
       e.stopPropagation();
-      if (launch.learningId) launch.stopLearn();
+      if (editNameId) editNameId = null;
+      else if (launch.learningId) launch.stopLearn();
       else if (launch.marking) launch.marking = false;
       else if (launch.selectedId) launch.selectedId = null;
       else launch.closePanel();
+      return;
+    }
+    if (e.key === "F2" && launch.selectedId) {
+      const b = launch.bindings.find((x) => x.id === launch.selectedId);
+      if (b) {
+        e.preventDefault();
+        startNameEdit(b.id, b.name);
+      }
       return;
     }
     if ((e.key === "Delete" || e.key === "Backspace") && launch.selectedId) {
@@ -198,7 +226,7 @@
       {:else if launch.marking}
         MARK is on — drag across any lanes (clips will not move)
       {:else}
-        Each launcher is its own note map. Right-click a MIDI clip and pick Use launcher.
+        Click a scene name to play it · F2 to rename · GATE/ONE-SHOT below
       {/if}
     </div>
 
@@ -221,21 +249,37 @@
           class:play={launch.overlay?.id === b.id}
           role="row"
           tabindex="0"
-          title="Click to select · double-click to audition (loop stays put)"
+          title="Click the name to play · F2 to rename · click target to jump"
           onclick={() => onRowClick(b.id)}
           ondblclick={() => onRowDblClick(b.id)}
           onkeydown={(e) => {
-            if (e.key === "Enter") launch.focus(b.id);
+            if (e.key === "Enter") playScene(b.id);
           }}
         >
-          <input
-            class="name mono"
-            value={b.name}
-            aria-label="Binding name"
-            onpointerdown={(e) => e.stopPropagation()}
-            ondblclick={(e) => e.stopPropagation()}
-            onchange={(e) => void launch.update(b.id, { name: e.currentTarget.value.trim() || b.name })}
-          />
+          {#if editNameId === b.id}
+            <input
+              class="name mono"
+              value={editNameDraft}
+              aria-label="Binding name"
+              onpointerdown={(e) => e.stopPropagation()}
+              oninput={(e) => (editNameDraft = e.currentTarget.value)}
+              onkeydown={(e) => {
+                if (e.key === "Enter") commitNameEdit();
+                if (e.key === "Escape") editNameId = null;
+              }}
+              onblur={commitNameEdit}
+            />
+          {:else}
+            <button
+              type="button"
+              class="name playlab mono"
+              title="Play {b.name}"
+              onclick={(e) => {
+                e.stopPropagation();
+                playScene(b.id);
+              }}>{b.name}</button
+            >
+          {/if}
           <select
             class="note mono"
             value={b.note}
@@ -488,6 +532,14 @@
     font-size: 11px;
     padding: 3px 5px;
     width: 100%;
+  }
+  button.name.playlab {
+    text-align: left;
+    cursor: pointer;
+  }
+  button.name.playlab:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
   }
   .tgt {
     overflow: hidden;

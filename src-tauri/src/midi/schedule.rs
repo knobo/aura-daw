@@ -74,6 +74,37 @@ pub fn clip_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
     out
 }
 
+/// Drive-clip notes for the launch mapper: **one pass** over the written
+/// notes, no content-loop expansion. A piano-roll with one note must fire
+/// once per playhead pass, even if the placement is longer than the content
+/// (drag-to-loop). Transport loop wrap still retriggers, because the same
+/// onset sample is crossed again.
+pub fn clip_drive_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
+    let clip_end_tick = clip.timeline_start_ticks.saturating_add(clip.length_ticks);
+    let mut out = Vec::with_capacity(clip.notes.len() * 2);
+    for n in &clip.notes {
+        if n.velocity == 0 || n.length_ticks == 0 {
+            continue;
+        }
+        let on_tick = clip.timeline_start_ticks.saturating_add(n.tick as u64);
+        if on_tick >= clip_end_tick {
+            continue;
+        }
+        let off_tick = on_tick
+            .saturating_add(n.length_ticks as u64)
+            .min(clip_end_tick);
+        let on_s = map.tick_to_samples(on_tick);
+        let mut off_s = map.tick_to_samples(off_tick);
+        if off_s <= on_s {
+            off_s = on_s + 1;
+        }
+        out.push(AbsNoteEvent { sample: on_s, key: n.key, velocity: n.velocity });
+        out.push(AbsNoteEvent { sample: off_s, key: n.key, velocity: 0 });
+    }
+    out.sort_by_key(|e| (e.sample, e.velocity));
+    out
+}
+
 /// Iterate the events that fall inside the block `[block_start,
 /// block_start + frames)`, converted to block-relative [`BlockNoteEvent`]s.
 /// `events` must be sorted by sample (as [`clip_events`] returns them).
@@ -160,6 +191,21 @@ mod tests {
         // Off would naturally land at (960+960)*25 = 1920*25, but placement
         // ends at 1440*25 — clamp there.
         assert_eq!(ev[3], AbsNoteEvent { sample: 1440 * 25, key: 60, velocity: 0 });
+    }
+
+    #[test]
+    fn drive_events_ignore_content_repeats() {
+        let mut c = clip(0, 1920, vec![note(0, 480, 60, 100)]);
+        c.content_length_ticks = Some(960);
+        let ev = clip_drive_events(&c, &map_120());
+        assert_eq!(
+            ev,
+            vec![
+                AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
+                AbsNoteEvent { sample: 480 * 25, key: 60, velocity: 0 },
+            ],
+            "one written note → one on/off, even when the placement loops the content"
+        );
     }
 
     #[test]
