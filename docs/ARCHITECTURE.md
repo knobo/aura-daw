@@ -294,6 +294,20 @@ owning modules):
 * sidecars — job kind `humToMidi` (`JobKind::HumToMidi`, dedicated
   `hum_to_song` command; rejected by the open-kind `sidecar_run_job` path)
 
+**Pitch Coach additions** (§5.1; all additive names, registered next to
+`subscribe_meters`):
+
+* live — `pitch_listen_start`, `pitch_listen_stop`, `pitch_subscribe`,
+  `pitch_unsubscribe`, `set_rehearse_hold`, `pitch_set_reference`
+* the recorded take — `pitch_score` (score a take's curve against a MIDI
+  track's melody), `pitch_track` (the stored curve on the timeline, thinned),
+  `pitch_analyze_clip` ((re)build a take's curve)
+
+`pitch_unsubscribe` is not optional symmetry. `pitch_subscribe` appends a
+sink and the engine only retires one when `send_batch` fails, which a live
+Tauri `Channel` never does no matter how dead its JS end is — a per-mount
+subscriber that only mutes its own end leaks a sink per visit.
+
 Payload shapes: see `docs/ipc-schemas/*.schema.json` (source of truth for the
 frontend; the Rust structs in the modules mirror them, `camelCase` on the
 wire). New v2 schemas are *emitter* contracts without
@@ -317,6 +331,7 @@ here — use the channels.
 | `export://done` | export result object + `jobId` (see `control/export.rs`) | (wave 1.5) export finished |
 | `export://error` | `{ jobId, message }`-shaped error (see `control/export.rs`) | (wave 1.5) export failed |
 | `loopjam://state` | Rust `LoopJamStatus` in `control/loopjam.rs` | (wave 1.5) loop-jam session state changes (idle/generating/ready/applied/cancelled) |
+| `pitch://state` | `pitch-state.schema.json` | (§5.1) listening/rehearse-hold/reference-track/device-rate changes. Pitch FRAMES do not ride here — they are a `Channel`, batched at 60 Hz |
 
 ## 4. Threading model
 
@@ -353,6 +368,80 @@ cpal input callback ──rtrb SPSC (≥1 s cap)──► disk writer thread
   `<project>/audio/`, computes remaining LOD tiles, and returns the new clip
   descriptor(s) (`clip.schema.json`).
 
+### 5.1 Input hub and pitch detection (Pitch Coach)
+
+The microphone's lifetime is **not** the take's. An `InputHub` in
+`audio/engine.rs` owns a listen-only stream, and a take on the same device
+takes the analyser over and drops it; stop hands the mic back. Listening
+starts on an explicit toggle or an open Pitch Coach panel, never on track arm
+(ruling R6).
+
+```
+cpal input callback ──► InputCb::capture ──┬─► recorder ring (as above)
+   (RT, no alloc/lock)                     │
+                                           └─► PitchTap: decimate to 8 kHz
+                                                    │  two rtrb rings:
+                                                    │  samples + per-chunk
+                                                    │  descriptors (device
+                                                    │  position and rate)
+                                                    ▼
+                             PitchWorker (own thread, NOT RT)
+                             YIN ► RMS gate ► median ► jump limiter
+                                                    │
+                                       ┌────────────┴────────────┐
+                                       ▼                         ▼
+                            60 Hz batch ► Channel      PitchFolder ► APTF
+                            (live lane/tuner)          cache/pitch/<clipId>.bin
+```
+
+Load-bearing details, each of which cost a bug to find:
+
+* **No detection runs on the callback.** The tap decimates and hands over;
+  everything else is the worker's. Samples are written *before* their
+  descriptor, and a chunk that does not fit anywhere is dropped **whole** —
+  a half-written chunk would mistime every frame after it. A dropped chunk
+  also owes the analyser a reset, because it otherwise carries most of an
+  analysis frame across the hole and timestamps the splice at the new
+  position.
+* **Taps are gated on a shared `pitch_active` flag, not on their own
+  existence.** A take carries a dormant tap whether or not anyone was
+  listening when it started, because a recording stream cannot be rebuilt
+  mid-take without losing audio. A dormant tap costs one relaxed atomic load
+  per buffer.
+* **`PitchFrame.sample` is a PROJECT sample position**, anchored to
+  `shared.position` and only offset within one callback buffer — not
+  device-rate. A 44.1 kHz microphone in a 48 kHz project makes any offset
+  computed against the capture rate ~8 % short.
+* **Rehearse-hold writes silence** into the take for the held span rather
+  than skipping it, so the take stays sample-aligned; the spans come back on
+  `recording://state` as `rehearseSpans`.
+* **The live median is causal**, so the live track lags the centred
+  (`sidecars/hum_to_midi.py`) one by the median half-kernel — 2 frames,
+  20 ms. This is a property of live detection, not a bug to fix; a parity
+  test asserts the two agree to 10 cents once it is accounted for.
+
+**The stored curve.** `audio/pitch_store.rs` defines `APTF` (magic, `u16`
+version, rate, hop, `first_sample`, provenance byte, frame count, then the
+frames). The recorder's writer thread folds it live, the same way it folds
+the waveform pyramid. Positions are **take-local**, in the take's own rate,
+snapped onto a `first_sample + i * hop` grid; the header carries
+`first_sample` because the analyser timestamps the *centre* of its window
+(~15 ms in), and deriving positions from a bare `i * hop` would slide every
+curve early by that much. Mapping onto the timeline is the reader's job:
+
+```
+timeline = clip.timeline_start_samples
+         + (sample * project_rate / clip.source_sample_rate) - clip.offset_samples
+```
+
+The conversion comes **first** and the offset subtraction second:
+`offset_samples` and `length_samples` index the decode cache, which
+`linear_resample`s to the engine rate at load, so they are project-rate
+quantities while the curve is not.
+
+Scores are **not** persisted — only the curve. `pitch_score` recomputes, so a
+report stays correct after the reference melody is edited.
+
 ## 6. Sidecar architecture (Demucs, Whisper.cpp)
 
 * **Demucs** (stem separation) runs as `python3 sidecars/demucs_worker.py`
@@ -386,6 +475,7 @@ MySong.aura/
 ├── stems/                # Demucs output: <sourceClipId>/{vocals,drums,bass,other}.wav
 └── cache/                # regenerable — safe to delete
     ├── waveforms/<clipId>/lod<N>.bin   # min/max tile pyramids (§2.5)
+    ├── pitch/<clipId>.bin              # APTF pitch curve per take (§5.1)
     └── transcripts/<clipId>.json       # Whisper output (text + timings + pitch)
 ```
 

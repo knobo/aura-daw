@@ -185,12 +185,17 @@ report, docs + PR.
 - [x] Task 14, **first half** — `audio/pitch_store.rs` (`APTF`, `PitchFolder`,
       `analyze_interleaved`) + the recorder fold — `9f21522`, 10/10 store,
       5/5 recorder.
-- [ ] Task 14, **second half** — the three commands (`pitch_score`,
+- [x] Task 14, **second half** — the three commands (`pitch_score`,
       `pitch_track`, `pitch_analyze_clip`), `pitch-score-report.schema.json`,
-      and their registration in `lib.rs` (additive names only, which the
-      owner has already authorised).
-- [ ] Task 15 — the report UI (`PitchReport.svelte`, `pitch/report.ts`).
-- [ ] Task 16 — `docs/pitch-coach.md`, ARCHITECTURE, the count docs, PR.
+      and their registration in `lib.rs` — `d67c831`. 38/38 across
+      `audio::pitch_store`, `control::pitch_coach` and `midi::schedule`.
+      **The handoff note below had the timeline conversion backwards** —
+      see the correction in the log.
+- [x] Task 15 — the report UI (`PitchReport.svelte`, `pitch/report.ts`,
+      wire types, three bindings + their `DemoBackend` mocks). 588 frontend
+      tests, `svelte-check` 0 errors, `npm run build` green.
+- [x] Task 16 — `docs/pitch-coach.md`, ARCHITECTURE §3.3/§3.4/§5.1/§7, the
+      README feature section, the count docs.
 
 `panel-logic.targetNotesFor` still expands repeats frontend-side with the
 timeline preview's rule. Task 12 built the backend replacement but nothing
@@ -206,9 +211,16 @@ Written down because the first half made the decisions:
 
 - **`APTF` positions are TAKE-LOCAL**, in the take's own sample rate, and
   they snap onto a `first_sample + i * hop` grid. The scorer therefore has
-  to map them onto the timeline itself:
-  `timeline = clip.timeline_start_samples + (sample - clip.offset_samples)
-  * project_rate / clip.source_sample_rate`. The reference notes from
+  to map them onto the timeline itself. **CORRECTED while implementing the
+  second half** — this bullet originally read `(sample - offset_samples) *
+  project_rate / source_rate`, which converts the offset as if it were a
+  source-rate quantity. It is not. `offset_samples` and `length_samples`
+  index the decode cache, and `audio/offline.rs` `linear_resample`s that
+  cache to the engine rate before indexing it, so both are PROJECT-rate.
+  The conversion comes first:
+  `timeline = clip.timeline_start_samples + (sample * project_rate /
+  clip.source_sample_rate) - clip.offset_samples`. The two agree only when
+  the take's rate equals the project's. The reference notes from
   `clip_notes` are already in project samples.
 - **The header carries `first_sample`** because the analyser timestamps the
   CENTRE of its window (~15 ms in). Deriving positions from a bare

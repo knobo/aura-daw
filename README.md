@@ -88,6 +88,21 @@ clock plus Start/Stop/Continue/SPP (Hydrogen and friends slave to it) and
 can play one MIDI track's notes through an external synth
 ([docs/midi-output.md](docs/midi-output.md)).
 
+### Pitch Coach — sing against a MIDI melody
+
+Pick a MIDI track as the reference and the bottom panel becomes a lane: the
+target notes scroll under the playhead with your pitch drawn as a live trail,
+detected in Rust (YIN, off the real-time callback) with no Web Audio
+anywhere. With no melody selected it is a tuner whose headline number is how
+*steadily* you are holding a note, not how close you are to one — steadiness
+improves while accuracy is still poor, so it is the number that shows
+progress. Record a take and it is scored note by note: signed cents, whether
+you sang the note at all, entry timing, drift and vibrato
+([docs/pitch-coach.md](docs/pitch-coach.md)).
+
+Wear headphones — a backing track coming out of the speakers gets detected
+as your pitch.
+
 ### Plugin hosting — CLAP + LV2 instruments
 
 Real in-graph hosting of third-party instruments on MIDI tracks, with one shared
