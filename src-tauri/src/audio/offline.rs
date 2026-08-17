@@ -294,6 +294,7 @@ mod tests {
         }
         let (arp, groove) = crate::control::demo_seed_clips("keys", "bass", 960);
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -365,6 +366,7 @@ mod tests {
             MidiNote { tick: 1200, length_ticks: 400, key: 72, velocity: 100, channel: 0, note_id: NoteId(2) },
         ];
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -510,6 +512,7 @@ mod tests {
             lane_id: crate::ids::LaneId::default_for_track("a1"),
         });
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -566,6 +569,7 @@ mod tests {
         assert_eq!(slots.len(), 1, "duplicate ids collapse in the slot map");
         assert_eq!(slots["dup"], 1, "…onto the LAST index");
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             ..MidiStore::default()
@@ -678,6 +682,7 @@ mod tests {
             lane_id: crate::ids::LaneId::default_for_track("a1"),
         });
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -787,6 +792,7 @@ mod tests {
             });
         }
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],

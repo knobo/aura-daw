@@ -306,6 +306,7 @@ impl Session {
             meter_events: self.midi.meter_events.clone(),
             clips: self.midi.clips.clone(),
             launch_maps: self.midi.launch_maps.clone(),
+            harmony: self.midi.harmony.clone(),
         }
     }
 
@@ -1003,6 +1004,27 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             effect.rebuild = true;
             effect.persist.midi = true;
             effect.persist.project = true; // the transport.tempo_bpm mirror lives in project.json
+            Ok(inverse)
+        }
+        // Plan H1 (ruling H-4): the harmony document, replaced atomically.
+        Op::HarmonySet { keys, chords } => {
+            let next = crate::theory::HarmonyDoc { keys: keys.clone(), chords: chords.clone() };
+            // Validate BEFORE mutating — a failed apply must leave the session
+            // untouched (round-2 §4), and an unsorted or overlapping document
+            // would corrupt every `chord_at` lookup downstream rather than
+            // failing loudly.
+            next.validate()?;
+            let inverse = Op::HarmonySet {
+                keys: session.midi.harmony.keys.clone(),
+                chords: session.midi.harmony.chords.clone(),
+            };
+            session.midi.harmony = next;
+            // No `effect.rebuild`: the harmony document is not scheduled and
+            // makes no sound of its own. It is read by the palette, the
+            // labels and the generators — all control-side — so a rebuild
+            // would be pure cost. `persist.midi` because it lives in the midi
+            // half of project.json.
+            effect.persist.midi = true;
             Ok(inverse)
         }
         Op::MidiClipAdd { clip, index } => {

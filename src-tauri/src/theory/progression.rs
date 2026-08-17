@@ -47,7 +47,8 @@ impl Progression {
 
 /// One chord in a generated progression, with its length in BARS and the
 /// sentence that says why it is there.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Slot {
     pub chord: Chord,
     pub bars: u32,
@@ -104,7 +105,8 @@ impl Plan {
 
 /// A named progression, written as Roman numerals so it transposes into any
 /// key. `numerals` tokens are `NUMERAL` or `NUMERAL*bars`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Schema {
     pub id: &'static str,
     pub label: &'static str,
@@ -507,7 +509,8 @@ fn functional(key: &Key, bars: usize, adventurousness: u8, seed: u64) -> Vec<Slo
 }
 
 /// One ranked suggestion for "what comes next".
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Suggestion {
     pub chord: Chord,
     pub roman: String,

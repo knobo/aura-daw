@@ -386,6 +386,10 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             Op::MidiClipAdd { clip, .. } | Op::MidiClipRemove { clip, .. } => {
                 midi_clip_heap(clip) + clip.notes.len() * size_of::<crate::midi::MidiNote>()
             }
+            Op::HarmonySet { keys, chords } => {
+                keys.len() * size_of::<crate::theory::KeySpan>()
+                    + chords.len() * size_of::<crate::theory::ChordSpan>()
+            }
             Op::MidiSetNotes { clip, notes, .. } => {
                 clip.as_str().len() + notes.len() * size_of::<crate::midi::MidiNote>()
             }

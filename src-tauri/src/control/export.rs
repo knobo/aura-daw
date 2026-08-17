@@ -546,6 +546,11 @@ impl ControlPlane {
                     tempo_events: m.tempo_events.clone(),
                     meter_events: m.meter_events.clone(),
                     clips: m.clips.clone(),
+                    // The bounce reads notes, not chords: the harmony document
+                    // makes no sound of its own, so an offline render has no
+                    // use for it. Cloned anyway rather than defaulted, so a
+                    // future harmony-aware render step finds it here.
+                    harmony: m.harmony.clone(),
                     launch_maps: m.launch_maps.clone(),
                     loaded_dir: None,
                     dirty: false,

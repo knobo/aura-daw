@@ -1887,6 +1887,7 @@ mod tests {
         let long_ticks = DEFAULT_PPQ as u64 * 8; // 4 s at 120 bpm: still sounding
         let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -2010,6 +2011,7 @@ mod tests {
         let track_clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
         let overridden_clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -2113,6 +2115,7 @@ mod tests {
         });
         let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -2557,6 +2560,7 @@ mod tests {
         // before forcing shutdown, so the note is still genuinely sounding.
         let long_ticks = DEFAULT_PPQ as u64 * 8;
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],

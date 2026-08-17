@@ -59,6 +59,10 @@ pub struct MidiSnapshot {
     pub meter_events: Arc<Vec<MeterEvent>>,
     pub clips: Arc<Vec<Arc<MidiClip>>>,
     pub launch_maps: Arc<Vec<crate::midi::launch::LaunchMap>>,
+    /// The Composer's harmony document (Plan H1). In the published image so a
+    /// reader that already holds a snapshot — the panel, a palette lookup, a
+    /// generator — never has to re-take the session lock.
+    pub harmony: Arc<crate::theory::HarmonyDoc>,
 }
 
 impl MidiSnapshot {
@@ -76,6 +80,7 @@ impl MidiSnapshot {
             meter_events: Arc::new(midi.meter_events.clone()),
             clips: Arc::new(midi.clips.iter().cloned().map(Arc::new).collect()),
             launch_maps: Arc::new(midi.launch_maps.clone()),
+            harmony: Arc::new(midi.harmony.clone()),
         }
     }
 }
@@ -92,6 +97,7 @@ pub struct ChangeSet {
     pub midi_structure: bool, // clip list add/remove (re-derive whole list)
     pub midi_clips: BTreeSet<ClipId>, // per-clip content rewrites
     pub launch_maps: bool,    // named launchers + bindings + drive clips
+    pub harmony: bool,        // the Composer's key/chord maps (Plan H1)
     pub automation: bool,
     pub modulation: bool,
     pub plugins: bool,
@@ -118,6 +124,7 @@ impl ChangeSet {
             midi_structure: true,
             midi_clips: BTreeSet::new(),
             launch_maps: true,
+            harmony: true,
             automation: true,
             modulation: true,
             plugins: true,
@@ -140,6 +147,7 @@ impl ChangeSet {
     /// · AutomationSetLane→automation · PluginAdd/PluginSetState→plugins
     /// · PluginRemove→plugins+tracks (G-10 insert sweep)
     /// · InsertAdd/Remove/Reorder/SetBypass→tracks · TrackReorder→tracks
+    /// · HarmonySet→harmony
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
         for op in ops {
@@ -187,6 +195,9 @@ impl ChangeSet {
                 | Op::LaunchMapSet { .. } => {
                     cs.launch_maps = true;
                 }
+                // Plan H1: only the harmony maps — no clip, track or transport
+                // state is addressable by this op.
+                Op::HarmonySet { .. } => cs.harmony = true,
                 Op::AutomationSetLane { .. } => {
                     cs.automation = true;
                     cs.modulation = true; // facade writes the graph too
@@ -246,6 +257,7 @@ impl SessionSnapshot {
                 meter_events: Arc::new(Vec::new()),
                 clips: Arc::new(Vec::new()),
                 launch_maps: Arc::new(Vec::new()),
+                harmony: Arc::new(crate::theory::HarmonyDoc::default()),
             },
             automation: Arc::new(Vec::new()),
             modulation: Arc::new(crate::modulation::ModulationDoc::default()),
@@ -310,6 +322,11 @@ impl SessionSnapshot {
                 Arc::new(session.midi.launch_maps.clone())
             } else {
                 prev.midi.launch_maps.clone()
+            },
+            harmony: if changed.harmony {
+                Arc::new(session.midi.harmony.clone())
+            } else {
+                prev.midi.harmony.clone()
             },
         };
         Self {
@@ -388,6 +405,10 @@ pub fn charge_of(next: &SessionSnapshot, changed: &ChangeSet) -> usize {
     if changed.midi_meta {
         charge += next.midi.tempo_events.len() * size_of::<TempoEvent>();
         charge += next.midi.meter_events.len() * size_of::<MeterEvent>();
+    }
+    if changed.harmony {
+        charge += next.midi.harmony.keys.len() * size_of::<crate::theory::KeySpan>();
+        charge += next.midi.harmony.chords.len() * size_of::<crate::theory::ChordSpan>();
     }
     if changed.launch_maps {
         charge += next.midi.launch_maps.len() * size_of::<crate::midi::launch::LaunchMap>();

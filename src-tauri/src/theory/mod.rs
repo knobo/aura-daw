@@ -27,6 +27,7 @@
 //! Plan: `docs/superpowers/plans/2026-08-17-plan-h-composer.md`.
 
 pub mod analysis;
+pub mod bass;
 pub mod chord;
 pub mod circle;
 pub mod groove;
@@ -43,6 +44,7 @@ pub mod voicing;
 pub use analysis::{analyze, Analysis, Function};
 pub use chord::{diatonic_chord, diatonic_chords, Chord, ChordQuality};
 pub use harmony::{ChordSpan, HarmonyDoc, KeySpan};
+pub use bass::{bass_notes, BassOptions, BassStyle};
 pub use groove::{groove_notes, Genre, GrooveOptions};
 pub use melody::{melody_notes, MelodyOptions};
 pub use metre::{Grid, Meter};

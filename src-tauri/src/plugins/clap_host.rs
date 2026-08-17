@@ -1354,6 +1354,7 @@ mod tests {
         t.instrument_id = Some(format!("plugin:{}", info.id));
         store.tracks.push(t);
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],

@@ -55,6 +55,7 @@ fn v2_multi_tempo_project_migrates_and_resaves_as_v3() {
     // exists, and the SAME (already-quantized) periods come back with zero
     // drift (Task 2's period_from_bpm/bpm_from_period idempotence).
     let store = aura_lib::midi::MidiStore {
+        harmony: Default::default(),
         ppq: v3.ppq,
         tempo_events: v3.tempo_events.clone(),
         meter_events: v3.meter_events.clone(),
@@ -107,6 +108,7 @@ fn v2_project_with_clips_migrates_clips_into_content_and_placements() {
     assert_eq!(v3.clips[0].lane_id, v3b.clips[0].lane_id, "deterministic lane id minting");
 
     let store = aura_lib::midi::MidiStore {
+        harmony: Default::default(),
         ppq: v3.ppq,
         tempo_events: v3.tempo_events.clone(),
         meter_events: v3.meter_events.clone(),

@@ -255,6 +255,21 @@ pub enum Op {
         id: String,
         binding: Option<crate::midi::launch::LaunchBinding>,
     },
+    /// Plan H1 (ruling H-4): atomic replacement of the Composer's harmony
+    /// document — `Op::TempoSet`'s shape, and for the same reason. A chord
+    /// region and the key it is analysed in are ONE edit: writing them
+    /// separately would let a commit land a ♭VII in a key that has not
+    /// arrived yet, and would make the inverse of a modulation two ops that
+    /// can be undone apart. Region counts are tens, so whole-list replacement
+    /// is right; a keyed upsert would buy nothing and fight folding.
+    ///
+    /// Additive: does NOT bump `OP_FORMAT_VERSION` (stays 2). Keys and chords
+    /// ride the wire as strings (`"C ionian"`, `"Cmaj7"`) — see
+    /// `theory::harmony` for why a persisted format spells them out.
+    HarmonySet {
+        keys: Vec<crate::theory::KeySpan>,
+        chords: Vec<crate::theory::ChordSpan>,
+    },
     /// Toggle whether a MIDI clip's notes drive a named launcher.
     LaunchDriveSet {
         #[serde(default)]

@@ -88,6 +88,12 @@ pub struct MidiStore {
     /// `[{tick:0,num:4,den:4}]` for stores that never loaded a v3 file.
     pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
+    /// The Composer's harmony document (Plan H1, ruling H-3): `tick -> key`
+    /// and `tick -> chord`. It lives HERE, beside the tempo and meter maps,
+    /// because it is the same kind of thing — a map over musical time that
+    /// every surface reads and no track owns. Empty by default; a project
+    /// that never used the Composer never writes the key.
+    pub harmony: crate::theory::HarmonyDoc,
     /// Named launchers (each a note→region/clip map + the clips that drive it).
     pub launch_maps: Vec<crate::midi::launch::LaunchMap>,
     /// Project dir this store was last synced with (None = in-memory only).
@@ -108,6 +114,7 @@ impl Default for MidiStore {
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
             clips: Vec::new(),
+            harmony: crate::theory::HarmonyDoc::default(),
             launch_maps: Vec::new(),
             loaded_dir: None,
             dirty: false,

@@ -13,7 +13,8 @@ use super::tpc::{interval_name, Tpc};
 
 /// Harmonic function — the three-way classification everything downstream
 /// reasons with (the functional automaton, the cadence rules, the ranking).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum Function {
     /// Home. Rest, arrival, where phrases end.
     Tonic,
@@ -38,7 +39,8 @@ impl Function {
 
 /// What the analysis found. `why` is the teaching payload (product doc §3:
 /// never a theory word without what it does).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Analysis {
     pub roman: String,
     pub function: Function,

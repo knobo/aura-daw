@@ -942,6 +942,7 @@ mod tests {
         let mut store = Store::default();
         store.tracks.push(midi_track(track_id, Some(instrument_id.into())));
         let midi = MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],

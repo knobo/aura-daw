@@ -21,7 +21,11 @@ use super::scale::{Key, ScaleType};
 use super::tpc::Tpc;
 
 /// One of the twelve slots of the circle, ready to draw.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Serialised straight to the panel: the widget draws what the backend says
+/// is true (ADR 0006 — the geometry is presentation, the CONTENT is not).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Wedge {
     /// Line-of-fifths index of this slot, spelled for the current key (E
     /// major gets `D♯`, B♭ major gets `E♭`).

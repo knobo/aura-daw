@@ -26,7 +26,8 @@ use super::scale::Key;
 use super::tpc::{degree_label, interval_step, Tpc};
 
 /// What a pitch class is, relative to the current chord and key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum NoteRole {
     Root,
     Third,
@@ -85,7 +86,8 @@ impl NoteRole {
 }
 
 /// One pitch class, classified.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NoteClass {
     pub pitch_class: u8,
     /// Best spelling in this context (the key's own, else the chord's, else
@@ -100,7 +102,8 @@ pub struct NoteClass {
 }
 
 /// The twelve classes, plus the context they were derived from.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Palette {
     pub key: Key,
     pub chord: Option<Chord>,
