@@ -9,6 +9,38 @@
   import { prefs } from "../../prefs/prefs.svelte";
   import { PREF_CATEGORIES, PREF_SCHEMA, type PrefDef, type PrefId } from "../../prefs/schema";
   import { directoryPicker } from "../../utils/pick-directory";
+  import { theme } from "../../theme/theme.svelte";
+  import { backend } from "../../tauri";
+  import { toasts } from "../../state/toasts.svelte";
+
+  // The themes folder path is only needed while the dialog is open.
+  let themesDir = $state("");
+  $effect(() => {
+    if (prefs.dialogOpen && themesDir === "") {
+      void backend.userThemesDir().then((d) => (themesDir = d));
+    }
+  });
+
+  /**
+   * Serialise the ACTIVE theme as a starting point for a custom one: its
+   * built-in base plus every resolved token inlined, so a user can delete
+   * the lines they do not care about rather than hunt for key names.
+   */
+  async function exportTheme() {
+    const active = theme.resolve(theme.activeId);
+    const id = `${active.id}-copy`;
+    const doc = {
+      name: `${active.name} (copy)`,
+      extends: active.base,
+      tokens: active.tokens,
+    };
+    try {
+      const path = await backend.writeUserTheme(id, JSON.stringify(doc, null, 2) + "\n");
+      toasts.success("THEME EXPORTED", path, "Restart AURA to see it in this list.");
+    } catch (err) {
+      toasts.error("EXPORT FAILED", String(err));
+    }
+  }
 
   const entries = Object.entries(PREF_SCHEMA) as [PrefId, PrefDef][];
 
@@ -114,6 +146,26 @@
                       </button>
                     {/each}
                   </div>
+                {:else if def.kind === "choice"}
+                  <select
+                    class="choice mono"
+                    aria-label={def.label}
+                    value={prefs.values[id] as string}
+                    onchange={(e) => prefs.set(id, e.currentTarget.value)}
+                  >
+                    <optgroup label="BUILT-IN">
+                      {#each theme.builtins() as t (t.id)}
+                        <option value={t.id}>{t.name}</option>
+                      {/each}
+                    </optgroup>
+                    {#if theme.userThemes().length > 0}
+                      <optgroup label="CUSTOM">
+                        {#each theme.userThemes() as t (t.id)}
+                          <option value={t.id}>{t.name}</option>
+                        {/each}
+                      </optgroup>
+                    {/if}
+                  </select>
                 {:else if def.kind === "number"}
                   <div class="numctl">
                     <input
@@ -131,6 +183,12 @@
                 {/if}
               </div>
               <p class="blurb silk">{def.blurb}</p>
+              {#if def.kind === "choice" && def.catalog === "themes"}
+                <div class="themedir">
+                  <span class="pathtext silk" title={themesDir}>{themesDir}</span>
+                  <button class="pathadd mono" onclick={exportTheme}>EXPORT CURRENT THEME…</button>
+                </div>
+              {/if}
               {#if def.kind === "pathList"}
                 <div class="pathlist">
                   {#each prefs.values[id] as string[] as p (p)}
@@ -164,6 +222,23 @@
 {/if}
 
 <style>
+  .choice {
+    background: var(--bg-2);
+    color: var(--text);
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 3px;
+    padding: 3px 6px;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+  }
+
+  .themedir {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
   .overlay {
     position: fixed;
     inset: 0;
