@@ -2528,6 +2528,7 @@ impl Control {
                 rel_path: rel,
                 source_id,
                 cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
+                pitch_path: Some(crate::audio::pitch_store::track_path(&project_dir, &clip_id)),
                 clip_id,
                 start_pos,
             });
@@ -6297,6 +6298,7 @@ mod tests {
             clip_id: uuid::Uuid::new_v4().to_string(),
             source_id: crate::ids::SourceId::mint(),
             take_name: "Take 1".into(),
+            pitch_path: None,
             wav_path: dir.join("audio/take.wav"),
             rel_path: "audio/take.wav".into(),
             cache_dir: dir.join("cache"),
@@ -6346,6 +6348,7 @@ mod tests {
             clip_id: uuid::Uuid::new_v4().to_string(),
             source_id: crate::ids::SourceId::mint(),
             take_name: "Take 1".into(),
+            pitch_path: None,
             wav_path: dir.join("blocker/audio/take.wav"),
             rel_path: "audio/take.wav".into(),
             cache_dir: dir.join("blocker/cache"),

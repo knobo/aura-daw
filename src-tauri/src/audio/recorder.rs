@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use crate::ids::SourceId;
 
+use super::pitch_store::{write_track, PitchFolder};
 use super::types::Clip;
 use super::waveform::PyramidBuilder;
 
@@ -35,6 +36,10 @@ pub struct RecSpec {
     pub rel_path: String,
     /// Waveform cache dir (`<proj>/cache/waveforms/<clipId>`).
     pub cache_dir: PathBuf,
+    /// Pitch-track destination (`<proj>/cache/pitch/<clipId>.bin`). `None`
+    /// skips the fold entirely — a take with no project dir behind it has
+    /// nowhere to put one.
+    pub pitch_path: Option<PathBuf>,
     /// Timeline position where the take started (engine samples).
     pub start_pos: u64,
 }
@@ -90,6 +95,9 @@ struct TrackWriter {
     spec: RecSpec,
     wav: hound::WavWriter<std::io::BufWriter<std::fs::File>>,
     pyramid: PyramidBuilder,
+    /// Folded alongside the pyramid, from the same drained samples. Absent
+    /// when the take has nowhere to write one.
+    pitch: Option<PitchFolder>,
     samples_written: u64,
 }
 
@@ -113,10 +121,12 @@ fn run_writer(
         }
         let wav = hound::WavWriter::create(&spec.wav_path, wav_spec)
             .map_err(|e| format!("create {}: {e}", spec.wav_path.display()))?;
+        let pitch = spec.pitch_path.as_ref().map(|_| PitchFolder::new(sample_rate, channels));
         writers.push(TrackWriter {
             spec,
             wav,
             pyramid: PyramidBuilder::new(channels as usize),
+            pitch,
             samples_written: 0,
         });
     }
@@ -140,6 +150,10 @@ fn run_writer(
             }
             w.pyramid.push_interleaved(a);
             w.pyramid.push_interleaved(b);
+            if let Some(p) = w.pitch.as_mut() {
+                p.push_interleaved(a);
+                p.push_interleaved(b);
+            }
             w.samples_written += avail as u64;
             chunk.commit_all();
             moved = true;
@@ -168,6 +182,14 @@ fn run_writer(
             .finish()
             .write_dir(&w.spec.cache_dir)
             .map_err(|e| format!("waveform cache: {e}"))?;
+        // A pitch track is a cache, not a take. Losing one costs a
+        // re-analysis, so a failure here must not fail the recording that
+        // is already safely on disk.
+        if let (Some(folder), Some(path)) = (w.pitch, w.spec.pitch_path.as_ref()) {
+            if let Err(e) = write_track(path, &folder.finish()) {
+                eprintln!("[recorder] pitch track not written: {e}");
+            }
+        }
         let lane_id = crate::ids::LaneId::default_for_track(&w.spec.track_id);
         clips.push(Clip {
             id: w.spec.clip_id.into(),
@@ -213,6 +235,7 @@ mod tests {
             source_id,
             take_name: "Take 1".into(),
             cache_dir: dir.join(format!("cache/waveforms/{clip_id}")),
+            pitch_path: Some(dir.join(format!("cache/pitch/{clip_id}.bin"))),
             start_pos,
         }
     }
@@ -296,6 +319,51 @@ mod tests {
         assert_eq!(back.len(), 200);
         assert_eq!(back[0], 0.5);
         assert_eq!(back[1], -0.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The take carries its own pitch curve out of the same drain that
+    /// writes the WAV — nothing has to re-read the audio afterwards.
+    #[test]
+    fn a_take_folds_a_pitch_track_beside_the_waveform_cache() {
+        let dir = tmp_dir("pitch");
+        let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(96_000 * 2);
+        let writer = spawn(vec![spec(&dir, "clipP", 0)], vec![cons], 1, 48_000).unwrap();
+        // 0.5 s of A3 (220 Hz) — long enough for the detector to lock.
+        for i in 0..24_000 {
+            let s = (2.0 * std::f32::consts::PI * 220.0 * i as f32 / 48_000.0).sin() * 0.5;
+            prod.push(s).unwrap();
+        }
+        drop(prod);
+        writer.finish(Duration::from_secs(10)).unwrap();
+
+        let track =
+            super::super::pitch_store::read_track(&dir.join("cache/pitch/clipP.bin")).unwrap();
+        assert_eq!(track.rate, 48_000);
+        assert_eq!(track.hop, 480);
+        let voiced: Vec<_> = track.frames.iter().filter(|f| f.voiced).collect();
+        assert!(voiced.len() > 20, "only {} voiced frames", voiced.len());
+        let mid = voiced[voiced.len() / 2];
+        assert!((mid.hz - 220.0).abs() < 2.0, "detected {} Hz", mid.hz);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A take without a project behind it still records; it just has
+    /// nowhere to keep a curve.
+    #[test]
+    fn no_pitch_path_means_no_fold_and_no_failure() {
+        let dir = tmp_dir("nopitch");
+        let (mut prod, cons) = rtrb::RingBuffer::<f32>::new(4096);
+        let mut s = spec(&dir, "clipN", 0);
+        s.pitch_path = None;
+        let writer = spawn(vec![s], vec![cons], 1, 48_000).unwrap();
+        for i in 0..480 {
+            prod.push(i as f32 / 480.0).unwrap();
+        }
+        drop(prod);
+        let clips = writer.finish(Duration::from_secs(10)).unwrap();
+        assert_eq!(clips[0].source_length_samples, 480);
+        assert!(!dir.join("cache/pitch").exists(), "nothing written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

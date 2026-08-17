@@ -26,6 +26,7 @@ pub mod metronome;
 pub mod midi_in;
 pub mod mixer;
 pub mod pitch;
+pub mod pitch_store;
 pub mod pitch_thread;
 pub mod project;
 pub mod recorder;
