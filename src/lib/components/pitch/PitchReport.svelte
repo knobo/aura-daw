@@ -191,7 +191,7 @@
     margin: 0;
   }
   .note.err {
-    color: var(--amber, #ffc857);
+    color: var(--amber);
     letter-spacing: 0;
   }
 
@@ -302,7 +302,7 @@
     cursor: default;
     position: sticky;
     top: 0;
-    background: var(--bg-1, rgba(5, 7, 13, 0.92));
+    background: rgb(var(--bg-1-rgb) / 0.92);
     padding-top: 4px;
     padding-bottom: 4px;
   }
@@ -310,7 +310,7 @@
     text-align: center;
   }
   button.row:hover {
-    background: rgba(96, 130, 190, 0.09);
+    background: var(--grid-line);
   }
   .row.unsung {
     opacity: 0.55;
@@ -347,14 +347,14 @@
     display: block;
     height: 9px;
     border-radius: 2px;
-    background: rgba(96, 130, 190, 0.09);
+    background: var(--grid-line);
   }
   .tick {
     position: absolute;
     top: -1px;
     bottom: -1px;
     width: 1px;
-    background: rgba(216, 227, 242, 0.35);
+    background: rgb(var(--text-rgb) / 0.35);
   }
   .fill {
     position: absolute;
@@ -362,16 +362,16 @@
     bottom: 1px;
     border-radius: 1px;
   }
-  /* Same vocabulary as the live lane: cyan in, amber near, magenta far.
+  /* Same vocabulary as the live lane — in/near/far map to cyan/amber/magenta.
      Magenta and not red — red means recording here, and being 40 cents
      flat is ordinary singing, not an error. */
   .fill.band-in {
-    background: #52e5ff;
+    background: var(--cyan);
   }
   .fill.band-near {
-    background: #ffc857;
+    background: var(--amber);
   }
   .fill.band-far {
-    background: #ff4fd8;
+    background: var(--magenta);
   }
 </style>
