@@ -885,6 +885,12 @@
       onresize={(px) => (ui.rollHeight = px)}
     />
     <header class="head">
+      <!-- Bottom-panel tabs. The pitch side carries the mirror pair, so the
+           two panels swap from either one. -->
+      <div class="tabs" role="group" aria-label="Bottom panel">
+        <button class="tabchip mono on" aria-current="page">ROLL</button>
+        <button class="tabchip mono" title="Pitch Coach" onclick={() => (ui.bottomPanel = "pitch")}>PITCH</button>
+      </div>
       <span class="dot" style:background={color}></span>
       <span class="title mono">{clip.name}</span>
       <span class="silk">on {track?.name ?? "?"}</span>
@@ -1075,6 +1081,28 @@
     padding: 0 12px;
     border-bottom: 1px solid var(--glass-border);
     flex: none;
+  }
+  .tabs {
+    display: flex;
+    gap: 2px;
+  }
+  .tabchip {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 0.18em;
+    padding: 3px 10px;
+    border-radius: 999px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .tabchip:hover {
+    color: var(--text);
+  }
+  .tabchip.on {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
   }
   .dot {
     width: 8px;

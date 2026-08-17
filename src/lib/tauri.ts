@@ -51,6 +51,7 @@ import type {
   PluginParamInfo,
   PasteRequest,
   PasteResult,
+  PitchFrameBatch,
   Project,
   ProjectSnapshot,
   SidecarEvent,
@@ -107,6 +108,18 @@ export interface Backend {
 
   // meters (Tauri v2 Channel<MeterFrame>)
   subscribeMeters(onFrame: (frame: MeterFrame) => void): Promise<Unsubscribe>;
+
+  // pitch coach — the mic opens on an explicit listen toggle or an open
+  // panel, never on track arm (owner ruling R6). Mode changes come back as
+  // `pitch://state`; none of these four set frontend state optimistically.
+  pitchListenStart(): Promise<void>;
+  pitchListenStop(): Promise<void>;
+  /** The returned `Unsubscribe` also tells the engine — see the note on
+   * `pitch_unsubscribe`; a muted channel is invisible to Rust. */
+  subscribePitch(onBatch: (batch: PitchFrameBatch) => void): Promise<Unsubscribe>;
+  setRehearseHold(enabled: boolean): Promise<void>;
+  /** MIDI track holding the target melody; `null` clears it. */
+  pitchSetReference(trackId: string | null): Promise<void>;
 
   // waveform tiles — raw AWTF binary
   getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer>;
@@ -459,6 +472,35 @@ class TauriBackend implements Backend {
     return () => {
       channel.onmessage = () => {};
     };
+  }
+
+  async pitchListenStart() {
+    await invoke("pitch_listen_start");
+  }
+  async pitchListenStop() {
+    await invoke("pitch_listen_stop");
+  }
+  async subscribePitch(onBatch: (batch: PitchFrameBatch) => void) {
+    const channel = new Channel<PitchFrameBatch>();
+    channel.onmessage = onBatch;
+    await invoke("pitch_subscribe", { channel });
+    // NOT the meter shape. `subscribeMeters` only mutes its end, which is
+    // safe there because it is subscribed once for the app's lifetime; the
+    // pitch panel subscribes on every open, and a muted channel still
+    // accepts sends, so the engine has to be told or one sink per visit
+    // accumulates for the rest of the session.
+    return () => {
+      channel.onmessage = () => {};
+      void invoke("pitch_unsubscribe", { channelId: channel.id }).catch((err) =>
+        console.warn("[aura] pitch_unsubscribe failed:", err),
+      );
+    };
+  }
+  async setRehearseHold(enabled: boolean) {
+    await invoke("set_rehearse_hold", { enabled });
+  }
+  async pitchSetReference(trackId: string | null) {
+    await invoke("pitch_set_reference", { trackId });
   }
 
   async getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer> {

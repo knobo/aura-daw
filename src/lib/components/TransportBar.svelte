@@ -114,6 +114,15 @@
       onClick: () => toggleDock("hum"),
     },
     {
+      id: "pitch",
+      kind: "chip",
+      priority: 9,
+      label: "◉ PITCH",
+      title: "Pitch Coach — sing against a reference melody and see how you track it",
+      on: ui.bottomPanel === "pitch",
+      onClick: () => (ui.bottomPanel = ui.bottomPanel === "pitch" ? "roll" : "pitch"),
+    },
+    {
       id: "lib",
       kind: "chip",
       priority: 5,

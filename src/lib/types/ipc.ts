@@ -212,6 +212,67 @@ export interface RecordingState {
    * MIDI. It is an id, not the clip — the store re-pulls, since the clip
    * arrives through no other channel. */
   midiClipId?: string | null;
+  /** Stop notification: `[startSample, endSample)` spans the take wrote as
+   * SILENCE because rehearse-hold was down (plan task 5). Sample-aligned —
+   * the audio is zeroed, not skipped — so a span is a hole in the take, not
+   * a shift. Absent on older backends and on takes that never held. */
+  rehearseSpans?: [number, number][];
+}
+
+// ── pitch-frame.schema.json + pitch-state.schema.json (Pitch Coach) ────────
+
+/**
+ * One 10 ms analysis hop from the pitch thread (Rust `audio::pitch::PitchFrame`).
+ * Unvoiced frames are still emitted, so the trail breaks on a breath instead
+ * of interpolating across it.
+ */
+export interface PitchFrame {
+  /** Transport sample position at the centre of the analysis window, in
+   * DEVICE-rate samples (see `PitchFrameBatch.deviceRate`), not 8 kHz. */
+  sample: number;
+  /** Detected fundamental in Hz. Meaningful only when `voiced`. */
+  hz: number;
+  /**
+   * Continuous MIDI note number, `69 + 12*log2(hz/440)` — a FLOAT, and the
+   * only thing the lane should draw. The rounded note NAME flips across a
+   * semitone boundary while the pitch barely moves (G5 795 Hz → G#5 811 Hz
+   * between two windows in the R3 checkpoint), so drawing the label makes
+   * the trail strobe for exactly the users this feature exists for.
+   */
+  midi: number;
+  /** `1.0 - YIN aperiodicity`, in [0, 1]. */
+  clarity: number;
+  /** RMS of the analysis window (linear, full scale = 1.0). */
+  rms: number;
+  /** True when detector, RMS gate, median and jump limiter all agree. */
+  voiced: boolean;
+}
+
+/**
+ * One 60 Hz batch pushed over the `Channel` handed to `pitch_subscribe`.
+ * The mode flags ride along so the UI learns that a hold started without
+ * waiting for the next `pitch://state`.
+ */
+export interface PitchFrameBatch {
+  /** Frames produced since the previous batch, in arrival order. May be
+   * empty while listening is on but nothing has been analysed yet. */
+  frames: PitchFrame[];
+  /** Capture rate of the input that produced these frames; 0 when closed. */
+  deviceRate: number;
+  listening: boolean;
+  rehearseHold: boolean;
+}
+
+/** Payload of the `pitch://state` app event. */
+export interface PitchState {
+  /** True while the user asked for live pitch — the listen toggle or the
+   * open panel. Track arm does NOT set it (owner ruling R6). */
+  listening: boolean;
+  rehearseHold: boolean;
+  /** MIDI track whose clips are the target melody, or null when none. */
+  referenceTrackId: string | null;
+  /** Capture rate of the open input, or 0 when the hub is closed. */
+  deviceRate: number;
 }
 
 // ── project.schema.json ─────────────────────────────────────────────────────
@@ -952,6 +1013,7 @@ export interface AuraEventMap {
   "loopjam://state": LoopJamStatus;
   "launch://changed": LaunchSnapshot;
   "launch://fired": LaunchFired;
+  "pitch://state": PitchState;
 }
 
 export type AuraEventName = keyof AuraEventMap;

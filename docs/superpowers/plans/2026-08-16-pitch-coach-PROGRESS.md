@@ -18,8 +18,9 @@ documentation and all commits are English.
 | | |
 |---|---|
 | On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
-| Worktrees | both stale after PR #54 merged — `pitch-coach`, `pitch-rt` |
-| Next | **Phase 2, Task 7**, from `origin/main` |
+| In flight | **Phase 2 (Tasks 7–11)** on `feat/pitch-coach-panel`, worktree `.claude/worktrees/pitch-phase2` |
+| Worktrees | `pitch-coach` and `pitch-rt` are stale (phase 1, merged) |
+| Next | **Phase 3, Task 12**, from `origin/main` once phase 2 lands |
 
 ## Status
 
@@ -138,12 +139,42 @@ follow-ups and the R3 instrument.
       and clarity. It does NOT exercise the Tauri command layer or the 60 Hz
       batching — that is phase 2's to prove.
 
-**Phase 2 — panel.** Not started. Tasks 7–11: wire types + backend
-bindings, the non-reactive frame bus, lane drawing helpers, preferences,
-the panel itself. **Start at Task 7.**
+**Phase 2 — panel. DONE** (pending review/merge), branch
+`feat/pitch-coach-panel`.
+
+- [x] Task 7 — wire types + backend bindings — `c757b8c`. Five bindings,
+      not the plan's four: `pitchSetReference` is the fifth command Task 6
+      registered and Task 11's picker needs it. `pitch://state` joined
+      `AuraEventMap`; `recording://state` grew the optional `rehearseSpans`
+      the backend already emits. **`vitest` does not type-check** — it
+      strips types — so `npx svelte-check` is what proves these types, and
+      the test file's runtime half compares the interface keys against the
+      published schemas' properties.
+- [x] Task 8 — non-reactive frame bus (`state/pitch.svelte.ts`) — `60d7ca3`,
+      10/10. Fixed 3000-frame ring. `startPitchStream` subscribes to BOTH
+      halves of the wire: the batch channel (frames + the two flags that
+      must not lag) and `pitch://state` (`referenceTrackId`, which rides on
+      nothing else).
+- [x] Task 9 — lane geometry (`pitch/lane.ts`) — `514866b`, 20/20.
+- [x] Task 10 — five preferences + `TOLERANCE_CENTS` — `809b3b5`, 25/25 in
+      the prefs suite. `NumberDef.unit` grew an `"ms"` case.
+- [x] Task 11 — the panel — `7cc1aa5`. 547 frontend tests green,
+      `svelte-check` clean, `npm run build` green.
+- [x] Review round on PR #58 — `a590136`. Nine findings, all fixed; the
+      branch is no longer frontend-only (see the log).
 
 **Phase 3 — scoring.** Not started. Tasks 12–16: shared repeat-expansion
 helper, scoring, pitch track on disk, the report, docs + PR.
+`panel-logic.targetNotesFor` currently expands repeats frontend-side with
+the timeline preview's rule — Task 12 is what replaces it.
+
+**Before implementing Task 14, read
+[`docs/backlog/pitch-as-data.md`](../../backlog/pitch-as-data.md).** The
+owner has since asked for pitch extraction from existing clips and for
+auto-tune, which makes `APTF` a shared format rather than a scoring detail.
+Four decisions are due while it is still unbuilt; the load-bearing one is
+that the recorder folds the CAUSAL median (20 ms lag) while an offline pass
+can use the centred one, so the format should record which it holds.
 
 ### What phase 2 must not get wrong
 
@@ -162,10 +193,12 @@ Both of these came out of actually running the detector against a voice
 
 ### Still open, beyond the numbered tasks
 
-- **The Tauri command layer is unproven.** `pitch_check` exercises the
-  detector, not `pitch_listen_start` / `pitch_subscribe` / the 60 Hz
-  batching in `Control`. Nothing has ever driven those end to end. Task 7
-  is the first thing that will.
+- **The Tauri command layer is still unproven against the real engine.**
+  Phase 2 drives all five commands and the batch channel end to end, but
+  only against `DemoBackend`'s synthetic singer in a browser. Nothing has
+  yet run the panel against `pitch_subscribe` in a live Tauri build — that
+  is the owner's ear-check, and it is the first thing to do with this
+  branch.
 - **One voice, one vowel, one room.** No woman's voice, no falsetto, no
   vibrato, no backing track under it.
 - **Speaker bleed is mitigated, not solved** (see below). The panel says so
@@ -258,6 +291,88 @@ with the commit sha and anything the next agent would be surprised by.
 
 ## Log
 
+- 2026-08-17 — **Owner ear-check done, and it found a real one.** The panel
+  tracked a real voice well, but the reference notes "did not fall into
+  place until I pressed record". Cause: the panel drew the LANE only while
+  `transport.isPlaying` and the TUNER otherwise, so selecting a reference
+  track while stopped showed the tuner — no target notes at all. On top of
+  that, `fixed` mode pinned the lane to the playhead, so a melody starting
+  at bar 5 sat off-screen even once the lane appeared. Fixed:
+  1. **The lane is drawn whenever a reference melody exists**, stopped
+     included. The tuner is for having no melody, or for asking (there is a
+     TUNER chip now) — never for hiding one.
+  2. **`laneWindowFor` replaces `laneScrollFor`** and gives the lane its own
+     zoom: a readable span derived from the melody's own length (4–12 s),
+     framing the melody when stopped outside it, pinning the playhead when
+     rolling or when stopped inside it. The zoom does NOT depend on
+     `playing`, so record is not a jump. `laneScrollFor` stays for now but
+     nothing uses it.
+  3. **The picker draws the user's choice immediately** instead of waiting
+     for `pitch_set_reference` to round-trip through the control thread. A
+     display-only echo, dropped the moment `pitch://state` arrives — the
+     truth still comes from the engine.
+  Also, the owner asked whether the detector can drive auto-tune. Answer and
+  staged path: [`docs/backlog/pitch-correction-autotune.md`](../../backlog/pitch-correction-autotune.md).
+  Detection is the done third; the shifter and the correction policy do not
+  exist. Offline correction of a take is Stage A.
+- 2026-08-16 — **PR #58 reviewed and fixed** (`a590136`). Rust 1020
+  (984 lib + 36 integration), frontend 564. Four things worth carrying
+  forward:
+  1. **`pitch_unsubscribe` exists now** — additive, keyed on
+     `Channel::id()`. It had to: `pitch_subscribe` appends a sink and the
+     engine only retires one when `send_batch` fails, which a live Tauri
+     `Channel` never does no matter how dead its JS end is. Every open of
+     the panel leaked a sink. Anything else that subscribes per-mount
+     (rather than once for the app's lifetime, like meters) needs the same
+     treatment — `subscribeMeters`' mute-only unsubscribe is NOT a pattern
+     to copy.
+  2. **`PitchFrame.sample` is a PROJECT sample position**, not device-rate.
+     It is anchored to `shared.position` and only offset within one
+     callback buffer. The old doc comment and schema said "device-rate
+     samples" and the panel believed them, which made the latency offset
+     ~8% short on a 44.1 kHz mic in a 48 kHz project. Both now say so.
+  3. **Rehearse-hold is refcounted** in `state/rehearse.svelte.ts`. Two
+     controls, one engine boolean: with a flag per control, releasing one
+     while the other is down ended the hold and the take started writing
+     real audio mid-rehearsal.
+  4. **The full Rust suite is only trustworthy single-threaded on this
+     box.** Three parallel runs failed a DIFFERENT set each time
+     (`midi_out::tests::*`, `mcp::server::tests::read_meters_hears_the_headless_engine`
+     — a 3 s deadline), each passing in isolation; `--test-threads=1` is
+     1020/1020. Load average was 5–6 with 4 GB free.
+- 2026-08-16 — **Phase 2 complete** on `feat/pitch-coach-panel`
+  (`c757b8c`, `60d7ca3`, `514866b`, `809b3b5`, `7cc1aa5`). 547 frontend
+  tests, `svelte-check` 0 errors, `npm run build` green. `cargo test` was
+  NOT re-run: the branch touches zero files under `src-tauri/`
+  (`git diff --name-only origin/main` is all `src/` plus the two count
+  docs), and the box is at 91% disk with no target dir in this worktree.
+  Seven things the next agent should know:
+  1. **Canvas `font` does not resolve `var(--font-mono)`.** An unparsable
+     font string is dropped whole and every label silently renders at 10px
+     sans — the panel looked "designed small" until the stacks were
+     inlined. Found by driving the demo engine in a headless browser, not
+     by reading the code. Any new canvas text in this repo needs a literal
+     font stack.
+  2. **The plan's `autoFitRange` example and its implementation note
+     contradict each other** ({58, 66} vs "minimum span 12"). The minimum
+     won; the test says why.
+  3. **The plan's `laneScrollFor` example computes -44000 samples** — a
+     lane starting before time zero. The clamp is now its own test and the
+     example uses a position that measures the formula.
+  4. **With no reference melody the lane fits the SINGER**, re-centring
+     only when they leave it. A fixed C4 octave pins the trail to an edge
+     for anyone who does not sing near middle C, and re-fitting every
+     frame makes the whole lane breathe with the vibrato.
+  5. **`h` was already the hum dock's key.** Rehearse-hold claims it only
+     while a take is running or the coach is open, and releases on keyup
+     AND on window blur — a window that loses focus mid-hold never
+     delivers the keyup, and the take would go on recording silence.
+  6. **`DemoBackend` now synthesizes a singer** (drift + vibrato + breath
+     gaps) so the lane is developable under `vite dev`. It is a mock; its
+     numbers say nothing about the detector.
+  7. **The panel opens the mic itself** (`pitch_listen_start` in an
+     `$effect`, closed on destroy) — ruling R6's "or while the panel is
+     open" half. The listen toggle is the other half.
 - 2026-08-16 — Review follow-ups 6 and 7 done on `feat/pitch-rt-thread`
   (`007d346`, `af9b1ea`). Five things the next agent should know:
   1. **The capture callback no longer detects anything.** `audio/pitch_thread.rs`

@@ -73,7 +73,8 @@ singer. It does not exercise the Tauri command layer.
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 1018 tests (982 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after HostForward insert restore + the pitch worker thread)
+cd src-tauri && cargo test   # 1020 tests (984 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after pitch_unsubscribe)
+npm test                     # 574 frontend unit tests (vitest; counted 2026-08-17 after the lane auto-framing fix)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```

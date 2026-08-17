@@ -43,7 +43,34 @@ export interface PrefValues {
   metronomeGain: number;
   /** Bars of click before a take arms. "0" = record immediately. */
   countInBars: "0" | "1" | "2" | "4";
+  /** How close counts as hitting a note. Cents per option: TOLERANCE_CENTS. */
+  pitchTolerance: PitchTolerance;
+  /** Shifts detected pitch against the timeline, ±50 ms, to cancel the
+   * interface's round-trip delay. Signed: the correction goes both ways. */
+  pitchLatencyOffsetMs: number;
+  /** Whether the pitch lane pins the playhead or scrolls with the timeline. */
+  pitchLaneFollow: "fixed" | "free";
+  /** Game mode: snap the trail onto the target when the note is hit. */
+  pitchTrailSnap: boolean;
+  /** Key held to rehearse (record silence into the take). "none" disables. */
+  pitchRehearseKey: "h" | "j" | "none";
 }
+
+/** Tolerance option ids, in order of strictness. */
+export type PitchTolerance = "forgiving" | "standard" | "strict" | "pro";
+
+/**
+ * Cents per tolerance option. ±50 is the standard research criterion for
+ * "the right pitch class" — half a semitone, past which a listener hears a
+ * different note. The rest bracket it for people who want an easier or a
+ * harder target.
+ */
+export const TOLERANCE_CENTS: Record<PitchTolerance, number> = {
+  forgiving: 100,
+  standard: 50,
+  strict: 33,
+  pro: 20,
+};
 
 export type PrefId = keyof PrefValues;
 
@@ -66,8 +93,8 @@ export type NumberDef = BaseDef & {
   min: number;
   max: number;
   step: number;
-  /** Render hint, e.g. "%" — the dialog shows value·100 for "%". */
-  unit?: "%";
+  /** Render hint: "%" makes the dialog show value·100; "ms" is a suffix. */
+  unit?: "%" | "ms";
 };
 export type EnumDef<T extends string> = BaseDef & {
   kind: "enum";
@@ -174,6 +201,63 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
       { value: "1", label: "1 BAR" },
       { value: "2", label: "2 BARS" },
       { value: "4", label: "4 BARS" },
+    ],
+  },
+  pitchTolerance: {
+    kind: "enum",
+    default: "standard",
+    category: "editing",
+    label: "Pitch tolerance",
+    blurb:
+      "How close you have to be for a note to count as hit. ±50 cents is the standard research criterion for the right pitch class.",
+    options: [
+      { value: "forgiving", label: "FORGIVING ±100" },
+      { value: "standard", label: "STANDARD ±50" },
+      { value: "strict", label: "STRICT ±33" },
+      { value: "pro", label: "PRO ±20" },
+    ],
+  },
+  pitchLatencyOffsetMs: {
+    kind: "number",
+    default: 0,
+    min: -50,
+    max: 50,
+    step: 1,
+    unit: "ms",
+    category: "editing",
+    label: "Pitch latency offset",
+    blurb: "Shifts detected pitch against the timeline, to compensate for your interface's round-trip delay.",
+  },
+  pitchLaneFollow: {
+    kind: "enum",
+    default: "fixed",
+    category: "interface",
+    label: "Pitch lane scrolling",
+    blurb:
+      "FIXED pins the playhead and scrolls the lane toward you while you sing. FREE scrolls like the rest of the timeline.",
+    options: [
+      { value: "fixed", label: "FIXED" },
+      { value: "free", label: "FREE" },
+    ],
+  },
+  pitchTrailSnap: {
+    kind: "boolean",
+    default: false,
+    category: "interface",
+    label: "Snap pitch trail",
+    blurb:
+      "Game mode: snaps your line onto the target note when you hit it. Off shows your true pitch, which is more useful for practice.",
+  },
+  pitchRehearseKey: {
+    kind: "enum",
+    default: "h",
+    category: "editing",
+    label: "Rehearse hold key",
+    blurb: "Hold this key while recording to keep the transport rolling without writing anything to the take.",
+    options: [
+      { value: "h", label: "H" },
+      { value: "j", label: "J" },
+      { value: "none", label: "OFF" },
     ],
   },
   mcpDefaultMode: {

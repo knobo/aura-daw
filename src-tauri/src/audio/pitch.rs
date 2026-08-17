@@ -31,6 +31,12 @@ const JUMP_CONFIRM_SEMITONES: f32 = 1.0;
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PitchFrame {
+    /// Transport position of the analysis window, in PROJECT samples — the
+    /// same domain as `transport.position` and the timeline, because it is
+    /// anchored to `shared.position` and only offset within one callback
+    /// buffer. It is NOT device-rate: a 44.1 kHz microphone in a 48 kHz
+    /// project still produces project-domain positions, so anything
+    /// converting milliseconds here must scale by the project rate.
     pub sample: u64,
     pub hz: f32,
     pub midi: f32,
@@ -128,8 +134,10 @@ impl PitchAnalyzer {
         self.window
     }
 
-    /// `start_sample` is the transport sample position of `input[0]`, in
-    /// DEVICE-rate samples. Appends one frame per completed hop.
+    /// `start_sample` is the transport position of `input[0]` in PROJECT
+    /// samples; `device_rate` only converts the intra-buffer offset of each
+    /// hop, so emitted `PitchFrame::sample`s stay in the project domain.
+    /// Appends one frame per completed hop.
     pub fn push(
         &mut self,
         input: &[f32],

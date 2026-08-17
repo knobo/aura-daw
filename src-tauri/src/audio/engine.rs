@@ -84,8 +84,16 @@ pub trait MeterSink: Send + 'static {
 
 /// One live-pitch subscription (a Tauri `Channel<PitchFrameBatch>`).
 /// Return `false` when the subscriber is gone so it gets dropped.
+///
+/// `send_batch` alone is not enough to retire a subscription: a Tauri
+/// `Channel` whose JS side has merely stopped listening keeps accepting
+/// sends, so a frontend that opens and closes a panel would leave one live
+/// sink behind per visit. `id` is the channel's own id, and
+/// [`ControlMsg::UnsubscribePitch`] is how a subscriber says it is done.
 pub trait PitchSink: Send + 'static {
     fn send_batch(&self, batch: &PitchFrameBatch) -> bool;
+    /// Identity of the underlying channel, for `UnsubscribePitch`.
+    fn id(&self) -> u32;
 }
 
 pub type Reply<T> = Sender<Result<T, String>>;
@@ -144,6 +152,9 @@ pub enum ControlMsg {
     SetPitchReference { track_id: Option<String>, reply: Reply<()> },
     /// Live pitch frames, batched on the same 60 Hz tick as meters.
     SubscribePitch(Box<dyn PitchSink>),
+    /// Retire the subscription whose channel has this id. Unknown ids are
+    /// ignored — a double unsubscribe is not an error.
+    UnsubscribePitch(u32),
     Shutdown,
 }
 
@@ -1296,7 +1307,16 @@ impl Control {
                 self.emit_pitch_state();
                 let _ = reply.send(Ok(()));
             }
-            ControlMsg::SubscribePitch(sink) => self.pitch_sinks.push(sink),
+            ControlMsg::SubscribePitch(sink) => {
+                // Replace rather than append when a channel resubscribes:
+                // ids are unique per channel, so this is only reachable if a
+                // caller subscribed twice, and two sinks on one channel
+                // would double every batch.
+                let id = sink.id();
+                self.pitch_sinks.retain(|s| s.id() != id);
+                self.pitch_sinks.push(sink);
+            }
+            ControlMsg::UnsubscribePitch(id) => self.pitch_sinks.retain(|s| s.id() != id),
             ControlMsg::Shutdown => return false,
         }
         true
@@ -5393,6 +5413,69 @@ mod tests {
             meter_rx.pop().is_err(),
             "listen-only must not contribute meter blocks"
         );
+    }
+
+    /// A counting stand-in for a Tauri `Channel<PitchFrameBatch>`. It keeps
+    /// accepting sends forever, exactly like the real one whose JS side has
+    /// merely stopped listening — which is the whole reason `id`-based
+    /// unsubscribe exists.
+    struct CountingPitchSink {
+        id: u32,
+        sent: Arc<AtomicUsize>,
+    }
+
+    impl PitchSink for CountingPitchSink {
+        fn send_batch(&self, _batch: &PitchFrameBatch) -> bool {
+            self.sent.fetch_add(1, Relaxed);
+            true
+        }
+        fn id(&self) -> u32 {
+            self.id
+        }
+    }
+
+    /// Opening and closing the panel must not leave a sink behind. Before
+    /// `UnsubscribePitch` existed, `send_batch` returning true forever meant
+    /// nothing was ever retired and every visit cost one more batch per tick.
+    #[test]
+    fn unsubscribe_pitch_retires_exactly_that_channel() {
+        let (mut ctl, _session) = bare_control();
+        let a = Arc::new(AtomicUsize::new(0));
+        let b = Arc::new(AtomicUsize::new(0));
+        ctl.handle(ControlMsg::SubscribePitch(Box::new(CountingPitchSink {
+            id: 7,
+            sent: a.clone(),
+        })));
+        ctl.handle(ControlMsg::SubscribePitch(Box::new(CountingPitchSink {
+            id: 9,
+            sent: b.clone(),
+        })));
+        assert_eq!(ctl.pitch_sinks.len(), 2);
+
+        ctl.handle(ControlMsg::UnsubscribePitch(7));
+        assert_eq!(ctl.pitch_sinks.len(), 1, "only channel 7 goes");
+        assert_eq!(ctl.pitch_sinks[0].id(), 9);
+
+        // Unknown and repeated ids are no-ops, not errors: a panel that is
+        // torn down twice must not take an innocent subscriber with it.
+        ctl.handle(ControlMsg::UnsubscribePitch(7));
+        ctl.handle(ControlMsg::UnsubscribePitch(1234));
+        assert_eq!(ctl.pitch_sinks.len(), 1);
+    }
+
+    /// Resubscribing the same channel replaces it. Two sinks on one channel
+    /// would double every batch the frontend receives.
+    #[test]
+    fn resubscribing_one_channel_does_not_stack_sinks() {
+        let (mut ctl, _session) = bare_control();
+        let sent = Arc::new(AtomicUsize::new(0));
+        for _ in 0..3 {
+            ctl.handle(ControlMsg::SubscribePitch(Box::new(CountingPitchSink {
+                id: 4,
+                sent: sent.clone(),
+            })));
+        }
+        assert_eq!(ctl.pitch_sinks.len(), 1);
     }
 
     /// `SelectInput` must emit `pitch://state` so `deviceRate` is not stale.

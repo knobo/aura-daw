@@ -32,7 +32,7 @@
       "type": "object",
       "properties": {
         "sample": {
-          "description": "Transport sample position at the centre of the analysis window, in device-rate samples.",
+          "description": "Transport position at the centre of the analysis window, in PROJECT samples \u2014 the same domain as transport.position and the timeline. Not device-rate: the capture device may run at a different rate, and only the intra-buffer offset is converted with deviceRate.",
           "type": "integer",
           "minimum": 0
         },
