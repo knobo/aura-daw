@@ -18,9 +18,9 @@ documentation and all commits are English.
 | | |
 |---|---|
 | On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
-| In flight | **Phase 2 (Tasks 7–11)** on `feat/pitch-coach-panel`, worktree `.claude/worktrees/pitch-phase2` |
-| Worktrees | `pitch-coach` and `pitch-rt` are stale (phase 1, merged) |
-| Next | **Phase 3, Task 12**, from `origin/main` once phase 2 lands |
+| On `main` | **Phase 2**: PR #58 `7c3cb87` (panel, frame bus, lane geometry, prefs, `pitch_unsubscribe`) |
+| Worktrees | all stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
+| Next | **Phase 3, Task 12**, from `origin/main`. Read [`pitch-as-data.md`](../../backlog/pitch-as-data.md) before Task 14 |
 
 ## Status
 
@@ -139,8 +139,7 @@ follow-ups and the R3 instrument.
       and clarity. It does NOT exercise the Tauri command layer or the 60 Hz
       batching — that is phase 2's to prove.
 
-**Phase 2 — panel. DONE** (pending review/merge), branch
-`feat/pitch-coach-panel`.
+**Phase 2 — panel. DONE and merged** — PR #58, squashed as `7c3cb87`.
 
 - [x] Task 7 — wire types + backend bindings — `c757b8c`. Five bindings,
       not the plan's four: `pitchSetReference` is the fifth command Task 6

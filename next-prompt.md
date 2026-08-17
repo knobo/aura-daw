@@ -11,14 +11,13 @@ Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-in
 
 **Do not:** start G2/G3/G4; write a stock FX suite; bump
 `OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
-Pitch Coach phase 1).
+Pitch Coach phases 1 **and 2**).
 
-**In flight:** Pitch Coach **phase 2** (Tasks 7–11) on
-`feat/pitch-coach-panel`, worktree `.claude/worktrees/pitch-phase2` —
-open PR. It touches only `src/` plus the two test-count docs. Stale
-worktrees for merged branches can be ignored — but keep the branches
-`feat/pitch-coach` and `plan-f-history`, whose squashed SHAs are cited in
-the handoffs.
+**Nothing is in flight.** Pitch Coach phase 2 merged as `7c3cb87`
+(PR #58). Stale worktrees for merged branches can be ignored — but keep
+the branches `feat/pitch-coach`, `feat/pitch-coach-panel` and
+`plan-f-history`, whose per-commit or squashed SHAs are cited in the
+handoffs.
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
@@ -31,6 +30,7 @@ this file (marked correction, ADR 0007) if they do.
 |---|---|
 | G1 Tasks 2–4 — insert ops, commands, `HostRole::Effect`, HostForward restore | PR #55 `118ae23`. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | G1 Task 1 — `InsertSlot` on `TrackState.inserts` | PR #52 `5c338ff` |
+| Pitch Coach **phase 2** — panel, frame bus, lane geometry, prefs | PR #58 `7c3cb87`. Adds `pitch_unsubscribe` (additive). Owner ear-check done; the fixes it produced have NOT been re-checked by ear. **Next: phase 3, Task 12** — but read [`pitch-as-data.md`](docs/backlog/pitch-as-data.md) before Task 14 |
 | Pitch Coach phase 1 | PR #49 `84b0313` + PR #54 `f451a5a` (detection off the RT callback, listen mid-take, `pitch_check`). R3 answered with numbers. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Gesture tokens | PR #47 |
 | External audio editor | PR #48 |
@@ -41,6 +41,13 @@ this file (marked correction, ADR 0007) if they do.
 
 - **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
 - **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **Sing-along from any song** — new owner ask (2026-08-17), and the reason
+  melody extraction outranks the auto-tune work: import → split stems →
+  melody from the vocal stem → sing against it in the coach. Three of four
+  steps are landed. Settle two things before building: does the detector
+  survive a Demucs stem (an afternoon, no new code), and tempo alignment
+  (`import.rs` detects no tempo, so a tick-based reference lands wrong).
+  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md).
 - **Pitch as data** — new owner ask (2026-08-17). Melody extraction from an
   existing clip (→ MIDI clip) and the continuous pitch track (→ `APTF`, from
   Pitch Coach Task 14). **If you are about to implement Task 14, read
@@ -61,7 +68,33 @@ this file (marked correction, ADR 0007) if they do.
   first. **The panel has never run against the real engine** — only against
   `DemoBackend`'s synthetic singer in a browser. That ear-check is the
   first thing to do with the phase 2 branch.
-- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **New:** the Pitch Coach panel (phase 2) needs an ear-check against a real microphone in a Tauri build.
+- **Uncommitted Windows-build work in the main checkout** (branch
+  `docs/pitch-coach-handoff`, 2026-08-17): a `lv2` Cargo feature with an
+  `lv2_host_stub`, Windows CLAP search paths, platform-aware ffmpeg hints, a
+  `release-windows.yml`, and `bundle.active: true`. Not mine, not in a PR,
+  and **`git status` in that tree is dirty** — do not stash it, do not
+  "clean up" around it. A review of it found five things the owner had not
+  seen yet, recorded here because they exist nowhere else:
+  1. **`src-tauri/icons/icon.ico` is untracked** while `tauri.conf.json`
+     (a tracked modification) references it. `git commit -am` lands the
+     reference without the asset and the first `v*` tag fails at the bundle
+     step. `.github/workflows/release-windows.yml` is untracked too.
+  2. **`bundle.active: true` with `targets: "all"`** enables bundling on
+     every platform, so a local Linux `tauri build` now runs the AppImage
+     bundler (which downloads `linuxdeploy` mid-build) and emits deb/rpm
+     with no `depends` and no sidecar resources. Scope it via
+     `tauri.windows.conf.json` or `"targets": ["nsis", "msi"]`.
+  3. **`control/export.rs:291`** still hard-codes `apt install ffmpeg` in
+     `capabilities()`, one function from the new platform-aware `HOW`.
+  4. **`control/export.rs:880`/`:894`** assert on `"apt install ffmpeg"`, so
+     `cargo test` is red on Windows — the platform being added. Assert on
+     `"requires ffmpeg"` instead.
+  5. **`.github/workflows/tests.yml:67`** only exercises the `lv2` axis on
+     ubuntu; nothing in CI compiles the new `#[cfg(target_os = "windows")]`
+     branches, which is exactly the rot the step's own comment warns about.
+  Unverified by the current session beyond reading the diff — treat as
+  leads, not verdicts.
+- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):
