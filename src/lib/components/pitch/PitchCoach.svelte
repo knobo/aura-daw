@@ -452,7 +452,7 @@
       else if (last.midi < lane.lowKey) drawChevron(ctx, px, h - 10, 1);
     }
 
-    if (pitchMode.rehearseHold) drawRehearseVeil(ctx, w, h);
+    if (pitchMode.rehearseHold && transport.isRecording) drawRehearseVeil(ctx, w, h);
   }
 
   function drawChevron(ctx: CanvasRenderingContext2D, x: number, y: number, dir: number) {
