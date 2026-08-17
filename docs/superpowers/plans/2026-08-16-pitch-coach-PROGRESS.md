@@ -19,8 +19,9 @@ documentation and all commits are English.
 |---|---|
 | On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
 | On `main` | **Phase 2**: PR #58 `7c3cb87` (panel, frame bus, lane geometry, prefs, `pitch_unsubscribe`) |
-| Worktrees | all stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
-| Next | **Phase 3, Task 12**, from `origin/main`. Read [`pitch-as-data.md`](../../backlog/pitch-as-data.md) before Task 14 |
+| Worktrees | stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
+| **In flight** | **Phase 3** on branch `feat/pitch-coach-scoring`, worktree `.claude/worktrees/pitch-phase3`, branched from `origin/main` `cf224ce`. Not pushed, no PR yet |
+| Next | **Task 14's command half** — see the phase 3 checklist below |
 
 ## Status
 
@@ -162,18 +163,71 @@ follow-ups and the R3 instrument.
 - [x] Review round on PR #58 — `a590136`. Nine findings, all fixed; the
       branch is no longer frontend-only (see the log).
 
-**Phase 3 — scoring.** Not started. Tasks 12–16: shared repeat-expansion
-helper, scoring, pitch track on disk, the report, docs + PR.
-`panel-logic.targetNotesFor` currently expands repeats frontend-side with
-the timeline preview's rule — Task 12 is what replaces it.
+**Phase 3 — scoring. IN PROGRESS** on `feat/pitch-coach-scoring`. Tasks
+12–16: shared repeat-expansion helper, scoring, pitch track on disk, the
+report, docs + PR.
 
-**Before implementing Task 14, read
-[`docs/backlog/pitch-as-data.md`](../../backlog/pitch-as-data.md).** The
-owner has since asked for pitch extraction from existing clips and for
-auto-tune, which makes `APTF` a shared format rather than a scoring detail.
-Four decisions are due while it is still unbuilt; the load-bearing one is
-that the recorder folds the CAUSAL median (20 ms lag) while an offline pass
-can use the centred one, so the format should record which it holds.
+- [x] Task 12 — `clip_notes` + `AbsNote` in `midi/schedule.rs` — `aff2564`,
+      14/14 `midi::schedule`, 151/151 `midi::`. `clip_events` and
+      `clip_notes` now share one `expand_notes`, and
+      `clip_notes_and_clip_events_agree_on_timing` fails if they drift.
+      `AbsNote.note_id` is the repo's `NoteId`, not the plan's bare `u32`;
+      `clip_id_hash` is FNV-1a because `DefaultHasher` is not stable across
+      Rust releases and this value reaches the frontend.
+- [x] Task 13 — `control/pitch_coach.rs`: `reference_melody` + `score` —
+      `78d0e32`, 14/14. Two deliberate deviations from the plan, both
+      because the plan disagreed with its own tests: `vibrato_extent_cents`
+      is PEAK-TO-PEAK (the plan said half of it, then asserted > 50 cents on
+      a 90 cent wobble), and the hit hysteresis counts the frames that
+      trigger a transition as part of the state they trigger (charging them
+      to the singer caps a flawless take at 97.8 %, and the plan's own first
+      test wants > 99).
+- [x] Task 14, **first half** — `audio/pitch_store.rs` (`APTF`, `PitchFolder`,
+      `analyze_interleaved`) + the recorder fold — `9f21522`, 10/10 store,
+      5/5 recorder.
+- [ ] Task 14, **second half** — the three commands (`pitch_score`,
+      `pitch_track`, `pitch_analyze_clip`), `pitch-score-report.schema.json`,
+      and their registration in `lib.rs` (additive names only, which the
+      owner has already authorised).
+- [ ] Task 15 — the report UI (`PitchReport.svelte`, `pitch/report.ts`).
+- [ ] Task 16 — `docs/pitch-coach.md`, ARCHITECTURE, the count docs, PR.
+
+`panel-logic.targetNotesFor` still expands repeats frontend-side with the
+timeline preview's rule. Task 12 built the backend replacement but nothing
+consumes it yet — retiring the frontend copy is Task 15's business.
+
+**Test counts are NOT yet updated** in README/CONTRIBUTING (the dated-count
+convention). Phase 3 has added 3 + 14 + 10 + 2 = 29 Rust lib tests so far;
+measure, do not copy that number, and land the update with Task 16.
+
+### What Task 14's second half needs to know
+
+Written down because the first half made the decisions:
+
+- **`APTF` positions are TAKE-LOCAL**, in the take's own sample rate, and
+  they snap onto a `first_sample + i * hop` grid. The scorer therefore has
+  to map them onto the timeline itself:
+  `timeline = clip.timeline_start_samples + (sample - clip.offset_samples)
+  * project_rate / clip.source_sample_rate`. The reference notes from
+  `clip_notes` are already in project samples.
+- **The header carries `first_sample`** because the analyser timestamps the
+  CENTRE of its window (~15 ms in). Deriving positions from a bare
+  `i * hop` would slide every curve early by that much.
+- **Provenance is `CausalMedian` for both producers today.** The offline
+  path reuses the live detector; being offline is not the same as being
+  centred. Decision (a) of `pitch-as-data.md` is satisfied by the byte
+  existing, not by a centred pass existing.
+- **`score()` leaves `reference_track_id` empty** — the command stamps it.
+- Missing cache: the intended shape is for `pitch_score` to analyse and
+  write the track when `cache/pitch/<clipId>.bin` is absent, so the UI
+  never has to make two round trips. Analysis runs at roughly 100× real
+  time, so a 3-minute take costs ~2 s on the command thread.
+
+**Before implementing anything more of Task 14, read
+[`docs/backlog/pitch-as-data.md`](../../backlog/pitch-as-data.md).** Its
+four decisions are what the format above already encodes; (b) (do not widen
+the format on speculation) and (d) (the curve is read-only) are still live
+constraints on the rest of the task.
 
 ### What phase 2 must not get wrong
 
@@ -289,6 +343,35 @@ After finishing each task: tick its box, and add a line under the log below
 with the commit sha and anything the next agent would be surprised by.
 
 ## Log
+
+- 2026-08-17 — Phase 3 started on `feat/pitch-coach-scoring` (worktree
+  `.claude/worktrees/pitch-phase3`, from `origin/main` `cf224ce`). Tasks 12,
+  13 and the first half of 14 are committed but NOT pushed. Six things the
+  next agent would otherwise rediscover the hard way:
+  1. **`cargo fmt`/`rustfmt` on a whole file reformats the repo's existing
+     code.** `rustfmt src/midi/schedule.rs` turned a 175-line diff into a
+     407-line one, all of it reflowing untouched test code — this crate has
+     never been rustfmt-clean. Hand-match the surrounding style instead, and
+     never run `cargo fmt` without a path (the phase 1 log says the same).
+  2. **Frame positions out of `PitchAnalyzer` are NOT exactly hop-spaced.**
+     Its integer timestamp maths re-anchors at every push, so a chunk
+     boundary shifts a frame by up to ~4 samples. Bounded, not cumulative,
+     and under 0.2 ms against a 10 ms hop — but a test asserting exact
+     spacing fails, and the file format snaps them back onto the grid.
+  3. **`PitchAnalyzer::push` stops appending at 2048 frames.** That cap
+     exists for the RT path; anything folding a whole take must drain the
+     out-vec after every push or silently lose everything past 20 s.
+  4. **A ring drain can split an interleaved frame down the middle.** The
+     recorder hands the writer two slices from one rtrb chunk, and the split
+     is at a raw sample index. `PitchFolder` carries the remainder to the
+     next push — a decimator that swallowed a half frame would swap the
+     channels for the rest of the take.
+  5. **`RecSpec` grew `pitch_path: Option<PathBuf>`.** `None` means "fold
+     nothing" and is what the engine's two error-path tests pass.
+  6. Verification ran per module (`cargo test --lib <module>`) with
+     `CARGO_TARGET_DIR` pointed at the main checkout's target dir, per the
+     box's disk constraint. The full suite has NOT been run on this branch
+     yet; it is owed before the PR, single-threaded.
 
 - 2026-08-17 — **Owner ear-check done, and it found a real one.** The panel
   tracked a real voice well, but the reference notes "did not fall into
