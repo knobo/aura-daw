@@ -120,7 +120,7 @@
     flex: 1;
     min-width: 0;
     height: 10px;
-    background: rgba(5, 7, 13, 0.6);
+    background: rgb(var(--bg-0-rgb) / 0.6);
     touch-action: none;
     outline: none;
     cursor: pointer;
@@ -133,18 +133,18 @@
     top: 2px;
     bottom: 2px;
     border-radius: 3px;
-    background: rgba(96, 130, 190, 0.35);
+    background: rgb(var(--line-rgb) / 0.35);
     transition: background 120ms ease, box-shadow 120ms ease;
   }
   .track.inert .thumb {
-    background: rgba(96, 130, 190, 0.12);
+    background: rgb(var(--line-rgb) / 0.12);
   }
   .track:hover:not(.inert) .thumb,
   .track:focus-visible .thumb {
-    background: rgba(122, 160, 220, 0.55);
+    background: rgb(var(--edge-rgb) / 0.55);
   }
   .track.dragging .thumb {
     background: var(--cyan-dim);
-    box-shadow: 0 0 8px rgba(82, 229, 255, 0.35);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.35);
   }
 </style>

@@ -98,7 +98,7 @@
   }
   .projbtn:hover,
   .projbtn.open {
-    background: rgba(82, 229, 255, 0.07);
+    background: rgb(var(--cyan-rgb) / 0.07);
   }
   .pname {
     font-size: 12px;
@@ -124,7 +124,7 @@
     flex-direction: column;
     padding: 5px;
     border-radius: 7px;
-    background: rgba(8, 10, 19, 0.96);
+    background: rgb(var(--bg-sunken-rgb) / 0.96);
   }
   .menu button {
     display: flex;
@@ -143,7 +143,7 @@
     cursor: pointer;
   }
   .menu button:hover:not(:disabled) {
-    background: rgba(82, 229, 255, 0.09);
+    background: rgb(var(--cyan-rgb) / 0.09);
     color: var(--cyan);
   }
   .menu button:disabled {

@@ -95,7 +95,7 @@
     border-top: none;
     border-bottom: none;
     border-right: none;
-    background: rgba(8, 10, 19, 0.88);
+    background: rgb(var(--bg-sunken-rgb) / 0.88);
     animation: dock-in 160ms ease-out;
   }
   @keyframes dock-in {
@@ -145,7 +145,7 @@
     height: 6px;
     border-radius: 50%;
     background: var(--amber);
-    box-shadow: 0 0 6px rgba(255, 200, 87, 0.8);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.8);
     animation: dot-pulse 1s ease-in-out infinite;
   }
   @keyframes dot-pulse {
