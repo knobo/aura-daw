@@ -1,0 +1,46 @@
+/**
+ * Solarized Dark — Ethan Schoonover's precision palette.
+ */
+
+import type { ThemeTokens } from "../tokens";
+
+export const SOLARIZED_DARK_TOKENS: ThemeTokens = {
+  bgVoid: "#00212b",
+  bg0: "#002b36",
+  bgSunken: "#00212b",
+  bg1: "#073642",
+  bg2: "#0a4352",
+  bg3: "#0e5263",
+  glass: "#073642",
+
+  line: "#586e75",
+  edge: "#657b83",
+
+  cyan: "#2aa198",
+  cyanBright: "#3dc0b6",
+  cyanDeep: "#1c736c",
+  magenta: "#e04693",
+  amber: "#b58900",
+  amberSunken: "#2b2000",
+  red: "#dc322f",
+  redSoft: "#e55f5c",
+  violet: "#7b80d5",
+  green: "#859900",
+  orange: "#d85620",
+
+  text: "#93a1a1",
+  textMid: "#839496",
+  textDim: "#7c8e91",
+  textFaint: "#586e75",
+  textOnAccent: "#002b36",
+
+  shadow: "#000000",
+
+  trackPalette: ["#2aa198", "#e04693", "#b58900", "#7b80d5", "#859900", "#d85620"],
+
+  borderWidth: "1px",
+  focusWidth: "1px",
+  glassBlur: "18px",
+  glowBlur: "6px",
+  bodyGlow: "0.05",
+};
