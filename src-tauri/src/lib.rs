@@ -50,6 +50,10 @@ pub mod modulation;
 pub mod plugins;
 pub mod sidecars;
 pub mod theme;
+// The Composer's music-theory library (Plan H1). PURE: no tauri, no locks,
+// no I/O, no state — see the purity contract in `theory/mod.rs`. The
+// stateful seam that calls it is `control::composer`.
+pub mod theory;
 pub mod time;
 
 use std::sync::Arc;
