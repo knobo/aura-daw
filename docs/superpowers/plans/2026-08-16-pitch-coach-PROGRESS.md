@@ -283,6 +283,30 @@ with the commit sha and anything the next agent would be surprised by.
 
 ## Log
 
+- 2026-08-17 — **Owner ear-check done, and it found a real one.** The panel
+  tracked a real voice well, but the reference notes "did not fall into
+  place until I pressed record". Cause: the panel drew the LANE only while
+  `transport.isPlaying` and the TUNER otherwise, so selecting a reference
+  track while stopped showed the tuner — no target notes at all. On top of
+  that, `fixed` mode pinned the lane to the playhead, so a melody starting
+  at bar 5 sat off-screen even once the lane appeared. Fixed:
+  1. **The lane is drawn whenever a reference melody exists**, stopped
+     included. The tuner is for having no melody, or for asking (there is a
+     TUNER chip now) — never for hiding one.
+  2. **`laneWindowFor` replaces `laneScrollFor`** and gives the lane its own
+     zoom: a readable span derived from the melody's own length (4–12 s),
+     framing the melody when stopped outside it, pinning the playhead when
+     rolling or when stopped inside it. The zoom does NOT depend on
+     `playing`, so record is not a jump. `laneScrollFor` stays for now but
+     nothing uses it.
+  3. **The picker draws the user's choice immediately** instead of waiting
+     for `pitch_set_reference` to round-trip through the control thread. A
+     display-only echo, dropped the moment `pitch://state` arrives — the
+     truth still comes from the engine.
+  Also, the owner asked whether the detector can drive auto-tune. Answer and
+  staged path: [`docs/backlog/pitch-correction-autotune.md`](../../backlog/pitch-correction-autotune.md).
+  Detection is the done third; the shifter and the correction policy do not
+  exist. Offline correction of a take is Stage A.
 - 2026-08-16 — **PR #58 reviewed and fixed** (`a590136`). Rust 1020
   (984 lib + 36 integration), frontend 564. Four things worth carrying
   forward:

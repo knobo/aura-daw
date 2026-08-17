@@ -36,6 +36,77 @@ export function laneScrollFor(
   return Math.max(0, positionSamples - PLAYHEAD_FRACTION * widthPx * spp);
 }
 
+/** Least time the lane shows at once, seconds — a two-note phrase must not
+ * be blown up until the trail's ordinary wobble looks like failure. */
+export const LANE_MIN_VISIBLE_S = 4;
+/** Most time the lane shows at once, seconds. Fitting a three-minute song
+ * to the width leaves every target note a pixel wide. */
+export const LANE_MAX_VISIBLE_S = 12;
+
+export interface LaneWindow {
+  /** Sample at the lane's left edge. */
+  startSample: number;
+  /** Samples per CSS pixel. */
+  spp: number;
+}
+
+/**
+ * The lane's viewport: where it starts and how zoomed it is.
+ *
+ * `fixed` (the default) makes the lane its OWN view rather than a slice of
+ * the timeline's, because the two want different things: the timeline is
+ * zoomed to arrange, the lane is zoomed to sing. It picks a readable span
+ * from the melody's own length, and:
+ *
+ *   - rolling: pins the playhead, scrolling the lane under it;
+ *   - stopped inside the melody: keeps the playhead in view;
+ *   - stopped outside it: frames the melody from its first note.
+ *
+ * That last case is the one that matters. Pinning the playhead at 35% while
+ * stopped at zero shows an empty lane for any melody that does not start at
+ * bar 1 — the notes only "arrive" once the transport rolls far enough,
+ * which reads as the panel being broken.
+ *
+ * The zoom does NOT depend on `playing`, so pressing record does not jump
+ * the view.
+ *
+ * `free` hands the lane to the timeline's own scroll and zoom, for lining a
+ * take up against the arrangement.
+ */
+export function laneWindowFor(opts: {
+  mode: "fixed" | "free";
+  playing: boolean;
+  positionSamples: number;
+  widthPx: number;
+  /** Sorted by start (see `targetNotesFor`). */
+  targets: TargetNote[];
+  /** Project sample rate — the domain frame positions live in. */
+  rate: number;
+  timelineStart: number;
+  timelineSpp: number;
+}): LaneWindow {
+  const { mode, playing, positionSamples, widthPx, targets, rate, timelineStart, timelineSpp } = opts;
+  if (mode === "free" || targets.length === 0) {
+    return { startSample: timelineStart, spp: timelineSpp };
+  }
+
+  const first = targets[0].startSample;
+  let last = first;
+  for (const n of targets) if (n.endSample > last) last = n.endSample;
+
+  const width = Math.max(1, widthPx);
+  const melodySeconds = (last - first) / Math.max(1, rate);
+  const visibleSeconds = Math.min(LANE_MAX_VISIBLE_S, Math.max(LANE_MIN_VISIBLE_S, melodySeconds * 1.1));
+  const spp = (visibleSeconds * rate) / width;
+  const span = width * spp;
+
+  const pinned = positionSamples - PLAYHEAD_FRACTION * span;
+  // Stopped outside the melody, frame it; otherwise follow the playhead.
+  const insideMelody = positionSamples >= first && positionSamples <= last;
+  const startSample = playing || insideMelody ? pinned : first - PLAYHEAD_FRACTION * 0.2 * span;
+  return { startSample: Math.max(0, startSample), spp };
+}
+
 /**
  * Whether a `KeyboardEvent.key` is the configured rehearse-hold key.
  * Case-insensitive: caps lock must not disarm the hold mid-take. `"none"`

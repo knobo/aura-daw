@@ -30,7 +30,7 @@
   import { TOLERANCE_CENTS } from "../../prefs/schema";
   import { pitchMode, recentFrames, startPitchStream, stopPitchStream } from "../../state/pitch.svelte";
   import { autoFitRange, bandFor, centsToTarget, trailSegments, yOfKey, type LaneRange } from "../../pitch/lane";
-  import { laneScrollFor, stabilityCents, targetNotesFor } from "./panel-logic";
+  import { laneWindowFor, stabilityCents, targetNotesFor } from "./panel-logic";
   import { view } from "../../state/view.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
@@ -61,16 +61,32 @@
   const SANS = 'Inter, "SF Pro Text", system-ui, "Segoe UI", sans-serif';
 
   const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
-  const referenceTrack = $derived(
-    pitchMode.referenceTrackId ? project.trackById(pitchMode.referenceTrackId) : undefined,
-  );
+
+  /**
+   * The track the user just picked, shown while `pitch_set_reference` makes
+   * its round trip through the engine. `undefined` means "nothing pending".
+   *
+   * Not an ADR 0006 violation: this is an echo of the user's own gesture for
+   * drawing only, dropped the moment `pitch://state` arrives. Without it the
+   * melody appears a control-thread round trip after the click, which reads
+   * as the panel being slow to notice.
+   */
+  let pendingReference = $state<string | null | undefined>(undefined);
+  const referenceId = $derived(pendingReference !== undefined ? pendingReference : pitchMode.referenceTrackId);
+  $effect(() => {
+    if (pendingReference !== undefined && pitchMode.referenceTrackId === pendingReference) {
+      pendingReference = undefined;
+    }
+  });
+
+  const referenceTrack = $derived(referenceId ? project.trackById(referenceId) : undefined);
   const tolerance = $derived(TOLERANCE_CENTS[prefs.values.pitchTolerance]);
 
   /** Reference notes as sample spans. Reactive: clips change rarely. */
   const targets = $derived(
-    pitchMode.referenceTrackId
+    referenceId
       ? targetNotesFor(
-          midi.clipsOf(pitchMode.referenceTrackId),
+          midi.clipsOf(referenceId),
           (t) => midi.ticksToSamples(t),
           (c) => midi.effectiveContentLengthTicks(c),
         )
@@ -89,8 +105,10 @@
   let steadiness = $state<number | null>(null);
   const STEADY_MS = 250;
   let steadyAt = 0;
-  /** Lane viewport start, samples. Owned by the loop in fixed mode. */
+  /** Lane viewport start, samples. Recomputed every frame by the loop. */
   let laneStart = 0;
+  /** User asked for the tuner while stopped, melody or not. */
+  let tunerPinned = $state(false);
   /** Lane range in use when there is no reference melody: fitted to the
    * singer, and re-centred only when they leave it. Re-fitting every frame
    * would make the whole lane breathe with the vibrato. */
@@ -225,7 +243,13 @@
       if (next !== steadiness) steadiness = next;
     }
 
-    if (transport.isPlaying) drawLane(ctx, w, h, frames, position, rate);
+    // The lane whenever there is a melody to sing against — including
+    // STOPPED, which is when the singer is looking at what is coming. The
+    // tuner is for having no melody (or asking for it), never for hiding
+    // one: drawing the tuner while a reference track was selected is what
+    // made the notes look like they only appeared on record.
+    const lane = targets.length > 0 && !(tunerPinned && !transport.isPlaying);
+    if (lane) drawLane(ctx, w, h, frames, position, rate);
     else drawTuner(ctx, w, h, frames, rate);
   }
 
@@ -243,8 +267,18 @@
     rate: number,
   ) {
     drawGround(ctx, w, h);
-    const spp = view.spp;
-    laneStart = laneScrollFor(prefs.values.pitchLaneFollow, position, spp, w, view.viewStart);
+    const win = laneWindowFor({
+      mode: prefs.values.pitchLaneFollow,
+      playing: transport.isPlaying,
+      positionSamples: position,
+      widthPx: w,
+      targets,
+      rate,
+      timelineStart: view.viewStart,
+      timelineSpp: view.spp,
+    });
+    const spp = win.spp;
+    laneStart = win.startSample;
     const xOf = (sample: number) => (sample - laneStart) / spp;
     const last = lastVoicedOf(frames);
     const lane = rangeFor(last);
@@ -529,10 +563,15 @@
     <label class="ref">
       <span class="silk">reference</span>
       <select
-        value={pitchMode.referenceTrackId ?? ""}
+        value={referenceId ?? ""}
         onchange={(e) => {
           const id = (e.currentTarget as HTMLSelectElement).value;
-          void backend.pitchSetReference(id === "" ? null : id);
+          const next = id === "" ? null : id;
+          pendingReference = next; // draw it now; pitch://state confirms
+          void backend.pitchSetReference(next).catch((err) => {
+            console.warn("[aura] pitch_set_reference failed:", err);
+            pendingReference = undefined; // fall back to the engine's truth
+          });
         }}
       >
         <option value="">none</option>
@@ -548,6 +587,18 @@
       <span class="silk">steady</span>
       {steadiness === null ? "—" : `±${steadiness.toFixed(1)}¢`}
     </span>
+
+    <button
+      class="tab mono"
+      class:on={tunerPinned}
+      disabled={transport.isPlaying}
+      title={transport.isPlaying
+        ? "The lane is the view while the transport rolls"
+        : "Tuner: one note, how steadily you hold it"}
+      onclick={() => (tunerPinned = !tunerPinned)}
+    >
+      TUNER
+    </button>
 
     <RehearseButton />
 

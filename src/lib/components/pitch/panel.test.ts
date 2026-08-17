@@ -4,7 +4,15 @@
  * `panel-logic.ts` so it is reachable without a canvas.
  */
 import { describe, it, expect, vi } from "vitest";
-import { laneScrollFor, rehearseKeyMatches, stabilityCents, targetNotesFor } from "./panel-logic";
+import {
+  LANE_MAX_VISIBLE_S,
+  LANE_MIN_VISIBLE_S,
+  laneScrollFor,
+  laneWindowFor,
+  rehearseKeyMatches,
+  stabilityCents,
+  targetNotesFor,
+} from "./panel-logic";
 import type { MidiClip, PitchFrame } from "../../types/ipc";
 
 describe("laneScrollFor", () => {
@@ -25,6 +33,90 @@ describe("laneScrollFor", () => {
 
   it("free mode starts at zero when the caller has no viewport yet", () => {
     expect(laneScrollFor("free", 96000, 1000, 400)).toBe(0);
+  });
+});
+
+describe("laneWindowFor", () => {
+  const RATE = 48000;
+  const W = 800;
+  // A melody from 4 s to 10 s.
+  const melody = [
+    { noteId: 0, startSample: 4 * RATE, endSample: 5 * RATE, key: 60 },
+    { noteId: 1, startSample: 9 * RATE, endSample: 10 * RATE, key: 64 },
+  ];
+  const base = {
+    mode: "fixed" as const,
+    playing: false,
+    positionSamples: 0,
+    widthPx: W,
+    targets: melody,
+    rate: RATE,
+    timelineStart: 0,
+    timelineSpp: 1200,
+  };
+
+  it("brings a melody that starts later into view, instead of showing empty lane", () => {
+    // The bug this exists for: stopped at 0 with a melody at bar 5, the
+    // pinned-playhead rule shows nothing at all.
+    const win = laneWindowFor(base);
+    const visibleEnd = win.startSample + W * win.spp;
+    expect(win.startSample).toBeLessThanOrEqual(melody[0].startSample);
+    expect(visibleEnd).toBeGreaterThan(melody[0].startSample);
+  });
+
+  it("frames the whole melody when it fits the readable span", () => {
+    const win = laneWindowFor(base);
+    const visibleEnd = win.startSample + W * win.spp;
+    expect(visibleEnd).toBeGreaterThanOrEqual(melody[1].endSample);
+  });
+
+  it("keeps a short phrase from filling the lane at absurd zoom", () => {
+    const short = [{ noteId: 0, startSample: 0, endSample: RATE / 4, key: 60 }];
+    const win = laneWindowFor({ ...base, targets: short });
+    expect((W * win.spp) / RATE).toBeGreaterThanOrEqual(LANE_MIN_VISIBLE_S);
+  });
+
+  it("caps how much of a long song is shown at once", () => {
+    const long = [
+      { noteId: 0, startSample: 0, endSample: RATE, key: 60 },
+      { noteId: 1, startSample: 300 * RATE, endSample: 301 * RATE, key: 60 },
+    ];
+    const win = laneWindowFor({ ...base, targets: long });
+    expect((W * win.spp) / RATE).toBeLessThanOrEqual(LANE_MAX_VISIBLE_S);
+  });
+
+  it("pins the playhead once the transport rolls", () => {
+    const win = laneWindowFor({ ...base, playing: true, positionSamples: 60 * RATE });
+    expect(win.startSample).toBe(60 * RATE - 0.35 * W * win.spp);
+  });
+
+  it("does not change zoom between stopped and rolling, so record is not a jump", () => {
+    const stopped = laneWindowFor(base);
+    const rolling = laneWindowFor({ ...base, playing: true, positionSamples: 5 * RATE });
+    expect(rolling.spp).toBe(stopped.spp);
+  });
+
+  it("follows the playhead when stopped inside the melody", () => {
+    // Seeked into the phrase: show where the playhead is, not the start.
+    const win = laneWindowFor({ ...base, positionSamples: 9.5 * RATE });
+    const visibleEnd = win.startSample + W * win.spp;
+    expect(win.startSample).toBeLessThanOrEqual(9.5 * RATE);
+    expect(visibleEnd).toBeGreaterThan(9.5 * RATE);
+  });
+
+  it("falls back to the timeline's own view with no melody", () => {
+    const win = laneWindowFor({ ...base, targets: [], timelineStart: 7777, timelineSpp: 999 });
+    expect(win).toEqual({ startSample: 7777, spp: 999 });
+  });
+
+  it("free mode is the timeline's view, melody or not", () => {
+    const win = laneWindowFor({ ...base, mode: "free", timelineStart: 4242, timelineSpp: 888 });
+    expect(win).toEqual({ startSample: 4242, spp: 888 });
+  });
+
+  it("never starts before time zero", () => {
+    const atZero = [{ noteId: 0, startSample: 0, endSample: RATE, key: 60 }];
+    expect(laneWindowFor({ ...base, targets: atZero }).startSample).toBeGreaterThanOrEqual(0);
   });
 });
 

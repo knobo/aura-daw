@@ -44,7 +44,15 @@ described here only.
 
 ## Tier 2 — competitive (months)
 
-- Time-stretch / pitch-shift of audio clips (engine + UI; big).
+- Time-stretch / pitch-shift of audio clips (engine + UI; big). **Shares
+  its shifter with pitch correction** — whichever lands first owns it;
+  see `pitch-correction-autotune.md`.
+- **Pitch correction / auto-tune** — owner ask 2026-08-17 after hearing the
+  Pitch Coach track a real voice. Detection is done and measured (3.3 cents
+  vs the sidecar, no octave errors in 1312 frames); what is missing is a
+  formant-preserving shifter and a correction policy. Staged path, offline
+  first: `pitch-correction-autotune.md`. Stage C (live insert) waits on G1
+  + PDC.
 - Pattern instancing (shared `ContentId` — groundwork landed in Plan C/D;
   round-2 §2.1 remint rules bind the first split/merge/copy op).
 - Takes & comping (natural continuation of Plan F's history storage).

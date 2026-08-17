@@ -41,6 +41,12 @@ this file (marked correction, ADR 0007) if they do.
 
 - **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
 - **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **Pitch correction / auto-tune** — new owner ask (2026-08-17), NOT part of
+  the Pitch Coach plan. Detection is done; a formant-preserving shifter and
+  a correction policy are not. Offline-first staged path and the four
+  rulings it needs before Stage A:
+  [`pitch-correction-autotune.md`](docs/backlog/pitch-correction-autotune.md).
+  Do not start Stage C (live insert) before G1 inserts + PDC.
 - **Pitch Coach phase 3** — scoring, Tasks 12–16, once phase 2's PR is in.
   Task 12 (the shared repeat-expansion helper) also replaces
   `panel-logic.targetNotesFor`, which expands repeats frontend-side today.
