@@ -46,7 +46,7 @@
     letter-spacing: 0.18em;
     padding: 3px 10px;
     border-radius: 999px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-dim);
     cursor: pointer;
@@ -60,8 +60,8 @@
   }
   .rehearse.on {
     color: var(--amber);
-    border-color: rgba(255, 200, 87, 0.5);
-    box-shadow: 0 0 14px rgba(255, 200, 87, 0.25);
+    border-color: rgb(var(--amber-rgb) / 0.5);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.25);
   }
   @media (prefers-reduced-motion: reduce) {
     .rehearse {

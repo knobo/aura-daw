@@ -36,18 +36,19 @@
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import RehearseButton from "./RehearseButton.svelte";
   import type { PitchFrame } from "../../types/ipc";
+  import { theme } from "../../theme/theme.svelte";
+  import { alpha } from "../../theme/tokens";
 
   const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
   /** Colours by band. Magenta, not red: red means recording here, and being
    * 40 cents flat is ordinary singing, not an error. */
-  const BAND_COLOR: Record<string, string> = {
-    in: "#52e5ff",
-    near: "#ffc857",
-    far: "#ff4fd8",
-  };
-  /** No target sounding: the trail is information, not a verdict. */
-  const NO_TARGET_COLOR = "#8fa3c4";
+  function bandColor(band: string): string {
+    if (band === "in") return theme.tokens.cyan;
+    if (band === "near") return theme.tokens.amber;
+    if (band === "far") return theme.tokens.magenta;
+    return theme.tokens.edge;
+  }
 
   /** Seconds of history the tuner shows. */
   const TUNER_WINDOW_S = 3;
@@ -254,7 +255,7 @@
   }
 
   function drawGround(ctx: CanvasRenderingContext2D, w: number, h: number) {
-    ctx.fillStyle = "rgba(5, 7, 13, 0.55)";
+    ctx.fillStyle = alpha(theme.tokens.bg0, 0.55);
     ctx.fillRect(0, 0, w, h);
   }
 
@@ -286,7 +287,7 @@
     // semitone rules — brighter at every C, so the eye has an octave anchor
     for (let key = Math.ceil(lane.lowKey); key <= Math.floor(lane.highKey); key++) {
       const y = yOfKey(key, lane, h);
-      ctx.strokeStyle = key % 12 === 0 ? "rgba(96, 130, 190, 0.22)" : "rgba(96, 130, 190, 0.1)";
+      ctx.strokeStyle = key % 12 === 0 ? alpha(theme.tokens.line, 0.22) : alpha(theme.tokens.line, 0.1);
       ctx.beginPath();
       ctx.moveTo(0, y);
       ctx.lineTo(w, y);
@@ -300,8 +301,8 @@
       const x1 = xOf(n.endSample);
       if (x1 < 0 || x0 > w) continue;
       const y = yOfKey(n.key, lane, h) - rowH / 2;
-      ctx.fillStyle = "rgba(157, 123, 255, 0.16)";
-      ctx.strokeStyle = "rgba(157, 123, 255, 0.5)";
+      ctx.fillStyle = alpha(theme.tokens.violet, 0.16);
+      ctx.strokeStyle = alpha(theme.tokens.violet, 0.5);
       ctx.lineWidth = 1;
       ctx.beginPath();
       ctx.roundRect(x0, y, Math.max(2, x1 - x0), rowH, Math.min(rowH / 2, 6));
@@ -311,7 +312,7 @@
 
     // hit fill: the part of each bar the singer was inside the tolerance for
     const shift = latencyShift();
-    ctx.fillStyle = "rgba(82, 229, 255, 0.35)";
+    ctx.fillStyle = alpha(theme.tokens.cyan, 0.35);
     const fillCursor = { i: 0 };
     for (const f of frames) {
       if (!f.voiced) continue;
@@ -349,7 +350,7 @@
         if (band !== prevBand) {
           if (started) ctx.stroke();
           ctx.beginPath();
-          ctx.strokeStyle = BAND_COLOR[band] ?? NO_TARGET_COLOR;
+          ctx.strokeStyle = bandColor(band);
           ctx.moveTo(x, y);
           prevBand = band;
           started = true;
@@ -362,7 +363,7 @@
 
     // playhead
     const px = xOf(position);
-    ctx.strokeStyle = "rgba(216, 227, 242, 0.65)";
+    ctx.strokeStyle = alpha(theme.tokens.text, 0.65);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(px, 0);
@@ -379,7 +380,7 @@
   }
 
   function drawChevron(ctx: CanvasRenderingContext2D, x: number, y: number, dir: number) {
-    ctx.strokeStyle = BAND_COLOR.far;
+    ctx.strokeStyle = theme.tokens.magenta;
     ctx.lineWidth = 2;
     ctx.beginPath();
     ctx.moveTo(x - 7, y + 6 * dir);
@@ -390,7 +391,7 @@
 
   function drawRehearseVeil(ctx: CanvasRenderingContext2D, w: number, h: number) {
     ctx.save();
-    ctx.strokeStyle = "rgba(255, 200, 87, 0.16)";
+    ctx.strokeStyle = alpha(theme.tokens.amber, 0.16);
     ctx.lineWidth = 1;
     for (let x = -h; x < w; x += 9) {
       ctx.beginPath();
@@ -398,7 +399,7 @@
       ctx.lineTo(x + h, 0);
       ctx.stroke();
     }
-    ctx.fillStyle = "rgba(255, 200, 87, 0.85)";
+    ctx.fillStyle = alpha(theme.tokens.amber, 0.85);
     ctx.font = `600 9px ${MONO}`;
     ctx.fillText("REHEARSING — TAKE IS SILENT", 12, 18);
     ctx.restore();
@@ -436,7 +437,7 @@
       newestVoiced && newest - newestVoiced.sample <= TUNER_STALE_S * rate ? newestVoiced : null;
 
     if (!pitchMode.listening) {
-      ctx.fillStyle = "rgba(95, 108, 133, 1)";
+      ctx.fillStyle = theme.tokens.textDim;
       ctx.font = `12px ${SANS}`;
       ctx.fillText("Turn on LISTEN to see your pitch.", 16, h / 2);
       return;
@@ -446,18 +447,18 @@
     const cx = 18;
     ctx.textBaseline = "alphabetic";
     if (last) {
-      ctx.fillStyle = "#d8e3f2";
+      ctx.fillStyle = theme.tokens.text;
       ctx.font = `300 44px ${MONO}`;
       ctx.fillText(`${last.hz.toFixed(1)}`, cx, 58);
       const hzW = ctx.measureText(`${last.hz.toFixed(1)}`).width;
-      ctx.fillStyle = "#5f6c85";
+      ctx.fillStyle = theme.tokens.textDim;
       ctx.font = `11px ${MONO}`;
       ctx.fillText("Hz", cx + hzW + 8, 58);
       // The name is deliberately secondary: it flips across a semitone
       // boundary while the pitch barely moves (G5 795 Hz → G#5 811 Hz).
       ctx.fillText(`≈ ${noteName(last.midi)}`, cx + hzW + 34, 58);
     } else {
-      ctx.fillStyle = "#39435c";
+      ctx.fillStyle = theme.tokens.bg3;
       ctx.font = `300 44px ${MONO}`;
       ctx.fillText("—", cx, 58);
     }
@@ -489,9 +490,9 @@
     if (last && steadiness !== null && spanCents) {
       const halfPx = Math.min(ribbonH / 2, ((steadiness / spanCents) * ribbonH) / 2);
       const grad = ctx.createLinearGradient(0, midY - halfPx, 0, midY + halfPx);
-      grad.addColorStop(0, "rgba(82, 229, 255, 0)");
-      grad.addColorStop(0.5, "rgba(82, 229, 255, 0.3)");
-      grad.addColorStop(1, "rgba(82, 229, 255, 0)");
+      grad.addColorStop(0, alpha(theme.tokens.cyan, 0));
+      grad.addColorStop(0.5, alpha(theme.tokens.cyan, 0.3));
+      grad.addColorStop(1, alpha(theme.tokens.cyan, 0));
       ctx.fillStyle = grad;
       ctx.fillRect(0, midY - halfPx - 1, w, halfPx * 2 + 2);
     }
@@ -499,7 +500,7 @@
     // One stroke per unbroken voiced run, positioned in TIME: a breath is a
     // gap in the line, exactly as it is in the lane.
     if (spanCents) {
-      ctx.strokeStyle = "#52e5ff";
+      ctx.strokeStyle = theme.tokens.cyan;
       ctx.lineWidth = 1.5;
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
@@ -517,14 +518,14 @@
       }
     }
 
-    ctx.strokeStyle = "rgba(96, 130, 190, 0.25)";
+    ctx.strokeStyle = alpha(theme.tokens.line, 0.25);
     ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.moveTo(0, midY);
     ctx.lineTo(w, midY);
     ctx.stroke();
 
-    ctx.fillStyle = "#39435c";
+    ctx.fillStyle = theme.tokens.bg3;
     ctx.font = `9px ${MONO}`;
     const scale = spanCents ? ` · ±${spanCents}¢ SHOWN` : "";
     const sungS = (sung.length / 100).toFixed(1);
@@ -666,7 +667,7 @@
     letter-spacing: 0.18em;
     padding: 3px 10px;
     border-radius: 999px;
-    border: 1px solid transparent;
+    border: var(--border-width) solid transparent;
     background: transparent;
     color: var(--text-dim);
     cursor: pointer;
@@ -685,7 +686,7 @@
   .listen.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 14px rgba(82, 229, 255, 0.2);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.2);
   }
   .ref {
     display: flex;
@@ -695,7 +696,7 @@
   .ref select {
     background: var(--bg-2);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-family: var(--font-mono);
     font-size: 11px;

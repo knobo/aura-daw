@@ -42,6 +42,8 @@
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import ClipEnvelopeLane from "../ClipEnvelopeLane.svelte";
   import type { MidiNote } from "../../types/ipc";
+  import { theme } from "../../theme/theme.svelte";
+  import { alpha } from "../../theme/tokens";
 
   const KEY_H = 14; // CSS px per pitch row
   const KEYS_W = 64;
@@ -49,7 +51,7 @@
 
   const clip = $derived(midi.openClip);
   const track = $derived(clip ? project.trackById(clip.trackId) : undefined);
-  const color = $derived(track?.color ?? "#5cf2b8");
+  const color = $derived(track?.color ?? theme.tokens.green);
   const instrument = $derived(instruments.byId(track?.instrumentId));
   const pluginInst = $derived(plugins.instanceForRef(track?.instrumentId));
   const usedLauncher = $derived(clip ? launch.driveMap(clip.id) : null);
@@ -513,14 +515,14 @@
       const key = keyAtY(y);
       if (key < 0 || key > 127) continue;
       if (BLACK.has(key % 12)) {
-        ctx.fillStyle = "rgba(5, 7, 13, 0.55)";
+        ctx.fillStyle = alpha(theme.tokens.bg0, 0.55);
         ctx.fillRect(0, y, w, KEY_H);
       }
       if (key % 12 === 0) {
-        ctx.fillStyle = "rgba(96,130,190,0.16)";
+        ctx.fillStyle = alpha(theme.tokens.line, 0.16);
         ctx.fillRect(0, y + KEY_H - 1, w, 1);
       } else {
-        ctx.fillStyle = "rgba(96,130,190,0.05)";
+        ctx.fillStyle = alpha(theme.tokens.line, 0.05);
         ctx.fillRect(0, y + KEY_H - 1, w, 1);
       }
     }
@@ -528,7 +530,7 @@
     // content bounds shading (past the content — one repetition — end)
     const endX = xOfTick(midi.effectiveContentLengthTicks(clip));
     if (endX < w) {
-      ctx.fillStyle = "rgba(5,7,13,0.5)";
+      ctx.fillStyle = alpha(theme.tokens.bg0, 0.5);
       ctx.fillRect(Math.max(0, endX), 0, w - Math.max(0, endX), h);
     }
 
@@ -543,10 +545,10 @@
       const isBar = t % midi.ticksPerBar === 0;
       const isBeat = t % midi.ppq === 0;
       ctx.fillStyle = isBar
-        ? "rgba(96,130,190,0.28)"
+        ? alpha(theme.tokens.line, 0.28)
         : isBeat
-          ? "rgba(96,130,190,0.14)"
-          : "rgba(96,130,190,0.055)";
+          ? alpha(theme.tokens.line, 0.14)
+          : alpha(theme.tokens.line, 0.055);
       ctx.fillRect(x, 0, 1, h);
     }
 
@@ -554,9 +556,9 @@
     if (region && region.clipId === clip.id) {
       const x0 = xOfTick(region.startTicks);
       const x1 = xOfTick(region.endTicks);
-      ctx.fillStyle = "rgba(82,229,255,0.07)";
+      ctx.fillStyle = alpha(theme.tokens.cyan, 0.07);
       ctx.fillRect(x0, 0, x1 - x0, h);
-      ctx.fillStyle = "rgba(82,229,255,0.5)";
+      ctx.fillStyle = alpha(theme.tokens.cyan, 0.5);
       ctx.fillRect(Math.round(x0), 0, 1, h);
       ctx.fillRect(Math.round(x1), 0, 1, h);
     }
@@ -579,7 +581,7 @@
       ctx.fillStyle = hexA(color, Math.min(1, 0.75 + 0.25 * lum));
       ctx.fillRect(x + 1, y + 2.5, 2, KEY_H - 5);
       if (sel.has(i)) {
-        ctx.strokeStyle = "rgba(216,227,242,0.95)";
+        ctx.strokeStyle = alpha(theme.tokens.text, 0.95);
         ctx.beginPath();
         ctx.roundRect(x - 0.5, y + 1, nw + 1, KEY_H - 2, 3);
         ctx.stroke();
@@ -590,8 +592,8 @@
     if (mq) {
       const x = Math.min(mq.x0, mq.x1);
       const y = Math.min(mq.y0, mq.y1);
-      ctx.fillStyle = "rgba(82,229,255,0.08)";
-      ctx.strokeStyle = "rgba(82,229,255,0.6)";
+      ctx.fillStyle = alpha(theme.tokens.cyan, 0.08);
+      ctx.strokeStyle = alpha(theme.tokens.cyan, 0.6);
       ctx.setLineDash([4, 3]);
       ctx.fillRect(x, y, Math.abs(mq.x1 - mq.x0), Math.abs(mq.y1 - mq.y0));
       ctx.strokeRect(x, y, Math.abs(mq.x1 - mq.x0), Math.abs(mq.y1 - mq.y0));
@@ -614,18 +616,18 @@
       const key = keyAtY(y);
       if (key < 0 || key > 127) continue;
       const black = BLACK.has(key % 12);
-      ctx.fillStyle = black ? "#0a0d17" : "#1b2340";
+      ctx.fillStyle = black ? theme.tokens.bg1 : theme.tokens.bg3;
       ctx.fillRect(0, y, w, KEY_H - 1);
       if (key === heldKey) {
         ctx.fillStyle = hexA(color, 0.55);
         ctx.fillRect(0, y, w, KEY_H - 1);
       }
       if (key % 12 === 0) {
-        ctx.fillStyle = "rgba(216,227,242,0.7)";
+        ctx.fillStyle = alpha(theme.tokens.text, 0.7);
         ctx.fillText(`C${Math.floor(key / 12) - 1}`, w - 18, y + KEY_H / 2);
       }
     }
-    ctx.fillStyle = "rgba(96,130,190,0.25)";
+    ctx.fillStyle = alpha(theme.tokens.line, 0.25);
     ctx.fillRect(w - 1, 0, 1, h);
   });
 
@@ -641,7 +643,7 @@
     const h = VEL_H;
     const ctx = setup(c, w, h);
     if (!ctx) return;
-    ctx.fillStyle = "rgba(96,130,190,0.12)";
+    ctx.fillStyle = alpha(theme.tokens.line, 0.12);
     ctx.fillRect(0, 0, w, 1);
     for (let i = 0; i < notes.length; i++) {
       const n = notes[i];
@@ -649,9 +651,9 @@
       if (x < -4 || x > w + 4) continue;
       const bh = Math.max(2, (n.velocity / 127) * (h - 6));
       const selHere = sel.has(i);
-      ctx.fillStyle = selHere ? "rgba(216,227,242,0.9)" : hexA(color, 0.55);
+      ctx.fillStyle = selHere ? alpha(theme.tokens.text, 0.9) : hexA(color, 0.55);
       ctx.fillRect(x, h - bh, 3, bh);
-      ctx.fillStyle = selHere ? "#fff" : hexA(color, 0.95);
+      ctx.fillStyle = selHere ? theme.tokens.textOnAccent : hexA(color, 0.95);
       ctx.fillRect(x, h - bh - 2, 3, 2);
     }
   });
@@ -715,12 +717,12 @@
         const x = xOfTick(n.tick);
         const nw = Math.max(3, n.lengthTicks / tpp - 1);
         if (x + nw < 0 || x > gridW || y + KEY_H < 0 || y > gridH) continue;
-        fctx.strokeStyle = hexA("#52e5ff", 0.35 + 0.55 * glow);
+        fctx.strokeStyle = hexA(theme.tokens.cyan, 0.35 + 0.55 * glow);
         fctx.lineWidth = 1.5 + 1.5 * glow;
         fctx.beginPath();
         fctx.roundRect(x - 1.5, y + 0.5, nw + 3, KEY_H - 1, 3.5);
         fctx.stroke();
-        fctx.fillStyle = hexA("#52e5ff", 0.16 * glow);
+        fctx.fillStyle = hexA(theme.tokens.cyan, 0.16 * glow);
         fctx.beginPath();
         fctx.roundRect(x - 3, y - 1, nw + 6, KEY_H + 1, 4.5);
         fctx.fill();
@@ -742,7 +744,7 @@
     const contentTicks = midi.effectiveContentLengthTicks(c);
     const posInContent = ((posTicks % contentTicks) + contentTicks) % contentTicks;
     const secPerTick = 60 / (project.tempoBpm * midi.ppq);
-    const MAG = "#ff4fd8";
+    const MAG = theme.tokens.magenta;
     fctx.globalCompositeOperation = "lighter";
     const keySustain = new Map<number, number>();
     const keyFlare = new Map<number, number>();
@@ -769,7 +771,7 @@
           fctx.roundRect(x - 2.5, y - 1, nw + 5, KEY_H, 4);
           fctx.stroke();
           // hot white core — at peak the note body reads solid white
-          fctx.fillStyle = `rgba(255,255,255,${Math.min(1, 0.95 * flare).toFixed(3)})`;
+          fctx.fillStyle = alpha(theme.tokens.textOnAccent, Math.min(1, 0.95 * flare));
           fctx.beginPath();
           fctx.roundRect(x - 0.5, y + 1, nw + 1, KEY_H - 2, 2.5);
           fctx.fill();
@@ -1068,7 +1070,7 @@
     border-left: none;
     border-right: none;
     border-bottom: none;
-    background: rgba(8, 10, 19, 0.92);
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
     position: relative;
     z-index: 10;
   }
@@ -1079,7 +1081,7 @@
     gap: 10px;
     height: 36px;
     padding: 0 12px;
-    border-bottom: 1px solid var(--glass-border);
+    border-bottom: var(--border-width) solid var(--glass-border);
     flex: none;
   }
   .tabs {
@@ -1092,7 +1094,7 @@
     letter-spacing: 0.18em;
     padding: 3px 10px;
     border-radius: 999px;
-    border: 1px solid transparent;
+    border: var(--border-width) solid transparent;
     background: transparent;
     color: var(--text-dim);
     cursor: pointer;
@@ -1123,8 +1125,8 @@
     letter-spacing: 0.1em;
     padding: 3px 8px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(5, 7, 13, 0.5);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.5);
     color: var(--text-dim);
     cursor: pointer;
   }
@@ -1146,7 +1148,7 @@
     font-size: 9px;
     padding: 3px 6px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
@@ -1168,7 +1170,7 @@
     cursor: pointer;
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--violet));
-    box-shadow: 0 0 12px rgba(82, 229, 255, 0.3);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.3);
   }
   .infill:hover {
     filter: brightness(1.15);
@@ -1234,7 +1236,7 @@
     left: 0;
     width: 1px;
     background: var(--cyan);
-    box-shadow: 0 0 6px var(--cyan-dim);
+    box-shadow: 0 0 var(--glow-blur) var(--cyan-dim);
     pointer-events: none;
     will-change: transform;
   }
@@ -1242,11 +1244,11 @@
   .scrollrow {
     flex: none;
     display: flex;
-    border-top: 1px solid rgba(96, 130, 190, 0.12);
+    border-top: 1px solid rgb(var(--line-rgb) / 0.12);
   }
   .scrollcorner {
     flex: none;
-    border-right: 1px solid rgba(96, 130, 190, 0.25);
+    border-right: 1px solid rgb(var(--line-rgb) / 0.25);
   }
 
   .velrow {
@@ -1259,7 +1261,7 @@
     align-items: center;
     justify-content: flex-end;
     padding-right: 10px;
-    border-right: 1px solid rgba(96, 130, 190, 0.25);
+    border-right: 1px solid rgb(var(--line-rgb) / 0.25);
   }
   .vel {
     flex: 1;
@@ -1271,6 +1273,6 @@
   .hints {
     flex: none;
     padding: 4px 12px 6px;
-    border-top: 1px solid rgba(96, 130, 190, 0.08);
+    border-top: 1px solid rgb(var(--line-rgb) / 0.08);
   }
 </style>

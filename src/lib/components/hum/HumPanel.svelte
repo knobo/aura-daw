@@ -335,14 +335,14 @@
     font-size: 10px;
     letter-spacing: 0.16em;
     border-radius: 5px;
-    border: 1px solid rgba(255, 65, 82, 0.35);
-    background: rgba(255, 65, 82, 0.07);
-    color: rgba(255, 120, 130, 0.9);
+    border: var(--border-width) solid rgb(var(--red-rgb) / 0.35);
+    background: rgb(var(--red-rgb) / 0.07);
+    color: rgb(var(--red-rgb) / 0.9);
     cursor: pointer;
     transition: box-shadow 120ms;
   }
   .rec:hover:not(:disabled) {
-    box-shadow: 0 0 12px rgba(255, 65, 82, 0.25);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.25);
   }
   .rec:disabled {
     opacity: 0.4;
@@ -355,7 +355,7 @@
   }
   @keyframes rec-pulse {
     50% {
-      box-shadow: 0 0 4px rgba(255, 65, 82, 0.1);
+      box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.1);
     }
   }
   .hint {
@@ -372,7 +372,7 @@
     font-size: 8px;
     letter-spacing: 0.16em;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
@@ -386,9 +386,9 @@
   input[type="text"],
   input[type="number"] {
     width: 100%;
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 11px;
     padding: 6px 8px;
@@ -452,8 +452,8 @@
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--magenta), var(--violet));
     box-shadow:
-      0 0 14px rgba(255, 79, 216, 0.3),
-      0 0 22px rgba(157, 123, 255, 0.2);
+      0 0 14px rgb(var(--magenta-rgb) / 0.3),
+      0 0 22px rgb(var(--violet-rgb) / 0.2);
   }
   .run:hover:not(:disabled) {
     filter: brightness(1.15);
@@ -468,7 +468,7 @@
   .zyn {
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--violet), var(--cyan));
-    box-shadow: 0 0 14px rgba(157, 123, 255, 0.25);
+    box-shadow: 0 0 14px rgb(var(--violet-rgb) / 0.25);
   }
   .zyn:hover:not(:disabled) {
     filter: brightness(1.15);
@@ -478,7 +478,7 @@
     cursor: wait;
   }
   .again {
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-dim);
   }
@@ -490,10 +490,10 @@
   /* staged analysis */
   .jobbox {
     position: relative;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
     padding: 9px 11px 11px;
-    background: rgba(10, 13, 23, 0.6);
+    background: rgb(var(--bg-1-rgb) / 0.6);
     overflow: hidden;
   }
   .jobbox.live {
@@ -513,9 +513,9 @@
     background: linear-gradient(
       90deg,
       transparent,
-      rgba(255, 79, 216, 0.12) 35%,
-      rgba(255, 79, 216, 0.3) 50%,
-      rgba(157, 123, 255, 0.2) 65%,
+      rgb(var(--magenta-rgb) / 0.12) 35%,
+      rgb(var(--magenta-rgb) / 0.3) 50%,
+      rgb(var(--violet-rgb) / 0.2) 65%,
       transparent
     );
     mix-blend-mode: screen;
@@ -561,30 +561,30 @@
     letter-spacing: 0.1em;
     padding: 2px 6px;
     border-radius: 3px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     color: var(--text-faint);
   }
   .stagechip.onstage {
     color: var(--magenta);
     border-color: var(--magenta-dim);
-    box-shadow: 0 0 8px rgba(255, 79, 216, 0.2);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.2);
   }
   .stagechip.donestage {
-    color: #5cf2b8;
-    border-color: rgba(92, 242, 184, 0.3);
+    color: var(--green);
+    border-color: rgb(var(--green-rgb) / 0.3);
   }
   .pbar {
     margin-top: 7px;
     height: 3px;
     border-radius: 2px;
-    background: rgba(96, 130, 190, 0.15);
+    background: rgb(var(--line-rgb) / 0.15);
     overflow: hidden;
     position: relative;
   }
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--magenta), var(--violet));
-    box-shadow: 0 0 8px rgba(255, 79, 216, 0.5);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.5);
     transition: width 160ms linear;
   }
   .log {
@@ -593,9 +593,9 @@
     font-size: 9px;
     line-height: 1.5;
     color: var(--text-dim);
-    background: rgba(5, 7, 13, 0.75);
+    background: rgb(var(--bg-0-rgb) / 0.75);
     border-radius: 4px;
-    border: 1px solid rgba(96, 130, 190, 0.1);
+    border: var(--border-width) solid rgb(var(--line-rgb) / 0.1);
     white-space: pre-wrap;
     word-break: break-all;
     max-height: 52px;
@@ -604,10 +604,10 @@
 
   /* landed */
   .landed {
-    border: 1px solid rgba(92, 242, 184, 0.3);
+    border: var(--border-width) solid rgb(var(--green-rgb) / 0.3);
     border-radius: 6px;
     padding: 9px 11px;
-    background: rgba(92, 242, 184, 0.05);
+    background: rgb(var(--green-rgb) / 0.05);
     display: flex;
     flex-direction: column;
     gap: 3px;
@@ -615,8 +615,8 @@
   .okline {
     font-size: 10px;
     letter-spacing: 0.18em;
-    color: #5cf2b8;
-    text-shadow: 0 0 10px rgba(92, 242, 184, 0.4);
+    color: var(--green);
+    text-shadow: 0 0 10px rgb(var(--green-rgb) / 0.4);
   }
   .okmeta {
     letter-spacing: 0.1em;
@@ -627,7 +627,7 @@
   }
   .accdone {
     font-size: 9px;
-    color: #5cf2b8;
+    color: var(--green);
   }
   .spin {
     display: inline-block;
