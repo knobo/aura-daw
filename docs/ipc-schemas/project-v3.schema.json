@@ -83,6 +83,10 @@
       "type": "array",
       "items": { "$ref": "aura:ipc/midi-launch.schema.json#/$defs/launchMap" }
     },
+    "harmony": {
+      "description": "The Composer's harmony document (Plan H1): key spans + chord regions in ticks. ADDITIVE and OPTIONAL — persist.rs writes this key only when the document is non-empty and REMOVES it when it becomes empty again, so a project that never used the Composer resaves byte-diff-free and schemaVersion does not move. Shape: harmony.schema.json. A malformed block is logged and dropped rather than failing the open.",
+      "$ref": "aura:ipc/harmony.schema.json"
+    },
     "launchBindings": {
       "description": "LEGACY read path: flat MIDI launch map from before named launchers. persist.rs migrates this (plus launchDriveClipIds) into launchMaps[0] when launchMaps is absent or empty. Never written on save.",
       "type": "array",

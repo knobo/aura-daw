@@ -1970,10 +1970,11 @@ export class DemoBackend implements Backend {
       // The fixture's one rule, and it is the real one: a scale note a
       // semitone above a chord tone is an avoid note.
       const above = tones.includes((pc + 11) % 12);
+      // Role by POSITION in the fixture's stack (root, third, fifth), so the
+      // tint's colours mean the same thing in demo mode as in the real app.
+      const CHORD_ROLES: NoteRole[] = ["root", "third", "fifth", "seventh"];
       const role: NoteRole = chordTone
-        ? pc === tones[0]
-          ? "root"
-          : "third"
+        ? (CHORD_ROLES[tones.indexOf(pc)] ?? "extension")
         : inScale
           ? above
             ? "avoid"

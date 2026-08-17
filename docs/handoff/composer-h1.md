@@ -4,7 +4,7 @@ Branch `feat/composer-assistant`, worktree `.claude/worktrees/composer`,
 branched from `origin/main` at `79c3e98`.
 
 **What this is.** The spine of the Composer: a pure music-theory library, a
-harmony document in the core document model, six generators, five additive
+harmony document in the core document model, five generators, five additive
 commands, a panel, and a piano roll that colours its own keys by what each note
 does over the chord in force. Every later phase (H2–H6 in the product doc) is a
 *reader* of what this built.
@@ -24,7 +24,9 @@ does over the chord in force. Every later phase (H2–H6 in the product doc) is 
 | `34e6a1e` | the harmony document + progression / voicing / melody / groove generators |
 | `9ae6267` | `MidiStore.harmony`, `Op::HarmonySet`, persistence, the published snapshot, `control/composer.rs`, the five commands, `theory/bass.rs`, the TS surface |
 | `3b2d701` | the COMPOSER panel, the circle widget, the progression strip, the store, the piano-roll tint, the demo fixture |
-| this one | docs: README, ARCHITECTURE §16, schemas, counts, this file |
+| `6256f83` | docs: README, ARCHITECTURE §16, the wire schemas, counts, this file |
+| `f619dbe` | the three field-by-field copies that were missing the harmony document, each with the test that fails without the fix |
+| this one | the pre-existing hum-test race, diagnosed and fixed (see "Where the numbers came from") |
 
 ## The decisions that will bite if they are forgotten
 
@@ -78,6 +80,21 @@ does over the chord in force. Every later phase (H2–H6 in the product doc) is 
 * **Try it in a minor key and in 3/4.** Both are covered by tests, neither has
   been heard.
 
+## The rough edge you will hit first
+
+**Generating twice makes a second set of tracks.** Each `composer_generate` is
+an independent sketch: with no `trackIds` it creates the tracks it needs, so
+pressing GENERATE again gives you `Composer Chords 2` and friends. That is
+deliberate for H1 and the alternative is worse — reusing the same tracks would
+drop a second clip on top of the first at the same tick, and two MIDI clips at
+one position both play, so you would hear doubled notes rather than a new idea.
+
+The workflow that works today is **Ctrl+Z, re-roll the seed, GENERATE** — one
+undo removes the whole sketch, which is exactly what H-7's single transaction
+bought. A proper "replace the last sketch" (remember the clips, remove them in
+the same transaction that writes the new ones) is a small, well-shaped follow-up
+and belongs in H2 with the rest of the editing surface.
+
 ## Deliberately not done (and why)
 
 * **No MCP tools.** The roster stays frozen this round (H-12/ruling 10).
@@ -103,7 +120,17 @@ Counts measured on this branch, `--test-threads=1`, against a real ALSA sink
 (see CONTRIBUTING for why both matter). Baseline at branch point was 1083
 backend + 738 frontend.
 
-The one flake seen during this work was a single unnamed failure in an
-otherwise-green parallel `cargo test` run that did not reproduce in two
-subsequent single-threaded runs — consistent with the `midi_out::tests`
-module-level flake CONTRIBUTING already documents, not with anything here.
+**One pre-existing flake surfaced, was diagnosed, and is fixed here.**
+`control::hum::tests::apply_hum_clip_commits_synchronously_and_announces_project_changed`
+asserted `rev == before_rev + 1` ("one commit, one rev bump") while its fixture
+runs a REAL engine — and opening the output stream submits a transient
+`Set{Transport, SampleRate}` commit from the engine control thread
+(`engine::commit_output_sample_rate`), which races the `before_rev` read. It
+failed in roughly half of the full single-threaded runs on this branch and
+passed 15/15 in isolation; a clean `main` lib run passed, which is consistent
+with a timing race that a 160-test-longer suite is simply more likely to lose.
+The assertion now measures the UNDO DEPTH instead: transient commits never
+enter history, so one non-transient commit is exactly one undo entry, and the
+check is both race-free and closer to what the test means. `rev` is still
+asserted to advance. Nothing in the Composer commits on that path — the flake
+is not a regression, it is an assertion that was always racy.
