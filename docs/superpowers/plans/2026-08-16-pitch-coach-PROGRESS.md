@@ -196,11 +196,12 @@ report, docs + PR.
       tests, `svelte-check` 0 errors, `npm run build` green.
 - [x] Task 16 — `docs/pitch-coach.md`, ARCHITECTURE §3.3/§3.4/§5.1/§7, the
       README feature section, the count docs.
-- [x] Pre-PR gate, 2026-08-17. **1002/1020 lib** (the 18 are the box, not the
-      branch — reproduced on `main`, see the environment warning), **36/36
-      integration**, **593 frontend**, `svelte-check` 0 errors (1 pre-existing
-      a11y warning in `LaunchMapPanel.svelte`), `npm run build` green. Counts
-      landed in README + CONTRIBUTING: 1056 Rust, 593 frontend.
+- [x] Pre-PR gate, 2026-08-17. **1020/1020 lib** and **36/36 integration**
+      (single-threaded, with the default sink off Bluetooth — see the
+      environment warning), **593 frontend**, `svelte-check` 0 errors (1
+      pre-existing a11y warning in `LaunchMapPanel.svelte`), `npm run build`
+      green. Counts landed in README + CONTRIBUTING: 1056 Rust, 593 frontend.
+      **CI is green on both jobs** (PR #61: frontend 36 s, Rust 12m30s).
 
 - [x] Review round on the branch — `f287723`. Eight findings fixed; three of
       them produced wrong NUMBERS (chord clustering was transitive, the
@@ -309,21 +310,30 @@ Both of these came out of actually running the detector against a voice
 
 ## Environment warning (read before running the suite)
 
-**2026-08-17: 18 lib tests fail on this box for reasons that have nothing to
-do with any branch.** Measured, not assumed: they fail identically on
-`origin/main` `cf224ce` with none of phase 3's code checked out, and they fail
-the same way in isolation on a quiet box, so this is not the concurrency flake
-described below. The engine simply never starts —
-`engine_pumps_meter_frames_at_60hz` gets 0 frames in 10 s,
-`transport_advances_headless_or_with_device` never leaves position 0, and
-every `control::loopjam` test dies on `"audio engine did not respond"`. The
-set is `audio::engine` (4), `control::loopjam` (9), `control::tests` (4, the
-transport/loop ones) and `mcp::server::tests::read_meters_hears_the_headless_engine`.
+**A Bluetooth default sink fails 18 lib tests, and it looks exactly like a
+regression.** Found 2026-08-17 and worth knowing before you debug anything
+else: with `pactl get-default-sink` reporting a `bluez_output.*`, the engine
+opens a stream and publishes a sample rate — the first assert passes — and
+then **no callback ever arrives**. The transport stays at position 0, no meter
+frames are produced, and every `control::loopjam` test dies on
+`"audio engine did not respond"`. The set is `audio::engine` (4, including
+both `ensure_loaded_builds_pyramids*`), `control::loopjam` (9),
+`control::tests` (4 transport/loop ones) and
+`mcp::server::tests::read_meters_hears_the_headless_engine`.
 
-Swap has been at 15/15 GB for days; that is the leading suspect. **Do not read
-these as a regression, and do not "fix" them** — reproduce against `main`
-first, exactly as above. Everything else is green: 1002/1020 lib and 36/36
-integration.
+The fix is one env var, and it changes nothing globally — the user's audio
+stays where they put it:
+
+```sh
+PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
+  cargo test -- --test-threads=1
+```
+
+**1020/1020 lib in 72 s** that way, against 1002/1020 in 882 s over Bluetooth
+— the timeouts *were* the runtime. Two things this cost, so you do not repeat
+them: the same failures reproduce on `origin/main` with none of the branch
+checked out (that is how the branch was cleared), and they are NOT memory
+pressure — the owner freed 9 GB and all 18 still failed.
 
 This box is under memory pressure: **swap is fully consumed (15/15 GB)** and
 other worktrees run `cargo test` concurrently. A full `cargo test` therefore
@@ -383,6 +393,16 @@ After finishing each task: tick its box, and add a line under the log below
 with the commit sha and anything the next agent would be surprised by.
 
 ## Log
+
+- 2026-08-17 — **The 18 "engine never starts" failures were the default audio
+  sink being a Bluetooth device.** Recorded because two plausible explanations
+  were wrong first: it is not the branch (the same failures reproduce on
+  `origin/main` `cf224ce`), and it is not memory pressure (the owner freed
+  9 GB and all 18 still failed). Pointing one test process at the HDMI sink
+  turned a 10 s timeout into a 0.23 s pass, and the whole suite into
+  **1020/1020 in 72 s**. See the environment warning for the command. The
+  symptom to recognise: the engine publishes a sample rate — so "the engine
+  started" — and then no callback ever arrives.
 
 - 2026-08-17 — **Phase 3 reviewed and fixed** (`f287723`). Eight findings.
   Six things the next agent should know:
