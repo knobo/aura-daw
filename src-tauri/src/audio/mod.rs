@@ -557,55 +557,82 @@ fn pitch_frames_on_timeline(
 
 /// Analyse a clip's audio and (re)write its pitch track. Returns the number
 /// of frames. Idempotent, and the only way to give an older take a curve.
+///
+/// `async` + `spawn_blocking` for the same reason as `seed_demo_project`:
+/// sync commands run on the MAIN thread, which on Linux is the GTK main loop
+/// the WebKitGTK webview draws on. Analysing a three-minute take is a couple
+/// of seconds, and on the main thread that is a couple of seconds in which
+/// the panel's own "ANALYSING THE TAKE…" state cannot paint. The session lock
+/// is taken and released BEFORE the move, so the audio thread's control plane
+/// is never held across the analysis.
 #[tauri::command]
-pub fn pitch_analyze_clip(clip_id: String, state: State<'_, AudioState>) -> Result<usize, String> {
+pub async fn pitch_analyze_clip(
+    clip_id: String,
+    state: State<'_, AudioState>,
+) -> Result<usize, String> {
     let (dir, clip) = clip_for_pitch(&state, &clip_id)?;
-    let wav = dir.join(&clip.source_path);
-    let (channels, rate, samples) = crate::control::import::decode_audio(&wav)?;
-    let track = pitch_store::analyze_interleaved(&samples, channels, rate);
-    pitch_store::write_track(&pitch_store::track_path(&dir, &clip_id), &track)?;
-    Ok(track.frames.len())
+    tauri::async_runtime::spawn_blocking(move || {
+        let wav = dir.join(&clip.source_path);
+        let (channels, rate, samples) = crate::control::import::decode_audio(&wav)?;
+        let track = pitch_store::analyze_interleaved(&samples, channels, rate);
+        pitch_store::write_track(&pitch_store::track_path(&dir, &clip_id), &track)?;
+        Ok(track.frames.len())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// The clip's pitch curve on the timeline, thinned to at most `max_points`
 /// (default 2000 — a wide screen has fewer pixels than a minute has frames).
+///
+/// `async` + `spawn_blocking`: a missing cache makes this an analysis (see
+/// [`pitch_analyze_clip`]).
 #[tauri::command]
-pub fn pitch_track(
+pub async fn pitch_track(
     clip_id: String,
     max_points: Option<u32>,
     state: State<'_, AudioState>,
 ) -> Result<PitchTrackView, String> {
     let (dir, clip) = clip_for_pitch(&state, &clip_id)?;
     let project_rate = state.shared.sample_rate.load(Relaxed).max(1);
-    let track = ensure_pitch_track(&dir, &clip)?;
-    let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
-    let cap = max_points.unwrap_or(2000).max(1) as usize;
-    let stride = frames.len().div_ceil(cap).max(1);
-    Ok(PitchTrackView {
-        clip_id,
-        source_rate: track.rate,
-        hop: track.hop,
-        provenance: track.provenance,
-        total_points: frames.len(),
-        points: frames
-            .iter()
-            .step_by(stride)
-            .map(|f| PitchPoint {
-                sample: f.sample,
-                midi: f.midi,
-                clarity: f.clarity,
-                voiced: f.voiced,
-            })
-            .collect(),
+    tauri::async_runtime::spawn_blocking(move || {
+        let track = ensure_pitch_track(&dir, &clip)?;
+        let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
+        let cap = max_points.unwrap_or(2000).max(1) as usize;
+        let stride = frames.len().div_ceil(cap).max(1);
+        Ok(PitchTrackView {
+            clip_id,
+            source_rate: track.rate,
+            hop: track.hop,
+            provenance: track.provenance,
+            total_points: frames.len(),
+            points: frames
+                .iter()
+                .step_by(stride)
+                .map(|f| PitchPoint {
+                    sample: f.sample,
+                    midi: f.midi,
+                    clarity: f.clarity,
+                    voiced: f.voiced,
+                })
+                .collect(),
+        })
     })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Score a recorded take against a MIDI track's melody.
 ///
 /// Scores are never persisted (spec): recomputing means the report stays
 /// correct after the reference melody is edited.
+///
+/// `async` + `spawn_blocking` for the analysis half (see
+/// [`pitch_analyze_clip`]). The reference melody is derived first, under the
+/// session lock, and only owned data crosses onto the blocking pool — this
+/// command must never hold the session lock while it decodes a take.
 #[tauri::command]
-pub fn pitch_score(
+pub async fn pitch_score(
     clip_id: String,
     reference_track_id: String,
     tolerance_cents: f32,
@@ -626,18 +653,22 @@ pub fn pitch_score(
         for c in midi.clips.iter().filter(|c| c.track_id == reference_track_id) {
             notes.extend(crate::midi::schedule::clip_notes(c, &map));
         }
-        control::pitch_coach::reference_melody(notes)
+        control::pitch_coach::reference_melody(notes, project_rate)
     };
     if reference.is_empty() {
         return Err(format!("track {reference_track_id} has no notes to score against"));
     }
 
-    let track = ensure_pitch_track(&dir, &clip)?;
-    let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
-    let mut report =
-        control::pitch_coach::score(&reference, &frames, project_rate, tolerance_cents);
-    report.reference_track_id = reference_track_id;
-    Ok(report)
+    tauri::async_runtime::spawn_blocking(move || {
+        let track = ensure_pitch_track(&dir, &clip)?;
+        let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
+        let mut report =
+            control::pitch_coach::score(&reference, &frames, project_rate, tolerance_cents);
+        report.reference_track_id = reference_track_id;
+        Ok(report)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Pitch-batch bridge (control thread -> Tauri IPC channel).

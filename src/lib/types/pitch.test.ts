@@ -81,6 +81,7 @@ describe("pitch wire types", () => {
     } satisfies NoteScore;
     const report = {
       notes: [note],
+      scoredNotes: 1,
       inTolerancePct: 0,
       meanAbsCents: 0,
       medianSignedCents: 0,

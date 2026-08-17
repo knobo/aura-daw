@@ -10,6 +10,7 @@ import {
   laneScrollFor,
   laneWindowFor,
   rehearseKeyMatches,
+  rehearseKeyReleases,
   stabilityCents,
   targetNotesFor,
 } from "./panel-logic";
@@ -140,6 +141,33 @@ describe("rehearseKeyMatches", () => {
   });
 });
 
+describe("rehearseKeyReleases", () => {
+  it("releases on the key that started the hold", () => {
+    expect(rehearseKeyReleases("h", "h")).toBe(true);
+    expect(rehearseKeyReleases("h", "H")).toBe(true);
+  });
+
+  /** The take-corruption case: any other keyup ending the hold means the
+   * engine starts committing real audio while the rehearse key is still
+   * physically down, and the later real keyup is a no-op. */
+  it("does not release on a different key", () => {
+    expect(rehearseKeyReleases("h", "Shift")).toBe(false);
+    expect(rehearseKeyReleases("h", "ArrowLeft")).toBe(false);
+    expect(rehearseKeyReleases("h", "j")).toBe(false);
+  });
+
+  it("is a no-op when no hold is down", () => {
+    expect(rehearseKeyReleases(null, "h")).toBe(false);
+  });
+
+  /** Compared against what went DOWN, not against the preference: changing
+   * the key mid-hold must not strand the engine writing silence. */
+  it("releases a key that is no longer the configured one", () => {
+    expect(rehearseKeyMatches("j", "h")).toBe(false);
+    expect(rehearseKeyReleases("h", "h")).toBe(true);
+  });
+});
+
 const clip = (over: Partial<MidiClip> = {}): MidiClip => ({
   id: "c1",
   trackId: "t1",
@@ -188,6 +216,13 @@ describe("targetNotesFor", () => {
   it("applies the placement transpose, so the target is the note that sounds", () => {
     const notes = targetNotesFor([clip({ transposeSemitones: -12 })], toSamples);
     expect(notes[0].key).toBe(48);
+  });
+
+  /** The backend's `clip_note_key_vel` clamps, so an unclamped lane would
+   * colour its bar against a different target than the report's row. */
+  it("clamps a transpose that leaves the MIDI range, like the backend does", () => {
+    expect(targetNotesFor([clip({ transposeSemitones: 96 })], toSamples)[0].key).toBe(127);
+    expect(targetNotesFor([clip({ transposeSemitones: -96 })], toSamples)[0].key).toBe(0);
   });
 
   it("offsets by the clip's timeline start", () => {

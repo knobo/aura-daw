@@ -46,6 +46,18 @@ where a lead line usually sits. Those notes are still drawn, but they are
 flagged in the report (a `◇` marker) and left out of the totals — the melody
 was guessed, and a guess should not move your score.
 
+What counts as a chord is **notes that start together** (within 30 ms), not
+notes that merely overlap. A melody drawn legato overlaps itself at every
+note, and grouping by overlap is transitive: one overhanging note would chain
+the whole phrase into a single target. A note that another note *covers*
+(more than half of the shorter one) is still flagged, so a drone held under
+the tune is not silently treated as the melody.
+
+If **every** reference note came out of a chord, the report says so instead of
+showing a score: there is no unambiguous note left to compute one from, and a
+0 % on a take that was sung well would be a lie. Pick a track that carries a
+single line.
+
 ## The report
 
 Recording a take with a reference selected scores it, note by note, and shows
@@ -59,7 +71,7 @@ The header:
 
 | | |
 |---|---|
-| the big percentage | how much of the take landed inside the tolerance, weighted by note length |
+| the big percentage | how much of the take landed inside the tolerance, weighted by note length. Material you did not sing counts as outside it, so one in-tune blip per note cannot read as a perfect take |
 | the word beside it | the same number in English: Finding it → Getting there → Solid → Sharp → Locked in |
 | **off by** | mean absolute error, in cents |
 | **lean** | median *signed* error. The sign is the actionable half: "consistently 30 cents flat" is advice, "off by 30 cents" is not |
@@ -83,6 +95,10 @@ skipped and a note you sang badly both score 0 on **hit**, and the advice
 differs completely; **sung** is what separates them. A row that was barely
 sung is dimmed and its timing reads `—`, because an entry offset measured
 over three frames is noise.
+
+Per row, **hit** is a share of what you *sang* — the headline is the one that
+also counts the silence, which is why a row can read 100 % while the take
+does not.
 
 ## Rehearse hold
 

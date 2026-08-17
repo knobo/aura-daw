@@ -118,6 +118,23 @@ export function rehearseKeyMatches(pref: string, key: string): boolean {
 }
 
 /**
+ * Does this `keyup` end the hold that `heldKey` started?
+ *
+ * Two things it must get right, and they pull in opposite directions:
+ *
+ * * It compares against the key that WENT DOWN, not against the preference.
+ *   Changing the rehearse key (or setting it to OFF) while the key is
+ *   physically held would otherwise mean no matching release ever arrives,
+ *   and the engine keeps writing silence into a running take.
+ * * It compares at all. Releasing on any keyup ends the hold when the singer
+ *   taps Shift with the rehearse key still down, and the take starts
+ *   committing real audio mid-rehearsal.
+ */
+export function rehearseKeyReleases(heldKey: string | null, key: string): boolean {
+  return heldKey !== null && key.toLowerCase() === heldKey;
+}
+
+/**
  * Reference-melody notes as sample spans, repeats expanded.
  *
  * The repeat rule is the timeline preview's (`utils/midi-preview.ts`):
@@ -154,7 +171,11 @@ export function targetNotesFor(
           noteId: out.length,
           startSample: toSamples(clip.timelineStartTicks + tick),
           endSample: toSamples(clip.timelineStartTicks + endTick),
-          key: note.key + transpose,
+          // Clamped like the backend's `clip_note_key_vel`: a transpose that
+          // pushes a note past the MIDI range is scored against the clamped
+          // key, and an unclamped lane would colour the bar against a
+          // different target than the report's row.
+          key: Math.max(0, Math.min(127, note.key + transpose)),
         });
       }
     }

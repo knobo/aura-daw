@@ -43,6 +43,16 @@ pub const HIT_LEAVE_FRAMES: usize = 3;
 pub const ONSET_LOOKBACK_MS: f32 = 250.0;
 /// Peak-to-peak wobble below which a "vibrato rate" is noise, not vibrato.
 const VIBRATO_FLOOR_CENTS: f32 = 20.0;
+/// Notes that start this close together are one chord. Grouping by ONSET is
+/// what keeps a legato melody a melody: grouping by "overlaps the cluster so
+/// far" is transitive, and one note overhanging the next chains the whole
+/// phrase into a single target (see
+/// `reference_melody_keeps_a_legato_phrase_separate`).
+const CHORD_ONSET_MS: f32 = 30.0;
+/// Share of the shorter note that two notes must share before the melody
+/// line is a guess. A legato overhang of a few ticks is not a chord; a drone
+/// held under the tune covers its whole length and is.
+const AMBIGUOUS_OVERLAP: f32 = 0.5;
 
 /// How one reference note was sung.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -85,6 +95,13 @@ pub struct NoteScore {
 #[serde(rename_all = "camelCase")]
 pub struct PitchScoreReport {
     pub notes: Vec<NoteScore>,
+    /// How many of `notes` the aggregates were computed from — the ones that
+    /// are not `ambiguous`. **Zero means the summary numbers mean nothing**
+    /// (every reference note came out of a chord), which is a different
+    /// story from a score of zero and has to be shown as one.
+    pub scored_notes: usize,
+    /// Share of the scored notes' duration that landed inside the tolerance,
+    /// counting silence as outside it. Meaningless when `scored_notes == 0`.
     pub in_tolerance_pct: f32,
     pub mean_abs_cents: f32,
     pub median_signed_cents: f32,
@@ -102,25 +119,38 @@ pub struct PitchScoreReport {
 /// Chord resolution is Rust-side on purpose (ADR 0006): the panel draws
 /// every note of the reference track, and only the backend decides which
 /// one the singer is being scored against.
-pub fn reference_melody(mut notes: Vec<AbsNote>) -> Vec<(AbsNote, bool)> {
+///
+/// Clustering is by ONSET ([`CHORD_ONSET_MS`]), not by overlap. Overlap is
+/// transitive and a melody drawn legato — every note overhanging the next by
+/// a tick — would collapse into one target covering the whole phrase, which
+/// leaves a report with a single row and nothing scoreable. A note that
+/// another note nonetheless covers ([`AMBIGUOUS_OVERLAP`] of the shorter
+/// one) is still flagged: a drone held under the tune makes the lead line a
+/// guess whether or not it shares an onset with it.
+pub fn reference_melody(mut notes: Vec<AbsNote>, rate: u32) -> Vec<(AbsNote, bool)> {
     notes.sort_by_key(|n| (n.start, n.key));
-    let mut out: Vec<(AbsNote, bool)> = Vec::new();
-    let mut cluster: Vec<AbsNote> = Vec::new();
-    let mut cluster_end = 0u64;
-    for n in notes {
-        if cluster.is_empty() || n.start < cluster_end {
-            cluster_end = cluster_end.max(n.end);
-            cluster.push(n);
-        } else {
-            out.push(top_of(&cluster));
-            cluster_end = n.end;
-            cluster = vec![n];
+    let eps = ms_to_samples(CHORD_ONSET_MS, rate);
+    let mut groups: Vec<Vec<AbsNote>> = Vec::new();
+    for n in notes.iter().copied() {
+        match groups.last_mut() {
+            Some(g) if n.start.saturating_sub(g[0].start) <= eps => g.push(n),
+            _ => groups.push(vec![n]),
         }
     }
-    if !cluster.is_empty() {
-        out.push(top_of(&cluster));
-    }
-    out
+    groups
+        .iter()
+        .map(|g| {
+            let (top, chord) = top_of(g);
+            // `notes` here, not the surviving targets: the note that makes a
+            // melody ambiguous is usually the one chord resolution just
+            // discarded.
+            // `*o != top`, not a `note_id` comparison: every repeat of a
+            // looped clip's content carries the same `note_id`, so a note
+            // would find itself in the next pass.
+            let covered = notes.iter().any(|o| *o != top && substantially_overlaps(&top, o));
+            (top, chord || covered)
+        })
+        .collect()
 }
 
 /// The highest note of a cluster, flagged ambiguous when the cluster held
@@ -128,6 +158,13 @@ pub fn reference_melody(mut notes: Vec<AbsNote>) -> Vec<(AbsNote, bool)> {
 fn top_of(cluster: &[AbsNote]) -> (AbsNote, bool) {
     let top = *cluster.iter().max_by_key(|n| n.key).expect("cluster is non-empty");
     (top, cluster.len() > 1)
+}
+
+/// Do these two notes share [`AMBIGUOUS_OVERLAP`] of the shorter one?
+fn substantially_overlaps(a: &AbsNote, b: &AbsNote) -> bool {
+    let overlap = a.end.min(b.end).saturating_sub(a.start.max(b.start));
+    let shorter = (a.end - a.start).min(b.end - b.start);
+    shorter > 0 && overlap as f32 >= AMBIGUOUS_OVERLAP * shorter as f32
 }
 
 /// Score `frames` (sorted by `sample`, project-domain positions) against a
@@ -158,14 +195,24 @@ pub fn score(
     let clean: Vec<&NoteScore> = notes.iter().filter(|n| !n.ambiguous).collect();
 
     let weight: f32 = clean.iter().map(|n| (n.end_sample - n.start_sample) as f32).sum();
+    // `hit_fraction * coverage`, not `hit_fraction` alone. `hit_fraction` is
+    // measured over the frames the singer VOICED, so one in-tune blip per
+    // note would otherwise claim the note's whole duration and report
+    // "Locked in" for a take that was mostly silence. The headline claims to
+    // be how much of the take landed inside the tolerance; that has to
+    // include the part that was not sung at all.
     let in_tolerance_pct = if weight > 0.0 {
         100.0
             * clean
                 .iter()
-                .map(|n| n.hit_fraction * (n.end_sample - n.start_sample) as f32)
+                .map(|n| n.hit_fraction * n.coverage * (n.end_sample - n.start_sample) as f32)
                 .sum::<f32>()
             / weight
     } else {
+        // Nothing scoreable is NOT the worst possible score: a reference
+        // track that is all chords would otherwise report 0 % "Finding it"
+        // for a flawless take. `scored_notes == 0` is what the report shows
+        // instead of a number.
         0.0
     };
     let mean_abs_cents = if all_cents.is_empty() {
@@ -182,6 +229,7 @@ pub fn score(
     };
 
     PitchScoreReport {
+        scored_notes: clean.len(),
         notes,
         in_tolerance_pct,
         mean_abs_cents,
@@ -220,6 +268,16 @@ pub fn cents_to_key(midi: f32, key: u8) -> f32 {
     let mut diff = midi - key as f32;
     diff -= 12.0 * (diff / 12.0).round();
     diff * 100.0
+}
+
+/// Undo the ±600 cent fold *in place*, so a series that steps across the
+/// fold boundary stays continuous. Each value is moved by whole octaves until
+/// it is within half an octave of the one before it.
+fn unwrap_octaves(cents: &mut [f32]) {
+    for i in 1..cents.len() {
+        let step = cents[i] - cents[i - 1];
+        cents[i] -= 1200.0 * (step / 1200.0).round();
+    }
 }
 
 fn ms_to_samples(ms: f32, rate: u32) -> u64 {
@@ -294,6 +352,18 @@ fn score_one(
             sustain_smoothed.push(cents);
             sustain_raw.push((f.sample, cents_to_key(f.midi, note.key)));
         }
+    }
+    // Wobble is measured on an UNWRAPPED series. `cents_to_key` folds every
+    // frame into ±600 independently, so a singer sitting about a tritone from
+    // the target flips between +600 and -600 while their voice barely moves —
+    // which reads as 1200 cents of vibrato and a rate invented out of the
+    // fold's own crossings. The reported error stays folded (that is the
+    // octave forgiveness); only the steadiness measures are unwrapped.
+    unwrap_octaves(&mut sustain_smoothed);
+    let mut sustain_unwrapped: Vec<f32> = sustain_raw.iter().map(|(_, c)| *c).collect();
+    unwrap_octaves(&mut sustain_unwrapped);
+    for (slot, c) in sustain_raw.iter_mut().zip(&sustain_unwrapped) {
+        slot.1 = *c;
     }
 
     let hit_fraction = if scored.is_empty() {
@@ -481,7 +551,7 @@ mod tests {
 
     #[test]
     fn a_perfect_run_scores_full_marks() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let rep = score(&r, &sung(0, 1000, 60.0), RATE, 50.0);
         assert!(rep.in_tolerance_pct > 99.0, "got {}", rep.in_tolerance_pct);
         assert!(rep.notes[0].mean_cents.abs() < 1.0);
@@ -493,7 +563,7 @@ mod tests {
     /// consistently 30 cents flat".
     #[test]
     fn a_consistently_flat_run_reports_a_signed_mean() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let rep = score(&r, &sung(0, 1000, 60.0 - 0.30), RATE, 50.0);
         assert!(
             (rep.notes[0].mean_cents + 30.0).abs() < 3.0,
@@ -509,7 +579,7 @@ mod tests {
 
     #[test]
     fn a_semitone_flat_run_is_not_a_hit() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let rep = score(&r, &sung(0, 1000, 59.0), RATE, 50.0);
         assert!(rep.notes[0].hit_fraction < 0.1, "got {}", rep.notes[0].hit_fraction);
         assert_eq!(rep.rating, "Finding it");
@@ -519,7 +589,7 @@ mod tests {
     /// is what stops a trained voice being marked down.
     #[test]
     fn vibrato_within_tolerance_still_counts_as_a_hit() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let frames: Vec<PitchFrame> = sung(0, 1000, 60.0)
             .into_iter()
             .enumerate()
@@ -553,7 +623,7 @@ mod tests {
     /// A consonant is not a mistake: the first 70 ms of a note is free.
     #[test]
     fn an_unvoiced_onset_does_not_penalise_the_note() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let mut frames = sung(0, 1000, 60.0);
         for f in frames.iter_mut().take(6) {
             f.voiced = false;
@@ -568,7 +638,7 @@ mod tests {
 
     #[test]
     fn a_late_entry_is_reported_as_positive_onset_offset() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let rep = score(&r, &sung(120, 1000, 60.0), RATE, 50.0);
         assert!(
             (rep.notes[0].onset_offset_ms - 120.0).abs() < 25.0,
@@ -579,7 +649,7 @@ mod tests {
 
     #[test]
     fn an_early_entry_is_reported_as_negative_onset_offset() {
-        let r = reference_melody(vec![note(1, 60, 500, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 500, 1000)], RATE);
         let rep = score(&r, &sung(400, 1500, 60.0), RATE, 50.0);
         assert!(rep.notes[0].onset_offset_ms < -50.0, "got {}", rep.notes[0].onset_offset_ms);
     }
@@ -589,7 +659,7 @@ mod tests {
     /// onset — a whole verse reported as "seconds early".
     #[test]
     fn a_legato_phrase_does_not_credit_every_note_with_the_first_entry() {
-        let r = reference_melody(vec![note(1, 60, 0, 500), note(2, 62, 500, 500)]);
+        let r = reference_melody(vec![note(1, 60, 0, 500), note(2, 62, 500, 500)], RATE);
         let mut frames = sung(0, 500, 60.0);
         frames.extend(sung(500, 1000, 62.0));
         let rep = score(&r, &frames, RATE, 50.0);
@@ -604,7 +674,7 @@ mod tests {
     /// the two need different advice.
     #[test]
     fn silence_reports_low_coverage_not_a_low_hit_fraction() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let mut frames = sung(0, 1000, 60.0);
         for f in frames.iter_mut() {
             f.voiced = false;
@@ -616,14 +686,14 @@ mod tests {
 
     #[test]
     fn an_octave_slip_is_forgiven_by_folding() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let rep = score(&r, &sung(0, 1000, 72.0), RATE, 50.0);
         assert!(rep.notes[0].hit_fraction > 0.9, "octave folding must absorb this");
     }
 
     #[test]
     fn a_chord_resolves_to_the_top_note_and_is_flagged() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000), note(2, 64, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000), note(2, 64, 0, 1000)], RATE);
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0.key, 64, "lead lines take the top note, never the root");
         assert!(r[0].1, "an overlap must be flagged ambiguous");
@@ -636,7 +706,7 @@ mod tests {
             note(1, 60, 0, 500),
             note(2, 64, 0, 500), // overlap -> ambiguous
             note(3, 62, 500, 500), // clean
-        ]);
+        ], RATE);
         let mut frames = sung(0, 500, 64.0 - 0.9); // badly off on the ambiguous one
         frames.extend(sung(500, 1000, 62.0)); // perfect on the clean one
         let rep = score(&r, &frames, RATE, 50.0);
@@ -650,7 +720,7 @@ mod tests {
 
     #[test]
     fn tolerance_tier_changes_what_counts_as_a_hit() {
-        let r = reference_melody(vec![note(1, 60, 0, 1000)]);
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
         let frames = sung(0, 1000, 60.0 + 0.40); // 40 cents sharp
         assert!(
             score(&r, &frames, RATE, 50.0).notes[0].hit_fraction > 0.9,
@@ -660,6 +730,126 @@ mod tests {
             score(&r, &frames, RATE, 20.0).notes[0].hit_fraction < 0.1,
             "outside pro"
         );
+    }
+
+    /// The bug this guards: clustering by "overlaps the cluster so far" is
+    /// transitive, so a phrase drawn legato — every note overhanging the next
+    /// by a hair — collapsed into ONE target spanning the whole phrase, and
+    /// the report came back with a single row.
+    #[test]
+    fn reference_melody_keeps_a_legato_phrase_separate() {
+        let overhang = 5; // ms of overlap between consecutive notes
+        let r = reference_melody(
+            (0..6)
+                .map(|i| note(i, 60 + i as u8, i as u64 * 500, 500 + overhang))
+                .collect(),
+            RATE,
+        );
+        assert_eq!(r.len(), 6, "a legato phrase is six targets, not one");
+        assert!(
+            r.iter().all(|(_, ambiguous)| !ambiguous),
+            "a few ms of overhang is not a chord"
+        );
+    }
+
+    /// A drone held under the tune makes every note it covers a guess, even
+    /// though it shares an onset with none of them.
+    #[test]
+    fn a_note_covered_by_a_longer_one_is_ambiguous() {
+        let r = reference_melody(
+            vec![
+                note(1, 48, 0, 2000), // the drone
+                note(2, 60, 0, 500),
+                note(3, 62, 500, 500),
+                note(4, 64, 1000, 500),
+            ],
+            RATE,
+        );
+        assert!(
+            r.iter().all(|(_, ambiguous)| *ambiguous),
+            "every note under a drone is a guessed melody line"
+        );
+    }
+
+    /// Nothing scoreable is not a score of zero. Before `scored_notes`
+    /// existed, an all-chords reference reported 0 % "Finding it" for a take
+    /// sung perfectly.
+    #[test]
+    fn an_all_ambiguous_reference_reports_no_scored_notes() {
+        let r = reference_melody(vec![note(1, 60, 0, 1000), note(2, 64, 0, 1000)], RATE);
+        let rep = score(&r, &sung(0, 1000, 64.0), RATE, 50.0);
+        assert_eq!(rep.scored_notes, 0, "the summary has nothing to stand on");
+        assert!(rep.notes[0].hit_fraction > 0.9, "the row itself still scores");
+    }
+
+    #[test]
+    fn scored_notes_counts_the_unambiguous_rows() {
+        let r = reference_melody(vec![note(1, 60, 0, 500), note(2, 62, 500, 500)], RATE);
+        let rep = score(&r, &sung(0, 1000, 60.0), RATE, 50.0);
+        assert_eq!(rep.scored_notes, 2);
+    }
+
+    /// One in-tune blip per note used to report "Locked in": `hit_fraction`
+    /// is measured over the frames that were VOICED, and the headline gave
+    /// each note its full duration regardless.
+    #[test]
+    fn a_note_barely_sung_cannot_claim_its_whole_duration() {
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
+        let mut frames = sung(0, 1000, 60.0);
+        // Sung for 150 ms of a 1 s note, in tune throughout.
+        for f in frames.iter_mut().skip(15) {
+            f.voiced = false;
+        }
+        let rep = score(&r, &frames, RATE, 50.0);
+        assert!(
+            rep.notes[0].hit_fraction > 0.5,
+            "what was sung was in tune: {}",
+            rep.notes[0].hit_fraction
+        );
+        assert!(rep.notes[0].coverage < 0.2, "and almost none of it was sung");
+        assert!(
+            rep.in_tolerance_pct < 25.0,
+            "the headline must not read as a take that was sung: {}",
+            rep.in_tolerance_pct
+        );
+    }
+
+    /// A singer parked about a tritone away crosses the ±600 cent fold, and
+    /// the folded series flips 1200 cents while their voice barely moves.
+    #[test]
+    fn a_singer_near_the_octave_fold_does_not_report_fake_vibrato() {
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
+        let frames: Vec<PitchFrame> = sung(0, 1000, 60.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut f)| {
+                // Wobbling ~10 cents either side of exactly six semitones up.
+                let t = i as f32 * 0.010;
+                f.midi = 66.0 + 0.10 * (2.0 * std::f32::consts::PI * 5.0 * t).sin();
+                f.hz = crate::audio::yin::midi_to_hz(f.midi);
+                f
+            })
+            .collect();
+        let rep = score(&r, &frames, RATE, 50.0);
+        assert!(
+            rep.notes[0].vibrato_extent_cents < 100.0,
+            "a 20 cent wobble read as {} cents of vibrato",
+            rep.notes[0].vibrato_extent_cents
+        );
+        assert!(
+            rep.notes[0].stability_cents < 50.0,
+            "the fold read as drift: {}",
+            rep.notes[0].stability_cents
+        );
+    }
+
+    #[test]
+    fn unwrap_octaves_makes_a_folded_series_continuous() {
+        let mut s = vec![590.0, -595.0, 598.0, -590.0];
+        unwrap_octaves(&mut s);
+        for w in s.windows(2) {
+            assert!((w[1] - w[0]).abs() < 600.0, "{s:?} still jumps an octave");
+        }
     }
 
     /// A single stray frame either way is detector noise, not a miss and

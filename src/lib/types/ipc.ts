@@ -238,7 +238,11 @@ export interface RecordingState {
  */
 export interface PitchFrame {
   /** Transport sample position at the centre of the analysis window, in
-   * DEVICE-rate samples (see `PitchFrameBatch.deviceRate`), not 8 kHz. */
+   * PROJECT samples — anchored to the engine's position and only offset
+   * within one callback buffer. NOT device-rate and not 8 kHz: a ms→samples
+   * conversion scaled by `PitchFrameBatch.deviceRate` is ~8 % short on a
+   * 44.1 kHz microphone in a 48 kHz project. `deviceRate` is reported for
+   * display, not for converting this field. */
   sample: number;
   /** Detected fundamental in Hz. Meaningful only when `voiced`. */
   hz: number;
@@ -327,8 +331,14 @@ export interface NoteScore {
 export interface PitchScoreReport {
   /** One row per reference note, in melody order. */
   notes: NoteScore[];
-  /** Duration-weighted percentage inside tolerance. Ambiguous notes are
-   * excluded. This is the headline number. */
+  /** How many rows the summary was computed from — the unambiguous ones.
+   * **Zero means every summary number below is meaningless** (every
+   * reference note came out of a chord), which is a different story from a
+   * score of zero and must be shown as one. */
+  scoredNotes: number;
+  /** Duration-weighted percentage inside tolerance, counting what was not
+   * sung as outside it. Ambiguous notes are excluded. This is the headline
+   * number — see `scoredNotes` before showing it. */
   inTolerancePct: number;
   meanAbsCents: number;
   /** Median SIGNED error across the take. */

@@ -10,8 +10,13 @@
       "type": "array",
       "items": { "$ref": "#/$defs/noteScore" }
     },
+    "scoredNotes": {
+      "description": "How many notes the summary was computed from (the unambiguous ones). Zero means the summary numbers are meaningless: every reference note came out of a chord, which is not the same as a score of zero.",
+      "type": "integer",
+      "minimum": 0
+    },
     "inTolerancePct": {
-      "description": "Duration-weighted percentage of the sung material that landed inside toleranceCents. Ambiguous notes are excluded.",
+      "description": "Duration-weighted percentage of the scored notes' duration that landed inside toleranceCents, counting material that was not sung as outside it. Ambiguous notes are excluded. Meaningless when scoredNotes is 0.",
       "type": "number",
       "minimum": 0,
       "maximum": 100
@@ -45,6 +50,7 @@
   },
   "required": [
     "notes",
+    "scoredNotes",
     "inTolerancePct",
     "meanAbsCents",
     "medianSignedCents",

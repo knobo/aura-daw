@@ -1350,11 +1350,17 @@ export class DemoBackend implements Backend {
     }
     const scored = notes.filter((n) => !n.ambiguous);
     const weight = scored.reduce((a, n) => a + (n.endSample - n.startSample), 0) || 1;
+    // `hitFraction * coverage`, like the backend: `hitFraction` is measured
+    // over what was voiced, so one blip per note must not claim the note's
+    // whole duration.
     const pct =
-      (scored.reduce((a, n) => a + n.hitFraction * (n.endSample - n.startSample), 0) / weight) * 100;
+      (scored.reduce((a, n) => a + n.hitFraction * n.coverage * (n.endSample - n.startSample), 0) /
+        weight) *
+      100;
     const signed = scored.map((n) => n.medianCents).sort((a, b) => a - b);
     return {
       notes,
+      scoredNotes: scored.length,
       inTolerancePct: pct,
       meanAbsCents: scored.reduce((a, n) => a + Math.abs(n.meanCents), 0) / (scored.length || 1),
       medianSignedCents: signed.length ? signed[signed.length >> 1] : 0,

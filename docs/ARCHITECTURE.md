@@ -301,7 +301,11 @@ owning modules):
   `pitch_unsubscribe`, `set_rehearse_hold`, `pitch_set_reference`
 * the recorded take — `pitch_score` (score a take's curve against a MIDI
   track's melody), `pitch_track` (the stored curve on the timeline, thinned),
-  `pitch_analyze_clip` ((re)build a take's curve)
+  `pitch_analyze_clip` ((re)build a take's curve). All three are `async` +
+  `spawn_blocking`: a missing cache turns any of them into a decode plus an
+  analysis, and a sync command runs on the GTK main thread the webview draws
+  on (see `seed_demo_project`). The session lock is taken and released before
+  the blocking half, never held across it
 
 `pitch_unsubscribe` is not optional symmetry. `pitch_subscribe` appends a
 sink and the engine only retires one when `send_batch` fails, which a live

@@ -66,28 +66,43 @@
     <p class="note mono">Record a take against the reference melody to see how it went.</p>
   {:else}
     <header class="summary">
-      <span class="headline">
-        <strong>{report.inTolerancePct.toFixed(0)}<span class="pct">%</span></strong>
-        <span class="rating">{report.rating}</span>
-      </span>
-      <dl class="stats mono">
-        <div title="Mean absolute error across every scored frame">
-          <dt>off by</dt>
-          <dd>{report.meanAbsCents.toFixed(0)}¢</dd>
-        </div>
-        <div title="Median SIGNED error — a consistent sign is the part you can act on">
-          <dt>lean</dt>
-          <dd>{signed(report.medianSignedCents)}</dd>
-        </div>
-        <div title="Mean entry offset; positive is late">
-          <dt>timing</dt>
-          <dd>{ms(report.meanOnsetOffsetMs)}</dd>
-        </div>
-        <div title="The tolerance this report was computed with">
-          <dt>within</dt>
-          <dd>±{report.toleranceCents}¢</dd>
-        </div>
-      </dl>
+      {#if report.scoredNotes === 0}
+        <!-- Nothing scoreable is not a score of zero: every reference note
+             came out of a chord, so the melody line was guessed throughout
+             and no summary number would mean anything. The rows below still
+             say what happened. -->
+        <span class="headline">
+          <strong class="nothing">—</strong>
+          <span class="rating">Every note came from a chord</span>
+        </span>
+        <p class="note mono chordy">
+          The melody line was guessed for the whole take, so it is not scored. Pick a reference
+          track that carries a single line, or mute the harmony.
+        </p>
+      {:else}
+        <span class="headline">
+          <strong>{report.inTolerancePct.toFixed(0)}<span class="pct">%</span></strong>
+          <span class="rating">{report.rating}</span>
+        </span>
+        <dl class="stats mono">
+          <div title="Mean absolute error across every scored frame">
+            <dt>off by</dt>
+            <dd>{report.meanAbsCents.toFixed(0)}¢</dd>
+          </div>
+          <div title="Median SIGNED error — a consistent sign is the part you can act on">
+            <dt>lean</dt>
+            <dd>{signed(report.medianSignedCents)}</dd>
+          </div>
+          <div title="Mean entry offset; positive is late">
+            <dt>timing</dt>
+            <dd>{ms(report.meanOnsetOffsetMs)}</dd>
+          </div>
+          <div title="The tolerance this report was computed with">
+            <dt>within</dt>
+            <dd>±{report.toleranceCents}¢</dd>
+          </div>
+        </dl>
+      {/if}
       <span class="spacer"></span>
       <div class="sorts" role="group" aria-label="Sort notes">
         <button class="chip mono" class:on={sort === "time"} onclick={() => (sort = "time")}>TIME</button>
@@ -199,6 +214,13 @@
     font-size: 13px;
     color: var(--text-dim);
     margin-left: 1px;
+  }
+  /* Not cyan: a dash where the score goes must not read as a good result. */
+  .headline strong.nothing {
+    color: var(--text-dim);
+  }
+  .chordy {
+    max-width: 46ch;
   }
   .rating {
     font-size: 11px;
