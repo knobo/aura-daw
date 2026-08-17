@@ -41,6 +41,13 @@ this file (marked correction, ADR 0007) if they do.
 
 - **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
 - **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **Sing-along from any song** — new owner ask (2026-08-17), and the reason
+  melody extraction outranks the auto-tune work: import → split stems →
+  melody from the vocal stem → sing against it in the coach. Three of four
+  steps are landed. Settle two things before building: does the detector
+  survive a Demucs stem (an afternoon, no new code), and tempo alignment
+  (`import.rs` detects no tempo, so a tick-based reference lands wrong).
+  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md).
 - **Pitch as data** — new owner ask (2026-08-17). Melody extraction from an
   existing clip (→ MIDI clip) and the continuous pitch track (→ `APTF`, from
   Pitch Coach Task 14). **If you are about to implement Task 14, read

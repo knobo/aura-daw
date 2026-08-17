@@ -47,6 +47,14 @@ described here only.
 - Time-stretch / pitch-shift of audio clips (engine + UI; big). **Shares
   its shifter with pitch correction** — whichever lands first owns it;
   see `pitch-correction-autotune.md`.
+- **Sing-along from any song** (owner, 2026-08-17): import a song → split
+  stems → melody from the `vocals` stem → sing against it in the Pitch
+  Coach, scored and recorded. **Three of the four steps are landed**;
+  melody extraction is the keystone, which raises its priority above the
+  auto-tune work. Two things to settle first: whether the detector survives
+  a Demucs stem (testable today, no new code) and tempo alignment — an
+  imported song has its own tempo and `import.rs` detects none, so a
+  tick-based reference lands in the wrong place. `pitch-as-data.md`.
 - **Pitch as data** — owner ask 2026-08-17: extract a pitch stream from a
   vocal/instrument lane and use it as input. Answer: notes go in a MIDI clip
   (exists), the curve goes in the `APTF` pitch track Pitch Coach Task 14

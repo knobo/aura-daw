@@ -72,6 +72,50 @@ alone: the delta you apply is continuous, and what you must *preserve*
    finished-system path is design §8; this is a new source kind inside it,
    not a parallel mechanism.
 
+## The flow this adds up to (owner, 2026-08-17)
+
+*"Man kan ta en full sang, gjøre split stems, generere midi track fra
+pitchen fra voice lane'en, og så synge selv med voice coach og recorde inn.
+Så har man en vanvittig kul app."*
+
+Worth writing down because of what it reveals: the chain is four steps and
+**three of them are already landed**.
+
+| Step | State |
+|---|---|
+| 1. Import a full song | **landed** — drag-and-drop, WAV/MP3/FLAC/OGG/AAC/M4A via symphonia |
+| 2. Split stems, keep `vocals` | **landed** — Demucs sidecar, real backend path since Plan E Task 11 |
+| 3. Melody from the vocal stem → a MIDI clip | **missing** — this is step 1 of "what this unlocks", above |
+| 4. Sing against it, scored, recorded | **landed** — Pitch Coach phase 2 (PR #58) + phase 3 for the report |
+
+So the melody-extraction slice is not a nice-to-have next to the others: it
+is the **keystone** that turns three shipped features into one product.
+That is a reason to raise its priority, and it is the strongest argument yet
+for building it before anything in the auto-tune doc.
+
+Three things will decide whether it actually works, and all three are
+cheap to answer before writing code:
+
+1. **Does the detector survive a separated stem?** Every number we have
+   (3.3 cents parity, no octave errors in 1312 frames) comes from a clean
+   close-miked vowel. A Demucs `vocals` stem has bleed, phase artefacts and
+   smeared consonants. This is testable today, in an afternoon, with no new
+   code: split a song, run `PitchAnalyzer` over the stem, look at the voiced
+   fraction and the octave-error rate. **Do that before designing anything.**
+2. **Tempo alignment, which is the real trap.** A MIDI clip lives in ticks;
+   ticks↔samples goes through the project's section table (ADR 0002). An
+   imported song has its own tempo, and `control/import.rs` does **no tempo
+   detection** — so a melody extracted from a commercial recording and
+   written as ticks at the project's 120 BPM lands in the wrong place, and
+   every target bar in the lane is wrong with it. Either the extraction
+   derives a tempo map for the song, or the reference for this flow stays in
+   **samples** (the analysed note spans) and never round-trips through
+   ticks. Do not discover this after the fact.
+3. **Headphones stop being advice.** Singing along to the song means the
+   backing track reaches the microphone and is detected as pitch. The panel
+   already says this once, plainly; in this flow it is a requirement, and
+   worth enforcing in the UI copy rather than mentioning.
+
 ## Decisions needed before `APTF` v1 ships (Task 14)
 
 This is the time-sensitive part: the format is specified but not built, so
