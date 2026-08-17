@@ -14,6 +14,7 @@
    */
   import { untrack } from "svelte";
   import { clipEditLoop } from "../../state/clip-edit-loop.svelte";
+  import { composer } from "../../state/composer.svelte";
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
   import { transport } from "../../state/transport.svelte";
@@ -44,6 +45,7 @@
   import type { MidiNote } from "../../types/ipc";
   import { theme } from "../../theme/theme.svelte";
   import { alpha } from "../../theme/tokens";
+  import { roleGloss, roleInk } from "../../utils/palette-colors";
 
   const KEY_H = 14; // CSS px per pitch row
   const KEYS_W = 64;
@@ -51,6 +53,73 @@
 
   const clip = $derived(midi.openClip);
   const track = $derived(clip ? project.trackById(clip.trackId) : undefined);
+  /**
+   * The Composer's tint (Plan H1 Task 8): the roll colours its own key rows by
+   * what each note DOES over the chord sounding at that point — chord tone,
+   * available colour, tension, or the one note that fights the chord. It is the
+   * feature's whole thesis in one surface: the 128 rows of a piano roll are not
+   * equal, and a beginner cannot see which is which.
+   *
+   * On by default when the project has a harmony, and a chip turns it off.
+   */
+  let harmonyTint = $state(true);
+  const harmonyOn = $derived(harmonyTint && composer.chords.length > 0);
+  /** Chord regions that overlap the open clip, in clip-relative ticks. */
+  const clipRegions = $derived.by(() => {
+    if (!clip) return [];
+    const from = clip.timelineStartTicks;
+    const to = from + midi.effectiveContentLengthTicks(clip);
+    return composer.chords
+      .filter((c) => c.tick < to && c.tick + c.lengthTicks > from)
+      .map((c) => ({
+        chord: c.chord,
+        fromTick: Math.max(0, c.tick - from),
+        toTick: Math.min(to - from, c.tick + c.lengthTicks - from),
+        palette: composer.regionPalettes[c.tick] ?? null,
+      }));
+  });
+  /**
+   * Which region the key gutter shows. Follows the playhead, but is only
+   * REASSIGNED when the playhead crosses into a different chord — the rAF loop
+   * runs at frame rate and a per-frame write would repaint the gutter canvas
+   * sixty times a second to say the same thing.
+   */
+  let gutterFrom = $state<number | null>(null);
+  const gutterRegion = $derived.by(() => {
+    if (clipRegions.length === 0) return null;
+    return clipRegions.find((r) => r.fromTick === gutterFrom) ?? clipRegions[0];
+  });
+
+  /** The chip's tooltip: the actual notes, named — never a category alone. */
+  const harmonyHint = $derived.by(() => {
+    const pal = gutterRegion?.palette;
+    if (!pal) return "Colour the keys by what each note does over the chord in force";
+    const names = (roles: string[]) =>
+      pal.classes
+        .filter((c) => roles.includes(c.role))
+        .map((c) => c.tpc)
+        .join(" ");
+    const chord = names(["root", "third", "fifth", "seventh"]);
+    const colour = names(["extension"]);
+    const avoid = names(["avoid"]);
+    return [
+      `over ${pal.chordPretty ?? pal.keyLabel}: ${chord} are the chord`,
+      colour ? `${colour} available` : "",
+      avoid ? `${avoid} — ${roleGloss("avoid")}` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  });
+
+  // Fetch the palette of every region the clip covers when the clip (or the
+  // harmony) changes. One call per region, cached in the store.
+  $effect(() => {
+    if (!clip || !harmonyTint) return;
+    const from = clip.timelineStartTicks;
+    const to = from + midi.effectiveContentLengthTicks(clip);
+    void composer.chords.length;
+    void composer.loadRegionPalettes(from, to);
+  });
   const color = $derived(track?.color ?? theme.tokens.green);
   const instrument = $derived(instruments.byId(track?.instrumentId));
   const pluginInst = $derived(plugins.instanceForRef(track?.instrumentId));
@@ -504,6 +573,9 @@
     const mq = marquee;
     const region = midi.region;
     void scrollTick, tpp, topKey, gridW, gridH, color, gridDiv;
+    // The Composer's tint depends on the harmony and its palettes, so a chord
+    // edit has to repaint the grid.
+    void harmonyOn, clipRegions;
 
     const w = gridW;
     const h = gridH;
@@ -524,6 +596,30 @@
       } else {
         ctx.fillStyle = alpha(theme.tokens.line, 0.05);
         ctx.fillRect(0, y + KEY_H - 1, w, 1);
+      }
+    }
+
+    // The Composer's tint, per CHORD REGION (Plan H1 Task 8). Vertical bands,
+    // because the answer to "which notes may I play" changes with the chord —
+    // that is the whole difference between this and a static scale highlight.
+    if (harmonyOn) {
+      for (const r of clipRegions) {
+        if (!r.palette) continue;
+        const x0 = Math.max(0, xOfTick(r.fromTick));
+        const x1 = Math.min(w, xOfTick(r.toTick));
+        if (x1 <= 0 || x0 >= w) continue;
+        for (let y = 0; y < h; y += KEY_H) {
+          const key = keyAtY(y);
+          if (key < 0 || key > 127) continue;
+          const ink = roleInk(r.palette.classes[key % 12].role, theme.tokens);
+          if (ink.rowAlpha <= 0) continue;
+          ctx.fillStyle = alpha(ink.color, ink.rowAlpha);
+          ctx.fillRect(x0, y, x1 - x0, KEY_H - 1);
+        }
+        // A hairline at each chord change: the bands have to be readable as
+        // regions, not as a gradient.
+        ctx.fillStyle = alpha(theme.tokens.cyan, 0.22);
+        ctx.fillRect(Math.round(x0), 0, 1, h);
       }
     }
 
@@ -605,19 +701,36 @@
   $effect(() => {
     const c = keysCanvas;
     if (!c) return;
-    void topKey, gridH, heldKey;
+    void topKey, gridH, heldKey, harmonyOn, gutterRegion;
     const w = KEYS_W;
     const h = gridH;
     const ctx = setup(c, w, h);
     if (!ctx) return;
     ctx.font = `8px ${getComputedStyle(document.documentElement).getPropertyValue("--font-mono")}`;
     ctx.textBaseline = "middle";
+    const gutter = harmonyOn ? gutterRegion?.palette : null;
     for (let y = 0; y < h; y += KEY_H) {
       const key = keyAtY(y);
       if (key < 0 || key > 127) continue;
       const black = BLACK.has(key % 12);
       ctx.fillStyle = black ? theme.tokens.bg1 : theme.tokens.bg3;
       ctx.fillRect(0, y, w, KEY_H - 1);
+      // The Composer's tint: what this note DOES over the chord in force.
+      const cls = gutter?.classes[key % 12];
+      if (cls) {
+        const ink = roleInk(cls.role, theme.tokens);
+        if (ink.keyAlpha > 0) {
+          ctx.fillStyle = alpha(ink.color, ink.keyAlpha);
+          ctx.fillRect(0, y, w - 20, KEY_H - 1);
+        }
+        // The one note that fights the chord gets struck through, so the
+        // warning survives a theme with a narrow palette and a viewer who
+        // cannot tell the accents apart.
+        if (cls.role === "avoid") {
+          ctx.fillStyle = alpha(theme.tokens.red, 0.85);
+          ctx.fillRect(2, y + Math.floor((KEY_H - 1) / 2), w - 26, 1);
+        }
+      }
       if (key === heldKey) {
         ctx.fillStyle = alpha(color, 0.55);
         ctx.fillRect(0, y, w, KEY_H - 1);
@@ -842,6 +955,13 @@
       const visible = posTicks >= 0 && posTicks <= c.lengthTicks && x >= -1 && x <= gridW + 1;
       playheadEl.style.opacity = visible ? "1" : "0";
       if (visible) playheadEl.style.transform = `translateX(${x.toFixed(2)}px)`;
+      // The Composer's gutter follows the chord under the playhead. Assigned
+      // only on a crossing (see `gutterFrom`).
+      const region = untrack(() => clipRegions).find(
+        (r) => posInContent >= r.fromTick && posInContent < r.toTick,
+      );
+      const from = region?.fromTick ?? null;
+      if (from !== untrack(() => gutterFrom)) gutterFrom = from;
     };
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
@@ -962,6 +1082,22 @@
       >
         ⚡ flash
       </button>
+
+      {#if composer.chords.length > 0}
+        <!-- The Composer's tint. The label is the chord in force, so the chip
+             doubles as a readout of what the colours currently mean. -->
+        <button
+          class="chip mono"
+          class:on={harmonyTint}
+          title={harmonyHint}
+          onclick={() => (harmonyTint = !harmonyTint)}
+        >
+          ♪ {gutterRegion?.palette?.chordPretty ?? gutterRegion?.chord ?? "harmony"}{gutterRegion
+            ?.palette?.roman
+            ? ` · ${gutterRegion.palette.roman}`
+            : ""}
+        </button>
+      {/if}
 
       {#if midi.region && midi.region.clipId === clip.id}
         <button

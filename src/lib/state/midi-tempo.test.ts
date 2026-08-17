@@ -39,6 +39,7 @@ vi.mock("../tauri", () => ({
         periodEvents: [],
         sectionTable: [],
         sectionTableRuleVersion: 1,
+        harmony: { keys: [], chords: [] },
       }),
   },
 }));
@@ -151,6 +152,7 @@ describe("applySnapshot meter", () => {
       periodEvents: [],
       sectionTable: [],
       sectionTableRuleVersion: 1,
+      harmony: { keys: [], chords: [] },
     });
     expect(project.timeSignature).toEqual([6, 8]);
     expect(project.tempoBpm).toBe(100);

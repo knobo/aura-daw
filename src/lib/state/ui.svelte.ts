@@ -3,7 +3,15 @@
 import { PREF_SCHEMA } from "../prefs/schema";
 import { prefs } from "../prefs/prefs.svelte";
 
-export type DockTab = "" | "generate" | "hum" | "library" | "instruments" | "plugins" | "mcp";
+export type DockTab =
+  | ""
+  | "composer"
+  | "generate"
+  | "hum"
+  | "library"
+  | "instruments"
+  | "plugins"
+  | "mcp";
 
 /** The bottom region shows one of these at a time. */
 export type BottomPanel = "roll" | "pitch";
@@ -57,6 +65,10 @@ export function toggleDock(tab: Exclude<DockTab, "">) {
  * a rebind cannot leave the UI advertising a key that no longer works.
  */
 export const DOCK_SHORTCUT: Record<Exclude<DockTab, "">, string> = {
+  // Not "c": bare C is already the library's CLIPS destination in
+  // App.svelte, and `dockTabForKey` is tested BEFORE it — a composer bound
+  // there would silently shadow a shipped shortcut. "o" as in cOmposer.
+  composer: "o",
   generate: "g",
   hum: "h",
   library: "l",
