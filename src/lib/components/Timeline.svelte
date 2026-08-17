@@ -1367,7 +1367,7 @@
     letter-spacing: 0.2em;
     color: var(--text-faint);
     background: transparent;
-    border: 1px solid rgba(122, 160, 220, 0.12);
+    border: 1px solid rgb(var(--edge-rgb) / 0.12);
     border-radius: 5px;
     cursor: pointer;
     transition: color 120ms, border-color 120ms;
@@ -1460,7 +1460,7 @@
   }
   .grouplane {
     position: relative;
-    border-bottom: 1px solid rgba(96, 130, 190, 0.14);
+    border-bottom: 1px solid rgb(var(--line-rgb) / 0.14);
     background: linear-gradient(
       to right,
       color-mix(in srgb, var(--group-color) 14%, transparent),
@@ -1483,7 +1483,7 @@
   }
   .dropline.intogroup {
     background: var(--amber);
-    box-shadow: 0 0 8px rgba(255, 200, 87, 0.5);
+    box-shadow: 0 0 8px rgb(var(--amber-rgb) / 0.5);
   }
   .droplabel {
     position: absolute;

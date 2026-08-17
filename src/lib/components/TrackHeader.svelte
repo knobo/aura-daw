@@ -427,8 +427,8 @@
     padding-left: 10px;
     background: linear-gradient(
       to right,
-      color-mix(in srgb, var(--track-color) 7%, rgba(16, 20, 42, 0.35)),
-      rgba(10, 13, 23, 0.15)
+      color-mix(in srgb, var(--track-color) 7%, rgb(var(--bg-2-rgb) / 0.35)),
+      rgb(var(--bg-1-rgb) / 0.15)
     );
   }
   .header.picking {
@@ -481,7 +481,7 @@
     letter-spacing: 0.12em;
     padding: 2px 5px;
     border-radius: 3px;
-    border: 1px dashed rgba(122, 160, 220, 0.22);
+    border: 1px dashed rgb(var(--edge-rgb) / 0.22);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
@@ -505,7 +505,7 @@
     font-size: 12px;
     font-weight: 500;
     color: var(--text);
-    background: rgba(5, 7, 13, 0.9);
+    background: rgb(var(--bg-0-rgb) / 0.9);
     border: 1px solid var(--cyan-dim);
     border-radius: 3px;
     padding: 1px 5px;

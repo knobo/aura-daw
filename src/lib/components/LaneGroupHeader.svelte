@@ -100,13 +100,13 @@
     height: var(--lane-group-height);
     flex: none;
     padding: 0 8px 0 4px;
-    border-bottom: 1px solid rgba(96, 130, 190, 0.14);
+    border-bottom: 1px solid rgb(var(--line-rgb) / 0.14);
     /* The group's tint runs left-to-right so the strip reads as a header
        for what is below it, not as another lane. */
     background: linear-gradient(
       to right,
       color-mix(in srgb, var(--group-color) 22%, transparent),
-      rgba(10, 13, 23, 0.35) 65%
+      rgb(var(--bg-1-rgb) / 0.35) 65%
     );
   }
   .fold {
@@ -148,7 +148,7 @@
     letter-spacing: 0.16em;
     text-transform: uppercase;
     color: var(--text);
-    background: rgba(5, 7, 13, 0.85);
+    background: rgb(var(--bg-0-rgb) / 0.85);
     border: 1px solid var(--cyan-dim);
     border-radius: 3px;
     padding: 1px 4px;
