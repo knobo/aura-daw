@@ -187,6 +187,8 @@ pub fn append_from(
                         slot,
                         clips: Vec::new(),
                         live: Some(LiveSource { node, events: Arc::new(events) }),
+                        inserts: Vec::new(),
+                        pdc: None,
                     });
                 }
             }
@@ -247,6 +249,8 @@ pub fn append_from_with_input(
                         slot,
                         clips: Vec::new(),
                         live: Some(LiveSource { node, events: Arc::new(events) }),
+                        inserts: Vec::new(),
+                        pdc: None,
                     });
                 }
             }
@@ -273,6 +277,8 @@ pub fn append_from_with_input(
                         slot,
                         clips: Vec::new(),
                         live: Some(LiveSource { node, events: Arc::new(Vec::new()) }),
+                        inserts: Vec::new(),
+                        pdc: None,
                     });
                 }
             }
