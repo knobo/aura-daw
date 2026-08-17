@@ -1,5 +1,25 @@
 # Plan H1 — The Composer MVP (theory core + harmony document + generators)
 
+> **STATUS: LANDED 2026-08-17** on `feat/composer-assistant` (branched from
+> `origin/main` at `79c3e98`). Handoff, including the owner ear-check owed and
+> what H2 should pick up first:
+> [`docs/handoff/composer-h1.md`](../../handoff/composer-h1.md). Measured after
+> the work, `--test-threads=1`: **1246 backend** (1210 lib + 36 integration,
+> plus 2 `#[ignore]`d) and **778 frontend**, from 1083 + 738 at the branch
+> point. Every task below is checked; two things in the plan changed shape while
+> being built and the boxes are ticked against what was actually done:
+>
+> * **Task 5 grew a sixth generator**, `theory/bass.rs` (root / root-fifth /
+>   walking with real approach notes / pedal). The plan had bass in H3; a
+>   generated sketch without one is not listenable, and it is 200 lines.
+> * **`progression::generate` returns the key it generated IN**, not just the
+>   slots. A minor-mode schema asked for in a major key resolves against the
+>   RELATIVE minor (the Andalusian cadence in C major is `Am G F E` — same seven
+>   notes, different home), so the caller has to be told which key to write into
+>   the document. The plan assumed the requested key always won.
+> * **The dock shortcut is `O`, not `C`** — bare `c` was already the library's
+>   CLIPS destination and `dockTabForKey` is tested before it.
+
 **Goal:** Land the spine of the Composer — a pure music-theory library, a
 harmony document in the core document model, four theory-driven generators,
 and a panel that makes all three visible — so that every later phase (H2–H6 in
@@ -49,7 +69,11 @@ type. The frontend renders pushed state and emits commands (ADR 0006).
   harmony state on the client. The circle widget's *geometry* is
   presentation, its *content* is backend-shipped.
 - **Theme tokens only** in new Svelte `<style>` blocks — `no-literals.test.ts`
-  fails a raw colour literal. Palette colours are new tokens, not hex.
+  fails a raw colour literal. *(Correction, as built: the palette ramp borrows
+  EXISTING accent tokens rather than adding new ones — a new token means editing
+  the `ThemeTokens` contract, all eight built-in themes and the user-theme
+  schema, for colours that already have the right meanings. The mapping lives in
+  `src/lib/utils/palette-colors.ts` and is tested against every built-in theme.)*
 - Run `timeout 900 cargo test` (with `--test-threads=1`, see CONTRIBUTING),
   `timeout 300 npx vitest run` and `npx svelte-check` before each commit that
   touches the corresponding half. Foreground, `timeout`-guarded.
@@ -169,15 +193,15 @@ pub struct Chord { pub root: Tpc, pub quality: ChordQuality, pub bass: Option<Tp
 ```
 
 **Steps**
-- [ ] Failing tests first: `F#`/`Gb` spell differently and share a pitch
+- [x] Failing tests first: `F#`/`Gb` spell differently and share a pitch
       class; `Cb4` sounds `B3` but keeps its letter; `Key::spelled` gives
       `[A,B,C,D,E,F,G]` for A aeolian; the seven diatonic sevenths of C
       major are `Cmaj7 Dm7 Em7 Fmaj7 G7 Am7 Bm7b5`; symbol round-trip
       (`parse(symbol(c)) == c`) for every quality; key signature of `F#`
       major is 6 sharps.
-- [ ] Implement. Scales as fifths-offset tables (H-2); chord qualities as
+- [x] Implement. Scales as fifths-offset tables (H-2); chord qualities as
       fifths-offset tables so `Cdim7`'s seventh spells `Bbb`.
-- [ ] Property test: `Tpc` transposition by n fifths then −n is identity for
+- [x] Property test: `Tpc` transposition by n fifths then −n is identity for
       `n ∈ −20..20`; `pitch_class` matches a semitone-table oracle.
 
 ## Task 2: analysis, the circle, the palette
@@ -186,13 +210,13 @@ pub struct Chord { pub root: Tpc, pub quality: ChordQuality, pub bass: Option<Tp
 `theory/palette.rs`.
 
 **Steps**
-- [ ] Failing tests: `G7` in C major analyses as `V7`, function `Dominant`;
+- [x] Failing tests: `G7` in C major analyses as `V7`, function `Dominant`;
       `Bb` in C major is `♭VII`, borrowed, with a why mentioning
       mixolydian/subdominant; `A7` in C major is `V/ii`; the C-major circle
       window is `F C G D A E B`; `key_distance(C major, A minor) == 0` and
       `(C, E major) == 4`; **the seven-row palette table from product doc
       §4.3 is a test** (this is H-9 and the rule's credibility).
-- [ ] Implement. `palette` returns a per-pitch-class role + degree label
+- [x] Implement. `palette` returns a per-pitch-class role + degree label
       (`"♯11"`, `"♭7"`) + optional why; `nearest_usable` snaps a key to the
       closest non-`Avoid` class (H2's "no wrong notes" seam, exposed now,
       wired later).
@@ -202,13 +226,13 @@ pub struct Chord { pub root: Tpc, pub quality: ChordQuality, pub bass: Option<Tp
 **Files:** create `theory/metre.rs`, `theory/rng.rs`.
 
 **Steps**
-- [ ] Failing tests: 4/4 at 16ths gives weights
+- [x] Failing tests: 4/4 at 16ths gives weights
       `[4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0]`; 6/8 groups by three; `euclid(3,8)`
       is the tresillo `x..x..x.`; `euclid(5,8)` the cinquillo; rotation is
       cyclic and length-preserving; LHL syncopation of a straight
       four-on-the-floor is 0 and of `..x.` patterns is positive; SplitMix64
       reproduces a known vector.
-- [ ] Implement. The weight function is THE accent/velocity source (H-10).
+- [x] Implement. The weight function is THE accent/velocity source (H-10).
 
 ## Task 4: the harmony document + `Op::HarmonySet` + persistence
 
@@ -230,13 +254,13 @@ Op::HarmonySet { keys: Vec<KeySpan>, chords: Vec<ChordSpan> }
 ```
 
 **Steps**
-- [ ] Failing tests: `HarmonySet` round-trips through the op wire form;
+- [x] Failing tests: `HarmonySet` round-trips through the op wire form;
       `apply_raw` rejects unsorted/overlapping spans **before mutating**
       (atomicity) and returns an inverse carrying the previous pair; undo
       restores it exactly; `ChangeSet::from_ops` flags the new arm; a save →
       load round-trip preserves the document; a project that never used the
       Composer resaves **without** a `harmony` key.
-- [ ] Implement. Chord/key spans serialise as `{tick, symbol}` /
+- [x] Implement. Chord/key spans serialise as `{tick, symbol}` /
       `{tick, tonic, scale}` strings on the wire (stable, readable, and it
       keeps `Tpc`'s integer encoding an implementation detail).
 
@@ -246,7 +270,7 @@ Op::HarmonySet { keys: Vec<KeySpan>, chords: Vec<ChordSpan> }
 `theory/melody.rs`, `theory/groove.rs`.
 
 **Steps**
-- [ ] Failing tests per generator:
+- [x] Failing tests per generator:
       *progression* — a circle walk from C returns `C G D A …`; the
       `I-V-vi-IV` schema in D major is `D A Bm G`; the functional automaton
       always ends on a cadence and never repeats a chord three times;
@@ -264,7 +288,7 @@ Op::HarmonySet { keys: Vec<KeySpan>, chords: Vec<ChordSpan> }
       monotonically with the syncopation dial; velocities correlate with
       metrical weight; a fill appears at the end of every `fill_every` bars;
       **same seed ⇒ identical notes** (determinism, for all four).
-- [ ] Implement. Each generator returns `(Vec<MidiNote>, Vec<Annotation>)`;
+- [x] Implement. Each generator returns `(Vec<MidiNote>, Vec<Annotation>)`;
       `Annotation { tick, length_ticks, label, why }` (H-6).
 
 ## Task 6: `control/composer.rs` — the four commands
@@ -276,13 +300,13 @@ create `docs/ipc-schemas/composer.schema.json`.
 `composer_suggest`, `composer_generate`.
 
 **Steps**
-- [ ] Failing tests: `harmony_set` is one op and one undo entry;
+- [x] Failing tests: `harmony_set` is one op and one undo entry;
       `composer_generate { parts: [chords, bass, melody, drums] }` lands four
       clips in ONE transaction (one undo removes all four — H-7) and
       auto-creates the tracks it needs (H-8); a rejected request mutates
       nothing; `composer_palette` at a tick inside a chord region returns
       that chord's palette and outside every region returns the key's.
-- [ ] Implement. `ControlPlane` methods first, commands as thin wrappers
+- [x] Implement. `ControlPlane` methods first, commands as thin wrappers
       (ARCHITECTURE §11). Validation and generation happen **outside** the
       transaction (the `hum.rs` prepare-outside pattern); the transaction is
       the mutation only.
@@ -294,30 +318,35 @@ create `docs/ipc-schemas/composer.schema.json`.
 `ui.svelte.ts`, `tauri.ts`, `types/ipc.ts`, `demo.ts`, `app.css`.
 
 **Steps**
-- [ ] Failing store tests: the store applies pushed harmony from the
+- [x] Failing store tests: the store applies pushed harmony from the
       snapshot, never computes theory; clicking a wedge appends one chord
       through one `harmony_set`; the generate button passes the displayed
       seed; the dice re-rolls the seed and nothing else.
-- [ ] Pure geometry helper for the circle (wedge paths, hit-testing) with its
+- [x] Pure geometry helper for the circle (wedge paths, hit-testing) with its
       own test — the only frontend logic this plan allows.
-- [ ] Implement the panel: circle (key arc highlighted, borrowed chords
+- [x] Implement the panel: circle (key arc highlighted, borrowed chords
       outside it), progression strip with Roman numerals, generate controls
       with a seed + dice, and the WHY list.
-- [ ] Dock tab `c` (`DOCK_SHORTCUT`), demo fixture (H-12).
+- [x] Dock tab `c` (`DOCK_SHORTCUT`), demo fixture (H-12).
 
 ## Task 8: the piano roll teaches
 
 **Files:** modify `pianoroll/PianoRoll.svelte`, `app.css`.
 
 **Steps**
-- [ ] Tint each key row by its palette class at the playhead's chord (five
-      new theme tokens; no literals). The tint follows the chord region under
-      the cursor/playhead, not a static key.
-- [ ] Name the class of the note under the pointer in the roll's status line.
+- [x] Tint each key row by its palette class at the chord in force (existing
+      accent tokens, no literals — see the corrected constraint above). The
+      tint follows the chord region under the playhead, not a static key, and
+      the grid is banded per region.
+- [x] Name the chord in force, and what its notes do, in the roll's header
+      chip (`♪ Cmaj7 · I`, with the full breakdown as its tooltip). *(As built:
+      a header chip that also toggles the tint, rather than a pointer-follow
+      status line — the roll has no status line, and a chip that names the
+      chord doubles as the legend for the colours.)*
 
 ## Task 9: docs, counts, handoff
 
-- [ ] README feature section + a screenshot placeholder; CONTRIBUTING test
+- [x] README feature section + a screenshot placeholder; CONTRIBUTING test
       counts re-measured with the date; `docs/ARCHITECTURE.md` §16 (the
       theory library's purity contract + the harmony document's place);
       `docs/backlog/00-ROADMAP-real-alternative.md` row;

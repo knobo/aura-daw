@@ -294,6 +294,11 @@ owning modules):
 * sidecars — job kind `humToMidi` (`JobKind::HumToMidi`, dedicated
   `hum_to_song` command; rejected by the open-kind `sidecar_run_job` path)
 
+**Composer additions** (§16; all additive names, `control::composer`):
+`harmony_get`, `harmony_set` (batch-shaped: one invoke carries the whole
+document, so an editing gesture is one op and one undo), `composer_palette`,
+`composer_suggest`, `composer_generate`.
+
 **Pitch Coach additions** (§5.1; all additive names, registered next to
 `subscribe_meters`):
 
@@ -866,3 +871,96 @@ project). The MCP tool roster stays frozen this round; candidate future
 tools (`list_plugins`, `set_plugin_param`) are noted in PHASE3-PLAN §6,
 not registered — loop and plugin state are visible to agents through
 `get_project_state`/`plugin_list` equivalents on the control plane.
+
+## 16. The Composer: a pure theory library + one harmony document — Plan H1
+
+Product doc: `docs/backlog/composer-assistant.md`. Plan and rulings:
+`docs/superpowers/plans/2026-08-17-plan-h-composer.md`.
+
+### 16.1 Two halves, one seam
+
+```
+        ┌──────────────────────────────────────────────────────────┐
+        │  src-tauri/src/theory/   PURE — no tauri, no locks,      │
+        │  no I/O, no state, no thread_rng                         │
+        │  tpc · scale · chord · analysis · circle · palette ·     │
+        │  metre · rng · harmony · progression · voicing · bass ·  │
+        │  melody · groove                                         │
+        └───────────────────────▲──────────────────────────────────┘
+                                │ pure calls
+        ┌───────────────────────┴──────────────────────────────────┐
+        │  control/composer.rs — the ONE stateful seam             │
+        │  harmony_get · harmony_set · composer_palette ·          │
+        │  composer_suggest · composer_generate                    │
+        └──────▲──────────────────────────────────▲────────────────┘
+               │ Tauri commands                   │ (H6: MCP later)
+      COMPOSER panel + piano-roll tint      agents compose too
+```
+
+**The purity contract is load-bearing, not stylistic.** `theory/` may not
+`use tauri`, `parking_lot`, `std::fs`, `crate::control` or `crate::audio`, and
+every generator takes an explicit `seed: u64` — no `thread_rng` anywhere. That
+is what keeps the theory suite fast enough to run on every save, makes a
+generator testable without a project, and keeps the library reusable by a
+future notation surface or a WASM build. One dependency on the rest of the
+crate is deliberate: the generators emit `crate::midi::MidiNote`, the
+tauri-free document note type, because a parallel note struct would buy
+nothing but a conversion at every call site.
+
+**Determinism is a contract** (ruling H-4): same seed + same params ⇒
+byte-identical notes, tested per generator. A reply carries the seed that
+produced it, so a take the user liked is recoverable.
+
+### 16.2 The harmony document
+
+`MidiStore.harmony` — `HarmonyDoc { keys: Vec<KeySpan>, chords: Vec<ChordSpan> }`,
+integer ticks at the project PPQ. It lives beside the tempo and meter maps
+because it is the same kind of thing: a map over musical time that every
+surface reads and no track owns. Consequences:
+
+* **No new `TrackKind`, no new lane** (H-5) — the chord ribbon is chrome.
+* **One op**, `Op::HarmonySet { keys, chords }`, `Op::TempoSet`'s shape and for
+  the same reason: a chord region and the key it is analysed in are ONE edit
+  (H-4). It validates before mutating, computes its inverse from store truth,
+  and sets **no** `effect.rebuild` — the harmony document is not scheduled and
+  makes no sound of its own. `OP_FORMAT_VERSION` stays **2**.
+* **Persisted additively**: the `harmony` key in `project.json`, written only
+  when the document is non-empty, so a project that never used the Composer
+  resaves byte-diff-free and `schemaVersion` does not move. A malformed block
+  loses the harmony, not the song.
+* **In the published snapshot** (`MidiSnapshot.harmony`) and in
+  `get_project_state`, so a reader holding an image never re-locks.
+* Wire form spells keys and chords as **strings** (`"C ionian"`, `"Cmaj7"`):
+  `Tpc`'s line-of-fifths integer encoding stays an implementation detail, a
+  journal line stays readable, and an enharmonic distinction survives a
+  round trip (`C♭maj7` does not come back as `Bmaj7`).
+
+### 16.3 Generation
+
+`composer_generate` prepares OUTSIDE the transaction (the `hum.rs`
+prepare-outside pattern — voice leading is a DP over the whole progression and
+has no business under the session lock), then commits the whole sketch in
+**one** transaction: the harmony write, the tracks it needs
+(`ops::add_track_tx`), and up to four `Op::MidiClipAdd`s. One Ctrl+Z removes
+the idea rather than a quarter of it (H-7/H-8); a rejected request writes
+nothing.
+
+Generated clips are **ordinary clips** (H-6): minted note ids, a content id,
+the track's own lane, editable in the piano roll, undoable, `.mid`-exportable.
+There is no generated-clip type and no regeneration link. The why-strings ride
+back with the reply as `Annotation`s for display and are never document state.
+
+### 16.4 Where the theory is written down
+
+Each module's head comment carries the derivation and the citation; the
+non-obvious ones are worth knowing about before touching them:
+
+| Module | The fact it is built on |
+|---|---|
+| `tpc.rs` | The line of fifths: `pitch_class = (fifths * 7) mod 12`, `letter = "FCGDAEB"[(fifths+1) mod 7]`. Spelling, key signatures and transposition are arithmetic. |
+| `scale.rs` | A diatonic mode is a CONTIGUOUS 7-window on that line, so a key signature is a subtraction. |
+| `palette.rs` | Berklee's avoid note: a key tone a semitone ABOVE a chord tone. The seven-chord table is a test, including the `Fmaj7` row (the ♯11 must come out available). |
+| `circle.rs` | A key's whole chord vocabulary is a contiguous arc; distance is relatedness; counter-clockwise is the strongest drive. |
+| `metre.rs` | Lerdahl & Jackendoff's metrical tree (ONE weight function drives placement, backbeat, accents and every velocity — H-10), Bjorklund/Euclid (Toussaint 2005), Longuet-Higgins & Lee syncopation as a NUMBER. |
+| `melody.rs` | Motif + development, with pitches as indices into the key's ladder so a transposed copy stays diatonic for free. |
+

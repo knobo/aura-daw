@@ -1,19 +1,35 @@
-# Next: Plan G1 Task 5
+# Next: the Composer's owner ear-check, then G1 Task 5
 
 `origin/main` is the baseline. Branch from there. Subagent-driven,
 task-by-task. Reply to the user in Norwegian — they write Norwegian;
 the repo documentation is English.
 
-**Do this:** G1 Task 5 — mixer strip (`source → inserts → fader`). Plan:
-[`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`](docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md)
-(product: [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)).
-Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+**Do this, in order:**
 
-**Do not:** start G2/G3/G4; write a stock FX suite; bump
+1. **Hear the Composer.** Plan H1 landed on `feat/composer-assistant`
+   (PR open, not merged): open the COMPOSER dock tab (`O`), pick a plan,
+   GENERATE, and listen. The suite proves the notes obey the theory; only
+   an ear can say whether the defaults are *nice*. The specific
+   judgements owed — registers, melodic taste, groove feel, and the fact
+   that a generated drum clip has no kit to play through — are listed in
+   [`docs/handoff/composer-h1.md`](docs/handoff/composer-h1.md).
+2. **G1 Task 5** — mixer strip (`source → inserts → fader`). Plan:
+   [`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`](docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md)
+   (product: [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)).
+   Handoff: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+
+**Do not:** start Composer H2–H6 before the ear-check (the whole point of
+H1 is that the next phase reads it, and taste feedback changes what H2
+should be); start G2/G3/G4; write a stock FX suite; bump
 `OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
-Pitch Coach phases 1–3, the lanes UX track, the theme system).
+Pitch Coach phases 1–3, the lanes UX track, the theme system, Composer
+H1).
 
-**Nothing is in flight.** Latest on `main`: `5f891cb` (lanes UX, PR #60).
+**In flight:** `feat/composer-assistant` (Plan H1, PR open) and a WIP
+`feat/g1-mixer-strip` worktree at `811b954` — a G1 Task 5 start from an
+earlier session ("wip: insert compile + unified mixer strip"), which this
+file previously described as "nothing in flight". Check that commit
+before starting Task 5 from scratch. Latest on `main`: `79c3e98`.
 Stale worktrees for merged branches can be ignored — but keep the
 branches `feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history`
 and `worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in
@@ -28,6 +44,7 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
+| **The Composer, Plan H1** — a pure music-theory library, the harmony document in the core, six generators (progression / voicing / bass / melody / groove, and the circle-of-fifths walk), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord | PR open on `feat/composer-assistant`. Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff (ear-check owed, what H2 picks up): [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
 | Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
 | Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
@@ -110,6 +127,17 @@ this file (marked correction, ADR 0007) if they do.
 - **Track B / C leftovers** that are not ear-checks: recording under an active loop; multi-clip delete. See the matching PHASE4-PLAN handoff.
 
 ## Standing constraints (all work)
+
+- **`src-tauri/src/theory/` is PURE and stays pure** (Plan H1, ruling H-5):
+  no `tauri`, `parking_lot`, `std::fs`, `crate::control`, `crate::audio`, and
+  no `thread_rng` — every generator takes an explicit `seed`. The only
+  sanctioned crate dependency is `crate::midi::MidiNote`. A generator that
+  needs project data is passed it. Same class of rule as the RT contract: it
+  is what keeps that suite fast and that library reusable.
+- **The harmony document is a map pair, not a track** (H-3/H-5): one op
+  (`Op::HarmonySet`), no `rebuild` effect, `OP_FORMAT_VERSION` still 2,
+  `schemaVersion` unmoved, and the `project.json` key written only when the
+  document is non-empty. Do not add a `TrackKind` or a second harmony op.
 
 These are load-bearing as of Gate E closing. Historical plans called
 this `next-prompt.md` §2.
