@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura://ipc/user-theme.schema.json",
+  "title": "UserTheme",
+  "description": "User-defined theme loaded from a JSON file in the user themes directory.",
+  "type": "object",
+  "required": ["name"],
+  "additionalProperties": false,
+  "properties": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Human-readable display name for the theme."
+    },
+    "extends": {
+      "type": "string",
+      "enum": [
+        "aura-dark",
+        "aura-light",
+        "high-contrast-dark",
+        "high-contrast-light",
+        "solarized-dark",
+        "solarized-light",
+        "nord",
+        "gruvbox-dark"
+      ],
+      "description": "Built-in theme base to inherit unspecified token values from."
+    },
+    "tokens": {
+      "type": "object",
+      "description": "Theme token overrides.",
+      "additionalProperties": true,
+      "properties": {
+        "bgVoid": { "type": "string" },
+        "bg0": { "type": "string" },
+        "bgSunken": { "type": "string" },
+        "bg1": { "type": "string" },
+        "bg2": { "type": "string" },
+        "bg3": { "type": "string" },
+        "glass": { "type": "string" },
+        "line": { "type": "string" },
+        "edge": { "type": "string" },
+        "cyan": { "type": "string" },
+        "cyanBright": { "type": "string" },
+        "cyanDeep": { "type": "string" },
+        "magenta": { "type": "string" },
+        "amber": { "type": "string" },
+        "amberSunken": { "type": "string" },
+        "red": { "type": "string" },
+        "redSoft": { "type": "string" },
+        "violet": { "type": "string" },
+        "green": { "type": "string" },
+        "orange": { "type": "string" },
+        "text": { "type": "string" },
+        "textMid": { "type": "string" },
+        "textDim": { "type": "string" },
+        "textFaint": { "type": "string" },
+        "textOnAccent": { "type": "string" },
+        "shadow": { "type": "string" },
+        "trackPalette": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 6,
+          "maxItems": 6
+        },
+        "borderWidth": { "type": "string" },
+        "focusWidth": { "type": "string" },
+        "glassBlur": { "type": "string" },
+        "glowBlur": { "type": "string" },
+        "bodyGlow": { "type": "string" }
+      }
+    }
+  }
+}
