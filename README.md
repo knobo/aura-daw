@@ -88,6 +88,21 @@ clock plus Start/Stop/Continue/SPP (Hydrogen and friends slave to it) and
 can play one MIDI track's notes through an external synth
 ([docs/midi-output.md](docs/midi-output.md)).
 
+### Pitch Coach — sing against a MIDI melody
+
+Pick a MIDI track as the reference and the bottom panel becomes a lane: the
+target notes scroll under the playhead with your pitch drawn as a live trail,
+detected in Rust (YIN, off the real-time callback) with no Web Audio
+anywhere. With no melody selected it is a tuner whose headline number is how
+*steadily* you are holding a note, not how close you are to one — steadiness
+improves while accuracy is still poor, so it is the number that shows
+progress. Record a take and it is scored note by note: signed cents, whether
+you sang the note at all, entry timing, drift and vibrato
+([docs/pitch-coach.md](docs/pitch-coach.md)).
+
+Wear headphones — a backing track coming out of the speakers gets detected
+as your pitch.
+
 ### Plugin hosting — CLAP + LV2 instruments
 
 Real in-graph hosting of third-party instruments on MIDI tracks, with one shared
@@ -415,8 +430,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 1020 tests (984 lib + 36 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-16 after pitch_unsubscribe): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map
-npm test                      # 574 frontend unit tests (counted 2026-08-17 after the lane auto-framing fix; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + launch map + pitch wire types + pitch frame bus + pitch lane geometry + pitch panel logic + pitch subscription lifetime + rehearse-hold refcount
+cd src-tauri && cargo test    # 1060 tests (1024 lib + 36 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-17 after the Pitch Coach fix review): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map, pitch scoring + stored pitch curve
+npm test                      # 593 frontend unit tests (counted 2026-08-17 after Pitch Coach scoring; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + launch map + pitch wire types + pitch frame bus + pitch lane geometry + pitch panel logic + pitch subscription lifetime + rehearse-hold refcount + pitch report geometry
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

@@ -48,7 +48,7 @@
   import { launch } from "./lib/state/launch.svelte";
   import LaunchMapPanel from "./lib/components/launch/LaunchMapPanel.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
-  import { rehearseKeyMatches } from "./lib/components/pitch/panel-logic";
+  import { rehearseKeyMatches, rehearseKeyReleases } from "./lib/components/pitch/panel-logic";
   import { releaseRehearse, setRehearseSource } from "./lib/state/rehearse.svelte";
   import { theme } from "./lib/theme/theme.svelte";
   import { loadUserThemes } from "./lib/theme/load";
@@ -115,9 +115,9 @@
     return transport.isRecording || ui.bottomPanel === "pitch";
   }
 
-  /** True while THIS window's key is the source of a rehearse hold. The
-   * button is the other source; `rehearse.svelte.ts` counts them. */
-  let rehearseKeyDown = false;
+  /** The key that started THIS window's rehearse hold, lower-cased, or null.
+   * The button is the other source; `rehearse.svelte.ts` counts them. */
+  let rehearseKeyDown: string | null = null;
 
   /**
    * Release on keyup — and on blur, since a window that loses focus
@@ -126,11 +126,14 @@
    * Deliberately does NOT re-test the preference: change the rehearse key
    * (or set it to OFF) in the Preferences dialog while the key is physically
    * held and a preference-matching release never comes, so the engine keeps
-   * writing silence into a running take. What went down is what comes up.
+   * writing silence into a running take. What went down is what comes up —
+   * which is why the KEY is stored rather than a bare flag. Releasing on any
+   * keyup ends the hold when the singer taps Shift with `H` still down, and
+   * the take starts committing real audio mid-rehearsal.
    */
-  function onKeyup(_e: KeyboardEvent) {
-    if (!rehearseKeyDown) return;
-    rehearseKeyDown = false;
+  function onKeyup(e: KeyboardEvent) {
+    if (!rehearseKeyReleases(rehearseKeyDown, e.key)) return;
+    rehearseKeyDown = null;
     setRehearseSource("key", false);
   }
 
@@ -208,7 +211,7 @@
       // whatever claims them — none of the branches above claim "h", so
       // without this they would all start a hold and be preventDefault()ed.
       e.preventDefault();
-      rehearseKeyDown = true;
+      rehearseKeyDown = e.key.toLowerCase();
       setRehearseSource("key", true);
       return;
     }
@@ -311,7 +314,7 @@
   onkeydown={onKeydown}
   onkeyup={onKeyup}
   onblur={() => {
-    rehearseKeyDown = false;
+    rehearseKeyDown = null;
     releaseRehearse();
   }}
 />

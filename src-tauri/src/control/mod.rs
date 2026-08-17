@@ -21,6 +21,7 @@ pub mod export;
 pub mod history;
 pub mod op;
 pub mod ops;
+pub mod pitch_coach;
 pub mod replay;
 pub mod loopjam;
 pub mod session;

@@ -73,11 +73,28 @@ singer. It does not exercise the Tauri command layer.
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 1020 tests (984 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-16 after pitch_unsubscribe)
-npm test                     # 574 frontend unit tests (vitest; counted 2026-08-17 after the lane auto-framing fix)
+cd src-tauri && cargo test   # 1060 tests (1024 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-17 after the Pitch Coach fix review)
+npm test                     # 593 frontend unit tests (vitest; counted 2026-08-17 after Pitch Coach scoring)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
+
+**A Bluetooth default output sink fails 18 engine tests, and it does not look
+like an audio problem.** The engine opens a stream and publishes a sample rate
+— so it appears to have started — and then no callback ever arrives: the
+transport stays at 0, no meter frames appear, and every `control::loopjam`
+test reports `"audio engine did not respond"`. Point the test process at a
+real ALSA sink instead. This changes nothing globally, so your own audio stays
+where it is:
+
+```sh
+PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
+  cargo test -- --test-threads=1
+```
+
+Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
+Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
+before filing an engine, transport, loopjam or meter failure as a regression.
 
 `midi_out::tests` is **known flaky as a module**, not as individual tests:
 its cases share a process-global hub and open real ALSA virtual ports, so

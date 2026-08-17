@@ -19,8 +19,9 @@ documentation and all commits are English.
 |---|---|
 | On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
 | On `main` | **Phase 2**: PR #58 `7c3cb87` (panel, frame bus, lane geometry, prefs, `pitch_unsubscribe`) |
-| Worktrees | all stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
-| Next | **Phase 3, Task 12**, from `origin/main`. Read [`pitch-as-data.md`](../../backlog/pitch-as-data.md) before Task 14 |
+| Worktrees | stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
+| **In flight** | **Phase 3** on branch `feat/pitch-coach-scoring`, worktree `.claude/worktrees/pitch-phase3`, branched from `origin/main` `cf224ce`. Pushed; **PR #61** |
+| Next | Tasks 12–16 done, reviewed, pushed. What is left is the owner's: the ear-check against the real engine, and merging PR #61 |
 
 ## Status
 
@@ -162,18 +163,102 @@ follow-ups and the R3 instrument.
 - [x] Review round on PR #58 — `a590136`. Nine findings, all fixed; the
       branch is no longer frontend-only (see the log).
 
-**Phase 3 — scoring.** Not started. Tasks 12–16: shared repeat-expansion
-helper, scoring, pitch track on disk, the report, docs + PR.
-`panel-logic.targetNotesFor` currently expands repeats frontend-side with
-the timeline preview's rule — Task 12 is what replaces it.
+**Phase 3 — scoring. IN PROGRESS** on `feat/pitch-coach-scoring`. Tasks
+12–16: shared repeat-expansion helper, scoring, pitch track on disk, the
+report, docs + PR.
 
-**Before implementing Task 14, read
-[`docs/backlog/pitch-as-data.md`](../../backlog/pitch-as-data.md).** The
-owner has since asked for pitch extraction from existing clips and for
-auto-tune, which makes `APTF` a shared format rather than a scoring detail.
-Four decisions are due while it is still unbuilt; the load-bearing one is
-that the recorder folds the CAUSAL median (20 ms lag) while an offline pass
-can use the centred one, so the format should record which it holds.
+- [x] Task 12 — `clip_notes` + `AbsNote` in `midi/schedule.rs` — `aff2564`,
+      14/14 `midi::schedule`, 151/151 `midi::`. `clip_events` and
+      `clip_notes` now share one `expand_notes`, and
+      `clip_notes_and_clip_events_agree_on_timing` fails if they drift.
+      `AbsNote.note_id` is the repo's `NoteId`, not the plan's bare `u32`;
+      `clip_id_hash` is FNV-1a because `DefaultHasher` is not stable across
+      Rust releases and this value reaches the frontend.
+- [x] Task 13 — `control/pitch_coach.rs`: `reference_melody` + `score` —
+      `78d0e32`, 14/14. Two deliberate deviations from the plan, both
+      because the plan disagreed with its own tests: `vibrato_extent_cents`
+      is PEAK-TO-PEAK (the plan said half of it, then asserted > 50 cents on
+      a 90 cent wobble), and the hit hysteresis counts the frames that
+      trigger a transition as part of the state they trigger (charging them
+      to the singer caps a flawless take at 97.8 %, and the plan's own first
+      test wants > 99).
+- [x] Task 14, **first half** — `audio/pitch_store.rs` (`APTF`, `PitchFolder`,
+      `analyze_interleaved`) + the recorder fold — `9f21522`, 10/10 store,
+      5/5 recorder.
+- [x] Task 14, **second half** — the three commands (`pitch_score`,
+      `pitch_track`, `pitch_analyze_clip`), `pitch-score-report.schema.json`,
+      and their registration in `lib.rs` — `d67c831`. 38/38 across
+      `audio::pitch_store`, `control::pitch_coach` and `midi::schedule`.
+      **The handoff note below had the timeline conversion backwards** —
+      see the correction in the log.
+- [x] Task 15 — the report UI (`PitchReport.svelte`, `pitch/report.ts`,
+      wire types, three bindings + their `DemoBackend` mocks). 588 frontend
+      tests, `svelte-check` 0 errors, `npm run build` green.
+- [x] Task 16 — `docs/pitch-coach.md`, ARCHITECTURE §3.3/§3.4/§5.1/§7, the
+      README feature section, the count docs.
+- [x] Pre-PR gate, 2026-08-17. **1020/1020 lib** and **36/36 integration**
+      (single-threaded, with the default sink off Bluetooth — see the
+      environment warning), **593 frontend**, `svelte-check` 0 errors (1
+      pre-existing a11y warning in `LaunchMapPanel.svelte`), `npm run build`
+      green. Counts landed in README + CONTRIBUTING: 1056 Rust, 593 frontend.
+      **CI is green on both jobs** (PR #61: frontend 36 s, Rust 12m30s).
+
+- [x] Review round on the branch — `f287723`. Eight findings fixed; three of
+      them produced wrong NUMBERS (chord clustering was transitive, the
+      headline ignored coverage, vibrato ran on folded cents) and one froze
+      the UI (three sync commands doing seconds of decode + YIN on the GTK
+      main thread). See the log.
+- [x] **Second review round, on the fixes themselves.** Five findings, and one
+      was a regression the first round's own fix introduced: multiplying
+      `hit_fraction` by the row's `coverage` billed the onset grace window
+      twice, so four flawless eighth notes entered with a 70 ms consonant
+      scored 72 % "Solid" and a 140 ms note could not pass 50 %. Reviewing a
+      fix commit is not optional — that number would have shipped. See the log.
+
+`panel-logic.targetNotesFor` still expands repeats frontend-side with the
+timeline preview's rule. Task 12 built the backend replacement, but it is
+consumed inside `pitch_score` only — retiring the frontend copy needs a
+command that returns the resolved melody to the LANE, and that command does
+not exist. **Left open deliberately**, not forgotten: it is new IPC surface,
+which is a decision for the owner and not a review fix. The two rules agree
+today and the comment in `panel-logic.ts` says a change to one is owed to
+the other.
+
+### What Task 14's second half needs to know
+
+Written down because the first half made the decisions:
+
+- **`APTF` positions are TAKE-LOCAL**, in the take's own sample rate, and
+  they snap onto a `first_sample + i * hop` grid. The scorer therefore has
+  to map them onto the timeline itself. **CORRECTED while implementing the
+  second half** — this bullet originally read `(sample - offset_samples) *
+  project_rate / source_rate`, which converts the offset as if it were a
+  source-rate quantity. It is not. `offset_samples` and `length_samples`
+  index the decode cache, and `audio/offline.rs` `linear_resample`s that
+  cache to the engine rate before indexing it, so both are PROJECT-rate.
+  The conversion comes first:
+  `timeline = clip.timeline_start_samples + (sample * project_rate /
+  clip.source_sample_rate) - clip.offset_samples`. The two agree only when
+  the take's rate equals the project's. The reference notes from
+  `clip_notes` are already in project samples.
+- **The header carries `first_sample`** because the analyser timestamps the
+  CENTRE of its window (~15 ms in). Deriving positions from a bare
+  `i * hop` would slide every curve early by that much.
+- **Provenance is `CausalMedian` for both producers today.** The offline
+  path reuses the live detector; being offline is not the same as being
+  centred. Decision (a) of `pitch-as-data.md` is satisfied by the byte
+  existing, not by a centred pass existing.
+- **`score()` leaves `reference_track_id` empty** — the command stamps it.
+- Missing cache: the intended shape is for `pitch_score` to analyse and
+  write the track when `cache/pitch/<clipId>.bin` is absent, so the UI
+  never has to make two round trips. Analysis runs at roughly 100× real
+  time, so a 3-minute take costs ~2 s on the command thread.
+
+**Before implementing anything more of Task 14, read
+[`docs/backlog/pitch-as-data.md`](../../backlog/pitch-as-data.md).** Its
+four decisions are what the format above already encodes; (b) (do not widen
+the format on speculation) and (d) (the curve is read-only) are still live
+constraints on the rest of the task.
 
 ### What phase 2 must not get wrong
 
@@ -230,6 +315,31 @@ Both of these came out of actually running the detector against a voice
   the ones the backend flagged.
 
 ## Environment warning (read before running the suite)
+
+**A Bluetooth default sink fails 18 lib tests, and it looks exactly like a
+regression.** Found 2026-08-17 and worth knowing before you debug anything
+else: with `pactl get-default-sink` reporting a `bluez_output.*`, the engine
+opens a stream and publishes a sample rate — the first assert passes — and
+then **no callback ever arrives**. The transport stays at position 0, no meter
+frames are produced, and every `control::loopjam` test dies on
+`"audio engine did not respond"`. The set is `audio::engine` (4, including
+both `ensure_loaded_builds_pyramids*`), `control::loopjam` (9),
+`control::tests` (4 transport/loop ones) and
+`mcp::server::tests::read_meters_hears_the_headless_engine`.
+
+The fix is one env var, and it changes nothing globally — the user's audio
+stays where they put it:
+
+```sh
+PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
+  cargo test -- --test-threads=1
+```
+
+**1020/1020 lib in 72 s** that way, against 1002/1020 in 882 s over Bluetooth
+— the timeouts *were* the runtime. Two things this cost, so you do not repeat
+them: the same failures reproduce on `origin/main` with none of the branch
+checked out (that is how the branch was cleared), and they are NOT memory
+pressure — the owner freed 9 GB and all 18 still failed.
 
 This box is under memory pressure: **swap is fully consumed (15/15 GB)** and
 other worktrees run `cargo test` concurrently. A full `cargo test` therefore
@@ -289,6 +399,136 @@ After finishing each task: tick its box, and add a line under the log below
 with the commit sha and anything the next agent would be surprised by.
 
 ## Log
+
+- 2026-08-17 — **Second review round, on the fix commit itself.** Five
+  findings. The one that matters is a regression the FIRST round's fix
+  introduced, which is the lesson: a fix commit needs reviewing like any other.
+  1. **`hit_fraction * coverage` double-counted the onset grace window.**
+     `hit_fraction` is measured past `ONSET_GRACE_MS`; the row's `coverage`
+     spans the whole note including it. Four flawless eighth notes entered
+     with a 70 ms consonant scored 72 % — "Solid" for a perfect take — and a
+     140 ms note capped at 50 %. There is now a `scored_coverage` measured over
+     the same post-grace window, the headline weights by
+     `scoreable_samples` rather than full length, and two tests pin it.
+  2. **A mean does not survive the octave fold.** Round one unwrapped the
+     wobble measures but left `mean_cents`/`median_cents` averaging folded
+     frames, so a singer parked a tritone away had +595 and -595 cancel to
+     nearly zero: the row drew its cents bar dead centre next to `hit 0 %`.
+     Now unwrapped, averaged, and folded back (`fold_cents`).
+  3. **Forcing `ui.bottomPanel = "roll"` destroyed the take report** — that
+     was round one's own fix for the dead double-click. The panel is
+     unmounted by the roll, and `takeClipId` was component state, so "read
+     the report → open the melody to look at the flat note → back to PITCH"
+     lost it. `takeState` in `state/pitch.svelte.ts` outlives the panel; the
+     report itself is still refetched, per the spec's no-persisted-scores rule.
+  4. The demo backend's report key was unclamped while the lane's is now
+     clamped — in demo mode that IS the report, and it rendered note names
+     that do not exist.
+  5. "Every note came from a chord" was the wrong explanation for
+     `scoredNotes == 0` once the `covered` rule existed: one held note under a
+     single-line melody flags every note without any chord existing.
+
+- 2026-08-17 — **The panel never read the CURRENT pitch state on mount**, only
+  future `pitch://state` events — and `emit_pitch_state` dedupes, so a panel
+  mounting against an engine that already had a reference track drew no melody
+  at all until some unrelated transition happened to emit (a take starting or
+  stopping flips `listening`, which is why the owner saw the notes appear
+  *after* recording). `SubscribePitch` now clears `last_pitch_state` and emits.
+  Reported by the owner's second ear-check; it did NOT reproduce after a
+  restart, which fits exactly — a restart makes them set the reference again,
+  after the panel is already listening. The hole was found in the code, not in
+  a repro, and the test
+  (`subscribing_to_pitch_gets_the_current_state_without_waiting_for_a_change`)
+  asserts the emit rather than the symptom.
+
+- 2026-08-17 — **The 18 "engine never starts" failures were the default audio
+  sink being a Bluetooth device.** Recorded because two plausible explanations
+  were wrong first: it is not the branch (the same failures reproduce on
+  `origin/main` `cf224ce`), and it is not memory pressure (the owner freed
+  9 GB and all 18 still failed). Pointing one test process at the HDMI sink
+  turned a 10 s timeout into a 0.23 s pass, and the whole suite into
+  **1020/1020 in 72 s**. See the environment warning for the command. The
+  symptom to recognise: the engine publishes a sample rate — so "the engine
+  started" — and then no callback ever arrives.
+
+- 2026-08-17 — **Phase 3 reviewed and fixed** (`f287723`). Eight findings.
+  Six things the next agent should know:
+  1. **Chord clustering by overlap is transitive, and that is a trap.** The
+     first implementation grouped a note into the cluster when
+     `n.start < cluster_end` with `cluster_end` the running MAX end, so one
+     note overhanging the next chained a whole legato phrase into ONE target:
+     one row, `clean` empty, headline 0 % "Finding it" on a take sung well.
+     Clustering is by ONSET now (`CHORD_ONSET_MS`, 30 ms — a humanised MIDI
+     chord does not share an exact tick), plus a separate
+     "another note covers more than half of this one" test so a drone under
+     the tune is still flagged. Identity in that test is the whole `AbsNote`,
+     NOT `note_id`: every repeat of a looped clip's content carries the same
+     `note_id`, so a note would find itself in the next pass.
+  2. **`hit_fraction` is a share of what was VOICED.** Weighting it by note
+     duration in the headline let one in-tune blip per note claim the note's
+     whole length — "Locked in" for a take that was mostly silence. The
+     headline is `hit * coverage`, duration-weighted; the per-row `hit`
+     deliberately still answers "was what you sang in tune".
+  3. **`cents_to_key` folds every frame independently**, so any series
+     measure built on it breaks at the ±600 boundary. A singer parked about a
+     tritone away flipped between +600 and -600 and reported 1200 cents of
+     vibrato at a rate invented from the fold's own crossings.
+     `unwrap_octaves` runs before vibrato and stability; the REPORTED error
+     stays folded, which is the octave forgiveness the spec asks for.
+  4. **Sync Tauri commands run on the GTK main thread** — the repo already
+     documents this on `seed_demo_project`, and the three new pitch commands
+     ignored it while doing a decode plus a YIN pass. The panel's own
+     "ANALYSING THE TAKE…" state could never paint. All three are `async` +
+     `spawn_blocking`, and the session lock is released before the move.
+  5. **`pitch_active` does NOT gate the stored curve.** Worth knowing before
+     "fixing" the panel's teardown: the APTF fold runs in the recorder's
+     writer thread off the audio it writes, so closing the panel mid-take
+     stops the live lane and the microphone but never truncates the take's
+     curve. The reviewer's "closing the panel kills a listen enabled
+     elsewhere" finding was left alone for the same reason the other way
+     round: there IS no listen control outside the panel today.
+  6. **Rehearse-hold released on any keyup.** `rehearseKeyDown` was a bare
+     boolean, so tapping Shift with `H` down ended the hold and the take
+     started committing real audio mid-rehearsal. The KEY is stored now
+     (`rehearseKeyReleases` in `panel-logic.ts`, so it is testable) — and it
+     still must not re-test the preference, or changing the rehearse key
+     mid-hold strands the engine writing silence.
+
+  Two findings were deliberately NOT fixed, both outside this feature:
+  `src-tauri/Cargo.toml`'s `--no-default-features` (LV2 stub) build points at
+  a workflow that does not exist and nothing in CI compiles it, so
+  `plugins/lv2_host_stub.rs` will rot on the next `lv2_host.rs` signature
+  change (it lines up today — checked by hand); and the frontend
+  repeat-expansion copy discussed above.
+
+- 2026-08-17 — Phase 3 started on `feat/pitch-coach-scoring` (worktree
+  `.claude/worktrees/pitch-phase3`, from `origin/main` `cf224ce`). Tasks 12,
+  13 and the first half of 14 are committed but NOT pushed. Six things the
+  next agent would otherwise rediscover the hard way:
+  1. **`cargo fmt`/`rustfmt` on a whole file reformats the repo's existing
+     code.** `rustfmt src/midi/schedule.rs` turned a 175-line diff into a
+     407-line one, all of it reflowing untouched test code — this crate has
+     never been rustfmt-clean. Hand-match the surrounding style instead, and
+     never run `cargo fmt` without a path (the phase 1 log says the same).
+  2. **Frame positions out of `PitchAnalyzer` are NOT exactly hop-spaced.**
+     Its integer timestamp maths re-anchors at every push, so a chunk
+     boundary shifts a frame by up to ~4 samples. Bounded, not cumulative,
+     and under 0.2 ms against a 10 ms hop — but a test asserting exact
+     spacing fails, and the file format snaps them back onto the grid.
+  3. **`PitchAnalyzer::push` stops appending at 2048 frames.** That cap
+     exists for the RT path; anything folding a whole take must drain the
+     out-vec after every push or silently lose everything past 20 s.
+  4. **A ring drain can split an interleaved frame down the middle.** The
+     recorder hands the writer two slices from one rtrb chunk, and the split
+     is at a raw sample index. `PitchFolder` carries the remainder to the
+     next push — a decimator that swallowed a half frame would swap the
+     channels for the rest of the take.
+  5. **`RecSpec` grew `pitch_path: Option<PathBuf>`.** `None` means "fold
+     nothing" and is what the engine's two error-path tests pass.
+  6. Verification ran per module (`cargo test --lib <module>`) with
+     `CARGO_TARGET_DIR` pointed at the main checkout's target dir, per the
+     box's disk constraint. The full suite has NOT been run on this branch
+     yet; it is owed before the PR, single-threaded.
 
 - 2026-08-17 — **Owner ear-check done, and it found a real one.** The panel
   tracked a real voice well, but the reference notes "did not fall into

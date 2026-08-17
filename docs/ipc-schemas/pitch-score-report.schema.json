@@ -1,0 +1,148 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "aura:ipc/pitch-score-report.schema.json",
+  "title": "PitchScoreReport",
+  "description": "How a recorded take was sung against a MIDI reference melody. Returned by the pitch_score command. Mirrors Rust struct control::pitch_coach::PitchScoreReport. Never persisted: a score is recomputed on demand so it stays correct after the reference melody is edited.",
+  "type": "object",
+  "properties": {
+    "notes": {
+      "description": "One row per reference note, in melody order. Notes resolved out of a chord are present but flagged.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/noteScore" }
+    },
+    "scoredNotes": {
+      "description": "How many notes the summary was computed from (the unambiguous ones). Zero means the summary numbers are meaningless: every reference note came out of a chord, which is not the same as a score of zero.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "inTolerancePct": {
+      "description": "Duration-weighted percentage of the scored notes' duration that landed inside toleranceCents, counting material that was not sung as outside it. Ambiguous notes are excluded. Meaningless when scoredNotes is 0.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100
+    },
+    "meanAbsCents": {
+      "description": "Mean absolute error over every scored frame of every unambiguous note.",
+      "type": "number",
+      "minimum": 0
+    },
+    "medianSignedCents": {
+      "description": "Median SIGNED error. The sign is the point: 'consistently 30 cents flat' is advice, 'off by 30 cents' is not.",
+      "type": "number"
+    },
+    "meanOnsetOffsetMs": {
+      "description": "Mean entry offset across the notes that were sung at all. Positive is late.",
+      "type": "number"
+    },
+    "rating": {
+      "description": "One of five words for inTolerancePct: Finding it, Getting there, Solid, Sharp, Locked in.",
+      "type": "string"
+    },
+    "toleranceCents": {
+      "description": "The tolerance this report was computed with, echoed so a stored view cannot misreport which tier produced it.",
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "referenceTrackId": {
+      "description": "The MIDI track the melody came from.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "notes",
+    "scoredNotes",
+    "inTolerancePct",
+    "meanAbsCents",
+    "medianSignedCents",
+    "meanOnsetOffsetMs",
+    "rating",
+    "toleranceCents",
+    "referenceTrackId"
+  ],
+  "$defs": {
+    "noteScore": {
+      "title": "NoteScore",
+      "description": "One reference note, and how it was sung.",
+      "type": "object",
+      "properties": {
+        "noteId": {
+          "description": "Identity inside the source clip. Every repeat of a looped clip's content shares it; startSample is what makes a row unique.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "startSample": {
+          "description": "Note onset on the timeline, in project samples. Clicking a row seeks here.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "endSample": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "key": {
+          "description": "MIDI key of the reference note, after the clip's transpose.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 127
+        },
+        "hitFraction": {
+          "description": "Fraction of the scored frames within tolerance, after debouncing. Scored frames are the voiced ones past the 70 ms onset grace window.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "coverage": {
+          "description": "Fraction of the note's frames that were voiced at all. Low coverage means 'you did not sing this', which is different advice from a low hitFraction.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "meanCents": {
+          "description": "Signed mean error against the note, octave-folded.",
+          "type": "number"
+        },
+        "medianCents": {
+          "type": "number"
+        },
+        "onsetOffsetMs": {
+          "description": "Entry offset in milliseconds; positive is late. 0 when nothing was sung — coverage carries that story instead.",
+          "type": "number"
+        },
+        "stabilityCents": {
+          "description": "Standard deviation of the smoothed error over the sustain: drift, with vibrato averaged out.",
+          "type": "number",
+          "minimum": 0
+        },
+        "vibratoRateHz": {
+          "description": "Estimated vibrato rate over the sustain, or 0 when the wobble is too small to be vibrato.",
+          "type": "number",
+          "minimum": 0
+        },
+        "vibratoExtentCents": {
+          "description": "Peak-to-peak vibrato width in cents.",
+          "type": "number",
+          "minimum": 0
+        },
+        "ambiguous": {
+          "description": "This note came out of a chord and the melody line was guessed (top note). Reported, but excluded from the session statistics.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "noteId",
+        "startSample",
+        "endSample",
+        "key",
+        "hitFraction",
+        "coverage",
+        "meanCents",
+        "medianCents",
+        "onsetOffsetMs",
+        "stabilityCents",
+        "vibratoRateHz",
+        "vibratoExtentCents",
+        "ambiguous"
+      ]
+    }
+  }
+}

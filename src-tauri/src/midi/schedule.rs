@@ -9,6 +9,7 @@
 use super::synth::BlockNoteEvent;
 use super::tempo::TempoMap;
 use super::types::MidiClip;
+use crate::ids::NoteId;
 
 /// A note edge at an absolute engine-sample position. `velocity == 0` is a
 /// note-off (same convention as [`BlockNoteEvent`]).
@@ -18,6 +19,84 @@ pub struct AbsNoteEvent {
     pub sample: u64,
     pub key: u8,
     pub velocity: u8,
+}
+
+/// One expanded note as a *span* in absolute engine samples, carrying the
+/// identity [`AbsNoteEvent`] drops. A consumer that must address a note back
+/// (the Pitch Coach report seeks to one) needs that identity; the scheduler
+/// does not — so the two views share one expansion and differ only in shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbsNote {
+    /// Absolute onset in engine samples.
+    pub start: u64,
+    /// Absolute release in engine samples, always `> start`.
+    pub end: u64,
+    /// Key after the clip's transpose — what the synth would sound.
+    pub key: u8,
+    /// Stable FNV-1a hash of the source clip id. Keeps [`AbsNote`] `Copy`
+    /// while still telling two clips' note 7 apart.
+    pub clip_id_hash: u64,
+    /// Identity of the note *inside* the clip. Every repeat of a looped
+    /// clip's content reports the SAME `note_id`; `repeat_index` separates
+    /// them.
+    pub note_id: NoteId,
+    /// Which pass over the clip content this note came from (0 = the first).
+    pub repeat_index: u32,
+}
+
+/// FNV-1a over a clip id's bytes. Not [`std::hash::DefaultHasher`], which is
+/// explicitly not stable across Rust releases — this value travels to the
+/// frontend inside a report.
+pub fn clip_id_hash(clip_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in clip_id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// One expanded note, before it is shaped into edges or into a span.
+struct Expanded {
+    on_s: u64,
+    off_s: u64,
+    key: u8,
+    velocity: u8,
+    note_id: NoteId,
+    repeat_index: u32,
+}
+
+/// The single expansion rule behind [`clip_events`] and [`clip_notes`]:
+/// content repeats, onset clipping at the placement end, off clamping and
+/// the 1-sample floor. Emission is repeat-major, then written order; both
+/// callers sort afterwards.
+fn expand_notes(clip: &MidiClip, map: &TempoMap, mut emit: impl FnMut(Expanded)) {
+    let clip_end_tick = clip.timeline_start_ticks.saturating_add(clip.length_ticks);
+    let content_len = clip.effective_content_length_ticks();
+    let repeats = clip.length_ticks.div_ceil(content_len).max(1);
+    for rep in 0..repeats {
+        let rep_start_tick =
+            clip.timeline_start_ticks.saturating_add(rep.saturating_mul(content_len));
+        for n in &clip.notes {
+            if n.velocity == 0 || n.length_ticks == 0 {
+                continue;
+            }
+            let on_tick = rep_start_tick.saturating_add(n.tick as u64);
+            if on_tick >= clip_end_tick {
+                continue;
+            }
+            let off_tick = on_tick
+                .saturating_add(n.length_ticks as u64)
+                .min(clip_end_tick);
+            let on_s = map.tick_to_samples(on_tick);
+            let mut off_s = map.tick_to_samples(off_tick);
+            if off_s <= on_s {
+                off_s = on_s + 1;
+            }
+            let (key, velocity) = clip_note_key_vel(clip, n);
+            emit(Expanded { on_s, off_s, key, velocity, note_id: n.note_id, repeat_index: rep as u32 });
+        }
+    }
 }
 
 fn clip_note_key_vel(clip: &MidiClip, n: &crate::midi::types::MidiNote) -> (u8, u8) {
@@ -45,37 +124,40 @@ fn clip_note_key_vel(clip: &MidiClip, n: &crate::midi::types::MidiNote) -> (u8, 
 /// * Zero-length results (rounding) still get a 1-sample duration so every
 ///   on has its off strictly after it.
 pub fn clip_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
-    let clip_end_tick = clip.timeline_start_ticks.saturating_add(clip.length_ticks);
-    let content_len = clip.effective_content_length_ticks();
-    let repeats = clip.length_ticks.div_ceil(content_len).max(1);
-    let mut out = Vec::with_capacity(clip.notes.len() * 2 * repeats as usize);
-    for rep in 0..repeats {
-        let rep_start_tick =
-            clip.timeline_start_ticks.saturating_add(rep.saturating_mul(content_len));
-        for n in &clip.notes {
-            if n.velocity == 0 || n.length_ticks == 0 {
-                continue;
-            }
-            let on_tick = rep_start_tick.saturating_add(n.tick as u64);
-            if on_tick >= clip_end_tick {
-                continue;
-            }
-            let off_tick = on_tick
-                .saturating_add(n.length_ticks as u64)
-                .min(clip_end_tick);
-            let on_s = map.tick_to_samples(on_tick);
-            let mut off_s = map.tick_to_samples(off_tick);
-            if off_s <= on_s {
-                off_s = on_s + 1;
-            }
-            let (key, velocity) = clip_note_key_vel(clip, n);
-            out.push(AbsNoteEvent { sample: on_s, key, velocity });
-            out.push(AbsNoteEvent { sample: off_s, key, velocity: 0 });
-        }
-    }
+    let mut out = Vec::with_capacity(clip.notes.len() * 2);
+    expand_notes(clip, map, |e| {
+        out.push(AbsNoteEvent { sample: e.on_s, key: e.key, velocity: e.velocity });
+        out.push(AbsNoteEvent { sample: e.off_s, key: e.key, velocity: 0 });
+    });
     // Offs before ons at the same sample position so retriggers of the same
     // key release the previous voice first.
     out.sort_by_key(|e| (e.sample, e.velocity));
+    out
+}
+
+/// The same expansion as [`clip_events`], shaped as note *spans* that keep
+/// their identity, sorted by `(start, key)`.
+///
+/// The Pitch Coach's reference melody goes through this: the report must be
+/// able to say "note 7, second repeat, was 30 cents flat" and seek there,
+/// which note-on/note-off edges cannot express. Both functions call
+/// [`expand_notes`], so a change to the repeat rule cannot move the
+/// scheduler and the report apart — `clip_notes_and_clip_events_agree_on_timing`
+/// is the test that pins them together.
+pub fn clip_notes(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNote> {
+    let hash = clip_id_hash(clip.id.as_str());
+    let mut out = Vec::with_capacity(clip.notes.len());
+    expand_notes(clip, map, |e| {
+        out.push(AbsNote {
+            start: e.on_s,
+            end: e.off_s,
+            key: e.key,
+            clip_id_hash: hash,
+            note_id: e.note_id,
+            repeat_index: e.repeat_index,
+        });
+    });
+    out.sort_by_key(|n| (n.start, n.key));
     out
 }
 
@@ -139,6 +221,10 @@ mod tests {
 
     fn note(tick: u32, len: u32, key: u8, vel: u8) -> MidiNote {
         MidiNote { tick, length_ticks: len, key, velocity: vel, channel: 0, note_id: NoteId(0) }
+    }
+
+    fn note_id(id: u32, tick: u32, len: u32, key: u8) -> MidiNote {
+        MidiNote { note_id: NoteId(id), ..note(tick, len, key, 100) }
     }
 
     fn clip(start_ticks: u64, len_ticks: u64, notes: Vec<MidiNote>) -> MidiClip {
@@ -333,6 +419,69 @@ mod tests {
         let c2 = clip(0, 960, vec![note(0, 1, 60, 100)]);
         let ev2 = clip_events(&c2, &fast);
         assert!(ev2[1].sample > ev2[0].sample);
+    }
+
+    #[test]
+    fn clip_notes_and_clip_events_agree_on_timing() {
+        // Content is 2 bars, placement 4 bars, so the content repeats once.
+        // The last note's off lands past the placement end in the second
+        // repeat and must be clamped identically by both functions.
+        let bar = 960 * 4;
+        let mut c = clip(
+            0,
+            (4 * bar) as u64,
+            vec![
+                note_id(1, 0, 480, 60),
+                note_id(2, bar, 480, 62),
+                note_id(3, 2 * bar - 240, 960, 64), // runs past the content end
+            ],
+        );
+        c.content_length_ticks = Some((2 * bar) as u64);
+        let map = map_120();
+        let events = clip_events(&c, &map);
+        let notes = clip_notes(&c, &map);
+
+        let mut ons: Vec<u64> = events.iter().filter(|e| e.velocity > 0).map(|e| e.sample).collect();
+        ons.sort_unstable();
+        let mut starts: Vec<u64> = notes.iter().map(|n| n.start).collect();
+        starts.sort_unstable();
+        assert_eq!(starts, ons, "the two expansions must not drift");
+
+        let mut offs: Vec<u64> = events.iter().filter(|e| e.velocity == 0).map(|e| e.sample).collect();
+        offs.sort_unstable();
+        let mut ends: Vec<u64> = notes.iter().map(|n| n.end).collect();
+        ends.sort_unstable();
+        assert_eq!(ends, offs, "note ends must match note-offs");
+        assert_eq!(notes.len(), 6, "three notes over two repeats");
+    }
+
+    #[test]
+    fn clip_notes_carries_identity_across_repeats() {
+        let bar = 960 * 4;
+        let mut c = clip(0, (3 * bar) as u64, vec![note_id(7, 0, 480, 60)]);
+        c.content_length_ticks = Some(bar as u64);
+        let notes = clip_notes(&c, &map_120());
+        assert_eq!(notes.len(), 3);
+        assert!(notes.iter().all(|n| n.note_id == NoteId(7)), "same source note");
+        assert_eq!(notes.iter().map(|n| n.repeat_index).collect::<Vec<_>>(), vec![0, 1, 2]);
+        assert!(
+            notes.iter().all(|n| n.clip_id_hash == clip_id_hash("c1")),
+            "every span names its source clip"
+        );
+        assert_ne!(clip_id_hash("c1"), clip_id_hash("c2"), "different clips, different hash");
+    }
+
+    #[test]
+    fn clip_notes_applies_transpose_and_orders_a_chord_by_key() {
+        let mut c = clip(0, 1920, vec![note_id(1, 0, 480, 64), note_id(2, 0, 480, 60)]);
+        c.transpose_semitones = 2;
+        let notes = clip_notes(&c, &map_120());
+        assert_eq!(
+            notes.iter().map(|n| n.key).collect::<Vec<_>>(),
+            vec![62, 66],
+            "sorted by (start, key), transposed as the scheduler sounds it"
+        );
+        assert!(notes.iter().all(|n| n.end > n.start), "every span has a positive length");
     }
 
     #[test]

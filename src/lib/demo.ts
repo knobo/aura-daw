@@ -29,6 +29,7 @@ import {
   type MeterFrame,
   type MidiClip,
   type MidiNote,
+  type NoteScore,
   type OpenSidecarEvent,
   type PendingConfirmation,
   type PluginDescriptor,
@@ -38,6 +39,9 @@ import {
   type PluginParamInfo,
   type PitchFrame,
   type PitchFrameBatch,
+  type PitchPoint,
+  type PitchScoreReport,
+  type PitchTrackView,
   type Project,
   type ProjectSnapshot,
   type SidecarEvent,
@@ -1287,6 +1291,113 @@ export class DemoBackend implements Backend {
   async pitchSetReference(trackId: string | null): Promise<void> {
     this.pitchReferenceTrackId = trackId;
     this.emitPitchState();
+  }
+
+  /**
+   * A plausible take report, so the report UI is developable under
+   * `vite dev`. It is a MOCK: the numbers are a deterministic function of
+   * the reference melody's own notes, not of anything anybody sang, and
+   * they say nothing about the detector or the scorer. Deterministic on
+   * purpose — a report that reshuffled on every refetch would make a real
+   * sort bug invisible.
+   */
+  async pitchScore(
+    clipId: string,
+    referenceTrackId: string,
+    toleranceCents: number,
+  ): Promise<PitchScoreReport> {
+    // Both halves are checked the way the real command checks them, so a
+    // caller that passes a stale id fails here too rather than only in Tauri.
+    if (!this.clips.some((c) => c.id === clipId)) throw new Error(`unknown audio clip ${clipId}`);
+    if (!this.tracks.some((t) => t.id === referenceTrackId)) {
+      throw new Error(`unknown reference track ${referenceTrackId}`);
+    }
+    const notes: NoteScore[] = [];
+    for (const mc of this.midiClips) {
+      if (mc.trackId !== referenceTrackId) continue;
+      const contentLen = mc.contentLengthTicks ?? mc.lengthTicks;
+      // The demo's melody is whatever is drawn on the track; overlapping
+      // notes are flagged the way the real chord resolver flags them.
+      for (const n of mc.notes) {
+        if (n.tick >= contentLen) continue;
+        const startTicks = mc.timelineStartTicks + n.tick;
+        const seed = hashString(`${mc.id}:${n.tick}:${n.key}`);
+        const meanCents = (noise(seed, 1) - 0.5) * 2 * toleranceCents * 2.2;
+        const inTune = Math.abs(meanCents) <= toleranceCents;
+        const ambiguous = mc.notes.some(
+          (o) => o !== n && o.tick === n.tick && o.key > n.key,
+        );
+        notes.push({
+          noteId: n.noteId ?? seed >>> 8,
+          startSample: Math.round(this.ticksToSamples(startTicks)),
+          endSample: Math.round(this.ticksToSamples(startTicks + n.lengthTicks)),
+          // Clamped like the backend's `clip_note_key_vel` and the lane's
+          // `targetNotesFor`: in demo mode this IS the report, and an
+          // unclamped key renders a note name that does not exist.
+          key: Math.max(0, Math.min(127, n.key + (mc.transposeSemitones ?? 0))),
+          hitFraction: inTune ? 0.72 + 0.28 * noise(seed, 2) : 0.15 * noise(seed, 3),
+          coverage: 0.55 + 0.45 * noise(seed, 4),
+          meanCents,
+          medianCents: meanCents * 0.9,
+          onsetOffsetMs: (noise(seed, 5) - 0.35) * 120,
+          stabilityCents: 4 + 22 * noise(seed, 6),
+          vibratoRateHz: noise(seed, 7) > 0.6 ? 4.5 + 1.5 * noise(seed, 8) : 0,
+          vibratoExtentCents: noise(seed, 7) > 0.6 ? 30 + 40 * noise(seed, 9) : 0,
+          ambiguous,
+        });
+      }
+    }
+    notes.sort((a, b) => a.startSample - b.startSample);
+    if (notes.length === 0) {
+      throw new Error(`track ${referenceTrackId} has no notes to score against`);
+    }
+    const scored = notes.filter((n) => !n.ambiguous);
+    const weight = scored.reduce((a, n) => a + (n.endSample - n.startSample), 0) || 1;
+    // `hitFraction * coverage`, like the backend: `hitFraction` is measured
+    // over what was voiced, so one blip per note must not claim the note's
+    // whole duration.
+    const pct =
+      (scored.reduce((a, n) => a + n.hitFraction * n.coverage * (n.endSample - n.startSample), 0) /
+        weight) *
+      100;
+    const signed = scored.map((n) => n.medianCents).sort((a, b) => a - b);
+    return {
+      notes,
+      scoredNotes: scored.length,
+      inTolerancePct: pct,
+      meanAbsCents: scored.reduce((a, n) => a + Math.abs(n.meanCents), 0) / (scored.length || 1),
+      medianSignedCents: signed.length ? signed[signed.length >> 1] : 0,
+      meanOnsetOffsetMs: scored.reduce((a, n) => a + n.onsetOffsetMs, 0) / (scored.length || 1),
+      // Mirrors the backend's five words; the demo is the one place the
+      // frontend is allowed to invent them, because there is no backend.
+      rating:
+        pct >= 95 ? "Locked in" : pct >= 85 ? "Sharp" : pct >= 70 ? "Solid" : pct >= 45 ? "Getting there" : "Finding it",
+      toleranceCents,
+      referenceTrackId,
+    };
+  }
+
+  async pitchTrack(clipId: string, maxPoints = 2000): Promise<PitchTrackView> {
+    const clip = this.clips.find((c) => c.id === clipId);
+    if (!clip) throw new Error(`unknown audio clip ${clipId}`);
+    const hop = Math.round(SR / 100);
+    const total = Math.max(1, Math.floor(clip.lengthSamples / hop));
+    const stride = Math.max(1, Math.ceil(total / Math.max(1, maxPoints)));
+    const points: PitchPoint[] = [];
+    for (let i = 0; i < total; i += stride) {
+      const sample = clip.timelineStartSamples + i * hop;
+      const t = sample / SR;
+      const midi = 57 + 2.5 * Math.sin(t * 0.7) + 0.35 * Math.sin(t * 5.5);
+      const voiced = noise(0x51ce, Math.floor(t * 4)) > 0.18;
+      points.push({ sample, midi: voiced ? midi : 0, clarity: voiced ? 0.93 : 0.1, voiced });
+    }
+    return { clipId, sourceRate: SR, hop, provenance: "causalMedian", totalPoints: total, points };
+  }
+
+  async pitchAnalyzeClip(clipId: string): Promise<number> {
+    const clip = this.clips.find((c) => c.id === clipId);
+    if (!clip) throw new Error(`unknown audio clip ${clipId}`);
+    return Math.max(1, Math.floor(clip.lengthSamples / Math.round(SR / 100)));
   }
 
   private emitPitchState() {

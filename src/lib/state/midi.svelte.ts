@@ -12,6 +12,7 @@ import { clipEditLoop } from "./clip-edit-loop.svelte";
 import { project } from "./project.svelte";
 import { sampleAtTick, tickAtSample, type SectionRow } from "../sectionTable";
 import { toasts } from "./toasts.svelte";
+import { ui } from "./ui.svelte";
 import { byTickKey } from "../utils/note-ops";
 import { clampTempo, isValidMeter, quartersPerBar } from "../utils/tempo";
 import type { MidiClip, MidiNote, ProjectSnapshot, TempoEvent, TempoMapState } from "../types/ipc";
@@ -286,6 +287,10 @@ class MidiStore {
   open(clipId: string) {
     this.openClipId = clipId;
     this.selectedClipId = clipId;
+    // The Pitch Coach shares the bottom region with the roll and REPLACES it
+    // while open, so opening a clip has to claim the region back — otherwise
+    // double-clicking a clip with the coach open looks like nothing happened.
+    ui.bottomPanel = "roll";
     if (this.region?.clipId !== clipId) this.region = null;
     const clip = this.clipById(clipId);
     if (clip) {

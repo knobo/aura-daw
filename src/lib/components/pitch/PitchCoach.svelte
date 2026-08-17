@@ -28,14 +28,21 @@
   import { ui } from "../../state/ui.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { TOLERANCE_CENTS } from "../../prefs/schema";
-  import { pitchMode, recentFrames, startPitchStream, stopPitchStream } from "../../state/pitch.svelte";
+  import {
+    pitchMode,
+    recentFrames,
+    startPitchStream,
+    stopPitchStream,
+    takeState,
+  } from "../../state/pitch.svelte";
   import { autoFitRange, bandFor, centsToTarget, trailSegments, yOfKey, type LaneRange } from "../../pitch/lane";
   import { laneWindowFor, stabilityCents, targetNotesFor } from "./panel-logic";
   import { view } from "../../state/view.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import RehearseButton from "./RehearseButton.svelte";
-  import type { PitchFrame } from "../../types/ipc";
+  import PitchReport from "./PitchReport.svelte";
+  import type { PitchFrame, PitchScoreReport } from "../../types/ipc";
   import { theme } from "../../theme/theme.svelte";
   import { alpha } from "../../theme/tokens";
 
@@ -114,6 +121,75 @@
    * singer, and re-centred only when they leave it. Re-fitting every frame
    * would make the whole lane breathe with the vibrato. */
   let liveRange: LaneRange = { lowKey: 54, highKey: 66 };
+
+  // ── the take report ──
+  //
+  // The take is the AUDIO clip the recording just produced; the report is
+  // that clip scored against the reference melody. Both halves have to
+  // exist, so a take recorded with no reference selected sits and waits for
+  // one instead of being scored against nothing.
+  // `takeState`, not component state: the roll unmounts this panel, and a
+  // report that vanishes when you go look at the melody is a report you
+  // cannot act on. See `state/pitch.svelte.ts`.
+  const takeClipId = $derived(takeState.clipId);
+  let report = $state<PitchScoreReport | null>(null);
+  let scorePending = $state(false);
+  let scoreError = $state<string | null>(null);
+  let showReport = $state(true);
+
+  $effect(() => {
+    // The take's own clips arrive on the stop notification and nowhere else.
+    // Last one wins: a multi-track arm records several, and the vocal is the
+    // one on the track the singer was on — which the engine does not label,
+    // so the newest is the honest guess and the user can re-record.
+    const off = backend.on("recording://state", (rs) => {
+      if (!rs.recording && rs.clips?.length) takeState.clipId = rs.clips[rs.clips.length - 1].id;
+    });
+    return off;
+  });
+
+  /**
+   * Refetch whenever the take, the melody or the tolerance changes.
+   *
+   * Recomputed rather than cached on purpose (spec): a score is a function
+   * of a melody that is still being edited, so a stored report would quietly
+   * describe a melody that no longer exists. The first call for a take also
+   * analyses its audio — seconds of control-thread work — which is why
+   * `scorePending` is a state and not a flicker.
+   */
+  $effect(() => {
+    const clip = takeClipId;
+    const ref = referenceId;
+    const tol = tolerance;
+    if (!clip || !ref) {
+      report = null;
+      scoreError = null;
+      return;
+    }
+    let cancelled = false;
+    scorePending = true;
+    scoreError = null;
+    backend
+      .pitchScore(clip, ref, tol)
+      .then((r) => {
+        if (cancelled) return;
+        report = r;
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        report = null;
+        scoreError = String(err);
+      })
+      .finally(() => {
+        if (!cancelled) scorePending = false;
+      });
+    // A tolerance flip mid-flight would otherwise land the stale report on
+    // top of the fresh one — the two requests differ only in a number the
+    // report echoes, so the mismatch would be invisible.
+    return () => {
+      cancelled = true;
+    };
+  });
 
   // ── panel lifetime: an open panel is a listening panel (ruling R6) ──
   $effect(() => {
@@ -376,7 +452,7 @@
       else if (last.midi < lane.lowKey) drawChevron(ctx, px, h - 10, 1);
     }
 
-    if (pitchMode.rehearseHold) drawRehearseVeil(ctx, w, h);
+    if (pitchMode.rehearseHold && transport.isRecording) drawRehearseVeil(ctx, w, h);
   }
 
   function drawChevron(ctx: CanvasRenderingContext2D, x: number, y: number, dir: number) {
@@ -601,6 +677,18 @@
       TUNER
     </button>
 
+    <button
+      class="tab mono"
+      class:on={showReport}
+      disabled={!takeClipId}
+      title={takeClipId
+        ? "How the last take went, note by note"
+        : "Record a take to see how it went"}
+      onclick={() => (showReport = !showReport)}
+    >
+      REPORT
+    </button>
+
     <RehearseButton />
 
     <button
@@ -619,6 +707,15 @@
   <div class="lane" bind:this={wrap}>
     <canvas bind:this={canvas} style:width="100%" style:height="100%"></canvas>
   </div>
+
+  {#if takeClipId && showReport}
+    <PitchReport
+      {report}
+      pending={scorePending}
+      error={scoreError}
+      onseek={(sample) => void transport.seek(sample).catch((err) => console.warn("[aura] seek failed:", err))}
+    />
+  {/if}
 
   <footer class="foot">
     {#if referenceTrack}

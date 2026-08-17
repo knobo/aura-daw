@@ -1315,6 +1315,19 @@ impl Control {
                 let id = sink.id();
                 self.pitch_sinks.retain(|s| s.id() != id);
                 self.pitch_sinks.push(sink);
+                // A new subscriber has to be TOLD the current state, not left
+                // to wait for the next change to it. `referenceTrackId` rides
+                // on `pitch://state` and nothing else, so a panel mounting
+                // against an engine that already has a reference track drew no
+                // melody at all — until some unrelated transition (a take
+                // starting or stopping changes `listening`) happened to emit.
+                // That is a panel that looks broken while the engine is right.
+                //
+                // `last_pitch_state` has to be cleared first: `emit_pitch_state`
+                // dedupes against it, and the state has NOT changed — that is
+                // the whole problem. A new listener is a new reason to send.
+                self.last_pitch_state = None;
+                self.emit_pitch_state();
             }
             ControlMsg::UnsubscribePitch(id) => self.pitch_sinks.retain(|s| s.id() != id),
             ControlMsg::Shutdown => return false,
@@ -2528,6 +2541,7 @@ impl Control {
                 rel_path: rel,
                 source_id,
                 cache_dir: Store::cache_dir_for(&project_dir, &clip_id),
+                pitch_path: Some(crate::audio::pitch_store::track_path(&project_dir, &clip_id)),
                 clip_id,
                 start_pos,
             });
@@ -3190,6 +3204,15 @@ mod tests {
     struct NullEvents;
     impl EventSink for NullEvents {
         fn emit(&self, _event: &str, _payload: serde_json::Value) {}
+    }
+
+    /// Keeps what was emitted, for the handful of tests that assert on the
+    /// events themselves rather than on the state behind them.
+    struct RecordingEvents(Arc<Mutex<Vec<(String, serde_json::Value)>>>);
+    impl EventSink for RecordingEvents {
+        fn emit(&self, event: &str, payload: serde_json::Value) {
+            self.0.lock().push((event.to_string(), payload));
+        }
     }
 
     struct CountingSink(Arc<AtomicUsize>, Arc<Mutex<Vec<MeterFrame>>>);
@@ -5463,6 +5486,40 @@ mod tests {
         assert_eq!(ctl.pitch_sinks.len(), 1);
     }
 
+    /// A panel that mounts against an engine which already has a reference
+    /// track must be TOLD about it. `referenceTrackId` rides on
+    /// `pitch://state` and nothing else, and `emit_pitch_state` dedupes — so
+    /// before this, a remounted panel drew no melody until some unrelated
+    /// transition (a take starting or stopping flips `listening`) happened to
+    /// emit. Which is exactly "the notes did not appear until the recording
+    /// finished".
+    #[test]
+    fn subscribing_to_pitch_gets_the_current_state_without_waiting_for_a_change() {
+        let (mut ctl, _session) = bare_control();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        ctl.events = Box::new(RecordingEvents(log.clone()));
+        ctl.reference_track_id = Some("trk-melody".into());
+        // Whatever transition set the reference in the first place.
+        ctl.emit_pitch_state();
+        log.lock().clear();
+
+        // The panel mounts. Nothing about the engine has changed since.
+        ctl.handle(ControlMsg::SubscribePitch(Box::new(CountingPitchSink {
+            id: 3,
+            sent: Arc::new(AtomicUsize::new(0)),
+        })));
+
+        let events = log.lock();
+        let (_, payload) = events
+            .iter()
+            .find(|(name, _)| name == "pitch://state")
+            .expect("subscribing must emit the current pitch state");
+        assert_eq!(
+            payload["referenceTrackId"], "trk-melody",
+            "the new subscriber has to learn which track the melody is on"
+        );
+    }
+
     /// Resubscribing the same channel replaces it. Two sinks on one channel
     /// would double every batch the frontend receives.
     #[test]
@@ -6297,6 +6354,7 @@ mod tests {
             clip_id: uuid::Uuid::new_v4().to_string(),
             source_id: crate::ids::SourceId::mint(),
             take_name: "Take 1".into(),
+            pitch_path: None,
             wav_path: dir.join("audio/take.wav"),
             rel_path: "audio/take.wav".into(),
             cache_dir: dir.join("cache"),
@@ -6346,6 +6404,7 @@ mod tests {
             clip_id: uuid::Uuid::new_v4().to_string(),
             source_id: crate::ids::SourceId::mint(),
             take_name: "Take 1".into(),
+            pitch_path: None,
             wav_path: dir.join("blocker/audio/take.wav"),
             rel_path: "audio/take.wav".into(),
             cache_dir: dir.join("blocker/cache"),

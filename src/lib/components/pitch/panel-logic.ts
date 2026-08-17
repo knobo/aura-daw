@@ -118,13 +118,34 @@ export function rehearseKeyMatches(pref: string, key: string): boolean {
 }
 
 /**
+ * Does this `keyup` end the hold that `heldKey` started?
+ *
+ * Two things it must get right, and they pull in opposite directions:
+ *
+ * * It compares against the key that WENT DOWN, not against the preference.
+ *   Changing the rehearse key (or setting it to OFF) while the key is
+ *   physically held would otherwise mean no matching release ever arrives,
+ *   and the engine keeps writing silence into a running take.
+ * * It compares at all. Releasing on any keyup ends the hold when the singer
+ *   taps Shift with the rehearse key still down, and the take starts
+ *   committing real audio mid-rehearsal.
+ */
+export function rehearseKeyReleases(heldKey: string | null, key: string): boolean {
+  return heldKey !== null && key.toLowerCase() === heldKey;
+}
+
+/**
  * Reference-melody notes as sample spans, repeats expanded.
  *
  * The repeat rule is the timeline preview's (`utils/midi-preview.ts`):
  * `ceil(placement / content)` iterations, cropped at the placement end.
- * Phase 3 Task 12 lifts that rule into one shared Rust helper and the lane
- * will read the backend's answer instead; until then the lane must agree
- * with what the piano roll and the timeline already draw.
+ * Phase 3 lifted that rule into one shared Rust helper
+ * (`midi::schedule::clip_notes`), but nothing exposes it to the LANE — the
+ * scorer consumes it inside `pitch_score`, and retiring this copy needs a
+ * command that does not exist yet. Until it does, this must agree with what
+ * the piano roll and the timeline already draw. The two rules are the same
+ * rule today; they are not the same code, so a change to one is a change
+ * owed to the other.
  *
  * Phase 2 draws EVERY note, chords included. Which note of a chord counts as
  * the target is `reference_melody`'s call in Rust (ADR 0006, ruling R4), and
@@ -154,7 +175,11 @@ export function targetNotesFor(
           noteId: out.length,
           startSample: toSamples(clip.timelineStartTicks + tick),
           endSample: toSamples(clip.timelineStartTicks + endTick),
-          key: note.key + transpose,
+          // Clamped like the backend's `clip_note_key_vel`: a transpose that
+          // pushes a note past the MIDI range is scored against the clamped
+          // key, and an unclamped lane would colour the bar against a
+          // different target than the report's row.
+          key: Math.max(0, Math.min(127, note.key + transpose)),
         });
       }
     }

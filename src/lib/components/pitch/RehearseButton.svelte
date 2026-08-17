@@ -10,6 +10,7 @@
    */
   import { pitchMode } from "../../state/pitch.svelte";
   import { setRehearseSource } from "../../state/rehearse.svelte";
+  import { transport } from "../../state/transport.svelte";
 
   /**
    * The button is one of two sources for a single engine-side hold; the key
@@ -17,6 +18,13 @@
    * counts them — a private flag here would let releasing the button end a
    * hold the key is still asserting, and the take would start writing real
    * audio mid-rehearsal.
+   *
+   * Holding this before recording starts is deliberate (matches the "h" key
+   * in App.svelte, live whenever the coach is open): pre-arm here, then hit
+   * record with the take starting silent from sample 0. Only the visible
+   * feedback while idle is wrong — see the veil in PitchCoach.svelte, gated
+   * on `transport.isRecording` so it stops claiming a take is being silenced
+   * when there is no take.
    */
   function set(on: boolean) {
     setRehearseSource("button", on);
@@ -27,7 +35,9 @@
   type="button"
   class="rehearse mono"
   class:on={pitchMode.rehearseHold}
-  title="Hold to rehearse: the transport rolls, the take records silence"
+  title={transport.isRecording
+    ? "Hold to rehearse: the transport rolls, the take records silence"
+    : "Hold to arm rehearse: the next take will start silent while held"}
   onpointerdown={(e) => {
     e.preventDefault();
     set(true);

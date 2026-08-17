@@ -193,6 +193,9 @@ pub fn run() {
             audio::pitch_unsubscribe,
             audio::set_rehearse_hold,
             audio::pitch_set_reference,
+            audio::pitch_score,
+            audio::pitch_track,
+            audio::pitch_analyze_clip,
             // ---- audio: tracks ----
             audio::add_track,
             audio::remove_track,

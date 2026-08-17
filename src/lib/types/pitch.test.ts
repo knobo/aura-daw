@@ -9,7 +9,8 @@
 import { describe, it, expect } from "vitest";
 import pitchFrameSchema from "../../../docs/ipc-schemas/pitch-frame.schema.json";
 import pitchStateSchema from "../../../docs/ipc-schemas/pitch-state.schema.json";
-import type { PitchFrame, PitchFrameBatch, PitchState } from "./ipc";
+import pitchScoreSchema from "../../../docs/ipc-schemas/pitch-score-report.schema.json";
+import type { NoteScore, PitchFrame, PitchFrameBatch, PitchScoreReport, PitchState } from "./ipc";
 
 describe("pitch wire types", () => {
   it("accepts a batch shaped exactly as the Rust serializer emits it", () => {
@@ -55,5 +56,55 @@ describe("pitch wire types", () => {
     expect(Object.keys(batch).sort()).toEqual(Object.keys(batchProps).sort());
     expect(Object.keys(frame).sort()).toEqual(Object.keys(frameProps).sort());
     expect(Object.keys(state).sort()).toEqual(Object.keys(stateProps).sort());
+  });
+
+  it("declares the score report exactly as the schema publishes it", () => {
+    const reportProps = (pitchScoreSchema as { properties: Record<string, unknown> }).properties;
+    const noteProps = (
+      pitchScoreSchema as { $defs: { noteScore: { properties: Record<string, unknown> } } }
+    ).$defs.noteScore.properties;
+
+    const note = {
+      noteId: 1,
+      startSample: 0,
+      endSample: 480,
+      key: 60,
+      hitFraction: 1,
+      coverage: 1,
+      meanCents: 0,
+      medianCents: 0,
+      onsetOffsetMs: 0,
+      stabilityCents: 0,
+      vibratoRateHz: 0,
+      vibratoExtentCents: 0,
+      ambiguous: false,
+    } satisfies NoteScore;
+    const report = {
+      notes: [note],
+      scoredNotes: 1,
+      inTolerancePct: 0,
+      meanAbsCents: 0,
+      medianSignedCents: 0,
+      meanOnsetOffsetMs: 0,
+      rating: "Finding it",
+      toleranceCents: 25,
+      referenceTrackId: "trk-1",
+    } satisfies PitchScoreReport;
+
+    expect(Object.keys(report).sort()).toEqual(Object.keys(reportProps).sort());
+    expect(Object.keys(note).sort()).toEqual(Object.keys(noteProps).sort());
+  });
+
+  it("keeps hitFraction and coverage as separate questions", () => {
+    // "Was it in tune" and "was it sung at all" are different advice, and
+    // the report must never be able to collapse them into one number.
+    const skipped: NoteScore = {
+      noteId: 1, startSample: 0, endSample: 480, key: 60,
+      hitFraction: 0, coverage: 0, meanCents: 0, medianCents: 0, onsetOffsetMs: 0,
+      stabilityCents: 0, vibratoRateHz: 0, vibratoExtentCents: 0, ambiguous: false,
+    };
+    const flat: NoteScore = { ...skipped, noteId: 2, coverage: 0.95, meanCents: -70 };
+    expect(skipped.hitFraction).toBe(flat.hitFraction);
+    expect(skipped.coverage).not.toBe(flat.coverage);
   });
 });

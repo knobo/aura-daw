@@ -238,7 +238,11 @@ export interface RecordingState {
  */
 export interface PitchFrame {
   /** Transport sample position at the centre of the analysis window, in
-   * DEVICE-rate samples (see `PitchFrameBatch.deviceRate`), not 8 kHz. */
+   * PROJECT samples — anchored to the engine's position and only offset
+   * within one callback buffer. NOT device-rate and not 8 kHz: a ms→samples
+   * conversion scaled by `PitchFrameBatch.deviceRate` is ~8 % short on a
+   * 44.1 kHz microphone in a 48 kHz project. `deviceRate` is reported for
+   * display, not for converting this field. */
   sample: number;
   /** Detected fundamental in Hz. Meaningful only when `voiced`. */
   hz: number;
@@ -271,6 +275,120 @@ export interface PitchFrameBatch {
   deviceRate: number;
   listening: boolean;
   rehearseHold: boolean;
+}
+
+// ── pitch-score-report.schema.json (Pitch Coach, the recorded take) ────────
+
+/**
+ * How one reference note was sung (Rust `control::pitch_coach::NoteScore`).
+ *
+ * Every judgement in here is the backend's. The report UI formats these
+ * numbers and sorts them; it never recomputes one (ADR 0006).
+ */
+export interface NoteScore {
+  /** Identity inside the source clip. Every repeat of a looped clip's
+   * content shares it — `startSample` is what makes a row unique. */
+  noteId: number;
+  /** Note onset on the timeline, in PROJECT samples. Clicking a row seeks
+   * here. */
+  startSample: number;
+  endSample: number;
+  /** MIDI key of the reference note, after the clip's transpose. */
+  key: number;
+  /** Fraction of the scored frames within tolerance, after debouncing.
+   * Scored frames are the voiced ones past the onset grace window. */
+  hitFraction: number;
+  /** Fraction of the note's frames that were voiced at all. Low coverage
+   * means "you did not sing this", which is different advice from a low
+   * `hitFraction` — the report must not collapse the two. */
+  coverage: number;
+  /** SIGNED mean error, octave-folded. The sign is the actionable half:
+   * "consistently 30 cents flat" is advice, "off by 30 cents" is not. */
+  meanCents: number;
+  medianCents: number;
+  /** Entry offset in ms; positive is late. 0 when nothing was sung —
+   * `coverage` carries that story instead. */
+  onsetOffsetMs: number;
+  /** Standard deviation of the smoothed error over the sustain: drift,
+   * with vibrato averaged out. */
+  stabilityCents: number;
+  /** Estimated vibrato rate, or 0 when the wobble is too small to be one. */
+  vibratoRateHz: number;
+  /** Peak-to-peak vibrato width in cents. */
+  vibratoExtentCents: number;
+  /** Came out of a chord, so the melody line was guessed (top note).
+   * Reported, but excluded from the session statistics. */
+  ambiguous: boolean;
+}
+
+/**
+ * A recorded take, scored against a MIDI reference melody. Returned by
+ * `pitch_score`.
+ *
+ * Never persisted: a score is recomputed on demand so the report stays
+ * correct after the reference melody is edited.
+ */
+export interface PitchScoreReport {
+  /** One row per reference note, in melody order. */
+  notes: NoteScore[];
+  /** How many rows the summary was computed from — the unambiguous ones.
+   * **Zero means every summary number below is meaningless** (every
+   * reference note came out of a chord), which is a different story from a
+   * score of zero and must be shown as one. */
+  scoredNotes: number;
+  /** Duration-weighted percentage inside tolerance, counting what was not
+   * sung as outside it. Ambiguous notes are excluded. This is the headline
+   * number — see `scoredNotes` before showing it. */
+  inTolerancePct: number;
+  meanAbsCents: number;
+  /** Median SIGNED error across the take. */
+  medianSignedCents: number;
+  /** Mean entry offset across the notes that were sung at all. */
+  meanOnsetOffsetMs: number;
+  /** The backend's word for `inTolerancePct`. Displayed, never derived
+   * frontend-side — one place decides what a percentage is worth. */
+  rating: string;
+  /** The tolerance this report was computed with, echoed so a report left
+   * on screen cannot misreport which tier produced it. */
+  toleranceCents: number;
+  referenceTrackId: string;
+}
+
+/**
+ * How a stored pitch curve was produced (Rust `audio::pitch_store::
+ * PitchProvenance`, an externally-tagged unit enum, so it is a bare string).
+ *
+ * `causalMedian` is what a live detector can produce and what both the
+ * recorder fold and today's offline re-analysis use; it lags the centred
+ * median by 20 ms. `centredMedian` is strictly better, offline-only, and
+ * not implemented yet — the byte exists so that pass will not need a v2.
+ */
+export type PitchProvenance = "causalMedian" | "centredMedian";
+
+/** One point of a stored pitch curve, at a PROJECT timeline position. */
+export interface PitchPoint {
+  sample: number;
+  /** Continuous MIDI note number — a float, drawn as-is (same reason as
+   * `PitchFrame.midi`). */
+  midi: number;
+  clarity: number;
+  voiced: boolean;
+}
+
+/** A take's pitch curve, mapped onto the timeline and thinned for drawing.
+ * Returned by `pitch_track`. */
+export interface PitchTrackView {
+  clipId: string;
+  /** The rate the curve was ANALYSED at — the take's own, which is not
+   * necessarily the project's. The points are already on the project
+   * timeline; this is provenance, not a conversion factor. */
+  sourceRate: number;
+  hop: number;
+  provenance: PitchProvenance;
+  /** How many points the curve had before thinning, so a caller can tell a
+   * short take from a heavily decimated one. */
+  totalPoints: number;
+  points: PitchPoint[];
 }
 
 /** Payload of the `pitch://state` app event. */
