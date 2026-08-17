@@ -146,8 +146,13 @@ pub fn reference_melody(mut notes: Vec<AbsNote>, rate: u32) -> Vec<(AbsNote, boo
             // discarded.
             // `*o != top`, not a `note_id` comparison: every repeat of a
             // looped clip's content carries the same `note_id`, so a note
-            // would find itself in the next pass.
-            let covered = notes.iter().any(|o| *o != top && substantially_overlaps(&top, o));
+            // would find itself in the next pass. `take_while` is sound
+            // because `notes` is sorted by start: nothing starting at or
+            // after this note's end can overlap it.
+            let covered = notes
+                .iter()
+                .take_while(|o| o.start < top.end)
+                .any(|o| *o != top && substantially_overlaps(&top, o));
             (top, chord || covered)
         })
         .collect()

@@ -139,9 +139,13 @@ export function rehearseKeyReleases(heldKey: string | null, key: string): boolea
  *
  * The repeat rule is the timeline preview's (`utils/midi-preview.ts`):
  * `ceil(placement / content)` iterations, cropped at the placement end.
- * Phase 3 Task 12 lifts that rule into one shared Rust helper and the lane
- * will read the backend's answer instead; until then the lane must agree
- * with what the piano roll and the timeline already draw.
+ * Phase 3 lifted that rule into one shared Rust helper
+ * (`midi::schedule::clip_notes`), but nothing exposes it to the LANE — the
+ * scorer consumes it inside `pitch_score`, and retiring this copy needs a
+ * command that does not exist yet. Until it does, this must agree with what
+ * the piano roll and the timeline already draw. The two rules are the same
+ * rule today; they are not the same code, so a change to one is a change
+ * owed to the other.
  *
  * Phase 2 draws EVERY note, chords included. Which note of a chord counts as
  * the target is `reference_melody`'s call in Rust (ADR 0006, ruling R4), and

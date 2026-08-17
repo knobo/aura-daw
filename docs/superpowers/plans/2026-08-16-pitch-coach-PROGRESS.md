@@ -20,8 +20,8 @@ documentation and all commits are English.
 | On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
 | On `main` | **Phase 2**: PR #58 `7c3cb87` (panel, frame bus, lane geometry, prefs, `pitch_unsubscribe`) |
 | Worktrees | stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
-| **In flight** | **Phase 3** on branch `feat/pitch-coach-scoring`, worktree `.claude/worktrees/pitch-phase3`, branched from `origin/main` `cf224ce`. Not pushed, no PR yet |
-| Next | **Task 14's command half** — see the phase 3 checklist below |
+| **In flight** | **Phase 3** on branch `feat/pitch-coach-scoring`, worktree `.claude/worktrees/pitch-phase3`, branched from `origin/main` `cf224ce` |
+| Next | Tasks 12–16 are all done and reviewed. What is left is the owner's: the ear-check against the real engine, and the PR |
 
 ## Status
 
@@ -196,14 +196,26 @@ report, docs + PR.
       tests, `svelte-check` 0 errors, `npm run build` green.
 - [x] Task 16 — `docs/pitch-coach.md`, ARCHITECTURE §3.3/§3.4/§5.1/§7, the
       README feature section, the count docs.
+- [x] Pre-PR gate, 2026-08-17. **1002/1020 lib** (the 18 are the box, not the
+      branch — reproduced on `main`, see the environment warning), **36/36
+      integration**, **593 frontend**, `svelte-check` 0 errors (1 pre-existing
+      a11y warning in `LaunchMapPanel.svelte`), `npm run build` green. Counts
+      landed in README + CONTRIBUTING: 1056 Rust, 593 frontend.
+
+- [x] Review round on the branch — `f287723`. Eight findings fixed; three of
+      them produced wrong NUMBERS (chord clustering was transitive, the
+      headline ignored coverage, vibrato ran on folded cents) and one froze
+      the UI (three sync commands doing seconds of decode + YIN on the GTK
+      main thread). See the log.
 
 `panel-logic.targetNotesFor` still expands repeats frontend-side with the
-timeline preview's rule. Task 12 built the backend replacement but nothing
-consumes it yet — retiring the frontend copy is Task 15's business.
-
-**Test counts are NOT yet updated** in README/CONTRIBUTING (the dated-count
-convention). Phase 3 has added 3 + 14 + 10 + 2 = 29 Rust lib tests so far;
-measure, do not copy that number, and land the update with Task 16.
+timeline preview's rule. Task 12 built the backend replacement, but it is
+consumed inside `pitch_score` only — retiring the frontend copy needs a
+command that returns the resolved melody to the LANE, and that command does
+not exist. **Left open deliberately**, not forgotten: it is new IPC surface,
+which is a decision for the owner and not a review fix. The two rules agree
+today and the comment in `panel-logic.ts` says a change to one is owed to
+the other.
 
 ### What Task 14's second half needs to know
 
@@ -297,6 +309,22 @@ Both of these came out of actually running the detector against a voice
 
 ## Environment warning (read before running the suite)
 
+**2026-08-17: 18 lib tests fail on this box for reasons that have nothing to
+do with any branch.** Measured, not assumed: they fail identically on
+`origin/main` `cf224ce` with none of phase 3's code checked out, and they fail
+the same way in isolation on a quiet box, so this is not the concurrency flake
+described below. The engine simply never starts —
+`engine_pumps_meter_frames_at_60hz` gets 0 frames in 10 s,
+`transport_advances_headless_or_with_device` never leaves position 0, and
+every `control::loopjam` test dies on `"audio engine did not respond"`. The
+set is `audio::engine` (4), `control::loopjam` (9), `control::tests` (4, the
+transport/loop ones) and `mcp::server::tests::read_meters_hears_the_headless_engine`.
+
+Swap has been at 15/15 GB for days; that is the leading suspect. **Do not read
+these as a regression, and do not "fix" them** — reproduce against `main`
+first, exactly as above. Everything else is green: 1002/1020 lib and 36/36
+integration.
+
 This box is under memory pressure: **swap is fully consumed (15/15 GB)** and
 other worktrees run `cargo test` concurrently. A full `cargo test` therefore
 fails *differently each run*, always in unrelated ALSA MIDI-loopback tests
@@ -355,6 +383,56 @@ After finishing each task: tick its box, and add a line under the log below
 with the commit sha and anything the next agent would be surprised by.
 
 ## Log
+
+- 2026-08-17 — **Phase 3 reviewed and fixed** (`f287723`). Eight findings.
+  Six things the next agent should know:
+  1. **Chord clustering by overlap is transitive, and that is a trap.** The
+     first implementation grouped a note into the cluster when
+     `n.start < cluster_end` with `cluster_end` the running MAX end, so one
+     note overhanging the next chained a whole legato phrase into ONE target:
+     one row, `clean` empty, headline 0 % "Finding it" on a take sung well.
+     Clustering is by ONSET now (`CHORD_ONSET_MS`, 30 ms — a humanised MIDI
+     chord does not share an exact tick), plus a separate
+     "another note covers more than half of this one" test so a drone under
+     the tune is still flagged. Identity in that test is the whole `AbsNote`,
+     NOT `note_id`: every repeat of a looped clip's content carries the same
+     `note_id`, so a note would find itself in the next pass.
+  2. **`hit_fraction` is a share of what was VOICED.** Weighting it by note
+     duration in the headline let one in-tune blip per note claim the note's
+     whole length — "Locked in" for a take that was mostly silence. The
+     headline is `hit * coverage`, duration-weighted; the per-row `hit`
+     deliberately still answers "was what you sang in tune".
+  3. **`cents_to_key` folds every frame independently**, so any series
+     measure built on it breaks at the ±600 boundary. A singer parked about a
+     tritone away flipped between +600 and -600 and reported 1200 cents of
+     vibrato at a rate invented from the fold's own crossings.
+     `unwrap_octaves` runs before vibrato and stability; the REPORTED error
+     stays folded, which is the octave forgiveness the spec asks for.
+  4. **Sync Tauri commands run on the GTK main thread** — the repo already
+     documents this on `seed_demo_project`, and the three new pitch commands
+     ignored it while doing a decode plus a YIN pass. The panel's own
+     "ANALYSING THE TAKE…" state could never paint. All three are `async` +
+     `spawn_blocking`, and the session lock is released before the move.
+  5. **`pitch_active` does NOT gate the stored curve.** Worth knowing before
+     "fixing" the panel's teardown: the APTF fold runs in the recorder's
+     writer thread off the audio it writes, so closing the panel mid-take
+     stops the live lane and the microphone but never truncates the take's
+     curve. The reviewer's "closing the panel kills a listen enabled
+     elsewhere" finding was left alone for the same reason the other way
+     round: there IS no listen control outside the panel today.
+  6. **Rehearse-hold released on any keyup.** `rehearseKeyDown` was a bare
+     boolean, so tapping Shift with `H` down ended the hold and the take
+     started committing real audio mid-rehearsal. The KEY is stored now
+     (`rehearseKeyReleases` in `panel-logic.ts`, so it is testable) — and it
+     still must not re-test the preference, or changing the rehearse key
+     mid-hold strands the engine writing silence.
+
+  Two findings were deliberately NOT fixed, both outside this feature:
+  `src-tauri/Cargo.toml`'s `--no-default-features` (LV2 stub) build points at
+  a workflow that does not exist and nothing in CI compiles it, so
+  `plugins/lv2_host_stub.rs` will rot on the next `lv2_host.rs` signature
+  change (it lines up today — checked by hand); and the frontend
+  repeat-expansion copy discussed above.
 
 - 2026-08-17 — Phase 3 started on `feat/pitch-coach-scoring` (worktree
   `.claude/worktrees/pitch-phase3`, from `origin/main` `cf224ce`). Tasks 12,
