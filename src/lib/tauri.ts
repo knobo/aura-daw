@@ -52,6 +52,8 @@ import type {
   PasteRequest,
   PasteResult,
   PitchFrameBatch,
+  PitchScoreReport,
+  PitchTrackView,
   Project,
   ProjectSnapshot,
   SidecarEvent,
@@ -121,6 +123,23 @@ export interface Backend {
   setRehearseHold(enabled: boolean): Promise<void>;
   /** MIDI track holding the target melody; `null` clears it. */
   pitchSetReference(trackId: string | null): Promise<void>;
+  /**
+   * Score a recorded take against a MIDI track's melody. Analyses and
+   * caches the take's pitch curve on a miss, so this is the only call the
+   * report needs — roughly 2 s of control-thread work for a 3-minute take
+   * the first time, and effectively free after.
+   *
+   * Never cached frontend-side either: the report is recomputed so it stays
+   * correct after the reference melody or the tolerance changes.
+   */
+  pitchScore(clipId: string, referenceTrackId: string, toleranceCents: number): Promise<PitchScoreReport>;
+  /** The take's stored pitch curve on the timeline, thinned to at most
+   * `maxPoints`. Analyses on a miss, same as `pitchScore`. */
+  pitchTrack(clipId: string, maxPoints?: number): Promise<PitchTrackView>;
+  /** (Re)analyse a clip's audio and write its pitch track; returns the
+   * frame count. The only way to give a take recorded before the live fold
+   * existed a curve. */
+  pitchAnalyzeClip(clipId: string): Promise<number>;
 
   // waveform tiles — raw AWTF binary
   getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer>;
@@ -510,6 +529,15 @@ class TauriBackend implements Backend {
   }
   async pitchSetReference(trackId: string | null) {
     await invoke("pitch_set_reference", { trackId });
+  }
+  async pitchScore(clipId: string, referenceTrackId: string, toleranceCents: number) {
+    return await invoke<PitchScoreReport>("pitch_score", { clipId, referenceTrackId, toleranceCents });
+  }
+  async pitchTrack(clipId: string, maxPoints?: number) {
+    return await invoke<PitchTrackView>("pitch_track", { clipId, maxPoints: maxPoints ?? null });
+  }
+  async pitchAnalyzeClip(clipId: string) {
+    return await invoke<number>("pitch_analyze_clip", { clipId });
   }
 
   async getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer> {
