@@ -4,7 +4,7 @@
 > `origin/main` at `79c3e98`). Handoff, including the owner ear-check owed and
 > what H2 should pick up first:
 > [`docs/handoff/composer-h1.md`](../../handoff/composer-h1.md). Measured after
-> the work, `--test-threads=1`: **1246 backend** (1210 lib + 36 integration,
+> the work, `--test-threads=1`: **1248 backend** (1212 lib + 36 integration,
 > plus 2 `#[ignore]`d) and **778 frontend**, from 1083 + 738 at the branch
 > point. Every task below is checked; two things in the plan changed shape while
 > being built and the boxes are ticked against what was actually done:
