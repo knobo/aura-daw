@@ -36,8 +36,8 @@
   import { launch } from "../state/launch.svelte";
   import { overlayBox, regionFromMarquee, resizeRegion, shiftRegion } from "../utils/launch-map";
   import type { TrackState } from "../types/ipc";
-
-  const TRACK_PALETTE = ["#52e5ff", "#ff4fd8", "#ffc857", "#9d7bff", "#5cf2b8", "#ff8b5c"];
+  import { theme } from "../theme/theme.svelte";
+  import { alpha } from "../theme/tokens";
 
   let rulerCanvas: HTMLCanvasElement | undefined = $state();
   let gridCanvas: HTMLCanvasElement | undefined = $state();
@@ -102,17 +102,17 @@
     for (let b = firstBar; b <= lastBar; b++) {
       const x = (b * bar - start) / spp;
       if (b % step === 0) {
-        ctx.fillStyle = "rgba(96,130,190,0.4)";
+        ctx.fillStyle = alpha(theme.tokens.line, 0.4);
         ctx.fillRect(Math.round(x), h - 14, 1, 14);
-        ctx.fillStyle = "rgba(95,108,133,0.9)";
+        ctx.fillStyle = alpha(theme.tokens.textDim, 0.9);
         ctx.fillText(String(b + 1).padStart(3, "0"), x + 4, h - 8);
       } else {
-        ctx.fillStyle = "rgba(96,130,190,0.2)";
+        ctx.fillStyle = alpha(theme.tokens.line, 0.2);
         ctx.fillRect(Math.round(x), h - 8, 1, 8);
       }
       // beats
       if (beatPx > 26 && b < lastBar) {
-        ctx.fillStyle = "rgba(96,130,190,0.14)";
+        ctx.fillStyle = alpha(theme.tokens.line, 0.14);
         for (let q = 1; q < project.timeSignature[0]; q++) {
           const bx = x + (q * beat) / spp;
           ctx.fillRect(Math.round(bx), h - 5, 1, 5);
@@ -151,10 +151,10 @@
 
     for (let b = firstBar; b <= lastBar; b++) {
       const x = Math.round((b * bar - start) / spp);
-      ctx.fillStyle = b % step === 0 ? "rgba(96,130,190,0.16)" : "rgba(96,130,190,0.07)";
+      ctx.fillStyle = alpha(theme.tokens.line, b % step === 0 ? 0.16 : 0.07);
       ctx.fillRect(x, 0, 1, h);
       if (beatPx > 26 && b < lastBar) {
-        ctx.fillStyle = "rgba(96,130,190,0.045)";
+        ctx.fillStyle = alpha(theme.tokens.line, 0.045);
         for (let q = 1; q < project.timeSignature[0]; q++) {
           ctx.fillRect(Math.round(x + (q * beat) / spp), 0, 1, h);
         }
@@ -341,17 +341,17 @@
   }
 
   async function addTrack() {
-    const color = TRACK_PALETTE[project.tracks.length % TRACK_PALETTE.length];
+    const color = theme.tokens.trackPalette[project.tracks.length % theme.tokens.trackPalette.length];
     await project.addTrack({ name: `Track ${project.tracks.length + 1}`, color });
   }
 
   async function addMidiTrack() {
-    const color = TRACK_PALETTE[project.tracks.length % TRACK_PALETTE.length];
+    const color = theme.tokens.trackPalette[project.tracks.length % theme.tokens.trackPalette.length];
     await project.addTrack({ name: `MIDI ${project.tracks.length + 1}`, color, kind: "midi" });
   }
 
   async function addAutomationTrack() {
-    const color = TRACK_PALETTE[project.tracks.length % TRACK_PALETTE.length];
+    const color = theme.tokens.trackPalette[project.tracks.length % theme.tokens.trackPalette.length];
     await project.addTrack({
       name: `Auto ${project.tracks.length + 1}`,
       color,
@@ -957,7 +957,7 @@
     display: flex;
     height: var(--ruler-height);
     border-bottom: 1px solid var(--glass-border);
-    background: rgba(10, 13, 23, 0.85);
+    background: rgb(var(--bg-1-rgb) / 0.85);
     flex: none;
   }
   .corner {
@@ -999,14 +999,14 @@
     position: absolute;
     top: 0;
     height: 45%;
-    background: rgba(122, 160, 220, 0.12);
-    border-bottom: 1px solid rgba(122, 160, 220, 0.25);
+    background: rgb(var(--edge-rgb) / 0.12);
+    border-bottom: 1px solid rgb(var(--edge-rgb) / 0.25);
     pointer-events: none;
   }
   .loopband.on {
-    background: rgba(255, 200, 87, 0.14);
-    border-bottom: 1px solid rgba(255, 200, 87, 0.55);
-    box-shadow: inset 0 0 10px rgba(255, 200, 87, 0.12);
+    background: rgb(var(--amber-rgb) / 0.14);
+    border-bottom: 1px solid rgb(var(--amber-rgb) / 0.55);
+    box-shadow: inset 0 0 10px rgb(var(--amber-rgb) / 0.12);
   }
   .looppin {
     position: absolute;
@@ -1024,7 +1024,7 @@
     left: 3.5px;
     width: 2px;
     height: 100%;
-    background: rgba(122, 160, 220, 0.6);
+    background: rgb(var(--edge-rgb) / 0.6);
   }
   .looppin::after {
     content: "";
@@ -1032,7 +1032,7 @@
     top: 0;
     width: 0;
     height: 0;
-    border-top: 6px solid rgba(122, 160, 220, 0.85);
+    border-top: 6px solid rgb(var(--edge-rgb) / 0.85);
   }
   .looppin.start::after {
     left: 4.5px;
@@ -1044,7 +1044,7 @@
   }
   .looppin.on::before {
     background: var(--amber);
-    box-shadow: 0 0 5px rgba(255, 200, 87, 0.6);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.6);
   }
   .looppin.on::after {
     border-top-color: var(--amber);
@@ -1055,9 +1055,9 @@
     position: absolute;
     top: 0;
     bottom: 0;
-    background: rgba(255, 200, 87, 0.035);
-    border-left: 1px solid rgba(255, 200, 87, 0.18);
-    border-right: 1px solid rgba(255, 200, 87, 0.18);
+    background: rgb(var(--amber-rgb) / 0.035);
+    border-left: 1px solid rgb(var(--amber-rgb) / 0.18);
+    border-right: 1px solid rgb(var(--amber-rgb) / 0.18);
     pointer-events: none;
   }
 
@@ -1070,16 +1070,16 @@
   }
   @keyframes jam-breathe {
     50% {
-      background: rgba(255, 79, 216, 0.22);
-      border-bottom-color: rgba(255, 79, 216, 0.7);
-      box-shadow: inset 0 0 16px rgba(255, 79, 216, 0.25);
+      background: rgb(var(--magenta-rgb) / 0.22);
+      border-bottom-color: rgb(var(--magenta-rgb) / 0.7);
+      box-shadow: inset 0 0 16px rgb(var(--magenta-rgb) / 0.25);
     }
   }
   @keyframes jam-breathe-shade {
     50% {
-      background: rgba(255, 79, 216, 0.06);
-      border-left-color: rgba(255, 79, 216, 0.35);
-      border-right-color: rgba(255, 79, 216, 0.35);
+      background: rgb(var(--magenta-rgb) / 0.06);
+      border-left-color: rgb(var(--magenta-rgb) / 0.35);
+      border-right-color: rgb(var(--magenta-rgb) / 0.35);
     }
   }
   /* …and flashes when the evolved audio swaps in at the wrap */
@@ -1091,21 +1091,21 @@
   }
   @keyframes jam-flash {
     0% {
-      background: rgba(92, 242, 184, 0.55);
-      box-shadow: inset 0 0 20px rgba(92, 242, 184, 0.6);
+      background: rgb(var(--green-rgb) / 0.55);
+      box-shadow: inset 0 0 20px rgb(var(--green-rgb) / 0.6);
     }
     100% {
-      background: rgba(255, 200, 87, 0.14);
+      background: rgb(var(--amber-rgb) / 0.14);
     }
   }
   @keyframes jam-flash-shade {
     0% {
-      background: rgba(92, 242, 184, 0.16);
-      border-left-color: rgba(92, 242, 184, 0.7);
-      border-right-color: rgba(92, 242, 184, 0.7);
+      background: rgb(var(--green-rgb) / 0.16);
+      border-left-color: rgb(var(--green-rgb) / 0.7);
+      border-right-color: rgb(var(--green-rgb) / 0.7);
     }
     100% {
-      background: rgba(255, 200, 87, 0.035);
+      background: rgb(var(--amber-rgb) / 0.035);
     }
   }
 
@@ -1121,7 +1121,7 @@
     flex: none;
     display: flex;
     border-top: 1px solid var(--glass-border);
-    background: rgba(10, 13, 23, 0.85);
+    background: rgb(var(--bg-1-rgb) / 0.85);
   }
   .scrollcorner {
     width: var(--rail-width);
@@ -1133,7 +1133,7 @@
     width: var(--rail-width);
     flex: none;
     border-right: 1px solid var(--glass-border);
-    background: rgba(10, 13, 23, 0.6);
+    background: rgb(var(--bg-1-rgb) / 0.6);
     display: flex;
     flex-direction: column;
   }
@@ -1150,7 +1150,7 @@
     letter-spacing: 0.2em;
     color: var(--text-faint);
     background: transparent;
-    border: 1px dashed rgba(122, 160, 220, 0.2);
+    border: var(--border-width) dashed rgb(var(--edge-rgb) / 0.2);
     border-radius: 5px;
     cursor: pointer;
     transition: color 120ms, border-color 120ms;
@@ -1160,19 +1160,19 @@
     border-color: var(--cyan-dim);
   }
   .add.midi:hover {
-    color: #5cf2b8;
-    border-color: rgba(92, 242, 184, 0.4);
+    color: var(--green);
+    border-color: rgb(var(--green-rgb) / 0.4);
   }
   .add.auto:hover {
     color: var(--violet);
-    border-color: rgba(157, 123, 255, 0.45);
+    border-color: rgb(var(--violet-rgb) / 0.45);
   }
   .lane.midilane {
     background:
       repeating-linear-gradient(
         to bottom,
         transparent 0 13px,
-        rgba(96, 130, 190, 0.03) 13px 14px
+        rgb(var(--line-rgb) / 0.03) 13px 14px
       );
   }
 
@@ -1208,14 +1208,14 @@
   .lane {
     position: relative;
     height: var(--track-height);
-    border-bottom: 1px solid rgba(96, 130, 190, 0.08);
+    border-bottom: 1px solid rgb(var(--line-rgb) / 0.08);
   }
   .lane.armed {
-    background: rgba(255, 65, 82, 0.03);
+    background: rgb(var(--red-rgb) / 0.03);
   }
   .lane.droptarget {
     box-shadow: inset 0 0 0 1px var(--cyan);
-    background: rgba(82, 229, 255, 0.05);
+    background: rgb(var(--cyan-rgb) / 0.05);
   }
   .lane-shade {
     position: absolute;
@@ -1235,17 +1235,17 @@
     letter-spacing: 0.18em;
     padding: 7px 14px;
     border-radius: 5px;
-    border: 1px solid var(--cyan-dim);
+    border: var(--border-width) solid var(--cyan-dim);
     background: linear-gradient(
       100deg,
-      rgba(82, 229, 255, 0.08),
-      rgba(255, 79, 216, 0.08)
+      rgb(var(--cyan-rgb) / 0.08),
+      rgb(var(--magenta-rgb) / 0.08)
     );
     color: var(--cyan);
     cursor: pointer;
   }
   .seedbtn:hover:not(:disabled) {
-    box-shadow: 0 0 12px rgba(82, 229, 255, 0.25);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
   }
   /* Busy: the same scanning cyan→magenta sweep clips wear while a job works
      on them, so "something is happening" reads the same everywhere. */
@@ -1272,8 +1272,8 @@
     background: linear-gradient(
       90deg,
       transparent,
-      rgba(82, 229, 255, 0.35) 45%,
-      rgba(255, 79, 216, 0.3) 65%,
+      rgb(var(--cyan-rgb) / 0.35) 45%,
+      rgb(var(--magenta-rgb) / 0.3) 65%,
       transparent
     );
     mix-blend-mode: screen;
@@ -1282,10 +1282,10 @@
   @keyframes seed-glow {
     0%,
     100% {
-      box-shadow: 0 0 10px rgba(82, 229, 255, 0.25);
+      box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
     }
     50% {
-      box-shadow: 0 0 18px rgba(255, 79, 216, 0.35);
+      box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.35);
     }
   }
   @keyframes seed-sweep {
@@ -1312,21 +1312,21 @@
 
   .marquee {
     position: absolute;
-    background: rgba(82, 229, 255, 0.08);
-    border: 1px solid var(--cyan-dim);
+    background: rgb(var(--cyan-rgb) / 0.08);
+    border: var(--border-width) solid var(--cyan-dim);
     pointer-events: none;
     z-index: 3;
   }
   .marquee.launching {
-    background: rgba(255, 200, 87, 0.1);
-    border-color: rgba(255, 200, 87, 0.55);
+    background: rgb(var(--amber-rgb) / 0.1);
+    border-color: rgb(var(--amber-rgb) / 0.55);
   }
   .launchmark {
     position: absolute;
     z-index: 2;
     box-sizing: border-box;
-    border: 1px solid rgba(255, 200, 87, 0.45);
-    background: rgba(255, 200, 87, 0.08);
+    border: var(--border-width) solid rgb(var(--amber-rgb) / 0.45);
+    background: rgb(var(--amber-rgb) / 0.08);
     pointer-events: auto;
     cursor: grab;
   }
@@ -1338,8 +1338,8 @@
   }
   .launchmark.sel {
     border-color: var(--amber);
-    background: rgba(255, 200, 87, 0.16);
-    box-shadow: inset 0 0 12px rgba(255, 200, 87, 0.12);
+    background: rgb(var(--amber-rgb) / 0.16);
+    box-shadow: inset 0 0 12px rgb(var(--amber-rgb) / 0.12);
   }
   .launchlab {
     position: absolute;
@@ -1373,7 +1373,7 @@
     width: 1px;
     background: var(--cyan);
     box-shadow:
-      0 0 6px var(--cyan-dim),
+      0 0 var(--glow-blur) var(--cyan-dim),
       0 0 1px var(--cyan);
     pointer-events: none;
     will-change: transform;

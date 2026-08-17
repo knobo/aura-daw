@@ -7,6 +7,8 @@
    */
   import { latestMeter } from "../state/meters.svelte";
   import { linToDb } from "../utils/format";
+  import { theme } from "../theme/theme.svelte";
+  import { alpha } from "../theme/tokens";
 
   let {
     trackId,
@@ -30,6 +32,7 @@
 
   $effect(() => {
     const id = trackId; // re-run when target changes
+    const tokens = theme.tokens; // subscribe to theme changes
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
@@ -78,11 +81,11 @@
 
       if (!gradient) {
         gradient = ctx.createLinearGradient(0, 0, meterW, 0);
-        gradient.addColorStop(0, "#1e7f95");
-        gradient.addColorStop(norm(-18), "#52e5ff");
-        gradient.addColorStop(norm(-6), "#8ef0ff");
-        gradient.addColorStop(norm(-3), "#ff4fd8");
-        gradient.addColorStop(1, "#ff4152");
+        gradient.addColorStop(0, tokens.cyanDeep);
+        gradient.addColorStop(norm(-18), tokens.cyan);
+        gradient.addColorStop(norm(-6), tokens.cyanBright);
+        gradient.addColorStop(norm(-3), tokens.magenta);
+        gradient.addColorStop(1, tokens.red);
       }
 
       for (let i = 0; i < 2; i++) {
@@ -105,7 +108,7 @@
         const y = i * (laneH + gap);
 
         // track bed
-        ctx.fillStyle = "rgba(96,130,190,0.10)";
+        ctx.fillStyle = alpha(tokens.line, 0.10);
         ctx.fillRect(0, y, meterW, laneH);
 
         // peak body (dim) + rms core (bright)
@@ -120,14 +123,14 @@
         // hold tick
         if (lane.holdDb > DB_MIN + 0.5) {
           const hx = norm(lane.holdDb) * meterW;
-          ctx.fillStyle = lane.holdDb > -3 ? "#ff8b96" : "#d8e3f2";
+          ctx.fillStyle = lane.holdDb > -3 ? tokens.redSoft : tokens.text;
           ctx.fillRect(Math.min(meterW - 2, hx), y, 2, laneH);
         }
       }
 
       // scale ticks
       if (scale) {
-        ctx.fillStyle = "rgba(216,227,242,0.28)";
+        ctx.fillStyle = alpha(tokens.text, 0.28);
         for (const db of [-48, -36, -24, -18, -12, -6, -3, 0]) {
           const x = Math.round(norm(db) * meterW);
           ctx.fillRect(x, 0, 1, h);
@@ -135,11 +138,11 @@
       }
 
       // clip LED
-      ctx.fillStyle = clipLatched ? "#ff4152" : "rgba(255,65,82,0.15)";
+      ctx.fillStyle = clipLatched ? tokens.red : alpha(tokens.red, 0.15);
       ctx.fillRect(w - ledW, 0, ledW, h);
       if (clipLatched) {
-        ctx.shadowColor = "#ff4152";
-        ctx.shadowBlur = 6;
+        ctx.shadowColor = tokens.red;
+        ctx.shadowBlur = parseFloat(tokens.glowBlur) || 0;
         ctx.fillRect(w - ledW, 0, ledW, h);
         ctx.shadowBlur = 0;
       }

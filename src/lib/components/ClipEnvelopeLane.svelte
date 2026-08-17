@@ -224,7 +224,7 @@
     align-items: center;
     justify-content: flex-end;
     padding-right: 8px;
-    border-right: 1px solid rgba(96, 130, 190, 0.25);
+    border-right: 1px solid rgb(var(--line-rgb) / 0.25);
     position: relative;
   }
   .picker {
@@ -235,7 +235,7 @@
     letter-spacing: 0.12em;
     padding: 2px 6px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
