@@ -452,6 +452,194 @@ pub fn pitch_set_reference(
         .request(|reply| ControlMsg::SetPitchReference { track_id, reply })
 }
 
+// ---------------------------------------------------------------------------
+// Pitch Coach — the recorded take: pitch track and score (plan task 14)
+// ---------------------------------------------------------------------------
+
+/// One point of a stored pitch curve, at a PROJECT timeline position.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PitchPoint {
+    pub sample: u64,
+    pub midi: f32,
+    pub clarity: f32,
+    pub voiced: bool,
+}
+
+/// A clip's pitch curve, thinned for drawing.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PitchTrackView {
+    pub clip_id: String,
+    /// The rate the curve was analysed at — the take's own, which is not
+    /// necessarily the project's.
+    pub source_rate: u32,
+    pub hop: u32,
+    pub provenance: pitch_store::PitchProvenance,
+    /// How many points the stored curve had before thinning.
+    pub total_points: usize,
+    pub points: Vec<PitchPoint>,
+}
+
+/// The clip and the project directory, or a clean error.
+fn clip_for_pitch(state: &AudioState, clip_id: &str) -> Result<(std::path::PathBuf, Clip), String> {
+    let session = state.session.lock();
+    let store = &session.store;
+    let dir = store
+        .project_dir
+        .clone()
+        .ok_or_else(|| "the project has no folder on disk yet".to_string())?;
+    let clip = store
+        .clips
+        .iter()
+        .find(|c| c.id == clip_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown audio clip {clip_id}"))?;
+    Ok((dir, clip))
+}
+
+/// Read the clip's pitch track, analysing the audio first if there is none
+/// (or if what is there cannot be read).
+///
+/// Analysis runs at roughly 100x real time, so a three-minute take costs a
+/// couple of seconds on the command thread. That is the price of never
+/// making the UI ask twice.
+fn ensure_pitch_track(
+    dir: &std::path::Path,
+    clip: &Clip,
+) -> Result<pitch_store::PitchTrack, String> {
+    let path = pitch_store::track_path(dir, clip.id.as_str());
+    if path.exists() {
+        match pitch_store::read_track(&path) {
+            Ok(t) => return Ok(t),
+            // A cache that cannot be read is a cache to rebuild, not an
+            // error to show someone who asked for a score.
+            Err(e) => eprintln!("[pitch] re-analysing {}: {e}", clip.id),
+        }
+    }
+    let wav = dir.join(&clip.source_path);
+    let (channels, rate, samples) = crate::control::import::decode_audio(&wav)?;
+    let track = pitch_store::analyze_interleaved(&samples, channels, rate);
+    if let Err(e) = pitch_store::write_track(&path, &track) {
+        eprintln!("[pitch] track analysed but not cached: {e}");
+    }
+    Ok(track)
+}
+
+/// Take-local source samples -> project timeline samples. `None` for a
+/// frame the clip's trim leaves off the timeline.
+fn pitch_frame_to_timeline(sample: u64, clip: &Clip, project_rate: u32, source_rate: u32) -> Option<u64> {
+    // The decode cache is resampled to the engine rate, which is the domain
+    // `offset_samples` and `length_samples` live in — `source_length_samples`
+    // and this curve are the two things measured in SOURCE samples.
+    let in_project = sample * project_rate.max(1) as u64 / source_rate.max(1) as u64;
+    let rel = in_project.checked_sub(clip.offset_samples)?;
+    if rel >= clip.length_samples {
+        return None;
+    }
+    Some(clip.timeline_start_samples + rel)
+}
+
+fn pitch_frames_on_timeline(
+    track: &pitch_store::PitchTrack,
+    clip: &Clip,
+    project_rate: u32,
+) -> Vec<PitchFrame> {
+    track
+        .frames
+        .iter()
+        .filter_map(|f| {
+            let sample = pitch_frame_to_timeline(f.sample, clip, project_rate, track.rate)?;
+            Some(PitchFrame { sample, ..*f })
+        })
+        .collect()
+}
+
+/// Analyse a clip's audio and (re)write its pitch track. Returns the number
+/// of frames. Idempotent, and the only way to give an older take a curve.
+#[tauri::command]
+pub fn pitch_analyze_clip(clip_id: String, state: State<'_, AudioState>) -> Result<usize, String> {
+    let (dir, clip) = clip_for_pitch(&state, &clip_id)?;
+    let wav = dir.join(&clip.source_path);
+    let (channels, rate, samples) = crate::control::import::decode_audio(&wav)?;
+    let track = pitch_store::analyze_interleaved(&samples, channels, rate);
+    pitch_store::write_track(&pitch_store::track_path(&dir, &clip_id), &track)?;
+    Ok(track.frames.len())
+}
+
+/// The clip's pitch curve on the timeline, thinned to at most `max_points`
+/// (default 2000 — a wide screen has fewer pixels than a minute has frames).
+#[tauri::command]
+pub fn pitch_track(
+    clip_id: String,
+    max_points: Option<u32>,
+    state: State<'_, AudioState>,
+) -> Result<PitchTrackView, String> {
+    let (dir, clip) = clip_for_pitch(&state, &clip_id)?;
+    let project_rate = state.shared.sample_rate.load(Relaxed).max(1);
+    let track = ensure_pitch_track(&dir, &clip)?;
+    let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
+    let cap = max_points.unwrap_or(2000).max(1) as usize;
+    let stride = frames.len().div_ceil(cap).max(1);
+    Ok(PitchTrackView {
+        clip_id,
+        source_rate: track.rate,
+        hop: track.hop,
+        provenance: track.provenance,
+        total_points: frames.len(),
+        points: frames
+            .iter()
+            .step_by(stride)
+            .map(|f| PitchPoint {
+                sample: f.sample,
+                midi: f.midi,
+                clarity: f.clarity,
+                voiced: f.voiced,
+            })
+            .collect(),
+    })
+}
+
+/// Score a recorded take against a MIDI track's melody.
+///
+/// Scores are never persisted (spec): recomputing means the report stays
+/// correct after the reference melody is edited.
+#[tauri::command]
+pub fn pitch_score(
+    clip_id: String,
+    reference_track_id: String,
+    tolerance_cents: f32,
+    state: State<'_, AudioState>,
+) -> Result<control::pitch_coach::PitchScoreReport, String> {
+    let (dir, clip) = clip_for_pitch(&state, &clip_id)?;
+    let project_rate = state.shared.sample_rate.load(Relaxed).max(1);
+
+    let reference = {
+        let session = state.session.lock();
+        let midi = &session.midi;
+        if !session.store.tracks.iter().any(|t| t.id == reference_track_id) {
+            return Err(format!("unknown reference track {reference_track_id}"));
+        }
+        let map = crate::midi::TempoMap::new(midi.ppq, midi.tempo_events.clone(), project_rate)
+            .map_err(|e| format!("tempo map: {e}"))?;
+        let mut notes = Vec::new();
+        for c in midi.clips.iter().filter(|c| c.track_id == reference_track_id) {
+            notes.extend(crate::midi::schedule::clip_notes(c, &map));
+        }
+        control::pitch_coach::reference_melody(notes)
+    };
+    if reference.is_empty() {
+        return Err(format!("track {reference_track_id} has no notes to score against"));
+    }
+
+    let track = ensure_pitch_track(&dir, &clip)?;
+    let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
+    let mut report =
+        control::pitch_coach::score(&reference, &frames, project_rate, tolerance_cents);
+    report.reference_track_id = reference_track_id;
+    Ok(report)
+}
+
 /// Pitch-batch bridge (control thread -> Tauri IPC channel).
 struct ChannelPitchSink(Channel<PitchFrameBatch>);
 
