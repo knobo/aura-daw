@@ -11,14 +11,13 @@ Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-in
 
 **Do not:** start G2/G3/G4; write a stock FX suite; bump
 `OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
-Pitch Coach phase 1).
+Pitch Coach phases 1 **and 2**).
 
-**In flight:** Pitch Coach **phase 2** (Tasks 7–11) on
-`feat/pitch-coach-panel`, worktree `.claude/worktrees/pitch-phase2` —
-open PR. It touches only `src/` plus the two test-count docs. Stale
-worktrees for merged branches can be ignored — but keep the branches
-`feat/pitch-coach` and `plan-f-history`, whose squashed SHAs are cited in
-the handoffs.
+**Nothing is in flight.** Pitch Coach phase 2 merged as `7c3cb87`
+(PR #58). Stale worktrees for merged branches can be ignored — but keep
+the branches `feat/pitch-coach`, `feat/pitch-coach-panel` and
+`plan-f-history`, whose per-commit or squashed SHAs are cited in the
+handoffs.
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
@@ -31,6 +30,7 @@ this file (marked correction, ADR 0007) if they do.
 |---|---|
 | G1 Tasks 2–4 — insert ops, commands, `HostRole::Effect`, HostForward restore | PR #55 `118ae23`. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | G1 Task 1 — `InsertSlot` on `TrackState.inserts` | PR #52 `5c338ff` |
+| Pitch Coach **phase 2** — panel, frame bus, lane geometry, prefs | PR #58 `7c3cb87`. Adds `pitch_unsubscribe` (additive). Owner ear-check done; the fixes it produced have NOT been re-checked by ear. **Next: phase 3, Task 12** — but read [`pitch-as-data.md`](docs/backlog/pitch-as-data.md) before Task 14 |
 | Pitch Coach phase 1 | PR #49 `84b0313` + PR #54 `f451a5a` (detection off the RT callback, listen mid-take, `pitch_check`). R3 answered with numbers. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Gesture tokens | PR #47 |
 | External audio editor | PR #48 |
@@ -61,7 +61,7 @@ this file (marked correction, ADR 0007) if they do.
   first. **The panel has never run against the real engine** — only against
   `DemoBackend`'s synthetic singer in a browser. That ear-check is the
   first thing to do with the phase 2 branch.
-- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **New:** the Pitch Coach panel (phase 2) needs an ear-check against a real microphone in a Tauri build.
+- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):
