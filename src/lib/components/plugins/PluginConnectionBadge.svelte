@@ -29,9 +29,9 @@
     text-transform: uppercase;
     padding: 2px 6px;
     border-radius: 3px;
-    border: 1px solid rgba(92, 242, 184, 0.35);
-    color: #5cf2b8;
-    background: rgba(92, 242, 184, 0.08);
+    border: var(--border-width) solid rgb(var(--green-rgb) / 0.35);
+    color: var(--green);
+    background: rgb(var(--green-rgb) / 0.08);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

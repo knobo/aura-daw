@@ -191,7 +191,7 @@
     flex-direction: column;
     padding: 5px;
     border-radius: 7px;
-    background: rgba(8, 10, 19, 0.96);
+    background: rgb(var(--bg-sunken-rgb) / 0.96);
   }
   .menu button {
     display: flex;
@@ -209,7 +209,7 @@
     text-align: left;
   }
   .menu button:hover {
-    background: rgba(82, 229, 255, 0.09);
+    background: rgb(var(--cyan-rgb) / 0.09);
     color: var(--cyan);
   }
   .mark {

@@ -352,18 +352,18 @@
     gap: 2px;
     padding: 7px 9px;
     border-radius: 5px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.35);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.35);
     cursor: pointer;
     text-align: left;
     transition: border-color 120ms, box-shadow 120ms;
   }
   .kind:hover {
-    border-color: rgba(122, 160, 220, 0.3);
+    border-color: rgb(var(--edge-rgb) / 0.3);
   }
   .kind.on {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.15);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.15);
   }
   .kname {
     font-size: 11px;
@@ -399,9 +399,9 @@
   input[type="text"],
   input[type="number"],
   select {
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 11px;
     font-family: var(--font-ui);
@@ -417,15 +417,15 @@
   .context {
     font-size: 10px;
     color: var(--cyan);
-    background: rgba(82, 229, 255, 0.05);
-    border: 1px dashed rgba(82, 229, 255, 0.25);
+    background: rgb(var(--cyan-rgb) / 0.05);
+    border: var(--border-width) dashed rgb(var(--cyan-rgb) / 0.25);
     border-radius: 4px;
     padding: 5px 8px;
   }
   .context.missing {
     color: var(--amber);
-    background: rgba(255, 200, 87, 0.05);
-    border-color: rgba(255, 200, 87, 0.3);
+    background: rgb(var(--amber-rgb) / 0.05);
+    border-color: rgb(var(--amber-rgb) / 0.3);
   }
 
   .run {
@@ -439,8 +439,8 @@
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--magenta));
     box-shadow:
-      0 0 14px rgba(82, 229, 255, 0.3),
-      0 0 22px rgba(255, 79, 216, 0.2);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.3),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
     transition: filter 120ms;
     white-space: nowrap;
     overflow: hidden;
@@ -467,17 +467,17 @@
   }
   .job {
     position: relative;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
     padding: 7px 9px 8px;
-    background: rgba(10, 13, 23, 0.6);
+    background: rgb(var(--bg-1-rgb) / 0.6);
     overflow: hidden;
   }
   .job.live {
     border-color: color-mix(in srgb, var(--cyan) 45%, var(--magenta) 25%);
   }
   .job.err {
-    border-color: rgba(255, 65, 82, 0.4);
+    border-color: rgb(var(--red-rgb) / 0.4);
   }
 
   .wavebox {
@@ -494,9 +494,9 @@
     background: linear-gradient(
       90deg,
       transparent,
-      rgba(82, 229, 255, 0.12) 35%,
-      rgba(82, 229, 255, 0.3) 50%,
-      rgba(255, 79, 216, 0.2) 65%,
+      rgb(var(--cyan-rgb) / 0.12) 35%,
+      rgb(var(--cyan-rgb) / 0.3) 50%,
+      rgb(var(--magenta-rgb) / 0.2) 65%,
       transparent
     );
     mix-blend-mode: screen;
@@ -548,7 +548,7 @@
     letter-spacing: 0.15em;
   }
   .jstate.done {
-    color: #5cf2b8;
+    color: var(--green);
   }
   .jstate.error,
   .jstate.cancelled {
@@ -572,7 +572,7 @@
     position: relative;
   }
   .jstage.done {
-    color: #5cf2b8;
+    color: var(--green);
   }
   .jstage.errtext {
     color: var(--red);
@@ -583,14 +583,14 @@
     margin-top: 5px;
     height: 3px;
     border-radius: 2px;
-    background: rgba(96, 130, 190, 0.15);
+    background: rgb(var(--line-rgb) / 0.15);
     overflow: hidden;
     position: relative;
   }
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
-    box-shadow: 0 0 8px rgba(82, 229, 255, 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 180ms linear;
   }
 
@@ -601,9 +601,9 @@
     font-size: 9px;
     line-height: 1.5;
     color: var(--text-dim);
-    background: rgba(5, 7, 13, 0.75);
+    background: rgb(var(--bg-0-rgb) / 0.75);
     border-radius: 4px;
-    border: 1px solid rgba(96, 130, 190, 0.1);
+    border: var(--border-width) solid rgb(var(--line-rgb) / 0.1);
     white-space: pre-wrap;
     word-break: break-all;
     max-height: 64px;

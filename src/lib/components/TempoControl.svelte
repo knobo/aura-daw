@@ -198,7 +198,7 @@
   }
   .tempo:hover,
   .tempo.open {
-    background: rgba(82, 229, 255, 0.07);
+    background: rgb(var(--cyan-rgb) / 0.07);
     border-color: var(--glass-border);
   }
   .tempo .val {
@@ -207,7 +207,7 @@
   }
   .tempo.open .val {
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
 
   .backdrop {
@@ -225,7 +225,7 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
   }
 
@@ -241,12 +241,12 @@
     font-size: 18px;
     letter-spacing: 0.04em;
     color: var(--cyan);
-    background: rgba(5, 7, 13, 0.75);
-    border: 1px solid var(--cyan-dim);
+    background: rgb(var(--bg-0-rgb) / 0.75);
+    border: var(--border-width) solid var(--cyan-dim);
     border-radius: 4px;
     padding: 2px 8px;
     outline: none;
-    box-shadow: 0 0 12px rgba(82, 229, 255, 0.18);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
     user-select: text;
     -webkit-user-select: text;
   }
@@ -269,10 +269,10 @@
       90deg,
       var(--cyan) 0%,
       var(--cyan) calc(var(--fill) * 100%),
-      rgba(16, 20, 42, 0.9) calc(var(--fill) * 100%),
-      rgba(16, 20, 42, 0.9) 100%
+      rgb(var(--bg-2-rgb) / 0.9) calc(var(--fill) * 100%),
+      rgb(var(--bg-2-rgb) / 0.9) 100%
     );
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     cursor: ew-resize;
   }
   .slider::-webkit-slider-thumb {
@@ -282,8 +282,8 @@
     height: 14px;
     border-radius: 1px;
     background: var(--text);
-    border: 1px solid var(--cyan);
-    box-shadow: 0 0 8px var(--cyan-dim);
+    border: var(--border-width) solid var(--cyan);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) var(--cyan-dim);
     cursor: ew-resize;
   }
   .range {
@@ -308,7 +308,7 @@
     letter-spacing: 0.08em;
     padding: 3px 6px;
     border-radius: 3px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;

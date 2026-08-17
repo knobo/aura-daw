@@ -529,9 +529,9 @@
     padding-left: 0.25em;
     color: var(--text);
     text-shadow:
-      0 0 14px var(--cyan-dim),
-      1px 0 0 rgba(255, 79, 216, 0.55),
-      -1px 0 0 rgba(82, 229, 255, 0.55);
+      0 0 calc(14px * var(--glow-scale)) var(--cyan-dim),
+      1px 0 0 rgb(var(--magenta-rgb) / 0.55),
+      -1px 0 0 rgb(var(--cyan-rgb) / 0.55);
   }
 
   .center {
@@ -551,46 +551,46 @@
     display: grid;
     place-items: center;
     border-radius: 5px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.5);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.5);
     color: var(--text-dim);
     cursor: pointer;
     transition: color 120ms, border-color 120ms, box-shadow 120ms;
   }
   .tbtn:hover {
     color: var(--text);
-    border-color: rgba(122, 160, 220, 0.3);
+    border-color: rgb(var(--edge-rgb) / 0.3);
   }
   .tbtn.play.active {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 12px rgba(82, 229, 255, 0.25);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
   }
   .tbtn.rec {
-    color: rgba(255, 65, 82, 0.6);
+    color: rgb(var(--red-rgb) / 0.6);
   }
   .tbtn.rec:disabled {
     opacity: 0.35;
     cursor: not-allowed;
   }
   .tbtn.rec.counting {
-    color: var(--accent);
-    border-color: var(--accent);
+    color: var(--green);
+    border-color: var(--green);
     animation: countpulse 0.6s ease-in-out infinite alternate;
   }
   @keyframes countpulse {
-    from { box-shadow: 0 0 0 0 rgba(92, 242, 184, 0.0); }
-    to { box-shadow: 0 0 0 4px rgba(92, 242, 184, 0.25); }
+    from { box-shadow: 0 0 0 0 rgb(var(--green-rgb) / 0.0); }
+    to { box-shadow: 0 0 0 4px rgb(var(--green-rgb) / 0.25); }
   }
   .tbtn.rec.recording {
     color: var(--red);
-    border-color: rgba(255, 65, 82, 0.5);
-    box-shadow: 0 0 14px rgba(255, 65, 82, 0.35);
+    border-color: rgb(var(--red-rgb) / 0.5);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--red-rgb) / 0.35);
     animation: rec-pulse 1.2s ease-in-out infinite;
   }
   @keyframes rec-pulse {
     50% {
-      box-shadow: 0 0 4px rgba(255, 65, 82, 0.15);
+      box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--red-rgb) / 0.15);
     }
   }
 
@@ -600,8 +600,8 @@
     gap: 12px;
     padding: 4px 14px;
     border-radius: 6px;
-    border: 1px solid var(--glass-border);
-    background: rgba(5, 7, 13, 0.75);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.75);
   }
   .clock {
     font-size: 21px;
@@ -611,7 +611,7 @@
   }
   .timecode.live .clock {
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .bars {
     font-size: 12px;
@@ -645,7 +645,7 @@
     letter-spacing: 0.18em;
     padding: 4px 8px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
@@ -657,46 +657,46 @@
   }
   .chip.loopchip.on {
     color: var(--amber);
-    border-color: rgba(255, 200, 87, 0.5);
-    box-shadow: 0 0 10px rgba(255, 200, 87, 0.2);
+    border-color: rgb(var(--amber-rgb) / 0.5);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.2);
   }
   .chip.studio {
     background: linear-gradient(
       100deg,
-      rgba(82, 229, 255, 0.08),
-      rgba(255, 79, 216, 0.08)
+      rgb(var(--cyan-rgb) / 0.08),
+      rgb(var(--magenta-rgb) / 0.08)
     );
   }
   .chip.studio:hover,
   .chip.studio.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.2);
   }
   .chip.hum {
     background: linear-gradient(
       100deg,
-      rgba(255, 79, 216, 0.08),
-      rgba(157, 123, 255, 0.08)
+      rgb(var(--magenta-rgb) / 0.08),
+      rgb(var(--violet-rgb) / 0.08)
     );
   }
   .chip.hum:hover,
   .chip.hum.on {
     color: var(--magenta);
     border-color: var(--magenta-dim);
-    box-shadow: 0 0 10px rgba(255, 79, 216, 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
   }
   .chip.exportchip:hover,
   .chip.exportchip.on {
-    color: #5cf2b8;
-    border-color: rgba(92, 242, 184, 0.45);
-    box-shadow: 0 0 10px rgba(92, 242, 184, 0.2);
+    color: var(--green);
+    border-color: rgb(var(--green-rgb) / 0.45);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--green-rgb) / 0.2);
   }
   .chip.launchchip:hover,
   .chip.launchchip.on {
     color: var(--amber);
-    border-color: rgba(255, 200, 87, 0.5);
-    box-shadow: 0 0 10px rgba(255, 200, 87, 0.22);
+    border-color: rgb(var(--amber-rgb) / 0.5);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.22);
   }
   .chip.busychip {
     animation: chip-busy 1s ease-in-out infinite;
@@ -714,19 +714,19 @@
   .mcpchip.alert,
   .morebtn.alert {
     color: var(--amber);
-    border-color: rgba(255, 200, 87, 0.5);
-    box-shadow: 0 0 10px rgba(255, 200, 87, 0.25);
+    border-color: rgb(var(--amber-rgb) / 0.5);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.25);
   }
   .mcpled {
     width: 5px;
     height: 5px;
     border-radius: 50%;
-    background: #5cf2b8;
-    box-shadow: 0 0 5px rgba(92, 242, 184, 0.8);
+    background: var(--green);
+    box-shadow: 0 0 calc(5px * var(--glow-scale)) rgb(var(--green-rgb) / 0.8);
   }
   .mcpled.pending {
     background: var(--amber);
-    box-shadow: 0 0 6px rgba(255, 200, 87, 0.9);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.9);
     animation: mcp-blink 0.9s ease-in-out infinite;
   }
   @keyframes mcp-blink {
@@ -748,7 +748,7 @@
     padding: 4px 8px;
     border-radius: 4px;
     color: var(--text-faint);
-    border: 1px dashed var(--glass-border);
+    border: var(--border-width) dashed var(--glass-border);
     white-space: nowrap;
   }
   .badge.mode {
@@ -787,7 +787,7 @@
     flex-direction: column;
     padding: 5px;
     border-radius: 7px;
-    background: rgba(8, 10, 19, 0.96);
+    background: rgb(var(--bg-sunken-rgb) / 0.96);
     max-height: calc(100vh - 90px);
     overflow-y: auto;
   }
@@ -807,7 +807,7 @@
     white-space: nowrap;
   }
   .mrow:hover {
-    background: rgba(82, 229, 255, 0.09);
+    background: rgb(var(--cyan-rgb) / 0.09);
     color: var(--cyan);
   }
   .mrow.on {

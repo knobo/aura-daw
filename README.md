@@ -187,6 +187,15 @@ gain and tail options:
 
 ![Export dialog: bounce done, export-complete toast](docs/screenshots/export-dialog.png)
 
+### Themes and accessibility
+
+Full tokenised styling with **eight built-in themes** (AURA Dark, AURA Light,
+WCAG AAA High Contrast Dark/Light, Solarized Dark/Light, Nord, Gruvbox Dark)
+and **user JSON themes** loaded from disk. All surfaces, borders, glow effects,
+and canvas renderings (timeline, piano roll, meters) update instantaneously.
+Custom themes can be exported directly from preferences with one click.
+See [docs/themes.md](docs/themes.md).
+
 ---
 
 ## Quickstart

@@ -127,8 +127,9 @@
     z-index: 85;
     display: grid;
     place-items: center;
-    background: rgba(3, 4, 8, 0.6);
-    backdrop-filter: blur(3px);
+    background: rgb(var(--bg-void-rgb) / 0.6);
+    /* A fraction of the panel blur: a scrim hints, it does not frost. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 6));
   }
   .dialog {
     width: 420px;
@@ -138,7 +139,7 @@
     display: flex;
     flex-direction: column;
     gap: 11px;
-    background: rgba(8, 10, 19, 0.94);
+    background: rgb(var(--bg-sunken-rgb) / 0.94);
     animation: dialog-in 160ms ease-out;
   }
   @keyframes dialog-in {
@@ -156,7 +157,7 @@
     font-size: 12px;
     letter-spacing: 0.22em;
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .sub {
     flex: 1;
@@ -192,9 +193,9 @@
     font-size: 10px;
   }
   input[type="text"] {
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 11px;
     padding: 6px 8px;
@@ -221,8 +222,8 @@
     font-size: 10px;
     letter-spacing: 0.14em;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.4);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.4);
     color: var(--text-dim);
     cursor: pointer;
   }
@@ -233,7 +234,7 @@
   .btn.primary {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
   .btn:disabled {
     opacity: 0.4;

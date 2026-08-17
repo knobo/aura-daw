@@ -87,7 +87,7 @@
   }
   .s {
     flex: 1;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     background: transparent;
     color: var(--text-faint);
@@ -104,9 +104,9 @@
     flex: none;
     margin-bottom: 6px;
     padding: 4px 6px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
-    background: rgba(0, 0, 0, 0.25);
+    background: rgb(var(--shadow-rgb) / 0.25);
     color: var(--text);
     font: inherit;
     font-size: 11px;

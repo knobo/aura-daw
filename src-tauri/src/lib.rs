@@ -49,6 +49,7 @@ pub mod osclipboard;
 pub mod modulation;
 pub mod plugins;
 pub mod sidecars;
+pub mod theme;
 pub mod time;
 
 use std::sync::Arc;
@@ -312,6 +313,10 @@ pub fn run() {
             modulation::commands::modulation_set_curve,
             modulation::commands::modulation_set_binding,
             modulation::commands::automation_clip_set,
+            // ---- themes ----
+            theme::list_user_themes,
+            theme::write_user_theme,
+            theme::user_themes_dir,
         ])
         // `build` + `run(callback)` rather than `run(context)`: the app has
         // to do something on the way out. See `RunEvent::Exit` below.

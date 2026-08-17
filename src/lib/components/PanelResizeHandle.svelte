@@ -128,6 +128,6 @@
   .handle:focus-visible::after,
   .handle.dragging::after {
     background: var(--cyan);
-    box-shadow: 0 0 8px var(--cyan-dim);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) var(--cyan-dim);
   }
 </style>

@@ -219,8 +219,9 @@
     z-index: 80;
     display: grid;
     place-items: center;
-    background: rgba(3, 4, 8, 0.6);
-    backdrop-filter: blur(3px);
+    background: rgb(var(--bg-void-rgb) / 0.6);
+    /* A fraction of the panel blur: a scrim hints, it does not frost. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 6));
   }
   .dialog {
     width: 440px;
@@ -232,7 +233,7 @@
     display: flex;
     flex-direction: column;
     gap: 11px;
-    background: rgba(8, 10, 19, 0.94);
+    background: rgb(var(--bg-sunken-rgb) / 0.94);
     animation: dialog-in 160ms ease-out;
   }
   @keyframes dialog-in {
@@ -251,7 +252,7 @@
     font-size: 12px;
     letter-spacing: 0.22em;
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .sub {
     flex: 1;
@@ -283,9 +284,9 @@
   input[type="text"],
   input[type="number"],
   select {
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 11px;
     padding: 6px 8px;
@@ -308,8 +309,8 @@
     font-size: 9px;
     letter-spacing: 0.14em;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.4);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.4);
     color: var(--text-dim);
     cursor: pointer;
     transition: border-color 120ms, color 120ms, box-shadow 120ms;
@@ -317,7 +318,7 @@
   .fmt.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
   .fmt.off {
     opacity: 0.32;
@@ -336,17 +337,17 @@
 
   .jobbox {
     position: relative;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
     padding: 8px 10px;
-    background: rgba(10, 13, 23, 0.6);
+    background: rgb(var(--bg-1-rgb) / 0.6);
     overflow: hidden;
   }
   .jobbox.live {
     border-color: color-mix(in srgb, var(--cyan) 45%, var(--magenta) 25%);
   }
   .jobbox.errb {
-    border-color: rgba(255, 65, 82, 0.4);
+    border-color: rgb(var(--red-rgb) / 0.4);
   }
   .wavebox {
     position: absolute;
@@ -362,9 +363,9 @@
     background: linear-gradient(
       90deg,
       transparent,
-      rgba(82, 229, 255, 0.12) 35%,
-      rgba(82, 229, 255, 0.3) 50%,
-      rgba(255, 79, 216, 0.2) 65%,
+      rgb(var(--cyan-rgb) / 0.12) 35%,
+      rgb(var(--cyan-rgb) / 0.3) 50%,
+      rgb(var(--magenta-rgb) / 0.2) 65%,
       transparent
     );
     mix-blend-mode: screen;
@@ -403,21 +404,21 @@
     margin-top: 5px;
     height: 3px;
     border-radius: 2px;
-    background: rgba(96, 130, 190, 0.15);
+    background: rgb(var(--line-rgb) / 0.15);
     overflow: hidden;
     position: relative;
   }
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
-    box-shadow: 0 0 8px rgba(82, 229, 255, 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 160ms linear;
   }
   .result {
     position: relative;
     margin-top: 6px;
     font-size: 9px;
-    color: #5cf2b8;
+    color: var(--green);
     word-break: break-all;
   }
   .result .meta {
@@ -440,8 +441,8 @@
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--magenta));
     box-shadow:
-      0 0 14px rgba(82, 229, 255, 0.3),
-      0 0 22px rgba(255, 79, 216, 0.2);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.3),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
     transition: filter 120ms;
   }
   .run:hover:not(:disabled) {

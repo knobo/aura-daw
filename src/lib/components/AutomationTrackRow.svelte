@@ -333,21 +333,21 @@
     top: 6px;
     bottom: 6px;
     border-radius: 6px;
-    border: 1px dashed color-mix(in srgb, var(--clip-color) 55%, transparent);
+    border: var(--border-width) dashed color-mix(in srgb, var(--clip-color) 55%, transparent);
     background:
       linear-gradient(
         to bottom,
         color-mix(in srgb, var(--clip-color) 14%, transparent),
         color-mix(in srgb, var(--clip-color) 5%, transparent)
       ),
-      rgba(10, 13, 23, 0.6);
+      rgb(var(--bg-1-rgb) / 0.6);
     overflow: hidden;
     cursor: grab;
     touch-action: none;
   }
   .aclip.selected {
     border-style: solid;
-    border-color: color-mix(in srgb, var(--clip-color) 85%, white 5%);
+    border-color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 5%);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent);
   }
   .aclip.edge {

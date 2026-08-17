@@ -54,6 +54,9 @@ export interface PrefValues {
   pitchTrailSnap: boolean;
   /** Key held to rehearse (record silence into the take). "none" disables. */
   pitchRehearseKey: "h" | "j" | "none";
+  /** Active theme id. A plain string, not a union: user themes are
+   * discovered at runtime, so the catalogue is not knowable here. */
+  theme: string;
 }
 
 /** Tolerance option ids, in order of strictness. */
@@ -102,6 +105,19 @@ export type EnumDef<T extends string> = BaseDef & {
   options: readonly PrefOption<T>[];
 };
 
+/**
+ * An enum whose options come from a named RUNTIME catalog rather than a
+ * static list — the theme picker, whose entries include whatever JSON files
+ * the user has dropped in their config folder. The schema still holds only
+ * data (the catalog's name); the dialog resolves it. That is what keeps this
+ * module free of reactive imports and import cycles.
+ */
+export type ChoiceDef = BaseDef & {
+  kind: "choice";
+  default: string;
+  catalog: "themes";
+};
+
 /** An ordered list of absolute filesystem paths (the library's sample
  * folders). Rendered by the dialog as a removable list plus an "add" button
  * driven by the native directory picker. */
@@ -123,9 +139,13 @@ type DefFor<V> = [V] extends [boolean]
     ? NumberDef
     : [V] extends [string[]]
       ? PathListDef
-      : [V] extends [string]
-        ? EnumDef<V>
-        : never;
+      : // `string extends V` is true only for the WIDEST string — a literal
+        // union like "0"|"1" fails it and falls through to EnumDef.
+        [string] extends [V]
+        ? ChoiceDef
+        : [V] extends [string]
+          ? EnumDef<V>
+          : never;
 
 export type PrefDef = { [K in PrefId]: DefFor<PrefValues[K]> }[PrefId];
 
@@ -272,6 +292,15 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
       { value: "full", label: "FULL" },
     ],
   },
+  theme: {
+    kind: "choice",
+    default: "aura-dark",
+    catalog: "themes",
+    category: "interface",
+    label: "Theme",
+    blurb:
+      "Colours and contrast for the whole interface. Custom themes are JSON files in the folder below; add or edit one and restart AURA to see it here.",
+  },
 };
 
 /**
@@ -284,6 +313,10 @@ export function coercePref<D extends PrefDef>(def: D, value: unknown): D["defaul
   switch (def.kind) {
     case "boolean":
       return typeof value === "boolean" ? value : undefined;
+    case "choice":
+      // Existence is checked where the catalog lives (the theme store), which
+      // falls back to the default for an id it does not know.
+      return typeof value === "string" && value.trim() !== "" ? (value as D["default"]) : undefined;
     case "enum":
       return def.options.some((o) => o.value === value) ? (value as D["default"]) : undefined;
     case "number": {

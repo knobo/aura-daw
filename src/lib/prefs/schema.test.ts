@@ -153,3 +153,33 @@ describe("pathList preferences", () => {
     expect(a).not.toBe(PREF_SCHEMA.librarySampleFolders.default);
   });
 });
+
+describe("the choice kind (runtime-catalogued options)", () => {
+  const def = PREF_SCHEMA.theme;
+
+  it("declares the theme preference against the themes catalog", () => {
+    expect(def.kind).toBe("choice");
+    expect(def.default).toBe("aura-dark");
+    expect(def.category).toBe("interface");
+    if (def.kind === "choice") expect(def.catalog).toBe("themes");
+  });
+
+  it("accepts any non-empty string, because the catalog is not known here", () => {
+    expect(coercePref(def, "solarized-dark")).toBe("solarized-dark");
+    expect(coercePref(def, "a-theme-someone-invented")).toBe("a-theme-someone-invented");
+  });
+
+  it("rejects blanks and non-strings", () => {
+    expect(coercePref(def, "")).toBeUndefined();
+    expect(coercePref(def, "   ")).toBeUndefined();
+    expect(coercePref(def, 7)).toBeUndefined();
+    expect(coercePref(def, null)).toBeUndefined();
+  });
+
+  it("leaves literal-union preferences resolving to enum defs", () => {
+    // countInBars is "0"|"1"|"2"|"4" — a union, so it must still be an enum
+    // with a static options list, not a choice.
+    expect(PREF_SCHEMA.countInBars.kind).toBe("enum");
+  });
+});
+

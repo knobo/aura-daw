@@ -220,8 +220,8 @@
     top: 6px;
     bottom: 6px;
     border-radius: 6px;
-    border: 1px solid color-mix(in srgb, var(--clip-color) 35%, transparent);
-    background: color-mix(in srgb, var(--clip-color) 8%, rgba(10, 13, 23, 0.55));
+    border: var(--border-width) solid color-mix(in srgb, var(--clip-color) 35%, transparent);
+    background: color-mix(in srgb, var(--clip-color) 8%, rgb(var(--bg-1-rgb) / 0.55));
     overflow: hidden;
     cursor: grab;
     touch-action: none;
@@ -231,10 +231,10 @@
     cursor: grabbing;
   }
   .clip.selected {
-    border-color: color-mix(in srgb, var(--clip-color) 85%, white 5%);
+    border-color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 5%);
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent),
-      0 0 18px color-mix(in srgb, var(--clip-color) 25%, transparent);
+      0 0 calc(18px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 25%, transparent);
   }
 
   .wave {
@@ -249,8 +249,8 @@
     top: 3px;
     font-size: 9px;
     letter-spacing: 0.06em;
-    color: color-mix(in srgb, var(--clip-color) 80%, white 20%);
-    background: rgba(5, 7, 13, 0.55);
+    color: color-mix(in srgb, var(--clip-color) 80%, var(--text) 20%);
+    background: rgb(var(--bg-0-rgb) / 0.55);
     padding: 1px 5px;
     border-radius: 3px;
     pointer-events: none;
@@ -265,7 +265,7 @@
     height: 15px;
     line-height: 1;
     border: none;
-    background: rgba(5, 7, 13, 0.55);
+    background: rgb(var(--bg-0-rgb) / 0.55);
     color: var(--text-faint);
     font-size: 12px;
     cursor: pointer;
@@ -292,8 +292,8 @@
     border: none;
     background: linear-gradient(100deg, var(--cyan), var(--magenta));
     box-shadow:
-      0 0 14px rgba(82, 229, 255, 0.35),
-      0 0 22px rgba(255, 79, 216, 0.25);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.25);
     transition: filter 120ms, transform 120ms;
   }
   .magic:hover {
@@ -313,17 +313,17 @@
   @keyframes proc-border {
     0%,
     100% {
-      box-shadow: 0 0 10px rgba(82, 229, 255, 0.25);
+      box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
     }
     50% {
-      box-shadow: 0 0 18px rgba(255, 79, 216, 0.35);
+      box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.35);
     }
   }
 
   .scanbox {
     position: absolute;
     inset: 0;
-    background: rgba(5, 7, 13, 0.35);
+    background: rgb(var(--bg-0-rgb) / 0.35);
   }
   .scan {
     position: absolute;
@@ -333,9 +333,9 @@
     background: linear-gradient(
       90deg,
       transparent,
-      rgba(82, 229, 255, 0.18) 35%,
-      rgba(82, 229, 255, 0.45) 50%,
-      rgba(255, 79, 216, 0.3) 65%,
+      rgb(var(--cyan-rgb) / 0.18) 35%,
+      rgb(var(--cyan-rgb) / 0.45) 50%,
+      rgb(var(--magenta-rgb) / 0.3) 65%,
       transparent
     );
     mix-blend-mode: screen;
@@ -364,8 +364,8 @@
     display: flex;
     align-items: center;
     gap: 7px;
-    background: rgba(5, 7, 13, 0.7);
-    border: 1px solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.7);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     padding: 2px 7px;
   }
@@ -394,12 +394,12 @@
     right: 0;
     bottom: 0;
     height: 3px;
-    background: rgba(96, 130, 190, 0.15);
+    background: rgb(var(--line-rgb) / 0.15);
   }
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
-    box-shadow: 0 0 8px rgba(82, 229, 255, 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 180ms linear;
   }
 </style>

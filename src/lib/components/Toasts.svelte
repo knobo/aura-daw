@@ -39,7 +39,7 @@
     pointer-events: auto;
     border-radius: 7px;
     padding: 9px 11px;
-    background: rgba(8, 10, 19, 0.92);
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
     animation: toast-in 200ms ease-out;
   }
   @keyframes toast-in {
@@ -49,16 +49,16 @@
     }
   }
   .toast.success {
-    border-color: rgba(92, 242, 184, 0.35);
-    box-shadow: 0 0 18px rgba(92, 242, 184, 0.12);
+    border-color: rgb(var(--green-rgb) / 0.35);
+    box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--green-rgb) / 0.12);
   }
   .toast.error {
-    border-color: rgba(255, 65, 82, 0.4);
-    box-shadow: 0 0 18px rgba(255, 65, 82, 0.12);
+    border-color: rgb(var(--red-rgb) / 0.4);
+    box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--red-rgb) / 0.12);
   }
   .toast.info {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 18px rgba(82, 229, 255, 0.1);
+    box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.1);
   }
 
   .head {
@@ -73,16 +73,16 @@
     flex: none;
   }
   .success .dot {
-    background: #5cf2b8;
-    box-shadow: 0 0 6px rgba(92, 242, 184, 0.8);
+    background: var(--green);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--green-rgb) / 0.8);
   }
   .error .dot {
     background: var(--red);
-    box-shadow: 0 0 6px rgba(255, 65, 82, 0.8);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--red-rgb) / 0.8);
   }
   .info .dot {
     background: var(--cyan);
-    box-shadow: 0 0 6px var(--cyan-dim);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) var(--cyan-dim);
   }
   .title {
     flex: 1;
@@ -91,7 +91,7 @@
     color: var(--text);
   }
   .success .title {
-    color: #5cf2b8;
+    color: var(--green);
   }
   .error .title {
     color: var(--red);

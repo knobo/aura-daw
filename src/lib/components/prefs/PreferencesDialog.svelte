@@ -9,6 +9,60 @@
   import { prefs } from "../../prefs/prefs.svelte";
   import { PREF_CATEGORIES, PREF_SCHEMA, type PrefDef, type PrefId } from "../../prefs/schema";
   import { directoryPicker } from "../../utils/pick-directory";
+  import { theme } from "../../theme/theme.svelte";
+  import { backend } from "../../tauri";
+  import { toasts } from "../../state/toasts.svelte";
+
+  // The themes folder path is only needed while the dialog is open.
+  let themesDir = $state("");
+  $effect(() => {
+    if (prefs.dialogOpen && themesDir === "") {
+      void backend.userThemesDir().then((d) => (themesDir = d));
+    }
+  });
+
+  /**
+   * `<base>`, then `<base>-2`, `<base>-3`, … — the first id no theme file is
+   * using. Asks the backend rather than `theme.userThemes()` so a file that
+   * failed to parse still counts as taken; it is a file the user can fix.
+   */
+  async function freeThemeId(base: string): Promise<string> {
+    let taken = new Set<string>();
+    try {
+      taken = new Set((await backend.listUserThemes()).map((f) => f.id));
+    } catch {
+      // No themes folder yet — nothing to collide with.
+    }
+    if (!taken.has(base)) return base;
+    for (let n = 2; ; n++) {
+      if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+    }
+  }
+
+  /**
+   * Serialise the ACTIVE theme as a starting point for a custom one: its
+   * built-in base plus every resolved token inlined, so a user can delete
+   * the lines they do not care about rather than hunt for key names.
+   *
+   * Writes to a fresh filename every time. The export exists to be EDITED,
+   * so a fixed name would mean the second click silently discards whatever
+   * the user did to the first one.
+   */
+  async function exportTheme() {
+    const active = theme.resolve(theme.activeId);
+    const doc = {
+      name: `${active.name} (copy)`,
+      extends: active.base,
+      tokens: active.tokens,
+    };
+    try {
+      const id = await freeThemeId(`${active.id}-copy`);
+      const path = await backend.writeUserTheme(id, JSON.stringify(doc, null, 2) + "\n");
+      toasts.success("THEME EXPORTED", path, "Restart AURA to see it in this list.");
+    } catch (err) {
+      toasts.error("EXPORT FAILED", String(err));
+    }
+  }
 
   const entries = Object.entries(PREF_SCHEMA) as [PrefId, PrefDef][];
 
@@ -114,6 +168,26 @@
                       </button>
                     {/each}
                   </div>
+                {:else if def.kind === "choice"}
+                  <select
+                    class="choice mono"
+                    aria-label={def.label}
+                    value={prefs.values[id] as string}
+                    onchange={(e) => prefs.set(id, e.currentTarget.value)}
+                  >
+                    <optgroup label="BUILT-IN">
+                      {#each theme.builtins() as t (t.id)}
+                        <option value={t.id}>{t.name}</option>
+                      {/each}
+                    </optgroup>
+                    {#if theme.userThemes().length > 0}
+                      <optgroup label="CUSTOM">
+                        {#each theme.userThemes() as t (t.id)}
+                          <option value={t.id}>{t.name}</option>
+                        {/each}
+                      </optgroup>
+                    {/if}
+                  </select>
                 {:else if def.kind === "number"}
                   <div class="numctl">
                     <input
@@ -131,6 +205,12 @@
                 {/if}
               </div>
               <p class="blurb silk">{def.blurb}</p>
+              {#if def.kind === "choice" && def.catalog === "themes"}
+                <div class="themedir">
+                  <span class="pathtext silk" title={themesDir}>{themesDir}</span>
+                  <button class="pathadd mono" onclick={exportTheme}>EXPORT CURRENT THEME…</button>
+                </div>
+              {/if}
               {#if def.kind === "pathList"}
                 <div class="pathlist">
                   {#each prefs.values[id] as string[] as p (p)}
@@ -164,14 +244,32 @@
 {/if}
 
 <style>
+  .choice {
+    background: var(--bg-2);
+    color: var(--text);
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 3px;
+    padding: 3px 6px;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+  }
+
+  .themedir {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+
   .overlay {
     position: fixed;
     inset: 0;
     z-index: 80;
     display: grid;
     place-items: center;
-    background: rgba(3, 4, 8, 0.6);
-    backdrop-filter: blur(3px);
+    background: rgb(var(--bg-void-rgb) / 0.6);
+    /* A fraction of the panel blur: a scrim hints, it does not frost. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 6));
   }
   .dialog {
     width: 460px;
@@ -183,7 +281,7 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
-    background: rgba(8, 10, 19, 0.94);
+    background: rgb(var(--bg-sunken-rgb) / 0.94);
     animation: dialog-in 160ms ease-out;
   }
   @keyframes dialog-in {
@@ -202,7 +300,7 @@
     font-size: 12px;
     letter-spacing: 0.22em;
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .sub {
     flex: 1;
@@ -228,7 +326,7 @@
     font-size: 9px;
     letter-spacing: 0.24em;
     color: var(--text-faint);
-    border-bottom: 1px solid var(--glass-border);
+    border-bottom: var(--border-width) solid var(--glass-border);
     padding-bottom: 4px;
   }
 
@@ -261,8 +359,8 @@
     font-size: 9px;
     letter-spacing: 0.16em;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.4);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.4);
     color: var(--text-dim);
     cursor: pointer;
     transition: border-color 120ms, color 120ms, box-shadow 120ms;
@@ -270,7 +368,7 @@
   .toggle.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
 
   .seg {
@@ -282,8 +380,8 @@
     font-size: 9px;
     letter-spacing: 0.12em;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.4);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.4);
     color: var(--text-dim);
     cursor: pointer;
     transition: border-color 120ms, color 120ms, box-shadow 120ms;
@@ -291,7 +389,7 @@
   .segbtn.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
 
   .numctl {
@@ -322,9 +420,9 @@
     justify-content: space-between;
     gap: 8px;
     padding: 3px 6px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
-    background: rgba(16, 20, 42, 0.4);
+    background: rgb(var(--bg-2-rgb) / 0.4);
   }
   .pathtext {
     flex: 1;

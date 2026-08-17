@@ -6,6 +6,16 @@
 
 import type { SectionRow } from "../sectionTable";
 
+// ── theme.schema.json ────────────────────────────────────────────────────────
+
+/** One `*.json` file found in the user themes folder, contents unparsed —
+ * `src/lib/theme/parse.ts` is the only thing that judges it. */
+export interface UserThemeFile {
+  /** Filename stem; the theme's id. */
+  id: string;
+  raw: string;
+}
+
 // ── audio-device.schema.json ────────────────────────────────────────────────
 
 export interface AudioDevice {

@@ -430,14 +430,14 @@
     bottom: 6px;
     border-radius: 6px;
     /* dotted border + tinted body = instantly non-audio */
-    border: 1px dashed color-mix(in srgb, var(--clip-color) 55%, transparent);
+    border: var(--border-width) dashed color-mix(in srgb, var(--clip-color) 55%, transparent);
     background:
       linear-gradient(
         to bottom,
         color-mix(in srgb, var(--clip-color) 14%, transparent),
         color-mix(in srgb, var(--clip-color) 5%, transparent)
       ),
-      rgba(10, 13, 23, 0.6);
+      rgb(var(--bg-1-rgb) / 0.6);
     overflow: hidden;
     cursor: grab;
     touch-action: none;
@@ -445,15 +445,15 @@
   }
   .mclip.selected {
     border-style: solid;
-    border-color: color-mix(in srgb, var(--clip-color) 85%, white 5%);
+    border-color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 5%);
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent),
-      0 0 18px color-mix(in srgb, var(--clip-color) 25%, transparent);
+      0 0 calc(18px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 25%, transparent);
   }
   .mclip.open {
     box-shadow:
       inset 0 0 0 1px color-mix(in srgb, var(--clip-color) 45%, transparent),
-      0 0 14px color-mix(in srgb, var(--clip-color) 30%, transparent);
+      0 0 calc(14px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 30%, transparent);
   }
   /* right-edge drag-to-loop zone — same idiom as the ruler's loop pins */
   .mclip.edge {
@@ -471,8 +471,8 @@
     50% {
       border-color: var(--clip-color);
       box-shadow:
-        0 0 0 2px color-mix(in srgb, var(--clip-color) 70%, white 10%),
-        0 0 26px color-mix(in srgb, var(--clip-color) 60%, transparent);
+        0 0 0 2px color-mix(in srgb, var(--clip-color) 70%, var(--text) 10%),
+        0 0 calc(26px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 60%, transparent);
     }
   }
 
@@ -482,7 +482,7 @@
     pointer-events: none;
     opacity: 0;
     background: color-mix(in srgb, var(--clip-color) 22%, transparent);
-    box-shadow: inset 0 0 14px color-mix(in srgb, var(--clip-color) 45%, transparent);
+    box-shadow: inset 0 0 calc(14px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 45%, transparent);
     will-change: opacity;
   }
 
@@ -500,8 +500,8 @@
     top: 3px;
     font-size: 9px;
     letter-spacing: 0.06em;
-    color: color-mix(in srgb, var(--clip-color) 85%, white 15%);
-    background: rgba(5, 7, 13, 0.55);
+    color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 15%);
+    background: rgb(var(--bg-0-rgb) / 0.55);
     padding: 1px 5px;
     border-radius: 3px;
     pointer-events: none;
@@ -516,18 +516,18 @@
     cursor: text;
   }
   .namestrip:hover {
-    background: rgba(255, 255, 255, 0.06);
+    background: rgb(var(--text-on-accent-rgb) / 0.06);
   }
   .rename {
     top: 2px;
     width: 12ch;
     pointer-events: auto; /* .tag turns them off; the input needs clicking */
-    border: 1px solid var(--clip-color);
+    border: var(--border-width) solid var(--clip-color);
     outline: none;
     font: inherit;
     font-size: 9px;
     color: var(--text);
-    background: rgba(5, 7, 13, 0.92);
+    background: rgb(var(--bg-0-rgb) / 0.92);
   }
   .count {
     position: absolute;
@@ -543,8 +543,8 @@
     right: 22px;
     height: 12px;
     line-height: 12px;
-    border: 1px solid color-mix(in srgb, var(--clip-color) 40%, transparent);
-    background: rgba(5, 7, 13, 0.55);
+    border: var(--border-width) solid color-mix(in srgb, var(--clip-color) 40%, transparent);
+    background: rgb(var(--bg-0-rgb) / 0.55);
     color: var(--cyan);
     font-size: 8px;
     letter-spacing: 0.08em;
@@ -568,7 +568,7 @@
     height: 12px;
     line-height: 1;
     border: none;
-    background: rgba(5, 7, 13, 0.55);
+    background: rgb(var(--bg-0-rgb) / 0.55);
     color: var(--text-faint);
     font-size: 12px;
     cursor: pointer;
@@ -599,10 +599,10 @@
     z-index: 31;
     display: flex;
     flex-direction: column;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
-    background: rgba(10, 13, 23, 0.96);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+    background: rgb(var(--bg-1-rgb) / 0.96);
+    box-shadow: 0 4px 14px rgb(var(--shadow-rgb) / 0.4);
     overflow: hidden;
   }
   .clipmenu button {
@@ -627,17 +627,17 @@
     align-items: center;
     gap: 4px;
     padding: 4px 6px;
-    border: 1px solid var(--clip-color);
+    border: var(--border-width) solid var(--clip-color);
     border-radius: 4px;
-    background: rgba(5, 7, 13, 0.96);
+    background: rgb(var(--bg-0-rgb) / 0.96);
   }
   .midipicker select,
   .midipicker input {
     font: inherit;
     font-size: 9px;
     color: var(--text);
-    background: rgba(5, 7, 13, 0.8);
-    border: 1px solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.8);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 3px;
     padding: 2px 4px;
   }

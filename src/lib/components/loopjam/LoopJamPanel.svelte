@@ -105,7 +105,7 @@
     gap: 6px;
     padding: 4px 6px;
     border-radius: 5px;
-    background: rgba(8, 10, 19, 0.85);
+    background: rgb(var(--bg-sunken-rgb) / 0.85);
     width: fit-content;
   }
 
@@ -118,7 +118,7 @@
     cursor: pointer;
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--amber), var(--magenta));
-    box-shadow: 0 0 10px rgba(255, 200, 87, 0.25);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.25);
     transition: filter 120ms;
     white-space: nowrap;
   }
@@ -136,7 +136,7 @@
     text-transform: uppercase;
     padding: 2px 6px;
     border-radius: 3px;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     color: var(--text-faint);
     white-space: nowrap;
   }
@@ -147,12 +147,12 @@
   }
   .state.ready {
     color: var(--amber);
-    border-color: rgba(255, 200, 87, 0.5);
+    border-color: rgb(var(--amber-rgb) / 0.5);
     animation: state-pulse 0.8s ease-in-out infinite;
   }
   .state.applied {
-    color: #5cf2b8;
-    border-color: rgba(92, 242, 184, 0.4);
+    color: var(--green);
+    border-color: rgb(var(--green-rgb) / 0.4);
   }
   @keyframes state-pulse {
     50% {
@@ -182,7 +182,7 @@
     gap: 7px;
     padding: 7px 8px;
     border-radius: 5px;
-    background: rgba(8, 10, 19, 0.92);
+    background: rgb(var(--bg-sunken-rgb) / 0.92);
     width: 300px;
     max-width: 90vw;
   }
@@ -197,22 +197,22 @@
     flex: 0 0 70px;
   }
   input[type="text"] {
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 10px;
     padding: 4px 7px;
   }
   input:focus {
-    border-color: rgba(255, 200, 87, 0.5);
+    border-color: rgb(var(--amber-rgb) / 0.5);
   }
 
   .err {
     font-size: 9px;
     color: var(--red);
-    background: rgba(8, 10, 19, 0.85);
-    border: 1px solid rgba(255, 65, 82, 0.35);
+    background: rgb(var(--bg-sunken-rgb) / 0.85);
+    border: var(--border-width) solid rgb(var(--red-rgb) / 0.35);
     border-radius: 4px;
     padding: 3px 7px;
     max-width: 320px;

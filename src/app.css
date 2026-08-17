@@ -10,27 +10,75 @@
   color-scheme: dark;
 
   /* surfaces */
-  --bg-0: #05070d; /* void */
-  --bg-1: #0a0d17; /* panel base */
-  --bg-2: #10142a; /* raised */
-  --glass: rgba(13, 17, 30, 0.62);
-  --glass-border: rgba(122, 160, 220, 0.12);
-  --grid-line: rgba(96, 130, 190, 0.09);
-  --grid-line-strong: rgba(96, 130, 190, 0.2);
+  --bg-void: #030408;
+  --bg-void-rgb: 3 4 8;
+  --bg-0: #05070d;
+  --bg-0-rgb: 5 7 13;
+  --bg-sunken: #080a13;
+  --bg-sunken-rgb: 8 10 19;
+  --bg-1: #0a0d17;
+  --bg-1-rgb: 10 13 23;
+  --bg-2: #10142a;
+  --bg-2-rgb: 16 20 42;
+  --bg-3: #1b2340;
+  --bg-3-rgb: 27 35 64;
+  --glass-base-rgb: 13 17 30;
+  --glass: rgb(13 17 30 / 0.62);
 
-  /* duotone accents */
+  /* hairlines */
+  --line-rgb: 96 130 190;
+  --edge-rgb: 122 160 220;
+  --glass-border: rgb(122 160 220 / 0.12);
+  --grid-line: rgb(96 130 190 / 0.09);
+  --grid-line-strong: rgb(96 130 190 / 0.2);
+
+  /* accents */
   --cyan: #52e5ff;
-  --cyan-dim: rgba(82, 229, 255, 0.35);
+  --cyan-rgb: 82 229 255;
+  --cyan-bright: #8ef0ff;
+  --cyan-deep: #1e7f95;
+  --cyan-dim: rgb(82 229 255 / 0.35);
   --magenta: #ff4fd8;
-  --magenta-dim: rgba(255, 79, 216, 0.35);
-  --red: #ff4152;
+  --magenta-rgb: 255 79 216;
+  --magenta-dim: rgb(255 79 216 / 0.35);
   --amber: #ffc857;
+  --amber-rgb: 255 200 87;
+  --amber-sunken: #1a1408;
+  --red: #ff4152;
+  --red-rgb: 255 65 82;
+  --red-soft: #ff8b96;
   --violet: #9d7bff;
+  --violet-rgb: 157 123 255;
+  --green: #5cf2b8;
+  --green-rgb: 92 242 184;
+  --orange: #ff8b5c;
+  --orange-rgb: 255 139 92;
 
   /* text */
   --text: #d8e3f2;
+  --text-rgb: 216 227 242;
+  --text-mid: #8fa3c4;
   --text-dim: #5f6c85;
   --text-faint: #39435c;
+  --text-on-accent: #ffffff;
+
+  --shadow-rgb: 0 0 0;
+
+  /* track identity */
+  --track-1: #52e5ff;
+  --track-2: #ff4fd8;
+  --track-3: #ffc857;
+  --track-4: #9d7bff;
+  --track-5: #5cf2b8;
+  --track-6: #ff8b5c;
+
+  /* affordances */
+  --border-width: 1px;
+  --focus-width: 1px;
+  --glass-blur: 18px;
+  --glass-alpha: 0.62;
+  --glow-scale: 1;
+  --body-glow: 0.05;
 
   /* type */
   --font-mono: "SFMono-Regular", "JetBrains Mono", "Cascadia Mono", ui-monospace,
@@ -60,8 +108,8 @@ body {
 
 body {
   background:
-    radial-gradient(1200px 500px at 75% -10%, rgba(82, 229, 255, 0.05), transparent 60%),
-    radial-gradient(900px 500px at 10% 110%, rgba(255, 79, 216, 0.045), transparent 60%),
+    radial-gradient(1200px 500px at 75% -10%, rgb(var(--cyan-rgb) / var(--body-glow)), transparent 60%),
+    radial-gradient(900px 500px at 10% 110%, rgb(var(--magenta-rgb) / calc(var(--body-glow) * 0.9)), transparent 60%),
     var(--bg-0);
   color: var(--text);
   font-family: var(--font-ui);
@@ -82,9 +130,9 @@ body {
 
 .glass {
   background: var(--glass);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
-  border: 1px solid var(--glass-border);
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.2);
+  border: var(--border-width) solid var(--glass-border);
 }
 
 .mono {
@@ -94,7 +142,7 @@ body {
 
 /* focus ring — visible, on-palette */
 :where(button, input, select, [tabindex]):focus-visible {
-  outline: 1px solid var(--cyan);
+  outline: var(--focus-width) solid var(--cyan);
   outline-offset: 1px;
 }
 
@@ -104,7 +152,7 @@ body {
   height: 8px;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(96, 130, 190, 0.2);
+  background: rgb(var(--line-rgb) / 0.2);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-track {
@@ -127,7 +175,7 @@ input[type="range"].fader::-webkit-slider-runnable-track {
     to right,
     var(--fader-fill, var(--cyan)) 0%,
     var(--fader-fill, var(--cyan)) var(--fader-pct, 50%),
-    rgba(96, 130, 190, 0.18) var(--fader-pct, 50%)
+    rgb(var(--line-rgb) / 0.18) var(--fader-pct, 50%)
   );
 }
 input[type="range"].fader::-webkit-slider-thumb {
@@ -138,12 +186,12 @@ input[type="range"].fader::-webkit-slider-thumb {
   margin-top: -5px;
   border-radius: 1px;
   background: var(--text);
-  box-shadow: 0 0 6px rgba(216, 227, 242, 0.5);
+  box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--text-rgb) / 0.5);
 }
 input[type="range"].fader::-moz-range-track {
   height: 3px;
   border-radius: 2px;
-  background: rgba(96, 130, 190, 0.18);
+  background: rgb(var(--line-rgb) / 0.18);
 }
 input[type="range"].fader::-moz-range-progress {
   height: 3px;
@@ -156,7 +204,7 @@ input[type="range"].fader::-moz-range-thumb {
   border: none;
   border-radius: 1px;
   background: var(--text);
-  box-shadow: 0 0 6px rgba(216, 227, 242, 0.5);
+  box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--text-rgb) / 0.5);
 }
 
 @media (prefers-reduced-motion: reduce) {

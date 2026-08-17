@@ -404,9 +404,9 @@
     max-height: min(70vh, 640px);
     display: flex;
     flex-direction: column;
-    background: rgba(8, 10, 19, 0.94);
-    border: 1px solid var(--glass-border);
-    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+    background: rgb(var(--bg-sunken-rgb) / 0.94);
+    border: var(--border-width) solid var(--glass-border);
+    box-shadow: 0 18px 48px rgb(var(--shadow-rgb) / 0.45);
   }
   .title {
     display: flex;
@@ -414,7 +414,7 @@
     gap: 10px;
     padding: 8px 10px 6px;
     cursor: grab;
-    border-bottom: 1px solid var(--glass-border);
+    border-bottom: var(--border-width) solid var(--glass-border);
   }
   .title:active {
     cursor: grabbing;
@@ -454,14 +454,14 @@
     letter-spacing: 0.1em;
     padding: 4px 8px;
     background: transparent;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     color: var(--text-dim);
     cursor: pointer;
   }
   .maptab.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    background: rgba(82, 229, 255, 0.08);
+    background: rgb(var(--cyan-rgb) / 0.08);
   }
   .maptab.add,
   .maptab.danger {
@@ -509,28 +509,28 @@
   }
   .row {
     padding: 4px 6px;
-    border: 1px solid transparent;
+    border: var(--border-width) solid transparent;
     cursor: pointer;
   }
   .row:hover {
-    background: rgba(82, 229, 255, 0.04);
+    background: rgb(var(--cyan-rgb) / 0.04);
   }
   .row.on {
     border-color: var(--cyan-dim);
-    background: rgba(82, 229, 255, 0.08);
+    background: rgb(var(--cyan-rgb) / 0.08);
   }
   .row.learn {
     border-color: var(--amber);
   }
   .row.play {
     border-color: var(--cyan);
-    background: rgba(82, 229, 255, 0.1);
+    background: rgb(var(--cyan-rgb) / 0.1);
   }
   .name,
   .note,
   .ch {
     background: var(--bg-2);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     color: var(--text);
     font-size: 11px;
     padding: 3px 5px;
@@ -568,7 +568,7 @@
     letter-spacing: 0.12em;
     padding: 3px 6px;
     background: transparent;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     color: var(--text-dim);
     cursor: pointer;
   }
@@ -593,19 +593,19 @@
     align-items: center;
     gap: 10px;
     padding: 8px 10px 10px;
-    border-top: 1px solid var(--glass-border);
+    border-top: var(--border-width) solid var(--glass-border);
   }
   .act {
     font-size: 9px;
     letter-spacing: 0.14em;
     padding: 6px 10px;
     background: transparent;
-    border: 1px solid var(--cyan-dim);
+    border: var(--border-width) solid var(--cyan-dim);
     color: var(--cyan);
     cursor: pointer;
   }
   .act.on {
-    color: #1a1408;
+    color: var(--bg-0);
     border-color: var(--amber);
     background: var(--amber);
   }

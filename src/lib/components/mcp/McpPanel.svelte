@@ -101,9 +101,9 @@
   }
 
   .statusbox {
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
-    background: rgba(10, 13, 23, 0.6);
+    background: rgb(var(--bg-1-rgb) / 0.6);
     padding: 9px 11px;
     display: flex;
     flex-direction: column;
@@ -118,16 +118,16 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: rgba(96, 130, 190, 0.3);
+    background: rgb(var(--line-rgb) / 0.3);
   }
   .led.on {
-    background: #5cf2b8;
-    box-shadow: 0 0 8px rgba(92, 242, 184, 0.7);
+    background: var(--green);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--green-rgb) / 0.7);
     animation: led-breathe 2.4s ease-in-out infinite;
   }
   @keyframes led-breathe {
     50% {
-      box-shadow: 0 0 3px rgba(92, 242, 184, 0.3);
+      box-shadow: 0 0 calc(3px * var(--glow-scale)) rgb(var(--green-rgb) / 0.3);
     }
   }
   .state {
@@ -165,26 +165,26 @@
     gap: 2px;
     padding: 7px 10px;
     border-radius: 5px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.35);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.35);
     cursor: pointer;
     text-align: left;
     transition: border-color 120ms, box-shadow 120ms;
   }
   .modebtn:hover:not(:disabled) {
-    border-color: rgba(122, 160, 220, 0.3);
+    border-color: rgb(var(--edge-rgb) / 0.3);
   }
   .modebtn.on {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 10px rgba(82, 229, 255, 0.15);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.15);
   }
   .modebtn.on .mlabel {
     color: var(--cyan);
   }
   /* FULL mode is a hazard — say so when armed */
   .modebtn.full.on {
-    border-color: rgba(255, 200, 87, 0.5);
-    box-shadow: 0 0 10px rgba(255, 200, 87, 0.2);
+    border-color: rgb(var(--amber-rgb) / 0.5);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.2);
   }
   .modebtn.full.on .mlabel {
     color: var(--amber);
@@ -199,10 +199,10 @@
   }
 
   .pendingbox {
-    border: 1px dashed rgba(255, 200, 87, 0.5);
+    border: var(--border-width) dashed rgb(var(--amber-rgb) / 0.5);
     border-radius: 5px;
     padding: 7px 10px;
-    background: rgba(255, 200, 87, 0.05);
+    background: rgb(var(--amber-rgb) / 0.05);
   }
   .amber {
     color: var(--amber);
@@ -222,8 +222,8 @@
     gap: 8px;
     padding: 6px 9px;
     border-radius: 5px;
-    border: 1px solid rgba(96, 130, 190, 0.12);
-    background: rgba(10, 13, 23, 0.5);
+    border: var(--border-width) solid rgb(var(--line-rgb) / 0.12);
+    background: rgb(var(--bg-1-rgb) / 0.5);
   }
   .glyph {
     font-size: 11px;
@@ -232,7 +232,7 @@
     flex: none;
   }
   .entry.approved .glyph {
-    color: #5cf2b8;
+    color: var(--green);
   }
   .entry.denied .glyph {
     color: var(--red);
@@ -268,7 +268,7 @@
   .docs {
     margin-top: auto;
     padding-top: 6px;
-    border-top: 1px solid rgba(96, 130, 190, 0.08);
+    border-top: var(--border-width) solid rgb(var(--line-rgb) / 0.08);
     text-transform: none;
     letter-spacing: 0.06em;
   }

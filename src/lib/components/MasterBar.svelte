@@ -311,9 +311,9 @@
   }
   .dev select {
     max-width: 190px;
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-dim);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 11px;
     padding: 3px 6px;
@@ -322,13 +322,13 @@
     width: 7px;
     height: 7px;
     border-radius: 50%;
-    background: rgba(96, 130, 190, 0.25);
+    background: rgb(var(--line-rgb) / 0.25);
     border: 1px solid var(--glass-border);
     transition: background 80ms linear, box-shadow 80ms linear;
   }
   .midi-dot.active {
     background: var(--cyan);
-    box-shadow: 0 0 6px 1px var(--cyan);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) 1px var(--cyan);
   }
   .monitor {
     display: flex;
@@ -358,8 +358,8 @@
     gap: 5px;
     padding: 2px 6px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(5, 7, 13, 0.7);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.7);
   }
   .pname {
     font-size: 10px;
@@ -382,9 +382,9 @@
   }
   .channel {
     width: 34px;
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-dim);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 11px;
     padding: 3px 4px;
@@ -405,8 +405,8 @@
     gap: 8px;
     padding: 3px 9px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(5, 7, 13, 0.6);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.6);
   }
   .jkind {
     font-size: 9px;
@@ -425,7 +425,7 @@
     width: 90px;
     height: 3px;
     border-radius: 2px;
-    background: rgba(96, 130, 190, 0.18);
+    background: rgb(var(--line-rgb) / 0.18);
     overflow: hidden;
   }
   .jfill {

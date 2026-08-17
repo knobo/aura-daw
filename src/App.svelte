@@ -50,14 +50,18 @@
   import Toasts from "./lib/components/Toasts.svelte";
   import { rehearseKeyMatches } from "./lib/components/pitch/panel-logic";
   import { releaseRehearse, setRehearseSource } from "./lib/state/rehearse.svelte";
+  import { theme } from "./lib/theme/theme.svelte";
+  import { loadUserThemes } from "./lib/theme/load";
 
   onMount(() => {
     prefs.init(); // restore persisted preferences before anything paints or boots
+    theme.bootstrap(prefs.values.theme); // paint the right colours on frame one
     void (async () => {
       // Wait out the empty-session snapshot before reopening the last
       // project — a parallel restore would race project.init() and could
       // paint the blank slate over the adopted one.
       await Promise.all([
+        loadUserThemes(),
         transport.init(),
         project.init(),
         midi.init(),
@@ -83,6 +87,10 @@
   // Interface zoom on <body> (not .app) so fixed overlays — dialogs,
   // toasts — scale along with the shell.
   $effect(() => applyUiZoom(document.body, prefs.values.uiZoom));
+
+  // Theme on the document root (not body): the tokens must reach dialogs and
+  // toasts, which render outside the shell.
+  $effect(() => theme.apply(prefs.values.theme));
 
   /** Where the playhead is right now — interpolated while rolling. */
   function playhead(): number {

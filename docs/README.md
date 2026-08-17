@@ -10,5 +10,6 @@
 | [PHASE3-PLAN.md](PHASE3-PLAN.md) | The executed plan for wave 3 (CLAP/LV2 plugin hosting, live instrument nodes): the acceptance contract that made ZynAddSubFX the gating test. Kept as process history. |
 | [mcp-usage.md](mcp-usage.md) | How to connect an MCP client (Claude Code / Claude Desktop) to a running AURA: endpoint, per-launch token, tool roster, policy modes, and the transport/security notes. |
 | [synth-compatibility.md](synth-compatibility.md) | The synth compatibility sweep: verdict table for every synth driven through the acceptance harness, and what it proved about co-hosting risk (D-11). |
-| [ipc-schemas/](ipc-schemas/) | The JSON Schema wire contracts for every IPC payload (project, clips, transport, meters, sidecar jobs, MCP policy, plugin state…). v1 schemas are frozen; v2 schemas are additive emitter contracts. |
+| [themes.md](themes.md) | Theme system guide: built-in themes, accessibility (WCAG AA/AAA), custom JSON theme format, token reference, and export workflow. |
+| [ipc-schemas/](ipc-schemas/) | The JSON Schema wire contracts for every IPC payload (project, clips, transport, meters, sidecar jobs, MCP policy, plugin state, user themes…). v1 schemas are frozen; v2 schemas are additive emitter contracts. |
 | [screenshots/](screenshots/) | The screenshots and captures used by the top-level README. |

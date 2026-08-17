@@ -239,8 +239,8 @@
     line-height: 1;
     font-size: 15px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.6);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.6);
     color: var(--text-dim);
     cursor: pointer;
   }
@@ -268,15 +268,15 @@
     text-transform: uppercase;
     padding: 2px 5px;
     border-radius: 3px;
-    border: 1px solid;
+    border: var(--border-width) solid;
   }
   .badge.clap {
     color: var(--cyan);
-    border-color: rgba(82, 229, 255, 0.4);
+    border-color: rgb(var(--cyan-rgb) / 0.4);
   }
   .badge.lv2 {
     color: var(--violet);
-    border-color: rgba(157, 123, 255, 0.4);
+    border-color: rgb(var(--violet-rgb) / 0.4);
   }
   .status {
     font-size: 8px;
@@ -287,15 +287,15 @@
   }
   .status.stub {
     color: var(--amber);
-    background: rgba(255, 200, 87, 0.1);
+    background: rgb(var(--amber-rgb) / 0.1);
   }
   .status.active {
-    color: #5cf2b8;
-    background: rgba(92, 242, 184, 0.1);
+    color: var(--green);
+    background: rgb(var(--green-rgb) / 0.1);
   }
   .status.crashed {
     color: var(--red);
-    background: rgba(255, 65, 82, 0.12);
+    background: rgb(var(--red-rgb) / 0.12);
   }
 
   .note {
@@ -317,9 +317,9 @@
   }
 
   .group {
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
-    background: rgba(10, 13, 23, 0.55);
+    background: rgb(var(--bg-1-rgb) / 0.55);
   }
   .ghead {
     width: 100%;
@@ -395,8 +395,8 @@
     letter-spacing: 0.14em;
     padding: 3px 8px;
     border-radius: 3px;
-    border: 1px solid rgba(122, 160, 220, 0.2);
-    background: rgba(5, 7, 13, 0.7);
+    border: var(--border-width) solid rgb(var(--edge-rgb) / 0.2);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-faint);
     cursor: pointer;
   }
@@ -404,7 +404,7 @@
     color: var(--bg-0);
     background: var(--cyan);
     border-color: var(--cyan);
-    box-shadow: 0 0 8px rgba(82, 229, 255, 0.35);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35);
   }
 
   /* "automate this knob" toggle — same small-button language as `.toggle`,
@@ -417,26 +417,26 @@
     font-size: 8px;
     letter-spacing: 0;
     border-radius: 3px;
-    border: 1px solid rgba(122, 160, 220, 0.2);
-    background: rgba(5, 7, 13, 0.7);
+    border: var(--border-width) solid rgb(var(--edge-rgb) / 0.2);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-faint);
     cursor: pointer;
   }
   .autobtn:hover {
     color: var(--violet);
-    border-color: rgba(157, 123, 255, 0.4);
+    border-color: rgb(var(--violet-rgb) / 0.4);
   }
   .autobtn.on {
     color: var(--bg-0);
     background: var(--violet);
     border-color: var(--violet);
-    box-shadow: 0 0 8px rgba(157, 123, 255, 0.35);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
   }
 
   .enum {
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-dim);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 10px;
     padding: 2px 6px;

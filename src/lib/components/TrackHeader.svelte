@@ -275,8 +275,8 @@
   .header {
     display: flex;
     height: var(--track-height);
-    border-bottom: 1px solid rgba(96, 130, 190, 0.08);
-    background: linear-gradient(to right, rgba(16, 20, 42, 0.35), rgba(10, 13, 23, 0.15));
+    border-bottom: 1px solid rgb(var(--line-rgb) / 0.08);
+    background: linear-gradient(to right, rgb(var(--bg-2-rgb) / 0.35), rgb(var(--bg-1-rgb) / 0.15));
   }
   .header.picking {
     z-index: 20;
@@ -285,7 +285,7 @@
     font-size: 8px;
     letter-spacing: 0.14em;
     color: var(--violet);
-    border: 1px solid rgba(157, 123, 255, 0.4);
+    border: var(--border-width) solid rgb(var(--violet-rgb) / 0.4);
     border-radius: 3px;
     padding: 1px 5px;
   }
@@ -336,7 +336,7 @@
     letter-spacing: 0.12em;
     padding: 2px 6px;
     border-radius: 3px;
-    border: 1px dashed rgba(157, 123, 255, 0.35);
+    border: var(--border-width) dashed rgb(var(--violet-rgb) / 0.35);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
@@ -350,7 +350,7 @@
     width: 3px;
     background: var(--track-color);
     opacity: 0.85;
-    box-shadow: 0 0 8px color-mix(in srgb, var(--track-color) 60%, transparent);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) color-mix(in srgb, var(--track-color) 60%, transparent);
   }
   .body {
     flex: 1;
@@ -388,7 +388,7 @@
     letter-spacing: 0.08em;
     padding: 2px 6px;
     border-radius: 3px;
-    border: 1px dashed rgba(122, 160, 220, 0.25);
+    border: var(--border-width) dashed rgb(var(--edge-rgb) / 0.25);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
@@ -397,9 +397,9 @@
     text-overflow: ellipsis;
   }
   .instchip.bound {
-    color: #5cf2b8;
+    color: var(--green);
     border-style: solid;
-    border-color: rgba(92, 242, 184, 0.35);
+    border-color: rgb(var(--green-rgb) / 0.35);
   }
   .instchip:hover {
     color: var(--cyan);
@@ -409,20 +409,20 @@
   .instchip.plugin {
     color: var(--violet);
     border-style: solid;
-    border-color: rgba(157, 123, 255, 0.45);
-    background: rgba(157, 123, 255, 0.09);
-    box-shadow: 0 0 6px rgba(157, 123, 255, 0.18);
+    border-color: rgb(var(--violet-rgb) / 0.45);
+    background: rgb(var(--violet-rgb) / 0.09);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.18);
   }
   .instchip.plugin.stub {
     color: var(--amber);
-    border-color: rgba(255, 200, 87, 0.4);
-    background: rgba(255, 200, 87, 0.07);
+    border-color: rgb(var(--amber-rgb) / 0.4);
+    background: rgb(var(--amber-rgb) / 0.07);
     box-shadow: none;
   }
   .instchip.plugin.crashed {
     color: var(--red);
-    border-color: rgba(255, 65, 82, 0.45);
-    background: rgba(255, 65, 82, 0.08);
+    border-color: rgb(var(--red-rgb) / 0.45);
+    background: rgb(var(--red-rgb) / 0.08);
   }
   .instchip.plugin:hover {
     color: var(--cyan);
@@ -460,16 +460,16 @@
     font-family: var(--font-mono);
     font-size: 9px;
     border-radius: 3px;
-    border: 1px solid rgba(122, 160, 220, 0.15);
+    border: var(--border-width) solid rgb(var(--edge-rgb) / 0.15);
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
   }
   .tog.arm.on {
-    color: #fff;
-    background: rgba(255, 65, 82, 0.8);
+    color: var(--text-on-accent);
+    background: rgb(var(--red-rgb) / 0.8);
     border-color: var(--red);
-    box-shadow: 0 0 8px rgba(255, 65, 82, 0.4);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--red-rgb) / 0.4);
   }
   .tog.mute.on {
     color: var(--bg-0);
@@ -480,13 +480,13 @@
     color: var(--bg-0);
     background: var(--cyan);
     border-color: var(--cyan);
-    box-shadow: 0 0 8px rgba(82, 229, 255, 0.4);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.4);
   }
   .tog.auto.on {
     color: var(--bg-0);
     background: var(--magenta);
     border-color: var(--magenta);
-    box-shadow: 0 0 8px rgba(255, 79, 216, 0.4);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.4);
   }
 
   .fader-wrap {
