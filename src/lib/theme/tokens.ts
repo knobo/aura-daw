@@ -147,6 +147,7 @@ export function toCssVars(t: ThemeTokens): Record<string, string> {
 
   // Derived tokens app.css has always exposed, at their established alphas,
   // so every existing var() call site keeps working untouched.
+  vars["--glass-base-rgb"] = rgbTriple(t.glass);
   vars["--glass"] = alpha(t.glass, 0.62);
   vars["--glass-border"] = alpha(t.edge, 0.12);
   vars["--grid-line"] = alpha(t.line, 0.09);

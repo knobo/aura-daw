@@ -97,6 +97,7 @@ describe("toCssVars", () => {
   });
 
   it("emits the derived tokens app.css already exposes, as literal colours", () => {
+    expect(vars["--glass-base-rgb"]).toBe("13 17 30");
     expect(vars["--glass"]).toBe("rgb(13 17 30 / 0.62)");
     expect(vars["--glass-border"]).toBe("rgb(122 160 220 / 0.12)");
     expect(vars["--grid-line"]).toBe("rgb(96 130 190 / 0.09)");
