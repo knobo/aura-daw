@@ -64,12 +64,12 @@
     cursor: pointer;
   }
   .row:hover {
-    background: rgba(122, 160, 220, 0.08);
+    background: rgb(var(--edge-rgb) / 0.08);
     color: var(--text);
   }
   .row.on {
     color: var(--cyan);
-    background: rgba(82, 229, 255, 0.08);
+    background: rgb(var(--cyan-rgb) / 0.08);
   }
   .icon {
     flex: none;

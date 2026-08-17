@@ -59,7 +59,7 @@
   }
   .root {
     flex: 1;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     background: transparent;
     color: var(--text-faint);
@@ -71,7 +71,7 @@
   .root.on {
     color: var(--cyan);
     border-color: var(--cyan);
-    background: rgba(82, 229, 255, 0.06);
+    background: rgb(var(--cyan-rgb) / 0.06);
   }
   .body {
     flex: 1;

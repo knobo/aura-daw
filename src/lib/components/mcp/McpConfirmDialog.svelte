@@ -76,9 +76,9 @@
     z-index: 100;
     display: grid;
     place-items: center;
-    background: rgba(5, 7, 13, 0.72);
-    backdrop-filter: blur(6px) saturate(0.8);
-    -webkit-backdrop-filter: blur(6px) saturate(0.8);
+    background: rgb(var(--scrim-rgb) / 0.72);
+    backdrop-filter: blur(var(--glass-blur)) saturate(0.8);
+    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(0.8);
     animation: veil-in 160ms ease-out;
   }
   @keyframes veil-in {
@@ -90,13 +90,13 @@
   .dialog {
     position: relative;
     width: min(480px, calc(100vw - 48px));
-    border: 1px solid rgba(255, 200, 87, 0.55);
+    border: var(--border-width) solid rgb(var(--amber-rgb) / 0.55);
     border-radius: 8px;
-    background: rgba(13, 17, 30, 0.96);
+    background: rgb(var(--bg-sunken-rgb) / 0.96);
     box-shadow:
-      0 0 0 1px rgba(255, 200, 87, 0.15),
-      0 0 40px rgba(255, 200, 87, 0.18),
-      0 24px 60px rgba(0, 0, 0, 0.6);
+      0 0 0 1px rgb(var(--amber-rgb) / 0.15),
+      0 0 40px rgb(var(--amber-rgb) / 0.18),
+      0 24px 60px rgb(var(--shadow-rgb) / 0.6);
     padding: 16px 18px 14px;
     overflow: hidden;
     animation: dialog-in 180ms cubic-bezier(0.2, 0.9, 0.3, 1.2);
@@ -117,7 +117,7 @@
     background: repeating-linear-gradient(
       -45deg,
       var(--amber) 0 10px,
-      rgba(5, 7, 13, 0.9) 10px 20px
+      rgb(var(--bg-0-rgb) / 0.9) 10px 20px
     );
     opacity: 0.85;
   }
@@ -133,12 +133,12 @@
     height: 10px;
     border-radius: 50%;
     background: var(--amber);
-    box-shadow: 0 0 12px rgba(255, 200, 87, 0.9);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.9);
     animation: siren 1s ease-in-out infinite;
   }
   @keyframes siren {
     50% {
-      box-shadow: 0 0 3px rgba(255, 200, 87, 0.4);
+      box-shadow: 0 0 3px rgb(var(--amber-rgb) / 0.4);
       opacity: 0.7;
     }
   }
@@ -166,8 +166,8 @@
   .tool {
     font-size: 12px;
     color: var(--cyan);
-    background: rgba(82, 229, 255, 0.07);
-    border: 1px solid rgba(82, 229, 255, 0.25);
+    background: rgb(var(--cyan-rgb) / 0.07);
+    border: var(--border-width) solid rgb(var(--cyan-rgb) / 0.25);
     border-radius: 4px;
     padding: 2px 8px;
   }
@@ -186,14 +186,14 @@
   .fuse {
     height: 3px;
     border-radius: 2px;
-    background: rgba(96, 130, 190, 0.18);
+    background: rgb(var(--line-rgb) / 0.18);
     overflow: hidden;
     margin-bottom: 12px;
   }
   .burn {
     height: 100%;
     background: linear-gradient(90deg, var(--red), var(--amber));
-    box-shadow: 0 0 8px rgba(255, 200, 87, 0.6);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.6);
   }
 
   .actions {
@@ -211,18 +211,18 @@
     transition: filter 120ms, box-shadow 120ms;
   }
   .deny {
-    border: 1px solid rgba(255, 65, 82, 0.5);
-    background: rgba(255, 65, 82, 0.08);
+    border: var(--border-width) solid rgb(var(--red-rgb) / 0.5);
+    background: rgb(var(--red-rgb) / 0.08);
     color: var(--red);
   }
   .deny:hover {
-    background: rgba(255, 65, 82, 0.18);
+    background: rgb(var(--red-rgb) / 0.18);
   }
   .approve {
     border: none;
-    background: linear-gradient(100deg, var(--amber), #ff8b5c);
+    background: linear-gradient(100deg, var(--amber), color-mix(in srgb, var(--amber) 60%, var(--red) 40%));
     color: var(--bg-0);
-    box-shadow: 0 0 16px rgba(255, 200, 87, 0.35);
+    box-shadow: 0 0 16px rgb(var(--amber-rgb) / 0.35);
   }
   .approve:hover {
     filter: brightness(1.12);

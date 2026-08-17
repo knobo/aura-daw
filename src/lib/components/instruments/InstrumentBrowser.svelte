@@ -110,7 +110,7 @@
     cursor: pointer;
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--violet));
-    box-shadow: 0 0 14px rgba(82, 229, 255, 0.25);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
     transition: filter 120ms;
   }
   .gen:hover {
@@ -134,9 +134,9 @@
     gap: 8px;
   }
   .inst {
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
-    background: rgba(10, 13, 23, 0.6);
+    background: rgb(var(--bg-1-rgb) / 0.6);
     padding: 8px 10px;
     display: flex;
     flex-direction: column;
@@ -145,7 +145,7 @@
   }
   .inst.previewing {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 12px rgba(82, 229, 255, 0.2);
+    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.2);
   }
 
   .row {
@@ -186,14 +186,14 @@
     font-size: 8px;
     letter-spacing: 0.05em;
     border-radius: 3px;
-    border: 1px solid rgba(122, 160, 220, 0.18);
-    background: rgba(27, 35, 64, 0.6);
+    border: var(--border-width) solid rgb(var(--edge-rgb) / 0.18);
+    background: rgb(var(--bg-3-rgb) / 0.6);
     color: var(--text-dim);
     cursor: pointer;
     transition: background 80ms, color 80ms;
   }
   .pkey.black {
-    background: rgba(5, 7, 13, 0.8);
+    background: rgb(var(--bg-0-rgb) / 0.8);
   }
   .pkey:hover {
     color: var(--bg-0);
@@ -207,15 +207,15 @@
   .bind select {
     flex: 1;
     min-width: 0;
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-dim);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 10px;
     padding: 4px 6px;
   }
   .bound {
-    color: #5cf2b8;
+    color: var(--green);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;

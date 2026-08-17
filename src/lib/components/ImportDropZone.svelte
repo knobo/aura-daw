@@ -129,8 +129,8 @@
   .droproot.active {
     display: flex;
     flex-direction: column;
-    background: rgba(3, 4, 8, 0.72);
-    backdrop-filter: blur(2px);
+    background: rgb(var(--scrim-rgb) / 0.72);
+    backdrop-filter: blur(var(--glass-blur));
     animation: drop-in 120ms ease-out;
   }
   @keyframes drop-in {
@@ -153,25 +153,25 @@
     align-items: center;
     justify-content: center;
     gap: 6px;
-    border: 1px dashed rgba(122, 160, 220, 0.35);
+    border: var(--border-width) dashed rgb(var(--edge-rgb) / 0.35);
     border-radius: 10px;
     color: var(--text-dim);
     transition: border-color 100ms, box-shadow 100ms, background 100ms;
   }
   .zone.hot {
     border-color: var(--cyan);
-    background: rgba(82, 229, 255, 0.06);
+    background: rgb(var(--cyan-rgb) / 0.06);
     box-shadow:
-      inset 0 0 30px rgba(82, 229, 255, 0.08),
-      0 0 22px rgba(82, 229, 255, 0.15);
+      inset 0 0 30px rgb(var(--cyan-rgb) / 0.08),
+      0 0 22px rgb(var(--cyan-rgb) / 0.15);
     color: var(--cyan);
   }
   .zone.split.hot {
     border-color: var(--magenta);
-    background: rgba(255, 79, 216, 0.06);
+    background: rgb(var(--magenta-rgb) / 0.06);
     box-shadow:
-      inset 0 0 30px rgba(255, 79, 216, 0.08),
-      0 0 22px rgba(255, 79, 216, 0.15);
+      inset 0 0 30px rgb(var(--magenta-rgb) / 0.08),
+      0 0 22px rgb(var(--magenta-rgb) / 0.15);
     color: var(--magenta);
   }
   .icon {

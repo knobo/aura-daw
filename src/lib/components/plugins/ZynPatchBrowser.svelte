@@ -151,8 +151,8 @@
     line-height: 1;
     font-size: 15px;
     border-radius: 4px;
-    border: 1px solid var(--glass-border);
-    background: rgba(16, 20, 42, 0.6);
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.6);
     color: var(--text-dim);
     cursor: pointer;
   }
@@ -179,9 +179,9 @@
 
   .search {
     flex: none;
-    background: rgba(5, 7, 13, 0.7);
+    background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 4px;
     font-size: 10px;
     padding: 6px 8px;
@@ -202,9 +202,9 @@
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    border: 1px solid var(--glass-border);
+    border: var(--border-width) solid var(--glass-border);
     border-radius: 6px;
-    background: rgba(5, 7, 13, 0.5);
+    background: rgb(var(--bg-0-rgb) / 0.5);
   }
   .spacer {
     position: relative;
@@ -225,8 +225,8 @@
     letter-spacing: 0.16em;
     text-transform: uppercase;
     color: var(--violet);
-    background: rgba(157, 123, 255, 0.06);
-    border-bottom: 1px solid rgba(157, 123, 255, 0.12);
+    background: rgb(var(--violet-rgb) / 0.06);
+    border-bottom: var(--border-width) solid rgb(var(--violet-rgb) / 0.12);
   }
   .bname {
     flex: 1;
@@ -249,12 +249,12 @@
     text-align: left;
   }
   .patch:hover {
-    background: rgba(82, 229, 255, 0.06);
+    background: rgb(var(--cyan-rgb) / 0.06);
     color: var(--text);
   }
   .patch.loaded {
     color: var(--cyan);
-    background: rgba(82, 229, 255, 0.07);
+    background: rgb(var(--cyan-rgb) / 0.07);
   }
   .patch.busy {
     color: var(--amber);
@@ -273,7 +273,7 @@
   .check {
     font-size: 8px;
     letter-spacing: 0.12em;
-    color: #5cf2b8;
+    color: var(--green);
   }
   .spin {
     animation: spin-pulse 0.9s linear infinite;
