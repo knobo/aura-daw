@@ -445,15 +445,15 @@
   }
   .mclip.selected {
     border-style: solid;
-    border-color: color-mix(in srgb, var(--clip-color) 85%, white 5%);
+    border-color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 5%);
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent),
-      0 0 18px color-mix(in srgb, var(--clip-color) 25%, transparent);
+      0 0 calc(18px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 25%, transparent);
   }
   .mclip.open {
     box-shadow:
       inset 0 0 0 1px color-mix(in srgb, var(--clip-color) 45%, transparent),
-      0 0 14px color-mix(in srgb, var(--clip-color) 30%, transparent);
+      0 0 calc(14px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 30%, transparent);
   }
   /* right-edge drag-to-loop zone — same idiom as the ruler's loop pins */
   .mclip.edge {
@@ -471,8 +471,8 @@
     50% {
       border-color: var(--clip-color);
       box-shadow:
-        0 0 0 2px color-mix(in srgb, var(--clip-color) 70%, white 10%),
-        0 0 26px color-mix(in srgb, var(--clip-color) 60%, transparent);
+        0 0 0 2px color-mix(in srgb, var(--clip-color) 70%, var(--text) 10%),
+        0 0 calc(26px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 60%, transparent);
     }
   }
 
@@ -482,7 +482,7 @@
     pointer-events: none;
     opacity: 0;
     background: color-mix(in srgb, var(--clip-color) 22%, transparent);
-    box-shadow: inset 0 0 14px color-mix(in srgb, var(--clip-color) 45%, transparent);
+    box-shadow: inset 0 0 calc(14px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 45%, transparent);
     will-change: opacity;
   }
 
@@ -500,7 +500,7 @@
     top: 3px;
     font-size: 9px;
     letter-spacing: 0.06em;
-    color: color-mix(in srgb, var(--clip-color) 85%, white 15%);
+    color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 15%);
     background: rgb(var(--bg-0-rgb) / 0.55);
     padding: 1px 5px;
     border-radius: 3px;

@@ -128,7 +128,7 @@
   .tab.on {
     color: var(--cyan);
     border-bottom-color: var(--cyan);
-    text-shadow: 0 0 8px var(--cyan-dim);
+    text-shadow: 0 0 calc(8px * var(--glow-scale)) var(--cyan-dim);
   }
   .key {
     margin-left: 4px;
@@ -145,7 +145,7 @@
     height: 6px;
     border-radius: 50%;
     background: var(--amber);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.8);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.8);
     animation: dot-pulse 1s ease-in-out infinite;
   }
   @keyframes dot-pulse {

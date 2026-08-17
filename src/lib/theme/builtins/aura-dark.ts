@@ -46,6 +46,7 @@ export const AURA_DARK_TOKENS: ThemeTokens = {
   borderWidth: "1px",
   focusWidth: "1px",
   glassBlur: "18px",
-  glowBlur: "6px",
+  glassAlpha: "0.62",
+  glowScale: "1",
   bodyGlow: "0.05",
 };

@@ -33,7 +33,8 @@ const T: ThemeTokens = {
   borderWidth: "1px",
   focusWidth: "1px",
   glassBlur: "18px",
-  glowBlur: "6px",
+  glassAlpha: "0.62",
+  glowScale: "1",
   bodyGlow: "0.05",
 };
 
@@ -92,13 +93,15 @@ describe("toCssVars", () => {
     expect(vars["--border-width"]).toBe("1px");
     expect(vars["--focus-width"]).toBe("1px");
     expect(vars["--glass-blur"]).toBe("18px");
-    expect(vars["--glow-blur"]).toBe("6px");
+    expect(vars["--glass-alpha"]).toBe("0.62");
+    expect(vars["--glow-scale"]).toBe("1");
     expect(vars["--body-glow"]).toBe("0.05");
   });
 
   it("emits the derived tokens app.css already exposes, as literal colours", () => {
     expect(vars["--glass-base-rgb"]).toBe("13 17 30");
     expect(vars["--glass"]).toBe("rgb(13 17 30 / 0.62)");
+    expect(toCssVars({ ...T, glassAlpha: "1" })["--glass"]).toBe("rgb(13 17 30 / 1)");
     expect(vars["--glass-border"]).toBe("rgb(122 160 220 / 0.12)");
     expect(vars["--grid-line"]).toBe("rgb(96 130 190 / 0.09)");
     expect(vars["--grid-line-strong"]).toBe("rgb(96 130 190 / 0.2)");

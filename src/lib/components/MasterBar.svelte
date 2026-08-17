@@ -328,7 +328,7 @@
   }
   .midi-dot.active {
     background: var(--cyan);
-    box-shadow: 0 0 var(--glow-blur) 1px var(--cyan);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) 1px var(--cyan);
   }
   .monitor {
     display: flex;

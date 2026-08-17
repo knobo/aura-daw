@@ -63,8 +63,15 @@ export interface ThemeTokens {
   focusWidth: string;
   /** Backdrop blur on glass panels; `0px` removes the frosted look. */
   glassBlur: string;
-  /** Glow radius. `0px` makes every 0-offset box-shadow render nothing. */
-  glowBlur: string;
+  /** Opacity of the glass panel fill, 0..1. `1` makes panels solid — which is
+   * what a theme wants whenever `glassBlur` is `0px`, since with no blur to
+   * soften it a translucent panel shows the raw grid through its own text. */
+  glassAlpha: string;
+  /** Multiplier on every glow radius, unitless. `1` is the designed radius;
+   * `0` collapses every glow to nothing. A scale rather than a length so each
+   * call site keeps its own designed radius — and so radius ANIMATIONS keep
+   * their two ends apart. */
+  glowScale: string;
   /** Alpha of the two radial washes on `body`; `0` flattens the background. */
   bodyGlow: string;
 }
@@ -79,8 +86,13 @@ export const COLOR_KEYS = [
 ] as const satisfies readonly (keyof ThemeTokens)[];
 
 export const AFFORDANCE_KEYS = [
-  "borderWidth", "focusWidth", "glassBlur", "glowBlur", "bodyGlow",
+  "borderWidth", "focusWidth", "glassBlur", "glassAlpha", "glowScale", "bodyGlow",
 ] as const satisfies readonly (keyof ThemeTokens)[];
+
+/** The affordances measured as a bare number rather than a CSS length. */
+export const UNITLESS_AFFORDANCE_KEYS: readonly (keyof ThemeTokens)[] = [
+  "glassAlpha", "glowScale", "bodyGlow",
+];
 
 /** Every key a theme must define — the runtime half of the interface. */
 export const TOKEN_KEYS: readonly (keyof ThemeTokens)[] = [
@@ -118,6 +130,12 @@ export function alpha(color: string, a: number): string {
   return `rgb(${r} ${g} ${b} / ${Math.round(out * 1000) / 1000})`;
 }
 
+/** A unitless token as a number, falling back rather than emitting `NaN`. */
+function number(value: string, fallback: number): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 /** camelCase token key → kebab-case CSS custom property name. */
 function cssName(key: string): string {
   return "--" + key.replace(/([a-z])([A-Z0-9])/g, "$1-$2").toLowerCase();
@@ -148,7 +166,7 @@ export function toCssVars(t: ThemeTokens): Record<string, string> {
   // Derived tokens app.css has always exposed, at their established alphas,
   // so every existing var() call site keeps working untouched.
   vars["--glass-base-rgb"] = rgbTriple(t.glass);
-  vars["--glass"] = alpha(t.glass, 0.62);
+  vars["--glass"] = alpha(t.glass, number(t.glassAlpha, 1));
   vars["--glass-border"] = alpha(t.edge, 0.12);
   vars["--grid-line"] = alpha(t.line, 0.09);
   vars["--grid-line-strong"] = alpha(t.line, 0.2);

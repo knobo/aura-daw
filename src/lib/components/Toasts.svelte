@@ -50,15 +50,15 @@
   }
   .toast.success {
     border-color: rgb(var(--green-rgb) / 0.35);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--green-rgb) / 0.12);
+    box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--green-rgb) / 0.12);
   }
   .toast.error {
     border-color: rgb(var(--red-rgb) / 0.4);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.12);
+    box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--red-rgb) / 0.12);
   }
   .toast.info {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.1);
+    box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.1);
   }
 
   .head {
@@ -74,15 +74,15 @@
   }
   .success .dot {
     background: var(--green);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--green-rgb) / 0.8);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--green-rgb) / 0.8);
   }
   .error .dot {
     background: var(--red);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.8);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--red-rgb) / 0.8);
   }
   .info .dot {
     background: var(--cyan);
-    box-shadow: 0 0 var(--glow-blur) var(--cyan-dim);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) var(--cyan-dim);
   }
   .title {
     flex: 1;

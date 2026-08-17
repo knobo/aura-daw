@@ -110,7 +110,7 @@
     cursor: pointer;
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--violet));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
     transition: filter 120ms;
   }
   .gen:hover {
@@ -145,7 +145,7 @@
   }
   .inst.previewing {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.2);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.2);
   }
 
   .row {

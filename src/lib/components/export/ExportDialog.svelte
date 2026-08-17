@@ -219,8 +219,9 @@
     z-index: 80;
     display: grid;
     place-items: center;
-    background: rgb(var(--scrim-rgb) / 0.6);
-    backdrop-filter: blur(var(--glass-blur));
+    background: rgb(var(--bg-void-rgb) / 0.6);
+    /* A fraction of the panel blur: a scrim hints, it does not frost. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 6));
   }
   .dialog {
     width: 440px;
@@ -251,7 +252,7 @@
     font-size: 12px;
     letter-spacing: 0.22em;
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .sub {
     flex: 1;
@@ -317,7 +318,7 @@
   .fmt.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
   .fmt.off {
     opacity: 0.32;
@@ -410,7 +411,7 @@
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 160ms linear;
   }
   .result {
@@ -440,8 +441,8 @@
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--magenta));
     box-shadow:
-      0 0 14px rgb(var(--cyan-rgb) / 0.3),
-      0 0 22px rgb(var(--magenta-rgb) / 0.2);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.3),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
     transition: filter 120ms;
   }
   .run:hover:not(:disabled) {

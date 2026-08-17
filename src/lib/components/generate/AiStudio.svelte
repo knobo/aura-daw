@@ -363,7 +363,7 @@
   }
   .kind.on {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.15);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.15);
   }
   .kname {
     font-size: 11px;
@@ -439,8 +439,8 @@
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--magenta));
     box-shadow:
-      0 0 14px rgb(var(--cyan-rgb) / 0.3),
-      0 0 22px rgb(var(--magenta-rgb) / 0.2);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.3),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
     transition: filter 120ms;
     white-space: nowrap;
     overflow: hidden;
@@ -590,7 +590,7 @@
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 180ms linear;
   }
 

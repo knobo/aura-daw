@@ -145,6 +145,6 @@
   }
   .track.dragging .thumb {
     background: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.35);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35);
   }
 </style>

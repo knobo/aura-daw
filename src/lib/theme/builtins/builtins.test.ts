@@ -63,7 +63,26 @@ describe("AURA Dark", () => {
     expect(AURA_DARK.tokens.borderWidth).toBe("1px");
     expect(AURA_DARK.tokens.focusWidth).toBe("1px");
     expect(AURA_DARK.tokens.glassBlur).toBe("18px");
-    expect(AURA_DARK.tokens.glowBlur).toBe("6px");
+    expect(AURA_DARK.tokens.glassAlpha).toBe("0.62");
     expect(AURA_DARK.tokens.bodyGlow).toBe("0.05");
+  });
+
+  // The glow scale is what keeps every call site's designed radius: at 1 the
+  // component's own `calc(<radius> * var(--glow-scale))` is the radius it
+  // shipped with, so AURA Dark glows exactly as it did before the sweep.
+  it("leaves glows at their designed radii", () => {
+    expect(AURA_DARK.tokens.glowScale).toBe("1");
+  });
+});
+
+describe("the flat themes", () => {
+  // A theme that turns off the blur must also turn off the transparency:
+  // translucent-with-no-blur puts the raw timeline behind panel text.
+  it("pair glassBlur: 0px with an opaque panel fill", () => {
+    for (const theme of BUILTIN_THEMES) {
+      if (theme.tokens.glassBlur === "0px") {
+        expect(theme.tokens.glassAlpha, theme.id).toBe("1");
+      }
+    }
   });
 });

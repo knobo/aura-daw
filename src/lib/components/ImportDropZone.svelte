@@ -129,8 +129,10 @@
   .droproot.active {
     display: flex;
     flex-direction: column;
-    background: rgb(var(--scrim-rgb) / 0.72);
-    backdrop-filter: blur(var(--glass-blur));
+    background: rgb(var(--bg-void-rgb) / 0.72);
+    /* A scrim wants a hint of blur, not the panel's frosting — a fraction of
+       it, so a theme that flattens the glass flattens this too. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 9));
     animation: drop-in 120ms ease-out;
   }
   @keyframes drop-in {
@@ -162,16 +164,16 @@
     border-color: var(--cyan);
     background: rgb(var(--cyan-rgb) / 0.06);
     box-shadow:
-      inset 0 0 30px rgb(var(--cyan-rgb) / 0.08),
-      0 0 22px rgb(var(--cyan-rgb) / 0.15);
+      inset 0 0 calc(30px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.08),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.15);
     color: var(--cyan);
   }
   .zone.split.hot {
     border-color: var(--magenta);
     background: rgb(var(--magenta-rgb) / 0.06);
     box-shadow:
-      inset 0 0 30px rgb(var(--magenta-rgb) / 0.08),
-      0 0 22px rgb(var(--magenta-rgb) / 0.15);
+      inset 0 0 calc(30px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.08),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.15);
     color: var(--magenta);
   }
   .icon {

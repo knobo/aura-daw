@@ -47,7 +47,7 @@
     if (band === "in") return theme.tokens.cyan;
     if (band === "near") return theme.tokens.amber;
     if (band === "far") return theme.tokens.magenta;
-    return theme.tokens.edge;
+    return theme.tokens.textMid;
   }
 
   /** Seconds of history the tuner shows. */
@@ -458,7 +458,7 @@
       // boundary while the pitch barely moves (G5 795 Hz → G#5 811 Hz).
       ctx.fillText(`≈ ${noteName(last.midi)}`, cx + hzW + 34, 58);
     } else {
-      ctx.fillStyle = theme.tokens.bg3;
+      ctx.fillStyle = theme.tokens.textFaint;
       ctx.font = `300 44px ${MONO}`;
       ctx.fillText("—", cx, 58);
     }
@@ -525,7 +525,7 @@
     ctx.lineTo(w, midY);
     ctx.stroke();
 
-    ctx.fillStyle = theme.tokens.bg3;
+    ctx.fillStyle = theme.tokens.textFaint;
     ctx.font = `9px ${MONO}`;
     const scale = spanCents ? ` · ±${spanCents}¢ SHOWN` : "";
     const sungS = (sung.length / 100).toFixed(1);
@@ -686,7 +686,7 @@
   .listen.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.2);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.2);
   }
   .ref {
     display: flex;

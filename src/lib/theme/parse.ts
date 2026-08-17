@@ -12,26 +12,48 @@
  * resolution across untrusted files entirely.
  */
 
-import { AFFORDANCE_KEYS, COLOR_KEYS, type ThemeTokens } from "./tokens";
+import {
+  AFFORDANCE_KEYS,
+  COLOR_KEYS,
+  UNITLESS_AFFORDANCE_KEYS,
+  type ThemeTokens,
+} from "./tokens";
 import { BUILTIN_BY_ID, DEFAULT_THEME_ID, type Theme } from "./builtins/index";
 
 export type ParsedTheme =
   | { ok: true; theme: Theme; dropped: string[] }
   | { ok: false; reason: string };
 
-const COLOR_RE = /^(#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})|rgba?\([^)]*\))$/i;
+// Only the spellings `channels()` in tokens.ts can actually read. A looser
+// pattern (`rgba?\([^)]*\)`) would accept `rgb(80% 50% 20%)`, report nothing
+// dropped, and then emit `--cyan-rgb: NaN NaN NaN` — a theme that loads
+// "successfully" and paints nothing.
+const NUM = String.raw`[0-9]*\.?[0-9]+`;
+const COLOR_RE = new RegExp(
+  String.raw`^(#([0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})` +
+    String.raw`|rgba?\(\s*${NUM}\s*[,\s]\s*${NUM}\s*[,\s]\s*${NUM}\s*([,/]\s*${NUM}\s*)?\))$`,
+  "i",
+);
 const LENGTH_RE = /^(0|[0-9]*\.?[0-9]+(px|rem|em))$/;
 const UNITLESS_RE = /^[0-9]*\.?[0-9]+$/;
 
 const COLOR_SET = new Set<string>(COLOR_KEYS);
 const AFFORDANCE_SET = new Set<string>(AFFORDANCE_KEYS);
+const UNITLESS_SET = new Set<string>(UNITLESS_AFFORDANCE_KEYS);
 
 function validAffordance(key: string, value: string): boolean {
-  return key === "bodyGlow" ? UNITLESS_RE.test(value) : LENGTH_RE.test(value);
+  return UNITLESS_SET.has(key) ? UNITLESS_RE.test(value) : LENGTH_RE.test(value);
+}
+
+/** A built-in by id — `hasOwn`, so `__proto__` and `constructor` are not
+ * theme names. Without it a file extending `"__proto__"` validates and then
+ * registers a theme with no tokens at all. */
+function builtin(id: string): Theme | undefined {
+  return Object.hasOwn(BUILTIN_BY_ID, id) ? BUILTIN_BY_ID[id] : undefined;
 }
 
 export function parseUserTheme(id: string, raw: string): ParsedTheme {
-  if (BUILTIN_BY_ID[id]) return { ok: false, reason: `"${id}" is the id of a built-in theme` };
+  if (builtin(id)) return { ok: false, reason: `"${id}" is the id of a built-in theme` };
 
   let doc: unknown;
   try {
@@ -49,7 +71,8 @@ export function parseUserTheme(id: string, raw: string): ParsedTheme {
   }
 
   const baseId = ext === undefined ? DEFAULT_THEME_ID : ext;
-  if (typeof baseId !== "string" || !BUILTIN_BY_ID[baseId]) {
+  const base = typeof baseId === "string" ? builtin(baseId) : undefined;
+  if (!base) {
     return { ok: false, reason: `"extends": ${JSON.stringify(ext)} is not a built-in theme` };
   }
 
@@ -57,7 +80,7 @@ export function parseUserTheme(id: string, raw: string): ParsedTheme {
     return { ok: false, reason: '"tokens" must be a JSON object' };
   }
 
-  const merged: ThemeTokens = { ...BUILTIN_BY_ID[baseId].tokens };
+  const merged: ThemeTokens = { ...base.tokens };
   const dropped: string[] = [];
 
   for (const [key, value] of Object.entries((tokens ?? {}) as Record<string, unknown>)) {
@@ -89,7 +112,7 @@ export function parseUserTheme(id: string, raw: string): ParsedTheme {
 
   return {
     ok: true,
-    theme: { id, name: name.trim(), base: baseId, tokens: merged, source: "user" },
+    theme: { id, name: name.trim(), base: base.id, tokens: merged, source: "user" },
     dropped,
   };
 }

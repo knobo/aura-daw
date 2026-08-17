@@ -60,8 +60,13 @@ export const BUILTIN_THEMES: readonly Theme[] = [
   GRUVBOX_DARK,
 ];
 
-export const BUILTIN_BY_ID: Readonly<Record<string, Theme>> = Object.fromEntries(
-  BUILTIN_THEMES.map((t) => [t.id, t]),
+// Null prototype on purpose: theme ids come from untrusted filenames and
+// preference blobs, and on a normal object `BUILTIN_BY_ID["__proto__"]` and
+// `["constructor"]` are truthy — a lookup that would pass validation and then
+// hand back something that is not a theme.
+export const BUILTIN_BY_ID: Readonly<Record<string, Theme>> = Object.assign(
+  Object.create(null) as Record<string, Theme>,
+  Object.fromEntries(BUILTIN_THEMES.map((t) => [t.id, t])),
 );
 
 export type BuiltinId =

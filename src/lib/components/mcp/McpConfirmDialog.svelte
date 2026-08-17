@@ -76,9 +76,12 @@
     z-index: 100;
     display: grid;
     place-items: center;
-    background: rgb(var(--scrim-rgb) / 0.72);
-    backdrop-filter: blur(var(--glass-blur)) saturate(0.8);
-    -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(0.8);
+    background: rgb(var(--bg-0-rgb) / 0.72);
+    /* Heavier than the other scrims on purpose — this one asks for consent,
+       so the app behind it should read as out of reach. Still a fraction of
+       the panel blur, so a flat theme flattens it. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 3)) saturate(0.8);
+    -webkit-backdrop-filter: blur(calc(var(--glass-blur) / 3)) saturate(0.8);
     animation: veil-in 160ms ease-out;
   }
   @keyframes veil-in {
@@ -95,7 +98,7 @@
     background: rgb(var(--bg-sunken-rgb) / 0.96);
     box-shadow:
       0 0 0 1px rgb(var(--amber-rgb) / 0.15),
-      0 0 40px rgb(var(--amber-rgb) / 0.18),
+      0 0 calc(40px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.18),
       0 24px 60px rgb(var(--shadow-rgb) / 0.6);
     padding: 16px 18px 14px;
     overflow: hidden;
@@ -133,12 +136,12 @@
     height: 10px;
     border-radius: 50%;
     background: var(--amber);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.9);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.9);
     animation: siren 1s ease-in-out infinite;
   }
   @keyframes siren {
     50% {
-      box-shadow: 0 0 3px rgb(var(--amber-rgb) / 0.4);
+      box-shadow: 0 0 calc(3px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.4);
       opacity: 0.7;
     }
   }
@@ -193,7 +196,7 @@
   .burn {
     height: 100%;
     background: linear-gradient(90deg, var(--red), var(--amber));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.6);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.6);
   }
 
   .actions {
@@ -222,7 +225,7 @@
     border: none;
     background: linear-gradient(100deg, var(--amber), color-mix(in srgb, var(--amber) 60%, var(--red) 40%));
     color: var(--bg-0);
-    box-shadow: 0 0 16px rgb(var(--amber-rgb) / 0.35);
+    box-shadow: 0 0 calc(16px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.35);
   }
   .approve:hover {
     filter: brightness(1.12);

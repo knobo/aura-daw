@@ -61,7 +61,7 @@
   .rehearse.on {
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.5);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.25);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.25);
   }
   @media (prefers-reduced-motion: reduce) {
     .rehearse {

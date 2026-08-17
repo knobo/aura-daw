@@ -32,6 +32,24 @@ describe("whole-file rejection", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toMatch(/built-in/i);
   });
+
+  // On a plain object every one of these reads back truthy, which is enough
+  // to pass an `extends` check and register a theme with NO tokens at all.
+  it("does not mistake a prototype key for a built-in", () => {
+    for (const ext of ["__proto__", "constructor", "toString", "valueOf"]) {
+      const r = parseUserTheme("mine", json({ name: "Mine", extends: ext }));
+      expect(r.ok, ext).toBe(false);
+    }
+  });
+
+  // The flip side: a prototype key is a legal FILENAME, so a theme called
+  // constructor.json must load like any other rather than being turned away
+  // as a built-in.
+  it("accepts a prototype key as a theme id", () => {
+    const r = parseUserTheme("constructor", json({ name: "Mine" }));
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.theme.tokens.cyan).toBe(AURA_DARK.tokens.cyan);
+  });
 });
 
 describe("successful parse", () => {
@@ -64,15 +82,25 @@ describe("successful parse", () => {
     expect(r.dropped).toEqual([]);
   });
 
-  it("accepts affordance lengths and a unitless bodyGlow", () => {
+  it("accepts affordance lengths and the unitless affordances", () => {
     const r = parseUserTheme(
       "mine",
-      json({ name: "Mine", tokens: { borderWidth: "2px", glassBlur: "0px", focusWidth: "0.2rem", bodyGlow: "0" } }),
+      json({ name: "Mine", tokens: { borderWidth: "2px", glassBlur: "0px", focusWidth: "0.2rem", bodyGlow: "0", glassAlpha: "1", glowScale: "0.5" } }),
     );
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.theme.tokens.borderWidth).toBe("2px");
     expect(r.theme.tokens.bodyGlow).toBe("0");
+    expect(r.theme.tokens.glassAlpha).toBe("1");
+    expect(r.theme.tokens.glowScale).toBe("0.5");
+  });
+
+  it("drops a unitless affordance written as a length", () => {
+    const r = parseUserTheme("mine", json({ name: "Mine", tokens: { glowScale: "6px" } }));
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.theme.tokens.glowScale).toBe(AURA_DARK.tokens.glowScale);
+    expect(r.dropped).toContain("glowScale");
   });
 
   it("takes a six-colour trackPalette", () => {
@@ -99,6 +127,27 @@ describe("key-level degradation — a bad key must not lose the whole theme", ()
     if (!r.ok) return;
     expect(r.theme.tokens.cyan).toBe(AURA_DARK.tokens.cyan);
     expect(r.dropped).toContain("cyan");
+  });
+
+  // A colour the validator accepts but `channels()` cannot read is worse than
+  // a rejected one: it reports nothing dropped and then emits `NaN NaN NaN`.
+  it("drops rgb() spellings the token layer cannot parse", () => {
+    for (const cyan of ["rgb(80% 50% 20%)", "rgb(none none none)", "rgb(abc)", "rgb(1 2)"]) {
+      const r = parseUserTheme("mine", json({ name: "Mine", tokens: { cyan } }));
+      expect(r.ok, cyan).toBe(true);
+      if (!r.ok) continue;
+      expect(r.dropped, cyan).toContain("cyan");
+      expect(r.theme.tokens.cyan, cyan).toBe(AURA_DARK.tokens.cyan);
+    }
+  });
+
+  it("still accepts the space- and comma-separated numeric forms", () => {
+    const r = parseUserTheme(
+      "mine",
+      json({ name: "Mine", tokens: { cyan: "rgb(82 229 255)", red: "rgb(82 229 255 / 0.4)" } }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.dropped).toEqual([]);
   });
 
   it("drops a non-string value", () => {

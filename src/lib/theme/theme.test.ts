@@ -94,6 +94,55 @@ describe("the boot cache", () => {
     expect(() => theme.bootstrap("sunny")).not.toThrow();
     expect(theme.tokens.bg1).toBe(AURA_DARK.tokens.bg1);
   });
+
+  // The cache outlives the build that wrote it. A shape check shallow enough
+  // to pass a half-populated entry through to applyTokens throws inside the
+  // mount effect, and boot stops there — before transport and project init.
+  it("bootstrap ignores a cache that does not carry every token", () => {
+    for (const tokens of [{}, { bg1: "#ffffff" }, { ...AURA_DARK.tokens, cyan: undefined }]) {
+      store[THEME_CACHE_KEY] = JSON.stringify({ id: "sunny", tokens });
+      const set = new Map<string, string>();
+      expect(() =>
+        theme.bootstrap("sunny", { style: { setProperty: (k, v) => void set.set(k, v) } }),
+      ).not.toThrow();
+      expect(theme.tokens.bg1).toBe(AURA_DARK.tokens.bg1);
+      expect(set.get("--cyan")).toBe(AURA_DARK.tokens.cyan);
+    }
+  });
+
+  it("bootstrap ignores a cache whose trackPalette is the wrong shape", () => {
+    store[THEME_CACHE_KEY] = JSON.stringify({
+      id: "sunny",
+      tokens: { ...AURA_DARK.tokens, trackPalette: ["#ffffff"] },
+    });
+    theme.bootstrap("sunny");
+    expect(theme.tokens.trackPalette).toEqual(AURA_DARK.tokens.trackPalette);
+  });
+
+  // App.svelte bootstraps in onMount and then applies prefs.values.theme in an
+  // $effect. Both are user effects, so the apply lands immediately — long
+  // before loadUserThemes() answers. It must not undo the cached paint, and it
+  // must not overwrite the cache with the fallback, which would disable the
+  // anti-flash path for every later launch too.
+  it("the preference effect right after bootstrap leaves the cached paint alone", () => {
+    store[THEME_CACHE_KEY] = JSON.stringify({
+      id: "sunny",
+      tokens: { ...AURA_DARK.tokens, bg1: "#ffffff" },
+    });
+    theme.bootstrap("sunny");
+    theme.apply("sunny"); // the $effect, firing before the backend answers
+    expect(theme.activeId).toBe("sunny");
+    expect(theme.tokens.bg1).toBe("#ffffff");
+    expect(JSON.parse(store[THEME_CACHE_KEY]).id).toBe("sunny");
+  });
+
+  it("bootstrap does not overwrite the cache with its placeholder paint", () => {
+    const cached = JSON.stringify({ id: "sunny", tokens: { ...AURA_DARK.tokens, bg1: "#ffffff" } });
+    store[THEME_CACHE_KEY] = cached;
+    theme.bootstrap("other"); // a different wish: no usable cache, paints default
+    expect(theme.tokens.bg1).toBe(AURA_DARK.tokens.bg1);
+    expect(store[THEME_CACHE_KEY]).toBe(cached);
+  });
 });
 
 describe("listing", () => {
@@ -109,5 +158,26 @@ describe("listing", () => {
     theme.setUserThemes([userTheme("sunny", { bg1: "#ffffff" })]);
     expect(theme.tokens.bg1).toBe("#ffffff");
     expect(theme.activeId).toBe("sunny");
+  });
+
+  it("hands out a copy, so a caller cannot reorder the store's own list", () => {
+    theme.setUserThemes([userTheme("sunny", {}), userTheme("mine", {})]);
+    theme.userThemes().reverse();
+    expect(theme.userThemes().map((t) => t.id)).toEqual(["sunny", "mine"]);
+  });
+
+  // The listing is authoritative: a wish painted from the cache but backed by
+  // no file any more has to give way, or the app sits on tokens for a theme
+  // the user deleted.
+  it("drops back to the default when the wish's file is gone", () => {
+    store[THEME_CACHE_KEY] = JSON.stringify({
+      id: "sunny",
+      tokens: { ...AURA_DARK.tokens, bg1: "#ffffff" },
+    });
+    theme.bootstrap("sunny");
+    expect(theme.tokens.bg1).toBe("#ffffff");
+    theme.setUserThemes([]); // the folder no longer holds sunny.json
+    expect(theme.activeId).toBe("aura-dark");
+    expect(theme.tokens.bg1).toBe(AURA_DARK.tokens.bg1);
   });
 });

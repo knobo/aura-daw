@@ -301,7 +301,7 @@
     font-size: 12px;
     letter-spacing: 0.2em;
     color: var(--magenta);
-    text-shadow: 0 0 10px var(--magenta-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--magenta-dim);
   }
   .blurb {
     letter-spacing: 0.12em;
@@ -342,7 +342,7 @@
     transition: box-shadow 120ms;
   }
   .rec:hover:not(:disabled) {
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.25);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--red-rgb) / 0.25);
   }
   .rec:disabled {
     opacity: 0.4;
@@ -355,7 +355,7 @@
   }
   @keyframes rec-pulse {
     50% {
-      box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.1);
+      box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--red-rgb) / 0.1);
     }
   }
   .hint {
@@ -452,8 +452,8 @@
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--magenta), var(--violet));
     box-shadow:
-      0 0 14px rgb(var(--magenta-rgb) / 0.3),
-      0 0 22px rgb(var(--violet-rgb) / 0.2);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.3),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.2);
   }
   .run:hover:not(:disabled) {
     filter: brightness(1.15);
@@ -468,7 +468,7 @@
   .zyn {
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--violet), var(--cyan));
-    box-shadow: 0 0 14px rgb(var(--violet-rgb) / 0.25);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.25);
   }
   .zyn:hover:not(:disabled) {
     filter: brightness(1.15);
@@ -567,7 +567,7 @@
   .stagechip.onstage {
     color: var(--magenta);
     border-color: var(--magenta-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.2);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
   }
   .stagechip.donestage {
     color: var(--green);
@@ -584,7 +584,7 @@
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--magenta), var(--violet));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.5);
     transition: width 160ms linear;
   }
   .log {
@@ -616,7 +616,7 @@
     font-size: 10px;
     letter-spacing: 0.18em;
     color: var(--green);
-    text-shadow: 0 0 10px rgb(var(--green-rgb) / 0.4);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--green-rgb) / 0.4);
   }
   .okmeta {
     letter-spacing: 0.1em;

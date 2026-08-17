@@ -529,7 +529,7 @@
     padding-left: 0.25em;
     color: var(--text);
     text-shadow:
-      0 0 14px var(--cyan-dim),
+      0 0 calc(14px * var(--glow-scale)) var(--cyan-dim),
       1px 0 0 rgb(var(--magenta-rgb) / 0.55),
       -1px 0 0 rgb(var(--cyan-rgb) / 0.55);
   }
@@ -564,7 +564,7 @@
   .tbtn.play.active {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
   }
   .tbtn.rec {
     color: rgb(var(--red-rgb) / 0.6);
@@ -585,12 +585,12 @@
   .tbtn.rec.recording {
     color: var(--red);
     border-color: rgb(var(--red-rgb) / 0.5);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.35);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--red-rgb) / 0.35);
     animation: rec-pulse 1.2s ease-in-out infinite;
   }
   @keyframes rec-pulse {
     50% {
-      box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.15);
+      box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--red-rgb) / 0.15);
     }
   }
 
@@ -611,7 +611,7 @@
   }
   .timecode.live .clock {
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .bars {
     font-size: 12px;
@@ -658,7 +658,7 @@
   .chip.loopchip.on {
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.5);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.2);
   }
   .chip.studio {
     background: linear-gradient(
@@ -671,7 +671,7 @@
   .chip.studio.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.2);
   }
   .chip.hum {
     background: linear-gradient(
@@ -684,19 +684,19 @@
   .chip.hum.on {
     color: var(--magenta);
     border-color: var(--magenta-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.2);
   }
   .chip.exportchip:hover,
   .chip.exportchip.on {
     color: var(--green);
     border-color: rgb(var(--green-rgb) / 0.45);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--green-rgb) / 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--green-rgb) / 0.2);
   }
   .chip.launchchip:hover,
   .chip.launchchip.on {
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.5);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.22);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.22);
   }
   .chip.busychip {
     animation: chip-busy 1s ease-in-out infinite;
@@ -715,18 +715,18 @@
   .morebtn.alert {
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.5);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.25);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.25);
   }
   .mcpled {
     width: 5px;
     height: 5px;
     border-radius: 50%;
     background: var(--green);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--green-rgb) / 0.8);
+    box-shadow: 0 0 calc(5px * var(--glow-scale)) rgb(var(--green-rgb) / 0.8);
   }
   .mcpled.pending {
     background: var(--amber);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.9);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.9);
     animation: mcp-blink 0.9s ease-in-out infinite;
   }
   @keyframes mcp-blink {

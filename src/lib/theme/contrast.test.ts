@@ -55,7 +55,10 @@ describe("the high-contrast themes clear AAA", () => {
 
     it(`${id}: turns off glass, glow and the body wash, and thickens edges`, () => {
       expect(theme.tokens.glassBlur).toBe("0px");
-      expect(theme.tokens.glowBlur).toBe("0px");
+      // Opaque, not merely unblurred: a translucent panel with no frosting
+      // puts the timeline grid straight through its own text.
+      expect(theme.tokens.glassAlpha).toBe("1");
+      expect(theme.tokens.glowScale).toBe("0");
       expect(theme.tokens.bodyGlow).toBe("0");
       expect(theme.tokens.borderWidth).toBe("2px");
       expect(theme.tokens.focusWidth).toBe("3px");

@@ -207,7 +207,7 @@
   }
   .tempo.open .val {
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
 
   .backdrop {
@@ -246,7 +246,7 @@
     border-radius: 4px;
     padding: 2px 8px;
     outline: none;
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.18);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
     user-select: text;
     -webkit-user-select: text;
   }
@@ -283,7 +283,7 @@
     border-radius: 1px;
     background: var(--text);
     border: var(--border-width) solid var(--cyan);
-    box-shadow: 0 0 var(--glow-blur) var(--cyan-dim);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) var(--cyan-dim);
     cursor: ew-resize;
   }
   .range {

@@ -22,19 +22,41 @@
   });
 
   /**
+   * `<base>`, then `<base>-2`, `<base>-3`, … — the first id no theme file is
+   * using. Asks the backend rather than `theme.userThemes()` so a file that
+   * failed to parse still counts as taken; it is a file the user can fix.
+   */
+  async function freeThemeId(base: string): Promise<string> {
+    let taken = new Set<string>();
+    try {
+      taken = new Set((await backend.listUserThemes()).map((f) => f.id));
+    } catch {
+      // No themes folder yet — nothing to collide with.
+    }
+    if (!taken.has(base)) return base;
+    for (let n = 2; ; n++) {
+      if (!taken.has(`${base}-${n}`)) return `${base}-${n}`;
+    }
+  }
+
+  /**
    * Serialise the ACTIVE theme as a starting point for a custom one: its
    * built-in base plus every resolved token inlined, so a user can delete
    * the lines they do not care about rather than hunt for key names.
+   *
+   * Writes to a fresh filename every time. The export exists to be EDITED,
+   * so a fixed name would mean the second click silently discards whatever
+   * the user did to the first one.
    */
   async function exportTheme() {
     const active = theme.resolve(theme.activeId);
-    const id = `${active.id}-copy`;
     const doc = {
       name: `${active.name} (copy)`,
       extends: active.base,
       tokens: active.tokens,
     };
     try {
+      const id = await freeThemeId(`${active.id}-copy`);
       const path = await backend.writeUserTheme(id, JSON.stringify(doc, null, 2) + "\n");
       toasts.success("THEME EXPORTED", path, "Restart AURA to see it in this list.");
     } catch (err) {
@@ -245,8 +267,9 @@
     z-index: 80;
     display: grid;
     place-items: center;
-    background: rgb(var(--scrim-rgb) / 0.6);
-    backdrop-filter: blur(var(--glass-blur));
+    background: rgb(var(--bg-void-rgb) / 0.6);
+    /* A fraction of the panel blur: a scrim hints, it does not frost. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 6));
   }
   .dialog {
     width: 460px;
@@ -277,7 +300,7 @@
     font-size: 12px;
     letter-spacing: 0.22em;
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .sub {
     flex: 1;
@@ -345,7 +368,7 @@
   .toggle.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
 
   .seg {
@@ -366,7 +389,7 @@
   .segbtn.on {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
 
   .numctl {

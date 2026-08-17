@@ -142,7 +142,7 @@
       ctx.fillRect(w - ledW, 0, ledW, h);
       if (clipLatched) {
         ctx.shadowColor = tokens.red;
-        ctx.shadowBlur = parseFloat(tokens.glowBlur) || 0;
+        ctx.shadowBlur = 6 * (parseFloat(tokens.glowScale) || 0);
         ctx.fillRect(w - ledW, 0, ledW, h);
         ctx.shadowBlur = 0;
       }

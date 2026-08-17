@@ -127,8 +127,9 @@
     z-index: 85;
     display: grid;
     place-items: center;
-    background: rgb(var(--scrim-rgb) / 0.6);
-    backdrop-filter: blur(var(--glass-blur));
+    background: rgb(var(--bg-void-rgb) / 0.6);
+    /* A fraction of the panel blur: a scrim hints, it does not frost. */
+    backdrop-filter: blur(calc(var(--glass-blur) / 6));
   }
   .dialog {
     width: 420px;
@@ -156,7 +157,7 @@
     font-size: 12px;
     letter-spacing: 0.22em;
     color: var(--cyan);
-    text-shadow: 0 0 10px var(--cyan-dim);
+    text-shadow: 0 0 calc(10px * var(--glow-scale)) var(--cyan-dim);
   }
   .sub {
     flex: 1;
@@ -233,7 +234,7 @@
   .btn.primary {
     color: var(--cyan);
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.18);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.18);
   }
   .btn:disabled {
     opacity: 0.4;

@@ -184,7 +184,7 @@
     cursor: pointer;
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--violet), var(--magenta));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--violet-rgb) / 0.25);
+    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.25);
     transition: filter 120ms;
   }
   .scan:hover:not(:disabled) {

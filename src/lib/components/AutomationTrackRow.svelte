@@ -347,7 +347,7 @@
   }
   .aclip.selected {
     border-style: solid;
-    border-color: color-mix(in srgb, var(--clip-color) 85%, white 5%);
+    border-color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 5%);
     box-shadow: 0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent);
   }
   .aclip.edge {

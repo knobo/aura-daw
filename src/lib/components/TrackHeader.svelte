@@ -350,7 +350,7 @@
     width: 3px;
     background: var(--track-color);
     opacity: 0.85;
-    box-shadow: 0 0 var(--glow-blur) color-mix(in srgb, var(--track-color) 60%, transparent);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) color-mix(in srgb, var(--track-color) 60%, transparent);
   }
   .body {
     flex: 1;
@@ -411,7 +411,7 @@
     border-style: solid;
     border-color: rgb(var(--violet-rgb) / 0.45);
     background: rgb(var(--violet-rgb) / 0.09);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--violet-rgb) / 0.18);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.18);
   }
   .instchip.plugin.stub {
     color: var(--amber);
@@ -469,7 +469,7 @@
     color: var(--text-on-accent);
     background: rgb(var(--red-rgb) / 0.8);
     border-color: var(--red);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--red-rgb) / 0.4);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--red-rgb) / 0.4);
   }
   .tog.mute.on {
     color: var(--bg-0);
@@ -480,13 +480,13 @@
     color: var(--bg-0);
     background: var(--cyan);
     border-color: var(--cyan);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.4);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.4);
   }
   .tog.auto.on {
     color: var(--bg-0);
     background: var(--magenta);
     border-color: var(--magenta);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.4);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.4);
   }
 
   .fader-wrap {

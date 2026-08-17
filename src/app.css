@@ -76,7 +76,8 @@
   --border-width: 1px;
   --focus-width: 1px;
   --glass-blur: 18px;
-  --glow-blur: 6px;
+  --glass-alpha: 0.62;
+  --glow-scale: 1;
   --body-glow: 0.05;
 
   /* type */
@@ -185,7 +186,7 @@ input[type="range"].fader::-webkit-slider-thumb {
   margin-top: -5px;
   border-radius: 1px;
   background: var(--text);
-  box-shadow: 0 0 var(--glow-blur) rgb(var(--text-rgb) / 0.5);
+  box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--text-rgb) / 0.5);
 }
 input[type="range"].fader::-moz-range-track {
   height: 3px;
@@ -203,7 +204,7 @@ input[type="range"].fader::-moz-range-thumb {
   border: none;
   border-radius: 1px;
   background: var(--text);
-  box-shadow: 0 0 var(--glow-blur) rgb(var(--text-rgb) / 0.5);
+  box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--text-rgb) / 0.5);
 }
 
 @media (prefers-reduced-motion: reduce) {

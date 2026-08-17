@@ -404,7 +404,7 @@
     color: var(--bg-0);
     background: var(--cyan);
     border-color: var(--cyan);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.35);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35);
   }
 
   /* "automate this knob" toggle — same small-button language as `.toggle`,
@@ -430,7 +430,7 @@
     color: var(--bg-0);
     background: var(--violet);
     border-color: var(--violet);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--violet-rgb) / 0.35);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
   }
 
   .enum {

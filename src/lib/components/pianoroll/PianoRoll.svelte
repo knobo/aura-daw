@@ -571,14 +571,14 @@
       const y = yOfKey(n.key);
       if (x + nw < 0 || x > w || y + KEY_H < 0 || y > h) continue;
       const lum = 0.35 + 0.65 * (n.velocity / 127);
-      ctx.fillStyle = hexA(color, 0.28 + 0.5 * lum);
-      ctx.strokeStyle = hexA(color, Math.min(1, 0.55 + 0.45 * lum));
+      ctx.fillStyle = alpha(color, 0.28 + 0.5 * lum);
+      ctx.strokeStyle = alpha(color, Math.min(1, 0.55 + 0.45 * lum));
       ctx.beginPath();
       ctx.roundRect(x, y + 1.5, nw, KEY_H - 3, 2.5);
       ctx.fill();
       ctx.stroke();
       // velocity notch at the left edge
-      ctx.fillStyle = hexA(color, Math.min(1, 0.75 + 0.25 * lum));
+      ctx.fillStyle = alpha(color, Math.min(1, 0.75 + 0.25 * lum));
       ctx.fillRect(x + 1, y + 2.5, 2, KEY_H - 5);
       if (sel.has(i)) {
         ctx.strokeStyle = alpha(theme.tokens.text, 0.95);
@@ -619,7 +619,7 @@
       ctx.fillStyle = black ? theme.tokens.bg1 : theme.tokens.bg3;
       ctx.fillRect(0, y, w, KEY_H - 1);
       if (key === heldKey) {
-        ctx.fillStyle = hexA(color, 0.55);
+        ctx.fillStyle = alpha(color, 0.55);
         ctx.fillRect(0, y, w, KEY_H - 1);
       }
       if (key % 12 === 0) {
@@ -651,9 +651,9 @@
       if (x < -4 || x > w + 4) continue;
       const bh = Math.max(2, (n.velocity / 127) * (h - 6));
       const selHere = sel.has(i);
-      ctx.fillStyle = selHere ? alpha(theme.tokens.text, 0.9) : hexA(color, 0.55);
+      ctx.fillStyle = selHere ? alpha(theme.tokens.text, 0.9) : alpha(color, 0.55);
       ctx.fillRect(x, h - bh, 3, bh);
-      ctx.fillStyle = selHere ? theme.tokens.textOnAccent : hexA(color, 0.95);
+      ctx.fillStyle = selHere ? theme.tokens.textOnAccent : alpha(color, 0.95);
       ctx.fillRect(x, h - bh - 2, 3, 2);
     }
   });
@@ -717,12 +717,12 @@
         const x = xOfTick(n.tick);
         const nw = Math.max(3, n.lengthTicks / tpp - 1);
         if (x + nw < 0 || x > gridW || y + KEY_H < 0 || y > gridH) continue;
-        fctx.strokeStyle = hexA(theme.tokens.cyan, 0.35 + 0.55 * glow);
+        fctx.strokeStyle = alpha(theme.tokens.cyan, 0.35 + 0.55 * glow);
         fctx.lineWidth = 1.5 + 1.5 * glow;
         fctx.beginPath();
         fctx.roundRect(x - 1.5, y + 0.5, nw + 3, KEY_H - 1, 3.5);
         fctx.stroke();
-        fctx.fillStyle = hexA(theme.tokens.cyan, 0.16 * glow);
+        fctx.fillStyle = alpha(theme.tokens.cyan, 0.16 * glow);
         fctx.beginPath();
         fctx.roundRect(x - 3, y - 1, nw + 6, KEY_H + 1, 4.5);
         fctx.fill();
@@ -760,12 +760,12 @@
       if (x + nw >= 0 && x <= gridW && y + KEY_H >= 0 && y <= gridH) {
         if (flare >= 0.03) {
           // wide magenta bloom around the note
-          fctx.fillStyle = hexA(MAG, 0.55 * flare);
+          fctx.fillStyle = alpha(MAG, 0.55 * flare);
           fctx.beginPath();
           fctx.roundRect(x - 6, y - 3.5, nw + 12, KEY_H + 4, 6);
           fctx.fill();
           // magenta rim
-          fctx.strokeStyle = hexA(MAG, Math.min(1, 1.2 * flare));
+          fctx.strokeStyle = alpha(MAG, Math.min(1, 1.2 * flare));
           fctx.lineWidth = 2;
           fctx.beginPath();
           fctx.roundRect(x - 2.5, y - 1, nw + 5, KEY_H, 4);
@@ -778,7 +778,7 @@
         }
         if (held) {
           // soft sustain glow in the track color while the note sounds
-          fctx.fillStyle = hexA(color, 0.25);
+          fctx.fillStyle = alpha(color, 0.25);
           fctx.beginPath();
           fctx.roundRect(x - 2, y - 0.5, nw + 4, KEY_H - 1, 4);
           fctx.fill();
@@ -790,13 +790,13 @@
     for (const [key, glow] of keySustain) {
       const y = yOfKey(key);
       if (y + KEY_H < 0 || y > gridH) continue;
-      kctx.fillStyle = hexA(color, 2 * glow);
+      kctx.fillStyle = alpha(color, 2 * glow);
       kctx.fillRect(0, y, KEYS_W, KEY_H - 1);
     }
     for (const [key, flare] of keyFlare) {
       const y = yOfKey(key);
       if (y + KEY_H < 0 || y > gridH) continue;
-      kctx.fillStyle = hexA(MAG, 0.85 * flare);
+      kctx.fillStyle = alpha(MAG, 0.85 * flare);
       kctx.fillRect(0, y, KEYS_W, KEY_H - 1);
     }
   }
@@ -846,13 +846,6 @@
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
   });
-
-  function hexA(hex: string, a: number): string {
-    const r = parseInt(hex.slice(1, 3), 16);
-    const g = parseInt(hex.slice(3, 5), 16);
-    const b = parseInt(hex.slice(5, 7), 16);
-    return `rgba(${r},${g},${b},${a})`;
-  }
 
   // scrollbar reach: one repetition of content plus a bar of headroom
   const contentEndTicks = $derived(
@@ -1110,7 +1103,7 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    box-shadow: 0 0 8px currentColor;
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) currentColor;
   }
   .title {
     font-size: 12px;
@@ -1170,7 +1163,7 @@
     cursor: pointer;
     color: var(--bg-0);
     background: linear-gradient(100deg, var(--cyan), var(--violet));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.3);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.3);
   }
   .infill:hover {
     filter: brightness(1.15);
@@ -1236,7 +1229,7 @@
     left: 0;
     width: 1px;
     background: var(--cyan);
-    box-shadow: 0 0 var(--glow-blur) var(--cyan-dim);
+    box-shadow: 0 0 calc(6px * var(--glow-scale)) var(--cyan-dim);
     pointer-events: none;
     will-change: transform;
   }

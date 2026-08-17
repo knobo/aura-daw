@@ -990,7 +990,7 @@
     border-right: 5px solid transparent;
     border-top: 7px solid var(--cyan);
     margin-left: -5px;
-    filter: drop-shadow(0 0 4px var(--cyan-dim));
+    filter: drop-shadow(0 0 calc(4px * var(--glow-scale)) var(--cyan-dim));
     pointer-events: none;
   }
 
@@ -1006,7 +1006,7 @@
   .loopband.on {
     background: rgb(var(--amber-rgb) / 0.14);
     border-bottom: 1px solid rgb(var(--amber-rgb) / 0.55);
-    box-shadow: inset 0 0 10px rgb(var(--amber-rgb) / 0.12);
+    box-shadow: inset 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.12);
   }
   .looppin {
     position: absolute;
@@ -1044,7 +1044,7 @@
   }
   .looppin.on::before {
     background: var(--amber);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.6);
+    box-shadow: 0 0 calc(5px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.6);
   }
   .looppin.on::after {
     border-top-color: var(--amber);
@@ -1072,7 +1072,7 @@
     50% {
       background: rgb(var(--magenta-rgb) / 0.22);
       border-bottom-color: rgb(var(--magenta-rgb) / 0.7);
-      box-shadow: inset 0 0 16px rgb(var(--magenta-rgb) / 0.25);
+      box-shadow: inset 0 0 calc(16px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.25);
     }
   }
   @keyframes jam-breathe-shade {
@@ -1092,7 +1092,7 @@
   @keyframes jam-flash {
     0% {
       background: rgb(var(--green-rgb) / 0.55);
-      box-shadow: inset 0 0 20px rgb(var(--green-rgb) / 0.6);
+      box-shadow: inset 0 0 calc(20px * var(--glow-scale)) rgb(var(--green-rgb) / 0.6);
     }
     100% {
       background: rgb(var(--amber-rgb) / 0.14);
@@ -1245,7 +1245,7 @@
     cursor: pointer;
   }
   .seedbtn:hover:not(:disabled) {
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
+    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
   }
   /* Busy: the same scanning cyan→magenta sweep clips wear while a job works
      on them, so "something is happening" reads the same everywhere. */
@@ -1282,10 +1282,10 @@
   @keyframes seed-glow {
     0%,
     100% {
-      box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
+      box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
     }
     50% {
-      box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.35);
+      box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.35);
     }
   }
   @keyframes seed-sweep {
@@ -1339,7 +1339,7 @@
   .launchmark.sel {
     border-color: var(--amber);
     background: rgb(var(--amber-rgb) / 0.16);
-    box-shadow: inset 0 0 12px rgb(var(--amber-rgb) / 0.12);
+    box-shadow: inset 0 0 calc(12px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.12);
   }
   .launchlab {
     position: absolute;
@@ -1373,8 +1373,8 @@
     width: 1px;
     background: var(--cyan);
     box-shadow:
-      0 0 var(--glow-blur) var(--cyan-dim),
-      0 0 1px var(--cyan);
+      0 0 calc(6px * var(--glow-scale)) var(--cyan-dim),
+      0 0 calc(1px * var(--glow-scale)) var(--cyan);
     pointer-events: none;
     will-change: transform;
   }

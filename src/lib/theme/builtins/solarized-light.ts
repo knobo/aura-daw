@@ -41,6 +41,7 @@ export const SOLARIZED_LIGHT_TOKENS: ThemeTokens = {
   borderWidth: "1px",
   focusWidth: "2px",
   glassBlur: "0px",
-  glowBlur: "0px",
+  glassAlpha: "1",
+  glowScale: "0",
   bodyGlow: "0",
 };

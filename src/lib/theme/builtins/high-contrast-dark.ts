@@ -47,6 +47,7 @@ export const HIGH_CONTRAST_DARK_TOKENS: ThemeTokens = {
   borderWidth: "2px",
   focusWidth: "3px",
   glassBlur: "0px",
-  glowBlur: "0px",
+  glassAlpha: "1",
+  glowScale: "0",
   bodyGlow: "0",
 };

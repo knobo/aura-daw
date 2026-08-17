@@ -231,10 +231,10 @@
     cursor: grabbing;
   }
   .clip.selected {
-    border-color: color-mix(in srgb, var(--clip-color) 85%, white 5%);
+    border-color: color-mix(in srgb, var(--clip-color) 85%, var(--text) 5%);
     box-shadow:
       0 0 0 1px color-mix(in srgb, var(--clip-color) 40%, transparent),
-      0 0 18px color-mix(in srgb, var(--clip-color) 25%, transparent);
+      0 0 calc(18px * var(--glow-scale)) color-mix(in srgb, var(--clip-color) 25%, transparent);
   }
 
   .wave {
@@ -249,7 +249,7 @@
     top: 3px;
     font-size: 9px;
     letter-spacing: 0.06em;
-    color: color-mix(in srgb, var(--clip-color) 80%, white 20%);
+    color: color-mix(in srgb, var(--clip-color) 80%, var(--text) 20%);
     background: rgb(var(--bg-0-rgb) / 0.55);
     padding: 1px 5px;
     border-radius: 3px;
@@ -292,8 +292,8 @@
     border: none;
     background: linear-gradient(100deg, var(--cyan), var(--magenta));
     box-shadow:
-      0 0 14px rgb(var(--cyan-rgb) / 0.35),
-      0 0 22px rgb(var(--magenta-rgb) / 0.25);
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35),
+      0 0 calc(22px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.25);
     transition: filter 120ms, transform 120ms;
   }
   .magic:hover {
@@ -313,10 +313,10 @@
   @keyframes proc-border {
     0%,
     100% {
-      box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.25);
+      box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
     }
     50% {
-      box-shadow: 0 0 var(--glow-blur) rgb(var(--magenta-rgb) / 0.35);
+      box-shadow: 0 0 calc(18px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.35);
     }
   }
 
@@ -399,7 +399,7 @@
   .pfill {
     height: 100%;
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.5);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 180ms linear;
   }
 </style>

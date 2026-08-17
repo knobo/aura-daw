@@ -122,12 +122,12 @@
   }
   .led.on {
     background: var(--green);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--green-rgb) / 0.7);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--green-rgb) / 0.7);
     animation: led-breathe 2.4s ease-in-out infinite;
   }
   @keyframes led-breathe {
     50% {
-      box-shadow: 0 0 3px rgb(var(--green-rgb) / 0.3);
+      box-shadow: 0 0 calc(3px * var(--glow-scale)) rgb(var(--green-rgb) / 0.3);
     }
   }
   .state {
@@ -176,7 +176,7 @@
   }
   .modebtn.on {
     border-color: var(--cyan-dim);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--cyan-rgb) / 0.15);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.15);
   }
   .modebtn.on .mlabel {
     color: var(--cyan);
@@ -184,7 +184,7 @@
   /* FULL mode is a hazard — say so when armed */
   .modebtn.full.on {
     border-color: rgb(var(--amber-rgb) / 0.5);
-    box-shadow: 0 0 var(--glow-blur) rgb(var(--amber-rgb) / 0.2);
+    box-shadow: 0 0 calc(10px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.2);
   }
   .modebtn.full.on .mlabel {
     color: var(--amber);
