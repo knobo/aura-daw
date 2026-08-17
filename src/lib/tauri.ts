@@ -62,6 +62,7 @@ import type {
   TrackState,
   TranscribeRequest,
   TransportState,
+  UserThemeFile,
   WaveformTileRequest,
   ZynPatch,
 } from "./types/ipc";
@@ -401,6 +402,14 @@ export interface Backend {
   mcpGetStatus(): Promise<McpStatus>;
   mcpSetPolicy(policy: McpPolicy): Promise<McpPolicy>;
   mcpConfirmPending(confirmationId: string, approve: boolean): Promise<void>;
+
+  // themes
+  /** User themes from `config_dir()/aura/themes/*.json`, contents unparsed. */
+  listUserThemes(): Promise<UserThemeFile[]>;
+  /** Write a theme file; returns its absolute path. */
+  writeUserTheme(id: string, json: string): Promise<string>;
+  /** Absolute path of the themes folder, for the preferences dialog. */
+  userThemesDir(): Promise<string>;
 
   // app events (frozen names)
   on<K extends AuraEventName>(
@@ -920,6 +929,16 @@ class TauriBackend implements Backend {
   }
   async mcpConfirmPending(confirmationId: string, approve: boolean) {
     await invoke("mcp_confirm_pending", { confirmationId, approve });
+  }
+
+  listUserThemes() {
+    return invoke<UserThemeFile[]>("list_user_themes");
+  }
+  writeUserTheme(id: string, json: string) {
+    return invoke<string>("write_user_theme", { id, json });
+  }
+  userThemesDir() {
+    return invoke<string>("user_themes_dir");
   }
 
   on<K extends AuraEventName>(event: K, cb: (payload: AuraEventMap[K]) => void) {

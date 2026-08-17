@@ -66,7 +66,7 @@ export function parseUserTheme(id: string, raw: string): ParsedTheme {
         Array.isArray(value) &&
         value.length === 6 &&
         value.every((c) => typeof c === "string" && COLOR_RE.test(c));
-      if (ok) merged.trackPalette = value as ThemeTokens["trackPalette"];
+      if (ok) merged.trackPalette = value as unknown as ThemeTokens["trackPalette"];
       else dropped.push(key);
       continue;
     }
@@ -75,12 +75,12 @@ export function parseUserTheme(id: string, raw: string): ParsedTheme {
       continue;
     }
     if (COLOR_SET.has(key)) {
-      if (COLOR_RE.test(value.trim())) (merged as Record<string, unknown>)[key] = value.trim();
+      if (COLOR_RE.test(value.trim())) (merged as unknown as Record<string, unknown>)[key] = value.trim();
       else dropped.push(key);
       continue;
     }
     if (AFFORDANCE_SET.has(key)) {
-      if (validAffordance(key, value.trim())) (merged as Record<string, unknown>)[key] = value.trim();
+      if (validAffordance(key, value.trim())) (merged as unknown as Record<string, unknown>)[key] = value.trim();
       else dropped.push(key);
       continue;
     }

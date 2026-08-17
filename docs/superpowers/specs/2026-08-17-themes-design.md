@@ -99,8 +99,9 @@ against a key added to the interface but forgotten in a theme file. User
 themes are always merged over a complete base, so they can never be partial
 at the point of use.
 
-**Surfaces** (opaque, a six-step ramp from deepest to most raised):
-`bgVoid`, `bg0`, `bgSunken`, `bg1`, `bg2`, `bg3`
+**Surfaces** (opaque, a six-step ramp from deepest to most raised, plus the
+base colour the translucent panel fill is mixed from):
+`bgVoid`, `bg0`, `bgSunken`, `bg1`, `bg2`, `bg3`, `glass`
 
 **Lines** (base colours, always consumed with an alpha):
 `line` — hairlines, grids, rulers; `edge` — panel borders, glass edges
@@ -116,8 +117,8 @@ at the point of use.
 identity ramp. A light theme needs its own; the dark palette is invisible on
 a light lane.
 
-**Affordances** (R1), five scalars, all CSS lengths:
-`borderWidth`, `focusWidth`, `glassBlur`, `glowBlur`, `bodyGlow`
+**Affordances** (R1), five scalars: `borderWidth`, `focusWidth`, `glassBlur`
+and `glowBlur` are CSS lengths; `bodyGlow` is a unitless alpha in `0..1`.
 
 `glowBlur: 0px` removes every glow with no CSS special-casing — a `box-shadow`
 with zero offset, zero blur, and zero spread renders nothing. `bodyGlow` is
@@ -390,7 +391,7 @@ Every literal in the codebase today, with its count and target token.
 | `255,255,255` / `#fff` | 4 | `textOnAccent` |
 | `27,35,64` / `#1b2340` | 2 | `bg3` |
 | `255,120,130` / `#ff8b96` | 2 | `redSoft` |
-| `13,17,30` | 1 | `glass` base |
+| `13,17,30` | 1 | `glass` |
 | `#39435c` | 2 | `textFaint` |
 | `#ff8b5c` | 2 | `orange` |
 | `#8fa3c4` | 1 | `textMid` |

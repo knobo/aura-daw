@@ -49,6 +49,7 @@ import {
   type TrackState,
   type TranscribeRequest,
   type TransportState,
+  type UserThemeFile,
   type WaveformTileRequest,
   type ZynPatch,
 } from "./types/ipc";
@@ -2660,6 +2661,18 @@ export class DemoBackend implements Backend {
         'aceStepGenerate: "rain-slick chrome arps, 118 bpm" (30 s → new track)',
       );
     }, 75_000);
+  }
+
+  // The browser demo has no filesystem: the eight built-ins are the whole
+  // catalogue there.
+  listUserThemes() {
+    return Promise.resolve([] as UserThemeFile[]);
+  }
+  writeUserTheme() {
+    return Promise.reject(new Error("user themes need the desktop app"));
+  }
+  userThemesDir() {
+    return Promise.resolve("(desktop app only)");
   }
 
   // ── events ──
