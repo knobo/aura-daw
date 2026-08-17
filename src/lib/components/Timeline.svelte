@@ -696,7 +696,10 @@
     if (view.snap) deltaTicks = Math.round(deltaTicks / midi.ppq) * midi.ppq;
     const originLane = nearestTrackIndexAtY(layout, markDrag.originY);
     const nowLane = nearestTrackIndexAtY(layout, p.y);
-    if (originLane === null || nowLane === null) return;
+    // Both are only null when NOTHING is painted (every track folded into
+    // one group) — keep the time shift live rather than freezing the whole
+    // drag; there's simply no lane delta to apply until a lane is visible.
+    const laneDelta = originLane !== null && nowLane !== null ? nowLane - originLane : 0;
     launch.patchLocal(markDrag.id, {
       target: shiftRegion(
         {
@@ -706,7 +709,7 @@
           trackIds: markDrag.trackIds,
         },
         deltaTicks,
-        nowLane - originLane,
+        laneDelta,
         project.tracks,
       ),
     });

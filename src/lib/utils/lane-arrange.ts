@@ -121,6 +121,18 @@ export function arrangementForMove(
  * reorder).
  */
 export function normalizeGroupRuns(placements: LanePlacement[]): LanePlacement[] {
+  // Bucket each group's members in one pass (document order preserved
+  // within a bucket), then a second pass flushes each bucket whole the
+  // first time its group is seen — same result as re-scanning per group,
+  // without the O(n²) rescan.
+  const buckets = new Map<string, LanePlacement[]>();
+  for (const p of placements) {
+    const g = p.group?.trim() ? p.group.trim() : null;
+    if (g === null) continue;
+    let bucket = buckets.get(g);
+    if (!bucket) buckets.set(g, (bucket = []));
+    bucket.push({ trackId: p.trackId, group: g });
+  }
   const out: LanePlacement[] = [];
   const emitted = new Set<string>();
   for (const p of placements) {
@@ -131,10 +143,7 @@ export function normalizeGroupRuns(placements: LanePlacement[]): LanePlacement[]
     }
     if (emitted.has(g)) continue; // already flushed with its run
     emitted.add(g);
-    for (const q of placements) {
-      const qg = q.group?.trim() ? q.group.trim() : null;
-      if (qg === g) out.push({ trackId: q.trackId, group: g });
-    }
+    out.push(...buckets.get(g)!);
   }
   return out;
 }
@@ -162,13 +171,22 @@ export function nextGroupName(tracks: TrackState[]): string {
   }
 }
 
-/** The arrangement produced by renaming a group (its members follow it). */
+/**
+ * The arrangement produced by renaming a group (its members follow it), or
+ * `null` if `to` collides with a DIFFERENT existing group's name.
+ *
+ * The name IS the group's identity (see `groupOf`), so renaming onto one
+ * that already exists would silently merge two groups the user never asked
+ * to combine — refuse instead, the same way `nextGroupName` refuses to hand
+ * out a name already in use.
+ */
 export function arrangementForGroupRename(
   tracks: TrackState[],
   from: string,
   to: string,
-): LanePlacement[] {
+): LanePlacement[] | null {
   const target = to.trim();
+  if (target && target !== from && groupNames(tracks).includes(target)) return null;
   return normalizeGroupRuns(
     tracks.map((t) => ({
       trackId: t.id,

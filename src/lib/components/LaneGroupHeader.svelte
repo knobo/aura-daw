@@ -10,40 +10,43 @@
    */
   import { project } from "../state/project.svelte";
   import { lanes } from "../state/lanes.svelte";
+  import { toasts } from "../state/toasts.svelte";
   import { arrangementForGroupDissolve, arrangementForGroupRename } from "../utils/lane-arrange";
+  import { focusAndSelect } from "../utils/focusAndSelect";
   import type { LaneRow } from "../utils/lane-layout";
 
   let { row }: { row: Extract<LaneRow, { kind: "group" }> } = $props();
 
   const editing = $derived(lanes.renamingGroup === row.group);
   let draft = $state("");
-  let nameInputEl: HTMLInputElement | undefined = $state();
 
   function startRename() {
     draft = row.group;
     lanes.renamingGroup = row.group;
   }
 
-  // The input is inserted after this flips, so focus and select once it
-  // exists — `autofocus` is unreliable for an element that appears
-  // mid-session, and without an explicit select() typing appends to the
-  // old name instead of replacing it.
-  $effect(() => {
-    if (editing && nameInputEl) {
-      nameInputEl.focus();
-      nameInputEl.select();
-    }
-  });
-
   async function commit() {
+    // Clear FIRST: `blur` fires on Enter too (the input is removed), and a
+    // second commit for the same edit would cost a second undo step. The
+    // guard makes that second, blur-triggered call a no-op — which is also
+    // what makes Escape's clear (below) actually cancel instead of
+    // committing the draft anyway.
+    if (lanes.renamingGroup !== row.group) return;
     const from = row.group;
     const to = draft.trim();
     lanes.renamingGroup = "";
     if (!to || to === from) return;
+    const arrangement = arrangementForGroupRename(project.tracks, from, to);
+    if (!arrangement) {
+      toasts.error("RENAME FAILED", `A group named "${to}" already exists`);
+      return;
+    }
     // Carry the fold state to the new name BEFORE the store changes, so the
-    // group does not visibly pop open for a frame on rename.
+    // group does not visibly pop open for a frame on rename. Rolled back
+    // below if the arrangement doesn't actually go through.
     lanes.renameGroupFold(from, to);
-    await project.arrangeLanes(arrangementForGroupRename(project.tracks, from, to));
+    const ok = await project.arrangeLanes(arrangement);
+    if (!ok) lanes.renameGroupFold(to, from);
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -72,7 +75,7 @@
   {#if editing}
     <input
       class="nameedit mono"
-      bind:this={nameInputEl}
+      use:focusAndSelect
       bind:value={draft}
       aria-label="Group name"
       onkeydown={onKeydown}

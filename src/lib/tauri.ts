@@ -155,7 +155,9 @@ export interface Backend {
   setTrackArm(trackId: string, armed: boolean): Promise<void>;
   /** Rename a track. Trimmed backend-side; an empty name is rejected. */
   setTrackName(trackId: string, name: string): Promise<TrackState>;
-  /** Put a track in a lane group, or take it out (`null`). */
+  /** Put a track in a lane group, or take it out (`null`). Does NOT keep
+   * the group contiguous — no UI path calls this; prefer `arrangeLanes`
+   * for anything user-facing, which normalizes runs by construction. */
   setTrackGroup(trackId: string, group: string | null): Promise<TrackState>;
   /** Whole lane arrangement — display order + group per lane — in ONE
    * undoable transaction. `lanes` must name every track exactly once, in

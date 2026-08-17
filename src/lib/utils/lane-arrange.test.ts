@@ -227,7 +227,7 @@ describe("group rename / dissolve / assign", () => {
   const tracks = [track("t1", "Drums"), track("t2"), track("t3", "Drums")];
 
   it("rename moves every member to the new name", () => {
-    const out = arrangementForGroupRename(tracks, "Drums", "Kit");
+    const out = arrangementForGroupRename(tracks, "Drums", "Kit")!;
     expect(out).toEqual([
       { trackId: "t1", group: "Kit" },
       { trackId: "t3", group: "Kit" },
@@ -236,8 +236,15 @@ describe("group rename / dissolve / assign", () => {
   });
 
   it("renaming to blank dissolves the group rather than creating a nameless one", () => {
-    const out = arrangementForGroupRename(tracks, "Drums", "   ");
+    const out = arrangementForGroupRename(tracks, "Drums", "   ")!;
     expect(out.map((p) => p.group)).toEqual([null, null, null]);
+  });
+
+  it("renaming onto a DIFFERENT existing group's name is refused, not merged", () => {
+    const withTwoGroups = [...tracks, track("t4", "Keys"), track("t5", "Keys")];
+    expect(arrangementForGroupRename(withTwoGroups, "Drums", "Keys")).toBeNull();
+    // The no-op case (renaming a group to its own current name) is fine.
+    expect(arrangementForGroupRename(withTwoGroups, "Drums", "Drums")).not.toBeNull();
   });
 
   it("dissolve clears the group but leaves the order alone", () => {

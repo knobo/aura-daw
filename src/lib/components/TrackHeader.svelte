@@ -14,6 +14,7 @@
   import { lanes } from "../state/lanes.svelte";
   import { formatDb } from "../utils/format";
   import { groupOf } from "../utils/lane-layout";
+  import { focusAndSelect } from "../utils/focusAndSelect";
   import Meter from "./Meter.svelte";
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
@@ -32,23 +33,11 @@
   // component only has to manage focus and the two keys.
   const renaming = $derived(lanes.renamingTrackId === track.id);
   let draft = $state("");
-  let nameInputEl: HTMLInputElement | undefined = $state();
 
   function startRename() {
     draft = track.name;
     lanes.renamingTrackId = track.id;
   }
-
-  // The input is inserted after this flips, so focus and select once it
-  // exists — `autofocus` is unreliable for an element that appears
-  // mid-session, and without an explicit select() typing appends to the
-  // old name instead of replacing it.
-  $effect(() => {
-    if (renaming && nameInputEl) {
-      nameInputEl.focus();
-      nameInputEl.select();
-    }
-  });
 
   async function commitRename() {
     // Clear FIRST: `blur` fires on Enter too (the input is removed), and a
@@ -180,7 +169,7 @@
       {#if renaming}
         <input
           class="nameedit"
-          bind:this={nameInputEl}
+          use:focusAndSelect
           bind:value={draft}
           aria-label="Track name"
           onkeydown={onNameKeydown}
@@ -227,7 +216,7 @@
       {#if renaming}
         <input
           class="nameedit"
-          bind:this={nameInputEl}
+          use:focusAndSelect
           bind:value={draft}
           aria-label="Track name"
           onkeydown={onNameKeydown}

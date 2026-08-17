@@ -1746,12 +1746,16 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                     order.len()
                 ));
             }
+            // A HashSet lookup here, not `previous.contains`: this runs once
+            // per lane drag, and `previous.contains` inside the loop would
+            // make the permutation check O(n²) in the track count.
+            let previous_set: std::collections::HashSet<_> = previous.iter().collect();
             let mut seen = std::collections::HashSet::with_capacity(order.len());
             for id in order {
                 if !seen.insert(id) {
                     return Err(format!("track reorder: duplicate track id: {id}"));
                 }
-                if !previous.contains(id) {
+                if !previous_set.contains(id) {
                     return Err(format!("track reorder: unknown track: {id}"));
                 }
             }

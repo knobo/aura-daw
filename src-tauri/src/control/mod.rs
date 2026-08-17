@@ -2328,6 +2328,16 @@ impl ControlPlane {
     /// Lanes UX: put one track in a lane group (`None` = ungrouped). See
     /// [`Self::arrange_lanes`] for the drag-shaped path that also moves the
     /// row — this one is the plain "set the label" case.
+    ///
+    /// Deliberately does NOT reorder: `buildLaneLayout` (frontend) treats a
+    /// group as the maximal CONTIGUOUS run of tracks sharing its name, so
+    /// calling this on a track outside its target group's run produces a
+    /// track whose `group` is set but is not adjacent to the rest of that
+    /// group — a split run the UI was built to never paint. No UI path
+    /// calls this today (every user-facing group change goes through
+    /// `arrange_lanes`, which keeps runs contiguous by construction); if you
+    /// are adding one, prefer `arrange_lanes` unless you also handle
+    /// contiguity at the call site.
     pub fn set_track_group(
         &self,
         id: &str,

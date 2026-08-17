@@ -213,8 +213,13 @@ class ProjectStore {
    */
   async renameTrack(trackId: string, name: string): Promise<boolean> {
     const t = this.trackById(trackId);
+    if (!t) return false;
     const trimmed = name.trim();
-    if (!t || !trimmed || trimmed === t.name) return false;
+    if (trimmed === t.name) return false;
+    if (!trimmed) {
+      toasts.error("RENAME FAILED", "Name cannot be empty");
+      return false;
+    }
     try {
       const updated = await backend.setTrackName(trackId, trimmed);
       this.patchTrack(trackId, { name: updated.name });
@@ -235,8 +240,12 @@ class ProjectStore {
    * exactly the jank the gesture is meant not to have. A failure re-pulls
    * the authoritative snapshot, so a rejected arrangement corrects itself
    * rather than leaving the UI lying.
+   *
+   * Returns whether it went through, so a caller that layered its own
+   * optimistic state on top (e.g. carrying fold state to a renamed group)
+   * knows to roll that back too.
    */
-  async arrangeLanes(placements: { trackId: string; group: string | null }[]): Promise<void> {
+  async arrangeLanes(placements: { trackId: string; group: string | null }[]): Promise<boolean> {
     const byId = new Map(this.tracks.map((t) => [t.id, t]));
     const reordered: TrackState[] = [];
     for (const p of placements) {
@@ -247,17 +256,19 @@ class ProjectStore {
     // a placement list that lost a track would silently delete lanes here.
     if (reordered.length !== this.tracks.length) {
       console.warn("[aura] arrangeLanes: incomplete arrangement, ignoring");
-      return;
+      return false;
     }
     const previous = this.tracks;
     this.tracks = reordered;
     try {
       await backend.arrangeLanes(placements);
+      return true;
     } catch (err) {
       console.warn("[aura] arrange_lanes failed:", err);
       this.tracks = previous;
       toasts.error("LANE ARRANGE FAILED", String(err));
       await this.reload();
+      return false;
     }
   }
 
