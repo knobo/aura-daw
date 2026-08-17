@@ -46,6 +46,25 @@ export const pitchMode = $state({
 });
 
 /**
+ * Which take the report is about — deliberately OUTSIDE the panel component.
+ *
+ * The Pitch Coach shares the bottom region with the piano roll and is
+ * unmounted when the roll claims it, so component-local state does not
+ * survive a tab switch. Reading the report, double-clicking the reference
+ * clip to look at the note that was flat, and coming back must not throw the
+ * report away — and it did, because this lived in the component. The report
+ * itself is NOT kept: it is refetched, which is the spec's rule (a score is a
+ * function of a melody that is still being edited).
+ *
+ * Not part of `pitchMode`, because `resetPitchBus` clears that on every
+ * unsubscribe and the take outlives the subscription.
+ */
+export const takeState = $state({
+  /** Newest recorded audio clip this session, or null. */
+  clipId: null as string | null,
+});
+
+/**
  * The frames still in the ring, oldest first. Allocates a copy — call it
  * once per rAF frame, not once per drawn point.
  */

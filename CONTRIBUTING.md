@@ -73,7 +73,7 @@ singer. It does not exercise the Tauri command layer.
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 1056 tests (1020 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-17 after Pitch Coach scoring)
+cd src-tauri && cargo test   # 1060 tests (1024 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-17 after the Pitch Coach fix review)
 npm test                     # 593 frontend unit tests (vitest; counted 2026-08-17 after Pitch Coach scoring)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
@@ -92,7 +92,7 @@ PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
   cargo test -- --test-threads=1
 ```
 
-Measured: 1020/1020 in 72 s that way, against 1002/1020 in 882 s over
+Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
 Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
 before filing an engine, transport, loopjam or meter failure as a regression.
 

@@ -208,6 +208,12 @@ report, docs + PR.
       headline ignored coverage, vibrato ran on folded cents) and one froze
       the UI (three sync commands doing seconds of decode + YIN on the GTK
       main thread). See the log.
+- [x] **Second review round, on the fixes themselves.** Five findings, and one
+      was a regression the first round's own fix introduced: multiplying
+      `hit_fraction` by the row's `coverage` billed the onset grace window
+      twice, so four flawless eighth notes entered with a 70 ms consonant
+      scored 72 % "Solid" and a 140 ms note could not pass 50 %. Reviewing a
+      fix commit is not optional — that number would have shipped. See the log.
 
 `panel-logic.targetNotesFor` still expands repeats frontend-side with the
 timeline preview's rule. Task 12 built the backend replacement, but it is
@@ -393,6 +399,47 @@ After finishing each task: tick its box, and add a line under the log below
 with the commit sha and anything the next agent would be surprised by.
 
 ## Log
+
+- 2026-08-17 — **Second review round, on the fix commit itself.** Five
+  findings. The one that matters is a regression the FIRST round's fix
+  introduced, which is the lesson: a fix commit needs reviewing like any other.
+  1. **`hit_fraction * coverage` double-counted the onset grace window.**
+     `hit_fraction` is measured past `ONSET_GRACE_MS`; the row's `coverage`
+     spans the whole note including it. Four flawless eighth notes entered
+     with a 70 ms consonant scored 72 % — "Solid" for a perfect take — and a
+     140 ms note capped at 50 %. There is now a `scored_coverage` measured over
+     the same post-grace window, the headline weights by
+     `scoreable_samples` rather than full length, and two tests pin it.
+  2. **A mean does not survive the octave fold.** Round one unwrapped the
+     wobble measures but left `mean_cents`/`median_cents` averaging folded
+     frames, so a singer parked a tritone away had +595 and -595 cancel to
+     nearly zero: the row drew its cents bar dead centre next to `hit 0 %`.
+     Now unwrapped, averaged, and folded back (`fold_cents`).
+  3. **Forcing `ui.bottomPanel = "roll"` destroyed the take report** — that
+     was round one's own fix for the dead double-click. The panel is
+     unmounted by the roll, and `takeClipId` was component state, so "read
+     the report → open the melody to look at the flat note → back to PITCH"
+     lost it. `takeState` in `state/pitch.svelte.ts` outlives the panel; the
+     report itself is still refetched, per the spec's no-persisted-scores rule.
+  4. The demo backend's report key was unclamped while the lane's is now
+     clamped — in demo mode that IS the report, and it rendered note names
+     that do not exist.
+  5. "Every note came from a chord" was the wrong explanation for
+     `scoredNotes == 0` once the `covered` rule existed: one held note under a
+     single-line melody flags every note without any chord existing.
+
+- 2026-08-17 — **The panel never read the CURRENT pitch state on mount**, only
+  future `pitch://state` events — and `emit_pitch_state` dedupes, so a panel
+  mounting against an engine that already had a reference track drew no melody
+  at all until some unrelated transition happened to emit (a take starting or
+  stopping flips `listening`, which is why the owner saw the notes appear
+  *after* recording). `SubscribePitch` now clears `last_pitch_state` and emits.
+  Reported by the owner's second ear-check; it did NOT reproduce after a
+  restart, which fits exactly — a restart makes them set the reference again,
+  after the panel is already listening. The hole was found in the code, not in
+  a repro, and the test
+  (`subscribing_to_pitch_gets_the_current_state_without_waiting_for_a_change`)
+  asserts the emit rather than the symptom.
 
 - 2026-08-17 — **The 18 "engine never starts" failures were the default audio
   sink being a Bluetooth device.** Recorded because two plausible explanations

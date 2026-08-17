@@ -1331,7 +1331,10 @@ export class DemoBackend implements Backend {
           noteId: n.noteId ?? seed >>> 8,
           startSample: Math.round(this.ticksToSamples(startTicks)),
           endSample: Math.round(this.ticksToSamples(startTicks + n.lengthTicks)),
-          key: n.key + (mc.transposeSemitones ?? 0),
+          // Clamped like the backend's `clip_note_key_vel` and the lane's
+          // `targetNotesFor`: in demo mode this IS the report, and an
+          // unclamped key renders a note name that does not exist.
+          key: Math.max(0, Math.min(127, n.key + (mc.transposeSemitones ?? 0))),
           hitFraction: inTune ? 0.72 + 0.28 * noise(seed, 2) : 0.15 * noise(seed, 3),
           coverage: 0.55 + 0.45 * noise(seed, 4),
           meanCents,

@@ -187,30 +187,49 @@ pub fn score(
     // Session statistics ignore ambiguous notes: a chord we resolved by
     // guessing must not be allowed to claim the singer was flat.
     let mut all_cents: Vec<f32> = Vec::new();
+    // Per note: the share of its SCOREABLE window that was voiced. Not
+    // `NoteScore.coverage`, which spans the whole note — see below.
+    let mut scored_coverage: Vec<f32> = Vec::new();
     let mut prev_end = 0u64;
     for (note, ambiguous) in reference {
-        let (scored, cents) = score_one(note, *ambiguous, frames, rate, tolerance_cents, prev_end);
+        let one = score_one(note, *ambiguous, frames, rate, tolerance_cents, prev_end);
         if !*ambiguous {
-            all_cents.extend(cents);
+            all_cents.extend(one.cents);
         }
-        notes.push(scored);
+        scored_coverage.push(one.scored_coverage);
+        notes.push(one.row);
         prev_end = prev_end.max(note.end);
     }
 
-    let clean: Vec<&NoteScore> = notes.iter().filter(|n| !n.ambiguous).collect();
+    let clean: Vec<(&NoteScore, f32)> = notes
+        .iter()
+        .zip(&scored_coverage)
+        .filter(|(n, _)| !n.ambiguous)
+        .map(|(n, c)| (n, *c))
+        .collect();
 
-    let weight: f32 = clean.iter().map(|n| (n.end_sample - n.start_sample) as f32).sum();
-    // `hit_fraction * coverage`, not `hit_fraction` alone. `hit_fraction` is
-    // measured over the frames the singer VOICED, so one in-tune blip per
-    // note would otherwise claim the note's whole duration and report
-    // "Locked in" for a take that was mostly silence. The headline claims to
-    // be how much of the take landed inside the tolerance; that has to
-    // include the part that was not sung at all.
+    // Weighted by the SCOREABLE part of each note, not its full length. The
+    // onset grace window is documented as free (`ONSET_GRACE_MS`), and giving
+    // it weight here is what charges the singer for it twice — see the
+    // `scored_coverage` comment below.
+    let weight: f32 = clean.iter().map(|(n, _)| scoreable_samples(n, rate)).sum();
+    // `hit_fraction * scored_coverage`, not `hit_fraction` alone.
+    // `hit_fraction` is measured over the frames the singer VOICED, so one
+    // in-tune blip per note would otherwise claim the note's whole duration
+    // and report "Locked in" for a take that was mostly silence. The headline
+    // claims to be how much of the take landed inside the tolerance; that has
+    // to include the part that was not sung at all.
+    //
+    // `scored_coverage` and NOT the row's `coverage`: the row's spans the
+    // whole note, grace window included, while `hit_fraction` starts after
+    // it. Multiplying those two bills every consonant twice — four flawless
+    // eighth notes entered with a 70 ms consonant scored 72 %, "Solid", and a
+    // 140 ms note could not exceed 50 % however well it was sung.
     let in_tolerance_pct = if weight > 0.0 {
         100.0
             * clean
                 .iter()
-                .map(|n| n.hit_fraction * n.coverage * (n.end_sample - n.start_sample) as f32)
+                .map(|(n, cov)| n.hit_fraction * cov * scoreable_samples(n, rate))
                 .sum::<f32>()
             / weight
     } else {
@@ -226,11 +245,11 @@ pub fn score(
         all_cents.iter().map(|c| c.abs()).sum::<f32>() / all_cents.len() as f32
     };
     let median_signed_cents = median(&mut all_cents);
-    let sung: Vec<&&NoteScore> = clean.iter().filter(|n| n.coverage > 0.0).collect();
+    let sung: Vec<&(&NoteScore, f32)> = clean.iter().filter(|(n, _)| n.coverage > 0.0).collect();
     let mean_onset_offset_ms = if sung.is_empty() {
         0.0
     } else {
-        sung.iter().map(|n| n.onset_offset_ms).sum::<f32>() / sung.len() as f32
+        sung.iter().map(|(n, _)| n.onset_offset_ms).sum::<f32>() / sung.len() as f32
     };
 
     PitchScoreReport {
@@ -273,6 +292,13 @@ pub fn cents_to_key(midi: f32, key: u8) -> f32 {
     let mut diff = midi - key as f32;
     diff -= 12.0 * (diff / 12.0).round();
     diff * 100.0
+}
+
+/// Fold a cents value into ±600 — the same rule as [`cents_to_key`], for a
+/// number that was computed in the unwrapped domain and has to be reported in
+/// the folded one.
+fn fold_cents(cents: f32) -> f32 {
+    cents - 1200.0 * (cents / 1200.0).round()
 }
 
 /// Undo the ±600 cent fold *in place*, so a series that steps across the
@@ -326,9 +352,28 @@ fn moving_mean_midi(voiced: &[&PitchFrame], rate: u32) -> Vec<f32> {
     out
 }
 
-/// Score one note, returning its row and the cents series it was judged on
-/// — the session aggregate reuses that series rather than recomputing it,
-/// so a summary can never disagree with the rows above it.
+/// One note's row plus what the session aggregate needs from it.
+struct ScoredNote {
+    row: NoteScore,
+    /// The per-frame cents the note was judged on. The session aggregate
+    /// reuses this rather than recomputing, so a summary can never disagree
+    /// with the rows above it.
+    cents: Vec<f32>,
+    /// Voiced share of the SCOREABLE window (past the onset grace), which is
+    /// the domain `hit_fraction` lives in. `NoteScore.coverage` answers the
+    /// user's question ("did I sing this note at all") over the whole note;
+    /// this answers the aggregate's.
+    scored_coverage: f32,
+}
+
+/// How much of a note the singer can be scored on: its length less the free
+/// onset window, never negative and never zero (a note shorter than the grace
+/// window still has to weigh something).
+fn scoreable_samples(n: &NoteScore, rate: u32) -> f32 {
+    let len = (n.end_sample - n.start_sample) as f32;
+    (len - ms_to_samples(ONSET_GRACE_MS, rate) as f32).max(len * 0.1)
+}
+
 fn score_one(
     note: &AbsNote,
     ambiguous: bool,
@@ -336,7 +381,7 @@ fn score_one(
     rate: u32,
     tolerance_cents: f32,
     prev_end: u64,
-) -> (NoteScore, Vec<f32>) {
+) -> ScoredNote {
     let win = window(frames, note.start, note.end);
     let voiced: Vec<&PitchFrame> = win.iter().filter(|f| f.voiced).collect();
     let coverage = if win.is_empty() { 0.0 } else { voiced.len() as f32 / win.len() as f32 };
@@ -348,6 +393,9 @@ fn score_one(
     let mut scored: Vec<f32> = Vec::new();
     let mut sustain_smoothed: Vec<f32> = Vec::new();
     let mut sustain_raw: Vec<(u64, f32)> = Vec::new();
+    // Frames past the grace window, voiced or not: the denominator of
+    // `scored_coverage`, measured in the same window `scored` is.
+    let scoreable_frames = win.iter().filter(|f| f.sample >= grace_end).count();
     for (f, m) in voiced.iter().zip(&smoothed) {
         let cents = cents_to_key(*m, note.key);
         if f.sample >= grace_end {
@@ -358,6 +406,11 @@ fn score_one(
             sustain_raw.push((f.sample, cents_to_key(f.midi, note.key)));
         }
     }
+    let scored_coverage = if scoreable_frames == 0 {
+        0.0
+    } else {
+        scored.len() as f32 / scoreable_frames as f32
+    };
     // Wobble is measured on an UNWRAPPED series. `cents_to_key` folds every
     // frame into ±600 independently, so a singer sitting about a tritone from
     // the target flips between +600 and -600 while their voice barely moves —
@@ -371,18 +424,32 @@ fn score_one(
         slot.1 = *c;
     }
 
+    // Hit detection stays on the PER-FRAME folded values: octave forgiveness
+    // is a property of each frame, and a singer an octave down is in tune.
     let hit_fraction = if scored.is_empty() {
         0.0
     } else {
         let hits = debounce(&scored.iter().map(|c| c.abs() <= tolerance_cents).collect::<Vec<_>>());
         hits.iter().filter(|h| **h).count() as f32 / hits.len() as f32
     };
-    let mean_cents = if scored.is_empty() {
+    // The reported ERROR, though, is a mean — and means do not survive the
+    // fold. A singer parked about a tritone away has frames at +595 and -595
+    // that cancel to nearly zero, so the row drew its bar dead centre next to
+    // `hit 0 %`. Unwrap, average, then fold the answer: one number in the
+    // folded frame, computed in a continuous one.
+    let mut unwrapped = scored.clone();
+    unwrap_octaves(&mut unwrapped);
+    let mean_unwrapped = if unwrapped.is_empty() {
         0.0
     } else {
-        scored.iter().sum::<f32>() / scored.len() as f32
+        unwrapped.iter().sum::<f32>() / unwrapped.len() as f32
     };
-    let median_cents = median(&mut scored.clone());
+    let mean_cents = fold_cents(mean_unwrapped);
+    // Shift the series into the same frame as the mean, so the session
+    // aggregate and this row cannot tell different stories about one note.
+    let shift = mean_cents - mean_unwrapped;
+    let session_cents: Vec<f32> = unwrapped.iter().map(|c| c + shift).collect();
+    let median_cents = median(&mut session_cents.clone());
     let (vibrato_rate_hz, vibrato_extent_cents) = vibrato(&sustain_raw, rate);
 
     let row = NoteScore {
@@ -400,7 +467,7 @@ fn score_one(
         vibrato_extent_cents,
         ambiguous,
     };
-    (row, scored)
+    ScoredNote { row, cents: session_cents, scored_coverage }
 }
 
 /// How late (positive) or early (negative) the singer entered, in ms.
@@ -846,6 +913,78 @@ mod tests {
             "the fold read as drift: {}",
             rep.notes[0].stability_cents
         );
+    }
+
+    /// The regression the coverage weighting introduced: `hit_fraction` starts
+    /// after the free onset window and `coverage` spans the whole note, so
+    /// multiplying them charged every consonant twice. Four flawless eighth
+    /// notes entered with a 70 ms consonant scored 72 % — "Solid" for a take
+    /// sung perfectly.
+    #[test]
+    fn a_consonant_on_every_note_does_not_cost_the_headline() {
+        let notes: Vec<AbsNote> = (0..4).map(|i| note(i, 60, i as u64 * 250, 250)).collect();
+        let r = reference_melody(notes, RATE);
+        let mut frames = Vec::new();
+        for i in 0..4u64 {
+            let start = i * 250;
+            let mut f = sung(start, start + 250, 60.0);
+            // 70 ms of consonant, exactly the documented free window.
+            for x in f.iter_mut().take(7) {
+                x.voiced = false;
+            }
+            frames.extend(f);
+        }
+        let rep = score(&r, &frames, RATE, 50.0);
+        assert!(
+            rep.in_tolerance_pct > 93.0,
+            "the free onset window must stay free: {} ({})",
+            rep.in_tolerance_pct,
+            rep.rating
+        );
+        assert_eq!(rep.rating, "Locked in");
+    }
+
+    /// Short notes are where the double-count hurt most: a 140 ms note could
+    /// not exceed 50 % however well it was sung.
+    #[test]
+    fn short_notes_can_still_reach_full_marks() {
+        let r = reference_melody(vec![note(1, 60, 0, 140), note(2, 62, 140, 140)], RATE);
+        let mut frames = sung(0, 140, 60.0);
+        frames.extend(sung(140, 280, 62.0));
+        let rep = score(&r, &frames, RATE, 50.0);
+        assert!(rep.in_tolerance_pct > 93.0, "got {}", rep.in_tolerance_pct);
+    }
+
+    /// A mean does not survive the fold: frames at +595 and -595 cancel to
+    /// nearly zero, which drew the row's cents bar dead centre next to
+    /// `hit 0 %`.
+    #[test]
+    fn a_row_near_the_fold_reports_its_error_not_the_average_of_the_fold() {
+        let r = reference_melody(vec![note(1, 60, 0, 1000)], RATE);
+        let frames: Vec<PitchFrame> = sung(0, 1000, 60.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut f)| {
+                let t = i as f32 * 0.010;
+                f.midi = 66.0 + 0.10 * (2.0 * std::f32::consts::PI * 5.0 * t).sin();
+                f.hz = crate::audio::yin::midi_to_hz(f.midi);
+                f
+            })
+            .collect();
+        let rep = score(&r, &frames, RATE, 50.0);
+        let n = &rep.notes[0];
+        assert!(
+            n.mean_cents.abs() > 500.0,
+            "a tritone off must not read as nearly in tune: {}",
+            n.mean_cents
+        );
+        assert!(
+            n.mean_cents.signum() == n.median_cents.signum(),
+            "mean {} and median {} must agree on which side of the note it was",
+            n.mean_cents,
+            n.median_cents
+        );
+        assert!(n.hit_fraction < 0.1, "and it is not a hit");
     }
 
     #[test]

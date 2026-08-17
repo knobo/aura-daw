@@ -28,7 +28,13 @@
   import { ui } from "../../state/ui.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { TOLERANCE_CENTS } from "../../prefs/schema";
-  import { pitchMode, recentFrames, startPitchStream, stopPitchStream } from "../../state/pitch.svelte";
+  import {
+    pitchMode,
+    recentFrames,
+    startPitchStream,
+    stopPitchStream,
+    takeState,
+  } from "../../state/pitch.svelte";
   import { autoFitRange, bandFor, centsToTarget, trailSegments, yOfKey, type LaneRange } from "../../pitch/lane";
   import { laneWindowFor, stabilityCents, targetNotesFor } from "./panel-logic";
   import { view } from "../../state/view.svelte";
@@ -122,7 +128,10 @@
   // that clip scored against the reference melody. Both halves have to
   // exist, so a take recorded with no reference selected sits and waits for
   // one instead of being scored against nothing.
-  let takeClipId = $state<string | null>(null);
+  // `takeState`, not component state: the roll unmounts this panel, and a
+  // report that vanishes when you go look at the melody is a report you
+  // cannot act on. See `state/pitch.svelte.ts`.
+  const takeClipId = $derived(takeState.clipId);
   let report = $state<PitchScoreReport | null>(null);
   let scorePending = $state(false);
   let scoreError = $state<string | null>(null);
@@ -134,7 +143,7 @@
     // one on the track the singer was on — which the engine does not label,
     // so the newest is the honest guess and the user can re-record.
     const off = backend.on("recording://state", (rs) => {
-      if (!rs.recording && rs.clips?.length) takeClipId = rs.clips[rs.clips.length - 1].id;
+      if (!rs.recording && rs.clips?.length) takeState.clipId = rs.clips[rs.clips.length - 1].id;
     });
     return off;
   });

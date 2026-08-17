@@ -67,17 +67,20 @@
   {:else}
     <header class="summary">
       {#if report.scoredNotes === 0}
-        <!-- Nothing scoreable is not a score of zero: every reference note
-             came out of a chord, so the melody line was guessed throughout
-             and no summary number would mean anything. The rows below still
-             say what happened. -->
+        <!-- Nothing scoreable is not a score of zero: the melody line was
+             guessed for every note, so no summary number would mean anything.
+             The wording says "ambiguous" and not "chord" because a chord is
+             only one of the two causes — a single held note under a
+             single-line melody covers every note of it without any two notes
+             sharing an onset. The rows below still say what happened. -->
         <span class="headline">
           <strong class="nothing">—</strong>
-          <span class="rating">Every note came from a chord</span>
+          <span class="rating">No note to score against</span>
         </span>
         <p class="note mono chordy">
-          The melody line was guessed for the whole take, so it is not scored. Pick a reference
-          track that carries a single line, or mute the harmony.
+          Every reference note overlaps another, so the melody line was guessed throughout and the
+          take is not scored. Pick a track that carries a single line — or mute whatever is held
+          underneath it.
         </p>
       {:else}
         <span class="headline">
