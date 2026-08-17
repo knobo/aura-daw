@@ -11,13 +11,13 @@ Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-in
 
 **Do not:** start G2/G3/G4; write a stock FX suite; bump
 `OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
-Pitch Coach phases 1 **and 2**).
+Pitch Coach phases 1–3, the lanes UX track, the theme system).
 
-**Nothing is in flight.** Pitch Coach phase 2 merged as `7c3cb87`
-(PR #58). Stale worktrees for merged branches can be ignored — but keep
-the branches `feat/pitch-coach`, `feat/pitch-coach-panel` and
-`plan-f-history`, whose per-commit or squashed SHAs are cited in the
-handoffs.
+**Nothing is in flight.** Latest on `main`: `5f891cb` (lanes UX, PR #60).
+Stale worktrees for merged branches can be ignored — but keep the
+branches `feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history`
+and `worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in
+the handoffs.
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
@@ -28,6 +28,9 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
+| Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
+| Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
+| Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
 | G1 Tasks 2–4 — insert ops, commands, `HostRole::Effect`, HostForward restore | PR #55 `118ae23`. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | G1 Task 1 — `InsertSlot` on `TrackState.inserts` | PR #52 `5c338ff` |
 | Pitch Coach **phase 2** — panel, frame bus, lane geometry, prefs | PR #58 `7c3cb87`. Adds `pitch_unsubscribe` (additive). Owner ear-check done; the fixes it produced have NOT been re-checked by ear. **Next: phase 3, Task 12** — but read [`pitch-as-data.md`](docs/backlog/pitch-as-data.md) before Task 14 |
@@ -60,21 +63,24 @@ this file (marked correction, ADR 0007) if they do.
   rulings it needs before Stage A:
   [`pitch-correction-autotune.md`](docs/backlog/pitch-correction-autotune.md).
   Do not start Stage C (live insert) before G1 inserts + PDC.
-- **Pitch Coach phase 3** — scoring, Tasks 12–16, once phase 2's PR is in.
-  Task 12 (the shared repeat-expansion helper) also replaces
-  `panel-logic.targetNotesFor`, which expands repeats frontend-side today.
-  Read
+- **Pitch Coach phase 3 landed** (PR #61, see the Landed table). Whatever
+  is next for Pitch Coach lives in
   [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md)
-  first. **The panel has never run against the real engine** — only against
-  `DemoBackend`'s synthetic singer in a browser. That ear-check is the
-  first thing to do with the phase 2 branch.
-- **Uncommitted Windows-build work in the main checkout** (branch
-  `docs/pitch-coach-handoff`, 2026-08-17): a `lv2` Cargo feature with an
-  `lv2_host_stub`, Windows CLAP search paths, platform-aware ffmpeg hints, a
-  `release-windows.yml`, and `bundle.active: true`. Not mine, not in a PR,
-  and **`git status` in that tree is dirty** — do not stash it, do not
-  "clean up" around it. A review of it found five things the owner had not
-  seen yet, recorded here because they exist nowhere else:
+  — read that file rather than this bullet, which is not being kept
+  current for that track.
+- **Uncommitted Windows-build work in the main checkout** — status
+  UNCLEAR as of this update (2026-08-17): the main checkout has since
+  moved from branch `docs/pitch-coach-handoff` to `main` and is now
+  clean, with none of the files below present or tracked. It is not
+  known from this session whether that work was committed elsewhere,
+  intentionally dropped, or is sitting in a stash/another checkout —
+  **check before assuming it is gone**. What follows is what a review
+  found while the tree was still dirty on branch `docs/pitch-coach-handoff`
+  (2026-08-17), recorded here because it exists nowhere else: a `lv2`
+  Cargo feature with an `lv2_host_stub`, Windows CLAP search paths,
+  platform-aware ffmpeg hints, a `release-windows.yml`, and
+  `bundle.active: true`. Not the current session's work, and not in a PR.
+  Five things the owner had not seen yet:
   1. **`src-tauri/icons/icon.ico` is untracked** while `tauri.conf.json`
      (a tracked modification) references it. `git commit -am` lands the
      reference without the asset and the first `v*` tag fails at the bundle
