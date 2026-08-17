@@ -142,5 +142,9 @@ once Stage B and the shifter exist, and a real reason people pick a tool.
   shape a corrector's UI too.
 - `docs/backlog/insert-fx-sends-sidechain.md` + the G1 plan — the insert
   seam Stage C needs.
+- [`pitch-as-data.md`](pitch-as-data.md) — where the source curve and the
+  target melody come from, and the four `APTF` decisions Stage A depends on.
+  In particular: the recorder's folded track is the CAUSAL median, and
+  correction wants the centred one.
 - `sidecars/hum_to_midi.py` — the constants the Rust detector copies
   verbatim, and the parity test that keeps them honest.

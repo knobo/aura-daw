@@ -41,6 +41,12 @@ this file (marked correction, ADR 0007) if they do.
 
 - **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
 - **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **Pitch as data** — new owner ask (2026-08-17). Melody extraction from an
+  existing clip (→ MIDI clip) and the continuous pitch track (→ `APTF`, from
+  Pitch Coach Task 14). **If you are about to implement Task 14, read
+  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md) first**: four
+  decisions are due before that format ships, and one of them (a provenance
+  byte for causal-vs-centred smoothing) is free now and a migration later.
 - **Pitch correction / auto-tune** — new owner ask (2026-08-17), NOT part of
   the Pitch Coach plan. Detection is done; a formant-preserving shifter and
   a correction policy are not. Offline-first staged path and the four

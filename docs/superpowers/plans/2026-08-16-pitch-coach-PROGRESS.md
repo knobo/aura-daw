@@ -168,6 +168,14 @@ helper, scoring, pitch track on disk, the report, docs + PR.
 `panel-logic.targetNotesFor` currently expands repeats frontend-side with
 the timeline preview's rule — Task 12 is what replaces it.
 
+**Before implementing Task 14, read
+[`docs/backlog/pitch-as-data.md`](../../backlog/pitch-as-data.md).** The
+owner has since asked for pitch extraction from existing clips and for
+auto-tune, which makes `APTF` a shared format rather than a scoring detail.
+Four decisions are due while it is still unbuilt; the load-bearing one is
+that the recorder folds the CAUSAL median (20 ms lag) while an offline pass
+can use the centred one, so the format should record which it holds.
+
 ### What phase 2 must not get wrong
 
 Both of these came out of actually running the detector against a voice
