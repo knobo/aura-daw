@@ -770,6 +770,12 @@ mod tests {
         // MidiSetNotes → midi_clips.insert(clip)
         let c = cs(&[Op::MidiSetNotes { clip: "mc-x".into(), notes: vec![] }]);
         assert_eq!(c, ChangeSet { midi_clips: clip_ids(&["mc-x"]), ..Default::default() });
+        // HarmonySet → harmony ONLY (Plan H1): no clip, track or transport
+        // state is addressable by it, and it deliberately does not touch
+        // midi_meta — the tempo/meter Arcs have no reason to re-derive when a
+        // chord changes.
+        let c = cs(&[Op::HarmonySet { keys: vec![], chords: vec![] }]);
+        assert_eq!(c, ChangeSet { harmony: true, ..Default::default() });
         // Launch* → launch_maps
         let c = cs(&[Op::LaunchBindingSet {
             map_id: String::new(),
@@ -962,6 +968,41 @@ mod tests {
     /// Launch maps are document content: a restore must put them back, and
     /// the published image must carry them so a later rebuild sees the same
     /// drive-clip set the live store has.
+    #[test]
+    fn restore_from_snapshot_round_trips_the_harmony_document() {
+        // `restore_from_snapshot` assigns field by field, and it is what the
+        // PANIC arm of `transact` uses (F-3 containment) — a content field
+        // missing from it survives a rollback that undoes everything else.
+        let m = two_clip_session();
+        let before = m.lock().published_handle().lock().clone();
+        assert!(before.midi.harmony.is_empty());
+        let doc = crate::theory::HarmonyDoc::from_chords(
+            crate::theory::Key::c_major(),
+            0,
+            3840,
+            &["C", "G7"].map(|s| crate::theory::Chord::parse(s).unwrap()),
+        );
+        Session::transact(&m, TxMeta::user("harmony"), |tx| {
+            tx.apply(Op::HarmonySet { keys: doc.keys.clone(), chords: doc.chords.clone() })
+        })
+        .unwrap();
+        assert_eq!(m.lock().midi.harmony, doc);
+        assert_eq!(*m.lock().published_handle().lock().midi.harmony, doc, "published too");
+
+        // The materialize-from-image path (the version graph's replay base)
+        // has the same field-by-field shape and needs the same field.
+        let scratch = Session::from_snapshot(&m.lock().published_handle().lock().clone());
+        assert_eq!(scratch.midi.harmony, doc, "from_snapshot carries it too");
+
+        let mut g = m.lock();
+        g.restore_from_snapshot(&before);
+        assert!(g.midi.harmony.is_empty(), "restored to the pre-edit document");
+        assert!(
+            g.published_handle().lock().midi.harmony.is_empty(),
+            "…and the published image with it"
+        );
+    }
+
     #[test]
     fn restore_from_snapshot_round_trips_launch_maps() {
         let m = two_clip_session();

@@ -227,6 +227,11 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
             midi.tempo_events = v2.tempo_events;
             midi.meter_events = v2.meter_events;
             midi.clips = v2.clips;
+            // Plan H1: the harmony document is adopted like every other midi
+            // field. Field-by-field assignment is why this line has to exist —
+            // without it, opening a project keeps the PREVIOUS project's chords
+            // in memory, and the first edit persists them into the new one.
+            midi.harmony = v2.harmony;
             midi.launch_maps = v2.launch_maps;
             crate::midi::launch::runtime().set_maps(midi.launch_maps.clone());
             crate::midi::launch::runtime().clear_armed();
@@ -238,6 +243,7 @@ pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm
                 midi.tempo_events = d0.tempo_events;
                 midi.meter_events = d0.meter_events;
                 midi.clips = d0.clips;
+                midi.harmony = d0.harmony;
                 midi.launch_maps = d0.launch_maps;
                 crate::midi::launch::runtime().set_maps(midi.launch_maps.clone());
                 crate::midi::launch::runtime().clear_armed();
@@ -970,6 +976,51 @@ mod tests {
             Some(std::path::PathBuf::from("/old/project")),
             "refuses to adopt the new dir while dirty"
         );
+    }
+
+    #[test]
+    fn adopt_midi_from_dir_adopts_the_harmony_document_and_clears_a_stale_one() {
+        // The trap this pins: `adopt_midi_from_dir` assigns field by field, so
+        // a new field that is not listed there survives a project switch —
+        // leaving the OLD project's chords in memory, ready to be persisted
+        // into the new one by the first edit.
+        let parent = std::env::temp_dir()
+            .join(format!("aura-harmony-adopt-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&parent).unwrap();
+        let (_p, with_harmony) =
+            crate::audio::project::create(&parent, "WithHarmony", 48_000, 120.0).unwrap();
+        let (_p2, without) =
+            crate::audio::project::create(&parent, "Plain", 48_000, 120.0).unwrap();
+
+        let mut saved = MidiStore::default();
+        saved.harmony = crate::theory::HarmonyDoc::from_chords(
+            crate::theory::Key::c_major(),
+            0,
+            3840,
+            &[crate::theory::Chord::parse("Am").unwrap()],
+        );
+        persist::save_into_project(&with_harmony, &saved).unwrap();
+        persist::save_into_project(&without, &MidiStore::default()).unwrap();
+
+        // `adopt_midi_from_dir` writes the PROCESS-GLOBAL launch runtime on
+        // its way past (`set_maps`/`clear_armed`), so this test puts it back —
+        // the suite runs single-threaded and a neighbour that expects launch
+        // state would otherwise pay for this one.
+        let launch_maps_before = crate::midi::launch::runtime().maps();
+
+        let mut midi = MidiStore::default();
+        adopt_midi_from_dir(&mut midi, &with_harmony, 120.0);
+        assert_eq!(midi.harmony.progression_string(), "Am", "adopted from disk");
+
+        adopt_midi_from_dir(&mut midi, &without, 120.0);
+        assert!(
+            midi.harmony.is_empty(),
+            "a project with no harmony must not inherit the previous one's: {}",
+            midi.harmony.progression_string()
+        );
+
+        crate::midi::launch::runtime().set_maps(launch_maps_before);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     // ---- Task 6 (Gate E test-4 precursor): declared MIDI read paths are

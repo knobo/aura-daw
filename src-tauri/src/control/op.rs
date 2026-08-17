@@ -661,6 +661,30 @@ mod tests {
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, tempo_set);
 
+        // Plan H1: `HarmonySet`'s wire form is a PERSISTED format (it rides
+        // journal.ndjson), and its whole design bet is that keys and chords
+        // ride as spelled strings — so the round trip has to preserve a
+        // spelling that a pitch-class encoding would have destroyed.
+        let harmony_set = Op::HarmonySet {
+            keys: vec![crate::theory::KeySpan {
+                tick: 0,
+                key: crate::theory::Key::parse("Gb major").unwrap(),
+            }],
+            chords: vec![crate::theory::ChordSpan::new(
+                0,
+                3840,
+                crate::theory::Chord::parse("Cbmaj7").unwrap(),
+            )],
+        };
+        let s = serde_json::to_string(&harmony_set).unwrap();
+        eprintln!("HarmonySet wire form: {}", s);
+        assert!(s.contains("\"kind\":\"harmonySet\""), "wire form was: {s}");
+        assert!(s.contains("\"Gb ionian\""), "keys spell themselves: {s}");
+        assert!(s.contains("\"Cbmaj7\""), "…and so do chords, Cb not B: {s}");
+        assert!(s.contains("\"lengthTicks\":3840"), "camelCase on the wire: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, harmony_set);
+
         let midi_clip = crate::midi::types::MidiClip {
             id: "mc-1".into(),
             track_id: "t-2".into(),

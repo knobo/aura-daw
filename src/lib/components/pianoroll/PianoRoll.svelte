@@ -117,7 +117,11 @@
     if (!clip || !harmonyTint) return;
     const from = clip.timelineStartTicks;
     const to = from + midi.effectiveContentLengthTicks(clip);
-    void composer.chords.length;
+    // Depend on the VIEW, not on the chord count: an edit that changes one
+    // chord's symbol without changing how many there are still drops the
+    // palette cache, and a length-only dependency would leave the roll
+    // untinted until something else happened to invalidate this effect.
+    void composer.view;
     void composer.loadRegionPalettes(from, to);
   });
   const color = $derived(track?.color ?? theme.tokens.green);

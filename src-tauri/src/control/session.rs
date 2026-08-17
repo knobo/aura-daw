@@ -225,6 +225,7 @@ impl Session {
         midi.tempo_events = (*snap.midi.tempo_events).clone();
         midi.meter_events = (*snap.midi.meter_events).clone();
         midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        midi.harmony = (*snap.midi.harmony).clone();
         midi.launch_maps = (*snap.midi.launch_maps).clone();
         // `loaded_dir: None` / `dirty: false` are `MidiStore::default()`'s.
         let mut plugins = (*snap.plugins).clone();
@@ -263,6 +264,11 @@ impl Session {
         self.midi.tempo_events = (*snap.midi.tempo_events).clone();
         self.midi.meter_events = (*snap.midi.meter_events).clone();
         self.midi.clips = snap.midi.clips.iter().map(|c| (**c).clone()).collect();
+        // Plan H1: the harmony document is content, so it is restored with the
+        // rest of it. Missing here, a panicking `transact` closure would leave
+        // a mutated progression behind while everything else rolled back —
+        // exactly the inconsistency F-3's containment exists to prevent.
+        self.midi.harmony = (*snap.midi.harmony).clone();
         self.midi.launch_maps = (*snap.midi.launch_maps).clone();
         crate::midi::launch::runtime().set_maps(self.midi.launch_maps.clone());
         self.automation.lanes = (*snap.automation).clone();
@@ -295,7 +301,8 @@ impl Session {
     }
 
     /// Clone of the midi fields `midi::persist` persists — `ppq`,
-    /// `tempo_events`, `meter_events`, `clips` — taken under the session
+    /// `tempo_events`, `meter_events`, `clips`, `launch_maps`, `harmony` —
+    /// taken under the session
     /// lock so `ControlPlane::execute_persist` can write it to disk AFTER
     /// the lock is released (round-2 §4: no disk I/O under the session
     /// lock). `midi::persist::V3Data` already has exactly this shape.
