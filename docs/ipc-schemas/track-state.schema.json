@@ -50,6 +50,12 @@
       "type": "string",
       "pattern": "^#[0-9a-f]{6}$"
     },
+    "group": {
+      "description": "Lane group this track displays under, as the group's own name. Absent or null = ungrouped. Display grouping only — the mixer graph and slot numbering ignore it. Additive (lanes UX); pre-lanes projects omit it.",
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 256
+    },
     "inserts": {
       "description": "Ordered insert-FX slots. Slot id is a stable UUID; instanceId names a PluginInstanceInfo.id. Absent means empty.",
       "type": "array",

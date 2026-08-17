@@ -694,6 +694,16 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 effect.persist.project = true;
                 return Ok(inverse);
             }
+            if matches!(path, PropPath::Name | PropPath::Group) {
+                // Document-only (lanes UX): a track's display name and its
+                // lane-group membership are labels. They have no RT param
+                // counterpart to write and no graph node to rebuild — the
+                // mixer topology is identical before and after — so these
+                // return here rather than falling into the mix-param
+                // rewrite below. They ARE durable, hence `persist.project`.
+                effect.persist.project = true;
+                return Ok(inverse);
+            }
             // Mirror the retired `ops::apply_track_mix` (deleted in Plan B,
             // behavior preserved here): a changed track gets all four mix
             // params rewritten from the current (post-write) snapshot, not
@@ -1720,6 +1730,54 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 bypassed: previous,
             })
         }
+        Op::TrackReorder { order } => {
+            // Permutation check FIRST, before any mutation: `derive_slots`
+            // numbers RT mixer slots from display order, so accepting a
+            // short/long/duplicated list would silently drop rows or
+            // re-point live param slots at the wrong track. A rejected op
+            // must leave the store untouched, so nothing is written until
+            // the order is known-good.
+            let previous: Vec<crate::ids::TrackId> =
+                session.store.tracks.iter().map(|t| t.id.clone()).collect();
+            if order.len() != previous.len() {
+                return Err(format!(
+                    "track reorder: expected {} ids, got {}",
+                    previous.len(),
+                    order.len()
+                ));
+            }
+            let mut seen = std::collections::HashSet::with_capacity(order.len());
+            for id in order {
+                if !seen.insert(id) {
+                    return Err(format!("track reorder: duplicate track id: {id}"));
+                }
+                if !previous.contains(id) {
+                    return Err(format!("track reorder: unknown track: {id}"));
+                }
+            }
+            // Same order in, same order out: skip the rebuild rather than
+            // churning the graph for a drag that landed where it started.
+            if *order == previous {
+                return Ok(Op::TrackReorder { order: previous });
+            }
+            // Drain into a lookup and re-collect, so each row moves exactly
+            // once and no row is cloned (tracks carry insert chains).
+            let mut by_id: std::collections::HashMap<crate::ids::TrackId, TrackState> = session
+                .store
+                .tracks
+                .drain(..)
+                .map(|t| (t.id.clone(), t))
+                .collect();
+            session.store.tracks = order
+                .iter()
+                .map(|id| by_id.remove(id).expect("checked above: order is a permutation"))
+                .collect();
+            // Structural: display order IS slot order (`derive_slots`), so
+            // the graph has to be rebuilt against the new numbering.
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::TrackReorder { order: previous })
+        }
         _ => Err("op not yet supported".into()),
     }
 }
@@ -1731,6 +1789,13 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
 /// Clip-only path like `TimelineStartSamples` — that must fail the
 /// transaction atomically (via `apply_raw`'s `?`), never panic a `transact`
 /// closure (round-2 §4's no-panic-in-transact invariant).
+/// Upper bound for a track name and a lane-group name, in CHARACTERS (not
+/// bytes) — mirrors `maxLength: 256` in track-state.schema.json. Counted in
+/// `chars()` so the limit means the same thing for a name typed in any
+/// script, and so a 256-emoji name cannot smuggle a kilobyte into every
+/// snapshot the store publishes.
+const MAX_TRACK_NAME_CHARS: usize = 256;
+
 fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String> {
     match path {
         PropPath::Gain => Ok(serde_json::json!(t.gain_db)),
@@ -1741,8 +1806,11 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         // Option<String> serializes as a JSON string or null, never a
         // wrapping object — same wire shape `write_prop` below accepts.
         PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
-        PropPath::Name
-        | PropPath::TimelineStartSamples
+        PropPath::Name => Ok(serde_json::json!(t.name)),
+        // Same string-or-null wire shape as `InstrumentId` — never an
+        // `Option`-shaped object.
+        PropPath::Group => Ok(serde_json::json!(t.group)),
+        PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
@@ -1801,8 +1869,44 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             t.instrument_id = v;
             Ok(serde_json::json!(t.instrument_id))
         }
-        PropPath::Name
-        | PropPath::TimelineStartSamples
+        // Trim-and-reject-empty, the same validation rule the MidiClip
+        // `Name` path applies: the write side is the authority, so the
+        // computed inverse observes the POST-trim value and an undo puts
+        // back exactly what was stored, not what the caller typed.
+        PropPath::Name => {
+            let v = to.as_str().ok_or("name: expected a string")?.trim();
+            if v.is_empty() {
+                return Err("name: must not be empty".into());
+            }
+            if v.chars().count() > MAX_TRACK_NAME_CHARS {
+                return Err(format!("name: at most {MAX_TRACK_NAME_CHARS} characters"));
+            }
+            t.name = v.to_string();
+            Ok(serde_json::json!(t.name))
+        }
+        // Empty/whitespace normalizes to `None` so "ungrouped" has exactly
+        // ONE store representation — otherwise `Some("")` and `None` would
+        // both mean ungrouped and every reader would need to test both.
+        PropPath::Group => {
+            let v = match to {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => match s.trim() {
+                    "" => None,
+                    t => {
+                        if t.chars().count() > MAX_TRACK_NAME_CHARS {
+                            return Err(format!(
+                                "group: at most {MAX_TRACK_NAME_CHARS} characters"
+                            ));
+                        }
+                        Some(t.to_string())
+                    }
+                },
+                _ => return Err("group: expected a string or null".into()),
+            };
+            t.group = v;
+            Ok(serde_json::json!(t.group))
+        }
+        PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
         | PropPath::TimelineStartTicks
@@ -1842,6 +1946,7 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Group
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
@@ -1916,6 +2021,7 @@ fn write_midi_prop(
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Group
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
         | PropPath::OffsetSamples
@@ -1952,6 +2058,7 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Group
         | PropPath::Name
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
@@ -2024,6 +2131,7 @@ fn write_transport_prop(
         | PropPath::Soloed
         | PropPath::Armed
         | PropPath::InstrumentId
+        | PropPath::Group
         | PropPath::Name
         | PropPath::TimelineStartSamples
         | PropPath::LengthSamples
@@ -2164,6 +2272,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         });
         Session::new(store, MidiStore::default())
     }
@@ -2654,6 +2763,182 @@ mod tests {
         })
         .unwrap();
         assert_eq!(m.lock().store.tracks[0].instrument_id, None, "undo restores None");
+    }
+
+    // ---- lanes UX: rename, group, reorder --------------------------------
+
+    /// Session with `n` tracks named `t-1..t-n`, in that display order.
+    fn session_with_tracks(n: usize) -> Session {
+        let mut store = Store::default();
+        for i in 1..=n {
+            let mut t = test_track(&format!("t-{i}"));
+            t.name = format!("Track {i}");
+            store.tracks.push(t);
+        }
+        Session::new(store, MidiStore::default())
+    }
+
+    fn order_of(s: &parking_lot::Mutex<Session>) -> Vec<String> {
+        s.lock().store.tracks.iter().map(|t| t.id.to_string()).collect()
+    }
+
+    #[test]
+    fn track_rename_round_trips_and_is_a_document_only_change() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let c = Session::transact(&m, TxMeta::user("rename"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::Name,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("  Lead Vocal  "),
+            })
+        })
+        .unwrap();
+        // The write side trims: what lands in the store is the trimmed name.
+        assert_eq!(m.lock().store.tracks[0].name, "Lead Vocal");
+        // A name is a label: no graph node changes, no RT param moves. If
+        // this ever starts rebuilding, renaming a track would glitch audio.
+        assert!(!c.effect.rebuild, "a rename must not rebuild the graph");
+        assert!(c.effect.param_writes.is_empty(), "a rename writes no RT params");
+        assert!(c.effect.persist.project, "a rename must persist the project");
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].name, "Track 1", "undo restores the old name");
+    }
+
+    #[test]
+    fn track_rename_rejects_empty_and_whitespace_only_names() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        for bad in ["", "   ", "\t\n"] {
+            let r = Session::transact(&m, TxMeta::user("rename"), |tx| {
+                tx.apply(Op::Set {
+                    object: ObjectRef::Track("t-1".into()),
+                    path: PropPath::Name,
+                    from: serde_json::Value::Null,
+                    to: serde_json::json!(bad),
+                })
+            });
+            assert!(r.is_err(), "{bad:?} must be rejected — a nameless lane is unaddressable");
+        }
+        assert_eq!(m.lock().store.tracks[0].name, "Track 1", "store untouched");
+    }
+
+    #[test]
+    fn track_group_normalizes_empty_to_none_and_round_trips() {
+        let m = parking_lot::Mutex::new(session_with_one_track("t-1"));
+        let c = Session::transact(&m, TxMeta::user("group"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::Group,
+                from: serde_json::Value::Null,
+                to: serde_json::json!(" Drums "),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].group.as_deref(), Some("Drums"));
+        assert!(!c.effect.rebuild, "grouping is display-only — never a rebuild");
+        // "" must land as None, not Some(""), so ungrouped has one shape.
+        Session::transact(&m, TxMeta::user("ungroup via empty"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Track("t-1".into()),
+                path: PropPath::Group,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("   "),
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0].group, None, "blank normalizes to None");
+    }
+
+    #[test]
+    fn track_reorder_permutes_and_inverse_restores_the_previous_order() {
+        let m = parking_lot::Mutex::new(session_with_tracks(4));
+        let c = Session::transact(&m, TxMeta::user("reorder"), |tx| {
+            tx.apply(Op::TrackReorder {
+                order: vec!["t-3".into(), "t-1".into(), "t-4".into(), "t-2".into()],
+            })
+        })
+        .unwrap();
+        assert_eq!(order_of(&m), ["t-3", "t-1", "t-4", "t-2"]);
+        // Display order IS mixer-slot order (`derive_slots`), so a reorder
+        // has to renumber the graph.
+        assert!(c.effect.rebuild, "reorder must rebuild — slots follow display order");
+        assert!(c.effect.persist.project);
+        Session::transact(&m, TxMeta::user("undo"), |tx| {
+            for op in c.inverses.clone() {
+                tx.apply(op)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(order_of(&m), ["t-1", "t-2", "t-3", "t-4"], "undo restores the order");
+    }
+
+    #[test]
+    fn track_reorder_rejects_non_permutations_without_touching_the_store() {
+        let bad: Vec<(&str, Vec<crate::ids::TrackId>)> = vec![
+            ("short", vec!["t-1".into(), "t-2".into()]),
+            ("duplicate", vec!["t-1".into(), "t-1".into(), "t-3".into()]),
+            ("unknown id", vec!["t-1".into(), "t-2".into(), "t-9".into()]),
+            (
+                "too long",
+                vec!["t-1".into(), "t-2".into(), "t-3".into(), "t-3".into()],
+            ),
+        ];
+        for (why, order) in bad {
+            let m = parking_lot::Mutex::new(session_with_tracks(3));
+            let before_rev = m.lock().rev;
+            let r = Session::transact(&m, TxMeta::user("reorder"), |tx| {
+                tx.apply(Op::TrackReorder { order: order.clone() })
+            });
+            assert!(r.is_err(), "{why} must be rejected");
+            // The whole point of validating before mutating: a rejected
+            // order must not have dropped or re-pointed a single row.
+            assert_eq!(order_of(&m), ["t-1", "t-2", "t-3"], "{why}: store untouched");
+            assert_eq!(m.lock().rev, before_rev, "{why}: rev unchanged");
+        }
+    }
+
+    #[test]
+    fn track_reorder_to_the_same_order_skips_the_rebuild() {
+        // A drag that ends where it started is common (grab, think, drop).
+        // Rebuilding the audio graph for it would be an audible cost for a
+        // no-op gesture.
+        let m = parking_lot::Mutex::new(session_with_tracks(3));
+        let c = Session::transact(&m, TxMeta::user("reorder"), |tx| {
+            tx.apply(Op::TrackReorder {
+                order: vec!["t-1".into(), "t-2".into(), "t-3".into()],
+            })
+        })
+        .unwrap();
+        assert!(!c.effect.rebuild, "an unchanged order must not rebuild");
+        assert_eq!(order_of(&m), ["t-1", "t-2", "t-3"]);
+    }
+
+    #[test]
+    fn track_reorder_preserves_every_row_field_including_inserts() {
+        // Reorder moves rows; it must never rebuild them. Insert chains and
+        // plugin bindings ride along untouched.
+        let m = parking_lot::Mutex::new(session_with_tracks(3));
+        m.lock().store.tracks[2].inserts.push(crate::audio::types::InsertSlot {
+            id: "slot-a".into(),
+            instance_id: "inst-a".into(),
+            bypassed: true,
+        });
+        m.lock().store.tracks[2].group = Some("Drums".into());
+        let before = m.lock().store.tracks[2].clone();
+        Session::transact(&m, TxMeta::user("reorder"), |tx| {
+            tx.apply(Op::TrackReorder {
+                order: vec!["t-3".into(), "t-1".into(), "t-2".into()],
+            })
+        })
+        .unwrap();
+        assert_eq!(m.lock().store.tracks[0], before, "the moved row is byte-identical");
     }
 
     #[test]

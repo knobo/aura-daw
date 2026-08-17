@@ -1,21 +1,21 @@
 /**
- * Lane geometry for the arrangement timeline: the lane height, y -> lane
- * index, and the per-clip sample-space boxes the marquee hit-tests against.
- * Pure, so the marquee's maths test without a DOM.
+ * Lane geometry for the arrangement timeline: the per-clip sample-space
+ * boxes the marquee hit-tests against. Pure, so the marquee's maths test
+ * without a DOM.
+ *
+ * The y -> lane-index half of this module MOVED to `lane-layout.ts` when
+ * lanes stopped being uniform: a lane is now full-height, a collapsed
+ * strip, or hidden inside a folded group, so a single height constant can
+ * no longer answer "which lane is at this y". `TRACK_HEIGHT_PX` is
+ * re-exported below for the callers that only need the default height.
  */
 import type { LaneBox } from "./clip-selection";
+import { LANE_HEIGHT_PX } from "./lane-layout";
 
-/** One lane's height in LAYOUT px. Mirrors `--track-height` in the app's
- * CSS and the grid canvas's own `trackH`; kept here so the marquee and the
- * grid cannot disagree. */
-export const TRACK_HEIGHT_PX = 88;
-
-/** Which lane a lane-area y coordinate falls in, clamped to the tracks that
- * exist (0 when there are none). */
-export function laneIndexAt(y: number, trackCount: number): number {
-  const raw = Math.floor(y / TRACK_HEIGHT_PX);
-  return Math.max(0, Math.min(raw, Math.max(0, trackCount - 1)));
-}
+/** A full-height lane in LAYOUT px. Re-export, not a second copy:
+ * `lane-layout.ts` owns the value, mirrored by `--track-height` in
+ * app.css. */
+export const TRACK_HEIGHT_PX = LANE_HEIGHT_PX;
 
 export interface BuildLaneBoxesArgs {
   /** Track ids in timeline order — the index into this array IS the lane. */

@@ -131,6 +131,23 @@ pub struct TrackState {
     /// Ordered insert-FX slots (Plan G1). Empty on pre-G1 files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inserts: Vec<InsertSlot>,
+    /// Lane group this track belongs to, as the group's own display NAME —
+    /// the group IS its name, so there is no second document collection to
+    /// keep in sync, no orphan-group GC, and no id→name lookup for the UI.
+    /// Renaming a group is therefore one transaction that rewrites this
+    /// field on each member (`ControlPlane::rename_track_group`), which is
+    /// also exactly the undo unit a user expects.
+    ///
+    /// `None` = ungrouped; the write path (`session::write_prop`) trims and
+    /// maps an empty string to `None`, so "" never reaches the store and
+    /// "ungrouped" has one representation only. Additive: a pre-lanes
+    /// project simply has no groups.
+    ///
+    /// Groups are a DISPLAY grouping (fold a drum bus out of the way), not
+    /// a routing bus — the mixer graph and `derive_slots` ignore this field
+    /// entirely. A bus track kind stays reserved for real routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// One insert-FX slot on a track. `id` is stable across reorder; `instance_id`
@@ -330,6 +347,7 @@ pub(crate) mod testutil {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         }
     }
 

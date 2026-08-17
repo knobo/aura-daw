@@ -944,6 +944,7 @@ mod tests {
                 color: "#7c9cff".into(),
                 instrument_id: None,
                 inserts: Vec::new(),
+                group: None,
             },
             index: 0,
             clips: vec![],

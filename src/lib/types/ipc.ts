@@ -167,6 +167,11 @@ export interface TrackState {
   color: string;
   /** Sampler instrument bound to this (midi) track — additive phase-2 field. */
   instrumentId?: string | null;
+  /** Lane group this track displays under, as the group's own NAME (the
+   * group is its name — there is no separate group row to look up). Absent
+   * or null = ungrouped. Display grouping only: it never affects routing,
+   * the mixer graph, or slot order. Additive (lanes UX). */
+  group?: string | null;
 }
 
 // ── clip.schema.json ────────────────────────────────────────────────────────

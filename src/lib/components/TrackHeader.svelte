@@ -11,12 +11,67 @@
   import { openPluginParams } from "../state/plugin-panel";
   import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
+  import { lanes } from "../state/lanes.svelte";
   import { formatDb } from "../utils/format";
+  import { groupOf } from "../utils/lane-layout";
   import Meter from "./Meter.svelte";
   import LanePickerMenu from "./LanePickerMenu.svelte";
+  import LaneGroupMenu from "./LaneGroupMenu.svelte";
 
-  let { track, index }: { track: TrackState; index: number } = $props();
+  let {
+    track,
+    index,
+    collapsed = false,
+  }: { track: TrackState; index: number; collapsed?: boolean } = $props();
   let pickerOpen = $state(false);
+  let groupMenuOpen = $state(false);
+
+  // ── rename ──
+  // The editor is opened by double-clicking the name, which is the gesture
+  // people already try; the store guards the no-op and empty cases, so this
+  // component only has to manage focus and the two keys.
+  const renaming = $derived(lanes.renamingTrackId === track.id);
+  let draft = $state("");
+  let nameInputEl: HTMLInputElement | undefined = $state();
+
+  function startRename() {
+    draft = track.name;
+    lanes.renamingTrackId = track.id;
+  }
+
+  // The input is inserted after this flips, so focus and select once it
+  // exists — `autofocus` is unreliable for an element that appears
+  // mid-session, and without an explicit select() typing appends to the
+  // old name instead of replacing it.
+  $effect(() => {
+    if (renaming && nameInputEl) {
+      nameInputEl.focus();
+      nameInputEl.select();
+    }
+  });
+
+  async function commitRename() {
+    // Clear FIRST: `blur` fires on Enter too (the input is removed), and a
+    // second commit for the same edit would cost a second undo step.
+    if (lanes.renamingTrackId !== track.id) return;
+    lanes.renamingTrackId = "";
+    await project.renameTrack(track.id, draft);
+  }
+
+  function onNameKeydown(e: KeyboardEvent) {
+    // Stop here rather than bubbling to the window shortcuts: while an
+    // editor is open, Escape means "cancel this", not "cancel a clip drag".
+    e.stopPropagation();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      void commitRename();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      lanes.renamingTrackId = "";
+    }
+  }
+
+  const group = $derived(groupOf(track));
   const isAutomation = $derived(track.kind === "automation");
   const autoTargets = $derived(isAutomation ? modulation.bindingsFrom(track.id) : []);
 
@@ -99,15 +154,105 @@
 
 <div
   class="header"
-  class:picking={pickerOpen}
+  class:picking={pickerOpen || groupMenuOpen}
   class:auto={isAutomation}
+  class:collapsed
+  class:grouped={group !== null}
+  class:dragging={lanes.draggingTrackId === track.id}
   style:--track-color={track.color}
 >
-  <div class="stripe"></div>
+  <!-- The colour stripe doubles as the drag handle: it is already the
+       lane's identity, it runs the full height, and it costs no layout.
+       `data-lane-grip` is what Timeline's rail pointer handler looks for —
+       the drag lives there because it needs the lane column's geometry. -->
+  <div
+    class="stripe"
+    data-lane-grip={track.id}
+    role="presentation"
+    title="Drag to reorder — drop on a group's lanes to join it"
+  ></div>
+  {#if collapsed}
+    <!-- Folded: one strip. Everything here has to survive at 22 px, so it
+         is the name plus the two toggles people scan for (mute, solo) and
+         nothing else. -->
+    <div class="strip">
+      <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
+      {#if renaming}
+        <input
+          class="nameedit"
+          bind:this={nameInputEl}
+          bind:value={draft}
+          aria-label="Track name"
+          onkeydown={onNameKeydown}
+          onblur={commitRename}
+        />
+      {:else}
+        <button class="name asbutton" title="Double-click to rename" ondblclick={startRename}
+          >{track.name}</button
+        >
+      {/if}
+      {#if !isAutomation}
+        <button
+          class="tog mute"
+          class:on={track.muted}
+          title="Mute"
+          onclick={() => project.toggleMute(track.id)}>M</button
+        >
+        <button
+          class="tog solo"
+          class:on={track.soloed}
+          title="Solo"
+          onclick={() => project.toggleSolo(track.id)}>S</button
+        >
+      {/if}
+      <button
+        class="foldbtn mono"
+        aria-expanded="false"
+        title="Unfold lane"
+        aria-label="Unfold lane {track.name}"
+        onclick={() => lanes.toggleTrack(track.id)}>▸</button
+      >
+    </div>
+  {:else}
   <div class="body">
     <div class="row top">
+      <button
+        class="foldbtn mono"
+        aria-expanded="true"
+        title="Fold lane to a strip"
+        aria-label="Fold lane {track.name}"
+        onclick={() => lanes.toggleTrack(track.id)}>▾</button
+      >
       <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
-      <span class="name" title={track.name}>{track.name}</span>
+      {#if renaming}
+        <input
+          class="nameedit"
+          bind:this={nameInputEl}
+          bind:value={draft}
+          aria-label="Track name"
+          onkeydown={onNameKeydown}
+          onblur={commitRename}
+        />
+      {:else}
+        <button
+          class="name asbutton"
+          title="{track.name} — double-click to rename"
+          ondblclick={startRename}>{track.name}</button
+        >
+      {/if}
+      <span class="picker">
+        <button
+          class="groupchip mono"
+          class:on={group !== null}
+          aria-haspopup="menu"
+          aria-expanded={groupMenuOpen}
+          title={group ? `Lane group: ${group}` : "Add this lane to a group"}
+          onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ?? "⌗"}</button
+        >
+        {#if groupMenuOpen}
+          <LaneGroupMenu {track} onclose={() => (groupMenuOpen = false)} />
+        {/if}
+      </span>
       {#if isAutomation}
         <span class="autotag mono">auto</span>
       {/if}
@@ -269,17 +414,122 @@
     </div>
     {/if}
   </div>
+  {/if}
 </div>
 
 <style>
   .header {
     display: flex;
+    /* flex: none is load-bearing. The rail is a flex column inside the
+       scrolling body; without it, a track list taller than the viewport
+       gets SHRUNK to fit while the lane column keeps its real height, and
+       the two columns silently drift apart row by row. */
+    flex: none;
     height: var(--track-height);
     border-bottom: 1px solid rgb(var(--line-rgb) / 0.08);
     background: linear-gradient(to right, rgb(var(--bg-2-rgb) / 0.35), rgb(var(--bg-1-rgb) / 0.15));
   }
+  .header.collapsed {
+    height: var(--lane-collapsed);
+  }
+  /* A grouped lane is inset, so membership is visible at a glance without
+     spending vertical space on a second border. */
+  .header.grouped {
+    padding-left: 10px;
+    background: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--track-color) 7%, rgba(16, 20, 42, 0.35)),
+      rgba(10, 13, 23, 0.15)
+    );
+  }
   .header.picking {
     z-index: 20;
+  }
+  /* The lane being dragged stays in place but recedes, so the drop
+     indicator — not the original row — is what the eye follows. */
+  .header.dragging {
+    opacity: 0.4;
+  }
+
+  /* ── folded lane ── */
+  .strip {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 8px 0 7px;
+  }
+  .strip .name {
+    font-size: 10px;
+  }
+  .strip .tog {
+    width: 16px;
+    height: 14px;
+    font-size: 8px;
+  }
+
+  .foldbtn {
+    width: 13px;
+    height: 13px;
+    flex: none;
+    padding: 0;
+    line-height: 1;
+    font-size: 8px;
+    border: none;
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+  }
+  .foldbtn:hover {
+    color: var(--cyan);
+  }
+
+  .groupchip {
+    flex: none;
+    max-width: 74px;
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    padding: 2px 5px;
+    border-radius: 3px;
+    border: 1px dashed rgba(122, 160, 220, 0.22);
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .groupchip.on {
+    color: var(--cyan);
+    border-style: solid;
+    border-color: var(--cyan-dim);
+  }
+  .groupchip:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+  }
+
+  .nameedit {
+    flex: 1;
+    min-width: 0;
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--text);
+    background: rgba(5, 7, 13, 0.9);
+    border: 1px solid var(--cyan-dim);
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
+  /* The name is a <button> so double-click-to-rename is reachable by
+     keyboard and announced; it must not look like one. */
+  .name.asbutton {
+    text-align: left;
+    border: none;
+    background: transparent;
+    padding: 0;
+    cursor: text;
+    font-family: inherit;
   }
   .autotag {
     font-size: 8px;
@@ -346,11 +596,28 @@
     color: var(--violet);
     border-color: var(--violet);
   }
+  /* Still a 3 px mark, but a 9 px drag target: the paint is clipped to the
+     content box and the extra width is padding, with a negative margin so
+     the body starts exactly where it always did. 3 px is a fine mark and a
+     terrible thing to grab. `filter` rather than `box-shadow` for the glow
+     — box-shadow would trace the 9 px border box and float free of the
+     stripe it belongs to. */
   .stripe {
-    width: 3px;
+    width: 9px;
+    flex: none;
+    padding: 0 3px;
+    margin-right: -6px;
     background: var(--track-color);
+    background-clip: content-box;
     opacity: 0.85;
     box-shadow: 0 0 calc(8px * var(--glow-scale)) color-mix(in srgb, var(--track-color) 60%, transparent);
+    cursor: grab;
+    /* The rail scrolls vertically and so does this gesture; without it the
+       browser claims the drag as a scroll on touch and precision trackpads. */
+    touch-action: none;
+  }
+  .stripe:active {
+    cursor: grabbing;
   }
   .body {
     flex: 1;

@@ -427,6 +427,14 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             Op::InsertSetBypass { track_id, slot_id, .. } => {
                 track_id.as_str().len() + slot_id.len()
             }
+            // Lanes UX: a whole-list order carries one id string per track,
+            // plus the Vec's own allocation. Charged honestly because the
+            // op scales with track count — unlike the fixed-size insert ops
+            // above, a 200-track reorder is not a rounding error.
+            Op::TrackReorder { order } => {
+                order.len() * size_of::<crate::ids::TrackId>()
+                    + order.iter().map(|id| id.as_str().len()).sum::<usize>()
+            }
         };
     }
     bytes
@@ -546,6 +554,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         }
     }
 

@@ -40,6 +40,22 @@ impl TrackMixChange {
     }
 }
 
+/// One lane's place in a whole-arrangement write (lanes UX). The POSITION
+/// in the `Vec` is the display order — there is no `index` field, because a
+/// list that carries its own indices can disagree with itself, and
+/// `Op::TrackReorder` is a whole-list op anyway.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneArrangement {
+    pub track_id: String,
+    /// Lane-group name; `None`/absent/empty = ungrouped. Optional on the
+    /// wire so a caller that only reorders can omit it — but note that an
+    /// omitted group reads as "ungrouped" and WILL clear an existing group,
+    /// so `arrange_lanes` callers send the full intended arrangement.
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
 pub const TRACK_COLORS: [&str; 6] =
     ["#7c9cff", "#ff9c7c", "#7cffb0", "#e07cff", "#ffe07c", "#7cd8ff"];
 
@@ -91,6 +107,9 @@ pub(crate) fn new_track_row(
         color: TRACK_COLORS[n % TRACK_COLORS.len()].into(),
         instrument_id: None,
         inserts: Vec::new(),
+        // Ungrouped: a new track lands at the end of the list, outside every
+        // group. Dropping it into one is an explicit gesture (`arrange_lanes`).
+        group: None,
     };
     Ok((track, n))
 }

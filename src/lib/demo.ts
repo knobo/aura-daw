@@ -1540,6 +1540,49 @@ export class DemoBackend implements Backend {
     if (t) t.armed = armed;
   }
 
+  /** Mirrors the Rust write side: trim, reject empty. The demo engine is
+   * how the browser-only mode is developed, so a validation rule the real
+   * backend enforces has to exist here too or the UI gets exercised
+   * against a more permissive engine than it will ever ship against. */
+  async setTrackName(trackId: string, name: string): Promise<TrackState> {
+    const t = this.track(trackId);
+    if (!t) throw new Error(`unknown track: ${trackId}`);
+    const trimmed = name.trim();
+    if (!trimmed) throw new Error("name: must not be empty");
+    t.name = trimmed;
+    return { ...t };
+  }
+
+  async setTrackGroup(trackId: string, group: string | null): Promise<TrackState> {
+    const t = this.track(trackId);
+    if (!t) throw new Error(`unknown track: ${trackId}`);
+    t.group = group?.trim() ? group.trim() : null;
+    return { ...t };
+  }
+
+  async arrangeLanes(
+    lanes: { trackId: string; group: string | null }[],
+  ): Promise<TrackState[]> {
+    // Same permutation contract as `Op::TrackReorder` — reject rather than
+    // silently drop rows, so a frontend bug fails loudly in demo mode too.
+    const ids = new Set(this.tracks.map((t) => t.id));
+    if (lanes.length !== ids.size) throw new Error("arrange_lanes: incomplete arrangement");
+    const seen = new Set<string>();
+    for (const l of lanes) {
+      if (seen.has(l.trackId)) throw new Error(`arrange_lanes: duplicate ${l.trackId}`);
+      if (!ids.has(l.trackId)) throw new Error(`arrange_lanes: unknown track ${l.trackId}`);
+      seen.add(l.trackId);
+    }
+    const byId = new Map(this.tracks.map((t) => [t.id, t]));
+    this.tracks = lanes.map((l) => {
+      const t = byId.get(l.trackId)!;
+      t.group = l.group?.trim() ? l.group.trim() : null;
+      return t;
+    });
+    this.refreshTrackAudio();
+    return this.tracks.map((t) => ({ ...t }));
+  }
+
   // ── project ──
 
   private projectSnapshot(): Project {

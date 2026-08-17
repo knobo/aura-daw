@@ -747,6 +747,40 @@ pub fn get_tracks(state: State<'_, AudioState>) -> Result<Vec<TrackState>, Strin
     Ok(state.session.lock().store.tracks.clone())
 }
 
+/// Rename a track (lanes UX). Additive command; the name is trimmed and an
+/// empty one is rejected by the write side, so the returned row carries the
+/// name that was actually stored, not the caller's raw string.
+#[tauri::command]
+pub fn set_track_name(
+    track_id: String,
+    name: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<TrackState, String> {
+    control.set_track_name(&track_id, name, control::op::TxMeta::user("rename track"))
+}
+
+/// Put a track in a lane group, or take it out (`group: None`). Lane groups
+/// are a display grouping only — see `TrackState::group`.
+#[tauri::command]
+pub fn set_track_group(
+    track_id: String,
+    group: Option<String>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<TrackState, String> {
+    control.set_track_group(&track_id, group, control::op::TxMeta::user("set lane group"))
+}
+
+/// Apply a whole lane arrangement — display order + group membership — in
+/// one transaction, so a drag that reorders lanes AND moves one into a
+/// group is a single undo step. `lanes` must name every track exactly once.
+#[tauri::command]
+pub fn arrange_lanes(
+    lanes: Vec<control::LaneArrangement>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Vec<TrackState>, String> {
+    control.arrange_lanes(lanes, control::op::TxMeta::user("arrange lanes"))
+}
+
 /// Apply one mix change through the batched control-plane path (param-table
 /// writes only — knob-rate safe, NO graph rebuild).
 fn single_mix_change(

@@ -1882,6 +1882,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         });
         let long_ticks = DEFAULT_PPQ as u64 * 8; // 4 s at 120 bpm: still sounding
         let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
@@ -2003,6 +2004,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         });
         let long_ticks = DEFAULT_PPQ as u64 * 8;
         let track_clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
@@ -2107,6 +2109,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         });
         let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
         let midi = MidiStore {
@@ -2548,6 +2551,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         });
         // 8 beats at 120 bpm = 4 s — well past the ~400 ms this test runs
         // before forcing shutdown, so the note is still genuinely sounding.

@@ -201,6 +201,66 @@ class ProjectStore {
     }
   }
 
+  /**
+   * Rename a track (lanes UX). NOT optimistic, unlike the mix setters
+   * above: the backend trims and rejects an empty name, so the store takes
+   * the name it actually stored rather than the string that was typed —
+   * otherwise a rejected rename would leave the UI showing a name the
+   * project does not have.
+   *
+   * Returns true when the name changed. A no-op rename (same name, or only
+   * whitespace added) never reaches the backend, so it costs no undo step.
+   */
+  async renameTrack(trackId: string, name: string): Promise<boolean> {
+    const t = this.trackById(trackId);
+    const trimmed = name.trim();
+    if (!t || !trimmed || trimmed === t.name) return false;
+    try {
+      const updated = await backend.setTrackName(trackId, trimmed);
+      this.patchTrack(trackId, { name: updated.name });
+      return true;
+    } catch (err) {
+      console.warn("[aura] set_track_name failed:", err);
+      toasts.error("RENAME FAILED", String(err));
+      return false;
+    }
+  }
+
+  /**
+   * Apply a whole lane arrangement — display order + group per lane — in
+   * one backend transaction, and mirror it locally.
+   *
+   * Optimistic, deliberately: this is the tail of a drag, and snapping the
+   * lanes back to the old order for the duration of an IPC round trip is
+   * exactly the jank the gesture is meant not to have. A failure re-pulls
+   * the authoritative snapshot, so a rejected arrangement corrects itself
+   * rather than leaving the UI lying.
+   */
+  async arrangeLanes(placements: { trackId: string; group: string | null }[]): Promise<void> {
+    const byId = new Map(this.tracks.map((t) => [t.id, t]));
+    const reordered: TrackState[] = [];
+    for (const p of placements) {
+      const t = byId.get(p.trackId);
+      if (t) reordered.push({ ...t, group: p.group });
+    }
+    // Guard the optimistic write the same way the backend guards the op:
+    // a placement list that lost a track would silently delete lanes here.
+    if (reordered.length !== this.tracks.length) {
+      console.warn("[aura] arrangeLanes: incomplete arrangement, ignoring");
+      return;
+    }
+    const previous = this.tracks;
+    this.tracks = reordered;
+    try {
+      await backend.arrangeLanes(placements);
+    } catch (err) {
+      console.warn("[aura] arrange_lanes failed:", err);
+      this.tracks = previous;
+      toasts.error("LANE ARRANGE FAILED", String(err));
+      await this.reload();
+    }
+  }
+
   /** Open a gesture boundary (Plan E Task 14) — call on `pointerdown` of a
    * fader/pan control, before the first `setGain`/`setPan` of the drag.
    * `label` is the gesture's history label (e.g. "gain drag"). No-op in

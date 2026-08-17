@@ -139,7 +139,7 @@ impl ChangeSet {
     /// · LaunchBindingSet/LaunchDriveSet/LaunchMapSet→launch_maps
     /// · AutomationSetLane→automation · PluginAdd/PluginSetState→plugins
     /// · PluginRemove→plugins+tracks (G-10 insert sweep)
-    /// · InsertAdd/Remove/Reorder/SetBypass→tracks
+    /// · InsertAdd/Remove/Reorder/SetBypass→tracks · TrackReorder→tracks
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
         for op in ops {
@@ -210,6 +210,10 @@ impl ChangeSet {
                 | Op::InsertSetBypass { .. } => {
                     cs.tracks = true;
                 }
+                // Lanes UX: reorder rewrites `store.tracks` wholesale. Only
+                // `tracks` — clips are addressed by `trackId`, never by the
+                // track's position, so no clip row changes.
+                Op::TrackReorder { .. } => cs.tracks = true,
             }
         }
         cs
@@ -526,6 +530,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         }
     }
 

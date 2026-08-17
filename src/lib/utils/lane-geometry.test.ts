@@ -1,23 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildLaneBoxes, laneIndexAt, TRACK_HEIGHT_PX } from "./lane-geometry";
+import { buildLaneBoxes } from "./lane-geometry";
 
-describe("laneIndexAt", () => {
-  it("maps y to the lane it falls in", () => {
-    expect(laneIndexAt(0, 3)).toBe(0);
-    expect(laneIndexAt(TRACK_HEIGHT_PX - 1, 3)).toBe(0);
-    expect(laneIndexAt(TRACK_HEIGHT_PX, 3)).toBe(1);
-    expect(laneIndexAt(TRACK_HEIGHT_PX * 2 + 4, 3)).toBe(2);
-  });
-
-  it("clamps below zero and above the last track", () => {
-    expect(laneIndexAt(-500, 3)).toBe(0);
-    expect(laneIndexAt(TRACK_HEIGHT_PX * 99, 3)).toBe(2);
-  });
-
-  it("returns 0 for an empty arrangement rather than -1", () => {
-    expect(laneIndexAt(0, 0)).toBe(0);
-  });
-});
+// `laneIndexAt`'s successors — `trackIndexAtY` / `nearestTrackIndexAtY` —
+// moved to lane-layout.ts when lanes stopped being uniform height, and are
+// tested in lane-layout.test.ts alongside the row table they read.
 
 describe("buildLaneBoxes", () => {
   const trackIds = ["t1", "t2"];
