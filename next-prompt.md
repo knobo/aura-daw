@@ -68,6 +68,32 @@ this file (marked correction, ADR 0007) if they do.
   first. **The panel has never run against the real engine** — only against
   `DemoBackend`'s synthetic singer in a browser. That ear-check is the
   first thing to do with the phase 2 branch.
+- **Uncommitted Windows-build work in the main checkout** (branch
+  `docs/pitch-coach-handoff`, 2026-08-17): a `lv2` Cargo feature with an
+  `lv2_host_stub`, Windows CLAP search paths, platform-aware ffmpeg hints, a
+  `release-windows.yml`, and `bundle.active: true`. Not mine, not in a PR,
+  and **`git status` in that tree is dirty** — do not stash it, do not
+  "clean up" around it. A review of it found five things the owner had not
+  seen yet, recorded here because they exist nowhere else:
+  1. **`src-tauri/icons/icon.ico` is untracked** while `tauri.conf.json`
+     (a tracked modification) references it. `git commit -am` lands the
+     reference without the asset and the first `v*` tag fails at the bundle
+     step. `.github/workflows/release-windows.yml` is untracked too.
+  2. **`bundle.active: true` with `targets: "all"`** enables bundling on
+     every platform, so a local Linux `tauri build` now runs the AppImage
+     bundler (which downloads `linuxdeploy` mid-build) and emits deb/rpm
+     with no `depends` and no sidecar resources. Scope it via
+     `tauri.windows.conf.json` or `"targets": ["nsis", "msi"]`.
+  3. **`control/export.rs:291`** still hard-codes `apt install ffmpeg` in
+     `capabilities()`, one function from the new platform-aware `HOW`.
+  4. **`control/export.rs:880`/`:894`** assert on `"apt install ffmpeg"`, so
+     `cargo test` is red on Windows — the platform being added. Assert on
+     `"requires ffmpeg"` instead.
+  5. **`.github/workflows/tests.yml:67`** only exercises the `lv2` axis on
+     ubuntu; nothing in CI compiles the new `#[cfg(target_os = "windows")]`
+     branches, which is exactly the rot the step's own comment warns about.
+  Unverified by the current session beyond reading the diff — treat as
+  leads, not verdicts.
 - **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
