@@ -297,9 +297,18 @@ fn ordinal(degree: usize) -> &'static str {
 /// language: `"I"`, `"vi"`, `"V7"`, `"bVII"`, `"ii7"`, `"V7/ii"`, `"IVmaj7"`,
 /// `"viio7"`, `"i"`, `"Isus4"`.
 ///
-/// The numeral's CASE is advisory, not authoritative: `"vi"` in C major and
-/// `"VI"` in C minor both mean "the chord the key builds on that degree",
-/// which is what a schema author means. An explicit quality suffix overrides.
+/// Two conventions, both load-bearing and both the ones a chord chart uses:
+///
+/// * **Case decides quality**, but a numeral whose case AGREES with the key's
+///   own chord there inherits that chord (so `"vii"` in C major is `Bdim`, not
+///   `Bm`, and `"ii7"` is `Dm7`). A case that DISAGREES wins: `"V"` in A minor
+///   is `E` major — the borrowed dominant, which is the whole reason a minor
+///   key can cadence — and `"IV"` in A minor is `D` major, the dorian colour.
+/// * **An accidental is measured from the MAJOR scale of the tonic**, never
+///   from the key's own degree. `♭VII` means a triad on the ♭7 of the major
+///   scale, which in a minor key is already the natural seventh degree — that
+///   is why the Andalusian cadence in A minor is `Am ♭VII ♭VI V` = `Am G F E`
+///   and not `Am G♭ F♭ E`.
 pub fn parse_roman(key: &Key, s: &str) -> Result<Chord, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -341,22 +350,22 @@ pub fn parse_roman(key: &Key, s: &str) -> Result<Chord, String> {
     let native = diatonic_chord(key, degree, seventh);
     let case_quality = if lowercase { ChordQuality::Min } else { ChordQuality::Maj };
     let quality = if suffix.is_empty() {
-        if alt != 0 {
-            // An ALTERED degree has no native chord to inherit from: ♭VII in
-            // major means a major triad on ♭7, and reading the key's own
-            // quality there (B diminished) would be nonsense.
-            case_quality
-        } else {
-            // No suffix, native degree: the key's own chord there. This is
-            // what makes a schema written in major transpose honestly into
-            // minor (`"vi"` in A minor is F major, not F minor).
-            native.map(|c| c.quality).unwrap_or(case_quality)
+        match native {
+            // The key's own chord, but only when the case agrees with it —
+            // see this function's doc for why the disagreement matters.
+            Some(c) if alt == 0 && is_lowercase_numeral(c.quality) == lowercase => c.quality,
+            _ => case_quality,
         }
     } else {
         quality_from_numeral_suffix(suffix, lowercase)
             .ok_or_else(|| format!("unknown numeral suffix {suffix:?} in {s:?}"))?
     };
-    let root = key.degree(degree).plus_fifths(alt * 7);
+    let root = if alt == 0 {
+        key.degree(degree)
+    } else {
+        // Measured from the major scale of the tonic (see the doc above).
+        key.tonic.plus_fifths(crate::theory::tpc::ionian_offset(degree) + alt * 7)
+    };
     Ok(Chord::new(root, quality))
 }
 
@@ -544,15 +553,39 @@ mod tests {
     }
 
     #[test]
-    fn numeral_case_is_advisory_so_schemas_transpose_into_minor() {
-        // "I-V-vi-IV" written for major, read in A minor, must give the
-        // key's OWN chords rather than forcing major/minor from the case.
+    fn case_decides_quality_but_agreement_inherits_the_keys_own_chord() {
+        let c = Key::c_major();
+        // Agreement: the key's chord, including the ones the case cannot spell
+        // (`vii` is diminished, not minor).
+        assert_eq!(parse_roman(&c, "vii").unwrap().symbol(), "Bdim");
+        assert_eq!(parse_roman(&c, "vi").unwrap().symbol(), "Am");
+        // Disagreement: the case wins, which is how a minor key gets a real
+        // dominant and a dorian IV.
         let am = Key::new(Tpc::A, ScaleType::Aeolian);
-        let got: Vec<String> = ["I", "V", "vi", "IV"]
+        assert_eq!(parse_roman(&am, "V").unwrap().symbol(), "E", "the borrowed dominant");
+        assert_eq!(parse_roman(&am, "v").unwrap().symbol(), "Em", "…and the powerless one");
+        assert_eq!(parse_roman(&am, "IV").unwrap().symbol(), "D", "dorian colour");
+        assert_eq!(parse_roman(&am, "iv").unwrap().symbol(), "Dm");
+    }
+
+    #[test]
+    fn altered_degrees_are_measured_from_the_major_scale() {
+        // The trap: in A minor the seventh degree is ALREADY G, and ♭VII must
+        // still mean G — not G♭. Same for ♭VI (F, not F♭).
+        let am = Key::new(Tpc::A, ScaleType::Aeolian);
+        let got: Vec<String> = ["i", "bVII", "bVI", "V"]
             .iter()
             .map(|n| parse_roman(&am, n).unwrap().symbol())
             .collect();
-        assert_eq!(got, ["Am", "Em", "F", "Dm"]);
+        assert_eq!(got, ["Am", "G", "F", "E"], "the Andalusian cadence");
+        // And unchanged in major, where the ♭7 really is an alteration.
+        let c = Key::c_major();
+        assert_eq!(parse_roman(&c, "bVII").unwrap().symbol(), "Bb");
+        assert_eq!(parse_roman(&c, "bVI").unwrap().symbol(), "Ab");
+        assert_eq!(parse_roman(&c, "bIII").unwrap().symbol(), "Eb");
+        // A phrygian key: ♭II is its own second degree.
+        let ep = Key::new(Tpc::E, ScaleType::Phrygian);
+        assert_eq!(parse_roman(&ep, "bII").unwrap().symbol(), "F");
     }
 
     #[test]

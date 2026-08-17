@@ -13,6 +13,11 @@
 //! WASM build. The one stateful seam is `crate::control::composer`, which is
 //! where `Session`, ops and commands live.
 //!
+//! ONE dependency on the rest of the crate is deliberate: the generators emit
+//! `crate::midi::MidiNote`, the tauri-free wire/document note type. Inventing a
+//! parallel note struct here would buy nothing but a conversion at every call
+//! site, and `midi::types` is itself pure (serde only).
+//!
 //! Reading order: [`tpc`] (spelling) → [`scale`] (keys) → [`chord`] →
 //! [`analysis`] (function) → [`circle`] / [`palette`] (the two user-facing
 //! views) → [`metre`] → the generators ([`progression`], [`voicing`],
@@ -24,17 +29,28 @@
 pub mod analysis;
 pub mod chord;
 pub mod circle;
+pub mod groove;
+pub mod harmony;
+pub mod melody;
 pub mod metre;
 pub mod palette;
+pub mod progression;
 pub mod rng;
 pub mod scale;
 pub mod tpc;
+pub mod voicing;
 
 pub use analysis::{analyze, Analysis, Function};
 pub use chord::{diatonic_chord, diatonic_chords, Chord, ChordQuality};
+pub use harmony::{ChordSpan, HarmonyDoc, KeySpan};
+pub use groove::{groove_notes, Genre, GrooveOptions};
+pub use melody::{melody_notes, MelodyOptions};
+pub use metre::{Grid, Meter};
 pub use palette::{palette, NoteRole, Palette};
+pub use progression::{Plan, Progression, Slot, SCHEMAS};
 pub use scale::{Key, ScaleType};
 pub use tpc::{Pitch, Tpc};
+pub use voicing::{chord_notes, ChordRhythm, VoicingOptions, VoicingStyle};
 
 /// One thing a generator did, and why it did it — the teaching payload
 /// (ruling H-6). Annotations are returned WITH a command result for display;

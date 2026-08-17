@@ -312,15 +312,6 @@ mod tests {
     use super::*;
     use crate::theory::chord::diatonic_chords;
 
-    fn roles(key: &Key, symbol: &str) -> Vec<(String, &'static str)> {
-        let chord = Chord::parse(symbol).unwrap();
-        palette(key, Some(&chord))
-            .classes
-            .iter()
-            .map(|c| (c.tpc.name(), c.role.id()))
-            .collect()
-    }
-
     fn names_with_role(key: &Key, symbol: &str, role: NoteRole) -> Vec<String> {
         let chord = Chord::parse(symbol).unwrap();
         palette(key, Some(&chord))

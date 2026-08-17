@@ -30,8 +30,16 @@ const NATURAL_SEMITONES: [i16; 7] = [0, 2, 4, 5, 7, 9, 11];
 
 /// The ionian scale's fifths offset per diatonic step (`1 2 3 4 5 6 7`).
 /// This is the "natural" interval for a step, which is what an alteration is
-/// measured against ([`interval_alteration`]).
+/// measured against ([`interval_alteration`]) — and, in `analysis`, what an
+/// accidental on a Roman numeral is measured from.
 pub(crate) const IONIAN_OFFSETS: [i16; 7] = [0, 2, 4, -1, 1, 3, 5];
+
+/// The fifths offset of a 0-based MAJOR-scale degree. The reference an altered
+/// Roman numeral is read against: `♭VII` is `ionian_offset(6) - 7`, in every
+/// key and every mode.
+pub fn ionian_offset(degree: usize) -> i16 {
+    IONIAN_OFFSETS[degree % 7]
+}
 
 /// A tonal pitch class: a position on the line of fifths.
 ///
