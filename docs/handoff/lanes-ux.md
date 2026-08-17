@@ -1,9 +1,13 @@
 # Handoff — Lanes UX (rename · fold · group · drag-reorder · scroll fix)
 
-**Branch:** `worktree-lanes-ux` · **Worktree:** `.claude/worktrees/lanes-ux`
-**Base:** `origin/main` @ `7c3cb87` (Pitch Coach phase 2)
-**Status at handoff:** backend complete + tested; frontend written, being
-type-checked. No PR opened yet.
+**Status: LANDED.** Merged to `main` as PR #60 (2026-08-17), `5f891cb`.
+Do not restart this track.
+
+**Branch:** `worktree-lanes-ux` (kept — its per-commit history is cited
+above) · **Worktree:** `.claude/worktrees/lanes-ux`
+**Base:** `origin/main` @ `7c3cb87` (Pitch Coach phase 2); rebased before
+merge onto `c14916d` (Pitch Coach phase 3, PR #61) + `46df20d` (theme
+system, PR #63).
 
 This file exists so a fresh session can finish the work without re-deriving
 anything. Trust the code over this file where they disagree.
@@ -232,36 +236,83 @@ how lanes get lost).
 
 ---
 
-## REMAINING WORK
+## REMAINING WORK — done, kept as a record
 
-1. **`npx svelte-check` is not clean yet.** Last run: 5 errors, all small.
-   - `project.svelte.ts` ~line 246/254 — the type predicate in
-     `arrangeLanes`'s optimistic map is not assignable because
-     `TrackState.group` is `string | null | undefined` while the mapped
-     object narrows it to `string | null`. Annotate the map result rather
-     than widening `TrackState`.
-   - unused `LaneRow` import in `lane-arrange.ts` and `Timeline.svelte`.
-   - `lane-geometry.test.ts` — already fixed (the `laneIndexAt` block was
-     removed and pointed at lane-layout.test.ts).
-2. **Write the frontend tests** (none written yet). The two pure modules
-   are the whole point of splitting them out:
-   - `lane-layout.test.ts` — row tops/heights with folded lanes, a folded
-     group hiding its members, `trackIndexAtY` returning `null` on a group
-     header, `nearestTrackIndexAtY` clamping, `bandForTrackRange` skipping
-     hidden lanes, and a **non-contiguous** `group` value rendering as two
-     runs rather than one broken group.
-   - `lane-arrange.test.ts` — `dropTargetAtY` at every boundary (above a
-     group header, below an open header, mid-group, below a group's last
-     member, past the last row, folded group), `arrangementForMove`
-     index adjustment when moving downward, `normalizeGroupRuns`
-     idempotence, `nextGroupName` avoiding collisions.
-3. **`npm test`** and **`npm run build`** must be green.
-4. **Update the test counts** in `CONTRIBUTING.md` (currently "1020 tests"
-   / "574 frontend unit tests") — the repo keeps those current with a date.
-5. **Run the app and look at it** (`npx vite` for browser-only demo mode,
-   or the `run-aura` skill for the full app). Nothing here has been seen
-   on screen yet — only measured in a headless harness.
-6. **Open the PR** against `main`.
+1. ~~`npx svelte-check` is not clean yet.~~ Fixed; 0 errors.
+2. ~~Write the frontend tests.~~ `lane-layout.test.ts` + `lane-arrange.test.ts`
+   written, covering everything listed here originally.
+3. ~~`npm test` and `npm run build` must be green.~~ Both green.
+4. ~~Update the test counts.~~ Done, recounted again after the rebase onto
+   Pitch Coach phase 3 + the theme system: 1083 backend / 738 frontend.
+5. **Run the app and look at it — done.** Exercised in a running
+   browser-demo instance: rename (this is where the bug below was found),
+   fold/unfold a lane, create a group, rename a group, drag a lane into a
+   group, fold a group. Not yet heard/seen in the full Tauri build against
+   a real project — an ear/eye-check with real content is still owed, same
+   caveat as every other UI track.
+6. ~~Open the PR.~~ #60, merged.
+
+### Code review round (2026-08-17) — all fixed before merge
+
+A review of the open PR found 10 issues, all confirmed and fixed:
+
+- **`LaneGroupHeader`'s rename `commit()` had no re-entrancy guard.**
+  Clearing `renamingGroup` before the `await` unmounts the focused input,
+  whose native `blur` re-invoked `commit()` a second time — double-firing
+  the rename, and defeating Escape's cancel (the blur-triggered commit
+  fired anyway). Guarded the same way `TrackHeader.commitRename` already
+  was.
+- **Group-fold-state migration ran optimistically with no rollback.**
+  `renameGroupFold` moved the collapsed-state key before `arrangeLanes`
+  resolved; a failed arrangement left the wrong key migrated.
+  `project.arrangeLanes` now returns whether it went through, so a failed
+  rename un-migrates the fold key.
+- **Renaming a group onto an existing DIFFERENT group's name silently
+  merged the two** (the name IS the group's identity —
+  `normalizeGroupRuns` gathers every placement sharing a name into one
+  run). `arrangementForGroupRename` now returns `null` on a collision;
+  the UI toasts instead of committing.
+- **A launch-mark drag froze entirely** (not just its lane axis) when
+  every track was folded into one group — `nearestTrackIndexAtY` has
+  nothing to fall back to when zero track rows are painted. The time
+  shift now stays live; only the lane delta is skipped when no lane is
+  visible.
+- **`renameTrack` silently discarded a blank rename** with no feedback,
+  unlike every other rejection path. Now toasts, same as a backend
+  failure.
+- **Two O(n²) algorithms**: `Op::TrackReorder`'s permutation check
+  (`Vec::contains` in a loop, Rust) and `normalizeGroupRuns` (a full
+  array rescan per distinct group, TS). Both now single-pass / hash-set.
+- **`set_track_group` has no UI caller** — every user-facing group change
+  goes through `arrange_lanes`, which keeps runs contiguous by
+  construction. Documented the non-contiguity hazard at both call-site
+  discovery points (the Rust command's doc comment, the `Backend`
+  interface in `tauri.ts`) rather than leaving it a silent trap.
+- **The focus+select-on-rename effect was duplicated** across
+  `TrackHeader`, `LaneGroupHeader`, `TempoControl` and `MidiClipView`.
+  Extracted to `src/lib/utils/focusAndSelect.ts`, a `use:` action.
+- **`--lane-collapsed`/`--lane-group-height` duplicated
+  `LANE_COLLAPSED_PX`/`GROUP_HEADER_PX`** as separate CSS literals kept in
+  sync by a comment. `main.ts` now sets both custom properties from the
+  TS constants before the app mounts; `app.css` carries no copy of the
+  number.
+
+### Rebase onto the theme system (PR #63) and Pitch Coach phase 3 (PR #61)
+
+Both landed on `main` while this branch was open. Rebasing hit real
+conflicts (not just noise) in `CONTRIBUTING.md`/`README.md` (the dated
+test-count lines) and `Timeline.svelte`/`TrackHeader.svelte` (the theme
+sweep re-themed lines this branch also touched — `.lane`'s height and
+border, `.stripe`'s glow). Resolved by combining both sides' actual
+changes, not by picking one wholesale.
+
+The theme system's `no-literals.test.ts` guard then caught 12 raw
+`rgba(...)` colours in the new lane components (`LaneGroupHeader`,
+`LaneGroupMenu`, plus new rules in `Timeline`/`TrackHeader`) — this
+branch predates the sweep. Every one was an exact match for an existing
+`AURA_DARK_TOKENS` value (confirmed by decimal-converting each literal
+against `aura-dark.ts`), so they were a straight substitution to
+`rgb(var(--x-rgb) / alpha)` — no new tokens needed.
 
 ## Things deliberately NOT done
 
