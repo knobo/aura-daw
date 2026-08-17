@@ -1,0 +1,104 @@
+name: Release (Windows)
+
+# Tag pushes produce a DRAFT GitHub release with the installers attached;
+# manual runs just leave them as workflow artifacts. Nothing here publishes
+# on its own — the draft is yours to review and release.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  # Only the tag path uses this (creating/uploading the draft release).
+  contents: write
+
+jobs:
+  windows:
+    name: Windows x64 installer
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # The bundle version comes from tauri.conf.json, the release name from
+      # the tag. Shipping AURA_0.1.0_x64-setup.exe under tag v0.2.0 is the
+      # kind of mismatch nobody notices until a user reports the wrong
+      # version, so tag builds refuse to run until the two agree.
+      - name: Tag matches tauri.conf.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          conf=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$conf" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME says $tag, tauri.conf.json says $conf — bump one of them"
+            exit 1
+          fi
+
+      # `-- --no-default-features` turns OFF the `lv2` feature (see
+      # src-tauri/Cargo.toml). LV2 hosting goes through livi -> lilv-sys,
+      # which has no build script and expects the SYSTEM `lilv-0` at link
+      # time — there is no such library on Windows, so the link step would
+      # fail. Windows therefore ships CLAP-only, with `plugins::lv2_host`
+      # resolving to its stub. The flag has to ride the `--` passthrough:
+      # `tauri build` has no --no-default-features of its own.
+      - name: Build (CLAP-only, no LV2)
+        run: npx tauri build -- --no-default-features --locked
+
+      # `tauri build` can succeed while producing nothing if the bundler is
+      # skipped, and an empty upload step passes silently. Fail loudly here
+      # instead of publishing an empty release.
+      - name: Installers exist
+        shell: bash
+        run: |
+          shopt -s nullglob
+          found=(src-tauri/target/release/bundle/nsis/*-setup.exe src-tauri/target/release/bundle/msi/*.msi)
+          if [ ${#found[@]} -eq 0 ]; then
+            echo "::error::no installer produced under src-tauri/target/release/bundle"
+            find src-tauri/target/release/bundle -maxdepth 2 -type f || true
+            exit 1
+          fi
+          printf 'built: %s\n' "${found[@]}"
+
+      # `aura.exe` is the cargo bin name (package `aura`), not the productName
+      # — it rides along as a portable build; a Tauri exe needs no runtime
+      # beyond the WebView2 that Windows already ships.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aura-windows-x64
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/aura.exe
+
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tag="$GITHUB_REF_NAME"
+          # nullglob so a missing MSI leaves the list short instead of passing
+          # gh an unexpanded pattern.
+          files=(src-tauri/target/release/bundle/nsis/*-setup.exe src-tauri/target/release/bundle/msi/*.msi)
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --draft --title "$tag" \
+                 --notes "Windows build is CLAP-only — LV2 hosting is Linux-only for now."
+          gh release upload "$tag" "${files[@]}" --clobber

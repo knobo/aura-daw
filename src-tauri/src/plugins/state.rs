@@ -1689,19 +1689,23 @@ mod tests {
 
     // ---- LV2 property-list encoding ---------------------------------------
 
+    /// Flags are literals here, not the `LV2_STATE_IS_*` constants: those
+    /// belong to the FFI half (feature-gated), while this codec treats
+    /// `flags` as an opaque `u32` and must keep round-tripping on a build
+    /// with no LV2 host at all.
     #[test]
     fn lv2_props_roundtrip_and_bounds_checks() {
         let props = vec![
             Lv2Property {
                 key: "urn:zyn:state".into(),
                 type_uri: "http://lv2plug.in/ns/ext/atom#Chunk".into(),
-                flags: LV2_STATE_IS_POD,
+                flags: 1, // IS_POD
                 value: b"<xml>patch</xml>".to_vec(),
             },
             Lv2Property {
                 key: "urn:other".into(),
                 type_uri: "http://www.w3.org/2001/XMLSchema#int".into(),
-                flags: LV2_STATE_IS_POD | LV2_STATE_IS_PORTABLE,
+                flags: 1 | 2, // IS_POD | IS_PORTABLE
                 value: 7i32.to_le_bytes().to_vec(),
             },
         ];
@@ -1723,11 +1727,16 @@ mod tests {
     /// `"active"` with real params — while a plugin missing on this machine
     /// stays `"stub"` with params AND state blob preserved (never lost).
     /// The Zyn half self-gates: without zynaddsubfx-lv2 the instance simply
-    /// exercises the missing-plugin branch too.
+    /// exercises the missing-plugin branch too. "Reachable" means the bundle
+    /// is on disk AND this build can host LV2 at all — a `--no-default-features`
+    /// build has the bundle sitting right there and still cannot activate it,
+    /// so keying the gate on the path alone would assert `"active"` against
+    /// the stub host.
     #[test]
     fn restored_instances_reactivate_through_host_and_missing_stay_stub() {
         const ZYN_UID: &str = "lv2:http://zynaddsubfx.sourceforge.net";
-        let zyn_installed = Path::new("/usr/lib/lv2/ZynAddSubFX.lv2/").is_dir();
+        let zyn_installed = cfg!(feature = "lv2")
+            && Path::new("/usr/lib/lv2/ZynAddSubFX.lv2/").is_dir();
 
         let parent = tmp_parent("reactivate");
         let (_p, dir) = project::create(&parent, "Song", 48_000, 120.0).unwrap();

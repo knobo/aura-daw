@@ -11,7 +11,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::descriptor::{clap_uid, lv2_uid, PluginDescriptor};
+#[cfg(feature = "lv2")]
+use super::descriptor::lv2_uid;
+use super::descriptor::{clap_uid, PluginDescriptor};
 
 // ---------------------------------------------------------------------------
 // Search paths

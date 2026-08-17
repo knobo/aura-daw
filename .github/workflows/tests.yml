@@ -57,3 +57,13 @@ jobs:
           cargo test --locked -- --test-threads=1 \
             --skip select_nonexistent_port_is_graceful_err \
             --skip opening_a_nonexistent_output_port_is_a_graceful_error
+
+      # The Windows release build (release-windows.yml) compiles with the
+      # `lv2` feature OFF, because livi -> lilv-sys cannot link on Windows.
+      # Nothing in the PR suite above exercises that configuration, so the
+      # cfg gating would silently rot until a tag build failed. This check
+      # costs a couple of minutes on an already-warm cache and catches it on
+      # the PR that broke it instead.
+      - name: cargo check --no-default-features (the Windows configuration)
+        working-directory: src-tauri
+        run: cargo check --locked --no-default-features --all-targets
