@@ -7,10 +7,10 @@
   import { project } from "../state/project.svelte";
   import { midi } from "../state/midi.svelte";
   import { COMMON_METERS, TEMPO_MAX, TEMPO_MIN, nudgeTempo, parseTempo } from "../utils/tempo";
+  import { focusAndSelect } from "../utils/focusAndSelect";
 
   let open = $state(false);
   let draft = $state("");
-  let inputEl: HTMLInputElement | undefined = $state();
   let wheelEnd: ReturnType<typeof setTimeout> | null = null;
 
   const fill = $derived(
@@ -86,13 +86,6 @@
       close();
     }
   }
-
-  $effect(() => {
-    if (open && inputEl) {
-      inputEl.focus();
-      inputEl.select();
-    }
-  });
 </script>
 
 <div class="tempo-wrap">
@@ -122,7 +115,7 @@
       <label class="field">
         <span class="silk">bpm</span>
         <input
-          bind:this={inputEl}
+          use:focusAndSelect
           class="bpm"
           type="text"
           inputmode="decimal"

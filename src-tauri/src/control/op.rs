@@ -299,6 +299,21 @@ pub enum Op {
         slot_id: String,
         bypassed: bool,
     },
+    /// Lanes UX: reorder the whole track list in one op. `order` is the
+    /// complete new display order and MUST be a permutation of the store's
+    /// current track ids — `apply_raw` rejects anything else rather than
+    /// dropping or duplicating rows, because track order is not cosmetic:
+    /// `audio::types::derive_slots` numbers the RT mixer slots FROM display
+    /// order, so a partial order would silently re-point live param slots.
+    ///
+    /// Whole-list (not `{from, to}`) on purpose: it is idempotent, it is
+    /// its own inverse shape (the previous order), and a drag that moves a
+    /// track into a group can also renormalize group contiguity in the same
+    /// commit — one undo step for what the user experienced as one drag.
+    ///
+    /// Structural: sets `rebuild`, so the next `GraphTables` renumbers
+    /// slots. Additive; does not bump `OP_FORMAT_VERSION`.
+    TrackReorder { order: Vec<crate::ids::TrackId> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -325,11 +340,20 @@ pub enum PropPath {
     /// Track: sampler-bank id or `plugin:<instanceId>`, `None` = unbound.
     /// Wire form: JSON string or `null` (not an `Option`-shaped object).
     InstrumentId,
-    /// MidiClip: display name (wire: JSON string). Trimmed on write and
-    /// rejected when empty — a nameless clip is unaddressable in the UI, and
-    /// the write side is the validation authority so the inverse observes
-    /// the post-trim value (mirroring `LengthTicks`'s clamp rule).
+    /// MidiClip **or** Track: display name (wire: JSON string). Trimmed on
+    /// write and rejected when empty — a nameless row is unaddressable in
+    /// the UI, and the write side is the validation authority so the
+    /// inverse observes the post-trim value (mirroring `LengthTicks`'s
+    /// clamp rule). The Track arm is the lanes-UX rename path; it reuses
+    /// this variant rather than minting a `TrackName` precisely because
+    /// `ObjectRef` already disambiguates which row is being named.
     Name,
+    /// Track: lane-group membership — the group's display NAME, or `null`
+    /// for ungrouped (wire: JSON string or `null`, like `InstrumentId`).
+    /// Trimmed on write; an empty string normalizes to `null` so
+    /// "ungrouped" has exactly one representation in the store. Purely a
+    /// display grouping — see `TrackState::group`.
+    Group,
     /// Clip: timeline placement position, in samples.
     TimelineStartSamples,
     /// Clip: placement length, in samples (Plan E Task 8 — LoopJam's
@@ -496,6 +520,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         };
         let clip = crate::audio::types::Clip {
             id: "c-1".into(),

@@ -153,6 +153,17 @@ export interface Backend {
   setTrackMute(trackId: string, muted: boolean): Promise<void>;
   setTrackSolo(trackId: string, soloed: boolean): Promise<void>;
   setTrackArm(trackId: string, armed: boolean): Promise<void>;
+  /** Rename a track. Trimmed backend-side; an empty name is rejected. */
+  setTrackName(trackId: string, name: string): Promise<TrackState>;
+  /** Put a track in a lane group, or take it out (`null`). Does NOT keep
+   * the group contiguous — no UI path calls this; prefer `arrangeLanes`
+   * for anything user-facing, which normalizes runs by construction. */
+  setTrackGroup(trackId: string, group: string | null): Promise<TrackState>;
+  /** Whole lane arrangement — display order + group per lane — in ONE
+   * undoable transaction. `lanes` must name every track exactly once, in
+   * the new order; the backend rejects a partial list rather than dropping
+   * rows. Returns the tracks in their new order. */
+  arrangeLanes(lanes: { trackId: string; group: string | null }[]): Promise<TrackState[]>;
 
   // project
   /** Create `<parentDir>/<name>.aura`; parentDir defaults to the home dir. */
@@ -571,6 +582,15 @@ class TauriBackend implements Backend {
   }
   async setTrackArm(trackId: string, armed: boolean) {
     await invoke("set_track_arm", { trackId, armed });
+  }
+  setTrackName(trackId: string, name: string) {
+    return invoke<TrackState>("set_track_name", { trackId, name });
+  }
+  setTrackGroup(trackId: string, group: string | null) {
+    return invoke<TrackState>("set_track_group", { trackId, group });
+  }
+  arrangeLanes(lanes: { trackId: string; group: string | null }[]) {
+    return invoke<TrackState[]>("arrange_lanes", { lanes });
   }
 
   createProject(name: string, parentDir: string | null = null) {

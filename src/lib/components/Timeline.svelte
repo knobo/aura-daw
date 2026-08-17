@@ -22,10 +22,14 @@
     startsMarquee,
   } from "../utils/clip-selection";
   import { selectionModeFor } from "../utils/selection-modifiers";
-  import { buildLaneBoxes, laneIndexAt, TRACK_HEIGHT_PX } from "../utils/lane-geometry";
+  import { buildLaneBoxes } from "../utils/lane-geometry";
+  import { bandForTrackRange, buildLaneLayout, nearestTrackIndexAtY } from "../utils/lane-layout";
+  import { arrangementForMove, dropTargetAtY } from "../utils/lane-arrange";
+  import { lanes } from "../state/lanes.svelte";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { library } from "../state/library.svelte";
   import TrackHeader from "./TrackHeader.svelte";
+  import LaneGroupHeader from "./LaneGroupHeader.svelte";
   import HScrollbar from "./HScrollbar.svelte";
   import ClipView from "./ClipView.svelte";
   import MidiClipView from "./MidiClipView.svelte";
@@ -47,6 +51,28 @@
 
   /** Track id currently under a library drag ("" = none). */
   let dropTrackId = $state("");
+
+  /**
+   * The row table every part of this view measures against — the rail, the
+   * lane column, the grid canvas, the marquee and the launch overlay all
+   * read THIS, so they cannot disagree about where lane 7 is. Rebuilt
+   * whenever the tracks or the fold state change; cheap (one pass).
+   */
+  const layout = $derived(
+    buildLaneLayout({
+      tracks: project.tracks,
+      collapsedTracks: lanes.collapsedTracks,
+      collapsedGroups: lanes.collapsedGroups,
+    }),
+  );
+
+  // Fold state belongs to a project, so it has to follow project switches
+  // and forget tracks and groups that are gone. Cheap and idempotent.
+  $effect(() => {
+    void project.projectDir;
+    void project.tracks;
+    lanes.sync();
+  });
 
   // keep viewport width fresh
   $effect(() => {
@@ -129,9 +155,10 @@
     const spp = view.spp;
     const start = view.viewStart;
     const w = view.width;
-    const trackCount = project.tracks.length;
-    const trackH = TRACK_HEIGHT_PX;
-    const h = Math.max(1, trackCount * trackH);
+    // The grid spans whatever the rows actually add up to — folded lanes
+    // and group strips included. `trackCount * TRACK_HEIGHT_PX` stopped
+    // being that number the moment lanes could collapse.
+    const h = Math.max(1, layout.totalHeight);
 
     const dpr = Math.min(3, window.devicePixelRatio || 1);
     c.width = Math.max(1, Math.round(w * dpr));
@@ -514,9 +541,12 @@
     if (launch.marking) return;
     const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
     const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
-    const n = project.tracks.length;
-    const laneLo = laneIndexAt(Math.min(marquee.y0, marquee.y1), n);
-    const laneHi = laneIndexAt(Math.max(marquee.y0, marquee.y1), n);
+    const laneLo = nearestTrackIndexAtY(layout, Math.min(marquee.y0, marquee.y1));
+    const laneHi = nearestTrackIndexAtY(layout, Math.max(marquee.y0, marquee.y1));
+    // No visible lane under the band at all (every lane folded away into
+    // groups): nothing to hit-test, and clamping to lane 0 would select
+    // clips the band never touched.
+    if (laneLo === null || laneHi === null) return;
     const boxes = buildLaneBoxes({
       trackIds: project.tracks.map((t) => t.id),
       audioClips: project.clips,
@@ -534,16 +564,20 @@
     if (launch.marking && marquee) {
       const s0 = view.samplesAt(Math.min(marquee.x0, marquee.x1));
       const s1 = view.samplesAt(Math.max(marquee.x0, marquee.x1));
-      const n = project.tracks.length;
-      const region = regionFromMarquee({
-        startSamples: s0,
-        endSamples: s1,
-        laneLo: laneIndexAt(Math.min(marquee.y0, marquee.y1), n),
-        laneHi: laneIndexAt(Math.max(marquee.y0, marquee.y1), n),
-        tracks: project.tracks,
-        samplesToTicks: (s) => midi.samplesToTicks(s),
-        snapTicks: view.snap ? midi.ppq : undefined,
-      });
+      const laneLo = nearestTrackIndexAtY(layout, Math.min(marquee.y0, marquee.y1));
+      const laneHi = nearestTrackIndexAtY(layout, Math.max(marquee.y0, marquee.y1));
+      const region =
+        laneLo === null || laneHi === null
+          ? null
+          : regionFromMarquee({
+              startSamples: s0,
+              endSamples: s1,
+              laneLo,
+              laneHi,
+              tracks: project.tracks,
+              samplesToTicks: (s) => midi.samplesToTicks(s),
+              snapTicks: view.snap ? midi.ppq : undefined,
+            });
       if (region) void launch.createRegion(region.startTicks, region.lengthTicks, region.trackIds);
       pendingMarquee = null;
       marquee = null;
@@ -660,8 +694,12 @@
     const nowTick = midi.samplesToTicks(view.samplesAt(p.x));
     let deltaTicks = Math.round(nowTick - originTick);
     if (view.snap) deltaTicks = Math.round(deltaTicks / midi.ppq) * midi.ppq;
-    const originLane = laneIndexAt(markDrag.originY, project.tracks.length);
-    const nowLane = laneIndexAt(p.y, project.tracks.length);
+    const originLane = nearestTrackIndexAtY(layout, markDrag.originY);
+    const nowLane = nearestTrackIndexAtY(layout, p.y);
+    // Both are only null when NOTHING is painted (every track folded into
+    // one group) — keep the time shift live rather than freezing the whole
+    // drag; there's simply no lane delta to apply until a lane is visible.
+    const laneDelta = originLane !== null && nowLane !== null ? nowLane - originLane : 0;
     launch.patchLocal(markDrag.id, {
       target: shiftRegion(
         {
@@ -671,7 +709,7 @@
           trackIds: markDrag.trackIds,
         },
         deltaTicks,
-        nowLane - originLane,
+        laneDelta,
         project.tracks,
       ),
     });
@@ -680,6 +718,76 @@
   function onMarkPointerUp() {
     if (markDrag && !markDrag.moved) launch.focus(markDrag.id);
     persistMarkDrag();
+  }
+
+  // ── lane reorder drag (the rail's colour stripe is the handle) ──
+  //
+  // The gesture lives here rather than in TrackHeader because it needs the
+  // ROW TABLE — where every lane sits, and which of them are inside a
+  // group — and that is this component's `layout`. The header only marks
+  // its grip with `data-lane-grip`.
+
+  let laneDrag: { trackId: string; originY: number; moved: boolean } | null = null;
+
+  /** Pointer y in ROW space (the lane column's coordinates). Measured
+   * against `lanesEl` and not the rail so the drop indicator, the row tops
+   * and the pointer are all in one space — and via `canvasPos`, which is
+   * the standing rule: raw rect maths drift under interface zoom. */
+  function rowY(e: PointerEvent): number {
+    return lanesEl ? canvasPos(lanesEl, e.clientX, e.clientY).y : 0;
+  }
+
+  function onRailPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    const grip = (e.target as HTMLElement).closest<HTMLElement>("[data-lane-grip]");
+    const trackId = grip?.dataset.laneGrip;
+    if (!trackId) return;
+    e.preventDefault();
+    laneDrag = { trackId, originY: rowY(e), moved: false };
+    try {
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+    } catch {
+      /* synthetic pointer */
+    }
+  }
+
+  function onRailPointerMove(e: PointerEvent) {
+    if (!laneDrag) return;
+    const y = rowY(e);
+    // Slop before committing to a drag: a plain click on the stripe should
+    // not fold the lanes' order into the undo stack.
+    if (!laneDrag.moved) {
+      if (Math.abs(y - laneDrag.originY) < 4) return;
+      laneDrag.moved = true;
+      lanes.draggingTrackId = laneDrag.trackId;
+    }
+    const target = dropTargetAtY(layout, project.tracks, y);
+    lanes.dropIndicator = { y: target.y, group: target.group };
+  }
+
+  function onRailPointerUp(e: PointerEvent) {
+    const drag = laneDrag;
+    laneDrag = null;
+    lanes.draggingTrackId = "";
+    lanes.dropIndicator = null;
+    try {
+      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+    } catch {
+      /* not captured */
+    }
+    if (!drag?.moved) return;
+    const target = dropTargetAtY(layout, project.tracks, rowY(e));
+    void project.arrangeLanes(
+      arrangementForMove(project.tracks, drag.trackId, target.index, target.group),
+    );
+  }
+
+  /** Escape abandons a lane drag — nothing has been committed until pointerup. */
+  function onRailKeydown(e: KeyboardEvent) {
+    if (e.key !== "Escape" || !laneDrag) return;
+    laneDrag = null;
+    lanes.draggingTrackId = "";
+    lanes.dropIndicator = null;
   }
 
   function onHandleDown(id: string, edge: "start" | "end", e: PointerEvent) {
@@ -779,17 +887,46 @@
     <LoopJamPanel />
   </div>
 
-  <!-- scrollable body -->
+  <!-- Scrollable body. `.bodyinner` is not decoration: `.body` used to be
+       the flex row itself, which made both columns flex ITEMS of the
+       scroller — so the rail's headers were shrunk to fit the viewport
+       while the lane column, clipped by its own `overflow: hidden`, simply
+       lost every lane below the fold and never scrolled at all. With a
+       plain block scroller wrapping a content-sized flex row, the columns
+       size to their rows and the scrollbar measures what is really there. -->
   <div class="body">
-    <div class="rail">
-      {#each project.tracks as track, i (track.id)}
-        <TrackHeader {track} index={i} />
+    <div class="bodyinner">
+    <div
+      class="rail"
+      role="presentation"
+      onpointerdown={onRailPointerDown}
+      onpointermove={onRailPointerMove}
+      onpointerup={onRailPointerUp}
+      onpointercancel={onRailPointerUp}
+      onkeydown={onRailKeydown}
+    >
+      {#each layout.rows as row (row.kind === "group" ? `g:${row.group}` : row.track.id)}
+        {#if row.kind === "group"}
+          <LaneGroupHeader {row} />
+        {:else}
+          <TrackHeader track={row.track} index={row.trackIndex} collapsed={row.collapsed} />
+        {/if}
       {/each}
       <div class="addrow">
         <button class="add mono" onclick={addTrack}>+ AUDIO</button>
         <button class="add midi mono" onclick={addMidiTrack}>+ MIDI</button>
         <button class="add auto mono" onclick={addAutomationTrack}>+ AUTO</button>
       </div>
+      {#if project.tracks.length > 1}
+        <div class="foldrow">
+          <button
+            class="foldall mono"
+            title="Fold every lane to a strip, or unfold them all"
+            onclick={() => lanes.setAllCollapsed(!lanes.anyCollapsed())}
+            >{lanes.anyCollapsed() ? "⤢ UNFOLD ALL" : "⤡ FOLD ALL"}</button
+          >
+        </div>
+      {/if}
     </div>
 
     <div
@@ -804,40 +941,69 @@
       onpointercancel={onLanesPointerUp}
     >
       <canvas bind:this={gridCanvas} class="grid"></canvas>
-      {#each project.tracks as track (track.id)}
-        <div
-          class="lane"
-          class:armed={track.armed}
-          class:midilane={track.kind === "midi"}
-          class:autolane={track.kind === "automation"}
-          class:droptarget={dropTrackId === track.id}
-          role="presentation"
-          ondblclick={(e) => onLaneDblClick(track, e)}
-          ondragover={(e) => onLaneDragOver(track, e)}
-          ondragleave={() => (dropTrackId = "")}
-          ondrop={(e) => onLaneDrop(track, e)}
-        >
-          {#if track.kind === "automation"}
-            <AutomationTrackRow {track} />
-          {:else}
-          {#each project.clipsOf(track.id) as clip (clip.id)}
-            <ClipView {clip} {track} />
-          {/each}
-          {#each midi.clipsOf(track.id) as clip (clip.id)}
-            <MidiClipView {clip} {track} />
-          {/each}
-          {#if modulation.hasVisible(track.id)}
-            <div class="lane-shade"></div>
-            {#each modulation.visibleBindingsFor(track.id) as binding (binding.id)}
-              {@const curve = modulation.curveOf(binding)}
-              {#if curve}
-                <ModulationLaneView {track} {binding} {curve} />
-              {/if}
+      {#each layout.rows as row (row.kind === "group" ? `g:${row.group}` : row.track.id)}
+        {#if row.kind === "group"}
+          <!-- The lane-column half of a group header: a tinted strip that
+               keeps the two columns row-for-row identical. Clicking it
+               folds, so the whole strip is a target, not just the rail's
+               little triangle. -->
+          <div
+            class="grouplane"
+            class:folded={row.collapsed}
+            style:height="{row.height}px"
+            style:--group-color={row.color}
+            role="presentation"
+            ondblclick={() => lanes.toggleGroup(row.group)}
+          ></div>
+        {:else}
+          {@const track = row.track}
+          <div
+            class="lane"
+            class:armed={track.armed}
+            class:midilane={track.kind === "midi"}
+            class:autolane={track.kind === "automation"}
+            class:lanefolded={row.collapsed}
+            class:droptarget={dropTrackId === track.id}
+            style:height="{row.height}px"
+            role="presentation"
+            ondblclick={(e) => onLaneDblClick(track, e)}
+            ondragover={(e) => onLaneDragOver(track, e)}
+            ondragleave={() => (dropTrackId = "")}
+            ondrop={(e) => onLaneDrop(track, e)}
+          >
+            {#if track.kind === "automation"}
+              <AutomationTrackRow {track} />
+            {:else}
+            {#each project.clipsOf(track.id) as clip (clip.id)}
+              <ClipView {clip} {track} />
             {/each}
-          {/if}
+            {#each midi.clipsOf(track.id) as clip (clip.id)}
+              <MidiClipView {clip} {track} />
+            {/each}
+            {#if modulation.hasVisible(track.id) && !row.collapsed}
+              <div class="lane-shade"></div>
+              {#each modulation.visibleBindingsFor(track.id) as binding (binding.id)}
+                {@const curve = modulation.curveOf(binding)}
+                {#if curve}
+                  <ModulationLaneView {track} {binding} {curve} />
+                {/if}
+              {/each}
+            {/if}
+            {/if}
+          </div>
+        {/if}
+      {/each}
+      {#if lanes.dropIndicator}
+        <div
+          class="dropline"
+          class:intogroup={lanes.dropIndicator.group !== null}
+          style:top="{lanes.dropIndicator.y}px"
+        >
+          {#if lanes.dropIndicator.group !== null}
+            <span class="droplabel mono">{lanes.dropIndicator.group}</span>
           {/if}
         </div>
-      {/each}
+      {/if}
       {#if project.tracks.length === 0}
         <div class="empty silk">
           <div>no tracks — add one to begin</div>
@@ -877,8 +1043,14 @@
       {#each launchMarks as mark (mark.binding.id)}
         {@const left = view.xOf(mark.box.startSamples)}
         {@const width = Math.max(4, (mark.box.endSamples - mark.box.startSamples) / view.spp)}
-        {@const top = mark.box.laneLo * TRACK_HEIGHT_PX}
-        {@const height = (mark.box.laneHi - mark.box.laneLo + 1) * TRACK_HEIGHT_PX}
+        <!-- The band covers only the lanes that are actually painted: a
+             region spanning a folded group shrinks onto what is visible
+             instead of drawing a block over the fold. `null` = every lane
+             it names is hidden, so the mark is not drawn at all. -->
+        {@const band = bandForTrackRange(layout, project.tracks, mark.box.laneLo, mark.box.laneHi)}
+        {#if band}
+        {@const top = band.top}
+        {@const height = band.height}
         <div
           class="launchmark"
           class:sel={launch.selectedId === mark.binding.id}
@@ -915,6 +1087,7 @@
             ></div>
           {/if}
         </div>
+        {/if}
       {/each}
       {#if marqueeRect && marqueeRect.width > 2}
         <div
@@ -927,6 +1100,7 @@
         ></div>
       {/if}
       <div bind:this={playheadEl} class="playhead"></div>
+    </div>
     </div>
   </div>
 
@@ -1109,12 +1283,44 @@
     }
   }
 
+  /*
+   * The vertical scroller. It is a plain BLOCK, not the flex row it used
+   * to be, and that distinction is the whole fix for three separate
+   * symptoms that were all one bug:
+   *
+   *   - `.rail` and `.lanes` were flex ITEMS of a container with a definite
+   *     height, so `align-items: stretch` sized both to the VIEWPORT rather
+   *     than to their content;
+   *   - the rail's headers, being flex items themselves with the default
+   *     `flex-shrink: 1`, were then squeezed to fit — 88 px lanes against
+   *     44 px headers, drifting further apart with every row, which is the
+   *     "the two columns don't line up" report;
+   *   - `.lanes` clipped its overflow (it must, horizontally), so lanes past
+   *     the fold were painted nowhere and, since a clipped child adds no
+   *     scroll height, the body never became scrollable at all — the lanes
+   *     "behind" the piano roll were simply unreachable, and interface zoom
+   *     made it worse by shrinking the viewport in layout px.
+   *
+   * Measured before: 10 tracks in a 473 px body → scrollHeight == clientHeight
+   * (no scroll), header 44 px vs lane 88 px, row 5 off by 445 px. After:
+   * scrollHeight 918, every row aligned to 0.00 px at every scroll offset.
+   */
   .body {
     flex: 1;
     min-height: 0;
-    display: flex;
     overflow-y: auto;
     overflow-x: hidden;
+    /* Keep the wheel inside the arrangement instead of chaining to the
+       shell once the lanes hit an end. */
+    overscroll-behavior-y: contain;
+  }
+  /* The flex row lives INSIDE the scroller, sized by its rows.
+     `min-height: 100%` only keeps the columns' backgrounds filling a
+     short arrangement; it never caps them. */
+  .bodyinner {
+    display: flex;
+    align-items: stretch;
+    min-height: 100%;
   }
 
   .scrollrow {
@@ -1136,12 +1342,39 @@
     background: rgb(var(--bg-1-rgb) / 0.6);
     display: flex;
     flex-direction: column;
+    /* The rail's own children must never shrink either — see the note on
+       `.header` in TrackHeader.svelte. Belt and braces: the two columns
+       drifting apart is a silent, cumulative failure. */
+    align-items: stretch;
+  }
+  .rail > :global(*) {
+    flex: none;
   }
   .addrow {
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
     margin: 10px;
+  }
+  .foldrow {
+    display: flex;
+    margin: 0 10px 10px;
+  }
+  .foldall {
+    flex: 1;
+    padding: 5px;
+    font-size: 8px;
+    letter-spacing: 0.2em;
+    color: var(--text-faint);
+    background: transparent;
+    border: 1px solid rgb(var(--edge-rgb) / 0.12);
+    border-radius: 5px;
+    cursor: pointer;
+    transition: color 120ms, border-color 120ms;
+  }
+  .foldall:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
   }
   .add {
     flex: 1;
@@ -1184,6 +1417,12 @@
     padding-left: var(--rail-width);
   }
 
+  /* Height is now content-driven (the rows are in normal flow) and then
+     stretched to the flex line, which is always at least as tall — the
+     rail carries the same rows PLUS the add/fold buttons. So
+     `overflow: hidden` only ever clips HORIZONTALLY, which is what it is
+     for: clips run past the right edge, and the timeline scrolls time by
+     redrawing rather than by scrollLeft. */
   .lanes {
     flex: 1;
     min-width: 0;
@@ -1205,10 +1444,59 @@
     width: 100%;
     pointer-events: none;
   }
+  /* Height comes from the row table (inline), not from `--track-height`:
+     a lane is full, folded, or a group strip. The token stays the default
+     the row table reads. */
   .lane {
     position: relative;
-    height: var(--track-height);
     border-bottom: 1px solid rgb(var(--line-rgb) / 0.08);
+  }
+  /* A folded lane keeps its clips — that is the point of the strip: you
+     can still see WHERE the material is, just not what it looks like. The
+     clip chrome that needs room is hidden rather than squashed. */
+  .lane.lanefolded :global(.cliplabel),
+  .lane.lanefolded :global(.launchlab) {
+    display: none;
+  }
+  .grouplane {
+    position: relative;
+    border-bottom: 1px solid rgb(var(--line-rgb) / 0.14);
+    background: linear-gradient(
+      to right,
+      color-mix(in srgb, var(--group-color) 14%, transparent),
+      transparent 40%
+    );
+  }
+  /* The drop indicator during a lane drag. It spans the lane column so the
+     landing place is unmistakable, and it is tinted when the drop would
+     join a group — the one thing a plain line cannot say. */
+  .dropline {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 2px;
+    margin-top: -1px;
+    background: var(--cyan);
+    box-shadow: 0 0 8px var(--cyan-dim);
+    pointer-events: none;
+    z-index: 6;
+  }
+  .dropline.intogroup {
+    background: var(--amber);
+    box-shadow: 0 0 8px rgb(var(--amber-rgb) / 0.5);
+  }
+  .droplabel {
+    position: absolute;
+    left: 8px;
+    top: -14px;
+    font-size: 8px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--bg-0);
+    background: var(--amber);
+    border-radius: 3px;
+    padding: 1px 5px;
+    white-space: nowrap;
   }
   .lane.armed {
     background: rgb(var(--red-rgb) / 0.03);

@@ -431,6 +431,7 @@ mod tests {
             color: "#aabbcc".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         });
         project.tempo_bpm = 92.5;
         save(&dir, &project).unwrap();
@@ -486,6 +487,7 @@ mod tests {
             color: "#7c9cff".into(),
             instrument_id: None,
             inserts: Vec::new(),
+            group: None,
         }
     }
 

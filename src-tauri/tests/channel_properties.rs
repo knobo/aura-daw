@@ -67,6 +67,7 @@ fn test_track(id: &str) -> TrackState {
         color: "#7c9cff".into(),
         instrument_id: None,
         inserts: Vec::new(),
+        group: None,
     }
 }
 

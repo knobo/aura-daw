@@ -44,7 +44,7 @@ use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
-pub use ops::TrackMixChange;
+pub use ops::{LaneArrangement, TrackMixChange};
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
 pub use vergraph::{VersionGraph, VersionNode, VersionStats};
@@ -489,6 +489,7 @@ impl Committer {
                     op::PropPath::Name
                     | op::PropPath::Armed
                     | op::PropPath::InstrumentId
+                    | op::PropPath::Group
                     | op::PropPath::TimelineStartSamples
                     | op::PropPath::LengthSamples
                     | op::PropPath::OffsetSamples
@@ -2307,6 +2308,145 @@ impl ControlPlane {
         })?;
         self.clear_midi_routing_for(id, &clip_ids);
         Ok(())
+    }
+
+    /// Lanes UX: rename one track. Property-addressed (`Op::Set` +
+    /// `PropPath::Name`), so it is undoable, journaled and coalescable like
+    /// every other track property — there is no bespoke rename channel.
+    /// Trim/empty/length validation lives on the WRITE side
+    /// (`session::write_prop`), so what comes back here is the value that
+    /// was actually stored.
+    pub fn set_track_name(
+        &self,
+        id: &str,
+        name: String,
+        meta: op::TxMeta,
+    ) -> Result<TrackState, String> {
+        self.set_track_prop(id, op::PropPath::Name, serde_json::Value::String(name), meta)
+    }
+
+    /// Lanes UX: put one track in a lane group (`None` = ungrouped). See
+    /// [`Self::arrange_lanes`] for the drag-shaped path that also moves the
+    /// row — this one is the plain "set the label" case.
+    ///
+    /// Deliberately does NOT reorder: `buildLaneLayout` (frontend) treats a
+    /// group as the maximal CONTIGUOUS run of tracks sharing its name, so
+    /// calling this on a track outside its target group's run produces a
+    /// track whose `group` is set but is not adjacent to the rest of that
+    /// group — a split run the UI was built to never paint. No UI path
+    /// calls this today (every user-facing group change goes through
+    /// `arrange_lanes`, which keeps runs contiguous by construction); if you
+    /// are adding one, prefer `arrange_lanes` unless you also handle
+    /// contiguity at the call site.
+    pub fn set_track_group(
+        &self,
+        id: &str,
+        group: Option<String>,
+        meta: op::TxMeta,
+    ) -> Result<TrackState, String> {
+        let to = match group {
+            Some(g) => serde_json::Value::String(g),
+            None => serde_json::Value::Null,
+        };
+        self.set_track_prop(id, op::PropPath::Group, to, meta)
+    }
+
+    /// Shared body of the two setters above: one `Op::Set` against a track,
+    /// then read the committed row back. Validating the id here (rather
+    /// than letting `apply_raw` fail) keeps the error message the same
+    /// shape as `set_track_mix`'s pre-check.
+    fn set_track_prop(
+        &self,
+        id: &str,
+        path: op::PropPath,
+        to: serde_json::Value,
+        meta: op::TxMeta,
+    ) -> Result<TrackState, String> {
+        {
+            let session = self.session.lock();
+            if !session.store.tracks.iter().any(|t| t.id.as_str() == id) {
+                return Err(format!("unknown track: {id}"));
+            }
+        }
+        let object = op::ObjectRef::Track(id.into());
+        self.commit(meta, |tx| {
+            // `from` is advisory — `apply_raw` reads store truth for the
+            // inverse — so `Null` here is correct, not a placeholder bug.
+            tx.apply(op::Op::Set { object, path, from: serde_json::Value::Null, to })
+        })?;
+        let session = self.session.lock();
+        session
+            .store
+            .tracks
+            .iter()
+            .find(|t| t.id.as_str() == id)
+            .cloned()
+            // Same race `set_track_mix` documents: a concurrent
+            // `remove_track` can land between commit and this lock.
+            .ok_or_else(|| format!("unknown track: {id}"))
+    }
+
+    /// Lanes UX: apply a whole lane arrangement — display order plus each
+    /// row's group — in ONE transaction.
+    ///
+    /// Coarse on purpose. Every lane gesture the UI offers (drag to
+    /// reorder, drag into or out of a group, rename a group, collapse-driven
+    /// regroup) changes order and membership together, and a user who drags
+    /// one lane into a group expects ONE Ctrl+Z to put it back. Splitting
+    /// this into `reorder` + N × `set_track_group` would make that two to
+    /// N+1 undo steps and would publish intermediate arrangements where a
+    /// group is momentarily non-contiguous.
+    ///
+    /// `lanes` must list EVERY track exactly once, in the new display
+    /// order; `Op::TrackReorder` enforces that and rejects the whole
+    /// transaction otherwise. Group writes are emitted only where the value
+    /// actually changes, so a pure reorder journals one op, not N+1.
+    pub fn arrange_lanes(
+        &self,
+        lanes: Vec<LaneArrangement>,
+        meta: op::TxMeta,
+    ) -> Result<Vec<TrackState>, String> {
+        // Snapshot current groups before the commit so the diff below only
+        // emits `Set`s that change something.
+        let current: std::collections::HashMap<String, Option<String>> = {
+            let session = self.session.lock();
+            session
+                .store
+                .tracks
+                .iter()
+                .map(|t| (t.id.to_string(), t.group.clone()))
+                .collect()
+        };
+        let order: Vec<crate::ids::TrackId> =
+            lanes.iter().map(|l| l.track_id.as_str().into()).collect();
+        self.commit(meta, |tx| {
+            // Reorder FIRST: it is the op that validates the id set, so a
+            // bogus arrangement fails before any group label is rewritten.
+            tx.apply(op::Op::TrackReorder { order })?;
+            for lane in &lanes {
+                // Normalize here as well as in `write_prop` so the
+                // "unchanged" comparison sees the same shape the store
+                // holds — otherwise `Some("")` from a caller would look
+                // different from the stored `None` and emit a no-op Set.
+                let want = lane.group.as_deref().map(str::trim).filter(|g| !g.is_empty());
+                let have = current.get(&lane.track_id).cloned().flatten();
+                if want == have.as_deref() {
+                    continue;
+                }
+                tx.apply(op::Op::Set {
+                    object: op::ObjectRef::Track(lane.track_id.as_str().into()),
+                    path: op::PropPath::Group,
+                    from: serde_json::Value::Null,
+                    to: match want {
+                        Some(g) => serde_json::Value::String(g.to_string()),
+                        None => serde_json::Value::Null,
+                    },
+                })?;
+            }
+            Ok(())
+        })?;
+        let session = self.session.lock();
+        Ok(session.store.tracks.clone())
     }
 
     /// Plan G1: document half of insert-add — `PluginAdd` then `InsertAdd`
@@ -4831,6 +4971,119 @@ mod tests {
             std::sync::Arc::new(crate::control::HistoryLog::new()),
         );
         (cp, engine_rx, events)
+    }
+
+    // ---- lanes UX: arrange_lanes ----------------------------------------
+
+    fn lane(id: &str, group: Option<&str>) -> LaneArrangement {
+        LaneArrangement { track_id: id.into(), group: group.map(str::to_string) }
+    }
+
+    fn ids_and_groups(cp: &ControlPlane) -> Vec<(String, Option<String>)> {
+        cp.session
+            .lock()
+            .store
+            .tracks
+            .iter()
+            .map(|t| (t.id.to_string(), t.group.clone()))
+            .collect()
+    }
+
+    /// The gesture this whole command exists for: drag a lane to a new
+    /// position AND into a group. It must be ONE transaction, because it is
+    /// one user action — two commits would mean two Ctrl+Z presses to undo
+    /// what looked like a single drag.
+    #[test]
+    fn arrange_lanes_reorders_and_regroups_in_one_undoable_step() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1", "t-2", "t-3"]);
+        let before_rev = cp.session.lock().rev;
+        cp.arrange_lanes(
+            vec![lane("t-3", Some("Drums")), lane("t-1", Some("Drums")), lane("t-2", None)],
+            op::TxMeta::user("arrange"),
+        )
+        .unwrap();
+        assert_eq!(
+            ids_and_groups(&cp),
+            [
+                ("t-3".to_string(), Some("Drums".to_string())),
+                ("t-1".to_string(), Some("Drums".to_string())),
+                ("t-2".to_string(), None),
+            ]
+        );
+        assert_eq!(cp.session.lock().rev, before_rev + 1, "exactly one commit, so exactly one undo");
+    }
+
+    /// A pure reorder journals ONE op, not one per track: `arrange_lanes`
+    /// diffs each group against store truth and skips the ones that already
+    /// match. Pinned on the committed op list because the cost is per-track
+    /// — on a 200-lane project the naive version writes 200 no-op `Set`s
+    /// into the journal for every drag.
+    #[test]
+    fn arrange_lanes_emits_group_writes_only_where_the_group_changed() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1", "t-2", "t-3"]);
+        cp.set_track_group("t-1", Some("Keys".into()), op::TxMeta::user("seed")).unwrap();
+
+        // Re-send t-1's EXISTING group while the order changes, and move
+        // t-3 into it. Expect: 1 reorder + 1 Set (for t-3) — not 3 Sets.
+        let committed = cp
+            .commit(op::TxMeta::user("arrange"), |tx| {
+                tx.apply(op::Op::TrackReorder {
+                    order: vec!["t-2".into(), "t-1".into(), "t-3".into()],
+                })
+            })
+            .unwrap();
+        assert_eq!(committed.ops.len(), 1, "the reorder itself is a single op");
+
+        let before = cp.session.lock().rev;
+        cp.arrange_lanes(
+            vec![lane("t-3", Some("Keys")), lane("t-1", Some("Keys")), lane("t-2", None)],
+            op::TxMeta::user("arrange"),
+        )
+        .unwrap();
+        assert_eq!(
+            ids_and_groups(&cp),
+            [
+                ("t-3".to_string(), Some("Keys".to_string())),
+                ("t-1".to_string(), Some("Keys".to_string())),
+                ("t-2".to_string(), None),
+            ],
+            "t-3 joined the group, t-1's survived untouched, t-2 stayed ungrouped"
+        );
+        assert_eq!(cp.session.lock().rev, before + 1, "still one commit");
+    }
+
+    /// A bad arrangement must fail atomically — no partial reorder, and no
+    /// group label rewritten. `Op::TrackReorder` is applied FIRST precisely
+    /// so this fails before any label is touched.
+    #[test]
+    fn arrange_lanes_rejects_an_incomplete_arrangement_atomically() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1", "t-2", "t-3"]);
+        let before = ids_and_groups(&cp);
+        let r = cp.arrange_lanes(
+            vec![lane("t-2", Some("Drums")), lane("t-1", Some("Drums"))],
+            op::TxMeta::user("arrange"),
+        );
+        assert!(r.is_err(), "an arrangement missing t-3 must be rejected");
+        assert_eq!(ids_and_groups(&cp), before, "no row moved, no group written");
+    }
+
+    #[test]
+    fn set_track_name_trims_and_rejects_a_blank_rename() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        let t = cp.set_track_name("t-1", "  Bass  ".into(), op::TxMeta::user("rename")).unwrap();
+        assert_eq!(t.name, "Bass", "the returned row carries the STORED name");
+        assert!(cp.set_track_name("t-1", "   ".into(), op::TxMeta::user("rename")).is_err());
+        assert_eq!(cp.session.lock().store.tracks[0].name, "Bass", "rejected rename changed nothing");
+        assert!(cp.set_track_name("nope", "X".into(), op::TxMeta::user("rename")).is_err());
+    }
+
+    #[test]
+    fn set_track_group_sets_and_clears() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        let t = cp.set_track_group("t-1", Some("Drums".into()), op::TxMeta::user("g")).unwrap();
+        assert_eq!(t.group.as_deref(), Some("Drums"));
+        let t = cp.set_track_group("t-1", None, op::TxMeta::user("g")).unwrap();
+        assert_eq!(t.group, None);
     }
 
     /// Round-2 O-13: the alias window (Gate B, Task 8 step 2). Sequence:
@@ -7363,6 +7616,7 @@ mod tests {
                 color: "#7c9cff".into(),
                 instrument_id: None,
                 inserts: Vec::new(),
+                group: None,
             });
         }
         let slots = derive_slots(&store.tracks);
@@ -7469,6 +7723,7 @@ mod tests {
                 color: "#7c9cff".into(),
                 instrument_id: Some(format!("plugin:{}", ids[slot])),
                 inserts: Vec::new(),
+                group: None,
             });
         }
         let slots = derive_slots(&store.tracks);

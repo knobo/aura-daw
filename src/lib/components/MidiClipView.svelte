@@ -17,6 +17,7 @@
   import { clipSelection } from "../state/clip-selection.svelte";
   import { clipDrag } from "../state/clip-drag.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
+  import { focusAndSelect } from "../utils/focusAndSelect";
 
   let { clip, track }: { clip: MidiClip; track: TrackState } = $props();
 
@@ -190,21 +191,11 @@
   let renaming = $state(false);
   let draft = $state("");
   let downOnHeader = false;
-  let inputEl: HTMLInputElement | undefined = $state();
 
   function startRename() {
     draft = clip.name;
     renaming = true;
   }
-
-  // The input is inserted after this flips, so focus it once it exists —
-  // `autofocus` is unreliable for an element that appears mid-session.
-  $effect(() => {
-    if (renaming && inputEl) {
-      inputEl.focus();
-      inputEl.select();
-    }
-  });
 
   async function commitRename() {
     if (!renaming) return;
@@ -321,7 +312,7 @@
     <canvas bind:this={canvas} class="mini" style:left="{visL}px" style:width="{Math.max(1, Math.floor(visR - visL))}px"></canvas>
     {#if renaming}
       <input
-        bind:this={inputEl}
+        use:focusAndSelect
         class="tag rename mono"
         style:left="{visL + 4}px"
         value={draft}

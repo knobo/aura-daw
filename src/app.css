@@ -87,6 +87,13 @@
 
   /* chrome metrics */
   --track-height: 88px;
+  /* --lane-collapsed / --lane-group-height are NOT declared here: a folded
+     lane and a group header are the same height on purpose (both read as
+     "one strip standing in for something bigger"), and that height is
+     LANE_COLLAPSED_PX / GROUP_HEADER_PX in utils/lane-layout.ts — the same
+     numbers the grid canvas and the marquee measure against. main.ts sets
+     both properties from those constants before the app mounts, so there is
+     one number to change instead of two kept in sync by a comment. */
   --rail-width: 268px;
   --ruler-height: 34px;
 }
