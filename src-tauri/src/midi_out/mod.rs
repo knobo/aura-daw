@@ -588,6 +588,20 @@ struct Inner {
     active: HashMap<String, ActiveOutput>,
 }
 
+/// Called once after every change to the routing table, from whichever thread
+/// made the change. `ControlPlane::attach_midi_out` installs one that pushes
+/// [`RoutedOut`] to the engine so a routed track's internal instrument stops
+/// (or resumes) sounding.
+///
+/// A hook rather than a call at each site on purpose: the table is mutated from
+/// six places, one of them the port thread's self-heal, and the first version of
+/// this feature notified from only three of them. The two delete paths that were
+/// missed left the engine believing a since-deleted track was still routed —
+/// undo restored the row byte-identically and it came back with no MIDI-out
+/// route AND no internal voice, silent with no rebuild able to converge it.
+/// Anything that can be forgotten at six call sites will be.
+pub type RoutesChanged = Arc<dyn Fn() + Send + Sync>;
+
 /// Owns every currently open MIDI output connection and the
 /// `aura-midi-out-<n>` threads driving them, plus the routing table shared
 /// across all of them. See the module doc for the full contract.
@@ -609,6 +623,9 @@ pub struct MidiOut {
     /// [`MidiOut::set_routing_path_for_test`] so `persist`/`adopt_project`
     /// never touch the real developer machine's config.
     routing_path: PlMutex<Option<std::path::PathBuf>>,
+    /// See [`RoutesChanged`]. `None` in every unit test that builds a bare
+    /// `MidiOut::default()`, where nothing is listening.
+    on_routes_changed: OnceLock<RoutesChanged>,
     inner: PlMutex<Inner>,
 }
 
@@ -619,6 +636,7 @@ impl Default for MidiOut {
             shared: OnceLock::new(),
             routes: Arc::new(PlMutex::new(HashMap::new())),
             routing_path: PlMutex::new(None),
+            on_routes_changed: OnceLock::new(),
             inner: PlMutex::new(Inner::default()),
         }
     }
@@ -631,6 +649,25 @@ impl MidiOut {
     pub fn attach(&self, session: Arc<PlMutex<Session>>, shared: Arc<SharedRt>) {
         let _ = self.session.set(session);
         let _ = self.shared.set(shared);
+    }
+
+    /// Install the [`RoutesChanged`] hook. First call wins, like `attach`.
+    /// Installing it does NOT fire it — the caller publishes the initial state
+    /// itself, so a hook that is installed before any project is open does not
+    /// race the first `adopt_project`.
+    pub fn set_routes_changed_hook(&self, hook: RoutesChanged) {
+        let _ = self.on_routes_changed.set(hook);
+    }
+
+    /// Fire the hook, if one is installed.
+    ///
+    /// NEVER call this while holding `self.routes`: the hook reads the table
+    /// back through [`Self::routed_out`], and `parking_lot::Mutex` is not
+    /// reentrant, so that is a hard deadlock rather than a slow path.
+    fn routes_changed(&self) {
+        if let Some(hook) = self.on_routes_changed.get() {
+            hook();
+        }
     }
 
     /// Open one more output port, additively — does not touch any other
@@ -670,6 +707,7 @@ impl MidiOut {
         let shared_for_thread = self.shared.get().cloned();
         let routes_for_thread = self.routes.clone();
         let port_id_for_thread = port_id.clone();
+        let changed_for_thread = self.on_routes_changed.get().cloned();
 
         let handle = std::thread::Builder::new()
             .name(format!("aura-midi-out-{port_id}"))
@@ -682,6 +720,7 @@ impl MidiOut {
                     clock_for_thread,
                     routes_for_thread,
                     port_id_for_thread,
+                    changed_for_thread,
                 )
             })
             .map_err(|e| e.to_string())?;
@@ -736,22 +775,25 @@ impl MidiOut {
     /// releases whatever the PREVIOUS routing left sounding before adopting
     /// the new one.
     pub fn set_route(&self, scope: RouteScope, target: Option<RouteTarget>) {
-        let mut routes = self.routes.lock();
-        match target {
-            Some(mut t) => {
-                // Port/channel edits must not drop an existing return; the
-                // dedicated `set_return` is how a return is cleared.
-                if t.return_device.is_none() {
-                    if let Some(old) = routes.get(&scope) {
-                        t.return_device = old.return_device.clone();
+        {
+            let mut routes = self.routes.lock();
+            match target {
+                Some(mut t) => {
+                    // Port/channel edits must not drop an existing return; the
+                    // dedicated `set_return` is how a return is cleared.
+                    if t.return_device.is_none() {
+                        if let Some(old) = routes.get(&scope) {
+                            t.return_device = old.return_device.clone();
+                        }
                     }
+                    routes.insert(scope, t);
                 }
-                routes.insert(scope, t);
-            }
-            None => {
-                routes.remove(&scope);
+                None => {
+                    routes.remove(&scope);
+                }
             }
         }
+        self.routes_changed();
     }
 
     /// Set (or, on `None`, clear) the audio-return input device on an
@@ -786,6 +828,7 @@ impl MidiOut {
     /// swap devices instead of closing one for good.
     pub fn clear_routes_for_port(&self, port_id: &str) {
         self.routes.lock().retain(|_, t| t.port_id != port_id);
+        self.routes_changed();
     }
 
     /// Drop every route addressing this track (its own track-level route,
@@ -793,11 +836,14 @@ impl MidiOut {
     /// from the document (ruling 10: nothing in the document model retires
     /// these on its own).
     pub fn clear_routes_for_track(&self, track_id: &str, clip_ids: &[String]) {
-        let mut routes = self.routes.lock();
-        routes.remove(&RouteScope::Track(track_id.to_string()));
-        for id in clip_ids {
-            routes.remove(&RouteScope::Clip(id.clone()));
+        {
+            let mut routes = self.routes.lock();
+            routes.remove(&RouteScope::Track(track_id.to_string()));
+            for id in clip_ids {
+                routes.remove(&RouteScope::Clip(id.clone()));
+            }
         }
+        self.routes_changed();
     }
 
     pub fn routes(&self) -> HashMap<RouteScope, RouteTarget> {
@@ -910,16 +956,29 @@ impl MidiOut {
         // "wanted" if its id is one of these, NOT if its name is spelled the
         // same, so an already-open Hydrogen is not closed and reopened just
         // because the file remembers its previous sequencer address.
-        let wanted_ids: HashSet<&str> = wanted_names.iter().filter_map(|n| resolve(n)).collect();
-
-        let leftover: Vec<String> = self
-            .inner
-            .lock()
-            .active
-            .values()
-            .filter(|a| !wanted_ids.contains(a.port.id.as_str()))
-            .map(|a| a.port.id.clone())
-            .collect();
+        //
+        // `available` empty means the enumeration itself failed (midir could not
+        // create a client), NOT that the machine has no MIDI: resolving against
+        // it would then close every open port, throwing away working
+        // connections over a transient failure. Degrade to "change nothing" and
+        // let the next project open sort it out.
+        let enumeration_worked = !available.is_empty();
+        let leftover: Vec<String> = if enumeration_worked {
+            let wanted_ids: HashSet<&str> =
+                wanted_names.iter().filter_map(|n| resolve(n)).collect();
+            self.inner
+                .lock()
+                .active
+                .values()
+                .filter(|a| !wanted_ids.contains(a.port.id.as_str()))
+                .map(|a| a.port.id.clone())
+                .collect()
+        } else {
+            log::warn!(
+                "midi routing: output port enumeration failed; keeping the ports that are open"
+            );
+            Vec::new()
+        };
         for id in leftover {
             let _ = self.close_port(&id);
         }
@@ -985,6 +1044,7 @@ impl MidiOut {
             );
         }
         *self.routes.lock() = new_routes;
+        self.routes_changed();
     }
 
     /// Save the current port-clock prefs (always) and, if `project_dir` is
@@ -1172,6 +1232,7 @@ fn run_thread(
     clock_enabled: Arc<AtomicBool>,
     routes: Arc<PlMutex<HashMap<RouteScope, RouteTarget>>>,
     port_id: String,
+    on_routes_changed: Option<RoutesChanged>,
 ) {
     let mut engine = ClockEngine::new();
     let mut route_states: RouteNoteStates = HashMap::new();
@@ -1218,8 +1279,16 @@ fn run_thread(
                     // Self-heal: drop this port's own routes whose track/
                     // clip no longer exists in the document, then take a
                     // snapshot of the (now-clean) full table.
-                    let all_routes: HashMap<RouteScope, RouteTarget> = {
+                    //
+                    // A drop here changes the routing table like any other, so
+                    // it owes the `RoutesChanged` hook a call — otherwise the
+                    // engine keeps suppressing the internal instrument of a
+                    // track this thread just un-routed, and an undo that brings
+                    // the track back finds it silent. Fired below, once the
+                    // session guard is released.
+                    let (all_routes, healed): (HashMap<RouteScope, RouteTarget>, bool) = {
                         let mut all = routes.lock();
+                        let before = all.len();
                         all.retain(|scope, target| {
                             if target.port_id != port_id {
                                 return true; // not this thread's to judge
@@ -1233,7 +1302,7 @@ fn run_thread(
                                 }
                             }
                         });
-                        all.clone()
+                        (all.clone(), all.len() != before)
                     };
 
                     // Any clip with its OWN route (on any port) is excluded
@@ -1287,6 +1356,11 @@ fn run_thread(
                         );
                     }
                     drop(guard);
+                    if healed {
+                        if let Some(hook) = &on_routes_changed {
+                            hook();
+                        }
+                    }
 
                     let pos_now = shared_rt.as_ref().map(|s| s.position.load(Relaxed)).unwrap_or(0);
 

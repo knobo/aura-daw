@@ -2050,24 +2050,45 @@ impl ControlPlane {
     /// unit test's `ControlPlane` has an unattached `midi_out`, and the
     /// methods below error instead of panicking.
     pub fn attach_midi_out(&self, out: Arc<crate::midi_out::MidiOut>) {
+        // Every change to the routing table — from here, from the panel, from
+        // a project adopt, from the port thread's own self-heal — has to reach
+        // the engine, because routing is app config and never rides a commit.
+        // One hook installed here does that, instead of a `publish` call
+        // remembered at each of six sites (which is how two delete paths came
+        // to be missed; see `midi_out::RoutesChanged`).
+        //
+        // WEAK, deliberately: the hook lives inside `MidiOut`, so a strong
+        // reference back to it would be a cycle that never drops.
+        let engine = self.engine.clone();
+        let weak = Arc::downgrade(&out);
+        out.set_routes_changed_hook(std::sync::Arc::new(move || {
+            if let Some(out) = weak.upgrade() {
+                engine.send(ControlMsg::SetExternalRouting(std::sync::Arc::new(
+                    out.routed_out(),
+                )));
+            }
+        }));
         // `OnceLock::set` returning `Err` (already attached) is silently
         // ignored — lib.rs calls this exactly once in `setup`, and a
         // hypothetical second call losing is harmless (first attach wins).
         let _ = self.midi_out.set(out);
+        // Seed the engine with whatever the table already holds; the hook only
+        // fires on later changes.
+        self.publish_external_routing();
     }
 
     fn midi_out(&self) -> Result<&Arc<crate::midi_out::MidiOut>, String> {
         self.midi_out.get().ok_or_else(|| "midi output driver not attached".to_string())
     }
 
-    /// Tell the engine which tracks/clips now go out to hardware, so their
-    /// internal instrument stops (or resumes) sounding. Routing is app
-    /// config — it never travels through `commit`, so nothing else in the
-    /// system would schedule the rebuild this needs. Must be called after
-    /// EVERY change to the routing table: patching or clearing a route,
-    /// closing a port (which clears its routes), and adopting a project's
-    /// persisted routing. A `ControlPlane` with no `MidiOut` attached (unit
-    /// tests) publishes an empty table, which is the correct answer.
+    /// Push the current routing table to the engine, so a routed track's
+    /// internal instrument stops (or resumes) sounding.
+    ///
+    /// Normal changes do NOT come through here — `attach_midi_out` installs a
+    /// `RoutesChanged` hook on `MidiOut` that fires on every mutation, which is
+    /// the only way to cover the port thread's self-heal as well. This is the
+    /// seeding call for attach time, and the answer for a `ControlPlane` with no
+    /// `MidiOut` attached (every unit test): an empty table, which is correct.
     fn publish_external_routing(&self) {
         let routed = self
             .midi_out
@@ -2113,7 +2134,6 @@ impl ControlPlane {
         out.close_port(&port_id)?;
         out.clear_routes_for_port(&port_id);
         out.persist(self.current_project_dir().as_deref());
-        self.publish_external_routing();
         Ok(())
     }
 
@@ -2182,7 +2202,6 @@ impl ControlPlane {
             port_id.map(|port_id| crate::midi_out::RouteTarget::new(port_id, channel)),
         );
         out.persist(self.current_project_dir().as_deref());
-        self.publish_external_routing();
         Ok(())
     }
 
@@ -2251,7 +2270,6 @@ impl ControlPlane {
             port_id.map(|port_id| crate::midi_out::RouteTarget::new(port_id, channel)),
         );
         out.persist(self.current_project_dir().as_deref());
-        self.publish_external_routing();
         Ok(())
     }
 
@@ -3842,7 +3860,6 @@ impl ControlPlane {
         crate::plugins::automation::adopt_open_project(&dir);
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
-            self.publish_external_routing();
         }
         self.adopt_modulation_from_dir(&dir);
         self.engine.send(ControlMsg::Rebuild);
@@ -3931,7 +3948,6 @@ impl ControlPlane {
         crate::plugins::automation::adopt_open_project(&dir);
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
-            self.publish_external_routing();
         }
         self.adopt_modulation_from_dir(&dir);
         self.engine.send(ControlMsg::Rebuild);

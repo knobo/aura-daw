@@ -19,8 +19,10 @@ input side uses). `aconnect -l` at the shell lists what ALSA can see.
 
 ## Recipe 1: sync Hydrogen to AURA
 
-1. Start Hydrogen (or whatever should follow) **before** opening AURA, or
-   restart AURA after — the port list is read once at startup.
+1. Start Hydrogen (or whatever should follow). Order does not matter — the
+   panel re-reads the port list every couple of seconds, so a device started
+   after AURA appears in the picker on its own. (It used to be read once at
+   startup, which is why older notes here said to restart AURA.)
 2. In AURA's MIDI panel (press **D**), open the device from the **OUT**
    section's port picker.
 3. Leave that port's **clock** toggle on (it defaults to on).
@@ -174,6 +176,13 @@ and the workaround today is a smaller audio buffer.
 
 ## Troubleshooting
 
+* **The device is running but not in the picker at all.** AURA sees
+  **ALSA-seq** ports (`aconnect -l` is the exact list it reads). A host whose
+  MIDI runs over **JACK** — Carla with the JACK engine, for instance — publishes
+  JACK ports, which are a different namespace and do not show up there no matter
+  how long you wait. Either switch that host's MIDI to ALSA in its own settings,
+  or bridge the two (`a2jmidid`). If `aconnect -l` does not list it, neither
+  does AURA, and that is a fact about the other program.
 * **Nothing happens at all.** Check that port's **clock** toggle is on
   for sync, or that a track/clip is routed to a port for notes. Check
   `aconnect -l` shows both AURA and the target. Check the receiving app is

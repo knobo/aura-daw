@@ -463,6 +463,48 @@ fn a_routed_clip_is_subtracted_from_its_tracks_internal_voice() {
     assert_eq!(keys, vec![67], "only the routed clip's note is gone: {keys:?}");
 }
 
+/// Every mutation of the routing table notifies, including the ones that only
+/// REMOVE. Found in review: the first version of this feature published from
+/// three of six call sites, and the two delete paths were among the misses. The
+/// engine then went on suppressing the internal instrument of a track that was
+/// no longer routed — and because `Op::TrackAdd` restores a deleted row
+/// byte-identically, undoing the delete brought the track back with no MIDI-out
+/// route AND no internal voice: silent, with no rebuild able to converge it.
+///
+/// Asserted at the hook, which is the single seam every path now goes through.
+#[test]
+fn every_routing_change_notifies_including_the_removals() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let out = Arc::new(MidiOut::default());
+    {
+        let calls = calls.clone();
+        out.set_routes_changed_hook(std::sync::Arc::new(move || {
+            calls.fetch_add(1, Relaxed);
+        }));
+    }
+    let seen = || calls.load(Relaxed);
+
+    out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::from_clip("p#0")));
+    assert_eq!(seen(), 1, "patching a route notifies");
+
+    out.set_route(RouteScope::Clip("c-1".into()), Some(RouteTarget::from_clip("p#0")));
+    assert_eq!(seen(), 2, "patching a clip override notifies");
+
+    // The clip-delete path (`ControlPlane::clear_midi_route_for_clip`).
+    out.set_route(RouteScope::Clip("c-1".into()), None);
+    assert_eq!(seen(), 3, "CLEARING a route notifies — this is the one that was missed");
+
+    // The track-delete path (`ControlPlane::clear_midi_routing_for`).
+    out.clear_routes_for_track("t-1", &["c-1".into()]);
+    assert_eq!(seen(), 4, "clearing a track's routes notifies — likewise");
+
+    // The port-close path.
+    out.set_route(RouteScope::Track("t-2".into()), Some(RouteTarget::from_clip("p#0")));
+    out.clear_routes_for_port("p#0");
+    assert_eq!(seen(), 6, "closing a port notifies");
+    assert!(out.routed_out().is_empty(), "and the table really is empty now");
+}
+
 /// Routing survives the device coming back at a different ALSA sequencer
 /// address. `midir` spells an ALSA port `"<client>:<port> <n>:<m>"`, and `<n>`
 /// is assigned in connection order — so restarting Hydrogen renamed the port
@@ -503,6 +545,7 @@ fn a_persisted_route_survives_a_new_alsa_client_number() {
     persist::save_to_path(
         &routing_path,
         &persist::RoutingFile {
+            version: persist::CURRENT_VERSION,
             ports: HashMap::new(),
             projects: HashMap::from([(
                 persist::project_key(&dir),

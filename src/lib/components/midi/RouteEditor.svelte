@@ -50,6 +50,17 @@
 
   const CHANNELS = Array.from({ length: 16 }, (_, i) => i);
 
+  /** The picker's current value as a string, `""` for "from clip".
+   *
+   * Bound through `value` rather than per-option `selected` attributes on
+   * purpose: once the user has changed a `<select>`, its options' selectedness
+   * is *dirty* per the HTML spec, and rewriting the `selected` content
+   * attribute no longer moves the selection. The box would then keep showing
+   * channel 10 after Clear route had set the route back to "from clip" — and
+   * the next port pick would create a route on the channel the UI was NOT
+   * showing. Svelte assigns `value` as a property, which does move it. */
+  const channelValue = $derived(target?.channel == null ? "" : String(target.channel));
+
   const missingPort = $derived(target && target.health === "missing" ? target : null);
 </script>
 
@@ -85,13 +96,14 @@
       <select
         class="mono"
         disabled={!target}
+        value={channelValue}
         aria-label="MIDI channel for {scopeLabel}"
         title="Leave it on 'from clip' unless the device needs one fixed channel — General MIDI drums live on channel 10, and that is what the clip already says"
         onchange={(e) => onchannel(toChannel(e.currentTarget.value))}
       >
-        <option value="" selected={target?.channel == null}>from clip</option>
+        <option value="">from clip</option>
         {#each CHANNELS as ch (ch)}
-          <option value={String(ch)} selected={target?.channel === ch}>{ch + 1}</option>
+          <option value={String(ch)}>{ch + 1}</option>
         {/each}
       </select>
     </label>
