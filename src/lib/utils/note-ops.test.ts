@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { MidiNote } from "../types/ipc";
 import {
   applyMarquee,
+  channelForNewNote,
   copySelection,
   marqueeHits,
   nudgeSelection,
@@ -188,5 +189,37 @@ describe("quantizeSelection", () => {
     const { notes: out, selection } = quantizeSelection(notes, new Set(), 480, 1);
     expect(out).toEqual(notes);
     expect(selection.size).toBe(0);
+  });
+});
+
+describe("channelForNewNote", () => {
+  const on = (channel: number): MidiNote => ({ ...note(0, 60), channel });
+
+  it("is channel 0 for an empty clip", () => {
+    expect(channelForNewNote([])).toBe(0);
+  });
+
+  it("inherits the clip's channel, so a drum clip stays on channel 10", () => {
+    // What the Composer's groove generator writes: 0-based 9 == "MIDI ch 10",
+    // where General MIDI percussion lives and where a drum machine listens. A
+    // note drawn in on channel 0 would leave for a different MIDI channel than
+    // every other hit in the groove once the track is routed to hardware.
+    expect(channelForNewNote([on(9), on(9), on(9)])).toBe(9);
+  });
+
+  it("takes the majority when the clip is already mixed", () => {
+    expect(channelForNewNote([on(9), on(9), on(0)])).toBe(9);
+    expect(channelForNewNote([on(9), on(0), on(0)])).toBe(0);
+  });
+
+  it("breaks a tie toward the lower channel, not by insertion order", () => {
+    expect(channelForNewNote([on(9), on(2)])).toBe(2);
+    expect(channelForNewNote([on(2), on(9)])).toBe(2);
+  });
+
+  it("treats a missing channel as 0", () => {
+    const noChannel = { ...note(0, 60) };
+    delete (noChannel as { channel?: number }).channel;
+    expect(channelForNewNote([noChannel])).toBe(0);
   });
 });
