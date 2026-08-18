@@ -22,11 +22,11 @@ before picking G1 back up**:
 1. **Track D leftovers (automation)** — pick one, read the Track D handoff
    in `docs/PHASE4-PLAN.md` first: plugin-param automation is not applied
    in a bounce (`audio::offline::build_graph`'s documented divergence);
-   the non-blocking CLAP param path (`clap_host::set_params` blocks —
-   `docs/PHASE4-PLAN.md` "Track D handoff"); write/touch/latch automation
-   modes (currently a flat lane always overrides the knob for the whole
-   playthrough); no DOM test environment (nothing inside a `.svelte` file
-   is covered by any test — both of Track D's real bugs lived there).
+   write/touch/latch automation modes (currently a flat lane always
+   overrides the knob for the whole playthrough); no DOM test environment
+   (nothing inside a `.svelte` file is covered by any test — both of
+   Track D's real bugs lived there). (The non-blocking CLAP param path is
+   closed, branch `clap-nonblocking-params` — see the Track D handoff.)
 2. **Plan F carry-forwards (undo)** — read the Plan F handoff in
    `docs/PHASE4-PLAN.md` first, and do not touch `engine::rebuild`, the
    journal reader or the version graph without it: the live-document
@@ -145,7 +145,7 @@ this file (marked correction, ADR 0007) if they do.
   leads, not verdicts.
 - **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 7 wires `compile_inserts` into `engine::rebuild` (Task 5 landed the mixer walk itself but nothing calls it yet). **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
-- **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
+- **Track D leftovers:** plugin-param bounce, write/touch/latch, no DOM test env. (Non-blocking CLAP param path closed 2026-08-18, branch `clap-nonblocking-params` — see the Track D handoff.) Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):
   [`docs/superpowers/specs/2026-08-15-modulation-system-design.md` §8](docs/superpowers/specs/2026-08-15-modulation-system-design.md#8-the-path-to-the-finished-system).
   ADR 0008. Handoff: `docs/PHASE4-PLAN.md` "Track F handoff". Do not restate §8 here (R2).

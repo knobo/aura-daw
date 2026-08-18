@@ -868,16 +868,26 @@ instantiation per automated instance, seeded from the live one's
 ### Deferrals created by this track
 
 - **Sample-accurate plugin-param automation** (ruling 2) — round-2 §8.
-- **Non-blocking CLAP param path.** `clap_host::set_params` is
-  `plugin_main().run(…)`, a BLOCKING round-trip; `lv2_host::set_params`
-  already posts, so only CLAP blocks. Task 9 batched the writes (one call
+- ~~**Non-blocking CLAP param path.**~~ → **closed** (2026-08-18,
+  `clap-nonblocking-params`): `clap_host::post_params` is the
+  fire-and-forget sibling (`plugin_main().post(…)`, mirroring the
+  `ClapNode::Drop` precedent), and `forward_params_to_host`'s "clap" arm now
+  calls it instead of the blocking `clap_host::set_params`. That arm is
+  shared by the automation driver AND `execute_host_forward`'s ordinary
+  knob-turn writes, so both stopped blocking — safe because neither caller
+  ever used the `Result<Vec<ParamInfo>, String>` `set_params` returned
+  (`forward_params_to_host` itself returns nothing); `post_params` logs a
+  warn internally on failure so that visibility isn't lost. `set_params`
+  (blocking) is untouched and still used by `plugins/state.rs`'s snapshot
+  restore (not a hot path) and by `get_params`/the other control-facing
+  calls. Historical record of the problem, for context: `clap_host::set_params`
+  was `plugin_main().run(…)`, a BLOCKING round-trip; `lv2_host::set_params`
+  already posted, so only CLAP blocked. Task 9 batched the writes (one call
   per automated CLAP instance per tick, ~3000 → ~500 round-trips/s at a
-  full-rate ramp, ~2/s for a static curve), which bounds it, but an active
-  ramp on two instances still costs ~1000 blocking round-trips per second
+  full-rate ramp, ~2/s for a static curve), which bounded it, but an active
+  ramp on two instances still cost ~1000 blocking round-trips per second
   onto the plugin-main thread that also serves the param panel,
-  `instantiate` and `save_state`. The fix is a fire-and-forget sibling to
-  `set_params` (post, don't `run`) plus a driver that uses it — a
-  `clap_host` API change deliberately kept out of Task 9's diff.
+  `instantiate` and `save_state`.
 - ~~**A GESTURE TOKEN, so `gesture_end` closes the gesture it meant to.**~~
   → **closed on `fix/gesture-end-id`** (`gesture_begin` returns the run
   id; `gesture_end(id)` no-ops on mismatch). Historical record of why it
@@ -1005,7 +1015,8 @@ first.**
   collapses into one host round-trip per plugin. The non-blocking post
   path was NOT built, because `set_params`' blocking form is its contract
   and LV2 already posts — the exposure is narrower than the finding
-  assumed. See the deferral above.
+  assumed. See the deferral above (later closed — `post_params`, branch
+  `clap-nonblocking-params`).
 - **One rebuild per lane commit, including transient folds** (Task 9,
   accepted): harmless under ruling 7 (a drag is one commit), and it would
   become expensive only if a future caller committed per pointermove.
