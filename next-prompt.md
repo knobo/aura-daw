@@ -33,7 +33,7 @@ before picking G1 back up**:
    `docs/PHASE4-PLAN.md` first, and do not touch `engine::rebuild`, the
    journal reader or the version graph without it: the live-document
    B-tree, I-1 option (a), no journal auto-apply. The read-only version-graph
-   browser is in flight as draft PR #82 on `codex/undo-version-graph-ui`; do not duplicate it.
+   browser is implemented by PR #82 on `codex/undo-version-graph-ui`; do not duplicate it.
 
 **Do not:** start Composer H2–H6 (deprioritized — ask the owner first);
 start G1 Task 7 or G2/G3/G4 before finishing at least one automation/undo
