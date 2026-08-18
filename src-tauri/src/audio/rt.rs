@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::dsp::LiveInstrument;
+use super::insert::InsertNode;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::transport::LoopSpec;
 use crate::ids::TrackId;
@@ -374,6 +375,10 @@ pub struct RtTrack {
     pub clips: Vec<RtClip>,
     /// Live instrument (midi tracks): PolySynth / SamplerNode / plugin node.
     pub live: Option<LiveSource>,
+    /// Compiled insert chain (document order). Empty = dry strip.
+    pub inserts: Vec<InsertNode>,
+    /// Compensating delay (Task 6). Task 5 leaves this `None`.
+    pub pdc: Option<()>,
 }
 
 impl RtTrack {
@@ -383,6 +388,8 @@ impl RtTrack {
             slot,
             clips,
             live: None,
+            inserts: Vec::new(),
+            pdc: None,
         }
     }
 }
@@ -397,10 +404,10 @@ pub struct TrackRamps {
 
 pub struct RtGraph {
     pub tracks: Vec<RtTrack>,
-    /// Preallocated stereo scratch for live-node rendering
-    /// (`MAX_LIVE_BLOCK * 2` once any track is live; empty otherwise).
+    /// Preallocated stereo strip buffer (`MAX_LIVE_BLOCK * 2`, always).
+    /// Clips + live sum here, then inserts REPLACE, then the shared fader.
     /// Allocated at BUILD time on the control thread — never on the RT path.
-    pub scratch: Vec<f32>,
+    pub track_buf: Vec<f32>,
     /// Monotonic graph generation; meter blocks echo it (Task 6).
     pub generation: u64,
     /// THIS graph's parameters — round-2 §2.4: the param table versions
@@ -439,13 +446,10 @@ pub struct RtGraph {
 }
 
 impl RtGraph {
-    /// Build a snapshot, allocating live-node scratch when needed.
+    /// Build a snapshot, always allocating the strip `track_buf`
+    /// (unified clip/live/insert path).
     pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
-        let scratch = if tracks.iter().any(|t| t.live.is_some()) {
-            vec![0.0; MAX_LIVE_BLOCK * 2]
-        } else {
-            Vec::new()
-        };
+        let track_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let n_chunks = (params.len() + METER_CHUNK_SLOTS - 1) / METER_CHUNK_SLOTS;
         let n_chunks = n_chunks.max(1);
         let meter_scratch = (0..n_chunks)
@@ -457,7 +461,7 @@ impl RtGraph {
             .collect();
         Self {
             tracks,
-            scratch,
+            track_buf,
             generation,
             params,
             meter_scratch,

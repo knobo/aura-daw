@@ -1,4 +1,4 @@
-# Next: the Composer's owner ear-check, then G1 Task 5
+# Next: the Composer's owner ear-check, then G1 Task 6
 
 `origin/main` is the baseline. Branch from there. Subagent-driven,
 task-by-task. Reply to the user in Norwegian — they write Norwegian;
@@ -6,34 +6,40 @@ the repo documentation is English.
 
 **Do this, in order:**
 
-1. **Hear the Composer.** Plan H1 landed on `feat/composer-assistant`
-   (PR #65, not merged): open the COMPOSER dock tab (`O`), pick a plan,
-   GENERATE, and listen. The suite proves the notes obey the theory; only
-   an ear can say whether the defaults are *nice*. The specific
-   judgements owed — registers, melodic taste, groove feel, and the fact
-   that a generated drum clip has no kit to play through — are listed in
+1. **Hear the Composer.** Plan H1 is up as PR #65 on
+   `feat/composer-assistant` (merged with `main`, not merged INTO it):
+   open the COMPOSER dock tab (`O`), pick a plan, GENERATE, and listen.
+   The suite proves the notes obey the theory; only an ear can say
+   whether the defaults are *nice*. The judgements owed — registers,
+   melodic taste, groove feel, and the fact that a generated drum clip
+   has no kit to play through — are listed in
    [`docs/handoff/composer-h1.md`](docs/handoff/composer-h1.md).
-2. **G1 Task 5** — mixer strip (`source → inserts → fader`). Plan:
+   **Playback on this box needs an ALSA/HDMI sink**: with a Bluetooth
+   default sink the engine opens a stream and never gets a callback, so
+   nothing plays and the transport stays at 0 (CONTRIBUTING documents
+   the same failure for 18 engine tests). `EXPORT` bounces offline and
+   works regardless.
+2. **G1 Task 6** — PDC (`DelayLine` + `compile_pdc`). Plan:
    [`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`](docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md)
    (product: [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)).
-   Handoff: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+   Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
 
 **Do not:** start Composer H2–H6 before the ear-check (the whole point of
 H1 is that the next phase reads it, and taste feedback changes what H2
 should be); start G2/G3/G4; write a stock FX suite; bump
-`OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
+`OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–5,
 Pitch Coach phases 1–3, the lanes UX track, the theme system, Composer
 H1).
 
-**In flight:** `feat/composer-assistant` (Plan H1, PR #65) and a WIP
-`feat/g1-mixer-strip` worktree at `811b954` — a G1 Task 5 start from an
-earlier session ("wip: insert compile + unified mixer strip"), which this
-file previously described as "nothing in flight". Check that commit
-before starting Task 5 from scratch. Latest on `main`: `79c3e98`.
-Stale worktrees for merged branches can be ignored — but keep the
-branches `feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history`
-and `worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in
-the handoffs.
+**In flight:** `feat/composer-assistant` (Plan H1, PR #65 — open, with
+`main` merged in). Latest on `main`: `c99293b` (G1 Task 5 mixer strip,
+PR #66). Stale worktrees for merged branches can be ignored — but keep
+the branches `feat/pitch-coach`, `feat/pitch-coach-panel`,
+`plan-f-history` and `worktree-lanes-ux`, whose per-commit or squashed
+SHAs are cited in the handoffs. (2026-08-18: 16 stale merged-branch
+worktrees under `.claude/worktrees/` were removed to free disk space —
+the branches themselves were not deleted; `.claude/worktrees/composer`
+is live and carries PR #65.)
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
@@ -44,7 +50,8 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
-| **The Composer, Plan H1** — a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord | PR [#65](https://github.com/knobo/aura-daw/pull/65) on `feat/composer-assistant`. Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff (ear-check owed, what H2 picks up): [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
+| G1 Task 5 — mixer strip: source-sum → inserts REPLACE → shared fader (`InsertNode`/`compile_inserts`) | PR #66 `c99293b`. `compile_inserts` is not yet wired into `engine::rebuild` (Task 7) — an insert still isn't audible end-to-end. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
+| **The Composer, Plan H1** — NOT on `main` yet (PR #65): a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord | PR [#65](https://github.com/knobo/aura-daw/pull/65) on `feat/composer-assistant`. Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff (ear-check owed, what H2 picks up): [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
 | Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
 | Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
@@ -59,8 +66,8 @@ this file (marked correction, ADR 0007) if they do.
 
 ## Open leftovers (open the pointer if you are on that item)
 
-- **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
-- **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **G1 Tasks 6–10** (not leftovers — the rest of the plan): PDC, rebuild/offline, IPC+UI, handoff. Start at Task 6. Do not jump to Task 9 UI before Task 7 wires the mixer into rebuild — an insert is still silent end-to-end until then (G-11 note in the handoff).
+- **G1 deferred minors** (do not block Task 6): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
 - **Sing-along from any song** — new owner ask (2026-08-17), and the reason
   melody extraction outranks the auto-tune work: import → split stems →
   melody from the vocal stem → sing against it in the coach. Three of four
@@ -117,7 +124,7 @@ this file (marked correction, ADR 0007) if they do.
      branches, which is exactly the rot the step's own comment warns about.
   Unverified by the current session beyond reading the diff — treat as
   leads, not verdicts.
-- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
+- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 7 wires `compile_inserts` into `engine::rebuild` (Task 5 landed the mixer walk itself but nothing calls it yet). **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):

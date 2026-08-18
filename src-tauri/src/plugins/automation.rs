@@ -1371,6 +1371,8 @@ mod tests {
             slot: 0,
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(events) }),
+            inserts: Vec::new(),
+            pdc: None,
         };
         let mut g = RtGraph::new(vec![track], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; BAR * 2];
@@ -1454,6 +1456,8 @@ mod tests {
             slot: 0,
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(vec![]) }),
+            inserts: Vec::new(),
+            pdc: None,
         };
         let mut g = RtGraph::new(vec![track], 1, Arc::new(ParamTable::default()));
 

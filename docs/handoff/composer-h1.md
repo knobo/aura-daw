@@ -125,8 +125,24 @@ and belongs in H2 with the rest of the editing surface.
 ## Where the numbers came from
 
 Counts measured on this branch, `--test-threads=1`, against a real ALSA sink
-(see CONTRIBUTING for why both matter). Baseline at branch point was 1083
-backend + 738 frontend.
+(see CONTRIBUTING for why both matter). Baseline at branch point (`79c3e98`)
+was 1083 backend + 738 frontend; the branch reached 1252 + 778, and after
+merging `origin/main` (G1 Task 5, PR #66) in it is **1261 backend** (1225 lib
++ 36 integration, plus 2 `#[ignore]`d) and **778 frontend**.
+
+**A second pre-existing race, surfaced by the merge.** With `main`'s extra
+tests in front of it, `tests/pure_readers.rs`'s
+`library_audition_core_leaves_the_document_and_the_history_untouched` started
+failing with `"sampleRate": 48000` vs `44100` — the engine opens its output
+stream on its own thread and commits the rate it negotiated
+(`engine::commit_output_sample_rate`), and that commit can land between the
+test's two `project_state()` reads. It passed in isolation and failed in the
+full run, on a Bluetooth sink AND on an ALSA one, which is what a timing race
+looks like. All three tests in that file now wait for the engine to settle on a
+rate first (`wait_for_engine_sample_rate`), which keeps the assertions intact
+and makes them deterministic — six consecutive runs green. Same shape as the
+hum-test fix above, and the same cause: an assertion about the document that a
+live engine is entitled to invalidate.
 
 **One more local-environment trap worth knowing about.** A full run aborted
 once with `SIGABRT` inside the gated third-party plugin probes

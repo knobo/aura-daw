@@ -6,7 +6,8 @@
 > [`docs/handoff/composer-h1.md`](../../handoff/composer-h1.md). Measured after
 > the work, `--test-threads=1`: **1252 backend** (1216 lib + 36 integration,
 > plus 2 `#[ignore]`d) and **778 frontend**, from 1083 + 738 at the branch
-> point. Every task below is checked; two things in the plan changed shape while
+> point. After merging `origin/main` (G1 Task 5, PR #66) in: **1261 backend**
+> (1225 lib + 36 integration) and the same 778 frontend. Every task below is checked; two things in the plan changed shape while
 > being built and the boxes are ticked against what was actually done:
 >
 > * **Task 5 grew a sixth generator**, `theory/bass.rs` (root / root-fifth /

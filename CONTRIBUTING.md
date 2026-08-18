@@ -73,8 +73,8 @@ singer. It does not exercise the Tauri command layer.
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 1252 tests (1216 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-17 after the Composer, Plan H1)
-npm test                     # 778 frontend unit tests (vitest; counted 2026-08-17 after the Composer, Plan H1)
+cd src-tauri && cargo test   # 1261 tests (1225 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-18 after G1 Task 5 merged into the Composer, Plan H1)
+npm test                     # 778 frontend unit tests (vitest; counted 2026-08-18 after the Composer, Plan H1)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
@@ -95,6 +95,15 @@ PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
 Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
 Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
 before filing an engine, transport, loopjam or meter failure as a regression.
+
+The engine tests are not the only casualty. A Bluetooth sink also makes the
+engine open its output stream at **44 100 Hz** where an ALSA sink gives it
+48 000, and the stream open commits that rate into the document
+(`engine::commit_output_sample_rate`, transient). Any test that snapshots the
+document twice around a live engine can catch the change in between — e.g.
+`tests/pure_readers.rs`'s `library_audition_core_leaves_the_document_and_the_history_untouched`
+fails with `"sampleRate": 48000` vs `44100` and reads exactly like a real
+mutation bug. Same fix: give the test process a real ALSA sink.
 
 `midi_out::tests` is **known flaky as a module**, not as individual tests:
 its cases share a process-global hub and open real ALSA virtual ports, so
