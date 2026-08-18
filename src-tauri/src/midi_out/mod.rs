@@ -133,8 +133,33 @@ pub const PULSES_PER_QUARTER: u64 = 24;
 pub const MAX_PULSE_BURST: u64 = 24;
 /// Position deviation (in samples) that counts as a transport JUMP rather
 /// than ordinary block quantization: 20 ms at the engine rate.
-pub fn drift_tolerance(rate: u32) -> u64 {
-    (rate as u64) / 50
+/// How far the engine's playhead may diverge from this thread's own wall-clock
+/// estimate before it counts as a transport JUMP rather than ordinary lag.
+///
+/// It must exceed the output block, and that is the whole point. `SharedRt::
+/// position` only moves when an audio callback runs, so between callbacks it
+/// stands still while the estimate keeps climbing: the divergence sawtooths up
+/// to one full block and drops back, every block. Any threshold below the block
+/// size is therefore crossed *on every block, forever*.
+///
+/// Not hypothetical. With PipeWire's default quantum of 1024 frames at 48 kHz —
+/// 21.3 ms — against the old fixed `rate / 50` (20 ms), this thread re-cued its
+/// device with `Stop`/`SongPosition`/`Continue` about 1500 times a second:
+/// measured on a real session as 31 676 re-cue triples against 22 429 clock
+/// pulses. The device could never play, because it was being re-cued faster than
+/// it could start; and the flood of realtime bytes overran the receiving
+/// ALSA-seq client's event pool, so NOTES were dropped as well — heard as three
+/// or four hits, a gap, three or four hits.
+///
+/// So: two blocks, with the old 20 ms as a floor for when no block size has been
+/// published yet (`block_frames == 0` — before the first callback, and in every
+/// test that drives the atomics by hand). Two rather than one leaves room for a
+/// late callback without turning jitter into a re-cue. The only cost of a wider
+/// tolerance is that a genuine drift correction is deferred a little longer, and
+/// that correction is audible either way.
+pub fn drift_tolerance(rate: u32, block_frames: u32) -> u64 {
+    let floor = (rate as u64) / 50;
+    floor.max((block_frames as u64) * 2)
 }
 
 pub fn pulse_of_tick(tick: u64, ppq: u32) -> u64 {
@@ -153,6 +178,9 @@ pub struct ClockInput<'a> {
     pub playing: bool,
     pub position: u64,
     pub rate: u32,
+    /// Frames per output block, from `SharedRt::block_frames`; 0 when the engine
+    /// has not rendered one yet. Sizes [`drift_tolerance`].
+    pub block_frames: u32,
     pub map: &'a TempoMap,
 }
 
@@ -182,7 +210,7 @@ impl ClockEngine {
     /// Append this tick's messages. Pure with respect to `now_micros` — the
     /// caller owns the clock, so tests drive it deterministically.
     pub fn step(&mut self, input: ClockInput<'_>, out: &mut Vec<ClockMsg>) {
-        let ClockInput { now_micros, playing, position, rate, map } = input;
+        let ClockInput { now_micros, playing, position, rate, block_frames, map } = input;
 
         // Clause 1: not playing.
         if !playing {
@@ -215,7 +243,7 @@ impl ClockEngine {
         let elapsed_us = now_micros.saturating_sub(anchor.micros);
         let est = anchor.sample + (elapsed_us * rate as u64) / 1_000_000;
 
-        if position.abs_diff(est) > drift_tolerance(rate) {
+        if position.abs_diff(est) > drift_tolerance(rate, block_frames) {
             out.push(ClockMsg::Stop);
             self.anchor = Some(Anchor { sample: position, micros: now_micros });
             self.estimated_sample = position;
@@ -1427,19 +1455,22 @@ fn run_thread(
             }
         }
 
-        let (playing, position, rate) = match &shared_rt {
+        let (playing, position, rate, block_frames) = match &shared_rt {
             Some(s) => (
                 s.playing.load(Relaxed),
                 s.position.load(Relaxed),
                 s.sample_rate.load(Relaxed),
+                // How coarsely `position` moves. Without it the clock cannot
+                // tell block quantization from a seek — see `drift_tolerance`.
+                s.block_frames.load(Relaxed),
             ),
-            None => (false, 0, fallback_rate),
+            None => (false, 0, fallback_rate, 0),
         };
         let rate = if rate > 0 { rate } else { fallback_rate };
         let now_micros = start.elapsed().as_micros() as u64;
         let enabled = clock_enabled.load(Relaxed);
 
-        let input = ClockInput { now_micros, playing, position, rate, map: &map };
+        let input = ClockInput { now_micros, playing, position, rate, block_frames, map: &map };
         if let Err(e) = out_tick(&mut engine, &mut route_states, &mut sink, input, enabled) {
             log::warn!("aura-midi-out: send failed: {e}");
         }
@@ -1491,6 +1522,9 @@ pub(crate) fn out_tick(
     let playing = input.playing;
     let was_running = engine.running();
     let prev_estimated = engine.estimated_sample();
+    // A correction no larger than this is the clock re-anchoring on ordinary
+    // lag, not the user jumping the playhead — see the `resynced` arm below.
+    let catch_up_limit = drift_tolerance(input.rate, input.block_frames).saturating_mul(2);
     let mut out = Vec::new();
     engine.step(input, &mut out);
     let resynced = out.iter().any(|m| matches!(m, ClockMsg::SongPosition(_)));
@@ -1514,11 +1548,26 @@ pub(crate) fn out_tick(
             notes.reseek(snap, est, &mut note_out);
             notes.advance(snap, est, est.saturating_add(1), &mut note_out);
         } else if was_running && resynced {
-            // Resync (backward jump / large forward seek): same
-            // "reseek + catch the boundary" shape as a fresh start.
             let est = engine.estimated_sample();
-            notes.reseek(snap, est, &mut note_out);
-            notes.advance(snap, est, est.saturating_add(1), &mut note_out);
+            let forward = est.saturating_sub(prev_estimated);
+            if est >= prev_estimated && forward <= catch_up_limit {
+                // A small FORWARD correction — the clock re-anchoring on lag,
+                // not a seek. Play straight through it. `reseek`ing here would
+                // release every sounding note and skip whatever fell in the
+                // gap, which is what turned every drift correction into a
+                // dropped hit; the transport bytes are re-cueing the device
+                // either way, but the notes have no business disappearing.
+                notes.advance(snap, prev_estimated, est.saturating_add(1), &mut note_out);
+            } else {
+                // A real jump: backward (rewind, loop wrap) or far enough
+                // forward that replaying everything in between would be a
+                // flood. Same "reseek + catch the boundary" shape as a fresh
+                // start — `reseek`'s "at or after" cursor deliberately leaves
+                // an event exactly AT the landing point for the follow-up
+                // `advance`.
+                notes.reseek(snap, est, &mut note_out);
+                notes.advance(snap, est, est.saturating_add(1), &mut note_out);
+            }
         } else {
             notes.advance(snap, prev_estimated, engine.estimated_sample(), &mut note_out);
         }
@@ -1633,7 +1682,7 @@ mod tests {
 
     fn step(e: &mut ClockEngine, now_us: u64, playing: bool, pos: u64, map: &TempoMap) -> Vec<ClockMsg> {
         let mut out = Vec::new();
-        e.step(ClockInput { now_micros: now_us, playing, position: pos, rate: 48_000, map }, &mut out);
+        e.step(ClockInput { now_micros: now_us, playing, position: pos, rate: 48_000, block_frames: 0, map }, &mut out);
         out
     }
 
@@ -1712,6 +1761,168 @@ mod tests {
         assert!(clocks >= 4, "clocks kept flowing: {clocks}");
     }
 
+    /// THE RE-CUE STORM. The old fixed 20 ms tolerance was SMALLER than
+    /// PipeWire's default 1024-frame block at 48 kHz (21.3 ms), and `position`
+    /// only moves once per block — so the divergence sawtoothed past the
+    /// threshold every single block and the engine re-cued the device forever.
+    /// Measured on a real session before this test existed: 31 676
+    /// Stop/SPP/Continue triples against 22 429 clock pulses, roughly 1500
+    /// re-cues a second. The device never played, and the flood overran the
+    /// receiving ALSA-seq client's event pool so notes were dropped too.
+    ///
+    /// The 480-frame sibling test below passed throughout, because a 10 ms
+    /// block happens to sit under 20 ms. Block size is the variable that
+    /// mattered and nothing varied it.
+    #[test]
+    fn a_pipewire_sized_block_does_not_re_cue_the_device() {
+        const RATE: u32 = 48_000;
+        const BLOCK: u32 = 1024; // PipeWire's default quantum
+        let map = map120();
+        let mut e = ClockEngine::new();
+        let step_at = |e: &mut ClockEngine, us: u64, pos: u64| {
+            let mut out = Vec::new();
+            e.step(
+                ClockInput {
+                    now_micros: us,
+                    playing: true,
+                    position: pos,
+                    rate: RATE,
+                    block_frames: BLOCK,
+                    map: &map,
+                },
+                &mut out,
+            );
+            out
+        };
+        step_at(&mut e, 0, 0);
+        // Five seconds of a callback landing every 1024 frames (21.33 ms) while
+        // this thread ticks every 500 us, exactly as `run_thread` does.
+        let block_us = (BLOCK as u64 * 1_000_000) / RATE as u64;
+        let mut clocks = 0usize;
+        let mut recues = 0usize;
+        for tick in 0..10_000u64 {
+            let us = tick * 500;
+            let pos = (us / block_us) * BLOCK as u64;
+            let out = step_at(&mut e, us, pos);
+            clocks += out.iter().filter(|m| **m == ClockMsg::Clock).count();
+            recues += out
+                .iter()
+                .filter(|m| matches!(m, ClockMsg::SongPosition(_)))
+                .count();
+        }
+        assert_eq!(e.resyncs(), 0, "block quantization is lag, not a jump");
+        assert_eq!(recues, 0, "no Stop/SPP/Continue storm");
+        // 5 s at 120 bpm is 10 beats, 24 pulses each.
+        assert!(clocks > 200, "the clock kept flowing: {clocks}");
+    }
+
+    /// The tolerance has to grow with the block, and keep the old 20 ms as a
+    /// floor for callers that have no block size to offer.
+    #[test]
+    fn drift_tolerance_never_sits_below_one_block() {
+        assert_eq!(drift_tolerance(48_000, 0), 960, "floor when nothing is published");
+        assert!(drift_tolerance(48_000, 1024) > 1024, "a 1024 block fits inside it");
+        assert!(drift_tolerance(48_000, 2048) > 2048, "so does a 2048 block");
+        assert_eq!(drift_tolerance(48_000, 128), 960, "a small block keeps the floor");
+    }
+
+    /// A small forward correction must PLAY the notes it skips over, not
+    /// swallow them. The clock re-anchors on ordinary lag; that is no reason
+    /// for a hit to vanish.
+    #[test]
+    fn a_drift_correction_still_plays_the_notes_in_the_gap() {
+        const RATE: u32 = 48_000;
+        let map = map120();
+        let mut engine = ClockEngine::new();
+        let mut sink = RecordingSink::default();
+        // One note 1000 samples in — inside the correction we are about to make.
+        let mut routes = one_route(
+            RouteScope::Track("t".into()),
+            snap(vec![
+                crate::midi::schedule::AbsNoteEvent { sample: 1_000, key: 60, velocity: 100, channel: 0 },
+                crate::midi::schedule::AbsNoteEvent { sample: 5_000, key: 60, velocity: 0, channel: 0 },
+            ]),
+        );
+        let tick = |engine: &mut ClockEngine,
+                    routes: &mut RouteNoteStates,
+                    sink: &mut RecordingSink,
+                    us: u64,
+                    pos: u64| {
+            out_tick(
+                engine,
+                routes,
+                sink,
+                ClockInput {
+                    now_micros: us,
+                    playing: true,
+                    position: pos,
+                    rate: RATE,
+                    block_frames: 0, // floor tolerance: 960 samples
+                    map: &map,
+                },
+                true,
+            )
+            .unwrap();
+        };
+        tick(&mut engine, &mut routes, &mut sink, 0, 0);
+        // Jump the playhead 1500 samples ahead of the estimate: past the 960
+        // tolerance, so the clock re-cues, but well inside the catch-up limit.
+        tick(&mut engine, &mut routes, &mut sink, 1_000, 1_500);
+        assert_eq!(engine.resyncs(), 1, "the clock did re-cue");
+        assert!(
+            sink.0.iter().any(|m| m.as_slice() == [0x90, 60, 100]),
+            "the note inside the corrected span still played: {:?}",
+            sink.0
+        );
+    }
+
+    /// ...but a real jump still repositions instead of replaying everything in
+    /// between, which would be a flood.
+    #[test]
+    fn a_large_forward_seek_still_repositions_instead_of_replaying() {
+        const RATE: u32 = 48_000;
+        let map = map120();
+        let mut engine = ClockEngine::new();
+        let mut sink = RecordingSink::default();
+        let mut routes = one_route(
+            RouteScope::Track("t".into()),
+            snap(vec![
+                crate::midi::schedule::AbsNoteEvent { sample: 1_000, key: 60, velocity: 100, channel: 0 },
+                crate::midi::schedule::AbsNoteEvent { sample: 5_000, key: 60, velocity: 0, channel: 0 },
+            ]),
+        );
+        let tick = |engine: &mut ClockEngine,
+                    routes: &mut RouteNoteStates,
+                    sink: &mut RecordingSink,
+                    us: u64,
+                    pos: u64| {
+            out_tick(
+                engine,
+                routes,
+                sink,
+                ClockInput {
+                    now_micros: us,
+                    playing: true,
+                    position: pos,
+                    rate: RATE,
+                    block_frames: 0,
+                    map: &map,
+                },
+                true,
+            )
+            .unwrap();
+        };
+        tick(&mut engine, &mut routes, &mut sink, 0, 0);
+        // A minute ahead: a seek by anyone's reckoning.
+        tick(&mut engine, &mut routes, &mut sink, 1_000, 48_000 * 60);
+        assert_eq!(engine.resyncs(), 1);
+        assert!(
+            !sink.0.iter().any(|m| m.as_slice() == [0x90, 60, 100]),
+            "the note a minute behind the landing point was NOT replayed: {:?}",
+            sink.0
+        );
+    }
+
     #[test]
     fn a_backward_jump_resyncs_with_stop_spp_continue() {
         let (m, mut e) = (map120(), ClockEngine::new());
@@ -1777,10 +1988,10 @@ mod tests {
         let mut engine = ClockEngine::new();
         let mut routes = no_routes();
         let mut sink = RecordingSink::default();
-        out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true).unwrap();
+        out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, block_frames: 0, map: &map }, true).unwrap();
         assert_eq!(sink.0, vec![vec![0xFA]]);
         for ms in 1..=25u64 {
-            out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, true).unwrap();
+            out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, block_frames: 0, map: &map }, true).unwrap();
         }
         assert!(sink.0.iter().any(|b| b == &vec![0xF8]), "clock bytes reached the sink");
     }
@@ -1792,7 +2003,7 @@ mod tests {
         let mut routes = no_routes();
         let mut sink = RecordingSink::default();
         for ms in 0..=25u64 {
-            out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
+            out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, block_frames: 0, map: &map }, false).unwrap();
         }
         assert!(sink.0.is_empty(), "clock disabled means no bytes");
     }
@@ -1808,7 +2019,7 @@ mod tests {
         let mut routes = no_routes();
         let mut sink = RecordingSink::default();
         for ms in 0..=25u64 {
-            out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map }, false).unwrap();
+            out_tick(&mut engine, &mut routes, &mut sink, ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, block_frames: 0, map: &map }, false).unwrap();
         }
         assert!(sink.0.is_empty(), "clock disabled means no bytes");
         assert!(engine.running(), "the transport still registers as running");
@@ -1985,7 +2196,7 @@ mod tests {
         let mut sink = RecordingSink::default();
         for ms in 0..=150u64 {
             out_tick(&mut clock, &mut routes, &mut sink,
-                ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, map: &map },
+                ClockInput { now_micros: ms * 1_000, playing: true, position: ms * 48, rate: 48_000, block_frames: 0, map: &map },
                 true).unwrap();
         }
         assert!(sink.0.iter().any(|b| b == &vec![0xFA]), "Start went out");
@@ -2001,9 +2212,9 @@ mod tests {
         let mut clock = ClockEngine::new();
         let mut routes = one_route(RouteScope::Track("t-1".into()), s);
         let mut sink = RecordingSink::default();
-        out_tick(&mut clock, &mut routes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true).unwrap();
+        out_tick(&mut clock, &mut routes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, block_frames: 0, map: &map }, true).unwrap();
         sink.0.clear();
-        out_tick(&mut clock, &mut routes, &mut sink, ClockInput { now_micros: 10_000, playing: false, position: 480, rate: 48_000, map: &map }, true).unwrap();
+        out_tick(&mut clock, &mut routes, &mut sink, ClockInput { now_micros: 10_000, playing: false, position: 480, rate: 48_000, block_frames: 0, map: &map }, true).unwrap();
         assert!(sink.0.iter().any(|b| b == &vec![0x80, 60, 0]), "no hanging note after stop: {:?}", sink.0);
         assert!(sink.0.iter().any(|b| b == &vec![0xFC]), "and the slave was told to stop");
     }
@@ -2019,7 +2230,7 @@ mod tests {
         routes.insert(RouteScope::Track("t-1".into()), RouteNoteState { engine: NoteOutEngine::new(), snapshot: track_snap });
         routes.insert(RouteScope::Clip("c-1".into()), RouteNoteState { engine: NoteOutEngine::new(), snapshot: clip_snap });
         let mut sink = RecordingSink::default();
-        out_tick(&mut clock, &mut routes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, map: &map }, true).unwrap();
+        out_tick(&mut clock, &mut routes, &mut sink, ClockInput { now_micros: 0, playing: true, position: 0, rate: 48_000, block_frames: 0, map: &map }, true).unwrap();
         assert!(sink.0.iter().any(|b| b == &vec![0x90, 60, 100]), "track route's note went out");
         assert!(sink.0.iter().any(|b| b == &vec![0x90, 72, 90]), "clip route's note went out independently");
     }

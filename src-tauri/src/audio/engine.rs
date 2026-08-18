@@ -502,6 +502,9 @@ impl OutputCb {
         // no other state is synchronized against it).
         let frames = (out.len() / self.channels.max(1)) as u64;
         let steady_base = self.shared.steady.fetch_add(frames, Relaxed);
+        // How coarsely `position` moves, for readers that interpolate between
+        // blocks — see `SharedRt::block_frames`.
+        self.shared.block_frames.store(frames as u32, Relaxed);
 
         // Hardware MIDI-in. One relaxed load; the control thread resolved
         // this id→slot under the tables lock (`MidiInHub::refresh_target`).
