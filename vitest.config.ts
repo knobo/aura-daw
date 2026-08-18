@@ -1,4 +1,5 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
+import { defaultClientConditions } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
 // Two projects because `.svelte` files compile differently per target:
@@ -16,11 +17,11 @@ export default defineConfig({
           name: "unit",
           environment: "node",
           include: ["src/**/*.test.ts"],
-          exclude: ["src/**/*.dom.test.ts"],
+          exclude: [...configDefaults.exclude, "src/**/*.dom.test.ts"],
         },
       },
       {
-        resolve: { conditions: ["browser"] },
+        resolve: { conditions: [...defaultClientConditions, "browser"] },
         plugins: [svelte()],
         test: {
           name: "dom",

@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
 import type { AutomationClip, Curve, TrackState } from "../types/ipc";
@@ -9,32 +8,69 @@ import type { AutomationClip, Curve, TrackState } from "../types/ipc";
  * ordering of async effects inside a `.svelte` event handler — as the
  * uncovered gap where both of that track's real frontend bugs lived,
  * because until now nothing could mount a component to exercise it.
+ *
+ * jsdom's `canvas.getContext("2d")` returns `null`, so the component's
+ * `paint()` early-returns and no canvas rendering is exercised here — only
+ * the pointer/gesture handler logic is under test.
  */
 
 let curvesOnServer: Curve[] = [];
 let clipsOnServer: AutomationClip[] = [];
 
+// `curve`/`clip` objects read out of the component's Svelte 5 $state
+// arrays are reactive Proxies; structuredClone throws DataCloneError on
+// them. JSON round-trip is a safe, sufficient clone for this file's plain
+// data shapes.
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T;
+}
+
 function snapshot() {
   return {
-    curves: curvesOnServer.map((c) => structuredClone(c)),
+    curves: curvesOnServer.map((c) => clone(c)),
     bindings: [],
-    automationClips: clipsOnServer.map((c) => structuredClone(c)),
+    automationClips: clipsOnServer.map((c) => clone(c)),
   };
+}
+
+// Lets a test hold `modulationSetCurve`'s round trip open — exactly like
+// the real IPC round trip is open while the backend processes it — so it
+// can assert the gesture has NOT closed yet, then release the reply and
+// assert it closes only after. Mirrors the pattern in
+// `src/lib/state/automation-gesture.test.ts`.
+let holdCurveReply = false;
+let pendingCurveReplies: (() => void)[] = [];
+
+function releasePendingCurveReplies() {
+  const resolvers = pendingCurveReplies;
+  pendingCurveReplies = [];
+  resolvers.forEach((resolve) => resolve());
+}
+
+// The resolve -> commit's await -> adopt -> commitInGesture's promise ->
+// its own .then(...) chain is a few microtask hops deep; a fixed count of
+// `await Promise.resolve()` is fragile against that depth. A macrotask
+// boundary flushes all of them regardless.
+function flushMicrotasks() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 const modulationSetCurve = vi.fn((curve: Curve) => {
   const i = curvesOnServer.findIndex((c) => c.id === curve.id);
-  if (i >= 0) curvesOnServer[i] = structuredClone(curve);
-  else curvesOnServer.push(structuredClone(curve));
-  return Promise.resolve(snapshot());
+  if (i >= 0) curvesOnServer[i] = clone(curve);
+  else curvesOnServer.push(clone(curve));
+  if (!holdCurveReply) return Promise.resolve(snapshot());
+  return new Promise<ReturnType<typeof snapshot>>((resolve) => {
+    pendingCurveReplies.push(() => resolve(snapshot()));
+  });
 });
 
 const automationClipSet = vi.fn((clip: AutomationClip, remove?: boolean) => {
   if (remove) clipsOnServer = clipsOnServer.filter((c) => c.id !== clip.id);
   else {
     const i = clipsOnServer.findIndex((c) => c.id === clip.id);
-    if (i >= 0) clipsOnServer[i] = structuredClone(clip);
-    else clipsOnServer.push(structuredClone(clip));
+    if (i >= 0) clipsOnServer[i] = clone(clip);
+    else clipsOnServer.push(clone(clip));
   }
   return Promise.resolve(snapshot());
 });
@@ -104,18 +140,26 @@ afterEach(() => {
   modulation.curves = [];
   modulation.automationClips = [];
   midi.sectionTable = [];
+  holdCurveReply = false;
+  pendingCurveReplies = [];
 });
 
 describe("AutomationTrackRow", () => {
-  it("a plain click selects the clip and shows the delete button", async () => {
+  it("a plain click (move mode) selects the clip and shows the delete button", async () => {
     seed();
     render(AutomationTrackRow, { props: { track: seedTrack() } });
 
     const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    // jsdom's default zero rect makes the near-right-edge test true for
+    // any clientX >= (rect.right - EDGE_PX); stub a realistic rect and
+    // click well inside it, off the seeded point, so this genuinely
+    // exercises "move" mode rather than falling through to "resize".
+    clipEl.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, right: 40, bottom: 20, width: 40, height: 20 }) as DOMRect;
     expect(screen.queryByRole("button", { name: /delete automation clip/i })).toBeNull();
 
-    await fireEvent.pointerDown(clipEl, { clientX: 50, clientY: 5, button: 0 });
-    await fireEvent.pointerUp(clipEl, { clientX: 50, clientY: 5, button: 0 });
+    await fireEvent.pointerDown(clipEl, { clientX: 20, clientY: 5, button: 0 });
+    await fireEvent.pointerUp(clipEl, { clientX: 20, clientY: 5, button: 0 });
 
     expect(screen.getByRole("button", { name: /delete automation clip/i })).toBeTruthy();
     expect(automationClipSet).not.toHaveBeenCalled();
@@ -137,8 +181,9 @@ describe("AutomationTrackRow", () => {
     expect(automationClipSet).toHaveBeenCalledWith(expect.objectContaining({ id: "clip-1" }), true);
   });
 
-  it("alt-click on an existing point deletes it and closes the SAME gesture it opened", async () => {
+  it("alt-click on an existing point deletes it and closes the SAME gesture only after the delete commits", async () => {
     seed();
+    holdCurveReply = true;
     render(AutomationTrackRow, { props: { track: seedTrack() } });
 
     const clipEl = screen.getByRole("button", { name: /automation clip/i });
@@ -155,6 +200,16 @@ describe("AutomationTrackRow", () => {
     expect(gestureBegin).toHaveBeenCalledWith("automation delete point");
     expect(modulationSetCurve).toHaveBeenCalledTimes(1);
     expect(modulationSetCurve.mock.calls[0][0].points).toEqual([]);
+    // The commit's round trip is still open (held) — the gesture must not
+    // have closed yet. A component that closes the gesture without
+    // awaiting the commit's result (the exact race this file exists to
+    // catch) would fail this line.
+    expect(gestureEnd).not.toHaveBeenCalled();
+
+    holdCurveReply = false;
+    releasePendingCurveReplies();
+    await flushMicrotasks();
+
     expect(gestureEnd).toHaveBeenCalledTimes(1);
     expect(gestureEnd).toHaveBeenCalledWith("gesture-automation delete point");
   });
@@ -184,11 +239,21 @@ describe("AutomationTrackRow", () => {
     await fireEvent.pointerMove(clipEl, { clientX: 0, clientY: 1 });
     expect(modulationSetCurve).not.toHaveBeenCalled();
 
+    holdCurveReply = true;
     await fireEvent.pointerUp(clipEl, { clientX: 0, clientY: 1, button: 0 });
     await Promise.resolve();
     await Promise.resolve();
 
     expect(modulationSetCurve).toHaveBeenCalledTimes(1);
+    expect(modulationSetCurve.mock.calls[0][0].points).toEqual([{ tick: 0, value: 0 }]);
+    // The commit's round trip is still open (held) — the gesture must not
+    // have closed yet.
+    expect(gestureEnd).not.toHaveBeenCalled();
+
+    holdCurveReply = false;
+    releasePendingCurveReplies();
+    await flushMicrotasks();
+
     expect(gestureEnd).toHaveBeenCalledTimes(1);
   });
 });
