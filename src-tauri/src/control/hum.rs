@@ -969,13 +969,32 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
             std::sync::Arc::new(crate::control::HistoryLog::new()),
         ));
 
+        // "One commit" is asserted on the UNDO DEPTH, not on a rev delta.
+        // `rev` is bumped by every commit including the engine's own transient
+        // ones, and this fixture starts a real engine: opening the output
+        // stream submits a transient `Set{Transport, SampleRate}`
+        // (`engine::commit_output_sample_rate`) from the engine control thread,
+        // which races the read below. That made this assertion fail roughly
+        // half the time in a full-suite run — a pre-existing race that only
+        // became visible when the suite got long enough to shift the timing
+        // (found while landing Plan H1). Transient commits never enter
+        // history, so the undo depth measures exactly what this test means.
         let before_rev = cp.session.lock().rev;
+        let before_undo = cp.committer().log().depths().0;
 
         let (clip, _created) = cp
             .apply_hum_clip(vec![note(0, 480, 69, 100)], 960, None, 0, "commit test melody")
             .unwrap();
 
-        assert_eq!(cp.session.lock().rev, before_rev + 1, "one commit, one rev bump");
+        assert_eq!(
+            cp.committer().log().depths().0,
+            before_undo + 1,
+            "one commit, one undo entry"
+        );
+        assert!(
+            cp.session.lock().rev > before_rev,
+            "…and it advanced the document revision"
+        );
 
         // Synchronous persistence: read the file right after
         // `apply_hum_clip` RETURNED — no separate flush step to remember.

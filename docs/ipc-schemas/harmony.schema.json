@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://aura.local/schemas/harmony.schema.json",
+  "title": "AURA harmony document (the Composer, Plan H1)",
+  "description": "The Composer's harmony document: `tick -> key` and `tick -> chord`, a map pair parallel to the tempo and meter maps (ruling H-3). Source of truth: `src-tauri/src/theory/harmony.rs`; the persisted form is the additive `harmony` key in project.json, written by `midi/persist.rs` ONLY when the document is non-empty, so a project that never used the Composer resaves byte-diff-free. An emitter contract: `additionalProperties` is not closed (debt D-06). Keys and chords are SPELLED STRINGS on the wire — `Tpc`'s line-of-fifths integer encoding is an implementation detail of `theory/`, and a persisted format that spells `Cb` as `Cb` stays readable, diffable and enharmonically honest.",
+  "type": "object",
+  "properties": {
+    "keys": {
+      "type": "array",
+      "description": "Key spans, sorted by tick, ticks distinct. The first MUST be at tick 0 whenever anything is present. An empty document is valid and means 'no harmonic claim yet'; readers treat it as C major.",
+      "items": { "$ref": "#/$defs/keySpan" }
+    },
+    "chords": {
+      "type": "array",
+      "description": "Chord regions, sorted by tick and non-overlapping. Gaps are legal and meaningful — a bar with no chord makes no harmonic claim, and the palette falls back to the key there.",
+      "items": { "$ref": "#/$defs/chordSpan" }
+    }
+  },
+  "$defs": {
+    "keySpan": {
+      "type": "object",
+      "required": ["tick", "key"],
+      "properties": {
+        "tick": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Integer ticks at the project PPQ (debt D-02: no musical position is ever in seconds)."
+        },
+        "key": {
+          "type": "string",
+          "description": "Canonical key: `\"<tonic> <scaleId>\"`, e.g. \"C ionian\", \"Bb aeolian\", \"E harmonicMinor\". Parsed by `theory::scale::Key::parse`, which also accepts friendly forms (\"Bb major\", \"f# minor\", bare \"C\") on input but never emits them.",
+          "examples": ["C ionian", "A aeolian", "D dorian", "Gb ionian"]
+        }
+      }
+    },
+    "chordSpan": {
+      "type": "object",
+      "required": ["tick", "lengthTicks", "chord"],
+      "properties": {
+        "tick": { "type": "integer", "minimum": 0 },
+        "lengthTicks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Length in ticks. Zero is rejected by `HarmonyDoc::validate` — a zero-length region would break every `chord_at` lookup."
+        },
+        "chord": {
+          "type": "string",
+          "description": "Chord symbol, parsed and emitted by `theory::chord::Chord`. Root + quality suffix, with an optional slash bass. Emitted suffixes are the canonical ones (`m7b5`, `maj7`, `7sus4`, `dim7`, …); aliases (`-7`, `M7`, `ø`, `°`) are accepted on input only.",
+          "examples": ["C", "Am", "Cmaj7", "F#m7b5", "Bb7sus4", "C/E", "Cdim7"]
+        }
+      }
+    }
+  }
+}

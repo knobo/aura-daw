@@ -46,6 +46,39 @@ impl EventSink for NullEvents {
 /// engine still runs... so the UI and tests stay functional"). Local,
 /// independent fixture (this file's own — not the crate's private
 /// `#[cfg(test)]` ones, per this directory's established convention).
+/// Wait until the engine has finished publishing its device sample rate.
+///
+/// `engine::start` opens the output stream on its own thread and commits the
+/// rate it negotiated into the document
+/// (`engine::commit_output_sample_rate`, transient). Until that has landed,
+/// ANY test that snapshots `project_state()` twice can catch the change in
+/// between and read it as a mutation — which is exactly what
+/// `library_audition_core_leaves_the_document_and_the_history_untouched` did:
+/// `"sampleRate": 48000` on one side and `44100` on the other, with nothing in
+/// the code under test able to cause it. (The rate differs by device; a
+/// Bluetooth sink negotiates 44100 where an ALSA sink gives 48000, so the
+/// window is wider on some machines than others — see CONTRIBUTING.)
+///
+/// Two consecutive equal reads, because the value STARTS non-zero (the
+/// project's own rate) and is then overwritten: "non-zero" would not mean
+/// "settled".
+fn wait_for_engine_sample_rate(cp: &ControlPlane) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut last = None;
+    loop {
+        let rate = cp.project_state().transport.sample_rate;
+        if last == Some(rate) && rate != 0 {
+            return;
+        }
+        last = Some(rate);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "engine never settled on a sample rate (last {rate})"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 fn fixture() -> (ControlPlane, engine::EngineHandle) {
     let shared = Arc::new(SharedRt::default());
     let tables = GraphTables::empty();
@@ -104,6 +137,9 @@ fn project_state_read_twice_is_byte_identical() {
 
     cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("add track")).unwrap();
 
+    // Same hazard as the audition test below, one window narrower: let the
+    // engine publish its device rate before comparing two reads.
+    wait_for_engine_sample_rate(&cp);
     let first = serde_json::to_value(cp.project_state()).unwrap();
     let second = serde_json::to_value(cp.project_state()).unwrap();
     assert_eq!(first, second, "two reads of the same document must be identical");
@@ -133,6 +169,7 @@ fn project_state_after_an_epoch_boundary_is_stable_across_repeated_reads() {
     assert_eq!(proj_a.name, "A");
     assert_eq!(proj_b.name, "B");
 
+    wait_for_engine_sample_rate(&cp);
     cp.open_project_epoch(&dir_a).unwrap();
     let after_open_a = serde_json::to_value(cp.project_state()).unwrap();
     assert_eq!(
@@ -190,6 +227,10 @@ fn library_audition_core_leaves_the_document_and_the_history_untouched() {
         w.finalize().unwrap();
     }
 
+    // The engine owns the device sample rate and publishes it asynchronously;
+    // let that land BEFORE the baseline snapshot, or it lands in the middle of
+    // the window this test is measuring.
+    wait_for_engine_sample_rate(&cp);
     let before = serde_json::to_value(cp.project_state()).unwrap();
     let depths_before = cp.history_depths();
 

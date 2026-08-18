@@ -1,0 +1,261 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://aura.local/schemas/composer.schema.json",
+  "title": "AURA Composer command payloads (Plan H1)",
+  "description": "Request/reply shapes for the five additive composer commands — `harmony_get`, `harmony_set`, `composer_palette`, `composer_suggest`, `composer_generate`. Source of truth: `src-tauri/src/control/composer.rs` (the wire types) over `src-tauri/src/theory/` (the meanings). An emitter contract: `additionalProperties` is not closed (debt D-06). The document itself lives in harmony.schema.json. NOTE what is NOT here: annotations are returned WITH a reply for display and are never document state (ruling H-6), and generated notes are ordinary MIDI clips described by midi-clip.schema.json — there is no generated-clip type.",
+  "type": "object",
+  "$defs": {
+    "harmonyView": {
+      "title": "harmony_get / harmony_set reply",
+      "description": "Everything the COMPOSER panel draws. All of it is backend-derived: the widget contains no theory (ADR 0006).",
+      "type": "object",
+      "properties": {
+        "harmony": { "$ref": "aura:ipc/harmony.schema.json" },
+        "key": { "type": "string", "description": "Canonical key in force at the request's `atTicks`." },
+        "keyLabel": { "type": "string", "description": "Display form, e.g. \"C major\"." },
+        "keySignature": {
+          "type": "integer",
+          "description": "Sharps (positive) or flats (negative): the fifths index of the relative major tonic."
+        },
+        "wedges": {
+          "type": "array",
+          "description": "The twelve circle-of-fifths slots, clockwise, SPELLED FOR THIS KEY (E major gets D#, Bb major gets Eb).",
+          "items": { "$ref": "#/$defs/wedge" }
+        },
+        "spans": { "type": "array", "items": { "$ref": "#/$defs/spanView" } },
+        "neighbours": {
+          "type": "array",
+          "description": "Keys one easy move away, each with why and its pivot chords.",
+          "items": { "$ref": "#/$defs/neighbour" }
+        },
+        "borrowed": { "type": "array", "items": { "$ref": "#/$defs/borrowed" } },
+        "schemas": {
+          "type": "array",
+          "description": "The named progressions, as Roman numerals that transpose into any key.",
+          "items": { "$ref": "#/$defs/schema" }
+        },
+        "genres": { "type": "array", "items": { "type": "string" } },
+        "voicingStyles": { "type": "array", "items": { "type": "string" } },
+        "bassStyles": { "type": "array", "items": { "type": "string" } },
+        "ppq": { "type": "integer" },
+        "ticksPerBar": { "type": "integer" }
+      }
+    },
+    "wedge": {
+      "type": "object",
+      "properties": {
+        "fifths": { "type": "integer", "description": "Line-of-fifths index of this slot." },
+        "major": { "type": "string", "description": "The major key here, spelled." },
+        "minor": { "type": "string", "description": "Its relative minor." },
+        "inKey": {
+          "type": "boolean",
+          "description": "Inside the key's diatonic arc. Exactly seven of the twelve are, which is the fact the widget draws."
+        },
+        "chord": { "type": ["string", "null"], "description": "The key's own chord here, when in the arc." },
+        "roman": { "type": ["string", "null"] },
+        "borrowedChord": {
+          "type": ["string", "null"],
+          "description": "What this slot offers as a borrowed chord when it is outside the arc."
+        },
+        "function": {
+          "type": ["string", "null"],
+          "enum": ["tonic", "predominant", "dominant", "chromatic", null]
+        },
+        "isTonic": {
+          "type": "boolean",
+          "description": "The widget rotates THIS slot to the top rather than hard-coding C."
+        }
+      }
+    },
+    "spanView": {
+      "description": "One chord region, analysed in the key in force at its own tick.",
+      "type": "object",
+      "properties": {
+        "tick": { "type": "integer" },
+        "lengthTicks": { "type": "integer" },
+        "symbol": { "type": "string", "description": "ASCII symbol — the parse form." },
+        "pretty": { "type": "string", "description": "Typographic accidentals, for display." },
+        "roman": { "type": "string", "description": "Roman numeral, with figured bass for an inversion (`V65`)." },
+        "function": { "type": "string", "enum": ["tonic", "predominant", "dominant", "chromatic"] },
+        "borrowed": { "type": "boolean" },
+        "why": { "type": "string", "description": "One concrete sentence — the teaching payload." },
+        "tones": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "neighbour": {
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "label": { "type": "string" },
+        "steps": { "type": "integer", "description": "Circle steps, 0..6." },
+        "why": { "type": "string" },
+        "pivots": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "borrowed": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string" },
+        "pretty": { "type": "string" },
+        "roman": { "type": "string" },
+        "why": { "type": "string" }
+      }
+    },
+    "schema": {
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "examples": ["axis", "doo-wop", "12-bar-blues", "andalusian"] },
+        "label": { "type": "string" },
+        "numerals": {
+          "type": "string",
+          "description": "Space-separated numerals, each optionally `*bars`: `\"I7*4 IV7*2 I7*2 V7 IV7 I7 V7\"`."
+        },
+        "minor": {
+          "type": "boolean",
+          "description": "Written for a minor tonic. Asked for against the other mode, the schema resolves in the RELATIVE key and the reply says so."
+        },
+        "why": { "type": "string" }
+      }
+    },
+    "paletteView": {
+      "title": "composer_palette reply",
+      "description": "Which notes may be played at a tick, and why (ruling H-9). Twelve entries, pitch-class order.",
+      "type": "object",
+      "properties": {
+        "tick": { "type": "integer" },
+        "key": { "type": "string" },
+        "keyLabel": { "type": "string" },
+        "chord": { "type": ["string", "null"] },
+        "chordPretty": { "type": ["string", "null"] },
+        "roman": { "type": ["string", "null"] },
+        "classes": { "type": "array", "items": { "$ref": "#/$defs/noteClass" } }
+      }
+    },
+    "noteClass": {
+      "type": "object",
+      "properties": {
+        "pitchClass": { "type": "integer", "minimum": 0, "maximum": 11 },
+        "tpc": { "type": "string", "description": "Best spelling in context (`Bb`, not `A#`, in a flat key)." },
+        "role": {
+          "type": "string",
+          "enum": [
+            "root",
+            "third",
+            "fifth",
+            "seventh",
+            "extension",
+            "scale",
+            "tension",
+            "avoid",
+            "outside"
+          ],
+          "description": "`avoid` is a key tone a SEMITONE ABOVE a chord tone — Berklee's avoid note, and the rule the whole feature's credibility rests on."
+        },
+        "degree": { "type": "string", "description": "Degree label relative to the chord: `1`, `b7`, `#11`." },
+        "why": { "type": ["string", "null"] }
+      }
+    },
+    "suggestion": {
+      "title": "composer_suggest reply item",
+      "type": "object",
+      "properties": {
+        "chord": { "type": "string" },
+        "roman": { "type": "string" },
+        "function": { "type": "string" },
+        "score": {
+          "type": "number",
+          "description": "0..1. Composed of the grammar's transition weight, how canonical the degree is, common tones and novelty — and `why` states the breakdown, because a ranking a user cannot interrogate is a black box."
+        },
+        "why": { "type": "string" }
+      }
+    },
+    "generateRequest": {
+      "title": "composer_generate request",
+      "type": "object",
+      "properties": {
+        "parts": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["chords", "bass", "melody", "drums"] },
+          "description": "Empty = all four. Every part lands in ONE transaction (ruling H-7)."
+        },
+        "key": { "type": ["string", "null"], "description": "None = the document's key at `atTicks`." },
+        "plan": {
+          "type": ["string", "null"],
+          "description": "A schema id, `\"circle\"` / `\"circle:cw\"`, or `\"functional:<0-100>\"`. None = keep the harmony document and write parts against it.",
+          "examples": ["axis", "12-bar-blues", "circle", "functional:70"]
+        },
+        "bars": { "type": ["integer", "null"], "minimum": 1 },
+        "atTicks": { "type": ["integer", "null"], "minimum": 0 },
+        "seed": {
+          "type": ["integer", "null"],
+          "description": "None = derived from the request, so the same request stays reproducible (ruling H-4)."
+        },
+        "genre": { "type": ["string", "null"] },
+        "voicing": { "type": ["string", "null"], "enum": ["close", "drop2", "shell", "spread", null] },
+        "rhythm": { "type": ["string", "null"], "enum": ["block", "arpeggio", null] },
+        "bassStyle": { "type": ["string", "null"], "enum": ["root", "rootFifth", "walking", "pedal", null] },
+        "density": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "syncopation": { "type": ["integer", "null"], "minimum": 0, "maximum": 100 },
+        "trackIds": {
+          "type": "object",
+          "description": "Reuse a track per part instead of creating one: `{\"melody\": \"<trackId>\"}`. A non-midi or unknown track is rejected and NOTHING is written."
+        },
+        "writeHarmony": {
+          "type": ["boolean", "null"],
+          "description": "Defaults to true when `plan` is given (the progression is the point), false otherwise."
+        }
+      }
+    },
+    "generateReply": {
+      "title": "composer_generate reply",
+      "type": "object",
+      "properties": {
+        "clips": { "type": "array", "items": { "$ref": "#/$defs/generatedClip" } },
+        "harmony": { "$ref": "#/$defs/harmonyView" },
+        "progression": { "type": ["object", "null"], "$ref": "#/$defs/progressionView" },
+        "seed": { "type": "integer", "description": "What produced this — store it and the take is recoverable." },
+        "bars": { "type": "integer", "description": "What was actually written: the HARMONY decides the length, not the request." }
+      }
+    },
+    "generatedClip": {
+      "type": "object",
+      "properties": {
+        "part": { "type": "string" },
+        "clipId": { "type": "string" },
+        "trackId": { "type": "string" },
+        "trackName": { "type": "string" },
+        "createdTrack": { "type": "boolean" },
+        "noteCount": { "type": "integer" },
+        "annotations": { "type": "array", "items": { "$ref": "#/$defs/annotation" } }
+      }
+    },
+    "annotation": {
+      "description": "Why a generator did what it did. Display only — never persisted, never a field on a clip (ruling H-6).",
+      "type": "object",
+      "properties": {
+        "tick": { "type": "integer", "description": "Clip-relative." },
+        "lengthTicks": { "type": "integer" },
+        "label": { "type": "string", "examples": ["kick · 4 onsets", "bar 3 · sequence", "C · I"] },
+        "why": { "type": "string" }
+      }
+    },
+    "progressionView": {
+      "type": "object",
+      "properties": {
+        "key": { "type": "string", "description": "The key the progression is actually IN — a minor-mode schema asked for in a major key resolves in the relative minor." },
+        "keyLabel": { "type": "string" },
+        "why": { "type": "string" },
+        "slots": { "type": "array", "items": { "$ref": "#/$defs/slot" } }
+      }
+    },
+    "slot": {
+      "type": "object",
+      "properties": {
+        "chord": { "type": "string" },
+        "bars": { "type": "integer" },
+        "roman": { "type": "string" },
+        "why": { "type": "string" }
+      }
+    }
+  }
+}

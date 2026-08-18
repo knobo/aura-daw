@@ -17,18 +17,24 @@ import type {
   AutomationLane,
   Binding,
   Clip,
+  ChordSpan,
   ClipPlacement,
+  ComposerGenerateReply,
+  ComposerGenerateRequest,
+  ComposerSuggestion,
   Curve,
   ModulationSnapshot,
   EvolveOptions,
   ExportCapabilities,
   ExportJobStatus,
   ExportRequest,
+  HarmonyView,
   HistoryStep,
   HumToSongRequest,
   ImportClipRequest,
   ImportSplitReply,
   InstrumentInfo,
+  KeySpan,
   LibraryEntry,
   LoopJamStatus,
   McpPolicy,
@@ -49,6 +55,7 @@ import type {
   PluginListResult,
   PluginParamChange,
   PluginParamInfo,
+  PaletteView,
   PasteRequest,
   PasteResult,
   PitchFrameBatch,
@@ -299,6 +306,22 @@ export interface Backend {
   midiGetClips(): Promise<MidiClip[]>;
   midiImportFile(path: string, trackId?: string | null, atTicks?: number | null): Promise<MidiClip[]>;
   midiExportFile(path: string, clipIds?: string[] | null): Promise<string>;
+
+  // ── the Composer (Plan H1) ──
+  // Optional so the demo backend can omit one without a type break; call
+  // through `backend.harmonyGet?.(...)`.
+  /** The harmony document plus everything the panel draws (the circle, the
+   *  per-chord analysis, the menus) — all backend-derived. */
+  harmonyGet?(atTicks?: number): Promise<HarmonyView>;
+  /** Replace the harmony document. Batch-shaped: one call is one op and one
+   *  undo entry, whatever the gesture touched. */
+  harmonySet?(keys: KeySpan[], chords: ChordSpan[], atTicks?: number): Promise<HarmonyView>;
+  /** Which notes may I play at this tick, and why. */
+  composerPalette?(tick: number): Promise<PaletteView>;
+  /** Ranked next chords, each carrying its own reasoning. */
+  composerSuggest?(atTicks?: number, limit?: number): Promise<ComposerSuggestion[]>;
+  /** Write parts as ordinary MIDI clips — one transaction, one undo. */
+  composerGenerate?(request: ComposerGenerateRequest): Promise<ComposerGenerateReply>;
 
   // sampler
   samplerLoadInstrument(sfzPath: string, name?: string | null): Promise<InstrumentInfo>;
@@ -767,6 +790,26 @@ class TauriBackend implements Backend {
   }
   midiExportFile(path: string, clipIds: string[] | null = null) {
     return invoke<string>("midi_export_file", { path, clipIds });
+  }
+
+  // ── the Composer (Plan H1) ──
+  harmonyGet(atTicks?: number) {
+    return invoke<HarmonyView>("harmony_get", { atTicks: atTicks ?? null });
+  }
+  harmonySet(keys: KeySpan[], chords: ChordSpan[], atTicks?: number) {
+    return invoke<HarmonyView>("harmony_set", { keys, chords, atTicks: atTicks ?? null });
+  }
+  composerPalette(tick: number) {
+    return invoke<PaletteView>("composer_palette", { tick });
+  }
+  composerSuggest(atTicks?: number, limit?: number) {
+    return invoke<ComposerSuggestion[]>("composer_suggest", {
+      atTicks: atTicks ?? null,
+      limit: limit ?? null,
+    });
+  }
+  composerGenerate(request: ComposerGenerateRequest) {
+    return invoke<ComposerGenerateReply>("composer_generate", { request });
   }
 
   samplerLoadInstrument(sfzPath: string, name: string | null = null) {

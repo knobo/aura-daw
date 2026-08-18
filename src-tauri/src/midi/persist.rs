@@ -72,6 +72,11 @@ pub struct V3Data {
     pub meter_events: Vec<MeterEvent>,
     pub clips: Vec<MidiClip>,
     pub launch_maps: Vec<super::launch::LaunchMap>,
+    /// The Composer's harmony document (Plan H1). Additive and OPTIONAL: the
+    /// key is written only when the document is non-empty, so a project that
+    /// never used the Composer resaves byte-diff-free and `schemaVersion`
+    /// stays where Track F left it (ruling H-9).
+    pub harmony: crate::theory::HarmonyDoc,
 }
 
 /// Persisted clip row (midi-clip.schema.json `$defs/persistedClip`) — the
@@ -157,6 +162,7 @@ pub fn save_into_project(dir: &Path, midi: &MidiStore) -> Result<(), String> {
             tempo_events: midi.tempo_events.clone(),
             meter_events: midi.meter_events.clone(),
             launch_maps: midi.launch_maps.clone(),
+            harmony: midi.harmony.clone(),
             clips: midi.clips.clone(),
         },
     )
@@ -286,6 +292,12 @@ pub fn save_snapshot_into_project(dir: &Path, midi: &V3Data) -> Result<(), Strin
         "launchMaps".into(),
         serde_json::to_value(&midi.launch_maps).unwrap(),
     );
+    // Additive, and only when there is something to say — see `V3Data::harmony`.
+    if midi.harmony.is_empty() {
+        obj.remove("harmony");
+    } else {
+        obj.insert("harmony".into(), serde_json::to_value(&midi.harmony).unwrap());
+    }
     obj.remove("midiClips"); // v3 stops writing the v2 key; still read forever (see load_from_project)
 
     atomic_write_json(dir, &root)?;
@@ -387,7 +399,17 @@ pub fn load_from_project(dir: &Path) -> Result<Option<V3Data>, String> {
         None => Vec::new(),
     };
     let launch_maps = super::launch::migrate_legacy_maps(maps, legacy_bindings, legacy_drive);
-    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips, launch_maps }))
+    // A malformed harmony block loses the harmony, not the project: it is
+    // derived-adjacent (chords the user can re-enter), and refusing to open a
+    // song because one chord symbol rotted would be the wrong trade.
+    let harmony = match root.get("harmony") {
+        Some(v) => serde_json::from_value(v.clone()).unwrap_or_else(|e| {
+            log::warn!("harmony: {e}; opening without it");
+            crate::theory::HarmonyDoc::default()
+        }),
+        None => crate::theory::HarmonyDoc::default(),
+    };
+    Ok(Some(V3Data { ppq, tempo_events, meter_events, clips, launch_maps, harmony }))
 }
 
 /// The v2/legacy `midiClips` shape — one row IS the placement+content
@@ -522,6 +544,7 @@ pub fn v1_migration_defaults(tempo_bpm: f64) -> V3Data {
         tempo_events: vec![TempoEvent { tick: 0, bpm: tempo_bpm }],
         clips: Vec::new(),
         launch_maps: Vec::new(),
+        harmony: crate::theory::HarmonyDoc::default(),
     }
 }
 
@@ -649,6 +672,7 @@ mod tests {
 
     fn store_with(clips: Vec<MidiClip>) -> MidiStore {
         MidiStore {
+            harmony: Default::default(),
             ppq: DEFAULT_PPQ,
             tempo_events: vec![
                 TempoEvent { tick: 0, bpm: 100.0 },

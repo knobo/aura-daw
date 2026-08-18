@@ -255,6 +255,21 @@ pub enum Op {
         id: String,
         binding: Option<crate::midi::launch::LaunchBinding>,
     },
+    /// Plan H1 (ruling H-4): atomic replacement of the Composer's harmony
+    /// document — `Op::TempoSet`'s shape, and for the same reason. A chord
+    /// region and the key it is analysed in are ONE edit: writing them
+    /// separately would let a commit land a ♭VII in a key that has not
+    /// arrived yet, and would make the inverse of a modulation two ops that
+    /// can be undone apart. Region counts are tens, so whole-list replacement
+    /// is right; a keyed upsert would buy nothing and fight folding.
+    ///
+    /// Additive: does NOT bump `OP_FORMAT_VERSION` (stays 2). Keys and chords
+    /// ride the wire as strings (`"C ionian"`, `"Cmaj7"`) — see
+    /// `theory::harmony` for why a persisted format spells them out.
+    HarmonySet {
+        keys: Vec<crate::theory::KeySpan>,
+        chords: Vec<crate::theory::ChordSpan>,
+    },
     /// Toggle whether a MIDI clip's notes drive a named launcher.
     LaunchDriveSet {
         #[serde(default)]
@@ -645,6 +660,30 @@ mod tests {
         assert!(s.contains("\"bpm\":140.0"), "tempo events must be present, was: {s}");
         let back: Op = serde_json::from_str(&s).unwrap();
         assert_eq!(back, tempo_set);
+
+        // Plan H1: `HarmonySet`'s wire form is a PERSISTED format (it rides
+        // journal.ndjson), and its whole design bet is that keys and chords
+        // ride as spelled strings — so the round trip has to preserve a
+        // spelling that a pitch-class encoding would have destroyed.
+        let harmony_set = Op::HarmonySet {
+            keys: vec![crate::theory::KeySpan {
+                tick: 0,
+                key: crate::theory::Key::parse("Gb major").unwrap(),
+            }],
+            chords: vec![crate::theory::ChordSpan::new(
+                0,
+                3840,
+                crate::theory::Chord::parse("Cbmaj7").unwrap(),
+            )],
+        };
+        let s = serde_json::to_string(&harmony_set).unwrap();
+        eprintln!("HarmonySet wire form: {}", s);
+        assert!(s.contains("\"kind\":\"harmonySet\""), "wire form was: {s}");
+        assert!(s.contains("\"Gb ionian\""), "keys spell themselves: {s}");
+        assert!(s.contains("\"Cbmaj7\""), "…and so do chords, Cb not B: {s}");
+        assert!(s.contains("\"lengthTicks\":3840"), "camelCase on the wire: {s}");
+        let back: Op = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, harmony_set);
 
         let midi_clip = crate::midi::types::MidiClip {
             id: "mc-1".into(),

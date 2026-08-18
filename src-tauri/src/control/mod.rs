@@ -15,6 +15,9 @@
 //!                (`get_project_state`, `set_track_mix`, `import_audio_clip`).
 
 pub mod clipboard;
+/// The Composer (Plan H1): the ONE stateful seam over the pure `theory`
+/// library — harmony document ops, the palette, suggestions, generation.
+pub mod composer;
 pub mod import;
 pub mod hum;
 pub mod export;
@@ -75,6 +78,10 @@ pub struct ProjectSnapshot {
     pub period_events: Vec<crate::midi::TempoPeriodEvent>,
     pub section_table: Vec<crate::midi::SectionRow>,
     pub section_table_rule_version: u32,
+    /// The Composer's harmony document (Plan H1, additive). Ships from cold
+    /// start for the same reason the section table does: the panel and the
+    /// piano-roll tint need it before anyone calls a composer command.
+    pub harmony: crate::theory::HarmonyDoc,
 }
 
 /// Argument of `import_audio_clip` (and the MCP tool of the same name).
@@ -1592,6 +1599,7 @@ impl ControlPlane {
             period_events: tms.period_events,
             section_table: tms.section_table,
             section_table_rule_version: tms.section_table_rule_version,
+            harmony: midi.harmony.clone(),
         }
     }
 
@@ -7626,6 +7634,7 @@ mod tests {
             n.validate().unwrap();
         }
         let midi = crate::midi::MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],
@@ -7729,6 +7738,7 @@ mod tests {
         let slots = derive_slots(&store.tracks);
         let (pad, lead, groove) = demo_seed_clips_v2("pad", "lead", "bass", 960);
         let midi = crate::midi::MidiStore {
+            harmony: Default::default(),
             ppq: 960,
             tempo_events: vec![crate::midi::TempoEvent { tick: 0, bpm: 120.0 }],
             meter_events: vec![crate::midi::MeterEvent { tick: 0, num: 4, den: 4 }],

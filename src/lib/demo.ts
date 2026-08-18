@@ -12,25 +12,37 @@ import {
   type AudioDevice,
   type AuraEventMap,
   type AuraEventName,
+  type ChordSpan,
+  type CircleWedge,
   type Clip,
+  type ComposerGenerateReply,
+  type ComposerGenerateRequest,
+  type ComposerSuggestion,
   type EvolveOptions,
   type ExportCapabilities,
   type ExportJobStatus,
   type ExportRequest,
   type ExportResult,
+  type GeneratedClipInfo,
   type GenJobResult,
+  type HarmonyDoc,
+  type HarmonyView,
   type HumToSongRequest,
   type ImportClipRequest,
   type ImportSplitReply,
   type LoopJamStatus,
   type InstrumentInfo,
+  type KeySpan,
   type McpPolicy,
   type McpStatus,
   type MeterFrame,
   type MidiClip,
   type MidiNote,
+  type NoteClass,
+  type NoteRole,
   type NoteScore,
   type OpenSidecarEvent,
+  type PaletteView,
   type PendingConfirmation,
   type PluginDescriptor,
   type PluginInstanceInfo,
@@ -1739,6 +1751,7 @@ export class DemoBackend implements Backend {
       midiClips: this.midiClips.map((c) => ({ ...c, notes: [...c.notes] })),
       ppq: this.ppq,
       tempoEvents: [...this.tempoEvents],
+      harmony: this.harmony,
       ...this.tempoMapAdditiveFields(),
     };
   }
@@ -1848,6 +1861,222 @@ export class DemoBackend implements Backend {
     this.midiClips = this.midiClips.filter((c) => c.id !== clipId);
     if (this.midiClips.length === before) throw new Error(`unknown MIDI clip: ${clipId}`);
     this.resyncAudio();
+  }
+
+  // ── the Composer (Plan H1, ruling H-12) ──────────────────────────────────
+  //
+  // A FIXTURE, not a second implementation. The theory lives in Rust
+  // (`src-tauri/src/theory/`, ADR 0006) and duplicating any of it here would
+  // be the exact mistake the thin-renderer rule exists to prevent — so what
+  // follows is canned DATA for one key, plus the arithmetic needed to place
+  // notes the fixture already names. In demo mode the key is always C major:
+  // changing it stores the change and keeps the C-major circle, which is
+  // honest about being a mock.
+
+  private harmony: HarmonyDoc = {
+    keys: [{ tick: 0, key: "C ionian" }],
+    chords: [
+      { tick: 0, lengthTicks: 3840, chord: "C" },
+      { tick: 3840, lengthTicks: 3840, chord: "G" },
+      { tick: 7680, lengthTicks: 3840, chord: "Am" },
+      { tick: 11520, lengthTicks: 3840, chord: "F" },
+    ],
+  };
+
+  /** The C-major circle, hard-coded: twelve slots clockwise from D♭. */
+  private static readonly DEMO_WEDGES: CircleWedge[] = [
+    { fifths: -5, major: "Db", minor: "Bb", inKey: false, borrowedChord: "Db", roman: "♭II", isTonic: false },
+    { fifths: -4, major: "Ab", minor: "F", inKey: false, borrowedChord: "Ab", roman: "♭VI", isTonic: false },
+    { fifths: -3, major: "Eb", minor: "C", inKey: false, borrowedChord: "Eb", roman: "♭III", isTonic: false },
+    { fifths: -2, major: "Bb", minor: "G", inKey: false, borrowedChord: "Bb", roman: "♭VII", isTonic: false },
+    { fifths: -1, major: "F", minor: "D", inKey: true, chord: "F", roman: "IV", function: "predominant", isTonic: false },
+    { fifths: 0, major: "C", minor: "A", inKey: true, chord: "C", roman: "I", function: "tonic", isTonic: true },
+    { fifths: 1, major: "G", minor: "E", inKey: true, chord: "G", roman: "V", function: "dominant", isTonic: false },
+    { fifths: 2, major: "D", minor: "B", inKey: true, chord: "Dm", roman: "ii", function: "predominant", isTonic: false },
+    { fifths: 3, major: "A", minor: "F#", inKey: true, chord: "Am", roman: "vi", function: "tonic", isTonic: false },
+    { fifths: 4, major: "E", minor: "C#", inKey: true, chord: "Em", roman: "iii", function: "tonic", isTonic: false },
+    { fifths: 5, major: "B", minor: "G#", inKey: true, chord: "Bdim", roman: "vii°", function: "dominant", isTonic: false },
+    { fifths: 6, major: "F#", minor: "D#", inKey: false, borrowedChord: "F#", roman: "♯IV", isTonic: false },
+  ];
+
+  /** Chord tones as MIDI keys, named rather than derived (see above). */
+  private static readonly DEMO_CHORD_KEYS: Record<string, number[]> = {
+    C: [60, 64, 67], G: [59, 62, 67], Am: [60, 64, 69], F: [60, 65, 69],
+    Dm: [62, 65, 69], Em: [59, 64, 67], Bdim: [59, 62, 65], G7: [59, 62, 65, 67],
+    Db: [61, 65, 68], Ab: [60, 63, 68], Eb: [58, 63, 67], Bb: [58, 62, 65], "F#": [58, 61, 66],
+  };
+
+  private static readonly DEMO_ROMAN: Record<string, string> = {
+    C: "I", G: "V", Am: "vi", F: "IV", Dm: "ii", Em: "iii", Bdim: "vii°", G7: "V7",
+  };
+
+  private harmonyView(): HarmonyView {
+    return {
+      harmony: { keys: [...this.harmony.keys], chords: [...this.harmony.chords] },
+      key: this.harmony.keys[0]?.key ?? "C ionian",
+      keyLabel: "C major",
+      keySignature: 0,
+      wedges: DemoBackend.DEMO_WEDGES.map((w: CircleWedge) => ({ ...w })),
+      spans: this.harmony.chords.map((c) => ({
+        tick: c.tick,
+        lengthTicks: c.lengthTicks,
+        symbol: c.chord,
+        pretty: c.chord,
+        roman: DemoBackend.DEMO_ROMAN[c.chord] ?? "?",
+        function: DemoBackend.DEMO_WEDGES.find((w: CircleWedge) => w.chord === c.chord)?.function ?? "chromatic",
+        borrowed: !DemoBackend.DEMO_ROMAN[c.chord],
+        why: "Demo mode ships a fixture, not the theory engine — run the real app for the analysis.",
+        tones: [],
+      })),
+      neighbours: [
+        { key: "G ionian", label: "G major", steps: 1, why: "One step clockwise: the dominant key.", pivots: ["C", "Am"] },
+        { key: "F ionian", label: "F major", steps: 1, why: "One step counter-clockwise: the subdominant key.", pivots: ["C", "Dm"] },
+        { key: "A aeolian", label: "A minor", steps: 0, why: "The relative minor — the same seven notes.", pivots: ["C", "Am"] },
+      ],
+      borrowed: [
+        { symbol: "Bb", pretty: "B♭", roman: "♭VII", why: "Borrowed from mixolydian, one step past IV." },
+        { symbol: "Fm", pretty: "Fm", roman: "iv", why: "Borrowed from the parallel minor." },
+      ],
+      schemas: [
+        { id: "axis", label: "I–V–vi–IV (the axis)", numerals: "I V vi IV", minor: false, why: "The four chords most of popular music is built from." },
+        { id: "doo-wop", label: "I–vi–IV–V (doo-wop)", numerals: "I vi IV V", minor: false, why: "The fifties changes — it ends on the dominant, so it loops." },
+        { id: "12-bar-blues", label: "12-bar blues", numerals: "I7*4 IV7*2 I7*2 V7 IV7 I7 V7", minor: false, why: "Twelve bars, three chords, all dominant sevenths." },
+      ],
+      genres: ["rock", "funk", "hipHop", "house", "jazz", "latin", "ballad", "metal"],
+      voicingStyles: ["close", "drop2", "shell", "spread"],
+      bassStyles: ["root", "rootFifth", "walking", "pedal"],
+      ppq: this.ppq,
+      ticksPerBar: this.ppq * 4,
+    };
+  }
+
+  async harmonyGet(): Promise<HarmonyView> {
+    return this.harmonyView();
+  }
+
+  async harmonySet(keys: KeySpan[], chords: ChordSpan[]): Promise<HarmonyView> {
+    this.harmony = { keys: [...keys], chords: [...chords] };
+    return this.harmonyView();
+  }
+
+  async composerPalette(tick: number): Promise<PaletteView> {
+    const span = this.harmony.chords.find((c) => tick >= c.tick && tick < c.tick + c.lengthTicks);
+    const tones = span ? (DemoBackend.DEMO_CHORD_KEYS[span.chord] ?? []).map((k: number) => k % 12) : [];
+    const scale = [0, 2, 4, 5, 7, 9, 11];
+    const NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const classes: NoteClass[] = Array.from({ length: 12 }, (_, pc) => {
+      const chordTone = tones.includes(pc);
+      const inScale = scale.includes(pc);
+      // The fixture's one rule, and it is the real one: a scale note a
+      // semitone above a chord tone is an avoid note.
+      const above = tones.includes((pc + 11) % 12);
+      // Role by POSITION in the fixture's stack (root, third, fifth), so the
+      // tint's colours mean the same thing in demo mode as in the real app.
+      const CHORD_ROLES: NoteRole[] = ["root", "third", "fifth", "seventh"];
+      const role: NoteRole = chordTone
+        ? (CHORD_ROLES[tones.indexOf(pc)] ?? "extension")
+        : inScale
+          ? above
+            ? "avoid"
+            : "extension"
+          : "outside";
+      return { pitchClass: pc, tpc: NAMES[pc], role, degree: "", why: null };
+    });
+    return {
+      tick,
+      key: "C ionian",
+      keyLabel: "C major",
+      chord: span?.chord ?? null,
+      chordPretty: span?.chord ?? null,
+      roman: span ? (DemoBackend.DEMO_ROMAN[span.chord] ?? null) : null,
+      classes,
+    };
+  }
+
+  async composerSuggest(): Promise<ComposerSuggestion[]> {
+    return [
+      { chord: "G7", roman: "V7", function: "dominant", score: 0.82, why: "The dominant: its tritone resolves inward to the tonic." },
+      { chord: "F", roman: "IV", function: "predominant", score: 0.71, why: "Departure — it sets up the dominant." },
+      { chord: "Am", roman: "vi", function: "tonic", score: 0.64, why: "The relative minor: home with the lights down." },
+      { chord: "Dm", roman: "ii", function: "predominant", score: 0.6, why: "The other predominant; ii–V–I is the oldest sentence in tonal music." },
+    ];
+  }
+
+  async composerGenerate(request: ComposerGenerateRequest): Promise<ComposerGenerateReply> {
+    const bars = request.bars ?? 4;
+    const at = request.atTicks ?? 0;
+    const bar = this.ppq * 4;
+    const chords = this.harmony.chords.slice(0, bars);
+    const parts = request.parts?.length ? request.parts : ["chords", "bass", "drums"];
+    const clips: GeneratedClipInfo[] = [];
+    for (const part of parts) {
+      const notes: MidiNote[] = [];
+      chords.forEach((span, i) => {
+        const keys = DemoBackend.DEMO_CHORD_KEYS[span.chord] ?? [60];
+        if (part === "chords") {
+          for (const key of keys) {
+            notes.push({ tick: i * bar, lengthTicks: bar, key, velocity: 84, channel: 0, noteId: 0 });
+          }
+        } else if (part === "bass") {
+          notes.push({ tick: i * bar, lengthTicks: bar, key: keys[0] - 24, velocity: 92, channel: 0, noteId: 0 });
+        } else if (part === "melody") {
+          for (let b = 0; b < 4; b++) {
+            notes.push({
+              tick: i * bar + b * (bar / 4),
+              lengthTicks: bar / 4,
+              key: keys[b % keys.length] + 12,
+              velocity: b === 0 ? 96 : 76,
+              channel: 0,
+              noteId: 0,
+            });
+          }
+        } else {
+          for (let b = 0; b < 4; b++) {
+            const t = i * bar + b * (bar / 4);
+            notes.push({ tick: t, lengthTicks: 120, key: b % 2 === 0 ? 36 : 38, velocity: 100, channel: 9, noteId: 0 });
+            notes.push({ tick: t, lengthTicks: 120, key: 42, velocity: 56, channel: 9, noteId: 0 });
+          }
+        }
+      });
+      const track = this.makeTrack({ name: `Composer ${part}`, kind: "midi", color: "#8b8bff" });
+      this.tracks.push(track);
+      const clip = await this.midiAddClip(track.id, `Composer ${part}`, at, bars * bar);
+      await this.midiSetNotes(clip.id, notes);
+      clips.push({
+        part,
+        clipId: clip.id,
+        trackId: track.id,
+        trackName: track.name,
+        createdTrack: true,
+        noteCount: notes.length,
+        annotations: [
+          {
+            tick: 0,
+            lengthTicks: bar,
+            label: `${part} · demo fixture`,
+            why: "Demo mode plays a fixture so the panel is not dead in the browser. The real generators — voice leading, motif development, Euclidean drums — run in the Rust backend.",
+          },
+        ],
+      });
+    }
+    this.resyncAudio();
+    return {
+      clips,
+      harmony: this.harmonyView(),
+      progression: {
+        key: "C ionian",
+        keyLabel: "C major",
+        why: "Demo fixture: I–V–vi–IV in C major.",
+        slots: chords.map((c) => ({
+          chord: c.chord,
+          bars: 1,
+          roman: DemoBackend.DEMO_ROMAN[c.chord] ?? "?",
+          why: "Fixture — the real analysis is in the backend.",
+        })),
+      },
+      seed: request.seed ?? 1,
+      bars,
+    };
   }
 
   async midiGetClips(): Promise<MidiClip[]> {

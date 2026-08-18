@@ -88,6 +88,58 @@ clock plus Start/Stop/Continue/SPP (Hydrogen and friends slave to it) and
 can play one MIDI track's notes through an external synth
 ([docs/midi-output.md](docs/midi-output.md)).
 
+### The Composer — write music with theory you do not know yet
+
+A piano roll is a grid of 128 equal keys, and music theory's whole claim is
+that they are **not** equal: at any moment, given a key and a chord, some notes
+are the chord, some are safe colour, some are tension that has to resolve, and
+one or two are actively wrong. So AURA has a **harmony document** — one
+`tick → (key, chord)` map in the core, under the op log, next to the tempo map
+— and every surface reads it.
+
+The **COMPOSER** panel (dock tab, `O`) is the editor for it. The circle of
+fifths is not a diagram: a key's seven diatonic chords are a *contiguous arc*
+on it, so the arc is lit and coloured by function (tonic / predominant /
+dominant), the slots outside it are the borrowed chords, labelled with the
+numeral they would be, and a click appends a chord. The progression strip
+names every chord's Roman numeral; a ranked **NEXT** row suggests what comes
+after it, with the reasoning spelled out rather than a score alone.
+
+**GENERATE** writes parts as ordinary MIDI clips — chords, bass, melody and
+drums, in **one** transaction, so one Ctrl+Z removes the whole idea:
+
+- **Progressions** from eleven named schemas (the axis, doo-wop, the royal
+  road, Pachelbel, ii–V–I, the 12-bar blues, the Andalusian cadence…), written
+  once as Roman numerals so they transpose into any key — or a walk around the
+  circle of fifths, or a weighted **functional grammar** (tonic departs,
+  predominant prepares, dominant resolves) with a cadence nailed to the end.
+- **Chords** voice-led by a dynamic-programming pass over the whole
+  progression, not chord by chord: the voices move as little as possible and
+  tendency tones resolve (the ♭7 of `V7` falls a semitone to the 3rd of `I`).
+  Close / drop-2 / shell / spread.
+- **Melody** as a motif and its **development** — repetition, sequence,
+  inversion, augmentation, fragmentation — with chord tones on strong beats, no
+  avoid notes, no leap over an octave, and a phrase that *ends* rather than
+  stops (the antecedent unresolved, the consequent on a stable tone approached
+  by step).
+- **Drums from metrical theory**, not a pattern library: Bjorklund/Euclidean
+  onset distribution (`E(3,8)` is the tresillo), a backbeat *derived* from the
+  metre so 3/4 and 6/8 work with no special case, a syncopation dial whose
+  effect is **measured** (Longuet-Higgins & Lee), velocities from the same
+  metrical weight function every other part uses, and fills at phrase
+  boundaries. A genre is six numbers, so it can be explained and tweaked.
+
+And the **piano roll teaches**: its key rows are tinted by what each note does
+over the chord at that point — banded per chord region, because the answer
+changes with the chord — with the one note that fights the chord struck
+through. The chip in the roll header names the chord in force (`♪ Cmaj7 · I`).
+
+Everything the Composer makes carries a sentence saying **why**: not "V7" but
+"the dominant — B rises to C and F falls to E, resolving inward". Generation is
+seeded and deterministic, so a take you liked comes back; the generators are
+pure functions in `src-tauri/src/theory/` with no I/O and no hidden state.
+Product doc and roadmap: [`docs/backlog/composer-assistant.md`](docs/backlog/composer-assistant.md).
+
 ### Pitch Coach — sing against a MIDI melody
 
 Pick a MIDI track as the reference and the bottom panel becomes a lane: the
@@ -430,8 +482,8 @@ hosting (see roadmap).
 ## Tests
 
 ```sh
-cd src-tauri && cargo test    # 1092 tests (1056 lib + 36 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-18 after G1 Task 5, mixer strip): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map, pitch scoring + stored pitch curve, lane rename/group/reorder, insert-FX mixer strip (source-sum → inserts → fader)
-npm test                      # 738 frontend unit tests (counted 2026-08-17 after lane rename/fold/group/drag-reorder; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + launch map + pitch wire types + pitch frame bus + pitch lane geometry + pitch panel logic + pitch subscription lifetime + rehearse-hold refcount + pitch report geometry + lane layout/arrange
+cd src-tauri && cargo test    # 1261 tests (1225 lib + 36 integration, plus 2 #[ignore]d long-running plugin repros; counted 2026-08-18 after G1 Task 5 merged into the Composer, Plan H1): engine, MIDI, sampler, plugins, MCP, sidecars, control plane, op log (history + journal), Gate E invariants, library scan/audition, group drag/resize, cross-instance clipboard, clip delete, modulation graph, Plan F history store + placement offsets, gesture tokens, MIDI launch map, pitch scoring + stored pitch curve, lane rename/group/reorder, music theory (spelling/scales/chords/analysis/circle/palette/metre) + the harmony document + the four generators, mixer strip (source-sum -> inserts -> fader)
+npm test                      # 778 frontend unit tests (counted 2026-08-18 after the Composer, Plan H1; vitest): stores + timeline math + section-table bijection + library store + automation/modulation edit ops + MIDI I/O + group drag/resize + clip selection/clipboard + frontend clipboard codec/orchestration + MIDI selection export + piano-roll quantize + recent-projects + tempo editor + launch map + pitch wire types + pitch frame bus + pitch lane geometry + pitch panel logic + pitch subscription lifetime + rehearse-hold refcount + pitch report geometry + lane layout/arrange + the composer store + circle geometry + the palette colour ramp
 npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```

@@ -9,6 +9,12 @@ described here only.
 
 ## Already differentiating (landed)
 
+- The Composer (PR #65, 2026-08-17): a harmony document in the core
+  document model, theory-driven and *explainable* generation next to the ML
+  generators, and an editor that colours its own keys by what each note does
+  over the chord. `composer-assistant.md` §2 is honest about the prior art
+  (Cubase's chord track, Hooktheory, Scaler) and about which combination is
+  actually new.
 - AI sidecars: hum-to-song, stem splitting (real backend path since Plan E
   Task 11), AMT infill, LoopJam.
 - The Plan E core: one mutation channel, full undo/redo (Ctrl+Z), a
@@ -41,6 +47,7 @@ described here only.
 | Quantize in the piano roll | **[done]** PR #32 — Q / Shift+Q over the selection; one `midi_set_notes` = one undo. |
 | Insert FX chains per track + sends/busses | **[plan G]** G1 plan: `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`. Product: `insert-fx-sends-sidechain.md` (host CLAP/LV2, no stock DSP). **Tasks 1–4 landed** (PR #52 + PR #55 `118ae23`). Next is Task 5 (mixer strip). G2 bus+sends / G3 sidechain / G4 envelope-follower wait. **PDC before sends ship.** Do **not** start G2. |
 | MIDI clock/start-stop out (Hydrogen sync) | **[done]** PR #21 slice 4 — owner Hydrogen ear check owed |
+| **Compose with theory you don't know yet** (owner ask 2026-08-17) | **[track H]** H1 landed: a pure theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel with an interactive circle of fifths, and a piano roll that tints its keys by what each note does over the chord. Product doc + H2–H6 roadmap: `composer-assistant.md`. Plan: `docs/superpowers/plans/2026-08-17-plan-h-composer.md`. Handoff (incl. the owner ear-check owed): `docs/handoff/composer-h1.md` |
 
 ## Tier 2 — competitive (months)
 

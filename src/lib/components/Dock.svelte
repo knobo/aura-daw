@@ -11,6 +11,7 @@
   import { plugins } from "../state/plugins.svelte";
   import { zyn } from "../state/zynpatches.svelte";
   import AiStudio from "./generate/AiStudio.svelte";
+  import ComposerPanel from "./composer/ComposerPanel.svelte";
   import HumPanel from "./hum/HumPanel.svelte";
   import LibraryPanel from "./library/LibraryPanel.svelte";
   import InstrumentBrowser from "./instruments/InstrumentBrowser.svelte";
@@ -20,6 +21,7 @@
   import McpPanel from "./mcp/McpPanel.svelte";
 
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
+    { id: "composer", label: "♪ COMPOSER" },
     { id: "generate", label: "AI STUDIO" },
     { id: "hum", label: "🎤 HUM" },
     { id: "library", label: "LIBRARY" },
@@ -59,7 +61,9 @@
     </div>
 
     <div class="content">
-      {#if ui.dock === "generate"}
+      {#if ui.dock === "composer"}
+        <ComposerPanel />
+      {:else if ui.dock === "generate"}
         <AiStudio />
       {:else if ui.dock === "hum"}
         <HumPanel />
@@ -108,6 +112,10 @@
   .tabs {
     flex: none;
     display: flex;
+    /* Seven tabs no longer fit one row at the default dock width, and a row
+       that overflows silently hides a whole panel from anyone who does not
+       know the keyboard shortcut. */
+    flex-wrap: wrap;
     align-items: center;
     gap: 2px;
     padding: 8px 10px 0;
@@ -117,7 +125,9 @@
     position: relative;
     font-size: 9px;
     letter-spacing: 0.14em;
-    padding: 7px 7px 9px;
+    /* Tight horizontally so seven tabs fit in as few rows as the dock's
+       current width allows. */
+    padding: 7px 5px 9px;
     white-space: nowrap;
     border: none;
     background: transparent;
@@ -155,6 +165,7 @@
   }
   .closer {
     margin-left: auto;
+    align-self: flex-start;
     border: none;
     background: transparent;
     color: var(--text-faint);
