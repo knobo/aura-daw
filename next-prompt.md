@@ -1,23 +1,25 @@
-# Next: Plan G1 Task 5
+# Next: Plan G1 Task 6
 
 `origin/main` is the baseline. Branch from there. Subagent-driven,
 task-by-task. Reply to the user in Norwegian — they write Norwegian;
 the repo documentation is English.
 
-**Do this:** G1 Task 5 — mixer strip (`source → inserts → fader`). Plan:
+**Do this:** G1 Task 6 — PDC (`DelayLine` + `compile_pdc`). Plan:
 [`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`](docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md)
 (product: [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)).
 Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
 
 **Do not:** start G2/G3/G4; write a stock FX suite; bump
-`OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–4,
+`OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–5,
 Pitch Coach phases 1–3, the lanes UX track, the theme system).
 
-**Nothing is in flight.** Latest on `main`: `5f891cb` (lanes UX, PR #60).
-Stale worktrees for merged branches can be ignored — but keep the
-branches `feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history`
-and `worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in
-the handoffs.
+**Nothing is in flight.** Latest on `main`: `c99293b` (G1 Task 5 mixer
+strip, PR #66). Stale worktrees for merged branches can be ignored —
+but keep the branches `feat/pitch-coach`, `feat/pitch-coach-panel`,
+`plan-f-history` and `worktree-lanes-ux`, whose per-commit or squashed
+SHAs are cited in the handoffs. (2026-08-18: 16 stale merged-branch
+worktrees under `.claude/worktrees/` were removed to free disk space —
+the branches themselves were not deleted.)
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
@@ -28,6 +30,7 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
+| G1 Task 5 — mixer strip: source-sum → inserts REPLACE → shared fader (`InsertNode`/`compile_inserts`) | PR #66 `c99293b`. `compile_inserts` is not yet wired into `engine::rebuild` (Task 7) — an insert still isn't audible end-to-end. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
 | Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
@@ -42,8 +45,8 @@ this file (marked correction, ADR 0007) if they do.
 
 ## Open leftovers (open the pointer if you are on that item)
 
-- **G1 Tasks 5–10** (not leftovers — the rest of the plan): mixer strip, PDC, rebuild/offline, IPC+UI, handoff. Start at Task 5. Do not jump to Task 9 UI before the mixer hears inserts (G-11).
-- **G1 deferred minors** (do not block Task 5): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **G1 Tasks 6–10** (not leftovers — the rest of the plan): PDC, rebuild/offline, IPC+UI, handoff. Start at Task 6. Do not jump to Task 9 UI before Task 7 wires the mixer into rebuild — an insert is still silent end-to-end until then (G-11 note in the handoff).
+- **G1 deferred minors** (do not block Task 6): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
 - **Sing-along from any song** — new owner ask (2026-08-17), and the reason
   melody extraction outranks the auto-tune work: import → split stems →
   melody from the vocal stem → sing against it in the coach. Three of four
@@ -100,7 +103,7 @@ this file (marked correction, ADR 0007) if they do.
      branches, which is exactly the rot the step's own comment warns about.
   Unverified by the current session beyond reading the diff — treat as
   leads, not verdicts.
-- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 5 lands. **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
+- **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 7 wires `compile_inserts` into `engine::rebuild` (Task 5 landed the mixer walk itself but nothing calls it yet). **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply, version-graph UI. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, non-blocking CLAP param path, write/touch/latch, no DOM test env. Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):
