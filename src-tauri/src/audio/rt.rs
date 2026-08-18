@@ -14,6 +14,7 @@ use std::sync::Arc;
 use super::dsp::LiveInstrument;
 use super::insert::InsertNode;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
+use super::pdc::DelayLine;
 use super::transport::LoopSpec;
 use crate::ids::TrackId;
 use crate::midi::schedule::AbsNoteEvent;
@@ -377,8 +378,12 @@ pub struct RtTrack {
     pub live: Option<LiveSource>,
     /// Compiled insert chain (document order). Empty = dry strip.
     pub inserts: Vec<InsertNode>,
-    /// Compensating delay (Task 6). Task 5 leaves this `None`.
-    pub pdc: Option<()>,
+    /// Compensating delay (Task 6): pads this track's path up to the
+    /// slowest sibling's (see `pdc::compile_pdc`), applied on the mixer
+    /// strip after inserts and before the fader. `None` = no compensation
+    /// needed (this track IS the slowest path, or PDC isn't wired up yet —
+    /// Task 6 adds the primitive; attaching it during graph build is Task 7).
+    pub pdc: Option<DelayLine>,
 }
 
 impl RtTrack {

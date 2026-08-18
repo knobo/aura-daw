@@ -201,6 +201,53 @@ impl Effect for GainHalfEffect {
     }
 }
 
+/// Test double: an insert that reports latency and actually delays by it
+/// (Plan G1 Task 6) — a stand-in for a lookahead plugin (limiter, linear-
+/// phase EQ) whose `process()` genuinely shifts audio, so PDC tests exercise
+/// the same "the plugin already ate the delay" shape a real host would.
+#[cfg(test)]
+pub struct LatencyDummy {
+    latency: usize,
+    delay: Option<crate::audio::pdc::DelayLine>,
+}
+
+#[cfg(test)]
+impl LatencyDummy {
+    pub fn new(latency: usize) -> Self {
+        Self { latency, delay: None }
+    }
+}
+
+#[cfg(test)]
+impl AudioProcessor for LatencyDummy {
+    fn prepare(&mut self, _sample_rate: u32, max_block: usize) {
+        self.delay = Some(crate::audio::pdc::DelayLine::new(self.latency, max_block, 2));
+    }
+    fn process(&mut self, io: &mut ProcessBlock<'_>) {
+        if let Some(d) = self.delay.as_mut() {
+            d.process(io.samples);
+        }
+    }
+    fn reset(&mut self) {}
+    fn latency_samples(&self) -> usize {
+        self.latency
+    }
+}
+
+#[cfg(test)]
+impl Effect for LatencyDummy {
+    fn effect_id(&self) -> &str {
+        "aura.test.latencydummy"
+    }
+    fn display_name(&self) -> &str {
+        "Latency Dummy"
+    }
+    fn set_bypassed(&mut self, _bypassed: bool) {}
+    fn bypassed(&self) -> bool {
+        false
+    }
+}
+
 /// Test double: each sample *= -1.
 #[cfg(test)]
 pub struct InvertEffect;
