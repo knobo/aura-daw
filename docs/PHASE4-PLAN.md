@@ -690,7 +690,7 @@ R-3 (Task 10), L-4 (Tasks 9+11), L-5 (Task 8).
 - **(c) No auto-apply of journal tails** — ruling F-8. Detection only.
 - **(d) Seeded-PRNG constraint** binds future random ops — ruling F-10.
 - **(e) Version-graph product surface — read-only browser implemented** on
-  `codex/undo-version-graph-ui`: additive overview/detail commands expose
+  `codex/undo-version-graph-ui` (draft PR #82): additive overview/detail commands expose
   retention statistics and materialized document counts; the HISTORY dock
   browses retained revisions and drives ordinary Undo/Redo. Restoring an
   arbitrary revision remains deliberately unbuilt (new mutation contract).
