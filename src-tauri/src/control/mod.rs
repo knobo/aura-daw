@@ -1320,13 +1320,19 @@ pub(crate) fn forward_param_to_host(instance: &str, format: &str, index: u32, va
 }
 
 /// The same, for a whole BATCH of params on one instance — one host call
-/// instead of one per param (Task 9 review, I-2). This matters for CLAP:
-/// `clap_host::set_params` is a blocking `plugin_main().run(…)` round-trip on
-/// the thread that also serves the param panel, instantiate and `save_state`,
-/// so a handful of automated params on a 2 ms tick would otherwise be
-/// thousands of blocking hops a second. The engine's automation driver hands
-/// its writes out grouped by instance precisely so this is one call per
-/// plugin per tick.
+/// instead of one per param (Task 9 review, I-2), and posted rather than run
+/// so neither caller ever waits on the plugin-main thread's queue. This
+/// matters most for CLAP: `clap_host::set_params` is a blocking
+/// `plugin_main().run(…)` round-trip on the thread that also serves the
+/// param panel, instantiate and `save_state`, so a handful of automated
+/// params on a 2 ms tick would otherwise be thousands of blocking hops a
+/// second. `clap_host::post_params` is the fire-and-forget sibling that
+/// closes that gap — both callers already discard the confirmed value
+/// `set_params` returned (this function has always returned nothing), so
+/// nothing downstream depended on the wait. LV2 was already posted this way
+/// via `lv2_host::set_params`; the engine's automation driver hands its
+/// writes out grouped by instance precisely so this is one call per plugin
+/// per tick regardless of format.
 pub(crate) fn forward_params_to_host(instance: &str, format: &str, changes: &[(u32, f32)]) {
     use crate::plugins::{clap_host, lv2_host};
     if changes.is_empty() {
@@ -1343,9 +1349,7 @@ pub(crate) fn forward_params_to_host(instance: &str, format: &str, changes: &[(u
                 .iter()
                 .map(|(id, v)| crate::plugins::ParamChange { id: *id, value: *v as f64 })
                 .collect();
-            if let Err(e) = clap_host::set_params(instance, changes) {
-                log::warn!("plugins: clap param write for {instance}: {e}");
-            }
+            clap_host::post_params(instance, changes);
         }
         _ => {}
     }
@@ -8848,5 +8852,34 @@ mod tests {
         drop(held);
         handle.join().expect("persist thread");
         let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    /// Track D leftover: the automation driver's CLAP writes went through
+    /// `forward_params_to_host`'s "clap" arm, which called the blocking
+    /// `clap_host::set_params` (`plugin_main().run(...)`) — a ~1000/s
+    /// round-trip cost under an active ramp. Wedge the plugin-main thread
+    /// behind a closure that only releases when WE say so; if the clap arm
+    /// still blocks on it, the call won't return within the budget.
+    #[test]
+    fn forward_params_to_host_does_not_block_the_clap_arm() {
+        use crate::plugins::host::plugin_main;
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        plugin_main().post(move |_| {
+            let _ = release_rx.recv();
+        });
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
+        std::thread::spawn(move || {
+            forward_params_to_host("no-such-instance", "clap", &[(0, 0.5)]);
+            let _ = done_tx.send(());
+        });
+
+        let returned_promptly =
+            done_rx.recv_timeout(std::time::Duration::from_millis(200)).is_ok();
+        let _ = release_tx.send(());
+        assert!(
+            returned_promptly,
+            "forward_params_to_host's clap arm must not block on the plugin-main queue"
+        );
     }
 }

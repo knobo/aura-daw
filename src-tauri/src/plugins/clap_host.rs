@@ -617,6 +617,23 @@ pub fn set_params(instance_id: &str, changes: Vec<ParamChange>) -> Result<Vec<Pa
     plugin_main().run(move |ctx| world(ctx).set_params(&id, &changes))?
 }
 
+/// Fire-and-forget sibling of [`set_params`]: same effect, posted instead of
+/// run so the caller never waits on the plugin-main thread's queue. Mirrors
+/// `lv2_host::set_params`, which is already fire-and-forget — this closes
+/// the gap where the automation driver's CLAP writes were the one blocking
+/// round-trip left on that tick (Track D leftover).
+pub fn post_params(instance_id: &str, changes: Vec<ParamChange>) {
+    if changes.is_empty() {
+        return;
+    }
+    let id = instance_id.to_string();
+    plugin_main().post(move |ctx| {
+        if let Err(e) = world(ctx).set_params(&id, &changes) {
+            log::warn!("plugins: clap param write for {id}: {e}");
+        }
+    });
+}
+
 /// Current param list with values refreshed from the plugin.
 pub fn get_params(instance_id: &str) -> Result<Vec<ParamInfo>, String> {
     let id = instance_id.to_string();
@@ -1165,6 +1182,56 @@ mod tests {
             }
             Err(e) => eprintln!("note: state ext unavailable ({e})"),
         }
+
+        drop(node);
+        plugin_main().run(|_| ()).unwrap();
+        remove(&id).expect("remove");
+    }
+
+    /// `post_params` (the automation driver's fire-and-forget sibling to
+    /// `set_params`, Track D leftover) must never block the caller behind
+    /// the plugin-main thread's queue, and the change it posts must still
+    /// land. Wedge the main thread behind a slow closure first — a blocking
+    /// call would stall on it — then confirm `post_params` returns almost
+    /// instantly, and that the value shows up once the wedge clears.
+    #[test]
+    fn post_params_returns_immediately_and_the_change_still_lands() {
+        let Some(uid) = instrument_uid() else {
+            eprintln!("skipping: no CLAP instrument installed");
+            return;
+        };
+        let id = format!("t-{}", uuid::Uuid::new_v4());
+        let params = instantiate(&id, &uid).expect("instantiate");
+        let p = params
+            .iter()
+            .find(|p| p.max > p.min && p.steps == 0)
+            .or_else(|| params.first())
+            .expect("has a param")
+            .clone();
+        let target = p.min + (p.max - p.min) * 0.75;
+
+        let mut node = activate_node(&id, 48_000).expect("activate");
+
+        plugin_main().post(|_| std::thread::sleep(std::time::Duration::from_millis(200)));
+
+        let started = std::time::Instant::now();
+        post_params(&id, vec![ParamChange { id: p.id, value: target }]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(50),
+            "post_params must not block behind the plugin-main queue: took {:?}",
+            started.elapsed()
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let _ = render_blocks(node.as_mut(), 2, 512);
+        let live = get_params(&id).expect("get");
+        let got = live.iter().find(|q| q.id == p.id).unwrap().value;
+        assert!(
+            (got - target).abs() <= (p.max - p.min) * 0.01 + 1e-6,
+            "plugin-side value {} ~ posted value {} (fire-and-forget path)",
+            got,
+            target
+        );
 
         drop(node);
         plugin_main().run(|_| ()).unwrap();
