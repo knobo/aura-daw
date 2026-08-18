@@ -220,8 +220,16 @@ fn transition_cost(prev: &[u8], cand: &[u8], prev_chord: &Chord, opts: &VoicingO
     let mut cost = 0.0f32;
     for i in 0..n {
         let d = (cand[i] as i16 - prev[i] as i16).unsigned_abs() as f32;
-        // The top voice is heard as a melody, so its motion costs more.
-        let w = if i + 1 == n { 1.5 } else { 1.0 };
+        // The OUTER voices are the ones the ear tracks: the top reads as a
+        // melody and the bottom as the bass line, so their motion costs more
+        // than an inner voice's. Without this the DP happily drops the bass an
+        // octave to save two inner semitones, which is the most audible flaw a
+        // comp part can have.
+        let w = match i {
+            _ if i + 1 == n => 1.5,
+            0 => 1.3,
+            _ => 1.0,
+        };
         cost += d * w;
     }
     if prev == cand {
@@ -255,7 +263,30 @@ fn transition_cost(prev: &[u8], cand: &[u8], prev_chord: &Chord, opts: &VoicingO
 }
 
 /// Cost of a voicing on its own: how far it sits from the middle of the
-/// register, plus a spacing penalty for gaps above the bass.
+/// register, a spacing penalty for gaps above the bass, and a mild preference
+/// for having the chord's ROOT in the bass.
+///
+/// The root preference is deliberately mild: inversions are how voice leading
+/// stays smooth, so banning them would defeat the point. But with it absent
+/// entirely the DP happily opens a progression on a second-inversion tonic
+/// (`C` voiced `G3 C4 C5 E5`), which is an unstable chord to start on and
+/// sounds like a mistake to anyone who can hear it. `first` makes the
+/// preference firm for the opening chord, where there is no previous voicing
+/// to be smooth with anyway.
+fn root_position_penalty(v: &[u8], chord: &Chord, first: bool) -> f32 {
+    if chord.bass.is_some() {
+        return 0.0; // a slash chord's bass is the composer's choice, not ours
+    }
+    let bass_pc = v.first().map(|k| k % 12);
+    if bass_pc == Some(chord.root.pitch_class()) {
+        0.0
+    } else if first {
+        14.0
+    } else {
+        0.5
+    }
+}
+
 fn static_cost(v: &[u8], opts: &VoicingOptions) -> f32 {
     let centre = (opts.lo as f32 + opts.hi as f32) / 2.0;
     let mean = v.iter().map(|k| *k as f32).sum::<f32>() / v.len().max(1) as f32;
@@ -303,7 +334,12 @@ pub fn voice_lead(chords: &[Chord], opts: &VoicingOptions) -> Vec<Vec<u8>> {
     // DP: best[i][j] = cheapest path ending on candidate j of chord i.
     let mut best: Vec<Vec<f32>> = Vec::with_capacity(all.len());
     let mut from: Vec<Vec<usize>> = Vec::with_capacity(all.len());
-    best.push(all[0].iter().map(|v| static_cost(v, opts)).collect());
+    best.push(
+        all[0]
+            .iter()
+            .map(|v| static_cost(v, opts) + root_position_penalty(v, &chords[0], true))
+            .collect(),
+    );
     from.push(vec![0; all[0].len()]);
     for i in 1..all.len() {
         let mut row = Vec::with_capacity(all[i].len());
@@ -319,7 +355,9 @@ pub fn voice_lead(chords: &[Chord], opts: &VoicingOptions) -> Vec<Vec<u8>> {
                     best_k = k;
                 }
             }
-            row.push(best_cost + static_cost(cand, opts));
+            row.push(
+                best_cost + static_cost(cand, opts) + root_position_penalty(cand, &chords[i], false),
+            );
             back.push(best_k);
         }
         best.push(row);
@@ -498,10 +536,51 @@ mod tests {
         // And it is not a trivial win: real progressions should move only a
         // few semitones per chord.
         assert!(
-            total_movement(&led) as f32 / (prog.len() - 1) as f32 <= 9.0,
-            "average movement per chord too high: {}",
-            total_movement(&led)
+            (total_movement(&led) as f32) < total_movement(&naive) as f32 / 1.5,
+            "the win should be substantial, not marginal: led {} vs naive {}",
+            total_movement(&led),
+            total_movement(&naive)
         );
+        // A per-chord average is the wrong guard here: the DP minimises a
+        // WEIGHTED cost (outer voices count more, register and root position
+        // enter it), so a path with a slightly larger raw semitone sum can be
+        // the better-sounding one. What must hold is that no single voice
+        // lurches: nothing moves more than an octave between two chords.
+        for w in led.windows(2) {
+            for i in 0..w[0].len().min(w[1].len()) {
+                let d = (w[1][i] as i16 - w[0][i] as i16).abs();
+                assert!(d <= 12, "voice {i} leapt {d} semitones: {:?} -> {:?}", w[0], w[1]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_progression_opens_in_root_position() {
+        // Inversions are how voice leading stays smooth, so they are welcome
+        // everywhere EXCEPT the opening chord, where there is no previous
+        // voicing to be smooth with and a second-inversion tonic just sounds
+        // like a mistake. (Found by reading a dumped sketch: the DP used to
+        // open `C` as `G3 C4 C5 E5`.)
+        let opts = VoicingOptions::default();
+        for symbols in [
+            vec!["C", "Am", "F", "G7", "C"],
+            vec!["Am", "F", "C", "G"],
+            vec!["Fmaj7", "Bb13", "Eb"],
+            vec!["Dm7", "G7", "Cmaj7"],
+        ] {
+            let prog = chords(&symbols);
+            let led = voice_lead(&prog, &opts);
+            assert_eq!(
+                led[0][0] % 12,
+                prog[0].root.pitch_class(),
+                "{} should open in root position, got {:?}",
+                symbols[0],
+                led[0]
+            );
+        }
+        // …but a slash chord's bass is the composer's choice, not ours.
+        let slash = voice_lead(&chords(&["C/E", "F"]), &opts);
+        assert_eq!(slash[0][0] % 12, 4, "C/E keeps E in the bass");
     }
 
     #[test]
@@ -591,6 +670,44 @@ mod tests {
         }
         let e_bass = voice_lead(&chords(&["C/E"]), &opts);
         assert_eq!(e_bass[0][0] % 12, 4, "E in the bass: {:?}", e_bass[0]);
+    }
+
+    #[test]
+    fn no_voice_lurches_in_any_schema_or_key() {
+        // A sweep over the shipped schemas in a major and a minor key: the
+        // properties that reading one dumped sketch taught us to check, applied
+        // to every progression the panel can produce.
+        use crate::theory::progression::{generate, Plan, SCHEMAS};
+        use crate::theory::scale::ScaleType;
+        for schema in SCHEMAS {
+            for key in [Key::c_major(), Key::new(crate::theory::Tpc::A, ScaleType::Aeolian)] {
+                let prog = generate(&key, &Plan::Schema(schema.id.into()), 8, 3).unwrap();
+                let chords: Vec<Chord> = prog.slots.iter().map(|s| s.chord).collect();
+                let led = voice_lead(&chords, &VoicingOptions::default());
+                assert_eq!(led.len(), chords.len(), "{} in {}", schema.id, key.label());
+                assert_eq!(
+                    led[0][0] % 12,
+                    chords[0].root.pitch_class(),
+                    "{} in {} should open in root position: {:?}",
+                    schema.id,
+                    key.label(),
+                    led[0]
+                );
+                for w in led.windows(2) {
+                    for i in 0..w[0].len().min(w[1].len()) {
+                        let d = (w[1][i] as i16 - w[0][i] as i16).abs();
+                        assert!(
+                            d <= 12,
+                            "{} in {}: voice {i} leapt {d}: {:?} -> {:?}",
+                            schema.id,
+                            key.label(),
+                            w[0],
+                            w[1]
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

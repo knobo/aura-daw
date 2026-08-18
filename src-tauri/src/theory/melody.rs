@@ -269,18 +269,29 @@ pub fn melody_notes(
 
     let mut placed: Vec<(u64, u8, u8)> = Vec::new(); // (absolute tick, key, velocity)
     let mut annotations: Vec<Annotation> = Vec::new();
+    let mut last_op: Option<Development> = None;
     for bar in 0..bars {
         let bar_start = start_tick + bar as u64 * bar_ticks;
         let op = if bar == 0 {
             Development::Repeat
         } else {
-            pick_development(bar, bars, peak_bar, &mut rng)
+            let mut chosen = pick_development(bar, bars, peak_bar, &mut rng);
+            // Never state the motif unchanged twice running. Repetition is how
+            // a listener learns the shape (which is why it is weighted high),
+            // but three identical bars is the most boring way a generated
+            // phrase can fail, and the dump of a real sketch produced exactly
+            // that.
+            if chosen == Development::Repeat && last_op == Some(Development::Repeat) {
+                chosen = pick_development(bar, bars, peak_bar, &mut rng);
+                if chosen == Development::Repeat {
+                    chosen = Development::Sequence(if rng.chance(0.5) { 1 } else { -1 });
+                }
+            }
+            chosen
         };
+        last_op = Some(op);
         let lean = if bar < peak_bar { 1 } else { -1 };
-        let figure = match op {
-            Development::Sequence(_) => motif.developed(op, steps_per_bar),
-            _ => motif.developed(op, steps_per_bar),
-        };
+        let figure = motif.developed(op, steps_per_bar);
         for (step, idx) in &figure.onsets {
             let tick = bar_start + *step as u64 * step_ticks;
             let pal = harmony.palette_at(tick);
@@ -601,6 +612,28 @@ mod tests {
             shared_total >= 40,
             "the motif's rhythm recurred only {shared_total} times across 20 phrases of 4 bars"
         );
+    }
+
+    #[test]
+    fn the_motif_is_never_restated_unchanged_twice_running() {
+        // Repetition is weighted high on purpose (it is how a listener learns
+        // the shape), but three identical bars is the most boring way a
+        // generated phrase can fail — and a dumped sketch produced exactly
+        // that before this rule existed.
+        for seed in 0..40u64 {
+            let (_, ann) = gen(seed);
+            let ops: Vec<String> = ann
+                .iter()
+                .filter(|a| a.label.starts_with("bar "))
+                .map(|a| a.label.split('·').nth(1).unwrap_or("").trim().to_string())
+                .collect();
+            for w in ops.windows(2) {
+                assert!(
+                    !(w[0] == "repetition" && w[1] == "repetition"),
+                    "seed {seed}: {ops:?}"
+                );
+            }
+        }
     }
 
     #[test]

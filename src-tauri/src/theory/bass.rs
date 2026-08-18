@@ -107,16 +107,30 @@ pub fn bass_notes(
     let max_weight = grid.max_weight();
     let beat_ticks = grid.ticks_per_step() as u64 * grid.steps_per_beat as u64;
     let mut notes: Vec<MidiNote> = Vec::new();
+    // Each chord's bass note is placed at the octave nearest the line's ANCHOR
+    // — the first chord's placement — rather than nearest the previous note.
+    // Chaining off the previous note looks equivalent and is not: the errors
+    // accumulate, and a progression that keeps stepping to the closer octave
+    // walks itself into the bottom of the register and stays there (a real
+    // sketch produced `C2 G1 A1 F1`). Anchoring keeps every root within a
+    // fifth or so of home. WITHIN a bar, walking tones still follow the note
+    // before them, which is where local smoothness actually matters.
+    let anchor = octave_into(spans[0].chord.bass.unwrap_or(spans[0].chord.root), opts);
+    // Where the line currently is, so a new chord starts near it rather than
+    // near a fixed octave.
+    let mut here = anchor;
 
     for (i, span) in spans.iter().enumerate() {
         // The bass plays the chord's BASS note when one is named (that is what
         // a slash chord means), otherwise the root.
         let bass_tpc = span.chord.bass.unwrap_or(span.chord.root);
-        let root_key = octave_into(bass_tpc, opts);
+        let root_key = octave_near_bounded(bass_tpc, here, anchor, opts);
+        here = root_key;
         let rel = span.tick.saturating_sub(start_tick);
-        let next_root = spans
-            .get(i + 1)
-            .map(|s| octave_into(s.chord.bass.unwrap_or(s.chord.root), opts));
+        // The approach note aims at where the NEXT chord's bass will actually
+        // be, so it has to be resolved with the same rule — from wherever this
+        // bar ends up, which the walking arm updates below.
+        let next_tpc = spans.get(i + 1).map(|s| s.chord.bass.unwrap_or(s.chord.root));
 
         match opts.style {
             BassStyle::Root | BassStyle::Pedal => {
@@ -136,31 +150,42 @@ pub fn bass_notes(
                 // The second strong beat of the span, if there is one.
                 let half = span.length_ticks / 2;
                 if half >= beat_ticks {
-                    let fifth = octave_into(bass_tpc.plus_fifths(1), opts);
+                    let fifth = octave_near_bounded(bass_tpc.plus_fifths(1), root_key, anchor, opts);
+                    here = fifth;
                     let step = ((half / grid.ticks_per_step() as u64) as usize) % weights.len();
                     notes.push(note(rel + half, span.length_ticks - half, fifth, weights[step], max_weight));
                 }
             }
             BassStyle::Walking => {
                 let beats = (span.length_ticks / beat_ticks.max(1)).max(1);
-                let tones: Vec<u8> = span
-                    .chord
-                    .tones()
-                    .iter()
-                    .map(|t| octave_into(*t, opts))
-                    .collect();
+                let tones = span.chord.tones();
+                let mut walking_prev = root_key;
                 for b in 0..beats {
                     let at = rel + b * beat_ticks;
                     let step = ((at / grid.ticks_per_step() as u64) as usize) % weights.len();
                     let last = b + 1 == beats;
-                    let key = match (last, next_root) {
-                        // The approach note: a semitone or a step below the
-                        // next root, whichever is available in the register.
-                        (true, Some(target)) => approach(target, opts),
-                        _ => tones[(b as usize) % tones.len().max(1)],
+                    let key = match (last, next_tpc) {
+                        // The approach note: a step from where the next chord's
+                        // bass will be, resolved from where this bar ended.
+                        (true, Some(target_tpc)) => {
+                            let target =
+                                octave_near_bounded(target_tpc, walking_prev, anchor, opts);
+                            approach(target, opts)
+                        }
+                        // Beat 1 is the chord's own bass; the rest walk to the
+                        // nearest placement of the next chord tone.
+                        _ if b == 0 => root_key,
+                        _ => octave_near_bounded(
+                            tones[(b as usize) % tones.len()],
+                            walking_prev,
+                            anchor,
+                            opts,
+                        ),
                     };
+                    walking_prev = key;
                     notes.push(note(at, beat_ticks, key, weights[step], max_weight));
                 }
+                here = walking_prev;
             }
         }
     }
@@ -198,13 +223,39 @@ fn note(tick: u64, length: u64, key: u8, weight: u8, max_weight: u8) -> MidiNote
     }
 }
 
-/// Place a spelling in the bass register, as low as it fits.
+/// Place a spelling in the bass register, as low as it fits. The anchor for
+/// the FIRST note of a line; every note after it goes through
+/// [`octave_near`] instead.
 fn octave_into(tpc: super::Tpc, opts: &BassOptions) -> u8 {
     let mut p = Pitch::at_or_above(tpc, opts.lo as i16);
     while p.midi() > opts.hi as i16 && p.midi() - 12 >= opts.lo as i16 {
         p.octave -= 1;
     }
     p.midi().clamp(opts.lo as i16, opts.hi as i16) as u8
+}
+
+/// Nearest to `near`, but never further than a fifth from `anchor` — the two
+/// rules a bass line needs at once.
+///
+/// Nearest-to-the-previous-note alone accumulates: each chord steps to its
+/// closer octave and the line walks into the floor of the register (`C2 G1 A1
+/// F1`). Nearest-to-the-anchor alone ignores where the line actually IS, so a
+/// bar that climbed to `G2` gets yanked back down to `G1` at the bar line — a
+/// 13-semitone drop. Both were real, both came from reading a dumped sketch.
+fn octave_near_bounded(tpc: super::Tpc, near: u8, anchor: u8, opts: &BassOptions) -> u8 {
+    let base = Pitch::at_or_above(tpc, opts.lo as i16).midi();
+    let candidates: Vec<i16> = (0..)
+        .map(|k| base + 12 * k)
+        .take_while(|m| *m <= opts.hi as i16)
+        .collect();
+    candidates
+        .iter()
+        .copied()
+        .filter(|m| (m - anchor as i16).abs() <= 7)
+        .min_by_key(|m| (m - near as i16).abs())
+        .or_else(|| candidates.iter().copied().min_by_key(|m| (m - anchor as i16).abs()))
+        .unwrap_or(base)
+        .clamp(opts.lo as i16, opts.hi as i16) as u8
 }
 
 /// A note a step or a semitone below `target`, inside the register. Below
@@ -287,6 +338,38 @@ mod tests {
         // Strong beats are chord tones of their own chord.
         let c_pcs = Chord::parse("C").unwrap().pitch_classes();
         assert!(c_pcs.contains(&(notes[0].key % 12)));
+    }
+
+    #[test]
+    fn a_line_moves_by_the_shortest_path_and_does_not_sink() {
+        // Two bugs at once, both found by reading a dumped sketch:
+        //   * every note was independently pushed to the bottom of the range,
+        //     so a walking bar came out `C2 E1 G1` (octave leaps) instead of
+        //     `C2 E2 G2`;
+        //   * chaining each chord's root off the PREVIOUS one accumulated, and
+        //     the line walked itself into the floor of the register (`C2 G1 A1
+        //     F1`) and stayed there.
+        let (notes, _) = bass_notes(
+            &harmony(),
+            &grid(),
+            0,
+            &BassOptions { style: BassStyle::Walking, ..Default::default() },
+        );
+        for w in notes.windows(2) {
+            let d = (w[1].key as i16 - w[0].key as i16).abs();
+            assert!(d <= 12, "a bass line should not leap an octave: {} -> {}", w[0].key, w[1].key);
+        }
+        // Every chord's downbeat stays within a fifth of the first one — the
+        // line has a home register instead of drifting out of one.
+        let downbeats: Vec<u8> =
+            notes.iter().filter(|n| n.tick % 3840 == 0).map(|n| n.key).collect();
+        assert_eq!(downbeats.len(), 4);
+        for k in &downbeats {
+            assert!(
+                (*k as i16 - downbeats[0] as i16).abs() <= 7,
+                "downbeats drifted: {downbeats:?}"
+            );
+        }
     }
 
     #[test]

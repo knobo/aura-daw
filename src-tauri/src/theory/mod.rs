@@ -75,3 +75,4 @@ impl Annotation {
         Self { tick, length_ticks, label: label.into(), why: why.into() }
     }
 }
+

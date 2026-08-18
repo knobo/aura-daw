@@ -65,7 +65,15 @@ does over the chord in force. Every later phase (H2–H6 in the product doc) is 
 
 * **Ear-check a generated sketch.** Open the COMPOSER panel, pick a plan,
   GENERATE, and listen. The tests prove the notes obey the rules; they cannot
-  tell you whether the result is *nice*. Specifically worth judging:
+  tell you whether the result is *nice*. Three things that a suite cannot see
+  were already found and fixed by DUMPING a sketch and reading the notes (a
+  throwaway `#[test]` that printed the voicings, the bass line as note names,
+  the melody per bar and the drums as an x/. grid — worth doing again the same
+  way): the DP opened a progression on a second-inversion tonic, the bass
+  placed every note independently at the bottom of its range (octave leaps, and
+  a line that sank into the floor over four bars), and the melody could state
+  the motif unchanged three bars running. Each fix carries a regression test.
+  What is left is taste — specifically worth judging:
   - are the voice-led chords smooth, or is the register too low/high? (defaults
     are C3–C6 for the comp, E1–E3 for the bass, C4–C6 for the melody)
   - does the melody sound composed rather than sampled? The development ops are
