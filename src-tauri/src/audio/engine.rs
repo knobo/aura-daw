@@ -3382,6 +3382,8 @@ mod tests {
             slot: 0,
             clips: Vec::new(),
             live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(Vec::new()) }),
+            inserts: Vec::new(),
+            pdc: None,
         };
         RtGraph::new(vec![tr], generation, Arc::new(ParamTable::with_slots(1)))
     }
@@ -3433,6 +3435,8 @@ mod tests {
                 slot,
                 clips: Vec::new(),
                 live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(events) }),
+                inserts: Vec::new(),
+                pdc: None,
             }],
             generation,
             Arc::new(ParamTable::with_slots(slot + 1)),
@@ -3459,6 +3463,8 @@ mod tests {
                     node: crate::audio::rt::LiveNodeCell::new(Box::new(synth)),
                     events: Arc::new(events0.take().unwrap_or_default()),
                 }),
+                inserts: Vec::new(),
+                pdc: None,
             }
         };
         RtGraph::new(vec![track(0), track(1)], generation, Arc::new(ParamTable::with_slots(2)))

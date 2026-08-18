@@ -5,13 +5,12 @@
 //! scratch buffer) or atomics (`ParamTable`); meter results are returned by
 //! value as a POD block.
 //!
-//! Track sources (phase 3, ARCHITECTURE §15): a track sums its audio CLIPS
-//! (immutable sample buffers) and, when present, its LIVE instrument node
-//! (`RtTrack::live`) — PolySynth / SamplerNode / plugin node behind the
-//! `LiveInstrument` seam. Live nodes are fed pre-scheduled absolute-sample
-//! note events (sliced per block, converted to block offsets — zero ticks,
-//! zero allocation on this thread) and render into the graph's preallocated
-//! scratch, which is then mixed through the same gain/pan/mute path as clips.
+//! Track strip (Plan G1): per run of `MAX_LIVE_BLOCK`, a track zeros
+//! `track_buf`, mixes clips (no fader), ADDs its LIVE instrument when
+//! present, walks inserts REPLACE in document order, then applies the
+//! shared gain/pan/mute fader into `out`. Live nodes are fed pre-scheduled
+//! absolute-sample note events (sliced per run, converted to block offsets
+//! — zero ticks, zero allocation on this thread).
 
 use std::sync::atomic::Ordering::Relaxed;
 
@@ -139,36 +138,94 @@ fn mix_out(out: &mut [f32], frame: usize, out_ch: usize, l: f32, r: f32) {
     }
 }
 
-/// Render a track's LIVE instrument node into `out` through the track's
-/// gain/pan/mute, folding meters into `acc`. RT-safe: the node renders into
-/// the graph's preallocated `scratch` in loop-aware contiguous runs (a loop
-/// wrap releases all voices — the note-offs beyond the loop end will never
-/// arrive), and note events are sliced from the snapshot's pre-scheduled
-/// absolute-sample event list by binary search (no allocation).
+/// The pan-gain quad for one block: `(gl0, gr0)` at the block's first frame,
+/// `(gl1, gr1)` at its last — [`lerp_pan`] interpolates between them per
+/// sample. Bundled (not four loose floats) so the two identically-typed
+/// pairs can't be transposed at a call site by accident.
+#[derive(Clone, Copy)]
+struct PanGains {
+    gl0: f32,
+    gr0: f32,
+    gl1: f32,
+    gr1: f32,
+}
+
+/// Resolve a block's pan-gain quad from the compiled pan ramp (or the flat
+/// atomic pan when there is none / it's empty). `first_pos`/`last_pos` are
+/// the absolute sample positions of the block's first and last frame —
+/// loop-aware in `render_impl`, a flat `base_pos..base_pos+frames` in
+/// `render_live_input_only` (monitoring never advances a position).
+/// `pan_gains` is two trig calls; per-sample evaluation would cost ~3M
+/// sin/cos per second at 32 tracks for a difference nobody can hear (design
+/// §6.1) — deliberate divergence from gain's per-sample `RampCursor`.
+fn pan_gain_quad(
+    pan_ramp: Option<&[AbsParamEvent]>,
+    pan: f32,
+    atomic: (f32, f32),
+    first_pos: u64,
+    last_pos: u64,
+) -> PanGains {
+    match pan_ramp {
+        Some(events) if !events.is_empty() => {
+            let p0 = value_at(events, first_pos).unwrap_or(pan);
+            let p1 = value_at(events, last_pos).unwrap_or(pan);
+            let (a, b) = (pan_gains(p0), pan_gains(p1));
+            PanGains { gl0: a.0, gr0: a.1, gl1: b.0, gr1: b.1 }
+        }
+        _ => PanGains { gl0: atomic.0, gr0: atomic.1, gl1: atomic.0, gr1: atomic.1 },
+    }
+}
+
+/// Per-block fader inputs shared by [`apply_fader`]'s two call sites.
+struct FaderCtx<'a> {
+    gain: f32,
+    ramp: &'a [AbsParamEvent],
+    pan: PanGains,
+    on: bool,
+}
+
+/// Shared fader: `gain * ramp * pan`, mute, mix into `out`, fold meters.
+/// One implementation for clips, live, and the insert chain.
 #[allow(clippy::too_many_arguments)]
-fn render_live(
-    tr: &RtTrack,
-    scratch: &mut [f32],
-    base_pos: u64,
-    lp: &LoopSpec,
+fn apply_fader(
+    buf: &[f32],
+    run: usize,
+    f: usize,
+    pos: u64,
+    ctx: &FaderCtx<'_>,
+    pan_last: usize,
+    ramp_cursor: &mut RampCursor,
     out: &mut [f32],
     out_ch: usize,
-    frames: usize,
-    sample_rate: u32,
-    discontinuity: bool,
-    steady_base: Option<u64>,
-    mix: (f32, f32, f32, f32, f32, bool),
-    ramp: &[AbsParamEvent],
     acc: &mut TrackAccum,
-    live_in_events: &[LiveMidiEvent],
-    block_frames: usize,
 ) {
+    for i in 0..run {
+        let g = ctx.gain * ramp_cursor.value(ctx.ramp, pos + i as u64).unwrap_or(1.0);
+        let (gl, gr) = lerp_pan(ctx.pan.gl0, ctx.pan.gr0, ctx.pan.gl1, ctx.pan.gr1, f + i, pan_last);
+        let mut l = buf[i * 2] * g * gl;
+        let mut r = buf[i * 2 + 1] * g * gr;
+        if !ctx.on {
+            l = 0.0;
+            r = 0.0;
+        }
+        acc.fold(l, r);
+        mix_out(out, f + i, out_ch, l, r);
+    }
+}
+
+/// Queue live-in events (and an optional discontinuity release) once per
+/// callback block. The `EV_ALL_OFF` arm is NOT what the engine's RT path
+/// sends: `OutputCb::render` expands a node-wide release into per-key
+/// note-offs for monitoring's own keys before the events get here, because
+/// this node also plays the track's clips and a node-wide release would cut
+/// a sounding clip note. Only the tests and the non-RT render path still
+/// reach this arm — do not "simplify" the engine expansion away on the
+/// strength of it.
+fn prime_live(tr: &RtTrack, discontinuity: bool, live_in_events: &[LiveMidiEvent]) {
     let Some(live) = &tr.live else { return };
     // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
     // time, on this (the only RT) thread; see `LiveNodeCell`.
     let node = unsafe { live.node.rt_mut() };
-    let (gain, gl0, gr0, gl1, gr1, on) = mix;
-    let pan_last = block_frames.saturating_sub(1);
     if discontinuity {
         node.all_notes_off();
     }
@@ -176,14 +233,6 @@ fn render_live(
     // sub-block placement in this slice). Velocity 0 IS the note-off
     // convention on this path — see `AbsNoteEvent`'s use in
     // `playback::track_events`.
-    //
-    // The `EV_ALL_OFF` arm below is NOT what the engine's RT path sends:
-    // `OutputCb::render` expands a node-wide release into per-key note-offs
-    // for monitoring's own keys before the events get here, because this
-    // node also plays the track's clips and a node-wide release would cut a
-    // sounding clip note. Only the tests and the non-RT render path still
-    // reach this arm — do not "simplify" the engine expansion away on the
-    // strength of it.
     for ev in live_in_events {
         match ev.kind {
             EV_ALL_OFF => node.all_notes_off(),
@@ -195,72 +244,70 @@ fn render_live(
             }
         }
     }
-    // Per-run discontinuity for the automation seam: the caller's flag on
-    // the first run, then true again after every loop wrap (the position
-    // jumps back to the loop start).
-    let mut run_discontinuity = discontinuity;
-    // Track D: one cursor for the whole call; `pos` is this run's base, and
-    // runs advance monotonically except across a loop wrap, which the
-    // cursor re-seeds for.
-    let mut ramp_cursor = RampCursor::new();
-    let mut f = 0usize;
-    while f < frames {
-        let pos = frame_pos(base_pos, f as u64, lp);
-        let mut run = (frames - f).min(MAX_LIVE_BLOCK);
-        let mut wraps = false;
-        if lp.active() && pos < lp.end {
-            let to_end = (lp.end - pos) as usize;
-            if to_end <= run {
-                run = to_end;
-                wraps = true;
-            }
-        }
-        if run == 0 || scratch.len() < run * 2 {
-            // Defensive: never render live audio without prepared scratch.
-            return;
-        }
-        let sblock = &mut scratch[..run * 2];
-        sblock.fill(0.0);
-        let end = pos + run as u64;
-        let evs = &live.events[..];
-        let lo = evs.partition_point(|e| e.sample < pos);
-        for e in evs[lo..].iter().take_while(|e| e.sample < end) {
-            node.queue_event(BlockNoteEvent {
-                offset: (e.sample - pos) as u32,
-                key: e.key,
-                velocity: e.velocity,
-            });
-        }
-        // Automation seam (ARCHITECTURE §15.1): the run's absolute base
-        // position + discontinuity reach the node BEFORE it processes, so
-        // ramp cursors survive seeks and loop wraps.
-        node.set_block_context(pos, run_discontinuity);
-        // Round-2 §3.5: the same engine-global steady_time base for every
-        // run in this block (a loop wrap can split one callback block into
-        // several runs) — non-decreasing is the CLAP contract, not
-        // strictly-increasing every call.
-        let mut io = ProcessBlock { samples: sblock, channels: 2, sample_rate, steady: steady_base };
-        node.process(&mut io);
-        if wraps {
-            node.all_notes_off();
-            run_discontinuity = true;
-        } else {
-            run_discontinuity = false;
-        }
-        for i in 0..run {
-            let g = gain * ramp_cursor.value(ramp, pos + i as u64).unwrap_or(1.0);
-            let (gl, gr) = lerp_pan(gl0, gr0, gl1, gr1, f + i, pan_last);
-            let mut l = scratch[i * 2] * g * gl;
-            let mut r = scratch[i * 2 + 1] * g * gr;
-            if !on {
-                l = 0.0;
-                r = 0.0;
-            }
-            acc.fold(l, r);
-            mix_out(out, f + i, out_ch, l, r);
-        }
-        f += run;
+}
+
+/// ADD one run of the track's live instrument into `buf` (already holding
+/// the clip sum). No gain/pan — the shared fader runs after inserts.
+fn render_live_into(
+    tr: &RtTrack,
+    buf: &mut [f32],
+    pos: u64,
+    run: usize,
+    sample_rate: u32,
+    discontinuity: bool,
+    steady_base: Option<u64>,
+) {
+    let Some(live) = &tr.live else { return };
+    // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
+    // time, on this (the only RT) thread; see `LiveNodeCell`.
+    let node = unsafe { live.node.rt_mut() };
+    let end = pos + run as u64;
+    let evs = &live.events[..];
+    let lo = evs.partition_point(|e| e.sample < pos);
+    for e in evs[lo..].iter().take_while(|e| e.sample < end) {
+        node.queue_event(BlockNoteEvent {
+            offset: (e.sample - pos) as u32,
+            key: e.key,
+            velocity: e.velocity,
+        });
     }
+    // Automation seam (ARCHITECTURE §15.1): the run's absolute base
+    // position + discontinuity reach the node BEFORE it processes, so
+    // ramp cursors survive seeks and loop wraps.
+    node.set_block_context(pos, discontinuity);
+    // Round-2 §3.5: the same engine-global steady_time base for every
+    // run in this block (a loop wrap can split one callback block into
+    // several runs) — non-decreasing is the CLAP contract, not
+    // strictly-increasing every call.
+    let mut io = ProcessBlock { samples: buf, channels: 2, sample_rate, steady: steady_base };
+    node.process(&mut io);
+}
+
+/// Walk inserts REPLACE in document order. True bypass skips `process()`.
+fn process_inserts(
+    tr: &RtTrack,
+    buf: &mut [f32],
+    sample_rate: u32,
+    steady_base: Option<u64>,
+) {
+    for insert in &tr.inserts {
+        if insert.bypassed {
+            continue;
+        }
+        // SAFETY: same RCU contract as `LiveNodeCell` — see `InsertNodeCell`.
+        let proc = unsafe { insert.proc.rt_mut() };
+        let mut io = ProcessBlock { samples: buf, channels: 2, sample_rate, steady: steady_base };
+        proc.process(&mut io);
+    }
+    // Task 6 replaces `Option<()>` with DelayLine and writes `d.process`.
+    debug_assert!(tr.pdc.is_none(), "DelayLine not attached (Task 6)");
+}
+
+fn live_all_notes_off(tr: &RtTrack) {
+    let Some(live) = &tr.live else { return };
+    // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
+    // time, on this (the only RT) thread; see `LiveNodeCell`.
+    unsafe { live.node.rt_mut() }.all_notes_off();
 }
 
 /// Render one output buffer: mixes all tracks into `out` (interleaved,
@@ -427,7 +474,7 @@ fn render_impl(
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
-    let RtGraph { tracks, scratch, meter_scratch, track_ramps, .. } = graph;
+    let RtGraph { tracks, track_buf, meter_scratch, track_ramps, .. } = graph;
     let track_ramps: &[super::rt::TrackRamps] = track_ramps;
 
     // Reset this callback's chunk templates in place (Task 7: preallocated
@@ -478,67 +525,64 @@ fn render_impl(
             .unwrap_or(&[]);
         let mut clip_ramp = RampCursor::new();
 
-        // Pan is evaluated at the block's first and last frame, converted
-        // through `pan_gains`, then `(gl, gr)` is lerped across the block.
-        // `pan_gains` is two trig calls; per-sample evaluation would cost
-        // ~3M sin/cos per second at 32 tracks for a difference nobody can
-        // hear (design §6.1). Deliberate divergence from gain's per-sample
-        // `RampCursor` — do not "fix" it.
-        let pan_ramp = ramps.and_then(|t| t.pan.as_ref());
-        let (gl0, gr0, gl1, gr1) = match pan_ramp {
-            Some(events) if !events.is_empty() => {
-                let first = frame_pos(track_base, 0, track_lp);
-                let last = frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp);
-                let p0 = value_at(events, first).unwrap_or(pan);
-                let p1 = value_at(events, last).unwrap_or(pan);
-                let (a, b) = (pan_gains(p0), pan_gains(p1));
-                (a.0, a.1, b.0, b.1)
-            }
-            _ => (gl_atomic, gr_atomic, gl_atomic, gr_atomic),
-        };
+        let pan_gains_quad = pan_gain_quad(
+            ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
+            pan,
+            (gl_atomic, gr_atomic),
+            frame_pos(track_base, 0, track_lp),
+            frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp),
+        );
         let pan_last = frames.saturating_sub(1);
-
-        if !tr.clips.is_empty() {
-            for i in 0..frames {
-                let pos = frame_pos(track_base, i as u64, track_lp);
-                let mut l = 0.0f32;
-                let mut r = 0.0f32;
-                for clip in &tr.clips {
-                    let s = clip_sample(clip, pos);
-                    l += s[0];
-                    r += s[1];
-                }
-                let g = gain * clip_ramp.value(ramp, pos).unwrap_or(1.0);
-                let (gl, gr) = lerp_pan(gl0, gr0, gl1, gr1, i, pan_last);
-                l *= g * gl;
-                r *= g * gr;
-                if !on {
-                    l = 0.0;
-                    r = 0.0;
-                }
-                acc.fold(l, r);
-                mix_out(out, i, out_ch, l, r);
-            }
-        }
+        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on };
 
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
-        render_live(
-            tr,
-            scratch,
-            track_base,
-            track_lp,
-            out,
-            out_ch,
-            frames,
-            sample_rate,
-            track_disc,
-            steady_base,
-            (gain, gl0, gr0, gl1, gr1, on),
-            ramp,
-            &mut acc,
-            live_in_events,
-            frames,
-        );
+        prime_live(tr, track_disc, live_in_events);
+
+        // Unified strip, in runs of MAX_LIVE_BLOCK so track_buf stays
+        // preallocated. A loop wrap is a run boundary (`frame_pos` / LoopSpec).
+        let mut run_discontinuity = track_disc;
+        let mut f = 0usize;
+        while f < frames {
+            let pos = frame_pos(track_base, f as u64, track_lp);
+            let mut run = (frames - f).min(MAX_LIVE_BLOCK);
+            let mut wraps = false;
+            if track_lp.active() && pos < track_lp.end {
+                let to_end = (track_lp.end - pos) as usize;
+                if to_end <= run {
+                    run = to_end;
+                    wraps = true;
+                }
+            }
+            if run == 0 || track_buf.len() < run * 2 {
+                break;
+            }
+            let buf = &mut track_buf[..run * 2];
+            buf.fill(0.0);
+            if !tr.clips.is_empty() {
+                for i in 0..run {
+                    let p = frame_pos(track_base, (f + i) as u64, track_lp);
+                    let mut l = 0.0f32;
+                    let mut r = 0.0f32;
+                    for clip in &tr.clips {
+                        let s = clip_sample(clip, p);
+                        l += s[0];
+                        r += s[1];
+                    }
+                    buf[i * 2] = l;
+                    buf[i * 2 + 1] = r;
+                }
+            }
+            render_live_into(tr, buf, pos, run, sample_rate, run_discontinuity, steady_base);
+            process_inserts(tr, buf, sample_rate, steady_base);
+            apply_fader(buf, run, f, pos, &fader, pan_last, &mut clip_ramp, out, out_ch, &mut acc);
+            if wraps {
+                live_all_notes_off(tr);
+                run_discontinuity = true;
+            } else {
+                run_discontinuity = false;
+            }
+            f += run;
+        }
 
         let chunk_idx = tr.slot / METER_CHUNK_SLOTS;
         let lane = tr.slot % METER_CHUNK_SLOTS;
@@ -578,8 +622,7 @@ fn render_impl(
 /// transport renders so monitoring is audible without playback: the
 /// scheduled-event slice would otherwise replay the clip's own notes.
 ///
-/// Mirrors `render_impl`'s per-track prologue (gain/pan/mute/solo from
-/// `graph.params`, meter chunk reset + push) for the one matching slot. It
+/// Same strip as `render_impl` minus clips (monitoring through FX). It
 /// never reads the track's own `live.events` (the pre-scheduled clip notes)
 /// and never advances a position — `base_pos` is handed to every run
 /// unchanged, because a stopped transport has nowhere to advance to.
@@ -601,7 +644,8 @@ pub fn render_live_input_only(
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
-    let RtGraph { tracks, scratch, meter_scratch, .. } = graph;
+    let RtGraph { tracks, track_buf, meter_scratch, track_ramps, .. } = graph;
+    let track_ramps: &[super::rt::TrackRamps] = track_ramps;
 
     for (i, chunk) in meter_scratch.iter_mut().enumerate() {
         *chunk = RawMeterBlock::new(generation, base_pos, frames as u32);
@@ -612,7 +656,9 @@ pub fn render_live_input_only(
         if tr.slot != live_in.slot || tr.slot >= n_slots {
             continue;
         }
-        let Some(live) = &tr.live else { continue };
+        if tr.live.is_none() {
+            continue;
+        }
         let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
         let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
@@ -622,49 +668,50 @@ pub fn render_live_input_only(
             any_solo,
             flags & FLAG_LAUNCH != 0,
         );
-        let (gl, gr) = pan_gains(pan);
+        let (gl_atomic, gr_atomic) = pan_gains(pan);
         let mut acc = TrackAccum::default();
 
-        // SAFETY: RCU discipline — exactly one graph snapshot is rendered at
-        // a time, on this (the only RT) thread; see `LiveNodeCell`.
-        let node = unsafe { live.node.rt_mut() };
-        // As in `render_impl`: the engine expands `EV_ALL_OFF` into per-key
-        // note-offs before the events reach here, so this arm is reached
-        // only by tests and the non-RT path.
-        for ev in live_in.events {
-            match ev.kind {
-                EV_ALL_OFF => node.all_notes_off(),
-                EV_NOTE_ON => {
-                    node.queue_event(BlockNoteEvent { offset: 0, key: ev.key, velocity: ev.velocity });
-                }
-                _ => {
-                    node.queue_event(BlockNoteEvent { offset: 0, key: ev.key, velocity: 0 });
-                }
-            }
-        }
+        let ramps = track_ramps.get(tr.slot);
+        let ramp: &[AbsParamEvent] = ramps
+            .and_then(|t| t.gain.as_ref())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        let mut clip_ramp = RampCursor::new();
+        let pan_gains_quad = pan_gain_quad(
+            ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
+            pan,
+            (gl_atomic, gr_atomic),
+            base_pos,
+            base_pos.saturating_add(frames.saturating_sub(1) as u64),
+        );
+        let pan_last = frames.saturating_sub(1);
+        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on };
+
+        prime_live(tr, false, live_in.events);
 
         let mut f = 0usize;
         while f < frames {
             let run = (frames - f).min(MAX_LIVE_BLOCK);
-            if run == 0 || scratch.len() < run * 2 {
-                // Defensive: never render live audio without prepared scratch.
+            if run == 0 || track_buf.len() < run * 2 {
                 break;
             }
-            let sblock = &mut scratch[..run * 2];
-            sblock.fill(0.0);
-            node.set_block_context(base_pos, false);
-            let mut io = ProcessBlock { samples: sblock, channels: 2, sample_rate, steady: Some(steady_base) };
-            node.process(&mut io);
-            for i in 0..run {
-                let mut l = scratch[i * 2] * gain * gl;
-                let mut r = scratch[i * 2 + 1] * gain * gr;
-                if !on {
-                    l = 0.0;
-                    r = 0.0;
-                }
-                acc.fold(l, r);
-                mix_out(out, f + i, out_ch, l, r);
+            let buf = &mut track_buf[..run * 2];
+            buf.fill(0.0);
+            // Monitoring: ADD live (no scheduled clip events) then inserts.
+            if let Some(live) = &tr.live {
+                // SAFETY: RCU discipline — see `LiveNodeCell`.
+                let node = unsafe { live.node.rt_mut() };
+                node.set_block_context(base_pos, false);
+                let mut io = ProcessBlock {
+                    samples: buf,
+                    channels: 2,
+                    sample_rate,
+                    steady: Some(steady_base),
+                };
+                node.process(&mut io);
             }
+            process_inserts(tr, buf, sample_rate, Some(steady_base));
+            apply_fader(buf, run, f, base_pos + f as u64, &fader, pan_last, &mut clip_ramp, out, out_ch, &mut acc);
             f += run;
         }
 
@@ -701,6 +748,7 @@ pub fn render_live_input_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::insert::{GainHalfEffect, InvertEffect};
     use super::super::rt::ParamTable;
     use super::super::rt::RtClipData;
     use super::super::rt::RtTrack;
@@ -902,6 +950,130 @@ mod tests {
         blocks
     }
 
+    fn insert_on(g: &mut RtGraph, slot: usize, node: Box<dyn crate::audio::dsp::AudioProcessor>, bypassed: bool) {
+        use crate::audio::insert::{InsertNode, InsertNodeCell};
+        let latency = node.latency_samples();
+        let Some(tr) = g.tracks.iter_mut().find(|t| t.slot == slot) else {
+            return;
+        };
+        let n = tr.inserts.len();
+        tr.inserts.push(InsertNode {
+            slot_id: format!("slot-{n}"),
+            instance_id: format!("inst-{n}"),
+            bypassed,
+            latency,
+            proc: InsertNodeCell::new(node),
+        });
+    }
+
+    #[test]
+    fn empty_inserts_are_byte_identical_to_today() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_pan(0, -1.0);
+        let mut a = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut a, 2);
+        // attach an empty inserts vec explicitly and render again
+        g.tracks[0].inserts = vec![];
+        let mut b = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut b, 2);
+        assert_eq!(a, b, "G-11 pin: no inserts must not change a single sample");
+    }
+
+    #[test]
+    fn insert_sees_the_sum_and_runs_before_the_fader() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_gain_linear(0, 0.5);
+        g.params.set_pan(0, -1.0);
+        insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        // clip 1.0 → insert 0.5 → fader 0.5 → 0.25 on the left
+        assert!((out[0] - 0.25).abs() < 1e-6, "got {}", out[0]);
+        assert!(out[1].abs() < 1e-6, "hard left");
+    }
+
+    #[test]
+    fn two_inserts_run_in_document_order() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_pan(0, -1.0);
+        insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
+        insert_on(&mut g, 0, Box::new(InvertEffect), false);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!((out[0] + 0.5).abs() < 1e-6, "1.0 → half → invert = -0.5, got {}", out[0]);
+    }
+
+    #[test]
+    fn bypassed_insert_is_true_bypass() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_pan(0, -1.0);
+        insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), true);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!((out[0] - 1.0).abs() < 1e-6, "bypassed GainHalf must not run, got {}", out[0]);
+    }
+
+    #[test]
+    fn clips_and_live_are_summed_before_inserts() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::rt::{LiveNodeCell, LiveSource};
+        struct ConstNode(f32);
+        impl AudioProcessor for ConstNode {
+            fn prepare(&mut self, _: u32, _: usize) {}
+            fn process(&mut self, io: &mut ProcessBlock<'_>) {
+                for s in io.samples.iter_mut() {
+                    *s += self.0;
+                }
+            }
+            fn reset(&mut self) {}
+        }
+        impl crate::audio::dsp::LiveInstrument for ConstNode {
+            fn queue_event(&mut self, _: crate::midi::synth::BlockNoteEvent) -> bool { true }
+            fn all_notes_off(&mut self) {}
+        }
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![0.25; 4], 1));
+        g.tracks[0].live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(ConstNode(0.25))),
+            events: Arc::new(vec![]),
+        });
+        g.params.set_pan(0, -1.0);
+        insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(
+            (out[0] - 0.25).abs() < 1e-6,
+            "sum 0.50 then half = 0.25 (not per-source half). got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn launch_overlay_still_plays_the_scene_through_inserts() {
+        let mut g = one_track_graph(0, clip(100, 0, 4, vec![1.0; 4], 1));
+        g.params.set_flag(0, FLAG_LAUNCH, true);
+        g.params.set_pan(0, -1.0);
+        insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
+        let mut out = vec![0.0f32; 8];
+        render_rt_launch(
+            &mut g,
+            0,
+            &LoopSpec::OFF,
+            &mut out,
+            2,
+            48_000,
+            false,
+            0,
+            None,
+            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false, ended: false }),
+            None,
+        );
+        assert!(
+            (out[0] - 0.5).abs() < 1e-5,
+            "overlay must hear the scene through the insert, got {}",
+            out[0]
+        );
+    }
+
     #[test]
     fn render_applies_gain_and_pan() {
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
@@ -1000,6 +1172,8 @@ mod tests {
                 node: LiveNodeCell::new(Box::new(synth)),
                 events: Arc::new(events),
             }),
+            inserts: Vec::new(),
+            pdc: None,
         }
     }
 
@@ -1018,7 +1192,7 @@ mod tests {
             AbsNoteEvent { sample: 9_000, key: 69, velocity: 0 },
         ];
         let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
-        assert!(!g.scratch.is_empty(), "live graph allocates scratch at build");
+        assert!(!g.track_buf.is_empty(), "graph allocates the strip buffer at build");
         // Render 24000 frames in odd-sized callback blocks.
         let mut out = vec![0.0f32; 24_000 * 2];
         let mut pos = 0u64;
@@ -1166,6 +1340,8 @@ mod tests {
                 node: LiveNodeCell::new(Box::new(FallbackNode(state.clone()))),
                 events: Arc::new(Vec::new()),
             }),
+            inserts: Vec::new(),
+            pdc: None,
         };
         let mut g = RtGraph::new(vec![tr], 1, Arc::new(ParamTable::with_slots(1)));
         let mut out = vec![0.0f32; 128 * 2];

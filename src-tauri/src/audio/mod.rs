@@ -21,6 +21,7 @@
 pub mod decimate;
 pub mod dsp;
 pub mod engine;
+pub mod insert;
 pub mod meters;
 pub mod metronome;
 pub mod midi_in;
