@@ -10,6 +10,7 @@ inline. Read them only when the job touches that area.
 | [plan-e-review.md](plan-e-review.md) | Plan E post-merge review: closed FIX NOW / held items, and the Track D leftovers that review left open. Do not re-open a struck item. |
 | [g1-insert-fx.md](g1-insert-fx.md) | Plan G1 Tasks 1–4 (insert ops/commands/host). Next is Task 5. Deferred minors live here. |
 | [lanes-ux.md](lanes-ux.md) | The lanes UX track (rename/fold/group/drag-reorder) and the timeline scroll fix. |
+| [midi-out-note-channel.md](midi-out-note-channel.md) | Why a routed drum track reached the device but played nothing, how it was measured, and the two things about the reporter's ALSA wiring that are still open. |
 | [composer-h1.md](composer-h1.md) | The Composer, Plan H1: the decisions that will bite if forgotten (the `theory/` purity contract, determinism, the harmony document's shape), the owner ear-check owed, and what H2 should pick up first. |
 
 Handoffs with rulings live in [`docs/PHASE4-PLAN.md`](../PHASE4-PLAN.md).
