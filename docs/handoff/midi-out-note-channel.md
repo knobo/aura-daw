@@ -1,8 +1,13 @@
 # MIDI output: what was broken, what is fixed, and what to do next
 
-Branch `worktree-fix-midi-out`, 8 commits, rebased on `origin/main` `31e3234`.
-Pushed; **no PR opened yet**. Read this before touching MIDI output again — it is
+**Merged as PR #77 `55257e8`** (2026-08-18), with the CI fix that followed it as
+PR #78 `2b00e91`. Read this before touching MIDI output again — it is
 self-contained on purpose, nothing here needs the session that produced it.
+
+One caveat on the merge: the owner merged #77 on local evidence (Rust 1250/0,
+frontend green) before CI finished, so no full CI run covered that diff. The
+first `main` run after #78 is the first real signal — and the ALSA-seq tests skip
+on the runner regardless, so their coverage stays local-only.
 
 Fixes the bug [`next-prompt.md`](../../next-prompt.md) recorded after the
 Composer H1 ear-check as *"one bug (MIDI-out to Hydrogen) needs its own PR, not
@@ -84,11 +89,9 @@ install stayed untracked-but-visible, one `git add -A` away from being committed
 
 ## Recommended route
 
-**1. Open the PR — or two.** The MIDI work is one coherent change; the two
-`.gitignore` commits are unrelated and could go as a separate one-line PR to keep
-the MIDI diff readable. Repo convention is a squash merge with the PR number in
-the subject. `gh pr edit` silently fails here — patch the body with
-`gh api -X PATCH` (memory `gh-pr-edit-fails-use-rest`).
+**1. ~~Open the PR~~ — done, #77.** The two `.gitignore` commits rode along in
+it; they are unrelated to MIDI and could have been split, which is worth doing
+next time rather than unpicking now.
 
 **2. An owner ear-check is still owed.** The wire is proven; the drum-kit end is
 not. Nobody has yet heard a GM drum machine play a channel-10 part end to end.
