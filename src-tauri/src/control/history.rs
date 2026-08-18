@@ -61,6 +61,7 @@ use parking_lot::Mutex;
 use super::op::{Actor, Op, TxMeta, OP_FORMAT_VERSION};
 use super::vergraph::{Janitor, VersionGraph, VersionItem, VersionStats};
 use super::CoalesceKey;
+use crate::audio::types::AutomationMode;
 
 // ---------------------------------------------------------------------------
 // Tunables (documented constants, not magic numbers)
@@ -951,6 +952,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             },
             index: 0,
             clips: vec![],

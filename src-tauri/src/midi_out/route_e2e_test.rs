@@ -24,6 +24,7 @@
 //! device, so it is not worth the coin flip.
 
 use super::*;
+use crate::audio::types::AutomationMode;
 
 /// Everything the fixture hands back: the wire log, the plane, and the ids.
 struct Rig {
@@ -317,6 +318,7 @@ fn a_routed_track_stops_sounding_its_internal_instrument() {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
     }
     let clip = |track: &str| MidiClip {
@@ -405,6 +407,7 @@ fn a_routed_clip_is_subtracted_from_its_tracks_internal_voice() {
         instrument_id: None,
         inserts: Vec::new(),
         group: None,
+        automation_mode: AutomationMode::Read,
     });
     let clip = |id: &str, at: u64, key: u8| MidiClip {
         id: id.into(),

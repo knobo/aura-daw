@@ -12,6 +12,7 @@ use crate::ids::TrackId;
 use crate::midi::MidiStore;
 use crate::plugins::automation::AutomationLane;
 use crate::plugins::{ParamInfo, PluginInstanceInfo};
+use crate::audio::types::AutomationMode;
 
 /// Automation lanes document (Plan E Task 10) — the in-memory half of the
 /// former standalone `plugins::automation::AutomationStore` +
@@ -2306,6 +2307,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         Session::new(store, MidiStore::default())
     }

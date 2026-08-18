@@ -24,6 +24,7 @@ use crate::control::session::{PluginDoc, Session};
 use crate::ids::ClipId;
 use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent};
 use crate::plugins::automation::AutomationLane;
+use crate::audio::types::AutomationMode;
 
 /// Immutable, Arc-structurally-shared image of the DOCUMENT (content
 /// fields only — bookkeeping like `midi.dirty`, `midi.loaded_dir` and
@@ -552,6 +553,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

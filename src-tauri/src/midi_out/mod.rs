@@ -79,6 +79,7 @@ use crate::control::Session;
 use crate::midi::tempo::TempoMap;
 use crate::midi::{TempoEvent, DEFAULT_PPQ};
 use crate::midi_input::MidiPortInfo;
+use crate::audio::types::AutomationMode;
 
 /// One outbound MIDI message. POD so the clock and the note scheduler share
 /// one output buffer.
@@ -2444,6 +2445,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         let long_ticks = DEFAULT_PPQ as u64 * 8; // 4 s at 120 bpm: still sounding
         let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
@@ -2567,6 +2569,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         let long_ticks = DEFAULT_PPQ as u64 * 8;
         let track_clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
@@ -2673,6 +2676,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         let clip_id: crate::ids::ClipId = uuid::Uuid::new_v4().to_string().into();
         let midi = MidiStore {
@@ -3187,6 +3191,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         // 8 beats at 120 bpm = 4 s — well past the ~400 ms this test runs
         // before forcing shutdown, so the note is still genuinely sounding.

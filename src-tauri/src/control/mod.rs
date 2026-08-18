@@ -45,6 +45,7 @@ use crate::ids::TrackId;
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
+use crate::audio::types::AutomationMode;
 
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
 pub use ops::{LaneArrangement, TrackMixChange};
@@ -7801,6 +7802,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             });
         }
         let slots = derive_slots(&store.tracks);
@@ -7909,6 +7911,7 @@ mod tests {
                 instrument_id: Some(format!("plugin:{}", ids[slot])),
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             });
         }
         let slots = derive_slots(&store.tracks);

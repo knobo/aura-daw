@@ -506,6 +506,7 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
 
     #[test]
     fn op_serde_round_trips_and_carries_version() {
@@ -536,6 +537,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         };
         let clip = crate::audio::types::Clip {
             id: "c-1".into(),

@@ -57,6 +57,7 @@ use std::sync::Arc;
 use super::op::{Actor, Op, TxMeta};
 use super::session::Committed;
 use super::snapshot::{ChangeSet, SessionSnapshot};
+use crate::audio::types::AutomationMode;
 
 /// Classification threshold (`benches/bulkbench/RESULTS.md` §6, MEASURED):
 /// a batch whose own-created bytes exceed this stores op + inverse instead
@@ -626,6 +627,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

@@ -49,6 +49,7 @@ use super::types::{derive_slots, mixer_slot_count, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
+use crate::audio::types::AutomationMode;
 
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
@@ -3955,6 +3956,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 
@@ -4824,6 +4826,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             });
         }
         // Rebuild derives slots + publishes tables (round-2 §2.4). The
@@ -5902,6 +5905,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             });
             let mut c1 = test_clip("c1", "t1");
             c1.source_id = sid.clone();
@@ -5997,6 +6001,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             });
             let mut c1 = test_clip("c1", "t1");
             c1.source_id = sid.clone();

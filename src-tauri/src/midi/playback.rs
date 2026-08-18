@@ -42,6 +42,7 @@ use super::tempo::TempoMap;
 use super::types::MidiClip;
 
 use crate::audio::dsp::AudioProcessor;
+use crate::audio::types::AutomationMode;
 
 /// READ-ONLY document view (Plan E Task 7 fix round 1 — binding requirement).
 /// This global exists purely so a cross-cutting reach with no session handle
@@ -422,6 +423,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

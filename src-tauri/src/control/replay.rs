@@ -59,6 +59,7 @@ use parking_lot::Mutex;
 
 use super::op::{Actor, Op, TxMeta, OP_FORMAT_VERSION};
 use super::session::Session;
+use crate::audio::types::AutomationMode;
 
 /// One parsed journal line.
 ///
@@ -1136,6 +1137,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             },
             index,
             clips: vec![],

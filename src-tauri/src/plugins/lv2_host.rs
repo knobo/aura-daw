@@ -55,6 +55,7 @@ use super::descriptor::ParamInfo;
 use super::host::{plugin_main, MainCtx};
 use super::state::StateBlob;
 use super::{HostRole, IoMode};
+use crate::audio::types::AutomationMode;
 
 /// Byte capacity of each preallocated atom sequence (MIDI in / atom out).
 /// One 3-byte MIDI event occupies 24 padded bytes -> ~340 events per block.
@@ -930,6 +931,7 @@ mod tests {
             instrument_id,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

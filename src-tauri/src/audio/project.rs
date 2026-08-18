@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use super::types::{Clip, Project, Store, TransportState};
 use crate::control::Session;
 use crate::ids::SourceId;
+use crate::audio::types::AutomationMode;
 
 pub const PROJECT_FILE: &str = "project.json";
 
@@ -432,6 +433,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         project.tempo_bpm = 92.5;
         save(&dir, &project).unwrap();
@@ -488,6 +490,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

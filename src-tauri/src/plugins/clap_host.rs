@@ -43,6 +43,7 @@ use crate::midi::synth::BlockNoteEvent;
 use super::descriptor::ParamInfo;
 use super::host::{plugin_main, MainCtx};
 use super::{HostRole, IoMode, ParamChange};
+use crate::audio::types::AutomationMode;
 
 /// Max note events buffered per block (mirror of the other live nodes).
 const MAX_NODE_EVENTS: usize = 256;
@@ -1423,6 +1424,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         };
         t.instrument_id = Some(format!("plugin:{}", info.id));
         store.tracks.push(t);
