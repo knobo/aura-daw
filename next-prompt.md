@@ -38,13 +38,22 @@ leftover above; write a stock FX suite; bump `OP_FORMAT_VERSION`; restart
 a landed track (A–F, Plan F, G1 Tasks 1–6, Pitch Coach phases 1–3, the
 lanes UX track, the theme system, Composer H1).
 
-**In flight:** nothing — PR #71 (G1 Task 6, PDC) and PR #70 (clip-delete
-keydown fix) both merged 2026-08-18. Latest on `main`: `7011e81`. Next
-branch (Track D or Plan F leftover) starts fresh from `origin/main`.
-Stale worktrees for merged branches can be ignored — but keep the branches
+**In flight:** nothing — PR #71 (G1 Task 6, PDC), PR #70 (clip-delete
+keydown fix), PR #72 (this file) and PR #73 (node_modules untracked, see
+below) all merged 2026-08-18. Latest on `main`: `760d1ca`. Next branch
+(Track D or Plan F leftover) starts fresh from `origin/main`. Stale
+worktrees for merged branches can be ignored — but keep the branches
 `feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history` and
 `worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in the
 handoffs.
+
+**node_modules (2026-08-18):** was accidentally committed as a
+self-referential symlink in PR #65 — untracked in PR #73. If a worktree
+still has the broken symlink (npm/vite/vitest fail immediately, or
+`node_modules` resolves to itself), `rm node_modules && npm install`
+fixes it; this should not recur now that it is gitignored-and-actually-
+untracked. Likely explains at least some of the disk-instability worktree
+confusion from earlier today.
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
