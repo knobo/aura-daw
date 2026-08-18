@@ -12,7 +12,7 @@ import { backend } from "../tauri";
 import { midiIo } from "./midiio.svelte";
 import { modulation } from "./modulation.svelte";
 import { toasts } from "./toasts.svelte";
-import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
+import type { AutomationMode, Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
   name = $state("Untitled");
@@ -199,6 +199,13 @@ class ProjectStore {
         await midiIo.setInputTrack(null);
       }
     }
+  }
+  /** Set the track's automation mode; no-op (no invoke) when already there. */
+  async setAutomationMode(trackId: string, mode: AutomationMode) {
+    const t = this.trackById(trackId);
+    if (!t || t.automationMode === mode) return;
+    this.patchTrack(trackId, { automationMode: mode });
+    await backend.setTrackAutomationMode(trackId, mode);
   }
 
   /**

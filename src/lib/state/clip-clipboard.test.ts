@@ -69,6 +69,7 @@ function testTrack(overrides: Partial<TrackState> = {}): TrackState {
     muted: false,
     soloed: false,
     armed: false,
+    automationMode: "read",
     color: "#888888",
     ...overrides,
   };

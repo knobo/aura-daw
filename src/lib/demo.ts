@@ -12,6 +12,7 @@ import {
   type AudioDevice,
   type AuraEventMap,
   type AuraEventName,
+  type AutomationMode,
   type ChordSpan,
   type CircleWedge,
   type Clip,
@@ -692,6 +693,7 @@ export class DemoBackend implements Backend {
       muted: init.muted ?? false,
       soloed: init.soloed ?? false,
       armed: init.armed ?? false,
+      automationMode: init.automationMode ?? "read",
       color: init.color ?? "#52e5ff",
       instrumentId: init.instrumentId ?? null,
     };
@@ -1678,6 +1680,10 @@ export class DemoBackend implements Backend {
   async setTrackArm(trackId: string, armed: boolean) {
     const t = this.track(trackId);
     if (t) t.armed = armed;
+  }
+  async setTrackAutomationMode(trackId: string, mode: AutomationMode) {
+    const t = this.track(trackId);
+    if (t) t.automationMode = mode;
   }
 
   /** Mirrors the Rust write side: trim, reject empty. The demo engine is

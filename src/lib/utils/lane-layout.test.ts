@@ -22,6 +22,7 @@ function track(id: string, group: string | null = null): TrackState {
     muted: false,
     soloed: false,
     armed: false,
+    automationMode: "read",
     color: `#00000${id.slice(-1)}`,
     group,
   };

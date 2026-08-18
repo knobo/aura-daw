@@ -15,6 +15,7 @@ const openClipInExternalEditor = vi.fn(() => Promise.resolve());
 const gestureBegin = vi.fn(() => Promise.resolve("gid-1"));
 const gestureEnd = vi.fn((_id?: string) => Promise.resolve());
 const setTrackArm = vi.fn(() => Promise.resolve());
+const setTrackAutomationMode = vi.fn(() => Promise.resolve());
 const midiSelectInputTrack = vi.fn(() => Promise.resolve());
 const addTrack = vi.fn();
 
@@ -28,6 +29,7 @@ vi.mock("../tauri", () => ({
     gestureBegin,
     gestureEnd,
     setTrackArm,
+    setTrackAutomationMode,
     midiSelectInputTrack,
     addTrack: (init: Partial<TrackState>) => addTrack(init as never),
   },
@@ -52,6 +54,7 @@ function testTrack(overrides: Partial<TrackState> = {}): TrackState {
     soloed: false,
     armed: false,
     color: "#888888",
+    automationMode: "read",
     ...overrides,
   };
 }
@@ -265,5 +268,24 @@ describe("toggleArm — MIDI routing glue", () => {
     project.tracks = [testTrack({ id: "a-1", kind: "audio", armed: false })];
     await project.toggleArm("a-1");
     expect(midiSelectInputTrack).not.toHaveBeenCalled();
+  });
+});
+
+describe("setAutomationMode", () => {
+  it("patches the track and calls the backend", async () => {
+    project.tracks = [testTrack({ id: "t-1", automationMode: "read" })];
+
+    await project.setAutomationMode("t-1", "write");
+
+    expect(setTrackAutomationMode).toHaveBeenCalledWith("t-1", "write");
+    expect(project.trackById("t-1")?.automationMode).toBe("write");
+  });
+
+  it("is a no-op (no invoke) when the mode is already set", async () => {
+    project.tracks = [testTrack({ id: "t-1", automationMode: "write" })];
+
+    await project.setAutomationMode("t-1", "write");
+
+    expect(setTrackAutomationMode).not.toHaveBeenCalled();
   });
 });
