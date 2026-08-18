@@ -1,7 +1,11 @@
 <script lang="ts">
   /**
    * Bottom master strip: big stereo peak-hold meter with scale, live dBFS
-   * readout, I/O device selectors and the sidecar job console.
+   * readout, audio I/O device selectors, a one-line MIDI status chip that
+   * opens the patchbay, and the sidecar job console.
+   *
+   * The MIDI controls themselves live in the dock's patchbay panel
+   * (components/midi/MidiPanel.svelte) — they never fit this row.
    */
   import { onMount } from "svelte";
   import { backend } from "../tauri";
@@ -10,6 +14,7 @@
   import { latestMeter } from "../state/meters.svelte";
   import { midiIo } from "../state/midiio.svelte";
   import { project } from "../state/project.svelte";
+  import { ui, DOCK_SHORTCUT } from "../state/ui.svelte";
   import { formatDb, linToDb } from "../utils/format";
   import type { AudioDevice } from "../types/ipc";
   import Meter from "./Meter.svelte";
@@ -18,22 +23,17 @@
   let outputs = $state<AudioDevice[]>([]);
   let dbEl: HTMLSpanElement | undefined = $state();
 
-  /** Note-out (ruling 10) can only address a MIDI track — the backend
-   * rejects anything else, so the selector never offers it. */
-  const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
+  // What the MIDI chip reports: the input port that is listening, the track
+  // its notes land on, and how many output ports are open.
+  const inPortName = $derived(
+    midiIo.inPortId
+      ? (midiIo.inPorts.find((p) => p.id === midiIo.inPortId)?.name ?? midiIo.inPortId)
+      : "no input",
+  );
 
   const targetTrackName = $derived(
     midiIo.targetTrackId ? (project.trackById(midiIo.targetTrackId)?.name ?? midiIo.targetTrackId) : null,
   );
-
-  // Output ports not currently open — the "+ add" dropdown's choices.
-  const closedOutPorts = $derived(midiIo.outPorts.filter((p) => !midiIo.outputs.some((o) => o.port.id === p.id)));
-
-  // Per-track routing: one MIDI track is "being edited" at a time in this
-  // compact strip; its current route (if any) drives the port/channel
-  // controls next to the track picker.
-  let editingTrackId = $state("");
-  const editingRoute = $derived(editingTrackId ? midiIo.trackRoute(editingTrackId) : undefined);
 
   onMount(() => {
     backend.listInputDevices().then((d) => (inputs = d)).catch(() => {});
@@ -41,47 +41,12 @@
     void midiIo.loadPorts();
   });
 
-  // Hardware MIDI I/O (slice 1/1b input, slice 2 output): port list/select,
-  // a live activity dot, monitor toggle, input routing readout, output
-  // port, clock toggle — all mirrored from `midiIo`'s poll (500 ms, mirrors
-  // the mcp status poll cadence pattern in state/mcp.svelte.ts, just faster
-  // since "activity" needs to feel live).
+  // The whole app's MIDI poll lives HERE, not in the patchbay panel: this
+  // strip is always mounted, the dock panel is conditional. Move this and
+  // the panel shows whatever was true when it was last open. 500 ms mirrors
+  // the mcp status poll cadence in state/mcp.svelte.ts, just faster since
+  // "activity" needs to feel live.
   $effect(() => midiIo.startPolling());
-
-  function selectMidiInPort(id: string) {
-    void midiIo.selectInPort(id);
-  }
-
-  function toggleMidiMonitor(enabled: boolean) {
-    void midiIo.setMonitor(enabled);
-  }
-
-  function openOutputPort(id: string) {
-    if (id) void midiIo.openOutPort(id);
-  }
-
-  function closeOutputPort(id: string) {
-    void midiIo.closeOutPort(id);
-  }
-
-  function toggleClock(portId: string, enabled: boolean) {
-    void midiIo.setClockEnabled(portId, enabled);
-  }
-
-  function selectRoutePort(portId: string) {
-    if (!editingTrackId) return;
-    void midiIo.setTrackRoute(editingTrackId, portId || null, editingRoute?.channel ?? 0);
-  }
-
-  function selectRouteChannel(channel: number) {
-    if (!editingTrackId || !editingRoute) return;
-    void midiIo.setTrackRoute(editingTrackId, editingRoute.portId, channel);
-  }
-
-  function selectRouteReturn(deviceId: string) {
-    if (!editingTrackId || !editingRoute) return;
-    void midiIo.setTrackReturn(editingTrackId, deviceId || null);
-  }
 
   // live dB readout without reactivity churn
   $effect(() => {
@@ -129,113 +94,18 @@
         {/each}
       </select>
     </label>
-    <div class="dev">
-      <span class="silk">midi in</span>
-      <select
-        name="midi-input-device"
-        onchange={(e) => selectMidiInPort((e.currentTarget as HTMLSelectElement).value)}
-      >
-        <option value="" selected={midiIo.inPortId === ""}>None</option>
-        {#each midiIo.inPorts as p (p.id)}
-          <option value={p.id} selected={p.id === midiIo.inPortId}>{p.name}</option>
-        {/each}
-      </select>
-      <span class="midi-dot" class:active={midiIo.active} title="MIDI activity"></span>
-      <label class="monitor" title="Hear incoming notes through a preview-grade voice (docs/midi-input.md)">
-        <input
-          type="checkbox"
-          checked={midiIo.monitor}
-          onchange={(e) => toggleMidiMonitor((e.currentTarget as HTMLInputElement).checked)}
-        />
-        <span class="silk">monitor</span>
-      </label>
-      {#if targetTrackName}
-        <span class="silk target" title="Incoming notes are routed to this track's instrument">
-          → {targetTrackName}
-        </span>
-      {/if}
-    </div>
-    <div class="dev midiout">
-      <span class="silk">midi out</span>
-      {#each midiIo.outputs as o (o.port.id)}
-        <span class="portchip" title={o.port.name}>
-          <span class="pname mono">{o.port.name}</span>
-          <label class="monitor" title="Send MIDI clock + transport (Start/Stop/Continue/SPP) to this port">
-            <input
-              type="checkbox"
-              checked={o.clockEnabled}
-              onchange={(e) => toggleClock(o.port.id, (e.currentTarget as HTMLInputElement).checked)}
-            />
-            <span class="silk">clock</span>
-          </label>
-          <button
-            type="button"
-            class="portclose"
-            title="Close this output port"
-            onclick={() => closeOutputPort(o.port.id)}
-          >×</button>
-        </span>
-      {/each}
-      {#if closedOutPorts.length > 0}
-        <select
-          name="midi-output-add"
-          title="Open an additional MIDI output port"
-          onchange={(e) => {
-            openOutputPort((e.currentTarget as HTMLSelectElement).value);
-            (e.currentTarget as HTMLSelectElement).value = "";
-          }}
-        >
-          <option value="" selected>+ open…</option>
-          {#each closedOutPorts as p (p.id)}
-            <option value={p.id}>{p.name}</option>
-          {/each}
-        </select>
-      {/if}
-      <span class="silk">trk</span>
-      <select
-        name="midi-output-track"
-        title="Configure which port+channel this MIDI track's notes are routed to (mute it in AURA to avoid doubling)"
-        onchange={(e) => (editingTrackId = (e.currentTarget as HTMLSelectElement).value)}
-      >
-        <option value="" selected={!editingTrackId}>None</option>
-        {#each midiTracks as t (t.id)}
-          <option value={t.id} selected={t.id === editingTrackId}>{t.name}</option>
-        {/each}
-      </select>
-      {#if editingTrackId}
-        <select
-          name="midi-output-track-port"
-          title="Port this track's notes are routed to"
-          onchange={(e) => selectRoutePort((e.currentTarget as HTMLSelectElement).value)}
-        >
-          <option value="" selected={!editingRoute}>None</option>
-          {#each midiIo.outputs as o (o.port.id)}
-            <option value={o.port.id} selected={o.port.id === editingRoute?.portId}>{o.port.name}</option>
-          {/each}
-        </select>
-        {#if editingRoute}
-          <input
-            class="channel mono"
-            type="number"
-            min="0"
-            max="15"
-            title="MIDI channel (0-15)"
-            value={editingRoute.channel}
-            onchange={(e) => selectRouteChannel(Math.max(0, Math.min(15, (e.currentTarget as HTMLInputElement).valueAsNumber || 0)))}
-          />
-          <select
-            name="midi-output-track-return"
-            title="Audio input this track records its return from (so export hears the external synth). Patch the synth into this input yourself."
-            onchange={(e) => selectRouteReturn((e.currentTarget as HTMLSelectElement).value)}
-          >
-            <option value="" selected={!editingRoute.returnDevice}>return: none</option>
-            {#each inputs as d (d.id)}
-              <option value={d.id} selected={d.id === editingRoute.returnDevice}>{d.name}</option>
-            {/each}
-          </select>
-        {/if}
-      {/if}
-    </div>
+    <button
+      class="dev midistat"
+      type="button"
+      title="MIDI patchbay — press {DOCK_SHORTCUT.midi.toUpperCase()}"
+      onclick={() => (ui.dock = "midi")}
+    >
+      <span class="silk">midi</span>
+      <span class="midi-dot" class:active={midiIo.active} aria-hidden="true"></span>
+      <span class="patched mono">{inPortName}{targetTrackName ? ` → ${targetTrackName}` : ""}</span>
+      <span class="tally mono">{midiIo.outputs.length} out</span>
+      <span class="opener silk" aria-hidden="true">⇄</span>
+    </button>
   </div>
 
   <div class="section jobsbox">
@@ -330,64 +200,43 @@
     background: var(--cyan);
     box-shadow: 0 0 calc(6px * var(--glow-scale)) 1px var(--cyan);
   }
-  .monitor {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-    cursor: pointer;
-  }
-  .monitor input {
-    accent-color: var(--cyan);
-    width: 11px;
-    height: 11px;
-    margin: 0;
-    cursor: pointer;
-  }
-  .target {
-    color: var(--cyan);
-    white-space: nowrap;
-  }
 
-  .midiout {
-    flex-wrap: wrap;
-    row-gap: 4px;
-  }
-  .portchip {
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    padding: 2px 6px;
+  /* One chip, fixed width: the 500 ms poll changes the text inside it, never
+     the strip's layout. Focus ring comes from the global :focus-visible. */
+  .midistat {
+    width: 214px;
+    padding: 3px 7px;
     border-radius: 4px;
     border: var(--border-width) solid var(--glass-border);
     background: rgb(var(--bg-0-rgb) / 0.7);
-  }
-  .pname {
-    font-size: 10px;
     color: var(--text-dim);
-    max-width: 110px;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: border-color 120ms linear, color 120ms linear;
+  }
+  .midistat:hover {
+    color: var(--text);
+    border-color: color-mix(in srgb, var(--cyan) 45%, transparent);
+  }
+  .patched {
+    flex: 1;
+    min-width: 0;
+    font-size: 10px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .portclose {
-    all: unset;
-    cursor: pointer;
-    font-size: 11px;
-    line-height: 1;
+  .tally {
+    flex: none;
+    width: 40px;
+    font-size: 10px;
+    text-align: right;
     color: var(--text-faint);
-    padding: 0 2px;
   }
-  .portclose:hover {
-    color: var(--text);
-  }
-  .channel {
-    width: 34px;
-    background: rgb(var(--bg-0-rgb) / 0.7);
-    color: var(--text-dim);
-    border: var(--border-width) solid var(--glass-border);
-    border-radius: 4px;
-    font-size: 11px;
-    padding: 3px 4px;
+  .opener {
+    flex: none;
+    color: var(--cyan);
   }
 
   .jobsbox {

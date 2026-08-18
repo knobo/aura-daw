@@ -21,16 +21,19 @@ AURA yet.
    the port list is read once when the app starts (see
    [Limitations](#limitations) below).
 2. **Open AURA.**
-3. In the bottom master strip, find the **midi in** selector next to the
-   audio input/output device selects.
-4. **Pick your device** from the dropdown. Selecting **None** closes any
-   open connection (and silences anything still sounding).
-5. Leave the **monitor** checkbox next to it checked (it's on by default
-   whenever a port is selected).
+3. **Open the MIDI panel** — the `⇄ MIDI` tab in the right-hand dock, or
+   press **D**. Its **IN** section is the whole input side in one place.
+4. **Pick your device** from the port list. Choosing **None — not
+   listening** closes any open connection (and silences anything still
+   sounding).
+5. Leave **monitor** checked (it's on by default whenever a port is
+   selected).
 6. **Play a key.** Two things should happen:
-   * The small dot next to the selector lights up briefly on every
-     incoming MIDI message (roughly every time the dot's status is polled
-     while a message is fresh — under ~300ms old).
+   * The activity dot lights up briefly on every incoming MIDI message
+     (roughly every time the dot's status is polled while a message is
+     fresh — under ~300ms old). It sits in the panel's IN header, and also
+     stays on the bottom master strip next to the **midi** button that
+     opens the panel — so you can watch for it with the panel closed.
    * You **hear a tone** — a simple built-in sine-ish sound, not
      necessarily any instrument you have loaded elsewhere in the app.
      Release the key and the tone stops (with a short release tail).

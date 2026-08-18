@@ -11,7 +11,8 @@ export type DockTab =
   | "library"
   | "instruments"
   | "plugins"
-  | "mcp";
+  | "mcp"
+  | "midi";
 
 /** The bottom region shows one of these at a time. */
 export type BottomPanel = "roll" | "pitch";
@@ -75,6 +76,9 @@ export const DOCK_SHORTCUT: Record<Exclude<DockTab, "">, string> = {
   instruments: "i",
   plugins: "p",
   mcp: "m",
+  // Not "m": that is MCP's, and MCP shipped first. "d" as in devices — the
+  // panel is where hardware ports are opened and patched.
+  midi: "d",
 };
 
 const BY_KEY = new Map(
