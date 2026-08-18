@@ -10,7 +10,7 @@
       "description": "Everything the COMPOSER panel draws. All of it is backend-derived: the widget contains no theory (ADR 0006).",
       "type": "object",
       "properties": {
-        "harmony": { "$ref": "harmony.schema.json" },
+        "harmony": { "$ref": "aura:ipc/harmony.schema.json" },
         "key": { "type": "string", "description": "Canonical key in force at the request's `atTicks`." },
         "keyLabel": { "type": "string", "description": "Display form, e.g. \"C major\"." },
         "keySignature": {
