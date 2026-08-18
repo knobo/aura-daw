@@ -278,6 +278,7 @@
       void midi.commitBounds(clip.id);
     } else if (e.key === "Delete" || e.key === "Backspace") {
       e.preventDefault();
+      e.stopPropagation();
       void midi.removeClip(clip.id);
     }
   }
