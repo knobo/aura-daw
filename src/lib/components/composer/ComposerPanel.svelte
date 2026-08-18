@@ -262,7 +262,10 @@
       <span>{syncopation}</span>
     </label>
 
-    <div class="row">
+    <!-- Sticky: the panel scrolls, and with the controls above it the primary
+         action sat below the fold — which is how it went missing entirely
+         ("jeg mangler en 'generer' knapp"). -->
+    <div class="row sticky">
       <label class="bar mono seed">
         SEED
         <input type="number" min="0" bind:value={composer.seed} aria-label="Seed" />
@@ -270,7 +273,6 @@
       <button class="dice mono" title="A new seed — the same settings, a different idea" onclick={() => composer.rollSeed()}>
         ↻
       </button>
-      <span class="spacer"></span>
       <button
         class="go mono"
         disabled={composer.busy || parts.length === 0}
@@ -372,6 +374,18 @@
   }
   .row.wrap {
     flex-wrap: wrap;
+  }
+  .row.sticky {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    padding: 6px 0;
+    margin-top: 2px;
+    background: linear-gradient(
+      to top,
+      rgb(var(--bg-sunken-rgb) / 0.98) 60%,
+      rgb(var(--bg-sunken-rgb) / 0)
+    );
   }
   .spacer {
     flex: 1;
