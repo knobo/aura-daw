@@ -9,7 +9,7 @@ described here only.
 
 ## Already differentiating (landed)
 
-- The Composer (PR pending, 2026-08-17): a harmony document in the core
+- The Composer (PR #65, 2026-08-17): a harmony document in the core
   document model, theory-driven and *explainable* generation next to the ML
   generators, and an editor that colours its own keys by what each note does
   over the chord. `composer-assistant.md` §2 is honest about the prior art

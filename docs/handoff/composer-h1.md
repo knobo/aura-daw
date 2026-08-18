@@ -1,6 +1,6 @@
 # Handoff: the Composer, Plan H1 (2026-08-17)
 
-Branch `feat/composer-assistant`, worktree `.claude/worktrees/composer`,
+PR [#65](https://github.com/knobo/aura-daw/pull/65). Branch `feat/composer-assistant`, worktree `.claude/worktrees/composer`,
 branched from `origin/main` at `79c3e98`.
 
 **What this is.** The spine of the Composer: a pure music-theory library, a

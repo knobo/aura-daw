@@ -7,7 +7,7 @@ the repo documentation is English.
 **Do this, in order:**
 
 1. **Hear the Composer.** Plan H1 landed on `feat/composer-assistant`
-   (PR open, not merged): open the COMPOSER dock tab (`O`), pick a plan,
+   (PR #65, not merged): open the COMPOSER dock tab (`O`), pick a plan,
    GENERATE, and listen. The suite proves the notes obey the theory; only
    an ear can say whether the defaults are *nice*. The specific
    judgements owed — registers, melodic taste, groove feel, and the fact
@@ -25,7 +25,7 @@ should be); start G2/G3/G4; write a stock FX suite; bump
 Pitch Coach phases 1–3, the lanes UX track, the theme system, Composer
 H1).
 
-**In flight:** `feat/composer-assistant` (Plan H1, PR open) and a WIP
+**In flight:** `feat/composer-assistant` (Plan H1, PR #65) and a WIP
 `feat/g1-mixer-strip` worktree at `811b954` — a G1 Task 5 start from an
 earlier session ("wip: insert compile + unified mixer strip"), which this
 file previously described as "nothing in flight". Check that commit
@@ -44,7 +44,7 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
-| **The Composer, Plan H1** — a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord | PR open on `feat/composer-assistant`. Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff (ear-check owed, what H2 picks up): [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
+| **The Composer, Plan H1** — a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord | PR [#65](https://github.com/knobo/aura-daw/pull/65) on `feat/composer-assistant`. Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff (ear-check owed, what H2 picks up): [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
 | Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
 | Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
