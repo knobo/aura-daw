@@ -45,7 +45,6 @@ use crate::ids::TrackId;
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
-use crate::audio::types::AutomationMode;
 
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
 pub use ops::{LaneArrangement, TrackMixChange};
@@ -5084,6 +5083,7 @@ pub async fn seed_demo_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::rt::{testutil::empty_tables, GraphTables, ParamTable};
     use crate::audio::types::{derive_slots, Store};
     use crate::midi::MidiStore;

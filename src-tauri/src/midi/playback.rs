@@ -42,7 +42,6 @@ use super::tempo::TempoMap;
 use super::types::MidiClip;
 
 use crate::audio::dsp::AudioProcessor;
-use crate::audio::types::AutomationMode;
 
 /// READ-ONLY document view (Plan E Task 7 fix round 1 — binding requirement).
 /// This global exists purely so a cross-cutting reach with no session handle
@@ -388,6 +387,7 @@ fn node_for_track(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::mixer;
     use crate::audio::rt::{ParamTable, RtGraph};
     use crate::audio::transport::LoopSpec;

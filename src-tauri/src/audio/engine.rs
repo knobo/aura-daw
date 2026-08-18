@@ -49,7 +49,6 @@ use super::types::{derive_slots, mixer_slot_count, Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
-use crate::audio::types::AutomationMode;
 
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
@@ -3223,6 +3222,7 @@ pub fn load_wav(path: &Path) -> Result<(u16, u32, Vec<f32>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use std::sync::atomic::AtomicUsize;
 
     struct NullEvents;

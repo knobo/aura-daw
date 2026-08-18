@@ -61,7 +61,6 @@ use parking_lot::Mutex;
 use super::op::{Actor, Op, TxMeta, OP_FORMAT_VERSION};
 use super::vergraph::{Janitor, VersionGraph, VersionItem, VersionStats};
 use super::CoalesceKey;
-use crate::audio::types::AutomationMode;
 
 // ---------------------------------------------------------------------------
 // Tunables (documented constants, not magic numbers)
@@ -917,6 +916,7 @@ impl HistoryLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::control::op::{ObjectRef, PropPath};
 
     fn set_gain(track: &str, to: f64) -> Op {

@@ -57,7 +57,6 @@ use std::sync::Arc;
 use super::op::{Actor, Op, TxMeta};
 use super::session::Committed;
 use super::snapshot::{ChangeSet, SessionSnapshot};
-use crate::audio::types::AutomationMode;
 
 /// Classification threshold (`benches/bulkbench/RESULTS.md` §6, MEASURED):
 /// a batch whose own-created bytes exceed this stores op + inverse instead
@@ -605,6 +604,7 @@ impl Janitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::types::Store;
     use crate::control::op::{ObjectRef, PropPath, TxMeta};
     use crate::control::session::Session;

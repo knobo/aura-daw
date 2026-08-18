@@ -24,7 +24,6 @@ use crate::control::session::{PluginDoc, Session};
 use crate::ids::ClipId;
 use crate::midi::types::{MeterEvent, MidiClip, MidiNote, TempoEvent};
 use crate::plugins::automation::AutomationLane;
-use crate::audio::types::AutomationMode;
 
 /// Immutable, Arc-structurally-shared image of the DOCUMENT (content
 /// fields only — bookkeeping like `midi.dirty`, `midi.loaded_dir` and
@@ -533,6 +532,7 @@ fn launch_target_heap(t: &crate::midi::launch::LaunchTarget) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::types::{Store, TrackState};
     use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
     use crate::ids::{ContentId, LaneId, NoteId};

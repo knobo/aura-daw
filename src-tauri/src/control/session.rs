@@ -12,7 +12,6 @@ use crate::ids::TrackId;
 use crate::midi::MidiStore;
 use crate::plugins::automation::AutomationLane;
 use crate::plugins::{ParamInfo, PluginInstanceInfo};
-use crate::audio::types::AutomationMode;
 
 /// Automation lanes document (Plan E Task 10) — the in-memory half of the
 /// former standalone `plugins::automation::AutomationStore` +
@@ -2283,6 +2282,7 @@ fn scopeguard<F: FnMut()>(f: F) -> impl Drop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::types::TrackState;
     use crate::audio::types::testutil::{test_clip, test_track};
     use crate::control::op::testutil::set_gain;

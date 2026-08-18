@@ -43,7 +43,6 @@ use crate::midi::synth::BlockNoteEvent;
 use super::descriptor::ParamInfo;
 use super::host::{plugin_main, MainCtx};
 use super::{HostRole, IoMode, ParamChange};
-use crate::audio::types::AutomationMode;
 
 /// Max note events buffered per block (mirror of the other live nodes).
 const MAX_NODE_EVENTS: usize = 256;
@@ -993,6 +992,7 @@ impl Drop for ClapNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::plugins::scan::{clap_search_paths, find_clap_bundles};
     use crate::plugins::scan_worker;
     use crate::plugins::PluginDescriptor;

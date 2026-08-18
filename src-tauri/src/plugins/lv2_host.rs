@@ -55,7 +55,6 @@ use super::descriptor::ParamInfo;
 use super::host::{plugin_main, MainCtx};
 use super::state::StateBlob;
 use super::{HostRole, IoMode};
-use crate::audio::types::AutomationMode;
 
 /// Byte capacity of each preallocated atom sequence (MIDI in / atom out).
 /// One 3-byte MIDI event occupies 24 padded bytes -> ~340 events per block.
@@ -777,6 +776,7 @@ impl LiveInstrument for Lv2Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::plugins::descriptor::lv2_uid;
 
     const ZYN_URI: &str = "http://zynaddsubfx.sourceforge.net";

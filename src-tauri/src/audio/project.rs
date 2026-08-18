@@ -19,7 +19,6 @@ use parking_lot::Mutex;
 use super::types::{Clip, Project, Store, TransportState};
 use crate::control::Session;
 use crate::ids::SourceId;
-use crate::audio::types::AutomationMode;
 
 pub const PROJECT_FILE: &str = "project.json";
 
@@ -401,6 +400,7 @@ pub fn from_store(store: &Store, position_samples: u64, sample_rate: u32) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use super::super::types::TrackState;
 
     fn tmp_parent(name: &str) -> PathBuf {

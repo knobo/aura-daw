@@ -79,7 +79,6 @@ use crate::control::Session;
 use crate::midi::tempo::TempoMap;
 use crate::midi::{TempoEvent, DEFAULT_PPQ};
 use crate::midi_input::MidiPortInfo;
-use crate::audio::types::AutomationMode;
 
 /// One outbound MIDI message. POD so the clock and the note scheduler share
 /// one output buffer.
@@ -1811,6 +1810,7 @@ pub fn midi_set_clip_virtual_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::midi::types::{DEFAULT_PPQ, TempoEvent};
 
     fn map120() -> TempoMap {

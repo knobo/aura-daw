@@ -26,7 +26,6 @@ use super::transport::LoopSpec;
 use super::types::{derive_slots, mixer_slot_count, Store};
 use crate::midi::playback::{append_from, LiveNodeRegistry};
 use crate::midi::MidiStore;
-use crate::audio::types::AutomationMode;
 
 /// Block size for offline rendering (matches `MAX_LIVE_BLOCK`, the largest
 /// contiguous run a live node processes). Fixed so renders are reproducible
@@ -278,6 +277,7 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::types::TrackState;
     use crate::ids::NoteId;
     use crate::midi::types::{MeterEvent, TempoEvent};

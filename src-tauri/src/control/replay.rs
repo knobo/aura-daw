@@ -59,7 +59,6 @@ use parking_lot::Mutex;
 
 use super::op::{Actor, Op, TxMeta, OP_FORMAT_VERSION};
 use super::session::Session;
-use crate::audio::types::AutomationMode;
 
 /// One parsed journal line.
 ///
@@ -614,6 +613,7 @@ pub fn replay_tail(session: &Mutex<Session>, tail: &[&JournalRecord]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::control::history::{EpochEvent, JournalWriter, JOURNAL_FILE};
     use crate::control::op::{ObjectRef, PropPath};
 
