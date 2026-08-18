@@ -2,11 +2,27 @@ name: Tests
 
 on:
   pull_request:
+  # ALSO on main, and not for its own sake: `Swatinem/rust-cache` can only SAVE
+  # a cache on the ref it runs on, and a PR may only restore caches from its own
+  # branch or its base. With `pull_request:` alone nothing ever ran on `main`, so
+  # there was never a base-branch cache to restore and every PR compiled ~600
+  # crates from scratch. Measured on run 32162462316: the cache step finished in
+  # 1 s (a miss) and `cargo test` then took 10m28s, of which the tests
+  # themselves were 20s.
+  push:
+    branches: [main]
+
+# A superseded run is wasted runner time, and these runs are expensive (see the
+# apt note below).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   frontend:
     name: Frontend (vitest, svelte-check, build)
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -29,13 +45,34 @@ jobs:
   rust:
     name: Rust (cargo test)
     runs-on: ubuntu-24.04
+    # Without a cap, a hung apt mirror burns half an hour before anyone notices:
+    # on run 32171878639 `apt-get update` stalled for 23.5 minutes and the job
+    # was cancelled having never started `cargo test`. Fail fast instead.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
+      # `--no-install-recommends`: the recommends of this list are enormous and
+      # unrelated — ffmpeg alone drags in `pocketsphinx-en-us`, a speech model
+      # that took 161 s to fetch on run 32162462316, plus libvidstab,
+      # librubberband and libzimg. Nothing here needs any of them.
+      #
+      # Retries and timeouts: GitHub runners default to
+      # `azure.archive.ubuntu.com`, which returned `Ign:` for every index on run
+      # 32171878639 and left apt hanging on the fallback with no deadline of its
+      # own. Bounded retries make it fall over to `archive.ubuntu.com` quickly
+      # rather than sitting there.
+      #
+      # ffmpeg is a REAL test dependency, not a leftover:
+      # `control::import`'s compressed-format test encodes mp3/flac/ogg/m4a with
+      # the ffmpeg CLI. It skips cleanly when ffmpeg is missing, so dropping it
+      # would silently cost that coverage rather than fail.
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get update -o Acquire::Retries=3 \
+            -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20
+          sudo apt-get install -y --no-install-recommends \
+            -o Acquire::Retries=3 -o Acquire::http::Timeout=20 \
             libasound2-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
             libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev liblilv-dev ffmpeg
