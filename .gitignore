@@ -3,7 +3,13 @@
 /benches/*/target/
 
 # Node
-/node_modules/
+# No trailing slash, deliberately: `/node_modules/` matches a DIRECTORY only,
+# so a `node_modules` SYMLINK stays untracked-but-visible and gets swept up by
+# the next `git add -A`. That is exactly how the self-referential link in PR #65
+# landed and had to be removed again in PR #73, and a worktree that links the
+# main checkout's install (the normal way to avoid a second 1 GB copy) recreates
+# the hazard every time. Without the slash, both shapes are ignored.
+/node_modules
 /dist/
 
 # Python sidecar environment (local, machine-specific)
