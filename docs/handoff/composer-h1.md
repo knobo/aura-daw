@@ -128,6 +128,18 @@ Counts measured on this branch, `--test-threads=1`, against a real ALSA sink
 (see CONTRIBUTING for why both matter). Baseline at branch point was 1083
 backend + 738 frontend.
 
+**One more local-environment trap worth knowing about.** A full run aborted
+once with `SIGABRT` inside the gated third-party plugin probes
+(`plugins::patches::tests::sweep_*`, `scan_worker::*`) — the tests that dlopen
+Cardinal, Surge XT, Yoshimi and friends, which CONTRIBUTING already calls
+crash-prone by design. The cause was not the branch: `/tmp` had accumulated
+**8910 leaked `aura-*` test project directories** (13 GB) from repeated suite
+runs, and some of those plugins fail loudly when the box is under that kind of
+pressure. `rm -rf /tmp/aura-*` and the same tests pass 78/78 on this branch and
+6/6 on `main`. The leak is in older tests (`import-test-announce`,
+`library-*`, `midi-routing-*` are the big ones — 848, ~500 and ~250 dirs each);
+worth a cleanup pass of its own, and the Composer's own tests leak zero.
+
 **One pre-existing flake surfaced, was diagnosed, and is fixed here.**
 `control::hum::tests::apply_hum_clip_commits_synchronously_and_announces_project_changed`
 asserted `rev == before_rev + 1` ("one commit, one rev bump") while its fixture
