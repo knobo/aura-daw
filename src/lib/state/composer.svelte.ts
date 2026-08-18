@@ -164,7 +164,13 @@ class ComposerStore {
     await this.write(keys, [], "COULD NOT CLEAR THE PROGRESSION");
   }
 
-  /** Generate parts as ordinary MIDI clips. One transaction, one undo. */
+  /** Generate parts as ordinary MIDI clips. One transaction, one undo.
+   *
+   * `request.trackIds` targets existing tracks per part (`{melody: "<id>"}`);
+   * a part without an entry gets a fresh track. Targeting matters more than it
+   * looks: a brand-new track has no instrument bound, so it plays through the
+   * built-in PolySynth, while an existing track can already be pointed at a
+   * plugin or a sampler patch you like. */
   async generate(request: ComposerGenerateRequest): Promise<ComposerGenerateReply | null> {
     if (!backend.composerGenerate || this.busy) return null;
     this.busy = true;

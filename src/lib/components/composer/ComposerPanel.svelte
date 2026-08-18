@@ -12,6 +12,7 @@
   import { onMount } from "svelte";
   import { composer, PARTS, type Part } from "../../state/composer.svelte";
   import { midi } from "../../state/midi.svelte";
+  import { project } from "../../state/project.svelte";
   import CircleOfFifths from "./CircleOfFifths.svelte";
   import ProgressionStrip from "./ProgressionStrip.svelte";
 
@@ -40,7 +41,14 @@
   let density = $state(45);
   let syncopation = $state(20);
   let chosen = $state<Record<Part, boolean>>({ chords: true, bass: true, melody: true, drums: true });
+  /** Per part: "" = create a track, otherwise write onto this existing one.
+   * The backend has always taken this (`trackIds`); the panel not offering it
+   * meant a generated part could never land on the track that already has your
+   * instrument bound to it. */
+  let target = $state<Record<Part, string>>({ chords: "", bass: "", melody: "", drums: "" });
   let atBar = $state(1);
+
+  const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
 
   const view = $derived(composer.view);
   const selected = $derived(composer.selectedSpan);
@@ -50,6 +58,9 @@
     ),
   );
   const parts = $derived(PARTS.filter((p) => chosen[p]));
+  const trackIds = $derived(
+    Object.fromEntries(parts.filter((p) => target[p]).map((p) => [p, target[p]])),
+  );
   const planLabel = $derived(
     view?.schemas.find((s) => s.id === plan)?.label ??
       (plan === "circle" ? "circle of fifths walk" : "functional grammar"),
@@ -102,13 +113,14 @@
       bassStyle,
       density,
       syncopation,
+      trackIds,
     });
     await composer.loadSuggestions();
   }
 
   async function generateParts() {
     // Arrange what is already there: no plan, so the harmony document stands.
-    await composer.generate({ parts, plan: null, bars });
+    await composer.generate({ parts, plan: null, bars, trackIds });
   }
 
   async function pickChord(symbol: string) {
@@ -196,14 +208,34 @@
     </div>
     <p class="why small">{planWhy}</p>
 
-    <div class="parts">
+    <div class="partrows">
       {#each PARTS as p (p)}
-        <label class="part mono" class:on={chosen[p]}>
-          <input type="checkbox" bind:checked={chosen[p]} />
-          {p}
-        </label>
+        <div class="partrow">
+          <label class="part mono" class:on={chosen[p]}>
+            <input type="checkbox" bind:checked={chosen[p]} />
+            {p}
+          </label>
+          <select
+            class="into"
+            bind:value={target[p]}
+            disabled={!chosen[p]}
+            aria-label="Target track for {p}"
+            title="Write this part onto an existing MIDI track — the one whose instrument you already like — instead of a new one"
+          >
+            <option value="">→ new track</option>
+            {#each midiTracks as t (t.id)}
+              <option value={t.id}>→ {t.name}</option>
+            {/each}
+          </select>
+        </div>
       {/each}
     </div>
+    {#if Object.keys(trackIds).length > 0}
+      <p class="small">
+        Lands as a new clip on the chosen track(s) — it does not replace what is
+        already there, so move or delete the old clip if they overlap.
+      </p>
+    {/if}
 
     <div class="row wrap">
       <select bind:value={genre} aria-label="Drum genre" disabled={!chosen.drums}>
@@ -239,17 +271,22 @@
         ↻
       </button>
       <span class="spacer"></span>
-      <button class="go mono" disabled={composer.busy || parts.length === 0} onclick={generate}>
-        {composer.busy ? "…" : `${planLabel.split(" ")[0]} ▸`}
+      <button
+        class="go mono"
+        disabled={composer.busy || parts.length === 0}
+        title={parts.length === 0 ? "Pick at least one part" : `Generate ${planLabel}`}
+        onclick={generate}
+      >
+        {composer.busy ? "GENERATING…" : "▸ GENERATE"}
       </button>
     </div>
     <button
-      class="link mono"
+      class="second mono"
       disabled={composer.busy || parts.length === 0 || composer.chords.length === 0}
       onclick={generateParts}
-      title="Write the selected parts against the progression you already have"
+      title="Write the selected parts against the progression you already have, without generating a new one"
     >
-      parts only — keep my progression
+      ▸ PARTS ONLY — KEEP MY PROGRESSION
     </button>
   </section>
 
@@ -371,10 +408,22 @@
     width: 84px;
   }
 
-  .parts {
+  .partrows {
     display: flex;
-    flex-wrap: wrap;
+    flex-direction: column;
     gap: 3px;
+  }
+  .partrow {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .partrow .part {
+    min-width: 74px;
+  }
+  .into {
+    flex: 1;
+    min-width: 0;
   }
   .part {
     display: flex;
@@ -416,14 +465,17 @@
   }
 
   .go {
-    border: var(--border-width) solid var(--cyan-dim);
-    background: rgb(var(--cyan-rgb) / 0.14);
+    flex: 1;
+    border: var(--border-width) solid var(--cyan);
+    background: rgb(var(--cyan-rgb) / 0.18);
     color: var(--cyan);
     border-radius: 2px;
-    padding: 4px 10px;
-    font-size: 9px;
-    letter-spacing: 0.14em;
+    padding: 7px 10px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.18em;
     cursor: pointer;
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.25);
   }
   .go:hover:not(:disabled) {
     background: rgb(var(--cyan-rgb) / 0.26);
@@ -432,6 +484,28 @@
     color: var(--text-faint);
     border-color: var(--glass-border);
     background: transparent;
+    cursor: default;
+    box-shadow: none;
+  }
+
+  /* The secondary action is a real button too — it was an underlined link,
+     which is not where anyone looks for "do the thing". */
+  .second {
+    border: var(--border-width) solid var(--glass-border);
+    background: transparent;
+    color: var(--text-mid);
+    border-radius: 2px;
+    padding: 5px 8px;
+    font-size: 8px;
+    letter-spacing: 0.12em;
+    cursor: pointer;
+  }
+  .second:hover:not(:disabled) {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+  }
+  .second:disabled {
+    color: var(--text-faint);
     cursor: default;
   }
 
