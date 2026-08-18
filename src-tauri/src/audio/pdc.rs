@@ -50,7 +50,21 @@ impl DelayLine {
 
     /// RT-safe. `io` is interleaved `frames * channels`. Does not allocate.
     /// A zero delay is a no-op (nothing to shift, nothing to preroll).
+    ///
+    /// Debug-only shape asserts (never on the release RT path): `io` must be
+    /// a whole number of frames at `self.channels`, and the block must not
+    /// exceed the `max_block` this line was sized for at `new()` — either
+    /// violation is a caller bug (a stray/misconverted sample count, or a
+    /// run larger than the graph's `MAX_LIVE_BLOCK`), not something this
+    /// method should silently paper over by dropping the tail or collapsing
+    /// toward passthrough.
     pub fn process(&mut self, io: &mut [f32]) {
+        debug_assert!(
+            self.channels == 0 || io.len() % self.channels == 0,
+            "DelayLine::process: io.len()={} is not a whole number of frames at {} channels",
+            io.len(),
+            self.channels
+        );
         if self.delay == 0 || self.channels == 0 {
             return;
         }
@@ -59,6 +73,13 @@ impl DelayLine {
             return;
         }
         let frames = io.len() / self.channels;
+        debug_assert!(
+            frames + self.delay <= buf_frames,
+            "DelayLine::process: block of {frames} frames + delay {} exceeds the {buf_frames}-frame \
+             buffer sized at new() for max_block={}",
+            self.delay,
+            buf_frames - self.delay
+        );
         for i in 0..frames {
             let read_frame = (self.w + buf_frames - self.delay) % buf_frames;
             let write_base = self.w * self.channels;

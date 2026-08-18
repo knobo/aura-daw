@@ -7,10 +7,12 @@
 //!
 //! Track strip (Plan G1): per run of `MAX_LIVE_BLOCK`, a track zeros
 //! `track_buf`, mixes clips (no fader), ADDs its LIVE instrument when
-//! present, walks inserts REPLACE in document order, then applies the
-//! shared gain/pan/mute fader into `out`. Live nodes are fed pre-scheduled
-//! absolute-sample note events (sliced per run, converted to block offsets
-//! — zero ticks, zero allocation on this thread).
+//! present, walks inserts REPLACE in document order, applies this track's
+//! PDC (`RtTrack::pdc`, Task 6 — pads a shorter path to match the slowest
+//! sibling's, see `audio::pdc`), then applies the shared gain/pan/mute
+//! fader into `out`. Live nodes are fed pre-scheduled absolute-sample note
+//! events (sliced per run, converted to block offsets — zero ticks, zero
+//! allocation on this thread).
 
 use std::sync::atomic::Ordering::Relaxed;
 
