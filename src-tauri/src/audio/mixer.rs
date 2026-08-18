@@ -51,8 +51,11 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
 }
 
 /// Solo/mute resolution: when any track is soloed only soloed tracks sound;
-/// mute always silences its own track (mute wins over its own solo).
-/// `launch` is a live launch target — it stays audible through both.
+/// mute always silences its own track (mute wins over its own solo, and
+/// over a live launch target — an explicitly muted track stays silent even
+/// while it drives a launched scene). `launch` only bypasses another
+/// track's solo, so a launched scene stays audible while auditioning
+/// across a solo elsewhere.
 #[inline]
 pub fn audible(muted: bool, soloed: bool, any_solo: bool) -> bool {
     audible_with_launch(muted, soloed, any_solo, false)
@@ -60,7 +63,7 @@ pub fn audible(muted: bool, soloed: bool, any_solo: bool) -> bool {
 
 #[inline]
 pub fn audible_with_launch(muted: bool, soloed: bool, any_solo: bool, launch: bool) -> bool {
-    launch || (!muted && (!any_solo || soloed))
+    !muted && (launch || !any_solo || soloed)
 }
 
 /// Sample a clip at absolute timeline position `pos` (engine samples).
@@ -811,8 +814,8 @@ mod tests {
             "launch target plays while another track is soloed"
         );
         assert!(
-            audible_with_launch(true, false, false, true),
-            "launch target bypasses its own mute"
+            !audible_with_launch(true, false, false, true),
+            "mute silences a launch target too"
         );
     }
 
