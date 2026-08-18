@@ -22,6 +22,38 @@ export const byTickKey = (a: MidiNote, b: MidiNote) => a.tick - b.tick || a.key 
  * the copy and the original (id stability lost). Exported so any call site
  * that materializes "new" notes from someone else's ids (paste, AMT infill
  * fills) can strip them the same way instead of re-deriving the rule. */
+/** The MIDI channel a note ADDED to this clip should carry: whatever most of
+ * the clip's existing notes are on, or 0 for an empty clip.
+ *
+ * Not simply 0, which is what the piano roll used to hardcode. The Composer
+ * writes a drum part on channel 10 (0-based 9) because that is where General
+ * MIDI percussion lives and where a drum machine listens; a note drawn into
+ * such a clip with channel 0 then leaves for a DIFFERENT MIDI channel than its
+ * neighbours the moment the track is routed to hardware with the default
+ * "from clip" setting — one silent hit in the middle of a groove, with nothing
+ * in the piano roll to show why. (Harmless until routing started honouring the
+ * per-note channel at all, which is why it went unnoticed.)
+ *
+ * Majority rather than "the first note": a clip legitimately mixed across
+ * channels has no single right answer, and the commonest one is the least
+ * surprising. Ties break toward the lower channel, for determinism. */
+export function channelForNewNote(notes: MidiNote[]): number {
+  const counts = new Map<number, number>();
+  for (const n of notes) {
+    const ch = n.channel ?? 0;
+    counts.set(ch, (counts.get(ch) ?? 0) + 1);
+  }
+  let best = 0;
+  let bestCount = 0;
+  for (const [ch, count] of [...counts].sort((a, b) => a[0] - b[0])) {
+    if (count > bestCount) {
+      best = ch;
+      bestCount = count;
+    }
+  }
+  return best;
+}
+
 export function copyNote(n: MidiNote): MidiNote {
   const { noteId: _dropId, ...copy } = n;
   return copy;

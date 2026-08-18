@@ -1265,7 +1265,7 @@ mod tests {
         let clip = midi_add_clip_core(&cp, track_id.as_str().into(), Some("Riff".into()), 0, 960).unwrap();
         out.set_route(
             crate::midi_out::RouteScope::Clip(clip.id.to_string()),
-            Some(crate::midi_out::RouteTarget::new("x#0", 0)),
+            Some(crate::midi_out::RouteTarget::new("x#0", None)),
         );
         assert!(out.routes().contains_key(&crate::midi_out::RouteScope::Clip(clip.id.to_string())));
 

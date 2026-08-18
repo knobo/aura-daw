@@ -18,12 +18,70 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// Bumped when a field's MEANING changes, not when one is added — a purely
+/// additive field is covered by `#[serde(default)]`.
+///
+/// * **1** (or absent): `channel` is a plain `u8` that the route commands
+///   filled with `channel.unwrap_or(0)`.
+/// * **2**: `channel` is `Option<u8>` — `null` means "each note on its own
+///   channel", and `0` means a deliberately forced MIDI channel 1.
+pub const CURRENT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingFile {
+    /// See [`CURRENT_VERSION`]. Absent in files written before versioning, so
+    /// `#[serde(default)]` + `default_version()` reads those as 1.
+    #[serde(default = "default_version")]
+    pub version: u32,
     #[serde(default)]
     pub ports: HashMap<String, PortPrefs>,
     #[serde(default)]
     pub projects: HashMap<String, ProjectRouting>,
+}
+
+fn default_version() -> u32 {
+    1
+}
+
+impl Default for RoutingFile {
+    /// A file this build would write, i.e. already current — `load` only ever
+    /// returns this for "no file / unreadable / corrupt", where there is
+    /// nothing to migrate.
+    fn default() -> Self {
+        Self { version: CURRENT_VERSION, ports: HashMap::new(), projects: HashMap::new() }
+    }
+}
+
+impl RoutingFile {
+    /// Bring a just-read file up to [`CURRENT_VERSION`].
+    ///
+    /// **v1 -> v2, the channel.** In v1 there was no way to say "leave the
+    /// notes on their own channel": `midi_set_*_route` stored
+    /// `channel.unwrap_or(0)`, so every route patched without touching the
+    /// channel box recorded a `0`. Reading those back as a forced MIDI channel
+    /// 1 would keep the reported drum bug alive across the upgrade for exactly
+    /// the people who hit it, so a v1 `0` becomes `None`.
+    ///
+    /// This MUST be keyed on the version and not on the value: from v2 on, `0`
+    /// is a legitimate, deliberate "force channel 1" — the setting a
+    /// mono-timbral synth listening on channel 1 needs — and treating it as
+    /// "unset" would silently un-force it on the next project open.
+    ///
+    /// Out-of-range channels are clamped into 0-15 at every version, so a
+    /// hand-edited file cannot forge a bad status byte.
+    pub fn migrate(&mut self) {
+        let from_v1 = self.version < 2;
+        for proj in self.projects.values_mut() {
+            for r in &mut proj.routes {
+                r.channel = match r.channel {
+                    Some(0) if from_v1 => None,
+                    Some(ch) => Some(ch & 0x0F),
+                    None => None,
+                };
+            }
+        }
+        self.version = CURRENT_VERSION;
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -50,7 +108,12 @@ pub struct PersistedRoute {
     pub scope: String,
     pub id: String,
     pub port_name: String,
-    pub channel: u8,
+    /// Forced output channel 0-15, or `None` for "each note on its own
+    /// channel" (the default — see [`super::RouteTarget::channel`]). How a
+    /// v1 file's `0` is read is [`RoutingFile::migrate`]'s business, not this
+    /// field's.
+    #[serde(default)]
+    pub channel: Option<u8>,
     /// cpal input-device name this track records its audio return from.
     /// Track routes only; clip overrides never carry one. Missing in files
     /// written before X1 — `None` means "no return, MIDI-only".
@@ -82,10 +145,14 @@ pub fn load() -> RoutingFile {
 /// funnel through, so a test never touches the real developer machine's
 /// config file.
 pub(crate) fn load_from_path(path: &Path) -> RoutingFile {
-    match std::fs::read_to_string(path) {
+    let mut file: RoutingFile = match std::fs::read_to_string(path) {
         Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
         Err(_) => RoutingFile::default(),
-    }
+    };
+    // Every read goes through the migration, so no caller can forget it and no
+    // caller has to know which version it just read.
+    file.migrate();
+    file
 }
 
 /// Whole-file rewrite — this is not a hot path (called once per explicit
@@ -128,6 +195,33 @@ pub fn project_key(dir: &Path) -> String {
         .unwrap_or_else(|_| dir.to_path_buf())
         .to_string_lossy()
         .into_owned()
+}
+
+/// A port name with the volatile ALSA address stripped off the end.
+///
+/// `midir`'s ALSA-seq backend formats a port name as
+/// `"<client>:<port> <clientNum>:<portNum>"` — e.g.
+/// `"Hydrogen:Hydrogen Midi-In 128:0"`. The trailing `128:0` is the sequencer
+/// address, which the kernel hands out in connection order: restart Hydrogen
+/// (or plug a USB keyboard in first) and the SAME device comes back as
+/// `"Hydrogen:Hydrogen Midi-In 129:0"`. Persisting routing by the raw name
+/// therefore lost the route on the next restart — silently, because a route
+/// naming a port that is not visible is skipped by design. A reporter's own
+/// routing file showed both spellings of the same Hydrogen for exactly that
+/// reason.
+///
+/// So matching is two-stage: exact name first (never weaken an exact hit),
+/// this normalized form second. A name with no such suffix — every non-ALSA
+/// backend — is returned unchanged, so nothing else changes behaviour.
+pub fn port_name_key(name: &str) -> &str {
+    let Some((head, tail)) = name.rsplit_once(' ') else { return name };
+    let Some((client, port)) = tail.split_once(':') else { return name };
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if numeric(client) && numeric(port) && !head.is_empty() {
+        head
+    } else {
+        name
+    }
 }
 
 #[cfg(test)]
@@ -173,7 +267,7 @@ mod tests {
                     scope: "track".into(),
                     id: "t-1".into(),
                     port_name: "Hydrogen".into(),
-                    channel: 9,
+                    channel: Some(9),
                     return_device: Some("Interface In 3-4".into()),
                 }],
                 open_ports: vec!["Hydrogen".into()],
@@ -201,6 +295,117 @@ mod tests {
         assert_eq!(proj.routes.len(), 1);
         assert_eq!(proj.routes[0].port_name, "Hydrogen");
         assert_eq!(proj.routes[0].return_device, None);
+    }
+
+    /// The field itself deserializes LITERALLY — interpreting a `0` is
+    /// [`RoutingFile::migrate`]'s job, because only the file's version says
+    /// whether it meant "never picked" or "force channel 1".
+    #[test]
+    fn the_channel_field_deserializes_literally() {
+        let zero = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen","channel":0}"#;
+        assert_eq!(serde_json::from_str::<PersistedRoute>(zero).unwrap().channel, Some(0));
+        let nine = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen","channel":9}"#;
+        assert_eq!(serde_json::from_str::<PersistedRoute>(nine).unwrap().channel, Some(9));
+    }
+
+    /// A missing channel is "follow the clip" at every version, so a route row
+    /// from a file that predates the field at all still loads.
+    #[test]
+    fn a_missing_channel_is_follow_the_clip() {
+        let json = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen"}"#;
+        let r: PersistedRoute = serde_json::from_str(json).unwrap();
+        assert_eq!(r.channel, None);
+    }
+
+    /// v1 -> v2: a `0` in a file written before the channel became an override
+    /// was `channel.unwrap_or(0)`, i.e. "never picked", and must load as
+    /// follow-the-clip — otherwise the reported drum bug survives the upgrade
+    /// for exactly the people who hit it.
+    #[test]
+    fn a_v1_zero_channel_migrates_to_follow_the_clip() {
+        let json = r#"{"projects":{"/p":{"routes":[
+            {"scope":"track","id":"t-1","port_name":"Hydrogen","channel":0},
+            {"scope":"track","id":"t-2","port_name":"Hydrogen","channel":9}
+        ]}}}"#;
+        let mut file: RoutingFile = serde_json::from_str(json).unwrap();
+        assert_eq!(file.version, 1, "a file with no version field reads as v1");
+        file.migrate();
+        let routes = &file.projects["/p"].routes;
+        assert_eq!(routes[0].channel, None, "the never-picked 0 becomes follow-the-clip");
+        assert_eq!(routes[1].channel, Some(9), "a deliberate pick stays forced");
+        assert_eq!(file.version, CURRENT_VERSION);
+    }
+
+    /// The other half, and the reason the migration is keyed on the VERSION and
+    /// not on the value: from v2 on, `0` is a legitimate "force MIDI channel 1"
+    /// — what a mono-timbral synth listening on channel 1 needs. Treating it as
+    /// "unset" would silently un-force it on the next project open, sending a GM
+    /// drum part back out on channel 10 and leaving that synth silent.
+    #[test]
+    fn a_v2_zero_channel_stays_a_forced_channel_one() {
+        let json = r#"{"version":2,"projects":{"/p":{"routes":[
+            {"scope":"track","id":"t-1","port_name":"Juno","channel":0}
+        ]}}}"#;
+        let mut file: RoutingFile = serde_json::from_str(json).unwrap();
+        file.migrate();
+        assert_eq!(file.projects["/p"].routes[0].channel, Some(0));
+    }
+
+    /// A file this build writes must survive its own round trip — the bug above
+    /// only exists if a fresh write is later read as v1.
+    #[test]
+    fn a_forced_channel_one_survives_a_save_load_round_trip() {
+        let dir = tmp_dir("forced-ch1-round-trip");
+        let path = dir.join("midi-routing.json");
+        let mut file = RoutingFile::default();
+        file.projects.insert(
+            "/p".into(),
+            ProjectRouting {
+                routes: vec![PersistedRoute {
+                    scope: "track".into(),
+                    id: "t-1".into(),
+                    port_name: "Juno".into(),
+                    channel: Some(0),
+                    return_device: None,
+                }],
+                open_ports: vec![],
+            },
+        );
+        save_to_path(&path, &file);
+        let back = load_from_path(&path);
+        assert_eq!(back.projects["/p"].routes[0].channel, Some(0));
+    }
+
+    /// A hand-edited or corrupt channel cannot forge a status byte.
+    #[test]
+    fn an_out_of_range_channel_is_clamped_not_trusted() {
+        let json = r#"{"version":2,"projects":{"/p":{"routes":[
+            {"scope":"track","id":"t-1","port_name":"Juno","channel":200}
+        ]}}}"#;
+        let mut file: RoutingFile = serde_json::from_str(json).unwrap();
+        file.migrate();
+        assert_eq!(file.projects["/p"].routes[0].channel, Some(200 & 0x0F));
+    }
+
+    #[test]
+    fn port_name_key_strips_only_a_trailing_alsa_address() {
+        assert_eq!(
+            port_name_key("Hydrogen:Hydrogen Midi-In 128:0"),
+            "Hydrogen:Hydrogen Midi-In"
+        );
+        // Same device, later session — both spell to the same key, which is
+        // the whole point.
+        assert_eq!(
+            port_name_key("Hydrogen:Hydrogen Midi-In 129:0"),
+            port_name_key("Hydrogen:Hydrogen Midi-In 128:0")
+        );
+        // Nothing that is not an address gets eaten.
+        assert_eq!(port_name_key("Hydrogen"), "Hydrogen");
+        assert_eq!(port_name_key("IAC Driver Bus 1"), "IAC Driver Bus 1");
+        assert_eq!(port_name_key("Weird:Port 12"), "Weird:Port 12");
+        assert_eq!(port_name_key("Weird:Port a:b"), "Weird:Port a:b");
+        assert_eq!(port_name_key("128:0"), "128:0");
+        assert_eq!(port_name_key(""), "");
     }
 
     /// Files written before X1 must still load — a missing `return_device`

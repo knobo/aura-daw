@@ -2170,7 +2170,11 @@ export class DemoBackend implements Backend {
     open.clockEnabled = enabled;
   }
 
-  async midiSetTrackRoute(trackId: string, portId: string | null, channel = 0): Promise<void> {
+  async midiSetTrackRoute(
+    trackId: string,
+    portId: string | null,
+    channel: number | null = null,
+  ): Promise<void> {
     // Only validate when actually routing: a leftover route to a track
     // that is already gone must stay clearable (portId: null) — the
     // orphan-forget case in the PATCH panel.
@@ -2192,7 +2196,11 @@ export class DemoBackend implements Backend {
     route.returnDevice = deviceId || null;
   }
 
-  async midiSetClipRoute(clipId: string, portId: string | null, channel = 0): Promise<void> {
+  async midiSetClipRoute(
+    clipId: string,
+    portId: string | null,
+    channel: number | null = null,
+  ): Promise<void> {
     // Same asymmetry as midiSetTrackRoute: clearing a leftover route to a
     // clip that is already gone must not fail the existence check.
     if (portId !== null && !this.midiClips.some((c) => c.id === clipId)) {
@@ -2224,7 +2232,12 @@ export class DemoBackend implements Backend {
    * MidiOut::set_route does. Any port id is accepted, open or not: the real
    * backend does not validate here either, and a route left pointing at a
    * device that went away is a state the panel has to render. */
-  private setMidiRoute(scope: "track" | "clip", id: string, portId: string | null, channel: number) {
+  private setMidiRoute(
+    scope: "track" | "clip",
+    id: string,
+    portId: string | null,
+    channel: number | null,
+  ) {
     const prev = this.midiRoutes.find((r) => r.scope === scope && r.id === id);
     this.midiRoutes = this.midiRoutes.filter((r) => !(r.scope === scope && r.id === id));
     if (portId === null) return;

@@ -30,6 +30,7 @@
   import { canvasPos } from "../../utils/canvas-pos";
   import {
     applyMarquee,
+    channelForNewNote,
     copySelection,
     marqueeHits,
     nudgeSelection,
@@ -305,7 +306,15 @@
     if (key < 0 || key > 127) return;
     const tick = snapTick(tickAtX(p.x), true);
     if (tick >= midi.effectiveContentLengthTicks(clip)) return;
-    const note: MidiNote = { tick, lengthTicks: gridTicks, key, velocity: 100, channel: 0 };
+    const note: MidiNote = {
+      tick,
+      lengthTicks: gridTicks,
+      key,
+      velocity: 100,
+      // Inherit the clip's own channel rather than assuming 1 — see
+      // `channelForNewNote`. A generated drum part lives on channel 10.
+      channel: channelForNewNote(working),
+    };
     working = [...working, note];
     const idx = working.length - 1;
     selection = new Set([idx]);

@@ -1272,8 +1272,8 @@ mod tests {
     fn live_node_renders_audibly_through_graph() {
         const RATE: u32 = 48_000;
         let events = vec![
-            AbsNoteEvent { sample: 1_000, key: 69, velocity: 110 },
-            AbsNoteEvent { sample: 9_000, key: 69, velocity: 0 },
+            AbsNoteEvent { sample: 1_000, key: 69, velocity: 110, channel: 0 },
+            AbsNoteEvent { sample: 9_000, key: 69, velocity: 0, channel: 0 },
         ];
         let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         assert!(!g.track_buf.is_empty(), "graph allocates the strip buffer at build");
@@ -1301,8 +1301,8 @@ mod tests {
     fn live_node_discontinuity_releases_voices() {
         const RATE: u32 = 48_000;
         let events = vec![
-            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 50_000, key: 60, velocity: 0 },
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 50_000, key: 60, velocity: 0, channel: 0 },
         ];
         let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; 512 * 2];
@@ -1329,8 +1329,8 @@ mod tests {
         // Note spans the whole loop; off is exactly at the loop end (never
         // inside the played region more than once).
         let events = vec![
-            AbsNoteEvent { sample: 0, key: 72, velocity: 100 },
-            AbsNoteEvent { sample: 40_000, key: 72, velocity: 0 },
+            AbsNoteEvent { sample: 0, key: 72, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 40_000, key: 72, velocity: 0, channel: 0 },
         ];
         let lp = LoopSpec { enabled: true, start: 0, end: 8_192 };
         let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
@@ -1505,8 +1505,8 @@ mod tests {
     fn render_live_input_only_ignores_scheduled_clip_events() {
         const RATE: u32 = 48_000;
         let scheduled = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-            crate::midi::schedule::AbsNoteEvent { sample: 40_000, key: 60, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 40_000, key: 60, velocity: 0, channel: 0 },
         ];
         let mut g = RtGraph::new(vec![live_track(0, scheduled, RATE)], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; 4_096 * 2];
@@ -1526,8 +1526,8 @@ mod tests {
         // renders scheduled events exactly as before.
         const RATE: u32 = 48_000;
         let events = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 1_000, key: 69, velocity: 110 },
-            crate::midi::schedule::AbsNoteEvent { sample: 9_000, key: 69, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 1_000, key: 69, velocity: 110, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 9_000, key: 69, velocity: 0, channel: 0 },
         ];
         let mut g = RtGraph::new(vec![live_track(0, events, RATE)], 1, Arc::new(ParamTable::default()));
         let mut out = vec![0.0f32; 4_096 * 2];
@@ -1621,7 +1621,7 @@ mod tests {
     fn track_gain_ramp_scales_live_output_too() {
         use crate::plugins::automation::AbsParamEvent;
         const RATE: u32 = 48_000;
-        let events = vec![AbsNoteEvent { sample: 0, key: 69, velocity: 110 }];
+        let events = vec![AbsNoteEvent { sample: 0, key: 69, velocity: 110, channel: 0 }];
 
         let mut control = RtGraph::new(
             vec![live_track(0, events.clone(), RATE)],

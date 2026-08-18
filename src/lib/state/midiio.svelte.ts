@@ -13,6 +13,11 @@ import { backend } from "../tauri";
 import type { MidiOutputPortStatus, MidiPortInfo, MidiRouteStatus } from "../types/ipc";
 
 const POLL_MS_DEFAULT = 500;
+/** How often the PORT LISTS are re-enumerated. Deliberately much slower than
+ * the status poll: each pass builds and drops a `midir` client (an ALSA-seq
+ * client create/destroy), where a status read is a few atomics. Two seconds is
+ * below what anyone notices when plugging a device in, and cheap. */
+const PORTS_POLL_MS = 2000;
 
 class MidiIoStore {
   inPorts = $state<MidiPortInfo[]>([]);
@@ -50,19 +55,38 @@ class MidiIoStore {
   }
 
   /** Both port lists, tolerant of a backend without the optional midi
-   * methods (demo mode has no hardware to simulate). */
+   * methods (demo mode has no hardware to simulate).
+   *
+   * A failed or empty enumeration leaves the previous list in place instead of
+   * blanking it: this now runs on a timer (see `startPolling`), and one
+   * unlucky read must not make every device vanish from the picker mid-click.
+   * A device that is genuinely gone still disappears — `list_*_ports` returns
+   * the others, so the list shrinks rather than emptying. */
   async loadPorts(): Promise<void> {
     const [inPorts, outPorts] = await Promise.all([
       backend.midiListInputPorts?.().catch(() => []) ?? Promise.resolve([]),
       backend.midiListOutputPorts?.().catch(() => []) ?? Promise.resolve([]),
     ]);
-    this.inPorts = inPorts;
-    this.outPorts = outPorts;
+    if (inPorts.length > 0 || this.inPorts.length === 0) this.inPorts = inPorts;
+    if (outPorts.length > 0 || this.outPorts.length === 0) this.outPorts = outPorts;
   }
 
   /** Poll both status endpoints at `intervalMs` (500 ms default) and mirror
-   * them into the store. Returns the stopper. */
+   * them into the store, and re-enumerate the PORT LISTS on a slower beat.
+   * Returns the stopper.
+   *
+   * The lists used to be read once when the panel mounted, so a device started
+   * after AURA — Carla, Hydrogen, a USB keyboard — never appeared in the picker
+   * and the documented workaround was to restart the app. The backend
+   * re-enumerates on every call already (`list_output_ports` builds and drops a
+   * throwaway `midir` client), so this only ever needed asking again.
+   *
+   * Slower than the status poll on purpose: enumeration creates and destroys an
+   * ALSA-seq client per call, where a status read is a few atomics. */
   startPolling(intervalMs: number = POLL_MS_DEFAULT): () => void {
+    const portsId = setInterval(() => {
+      void this.loadPorts().catch(() => {});
+    }, Math.max(intervalMs, PORTS_POLL_MS));
     const id = setInterval(() => {
       backend.midiInputStatus?.().then((s) => {
         this.inPortId = s.selected?.id ?? "";
@@ -77,7 +101,10 @@ class MidiIoStore {
         this.routes = s.routes;
       }).catch(() => {});
     }, intervalMs);
-    return () => clearInterval(id);
+    return () => {
+      clearInterval(id);
+      clearInterval(portsId);
+    };
   }
 
   async selectInPort(id: string): Promise<void> {
@@ -109,7 +136,12 @@ class MidiIoStore {
     await backend.midiSetOutputClockEnabled?.(portId, on);
   }
 
-  async setTrackRoute(trackId: string, portId: string | null, channel = 0): Promise<void> {
+  /** `channel` null (the default) = each note keeps its own MIDI channel. */
+  async setTrackRoute(
+    trackId: string,
+    portId: string | null,
+    channel: number | null = null,
+  ): Promise<void> {
     const prev = this.trackRoute(trackId);
     this.routes = this.routes.filter((r) => !(r.scope === "track" && r.id === trackId));
     if (portId) {
@@ -128,7 +160,12 @@ class MidiIoStore {
     await backend.midiSetTrackReturn?.(trackId, deviceId);
   }
 
-  async setClipRoute(clipId: string, portId: string | null, channel = 0): Promise<void> {
+  /** `channel` null (the default) = each note keeps its own MIDI channel. */
+  async setClipRoute(
+    clipId: string,
+    portId: string | null,
+    channel: number | null = null,
+  ): Promise<void> {
     this.routes = this.routes.filter((r) => !(r.scope === "clip" && r.id === clipId));
     if (portId) this.routes = [...this.routes, { scope: "clip", id: clipId, portId, channel }];
     await backend.midiSetClipRoute?.(clipId, portId, channel);

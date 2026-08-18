@@ -420,13 +420,13 @@ export interface Backend {
   /** Route this MIDI track's notes to a port+channel, or `portId: null` to
    * clear the route. A clip's own route (below) always wins over its
    * track's. */
-  midiSetTrackRoute?(trackId: string, portId: string | null, channel?: number): Promise<void>;
+  midiSetTrackRoute?(trackId: string, portId: string | null, channel?: number | null): Promise<void>;
   /** Pick (or `deviceId: null` to clear) the audio-return input on a
    * routed MIDI track. The track must already have a MIDI-out route. */
   midiSetTrackReturn?(trackId: string, deviceId: string | null): Promise<void>;
   /** Route one MIDI clip's notes, overriding its track's route, or
    * `portId: null` to fall back to the track's routing. */
-  midiSetClipRoute?(clipId: string, portId: string | null, channel?: number): Promise<void>;
+  midiSetClipRoute?(clipId: string, portId: string | null, channel?: number | null): Promise<void>;
   midiOutputStatus?(): Promise<MidiOutputStatus>;
 
   // ── MIDI launch map (note → region/clip) ──
@@ -961,13 +961,13 @@ class TauriBackend implements Backend {
   async midiSetOutputClockEnabled(portId: string, enabled: boolean) {
     await invoke("midi_set_output_clock_enabled", { portId, enabled });
   }
-  async midiSetTrackRoute(trackId: string, portId: string | null, channel?: number) {
+  async midiSetTrackRoute(trackId: string, portId: string | null, channel?: number | null) {
     await invoke("midi_set_track_route", { trackId, portId, channel: channel ?? null });
   }
   async midiSetTrackReturn(trackId: string, deviceId: string | null) {
     await invoke("midi_set_track_return", { trackId, deviceId });
   }
-  async midiSetClipRoute(clipId: string, portId: string | null, channel?: number) {
+  async midiSetClipRoute(clipId: string, portId: string | null, channel?: number | null) {
     await invoke("midi_set_clip_route", { clipId, portId, channel: channel ?? null });
   }
   midiOutputStatus() {

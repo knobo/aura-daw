@@ -70,7 +70,11 @@ export interface MidiRouteStatus {
   scope: "track" | "clip";
   id: string;
   portId: string;
-  channel: number;
+  /** Forced output channel 0-15, or null for "each note on the channel it
+   * carries in the clip" — the default, and the only setting under which a
+   * General MIDI drum part reaches a drum machine (GM drums are channel 10,
+   * 0-based 9, which is what the Composer writes). */
+  channel: number | null;
   /** cpal input-device name this track records its audio return from. Clip
    * routes never have one; missing/null = MIDI-only. */
   returnDevice?: string | null;

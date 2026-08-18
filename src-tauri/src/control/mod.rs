@@ -2050,14 +2050,53 @@ impl ControlPlane {
     /// unit test's `ControlPlane` has an unattached `midi_out`, and the
     /// methods below error instead of panicking.
     pub fn attach_midi_out(&self, out: Arc<crate::midi_out::MidiOut>) {
+        // Every change to the routing table — from here, from the panel, from
+        // a project adopt, from the port thread's own self-heal — has to reach
+        // the engine, because routing is app config and never rides a commit.
+        // One hook installed here does that, instead of a `publish` call
+        // remembered at each of six sites (which is how two delete paths came
+        // to be missed; see `midi_out::RoutesChanged`).
+        //
+        // WEAK, deliberately: the hook lives inside `MidiOut`, so a strong
+        // reference back to it would be a cycle that never drops.
+        let engine = self.engine.clone();
+        let weak = Arc::downgrade(&out);
+        out.set_routes_changed_hook(std::sync::Arc::new(move || {
+            if let Some(out) = weak.upgrade() {
+                engine.send(ControlMsg::SetExternalRouting(std::sync::Arc::new(
+                    out.routed_out(),
+                )));
+            }
+        }));
         // `OnceLock::set` returning `Err` (already attached) is silently
         // ignored — lib.rs calls this exactly once in `setup`, and a
         // hypothetical second call losing is harmless (first attach wins).
         let _ = self.midi_out.set(out);
+        // Seed the engine with whatever the table already holds; the hook only
+        // fires on later changes.
+        self.publish_external_routing();
     }
 
     fn midi_out(&self) -> Result<&Arc<crate::midi_out::MidiOut>, String> {
         self.midi_out.get().ok_or_else(|| "midi output driver not attached".to_string())
+    }
+
+    /// Push the current routing table to the engine, so a routed track's
+    /// internal instrument stops (or resumes) sounding.
+    ///
+    /// Normal changes do NOT come through here — `attach_midi_out` installs a
+    /// `RoutesChanged` hook on `MidiOut` that fires on every mutation, which is
+    /// the only way to cover the port thread's self-heal as well. This is the
+    /// seeding call for attach time, and the answer for a `ControlPlane` with no
+    /// `MidiOut` attached (every unit test): an empty table, which is correct.
+    fn publish_external_routing(&self) {
+        let routed = self
+            .midi_out
+            .get()
+            .map(|out| out.routed_out())
+            .unwrap_or_default();
+        self.engine
+            .send(ControlMsg::SetExternalRouting(std::sync::Arc::new(routed)));
     }
 
     /// The current project's directory, if it has one yet (an unsaved
@@ -2129,7 +2168,7 @@ impl ControlPlane {
         &self,
         track_id: String,
         port_id: Option<String>,
-        channel: u8,
+        channel: Option<u8>,
         meta: op::TxMeta,
     ) -> Result<(), String> {
         // Only validate when actually routing to a track: a leftover route
@@ -2153,7 +2192,7 @@ impl ControlPlane {
             }
         }
         log::info!(
-            "set_midi_track_route: actor={:?} label={:?} track={track_id} port={port_id:?} channel={channel}",
+            "set_midi_track_route: actor={:?} label={:?} track={track_id} port={port_id:?} channel={channel:?}",
             meta.actor,
             meta.label
         );
@@ -2208,7 +2247,7 @@ impl ControlPlane {
         &self,
         clip_id: String,
         port_id: Option<String>,
-        channel: u8,
+        channel: Option<u8>,
         meta: op::TxMeta,
     ) -> Result<(), String> {
         // Same asymmetry as `set_midi_track_route`: clearing a leftover
@@ -2221,7 +2260,7 @@ impl ControlPlane {
             }
         }
         log::info!(
-            "set_midi_clip_route: actor={:?} label={:?} clip={clip_id} port={port_id:?} channel={channel}",
+            "set_midi_clip_route: actor={:?} label={:?} clip={clip_id} port={port_id:?} channel={channel:?}",
             meta.actor,
             meta.label
         );
@@ -7283,7 +7322,7 @@ mod tests {
         cp.attach_midi_out(Arc::clone(&out));
         let keys = cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
         let other = cp.add_track(Some("Pads".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
-        cp.set_midi_track_route(other.id.to_string(), Some("x#0".into()), 0, TxMeta::user("route")).unwrap();
+        cp.set_midi_track_route(other.id.to_string(), Some("x#0".into()), None, TxMeta::user("route")).unwrap();
 
         cp.remove_track(keys.id.as_str(), TxMeta::user("delete")).unwrap();
         assert!(
@@ -7657,7 +7696,7 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &crate::midi_out::RoutedOut::default(), &mut nodes, &mut out);
         assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
@@ -7762,7 +7801,7 @@ mod tests {
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
         let doc = session.lock().plugin_snapshot();
-        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &crate::midi_out::RoutedOut::default(), &mut nodes, &mut out);
         assert_eq!(out.len(), 3);
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(
