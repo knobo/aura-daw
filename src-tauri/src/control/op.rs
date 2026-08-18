@@ -351,7 +351,7 @@ pub enum ObjectRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PropPath {
-    Gain, Pan, Muted, Soloed, Armed,
+    Gain, Pan, Muted, Soloed, Armed, AutomationMode,
     /// Track: sampler-bank id or `plugin:<instanceId>`, `None` = unbound.
     /// Wire form: JSON string or `null` (not an `Option`-shaped object).
     InstrumentId,

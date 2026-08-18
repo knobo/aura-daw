@@ -495,6 +495,7 @@ impl Committer {
                     // no rebuild — `apply_raw` never pushes it here either.
                     op::PropPath::Name
                     | op::PropPath::Armed
+                    | op::PropPath::AutomationMode
                     | op::PropPath::InstrumentId
                     | op::PropPath::Group
                     | op::PropPath::TimelineStartSamples
@@ -1412,6 +1413,9 @@ fn apply_mix_changes(changes: &[TrackMixChange], tx: &mut session::Tx<'_>) -> Re
         }
         if let Some(a) = c.armed {
             tx.apply(set_prop(&c.track_id, op::PropPath::Armed, serde_json::json!(a)))?;
+        }
+        if let Some(m) = c.automation_mode {
+            tx.apply(set_prop(&c.track_id, op::PropPath::AutomationMode, serde_json::json!(m)))?;
         }
     }
     Ok(())
@@ -6222,6 +6226,57 @@ mod tests {
             "failed batch must not announce a change"
         );
         engine.send(crate::audio::engine::ControlMsg::Shutdown);
+    }
+
+    /// Task 2: `set_track_mix` writes `automation_mode` through the new
+    /// `PropPath::AutomationMode` arm and returns the as-applied value.
+    /// Structural (mirrors `InstrumentId`): changing the mode must trigger a
+    /// rebuild, or an already-published `RtGraph::gain_ramps` slot would
+    /// keep applying an Off track's lane until the NEXT unrelated rebuild.
+    #[test]
+    fn set_track_mix_updates_automation_mode_and_triggers_rebuild() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+
+        let updated = plane
+            .set_track_mix(
+                vec![TrackMixChange {
+                    automation_mode: Some(AutomationMode::Off),
+                    ..TrackMixChange::new("t-1")
+                }],
+                TxMeta::user("set track mix"),
+            )
+            .unwrap();
+
+        assert_eq!(updated[0].automation_mode, AutomationMode::Off);
+        assert!(
+            engine_rx.try_iter().any(|m| matches!(m, ControlMsg::Rebuild)),
+            "expected a Rebuild message"
+        );
+    }
+
+    /// Task 2: an `automation_mode` change is a normal undoable `Set` op —
+    /// undo restores the prior mode, same as any other track property.
+    #[test]
+    fn set_track_automation_mode_round_trips_through_undo() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        plane
+            .set_track_mix(
+                vec![TrackMixChange {
+                    automation_mode: Some(AutomationMode::Write),
+                    ..TrackMixChange::new("t-1")
+                }],
+                TxMeta::user("set mode"),
+            )
+            .unwrap();
+        assert_eq!(
+            plane.session().lock().store.tracks.iter().find(|t| t.id == "t-1").unwrap().automation_mode,
+            AutomationMode::Write
+        );
+        plane.undo().unwrap();
+        assert_eq!(
+            plane.session().lock().store.tracks.iter().find(|t| t.id == "t-1").unwrap().automation_mode,
+            AutomationMode::Read
+        );
     }
 
     /// I-3 (Plan E whole-branch review): `execute_host_forward`'s Instantiate

@@ -209,6 +209,7 @@ pub fn run() {
             audio::set_track_mute,
             audio::set_track_solo,
             audio::set_track_arm,
+            audio::set_track_automation_mode,
             audio::set_track_name,
             audio::set_track_group,
             audio::arrange_lanes,

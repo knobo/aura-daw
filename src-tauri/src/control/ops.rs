@@ -26,6 +26,7 @@ pub struct TrackMixChange {
     pub muted: Option<bool>,
     pub soloed: Option<bool>,
     pub armed: Option<bool>,
+    pub automation_mode: Option<crate::audio::types::AutomationMode>,
 }
 
 impl TrackMixChange {
@@ -37,6 +38,7 @@ impl TrackMixChange {
             muted: None,
             soloed: None,
             armed: None,
+            automation_mode: None,
         }
     }
 }

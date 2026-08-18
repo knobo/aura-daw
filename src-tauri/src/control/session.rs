@@ -5,7 +5,7 @@ use std::collections::HashMap;
 
 use std::sync::Arc;
 
-use crate::audio::types::{Store, TrackState, TransportState};
+use crate::audio::types::{AutomationMode, Store, TrackState, TransportState};
 use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use crate::control::snapshot::{charge_of, ChangeSet, SessionSnapshot};
 use crate::ids::TrackId;
@@ -698,6 +698,15 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 // triggers a rebuild + persists the project, instead of the
                 // mix-param-table writes below (InstrumentId has no RT
                 // param counterpart — nothing there to write).
+                effect.rebuild = true;
+                effect.persist.project = true;
+                return Ok(inverse);
+            }
+            if matches!(path, PropPath::AutomationMode) {
+                // Structural: which lanes `compile_track_ramps` attaches
+                // depends on this field (Off skips the lane entirely), so
+                // changing it must rebuild — there is no ParamTable
+                // counterpart to write live, same reasoning as InstrumentId.
                 effect.rebuild = true;
                 effect.persist.project = true;
                 return Ok(inverse);
@@ -1836,6 +1845,7 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         PropPath::Muted => Ok(serde_json::json!(t.muted)),
         PropPath::Soloed => Ok(serde_json::json!(t.soloed)),
         PropPath::Armed => Ok(serde_json::json!(t.armed)),
+        PropPath::AutomationMode => Ok(serde_json::json!(t.automation_mode)),
         // Option<String> serializes as a JSON string or null, never a
         // wrapping object — same wire shape `write_prop` below accepts.
         PropPath::InstrumentId => Ok(serde_json::json!(t.instrument_id)),
@@ -1892,6 +1902,12 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
             let v = to.as_bool().ok_or("armed: expected a bool")?;
             t.armed = v;
             Ok(serde_json::json!(t.armed))
+        }
+        PropPath::AutomationMode => {
+            let v: AutomationMode = serde_json::from_value(to.clone())
+                .map_err(|e| format!("automationMode: {e}"))?;
+            t.automation_mode = v;
+            Ok(serde_json::json!(t.automation_mode))
         }
         PropPath::InstrumentId => {
             let v = match to {
@@ -1978,6 +1994,7 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::Muted
         | PropPath::Soloed
         | PropPath::Armed
+        | PropPath::AutomationMode
         | PropPath::InstrumentId
         | PropPath::Group
         | PropPath::TimelineStartSamples
@@ -2053,6 +2070,7 @@ fn write_midi_prop(
         | PropPath::Muted
         | PropPath::Soloed
         | PropPath::Armed
+        | PropPath::AutomationMode
         | PropPath::InstrumentId
         | PropPath::Group
         | PropPath::TimelineStartSamples
@@ -2090,6 +2108,7 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::Muted
         | PropPath::Soloed
         | PropPath::Armed
+        | PropPath::AutomationMode
         | PropPath::InstrumentId
         | PropPath::Group
         | PropPath::Name
@@ -2163,6 +2182,7 @@ fn write_transport_prop(
         | PropPath::Muted
         | PropPath::Soloed
         | PropPath::Armed
+        | PropPath::AutomationMode
         | PropPath::InstrumentId
         | PropPath::Group
         | PropPath::Name

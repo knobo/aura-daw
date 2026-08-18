@@ -386,6 +386,10 @@ impl AuraMcpHandler {
                 muted: c.muted,
                 soloed: c.soloed,
                 armed: c.armed,
+                // MCP's `SetTrackMixParams` doesn't expose automation mode
+                // (out of this task's scope — Task 2 wires the property
+                // through the control plane/Tauri command only).
+                automation_mode: None,
             })
             .collect();
         let meta = TxMeta::agent(
