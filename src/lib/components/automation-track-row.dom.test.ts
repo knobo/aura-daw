@@ -1,0 +1,259 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import type { AutomationClip, Curve, TrackState } from "../types/ipc";
+
+/**
+ * `AutomationTrackRow`'s pointer/gesture handlers, mounted for real. The
+ * Track D handoff (`docs/PHASE4-PLAN.md`) names this exact class of code —
+ * ordering of async effects inside a `.svelte` event handler — as the
+ * uncovered gap where both of that track's real frontend bugs lived,
+ * because until now nothing could mount a component to exercise it.
+ *
+ * jsdom's `canvas.getContext("2d")` returns `null`, so the component's
+ * `paint()` early-returns and no canvas rendering is exercised here — only
+ * the pointer/gesture handler logic is under test.
+ */
+
+let curvesOnServer: Curve[] = [];
+let clipsOnServer: AutomationClip[] = [];
+
+// `curve`/`clip` objects read out of the component's Svelte 5 $state
+// arrays are reactive Proxies; structuredClone throws DataCloneError on
+// them. JSON round-trip is a safe, sufficient clone for this file's plain
+// data shapes.
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T;
+}
+
+function snapshot() {
+  return {
+    curves: curvesOnServer.map((c) => clone(c)),
+    bindings: [],
+    automationClips: clipsOnServer.map((c) => clone(c)),
+  };
+}
+
+// Lets a test hold `modulationSetCurve`'s round trip open — exactly like
+// the real IPC round trip is open while the backend processes it — so it
+// can assert the gesture has NOT closed yet, then release the reply and
+// assert it closes only after. Mirrors the pattern in
+// `src/lib/state/automation-gesture.test.ts`.
+let holdCurveReply = false;
+let pendingCurveReplies: (() => void)[] = [];
+
+function releasePendingCurveReplies() {
+  const resolvers = pendingCurveReplies;
+  pendingCurveReplies = [];
+  resolvers.forEach((resolve) => resolve());
+}
+
+// The resolve -> commit's await -> adopt -> commitInGesture's promise ->
+// its own .then(...) chain is a few microtask hops deep; a fixed count of
+// `await Promise.resolve()` is fragile against that depth. A macrotask
+// boundary flushes all of them regardless.
+function flushMicrotasks() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+const modulationSetCurve = vi.fn((curve: Curve) => {
+  const i = curvesOnServer.findIndex((c) => c.id === curve.id);
+  if (i >= 0) curvesOnServer[i] = clone(curve);
+  else curvesOnServer.push(clone(curve));
+  if (!holdCurveReply) return Promise.resolve(snapshot());
+  return new Promise<ReturnType<typeof snapshot>>((resolve) => {
+    pendingCurveReplies.push(() => resolve(snapshot()));
+  });
+});
+
+const automationClipSet = vi.fn((clip: AutomationClip, remove?: boolean) => {
+  if (remove) clipsOnServer = clipsOnServer.filter((c) => c.id !== clip.id);
+  else {
+    const i = clipsOnServer.findIndex((c) => c.id === clip.id);
+    if (i >= 0) clipsOnServer[i] = clone(clip);
+    else clipsOnServer.push(clone(clip));
+  }
+  return Promise.resolve(snapshot());
+});
+
+const gestureBegin = vi.fn((label: string) => Promise.resolve(`gesture-${label}`));
+const gestureEnd = vi.fn((_id: string) => Promise.resolve());
+
+vi.mock("../tauri", () => ({
+  backend: {
+    mode: "tauri",
+    on: () => () => {},
+    gestureBegin,
+    gestureEnd,
+    modulationSetCurve,
+    automationClipSet,
+  },
+}));
+
+const { default: AutomationTrackRow } = await import("./AutomationTrackRow.svelte");
+const { modulation } = await import("../state/modulation.svelte");
+const { midi } = await import("../state/midi.svelte");
+
+// 120 BPM @ 48 kHz, identity-ish (25 samples/tick). See this plan's Global
+// Constraints for why an unseeded `sectionTable` silently hides every clip.
+const SECTION_TABLE = [{ startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 254_016_000 }];
+
+function seedTrack(): TrackState {
+  return {
+    id: "t-1",
+    name: "Auto",
+    kind: "automation",
+    gainDb: 0,
+    pan: 0,
+    muted: false,
+    soloed: false,
+    armed: false,
+    color: "#38bdf8",
+  };
+}
+
+function seedCurve(): Curve {
+  return { id: "curve-1", name: "Cutoff", points: [{ tick: 0, value: 1 }] };
+}
+
+function seedClip(): AutomationClip {
+  return {
+    id: "clip-1",
+    trackId: "t-1",
+    curveId: "curve-1",
+    timelineStartTicks: 0,
+    lengthTicks: 1920,
+    contentLengthTicks: 1920,
+  };
+}
+
+function seed() {
+  midi.sectionTable = SECTION_TABLE;
+  modulation.curves = [seedCurve()];
+  modulation.automationClips = [seedClip()];
+}
+
+afterEach(() => {
+  cleanup();
+  curvesOnServer = [];
+  clipsOnServer = [];
+  vi.clearAllMocks();
+  modulation.curves = [];
+  modulation.automationClips = [];
+  midi.sectionTable = [];
+  holdCurveReply = false;
+  pendingCurveReplies = [];
+});
+
+describe("AutomationTrackRow", () => {
+  it("a plain click (move mode) selects the clip and shows the delete button", async () => {
+    seed();
+    render(AutomationTrackRow, { props: { track: seedTrack() } });
+
+    const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    // jsdom's default zero rect makes the near-right-edge test true for
+    // any clientX >= (rect.right - EDGE_PX); stub a realistic rect and
+    // click well inside it, off the seeded point, so this genuinely
+    // exercises "move" mode rather than falling through to "resize".
+    clipEl.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, right: 40, bottom: 20, width: 40, height: 20 }) as DOMRect;
+    expect(screen.queryByRole("button", { name: /delete automation clip/i })).toBeNull();
+
+    await fireEvent.pointerDown(clipEl, { clientX: 20, clientY: 5, button: 0 });
+    await fireEvent.pointerUp(clipEl, { clientX: 20, clientY: 5, button: 0 });
+
+    expect(screen.getByRole("button", { name: /delete automation clip/i })).toBeTruthy();
+    expect(automationClipSet).not.toHaveBeenCalled();
+    expect(gestureBegin).not.toHaveBeenCalled();
+  });
+
+  it("clicking the delete button removes the clip", async () => {
+    seed();
+    render(AutomationTrackRow, { props: { track: seedTrack() } });
+
+    const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    await fireEvent.pointerDown(clipEl, { clientX: 50, clientY: 5, button: 0 });
+    await fireEvent.pointerUp(clipEl, { clientX: 50, clientY: 5, button: 0 });
+
+    const delBtn = screen.getByRole("button", { name: /delete automation clip/i });
+    await fireEvent.click(delBtn);
+
+    expect(automationClipSet).toHaveBeenCalledTimes(1);
+    expect(automationClipSet).toHaveBeenCalledWith(expect.objectContaining({ id: "clip-1" }), true);
+  });
+
+  it("alt-click on an existing point deletes it and closes the SAME gesture only after the delete commits", async () => {
+    seed();
+    holdCurveReply = true;
+    render(AutomationTrackRow, { props: { track: seedTrack() } });
+
+    const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    // clientX/Y = 0 lands exactly on the seeded point (tick 0, value 1) —
+    // canvasPos falls back to a 1:1 scale under jsdom's zero-rect default
+    // (see this plan's Global Constraints), so {x, y} = {clientX, clientY}.
+    await fireEvent.pointerDown(clipEl, { clientX: 0, clientY: 0, button: 0, altKey: true });
+    // commitInGesture's .then(...) is a microtask chain off an unawaited
+    // promise in the handler; give it two ticks to run.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(gestureBegin).toHaveBeenCalledTimes(1);
+    expect(gestureBegin).toHaveBeenCalledWith("automation delete point");
+    expect(modulationSetCurve).toHaveBeenCalledTimes(1);
+    expect(modulationSetCurve.mock.calls[0][0].points).toEqual([]);
+    // The commit's round trip is still open (held) — the gesture must not
+    // have closed yet. A component that closes the gesture without
+    // awaiting the commit's result (the exact race this file exists to
+    // catch) would fail this line.
+    expect(gestureEnd).not.toHaveBeenCalled();
+
+    holdCurveReply = false;
+    releasePendingCurveReplies();
+    await flushMicrotasks();
+
+    expect(gestureEnd).toHaveBeenCalledTimes(1);
+    expect(gestureEnd).toHaveBeenCalledWith("gesture-automation delete point");
+  });
+
+  it("dragging a point commits once on pointerup, not on every pointermove", async () => {
+    seed();
+    render(AutomationTrackRow, { props: { track: seedTrack() } });
+
+    const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    const canvasEl = document.querySelector("canvas") as HTMLCanvasElement;
+    // jsdom implements no Pointer Capture API at all; the point-edit path
+    // calls `canvas.setPointerCapture` unconditionally (see Global
+    // Constraints).
+    Object.defineProperty(canvasEl, "setPointerCapture", { value: vi.fn(), writable: true });
+    // jsdom's default zero rect makes the near-right-edge test
+    // (`rect.right - clientX <= EDGE_PX`) true for any non-negative
+    // clientX, which would misroute this click to "resize" instead of
+    // "point" — stub the div's rect to its actual rendered size.
+    clipEl.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, right: 40, bottom: 20, width: 40, height: 20 }) as DOMRect;
+
+    await fireEvent.pointerDown(clipEl, { clientX: 0, clientY: 0, button: 0 });
+    expect(gestureBegin).toHaveBeenCalledTimes(1);
+    expect(gestureBegin).toHaveBeenCalledWith("automation edit");
+
+    await fireEvent.pointerMove(clipEl, { clientX: 0, clientY: 1 });
+    await fireEvent.pointerMove(clipEl, { clientX: 0, clientY: 1 });
+    expect(modulationSetCurve).not.toHaveBeenCalled();
+
+    holdCurveReply = true;
+    await fireEvent.pointerUp(clipEl, { clientX: 0, clientY: 1, button: 0 });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(modulationSetCurve).toHaveBeenCalledTimes(1);
+    expect(modulationSetCurve.mock.calls[0][0].points).toEqual([{ tick: 0, value: 0 }]);
+    // The commit's round trip is still open (held) — the gesture must not
+    // have closed yet.
+    expect(gestureEnd).not.toHaveBeenCalled();
+
+    holdCurveReply = false;
+    releasePendingCurveReplies();
+    await flushMicrotasks();
+
+    expect(gestureEnd).toHaveBeenCalledTimes(1);
+  });
+});
