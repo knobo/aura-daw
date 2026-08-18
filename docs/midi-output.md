@@ -51,15 +51,26 @@ knob to change — it is a one-line behaviour swap in `midi_out.rs`.
 **Tempo changes** reach every slaved port within about 250 ms (each port's
 own out thread re-snapshots the tempo map on that cadence).
 
-**Expect an occasional re-cue on a long take, with no loop involved.**
-Between transport events each port's clock is paced by the system clock
-from an anchor set at start; AURA's audio runs on the soundcard's clock. The
-two differ by a few tens of parts per million on ordinary hardware, so the
-gap crosses the 20 ms threshold roughly every 5–10 minutes of continuous
-play and that port's thread re-anchors with the same `Stop`/SPP/`Continue`
-a loop wrap uses. The tempo stays right; you hear the re-cue. Re-anchoring
-more often than the threshold would trade the artifact for jitter, which is
-why it is where it is.
+**Expect a rare re-cue on a long take, with no loop involved.**
+Between transport events each port's clock is paced by the system clock from an
+anchor set at start; AURA's audio runs on the soundcard's clock. The two differ
+by a few tens of parts per million on ordinary hardware, so the gap eventually
+crosses the tolerance and that port's thread re-anchors with the same
+`Stop`/SPP/`Continue` a loop wrap uses. The tempo stays right; you may hear the
+re-cue. Notes are NOT lost when it happens — the scheduler plays straight
+through a forward correction.
+
+The tolerance is two audio blocks, or 20 ms, whichever is larger. It has to
+exceed the block, because the playhead only moves when an audio callback runs:
+between callbacks it lags the wall clock by up to a full block and then catches
+up in one step, and a threshold under the block size mistakes that sawtooth for
+a seek *on every block*. It used to be a flat 20 ms, which is smaller than
+PipeWire's default 1024-frame quantum at 48 kHz (21.3 ms) — so on a stock
+PipeWire setup AURA re-cued the device about 1500 times a second. Nothing
+downstream could play under that, and the flood of realtime bytes overran the
+receiving ALSA-seq client's event pool, taking notes down with it. If you are on
+a build from before that fix, this is what "the device starts but never plays"
+and "a few hits, then a gap" were.
 
 ---
 
@@ -213,9 +224,11 @@ and the workaround today is a smaller audio buffer.
   While you are in `aconnect -l`, also look for the device's *output* port
   feeding back into Midi Through and thus into its own input — Hydrogen ships
   with MIDI feedback on, and that loop is its own source of confusion.
-* **Hydrogen restarts itself now and then.** Two causes, both above: the
-  loop re-cue on every wrap, and the periodic clock re-anchor on long
-  continuous playback. Neither is a fault you can configure away today.
+* **Hydrogen restarts itself now and then.** The loop re-cue on every wrap, and
+  the rare clock re-anchor on long continuous playback (both above). Neither is
+  configurable today. If it happens *constantly* — many times a second, so the
+  device never gets going — that is the pre-fix drift tolerance described under
+  Recipe 1, not your setup.
 * **A note hangs on the external device.** AURA releases sounding notes
   when you close a port, change a route, edit a routed clip, or close the
   app. If one hangs anyway, clear the route (or close the port) and set it

@@ -57,7 +57,39 @@ route's channel (a `u8` defaulting to 0) was stamped over every note. MIDI
 * `append_from` now forwards to `append_from_with_input` instead of
   duplicating its loop, as its doc already claimed.
 
-## Still open — NOT AURA bugs, but they were in the reporter's way
+## The root cause, found later: a re-cue storm
+
+The channel bug above is real, but it is NOT what made the device look broken.
+Snooping the ALSA-seq port the device listens on, during a real session, gave:
+
+| | count |
+|---|---|
+| `Stop` -> `SongPosition` -> `Continue` triples | **31 676** |
+| clock pulses | 22 429 |
+| note-ons | 950 |
+
+`midi_out`'s clock engine was re-cueing the device roughly 1500 times a second.
+`drift_tolerance` was a flat `rate / 50` (960 samples, 20 ms at 48 kHz) while
+PipeWire's default quantum is 1024 frames (21.3 ms) — and `SharedRt::position`
+only moves when an audio callback runs, so the divergence sawtooths up to one
+full block every block. The threshold sat *below* the sawtooth it existed to
+ignore, so it tripped forever. Nothing downstream can start under that, and the
+flood of realtime bytes overran the receiving client's event pool, so notes were
+dropped as collateral — heard as "three or four hits, a gap, three or four
+hits".
+
+Fixed by publishing `SharedRt::block_frames` from the callback and sizing the
+tolerance as `max(rate / 50, 2 * block)`, plus making a small forward resync
+advance through the gap instead of `reseek`ing past it. `midi_out::tests::
+a_pipewire_sized_block_does_not_re_cue_the_device` is the regression test.
+
+**Why the existing test missed it:** `block_quantized_position_does_not_trigger_a_resync`
+used a 480-frame block — 10 ms, which happens to fit under 20 ms. Block size was
+the variable that mattered and nothing varied it. A test that pins the intended
+*behaviour* at one arbitrary parameter value is not the same as a test of the
+behaviour.
+
+## Also in the reporter's way — NOT AURA bugs
 
 `aconnect -l` on the reporting machine showed **two paths from AURA into
 Hydrogen at once**: a direct subscription to `Hydrogen:Hydrogen Midi-In`, and a
@@ -68,10 +100,16 @@ tempo. Hydrogen's own output was also looping back into Midi Through and thence
 into its own input (`enable_midi_feedback: true`).
 
 AURA cannot detect this; from its side they are two unrelated ports. Added to
-`docs/midi-output.md`'s troubleshooting section. **The owner has not yet
-re-tested by ear with this branch**, so whether the channel fix alone makes
-Hydrogen play is unconfirmed — the wire-level assertion is, the ear check is
-not.
+`docs/midi-output.md`'s troubleshooting section.
+
+Carla, which the owner moved to mid-session, publishes **no ALSA-seq port at all**
+when its engine is JACK — so it is invisible to AURA's `midir` ALSA backend no
+matter how long you wait. The way in was PipeWire's ALSA-seq/JACK-MIDI bridge
+(client `PipeWire-RT-Event`), patched in Carla's own patchbay. Also documented.
+
+The owner confirmed by ear that a routed track reaches another MIDI application,
+and that the internal synth used to double it. The re-cue fix was reported as
+"better" but has not been confirmed against a fresh wire capture yet.
 
 If a simpler target is wanted for the next ear check: anything that maps GM
 percussion without a session concept is less work than Hydrogen — a soundfont
