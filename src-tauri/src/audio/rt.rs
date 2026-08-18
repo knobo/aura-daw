@@ -76,6 +76,22 @@ pub struct SharedRt {
     /// the one that knows. Mechanism, not policy: the callback never decides
     /// to park, only carries out a position already computed for it.
     pub park: AtomicU64,
+    /// Frames in the output callback's most recent block, or 0 before the
+    /// first one.
+    ///
+    /// Published so a consumer of [`Self::position`] can tell **block
+    /// quantization apart from a transport jump**. `position` only moves when
+    /// a callback runs, so anything reading it against a continuous clock sees
+    /// it lag by up to one full block and then catch up in one step. A reader
+    /// that treats that step as a seek will do so on every block, forever:
+    /// `midi_out`'s clock engine did exactly that on a PipeWire quantum of
+    /// 1024 frames at 48 kHz (21.3 ms) against a fixed 20 ms tolerance, and
+    /// re-cued the external device roughly 1500 times a second. See
+    /// `midi_out::drift_tolerance`.
+    ///
+    /// Written by the RT callback (one relaxed store per block, no
+    /// synchronization implied); read by non-RT threads.
+    pub block_frames: AtomicU32,
     /// Ring-buffer over/underrun count since engine start.
     pub xruns: AtomicU64,
     /// Engine-global CLAP `steady_time` base, in samples — advanced ONCE
@@ -129,6 +145,7 @@ impl Default for SharedRt {
             song_end: AtomicU64::new(0),
             stop_at_end: AtomicBool::new(true),
             park: AtomicU64::new(NO_PARK),
+            block_frames: AtomicU32::new(0),
             xruns: AtomicU64::new(0),
             steady: AtomicU64::new(0),
             metro_on: AtomicBool::new(false),

@@ -42,7 +42,10 @@
     row.target && row.target.health !== "open" ? row.target.health : null,
   );
 
-  function jackLabel(name: string, r: { portName: string; channel: number; health: string } | null): string {
+  function jackLabel(
+    name: string,
+    r: { portName: string; channel: number | null; health: string } | null,
+  ): string {
     if (!r) return `${name} is not patched — pick a port`;
     const note =
       r.health === "closed"
@@ -50,7 +53,8 @@
         : r.health === "missing"
           ? ", device missing"
           : "";
-    return `${name} → ${r.portName}, channel ${r.channel + 1}${note} — edit this patch`;
+    const chan = r.channel === null ? "channel from clip" : `channel ${r.channel + 1}`;
+    return `${name} → ${r.portName}, ${chan}${note} — edit this patch`;
   }
 
   function toggleGate() {
@@ -58,16 +62,16 @@
   }
 
   function setTrackPort(portId: string | null) {
-    void midiIo.setTrackRoute(row.trackId, portId, row.target?.channel ?? 0);
+    void midiIo.setTrackRoute(row.trackId, portId, row.target?.channel ?? null);
   }
-  function setTrackChannel(channel: number) {
+  function setTrackChannel(channel: number | null) {
     if (!row.target) return;
     void midiIo.setTrackRoute(row.trackId, row.target.portId, channel);
   }
   function setClipPort(clip: ClipRouteRow, portId: string | null) {
     void midiIo.setClipRoute(clip.clipId, portId, clip.target.channel);
   }
-  function setClipChannel(clip: ClipRouteRow, channel: number) {
+  function setClipChannel(clip: ClipRouteRow, channel: number | null) {
     void midiIo.setClipRoute(clip.clipId, clip.target.portId, channel);
   }
 </script>

@@ -354,7 +354,12 @@
     {/if}
     <span class="count silk">{clip.notes.length}n</span>
     {#if override}
-      <span class="routedot" title="MIDI output override: {override.portId}, channel {override.channel + 1}">⇥</span>
+      <span
+        class="routedot"
+        title="MIDI output override: {override.portId}, {override.channel === null
+          ? 'channel from clip'
+          : `channel ${override.channel + 1}`}">⇥</span
+      >
     {/if}
     {#if usedLauncher}
       <span class="routedot" title="This clip uses launcher {usedLauncher.name}">▶</span>

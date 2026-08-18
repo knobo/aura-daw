@@ -147,6 +147,20 @@ pub fn build_graph(
         &slots,
         rate,
         bank,
+        // Deliberately EMPTY, unlike `engine::rebuild`: a hardware MIDI-out
+        // route silences a track's internal instrument in the LIVE graph, so
+        // you hear the external device instead of a doubled voice — but it
+        // must not change a bounce. Routing is per-machine app config that
+        // never travels with the project (ruling 10), so honouring it here
+        // would make `export_song` render differently on the machine with the
+        // synth plugged in than anywhere else, from the same project file.
+        // Keeping the external device out of the bounce is what the audio
+        // RETURN is for (`docs/midi-output.md` recipe 2 step 6): once a
+        // return clip lands on the track, the audio-clip rule above skips the
+        // internal instrument here too. To leave a routed part out of the
+        // master entirely, MUTE the track — mute is document state and does
+        // travel.
+        &crate::midi_out::RoutedOut::default(),
         &mut nodes,
         &mut tracks,
     );

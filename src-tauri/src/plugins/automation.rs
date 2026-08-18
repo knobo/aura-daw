@@ -1364,8 +1364,8 @@ mod tests {
         };
         // A4 held across the whole bar (off far beyond the render window).
         let events = vec![
-            AbsNoteEvent { sample: 0, key: 69, velocity: 110 },
-            AbsNoteEvent { sample: 200_000, key: 69, velocity: 0 },
+            AbsNoteEvent { sample: 0, key: 69, velocity: 110, channel: 0 },
+            AbsNoteEvent { sample: 200_000, key: 69, velocity: 0, channel: 0 },
         ];
         let track = RtTrack {
             slot: 0,

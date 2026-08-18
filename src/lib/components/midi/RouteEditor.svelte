@@ -34,16 +34,32 @@
     /** Named in the labels so a nested clip editor is never mistaken for its track's. */
     scopeLabel: string;
     onport: (portId: string | null) => void;
-    onchannel: (channel: number) => void;
+    /** `null` = leave every note on the channel it has in the clip. */
+    onchannel: (channel: number | null) => void;
     onreturn?: (deviceId: string | null) => void;
     onclear: () => void;
   } = $props();
 
-  /** 1-16 on the panel, 0-15 on the wire. */
-  function toChannel(shown: number): number {
-    if (!Number.isFinite(shown)) return 0;
-    return Math.max(0, Math.min(15, Math.round(shown) - 1));
+  /** The picker's value, "" for "from clip"; 0-15 on the wire, 1-16 shown. */
+  function toChannel(raw: string): number | null {
+    if (raw === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return Math.max(0, Math.min(15, Math.round(n)));
   }
+
+  const CHANNELS = Array.from({ length: 16 }, (_, i) => i);
+
+  /** The picker's current value as a string, `""` for "from clip".
+   *
+   * Bound through `value` rather than per-option `selected` attributes on
+   * purpose: once the user has changed a `<select>`, its options' selectedness
+   * is *dirty* per the HTML spec, and rewriting the `selected` content
+   * attribute no longer moves the selection. The box would then keep showing
+   * channel 10 after Clear route had set the route back to "from clip" — and
+   * the next port pick would create a route on the channel the UI was NOT
+   * showing. Svelte assigns `value` as a property, which does move it. */
+  const channelValue = $derived(target?.channel == null ? "" : String(target.channel));
 
   const missingPort = $derived(target && target.health === "missing" ? target : null);
 </script>
@@ -77,17 +93,19 @@
   <div class="pair">
     <label class="field chan">
       <span class="silk">channel</span>
-      <input
+      <select
         class="mono"
-        type="number"
-        min="1"
-        max="16"
         disabled={!target}
-        value={(target?.channel ?? 0) + 1}
-        aria-label="MIDI channel for {scopeLabel}, 1 to 16"
-        title="MIDI channel, 1-16"
-        onchange={(e) => onchannel(toChannel(e.currentTarget.valueAsNumber))}
-      />
+        value={channelValue}
+        aria-label="MIDI channel for {scopeLabel}"
+        title="Leave it on 'from clip' unless the device needs one fixed channel — General MIDI drums live on channel 10, and that is what the clip already says"
+        onchange={(e) => onchannel(toChannel(e.currentTarget.value))}
+      >
+        <option value="">from clip</option>
+        {#each CHANNELS as ch (ch)}
+          <option value={String(ch)}>{ch + 1}</option>
+        {/each}
+      </select>
     </label>
     <button
       class="clear mono"
@@ -153,8 +171,7 @@
     width: 46px;
   }
 
-  select,
-  input[type="number"] {
+  select {
     flex: 1;
     min-width: 0;
     background: rgb(var(--bg-2-rgb) / 0.8);
@@ -165,13 +182,12 @@
     font-family: var(--font-ui);
     padding: 3px 4px;
   }
-  select:disabled,
-  input:disabled {
+  select:disabled {
     color: var(--text-faint);
   }
-  input[type="number"] {
+  .chan select {
     flex: none;
-    width: 44px;
+    width: 76px;
     font-family: var(--font-mono);
   }
 

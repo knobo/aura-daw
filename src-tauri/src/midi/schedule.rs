@@ -19,6 +19,14 @@ pub struct AbsNoteEvent {
     pub sample: u64,
     pub key: u8,
     pub velocity: u8,
+    /// The note's own MIDI channel, 0-based (`MidiNote::channel`), carried
+    /// through unchanged. AURA's internal instruments are per-track and
+    /// mono-timbral, so they ignore it — but hardware MIDI-out MUST NOT:
+    /// General MIDI puts drums on channel 10 (0-based 9), which is exactly
+    /// what the Composer's groove generator writes and what a drum machine
+    /// listens for. Dropping it here is what made a routed drum track
+    /// arrive on channel 1 and play nothing.
+    pub channel: u8,
 }
 
 /// One expanded note as a *span* in absolute engine samples, carrying the
@@ -62,6 +70,7 @@ struct Expanded {
     off_s: u64,
     key: u8,
     velocity: u8,
+    channel: u8,
     note_id: NoteId,
     repeat_index: u32,
 }
@@ -94,7 +103,15 @@ fn expand_notes(clip: &MidiClip, map: &TempoMap, mut emit: impl FnMut(Expanded))
                 off_s = on_s + 1;
             }
             let (key, velocity) = clip_note_key_vel(clip, n);
-            emit(Expanded { on_s, off_s, key, velocity, note_id: n.note_id, repeat_index: rep as u32 });
+            emit(Expanded {
+                on_s,
+                off_s,
+                key,
+                velocity,
+                channel: n.channel,
+                note_id: n.note_id,
+                repeat_index: rep as u32,
+            });
         }
     }
 }
@@ -126,8 +143,8 @@ fn clip_note_key_vel(clip: &MidiClip, n: &crate::midi::types::MidiNote) -> (u8, 
 pub fn clip_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
     let mut out = Vec::with_capacity(clip.notes.len() * 2);
     expand_notes(clip, map, |e| {
-        out.push(AbsNoteEvent { sample: e.on_s, key: e.key, velocity: e.velocity });
-        out.push(AbsNoteEvent { sample: e.off_s, key: e.key, velocity: 0 });
+        out.push(AbsNoteEvent { sample: e.on_s, key: e.key, velocity: e.velocity, channel: e.channel });
+        out.push(AbsNoteEvent { sample: e.off_s, key: e.key, velocity: 0, channel: e.channel });
     });
     // Offs before ons at the same sample position so retriggers of the same
     // key release the previous voice first.
@@ -186,8 +203,8 @@ pub fn clip_drive_events(clip: &MidiClip, map: &TempoMap) -> Vec<AbsNoteEvent> {
             off_s = on_s + 1;
         }
         let (key, velocity) = clip_note_key_vel(clip, n);
-        out.push(AbsNoteEvent { sample: on_s, key, velocity });
-        out.push(AbsNoteEvent { sample: off_s, key, velocity: 0 });
+        out.push(AbsNoteEvent { sample: on_s, key, velocity, channel: n.channel });
+        out.push(AbsNoteEvent { sample: off_s, key, velocity: 0, channel: n.channel });
     }
     out.sort_by_key(|e| (e.sample, e.velocity));
     out
@@ -259,10 +276,10 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-                AbsNoteEvent { sample: 480 * 25, key: 60, velocity: 0 },
-                AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 100 },
-                AbsNoteEvent { sample: (960 + 480) * 25, key: 60, velocity: 0 },
+                AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+                AbsNoteEvent { sample: 480 * 25, key: 60, velocity: 0, channel: 0 },
+                AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 100, channel: 0 },
+                AbsNoteEvent { sample: (960 + 480) * 25, key: 60, velocity: 0, channel: 0 },
             ],
             "note repeats once at the content-length offset"
         );
@@ -277,12 +294,12 @@ mod tests {
         c.content_length_ticks = Some(960);
         let ev = clip_events(&c, &map_120());
         assert_eq!(ev.len(), 4, "both repeats' onsets are before placement end (1440)");
-        assert_eq!(ev[0], AbsNoteEvent { sample: 0, key: 60, velocity: 100 });
-        assert_eq!(ev[1], AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 0 });
-        assert_eq!(ev[2], AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 100 });
+        assert_eq!(ev[0], AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 });
+        assert_eq!(ev[1], AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 0, channel: 0 });
+        assert_eq!(ev[2], AbsNoteEvent { sample: 960 * 25, key: 60, velocity: 100, channel: 0 });
         // Off would naturally land at (960+960)*25 = 1920*25, but placement
         // ends at 1440*25 — clamp there.
-        assert_eq!(ev[3], AbsNoteEvent { sample: 1440 * 25, key: 60, velocity: 0 });
+        assert_eq!(ev[3], AbsNoteEvent { sample: 1440 * 25, key: 60, velocity: 0, channel: 0 });
     }
 
     #[test]
@@ -293,8 +310,8 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-                AbsNoteEvent { sample: 480 * 25, key: 60, velocity: 0 },
+                AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+                AbsNoteEvent { sample: 480 * 25, key: 60, velocity: 0, channel: 0 },
             ],
             "one written note → one on/off, even when the placement loops the content"
         );
@@ -339,7 +356,7 @@ mod tests {
         c.content_length_ticks = Some(3840);
         let ev = clip_events(&c, &map);
         // Repeat 0: on at tick 0 (120bpm) -> sample 0.
-        assert_eq!(ev[0], AbsNoteEvent { sample: 0, key: 64, velocity: 90 });
+        assert_eq!(ev[0], AbsNoteEvent { sample: 0, key: 64, velocity: 90, channel: 0 });
         // Repeat 1: on at tick 3840 (exactly the tempo change) -> 3840*25 = 96000.
         assert_eq!(ev[2].sample, 96_000);
         assert_eq!(ev[2].velocity, 90);
@@ -355,8 +372,8 @@ mod tests {
         assert_eq!(
             ev,
             vec![
-                AbsNoteEvent { sample: 120_000, key: 60, velocity: 100 },
-                AbsNoteEvent { sample: 144_000, key: 60, velocity: 0 },
+                AbsNoteEvent { sample: 120_000, key: 60, velocity: 100, channel: 0 },
+                AbsNoteEvent { sample: 144_000, key: 60, velocity: 0, channel: 0 },
             ]
         );
     }
@@ -374,8 +391,8 @@ mod tests {
         // 3840 * 25 = 96000. Its off (one beat at 60 bpm = 48000 samples).
         let c = clip(0, 7680, vec![note(3840, 960, 64, 90)]);
         let ev = clip_events(&c, &map);
-        assert_eq!(ev[0], AbsNoteEvent { sample: 96_000, key: 64, velocity: 90 });
-        assert_eq!(ev[1], AbsNoteEvent { sample: 96_000 + 48_000, key: 64, velocity: 0 });
+        assert_eq!(ev[0], AbsNoteEvent { sample: 96_000, key: 64, velocity: 90, channel: 0 });
+        assert_eq!(ev[1], AbsNoteEvent { sample: 96_000 + 48_000, key: 64, velocity: 0, channel: 0 });
 
         // A note STRADDLING the tempo change: on at tick 3360 (120bpm zone),
         // length 960 -> off at 4320 (60bpm zone).
@@ -399,7 +416,7 @@ mod tests {
         );
         let ev = clip_events(&c, &map_120());
         assert_eq!(ev.len(), 2);
-        assert_eq!(ev[1], AbsNoteEvent { sample: 24_000, key: 60, velocity: 0 });
+        assert_eq!(ev[1], AbsNoteEvent { sample: 24_000, key: 60, velocity: 0, channel: 0 });
     }
 
     #[test]
@@ -504,7 +521,7 @@ mod tests {
         assert_eq!(collected, expect, "every event exactly once, correct offsets");
 
         // An event exactly ON a block boundary belongs to the block it starts.
-        let ev2 = vec![AbsNoteEvent { sample: 1024, key: 70, velocity: 100 }];
+        let ev2 = vec![AbsNoteEvent { sample: 1024, key: 70, velocity: 100, channel: 0 }];
         assert_eq!(slice_block(&ev2, 512, 512).count(), 0);
         let hits: Vec<_> = slice_block(&ev2, 1024, 512).collect();
         assert_eq!(hits, vec![BlockNoteEvent { offset: 0, key: 70, velocity: 100 }]);

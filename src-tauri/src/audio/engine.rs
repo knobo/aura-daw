@@ -121,6 +121,13 @@ pub enum ControlMsg {
     /// Used for STRUCTURAL changes only (tracks/clips/project) — continuous
     /// parameters go through `ParamTable` atomics instead.
     Rebuild,
+    /// Which tracks/clips are routed to hardware MIDI-out, followed by a
+    /// rebuild. Its own message rather than a field on `Rebuild` because
+    /// routing is app config: it never arrives through a commit, so the
+    /// published document image the rebuild reads cannot carry it (see
+    /// `midi_out::RoutedOut`). A routed track's internal instrument stops
+    /// sounding — the external device is the instrument.
+    SetExternalRouting(Arc<crate::midi_out::RoutedOut>),
     SelectOutput { device_id: Option<String>, reply: Reply<()> },
     SelectInput { device_id: Option<String>, reply: Reply<()> },
     StartRecording {
@@ -247,6 +254,7 @@ pub fn start(
                 param_writes: Vec::new(),
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
+                external_routing: Arc::new(crate::midi_out::RoutedOut::default()),
                 published,
                 #[cfg(test)]
                 after_assembly: None,
@@ -494,6 +502,9 @@ impl OutputCb {
         // no other state is synchronized against it).
         let frames = (out.len() / self.channels.max(1)) as u64;
         let steady_base = self.shared.steady.fetch_add(frames, Relaxed);
+        // How coarsely `position` moves, for readers that interpolate between
+        // blocks — see `SharedRt::block_frames`.
+        self.shared.block_frames.store(frames as u32, Relaxed);
 
         // Hardware MIDI-in. One relaxed load; the control thread resolved
         // this id→slot under the tables lock (`MidiInHub::refresh_target`).
@@ -1027,6 +1038,11 @@ struct Control {
     /// the hub to notice a selection that, being app config, commits nothing
     /// and therefore schedules no rebuild of its own.
     live_in_target: Option<String>,
+    /// Which tracks/clips currently send their notes to hardware MIDI-out,
+    /// as last pushed by `ControlMsg::SetExternalRouting`. Same nature as
+    /// `live_in_target`: app config that commits nothing, so it has to
+    /// arrive over the control channel rather than in the document image.
+    external_routing: Arc<crate::midi_out::RoutedOut>,
     /// Plan F Task 6: the published-snapshot slot behind the SAME `Session`
     /// this thread holds, cloned once at construction. This is the door the
     /// heavy half of `rebuild` (and all of `ensure_loaded`) reads the
@@ -1238,6 +1254,12 @@ impl Control {
         match msg {
             ControlMsg::Subscribe(sink) => self.sinks.push((sink, 0)),
             ControlMsg::Rebuild => self.rebuild(),
+            ControlMsg::SetExternalRouting(routed) => {
+                if self.external_routing != routed {
+                    self.external_routing = routed;
+                    self.rebuild();
+                }
+            }
             ControlMsg::SelectOutput { device_id, reply } => {
                 self.sel_output = device_id;
                 let _ = reply.send(self.open_output());
@@ -1568,6 +1590,7 @@ impl Control {
                 &slots_s,
                 self.cache_rate,
                 bank.as_deref(),
+                &self.external_routing,
                 &mut self.live_nodes,
                 &mut tracks,
                 live_in_target.as_deref(),
@@ -3561,7 +3584,7 @@ mod tests {
     fn without_a_target_a_stopped_transport_still_renders_silence() {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _r, _m)) = output_cb(shared.clone());
-        let scheduled = vec![crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100 }];
+        let scheduled = vec![crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 }];
         graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
         let mut out = vec![1.0f32; 128 * 2];
         cb.render(&mut out);
@@ -3580,8 +3603,8 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
         let scheduled = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
-            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0, channel: 0 },
         ];
         graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
         target_slot_0(&cb, "t-1");
@@ -3610,8 +3633,8 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
         let scheduled = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
-            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0, channel: 0 },
         ];
         graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
         shared.playing.store(true, Relaxed);
@@ -3647,8 +3670,8 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
         let scheduled = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
-            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0, channel: 0 },
         ];
         graph_tx.push(GraphPtr::new(Box::new(polysynth_graph_pair(1, scheduled)))).unwrap();
         target_slot_0(&cb, "t-1");
@@ -3682,8 +3705,8 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
         let scheduled = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
-            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0, channel: 0 },
         ];
         graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
         target_slot_0(&cb, "t-1");
@@ -3721,8 +3744,8 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let (mut cb, _evt_rx, (mut graph_tx, _retire_rx, _meter_rx)) = output_cb(shared.clone());
         let scheduled = vec![
-            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110 },
-            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 0, key: 60, velocity: 110, channel: 0 },
+            crate::midi::schedule::AbsNoteEvent { sample: 480_000, key: 60, velocity: 0, channel: 0 },
         ];
         graph_tx.push(GraphPtr::new(Box::new(polysynth_graph(0, 1, scheduled)))).unwrap();
         shared.playing.store(true, Relaxed);
@@ -3896,6 +3919,7 @@ mod tests {
             // otherwise race every other test that selects a routing target.
             live_in_hub: Arc::new(MidiInHub::new()),
             live_in_target: None,
+            external_routing: Arc::new(crate::midi_out::RoutedOut::default()),
             published: session.lock().published_handle(),
             after_assembly: None,
             count_in_bars: 0,
