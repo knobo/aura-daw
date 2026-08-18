@@ -1,11 +1,18 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { backend } from "../../tauri";
   import { historyBrowser } from "../../state/history.svelte";
   import { projectops } from "../../state/projectops.svelte";
 
   // The dock also requests a load when HISTORY becomes active. Concurrent
   // requests are coalesced; this fallback covers keyboard/direct mounting.
-  onMount(() => void historyBrowser.load());
+  onMount(() => {
+    void historyBrowser.load();
+    // Keep an open browser live. `project://changed` is the common commit
+    // announcement for user edits, agent edits, Undo and Redo. `refresh`
+    // queues a fresh read if an earlier overview request is still in flight.
+    return backend.on("project://changed", () => void historyBrowser.refresh());
+  });
 
   const bytes = (n: number) =>
     n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / 1024 / 1024).toFixed(1)} MiB`;

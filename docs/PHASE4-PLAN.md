@@ -693,8 +693,17 @@ R-3 (Task 10), L-4 (Tasks 9+11), L-5 (Task 8).
   `codex/undo-version-graph-ui` (draft PR #82): additive overview/detail
   commands expose retention statistics, human-readable edit labels/actors
   and materialized document counts. The HISTORY dock auto-refreshes on open,
-  browses retained revisions and drives ordinary Undo/Redo. Restoring an
-  arbitrary revision remains deliberately unbuilt (new mutation contract).
+  browses retained revisions, stays live from `project://changed`, and drives
+  ordinary Undo/Redo.
+
+  **Ordered next step:** add an `Undo to here` action only for revisions on
+  the current linear undo ancestry. The backend must own target validation and
+  stepping under `history_gate`; the request must carry the observed epoch and
+  current revision, abort if either changed, preserve the resulting redo chain,
+  and emit the ordinary project-change event. Cover stale-target, eviction,
+  epoch-swap and round-trip tests before exposing the button. Do not implement
+  arbitrary branch checkout or direct snapshot replacement as part of that
+  step: those still require a separate mutation, persistence and undo contract.
 
 Also recorded from the review follow-up on this branch: `ChangeSet::from_ops`
 flags modulation+automation on `TrackAdd`/`TrackRemove` and on

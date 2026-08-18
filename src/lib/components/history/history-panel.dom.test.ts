@@ -5,9 +5,15 @@ const historyOverview = vi.fn();
 const historyVersion = vi.fn();
 const undo = vi.fn(() => Promise.resolve());
 const redo = vi.fn(() => Promise.resolve());
+let projectChanged: (() => void) | null = null;
+const unlisten = vi.fn();
+const on = vi.fn((event: string, cb: () => void) => {
+  if (event === "project://changed") projectChanged = cb;
+  return unlisten;
+});
 
 vi.mock("../../tauri", () => ({
-  backend: { mode: "tauri", historyOverview, historyVersion },
+  backend: { mode: "tauri", historyOverview, historyVersion, on },
 }));
 vi.mock("../../state/projectops.svelte", () => ({
   projectops: { undo, redo },
@@ -33,6 +39,7 @@ function overview(undoDepth = 2, redoDepth = 1) {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  projectChanged = null;
   historyBrowser.overview = null;
   historyBrowser.detail = null;
   historyBrowser.selectedRev = null;
@@ -58,6 +65,28 @@ describe("HistoryPanel", () => {
     expect(screen.getByRole("option", { name: /move clip r8 .* snapshot/i })).toBeTruthy();
     expect(await screen.findByText("3")).toBeTruthy();
     expect(historyVersion).toHaveBeenCalledWith(9);
+  });
+
+  it("refreshes an open panel when the project announces a committed edit", async () => {
+    historyOverview
+      .mockResolvedValueOnce(overview())
+      .mockResolvedValueOnce({
+        ...overview(3, 0),
+        versions: [
+          { rev: 10, materialized: false, chargedBytes: 96, label: "rename track", actor: "You" },
+          ...overview().versions,
+        ],
+      });
+    historyVersion.mockResolvedValue({
+      rev: 9, projectName: "Song", trackCount: 3, audioClipCount: 1, midiClipCount: 2, automationLaneCount: 1,
+    });
+
+    render(HistoryPanel);
+    await screen.findByRole("option", { name: /set gain r9 .* replay/i });
+    projectChanged?.();
+
+    expect(await screen.findByRole("option", { name: /rename track r10 .* replay/i })).toBeTruthy();
+    expect(historyOverview).toHaveBeenCalledTimes(2);
   });
 
   it("drives ordinary undo and refreshes the graph without restoring a revision directly", async () => {

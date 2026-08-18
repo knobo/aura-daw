@@ -3,6 +3,7 @@ import type { HistoryOverview, HistoryVersionDetail } from "../types/ipc";
 
 class HistoryBrowser {
   private pending: Promise<void> | null = null;
+  private selectionRequest = 0;
   overview: HistoryOverview | null = $state(null);
   detail: HistoryVersionDetail | null = $state(null);
   selectedRev: number | null = $state(null);
@@ -50,10 +51,14 @@ class HistoryBrowser {
     if (!backend.historyVersion) return;
     this.selectedRev = rev;
     this.error = null;
+    const request = ++this.selectionRequest;
     try {
-      this.detail = await backend.historyVersion(rev);
-      if (!this.detail) this.error = `Revision ${rev} is no longer retained.`;
+      const detail = await backend.historyVersion(rev);
+      if (request !== this.selectionRequest || this.selectedRev !== rev) return;
+      this.detail = detail;
+      if (!detail) this.error = `Revision ${rev} is no longer retained.`;
     } catch (err) {
+      if (request !== this.selectionRequest || this.selectedRev !== rev) return;
       this.detail = null;
       this.error = String(err);
     }

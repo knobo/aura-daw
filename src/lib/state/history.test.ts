@@ -55,6 +55,25 @@ describe("history browser", () => {
     expect(historyBrowser.error).toContain("no longer retained");
   });
 
+  it("does not let a stale materialization overwrite a newer selection", async () => {
+    await historyBrowser.load();
+    let release!: (value: Awaited<ReturnType<typeof historyVersion>>) => void;
+    historyVersion.mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+
+    const oldSelection = historyBrowser.select(8);
+    historyVersion.mockResolvedValueOnce({
+      rev: 9, projectName: "Song", trackCount: 9, audioClipCount: 0, midiClipCount: 0, automationLaneCount: 0,
+    });
+    await historyBrowser.select(9);
+    release({
+      rev: 8, projectName: "Old", trackCount: 8, audioClipCount: 0, midiClipCount: 0, automationLaneCount: 0,
+    });
+    await oldSelection;
+
+    expect(historyBrowser.selectedRev).toBe(9);
+    expect(historyBrowser.detail?.rev).toBe(9);
+  });
+
   it("coalesces tab activation and component mount into one automatic load", async () => {
     let release!: (value: Awaited<ReturnType<typeof historyOverview>>) => void;
     historyOverview.mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
