@@ -9,7 +9,10 @@ import {
   decodeLibraryDrag,
   encodeLibraryDrag,
   hasLibraryDrag,
+  nextUsage,
+  usageLocations,
 } from "./library";
+import type { ClipUsageEntry } from "./library";
 
 describe("parentDir", () => {
   it("walks up a POSIX path", () => {
@@ -89,5 +92,58 @@ describe("library drag payloads", () => {
     const unknown = fakeDataTransfer();
     unknown.setData(LIBRARY_DRAG_MIME, JSON.stringify({ kind: "somethingElse" }));
     expect(decodeLibraryDrag(unknown)).toBeNull();
+  });
+});
+
+function entry(id: string, name: string, trackId: string, startTicks = 0): ClipUsageEntry {
+  return { id, name, trackId, timelineStartTicks: startTicks };
+}
+
+describe("usageLocations", () => {
+  it("finds every placement sharing a name, on tracks that still exist", () => {
+    const clips = [
+      entry("a", "Groove", "t1", 0),
+      entry("b", "Groove", "t2", 960),
+      entry("c", "Other", "t1", 0),
+    ];
+    const live = new Set(["t1", "t2"]);
+    expect(usageLocations(clips, "Groove", live)).toEqual([clips[0], clips[1]]);
+  });
+
+  it("drops placements whose track was deleted", () => {
+    const clips = [entry("a", "Groove", "t1"), entry("b", "Groove", "t-gone")];
+    const live = new Set(["t1"]);
+    expect(usageLocations(clips, "Groove", live)).toEqual([clips[0]]);
+  });
+
+  it("is empty for a name with no live placement", () => {
+    const clips = [entry("a", "Groove", "t-gone")];
+    expect(usageLocations(clips, "Groove", new Set())).toEqual([]);
+  });
+});
+
+describe("nextUsage", () => {
+  it("returns the first location when nothing is current", () => {
+    const locs = [entry("a", "Groove", "t1"), entry("b", "Groove", "t2")];
+    expect(nextUsage(locs, null)).toBe(locs[0]);
+  });
+
+  it("advances to the following location", () => {
+    const locs = [entry("a", "Groove", "t1"), entry("b", "Groove", "t2")];
+    expect(nextUsage(locs, "a")).toBe(locs[1]);
+  });
+
+  it("wraps around after the last location", () => {
+    const locs = [entry("a", "Groove", "t1"), entry("b", "Groove", "t2")];
+    expect(nextUsage(locs, "b")).toBe(locs[0]);
+  });
+
+  it("restarts from the first location when the current id is stale", () => {
+    const locs = [entry("a", "Groove", "t1"), entry("b", "Groove", "t2")];
+    expect(nextUsage(locs, "gone")).toBe(locs[0]);
+  });
+
+  it("is null for an empty group", () => {
+    expect(nextUsage([], null)).toBeNull();
   });
 });

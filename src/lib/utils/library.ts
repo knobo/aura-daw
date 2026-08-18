@@ -79,3 +79,37 @@ export function decodeLibraryDrag(dt: DragReader | null | undefined): LibraryDra
     return null;
   }
 }
+
+/** The bits of a MIDI clip the Library's usage tools need — a structural
+ * subset so this stays testable without the full `MidiClip` IPC type. */
+export interface ClipUsageEntry {
+  id: string;
+  name: string;
+  trackId: string;
+  timelineStartTicks: number;
+}
+
+/** Every placement sharing `name`, restricted to tracks that still exist —
+ * a track delete leaves its MIDI clips behind (orphaned, invisible on any
+ * timeline) rather than removing them, so "still exists" is not implied by
+ * being in `clips`. Order is the incoming array's order (first-created /
+ * timeline-appended first), so double-click-to-jump lands on the first one. */
+export function usageLocations(
+  clips: readonly ClipUsageEntry[],
+  name: string,
+  liveTrackIds: ReadonlySet<string>,
+): ClipUsageEntry[] {
+  return clips.filter((c) => c.name === name && liveTrackIds.has(c.trackId));
+}
+
+/** The location after `currentId` in `locations`, wrapping around. The
+ * first location when nothing is current yet, or when `currentId` no
+ * longer appears (its track was deleted since). `null` for an empty group. */
+export function nextUsage(
+  locations: readonly ClipUsageEntry[],
+  currentId: string | null,
+): ClipUsageEntry | null {
+  if (locations.length === 0) return null;
+  const i = currentId == null ? -1 : locations.findIndex((c) => c.id === currentId);
+  return locations[(i + 1) % locations.length];
+}
