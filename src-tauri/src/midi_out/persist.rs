@@ -16,7 +16,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Read [`PersistedRoute::channel`]: absent or `null` -> `None`, `0` ->
+/// `None` (the legacy "never picked" value, see the field's doc), any other
+/// channel -> `Some(ch)`. Out-of-range values are clamped into 0-15 by the
+/// same rule, so a corrupt file cannot forge a bad status byte.
+fn de_channel<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    let raw = Option::<u8>::deserialize(d)?;
+    Ok(match raw {
+        None | Some(0) => None,
+        Some(ch) => Some(ch & 0x0F),
+    })
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RoutingFile {
@@ -50,7 +62,18 @@ pub struct PersistedRoute {
     pub scope: String,
     pub id: String,
     pub port_name: String,
-    pub channel: u8,
+    /// Forced output channel, or `None` for "each note on its own channel"
+    /// (the default — see [`super::RouteTarget::channel`]).
+    ///
+    /// **Legacy migration.** Before the channel became an override, this
+    /// field was a plain `u8` that `midi_set_*_route` filled with
+    /// `channel.unwrap_or(0)` — so a stored `0` cannot be told apart from
+    /// "the user never picked a channel", which is what it almost always
+    /// was. A stored `0` therefore loads as `None` (follow the clip),
+    /// while any stored non-zero channel was a deliberate pick and stays
+    /// forced. See [`de_channel`].
+    #[serde(default, deserialize_with = "de_channel")]
+    pub channel: Option<u8>,
     /// cpal input-device name this track records its audio return from.
     /// Track routes only; clip overrides never carry one. Missing in files
     /// written before X1 — `None` means "no return, MIDI-only".
@@ -130,6 +153,33 @@ pub fn project_key(dir: &Path) -> String {
         .into_owned()
 }
 
+/// A port name with the volatile ALSA address stripped off the end.
+///
+/// `midir`'s ALSA-seq backend formats a port name as
+/// `"<client>:<port> <clientNum>:<portNum>"` — e.g.
+/// `"Hydrogen:Hydrogen Midi-In 128:0"`. The trailing `128:0` is the sequencer
+/// address, which the kernel hands out in connection order: restart Hydrogen
+/// (or plug a USB keyboard in first) and the SAME device comes back as
+/// `"Hydrogen:Hydrogen Midi-In 129:0"`. Persisting routing by the raw name
+/// therefore lost the route on the next restart — silently, because a route
+/// naming a port that is not visible is skipped by design. A reporter's own
+/// routing file showed both spellings of the same Hydrogen for exactly that
+/// reason.
+///
+/// So matching is two-stage: exact name first (never weaken an exact hit),
+/// this normalized form second. A name with no such suffix — every non-ALSA
+/// backend — is returned unchanged, so nothing else changes behaviour.
+pub fn port_name_key(name: &str) -> &str {
+    let Some((head, tail)) = name.rsplit_once(' ') else { return name };
+    let Some((client, port)) = tail.split_once(':') else { return name };
+    let numeric = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if numeric(client) && numeric(port) && !head.is_empty() {
+        head
+    } else {
+        name
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,7 +223,7 @@ mod tests {
                     scope: "track".into(),
                     id: "t-1".into(),
                     port_name: "Hydrogen".into(),
-                    channel: 9,
+                    channel: Some(9),
                     return_device: Some("Interface In 3-4".into()),
                 }],
                 open_ports: vec!["Hydrogen".into()],
@@ -201,6 +251,58 @@ mod tests {
         assert_eq!(proj.routes.len(), 1);
         assert_eq!(proj.routes[0].port_name, "Hydrogen");
         assert_eq!(proj.routes[0].return_device, None);
+    }
+
+    /// The legacy `channel: 0` migration. Before the channel became an
+    /// override there was no way to express "leave the notes alone": the
+    /// command filled the field with `channel.unwrap_or(0)`, so every route a
+    /// user patched without touching the channel box stored a 0. Loading that
+    /// as a forced channel 1 would keep the reported bug alive across the
+    /// upgrade for exactly the people who hit it.
+    #[test]
+    fn a_legacy_zero_channel_loads_as_follow_the_clip() {
+        let json = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen","channel":0}"#;
+        let r: PersistedRoute = serde_json::from_str(json).unwrap();
+        assert_eq!(r.channel, None);
+    }
+
+    /// A non-zero channel, on the other hand, could only have come from a
+    /// deliberate pick — it stays forced.
+    #[test]
+    fn a_deliberately_picked_channel_stays_forced() {
+        let json = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen","channel":9}"#;
+        let r: PersistedRoute = serde_json::from_str(json).unwrap();
+        assert_eq!(r.channel, Some(9));
+    }
+
+    /// A missing channel is the same "follow the clip" default, so a file
+    /// written by this version round-trips through an older reader shape.
+    #[test]
+    fn a_missing_channel_is_follow_the_clip() {
+        let json = r#"{"scope":"track","id":"t-1","port_name":"Hydrogen"}"#;
+        let r: PersistedRoute = serde_json::from_str(json).unwrap();
+        assert_eq!(r.channel, None);
+    }
+
+    #[test]
+    fn port_name_key_strips_only_a_trailing_alsa_address() {
+        assert_eq!(
+            port_name_key("Hydrogen:Hydrogen Midi-In 128:0"),
+            "Hydrogen:Hydrogen Midi-In"
+        );
+        // Same device, later session — both spell to the same key, which is
+        // the whole point.
+        assert_eq!(
+            port_name_key("Hydrogen:Hydrogen Midi-In 129:0"),
+            port_name_key("Hydrogen:Hydrogen Midi-In 128:0")
+        );
+        // Nothing that is not an address gets eaten.
+        assert_eq!(port_name_key("Hydrogen"), "Hydrogen");
+        assert_eq!(port_name_key("IAC Driver Bus 1"), "IAC Driver Bus 1");
+        assert_eq!(port_name_key("Weird:Port 12"), "Weird:Port 12");
+        assert_eq!(port_name_key("Weird:Port a:b"), "Weird:Port a:b");
+        assert_eq!(port_name_key("128:0"), "128:0");
+        assert_eq!(port_name_key(""), "");
     }
 
     /// Files written before X1 must still load — a missing `return_device`

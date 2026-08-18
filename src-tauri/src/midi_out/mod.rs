@@ -59,6 +59,8 @@
 //! dropped. That is what `release_on_exit` exists for.
 
 pub mod persist;
+#[cfg(test)]
+mod route_e2e_test;
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -305,6 +307,15 @@ pub enum RouteScope {
 /// Where a route sends its notes: a port id (as returned by
 /// [`list_output_ports`]) and a MIDI channel (0-based on the wire, 0-15).
 ///
+/// `channel` is an OVERRIDE, not "the channel": `None` — the default for a
+/// new route — means "send each note on the channel it carries in the
+/// document" (`MidiNote::channel`). That is the only setting under which a
+/// General MIDI drum part reaches a drum machine, because GM puts drums on
+/// channel 10 (0-based 9) and that is exactly what the Composer's groove
+/// generator writes. `Some(ch)` forces every note of the route onto `ch`,
+/// which is what a mono-timbral external synth listening on one channel
+/// wants.
+///
 /// `return_device` is the cpal input-device **name** this track records its
 /// audio return from (X1). Clip routes never carry one; track routes may.
 /// Changing the port/channel via [`MidiOut::set_route`] preserves a
@@ -312,13 +323,54 @@ pub enum RouteScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RouteTarget {
     pub port_id: String,
-    pub channel: u8,
+    pub channel: Option<u8>,
     pub return_device: Option<String>,
 }
 
 impl RouteTarget {
-    pub fn new(port_id: impl Into<String>, channel: u8) -> Self {
+    pub fn new(port_id: impl Into<String>, channel: Option<u8>) -> Self {
         Self { port_id: port_id.into(), channel, return_device: None }
+    }
+
+    /// A route that leaves every note on the channel the document gives it
+    /// — the default for a freshly patched track or clip.
+    pub fn from_clip(port_id: impl Into<String>) -> Self {
+        Self::new(port_id, None)
+    }
+}
+
+/// Which tracks and clips are currently sending their notes to external
+/// gear — the routing table reduced to the one question graph assembly asks
+/// of it: *is this track's (or this clip's) instrument the external device
+/// rather than AURA's own?*
+///
+/// Routing is app config, not document state (ruling 10), so it does not
+/// travel to the engine inside the committer's published image the way clips
+/// and tracks do. It reaches graph assembly as an explicit argument instead
+/// (`midi::playback::append_from`), pushed over the engine's control channel
+/// by `ControlPlane::publish_external_routing` whenever the table changes.
+/// Deliberately NOT a process global: engine and `midi_out` unit tests share
+/// short track ids like `"t-1"`, and a global would let one test's route
+/// silence another test's instrument.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutedOut {
+    /// Track ids with a track-level route: the whole track goes out.
+    pub tracks: HashSet<String>,
+    /// Clip ids with a clip-level override: only that clip goes out.
+    pub clips: HashSet<String>,
+}
+
+impl RoutedOut {
+    pub fn is_empty(&self) -> bool {
+        self.tracks.is_empty() && self.clips.is_empty()
+    }
+
+    pub fn has_track(&self, track_id: &str) -> bool {
+        self.tracks.contains(track_id)
+    }
+
+    pub fn has_clip(&self, clip_id: &str) -> bool {
+        self.clips.contains(clip_id)
     }
 }
 
@@ -333,8 +385,18 @@ impl RouteTarget {
 #[derive(Clone, Default)]
 pub struct NoteOutSnapshot {
     pub events: Arc<Vec<crate::midi::schedule::AbsNoteEvent>>,
-    /// MIDI channel for outgoing notes (0-based on the wire).
-    pub channel: u8,
+    /// `None` — send each note on its own `AbsNoteEvent::channel`;
+    /// `Some(ch)` — force every note onto `ch`. See [`RouteTarget::channel`].
+    pub channel_override: Option<u8>,
+}
+
+impl NoteOutSnapshot {
+    /// The wire channel one event resolves to under this snapshot's
+    /// override. Masked to 0-15 so a status byte can never spill into the
+    /// message type's high nibble.
+    fn wire_channel(&self, ev: &crate::midi::schedule::AbsNoteEvent) -> u8 {
+        self.channel_override.unwrap_or(ev.channel) & 0x0F
+    }
 }
 
 /// Only `AbsNoteEvent` indices this module ever assumed sorted, ascending
@@ -357,13 +419,18 @@ fn debug_assert_events_sorted(events: &[crate::midi::schedule::AbsNoteEvent]) {
 /// two independent routes on the same port) never share cursor state.
 pub struct NoteOutEngine {
     cursor: usize,
-    sounding: [bool; 128],
+    /// `sounding[key][channel]` — indexed by BOTH, because a route no longer
+    /// has one channel: under the default `channel: None` override a single
+    /// track can put key 36 on channel 10 and key 60 on channel 1 in the
+    /// same pass, and `all_off` has to release each on the channel it was
+    /// started on or the note hangs on the device forever.
+    sounding: [[bool; 16]; 128],
     notes_sent: u64,
 }
 
 impl Default for NoteOutEngine {
     fn default() -> Self {
-        Self { cursor: 0, sounding: [false; 128], notes_sent: 0 }
+        Self { cursor: 0, sounding: [[false; 16]; 128], notes_sent: 0 }
     }
 }
 
@@ -382,13 +449,14 @@ impl NoteOutEngine {
         debug_assert_events_sorted(&snap.events);
         while self.cursor < snap.events.len() && snap.events[self.cursor].sample < to {
             let ev = snap.events[self.cursor];
+            let ch = snap.wire_channel(&ev);
             if ev.velocity == 0 {
-                out.push(OutMsg::three(0x80 | snap.channel, ev.key, 0));
-                self.sounding[ev.key as usize] = false;
+                out.push(OutMsg::three(0x80 | ch, ev.key, 0));
+                self.sounding[ev.key as usize][ch as usize] = false;
             } else {
-                out.push(OutMsg::three(0x90 | snap.channel, ev.key, ev.velocity));
-                self.sounding[ev.key as usize] = true;
-                crate::midi::launch::runtime().record_out(ev.key, snap.channel);
+                out.push(OutMsg::three(0x90 | ch, ev.key, ev.velocity));
+                self.sounding[ev.key as usize][ch as usize] = true;
+                crate::midi::launch::runtime().record_out(ev.key, ch);
             }
             self.notes_sent += 1;
             self.cursor += 1;
@@ -399,12 +467,14 @@ impl NoteOutEngine {
     /// removed/changed, port close). Emits one Note Off per sounding key —
     /// explicit offs, not just CC 123, because not every device honors All
     /// Notes Off.
-    pub fn all_off(&mut self, channel: u8, out: &mut Vec<OutMsg>) {
-        for key in 0..128u8 {
-            if self.sounding[key as usize] {
-                out.push(OutMsg::three(0x80 | channel, key, 0));
-                self.sounding[key as usize] = false;
-                self.notes_sent += 1;
+    pub fn all_off(&mut self, out: &mut Vec<OutMsg>) {
+        for key in 0..128usize {
+            for ch in 0..16usize {
+                if self.sounding[key][ch] {
+                    out.push(OutMsg::three(0x80 | ch as u8, key as u8, 0));
+                    self.sounding[key][ch] = false;
+                    self.notes_sent += 1;
+                }
             }
         }
     }
@@ -417,7 +487,7 @@ impl NoteOutEngine {
     /// `NoteOutEngine` are all handled uniformly.
     pub fn reseek(&mut self, snap: &NoteOutSnapshot, to: u64, out: &mut Vec<OutMsg>) {
         debug_assert_events_sorted(&snap.events);
-        self.all_off(snap.channel, out);
+        self.all_off(out);
         self.cursor = snap.events.partition_point(|e| e.sample < to);
     }
 
@@ -474,7 +544,10 @@ pub struct RouteStatus {
     pub scope: &'static str,
     pub id: String,
     pub port_id: String,
-    pub channel: u8,
+    /// Forced channel, or `null` for "each note on its own channel" — the
+    /// default. Always serialized (never skipped) so the panel can tell
+    /// "follow the clip" apart from a forced channel 1.
+    pub channel: Option<u8>,
     /// cpal input-device name for this track's audio return. `None` on clip
     /// routes and on track routes that have not picked a return yet.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -731,6 +804,26 @@ impl MidiOut {
         self.routes.lock().clone()
     }
 
+    /// The routing table reduced to [`RoutedOut`] — what graph assembly needs
+    /// in order to stop sounding a routed track's internal instrument.
+    /// Includes routes whose port is not currently open: a route pointing at
+    /// a closed port is the user saying "this track's sound lives out there",
+    /// and reviving AURA's own voice underneath it the moment the cable is
+    /// unplugged would be a surprise, not a rescue. The PATCH panel already
+    /// says so in that case ("Port is not open — notes are not leaving
+    /// AURA.").
+    pub fn routed_out(&self) -> RoutedOut {
+        let routes = self.routes.lock();
+        let mut out = RoutedOut::default();
+        for scope in routes.keys() {
+            match scope {
+                RouteScope::Track(id) => out.tracks.insert(id.clone()),
+                RouteScope::Clip(id) => out.clips.insert(id.clone()),
+            };
+        }
+        out
+    }
+
     /// Cheap live snapshot for polling.
     pub fn status(&self) -> MidiOutputStatus {
         let inner = self.inner.lock();
@@ -787,8 +880,23 @@ impl MidiOut {
         let proj = file.projects.get(&key).unwrap_or(&empty);
 
         let available = list_output_ports().unwrap_or_default();
-        let name_to_id: HashMap<&str, &str> =
-            available.iter().map(|p| (p.name.as_str(), p.id.as_str())).collect();
+        // Exact name first, then the same name with ALSA's volatile
+        // `<client>:<port>` address stripped — see `persist::port_name_key`
+        // for why a persisted name stops matching after the device restarts.
+        // Exact entries are inserted last so they always win a collision.
+        let mut name_to_id: HashMap<&str, &str> = HashMap::new();
+        for p in &available {
+            name_to_id.insert(persist::port_name_key(p.name.as_str()), p.id.as_str());
+        }
+        for p in &available {
+            name_to_id.insert(p.name.as_str(), p.id.as_str());
+        }
+        let resolve = |persisted: &str| -> Option<&str> {
+            name_to_id
+                .get(persisted)
+                .or_else(|| name_to_id.get(persist::port_name_key(persisted)))
+                .copied()
+        };
 
         // Drop the previous project's table first so a leftover route cannot
         // emit into a port we are about to open for this one.
@@ -798,13 +906,18 @@ impl MidiOut {
         for r in &proj.routes {
             wanted_names.insert(r.port_name.as_str());
         }
+        // What the wanted names actually resolve to here and now — a port is
+        // "wanted" if its id is one of these, NOT if its name is spelled the
+        // same, so an already-open Hydrogen is not closed and reopened just
+        // because the file remembers its previous sequencer address.
+        let wanted_ids: HashSet<&str> = wanted_names.iter().filter_map(|n| resolve(n)).collect();
 
         let leftover: Vec<String> = self
             .inner
             .lock()
             .active
             .values()
-            .filter(|a| !wanted_names.contains(a.port.name.as_str()))
+            .filter(|a| !wanted_ids.contains(a.port.id.as_str()))
             .map(|a| a.port.id.clone())
             .collect();
         for id in leftover {
@@ -812,7 +925,7 @@ impl MidiOut {
         }
 
         for name in &wanted_names {
-            let Some(&port_id) = name_to_id.get(name) else { continue };
+            let Some(port_id) = resolve(name) else { continue };
             if self.inner.lock().active.contains_key(port_id) {
                 continue;
             }
@@ -824,7 +937,19 @@ impl MidiOut {
         {
             let inner = self.inner.lock();
             for active in inner.active.values() {
-                if let Some(prefs) = file.ports.get(&active.port.name) {
+                // Same two-stage match as the ports themselves, so a device
+                // that came back at a new sequencer address keeps its clock
+                // preference instead of silently reverting to the default.
+                let prefs = file.ports.get(&active.port.name).or_else(|| {
+                    file.ports
+                        .iter()
+                        .find(|(name, _)| {
+                            persist::port_name_key(name)
+                                == persist::port_name_key(active.port.name.as_str())
+                        })
+                        .map(|(_, prefs)| prefs)
+                });
+                if let Some(prefs) = prefs {
                     active.clock_enabled.store(prefs.clock_enabled, Relaxed);
                 }
             }
@@ -832,7 +957,7 @@ impl MidiOut {
 
         let mut new_routes = HashMap::new();
         for r in &proj.routes {
-            let Some(&port_id) = name_to_id.get(r.port_name.as_str()) else {
+            let Some(port_id) = resolve(r.port_name.as_str()) else {
                 log::info!(
                     "midi routing: port '{}' not found on this machine; skipping a persisted route",
                     r.port_name
@@ -878,12 +1003,27 @@ impl MidiOut {
         // something we want to do under the active-port lock, and a failed
         // list degrades to "nothing visible" so merge keeps every
         // previously persisted name rather than dropping unresolved rows.
+        // Keyed by `port_name_key`, not the raw name: a device that came
+        // back at a new ALSA address IS visible, so its stale-address row is
+        // dropped on this write instead of being kept forever as an
+        // "unplugged" leftover and duplicated by the fresh row next to it.
         let available_names: HashSet<String> = list_output_ports()
-            .map(|ports| ports.into_iter().map(|p| p.name).collect())
+            .map(|ports| {
+                ports
+                    .into_iter()
+                    .map(|p| persist::port_name_key(p.name.as_str()).to_string())
+                    .collect()
+            })
             .unwrap_or_default();
+        let is_visible = |name: &str| available_names.contains(persist::port_name_key(name));
 
         let inner = self.inner.lock();
         for active in inner.active.values() {
+            // Retire any other spelling of this same device before adding the
+            // current one, so the file does not collect one entry per session.
+            let key = persist::port_name_key(active.port.name.as_str()).to_string();
+            file.ports
+                .retain(|name, _| name == &active.port.name || persist::port_name_key(name) != key);
             file.ports.insert(
                 active.port.name.clone(),
                 persist::PortPrefs { clock_enabled: active.clock_enabled.load(Relaxed) },
@@ -923,7 +1063,7 @@ impl MidiOut {
                     if written.contains(&(r.scope.clone(), r.id.clone())) {
                         continue;
                     }
-                    if !available_names.contains(&r.port_name) {
+                    if !is_visible(&r.port_name) {
                         persisted.push(r.clone());
                     }
                 }
@@ -933,7 +1073,7 @@ impl MidiOut {
                 inner.active.values().map(|a| a.port.name.clone()).collect();
             if let Some(existing) = file.projects.get(&key) {
                 for name in &existing.open_ports {
-                    if !open_ports.iter().any(|n| n == name) && !available_names.contains(name) {
+                    if !open_ports.iter().any(|n| n == name) && !is_visible(name) {
                         open_ports.push(name.clone());
                     }
                 }
@@ -1143,7 +1283,7 @@ fn run_thread(
                         };
                         new_snapshots.insert(
                             scope.clone(),
-                            NoteOutSnapshot { events: Arc::new(events), channel: target.channel },
+                            NoteOutSnapshot { events: Arc::new(events), channel_override: target.channel },
                         );
                     }
                     drop(guard);
@@ -1161,7 +1301,7 @@ fn run_thread(
                     for scope in gone {
                         if let Some(mut state) = route_states.remove(&scope) {
                             let mut edge = Vec::new();
-                            state.engine.all_off(state.snapshot.channel, &mut edge);
+                            state.engine.all_off(&mut edge);
                             for m in &edge {
                                 let _ = sink.send(m.as_slice());
                             }
@@ -1178,10 +1318,10 @@ fn run_thread(
                         match route_states.get_mut(&scope) {
                             Some(existing)
                                 if existing.snapshot.events == snap.events
-                                    && existing.snapshot.channel == snap.channel => {}
+                                    && existing.snapshot.channel_override == snap.channel_override => {}
                             Some(existing) => {
                                 let mut edge = Vec::new();
-                                existing.engine.all_off(existing.snapshot.channel, &mut edge);
+                                existing.engine.all_off(&mut edge);
                                 existing.engine.reseek(&snap, pos_now, &mut edge);
                                 for m in &edge {
                                     let _ = sink.send(m.as_slice());
@@ -1252,7 +1392,7 @@ fn run_thread(
 fn shutdown_release_and_stop(sink: &mut dyn ClockSink, route_states: &mut RouteNoteStates) {
     let mut edge = Vec::new();
     for state in route_states.values_mut() {
-        state.engine.all_off(state.snapshot.channel, &mut edge);
+        state.engine.all_off(&mut edge);
     }
     for msg in &edge {
         let _ = sink.send(msg.as_slice());
@@ -1287,7 +1427,7 @@ pub(crate) fn out_tick(
         let mut note_out = Vec::new();
         if !playing {
             if was_running {
-                notes.all_off(snap.channel, &mut note_out);
+                notes.all_off(&mut note_out);
             }
         } else if !was_running {
             // Fresh start: reposition past anything already behind us, then
@@ -1375,7 +1515,7 @@ pub fn midi_set_track_route(
     control.set_midi_track_route(
         track_id,
         port_id,
-        channel.unwrap_or(0),
+        channel,
         crate::control::op::TxMeta::user("set midi track route"),
     )
 }
@@ -1403,7 +1543,7 @@ pub fn midi_set_clip_route(
     control.set_midi_clip_route(
         clip_id,
         port_id,
-        channel.unwrap_or(0),
+        channel,
         crate::control::op::TxMeta::user("set midi clip route"),
     )
 }
@@ -1606,15 +1746,15 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn snap(events: Vec<crate::midi::schedule::AbsNoteEvent>) -> NoteOutSnapshot {
-        NoteOutSnapshot { events: Arc::new(events), channel: 0 }
+        NoteOutSnapshot { events: Arc::new(events), channel_override: None }
     }
 
     #[test]
     fn advance_emits_on_and_off_inside_the_window_only() {
         use crate::midi::schedule::AbsNoteEvent;
         let s = snap(vec![
-            AbsNoteEvent { sample: 100, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 500, key: 60, velocity: 0 },
+            AbsNoteEvent { sample: 100, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 500, key: 60, velocity: 0, channel: 0 },
         ]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
@@ -1631,7 +1771,7 @@ mod tests {
     #[test]
     fn advance_never_replays_an_event_across_windows() {
         use crate::midi::schedule::AbsNoteEvent;
-        let s = snap(vec![AbsNoteEvent { sample: 10, key: 64, velocity: 90 }]);
+        let s = snap(vec![AbsNoteEvent { sample: 10, key: 64, velocity: 90, channel: 0 }]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
         e.advance(&s, 0, 100, &mut out);
@@ -1644,19 +1784,19 @@ mod tests {
     fn all_off_releases_exactly_the_sounding_keys() {
         use crate::midi::schedule::AbsNoteEvent;
         let s = snap(vec![
-            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 0, key: 67, velocity: 100 },
-            AbsNoteEvent { sample: 10, key: 60, velocity: 0 },
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 0, key: 67, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 10, key: 60, velocity: 0, channel: 0 },
         ]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
         e.advance(&s, 0, 20, &mut out);
         out.clear();
-        e.all_off(0, &mut out);
+        e.all_off(&mut out);
         assert_eq!(out.len(), 1, "only key 67 is still sounding: {:?}", out);
         assert_eq!(out[0].as_slice(), &[0x80, 67, 0]);
         out.clear();
-        e.all_off(0, &mut out);
+        e.all_off(&mut out);
         assert!(out.is_empty(), "all_off is idempotent");
     }
 
@@ -1664,8 +1804,8 @@ mod tests {
     fn reseek_releases_and_repositions_the_cursor() {
         use crate::midi::schedule::AbsNoteEvent;
         let s = snap(vec![
-            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 1_000, key: 62, velocity: 100 },
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 1_000, key: 62, velocity: 100, channel: 0 },
         ]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
@@ -1686,9 +1826,9 @@ mod tests {
     fn reseek_moves_the_cursor_backward_and_replays_the_intervening_note() {
         use crate::midi::schedule::AbsNoteEvent;
         let s = snap(vec![
-            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 1_000, key: 62, velocity: 100 },
-            AbsNoteEvent { sample: 2_000, key: 64, velocity: 100 },
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 1_000, key: 62, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 2_000, key: 64, velocity: 100, channel: 0 },
         ]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
@@ -1714,17 +1854,17 @@ mod tests {
     fn a_content_swap_with_a_shorter_array_still_emits() {
         use crate::midi::schedule::AbsNoteEvent;
         let long = snap(vec![
-            AbsNoteEvent { sample: 0, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 1_000, key: 60, velocity: 0 },
-            AbsNoteEvent { sample: 2_000, key: 62, velocity: 100 },
-            AbsNoteEvent { sample: 3_000, key: 62, velocity: 0 },
-            AbsNoteEvent { sample: 4_000, key: 64, velocity: 100 },
+            AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 1_000, key: 60, velocity: 0, channel: 0 },
+            AbsNoteEvent { sample: 2_000, key: 62, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 3_000, key: 62, velocity: 0, channel: 0 },
+            AbsNoteEvent { sample: 4_000, key: 64, velocity: 100, channel: 0 },
         ]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
         e.advance(&long, 0, 4_500, &mut out); // cursor now past every event (index 5)
 
-        let short = snap(vec![AbsNoteEvent { sample: 100, key: 67, velocity: 90 }]);
+        let short = snap(vec![AbsNoteEvent { sample: 100, key: 67, velocity: 90, channel: 0 }]);
 
         out.clear();
         e.reseek(&short, 0, &mut out);
@@ -1742,8 +1882,8 @@ mod tests {
     fn advance_panics_in_debug_on_an_out_of_order_snapshot() {
         use crate::midi::schedule::AbsNoteEvent;
         let s = snap(vec![
-            AbsNoteEvent { sample: 500, key: 60, velocity: 100 },
-            AbsNoteEvent { sample: 100, key: 62, velocity: 100 }, // out of order
+            AbsNoteEvent { sample: 500, key: 60, velocity: 100, channel: 0 },
+            AbsNoteEvent { sample: 100, key: 62, velocity: 100, channel: 0 }, // out of order
         ]);
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
@@ -1753,8 +1893,8 @@ mod tests {
     #[test]
     fn channel_is_encoded_in_the_status_byte() {
         use crate::midi::schedule::AbsNoteEvent;
-        let mut s = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100 }]);
-        s.channel = 9; // GM drums
+        let mut s = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 }]);
+        s.channel_override = Some(9); // force GM drums
         let mut e = NoteOutEngine::new();
         let mut out = Vec::new();
         e.advance(&s, 0, 10, &mut out);
@@ -1765,7 +1905,7 @@ mod tests {
     fn out_tick_sends_clock_and_notes_from_one_anchor() {
         use crate::midi::schedule::AbsNoteEvent;
         let map = map120();
-        let s = snap(vec![AbsNoteEvent { sample: 4_800, key: 60, velocity: 100 }]); // 100 ms in
+        let s = snap(vec![AbsNoteEvent { sample: 4_800, key: 60, velocity: 100, channel: 0 }]); // 100 ms in
         let mut clock = ClockEngine::new();
         let mut routes = one_route(RouteScope::Track("t-1".into()), s);
         let mut sink = RecordingSink::default();
@@ -1783,7 +1923,7 @@ mod tests {
     fn stopping_the_transport_releases_outgoing_notes() {
         use crate::midi::schedule::AbsNoteEvent;
         let map = map120();
-        let s = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100 }]);
+        let s = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 }]);
         let mut clock = ClockEngine::new();
         let mut routes = one_route(RouteScope::Track("t-1".into()), s);
         let mut sink = RecordingSink::default();
@@ -1798,8 +1938,8 @@ mod tests {
     fn two_routes_on_the_same_tick_stay_independent() {
         use crate::midi::schedule::AbsNoteEvent;
         let map = map120();
-        let track_snap = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100 }]);
-        let clip_snap = snap(vec![AbsNoteEvent { sample: 0, key: 72, velocity: 90 }]);
+        let track_snap = snap(vec![AbsNoteEvent { sample: 0, key: 60, velocity: 100, channel: 0 }]);
+        let clip_snap = snap(vec![AbsNoteEvent { sample: 0, key: 72, velocity: 90, channel: 0 }]);
         let mut clock = ClockEngine::new();
         let mut routes: RouteNoteStates = HashMap::new();
         routes.insert(RouteScope::Track("t-1".into()), RouteNoteState { engine: NoteOutEngine::new(), snapshot: track_snap });
@@ -1934,7 +2074,7 @@ mod tests {
 
         let out = MidiOut::default();
         out.attach(session.clone(), shared.clone());
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 0)));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
         out.open_port(target.id.clone()).expect("open the loopback port");
 
         // Past the short note's own note-off (125 ms) and at least one
@@ -2071,8 +2211,8 @@ mod tests {
         out.attach(session, shared.clone());
         // Track routed on channel 0; the second clip overrides to channel 5
         // on the SAME port.
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 0)));
-        out.set_route(RouteScope::Clip(overridden_clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), 5)));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
+        out.set_route(RouteScope::Clip(overridden_clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), Some(5))));
         out.open_port(target.id.clone()).expect("open the loopback port");
 
         std::thread::sleep(std::time::Duration::from_millis(400));
@@ -2157,7 +2297,7 @@ mod tests {
             eprintln!("skipping: loopback port not visible"); return;
         };
 
-        out.set_route(RouteScope::Clip(clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), 0)));
+        out.set_route(RouteScope::Clip(clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), Some(0))));
         out.open_port(target.id.clone()).expect("open the loopback port");
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(
@@ -2208,7 +2348,7 @@ mod tests {
         before.set_routing_path_for_test(routing_path.clone());
         before.open_port(target.id.clone()).expect("open the loopback port");
         before.set_clock_enabled(&target.id, false).unwrap();
-        before.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 3)));
+        before.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(3))));
         before.persist(Some(&project_dir));
         before.close_port(&target.id).ok();
         assert!(before.status().outputs.is_empty(), "the OLD instance's port is closed, simulating app exit");
@@ -2226,7 +2366,7 @@ mod tests {
         assert!(!status.outputs[0].clock_enabled, "the persisted clock-enabled preference was restored");
         assert!(
             after.routes().get(&RouteScope::Track("t-1".into()))
-                == Some(&RouteTarget::new(status.outputs[0].port.id.clone(), 3)),
+                == Some(&RouteTarget::new(status.outputs[0].port.id.clone(), Some(3))),
             "the persisted track route was reapplied, re-pointed at the freshly resolved port id: {:?}",
             after.routes()
         );
@@ -2265,7 +2405,7 @@ mod tests {
         out.set_routing_path_for_test(routing_path.clone());
         out.set_route(
             RouteScope::Track("t-prev".into()),
-            Some(RouteTarget::new("ghost#0", 2)),
+            Some(RouteTarget::new("ghost#0", Some(2))),
         );
         assert!(
             !out.routes().is_empty(),
@@ -2299,7 +2439,7 @@ mod tests {
             "no route yet — cannot hang a return on nothing"
         );
 
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new("out#0", 0)));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new("out#0", Some(0))));
         out.set_return("t-1", Some("Mic 2".into())).unwrap();
         assert_eq!(out.return_sources().get("t-1").map(String::as_str), Some("Mic 2"));
         assert_eq!(
@@ -2307,10 +2447,10 @@ mod tests {
             Some("Mic 2")
         );
 
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new("out#1", 4)));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new("out#1", Some(4))));
         let kept = out.routes().get(&RouteScope::Track("t-1".into())).cloned().unwrap();
         assert_eq!(kept.port_id, "out#1");
-        assert_eq!(kept.channel, 4);
+        assert_eq!(kept.channel, Some(4));
         assert_eq!(kept.return_device.as_deref(), Some("Mic 2"), "port/channel edit must not drop the return");
 
         out.set_return("t-1", None).unwrap();
@@ -2372,14 +2512,14 @@ mod tests {
                         scope: "track".into(),
                         id: "t-1".into(),
                         port_name: "Unplugged Synth".into(),
-                        channel: 3,
+                        channel: Some(3),
                         return_device: Some("Mic 2".into()),
                     },
                     persist::PersistedRoute {
                         scope: "clip".into(),
                         id: "c-9".into(),
                         port_name: "Missing Drum Machine".into(),
-                        channel: 9,
+                        channel: Some(9),
                         return_device: None,
                     },
                 ],
@@ -2408,14 +2548,14 @@ mod tests {
                 r.scope == "track"
                     && r.id == "t-1"
                     && r.port_name == "Unplugged Synth"
-                    && r.channel == 3
+                    && r.channel == Some(3)
                     && r.return_device.as_deref() == Some("Mic 2")
             }),
             "the unplugged track route (and its return) stays on disk: {:?}",
             proj.routes
         );
         assert!(
-            proj.routes.iter().any(|r| r.scope == "clip" && r.id == "c-9" && r.port_name == "Missing Drum Machine" && r.channel == 9),
+            proj.routes.iter().any(|r| r.scope == "clip" && r.id == "c-9" && r.port_name == "Missing Drum Machine" && r.channel == Some(9)),
             "the unplugged clip route stays on disk: {:?}",
             proj.routes
         );
@@ -2606,7 +2746,7 @@ mod tests {
 
         let out = MidiOut::default();
         out.attach(session, shared.clone());
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), 0)));
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
         out.open_port(target.id.clone()).expect("open the loopback port");
 
         // The thread's 250 ms try_lock snapshot window has to pick up the

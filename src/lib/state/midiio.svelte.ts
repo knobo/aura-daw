@@ -109,7 +109,12 @@ class MidiIoStore {
     await backend.midiSetOutputClockEnabled?.(portId, on);
   }
 
-  async setTrackRoute(trackId: string, portId: string | null, channel = 0): Promise<void> {
+  /** `channel` null (the default) = each note keeps its own MIDI channel. */
+  async setTrackRoute(
+    trackId: string,
+    portId: string | null,
+    channel: number | null = null,
+  ): Promise<void> {
     const prev = this.trackRoute(trackId);
     this.routes = this.routes.filter((r) => !(r.scope === "track" && r.id === trackId));
     if (portId) {
@@ -128,7 +133,12 @@ class MidiIoStore {
     await backend.midiSetTrackReturn?.(trackId, deviceId);
   }
 
-  async setClipRoute(clipId: string, portId: string | null, channel = 0): Promise<void> {
+  /** `channel` null (the default) = each note keeps its own MIDI channel. */
+  async setClipRoute(
+    clipId: string,
+    portId: string | null,
+    channel: number | null = null,
+  ): Promise<void> {
     this.routes = this.routes.filter((r) => !(r.scope === "clip" && r.id === clipId));
     if (portId) this.routes = [...this.routes, { scope: "clip", id: clipId, portId, channel }];
     await backend.midiSetClipRoute?.(clipId, portId, channel);

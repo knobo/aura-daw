@@ -2060,6 +2060,24 @@ impl ControlPlane {
         self.midi_out.get().ok_or_else(|| "midi output driver not attached".to_string())
     }
 
+    /// Tell the engine which tracks/clips now go out to hardware, so their
+    /// internal instrument stops (or resumes) sounding. Routing is app
+    /// config — it never travels through `commit`, so nothing else in the
+    /// system would schedule the rebuild this needs. Must be called after
+    /// EVERY change to the routing table: patching or clearing a route,
+    /// closing a port (which clears its routes), and adopting a project's
+    /// persisted routing. A `ControlPlane` with no `MidiOut` attached (unit
+    /// tests) publishes an empty table, which is the correct answer.
+    fn publish_external_routing(&self) {
+        let routed = self
+            .midi_out
+            .get()
+            .map(|out| out.routed_out())
+            .unwrap_or_default();
+        self.engine
+            .send(ControlMsg::SetExternalRouting(std::sync::Arc::new(routed)));
+    }
+
     /// The current project's directory, if it has one yet (an unsaved
     /// project has none, and its routing simply isn't persisted — see
     /// `midi_out::MidiOut::persist`'s doc).
@@ -2095,6 +2113,7 @@ impl ControlPlane {
         out.close_port(&port_id)?;
         out.clear_routes_for_port(&port_id);
         out.persist(self.current_project_dir().as_deref());
+        self.publish_external_routing();
         Ok(())
     }
 
@@ -2129,7 +2148,7 @@ impl ControlPlane {
         &self,
         track_id: String,
         port_id: Option<String>,
-        channel: u8,
+        channel: Option<u8>,
         meta: op::TxMeta,
     ) -> Result<(), String> {
         // Only validate when actually routing to a track: a leftover route
@@ -2153,7 +2172,7 @@ impl ControlPlane {
             }
         }
         log::info!(
-            "set_midi_track_route: actor={:?} label={:?} track={track_id} port={port_id:?} channel={channel}",
+            "set_midi_track_route: actor={:?} label={:?} track={track_id} port={port_id:?} channel={channel:?}",
             meta.actor,
             meta.label
         );
@@ -2163,6 +2182,7 @@ impl ControlPlane {
             port_id.map(|port_id| crate::midi_out::RouteTarget::new(port_id, channel)),
         );
         out.persist(self.current_project_dir().as_deref());
+        self.publish_external_routing();
         Ok(())
     }
 
@@ -2208,7 +2228,7 @@ impl ControlPlane {
         &self,
         clip_id: String,
         port_id: Option<String>,
-        channel: u8,
+        channel: Option<u8>,
         meta: op::TxMeta,
     ) -> Result<(), String> {
         // Same asymmetry as `set_midi_track_route`: clearing a leftover
@@ -2221,7 +2241,7 @@ impl ControlPlane {
             }
         }
         log::info!(
-            "set_midi_clip_route: actor={:?} label={:?} clip={clip_id} port={port_id:?} channel={channel}",
+            "set_midi_clip_route: actor={:?} label={:?} clip={clip_id} port={port_id:?} channel={channel:?}",
             meta.actor,
             meta.label
         );
@@ -2231,6 +2251,7 @@ impl ControlPlane {
             port_id.map(|port_id| crate::midi_out::RouteTarget::new(port_id, channel)),
         );
         out.persist(self.current_project_dir().as_deref());
+        self.publish_external_routing();
         Ok(())
     }
 
@@ -3821,6 +3842,7 @@ impl ControlPlane {
         crate::plugins::automation::adopt_open_project(&dir);
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
+            self.publish_external_routing();
         }
         self.adopt_modulation_from_dir(&dir);
         self.engine.send(ControlMsg::Rebuild);
@@ -3909,6 +3931,7 @@ impl ControlPlane {
         crate::plugins::automation::adopt_open_project(&dir);
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
+            self.publish_external_routing();
         }
         self.adopt_modulation_from_dir(&dir);
         self.engine.send(ControlMsg::Rebuild);
@@ -7283,7 +7306,7 @@ mod tests {
         cp.attach_midi_out(Arc::clone(&out));
         let keys = cp.add_track(Some("Keys".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
         let other = cp.add_track(Some("Pads".into()), Some("midi".into()), TxMeta::user("add")).unwrap();
-        cp.set_midi_track_route(other.id.to_string(), Some("x#0".into()), 0, TxMeta::user("route")).unwrap();
+        cp.set_midi_track_route(other.id.to_string(), Some("x#0".into()), None, TxMeta::user("route")).unwrap();
 
         cp.remove_track(keys.id.as_str(), TxMeta::user("delete")).unwrap();
         assert!(
@@ -7657,7 +7680,7 @@ mod tests {
         };
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
-        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &crate::control::session::PluginDoc::default(), &slots, 48_000, None, &crate::midi_out::RoutedOut::default(), &mut nodes, &mut out);
         assert_eq!(out.len(), 3, "all three seeded tracks reach the RT graph");
         // Live-node model (phase 3): render the graph headlessly through the
         // real RT path and assert the seeded music is audible.
@@ -7762,7 +7785,7 @@ mod tests {
         let mut nodes = crate::midi::playback::LiveNodeRegistry::default();
         let mut out = Vec::new();
         let doc = session.lock().plugin_snapshot();
-        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &mut nodes, &mut out);
+        crate::midi::playback::append_from(&crate::control::snapshot::MidiSnapshot::from_store(&midi), &store.tracks, &store.clips, &doc, &slots, 48_000, None, &crate::midi_out::RoutedOut::default(), &mut nodes, &mut out);
         assert_eq!(out.len(), 3);
         for (track, inst) in [("pad", &ids[0]), ("lead", &ids[1]), ("bass", &ids[2])] {
             assert_eq!(

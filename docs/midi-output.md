@@ -67,28 +67,67 @@ why it is where it is.
 2. In **PATCH**, find the MIDI track you want to route. Every MIDI track is
    listed there, so you can see what is already patched where before you
    change anything.
-3. Pick its port and (optionally) a channel other than 1. The cord between
-   the track and its port takes that port's colour, so two tracks sharing a
-   port are one glance apart.
-4. Press play. That track's notes go out to the external instrument.
-5. **Mute the track in AURA** if you don't want to hear its internal
-   instrument at the same time. The track keeps sounding internally
-   otherwise — routing to a device does not replace AURA's own voice, and
-   muting is the documented way to avoid doubling — until a return clip
-   lands on the track (step 7), which replaces the internal instrument.
-6. To **capture the synth into the project** (so export hears it): next
+3. Pick its port. Leave **channel** on `from clip` unless the device insists
+   on one fixed channel — see *Channels* below; it matters for drums. The cord
+   between the track and its port takes that port's colour, so two tracks
+   sharing a port are one glance apart.
+4. Press play. That track's notes go out to the external instrument, and
+   **AURA stops playing its own instrument on that track** — the device you
+   patched is the instrument now. Clear the route to get AURA's voice back.
+5. To **capture the synth into the project** (so export hears it): next
    to the channel, pick a **return** input — the same list as the master
    strip's audio input picker. Patch the synth (or Hydrogen) into that
    input yourself (a cable, or Helvum / qpwgraph). Arm the track and
    record. A WAV clip lands on *this* MIDI track.
-7. Once that clip exists, AURA stops playing the internal instrument on
-   the track so the return is what you hear and what `export_song` mixes.
-   Delete the clip to get the internal voice back.
+6. That clip is then what you hear and what `export_song` mixes.
 
 Unlike the single-track carve-out this shipped with originally, **more than
 one track can be routed at once** — give any other track in **PATCH** its
 own port and channel; the previous track's routing is untouched. The panel
 lists every route at once, so you never have to remember what you set.
+
+### Channels
+
+A route's **channel** field is an override, not the channel. Left on
+`from clip` — the default — every note goes out on the channel it carries in
+the document (`MidiNote.channel`, what a `.mid` import preserves and what MIDI
+export writes). Pick 1-16 instead and the whole route is forced onto that one
+channel, which is what a mono-timbral synth listening on a single channel
+wants.
+
+`from clip` is the setting that matters for **drums**. General MIDI puts
+percussion on channel 10, and that is what the Composer's groove generator
+writes and what a drum machine maps to its kit — so a forced channel 1 (what
+every route used to send, unavoidably) reaches the device and triggers
+nothing. If a drum machine is receiving but silent, check this field first.
+
+### What the internal instrument does
+
+A routed track does not sound AURA's own instrument: routing REPLACES the
+internal voice rather than layering with it. Without that, a drum clip plays
+as pitches out of AURA's synth at the same time as the drum machine plays it
+as drums, loud enough to hide the device you are trying to hear.
+
+Two exceptions, both deliberate:
+
+* **Live monitoring still goes through AURA.** There is no MIDI thru yet (see
+  *Not in this slice*), so an armed keyboard has no path to the external
+  device — killing the internal voice would leave you hearing nothing at all.
+  Only a routed track's *clips* go quiet internally.
+* **`export_song` still renders the internal instrument.** Routing is
+  per-machine app config that never travels with the project, so honouring it
+  in a bounce would make the same project export differently on the machine
+  with the synth plugged in. Record a **return** (step 5) to get the device
+  into the mix, or **mute** the track to keep it out — mute is document state
+  and does travel.
+
+A clip-level override behaves the same way, one clip at a time: that clip's
+notes leave the internal instrument, the track's other clips keep sounding.
+
+**Mute does not stop the MIDI.** Muting a routed track silences its AURA
+channel (and keeps it out of a bounce), but the notes still leave for the
+device — mute is a mixer control, and the device is not on AURA's mixer. To
+stop sending, clear the route or close the port.
 
 ### Per-clip overrides
 
@@ -104,9 +143,17 @@ Which ports are open, each port's clock setting, and the current
 track/clip routing table are all saved to a small file on THIS machine
 (`~/.config/aura/midi-routing.json` on Linux) whenever you change them, keyed
 by the project's file path. Opening the SAME project again on the SAME
-machine reopens the same ports (matched by device **name**, since the
-underlying port id can shift between restarts) and reapplies its routing
-automatically — no more re-configuring on every launch.
+machine reopens the same ports and reapplies its routing automatically — no
+more re-configuring on every launch.
+
+Ports are matched by device **name**, because the `"<name>#<index>"` id
+`midir` hands out can shift between restarts. On ALSA the name itself ends in
+the sequencer address the kernel assigned (`Hydrogen:Hydrogen Midi-In 128:0`),
+and that number is handed out in connection order — so restarting Hydrogen, or
+plugging a USB keyboard in first, renames the port. Matching therefore tries
+the exact name first and then the name with that trailing address stripped, so
+a device that came back at a new address keeps its routing instead of silently
+losing it.
 
 This file is **never part of the project itself** and never travels with
 it: opening the project on a different machine (different MIDI hardware) or
@@ -132,6 +179,11 @@ and the workaround today is a smaller audio buffer.
   `aconnect -l` shows both AURA and the target. Check the receiving app is
   actually set to slave to external MIDI clock — most default to their own
   internal clock.
+* **The device receives, but plays nothing.** Almost always the channel. A
+  drum machine only maps percussion on MIDI channel 10; set the route's
+  channel field back to `from clip` (the default) so the notes go out on the
+  channel the clip actually says. If the device has a channel filter of its
+  own, either set it to *all* or match it to what the clip uses.
 * **A track is routed but silent.** The MIDI panel's **PATCH** section says
   why. An amber cord and *"Port is not open — notes are not leaving AURA."*
   means the route points at a port nobody opened — its **Open port** button
@@ -139,6 +191,19 @@ and the workaround today is a smaller audio buffer.
   route names is not on this machine any more; reconnect it or pick another.
   Routes whose track or clip has since been deleted collect in the panel's
   **left over** footer: they send nothing, and forgetting them is safe.
+* **The slave runs at double tempo, or restarts oddly.** Check `aconnect -l`
+  for TWO paths from AURA to the same device. On Linux it is easy to end up
+  with both `Midi Through:Midi Through Port-0` and the device's own input port
+  open in AURA's **OUT** section while the device is *subscribed to Midi
+  Through* — then every clock pulse and every note arrives twice, so a slave
+  counting 48 pulses per quarter instead of 24 runs at 2x. Close one of the two
+  ports (the direct one is the better keep), or point the device's MIDI input
+  at AURA instead of at Midi Through. AURA cannot detect this: from its side
+  they are two unrelated ports.
+
+  While you are in `aconnect -l`, also look for the device's *output* port
+  feeding back into Midi Through and thus into its own input — Hydrogen ships
+  with MIDI feedback on, and that loop is its own source of confusion.
 * **Hydrogen restarts itself now and then.** Two causes, both above: the
   loop re-cue on every wrap, and the periodic clock re-anchor on long
   continuous playback. Neither is a fault you can configure away today.

@@ -117,7 +117,9 @@ describe("midiIo", () => {
     });
 
     await midiIo.setTrackRoute("t-9", null);
-    expect(midiSetTrackRoute).toHaveBeenCalledWith("t-9", null, 0);
+    // No channel argument = "follow each note's own channel", which is the
+    // default a freshly patched route gets and what a GM drum part needs.
+    expect(midiSetTrackRoute).toHaveBeenCalledWith("t-9", null, null);
     expect(midiIo.trackRoute("t-9")).toBeUndefined();
   });
 

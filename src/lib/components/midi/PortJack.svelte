@@ -33,7 +33,9 @@
   <span class="plug" class:live aria-hidden="true"></span>
   {#if target}
     <span class="pname" title={target.portName}>{target.portName}</span>
-    <span class="ch">ch {target.channel + 1}</span>
+    <span class="ch" title={target.channel === null ? "each note on its own channel" : undefined}
+      >{target.channel === null ? "ch •" : `ch ${target.channel + 1}`}</span
+    >
     {#if target.health !== "open"}
       <span class="warn" aria-hidden="true">!</span>
     {/if}

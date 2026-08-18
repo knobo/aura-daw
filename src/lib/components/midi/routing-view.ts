@@ -29,8 +29,9 @@ export interface RouteTarget {
   /** Human name from `outputs`/`outPorts`; falls back to the raw portId when
    * the device is missing and there is no name left to look up. */
   portName: string;
-  /** Stored 0-15. The panel labels it `ch N+1`. */
-  channel: number;
+  /** Forced channel, stored 0-15 and labelled `ch N+1`; null = follow each
+   * note's own channel (the default). */
+  channel: number | null;
   health: PortHealth;
 }
 

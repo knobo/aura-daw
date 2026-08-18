@@ -477,9 +477,11 @@ fn prepare(
                     0,
                     bar_ticks,
                     "General MIDI",
-                    "These are GM drum keys on channel 10 (kick 36, snare 38, hats 42/46). Point \
-                     the track at a drum kit — a sampler instrument or a plugin — to hear it as \
-                     drums rather than as pitches."
+                    "These are GM drum keys on channel 10 (kick 36, snare 38, hats 42/46). To \
+                     hear them as drums rather than as pitches, either point the track at a drum \
+                     kit — a sampler instrument or a plugin — or patch it to a hardware drum \
+                     machine in the MIDI panel's PATCH section, leaving its channel on \
+                     \"from clip\" so channel 10 survives the trip."
                         .to_string(),
                 ));
                 parts.push(Part { name: "drums", track_name: "Composer Drums".into(), notes, annotations });
