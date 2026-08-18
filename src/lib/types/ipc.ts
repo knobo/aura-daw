@@ -1328,6 +1328,31 @@ export interface HistoryStep {
   redoDepth: number;
 }
 
+export interface HistoryVersion {
+  rev: number;
+  materialized: boolean;
+  chargedBytes: number;
+}
+
+export interface HistoryOverview {
+  undoDepth: number;
+  redoDepth: number;
+  retainedBytes: number;
+  materialized: number;
+  replayOnly: number;
+  /** Newest first. */
+  versions: HistoryVersion[];
+}
+
+export interface HistoryVersionDetail {
+  rev: number;
+  projectName: string | null;
+  trackCount: number;
+  audioClipCount: number;
+  midiClipCount: number;
+  automationLaneCount: number;
+}
+
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────
 
 export interface AuraEventMap {

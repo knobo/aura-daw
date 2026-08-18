@@ -12,6 +12,7 @@ import { DOCK_SHORTCUT, dockTabForKey, type DockTab } from "./ui.svelte";
 const TABS: Exclude<DockTab, "">[] = [
   "composer",
   "generate",
+  "history",
   "hum",
   "library",
   "instruments",

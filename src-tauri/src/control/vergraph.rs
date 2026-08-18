@@ -114,6 +114,16 @@ pub struct VersionStats {
     pub newest_rev: Option<u64>,
 }
 
+/// Small descriptor for the history browser. The document image stays
+/// behind the graph; the renderer asks explicitly to materialize one
+/// revision when the user selects it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VersionItem {
+    pub rev: u64,
+    pub materialized: bool,
+    pub charged_bytes: usize,
+}
+
 /// Everything needed to reconstruct a rev, CLONED OUT of the graph so the
 /// replay itself runs with no mutex held (`materialize` is CPU-bound).
 pub struct ReplayPlan {
@@ -323,6 +333,19 @@ impl VersionGraph {
             oldest_rev: self.nodes.first().map(|(r, _)| *r),
             newest_rev: self.nodes.last().map(|(r, _)| *r),
         }
+    }
+
+    /// Retained revisions in newest-first display order.
+    pub fn items(&self) -> Vec<VersionItem> {
+        self.nodes
+            .iter()
+            .rev()
+            .map(|(rev, node)| VersionItem {
+                rev: *rev,
+                materialized: node.is_materialized(),
+                charged_bytes: node.charge(),
+            })
+            .collect()
     }
 }
 

@@ -689,8 +689,11 @@ R-3 (Task 10), L-4 (Tasks 9+11), L-5 (Task 8).
   flush the outgoing document's pending persist before a swap.
 - **(c) No auto-apply of journal tails** — ruling F-8. Detection only.
 - **(d) Seeded-PRNG constraint** binds future random ops — ruling F-10.
-- **(e) Version-graph product surface unbuilt on purpose** — no browse UI,
-  no `history_stats` command. Substrate + tests only.
+- **(e) Version-graph product surface — read-only browser implemented** on
+  `codex/undo-version-graph-ui`: additive overview/detail commands expose
+  retention statistics and materialized document counts; the HISTORY dock
+  browses retained revisions and drives ordinary Undo/Redo. Restoring an
+  arbitrary revision remains deliberately unbuilt (new mutation contract).
 
 Also recorded from the review follow-up on this branch: `ChangeSet::from_ops`
 flags modulation+automation on `TrackAdd`/`TrackRemove` and on

@@ -20,6 +20,7 @@
   import ZynPatchBrowser from "./plugins/ZynPatchBrowser.svelte";
   import McpPanel from "./mcp/McpPanel.svelte";
   import MidiPanel from "./midi/MidiPanel.svelte";
+  import HistoryPanel from "./history/HistoryPanel.svelte";
 
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
     { id: "composer", label: "♪ COMPOSER" },
@@ -30,6 +31,7 @@
     { id: "plugins", label: "PLUGINS" },
     { id: "mcp", label: "MCP" },
     { id: "midi", label: "⇄ MIDI" },
+    { id: "history", label: "HISTORY" },
   ];
 </script>
 
@@ -85,6 +87,8 @@
         <McpPanel />
       {:else if ui.dock === "midi"}
         <MidiPanel />
+      {:else if ui.dock === "history"}
+        <HistoryPanel />
       {/if}
     </div>
   </aside>
