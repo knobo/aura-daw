@@ -1,19 +1,21 @@
+# No trailing slashes below, deliberately, on everything a worktree is likely to
+# SYMLINK at the main checkout instead of duplicating (target dirs, the npm
+# install, the sidecar venv — gigabytes each on this box). `foo/` matches a
+# DIRECTORY only, so a `foo` symlink stays untracked-but-visible and gets swept
+# up by the next `git add -A`: that is exactly how the self-referential
+# node_modules link in PR #65 landed and had to be removed again in PR #73.
+# Without the slash, both shapes are ignored.
+
 # Rust
-/src-tauri/target/
-/benches/*/target/
+/src-tauri/target
+/benches/*/target
 
 # Node
-# No trailing slash, deliberately: `/node_modules/` matches a DIRECTORY only,
-# so a `node_modules` SYMLINK stays untracked-but-visible and gets swept up by
-# the next `git add -A`. That is exactly how the self-referential link in PR #65
-# landed and had to be removed again in PR #73, and a worktree that links the
-# main checkout's install (the normal way to avoid a second 1 GB copy) recreates
-# the hazard every time. Without the slash, both shapes are ignored.
 /node_modules
 /dist/
 
 # Python sidecar environment (local, machine-specific)
-/.venv-sidecars/
+/.venv-sidecars
 
 # Tauri
 /src-tauri/gen/
