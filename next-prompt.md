@@ -1,45 +1,50 @@
-# Next: the Composer's owner ear-check, then G1 Task 6
+# Next: core-functionality leftovers — automation (Track D) and undo (Plan F)
 
 `origin/main` is the baseline. Branch from there. Subagent-driven,
 task-by-task. Reply to the user in Norwegian — they write Norwegian;
 the repo documentation is English.
 
-**Do this, in order:**
+**Correction (2026-08-18, ADR 0007):** PR #65 (Composer Plan H1) merged
+into `main` at `63cb7fa` (06:27) — the "open, not merged into main" framing
+below is stale. The owner ear-checked it the same day: generation works;
+one bug (MIDI-out to Hydrogen) needs its own PR, not yet filed/scoped.
+**The owner's explicit steer: Composer is a bonus feature — do not pick up
+H2+ without being asked. Focus is core functionality (G-series and other
+core tracks).** Details: memory `aura-composer-deprioritized-2026-08-18`.
 
-1. **Hear the Composer.** Plan H1 is up as PR #65 on
-   `feat/composer-assistant` (merged with `main`, not merged INTO it):
-   open the COMPOSER dock tab (`O`), pick a plan, GENERATE, and listen.
-   The suite proves the notes obey the theory; only an ear can say
-   whether the defaults are *nice*. The judgements owed — registers,
-   melodic taste, groove feel, and the fact that a generated drum clip
-   has no kit to play through — are listed in
-   [`docs/handoff/composer-h1.md`](docs/handoff/composer-h1.md).
-   **Playback on this box needs an ALSA/HDMI sink**: with a Bluetooth
-   default sink the engine opens a stream and never gets a callback, so
-   nothing plays and the transport stays at 0 (CONTRIBUTING documents
-   the same failure for 18 engine tests). `EXPORT` bounces offline and
-   works regardless.
-2. **G1 Task 6** — PDC (`DelayLine` + `compile_pdc`). Plan:
-   [`docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`](docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md)
-   (product: [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)).
-   Handoff of what just landed: [`docs/handoff/g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+**Correction (2026-08-18, ADR 0007):** G1 Task 6 (PDC) landed as PR #71 — see the
+Landed table. The owner steered the NEXT session toward core leftovers
+that are automation- or undo-related rather than G1 Task 7, so **do that
+before picking G1 back up**:
 
-**Do not:** start Composer H2–H6 before the ear-check (the whole point of
-H1 is that the next phase reads it, and taste feedback changes what H2
-should be); start G2/G3/G4; write a stock FX suite; bump
-`OP_FORMAT_VERSION`; restart a landed track (A–F, Plan F, G1 Tasks 1–5,
-Pitch Coach phases 1–3, the lanes UX track, the theme system, Composer
-H1).
+**Do this:**
 
-**In flight:** `feat/composer-assistant` (Plan H1, PR #65 — open, with
-`main` merged in). Latest on `main`: `c99293b` (G1 Task 5 mixer strip,
-PR #66). Stale worktrees for merged branches can be ignored — but keep
-the branches `feat/pitch-coach`, `feat/pitch-coach-panel`,
-`plan-f-history` and `worktree-lanes-ux`, whose per-commit or squashed
-SHAs are cited in the handoffs. (2026-08-18: 16 stale merged-branch
-worktrees under `.claude/worktrees/` were removed to free disk space —
-the branches themselves were not deleted; `.claude/worktrees/composer`
-is live and carries PR #65.)
+1. **Track D leftovers (automation)** — pick one, read the Track D handoff
+   in `docs/PHASE4-PLAN.md` first: plugin-param automation is not applied
+   in a bounce (`audio::offline::build_graph`'s documented divergence);
+   the non-blocking CLAP param path (`clap_host::set_params` blocks —
+   `docs/PHASE4-PLAN.md` "Track D handoff"); write/touch/latch automation
+   modes (currently a flat lane always overrides the knob for the whole
+   playthrough); no DOM test environment (nothing inside a `.svelte` file
+   is covered by any test — both of Track D's real bugs lived there).
+2. **Plan F carry-forwards (undo)** — read the Plan F handoff in
+   `docs/PHASE4-PLAN.md` first, and do not touch `engine::rebuild`, the
+   journal reader or the version graph without it: the live-document
+   B-tree, I-1 option (a), no journal auto-apply, a version-graph UI.
+
+**Do not:** start Composer H2–H6 (deprioritized — ask the owner first);
+start G1 Task 7 or G2/G3/G4 before finishing at least one automation/undo
+leftover above; write a stock FX suite; bump `OP_FORMAT_VERSION`; restart
+a landed track (A–F, Plan F, G1 Tasks 1–6, Pitch Coach phases 1–3, the
+lanes UX track, the theme system, Composer H1).
+
+**In flight:** nothing — PR #71 (G1 Task 6, PDC) and PR #70 (clip-delete
+keydown fix) both merged 2026-08-18. Latest on `main`: `7011e81`. Next
+branch (Track D or Plan F leftover) starts fresh from `origin/main`.
+Stale worktrees for merged branches can be ignored — but keep the branches
+`feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history` and
+`worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in the
+handoffs.
 
 This file is the briefing after `/clear`. History and leftovers that
 are not every task's business live under [`docs/handoff/`](docs/handoff/).
@@ -50,8 +55,10 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
+| G1 Task 6 — PDC (`DelayLine` + `compile_pdc`) | PR #71 `9e0b884`. `RtTrack::pdc` is still `None` everywhere in production — wiring `compile_pdc`'s output into a graph rebuild is Task 7, not started. Code review before merge caught and fixed a real bug: the formula didn't handle a bypassed insert's latency correctly (would have jumped the mix on bypass toggle once Task 7 wired it in). Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
+| Clip Delete/Backspace after a plain pointer-click | PR #70 `7011e81`. Pointer-select never focused the clip element, so its own keydown handler never fired; a window-level fallback now reads `clipSelection` directly. Single-clip only — batch-deleting a multi-selection still needs a `clips_remove` transaction (Track C leftover, unchanged) |
 | G1 Task 5 — mixer strip: source-sum → inserts REPLACE → shared fader (`InsertNode`/`compile_inserts`) | PR #66 `c99293b`. `compile_inserts` is not yet wired into `engine::rebuild` (Task 7) — an insert still isn't audible end-to-end. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
-| **The Composer, Plan H1** — NOT on `main` yet (PR #65): a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord | PR [#65](https://github.com/knobo/aura-daw/pull/65) on `feat/composer-assistant`. Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff (ear-check owed, what H2 picks up): [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
+| **The Composer, Plan H1** — merged to `main` (PR #65, `63cb7fa`, 2026-08-18): a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord. Owner ear-checked the same day: works; MIDI-out-to-Hydrogen bug found, needs its own unscoped PR. **Composer is now deprioritized — do not start H2+ unless asked.** | PR [#65](https://github.com/knobo/aura-daw/pull/65) (merged). Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff: [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
 | Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
 | Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
@@ -66,8 +73,11 @@ this file (marked correction, ADR 0007) if they do.
 
 ## Open leftovers (open the pointer if you are on that item)
 
-- **G1 Tasks 6–10** (not leftovers — the rest of the plan): PDC, rebuild/offline, IPC+UI, handoff. Start at Task 6. Do not jump to Task 9 UI before Task 7 wires the mixer into rebuild — an insert is still silent end-to-end until then (G-11 note in the handoff).
-- **G1 deferred minors** (do not block Task 6): listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **G1 Tasks 7–10** (the rest of the plan, HOLD until an automation/undo leftover above is done — owner steer, 2026-08-18): rebuild/offline wiring, IPC+UI, handoff. Do not jump to Task 9 UI before Task 7 wires the mixer into rebuild — an insert is still silent end-to-end until then (G-11 note in the handoff). Task 6's own known gap for Task 7 to pick up: PDC is applied after inserts but before the fader, so once wired, a track's automation ramps will read the wrong playhead position by its own PDC delay — documented in `pdc.rs`'s module doc.
+- **G1 deferred minors**: listed in [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md).
+- **MIDI-out to Hydrogen bug** — found during the Composer H1 ear-check
+  (2026-08-18), not yet filed or scoped. Needs its own small PR; do not fold
+  it into G-series or Composer work.
 - **Sing-along from any song** — new owner ask (2026-08-17), and the reason
   melody extraction outranks the auto-tune work: import → split stems →
   melody from the vocal stem → sing against it in the coach. Three of four
@@ -131,7 +141,7 @@ this file (marked correction, ADR 0007) if they do.
   [`docs/superpowers/specs/2026-08-15-modulation-system-design.md` §8](docs/superpowers/specs/2026-08-15-modulation-system-design.md#8-the-path-to-the-finished-system).
   ADR 0008. Handoff: `docs/PHASE4-PLAN.md` "Track F handoff". Do not restate §8 here (R2).
 - **Plan E review leftovers:** M-8 (unowned). Closed items: [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md) — do not re-open them.
-- **Track B / C leftovers** that are not ear-checks: recording under an active loop; multi-clip delete. See the matching PHASE4-PLAN handoff.
+- **Track B / C leftovers** that are not ear-checks: recording under an active loop; multi-clip delete (batch `clips_remove` — single-clip Delete-after-click is now fixed, PR #70). See the matching PHASE4-PLAN handoff.
 
 ## Standing constraints (all work)
 
