@@ -14,8 +14,9 @@
   import { transport } from "../../state/transport.svelte";
   import { view } from "../../state/view.svelte";
   import { toasts } from "../../state/toasts.svelte";
-  import { encodeLibraryDrag, nextUsage, usageLocations } from "../../utils/library";
+  import { encodeLibraryDrag, groupLiveUsages, nextUsage } from "../../utils/library";
   import type { ClipUsageEntry } from "../../utils/library";
+  import { focusAndSelect } from "../../utils/focusAndSelect";
   import LibraryRow from "./LibraryRow.svelte";
   import type { MidiClip } from "../../types/ipc";
 
@@ -27,12 +28,19 @@
     return project.trackById(c.trackId) != null;
   }
 
-  /** Other placements sharing `name`, restricted to live tracks — real
+  /** Every clip name's live placements, grouped once per render — real
    * content-instancing (ADR 0004) isn't wired to any action yet, so a
-   * shared name is the closest thing to "the same logical clip" today. */
+   * shared name is the closest thing to "the same logical clip" today.
+   * A `$derived` map, not a per-row lookup: with N clip rows each doing
+   * its own name filter over the whole clip array, a render is O(n²). */
+  const usageByName = $derived.by(() =>
+    groupLiveUsages(
+      midi.clips,
+      new Set(project.tracks.map((t) => t.id)),
+    ),
+  );
   function liveLocations(name: string): ClipUsageEntry[] {
-    const live = new Set(project.tracks.map((t) => t.id));
-    return usageLocations(midi.clips, name, live);
+    return usageByName.get(name) ?? [];
   }
 
   /** Last clip id jumped to, per clip name — lets the Next button resume
@@ -126,6 +134,7 @@
           class="name-edit mono"
           value={renameDraft}
           aria-label="Clip name"
+          use:focusAndSelect
           onpointerdown={(e) => e.stopPropagation()}
           ondblclick={(e) => e.stopPropagation()}
           oninput={(e) => (renameDraft = e.currentTarget.value)}

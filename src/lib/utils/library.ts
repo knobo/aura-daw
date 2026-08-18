@@ -89,17 +89,27 @@ export interface ClipUsageEntry {
   timelineStartTicks: number;
 }
 
-/** Every placement sharing `name`, restricted to tracks that still exist —
+/** Every placement grouped by name, restricted to tracks that still exist —
  * a track delete leaves its MIDI clips behind (orphaned, invisible on any
  * timeline) rather than removing them, so "still exists" is not implied by
- * being in `clips`. Order is the incoming array's order (first-created /
- * timeline-appended first), so double-click-to-jump lands on the first one. */
-export function usageLocations(
+ * being in `clips`. One pass over `clips` regardless of how many distinct
+ * names the caller looks up (a Library render does one lookup per row), so
+ * this is the single source of truth for a render — build it once and
+ * reuse the map, don't call this per row. Each group keeps the incoming
+ * array's order (first-created / timeline-appended first), so
+ * double-click-to-jump lands on the first one. */
+export function groupLiveUsages(
   clips: readonly ClipUsageEntry[],
-  name: string,
   liveTrackIds: ReadonlySet<string>,
-): ClipUsageEntry[] {
-  return clips.filter((c) => c.name === name && liveTrackIds.has(c.trackId));
+): Map<string, ClipUsageEntry[]> {
+  const groups = new Map<string, ClipUsageEntry[]>();
+  for (const c of clips) {
+    if (!liveTrackIds.has(c.trackId)) continue;
+    const group = groups.get(c.name);
+    if (group) group.push(c);
+    else groups.set(c.name, [c]);
+  }
+  return groups;
 }
 
 /** The location after `currentId` in `locations`, wrapping around. The

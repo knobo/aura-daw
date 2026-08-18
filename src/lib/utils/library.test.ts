@@ -8,9 +8,9 @@ import {
   LIBRARY_DRAG_MIME,
   decodeLibraryDrag,
   encodeLibraryDrag,
+  groupLiveUsages,
   hasLibraryDrag,
   nextUsage,
-  usageLocations,
 } from "./library";
 import type { ClipUsageEntry } from "./library";
 
@@ -99,26 +99,28 @@ function entry(id: string, name: string, trackId: string, startTicks = 0): ClipU
   return { id, name, trackId, timelineStartTicks: startTicks };
 }
 
-describe("usageLocations", () => {
-  it("finds every placement sharing a name, on tracks that still exist", () => {
+describe("groupLiveUsages", () => {
+  it("groups every placement by name, on tracks that still exist", () => {
     const clips = [
       entry("a", "Groove", "t1", 0),
       entry("b", "Groove", "t2", 960),
       entry("c", "Other", "t1", 0),
     ];
     const live = new Set(["t1", "t2"]);
-    expect(usageLocations(clips, "Groove", live)).toEqual([clips[0], clips[1]]);
+    const groups = groupLiveUsages(clips, live);
+    expect(groups.get("Groove")).toEqual([clips[0], clips[1]]);
+    expect(groups.get("Other")).toEqual([clips[2]]);
   });
 
   it("drops placements whose track was deleted", () => {
     const clips = [entry("a", "Groove", "t1"), entry("b", "Groove", "t-gone")];
     const live = new Set(["t1"]);
-    expect(usageLocations(clips, "Groove", live)).toEqual([clips[0]]);
+    expect(groupLiveUsages(clips, live).get("Groove")).toEqual([clips[0]]);
   });
 
-  it("is empty for a name with no live placement", () => {
+  it("omits a name with no live placement", () => {
     const clips = [entry("a", "Groove", "t-gone")];
-    expect(usageLocations(clips, "Groove", new Set())).toEqual([]);
+    expect(groupLiveUsages(clips, new Set()).get("Groove")).toBeUndefined();
   });
 });
 
