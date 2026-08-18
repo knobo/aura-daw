@@ -34,6 +34,7 @@
   import { clipClipboard } from "./lib/state/clip-clipboard.svelte";
   import { clipDrag } from "./lib/state/clip-drag.svelte";
   import { clipSelection } from "./lib/state/clip-selection.svelte";
+  import { clipDeleteTarget } from "./lib/utils/clip-delete";
   import TransportBar from "./lib/components/TransportBar.svelte";
   import Timeline from "./lib/components/Timeline.svelte";
   import MasterBar from "./lib/components/MasterBar.svelte";
@@ -262,6 +263,18 @@
     } else if (e.key === "Escape" && clipDrag.active) {
       e.preventDefault();
       clipDrag.cancel();
+    } else if ((e.key === "Delete" || e.key === "Backspace") && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      // Pointer-select does not focus the clip, so the clip's own onkeydown
+      // never fires after a plain click — this is the window-level
+      // fallback, same pattern as copy/paste. Single clip only: batch
+      // deleting the whole timeline selection needs a clips_remove
+      // transaction that does not exist yet (Track C handoff).
+      const target = clipDeleteTarget(clipSelection.refs());
+      if (target) {
+        e.preventDefault();
+        if (target.kind === "midi") void midi.removeClip(target.id);
+        else void project.removeClip(target.id);
+      }
     } else if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === "c") {
       // Copy the timeline selection (multi-clip, audio + MIDI). Falls back
       // to the legacy single-clip stamp when nothing is multi-selected, so
