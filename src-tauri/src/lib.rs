@@ -240,6 +240,8 @@ pub fn run() {
             // ---- control plane: undo/redo (Plan E Task 17, additive) ----
             control::undo,
             control::redo,
+            control::history_overview,
+            control::history_version,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----

@@ -59,7 +59,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use super::op::{Actor, Op, TxMeta, OP_FORMAT_VERSION};
-use super::vergraph::{Janitor, VersionGraph, VersionStats};
+use super::vergraph::{Janitor, VersionGraph, VersionItem, VersionStats};
 use super::CoalesceKey;
 
 // ---------------------------------------------------------------------------
@@ -875,6 +875,12 @@ impl HistoryLog {
     /// for the browsing UI's depth report anyway.
     pub fn version_stats(&self) -> VersionStats {
         self.versions.lock().stats()
+    }
+
+    /// Read-only descriptors for the version-history product surface.
+    pub fn version_overview(&self) -> (VersionStats, Vec<VersionItem>) {
+        let versions = self.versions.lock();
+        (versions.stats(), versions.items())
     }
 
     /// Rebuild the document at `rev`, or `None` if that revision was never

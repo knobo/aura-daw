@@ -50,7 +50,7 @@ pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, Jo
 pub use ops::{LaneArrangement, TrackMixChange};
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
-pub use vergraph::{VersionGraph, VersionNode, VersionStats};
+pub use vergraph::{VersionGraph, VersionItem, VersionNode, VersionStats};
 
 // ---------------------------------------------------------------------------
 // Wire types
@@ -3502,8 +3502,15 @@ impl ControlPlane {
         self.committer.log().version_stats()
     }
 
-    // ---- gestures (Plan E Task 14) ---------------------------------------
+    pub fn version_overview(&self) -> (vergraph::VersionStats, Vec<vergraph::VersionItem>) {
+        self.committer.log().version_overview()
+    }
 
+    pub fn materialize_version(&self, rev: u64) -> Option<SessionSnapshot> {
+        self.committer.log().materialize_version(rev)
+    }
+
+    // ---- gestures (Plan E Task 14) ---------------------------------------
     /// Opens a gesture boundary — the CLAP-style primitive round-2 §4.4 /
     /// ADR 0003 describe. While open, matching commits (today: only
     /// `set_track_mix` checks — same actor class as this gesture's) run
@@ -4882,6 +4889,84 @@ pub struct HistoryStep {
     pub label: Option<String>,
     pub undo_depth: usize,
     pub redo_depth: usize,
+}
+
+/// Read-only product surface over Plan F's retained version chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryVersion {
+    pub rev: u64,
+    pub materialized: bool,
+    pub charged_bytes: usize,
+    pub label: String,
+    pub actor: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryOverview {
+    pub undo_depth: usize,
+    pub redo_depth: usize,
+    pub retained_bytes: usize,
+    pub materialized: usize,
+    pub replay_only: usize,
+    pub versions: Vec<HistoryVersion>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryVersionDetail {
+    pub rev: u64,
+    pub project_name: Option<String>,
+    pub track_count: usize,
+    pub audio_clip_count: usize,
+    pub midi_clip_count: usize,
+    pub automation_lane_count: usize,
+}
+
+#[tauri::command]
+pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOverview {
+    let (stats, versions) = control.version_overview();
+    let (undo_depth, redo_depth) = control.history_depths();
+    HistoryOverview {
+        undo_depth,
+        redo_depth,
+        retained_bytes: stats.retained_bytes,
+        materialized: stats.materialized,
+        replay_only: stats.replay_only,
+        versions: versions
+            .into_iter()
+            .map(|v| HistoryVersion {
+                rev: v.rev,
+                materialized: v.materialized,
+                charged_bytes: v.charged_bytes,
+                label: v.label,
+                actor: v.actor,
+            })
+            .collect(),
+    }
+}
+
+/// Materialization may replay a chain, so keep it off the UI thread.
+#[tauri::command]
+pub async fn history_version(
+    rev: u64,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<Option<HistoryVersionDetail>, String> {
+    let cp = control.inner().clone();
+    let detail = tauri::async_runtime::spawn_blocking(move || {
+        cp.materialize_version(rev).map(|snapshot| HistoryVersionDetail {
+            rev: snapshot.rev,
+            project_name: snapshot.project_name.clone(),
+            track_count: snapshot.tracks.len(),
+            audio_clip_count: snapshot.clips.len(),
+            midi_clip_count: snapshot.midi.clips.len(),
+            automation_lane_count: snapshot.automation.len(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    Ok(detail)
 }
 
 /// Undo the most recent history step (Plan E Task 17) — thin delegate over

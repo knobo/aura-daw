@@ -29,7 +29,9 @@ import type {
   ExportJobStatus,
   ExportRequest,
   HarmonyView,
+  HistoryOverview,
   HistoryStep,
+  HistoryVersionDetail,
   HumToSongRequest,
   ImportClipRequest,
   ImportSplitReply,
@@ -275,6 +277,10 @@ export interface Backend {
   undo?(): Promise<HistoryStep>;
   /** Redo the most recently undone step (see `undo`). */
   redo?(): Promise<HistoryStep>;
+  /** Read-only retained-version browser; real engine only. */
+  historyOverview?(): Promise<HistoryOverview>;
+  /** Materialize one retained revision and return a summary, never state. */
+  historyVersion?(rev: number): Promise<HistoryVersionDetail | null>;
 
   // midi (all musical positions are integer ticks at the project ppq)
   setTempoMap(
@@ -731,6 +737,12 @@ class TauriBackend implements Backend {
   }
   redo() {
     return invoke<HistoryStep>("redo");
+  }
+  historyOverview() {
+    return invoke<HistoryOverview>("history_overview");
+  }
+  historyVersion(rev: number) {
+    return invoke<HistoryVersionDetail | null>("history_version", { rev });
   }
   async gestureBegin(label: string) {
     return invoke<string>("gesture_begin", { label });

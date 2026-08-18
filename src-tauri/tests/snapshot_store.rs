@@ -981,6 +981,18 @@ fn the_version_graph_gets_one_node_per_non_transient_commit_and_drains_at_a_swap
     assert!(s.retained_bytes > 0, "and they charge what they created");
     assert_eq!(s.newest_rev, Some(session.lock().rev()), "the newest node IS the live rev");
 
+    let (overview_stats, items) = log.version_overview();
+    assert_eq!(overview_stats, s, "the browser summary and rows share one graph snapshot");
+    assert_eq!(items.len(), 4);
+    assert_eq!(items[0].label, "gain");
+    assert_eq!(items[0].actor, "You");
+    assert!(items.windows(2).all(|pair| pair[0].rev > pair[1].rev), "browser rows are newest first");
+    assert_eq!(
+        items.iter().map(|item| item.charged_bytes).sum::<usize>(),
+        s.retained_bytes,
+        "row charges explain the graphs charged-byte total",
+    );
+
     // TRANSIENT: a transport batch captures an image (the engine needs it)
     // but is journaled nowhere, undoable nowhere, and retained nowhere.
     let before = log.version_stats();

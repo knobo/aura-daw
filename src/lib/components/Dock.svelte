@@ -20,6 +20,13 @@
   import ZynPatchBrowser from "./plugins/ZynPatchBrowser.svelte";
   import McpPanel from "./mcp/McpPanel.svelte";
   import MidiPanel from "./midi/MidiPanel.svelte";
+  import HistoryPanel from "./history/HistoryPanel.svelte";
+  import { historyBrowser } from "../state/history.svelte";
+
+  function selectTab(tab: Exclude<DockTab, "">) {
+    ui.dock = tab;
+    if (tab === "history") void historyBrowser.load();
+  }
 
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
     { id: "composer", label: "♪ COMPOSER" },
@@ -30,6 +37,7 @@
     { id: "plugins", label: "PLUGINS" },
     { id: "mcp", label: "MCP" },
     { id: "midi", label: "⇄ MIDI" },
+    { id: "history", label: "HISTORY" },
   ];
 </script>
 
@@ -50,7 +58,7 @@
           role="tab"
           aria-selected={ui.dock === t.id}
           title="{t.label} — press {DOCK_SHORTCUT[t.id].toUpperCase()}"
-          onclick={() => (ui.dock = t.id)}
+          onclick={() => selectTab(t.id)}
         >
           {t.label}
           <span class="key silk" aria-hidden="true">{DOCK_SHORTCUT[t.id]}</span>
@@ -85,6 +93,8 @@
         <McpPanel />
       {:else if ui.dock === "midi"}
         <MidiPanel />
+      {:else if ui.dock === "history"}
+        <HistoryPanel />
       {/if}
     </div>
   </aside>
