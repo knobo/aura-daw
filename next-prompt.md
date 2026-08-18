@@ -22,11 +22,11 @@ before picking G1 back up**:
 1. **Track D leftovers (automation)** — pick one, read the Track D handoff
    in `docs/PHASE4-PLAN.md` first: plugin-param automation is not applied
    in a bounce (`audio::offline::build_graph`'s documented divergence);
-   the non-blocking CLAP param path (`clap_host::set_params` blocks —
-   `docs/PHASE4-PLAN.md` "Track D handoff"); write/touch/latch automation
-   modes (currently a flat lane always overrides the knob for the whole
-   playthrough); no DOM test environment (nothing inside a `.svelte` file
-   is covered by any test — both of Track D's real bugs lived there).
+   write/touch/latch automation modes (currently a flat lane always
+   overrides the knob for the whole playthrough); no DOM test environment
+   (nothing inside a `.svelte` file is covered by any test — both of
+   Track D's real bugs lived there). (The non-blocking CLAP param path is
+   closed, branch `clap-nonblocking-params` — see the Track D handoff.)
 2. **Plan F carry-forwards (undo)** — read the Plan F handoff in
    `docs/PHASE4-PLAN.md` first, and do not touch `engine::rebuild`, the
    journal reader or the version graph without it: the live-document

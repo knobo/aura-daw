@@ -1015,7 +1015,8 @@ first.**
   collapses into one host round-trip per plugin. The non-blocking post
   path was NOT built, because `set_params`' blocking form is its contract
   and LV2 already posts — the exposure is narrower than the finding
-  assumed. See the deferral above.
+  assumed. See the deferral above (later closed — `post_params`, branch
+  `clap-nonblocking-params`).
 - **One rebuild per lane commit, including transient folds** (Task 9,
   accepted): harmless under ruling 7 (a drag is one commit), and it would
   become expensive only if a future caller committed per pointermove.
