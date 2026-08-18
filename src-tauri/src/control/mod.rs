@@ -8860,6 +8860,11 @@ mod tests {
     /// round-trip cost under an active ramp. Wedge the plugin-main thread
     /// behind a closure that only releases when WE say so; if the clap arm
     /// still blocks on it, the call won't return within the budget.
+    ///
+    /// Wedges the same process-wide `plugin_main()` singleton
+    /// `clap_host`'s own tests share — safe under this project's CI
+    /// convention (`--test-threads=1`); a parallel local run can stall
+    /// another concurrently running CLAP test that's mid-`run()`.
     #[test]
     fn forward_params_to_host_does_not_block_the_clap_arm() {
         use crate::plugins::host::plugin_main;

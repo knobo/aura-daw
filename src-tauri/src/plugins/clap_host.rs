@@ -1194,6 +1194,12 @@ mod tests {
     /// land. Wedge the main thread behind a slow closure first — a blocking
     /// call would stall on it — then confirm `post_params` returns almost
     /// instantly, and that the value shows up once the wedge clears.
+    ///
+    /// Wedges the process-wide `plugin_main()` singleton this whole test
+    /// binary shares — safe under this project's CI convention
+    /// (`--test-threads=1`, `.github/workflows/tests.yml`); running with
+    /// cargo's default parallel threads can stall another concurrently
+    /// running `clap_host` test that's mid-`run()` on the same static.
     #[test]
     fn post_params_returns_immediately_and_the_change_still_lands() {
         let Some(uid) = instrument_uid() else {
