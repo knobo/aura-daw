@@ -136,4 +136,59 @@ describe("AutomationTrackRow", () => {
     expect(automationClipSet).toHaveBeenCalledTimes(1);
     expect(automationClipSet).toHaveBeenCalledWith(expect.objectContaining({ id: "clip-1" }), true);
   });
+
+  it("alt-click on an existing point deletes it and closes the SAME gesture it opened", async () => {
+    seed();
+    render(AutomationTrackRow, { props: { track: seedTrack() } });
+
+    const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    // clientX/Y = 0 lands exactly on the seeded point (tick 0, value 1) —
+    // canvasPos falls back to a 1:1 scale under jsdom's zero-rect default
+    // (see this plan's Global Constraints), so {x, y} = {clientX, clientY}.
+    await fireEvent.pointerDown(clipEl, { clientX: 0, clientY: 0, button: 0, altKey: true });
+    // commitInGesture's .then(...) is a microtask chain off an unawaited
+    // promise in the handler; give it two ticks to run.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(gestureBegin).toHaveBeenCalledTimes(1);
+    expect(gestureBegin).toHaveBeenCalledWith("automation delete point");
+    expect(modulationSetCurve).toHaveBeenCalledTimes(1);
+    expect(modulationSetCurve.mock.calls[0][0].points).toEqual([]);
+    expect(gestureEnd).toHaveBeenCalledTimes(1);
+    expect(gestureEnd).toHaveBeenCalledWith("gesture-automation delete point");
+  });
+
+  it("dragging a point commits once on pointerup, not on every pointermove", async () => {
+    seed();
+    render(AutomationTrackRow, { props: { track: seedTrack() } });
+
+    const clipEl = screen.getByRole("button", { name: /automation clip/i });
+    const canvasEl = document.querySelector("canvas") as HTMLCanvasElement;
+    // jsdom implements no Pointer Capture API at all; the point-edit path
+    // calls `canvas.setPointerCapture` unconditionally (see Global
+    // Constraints).
+    Object.defineProperty(canvasEl, "setPointerCapture", { value: vi.fn(), writable: true });
+    // jsdom's default zero rect makes the near-right-edge test
+    // (`rect.right - clientX <= EDGE_PX`) true for any non-negative
+    // clientX, which would misroute this click to "resize" instead of
+    // "point" — stub the div's rect to its actual rendered size.
+    clipEl.getBoundingClientRect = () =>
+      ({ left: 0, top: 0, right: 40, bottom: 20, width: 40, height: 20 }) as DOMRect;
+
+    await fireEvent.pointerDown(clipEl, { clientX: 0, clientY: 0, button: 0 });
+    expect(gestureBegin).toHaveBeenCalledTimes(1);
+    expect(gestureBegin).toHaveBeenCalledWith("automation edit");
+
+    await fireEvent.pointerMove(clipEl, { clientX: 0, clientY: 1 });
+    await fireEvent.pointerMove(clipEl, { clientX: 0, clientY: 1 });
+    expect(modulationSetCurve).not.toHaveBeenCalled();
+
+    await fireEvent.pointerUp(clipEl, { clientX: 0, clientY: 1, button: 0 });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(modulationSetCurve).toHaveBeenCalledTimes(1);
+    expect(gestureEnd).toHaveBeenCalledTimes(1);
+  });
 });
