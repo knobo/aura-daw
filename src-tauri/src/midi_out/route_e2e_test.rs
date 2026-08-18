@@ -91,6 +91,7 @@ fn rig(label: &str, note_channel: u8, route_channel: Option<u8>) -> Option<Rig> 
         Arc::new(JobManager::new(2, std::time::Duration::ZERO)),
         Box::new(|_e, _p| {}),
         std::sync::Arc::new(crate::control::HistoryLog::new()),
+        Arc::new(crate::control::GestureState::new()),
     ));
 
     let dir = std::env::temp_dir().join(format!("aura-route-e2e-{label}-{}", uuid::Uuid::new_v4()));

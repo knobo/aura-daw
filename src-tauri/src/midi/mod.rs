@@ -1148,6 +1148,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
             Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
         );
         (cp, events)
     }

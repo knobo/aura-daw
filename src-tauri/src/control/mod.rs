@@ -175,7 +175,14 @@ pub struct ControlPlane {
     /// The (at most one) open gesture boundary (Plan E Task 14) —
     /// `gesture_begin`/`gesture_end` and `set_track_mix`'s transient-fold
     /// check all go through it. See `GestureState`'s doc.
-    gesture: GestureState,
+    ///
+    /// `Arc`-shared with the engine control thread's `Control` (automation
+    /// Task 7), which needs the READ-ONLY
+    /// [`GestureState::is_track_gain_touched`] to tell Touch/Latch whether
+    /// the user's hand is on a fader right now. Same sharing shape as
+    /// `session`/`shared`/`tables`/the history log: `AudioState` mints the
+    /// one `Arc` and hands a clone to each side.
+    gesture: Arc<GestureState>,
     /// The last gesture batch `close_gesture` synthesized, parked for
     /// `take_last_gesture_batch`. TEST-ONLY as of Task 17: history is now
     /// fed DIRECTLY by `close_gesture` (see its doc), so nothing in
@@ -1175,9 +1182,51 @@ struct OpenGesture {
 /// today, not just a convention to remember.
 pub struct GestureState(Mutex<Option<OpenGesture>>);
 
+/// Mirrors `HistoryLog`'s pair — `new` is the name every call site uses; this
+/// exists so a `pub fn new()` on a public type is not a clippy wart.
+impl Default for GestureState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GestureState {
-    fn new() -> Self {
+    /// `pub` rather than private because the ONE instance is minted by
+    /// `AudioState::default` — `audio::init` builds the engine's `Control`
+    /// before `ControlPlane` exists, so the `Arc` both sides share has to be
+    /// born outside this module (exactly the carve-out
+    /// `AudioState::log`/`HistoryLog` already documents) — and because
+    /// `ControlPlane::new`/`engine::start` are themselves `pub` and now take
+    /// one, so the crate's integration tests must be able to mint it too.
+    /// Minting a SECOND `GestureState` in production would be the bug: the
+    /// engine would then watch a gesture slot the UI never opens.
+    pub fn new() -> Self {
         Self(Mutex::new(None))
+    }
+
+    /// True while there is an open gesture that has already folded a gain
+    /// write for `track_id` — i.e. the user has an active fader drag on this
+    /// track right now. Read-only: it peeks at the open gesture's `last`
+    /// accumulator and neither mutates nor closes anything, and it takes no
+    /// lock but this one, so it cannot participate in the gesture-before-
+    /// session order this type's doc pins down.
+    ///
+    /// Note the "already folded" half: a gesture that has begun but not yet
+    /// committed anything reads as untouched, which is the honest answer for
+    /// Touch/Latch — the recorder arms on the first value the user actually
+    /// moved, not on the pointerdown that preceded it.
+    ///
+    /// Consumed by the automation recorder (Touch/Latch) on the ENGINE
+    /// CONTROL THREAD, which is why this exists at all: that thread holds a
+    /// clone of the same `Arc<GestureState>` `ControlPlane` does.
+    pub fn is_track_gain_touched(&self, track_id: &str) -> bool {
+        let guard = self.0.lock();
+        let Some(g) = guard.as_ref() else { return false };
+        g.last.iter().any(|(key, _)| {
+            key.kind == "set"
+                && key.path == Some(op::PropPath::Gain)
+                && matches!(&key.target, CoalesceTarget::Object(op::ObjectRef::Track(id)) if id.as_str() == track_id)
+        })
     }
 
     /// Opens a new gesture. If one was already open, it's taken (closed)
@@ -1532,6 +1581,7 @@ impl ControlPlane {
         jobs: Arc<JobManager>,
         emit: EventEmitter,
         log: Arc<history::HistoryLog>,
+        gesture: Arc<GestureState>,
     ) -> Self {
         let latest_meters = Arc::new(Mutex::new(None));
         engine.send(ControlMsg::Subscribe(Box::new(LatestMeterCache(
@@ -1556,7 +1606,10 @@ impl ControlPlane {
             latest_meters,
             emit,
             committer,
-            gesture: GestureState::new(),
+            // The SAME `Arc` the engine's `Control` holds (automation Task 7):
+            // `AudioState` minted it before `audio::init` started the control
+            // thread, for the same reason `log` is minted there.
+            gesture,
             last_gesture_batch: Mutex::new(None),
             midi_input: std::sync::OnceLock::new(),
             midi_out: std::sync::OnceLock::new(),
@@ -5158,6 +5211,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
         );
         (cp, engine_rx, events)
     }
@@ -5328,6 +5382,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
         );
 
         // Real ops through the real channel — remove X, add Y — mirroring
@@ -6150,12 +6205,14 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let events: RecordedEvents = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -6167,6 +6224,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
         (cp, events, engine)
     }
@@ -6508,6 +6566,56 @@ mod tests {
             .collect();
         finals.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(finals, vec![("t-1".to_string(), -6.0), ("t-2".to_string(), -4.0)]);
+    }
+
+    /// Task 7 (Off/Read/Write/Touch/Latch): the read-only "is the user
+    /// dragging THIS track's fader right now" query the automation recorder
+    /// asks from the engine control thread. It must tell apart: no gesture
+    /// open; a gesture open that has folded nothing yet; a gesture that folded
+    /// a gain write for THIS track; a gesture that touched something else (a
+    /// different track, or a different property of the same track); and a
+    /// gesture that has since closed.
+    #[test]
+    fn is_track_gain_touched_reflects_the_open_gesture() {
+        let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
+        assert!(!plane.gesture.is_track_gain_touched("t-1"), "no gesture open");
+
+        plane.gesture_begin("gain drag".into()).unwrap();
+        assert!(
+            !plane.gesture.is_track_gain_touched("t-1"),
+            "a gesture that has folded nothing yet touches no track"
+        );
+
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { gain_db: Some(-3.0), ..TrackMixChange::new("t-1") }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+        assert!(plane.gesture.is_track_gain_touched("t-1"));
+        assert!(
+            !plane.gesture.is_track_gain_touched("t-2"),
+            "a different track must not read as touched"
+        );
+
+        // Same gesture, a PAN write on t-2: the key's target matches that
+        // track but its path does not, so t-2's GAIN is still untouched.
+        plane
+            .set_track_mix(
+                vec![TrackMixChange { pan: Some(0.5), ..TrackMixChange::new("t-2") }],
+                TxMeta::user("set pan"),
+            )
+            .unwrap();
+        assert!(
+            !plane.gesture.is_track_gain_touched("t-2"),
+            "a pan drag is not a gain drag — the PropPath half of the key matters"
+        );
+
+        plane.gesture_end().unwrap();
+        assert!(
+            !plane.gesture.is_track_gain_touched("t-1"),
+            "the gesture is closed — nothing is touched any more"
+        );
     }
 
     /// I-8 (Plan E whole-branch review): folding a knob drag into a gesture is
@@ -7613,12 +7721,14 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(Recorder(Arc::clone(&events))),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let cp = ControlPlane::new(
             session,
@@ -7628,6 +7738,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::default()),
             Box::new(|_, _| {}),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         );
         // Barrier: once the engine answers, its startup open_output is done.
         engine
@@ -7751,12 +7862,14 @@ mod tests {
         let shared = Arc::new(SharedRt::default());
         let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let cp = ControlPlane::new(
             session.clone(),
@@ -7766,6 +7879,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::default()),
             Box::new(|_, _| {}),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         );
         // Round-trip barrier: once the engine thread answers, its startup
         // `open_output` has finished, so the rate below is final (a fixed

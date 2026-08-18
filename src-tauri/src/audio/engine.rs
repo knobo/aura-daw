@@ -220,6 +220,7 @@ pub fn start(
     session: Arc<Mutex<Session>>,
     events: Box<dyn EventSink>,
     committer: Committer,
+    gesture: Arc<crate::control::GestureState>,
 ) -> EngineHandle {
     let (tx, rx) = unbounded();
     let published = session.lock().published_handle();
@@ -249,6 +250,7 @@ pub fn start(
                 last_frame: Instant::now(),
                 last_tick: Instant::now(),
                 committer,
+                gesture,
                 ensure_project_fn: None,
                 param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
                 param_writes: Vec::new(),
@@ -1016,6 +1018,23 @@ struct Control {
     /// covering the engine control thread committing from inside its own
     /// message loop.
     committer: Committer,
+    /// The SAME `Arc<GestureState>` the `ControlPlane` holds (automation
+    /// Task 7) — `AudioState` mints it before `audio::init` starts this
+    /// thread, exactly like the shared history log, because `ControlPlane`
+    /// does not exist yet at this point.
+    ///
+    /// Read-only from here: this thread only ever asks
+    /// [`crate::control::GestureState::is_track_gain_touched`], so it can
+    /// never open, fold into, or close a gesture, and it takes no other lock
+    /// while holding the gesture mutex — the gesture-before-session order is
+    /// untouched. It is a plain `parking_lot::Mutex` peek on the CONTROL
+    /// thread (which already does host round-trips and session locks), not
+    /// in the RT audio callback.
+    ///
+    /// Consumed by the Write/Touch/Latch automation recorder (Task 9); held
+    /// here from Task 7 so the sharing seam lands in one reviewable change.
+    #[allow(dead_code, reason = "read by the automation recorder wiring (Task 9)")]
+    gesture: Arc<crate::control::GestureState>,
     /// "Document birth" closure, installed post-construction by `lib.rs`
     /// once `ControlPlane` exists (`ControlMsg::SetEnsureProject`'s doc) —
     /// `None` until then. Bound over the `ControlPlane` `Arc`; calling it
@@ -3868,12 +3887,14 @@ mod tests {
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let handle = start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         (handle, shared, tables, session)
     }
@@ -3930,6 +3951,9 @@ mod tests {
             last_frame: Instant::now(),
             last_tick: Instant::now(),
             committer,
+            // Its own, never-opened gesture: no `ControlPlane` shares this
+            // fixture, so nothing can be mid-drag here.
+            gesture: Arc::new(crate::control::GestureState::new()),
             ensure_project_fn: None,
             param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
             param_writes: Vec::new(),

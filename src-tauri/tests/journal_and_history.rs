@@ -57,12 +57,14 @@ fn fixture() -> Fix {
         Arc::new(Box::new(|_: &str, _: serde_json::Value| {}) as EventEmitter),
         log.clone(),
     );
+    let gesture = Arc::new(aura_lib::control::GestureState::new());
     let eng = engine::start(
         shared.clone(),
         tables.clone(),
         session.clone(),
         Box::new(NullEvents),
         committer.clone(),
+        gesture.clone(),
     );
     let cp = Arc::new(ControlPlane::new(
         session,
@@ -72,6 +74,7 @@ fn fixture() -> Fix {
         Arc::new(JobManager::new(2, std::time::Duration::ZERO)),
         Box::new(|_e, _p| {}),
         log.clone(),
+        gesture,
     ));
     Fix { cp, eng, engine_committer: committer, log }
 }

@@ -565,12 +565,14 @@ mod tests {
         // handed to BOTH `engine::start` and `ControlPlane::new` as the
         // SAME `Arc` (round-2 §2.4).
         let tables = crate::audio::rt::testutil::empty_tables();
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared_rt.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullSink),
             crate::control::testutil::test_committer(&session, &shared_rt, &tables),
+            gesture.clone(),
         );
         let jobs = Arc::new(crate::sidecars::jobs::JobManager::new(
             2,
@@ -584,6 +586,7 @@ mod tests {
             jobs,
             Box::new(|_, _| {}),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ))
     }
 

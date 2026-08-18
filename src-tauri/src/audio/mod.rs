@@ -86,6 +86,14 @@ pub struct AudioState {
     /// second, invisible history. `lib.rs`'s setup passes it on via
     /// [`AudioState::history_log`].
     log: Arc<control::HistoryLog>,
+    /// The ONE open-gesture slot (automation Task 7), minted here for
+    /// exactly the reason `log` is: `init` starts the engine control thread
+    /// before `ControlPlane` exists, and both sides must hold clones of this
+    /// same `Arc` — the control thread's Touch/Latch automation recorder
+    /// answers "is the user dragging this fader right now?" by reading the
+    /// gesture the `ControlPlane` opened. `lib.rs`'s setup passes it on via
+    /// [`AudioState::gesture_state`].
+    gesture: Arc<control::GestureState>,
 }
 
 impl Default for AudioState {
@@ -98,6 +106,7 @@ impl Default for AudioState {
             samplers: Arc::new(Mutex::new(SamplerBank::default())),
             preview: OnceLock::new(),
             log: Arc::new(control::HistoryLog::new()),
+            gesture: Arc::new(control::GestureState::new()),
         }
     }
 }
@@ -131,6 +140,13 @@ impl AudioState {
     /// control thread commit into the SAME log.
     pub(crate) fn history_log(&self) -> Arc<control::HistoryLog> {
         self.log.clone()
+    }
+
+    /// The shared open-gesture slot (automation Task 7) — `lib.rs` hands
+    /// this to `ControlPlane::new` so the control plane's gestures are the
+    /// ones the engine control thread's automation recorder observes.
+    pub(crate) fn gesture_state(&self) -> Arc<control::GestureState> {
+        self.gesture.clone()
     }
 }
 
@@ -171,6 +187,10 @@ pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         state.session.clone(),
         Box::new(TauriEvents(app.clone())),
         committer,
+        // The SAME gesture slot `ControlPlane` gets a moment later (lib.rs
+        // setup): Touch/Latch automation on this thread has to see the very
+        // gesture the user's fader drag opened, not a second empty one.
+        state.gesture.clone(),
     );
     let _ = state.engine.set(handle);
     log::info!("audio::init — engine control thread started");

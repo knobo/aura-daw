@@ -1070,12 +1070,14 @@ mod tests {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
         let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let cp = Arc::new(ControlPlane::new(
             session,
@@ -1085,6 +1087,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(|_, _| {}),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
         let parent = tmp_parent(name);
         cp.create_project(parent.to_str().unwrap(), "Split").unwrap();
@@ -1098,12 +1101,14 @@ mod tests {
         let shared = Arc::new(crate::audio::rt::SharedRt::default());
         let tables = empty_tables();
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&events);
@@ -1115,6 +1120,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
         let parent = tmp_parent(name);
         cp.create_project(parent.to_str().unwrap(), "Announce").unwrap();
