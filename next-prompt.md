@@ -72,9 +72,11 @@ PR #73 (node_modules untracked, see below) and PR #75 (non-blocking CLAP params)
 all merged 2026-08-18. Latest on `main`: `31e3234`. Next branch
 (Track D or Plan F leftover) starts fresh from `origin/main`. Stale
 worktrees for merged branches can be ignored — but keep the branches
-`feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history` and
-`worktree-lanes-ux`, whose per-commit or squashed SHAs are cited in the
-handoffs.
+`feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history`,
+`worktree-lanes-ux` and `worktree-fix-midi-out`, whose per-commit or squashed
+SHAs are cited in the handoffs. (`worktree-fix-midi-out` in particular: #77 was
+squash-merged, so the seven per-commit SHAs the MIDI-output handoff cites exist
+on that branch and nowhere else. Deleting it silently breaks every one of them.)
 
 **node_modules (2026-08-18):** was accidentally committed as a
 self-referential symlink in PR #65 — untracked in PR #73. If a worktree
