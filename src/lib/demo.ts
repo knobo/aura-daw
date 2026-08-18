@@ -37,7 +37,11 @@ import {
   type McpStatus,
   type MeterFrame,
   type MidiClip,
+  type MidiInputStatus,
   type MidiNote,
+  type MidiOutputStatus,
+  type MidiPortInfo,
+  type MidiRouteStatus,
   type NoteClass,
   type NoteRole,
   type NoteScore,
@@ -204,6 +208,54 @@ function demoChordNotes(): MidiNote[] {
         velocity: 74,
         channel: 0,
       });
+    }
+  });
+  return notes;
+}
+
+/** Driving 8ths bassline over the same A-F-C-G motion as the arp, 4 bars. */
+function demoBassNotes(): MidiNote[] {
+  const roots = [45, 41, 36, 43]; // A2 F2 C2 G2
+  const step = PPQ / 2; // 8ths
+  const notes: MidiNote[] = [];
+  for (let bar = 0; bar < 4; bar++) {
+    const root = roots[bar % roots.length];
+    for (let s = 0; s < 8; s++) {
+      // walk up to the fifth mid-bar, octave pop on the last 8th
+      const key = s === 7 ? root + 12 : s >= 4 ? root + 7 : root;
+      notes.push({
+        tick: bar * BAR_TICKS + s * step,
+        lengthTicks: Math.round(step * 0.8),
+        key,
+        velocity: s % 2 === 0 ? 106 : 84,
+        channel: 0,
+      });
+    }
+  }
+  return notes;
+}
+
+/** Offbeat poly-synth stabs on the same changes, 4 bars. */
+function demoStabNotes(): MidiNote[] {
+  const chords = [
+    [64, 69, 72], // Am
+    [60, 65, 69], // F
+    [55, 60, 64], // C
+    [59, 62, 67], // G
+  ];
+  const offbeats = [0.5, 1.5, 2.5, 3.25];
+  const notes: MidiNote[] = [];
+  chords.forEach((chord, bar) => {
+    for (const beat of offbeats) {
+      for (const key of chord) {
+        notes.push({
+          tick: Math.round(bar * BAR_TICKS + beat * PPQ),
+          lengthTicks: Math.round(PPQ * 0.4),
+          key,
+          velocity: beat === 0.5 ? 98 : 78,
+          channel: 0,
+        });
+      }
     }
   });
   return notes;
@@ -439,7 +491,64 @@ const DEMO_SONG: DemoTrackInit[] = [
       { name: "chorus chords", startBar: 8, lengthBars: 4, notes: demoChordNotes() },
     ],
   },
+  {
+    name: "Bass Station",
+    color: "#ff9d4f",
+    character: "bass",
+    kind: "midi",
+    instrumentId: "d3m0-inst-tape-bass",
+    clips: [],
+    midiClips: [
+      { name: "sub pulse", startBar: 4, lengthBars: 4, notes: demoBassNotes() },
+      { name: "octave run", startBar: 12, lengthBars: 4, notes: demoBassNotes() },
+    ],
+  },
+  {
+    name: "Poly Six",
+    color: "#7c9dff",
+    character: "pad",
+    kind: "midi",
+    instrumentId: "d3m0-inst-glass-bells",
+    clips: [],
+    midiClips: [
+      { name: "chord stabs", startBar: 8, lengthBars: 4, notes: demoStabNotes() },
+      { name: "tail stabs", startBar: 16, lengthBars: 4, notes: demoStabNotes() },
+    ],
+  },
 ];
+
+// ── Simulated MIDI hardware ─────────────────────────────────────────────────
+//
+// There is no midir in a browser tab, so the ports below stand in for real
+// devices: two keyboards in, three synths out, ids in the backend's
+// `<name>#<index>` shape. It is a fixture and nothing more — no bytes leave
+// the page — but the state is real state, mutated by the setters, so the
+// patchbay's controls do something you can watch: open a port and it shows
+// up in `outputs`, route a track and the route sticks, close a port and its
+// routes retire the way the real backend retires them.
+
+const DEMO_MIDI_IN_PORTS: MidiPortInfo[] = [
+  { id: "Arturia KeyStep#0", name: "Arturia KeyStep" },
+  { id: "Launchkey 49 MIDI#1", name: "Launchkey 49 MIDI" },
+];
+
+const DEMO_MIDI_OUT_PORTS: MidiPortInfo[] = [
+  { id: "Elektron Digitone#0", name: "Elektron Digitone" },
+  { id: "Hydrogen#1", name: "Hydrogen" },
+  { id: "MIDI Through Port-0#2", name: "MIDI Through Port-0" },
+];
+
+/** One open output port, plus the counters its clock thread would own. */
+interface DemoMidiOutPort {
+  port: MidiPortInfo;
+  clockEnabled: boolean;
+  pulsesSent: number;
+  resyncs: number;
+  notesSent: number;
+}
+
+/** Fixed seed for the fake player's note grid — same pattern every session. */
+const MIDI_IN_SEED = 0x5eedbeef;
 
 // ── Engine ──────────────────────────────────────────────────────────────────
 
@@ -518,6 +627,24 @@ export class DemoBackend implements Backend {
   private zynPatches: ZynPatch[] = demoZynPatches();
   private zynLoaded = new Map<string, ZynPatch>();
 
+  // simulated MIDI hardware (see the section of the same name below)
+  private midiInPorts: MidiPortInfo[] = DEMO_MIDI_IN_PORTS.map((p) => ({ ...p }));
+  private midiOutPorts: MidiPortInfo[] = DEMO_MIDI_OUT_PORTS.map((p) => ({ ...p }));
+  private midiInPortId: string | null = DEMO_MIDI_IN_PORTS[0].id;
+  private midiInMonitor = true;
+  private midiInTarget: string | null = null; // a real track id, set at seed
+  private midiInEvents = 0;
+  private midiInDropped = 0;
+  private midiInStatusBytes: number[] = [];
+  /** performance.now() of the fake player's last note-on, or null. */
+  private midiInLastHit: number | null = null;
+  /** Last 8th-note slot the fake player was walked to. */
+  private midiInGrid: number | null = null;
+  private midiOutOpen = new Map<string, DemoMidiOutPort>();
+  private midiRoutes: MidiRouteStatus[] = [];
+  private midiOutWall = 0;
+  private midiOutTicks = 0;
+
   // WebAudio playback graph (see "demo playback audio" section below)
   private master: GainNode | null = null;
   private trackChains = new Map<string, { gain: GainNode; pan: StereoPannerNode }>();
@@ -549,6 +676,7 @@ export class DemoBackend implements Backend {
         });
       }
     }
+    this.seedMidiHardware();
     this.scheduleMcpScript();
   }
 
@@ -1861,6 +1989,287 @@ export class DemoBackend implements Backend {
     this.midiClips = this.midiClips.filter((c) => c.id !== clipId);
     if (this.midiClips.length === before) throw new Error(`unknown MIDI clip: ${clipId}`);
     this.resyncAudio();
+  }
+
+  // ── simulated MIDI hardware ──
+  //
+  // Stand-ins for midir's ports (see DEMO_MIDI_IN_PORTS above): a fixture
+  // patch held in memory, mutated by the setters, honest about being a mock.
+  // The error surfaces mirror the real backend's word for word, so the panel's
+  // failure copy is exercised by the same strings the desktop app produces.
+  // Activity and the port counters are derived from the demo transport clock,
+  // so they move while the song rolls and settle when it stops — no timers of
+  // their own, and no Math.random to jitter the UI between two polls.
+
+  /** Fixture patch: the KeyStep plays the first MIDI track, the Digitone is
+   * the one open port (with clock), and the three MIDI tracks cover the
+   * panel's three states — routed to an open port, routed to a port nobody
+   * opened, and not routed at all. The arp clip overrides its track onto the
+   * Digitone's drum channel. */
+  private seedMidiHardware() {
+    const [keys, bass] = this.tracks.filter((t) => t.kind === "midi");
+    this.midiInTarget = keys?.id ?? null;
+    const digitone = this.midiOutPorts[0];
+    this.midiOutOpen.set(digitone.id, {
+      port: { ...digitone },
+      clockEnabled: true,
+      pulsesSent: 0,
+      resyncs: 0,
+      notesSent: 0,
+    });
+    if (keys) {
+      this.midiRoutes.push({
+        scope: "track",
+        id: keys.id,
+        portId: digitone.id,
+        channel: 0,
+        returnDevice: "demo-in", // listInputDevices()'s "Demo Interface — In 1/2"
+      });
+      const arp = this.midiClips.find((c) => c.trackId === keys.id);
+      // A clip that beats its track's route: same synth, drum channel.
+      if (arp) this.midiRoutes.push({ scope: "clip", id: arp.id, portId: digitone.id, channel: 9 });
+    }
+    if (bass) {
+      // Routed at a port nobody opened — the panel's "closed" health state.
+      this.midiRoutes.push({
+        scope: "track",
+        id: bass.id,
+        portId: this.midiOutPorts[1].id,
+        channel: 2,
+        returnDevice: null,
+      });
+    }
+    // The third MIDI track stays unrouted on purpose: "sends nowhere".
+  }
+
+  async midiListInputPorts(): Promise<MidiPortInfo[]> {
+    return this.midiInPorts.map((p) => ({ ...p }));
+  }
+
+  async midiSelectInputPort(portId: string | null, monitor = true): Promise<void> {
+    if (portId === null) {
+      this.midiInPortId = null;
+      this.forgetMidiInTraffic();
+      return;
+    }
+    const port = this.midiInPorts.find((p) => p.id === portId);
+    if (!port) throw new Error(`MIDI input port not found: ${portId}`);
+    // A fresh connection has seen nothing yet, same as a new midir handle.
+    if (portId !== this.midiInPortId) this.forgetMidiInTraffic();
+    this.midiInPortId = portId;
+    this.midiInMonitor = monitor;
+  }
+
+  async midiSelectInputTrack(trackId: string | null): Promise<void> {
+    if (trackId !== null) {
+      const track = this.track(trackId);
+      if (!track) throw new Error(`unknown track: ${trackId}`);
+      if (track.kind !== "midi") {
+        throw new Error(`track ${trackId} is kind "${track.kind}" (midi input needs a midi track)`);
+      }
+    }
+    this.midiInTarget = trackId;
+  }
+
+  async midiInputStatus(): Promise<MidiInputStatus> {
+    const selected = this.midiInPorts.find((p) => p.id === this.midiInPortId) ?? null;
+    if (!selected) {
+      // Nothing open ⇒ monitor never reads true and nothing is routed.
+      return {
+        selected: null,
+        eventsSeen: 0,
+        lastEventAgeMs: null,
+        lastStatusBytes: [],
+        monitor: false,
+        targetTrackId: this.midiInTarget,
+        routing: false,
+        droppedEvents: this.midiInDropped,
+        capturing: false,
+      };
+    }
+    this.playFakeMidiIn();
+    return {
+      selected: { ...selected },
+      eventsSeen: this.midiInEvents,
+      lastEventAgeMs:
+        this.midiInLastHit === null ? null : Math.round(this.now() - this.midiInLastHit),
+      lastStatusBytes: [...this.midiInStatusBytes],
+      monitor: this.midiInMonitor,
+      targetTrackId: this.midiInTarget,
+      routing: this.midiInMonitor && this.midiInTarget !== null,
+      droppedEvents: this.midiInDropped,
+      // The connection itself is live the moment a port is open — the real
+      // hub's `capturing` flag says the reader thread is running, not that a
+      // take is rolling. Selecting "none" closes it and this reads false again.
+      capturing: true,
+    };
+  }
+
+  private forgetMidiInTraffic() {
+    this.midiInEvents = 0;
+    this.midiInStatusBytes = [];
+    this.midiInLastHit = null;
+    this.midiInGrid = null;
+  }
+
+  /** The fake player: notes on the 8th-note grid of the demo transport —
+   * about three of every five, unevenly spaced — so the activity lamp blinks
+   * on a musical cadence instead of holding steady or strobing. Each hit is
+   * back-dated to its own 8th and then read as a wall-clock age — the lamp
+   * keeps the transport's rhythm while the song plays and fades out on its own
+   * once it stops. */
+  private playFakeMidiIn() {
+    if (this.tState === "stopped") return;
+    const ticks = this.samplesToTicks(this.position());
+    const grid = ticks / (this.ppq / 2);
+    const slot = Math.floor(grid);
+    // A loop wrap or a locate re-anchors instead of replaying the whole gap.
+    if (this.midiInGrid === null || slot < this.midiInGrid) this.midiInGrid = slot - 1;
+    const msPerEighth = 30_000 / this.bpmAtTick(ticks);
+    for (let i = Math.max(this.midiInGrid + 1, slot - 8); i <= slot; i++) {
+      // Rests are drawn from the fixed noise table, not a fixed subdivision:
+      // the gaps come out uneven (one 8th here, three there) so the 500 ms
+      // status poll cannot phase-lock onto them and leave the lamp stuck.
+      if (noise(MIDI_IN_SEED, i) < 0.4) continue; // a rest
+      this.midiInEvents++;
+      // The real status ring keeps the last 3 status bytes, oldest first.
+      this.midiInStatusBytes = [...this.midiInStatusBytes, i % 7 === 3 ? 0xb0 : 0x90].slice(-3);
+      this.midiInLastHit = this.now() - Math.max(0, (grid - i) * msPerEighth);
+    }
+    this.midiInGrid = slot;
+  }
+
+  async midiListOutputPorts(): Promise<MidiPortInfo[]> {
+    return this.midiOutPorts.map((p) => ({ ...p }));
+  }
+
+  async midiOpenOutputPort(portId: string): Promise<void> {
+    if (this.midiOutOpen.has(portId)) return; // already open: a no-op, not an error
+    const port = this.midiOutPorts.find((p) => p.id === portId);
+    if (!port) throw new Error(`MIDI output port not found: ${portId}`);
+    // Clock comes up enabled on every freshly opened port, as in midi_out.
+    this.midiOutOpen.set(portId, {
+      port: { ...port },
+      clockEnabled: true,
+      pulsesSent: 0,
+      resyncs: 0,
+      notesSent: 0,
+    });
+  }
+
+  async midiCloseOutputPort(portId: string): Promise<void> {
+    this.midiOutOpen.delete(portId);
+    // A retired port does not leave routes pointing at nothing (same rule as
+    // ControlPlane::close_midi_output_port ⇒ clear_routes_for_port).
+    this.midiRoutes = this.midiRoutes.filter((r) => r.portId !== portId);
+  }
+
+  async midiSetOutputClockEnabled(portId: string, enabled: boolean): Promise<void> {
+    const open = this.midiOutOpen.get(portId);
+    if (!open) throw new Error(`MIDI output port not open: ${portId}`);
+    open.clockEnabled = enabled;
+  }
+
+  async midiSetTrackRoute(trackId: string, portId: string | null, channel = 0): Promise<void> {
+    // Only validate when actually routing: a leftover route to a track
+    // that is already gone must stay clearable (portId: null) — the
+    // orphan-forget case in the PATCH panel.
+    if (portId !== null) {
+      const track = this.track(trackId);
+      if (!track) throw new Error(`unknown track: ${trackId}`);
+      if (track.kind !== "midi") {
+        throw new Error(`track ${trackId} is kind "${track.kind}" (midi output needs a midi track)`);
+      }
+    }
+    this.setMidiRoute("track", trackId, portId, channel);
+  }
+
+  async midiSetTrackReturn(trackId: string, deviceId: string | null): Promise<void> {
+    const route = this.midiRoutes.find((r) => r.scope === "track" && r.id === trackId);
+    if (!route) {
+      throw new Error(`track ${trackId} is not routed — pick a MIDI output before a return source`);
+    }
+    route.returnDevice = deviceId || null;
+  }
+
+  async midiSetClipRoute(clipId: string, portId: string | null, channel = 0): Promise<void> {
+    // Same asymmetry as midiSetTrackRoute: clearing a leftover route to a
+    // clip that is already gone must not fail the existence check.
+    if (portId !== null && !this.midiClips.some((c) => c.id === clipId)) {
+      throw new Error(`unknown MIDI clip: ${clipId}`);
+    }
+    this.setMidiRoute("clip", clipId, portId, channel);
+  }
+
+  async midiOutputStatus(): Promise<MidiOutputStatus> {
+    this.runMidiOutClocks();
+    // One clock engine drives every open port, so `running` is the transport's
+    // own state; the per-port clock toggle only gates the bytes.
+    const running = this.tState !== "stopped";
+    return {
+      outputs: [...this.midiOutOpen.values()].map((o) => ({
+        port: { ...o.port },
+        clockEnabled: o.clockEnabled,
+        running,
+        pulsesSent: o.pulsesSent,
+        resyncs: o.resyncs,
+        notesSent: o.notesSent,
+      })),
+      routes: this.midiRoutes.map((r) => ({ ...r })),
+    };
+  }
+
+  /** Upsert (or, on a null port, clear) one route. A port/channel edit keeps
+   * the track's audio return — only midiSetTrackReturn clears that, exactly as
+   * MidiOut::set_route does. Any port id is accepted, open or not: the real
+   * backend does not validate here either, and a route left pointing at a
+   * device that went away is a state the panel has to render. */
+  private setMidiRoute(scope: "track" | "clip", id: string, portId: string | null, channel: number) {
+    const prev = this.midiRoutes.find((r) => r.scope === scope && r.id === id);
+    this.midiRoutes = this.midiRoutes.filter((r) => !(r.scope === scope && r.id === id));
+    if (portId === null) return;
+    this.midiRoutes.push(
+      scope === "track"
+        ? { scope, id, portId, channel, returnDevice: prev?.returnDevice ?? null }
+        : { scope, id, portId, channel },
+    );
+  }
+
+  /** Clock pulses and note counts for the open ports, integrated from the demo
+   * transport between two status polls — so the counters climb while the song
+   * plays, hold when it stops, and a backward jump books a resync the way the
+   * real clock engine's stop/SPP/continue does. Driven by the poll itself:
+   * there is no thread here to own a timer. */
+  private runMidiOutClocks() {
+    const wall = this.now();
+    const ticks = this.samplesToTicks(this.position());
+    const prevWall = this.midiOutWall;
+    const prevTicks = this.midiOutTicks;
+    this.midiOutWall = wall;
+    this.midiOutTicks = ticks;
+    if (this.tState === "stopped" || prevWall === 0 || this.midiOutOpen.size === 0) return;
+    // Clamped: a backgrounded tab must not come back and spike the counters.
+    const elapsedMs = Math.min(2_000, Math.max(0, wall - prevWall));
+    const beats = (elapsedMs / 60_000) * this.bpmAtTick(ticks);
+    const pulses = Math.round(beats * 24); // MIDI clock is 24 ppqn
+    const jumped = ticks < prevTicks; // loop wrap or locate
+    for (const [portId, open] of this.midiOutOpen) {
+      if (open.clockEnabled) {
+        open.pulsesSent += pulses;
+        if (jumped) open.resyncs++;
+      }
+      // Note traffic scales with how much is patched to this port.
+      const patched = this.midiRoutes.filter((r) => r.portId === portId).length;
+      open.notesSent += Math.round(beats * 2 * patched);
+    }
+  }
+
+  private bpmAtTick(tick: number): number {
+    let bpm = this.tempoEvents[0]?.bpm ?? TEMPO;
+    for (const e of this.tempoEvents) {
+      if (e.tick <= tick) bpm = e.bpm;
+    }
+    return bpm;
   }
 
   // ── the Composer (Plan H1, ruling H-12) ──────────────────────────────────

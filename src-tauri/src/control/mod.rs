@@ -2128,7 +2128,12 @@ impl ControlPlane {
         channel: u8,
         meta: op::TxMeta,
     ) -> Result<(), String> {
-        {
+        // Only validate when actually routing to a track: a leftover route
+        // to a track the document no longer has must stay clearable
+        // (`port_id: None`) even though the track itself fails this lookup
+        // — that is exactly the orphan case the PATCH panel's "forget"
+        // button exists for.
+        if port_id.is_some() {
             let session = self.session.lock();
             let t = session
                 .store
@@ -2202,7 +2207,10 @@ impl ControlPlane {
         channel: u8,
         meta: op::TxMeta,
     ) -> Result<(), String> {
-        {
+        // Same asymmetry as `set_midi_track_route`: clearing a leftover
+        // route to a clip that is already gone must not fail the existence
+        // check that only makes sense when actually routing to a clip.
+        if port_id.is_some() {
             let session = self.session.lock();
             if !session.midi.clips.iter().any(|c| c.id.as_str() == clip_id) {
                 return Err(format!("unknown midi clip: {clip_id}"));

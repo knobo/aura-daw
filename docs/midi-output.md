@@ -7,9 +7,10 @@ individual clips out to external synths**, each to its own port and MIDI
 channel.
 
 Any number of hardware output ports can be open at once. Each open port
-gets its own row in the **midi out** group of the bottom master strip (next
-to **midi in**): device name, a **clock** checkbox, and a close button, plus
-an "+ open…" picker for any port not already open.
+gets its own card in the **OUT** section of the MIDI panel (the `⇄ MIDI`
+tab in the right-hand dock, or press **D**): device name, a **clock**
+toggle, live note and clock-pulse counters, and a close button — plus a
+picker for any port not already open.
 
 **Linux via ALSA-seq** is the verified path (the same `midir` backend the
 input side uses). `aconnect -l` at the shell lists what ALSA can see.
@@ -20,9 +21,9 @@ input side uses). `aconnect -l` at the shell lists what ALSA can see.
 
 1. Start Hydrogen (or whatever should follow) **before** opening AURA, or
    restart AURA after — the port list is read once at startup.
-2. In AURA's master strip, open the device from the **midi out** "+ open…"
-   picker.
-3. Leave that port's **clock** checkbox on (it defaults to on).
+2. In AURA's MIDI panel (press **D**), open the device from the **OUT**
+   section's port picker.
+3. Leave that port's **clock** toggle on (it defaults to on).
 4. In Hydrogen: **Preferences → MIDI**, set the *input* port to AURA, and
    turn on transport slave / "use MIDI clock" so Hydrogen follows an
    external clock rather than its own.
@@ -62,10 +63,13 @@ why it is where it is.
 
 ## Recipe 2: play a MIDI track through an external synth
 
-1. Open the device in **midi out** if it isn't already.
-2. Next to **trk**, pick the MIDI track you want to route — a port + MIDI
-   channel selector appears for it.
-3. Pick the port and (optionally) a channel other than 1.
+1. Open the device in the panel's **OUT** section if it isn't already.
+2. In **PATCH**, find the MIDI track you want to route. Every MIDI track is
+   listed there, so you can see what is already patched where before you
+   change anything.
+3. Pick its port and (optionally) a channel other than 1. The cord between
+   the track and its port takes that port's colour, so two tracks sharing a
+   port are one glance apart.
 4. Press play. That track's notes go out to the external instrument.
 5. **Mute the track in AURA** if you don't want to hear its internal
    instrument at the same time. The track keeps sounding internally
@@ -73,8 +77,8 @@ why it is where it is.
    muting is the documented way to avoid doubling — until a return clip
    lands on the track (step 7), which replaces the internal instrument.
 6. To **capture the synth into the project** (so export hears it): next
-   to the channel box, pick a **return** input — the same list as the
-   master-strip input picker. Patch the synth (or Hydrogen) into that
+   to the channel, pick a **return** input — the same list as the master
+   strip's audio input picker. Patch the synth (or Hydrogen) into that
    input yourself (a cable, or Helvum / qpwgraph). Arm the track and
    record. A WAV clip lands on *this* MIDI track.
 7. Once that clip exists, AURA stops playing the internal instrument on
@@ -82,9 +86,9 @@ why it is where it is.
    Delete the clip to get the internal voice back.
 
 Unlike the single-track carve-out this shipped with originally, **more than
-one track can be routed at once** — pick a different track from the **trk**
-selector and give it its own port/channel; the previous track's routing is
-untouched.
+one track can be routed at once** — give any other track in **PATCH** its
+own port and channel; the previous track's routing is untouched. The panel
+lists every route at once, so you never have to remember what you set.
 
 ### Per-clip overrides
 
@@ -123,11 +127,18 @@ and the workaround today is a smaller audio buffer.
 
 ## Troubleshooting
 
-* **Nothing happens at all.** Check that port's **clock** checkbox is on
+* **Nothing happens at all.** Check that port's **clock** toggle is on
   for sync, or that a track/clip is routed to a port for notes. Check
   `aconnect -l` shows both AURA and the target. Check the receiving app is
   actually set to slave to external MIDI clock — most default to their own
   internal clock.
+* **A track is routed but silent.** The MIDI panel's **PATCH** section says
+  why. An amber cord and *"Port is not open — notes are not leaving AURA."*
+  means the route points at a port nobody opened — its **Open port** button
+  fixes that in place. A red cord and *"Device missing"* means the port the
+  route names is not on this machine any more; reconnect it or pick another.
+  Routes whose track or clip has since been deleted collect in the panel's
+  **left over** footer: they send nothing, and forgetting them is safe.
 * **Hydrogen restarts itself now and then.** Two causes, both above: the
   loop re-cue on every wrap, and the periodic clock re-anchor on long
   continuous playback. Neither is a fault you can configure away today.

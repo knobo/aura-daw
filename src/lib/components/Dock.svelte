@@ -19,6 +19,7 @@
   import PluginParamPanel from "./plugins/PluginParamPanel.svelte";
   import ZynPatchBrowser from "./plugins/ZynPatchBrowser.svelte";
   import McpPanel from "./mcp/McpPanel.svelte";
+  import MidiPanel from "./midi/MidiPanel.svelte";
 
   const TABS: { id: Exclude<DockTab, "">; label: string }[] = [
     { id: "composer", label: "♪ COMPOSER" },
@@ -28,6 +29,7 @@
     { id: "instruments", label: "INSTRUMENTS" },
     { id: "plugins", label: "PLUGINS" },
     { id: "mcp", label: "MCP" },
+    { id: "midi", label: "⇄ MIDI" },
   ];
 </script>
 
@@ -81,6 +83,8 @@
         {/if}
       {:else if ui.dock === "mcp"}
         <McpPanel />
+      {:else if ui.dock === "midi"}
+        <MidiPanel />
       {/if}
     </div>
   </aside>
@@ -112,7 +116,7 @@
   .tabs {
     flex: none;
     display: flex;
-    /* Seven tabs no longer fit one row at the default dock width, and a row
+    /* Eight tabs no longer fit one row at the default dock width, and a row
        that overflows silently hides a whole panel from anyone who does not
        know the keyboard shortcut. */
     flex-wrap: wrap;
@@ -125,7 +129,7 @@
     position: relative;
     font-size: 9px;
     letter-spacing: 0.14em;
-    /* Tight horizontally so seven tabs fit in as few rows as the dock's
+    /* Tight horizontally so eight tabs fit in as few rows as the dock's
        current width allows. */
     padding: 7px 5px 9px;
     white-space: nowrap;
