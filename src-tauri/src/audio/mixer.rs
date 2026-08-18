@@ -283,9 +283,13 @@ fn render_live_into(
     node.process(&mut io);
 }
 
-/// Walk inserts REPLACE in document order. True bypass skips `process()`.
+/// Walk inserts REPLACE in document order, then apply this track's PDC
+/// (Task 6): a shorter path is padded to match the slowest sibling's, so
+/// every track lands at the fader in step. True bypass skips `process()`
+/// on the plugin but NOT the compensating delay — `compile_pdc` (Task 7)
+/// still counts a bypassed insert's latency, so the track must still wait.
 fn process_inserts(
-    tr: &RtTrack,
+    tr: &mut RtTrack,
     buf: &mut [f32],
     sample_rate: u32,
     steady_base: Option<u64>,
@@ -299,8 +303,9 @@ fn process_inserts(
         let mut io = ProcessBlock { samples: buf, channels: 2, sample_rate, steady: steady_base };
         proc.process(&mut io);
     }
-    // Task 6 replaces `Option<()>` with DelayLine and writes `d.process`.
-    debug_assert!(tr.pdc.is_none(), "DelayLine not attached (Task 6)");
+    if let Some(d) = tr.pdc.as_mut() {
+        d.process(buf);
+    }
 }
 
 fn live_all_notes_off(tr: &RtTrack) {
@@ -484,7 +489,7 @@ fn render_impl(
         chunk.base_slot = (i * METER_CHUNK_SLOTS) as u32;
     }
 
-    for tr in tracks.iter() {
+    for tr in tracks.iter_mut() {
         if tr.slot >= n_slots {
             continue;
         }
@@ -652,7 +657,7 @@ pub fn render_live_input_only(
         chunk.base_slot = (i * METER_CHUNK_SLOTS) as u32;
     }
 
-    for tr in tracks.iter() {
+    for tr in tracks.iter_mut() {
         if tr.slot != live_in.slot || tr.slot >= n_slots {
             continue;
         }
@@ -748,7 +753,8 @@ pub fn render_live_input_only(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::insert::{GainHalfEffect, InvertEffect};
+    use super::super::insert::{GainHalfEffect, InvertEffect, LatencyDummy};
+    use super::super::pdc::DelayLine;
     use super::super::rt::ParamTable;
     use super::super::rt::RtClipData;
     use super::super::rt::RtTrack;
@@ -1011,6 +1017,79 @@ mod tests {
         let mut out = vec![0.0f32; 8];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!((out[0] - 1.0).abs() < 1e-6, "bypassed GainHalf must not run, got {}", out[0]);
+    }
+
+    // ---- PDC (Plan G1 Task 6): DelayLine attached to RtTrack::pdc lines
+    // tracks up at the master after inserts add latency. ----
+
+    fn impulse_clip() -> RtClip {
+        let mut data = vec![0.0f32; 512];
+        data[0] = 1.0;
+        clip(0, 0, 512, data, 1)
+    }
+
+    #[test]
+    fn two_tracks_line_up_when_one_has_256_samples_of_latency() {
+        let mut dummy = LatencyDummy::new(256);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut g = RtGraph::new(
+            vec![
+                RtTrack::clips(0, vec![impulse_clip()]),
+                RtTrack::clips(1, vec![impulse_clip()]),
+            ],
+            1,
+            Arc::new(ParamTable::default()),
+        );
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        insert_on(&mut g, 0, Box::new(dummy), false);
+        g.tracks[0].pdc = None; // wet path: plugin supplies the 256
+        g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        let mut out = vec![0.0f32; 512 * 2];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        let peak = left
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        assert_eq!(peak.0, 256, "both impulses must land at 256, got {}", peak.0);
+        assert!(
+            (left[256] - 2.0).abs() < 1e-4,
+            "A + B impulses coincide (2.0), got {}",
+            left[256]
+        );
+    }
+
+    #[test]
+    fn bypassed_insert_still_contributes_latency() {
+        let mut dummy = LatencyDummy::new(256);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut g = RtGraph::new(
+            vec![
+                RtTrack::clips(0, vec![impulse_clip()]),
+                RtTrack::clips(1, vec![impulse_clip()]),
+            ],
+            1,
+            Arc::new(ParamTable::default()),
+        );
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        insert_on(&mut g, 0, Box::new(dummy), true); // true bypass
+        // G-5: compile_pdc still sees 256 on A, so BOTH tracks get 256 of PDC
+        // (A's plugin does not delay; A's DelayLine does).
+        g.tracks[0].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        let mut out = vec![0.0f32; 512 * 2];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(
+            (left[256] - 2.0).abs() < 1e-4,
+            "bypass must not make A early; both at 256. left[0]={} left[256]={}",
+            left[0],
+            left[256]
+        );
+        assert!(left[0].abs() < 1e-6, "nothing at t=0");
     }
 
     #[test]
