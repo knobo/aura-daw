@@ -888,6 +888,24 @@ instantiation per automated instance, seeded from the live one's
   ramp on two instances still cost ~1000 blocking round-trips per second
   onto the plugin-main thread that also serves the param panel,
   `instantiate` and `save_state`.
+
+  **Recorded consequence (found in code review, accepted not fixed):**
+  `plugin_main()`'s `MainMsg` channel is `unbounded` (`host.rs:146`), so
+  `post_params` traded the old block for a queue with no back-pressure. If
+  a slow main-thread `run()` (an `instantiate`, `save_state` or `remove` on
+  ANY instance — CLAP or LV2, one shared thread) stalls for hundreds of ms
+  while automation is ticking, `post_params` closures pile up unconsumed
+  and then drain back-to-back once the thread frees, collapsing a ramp's
+  intermediate values into a near-instant catch-up instead of the smooth
+  curve the driver computed — audible, and unbounded memory growth for the
+  stall's duration. Not new to this change: `lv2_host::set_params` has
+  posted into the exact same unbounded queue since Track D landed, so this
+  was already true for LV2 automation; this closure brings CLAP to parity
+  with an already-accepted risk rather than introducing a new one. A real
+  fix (bounding the queue, or coalescing a pending write per instance
+  before it posts) is out of scope here — it's a `plugin_main()`-level
+  design question that would also change LV2's behavior, not a CLAP-local
+  one.
 - ~~**A GESTURE TOKEN, so `gesture_end` closes the gesture it meant to.**~~
   → **closed on `fix/gesture-end-id`** (`gesture_begin` returns the run
   id; `gesture_end(id)` no-ops on mismatch). Historical record of why it
