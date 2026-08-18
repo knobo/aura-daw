@@ -7,7 +7,9 @@ the repo documentation is English.
 **Correction (2026-08-18, ADR 0007):** PR #65 (Composer Plan H1) merged
 into `main` at `63cb7fa` (06:27) — the "open, not merged into main" framing
 below is stale. The owner ear-checked it the same day: generation works;
-one bug (MIDI-out to Hydrogen) needs its own PR, not yet filed/scoped.
+one bug (MIDI-out to Hydrogen) needed its own PR — **scoped, fixed and pushed
+2026-08-18 on `worktree-fix-midi-out`, PR not yet opened**; see the In flight
+section.
 **The owner's explicit steer: Composer is a bonus feature — do not pick up
 H2+ without being asked. Focus is core functionality (G-series and other
 core tracks).** Details: memory `aura-composer-deprioritized-2026-08-18`.
@@ -38,9 +40,31 @@ leftover above; write a stock FX suite; bump `OP_FORMAT_VERSION`; restart
 a landed track (A–F, Plan F, G1 Tasks 1–6, Pitch Coach phases 1–3, the
 lanes UX track, the theme system, Composer H1).
 
-**In flight:** nothing — PR #71 (G1 Task 6, PDC), PR #70 (clip-delete
-keydown fix), PR #72 (this file) and PR #73 (node_modules untracked, see
-below) all merged 2026-08-18. Latest on `main`: `760d1ca`. Next branch
+**In flight: `worktree-fix-midi-out`, 8 commits, rebased on `31e3234`, pushed,
+NO PR OPENED YET.** The MIDI-out-to-Hydrogen bug from the Composer ear-check,
+which turned out to be eight bugs. The root cause was not the notes: the clock
+engine's drift tolerance (a flat 20 ms) was smaller than PipeWire's default
+1024-frame block at 48 kHz, so it re-cued the external device with
+`Stop`/`SongPosition`/`Continue` about **1500 times a second** — measured 31 676
+re-cue triples against 22 429 clock pulses, down to **1** after the fix. Nothing
+downstream could play, and the flood dropped notes as collateral. Also: the
+per-note MIDI channel was dropped on the way out (GM drums on channel 10 went out
+on channel 1), a routed track doubled itself with AURA's internal synth, and a
+deleted-then-undone routed track went permanently silent.
+
+Rust 1250/0 and the frontend gate are green locally, but this branch has **never
+run in CI** — and note the runner has no `/dev/snd/seq`, so the ALSA-seq tests
+skip there. **Read
+[`docs/handoff/midi-out-note-channel.md`](docs/handoff/midi-out-note-channel.md)
+before touching MIDI output**; it carries the full status, a recommended route
+(open the PR, the ear-check still owed, the piano-roll channel gap worth filing,
+two decisions that are the owner's), and the environment traps that cost hours
+(`pipewire-pulse` wedging looks exactly like an audio-path regression and fails 20
+tests).
+
+PR #71 (G1 Task 6, PDC), PR #70 (clip-delete keydown fix), PR #72 (this file),
+PR #73 (node_modules untracked, see below) and PR #75 (non-blocking CLAP params)
+all merged 2026-08-18. Latest on `main`: `31e3234`. Next branch
 (Track D or Plan F leftover) starts fresh from `origin/main`. Stale
 worktrees for merged branches can be ignored — but keep the branches
 `feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history` and
@@ -68,6 +92,7 @@ this file (marked correction, ADR 0007) if they do.
 | Clip Delete/Backspace after a plain pointer-click | PR #70 `7011e81`. Pointer-select never focused the clip element, so its own keydown handler never fired; a window-level fallback now reads `clipSelection` directly. Single-clip only — batch-deleting a multi-selection still needs a `clips_remove` transaction (Track C leftover, unchanged) |
 | G1 Task 5 — mixer strip: source-sum → inserts REPLACE → shared fader (`InsertNode`/`compile_inserts`) | PR #66 `c99293b`. `compile_inserts` is not yet wired into `engine::rebuild` (Task 7) — an insert still isn't audible end-to-end. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | **The Composer, Plan H1** — merged to `main` (PR #65, `63cb7fa`, 2026-08-18): a pure music-theory library, the harmony document in the core, five generators (progression, voice-led chords, bass, melody, groove), the COMPOSER panel, and a piano roll that tints its keys by what each note does over the chord. Owner ear-checked the same day: works; MIDI-out-to-Hydrogen bug found, needs its own unscoped PR. **Composer is now deprioritized — do not start H2+ unless asked.** | PR [#65](https://github.com/knobo/aura-daw/pull/65) (merged). Product doc: [`composer-assistant.md`](docs/backlog/composer-assistant.md). Plan + rulings H-1…H-12: [`2026-08-17-plan-h-composer.md`](docs/superpowers/plans/2026-08-17-plan-h-composer.md). Handoff: [`composer-h1.md`](docs/handoff/composer-h1.md). ARCHITECTURE §16 |
+| **MIDI output — eight fixes** (re-cue storm, per-note channel, routed track no longer doubles its internal synth, undo-after-delete silence, forced-channel persistence, piano-roll note channel, ALSA re-address, live port list). Branch `worktree-fix-midi-out`, **not merged** — see In flight. | [`midi-out-note-channel.md`](docs/handoff/midi-out-note-channel.md) |
 | Lanes UX — rename, fold (lane + group), group, drag-reorder, and the timeline scroll/alignment fix | PR #60 `5f891cb`. Rebased onto phase 3 + the theme system; 10 code-review findings fixed before merge. Handoff: [`lanes-ux.md`](docs/handoff/lanes-ux.md) |
 | Pitch Coach **phase 3** — per-note scoring, stored pitch curve, take report | PR #61 `c14916d`. [`pitch-coach-PROGRESS.md`](docs/superpowers/plans/2026-08-16-pitch-coach-PROGRESS.md) |
 | Theme system — token contract, eight built-in themes, user themes from JSON | PR #63 `46df20d`. User docs: [`docs/themes.md`](docs/themes.md). `no-literals.test.ts` now guards every component's `<style>` block — a new component with a raw colour literal fails CI; use a token or a `theme-exempt:` comment. |
