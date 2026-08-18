@@ -11,6 +11,17 @@
 //! This module only computes numbers and offers the primitive. Wiring
 //! `compile_pdc`'s output into an actual graph rebuild (attaching
 //! `DelayLine`s to `RtTrack::pdc`) is Task 7 — out of scope here.
+//!
+//! KNOWN GAP FOR TASK 7: `mixer::process_inserts` applies `RtTrack::pdc`
+//! AFTER inserts, shifting the audio buffer `delay` samples into the past —
+//! but the fader/pan automation ramps applied right after in `apply_fader`
+//! are still keyed to the un-shifted "now". Once a real `DelayLine` is
+//! attached, a track with nonzero PDC will read automation values for the
+//! wrong playhead position (off by `delay` samples), a timing error that
+//! grows with plugin latency. Not reachable today — no production `RtTrack`
+//! sets `pdc` to anything but `None` — but Task 7 needs to either offset
+//! the ramp lookup by the track's own PDC delay or accept the drift as a
+//! documented divergence.
 
 /// A fixed-length delay: shifts an interleaved stream by exactly `delay`
 /// samples. RT-safe — `buf` is sized once in [`DelayLine::new`] and never
@@ -60,12 +71,12 @@ impl DelayLine {
     /// toward passthrough.
     pub fn process(&mut self, io: &mut [f32]) {
         debug_assert!(
-            self.channels == 0 || io.len() % self.channels == 0,
+            io.len() % self.channels == 0,
             "DelayLine::process: io.len()={} is not a whole number of frames at {} channels",
             io.len(),
             self.channels
         );
-        if self.delay == 0 || self.channels == 0 {
+        if self.delay == 0 {
             return;
         }
         let buf_frames = self.buf.len() / self.channels;
@@ -81,7 +92,15 @@ impl DelayLine {
             buf_frames - self.delay
         );
         for i in 0..frames {
-            let read_frame = (self.w + buf_frames - self.delay) % buf_frames;
+            // Equivalent to `(self.w + buf_frames - self.delay) % buf_frames`
+            // without a division on the RT hot path — `self.w < buf_frames`
+            // and `self.delay <= buf_frames` (sized at `new()`) keep both
+            // branches in range.
+            let read_frame = if self.w >= self.delay {
+                self.w - self.delay
+            } else {
+                self.w + buf_frames - self.delay
+            };
             let write_base = self.w * self.channels;
             let read_base = read_frame * self.channels;
             let io_base = i * self.channels;
@@ -90,7 +109,10 @@ impl DelayLine {
                 io[io_base + c] = self.buf[read_base + c];
                 self.buf[write_base + c] = incoming;
             }
-            self.w = (self.w + 1) % buf_frames;
+            self.w += 1;
+            if self.w == buf_frames {
+                self.w = 0;
+            }
         }
     }
 }
@@ -103,12 +125,25 @@ pub fn track_latency(instrument: usize, insert_latencies: &[usize]) -> usize {
 }
 
 /// Per-track compensating delay: every track is padded up to the slowest
-/// path (`max - each`), so the whole mix lines up at the master. Empty
-/// input yields empty output; a single track (or all-equal latencies)
-/// yields all zeros.
-pub fn compile_pdc(path_latencies: &[usize]) -> Vec<usize> {
-    let max = path_latencies.iter().copied().max().unwrap_or(0);
-    path_latencies.iter().map(|&l| max - l).collect()
+/// DECLARED path (`max` of `declared`), then topped up by what its OWN
+/// signal is not already delayed by (`applied`).
+///
+/// `declared[i]` is `track_latency` counting every insert regardless of
+/// bypass — it sets the alignment target so a bypassed insert elsewhere
+/// still holds the target where it would be if active. `applied[i]` is
+/// `track_latency` counting only NON-bypassed inserts — the delay actually
+/// present in that track's signal today, since `mixer::process_inserts`
+/// skips `process()` (and therefore the delay) on a bypassed insert. The
+/// two differ exactly on a track with a bypassed insert: its declared
+/// latency still counts toward `max`, but none of it is real, so the
+/// DelayLine must supply the WHOLE gap itself (G-5 — toggling bypass must
+/// not jump the mix: the track waits the same amount whether the plugin is
+/// running or skipped). `declared` and `applied` are paired by index, one
+/// entry per track; empty input yields empty output.
+pub fn compile_pdc(declared: &[usize], applied: &[usize]) -> Vec<usize> {
+    debug_assert_eq!(declared.len(), applied.len(), "compile_pdc: declared/applied must pair 1:1 per track");
+    let max = declared.iter().copied().max().unwrap_or(0);
+    applied.iter().map(|&a| max.saturating_sub(a)).collect()
 }
 
 #[cfg(test)]
@@ -117,9 +152,20 @@ mod tests {
 
     #[test]
     fn compile_pdc_delays_the_shorter_paths() {
-        assert_eq!(compile_pdc(&[256, 0, 64]), vec![0, 256, 192]);
-        assert_eq!(compile_pdc(&[0, 0]), vec![0, 0]);
-        assert_eq!(compile_pdc(&[]), Vec::<usize>::new());
+        assert_eq!(compile_pdc(&[256, 0, 64], &[256, 0, 64]), vec![0, 256, 192]);
+        assert_eq!(compile_pdc(&[0, 0], &[0, 0]), vec![0, 0]);
+        assert_eq!(compile_pdc(&[], &[]), Vec::<usize>::new());
+    }
+
+    /// G-5: a bypassed insert's declared latency still sets the alignment
+    /// target, but its DelayLine must supply the WHOLE gap — the plugin
+    /// isn't actually delaying anything (`process()` is skipped), so
+    /// `applied` is 0 for that track even though `declared` is 256. Mirrors
+    /// `mixer::tests::bypassed_insert_still_contributes_latency`, which
+    /// exercises the same numbers end-to-end through a real render.
+    #[test]
+    fn compile_pdc_gives_a_bypassed_insert_s_full_latency_as_pdc() {
+        assert_eq!(compile_pdc(&[256, 0], &[0, 0]), vec![256, 256]);
     }
 
     #[test]
