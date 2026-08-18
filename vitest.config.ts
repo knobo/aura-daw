@@ -1,13 +1,33 @@
 import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 
-// Frontend unit tests. The svelte plugin is what compiles runes in
-// `*.svelte.ts` store modules; no DOM is needed since these test stores,
-// not components.
+// Two projects because `.svelte` files compile differently per target:
+// `unit` runs stores/utils in plain node against the SSR-compiled output
+// (no DOM, no `mount()`); `dom` runs *.dom.test.ts under jsdom against the
+// client-compiled output (needs `resolve.conditions: ["browser"]` or
+// vite-plugin-svelte keeps emitting the SSR build and `mount()` throws
+// "not available on the server").
 export default defineConfig({
-  plugins: [svelte()],
   test: {
-    environment: "node",
-    include: ["src/**/*.test.ts"],
+    projects: [
+      {
+        plugins: [svelte()],
+        test: {
+          name: "unit",
+          environment: "node",
+          include: ["src/**/*.test.ts"],
+          exclude: ["src/**/*.dom.test.ts"],
+        },
+      },
+      {
+        resolve: { conditions: ["browser"] },
+        plugins: [svelte()],
+        test: {
+          name: "dom",
+          environment: "jsdom",
+          include: ["src/**/*.dom.test.ts"],
+        },
+      },
+    ],
   },
 });
