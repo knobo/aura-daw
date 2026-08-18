@@ -19,6 +19,7 @@
   import Meter from "./Meter.svelte";
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
+  import AutomationModeSelector from "./AutomationModeSelector.svelte";
 
   let {
     track,
@@ -366,6 +367,10 @@
             <LanePickerMenu {track} onclose={() => (pickerOpen = false)} />
           {/if}
         </span>
+        <AutomationModeSelector
+          mode={track.automationMode}
+          onchange={(mode) => project.setAutomationMode(track.id, mode)}
+        />
       </div>
 
       <div class="fader-wrap">
