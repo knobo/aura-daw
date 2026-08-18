@@ -24,8 +24,8 @@ function overview(undoDepth = 2, redoDepth = 1) {
     materialized: 1,
     replayOnly: 1,
     versions: [
-      { rev: 9, materialized: false, chargedBytes: 128 },
-      { rev: 8, materialized: true, chargedBytes: 256 },
+      { rev: 9, materialized: false, chargedBytes: 128, label: "set gain", actor: "You" },
+      { rev: 8, materialized: true, chargedBytes: 256, label: "move clip", actor: "You" },
     ],
   };
 }
@@ -54,8 +54,8 @@ describe("HistoryPanel", () => {
 
     render(HistoryPanel);
 
-    expect(await screen.findByRole("option", { name: /r9 replay/i })).toBeTruthy();
-    expect(screen.getByRole("option", { name: /r8 snapshot/i })).toBeTruthy();
+    expect(await screen.findByRole("option", { name: /set gain r9 .* replay/i })).toBeTruthy();
+    expect(screen.getByRole("option", { name: /move clip r8 .* snapshot/i })).toBeTruthy();
     expect(await screen.findByText("3")).toBeTruthy();
     expect(historyVersion).toHaveBeenCalledWith(9);
   });
@@ -72,7 +72,7 @@ describe("HistoryPanel", () => {
     });
 
     render(HistoryPanel);
-    const undoButton = await screen.findByRole("button", { name: /undo 2/i });
+    const undoButton = await screen.findByRole("button", { name: /undo\s*2/i });
     await fireEvent.click(undoButton);
 
     await waitFor(() => expect(undo).toHaveBeenCalledOnce());

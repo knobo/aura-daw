@@ -4898,6 +4898,8 @@ pub struct HistoryVersion {
     pub rev: u64,
     pub materialized: bool,
     pub charged_bytes: usize,
+    pub label: String,
+    pub actor: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4938,6 +4940,8 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
                 rev: v.rev,
                 materialized: v.materialized,
                 charged_bytes: v.charged_bytes,
+                label: v.label,
+                actor: v.actor,
             })
             .collect(),
     }

@@ -984,6 +984,8 @@ fn the_version_graph_gets_one_node_per_non_transient_commit_and_drains_at_a_swap
     let (overview_stats, items) = log.version_overview();
     assert_eq!(overview_stats, s, "the browser summary and rows share one graph snapshot");
     assert_eq!(items.len(), 4);
+    assert_eq!(items[0].label, "gain");
+    assert_eq!(items[0].actor, "You");
     assert!(items.windows(2).all(|pair| pair[0].rev > pair[1].rev), "browser rows are newest first");
     assert_eq!(
         items.iter().map(|item| item.charged_bytes).sum::<usize>(),

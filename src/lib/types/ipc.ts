@@ -1332,6 +1332,8 @@ export interface HistoryVersion {
   rev: number;
   materialized: boolean;
   chargedBytes: number;
+  label: string;
+  actor: string;
 }
 
 export interface HistoryOverview {

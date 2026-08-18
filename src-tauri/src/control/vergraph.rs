@@ -54,7 +54,7 @@
 
 use std::sync::Arc;
 
-use super::op::Op;
+use super::op::{Actor, Op, TxMeta};
 use super::session::Committed;
 use super::snapshot::{ChangeSet, SessionSnapshot};
 
@@ -79,13 +79,23 @@ pub const VER_STEPS_FLOOR: usize = 200;
 
 /// One retained version.
 pub enum VersionNode {
-    Materialized { snapshot: Arc<SessionSnapshot>, charge: usize },
-    ReplayOnly { ops: Vec<Op>, inverses: Vec<Op>, charge: usize },
+    Materialized {
+        snapshot: Arc<SessionSnapshot>,
+        charge: usize,
+        meta: TxMeta,
+    },
+    ReplayOnly {
+        ops: Vec<Op>,
+        inverses: Vec<Op>,
+        charge: usize,
+        meta: TxMeta,
+    },
 }
 
 impl VersionNode {
     /// Bytes this node ADDED — its own-created image bytes, or (replay-only)
-    /// the op and inverse vectors it stores. Charging a replay-only node the
+    /// the op and inverse vectors it stores, plus the retained transaction
+    /// metadata used to label the history browser. Charging a replay-only node the
     /// image charge it avoided would defend the budget against a fiction.
     ///
     /// NOT the bytes dropping it frees: a surviving node's image may still
@@ -102,6 +112,12 @@ impl VersionNode {
     pub fn is_materialized(&self) -> bool {
         matches!(self, VersionNode::Materialized { .. })
     }
+
+    pub fn meta(&self) -> &TxMeta {
+        match self {
+            VersionNode::Materialized { meta, .. } | VersionNode::ReplayOnly { meta, .. } => meta,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -117,11 +133,13 @@ pub struct VersionStats {
 /// Small descriptor for the history browser. The document image stays
 /// behind the graph; the renderer asks explicitly to materialize one
 /// revision when the user selects it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionItem {
     pub rev: u64,
     pub materialized: bool,
     pub charged_bytes: usize,
+    pub label: String,
+    pub actor: String,
 }
 
 /// Everything needed to reconstruct a rev, CLONED OUT of the graph so the
@@ -235,11 +253,16 @@ impl VersionGraph {
                 return VersionNode::ReplayOnly {
                     ops: committed.ops.clone(),
                     inverses: committed.inverses.clone(),
-                    charge: replay_charge,
+                    charge: replay_charge.saturating_add(meta_bytes(&committed.meta)),
+                    meta: committed.meta.clone(),
                 };
             }
         }
-        VersionNode::Materialized { snapshot: committed.snapshot.clone(), charge: image_charge }
+        VersionNode::Materialized {
+            snapshot: committed.snapshot.clone(),
+            charge: image_charge.saturating_add(meta_bytes(&committed.meta)),
+            meta: committed.meta.clone(),
+        }
     }
 
     /// Drain everything (returned for the janitor) and root the chain at
@@ -344,6 +367,8 @@ impl VersionGraph {
                 rev: *rev,
                 materialized: node.is_materialized(),
                 charged_bytes: node.charge(),
+                label: node.meta().label.clone(),
+                actor: actor_label(&node.meta().actor),
             })
             .collect()
     }
@@ -356,6 +381,25 @@ impl VersionGraph {
 /// replay-only; this comparison decides whether it would pay.
 fn replay_pays_off(replay_charge: usize, image_charge: usize) -> bool {
     replay_charge < image_charge
+}
+
+fn actor_label(actor: &Actor) -> String {
+    match actor {
+        Actor::User => "You".into(),
+        Actor::Agent { tool } => format!("Agent · {tool}"),
+        Actor::Engine => "Engine".into(),
+        Actor::System => "System".into(),
+    }
+}
+
+fn meta_bytes(meta: &TxMeta) -> usize {
+    meta.label
+        .capacity()
+        .saturating_add(meta.run.capacity())
+        .saturating_add(match &meta.actor {
+            Actor::Agent { tool } => tool.capacity(),
+            Actor::User | Actor::Engine | Actor::System => 0,
+        })
 }
 
 /// Deep bytes a stored op list retains: the enum slots plus every heap
@@ -894,7 +938,8 @@ mod tests {
         assert_eq!(evicted_total, 3, "and the three oldest were handed out for disposal");
         assert_eq!(s.oldest_rev, Some(4), "the OLDEST go first");
         assert_eq!(s.newest_rev, Some(6));
-        assert_eq!(s.retained_bytes, 3 * 4 * 1024, "retained_bytes tracks what is left");
+        let per_node = 4 * 1024 + meta_bytes(&TxMeta::user("t"));
+        assert_eq!(s.retained_bytes, 3 * per_node, "retained_bytes tracks data plus labels");
         assert!(
             s.retained_bytes > g.budget_bytes,
             "the floor OUTRANKS the budget: 3 x 4 KB is over the 10 KB ceiling and stays"

@@ -22,8 +22,8 @@ beforeEach(() => {
     materialized: 1,
     replayOnly: 1,
     versions: [
-      { rev: 9, materialized: false, chargedBytes: 128 },
-      { rev: 8, materialized: true, chargedBytes: 256 },
+      { rev: 9, materialized: false, chargedBytes: 128, label: "set gain", actor: "You" },
+      { rev: 8, materialized: true, chargedBytes: 256, label: "move clip", actor: "You" },
     ],
   });
   historyVersion.mockResolvedValue({
@@ -53,5 +53,20 @@ describe("history browser", () => {
 
     expect(historyBrowser.detail).toBeNull();
     expect(historyBrowser.error).toContain("no longer retained");
+  });
+
+  it("coalesces tab activation and component mount into one automatic load", async () => {
+    let release!: (value: Awaited<ReturnType<typeof historyOverview>>) => void;
+    historyOverview.mockReturnValueOnce(new Promise((resolve) => (release = resolve)));
+
+    const fromTab = historyBrowser.load();
+    const fromMount = historyBrowser.load();
+
+    expect(historyOverview).toHaveBeenCalledOnce();
+    release({
+      undoDepth: 0, redoDepth: 0, retainedBytes: 0, materialized: 0, replayOnly: 0, versions: [],
+    });
+    await Promise.all([fromTab, fromMount]);
+    expect(historyOverview).toHaveBeenCalledOnce();
   });
 });
