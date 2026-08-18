@@ -571,6 +571,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// `Off` mode must bypass a track's gain lane entirely — not just mute
+    /// its effect, but leave no ramp in the compiled table at all, exactly
+    /// as if the lane didn't exist. `compile_track_ramps` (`engine.rs`) is
+    /// the ONE function both this offline bounce path and the live rebuild
+    /// path funnel through, so proving it here proves both agree.
+    #[test]
+    fn build_graph_skips_a_gain_lane_when_the_track_is_off() {
+        const RATE: u32 = 48_000;
+        let mut store = Store::default();
+        store.tracks.push(TrackState {
+            automation_mode: AutomationMode::Off,
+            ..track("t-1", "audio")
+        });
+        let midi = MidiStore {
+            harmony: Default::default(),
+            ppq: 960,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![],
+            launch_maps: Vec::new(),
+            loaded_dir: None,
+            dirty: false,
+        };
+        let automation = crate::control::session::AutomationDoc {
+            lanes: vec![crate::plugins::automation::AutomationLane {
+                id: "l1".into(),
+                target_node: "track:t-1".into(),
+                param_id: crate::plugins::automation::TRACK_PARAM_GAIN,
+                points: vec![
+                    crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 },
+                    crate::plugins::automation::AutomationPoint { tick: 160, value: 0.0 },
+                ],
+            }],
+        };
+        let og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &automation,
+            &Default::default(),
+            None,
+            RATE,
+        );
+        assert!(
+            og.graph.track_ramps[0].gain.is_none(),
+            "Off must skip the lane entirely — no ramp entry, same as if it didn't exist"
+        );
+    }
+
+    /// Parity guard for the test above: `Read` (the default mode) must NOT
+    /// be affected by the `Off` filter in `compile_track_ramps` — the lane
+    /// still compiles into a ramp exactly as before this change.
+    #[test]
+    fn build_graph_still_applies_a_gain_lane_when_the_track_is_read() {
+        const RATE: u32 = 48_000;
+        let mut store = Store::default();
+        store.tracks.push(TrackState {
+            automation_mode: AutomationMode::Read,
+            ..track("t-1", "audio")
+        });
+        let midi = MidiStore {
+            harmony: Default::default(),
+            ppq: 960,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![],
+            launch_maps: Vec::new(),
+            loaded_dir: None,
+            dirty: false,
+        };
+        let automation = crate::control::session::AutomationDoc {
+            lanes: vec![crate::plugins::automation::AutomationLane {
+                id: "l1".into(),
+                target_node: "track:t-1".into(),
+                param_id: crate::plugins::automation::TRACK_PARAM_GAIN,
+                points: vec![
+                    crate::plugins::automation::AutomationPoint { tick: 0, value: 1.0 },
+                    crate::plugins::automation::AutomationPoint { tick: 160, value: 0.0 },
+                ],
+            }],
+        };
+        let og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &automation,
+            &Default::default(),
+            None,
+            RATE,
+        );
+        assert!(
+            og.graph.track_ramps[0].gain.is_some(),
+            "Read (default) must still compile the lane into a ramp"
+        );
+    }
+
     /// The ramp table is sized by the TRACK COUNT, not by `slots.len()`.
     /// `derive_slots` keys by track id, so two tracks sharing an id collapse
     /// to one map entry pointing at the LAST index — sizing by the map would

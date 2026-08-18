@@ -1122,7 +1122,24 @@ pub(crate) fn compile_track_ramps(
     let mut ramps: Vec<TrackRamps> = if lanes.is_empty() {
         (0..n_slots).map(|_| TrackRamps::default()).collect()
     } else {
-        crate::plugins::automation::compile_gain_ramps(lanes, map, n_slots, &|tid| {
+        let live_lanes: Vec<_> = lanes
+            .iter()
+            .filter(|lane| {
+                // Off bypasses the lane entirely — same rule for a live
+                // rebuild and an offline bounce, since both funnel through
+                // this one function.
+                match crate::plugins::automation::resolve_target(lane) {
+                    Some(crate::plugins::automation::LaneTarget::TrackGain(tid)) => store
+                        .tracks
+                        .iter()
+                        .find(|t| t.id.as_str() == tid)
+                        .is_none_or(|t| t.automation_mode != crate::audio::types::AutomationMode::Off),
+                    _ => true, // not a track-gain lane; unaffected by this filter
+                }
+            })
+            .cloned()
+            .collect();
+        crate::plugins::automation::compile_gain_ramps(&live_lanes, map, n_slots, &|tid| {
             slots.get(tid).copied()
         })
         .into_iter()
