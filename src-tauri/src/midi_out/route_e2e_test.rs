@@ -1,34 +1,42 @@
 //! End-to-end regression test for the bug report *"I patch a MIDI track to
 //! Hydrogen and the drum machine plays nothing"*.
 //!
-//! Everything the app does is in the loop here — a real audio engine, a real
-//! `ControlPlane`, a real committed MIDI clip, a real route through
-//! `set_midi_track_route`, a real `midir` connection — and the assertions are
-//! on the actual bytes a virtual ALSA-seq input receives. Kept as a whole
-//! rather than split into units because the defect it pins down lived in none
-//! of the pieces: every layer was individually correct, and the note's MIDI
-//! channel was simply dropped at the seam between them.
+//! Everything the app does between a committed clip and the wire is in the
+//! loop here — a real `ControlPlane`, a real committed MIDI clip, a real route
+//! through `set_midi_track_route`, a real `midir` connection — and the
+//! assertions are on the actual bytes a virtual ALSA-seq input receives. Kept
+//! as a whole rather than split into units because the defect it pins down
+//! lived in none of the pieces: every layer was individually correct, and the
+//! note's MIDI channel was simply dropped at the seam between them.
 //!
 //! The document under test is the shape the Composer's groove generator
 //! produces: General MIDI drum keys on **channel 10** (0-based 9). A drum
 //! machine listens there; before this test existed those notes went out on
 //! channel 1, which is why nothing played.
+//!
+//! **No audio engine.** The transport atomics are driven by this file's own
+//! updater thread (`EngineHandle::for_tests` stands in for the control thread),
+//! the way the rest of this module's port-thread tests already do it. An
+//! earlier version started a real engine and was flaky roughly one run in
+//! four: two of these tests in one process open the default output device in
+//! turn, and when the second one gets no callbacks the playhead never moves and
+//! no note is ever due. Nothing about the bug under test involves the audio
+//! device, so it is not worth the coin flip.
 
 use super::*;
-
-struct NullEvents;
-impl crate::audio::engine::EventSink for NullEvents {
-    fn emit(&self, _e: &str, _p: serde_json::Value) {}
-}
 
 /// Everything the fixture hands back: the wire log, the plane, and the ids.
 struct Rig {
     seen: std::sync::Arc<PlMutex<Vec<Vec<u8>>>>,
     cp: Arc<crate::control::ControlPlane>,
+    shared: Arc<SharedRt>,
     port_id: String,
     dir: std::path::PathBuf,
     /// Kept alive for the length of the test — dropping it closes the port.
     _conn: midir::MidiInputConnection<()>,
+    /// Kept alive so `EngineHandle::send` still has a receiver; the messages
+    /// themselves are of no interest here.
+    _engine_rx: crossbeam_channel::Receiver<crate::audio::engine::ControlMsg>,
 }
 
 /// A project with one MIDI track carrying a four-hit GM drum bar on channel
@@ -65,25 +73,15 @@ fn rig(label: &str, note_channel: u8, route_channel: Option<u8>) -> Option<Rig> 
         .find(|p| p.name.contains(&port_name))?;
 
     let shared = Arc::new(SharedRt::default());
+    // The out thread reads the rate to pace its clock and its drift tolerance;
+    // with a stand-in engine nobody publishes one, so state it here.
+    shared.sample_rate.store(48_000, Relaxed);
     let tables = empty_tables();
     let session = Arc::new(PlMutex::new(crate::control::Session::new(
         Store::default(),
         MidiStore::default(),
     )));
-    let engine = crate::audio::engine::start(
-        shared.clone(),
-        tables.clone(),
-        session.clone(),
-        Box::new(NullEvents),
-        crate::control::testutil::test_committer(&session, &shared, &tables),
-    );
-    // Event-driven readiness: one synchronous round-trip guarantees the output
-    // stream is open and the real sample rate settled before the fixture
-    // computes anything from it (same trick `control::loopjam`'s fixture uses;
-    // a fixed sleep raced the stream open under full-suite load).
-    engine
-        .request(|reply| crate::audio::engine::ControlMsg::SelectInput { device_id: None, reply })
-        .expect("engine control thread responds");
+    let (engine, engine_rx) = crate::audio::engine::EngineHandle::for_tests();
     let cp = Arc::new(ControlPlane::new(
         session.clone(),
         shared.clone(),
@@ -106,18 +104,26 @@ fn rig(label: &str, note_channel: u8, route_channel: Option<u8>) -> Option<Rig> 
         )
         .unwrap();
     let q = DEFAULT_PPQ as u32;
+    // FOUR bars of quarter-note hits, not one. The assertions only need three
+    // hits, but the out thread adopts a route on a 250 ms cadence and a loaded
+    // machine can stretch that — with a single bar of material, a late adoption
+    // plus `stop_at_end` retiring the transport means the notes are simply gone
+    // and the test fails for a reason that has nothing to do with the bug it
+    // guards. Extra length costs no wall clock: `play_until` stops as soon as it
+    // has what it needs.
+    const HITS: u32 = 16;
     let clip = crate::midi::midi_add_clip_core(
         &cp,
         track.id.to_string(),
         Some("Groove".into()),
         0,
-        DEFAULT_PPQ as u64 * 4,
+        DEFAULT_PPQ as u64 * HITS as u64,
     )
     .unwrap();
     // Kick, snare, kick, snare — GM keys, so a drum machine has something to
     // map them onto, and two distinct keys so an off cannot be mistaken for
     // another key's.
-    let notes: Vec<MidiNote> = (0..4u32)
+    let notes: Vec<MidiNote> = (0..HITS)
         .map(|i| MidiNote {
             tick: i * q,
             length_ticks: q / 2,
@@ -146,16 +152,60 @@ fn rig(label: &str, note_channel: u8, route_channel: Option<u8>) -> Option<Rig> 
     // route before the transport rolls.
     std::thread::sleep(std::time::Duration::from_millis(400));
 
-    Some(Rig { seen, cp, port_id: target.id, dir, _conn: conn })
+    Some(Rig {
+        seen,
+        cp,
+        shared,
+        port_id: target.id,
+        dir,
+        _conn: conn,
+        _engine_rx: engine_rx,
+    })
 }
 
 impl Rig {
-    /// Roll the transport far enough to cross all four hits, then stop.
-    fn play_a_bar(&self) {
-        self.cp.transport(crate::control::TransportAction::Play).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(2200));
-        self.cp.transport(crate::control::TransportAction::Stop).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(200));
+    /// Roll the playhead until at least `want` note-ons have reached the wire,
+    /// then park it.
+    ///
+    /// The playhead is advanced by a thread of our own from wall clock at
+    /// 48 kHz — the same stand-in the rest of this module's port-thread tests
+    /// use — so there is no audio device in the loop. POLLED rather than slept
+    /// because the out thread adopts a route on a 250 ms cadence: a fixed sleep
+    /// long enough to be safe under load is a slow test, and one short enough
+    /// to be quick is a flaky one. The deadline is only a failure bound; a
+    /// healthy run leaves in well under a second.
+    fn play_until(&self, want: usize) {
+        self.shared.position.store(0, Relaxed);
+        self.shared.playing.store(true, Relaxed);
+        let running = Arc::new(AtomicBool::new(true));
+        let updater = {
+            let shared = self.shared.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                while running.load(Relaxed) {
+                    shared
+                        .position
+                        .store((t0.elapsed().as_secs_f64() * 48_000.0) as u64, Relaxed);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            })
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            if self.note_ons().len() >= want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        running.store(false, Relaxed);
+        let _ = updater.join();
+        // Stopping the transport is what releases whatever is still sounding,
+        // so the note-off assertions have something to read.
+        self.shared.playing.store(false, Relaxed);
+        std::thread::sleep(Duration::from_millis(150));
     }
 
     /// Every note-on that reached the wire, as `(channel, key, velocity)`.
@@ -199,7 +249,7 @@ fn gm_drum_notes_reach_the_wire_on_channel_10() {
         eprintln!("skipping: ALSA seq unavailable");
         return;
     };
-    rig.play_a_bar();
+    rig.play_until(3);
 
     let ons = rig.note_ons();
     assert!(
@@ -231,7 +281,7 @@ fn a_forced_channel_overrides_what_the_clip_says() {
         eprintln!("skipping: ALSA seq unavailable");
         return;
     };
-    rig.play_a_bar();
+    rig.play_until(3);
 
     let ons = rig.note_ons();
     assert!(!ons.is_empty(), "the routed track sent nothing at all");
