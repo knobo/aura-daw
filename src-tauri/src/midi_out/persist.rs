@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 ///   filled with `channel.unwrap_or(0)`.
 /// * **2**: `channel` is `Option<u8>` — `null` means "each note on its own
 ///   channel", and `0` means a deliberately forced MIDI channel 1.
-pub const CURRENT_VERSION: u32 = 2;
+/// * **3**: virtual outputs carry an explicit `virtual_output` flag instead
+///   of being inferred from their display name.
+pub const CURRENT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingFile {
@@ -78,7 +80,15 @@ impl RoutingFile {
                     Some(ch) => Some(ch & 0x0F),
                     None => None,
                 };
+                if self.version < 3 && r.port_name.starts_with("AURA · ") {
+                    r.virtual_output = true;
+                }
             }
+            let virtual_names: std::collections::HashSet<&str> = proj.routes.iter()
+                .filter(|r| r.virtual_output)
+                .map(|r| r.port_name.as_str())
+                .collect();
+            proj.open_ports.retain(|name| !virtual_names.contains(name.as_str()));
         }
         self.version = CURRENT_VERSION;
     }
@@ -108,6 +118,10 @@ pub struct PersistedRoute {
     pub scope: String,
     pub id: String,
     pub port_name: String,
+    /// True when AURA publishes this route as its own virtual source.
+    /// Explicit type information avoids guessing from the user-visible name.
+    #[serde(default)]
+    pub virtual_output: bool,
     /// Forced output channel 0-15, or `None` for "each note on its own
     /// channel" (the default — see [`super::RouteTarget::channel`]). How a
     /// v1 file's `0` is read is [`RoutingFile::migrate`]'s business, not this
@@ -267,6 +281,7 @@ mod tests {
                     scope: "track".into(),
                     id: "t-1".into(),
                     port_name: "Hydrogen".into(),
+                    virtual_output: false,
                     channel: Some(9),
                     return_device: Some("Interface In 3-4".into()),
                 }],
@@ -317,6 +332,19 @@ mod tests {
         assert_eq!(r.channel, None);
     }
 
+    #[test]
+    fn v2_virtual_routes_migrate_from_the_old_name_convention() {
+        let json = r#"{"version":2,"projects":{"/p":{"routes":[
+            {"scope":"track","id":"t-1","port_name":"AURA · Track · Bass"}
+        ],"open_ports":["AURA · Track · Bass"]}}}"#;
+        let mut file: RoutingFile = serde_json::from_str(json).unwrap();
+        file.migrate();
+        let project = &file.projects["/p"];
+        assert!(project.routes[0].virtual_output);
+        assert!(project.open_ports.is_empty(), "virtual sources are represented by routes, not hardware open_ports");
+        assert_eq!(file.version, CURRENT_VERSION);
+    }
+
     /// v1 -> v2: a `0` in a file written before the channel became an override
     /// was `channel.unwrap_or(0)`, i.e. "never picked", and must load as
     /// follow-the-clip — otherwise the reported drum bug survives the upgrade
@@ -365,6 +393,7 @@ mod tests {
                     scope: "track".into(),
                     id: "t-1".into(),
                     port_name: "Juno".into(),
+                    virtual_output: false,
                     channel: Some(0),
                     return_device: None,
                 }],

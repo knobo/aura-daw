@@ -71,6 +71,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex as PlMutex;
 use serde::Serialize;
 
+#[cfg(unix)]
+use midir::os::unix::VirtualOutput;
+
 use crate::audio::rt::SharedRt;
 use crate::control::Session;
 use crate::midi::tempo::TempoMap;
@@ -611,6 +614,29 @@ struct ActiveOutput {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+const VIRTUAL_PORT_PREFIX: &str = "aura-virtual:";
+
+fn virtual_port_id(scope: &RouteScope) -> String {
+    match scope {
+        RouteScope::Track(id) => format!("{VIRTUAL_PORT_PREFIX}track:{id}"),
+        RouteScope::Clip(id) => format!("{VIRTUAL_PORT_PREFIX}clip:{id}"),
+    }
+}
+
+fn virtual_port_name(scope: &RouteScope, label: &str) -> String {
+    let kind = match scope { RouteScope::Track(_) => "Track", RouteScope::Clip(_) => "Clip" };
+    let clean = label.replace(['\n', '\r'], " ").trim().to_string();
+    format!("AURA · {kind} · {}", if clean.is_empty() { "MIDI" } else { &clean })
+}
+
+fn virtual_port_label<'a>(scope: &RouteScope, name: &'a str) -> &'a str {
+    let prefix = match scope {
+        RouteScope::Track(_) => "AURA · Track · ",
+        RouteScope::Clip(_) => "AURA · Clip · ",
+    };
+    name.strip_prefix(prefix).unwrap_or(name)
+}
+
 #[derive(Default)]
 struct Inner {
     active: HashMap<String, ActiveOutput>,
@@ -671,6 +697,28 @@ impl Default for MidiOut {
 }
 
 impl MidiOut {
+    fn start_output(&self, inner: &mut Inner, port_id: String, info: MidiPortInfo, sink: MidiOutSink, clock_default: bool) -> Result<(), String> {
+        let thread_shared = Arc::new(ThreadShared::default());
+        let clock_enabled = Arc::new(AtomicBool::new(clock_default));
+        let ts_for_thread = thread_shared.clone();
+        let clock_for_thread = clock_enabled.clone();
+        let session_for_thread = self.session.get().cloned();
+        let shared_for_thread = self.shared.get().cloned();
+        let routes_for_thread = self.routes.clone();
+        let port_id_for_thread = port_id.clone();
+        let changed_for_thread = self.on_routes_changed.get().cloned();
+        let thread_name = format!("aura-midi-out-{}", port_id.replace(':', "-"));
+        let handle = std::thread::Builder::new()
+            .name(thread_name)
+            .spawn(move || run_thread(sink, ts_for_thread, session_for_thread, shared_for_thread,
+                clock_for_thread, routes_for_thread, port_id_for_thread, changed_for_thread))
+            .map_err(|e| e.to_string())?;
+        inner.active.insert(port_id, ActiveOutput {
+            port: info, thread_shared, clock_enabled, handle: Some(handle),
+        });
+        Ok(())
+    }
+
     /// lib.rs setup, once: threads need the transport atomics and a way to
     /// snapshot tempo. A second call is silently ignored (first attach
     /// wins).
@@ -727,37 +775,35 @@ impl MidiOut {
             .map_err(|e| e.to_string())?;
         let sink = MidiOutSink(conn);
 
-        let thread_shared = Arc::new(ThreadShared::default());
-        let clock_enabled = Arc::new(AtomicBool::new(true));
-        let ts_for_thread = thread_shared.clone();
-        let clock_for_thread = clock_enabled.clone();
-        let session_for_thread = self.session.get().cloned();
-        let shared_for_thread = self.shared.get().cloned();
-        let routes_for_thread = self.routes.clone();
-        let port_id_for_thread = port_id.clone();
-        let changed_for_thread = self.on_routes_changed.get().cloned();
+        self.start_output(&mut inner, port_id, info, sink, true)
+    }
 
-        let handle = std::thread::Builder::new()
-            .name(format!("aura-midi-out-{port_id}"))
-            .spawn(move || {
-                run_thread(
-                    sink,
-                    ts_for_thread,
-                    session_for_thread,
-                    shared_for_thread,
-                    clock_for_thread,
-                    routes_for_thread,
-                    port_id_for_thread,
-                    changed_for_thread,
-                )
-            })
-            .map_err(|e| e.to_string())?;
-
-        inner.active.insert(
-            port_id,
-            ActiveOutput { port: info, thread_shared, clock_enabled, handle: Some(handle) },
-        );
+    /// Publish one route as its own ALSA-seq MIDI source. Carla can then
+    /// patch this named source to any synth without AURA knowing the target.
+    #[cfg(unix)]
+    pub fn set_virtual_route(&self, scope: RouteScope, label: &str, enabled: bool) -> Result<(), String> {
+        let id = virtual_port_id(&scope);
+        if !enabled {
+            if self.routes.lock().get(&scope).is_some_and(|r| r.port_id == id) {
+                self.set_route(scope, None);
+            }
+            return self.close_port(&id);
+        }
+        let mut inner = self.inner.lock();
+        if !inner.active.contains_key(&id) {
+            let name = virtual_port_name(&scope, label);
+            let midi_out = midir::MidiOutput::new("aura-virtual-midi-output").map_err(|e| e.to_string())?;
+            let conn = midi_out.create_virtual(&name).map_err(|e| e.to_string())?;
+            self.start_output(&mut inner, id.clone(), MidiPortInfo { id: id.clone(), name }, MidiOutSink(conn), false)?;
+        }
+        drop(inner);
+        self.set_route(scope, Some(RouteTarget::from_clip(id)));
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    pub fn set_virtual_route(&self, _scope: RouteScope, _label: &str, _enabled: bool) -> Result<(), String> {
+        Err("virtual MIDI outputs are currently supported on Linux/macOS only".into())
     }
 
     /// Close one open port (Stop-then-drop, see module doc). Closing a port
@@ -872,6 +918,15 @@ impl MidiOut {
             }
         }
         self.routes_changed();
+        let _ = self.close_port(&virtual_port_id(&RouteScope::Track(track_id.to_string())));
+        for id in clip_ids {
+            let _ = self.close_port(&virtual_port_id(&RouteScope::Clip(id.clone())));
+        }
+    }
+
+    pub fn clear_route_for_clip(&self, clip_id: &str) {
+        self.set_route(RouteScope::Clip(clip_id.to_string()), None);
+        let _ = self.close_port(&virtual_port_id(&RouteScope::Clip(clip_id.to_string())));
     }
 
     pub fn routes(&self) -> HashMap<RouteScope, RouteTarget> {
@@ -900,7 +955,18 @@ impl MidiOut {
 
     /// Cheap live snapshot for polling.
     pub fn status(&self) -> MidiOutputStatus {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
+        let finished: Vec<String> = inner.active.iter()
+            .filter(|(_, active)| active.handle.as_ref().is_some_and(|h| h.is_finished()))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            if let Some(mut active) = inner.active.remove(&id) {
+                if let Some(handle) = active.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
         let outputs = inner
             .active
             .values()
@@ -991,6 +1057,27 @@ impl MidiOut {
         // connections over a transient failure. Degrade to "change nothing" and
         // let the next project open sort it out.
         let enumeration_worked = !available.is_empty();
+        let wanted_virtual_ids: HashSet<String> = proj
+            .routes
+            .iter()
+            .filter(|r| r.virtual_output)
+            .filter_map(|r| match r.scope.as_str() {
+                "track" => Some(virtual_port_id(&RouteScope::Track(r.id.clone()))),
+                "clip" => Some(virtual_port_id(&RouteScope::Clip(r.id.clone()))),
+                _ => None,
+            })
+            .collect();
+        let stale_virtual: Vec<String> = self
+            .inner
+            .lock()
+            .active
+            .keys()
+            .filter(|id| id.starts_with(VIRTUAL_PORT_PREFIX) && !wanted_virtual_ids.contains(*id))
+            .cloned()
+            .collect();
+        for id in stale_virtual {
+            let _ = self.close_port(&id);
+        }
         let leftover: Vec<String> = if enumeration_worked {
             let wanted_ids: HashSet<&str> =
                 wanted_names.iter().filter_map(|n| resolve(n)).collect();
@@ -998,6 +1085,7 @@ impl MidiOut {
                 .lock()
                 .active
                 .values()
+                .filter(|a| !a.port.id.starts_with(VIRTUAL_PORT_PREFIX))
                 .filter(|a| !wanted_ids.contains(a.port.id.as_str()))
                 .map(|a| a.port.id.clone())
                 .collect()
@@ -1044,6 +1132,29 @@ impl MidiOut {
 
         let mut new_routes = HashMap::new();
         for r in &proj.routes {
+            let scope = match r.scope.as_str() {
+                "track" => RouteScope::Track(r.id.clone()),
+                "clip" => RouteScope::Clip(r.id.clone()),
+                other => {
+                    log::warn!("midi routing: unknown persisted scope '{other}'; skipping");
+                    continue;
+                }
+            };
+            // Virtual sources are created by AURA itself, so they can never
+            // appear in destination-port enumeration. Recreate them from the
+            // persisted route row before resolving ordinary hardware ports.
+            if r.virtual_output {
+                if let Err(e) = self.set_virtual_route(scope.clone(), virtual_port_label(&scope, &r.port_name), true) {
+                    log::warn!("midi routing: failed to recreate virtual port '{}': {e}", r.port_name);
+                    continue;
+                }
+                new_routes.insert(scope.clone(), RouteTarget {
+                    port_id: virtual_port_id(&scope),
+                    channel: r.channel,
+                    return_device: r.return_device.clone(),
+                });
+                continue;
+            }
             let Some(port_id) = resolve(r.port_name.as_str()) else {
                 log::info!(
                     "midi routing: port '{}' not found on this machine; skipping a persisted route",
@@ -1054,14 +1165,6 @@ impl MidiOut {
             if !self.inner.lock().active.contains_key(port_id) {
                 continue;
             }
-            let scope = match r.scope.as_str() {
-                "track" => RouteScope::Track(r.id.clone()),
-                "clip" => RouteScope::Clip(r.id.clone()),
-                other => {
-                    log::warn!("midi routing: unknown persisted scope '{other}'; skipping");
-                    continue;
-                }
-            };
             new_routes.insert(
                 scope,
                 RouteTarget {
@@ -1134,6 +1237,7 @@ impl MidiOut {
                         scope: kind.into(),
                         id,
                         port_name,
+                        virtual_output: target.port_id.starts_with(VIRTUAL_PORT_PREFIX),
                         channel: target.channel,
                         return_device: match kind {
                             "track" => target.return_device.clone(),
@@ -1151,14 +1255,16 @@ impl MidiOut {
                     if written.contains(&(r.scope.clone(), r.id.clone())) {
                         continue;
                     }
-                    if !is_visible(&r.port_name) {
+                    if !r.virtual_output && !is_visible(&r.port_name) {
                         persisted.push(r.clone());
                     }
                 }
             }
 
             let mut open_ports: Vec<String> =
-                inner.active.values().map(|a| a.port.name.clone()).collect();
+                inner.active.values()
+                    .filter(|a| !a.port.id.starts_with(VIRTUAL_PORT_PREFIX))
+                    .map(|a| a.port.name.clone()).collect();
             if let Some(existing) = file.projects.get(&key) {
                 for name in &existing.open_ports {
                     if !open_ports.iter().any(|n| n == name) && !is_visible(name) {
@@ -1408,6 +1514,14 @@ fn run_thread(
                                 let _ = sink.send(m.as_slice());
                             }
                         }
+                    }
+                    // A virtual source exists for exactly one document scope.
+                    // If self-healing removed that scope (e.g. a nonstandard
+                    // mutation bypassed the explicit delete hook), retire the
+                    // source thread too. status() reaps its finished handle
+                    // from the active registry on the next UI poll.
+                    if healed && port_id.starts_with(VIRTUAL_PORT_PREFIX) {
+                        thread_shared.stop.store(true, Relaxed);
                     }
 
                     // New or changed routes: whole-track review, Critical
@@ -1668,6 +1782,28 @@ pub fn midi_set_clip_route(
         port_id,
         channel,
         crate::control::op::TxMeta::user("set midi clip route"),
+    )
+}
+
+#[tauri::command]
+pub fn midi_set_track_virtual_output(
+    track_id: String,
+    enabled: bool,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.set_midi_track_virtual_output(
+        track_id, enabled, crate::control::op::TxMeta::user("set track virtual MIDI output"),
+    )
+}
+
+#[tauri::command]
+pub fn midi_set_clip_virtual_output(
+    clip_id: String,
+    enabled: bool,
+    control: tauri::State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.set_midi_clip_virtual_output(
+        clip_id, enabled, crate::control::op::TxMeta::user("set clip virtual MIDI output"),
     )
 }
 
@@ -2676,6 +2812,75 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn deleting_a_track_closes_its_virtual_output_and_clip_outputs() {
+        let out = MidiOut::default();
+        let track = RouteScope::Track("t-virtual".into());
+        let clip = RouteScope::Clip("c-virtual".into());
+        if let Err(e) = out.set_virtual_route(track.clone(), "Bass", true) {
+            eprintln!("skipping: virtual MIDI output unavailable: {e}");
+            return;
+        }
+        if let Err(e) = out.set_virtual_route(clip.clone(), "Verse", true) {
+            eprintln!("skipping: second virtual MIDI output unavailable: {e}");
+            out.close_all();
+            return;
+        }
+        assert_eq!(out.status().outputs.len(), 2);
+
+        out.clear_routes_for_track("t-virtual", &["c-virtual".into()]);
+
+        assert!(out.routes().is_empty());
+        assert!(out.status().outputs.is_empty(), "deleted document rows must disappear from Carla's patchbay");
+    }
+
+    #[test]
+    fn project_switch_closes_a_virtual_output_even_when_hardware_enumeration_is_empty() {
+        let out = MidiOut::default();
+        out.set_routing_path_for_test(test_routing_path("virtual-project-switch"));
+        if let Err(e) = out.set_virtual_route(RouteScope::Track("t-old".into()), "Old project", true) {
+            eprintln!("skipping: virtual MIDI output unavailable: {e}");
+            return;
+        }
+        assert_eq!(out.status().outputs.len(), 1);
+
+        out.adopt_project(&test_project_dir("virtual-project-switch-empty"));
+
+        assert!(out.status().outputs.is_empty(), "the previous project's virtual port must close");
+        assert!(out.routes().is_empty());
+    }
+
+    #[test]
+    fn virtual_output_persists_with_an_explicit_kind_and_reopens() {
+        let routing_path = test_routing_path("virtual-reopen");
+        let project_dir = test_project_dir("virtual-reopen");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let before = MidiOut::default();
+        before.set_routing_path_for_test(routing_path.clone());
+        if let Err(e) = before.set_virtual_route(RouteScope::Track("t-1".into()), "Lead · Main", true) {
+            eprintln!("skipping: virtual MIDI output unavailable: {e}");
+            return;
+        }
+        before.persist(Some(&project_dir));
+        let file = persist::load_from_path(&routing_path);
+        let row = &file.projects[&persist::project_key(&project_dir)].routes[0];
+        assert!(row.virtual_output);
+        assert_eq!(row.port_name, "AURA · Track · Lead · Main");
+        before.close_all();
+
+        let after = MidiOut::default();
+        after.set_routing_path_for_test(routing_path.clone());
+        after.adopt_project(&project_dir);
+        let status = after.status();
+        assert_eq!(status.outputs.len(), 1);
+        assert_eq!(status.outputs[0].port.name, "AURA · Track · Lead · Main");
+        assert!(after.routes().contains_key(&RouteScope::Track("t-1".into())));
+        after.close_all();
+        let _ = std::fs::remove_file(routing_path);
+        let _ = std::fs::remove_dir_all(project_dir);
+    }
+
     /// File > New (or opening a project that has never been routed) must
     /// not keep the previous project's in-memory table: `create_project_at`
     /// / `open_project_epoch` both call `adopt_project` after the document
@@ -2797,6 +3002,7 @@ mod tests {
                         scope: "track".into(),
                         id: "t-1".into(),
                         port_name: "Unplugged Synth".into(),
+                        virtual_output: false,
                         channel: Some(3),
                         return_device: Some("Mic 2".into()),
                     },
@@ -2804,6 +3010,7 @@ mod tests {
                         scope: "clip".into(),
                         id: "c-9".into(),
                         port_name: "Missing Drum Machine".into(),
+                        virtual_output: false,
                         channel: Some(9),
                         return_device: None,
                     },

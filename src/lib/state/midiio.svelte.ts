@@ -10,6 +10,7 @@
  */
 
 import { backend } from "../tauri";
+import { toasts } from "./toasts.svelte";
 import type { MidiOutputPortStatus, MidiPortInfo, MidiRouteStatus } from "../types/ipc";
 
 const POLL_MS_DEFAULT = 500;
@@ -52,6 +53,42 @@ class MidiIoStore {
 
   trackRoute(trackId: string): MidiRouteStatus | undefined {
     return this.routes.find((r) => r.scope === "track" && r.id === trackId);
+  }
+
+  isVirtualTrack(trackId: string): boolean {
+    return this.trackRoute(trackId)?.portId === `aura-virtual:track:${trackId}`;
+  }
+
+  isVirtualClip(clipId: string): boolean {
+    return this.clipOverride(clipId)?.portId === `aura-virtual:clip:${clipId}`;
+  }
+
+  async setTrackVirtualOutput(trackId: string, enabled: boolean): Promise<void> {
+    try {
+      await backend.midiSetTrackVirtualOutput?.(trackId, enabled);
+    } catch (err) {
+      toasts.error("MIDI OUTPUT FAILED", String(err));
+    } finally {
+      const status = await backend.midiOutputStatus?.().catch(() => undefined);
+      if (status) {
+        this.outputs = status.outputs;
+        this.routes = status.routes;
+      }
+    }
+  }
+
+  async setClipVirtualOutput(clipId: string, enabled: boolean): Promise<void> {
+    try {
+      await backend.midiSetClipVirtualOutput?.(clipId, enabled);
+    } catch (err) {
+      toasts.error("MIDI OUTPUT FAILED", String(err));
+    } finally {
+      const status = await backend.midiOutputStatus?.().catch(() => undefined);
+      if (status) {
+        this.outputs = status.outputs;
+        this.routes = status.routes;
+      }
+    }
   }
 
   /** Both port lists, tolerant of a backend without the optional midi

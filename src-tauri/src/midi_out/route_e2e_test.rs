@@ -554,6 +554,7 @@ fn a_persisted_route_survives_a_new_alsa_client_number() {
                         scope: "track".into(),
                         id: "t-1".into(),
                         port_name: stale_name.clone(),
+                        virtual_output: false,
                         channel: None,
                         return_device: None,
                     }],
