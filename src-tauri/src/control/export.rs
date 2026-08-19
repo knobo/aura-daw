@@ -899,12 +899,14 @@ mod tests {
             Store::default(),
             MidiStore::default(),
         )));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         // Round-trip barrier: once the engine thread answers, its startup
         // `open_output` has finished, so the engine rate is final (a mid-test
@@ -923,6 +925,7 @@ mod tests {
             Arc::new(JobManager::default()),
             Box::new(move |e, p| ev.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
         // Demo-song content, placed directly (no engine round-trip needed).
         let (keys, bass) = {

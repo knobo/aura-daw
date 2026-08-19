@@ -19,6 +19,7 @@
   import Meter from "./Meter.svelte";
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
+  import AutomationModeSelector from "./AutomationModeSelector.svelte";
 
   let {
     track,
@@ -78,18 +79,39 @@
     return "→ target";
   }
 
+  let token: Promise<string | undefined> | undefined;
+  let gestureTail: Promise<void> = Promise.resolve();
+
+  function settle(operation: Promise<unknown>): Promise<void> {
+    return operation.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
+  function queueGestureWrite(write: () => Promise<unknown>) {
+    gestureTail = settle(gestureTail.then(write));
+  }
+
   function onDepth(b: (typeof autoTargets)[number], e: Event) {
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
-    void modulation.setDepth(b, v);
+    queueGestureWrite(() => modulation.setDepth(b, v));
   }
-  let token: Promise<string | undefined> | undefined;
+
   function openGesture(label: string) {
-    token = project.beginGesture(label);
+    token = gestureTail.then(() => project.beginGesture(label));
+    gestureTail = settle(token);
   }
   function closeGesture() {
     const idp = token;
     token = undefined;
-    void idp?.then((id) => project.endGesture(id));
+    if (!idp) return;
+    gestureTail = settle(
+      gestureTail.then(async () => {
+        const id = await idp;
+        await project.endGesture(id);
+      }),
+    );
   }
 
   function onDepthDown() {
@@ -119,18 +141,23 @@
 
   function onGain(e: Event) {
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
-    void project.setGain(track.id, v);
+    queueGestureWrite(() => project.setGain(track.id, v));
   }
   function onPan(e: Event) {
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
-    void project.setPan(track.id, v);
+    queueGestureWrite(() => project.setPan(track.id, v));
+  }
+
+  function formatPan(value: number): string {
+    if (Math.abs(value) < 0.005) return "C";
+    return String(Math.round(Math.abs(value) * 100)) + (value < 0 ? "L" : "R");
   }
 
   /** Gesture boundaries (Plan E Task 14): explicit begin/end brackets a
    * fader/pan drag so the backend coalesces the per-`input`-event commits
-   * into one history-bound batch instead of one per pointer move. `oninput`
-   * itself (`onGain`/`onPan` above) is unchanged — the coalescing happens
-   * backend-side, not by throttling these calls. */
+   * into one history-bound batch instead of one per pointer move. The close
+   * waits for every in-flight input write so the backend sees the final value
+   * before it commits a Touch gesture. */
   function onGainPointerDown() {
     openGesture("gain drag");
   }
@@ -204,222 +231,103 @@
       >
     </div>
   {:else}
-  <div class="body">
-    <div class="row top">
-      <button
-        class="foldbtn mono"
-        aria-expanded="true"
-        title="Fold lane to a strip"
-        aria-label="Fold lane {track.name}"
-        onclick={() => lanes.toggleTrack(track.id)}>▾</button
-      >
-      <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
-      {#if renaming}
-        <input
-          class="nameedit"
-          use:focusAndSelect
-          bind:value={draft}
-          aria-label="Track name"
-          onkeydown={onNameKeydown}
-          onblur={commitRename}
-        />
-      {:else}
-        <button
-          class="name asbutton"
-          title="{track.name} — double-click to rename"
-          ondblclick={startRename}>{track.name}</button
-        >
-      {/if}
-      <span class="picker">
-        <button
-          class="groupchip mono"
-          class:on={group !== null}
-          aria-haspopup="menu"
-          aria-expanded={groupMenuOpen}
-          title={group ? `Lane group: ${group}` : "Add this lane to a group"}
-          onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ?? "⌗"}</button
-        >
-        {#if groupMenuOpen}
-          <LaneGroupMenu {track} onclose={() => (groupMenuOpen = false)} />
+    <div class="body">
+      <div class="identity-row">
+        <button class="foldbtn mono" aria-expanded="true" title="Fold lane to a strip" aria-label="Fold lane {track.name}" onclick={() => lanes.toggleTrack(track.id)}>▾</button>
+        <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
+        {#if renaming}
+          <input class="nameedit" use:focusAndSelect bind:value={draft} aria-label="Track name" onkeydown={onNameKeydown} onblur={commitRename} />
+        {:else}
+          <button class="name asbutton" title="Double-click to rename {track.name}" ondblclick={startRename}>{track.name}</button>
         {/if}
-      </span>
+        <button class="del" title="Remove track" aria-label="Remove track {track.name}" onclick={() => project.removeTrack(track.id)}>×</button>
+      </div>
+
+      <div class="metadata-row">
+        <span class="picker">
+          <button class="groupchip mono" class:on={group !== null} aria-haspopup="menu" aria-expanded={groupMenuOpen} aria-label={group ? "Change lane group " + group : "Add lane to a group"} title={group ? "Lane group: " + group : "Add this lane to a group"} onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ? "Group · " + group : "Group · none"}</button>
+          {#if groupMenuOpen}<LaneGroupMenu {track} onclose={() => (groupMenuOpen = false)} />{/if}
+        </span>
+        {#if isAutomation}
+          <span class="kindchip automation-kind mono">Automation track</span>
+        {:else if track.kind === "midi"}
+          <button class="instchip mono" class:bound={!!instrument} class:plugin={!!pluginInst} class:stub={pluginInst?.status === "stub"} class:crashed={pluginInst?.status === "crashed"} title={pluginInst ? "Open plugin parameters for " + pluginInst.name : instrument ? "Open instrument browser for " + instrument.name : "Assign an instrument"} onclick={openInstrumentPanel}>
+            {#if pluginInst}Instrument · {patch?.name ?? pluginInst.name}{:else if instrument}Instrument · {instrument.name}{:else}Instrument · polysynth{/if}
+          </button>
+        {:else}
+          <span class="kindchip mono">Audio track</span>
+        {/if}
+        {#if !isAutomation}
+          <span class="picker metadata-lanes">
+            <button class="status lanes" class:on={modulation.hasVisible(track.id) || pickerOpen} title="Show or add automation lanes" aria-haspopup="menu" aria-expanded={pickerOpen} aria-pressed={modulation.hasVisible(track.id)} onclick={() => (pickerOpen = !pickerOpen)}>Lanes</button>
+            {#if pickerOpen}<LanePickerMenu {track} onclose={() => (pickerOpen = false)} />{/if}
+          </span>
+        {/if}
+      </div>
+
       {#if isAutomation}
-        <span class="autotag mono">auto</span>
-      {/if}
-      {#if track.kind === "midi"}
-        <button
-          class="instchip mono"
-          class:bound={!!instrument}
-          class:plugin={!!pluginInst}
-          class:stub={pluginInst?.status === "stub"}
-          class:crashed={pluginInst?.status === "crashed"}
-          title={pluginInst
-            ? `Plugin: ${pluginInst.name} (${pluginInst.format}, ${pluginInst.status})${
-                patch ? ` — patch: ${patch.bank} / ${patch.name}` : ""
-              } — open params`
-            : instrument
-              ? `Instrument: ${instrument.name} — open browser`
-              : "MIDI track — built-in polysynth; assign an instrument"}
-          onclick={openInstrumentPanel}
-        >
-          {#if pluginInst}
-            ⚡ {patch?.name ?? pluginInst.name}
-          {:else if instrument}
-            ⌁ {instrument.name}
-          {:else}
-            ⌁ polysynth
-          {/if}
-        </button>
-      {/if}
-      <button
-        class="del"
-        title="Remove track"
-        aria-label="Remove track {track.name}"
-        onclick={() => project.removeTrack(track.id)}>×</button
-      >
-    </div>
-
-    {#if isAutomation}
-      <div class="targets">
-        {#each autoTargets as b (b.id)}
-          <div class="target">
-            <span class="tlabel mono" title={targetLabel(b)}>{targetLabel(b)}</span>
-            <input
-              class="fader depth"
-              type="range"
-              min="-1"
-              max="1"
-              step="0.01"
-              value={b.depth}
-              style:--fader-pct="{((b.depth + 1) / 2) * 100}%"
-              style:--fader-fill="var(--violet)"
-              title="Depth"
-              aria-label="Depth for {targetLabel(b)}"
-              oninput={(e) => onDepth(b, e)}
-              onpointerdown={onDepthDown}
-              onpointerup={onGestureEnd}
-              onpointercancel={onGestureEnd}
-            />
-            <button
-              class="todel"
-              title="Remove target"
-              aria-label="Remove {targetLabel(b)}"
-              onclick={() => modulation.removeBinding(b.id)}>×</button
-            >
+        <section class="targets" aria-label="Automation targets for {track.name}">
+          <div class="section-head">
+            <span class="section-label mono">Targets</span>
+            <span class="picker">
+              <button class="addtgt mono" class:on={pickerOpen} aria-haspopup="menu" aria-expanded={pickerOpen} onclick={() => (pickerOpen = !pickerOpen)}>+ Add target</button>
+              {#if pickerOpen}<LanePickerMenu sourceTrackId={track.id} onclose={() => (pickerOpen = false)} />{/if}
+            </span>
           </div>
-        {/each}
-        <span class="picker">
-          <button
-            class="addtgt mono"
-            class:on={pickerOpen}
-            aria-haspopup="menu"
-            aria-expanded={pickerOpen}
-            onclick={() => (pickerOpen = !pickerOpen)}>+ add target</button
-          >
-          {#if pickerOpen}
-            <LanePickerMenu sourceTrackId={track.id} onclose={() => (pickerOpen = false)} />
+          {#if autoTargets.length === 0}<span class="empty-target">No targets yet. Add one to route this automation.</span>{/if}
+          {#each autoTargets as b (b.id)}
+            <div class="target">
+              <span class="tlabel mono" title={targetLabel(b)}>{targetLabel(b)}</span>
+              <label class="depth-control">
+                <span class="depth-label mono">Depth {Math.round(b.depth * 100)}%</span>
+                <input class="fader depth" type="range" min="-1" max="1" step="0.01" value={b.depth} style:--fader-pct="{((b.depth + 1) / 2) * 100}%" style:--fader-fill="var(--violet)" title="Depth for {targetLabel(b)}" aria-label="Depth for {targetLabel(b)}" oninput={(e) => onDepth(b, e)} onpointerdown={onDepthDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} />
+              </label>
+              <button class="todel" title="Remove target" aria-label="Remove {targetLabel(b)}" onclick={() => modulation.removeBinding(b.id)}>×</button>
+            </div>
+          {/each}
+        </section>
+      {:else}
+        <div class="status-row" role="group" aria-label="Mix status for {track.name}">
+          {#if track.kind === "midi"}
+            <label class="midiout-check mono" title="Publiser som egen MIDI-utgang i Carla/ALSA patchbay">
+              <input type="checkbox" checked={midiIo.isVirtualTrack(track.id)} onchange={(e) => void midiIo.setTrackVirtualOutput(track.id, e.currentTarget.checked)} />
+              MIDI OUT
+            </label>
           {/if}
-        </span>
-      </div>
-    {:else}
-    <div class="row mid">
-      <div class="toggles">
-        {#if track.kind === "midi"}
-          <label class="midiout-check mono" title="Publiser som egen MIDI-utgang i Carla/ALSA patchbay">
-            <input
-              type="checkbox"
-              checked={midiIo.isVirtualTrack(track.id)}
-              onchange={(e) => void midiIo.setTrackVirtualOutput(track.id, e.currentTarget.checked)}
-            />
-            OUT
-          </label>
-        {/if}
-        <button
-          class="tog arm"
-          class:on={track.armed}
-          title="Record arm"
-          onclick={() => project.toggleArm(track.id)}>R</button
-        >
-        <button
-          class="tog mute"
-          class:on={track.muted}
-          title="Mute"
-          onclick={() => project.toggleMute(track.id)}>M</button
-        >
-        <button
-          class="tog solo"
-          class:on={track.soloed}
-          title="Solo"
-          onclick={() => project.toggleSolo(track.id)}>S</button
-        >
-        <span class="picker">
-          <button
-            class="tog auto"
-            class:on={modulation.hasVisible(track.id) || pickerOpen}
-            title="Show automation lanes"
-            aria-haspopup="menu"
-            aria-expanded={pickerOpen}
-            aria-pressed={modulation.hasVisible(track.id)}
-            onclick={() => (pickerOpen = !pickerOpen)}>A</button
-          >
-          {#if pickerOpen}
-            <LanePickerMenu {track} onclose={() => (pickerOpen = false)} />
-          {/if}
-        </span>
-      </div>
+          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title="Record arm" onclick={() => project.toggleArm(track.id)}>Arm</button>
+          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title="Mute" onclick={() => project.toggleMute(track.id)}>Mute</button>
+          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title="Solo" onclick={() => project.toggleSolo(track.id)}>Solo</button>
+        </div>
 
-      <div class="fader-wrap">
-        <input
-          class="fader"
-          type="range"
-          min="-60"
-          max="12"
-          step="0.1"
-          value={track.gainDb}
-          style:--fader-pct="{gainPct}%"
-          style:--fader-fill={track.color}
-          title="Gain"
-          aria-label="Gain for {track.name}"
-          oninput={onGain}
-          onpointerdown={onGainPointerDown}
-          onpointerup={onGestureEnd}
-          onpointercancel={onGestureEnd}
-        />
-        <span class="db mono">{formatDb(track.gainDb)}</span>
-      </div>
+        <div class="automation-row">
+          <span class="section-label mono">Automation</span>
+          <AutomationModeSelector mode={track.automationMode} onchange={(mode) => project.setAutomationMode(track.id, mode)} />
+        </div>
 
-      <div class="pan-wrap" title="Pan">
-        <span class="silk">pan</span>
-        <input
-          class="fader pan"
-          type="range"
-          min="-1"
-          max="1"
-          step="0.01"
-          value={track.pan}
-          style:--fader-pct="{((track.pan + 1) / 2) * 100}%"
-          style:--fader-fill="var(--violet)"
-          aria-label="Pan for {track.name}"
-          oninput={onPan}
-          onpointerdown={onPanPointerDown}
-          onpointerup={onGestureEnd}
-          onpointercancel={onGestureEnd}
-          ondblclick={() => project.setPan(track.id, 0)}
-        />
-      </div>
+        <section class="level-area" aria-label="Level controls for {track.name}">
+          <div class="level-head"><span class="section-label mono">Level</span><Meter trackId={track.id} height={8} /></div>
+          <div class="level-controls">
+            <label class="level-control gain-control">
+              <span class="control-label">Gain</span>
+              <input class="fader" type="range" min="-60" max="12" step="0.1" value={track.gainDb} style:--fader-pct="{gainPct}%" style:--fader-fill={track.color} aria-label="Gain for {track.name}" oninput={onGain} onpointerdown={onGainPointerDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} />
+              <output class="value mono">{formatDb(track.gainDb)}</output>
+            </label>
+            <label class="level-control pan-control">
+              <span class="control-label">Pan</span>
+              <input class="fader pan" type="range" min="-1" max="1" step="0.01" value={track.pan} style:--fader-pct="{((track.pan + 1) / 2) * 100}%" style:--fader-fill="var(--violet)" aria-label="Pan for {track.name}" oninput={onPan} onpointerdown={onPanPointerDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} ondblclick={() => project.setPan(track.id, 0)} />
+              <output class="value pan-value mono">{formatPan(track.pan)}</output>
+            </label>
+          </div>
+        </section>
+      {/if}
     </div>
-
-    <div class="row meter-row">
-      <Meter trackId={track.id} height={10} />
-    </div>
-    {/if}
-  </div>
   {/if}
 </div>
 
 <style>
   .header {
     display: flex;
+    box-sizing: border-box;
     /* flex: none is load-bearing. The rail is a flex column inside the
        scrolling body; without it, a track list taller than the viewport
        gets SHRUNK to fit while the lane column keeps its real height, and
@@ -531,14 +439,6 @@
     cursor: text;
     font-family: inherit;
   }
-  .autotag {
-    font-size: 8px;
-    letter-spacing: 0.14em;
-    color: var(--violet);
-    border: var(--border-width) solid rgb(var(--violet-rgb) / 0.4);
-    border-radius: 3px;
-    padding: 1px 5px;
-  }
   .targets {
     flex: 1;
     min-height: 0;
@@ -628,11 +528,6 @@
     gap: 6px;
   }
 
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
 
   .idx {
     font-size: 9px;
@@ -714,10 +609,6 @@
     color: var(--red);
   }
 
-  .toggles {
-    display: flex;
-    gap: 3px;
-  }
   .picker {
     position: relative;
   }
@@ -732,12 +623,6 @@
     color: var(--text-faint);
     cursor: pointer;
   }
-  .tog.arm.on {
-    color: var(--text-on-accent);
-    background: rgb(var(--red-rgb) / 0.8);
-    border-color: var(--red);
-    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--red-rgb) / 0.4);
-  }
   .tog.mute.on {
     color: var(--bg-0);
     background: var(--amber);
@@ -749,10 +634,74 @@
     border-color: var(--cyan);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.4);
   }
+
+  .fader {
+    flex: 1;
+    min-width: 0;
+  }
+
+
+
+  /* Expanded 320 px rail / 132 px lane: each concept gets a stable row. */
+  .body {
+    padding: 5px 9px 4px 9px;
+    gap: 3px;
+  }
+  .identity-row,
+  .metadata-row,
+  .status-row,
+  .automation-row {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    flex: none;
+  }
+  .identity-row {
+    height: 17px;
+    gap: 7px;
+  }
+  .identity-row .del {
+    color: var(--text-faint);
+  }
+  .metadata-row {
+    height: 17px;
+    gap: 6px;
+    padding-left: 20px;
+  }
+  .metadata-row .picker {
+    flex: none;
+  }
+  .metadata-row .metadata-lanes {
+    margin-left: auto;
+  }
+  .metadata-row .status {
+    min-width: 48px;
+    height: 17px;
+  }
+  .metadata-row .groupchip {
+    max-width: 112px;
+  }
+  .metadata-row .instchip {
+    flex: 1;
+    max-width: none;
+  }
+  .kindchip {
+    min-width: 0;
+    padding: 2px 6px;
+    border: var(--border-width) solid rgb(var(--edge-rgb) / 0.18);
+    border-radius: 3px;
+    color: var(--text-faint);
+    font-size: 8px;
+    letter-spacing: 0.08em;
+  }
+  .automation-kind {
+    color: var(--violet);
+    border-color: rgb(var(--violet-rgb) / 0.35);
+  }
   .midiout-check {
     display: inline-flex;
     align-items: center;
-    gap: 2px;
+    gap: 3px;
     font-size: 9px;
     color: var(--text-dim);
     white-space: nowrap;
@@ -763,43 +712,154 @@
     margin: 0;
     accent-color: var(--cyan);
   }
-
-  .tog.auto.on {
+  .status-row {
+    height: 19px;
+    gap: 4px;
+    padding-left: 20px;
+  }
+  .status {
+    flex: 1;
+    min-width: 48px;
+    height: 19px;
+    padding: 0 8px;
+    border-radius: 3px;
+    border: var(--border-width) solid rgb(var(--edge-rgb) / 0.18);
+    background: transparent;
+    color: var(--text-faint);
+    font-family: var(--font-mono);
+    font-size: 8px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+  }
+  .status.arm.on {
+    color: var(--text-on-accent);
+    background: rgb(var(--red-rgb) / 0.8);
+    border-color: var(--red);
+  }
+  .status.mute.on {
+    color: var(--bg-0);
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .status.solo.on {
+    color: var(--bg-0);
+    background: var(--cyan);
+    border-color: var(--cyan);
+  }
+  .status.lanes.on {
     color: var(--bg-0);
     background: var(--magenta);
     border-color: var(--magenta);
-    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--magenta-rgb) / 0.4);
   }
-
-  .fader-wrap {
+  .automation-row {
+    height: 20px;
+    gap: 8px;
+    padding-left: 20px;
+  }
+  .section-label {
+    flex: none;
+    color: var(--text-faint);
+    font-size: 8px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+  }
+  .automation-row .section-label {
+    width: 62px;
+  }
+  .level-area {
     flex: 1;
-    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 3px 5px;
+    border-top: var(--border-width) solid rgb(var(--edge-rgb) / 0.12);
+    background: rgb(var(--bg-0-rgb) / 0.12);
+  }
+  .level-head {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
+    min-height: 8px;
   }
-  .fader {
+  .level-head .section-label {
+    width: 34px;
+  }
+  .level-head :global(.meter) {
     flex: 1;
     min-width: 0;
   }
-  .db {
-    font-size: 9px;
-    width: 34px;
-    text-align: right;
-    color: var(--text-dim);
+  .level-controls {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    min-width: 0;
   }
-
-  .pan-wrap {
+  .level-control {
     display: flex;
     align-items: center;
     gap: 4px;
-    width: 64px;
+    min-width: 0;
   }
-  .pan-wrap .pan {
-    width: 44px;
+  .gain-control {
+    flex: 1.3;
   }
-
-  .meter-row {
-    padding-right: 2px;
+  .pan-control {
+    flex: 1;
+  }
+  .control-label {
+    flex: none;
+    color: var(--text-dim);
+    font-size: 9px;
+  }
+  .level-control .fader {
+    min-width: 28px;
+  }
+  .level-control .value {
+    width: 34px;
+    flex: none;
+    color: var(--text-dim);
+    font-size: 8px;
+    text-align: right;
+  }
+  .level-control .pan-value {
+    width: 24px;
+  }
+  .targets {
+    margin-left: 20px;
+    padding: 3px 5px;
+    gap: 4px;
+    border-top: var(--border-width) solid rgb(var(--edge-rgb) / 0.12);
+    background: rgb(var(--bg-0-rgb) / 0.12);
+  }
+  .section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex: none;
+  }
+  .empty-target {
+    color: var(--text-faint);
+    font-size: 9px;
+    line-height: 1.35;
+  }
+  .target {
+    min-height: 27px;
+  }
+  .depth-control {
+    width: 104px;
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .depth-label {
+    color: var(--text-faint);
+    font-size: 7px;
+    text-align: right;
+  }
+  .depth-control .depth {
+    width: 100%;
   }
 </style>

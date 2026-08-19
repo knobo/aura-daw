@@ -779,12 +779,14 @@ mod tests {
         store.project_dir = Some(dir);
         store.project_name = Some("Hum".into());
         let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let cp = Arc::new(ControlPlane::new(
             session,
@@ -794,6 +796,7 @@ mod tests {
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(|_, _| {}),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
         (cp, parent)
     }
@@ -950,12 +953,14 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         store.project_dir = Some(dir.clone());
         store.project_name = Some("HumCommit".into());
         let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
         let ev2 = Arc::clone(&events);
@@ -967,6 +972,7 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
             Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
 
         // "One commit" is asserted on the UNDO DEPTH, not on a rev delta.

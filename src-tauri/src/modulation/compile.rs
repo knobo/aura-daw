@@ -166,7 +166,7 @@ pub fn contribution(mode: BindingMode, base: f32, mapped: f32, depth: f32) -> Co
 /// `out = clamp(v * f + a, 0, 1)`, where `v` is the absolute contribution
 /// (or the base when there is none), `f` the product of the multiply
 /// contributions and `a` the sum of the adds.
-pub fn combine(base: f32, contributions: &[Contribution]) -> f32 {
+fn combine_raw(base: f32, contributions: &[Contribution]) -> f32 {
     let mut v = base;
     let mut f = 1.0f32;
     let mut a = 0.0f32;
@@ -177,7 +177,11 @@ pub fn combine(base: f32, contributions: &[Contribution]) -> f32 {
             Contribution::Add(x) => a += *x,
         }
     }
-    (v * f + a).clamp(0.0, 1.0)
+    v * f + a
+}
+
+pub fn combine(base: f32, contributions: &[Contribution]) -> f32 {
+    combine_raw(base, contributions).clamp(0.0, 1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +454,13 @@ fn compile_group(
             let mapped = b.range.min + (b.range.max - b.range.min) * raw;
             contribs.push(contribution(b.mode, base, mapped, b.depth));
         }
-        let v = combine(base, &contribs);
+        // Gain lanes are positive linear multipliers. Unlike normalized pan
+        // and plugin domains, boosts above unity must survive compilation.
+        let v = if matches!(target, ResolvedTarget::TrackGain(_)) {
+            combine_raw(base, &contribs).max(0.0)
+        } else {
+            combine(base, &contribs)
+        };
         let native = denorm(v);
         match events.last_mut() {
             Some(last) if last.sample == sample => last.value = native,
@@ -624,6 +634,24 @@ mod tests {
         assert_eq!(gain.first().map(|e| e.value), Some(1.0));
         assert!((gain.last().unwrap().value - 0.25).abs() < 1e-6);
         assert!(out.tracks[0].pan.is_none());
+    }
+
+    #[test]
+    fn native_track_gain_boost_is_not_clamped_at_unity() {
+        let mut doc = ModulationDoc::default();
+        doc.curves.push(curve("cur", None, vec![(0, 2.0), (DEFAULT_PPQ, 2.0)]));
+        let mut gain_binding = binding(
+            "b",
+            Source::Curve { curve_id: "cur".into() },
+            TargetRef::TrackParam { track_id: "t1".into(), param: TrackParam::Gain },
+            BindingMode::Multiply,
+        );
+        gain_binding.domain = Domain::Native;
+        doc.bindings.push(gain_binding);
+        let slot_of = |t: &str| (t == "t1").then_some(0usize);
+        let out = compile(&doc, &map(), &ctx(1, &slot_of));
+        let gain = out.tracks[0].gain.as_ref().expect("a gain ramp");
+        assert!((gain[0].value - 2.0).abs() < 1e-6);
     }
 
     #[test]

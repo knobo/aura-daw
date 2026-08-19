@@ -104,6 +104,22 @@ pub struct TrackMeter {
 // Tracks
 // ---------------------------------------------------------------------------
 
+/// Track-gain automation playback/record mode. `Read` (the default) is
+/// today's behavior: the compiled lane always overrides the fader during
+/// playback. `Off` skips the lane entirely (bypass). `Write`/`Touch`/
+/// `Latch` additionally RECORD new points into the lane while playing —
+/// see `docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AutomationMode {
+    Off,
+    #[default]
+    Read,
+    Write,
+    Touch,
+    Latch,
+}
+
 /// Mirrors docs/ipc-schemas/track-state.schema.json
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -148,6 +164,11 @@ pub struct TrackState {
     /// entirely. A bus track kind stays reserved for real routing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Track-gain automation mode (this feature). Additive: absent on
+    /// pre-existing files reads as `Read`, which is exactly today's
+    /// always-on behavior — no migration needed.
+    #[serde(default)]
+    pub automation_mode: AutomationMode,
 }
 
 /// One insert-FX slot on a track. `id` is stable across reorder; `instance_id`
@@ -331,7 +352,7 @@ impl Store {
 /// instead of four hand-kept copies).
 #[cfg(test)]
 pub(crate) mod testutil {
-    use super::{Clip, TrackState};
+    use super::{AutomationMode, Clip, TrackState};
     use crate::ids::{ContentId, LaneId, SourceId};
 
     pub fn test_track(id: &str) -> TrackState {
@@ -348,6 +369,7 @@ pub(crate) mod testutil {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 
@@ -433,6 +455,32 @@ mod tests {
         let v = serde_json::to_value(&m).unwrap();
         assert!(v["master"].get("peakL").is_some());
         assert!(v["master"].get("trackId").is_some());
+    }
+
+    #[test]
+    fn automation_mode_defaults_to_read_when_absent_from_json() {
+        let json = serde_json::json!({
+            "id": "t-1", "name": "Track", "kind": "audio", "gainDb": 0.0,
+            "pan": 0.0, "muted": false, "soloed": false, "armed": false,
+            "color": "#ffffff"
+        });
+        let t: TrackState = serde_json::from_value(json).unwrap();
+        assert_eq!(t.automation_mode, AutomationMode::Read);
+    }
+
+    #[test]
+    fn automation_mode_round_trips_every_variant() {
+        for mode in [
+            AutomationMode::Off,
+            AutomationMode::Read,
+            AutomationMode::Write,
+            AutomationMode::Touch,
+            AutomationMode::Latch,
+        ] {
+            let json = serde_json::to_value(mode).unwrap();
+            let back: AutomationMode = serde_json::from_value(json).unwrap();
+            assert_eq!(back, mode);
+        }
     }
 }
 

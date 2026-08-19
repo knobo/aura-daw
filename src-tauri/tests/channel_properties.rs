@@ -28,7 +28,7 @@ use std::collections::HashMap;
 
 use proptest::prelude::*;
 
-use aura_lib::audio::types::{Clip, Store, TrackState};
+use aura_lib::audio::types::{AutomationMode, Clip, Store, TrackState};
 use aura_lib::control::op::{Actor, ObjectRef, Op, PropPath, TxMeta};
 use aura_lib::control::Session;
 use aura_lib::ids::{ContentId, LaneId, NoteId, SourceId};
@@ -68,6 +68,7 @@ fn test_track(id: &str) -> TrackState {
         instrument_id: None,
         inserts: Vec::new(),
         group: None,
+        automation_mode: AutomationMode::Read,
     }
 }
 

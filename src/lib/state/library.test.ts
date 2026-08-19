@@ -31,6 +31,7 @@ const audioTrack = (id: string) => ({
   muted: false,
   soloed: false,
   armed: false,
+  automationMode: "read" as const,
   color: "#888888",
 });
 const midiTrack = (id: string) => ({
@@ -42,6 +43,7 @@ const midiTrack = (id: string) => ({
   muted: false,
   soloed: false,
   armed: false,
+  automationMode: "read" as const,
   color: "#888888",
 });
 
@@ -105,6 +107,7 @@ const invokes = {
     muted: false,
     soloed: false,
     armed: false,
+    automationMode: "read" as const,
     color: "#888888",
     instrumentId,
   })),
@@ -217,7 +220,7 @@ describe("library store", () => {
 describe("dropOnTrack — sample file", () => {
   it("imports the file onto the target track at the drop position", async () => {
     project.tracks = [
-      { id: "t1", name: "Audio 1", kind: "audio", gainDb: 0, pan: 0, muted: false, soloed: false, armed: false, color: "#888888" },
+      { id: "t1", name: "Audio 1", kind: "audio", gainDb: 0, pan: 0, muted: false, soloed: false, armed: false, automationMode: "read", color: "#888888" },
     ];
     await library.dropOnTrack(
       { kind: "sampleFile", path: "/lib/kick.wav", name: "kick.wav" },
@@ -233,7 +236,7 @@ describe("dropOnTrack — sample file", () => {
 
   it("refuses a MIDI track and never calls the import command", async () => {
     project.tracks = [
-      { id: "m1", name: "Synth", kind: "midi", gainDb: 0, pan: 0, muted: false, soloed: false, armed: false, color: "#888888" },
+      { id: "m1", name: "Synth", kind: "midi", gainDb: 0, pan: 0, muted: false, soloed: false, armed: false, automationMode: "read", color: "#888888" },
     ];
     await library.dropOnTrack(
       { kind: "sampleFile", path: "/lib/kick.wav", name: "kick.wav" },

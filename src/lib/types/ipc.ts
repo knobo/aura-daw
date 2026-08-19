@@ -156,6 +156,8 @@ export interface TransportState {
 
 export type TrackKind = "audio" | "midi" | "automation" | "bus";
 
+export type AutomationMode = "off" | "read" | "write" | "touch" | "latch";
+
 export interface TrackState {
   id: string;
   name: string;
@@ -167,6 +169,8 @@ export interface TrackState {
   muted: boolean;
   soloed: boolean;
   armed: boolean;
+  /** Track-gain automation mode. Additive; absent on older projects means "read". */
+  automationMode: AutomationMode;
   /** "#rrggbb" lowercase. */
   color: string;
   /** Sampler instrument bound to this (midi) track — additive phase-2 field. */
@@ -1364,6 +1368,7 @@ export interface AuraEventMap {
   "sidecar://done": SidecarDoneEvent;
   "sidecar://error": SidecarErrorEvent;
   "project://changed": Project;
+  "automation://changed": { trackId: string };
   "mcp://confirm-requested": PendingConfirmation;
   "export://progress": ExportProgressEvent;
   "export://done": ExportDoneEvent;

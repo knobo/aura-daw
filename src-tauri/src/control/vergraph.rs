@@ -604,6 +604,7 @@ impl Janitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::types::Store;
     use crate::control::op::{ObjectRef, PropPath, TxMeta};
     use crate::control::session::Session;
@@ -626,6 +627,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::audio::rt::SharedRt;
 use crate::audio::types::{Store, TrackState, TransportState};
+use crate::audio::types::AutomationMode;
 
 /// One batched mix change (op-log-shaped per debt D-03: a UI gesture or MCP
 /// tool call carries MANY of these in one request). `None` = leave unchanged.
@@ -25,6 +26,7 @@ pub struct TrackMixChange {
     pub muted: Option<bool>,
     pub soloed: Option<bool>,
     pub armed: Option<bool>,
+    pub automation_mode: Option<crate::audio::types::AutomationMode>,
 }
 
 impl TrackMixChange {
@@ -36,6 +38,7 @@ impl TrackMixChange {
             muted: None,
             soloed: None,
             armed: None,
+            automation_mode: None,
         }
     }
 }
@@ -110,6 +113,7 @@ pub(crate) fn new_track_row(
         // Ungrouped: a new track lands at the end of the list, outside every
         // group. Dropping it into one is an explicit gesture (`arrange_lanes`).
         group: None,
+        automation_mode: AutomationMode::Read,
     };
     Ok((track, n))
 }

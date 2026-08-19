@@ -92,6 +92,10 @@ pub fn run() {
             // engine's own `Committer` (audio::init) — shared, not a second
             // instance, so the engine's non-transient commits are undoable.
             let history_log = audio_state.history_log();
+            // Automation Task 7: the ONE open-gesture slot, already held by
+            // the engine control thread (audio::init) — shared, not a second
+            // instance, so Touch/Latch sees the user's real fader drags.
+            let gesture = audio_state.gesture_state();
             let engine = audio_state
                 .engine_handle()
                 .ok_or("audio engine failed to start")?;
@@ -115,6 +119,7 @@ pub fn run() {
                     }
                 }),
                 history_log,
+                gesture,
             ));
             app.manage(control_plane.clone());
             // MIDI slice 2, Task 5: attach the already-`.manage`d MIDI-input

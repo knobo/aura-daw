@@ -51,6 +51,7 @@ use serde_json::Value;
 use tauri::State;
 
 use crate::audio::dsp::{AudioProcessor, LiveInstrument, ProcessBlock};
+use crate::audio::types::AutomationMode;
 use crate::midi::events::{AMEV_MAGIC, AMEV_VERSION, COLUMNS_CORE, KIND_AUTOMATION};
 use crate::midi::synth::BlockNoteEvent;
 use crate::midi::types::DEFAULT_PPQ;
@@ -117,9 +118,14 @@ pub fn normalize_lane(lane: &mut AutomationLane) -> Result<(), String> {
     if lane.target_node.is_empty() {
         return Err("targetNode must not be empty".into());
     }
+    let is_track_gain = lane.param_id == TRACK_PARAM_GAIN
+        && lane.target_node.starts_with(TRACK_TARGET_PREFIX);
     for p in &lane.points {
         if !p.value.is_finite() {
             return Err(format!("non-finite automation value at tick {}", p.tick));
+        }
+        if is_track_gain && p.value < 0.0 {
+            return Err(format!("negative track-gain multiplier at tick {}", p.tick));
         }
     }
     lane.points.sort_by_key(|p| p.tick);
@@ -886,6 +892,105 @@ pub fn automation_set(
     Ok(control.automation_lanes())
 }
 
+/// Records new track-gain automation points while the transport plays and
+/// a track's mode is Write/Touch/Latch (spec
+/// `docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md`
+/// §4). CONTROL THREAD ONLY, same reasoning as `ParamAutomationDriver`:
+/// ticks are musical time, and the caller (Task 9/10) is what converts a
+/// sample-domain playhead position to `tick` via `TempoMap` before calling
+/// `sample`. One instance lives for the process; per-track in-progress
+/// buffers are looked up by track id.
+#[derive(Default)]
+pub struct AutomationRecorder {
+    in_progress: std::collections::HashMap<String, Vec<AutomationPoint>>,
+    /// Latch-only: once a track has been touched during the current pass,
+    /// it keeps recording every subsequent tick — even after `touched`
+    /// goes back to false — until `finish` clears this. Touch has no
+    /// equivalent: it stops the instant `touched` goes false, which is why
+    /// this bookkeeping exists only for Latch.
+    latch_armed: std::collections::HashMap<String, bool>,
+    /// Last value observed while the user was actually touching the
+    /// control. Latch holds THIS value after release; it must not keep
+    /// reading the shared live fader, which another control source may
+    /// change behind the gesture's back.
+    latch_values: std::collections::HashMap<String, f32>,
+}
+
+impl AutomationRecorder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn sample(&mut self, track_id: &str, tick: u32, mode: AutomationMode, touched: bool, value: f32) {
+        let value = match mode {
+            AutomationMode::Write => value,
+            AutomationMode::Touch if touched => value,
+            AutomationMode::Touch => return,
+            AutomationMode::Latch => {
+                let armed = self.latch_armed.entry(track_id.to_string()).or_insert(false);
+                if touched {
+                    *armed = true;
+                    self.latch_values.insert(track_id.to_string(), value);
+                }
+                if !*armed {
+                    return;
+                }
+                self.latch_values.get(track_id).copied().unwrap_or(value)
+            }
+            AutomationMode::Off | AutomationMode::Read => return,
+        };
+
+        let points = self.in_progress.entry(track_id.to_string()).or_default();
+        let extends_existing_hold =
+            points.len() >= 2 && points[points.len() - 2].value == value;
+        if let Some(last) = points.last_mut() {
+            if last.tick == tick {
+                last.value = value;
+                return;
+            }
+            if last.value == value {
+                // A held segment needs its first AND latest endpoint so its
+                // recorded range extends to release/stop, but no point for
+                // every 2 ms control tick. Keep at most those two points.
+                if extends_existing_hold {
+                    last.tick = tick;
+                } else {
+                    points.push(AutomationPoint { tick, value });
+                }
+                return;
+            }
+        }
+        points.push(AutomationPoint { tick, value });
+    }
+
+    /// Snapshot a pass for an atomic commit attempt without consuming it.
+    /// `finish` is called only after the transaction succeeds; ordinary
+    /// commit errors therefore leave the points available for retry.
+    pub fn is_latch_armed(&self, track_id: &str) -> bool {
+        self.latch_armed.get(track_id).copied().unwrap_or(false)
+    }
+
+    pub fn pending(&self, track_id: &str) -> Option<Vec<AutomationPoint>> {
+        self.in_progress.get(track_id).filter(|p| !p.is_empty()).cloned()
+    }
+
+    pub fn finish(&mut self, track_id: &str) -> Option<Vec<AutomationPoint>> {
+        self.latch_armed.remove(track_id);
+        self.latch_values.remove(track_id);
+        let points = self.in_progress.remove(track_id)?;
+        if points.is_empty() { None } else { Some(points) }
+    }
+
+    /// A document swap invalidates every buffered track id, tick and lane
+    /// target at once. Nothing from the old epoch may be committed into the
+    /// newly opened project.
+    pub fn reset(&mut self) {
+        self.in_progress.clear();
+        self.latch_armed.clear();
+        self.latch_values.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,5 +1699,143 @@ mod tests {
         assert_eq!(r0[0], AbsParamEvent { sample: 0, value: 1.0 });
         assert_eq!(r0[1], AbsParamEvent { sample: 96_000, value: 0.0 });
         assert!(ramps[1].is_none(), "an empty lane compiles to no ramp");
+    }
+
+    // ---- Task 6: AutomationRecorder -----------------------------------------
+
+    #[test]
+    fn write_mode_records_every_tick_unconditionally() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Write, false, 0.5);
+        rec.sample("t-1", 10, AutomationMode::Write, false, 0.75);
+        rec.sample("t-1", 20, AutomationMode::Write, false, 1.0);
+        let points = rec.finish("t-1").expect("write mode must record");
+        assert_eq!(
+            points,
+            vec![
+                AutomationPoint { tick: 0, value: 0.5 },
+                AutomationPoint { tick: 10, value: 0.75 },
+                AutomationPoint { tick: 20, value: 1.0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn touch_mode_records_only_while_touched() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Touch, false, 0.2); // not touched: ignored
+        rec.sample("t-1", 10, AutomationMode::Touch, true, 0.6);
+        rec.sample("t-1", 20, AutomationMode::Touch, true, 0.8);
+        rec.sample("t-1", 30, AutomationMode::Touch, false, 0.9); // released: ignored
+        let points = rec.finish("t-1").expect("touch mode recorded while touched");
+        assert_eq!(
+            points,
+            vec![
+                AutomationPoint { tick: 10, value: 0.6 },
+                AutomationPoint { tick: 20, value: 0.8 },
+            ]
+        );
+    }
+
+    #[test]
+    fn off_and_read_never_record() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Off, true, 0.5);
+        rec.sample("t-1", 10, AutomationMode::Read, true, 0.5);
+        assert_eq!(rec.finish("t-1"), None);
+    }
+
+    #[test]
+    fn latch_mode_keeps_recording_after_release_until_finish() {
+        // Unlike Touch, Latch must NOT stop recording when `touched` goes back
+        // to false — it keeps sampling (holding whatever value it's given,
+        // which in production is the live fader value sitting still) until the
+        // pass truly ends at `finish`.
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Latch, false, 0.2); // not yet armed: ignored
+        rec.sample("t-1", 10, AutomationMode::Latch, true, 0.6); // touched: arms it
+        rec.sample("t-1", 20, AutomationMode::Latch, false, 0.6); // released: KEEPS recording
+        rec.sample("t-1", 30, AutomationMode::Latch, false, 0.6); // still recording
+        let points = rec.finish("t-1").expect("latch mode must keep recording after release");
+        assert_eq!(
+            points,
+            vec![
+                AutomationPoint { tick: 10, value: 0.6 },
+                AutomationPoint { tick: 30, value: 0.6 },
+            ]
+        );
+    }
+
+    #[test]
+    fn latch_arming_does_not_carry_across_finish() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Latch, true, 0.5);
+        rec.finish("t-1");
+        // A second pass must start un-armed again.
+        rec.sample("t-1", 100, AutomationMode::Latch, false, 0.9);
+        assert_eq!(rec.finish("t-1"), None, "a fresh Latch pass must not record before being touched again");
+    }
+
+    #[test]
+    fn finish_with_no_samples_returns_none() {
+        let mut rec = AutomationRecorder::new();
+        assert_eq!(rec.finish("never-touched"), None);
+    }
+
+    #[test]
+    fn finish_clears_the_track_so_a_second_pass_starts_fresh() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Write, false, 0.1);
+        assert!(rec.finish("t-1").is_some());
+        assert_eq!(rec.finish("t-1"), None, "a second finish with no new samples must be None");
+    }
+
+    #[test]
+    fn held_values_keep_only_the_segment_endpoints() {
+        let mut rec = AutomationRecorder::new();
+        for tick in 0..10_000 {
+            rec.sample("t-1", tick, AutomationMode::Write, false, 0.5);
+        }
+        assert_eq!(
+            rec.finish("t-1").unwrap(),
+            vec![
+                AutomationPoint { tick: 0, value: 0.5 },
+                AutomationPoint { tick: 9_999, value: 0.5 },
+            ],
+            "a long held fader must not allocate one point per control tick"
+        );
+    }
+
+    #[test]
+    fn latch_holds_the_last_touched_value_when_the_live_fader_changes_elsewhere() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 10, AutomationMode::Latch, true, 0.6);
+        rec.sample("t-1", 20, AutomationMode::Latch, false, 0.2);
+        rec.sample("t-1", 30, AutomationMode::Latch, false, 0.9);
+        assert_eq!(
+            rec.finish("t-1").unwrap(),
+            vec![
+                AutomationPoint { tick: 10, value: 0.6 },
+                AutomationPoint { tick: 30, value: 0.6 },
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_drops_points_and_latch_state_from_the_previous_document() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 10, AutomationMode::Latch, true, 0.6);
+        rec.reset();
+        rec.sample("t-1", 20, AutomationMode::Latch, false, 0.9);
+        assert_eq!(rec.finish("t-1"), None);
+    }
+
+    #[test]
+    fn tracks_are_independent() {
+        let mut rec = AutomationRecorder::new();
+        rec.sample("t-1", 0, AutomationMode::Write, false, 0.1);
+        rec.sample("t-2", 0, AutomationMode::Write, false, 0.9);
+        assert_eq!(rec.finish("t-1").unwrap(), vec![AutomationPoint { tick: 0, value: 0.1 }]);
+        assert_eq!(rec.finish("t-2").unwrap(), vec![AutomationPoint { tick: 0, value: 0.9 }]);
     }
 }

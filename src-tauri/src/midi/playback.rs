@@ -387,6 +387,7 @@ fn node_for_track(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::mixer;
     use crate::audio::rt::{ParamTable, RtGraph};
     use crate::audio::transport::LoopSpec;
@@ -422,6 +423,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

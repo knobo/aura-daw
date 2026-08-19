@@ -77,6 +77,7 @@ function track(id: string, soloed = false, muted = false) {
     muted,
     soloed,
     armed: false,
+    automationMode: "read",
     color: "#888888",
   } as (typeof project.tracks)[number];
 }

@@ -400,6 +400,7 @@ pub fn from_store(store: &Store, position_samples: u64, sample_rate: u32) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use super::super::types::TrackState;
 
     fn tmp_parent(name: &str) -> PathBuf {
@@ -432,6 +433,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         });
         project.tempo_bpm = 92.5;
         save(&dir, &project).unwrap();
@@ -488,6 +490,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

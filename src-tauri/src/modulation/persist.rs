@@ -70,8 +70,8 @@ struct PersistedModulation {
 
 /// Translate Track D `automation[]` lanes into a [`ModulationDoc`].
 ///
-/// - `track:<id>` + param 0 → multiply binding on track gain (points already
-///   0..1; Track D ruling 6).
+/// - `track:<id>` + param 0 → native positive multiply binding on track gain.
+///   Historical 0..1 values retain their exact meaning; boosts may exceed 1.
 /// - plugin instance + paramId → absolute binding. When `params` returns the
 ///   native range, points are normalized and `rangeSnapshot` recorded;
 ///   otherwise `domain: native` and the points stay in the param's units so
@@ -99,7 +99,7 @@ pub fn migrate_v3_lanes(
                         param: TrackParam::Gain,
                     },
                     BindingMode::Multiply,
-                    Domain::Normalized,
+                    Domain::Native,
                     None,
                 )
             } else {
@@ -365,16 +365,17 @@ mod tests {
             param_id: 0,
             points: vec![
                 AutomationPoint { tick: 0, value: 1.0 },
-                AutomationPoint { tick: 960, value: 0.25 },
+                AutomationPoint { tick: 960, value: 2.0 },
             ],
         }];
         let doc = migrate_v3_lanes(&lanes, &|_, _| None);
         assert_eq!(doc.curves.len(), 1);
-        assert_eq!(doc.curves[0].points[1].value, 0.25, "gain points are ALREADY 0..1");
+        assert_eq!(doc.curves[0].points[1].value, 2.0, "boost multiplier stays native");
         assert_eq!(doc.bindings.len(), 1);
         let b = &doc.bindings[0];
         assert_eq!(b.mode, BindingMode::Multiply, "Track D ruling 6: a multiplier on the fader");
         assert_eq!(b.depth, 1.0);
+        assert_eq!(b.domain, Domain::Native);
         assert_eq!(
             b.target,
             TargetRef::TrackParam { track_id: "t1".into(), param: TrackParam::Gain }

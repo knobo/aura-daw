@@ -155,6 +155,7 @@
   >
     <div
       class="title"
+      role="presentation"
       onpointerdown={onTitleDown}
       onpointermove={onTitleMove}
       onpointerup={onTitleUp}

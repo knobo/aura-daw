@@ -15,6 +15,7 @@ import type {
   AuraEventName,
   AutomationClip,
   AutomationLane,
+  AutomationMode,
   Binding,
   Clip,
   ChordSpan,
@@ -162,6 +163,7 @@ export interface Backend {
   setTrackMute(trackId: string, muted: boolean): Promise<void>;
   setTrackSolo(trackId: string, soloed: boolean): Promise<void>;
   setTrackArm(trackId: string, armed: boolean): Promise<void>;
+  setTrackAutomationMode(trackId: string, mode: AutomationMode): Promise<void>;
   /** Rename a track. Trimmed backend-side; an empty name is rejected. */
   setTrackName(trackId: string, name: string): Promise<TrackState>;
   /** Put a track in a lane group, or take it out (`null`). Does NOT keep
@@ -613,6 +615,11 @@ class TauriBackend implements Backend {
   }
   async setTrackArm(trackId: string, armed: boolean) {
     await invoke("set_track_arm", { trackId, armed });
+  }
+  async setTrackAutomationMode(trackId: string, mode: AutomationMode) {
+    await invoke<TrackState[]>("set_track_mix", {
+      changes: [{ trackId, automationMode: mode }],
+    });
   }
   setTrackName(trackId: string, name: string) {
     return invoke<TrackState>("set_track_name", { trackId, name });

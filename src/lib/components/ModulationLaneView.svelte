@@ -5,9 +5,10 @@
    * lane column share `--track-height` and inserting a sub-row would
    * desynchronise them).
    *
-   * Curve values are normalized [0,1] (R3). Gain is a linear multiplier on
-   * top of the fader (scope ruling 6): y=top is 1.0, y=bottom is 0.0. Pan
-   * uses the same 0..1 draw space (0 = hard left, 1 = hard right).
+   * Gain is a positive linear multiplier on top of the fader (scope ruling 6).
+   * The vertical range starts at 2x and grows to the next power-of-two
+   * ceiling above the current peak, keeping boost authoring available. Pan and
+   * normalized plugin curves retain their 0..1 draw space.
    *
    * Edit shape: pointerdown opens a gesture and either grabs an existing
    * point or inserts one; pointermove PREVIEWS locally (no invoke);
@@ -20,13 +21,20 @@
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { canvasPos } from "../utils/canvas-pos";
-  import { deletePoint, hitTest, insertPoint, movePoint } from "../utils/automation-edit";
+  import {
+    deletePoint,
+    hitTest,
+    insertPoint,
+    movePoint,
+    positiveValueCeiling,
+  } from "../utils/automation-edit";
 
   let { track, binding, curve }: { track: TrackState; binding: Binding; curve: Curve } =
     $props();
 
   let canvas: HTMLCanvasElement | undefined = $state();
   let dragIndex = $state(-1);
+  let dragValueMax = $state(1);
   /** True between the pointerdown that OPENED an edit gesture and the
    * pointerup that closes it. The alt-click delete path closes its own
    * gesture (after its commit lands), so without this the pointerup that
@@ -61,6 +69,14 @@
     paint();
   });
 
+  function isGainLane(): boolean {
+    return binding.target.kind === "trackParam" && binding.target.param === "gain";
+  }
+
+  function laneValueMax(): number {
+    return isGainLane() ? positiveValueCeiling(live.points ?? []) : 1;
+  }
+
   function paint() {
     const c = canvas;
     if (!c) return;
@@ -76,19 +92,21 @@
     ctx.clearRect(0, 0, w, h);
     const pts = live.points ?? [];
     if (pts.length === 0) return;
+    const valueMax = dragIndex >= 0 ? dragValueMax : laneValueMax();
+    const yOf = (value: number) => (1 - value / valueMax) * h;
 
     ctx.strokeStyle = strokeOf();
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     // hold before the first and after the last point (the compile contract)
-    ctx.moveTo(0, (1 - pts[0].value) * h);
-    for (const p of pts) ctx.lineTo(xOfTick(p.tick), (1 - p.value) * h);
-    ctx.lineTo(w, (1 - pts[pts.length - 1].value) * h);
+    ctx.moveTo(0, yOf(pts[0].value));
+    for (const p of pts) ctx.lineTo(xOfTick(p.tick), yOf(p.value));
+    ctx.lineTo(w, yOf(pts[pts.length - 1].value));
     ctx.stroke();
     ctx.fillStyle = strokeOf();
     for (const p of pts) {
       ctx.beginPath();
-      ctx.arc(xOfTick(p.tick), (1 - p.value) * h, 3, 0, Math.PI * 2);
+      ctx.arc(xOfTick(p.tick), yOf(p.value), 3, 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -107,18 +125,22 @@
     return "automation";
   }
 
-  function domainAt(e: PointerEvent | MouseEvent) {
+  function domainAt(e: PointerEvent | MouseEvent, valueMax = laneValueMax()) {
     const p = canvasPos(canvas!, e.clientX, e.clientY);
     const h = canvas!.clientHeight || 1;
-    return { tick: tickAtX(p.x), value: Math.min(1, Math.max(0, 1 - p.y / h)) };
+    return {
+      tick: tickAtX(p.x),
+      value: Math.min(valueMax, Math.max(0, (1 - p.y / h) * valueMax)),
+    };
   }
 
   function onPointerDown(e: PointerEvent) {
     if (!canvas) return;
-    const { tick, value } = domainAt(e);
+    dragValueMax = laneValueMax();
+    const { tick, value } = domainAt(e, dragValueMax);
     const c = live;
     const tickPerPx = Math.max(1e-9, midi.samplesToTicks(view.spp) - midi.samplesToTicks(0));
-    const valuePerPx = 1 / Math.max(1, canvas.clientHeight);
+    const valuePerPx = dragValueMax / Math.max(1, canvas.clientHeight);
     const hit = hitTest(c.points, tick, value, tickPerPx, valuePerPx, HIT_RADIUS_PX);
 
     if (e.button === 2 || e.altKey) {
@@ -148,8 +170,8 @@
     if (dragIndex < 0 || !canvas) return;
     const c = modulation.curves.find((x) => x.id === live.id);
     if (!c) return;
-    const { tick, value } = domainAt(e);
-    const moved = movePoint(c.points, dragIndex, tick, value, 0, 1);
+    const { tick, value } = domainAt(e, dragValueMax);
+    const moved = movePoint(c.points, dragIndex, tick, value, 0, dragValueMax);
     dragIndex = moved.index;
     modulation.preview(c.id, moved.points); // LOCAL only — no invoke per move
   }

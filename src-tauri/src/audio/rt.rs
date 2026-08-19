@@ -25,6 +25,33 @@ pub const FLAG_SOLO: u32 = 1 << 1;
 /// Track is a live launch target — mixer must hear it even if another
 /// track is soloed or this one is muted.
 pub const FLAG_LAUNCH: u32 = 1 << 2;
+/// A live Write/Touch/Latch controller owns track gain. While set, the
+/// mixer bypasses the compiled gain lane so the fader value is heard
+/// exactly once (the lane remains a relative multiplier when read back).
+pub const NO_GAIN_AUTOMATION_OWNER: u64 = u64::MAX;
+
+#[inline]
+pub fn advance_automation_pass(pass: &AtomicU64) -> u64 {
+    loop {
+        let observed = pass.load(Ordering::Acquire);
+        let current = if observed == NO_GAIN_AUTOMATION_OWNER { 0 } else { observed };
+        let incremented = current.wrapping_add(1);
+        let next = if incremented == NO_GAIN_AUTOMATION_OWNER { 0 } else { incremented };
+        if pass
+            .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current;
+        }
+    }
+}
+
+/// Relative automation value for a coherent live/base gain snapshot. Every
+/// finite positive base is meaningful, including subnormal values; only zero
+/// or non-finite bases use the safe silence fallback.
+pub fn relative_gain_multiplier(live: f32, base: f32) -> f32 {
+    if base.is_finite() && base > 0.0 { live / base } else { 0.0 }
+}
 
 /// One-shot shadow playhead for a drive-clip launch. Launched tracks
 /// render at `pos` instead of the arrangement playhead.
@@ -50,6 +77,8 @@ pub struct SharedRt {
     pub position: AtomicU64,
     pub playing: AtomicBool,
     pub recording: AtomicBool,
+    /// Monotonic automation-pass identity carried by gesture endpoints.
+    pub automation_pass: AtomicU64,
     /// Actual engine/stream sample rate.
     pub sample_rate: AtomicU32,
     pub loop_enabled: AtomicBool,
@@ -138,6 +167,7 @@ impl Default for SharedRt {
             position: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             recording: AtomicBool::new(false),
+            automation_pass: AtomicU64::new(0),
             sample_rate: AtomicU32::new(48_000),
             loop_enabled: AtomicBool::new(false),
             loop_start: AtomicU64::new(0),
@@ -230,7 +260,13 @@ impl SharedRt {
 /// argument), and a rebuild always sizes the fresh table to the CURRENT
 /// track count, however wide that gets.
 pub struct ParamTable {
+    /// Current live fader value (gestures may override it without moving the document base).
     pub gain: Vec<AtomicU32>,
+    /// Persisted base-fader value used as the denominator for relative gain recording.
+    pub base_gain: Vec<AtomicU32>,
+    /// Even = stable; odd = a live/base writer is in progress.
+    gain_seq: Vec<AtomicU32>,
+    gain_automation_owner: Vec<AtomicU64>,
     pub pan: Vec<AtomicU32>,
     pub flags: Vec<AtomicU32>,
     pub any_solo: AtomicBool,
@@ -253,6 +289,11 @@ impl ParamTable {
     pub fn with_slots(n: usize) -> Self {
         Self {
             gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            base_gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            gain_seq: (0..n).map(|_| AtomicU32::new(0)).collect(),
+            gain_automation_owner: (0..n)
+                .map(|_| AtomicU64::new(NO_GAIN_AUTOMATION_OWNER))
+                .collect(),
             pan: (0..n).map(|_| AtomicU32::new(0.0f32.to_bits())).collect(),
             flags: (0..n).map(|_| AtomicU32::new(0)).collect(),
             any_solo: AtomicBool::new(false),
@@ -267,16 +308,113 @@ impl ParamTable {
         self.gain.is_empty()
     }
 
-    pub fn set_gain_linear(&self, slot: usize, gain: f32) {
-        if slot < self.len() {
-            self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+    fn begin_gain_write(&self, slot: usize) -> Option<&AtomicU32> {
+        let seq = self.gain_seq.get(slot)?;
+        loop {
+            let current = seq.load(Ordering::Acquire);
+            if current & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if seq
+                .compare_exchange_weak(
+                    current,
+                    current.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(seq);
+            }
         }
+    }
+
+    fn end_gain_write(seq: &AtomicU32) {
+        seq.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn set_gain_linear(&self, slot: usize, gain: f32) {
+        let Some(seq) = self.begin_gain_write(slot) else { return };
+        self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+        Self::end_gain_write(seq);
+    }
+
+    pub fn gain_linear(&self, slot: usize) -> f32 {
+        self.gain.get(slot).map_or(1.0, |g| f32::from_bits(g.load(Ordering::Relaxed)))
+    }
+
+    pub fn set_base_gain_linear(&self, slot: usize, gain: f32) {
+        let Some(seq) = self.begin_gain_write(slot) else { return };
+        self.base_gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+        Self::end_gain_write(seq);
+    }
+
+    /// Publish a persisted fader change as one coherent live/base pair.
+    pub fn set_gain_pair_linear(&self, slot: usize, gain: f32) {
+        let Some(seq) = self.begin_gain_write(slot) else { return };
+        let bits = gain.to_bits();
+        self.gain[slot].store(bits, Ordering::Relaxed);
+        self.base_gain[slot].store(bits, Ordering::Relaxed);
+        Self::end_gain_write(seq);
+    }
+
+    /// Coherent snapshot for relative automation recording.
+    pub fn gain_pair_linear(&self, slot: usize) -> (f32, f32) {
+        let (Some(seq), Some(live), Some(base)) = (
+            self.gain_seq.get(slot),
+            self.gain.get(slot),
+            self.base_gain.get(slot),
+        ) else {
+            return (1.0, 1.0);
+        };
+        loop {
+            let before = seq.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let live = f32::from_bits(live.load(Ordering::Relaxed));
+            let base = f32::from_bits(base.load(Ordering::Relaxed));
+            if seq.load(Ordering::Acquire) == before {
+                return (live, base);
+            }
+        }
+    }
+
+    pub fn base_gain_linear(&self, slot: usize) -> f32 {
+        self.base_gain
+            .get(slot)
+            .map_or(1.0, |g| f32::from_bits(g.load(Ordering::Relaxed)))
     }
 
     pub fn set_pan(&self, slot: usize, pan: f32) {
         if slot < self.len() {
             self.pan[slot].store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
         }
+    }
+
+    pub fn set_gain_automation_owner(&self, slot: usize, pass: Option<u64>) {
+        let Some(owner) = self.gain_automation_owner.get(slot) else { return };
+        owner.store(pass.unwrap_or(NO_GAIN_AUTOMATION_OWNER), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn gain_automation_owner(&self, slot: usize) -> Option<u64> {
+        let pass = self.gain_automation_owner.get(slot)?.load(Ordering::Acquire);
+        (pass != NO_GAIN_AUTOMATION_OWNER).then_some(pass)
+    }
+
+    pub fn clear_gain_automation_owner_if(&self, slot: usize, expected_pass: u64) -> bool {
+        let Some(owner) = self.gain_automation_owner.get(slot) else { return false };
+        owner
+            .compare_exchange(
+                expected_pass,
+                NO_GAIN_AUTOMATION_OWNER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub fn set_flag(&self, slot: usize, flag: u32, on: bool) {
@@ -295,6 +433,8 @@ impl ParamTable {
             self.gain[slot].store(1.0f32.to_bits(), Ordering::Relaxed);
             self.pan[slot].store(0.0f32.to_bits(), Ordering::Relaxed);
             self.flags[slot].store(0, Ordering::Relaxed);
+            self.gain_automation_owner[slot]
+                .store(NO_GAIN_AUTOMATION_OWNER, Ordering::Relaxed);
         }
     }
 }
@@ -660,5 +800,76 @@ mod tests {
         // at 1, it never goes to 0.
         let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(0)));
         assert_eq!(g.meter_scratch.len(), 1);
+    }
+
+    #[test]
+    fn gain_linear_reads_back_what_set_gain_linear_wrote() {
+        let t = ParamTable::with_slots(4);
+        t.set_gain_linear(2, 0.5);
+        assert_eq!(t.gain_linear(2), 0.5);
+    }
+
+    #[test]
+    fn coherent_gain_pair_never_observes_a_torn_persisted_write() {
+        let table = Arc::new(ParamTable::with_slots(1));
+        let writer = table.clone();
+        let thread = std::thread::spawn(move || {
+            for i in 0..50_000 {
+                writer.set_gain_pair_linear(0, if i % 2 == 0 { 2.0 } else { 4.0 });
+            }
+        });
+        for _ in 0..50_000 {
+            let (live, base) = table.gain_pair_linear(0);
+            assert_eq!(live, base);
+        }
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn automation_pass_advance_skips_the_reserved_owner_sentinel_at_wrap() {
+        let pass = AtomicU64::new(NO_GAIN_AUTOMATION_OWNER - 2);
+        assert_eq!(advance_automation_pass(&pass), NO_GAIN_AUTOMATION_OWNER - 2);
+        assert_eq!(pass.load(Ordering::Relaxed), NO_GAIN_AUTOMATION_OWNER - 1);
+        assert_eq!(advance_automation_pass(&pass), NO_GAIN_AUTOMATION_OWNER - 1);
+        assert_eq!(pass.load(Ordering::Relaxed), 0);
+        assert_eq!(advance_automation_pass(&pass), 0);
+        assert_eq!(pass.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn automation_owner_compare_clear_cannot_erase_a_newer_pass() {
+        let table = Arc::new(ParamTable::with_slots(1));
+        table.set_gain_automation_owner(0, Some(7));
+        let cleanup_table = table.clone();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            let observed = cleanup_table.gain_automation_owner(0).unwrap();
+            observed_tx.send(observed).unwrap();
+            continue_rx.recv().unwrap();
+            cleanup_table.clear_gain_automation_owner_if(0, observed)
+        });
+
+        assert_eq!(observed_rx.recv().unwrap(), 7);
+        table.set_gain_automation_owner(0, Some(8));
+        continue_tx.send(()).unwrap();
+
+        assert!(!cleanup.join().unwrap(), "stale cleanup must lose the CAS");
+        assert_eq!(table.gain_automation_owner(0), Some(8));
+        assert!(table.gain_automation_owner(0).is_some(), "the same owner atomic keeps RT bypass active");
+    }
+
+    #[test]
+    fn relative_gain_divides_by_every_finite_positive_base() {
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        assert_eq!(relative_gain_multiplier(subnormal * 2.0, subnormal), 2.0);
+        assert_eq!(relative_gain_multiplier(1.0, 0.0), 0.0);
+        assert_eq!(relative_gain_multiplier(1.0, f32::NAN), 0.0);
+    }
+
+    #[test]
+    fn gain_linear_out_of_range_slot_returns_unity() {
+        let t = ParamTable::with_slots(2);
+        assert_eq!(t.gain_linear(99), 1.0);
     }
 }

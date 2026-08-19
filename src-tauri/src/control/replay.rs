@@ -613,6 +613,7 @@ pub fn replay_tail(session: &Mutex<Session>, tail: &[&JournalRecord]) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::control::history::{EpochEvent, JournalWriter, JOURNAL_FILE};
     use crate::control::op::{ObjectRef, PropPath};
 
@@ -1136,6 +1137,7 @@ mod tests {
                 instrument_id: None,
                 inserts: Vec::new(),
                 group: None,
+                automation_mode: AutomationMode::Read,
             },
             index,
             clips: vec![],

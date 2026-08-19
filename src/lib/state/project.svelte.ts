@@ -12,7 +12,7 @@ import { backend } from "../tauri";
 import { midiIo } from "./midiio.svelte";
 import { modulation } from "./modulation.svelte";
 import { toasts } from "./toasts.svelte";
-import type { Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
+import type { AutomationMode, Clip, Project, ProjectSnapshot, TrackState } from "../types/ipc";
 
 class ProjectStore {
   name = $state("Untitled");
@@ -200,6 +200,13 @@ class ProjectStore {
       }
     }
   }
+  /** Set the track's automation mode; no-op (no invoke) when already there. */
+  async setAutomationMode(trackId: string, mode: AutomationMode) {
+    const t = this.trackById(trackId);
+    if (!t || t.automationMode === mode) return;
+    this.patchTrack(trackId, { automationMode: mode });
+    await backend.setTrackAutomationMode(trackId, mode);
+  }
 
   /**
    * Rename a track (lanes UX). NOT optimistic, unlike the mix setters
@@ -285,9 +292,9 @@ class ProjectStore {
    * a mismatch is a no-op so a late end cannot close a different
    * gesture. Omitting the id keeps the old close-whatever contract.
    * Safe to call even without a matching `beginGesture`. */
-  endGesture(id?: string) {
+  async endGesture(id?: string): Promise<void> {
     if (id == null) return;
-    void backend.gestureEnd?.(id);
+    await backend.gestureEnd?.(id);
   }
 
   // ── clips ──

@@ -992,6 +992,7 @@ impl Drop for ClapNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::plugins::scan::{clap_search_paths, find_clap_bundles};
     use crate::plugins::scan_worker;
     use crate::plugins::PluginDescriptor;
@@ -1423,6 +1424,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         };
         t.instrument_id = Some(format!("plugin:{}", info.id));
         store.tracks.push(t);

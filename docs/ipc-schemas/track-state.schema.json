@@ -56,6 +56,11 @@
       "minLength": 1,
       "maxLength": 256
     },
+    "automationMode": {
+      "description": "Track-gain automation mode: \"off\" bypasses the lane entirely, \"read\" (default) always applies it during playback, \"write\"/\"touch\"/\"latch\" additionally record new points while playing. Additive; pre-existing files omit it and default to \"read\".",
+      "type": "string",
+      "enum": ["off", "read", "write", "touch", "latch"]
+    },
     "inserts": {
       "description": "Ordered insert-FX slots. Slot id is a stable UUID; instanceId names a PluginInstanceInfo.id. Absent means empty.",
       "type": "array",

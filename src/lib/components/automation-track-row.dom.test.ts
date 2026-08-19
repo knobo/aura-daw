@@ -107,6 +107,7 @@ function seedTrack(): TrackState {
     muted: false,
     soloed: false,
     armed: false,
+    automationMode: "read",
     color: "#38bdf8",
   };
 }

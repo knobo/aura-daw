@@ -1,13 +1,31 @@
 import { mount } from "svelte";
 import "./app.css";
 import App from "./App.svelte";
-import { GROUP_HEADER_PX, LANE_COLLAPSED_PX } from "./lib/utils/lane-layout";
+import {
+  GROUP_HEADER_PX,
+  LANE_COLLAPSED_PX,
+  LANE_HEIGHT_PX,
+  RAIL_WIDTH_PX,
+} from "./lib/utils/lane-layout";
 
-// A folded lane and a group header are the same height on purpose (see the
-// doc comments on LANE_COLLAPSED_PX / GROUP_HEADER_PX) — set here, before
-// anything mounts, so app.css doesn't carry its own copy of the number.
-document.documentElement.style.setProperty("--lane-collapsed", `${LANE_COLLAPSED_PX}px`);
-document.documentElement.style.setProperty("--lane-group-height", `${GROUP_HEADER_PX}px`);
+// Publish the shared geometry constants before mount. app.css carries only
+// matching fallbacks for non-app renderers; lane-layout is authoritative.
+document.documentElement.style.setProperty(
+  "--track-height",
+  String(LANE_HEIGHT_PX) + "px",
+);
+document.documentElement.style.setProperty(
+  "--rail-width",
+  String(RAIL_WIDTH_PX) + "px",
+);
+document.documentElement.style.setProperty(
+  "--lane-collapsed",
+  String(LANE_COLLAPSED_PX) + "px",
+);
+document.documentElement.style.setProperty(
+  "--lane-group-height",
+  String(GROUP_HEADER_PX) + "px",
+);
 
 const app = mount(App, {
   target: document.getElementById("app")!,

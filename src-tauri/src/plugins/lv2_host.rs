@@ -776,6 +776,7 @@ impl LiveInstrument for Lv2Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::plugins::descriptor::lv2_uid;
 
     const ZYN_URI: &str = "http://zynaddsubfx.sourceforge.net";
@@ -930,6 +931,7 @@ mod tests {
             instrument_id,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

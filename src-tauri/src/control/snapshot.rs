@@ -532,6 +532,7 @@ fn launch_target_heap(t: &crate::midi::launch::LaunchTarget) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::AutomationMode;
     use crate::audio::types::{Store, TrackState};
     use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
     use crate::ids::{ContentId, LaneId, NoteId};
@@ -552,6 +553,7 @@ mod tests {
             instrument_id: None,
             inserts: Vec::new(),
             group: None,
+            automation_mode: AutomationMode::Read,
         }
     }
 

@@ -17,7 +17,10 @@
 import type { TrackState } from "../types/ipc";
 
 /** A full-height lane, in LAYOUT px. Mirrors `--track-height` in app.css. */
-export const LANE_HEIGHT_PX = 88;
+export const LANE_HEIGHT_PX = 132;
+
+/** Expanded track-rail width. Mirrors `--rail-width` in app.css. */
+export const RAIL_WIDTH_PX = 320;
 
 /** A collapsed lane: one thin strip, tall enough for the name, the index
  * and the mute/solo pair, and nothing else. Mirrors `--lane-collapsed`. */
@@ -104,7 +107,11 @@ export function buildLaneLayout(args: BuildLaneLayoutArgs): LaneLayout {
   const byTrackId = new Map<string, Extract<LaneRow, { kind: "track" }>>();
   let top = 0;
 
-  const pushTrack = (track: TrackState, trackIndex: number, group: string | null) => {
+  const pushTrack = (
+    track: TrackState,
+    trackIndex: number,
+    group: string | null,
+  ) => {
     const collapsed = collapsedTracks.has(track.id);
     const row = {
       kind: "track" as const,
@@ -130,7 +137,8 @@ export function buildLaneLayout(args: BuildLaneLayoutArgs): LaneLayout {
     }
     // Extend to the end of this run.
     let end = i;
-    while (end + 1 < tracks.length && groupOf(tracks[end + 1]) === group) end += 1;
+    while (end + 1 < tracks.length && groupOf(tracks[end + 1]) === group)
+      end += 1;
     const members = tracks.slice(i, end + 1);
     const collapsed = collapsedGroups.has(group);
     rows.push({
@@ -164,7 +172,8 @@ export function buildLaneLayout(args: BuildLaneLayoutArgs): LaneLayout {
 export function trackIndexAtY(layout: LaneLayout, y: number): number | null {
   for (const row of layout.rows) {
     if (y < row.top) break;
-    if (y < row.top + row.height) return row.kind === "track" ? row.trackIndex : null;
+    if (y < row.top + row.height)
+      return row.kind === "track" ? row.trackIndex : null;
   }
   return null;
 }
@@ -176,7 +185,10 @@ export function trackIndexAtY(layout: LaneLayout, y: number): number | null {
  * drag over a group header behaves as if it were over the lane the user
  * can see rather than aborting.
  */
-export function nearestTrackIndexAtY(layout: LaneLayout, y: number): number | null {
+export function nearestTrackIndexAtY(
+  layout: LaneLayout,
+  y: number,
+): number | null {
   let last: number | null = null;
   for (const row of layout.rows) {
     if (row.kind !== "track") continue;

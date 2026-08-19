@@ -1020,12 +1020,14 @@ mod tests {
             Store::default(),
             MidiStore::default(),
         )));
+        let gesture = Arc::new(crate::control::GestureState::new());
         let engine = crate::audio::engine::start(
             shared.clone(),
             tables.clone(),
             session.clone(),
             Box::new(NullEvents),
             crate::control::testutil::test_committer(&session, &shared, &tables),
+            gesture.clone(),
         );
         // Event-driven readiness: the control thread opens (or fails to
         // open) its output stream BEFORE draining its first message, so one
@@ -1049,6 +1051,7 @@ mod tests {
             Arc::new(JobManager::new(2, Duration::ZERO)),
             Box::new(move |e, p| ev2.lock().push((e.to_string(), p))),
             std::sync::Arc::new(crate::control::HistoryLog::new()),
+            gesture.clone(),
         ));
         // (Sample rate settled by the round-trip above — no sleep needed.)
 
