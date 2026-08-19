@@ -1,12 +1,10 @@
 <script lang="ts">
   /**
-   * Inline effect-chain rack: renders insert-FX slots as clickable chips
-   * inside the track header. Each chip shows the plugin name, format badge,
-   * bypass toggle, and a shortcuts popover.
+   * Effect chain popover: shows the current insert-FX chain for a track
+   * with bypass toggles, param access, reorder, and an add button.
    *
-   * Pedagogic design: the chain reads left-to-right = signal flow, exactly
-   * like a guitar pedalboard. Empty state is invisible — just the "+" button
-   * until you add something.
+   * Positioned below the FX chip in the track header metadata row
+   * (same popover pattern as LanePickerMenu).
    */
   import type { InsertSlot, PluginInstanceInfo, TrackState } from "../../types/ipc";
   import { plugins } from "../../state/plugins.svelte";
@@ -15,8 +13,10 @@
 
   let {
     track,
+    onclose,
   }: {
     track: TrackState;
+    onclose: () => void;
   } = $props();
 
   const insertSlots = $derived(track.inserts ?? []);
@@ -60,7 +60,8 @@
     }
   }
 
-  function openParams(instanceId: string) {
+  function onOpenParams(instanceId: string) {
+    onclose();
     void openPluginParams(instanceId);
   }
 
@@ -72,163 +73,154 @@
     }
   }
 
-  let pickerOpen = $state(false);
+  // ── add-effect sub-picker ──
+  let showPicker = $state(false);
 
+  // Pre-close if the track is gone or has no inserts
   const fxPlugins = $derived(
     plugins.descriptors.filter((d) => !d.isInstrument && plugins.scanned),
   );
-
-  const hasEffectsScanned = $derived(fxPlugins.length > 0);
   const scanNeeded = $derived(!plugins.scanned && !plugins.scanning);
+  const hasEffects = $derived(insertSlots.length > 0);
 </script>
 
-<div class="chain">
-  <div class="chainhead">
-    <span class="label mono">Effects</span>
-    <button
-      class="addbtn mono"
-      title="Add an effect"
-      aria-label="Add effect to {track.name}"
-      onclick={() => (pickerOpen = !pickerOpen)}
-      disabled={plugins.scanning}
-    >
-      +{plugins.scanning ? " scan\u2026" : ""}
-    </button>
-    {#if pickerOpen}
-      <div class="backdrop" role="presentation" onpointerdown={() => (pickerOpen = false)}></div>
-      <div class="fxpicker mono" role="menu" aria-label="Select an effect plugin">
-        {#if scanNeeded}
-          <button class="scanbtn" role="menuitem" onclick={() => { void plugins.scan(); pickerOpen = false; }}>
-            Scan for plugins\u2026
-          </button>
-        {:else if !hasEffectsScanned}
-          <div class="empty-state silk">No effects found</div>
-        {:else}
-          {#each fxPlugins as desc (desc.uid)}
-            <button
-              class="fxitem"
-              role="menuitem"
-              disabled={!!busy[`add:${desc.uid}`]}
-              onclick={() => { void addEffect(desc.uid); pickerOpen = false; }}
-            >
-              <span class="fbadge mono {desc.format}">{desc.format}</span>
-              <span class="fname">{desc.name}</span>
-              {#if desc.vendor}
-                <span class="fvendor silk">{desc.vendor}</span>
-              {/if}
-            </button>
-          {/each}
-        {/if}
-      </div>
+<div class="backdrop" role="presentation" onpointerdown={onclose}></div>
+<div class="popover glass mono" role="menu" aria-label="Effect chain for {track.name}">
+  <div class="pophead">
+    <span class="ptitle">Effects</span>
+    {#if !showPicker}
+      <button
+        class="addbtn mono"
+        title="Add an effect"
+        onclick={() => (showPicker = true)}
+        disabled={plugins.scanning}
+      >
+        +{plugins.scanning ? " scan\u2026" : ""}
+      </button>
     {/if}
   </div>
 
-  {#if insertSlots.length > 0}
-    <div class="slots" role="list" aria-label="Effect chain">
-      {#each insertSlots as slot (slot.id)}
-        {@const inst = slotInstance(slot)}
-        <div
-          class="slot"
-          class:bypassed={slot.bypassed}
-          role="listitem"
-          aria-label={inst?.name ?? "Unknown effect"}
-        >
-          {#if inst}
-            <button
-              class="byp mono"
-              class:on={!slot.bypassed}
-              title={slot.bypassed ? "Bypassed \u2014 click to enable" : "Active \u2014 click to bypass"}
-              aria-pressed={!slot.bypassed}
-              onclick={() => toggleBypass(slot)}
-              disabled={!!busy[slot.id]}
-            >
-              {slot.bypassed ? "B" : "A"}
-            </button>
-            <span class="fbadge mono {inst.format}">{inst.format}</span>
-            <button
-              class="pname"
-              title="Open {inst.name} parameters"
-              onclick={() => openParams(inst.id)}
-            >
-              {inst.name}
-            </button>
-            {#if inst.status === "stub"}
-              <span class="status mono stub">stub</span>
-            {:else if inst.status === "crashed"}
-              <span class="status mono crashed">crash</span>
-            {/if}
-            <button
-              class="del mono"
-              title="Remove {inst.name} from the chain"
-              aria-label="Remove {inst.name}"
-              onclick={() => removeSlot(slot)}
-              disabled={!!busy[slot.id]}
-            >
-              \u00d7
-            </button>
-          {:else}
-            <span class="unknown silk">{slot.instanceId.slice(0, 8)}\u2026</span>
-            <button class="del mono" title="Remove stale slot" onclick={() => removeSlot(slot)}>
-              \u00d7
-            </button>
-          {/if}
-        </div>
-      {/each}
+  {#if showPicker}
+    <div class="picker-panel">
+      {#if scanNeeded}
+        <button class="scanbtn" onclick={() => { void plugins.scan(); showPicker = false; }}>
+          Scan for plugins\u2026
+        </button>
+      {:else if fxPlugins.length === 0}
+        <span class="empty-silk">No effects found</span>
+      {:else}
+        {#each fxPlugins as desc (desc.uid)}
+          <button
+            class="fxitem"
+            disabled={!!busy[`add:${desc.uid}`]}
+            onclick={() => { void addEffect(desc.uid); showPicker = false; }}
+          >
+            <span class="fbadge mono {desc.format}">{desc.format}</span>
+            <span class="fname">{desc.name}</span>
+          </button>
+        {/each}
+      {/if}
+      <button class="backbtn mono" onclick={() => (showPicker = false)}>
+        \u2190 Back
+      </button>
     </div>
-
-    {#if insertSlots.length > 1}
-      <div class="reorder-row mono">
-        {#each insertSlots as slot, i (slot.id)}
-          {#if i > 0}
-            <button
-              class="reorderbtn"
-              title="Move earlier"
-              onclick={() => moveSlot(slot.id, i - 1)}
-            >\u2191</button>
-          {/if}
-          {#if i < insertSlots.length - 1}
-            <button
-              class="reorderbtn"
-              title="Move later"
-              onclick={() => moveSlot(slot.id, i + 1)}
-            >\u2193</button>
-          {/if}
+  {:else}
+    {#if hasEffects}
+      <div class="slots">
+        {#each insertSlots as slot (slot.id)}
+          {@const inst = slotInstance(slot)}
+          <div class="slot" class:bypassed={slot.bypassed}>
+            {#if inst}
+              <div class="slot-row">
+                <button
+                  class="byp mono"
+                  class:on={!slot.bypassed}
+                  title={slot.bypassed ? "Enable" : "Bypass"}
+                  onclick={() => toggleBypass(slot)}
+                  disabled={!!busy[slot.id]}
+                >
+                  {slot.bypassed ? "B" : "A"}
+                </button>
+                <span class="fbadge mono {inst.format}">{inst.format}</span>
+                <button class="pname" onclick={() => onOpenParams(inst.id)}>
+                  {inst.name}
+                </button>
+                <button
+                  class="del mono"
+                  title="Remove"
+                  onclick={() => removeSlot(slot)}
+                  disabled={!!busy[slot.id]}
+                >
+                  \u00d7
+                </button>
+              </div>
+              {#if insertSlots.length > 1}
+                <div class="slot-arrows">
+                  {#if insertSlots.indexOf(slot) > 0}
+                    <button class="arrowbtn" onclick={() => moveSlot(slot.id, insertSlots.indexOf(slot) - 1)}>\u2191</button>
+                  {/if}
+                  {#if insertSlots.indexOf(slot) < insertSlots.length - 1}
+                    <button class="arrowbtn" onclick={() => moveSlot(slot.id, insertSlots.indexOf(slot) + 1)}>\u2193</button>
+                  {/if}
+                </div>
+              {/if}
+            {:else}
+              <span class="unknown-silk">{slot.instanceId.slice(0, 8)}\u2026</span>
+              <button class="del mono" onclick={() => removeSlot(slot)}>\u00d7</button>
+            {/if}
+          </div>
         {/each}
       </div>
+    {:else}
+      <span class="empty-silk">No effects yet</span>
     {/if}
   {/if}
 </div>
 
 <style>
-  .chain {
+  .backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 89;
+  }
+  .popover {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 90;
+    min-width: 180px;
+    max-width: 260px;
+    max-height: 280px;
+    overflow-y: auto;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    padding: 0;
+    padding: 6px;
+    border-radius: 7px;
+    background: rgb(var(--bg-sunken-rgb) / 0.96);
+    border: var(--border-width) solid var(--glass-border);
   }
-  .chainhead {
+  .pophead {
     display: flex;
     align-items: center;
-    gap: 6px;
-    min-height: 16px;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
   }
-  .label {
-    font-size: 8px;
-    letter-spacing: 0.14em;
+  .ptitle {
+    font-size: 9px;
+    letter-spacing: 0.16em;
     text-transform: uppercase;
-    color: var(--text-faint);
-    flex: none;
+    color: var(--text-dim);
   }
   .addbtn {
-    padding: 1px 6px;
+    padding: 2px 7px;
     border-radius: 3px;
-    border: var(--border-width) dashed rgb(var(--edge-rgb) / 0.25);
+    border: var(--border-width) dashed rgb(var(--edge-rgb) / 0.3);
     background: transparent;
     color: var(--text-faint);
-    font-size: 8px;
-    letter-spacing: 0.12em;
+    font-size: 9px;
+    letter-spacing: 0.1em;
     cursor: pointer;
-    white-space: nowrap;
   }
   .addbtn:hover:not(:disabled) {
     color: var(--cyan);
@@ -237,25 +229,11 @@
   .addbtn:disabled {
     cursor: wait;
   }
-  .backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 89;
-  }
-  .fxpicker {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    z-index: 90;
-    min-width: 200px;
-    max-height: 200px;
-    overflow-y: auto;
+
+  .picker-panel {
     display: flex;
     flex-direction: column;
-    padding: 5px;
-    border-radius: 7px;
-    background: rgb(var(--bg-sunken-rgb) / 0.96);
-    border: var(--border-width) solid var(--glass-border);
+    gap: 3px;
   }
   .fxitem {
     display: flex;
@@ -264,7 +242,7 @@
     background: transparent;
     border: none;
     border-radius: 4px;
-    padding: 6px 8px;
+    padding: 5px 7px;
     font-size: 10px;
     cursor: pointer;
     text-align: left;
@@ -277,64 +255,85 @@
     cursor: wait;
     opacity: 0.5;
   }
-  .fname {
-    flex: 1;
-    min-width: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    color: var(--text-dim);
-  }
-  .fvendor {
-    font-size: 8px;
-    color: var(--text-faint);
-  }
   .scanbtn {
     font-size: 10px;
-    padding: 6px 8px;
+    padding: 5px 7px;
     color: var(--cyan);
     background: transparent;
     border: none;
     cursor: pointer;
     text-align: left;
+    border-radius: 4px;
   }
   .scanbtn:hover {
     background: rgb(var(--cyan-rgb) / 0.09);
   }
-  .empty-state {
-    padding: 6px 8px;
+  .backbtn {
     font-size: 9px;
+    padding: 4px 7px;
+    color: var(--text-faint);
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    text-align: left;
+    border-radius: 4px;
+    margin-top: 2px;
+  }
+  .backbtn:hover {
+    color: var(--cyan);
+    background: rgb(var(--cyan-rgb) / 0.07);
   }
 
   .slots {
     display: flex;
     flex-direction: column;
-    gap: 2px;
+    gap: 3px;
   }
-
   .slot {
     display: flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 5px;
-    border-radius: 3px;
-    border: var(--border-width) solid rgb(var(--violet-rgb) / 0.18);
+    flex-direction: column;
+    gap: 1px;
+    padding: 3px 5px;
+    border-radius: 4px;
+    border: var(--border-width) solid rgb(var(--violet-rgb) / 0.2);
     background: rgb(var(--bg-1-rgb) / 0.5);
-    min-height: 18px;
   }
   .slot.bypassed {
     opacity: 0.5;
     border-color: var(--glass-border);
   }
+  .slot-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 18px;
+  }
+  .slot-arrows {
+    display: flex;
+    gap: 2px;
+    padding-left: 22px;
+  }
+  .arrowbtn {
+    background: transparent;
+    border: none;
+    color: var(--text-faint);
+    font-size: 8px;
+    cursor: pointer;
+    padding: 0 2px;
+    line-height: 1;
+  }
+  .arrowbtn:hover {
+    color: var(--cyan);
+  }
 
   .byp {
     flex: none;
-    width: 15px;
-    height: 14px;
+    width: 14px;
+    height: 13px;
     line-height: 1;
-    font-size: 8px;
+    font-size: 7px;
     letter-spacing: 0;
-    border-radius: 3px;
+    border-radius: 2px;
     border: var(--border-width) solid rgb(var(--edge-rgb) / 0.2);
     background: transparent;
     color: var(--text-faint);
@@ -345,13 +344,9 @@
     color: var(--bg-0);
     background: var(--green);
     border-color: var(--green);
-    box-shadow: 0 0 calc(5px * var(--glow-scale)) rgb(var(--green-rgb) / 0.3);
   }
   .byp:hover:not(:disabled) {
     border-color: rgb(var(--green-rgb) / 0.4);
-  }
-  .byp:disabled {
-    cursor: wait;
   }
 
   .fbadge {
@@ -359,7 +354,7 @@
     font-size: 7px;
     letter-spacing: 0.12em;
     text-transform: uppercase;
-    padding: 1px 4px;
+    padding: 1px 3px;
     border-radius: 2px;
     border: var(--border-width) solid;
   }
@@ -392,27 +387,6 @@
     color: var(--cyan);
   }
 
-  .status {
-    flex: none;
-    font-size: 7px;
-    letter-spacing: 0.1em;
-    padding: 1px 4px;
-    border-radius: 2px;
-  }
-  .status.stub {
-    color: var(--amber);
-    background: rgb(var(--amber-rgb) / 0.1);
-  }
-  .status.crashed {
-    color: var(--red);
-    background: rgb(var(--red-rgb) / 0.1);
-  }
-
-  .unknown {
-    flex: 1;
-    font-size: 8px;
-  }
-
   .del {
     flex: none;
     width: 12px;
@@ -429,23 +403,14 @@
     color: var(--red);
   }
 
-  .reorder-row {
-    display: flex;
-    gap: 4px;
-    flex-wrap: wrap;
-    padding-left: 62px;
-  }
-  .reorderbtn {
-    background: transparent;
-    border: var(--border-width) solid transparent;
-    color: var(--text-faint);
+  .empty-silk {
     font-size: 9px;
-    cursor: pointer;
-    padding: 0 3px;
+    color: var(--text-faint);
+    padding: 4px 0;
   }
-  .reorderbtn:hover {
-    color: var(--cyan);
-    border-color: rgb(var(--cyan-rgb) / 0.3);
-    border-radius: 2px;
+  .unknown-silk {
+    flex: 1;
+    font-size: 8px;
+    color: var(--text-faint);
   }
 </style>

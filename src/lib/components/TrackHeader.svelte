@@ -29,6 +29,7 @@
   }: { track: TrackState; index: number; collapsed?: boolean } = $props();
   let pickerOpen = $state(false);
   let groupMenuOpen = $state(false);
+  let fxPopoverOpen = $state(false);
 
   // ── rename ──
   // The editor is opened by double-clicking the name, which is the gesture
@@ -259,18 +260,28 @@
           <span class="kindchip mono">Audio track</span>
         {/if}
         {#if !isAutomation}
+          <span class="picker">
+            <button
+              class="status fxchip"
+              class:on={fxPopoverOpen}
+              title={(track.inserts?.length ?? 0) > 0 ? `Effects (${track.inserts!.length})` : "Add effects"}
+              aria-haspopup="menu"
+              aria-expanded={fxPopoverOpen}
+              aria-pressed={fxPopoverOpen}
+              onclick={() => (fxPopoverOpen = !fxPopoverOpen)}
+            >
+              FX{(track.inserts?.length ?? 0) > 0 ? ` ${track.inserts!.length}` : ""}
+            </button>
+            {#if fxPopoverOpen}
+              <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
+            {/if}
+          </span>
           <span class="picker metadata-lanes">
             <button class="status lanes" class:on={modulation.hasVisible(track.id) || pickerOpen} title="Show or add automation lanes" aria-haspopup="menu" aria-expanded={pickerOpen} aria-pressed={modulation.hasVisible(track.id)} onclick={() => (pickerOpen = !pickerOpen)}>Lanes</button>
             {#if pickerOpen}<LanePickerMenu {track} onclose={() => (pickerOpen = false)} />{/if}
           </span>
         {/if}
       </div>
-
-      {#if !isAutomation && (track.kind === "audio" || track.kind === "midi")}
-        <div class="effects-row">
-          <InsertChain {track} />
-        </div>
-      {/if}
 
       {#if isAutomation}
         <section class="targets" aria-label="Automation targets for {track.name}">
@@ -657,8 +668,7 @@
   .identity-row,
   .metadata-row,
   .status-row,
-  .automation-row,
-  .effects-row {
+  .automation-row {
     display: flex;
     align-items: center;
     min-width: 0;
@@ -759,6 +769,15 @@
     background: var(--magenta);
     border-color: var(--magenta);
   }
+  .status.fxchip {
+    min-width: 32px;
+  }
+  .status.fxchip.on {
+    color: var(--bg-0);
+    background: var(--violet);
+    border-color: var(--violet);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
   .automation-row {
     height: 20px;
     gap: 8px;
@@ -773,15 +792,6 @@
   }
   .automation-row .section-label {
     width: 62px;
-  }
-  .effects-row {
-    flex-direction: column;
-    align-items: stretch;
-    height: auto;
-    min-height: 0;
-    padding-left: 20px;
-    padding-top: 0;
-    padding-bottom: 0;
   }
   .level-area {
     flex: 1;
