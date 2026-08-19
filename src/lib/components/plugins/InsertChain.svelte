@@ -9,6 +9,7 @@
   import type { InsertSlot, PluginInstanceInfo, TrackState } from "../../types/ipc";
   import { plugins } from "../../state/plugins.svelte";
   import { openPluginParams } from "../../state/plugin-panel";
+  import { toasts } from "../../state/toasts.svelte";
   import { backend } from "../../tauri";
 
   let {
@@ -33,6 +34,7 @@
       await backend.insertAdd?.(track.id, uid);
     } catch (err) {
       console.error("[aura] insert_add failed:", err);
+      toasts.error("INSERT FAILED", String(err));
     } finally {
       busy[key] = false;
     }
@@ -44,6 +46,7 @@
       await backend.insertSetBypass?.(track.id, slot.id, !slot.bypassed);
     } catch (err) {
       console.error("[aura] insert_set_bypass failed:", err);
+      toasts.error("BYPASS FAILED", String(err));
     } finally {
       busy[slot.id] = false;
     }
@@ -55,6 +58,7 @@
       await backend.insertRemove?.(track.id, slot.id);
     } catch (err) {
       console.error("[aura] insert_remove failed:", err);
+      toasts.error("REMOVE FAILED", String(err));
     } finally {
       busy[slot.id] = false;
     }

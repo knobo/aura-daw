@@ -9,6 +9,7 @@
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { openPluginParams } from "../../state/plugin-panel";
+  import { toasts } from "../../state/toasts.svelte";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
   import { backend } from "../../tauri";
   import type { PluginDescriptor, PluginInstanceInfo } from "../../types/ipc";
@@ -62,6 +63,7 @@
       await backend.insertAdd?.(trackId, uid);
     } catch (err) {
       console.error("[aura] insert_add failed:", err);
+      toasts.error("INSERT FAILED", String(err));
     } finally {
       busy[key] = false;
     }
