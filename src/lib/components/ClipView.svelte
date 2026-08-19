@@ -15,6 +15,10 @@
   import { clipSelection } from "../state/clip-selection.svelte";
   import { clipDrag } from "../state/clip-drag.svelte";
   import { launch } from "../state/launch.svelte";
+  import { toasts } from "../state/toasts.svelte";
+  import { backend } from "../tauri";
+  import { analyzePitchTrack, type PitchAnalysisState } from "../pitch/analyze";
+  import { invalidatePitchCache } from "../state/pitch.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildPeakColumns } from "../render/tiles";
   import { createPainter, hexToRgba, type WaveformPainter } from "../render/painter";
@@ -32,6 +36,31 @@
   const visW = $derived(Math.max(0, Math.floor(visR - visL)));
   const selected = $derived(clipSelection.has({ kind: "audio", id: clip.id }));
   const job = $derived(jobs.jobForClip(clip.id));
+  let pitchAnalysis = $state<PitchAnalysisState>({ phase: "idle" });
+  let analysisGeneration = 0;
+
+  $effect(() => {
+    void clip.id;
+    return () => {
+      // Invalidate in-flight analysis callbacks when this view unmounts or changes clip
+      analysisGeneration++;
+    };
+  });
+
+  async function analyzePitch() {
+    if (pitchAnalysis.phase === "analyzing") return;
+    const gen = ++analysisGeneration;
+    await analyzePitchTrack(clip.id, (id) => backend.pitchAnalyzeClip(id), (state) => {
+      if (gen !== analysisGeneration) return;
+      pitchAnalysis = state;
+      if (state.phase === "done") {
+        invalidatePitchCache(clip.id);
+        toasts.success("PITCH TRACK READY", `${clip.name}: ${state.frames} analysis frames cached`);
+      } else if (state.phase === "error") {
+        toasts.error("PITCH ANALYSIS FAILED", state.message);
+      }
+    });
+  }
 
   // ── waveform painting ──
 
@@ -196,6 +225,30 @@
       >
         <span class="spark">✦</span> SPLIT STEMS
       </button>
+      <button
+        class="pitch-action mono"
+        type="button"
+        class:error={pitchAnalysis.phase === "error"}
+        disabled={pitchAnalysis.phase === "analyzing"}
+        title={pitchAnalysis.phase === "error"
+          ? `Pitch analysis failed: ${pitchAnalysis.message}. Click to retry.`
+          : "Analyse this audio clip and persist its APTF pitch track"}
+        aria-live="polite"
+        onclick={(e) => {
+          e.stopPropagation();
+          void analyzePitch();
+        }}
+      >
+        {#if pitchAnalysis.phase === "analyzing"}
+          ANALYSING PITCH…
+        {:else if pitchAnalysis.phase === "done"}
+          ✓ PITCH READY · {pitchAnalysis.frames}
+        {:else if pitchAnalysis.phase === "error"}
+          RETRY PITCH
+        {:else}
+          ANALYSE PITCH
+        {/if}
+      </button>
     {/if}
 
     {#if job}
@@ -300,6 +353,32 @@
   .magic:hover {
     filter: brightness(1.15);
     transform: translateY(-1px);
+  }
+  .pitch-action {
+    position: absolute;
+    left: 5px;
+    bottom: 4px;
+    z-index: 1;
+    padding: 3px 7px;
+    border-radius: 4px;
+    border: var(--border-width) solid color-mix(in srgb, var(--cyan) 55%, var(--glass-border));
+    background: rgb(var(--bg-0-rgb) / 0.78);
+    color: var(--cyan);
+    font-size: 8px;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+  }
+  .pitch-action:hover:not(:disabled) {
+    border-color: var(--cyan);
+    filter: brightness(1.15);
+  }
+  .pitch-action:disabled {
+    cursor: wait;
+    color: var(--text-faint);
+  }
+  .pitch-action.error {
+    border-color: var(--red);
+    color: var(--red);
   }
   .spark {
     font-size: 10px;

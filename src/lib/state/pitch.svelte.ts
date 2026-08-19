@@ -65,6 +65,17 @@ export const takeState = $state({
 });
 
 /**
+ * Per-clip cache revision counter for persisted APTF pitch tracks.
+ * Bumped whenever an audio clip is (re)analyzed so downstream subscribers
+ * (such as PitchCoach) know to invalidate their cached score reports.
+ */
+export const pitchCacheRevision = $state<Record<string, number>>({});
+
+export function invalidatePitchCache(clipId: string): void {
+  pitchCacheRevision[clipId] = (pitchCacheRevision[clipId] ?? 0) + 1;
+}
+
+/**
  * The frames still in the ring, oldest first. Allocates a copy — call it
  * once per rAF frame, not once per drawn point.
  */
