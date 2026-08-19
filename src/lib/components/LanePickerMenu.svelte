@@ -43,6 +43,12 @@
         : plugins.instances.filter(
             (i) =>
               !!track && (i.trackId === track.id || track.instrumentId === `plugin:${i.id}`),
+          ).concat(
+            // Also include any plugin instances that are in the track's
+            // insert-FX slots so their params appear in the automation picker.
+            (track?.inserts ?? [])
+              .map((s) => plugins.byId(s.instanceId))
+              .filter((i): i is PluginInstanceInfo => i != null),
           );
     let cancelled = false;
     void Promise.all(

@@ -20,6 +20,7 @@
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
+  import InsertChain from "./plugins/InsertChain.svelte";
 
   let {
     track,
@@ -264,6 +265,12 @@
           </span>
         {/if}
       </div>
+
+      {#if !isAutomation && (track.kind === "audio" || track.kind === "midi")}
+        <div class="effects-row">
+          <InsertChain {track} />
+        </div>
+      {/if}
 
       {#if isAutomation}
         <section class="targets" aria-label="Automation targets for {track.name}">
@@ -650,7 +657,8 @@
   .identity-row,
   .metadata-row,
   .status-row,
-  .automation-row {
+  .automation-row,
+  .effects-row {
     display: flex;
     align-items: center;
     min-width: 0;
@@ -765,6 +773,16 @@
   }
   .automation-row .section-label {
     width: 62px;
+  }
+  .effects-row {
+    flex-direction: column;
+    align-items: stretch;
+    height: auto;
+    min-height: 0;
+    padding-left: 20px;
+    border-top: var(--border-width) solid rgb(var(--edge-rgb) / 0.08);
+    margin-top: 2px;
+    padding-top: 2px;
   }
   .level-area {
     flex: 1;

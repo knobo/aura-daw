@@ -175,6 +175,8 @@ export interface TrackState {
   color: string;
   /** Sampler instrument bound to this (midi) track — additive phase-2 field. */
   instrumentId?: string | null;
+  /** Ordered insert-FX slots (Plan G1). Empty on pre-G1 files. */
+  inserts?: InsertSlot[] | null;
   /** Lane group this track displays under, as the group's own NAME (the
    * group is its name — there is no separate group row to look up). Absent
    * or null = ungrouped. Display grouping only: it never affects routing,
@@ -1058,6 +1060,17 @@ export interface PluginListResult {
   plugins: PluginDescriptor[];
   instances: PluginInstanceInfo[];
   scanned: boolean;
+}
+
+/** One insert-FX slot on a track (Plan G1). Mirrors
+ * `audio::types::InsertSlot`. */
+export interface InsertSlot {
+  /** Slot identity, stable across the session. */
+  id: string;
+  /** The plugin instance hosted in this slot. */
+  instanceId: string;
+  /** True when the slot is bypassed (dsp skipped). */
+  bypassed: boolean;
 }
 
 // ── automation (plugins::automation) ────────────────────────────────────────

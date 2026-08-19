@@ -11,6 +11,7 @@
   import { launch } from "../state/launch.svelte";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
+  import { ui } from "../state/ui.svelte";
   import { prefs } from "../prefs/prefs.svelte";
   import { midiPreviewLayout } from "../utils/midi-preview";
   import { view } from "../state/view.svelte";
@@ -384,6 +385,7 @@
           >{usedLauncher ? `Using ${usedLauncher.name}…` : "Use launcher…"}</button
         >
         <button type="button" role="menuitem" onclick={() => void mapToNote()}>Map to MIDI note…</button>
+        <button type="button" role="menuitem" onclick={() => { menuOpen = false; ui.dock = "plugins"; }}>Add effect to track…</button>
       </div>
     {/if}
     {#if launcherOpen}

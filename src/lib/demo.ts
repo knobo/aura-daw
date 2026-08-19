@@ -52,6 +52,7 @@ import {
   type PluginDescriptor,
   type PluginInstanceInfo,
   type PluginListResult,
+  type InsertSlot,
   type PluginParamChange,
   type PluginParamInfo,
   type PitchFrame,
@@ -2642,9 +2643,6 @@ export class DemoBackend implements Backend {
     if (!this.pluginScanned) throw new Error("no plugin scan yet — call plugin_scan first");
     const desc = this.pluginDescriptors.find((d) => d.uid === uid);
     if (!desc) throw new Error(`unknown plugin uid: ${uid}`);
-    if (!desc.isInstrument) {
-      throw new Error(`${desc.name} is an effect; v1 hosts instruments on midi tracks only`);
-    }
     const info: PluginInstanceInfo = {
       id: uuid(),
       uid: desc.uid,
@@ -2704,6 +2702,58 @@ export class DemoBackend implements Backend {
       }, 160);
     }
     return params.map((p) => ({ ...p }));
+  }
+
+  // ── insert-FX slots (Plan G1) ──
+
+  private insertSlots = new Map<string, InsertSlot[]>();
+
+  async insertAdd(trackId: string, uid: string, index?: number): Promise<InsertSlot> {
+    const desc = this.pluginDescriptors.find((d) => d.uid === uid);
+    if (!desc) throw new Error(`unknown plugin uid: ${uid}`);
+    // Ensure the track's insert list exists
+    if (!this.insertSlots.has(trackId)) this.insertSlots.set(trackId, []);
+    const slots = [...(this.insertSlots.get(trackId) ?? [])];
+    // Instantiate the plugin instance (reuse the real instantiate path)
+    const inst = await this.pluginInstantiate(uid);
+    const slot: InsertSlot = { id: uuid(), instanceId: inst.id, bypassed: false };
+    const idx = index ?? slots.length;
+    slots.splice(idx, 0, slot);
+    this.insertSlots.set(trackId, slots);
+    return { ...slot };
+  }
+
+  async insertRemove(trackId: string, slotId: string): Promise<void> {
+    const slots = this.insertSlots.get(trackId);
+    if (!slots) return;
+    const slot = slots.find((s) => s.id === slotId);
+    if (!slot) return;
+    // Remove the plugin instance too
+    await this.pluginRemove(slot.instanceId).catch(() => {});
+    this.insertSlots.set(
+      trackId,
+      slots.filter((s) => s.id !== slotId),
+    );
+  }
+
+  async insertReorder(trackId: string, slotId: string, toIndex: number): Promise<void> {
+    const slots = this.insertSlots.get(trackId);
+    if (!slots) return;
+    const idx = slots.findIndex((s) => s.id === slotId);
+    if (idx < 0) return;
+    const copy = [...slots];
+    const [slot] = copy.splice(idx, 1);
+    copy.splice(Math.min(toIndex, copy.length), 0, slot);
+    this.insertSlots.set(trackId, copy);
+  }
+
+  async insertSetBypass(trackId: string, slotId: string, bypassed: boolean): Promise<void> {
+    const slots = this.insertSlots.get(trackId);
+    if (!slots) return;
+    this.insertSlots.set(
+      trackId,
+      slots.map((s) => (s.id === slotId ? { ...s, bypassed } : s)),
+    );
   }
 
   // ── phase 2: open-kind generation jobs ──
