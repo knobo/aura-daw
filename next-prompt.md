@@ -24,9 +24,8 @@ before picking G1 back up**:
 1. **Track D leftovers (automation)** — pick one, read the Track D handoff
    in `docs/PHASE4-PLAN.md` first: plugin-param automation is not applied
    in a bounce (`audio::offline::build_graph`'s documented divergence);
-   write/touch/latch automation modes (partially implemented on the current
-   feature branch for gain lanes on regular audio/MIDI tracks); recording
-   gestures into a **separate automation track**, routing that recording to
+   write/touch/latch automation modes for track gain lanes **landed in PR #85**;
+   recording gestures into a **separate automation track**, routing that recording to
    its selected targets, and an explicit Enabled/Bypass control for the
    automation-track source remain follow-up work. A later PR must also add
    external MIDI-controller mapping for automatable parameters, with both a
@@ -101,6 +100,10 @@ this file (marked correction, ADR 0007) if they do.
 
 | What | Pointer |
 |---|---|
+| **Write / Touch / Latch automation modes** — Off / Read / Write / Touch / Latch per track, real-time control-thread point recorder, single-op commit on stop/release with undo | PR #85 `d496903`. Design spec: [`2026-08-18-automation-write-touch-latch-design.md`](docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md). Plan: [`2026-08-18-automation-write-touch-latch.md`](docs/superpowers/plans/2026-08-18-automation-write-touch-latch.md) |
+| **MIDI output — per-track and per-clip patchbay routing** | PR #84 `cbbc240`. Handoff: [`midi-output.md`](docs/midi-output.md) |
+| **Undo / Version graph read-only browser** | PR #82 `b741251`. |
+| **DOM test environment (jsdom)** — mounted component tests for `AutomationTrackRow` | PR #80 `ca67b7d`. |
 | G1 Task 6 — PDC (`DelayLine` + `compile_pdc`) | PR #71 `9e0b884`. `RtTrack::pdc` is still `None` everywhere in production — wiring `compile_pdc`'s output into a graph rebuild is Task 7, not started. Code review before merge caught and fixed a real bug: the formula didn't handle a bypassed insert's latency correctly (would have jumped the mix on bypass toggle once Task 7 wired it in). Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
 | Clip Delete/Backspace after a plain pointer-click | PR #70 `7011e81`. Pointer-select never focused the clip element, so its own keydown handler never fired; a window-level fallback now reads `clipSelection` directly. Single-clip only — batch-deleting a multi-selection still needs a `clips_remove` transaction (Track C leftover, unchanged) |
 | G1 Task 5 — mixer strip: source-sum → inserts REPLACE → shared fader (`InsertNode`/`compile_inserts`) | PR #66 `c99293b`. `compile_inserts` is not yet wired into `engine::rebuild` (Task 7) — an insert still isn't audible end-to-end. Handoff: [`g1-insert-fx.md`](docs/handoff/g1-insert-fx.md) |
