@@ -5,8 +5,8 @@
    * bypass toggle, and a shortcuts popover.
    *
    * Pedagogic design: the chain reads left-to-right = signal flow, exactly
-   * like a guitar pedalboard. Empty state gently suggests what to do:
-   * "No effects — + to add reverb, EQ, compressor…"
+   * like a guitar pedalboard. Empty state is invisible — just the "+" button
+   * until you add something.
    */
   import type { InsertSlot, PluginInstanceInfo, TrackState } from "../../types/ipc";
   import { plugins } from "../../state/plugins.svelte";
@@ -22,12 +22,10 @@
   const insertSlots = $derived(track.inserts ?? []);
   const busy = $state<Record<string, boolean>>({});
 
-  /** Resolve each slot to its plugin instance info. */
   function slotInstance(slot: InsertSlot): PluginInstanceInfo | undefined {
     return plugins.byId(slot.instanceId);
   }
 
-  /** Pick an effect from the browser and add it as a new insert slot. */
   async function addEffect(uid: string) {
     const key = `add:${uid}`;
     busy[key] = true;
@@ -40,7 +38,6 @@
     }
   }
 
-  /** Toggle bypass on a slot. */
   async function toggleBypass(slot: InsertSlot) {
     busy[slot.id] = true;
     try {
@@ -52,7 +49,6 @@
     }
   }
 
-  /** Remove a slot and its plugin instance. */
   async function removeSlot(slot: InsertSlot) {
     busy[slot.id] = true;
     try {
@@ -64,12 +60,10 @@
     }
   }
 
-  /** Open the param panel for a slot's plugin instance. */
   function openParams(instanceId: string) {
     void openPluginParams(instanceId);
   }
 
-  /** Move a slot to a new index (drag-to-reorder). */
   async function moveSlot(slotId: string, toIndex: number) {
     try {
       await backend.insertReorder?.(track.id, slotId, toIndex);
@@ -78,7 +72,6 @@
     }
   }
 
-  // ── effect picker popup ──
   let pickerOpen = $state(false);
 
   const fxPlugins = $derived(
@@ -92,60 +85,46 @@
 <div class="chain">
   <div class="chainhead">
     <span class="label mono">Effects</span>
-    <span class="picker">
-      <button
-        class="addbtn mono"
-        title="Add an effect (reverb, EQ, compressor…)"
-        aria-label="Add effect to {track.name}"
-        onclick={() => (pickerOpen = !pickerOpen)}
-        disabled={plugins.scanning}
-      >
-        +{plugins.scanning ? " scan…" : ""}
-      </button>
-      {#if pickerOpen}
-        <div class="backdrop" role="presentation" onpointerdown={() => (pickerOpen = false)}></div>
-        <div class="fxpicker mono" role="menu" aria-label="Select an effect plugin">
-          {#if scanNeeded}
+    <button
+      class="addbtn mono"
+      title="Add an effect"
+      aria-label="Add effect to {track.name}"
+      onclick={() => (pickerOpen = !pickerOpen)}
+      disabled={plugins.scanning}
+    >
+      +{plugins.scanning ? " scan\u2026" : ""}
+    </button>
+    {#if pickerOpen}
+      <div class="backdrop" role="presentation" onpointerdown={() => (pickerOpen = false)}></div>
+      <div class="fxpicker mono" role="menu" aria-label="Select an effect plugin">
+        {#if scanNeeded}
+          <button class="scanbtn" role="menuitem" onclick={() => { void plugins.scan(); pickerOpen = false; }}>
+            Scan for plugins\u2026
+          </button>
+        {:else if !hasEffectsScanned}
+          <div class="empty-state silk">No effects found</div>
+        {:else}
+          {#each fxPlugins as desc (desc.uid)}
             <button
-              class="scanbtn"
+              class="fxitem"
               role="menuitem"
-              onclick={() => {
-                void plugins.scan();
-                pickerOpen = false;
-              }}
+              disabled={!!busy[`add:${desc.uid}`]}
+              onclick={() => { void addEffect(desc.uid); pickerOpen = false; }}
             >
-              Scan for plugins…
+              <span class="fbadge mono {desc.format}">{desc.format}</span>
+              <span class="fname">{desc.name}</span>
+              {#if desc.vendor}
+                <span class="fvendor silk">{desc.vendor}</span>
+              {/if}
             </button>
-          {:else if !hasEffectsScanned}
-            <div class="empty-state silk">No effects found — scan discovered no effect plugins</div>
-          {:else}
-            {#each fxPlugins as desc (desc.uid)}
-              <button
-                class="fxitem"
-                role="menuitem"
-                disabled={!!busy[`add:${desc.uid}`]}
-                onclick={() => {
-                  void addEffect(desc.uid);
-                  pickerOpen = false;
-                }}
-              >
-                <span class="fbadge mono {desc.format}">{desc.format}</span>
-                <span class="fname">{desc.name}</span>
-                {#if desc.vendor}
-                  <span class="fvendor silk">{desc.vendor}</span>
-                {/if}
-              </button>
-            {/each}
-          {/if}
-        </div>
-      {/if}
-    </span>
+          {/each}
+        {/if}
+      </div>
+    {/if}
   </div>
 
-  <div class="slots" role="list" aria-label="Effect chain">
-    {#if insertSlots.length === 0}
-      <span class="empty silk">+ add effect</span>
-    {:else}
+  {#if insertSlots.length > 0}
+    <div class="slots" role="list" aria-label="Effect chain">
       {#each insertSlots as slot (slot.id)}
         {@const inst = slotInstance(slot)}
         <div
@@ -158,7 +137,7 @@
             <button
               class="byp mono"
               class:on={!slot.bypassed}
-              title={slot.bypassed ? "Bypassed — click to enable" : "Active — click to bypass"}
+              title={slot.bypassed ? "Bypassed \u2014 click to enable" : "Active \u2014 click to bypass"}
               aria-pressed={!slot.bypassed}
               onclick={() => toggleBypass(slot)}
               disabled={!!busy[slot.id]}
@@ -185,42 +164,38 @@
               onclick={() => removeSlot(slot)}
               disabled={!!busy[slot.id]}
             >
-              ×
+              \u00d7
             </button>
           {:else}
-            <span class="unknown silk">unknown instance {slot.instanceId.slice(0, 8)}…</span>
-            <button
-              class="del mono"
-              title="Remove this stale slot"
-              onclick={() => removeSlot(slot)}
-            >
-              ×
+            <span class="unknown silk">{slot.instanceId.slice(0, 8)}\u2026</span>
+            <button class="del mono" title="Remove stale slot" onclick={() => removeSlot(slot)}>
+              \u00d7
             </button>
           {/if}
         </div>
       {/each}
-    {/if}
-  </div>
-
-  {#if insertSlots.length > 1}
-    <div class="reorder-row mono">
-      {#each insertSlots as slot, i (slot.id)}
-        {#if i > 0}
-          <button
-            class="reorderbtn"
-            title="Move {slotInstance(slot)?.name ?? 'effect'} earlier in chain"
-            onclick={() => moveSlot(slot.id, i - 1)}
-          >↑</button>
-        {/if}
-        {#if i < insertSlots.length - 1}
-          <button
-            class="reorderbtn"
-            title="Move {slotInstance(slot)?.name ?? 'effect'} later in chain"
-            onclick={() => moveSlot(slot.id, i + 1)}
-          >↓</button>
-        {/if}
-      {/each}
     </div>
+
+    {#if insertSlots.length > 1}
+      <div class="reorder-row mono">
+        {#each insertSlots as slot, i (slot.id)}
+          {#if i > 0}
+            <button
+              class="reorderbtn"
+              title="Move earlier"
+              onclick={() => moveSlot(slot.id, i - 1)}
+            >\u2191</button>
+          {/if}
+          {#if i < insertSlots.length - 1}
+            <button
+              class="reorderbtn"
+              title="Move later"
+              onclick={() => moveSlot(slot.id, i + 1)}
+            >\u2193</button>
+          {/if}
+        {/each}
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -229,28 +204,23 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-    padding: 1px 0;
+    padding: 0;
   }
   .chainhead {
     display: flex;
     align-items: center;
     gap: 6px;
-    min-height: 14px;
+    min-height: 16px;
   }
   .label {
     font-size: 8px;
     letter-spacing: 0.14em;
     text-transform: uppercase;
     color: var(--text-faint);
-    width: 62px;
-    flex: none;
-  }
-  .picker {
-    position: relative;
     flex: none;
   }
   .addbtn {
-    padding: 2px 8px;
+    padding: 1px 6px;
     border-radius: 3px;
     border: var(--border-width) dashed rgb(var(--edge-rgb) / 0.25);
     background: transparent;
@@ -340,12 +310,6 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
-  }
-  .empty {
-    font-size: 8px;
-    color: var(--text-faint);
-    padding: 1px 0;
-    cursor: default;
   }
 
   .slot {

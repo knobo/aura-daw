@@ -780,8 +780,8 @@
     height: auto;
     min-height: 0;
     padding-left: 20px;
-    padding-top: 1px;
-    padding-bottom: 1px;
+    padding-top: 0;
+    padding-bottom: 0;
   }
   .level-area {
     flex: 1;
