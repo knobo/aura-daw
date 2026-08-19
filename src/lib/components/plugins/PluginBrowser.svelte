@@ -2,8 +2,9 @@
   /**
    * Plugin browser: scan trigger (plugin_scan), discovered CLAP/LV2 list
    * with format badges, instantiation onto midi tracks (plugin_instantiate +
-   * set_track_instrument "plugin:<id>" refs), and the live-instance rack with
-   * stub/active/crashed status badges, rebinding, params and removal.
+   * set_track_instrument "plugin:<id>" refs), fuzzy search, and the
+   * live-instance rack with stub/active/crashed status badges, rebinding,
+   * params and removal.
    */
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
@@ -14,12 +15,31 @@
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   let instrumentsOnly = $state(true);
+  let searchQuery = $state("");
 
   const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
-  const shown = $derived(
-    instrumentsOnly ? plugins.descriptors.filter((d) => d.isInstrument) : plugins.descriptors,
+
+  /** All plugins matching the instrument/effect filter. */
+  const kindFiltered = $derived(
+    instrumentsOnly
+      ? plugins.descriptors.filter((d) => d.isInstrument)
+      : plugins.descriptors,
   );
-  const hiddenFx = $derived(plugins.descriptors.length - shown.length);
+
+  /** Fuzzy match: does the query appear in name, vendor, uid or any category? */
+  function fuzzy(d: PluginDescriptor, q: string): boolean {
+    if (!q) return true;
+    const lower = q.toLowerCase();
+    return (
+      d.name.toLowerCase().includes(lower) ||
+      (d.vendor ?? "").toLowerCase().includes(lower) ||
+      d.uid.toLowerCase().includes(lower) ||
+      (d.categories ?? []).some((c) => c.toLowerCase().includes(lower))
+    );
+  }
+
+  const shown = $derived(kindFiltered.filter((d) => fuzzy(d, searchQuery)));
+  const hiddenFx = $derived(plugins.descriptors.filter((d) => !d.isInstrument).length);
 
   function onInstantiate(desc: PluginDescriptor, e: Event) {
     const sel = e.currentTarget as HTMLSelectElement;
@@ -48,6 +68,16 @@
     <button class="scan mono" disabled={plugins.scanning} onclick={() => plugins.scan()}>
       {plugins.scanning ? "◌ SCANNING…" : plugins.scanned ? "↻ RESCAN" : "⌕ SCAN PLUGINS"}
     </button>
+  </div>
+
+  <div class="toolbar">
+    <input
+      class="search mono"
+      type="text"
+      placeholder="search plugins…"
+      bind:value={searchQuery}
+      aria-label="Search plugins by name, vendor or category"
+    />
     <label class="filter silk">
       <input type="checkbox" bind:checked={instrumentsOnly} />
       instruments
@@ -65,9 +95,9 @@
     <div class="empty silk">no scan yet — scan to discover installed clap / lv2 plugins</div>
   {:else if plugins.scanned && shown.length === 0}
     <div class="empty silk">
-      {plugins.descriptors.length === 0
+      {kindFiltered.length === 0
         ? "scan found no plugins on this machine"
-        : "no instruments found — untick the filter to see effects"}
+        : `no match for "${searchQuery}" — try a different search or untick the filter`}
     </div>
   {/if}
 
@@ -84,7 +114,11 @@
         <div class="row meta silk">
           <span class="vendor">{desc.vendor ?? "unknown vendor"}</span>
           {#if desc.version}<span>v{desc.version}</span>{/if}
-          {#if !desc.isInstrument}<span class="fxnote">fx — v1 hosts instruments only</span>{/if}
+          {#if !desc.isInstrument}
+            <span class="fxchip mono">effect</span>
+          {:else}
+            <span class="instchip-small mono">instrument</span>
+          {/if}
         </div>
         {#if desc.isInstrument}
           <div class="row">
@@ -154,7 +188,7 @@
   {/if}
 
   {#if midiTracks.length === 0}
-    <div class="hint silk">no midi tracks yet — add one with “+ midi” in the track rail</div>
+    <div class="hint silk">no midi tracks yet — add one with "+ midi" in the track rail</div>
   {/if}
 </div>
 
@@ -194,11 +228,36 @@
     opacity: 0.6;
     cursor: wait;
   }
+
+  .toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .search {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px;
+    border-radius: 5px;
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.7);
+    color: var(--text);
+    font-size: 11px;
+    outline: none;
+  }
+  .search:focus {
+    border-color: var(--cyan-dim);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.15);
+  }
+  .search::placeholder {
+    color: var(--text-faint);
+  }
   .filter {
     display: flex;
     align-items: center;
     gap: 5px;
     cursor: pointer;
+    flex: none;
   }
   .filter input {
     accent-color: var(--violet);
@@ -228,7 +287,7 @@
     gap: 6px;
   }
   .plug.fx {
-    opacity: 0.55;
+    opacity: 0.85;
   }
   .inst {
     border-color: rgb(var(--violet-rgb) / 0.22);
@@ -262,8 +321,25 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .fxnote {
-    color: var(--amber);
+  .fxchip {
+    color: var(--cyan);
+    font-size: 7px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: var(--border-width) solid rgb(var(--cyan-rgb) / 0.3);
+    background: rgb(var(--cyan-rgb) / 0.06);
+  }
+  .instchip-small {
+    color: var(--violet);
+    font-size: 7px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: var(--border-width) solid rgb(var(--violet-rgb) / 0.3);
+    background: rgb(var(--violet-rgb) / 0.06);
   }
   .busy {
     color: var(--cyan);
