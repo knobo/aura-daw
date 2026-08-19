@@ -254,6 +254,8 @@ pub fn start(
                 ensure_project_fn: None,
                 param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
                 param_writes: Vec::new(),
+                automation_modes: Vec::new(),
+                tempo_map: None,
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
                 external_routing: Arc::new(crate::midi_out::RoutedOut::default()),
@@ -1049,6 +1051,18 @@ struct Control {
     /// Reused scratch for `param_automation.tick` so the tick allocates
     /// nothing steady-state.
     param_writes: Vec<crate::plugins::automation::ParamWrite>,
+    /// Slot-indexed automation mode, refreshed every rebuild from
+    /// `store.tracks` — read every control-thread tick by
+    /// `drive_automation_recording` (Task 9) without touching the session
+    /// lock on the hot path, same shape as `param_automation`/gain ramps. An
+    /// out-of-range or unmapped slot reads as `Read` (today's behavior).
+    automation_modes: Vec<crate::audio::types::AutomationMode>,
+    /// This rebuild's `TempoMap`, cached from `compile_automation` — `None`
+    /// when there are no automation lanes/modulation to compile, or the
+    /// tempo map failed to build (`compile_automation`'s doc). Task 9 reads
+    /// this every tick to convert automation points without re-deriving the
+    /// map or touching the session lock.
+    tempo_map: Option<crate::midi::TempoMap>,
     /// The hardware MIDI-in seam. Held as an `Arc` rather than reached
     /// through `midi_in::hub()` at each call site so tests can drive the
     /// engine against their own hub; `start` binds the process-global one.
@@ -1672,7 +1686,7 @@ impl Control {
         // enumerated sites where a command swaps the document and
         // republishes a few statements later; there, live truth is what [C1]
         // requires and the image is momentarily behind it.
-        let (params, slots, track_ramps, param_driver, clicks) = {
+        let (params, slots, track_ramps, param_driver, tempo_map, automation_modes, clicks) = {
             let session = self.session.lock(); // read-only: param VALUES + slot map + automation compile — short, no assembly
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
@@ -1706,16 +1720,31 @@ impl Control {
             // tables (Task 6) — the meter fold resolves blocks under
             // whichever generation produced them, not the current tables.
             self.gen_maps.publish(self.generation, &slots);
-            let (track_ramps, param_driver) =
+            let (track_ramps, param_driver, tempo_map) =
                 self.compile_automation(&session, &slots, n_slots);
+            // Slot-indexed automation-mode cache (Task 8), same slot map
+            // and mixer-slot count as `params`/`track_ramps` above — an
+            // automation track (no slot) or a slot nothing currently maps
+            // to defaults to `Read`, matching `AutomationMode::default()`.
+            let automation_modes: Vec<crate::audio::types::AutomationMode> = (0..n_slots)
+                .map(|slot| {
+                    store
+                        .tracks
+                        .iter()
+                        .find(|t| slots.get(&t.id) == Some(&slot))
+                        .map_or(crate::audio::types::AutomationMode::Read, |t| t.automation_mode)
+                })
+                .collect();
             let clicks = compile_clicks(
                 &session,
                 self.cache_rate,
                 self.shared.song_end.load(Relaxed),
             );
-            (params, slots, track_ramps, param_driver, clicks)
+            (params, slots, track_ramps, param_driver, tempo_map, automation_modes, clicks)
         };
         self.param_automation = param_driver;
+        self.tempo_map = tempo_map;
+        self.automation_modes = automation_modes;
 
         let Some((slots_s, mut tracks)) = assembled else { return };
         // The rows were assembled against S's slot map; the tables just
@@ -1812,7 +1841,11 @@ impl Control {
         session: &Session,
         slots: &HashMap<crate::ids::TrackId, usize>,
         n_slots: usize,
-    ) -> (Vec<TrackRamps>, crate::plugins::automation::ParamAutomationDriver) {
+    ) -> (
+        Vec<TrackRamps>,
+        crate::plugins::automation::ParamAutomationDriver,
+        Option<crate::midi::TempoMap>,
+    ) {
         use crate::plugins::automation as auto;
         // The overwhelmingly common case, and every structural commit in the
         // suite goes through here: no lanes and no modulation, so no
@@ -1821,6 +1854,7 @@ impl Control {
             return (
                 (0..n_slots).map(|_| TrackRamps::default()).collect(),
                 auto::ParamAutomationDriver::empty(),
+                None,
             );
         }
         let map = crate::midi::TempoMap::new(
@@ -1833,6 +1867,7 @@ impl Control {
             return (
                 (0..n_slots).map(|_| TrackRamps::default()).collect(),
                 auto::ParamAutomationDriver::empty(),
+                None,
             );
         };
         let (ramps, param_specs) = compile_track_ramps(
@@ -1849,7 +1884,7 @@ impl Control {
         if !session.automation.lanes.is_empty() {
             driver.merge_uncovered_lanes(&session.automation.lanes, &session.plugins, &map);
         }
-        (ramps, driver)
+        (ramps, driver, Some(map))
     }
 
     /// Track D: apply plugin-parameter automation at this thread's own tick
@@ -3957,6 +3992,8 @@ mod tests {
             ensure_project_fn: None,
             param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
             param_writes: Vec::new(),
+            automation_modes: Vec::new(),
+            tempo_map: None,
             // Its OWN hub, never the process-global one: these tests would
             // otherwise race every other test that selects a routing target.
             live_in_hub: Arc::new(MidiInHub::new()),
@@ -4044,6 +4081,28 @@ mod tests {
         session.lock().automation.lanes.clear();
         ctl.rebuild();
         assert!(ctl.param_automation.is_empty());
+    }
+
+    /// Task 8: `automation_modes` is the slot-indexed cache Task 9 reads
+    /// every control-thread tick — a rebuild refreshes it from
+    /// `store.tracks`, same shape as `param_automation`/gain ramps.
+    #[test]
+    fn rebuild_caches_automation_mode_by_slot() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.automation_mode = AutomationMode::Off;
+            s.store.tracks.push(t);
+        }
+        ctl.rebuild();
+        assert_eq!(ctl.automation_modes, vec![AutomationMode::Off]);
+
+        // A later rebuild refreshes the cache wholesale, like every other
+        // rebuild-time table — it does not merely append or patch a slot.
+        session.lock().store.tracks[0].automation_mode = AutomationMode::Write;
+        ctl.rebuild();
+        assert_eq!(ctl.automation_modes, vec![AutomationMode::Write]);
     }
 
     /// Seed a hosted instance and a 0→1 lane on its param 7, spanning one
@@ -4412,7 +4471,7 @@ mod tests {
             s.automation.lanes.push(test_lane("l2", "track:ghost", 0));
             s.automation.lanes.push(test_lane("l3", "inst-1", 7));
         }
-        let (ramps, driver) = {
+        let (ramps, driver, _) = {
             let s = session.lock();
             let slots = derive_slots(&s.store.tracks);
             ctl.compile_automation(&s, &slots, s.store.tracks.len())
@@ -4431,7 +4490,7 @@ mod tests {
 
         // A failed tempo map compiles nothing, rather than something at rate 0.
         ctl.cache_rate = 0; // as if the tempo map failed to build
-        let (ramps, driver) = {
+        let (ramps, driver, _) = {
             let s = session.lock();
             let slots = derive_slots(&s.store.tracks);
             ctl.compile_automation(&s, &slots, s.store.tracks.len())
@@ -4508,7 +4567,7 @@ mod tests {
                 enabled: true,
             });
         }
-        let (_, mut driver) = {
+        let (_, mut driver, _) = {
             let s = session.lock();
             let slots = derive_slots(&s.store.tracks);
             ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
@@ -4591,7 +4650,7 @@ mod tests {
                 enabled: true,
             });
         }
-        let (ramps, _) = {
+        let (ramps, _, _) = {
             let s = session.lock();
             let slots = derive_slots(&s.store.tracks);
             ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))
@@ -4681,7 +4740,7 @@ mod tests {
                 enabled: true,
             });
         }
-        let (_, mut driver) = {
+        let (_, mut driver, _) = {
             let s = session.lock();
             let slots = derive_slots(&s.store.tracks);
             ctl.compile_automation(&s, &slots, mixer_slot_count(&s.store.tracks))

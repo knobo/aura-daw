@@ -273,6 +273,10 @@ impl ParamTable {
         }
     }
 
+    pub fn gain_linear(&self, slot: usize) -> f32 {
+        self.gain.get(slot).map_or(1.0, |g| f32::from_bits(g.load(Ordering::Relaxed)))
+    }
+
     pub fn set_pan(&self, slot: usize, pan: f32) {
         if slot < self.len() {
             self.pan[slot].store(pan.clamp(-1.0, 1.0).to_bits(), Ordering::Relaxed);
@@ -660,5 +664,18 @@ mod tests {
         // at 1, it never goes to 0.
         let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(0)));
         assert_eq!(g.meter_scratch.len(), 1);
+    }
+
+    #[test]
+    fn gain_linear_reads_back_what_set_gain_linear_wrote() {
+        let t = ParamTable::with_slots(4);
+        t.set_gain_linear(2, 0.5);
+        assert_eq!(t.gain_linear(2), 0.5);
+    }
+
+    #[test]
+    fn gain_linear_out_of_range_slot_returns_unity() {
+        let t = ParamTable::with_slots(2);
+        assert_eq!(t.gain_linear(99), 1.0);
     }
 }
