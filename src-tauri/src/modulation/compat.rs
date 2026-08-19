@@ -10,7 +10,7 @@ use crate::plugins::automation::{
 };
 
 use super::model::{
-    Binding, BindingMode, Curve, Domain, Range, RangeSnapshot, Source, TargetRef, TrackParam,
+    Binding, BindingMode, Curve, Domain, RangeSnapshot, Source, TargetRef, TrackParam,
 };
 use super::ModulationDoc;
 
@@ -196,6 +196,7 @@ fn normalize_incoming_points(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modulation::model::Range;
 
     fn gain_binding(id: &str, curve_id: &str, track_id: &str) -> Binding {
         Binding {
