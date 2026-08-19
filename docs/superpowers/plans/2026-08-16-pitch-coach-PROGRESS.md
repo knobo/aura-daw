@@ -17,11 +17,11 @@ documentation and all commits are English.
 
 | | |
 |---|---|
-| On `main` | PR #49 `84b0313` (phase 1) + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
+| On `main` | **Phase 1**: PR #49 `84b0313` + PR #54 (off-RT split, listen mid-take, `pitch_check`) |
 | On `main` | **Phase 2**: PR #58 `7c3cb87` (panel, frame bus, lane geometry, prefs, `pitch_unsubscribe`) |
-| Worktrees | stale — `pitch-coach`, `pitch-rt`, `pitch-phase2`. Keep the BRANCHES: this file cites their per-commit SHAs |
-| **In flight** | **Phase 3** on branch `feat/pitch-coach-scoring`, worktree `.claude/worktrees/pitch-phase3`, branched from `origin/main` `cf224ce`. Pushed; **PR #61** |
-| Next | Tasks 12–16 done, reviewed, pushed. What is left is the owner's: the ear-check against the real engine, and merging PR #61 |
+| On `main` | **Phase 3**: PR #61 `c14916d` (per-note scoring, stored pitch curve, take report) |
+| On `main` | **Clip View Action**: PR #87 `25af6ae` (explicit pitch analysis action on audio clips, APTF rebuild + PitchCoach report cache invalidation) |
+| Next | Pitch as data / sing-along (`docs/backlog/pitch-as-data.md`): melody extraction from audio clip → MIDI clip, or offline pitch correction (`docs/backlog/pitch-correction-autotune.md`) |
 
 ## Status
 
