@@ -12,6 +12,7 @@
   import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
   import { lanes } from "../state/lanes.svelte";
+  import { midiIo } from "../state/midiio.svelte";
   import { formatDb } from "../utils/format";
   import { groupOf } from "../utils/lane-layout";
   import { focusAndSelect } from "../utils/focusAndSelect";
@@ -323,6 +324,16 @@
     {:else}
     <div class="row mid">
       <div class="toggles">
+        {#if track.kind === "midi"}
+          <label class="midiout-check mono" title="Publiser som egen MIDI-utgang i Carla/ALSA patchbay">
+            <input
+              type="checkbox"
+              checked={midiIo.isVirtualTrack(track.id)}
+              onchange={(e) => void midiIo.setTrackVirtualOutput(track.id, e.currentTarget.checked)}
+            />
+            OUT
+          </label>
+        {/if}
         <button
           class="tog arm"
           class:on={track.armed}
@@ -738,6 +749,21 @@
     border-color: var(--cyan);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.4);
   }
+  .midiout-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 9px;
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .midiout-check input {
+    width: 11px;
+    height: 11px;
+    margin: 0;
+    accent-color: var(--cyan);
+  }
+
   .tog.auto.on {
     color: var(--bg-0);
     background: var(--magenta);

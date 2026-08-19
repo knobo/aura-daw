@@ -433,6 +433,8 @@ export interface Backend {
   /** Route one MIDI clip's notes, overriding its track's route, or
    * `portId: null` to fall back to the track's routing. */
   midiSetClipRoute?(clipId: string, portId: string | null, channel?: number | null): Promise<void>;
+  midiSetTrackVirtualOutput?(trackId: string, enabled: boolean): Promise<void>;
+  midiSetClipVirtualOutput?(clipId: string, enabled: boolean): Promise<void>;
   midiOutputStatus?(): Promise<MidiOutputStatus>;
 
   // ── MIDI launch map (note → region/clip) ──
@@ -981,6 +983,12 @@ class TauriBackend implements Backend {
   }
   async midiSetClipRoute(clipId: string, portId: string | null, channel?: number | null) {
     await invoke("midi_set_clip_route", { clipId, portId, channel: channel ?? null });
+  }
+  async midiSetTrackVirtualOutput(trackId: string, enabled: boolean) {
+    await invoke("midi_set_track_virtual_output", { trackId, enabled });
+  }
+  async midiSetClipVirtualOutput(clipId: string, enabled: boolean) {
+    await invoke("midi_set_clip_virtual_output", { clipId, enabled });
   }
   midiOutputStatus() {
     return invoke<MidiOutputStatus>("midi_output_status");

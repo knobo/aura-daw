@@ -331,6 +331,18 @@
       <span class="tag mono" style:left="{visL + 4}px">▦ {clip.name}</span>
     {/if}
     {#if selected}
+      <label
+        class="clip-midiout mono"
+        title="Publiser dette clip-et som egen MIDI-utgang i Carla/ALSA patchbay"
+        onpointerdown={(e) => e.stopPropagation()}
+      >
+        <input
+          type="checkbox"
+          checked={midiIo.isVirtualClip(clip.id)}
+          onchange={(e) => void midiIo.setClipVirtualOutput(clip.id, e.currentTarget.checked)}
+        />
+        OUT
+      </label>
       <button
         class="use-launch mono"
         type="button"
@@ -421,6 +433,17 @@
 {/if}
 
 <style>
+  .clip-midiout {
+    position: absolute;
+    right: 54px;
+    top: 3px;
+    z-index: 4;
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    font-size: 9px;
+    color: var(--text);
+  }
   .mclip {
     position: absolute;
     top: 6px;

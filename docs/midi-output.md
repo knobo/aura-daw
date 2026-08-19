@@ -150,6 +150,16 @@ its track is routed to. A clip's own routing always wins: the track's route
 skips that clip's notes so they are never sent twice. Choosing "Inherit
 from track" clears the override.
 
+### Separate patchbay ports for Carla
+
+On a MIDI track, tick **OUT** in the track header to publish a dedicated
+ALSA-seq source named `AURA · Track · <track name>`. Select a MIDI clip and
+tick its **OUT** checkbox to publish only that clip as
+`AURA · Clip · <clip name>`. Each checked item is an independent port in
+Carla's patchbay and can be wired to a different synth. Unticking it removes
+the port. A clip output still overrides its track output, so notes are not
+sent twice.
+
 ### Routing persists per machine, per project
 
 Which ports are open, each port's clock setting, and the current

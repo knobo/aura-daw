@@ -2273,6 +2273,46 @@ impl ControlPlane {
         Ok(())
     }
 
+    pub fn set_midi_track_virtual_output(
+        &self,
+        track_id: String,
+        enabled: bool,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let name = {
+            let session = self.session.lock();
+            let track = session.store.tracks.iter().find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            if track.kind != "midi" {
+                return Err(format!("track {track_id} is not a MIDI track"));
+            }
+            track.name.clone()
+        };
+        log::info!("set_midi_track_virtual_output: actor={:?} label={:?} track={track_id} enabled={enabled}", meta.actor, meta.label);
+        let out = self.midi_out()?;
+        out.set_virtual_route(crate::midi_out::RouteScope::Track(track_id), &name, enabled)?;
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
+    }
+
+    pub fn set_midi_clip_virtual_output(
+        &self,
+        clip_id: String,
+        enabled: bool,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let name = {
+            let session = self.session.lock();
+            session.midi.clips.iter().find(|c| c.id.as_str() == clip_id)
+                .ok_or_else(|| format!("unknown midi clip: {clip_id}"))?.name.clone()
+        };
+        log::info!("set_midi_clip_virtual_output: actor={:?} label={:?} clip={clip_id} enabled={enabled}", meta.actor, meta.label);
+        let out = self.midi_out()?;
+        out.set_virtual_route(crate::midi_out::RouteScope::Clip(clip_id), &name, enabled)?;
+        out.persist(self.current_project_dir().as_deref());
+        Ok(())
+    }
+
     // ---- structure ------------------------------------------------------
 
     /// Create a track and insert it through the transaction channel
@@ -2667,7 +2707,7 @@ impl ControlPlane {
     /// `MidiOut` is attached (every unit test's `ControlPlane` by default).
     pub fn clear_midi_route_for_clip(&self, clip_id: &str) {
         if let Some(out) = self.midi_out.get() {
-            out.set_route(crate::midi_out::RouteScope::Clip(clip_id.to_string()), None);
+            out.clear_route_for_clip(clip_id);
             out.persist(self.current_project_dir().as_deref());
         }
     }

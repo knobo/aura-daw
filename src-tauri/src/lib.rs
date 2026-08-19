@@ -285,6 +285,8 @@ pub fn run() {
             midi_out::midi_set_track_route,
             midi_out::midi_set_track_return,
             midi_out::midi_set_clip_route,
+            midi_out::midi_set_track_virtual_output,
+            midi_out::midi_set_clip_virtual_output,
             // ---- MIDI launch map (note → region/clip) ----
             midi::launch::launch_get,
             midi::launch::launch_set,
