@@ -11,6 +11,8 @@ import {
   resetPitchBus,
   pitchMode,
   RING_CAPACITY,
+  pitchCacheRevision,
+  invalidatePitchCache,
 } from "./pitch.svelte";
 import type { PitchFrame } from "../types/ipc";
 
@@ -107,5 +109,15 @@ describe("pitch frame bus", () => {
     expect(latestVoiced()).toBeNull();
     expect(pitchMode.listening).toBe(false);
     expect(pitchMode.rehearseHold).toBe(false);
+  });
+
+  it("invalidatePitchCache increments revision per clip", () => {
+    expect(pitchCacheRevision["clip-1"]).toBeUndefined();
+    invalidatePitchCache("clip-1");
+    expect(pitchCacheRevision["clip-1"]).toBe(1);
+    invalidatePitchCache("clip-1");
+    expect(pitchCacheRevision["clip-1"]).toBe(2);
+    invalidatePitchCache("clip-2");
+    expect(pitchCacheRevision["clip-2"]).toBe(1);
   });
 });

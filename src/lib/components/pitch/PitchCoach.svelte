@@ -34,6 +34,7 @@
     startPitchStream,
     stopPitchStream,
     takeState,
+    pitchCacheRevision,
   } from "../../state/pitch.svelte";
   import { autoFitRange, bandFor, centsToTarget, trailSegments, yOfKey, type LaneRange } from "../../pitch/lane";
   import { laneWindowFor, stabilityCents, targetNotesFor } from "./panel-logic";
@@ -149,7 +150,7 @@
   });
 
   /**
-   * Refetch whenever the take, the melody or the tolerance changes.
+   * Refetch whenever the take, the melody, the tolerance or the clip's pitch cache changes.
    *
    * Recomputed rather than cached on purpose (spec): a score is a function
    * of a melody that is still being edited, so a stored report would quietly
@@ -161,6 +162,8 @@
     const clip = takeClipId;
     const ref = referenceId;
     const tol = tolerance;
+    const rev = clip ? (pitchCacheRevision[clip] ?? 0) : 0;
+    void rev;
     if (!clip || !ref) {
       report = null;
       scoreError = null;

@@ -18,6 +18,7 @@
   import { toasts } from "../state/toasts.svelte";
   import { backend } from "../tauri";
   import { analyzePitchTrack, type PitchAnalysisState } from "../pitch/analyze";
+  import { invalidatePitchCache } from "../state/pitch.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildPeakColumns } from "../render/tiles";
   import { createPainter, hexToRgba, type WaveformPainter } from "../render/painter";
@@ -36,12 +37,24 @@
   const selected = $derived(clipSelection.has({ kind: "audio", id: clip.id }));
   const job = $derived(jobs.jobForClip(clip.id));
   let pitchAnalysis = $state<PitchAnalysisState>({ phase: "idle" });
+  let analysisGeneration = 0;
+
+  $effect(() => {
+    void clip.id;
+    return () => {
+      // Invalidate in-flight analysis callbacks when this view unmounts or changes clip
+      analysisGeneration++;
+    };
+  });
 
   async function analyzePitch() {
     if (pitchAnalysis.phase === "analyzing") return;
+    const gen = ++analysisGeneration;
     await analyzePitchTrack(clip.id, (id) => backend.pitchAnalyzeClip(id), (state) => {
+      if (gen !== analysisGeneration) return;
       pitchAnalysis = state;
       if (state.phase === "done") {
+        invalidatePitchCache(clip.id);
         toasts.success("PITCH TRACK READY", `${clip.name}: ${state.frames} analysis frames cached`);
       } else if (state.phase === "error") {
         toasts.error("PITCH ANALYSIS FAILED", state.message);
