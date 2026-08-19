@@ -617,7 +617,9 @@ class TauriBackend implements Backend {
     await invoke("set_track_arm", { trackId, armed });
   }
   async setTrackAutomationMode(trackId: string, mode: AutomationMode) {
-    await invoke("set_track_automation_mode", { trackId, mode });
+    await invoke<TrackState[]>("set_track_mix", {
+      changes: [{ trackId, automationMode: mode }],
+    });
   }
   setTrackName(trackId: string, name: string) {
     return invoke<TrackState>("set_track_name", { trackId, name });

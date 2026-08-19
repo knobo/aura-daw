@@ -529,10 +529,14 @@ fn render_impl(
         // Track D: this snapshot's compiled gain automation for the slot.
         // RT-safe: a slice read + an index walk, no allocation, no locks.
         let ramps = track_ramps.get(tr.slot);
-        let ramp: &[AbsParamEvent] = ramps
-            .and_then(|t| t.gain.as_ref())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
+        let ramp: &[AbsParamEvent] = if params.gain_automation_owner(tr.slot).is_some() {
+            &[]
+        } else {
+            ramps
+                .and_then(|t| t.gain.as_ref())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+        };
         let mut clip_ramp = RampCursor::new();
 
         let pan_gains_quad = pan_gain_quad(
@@ -682,10 +686,14 @@ pub fn render_live_input_only(
         let mut acc = TrackAccum::default();
 
         let ramps = track_ramps.get(tr.slot);
-        let ramp: &[AbsParamEvent] = ramps
-            .and_then(|t| t.gain.as_ref())
-            .map(|a| a.as_slice())
-            .unwrap_or(&[]);
+        let ramp: &[AbsParamEvent] = if params.gain_automation_owner(tr.slot).is_some() {
+            &[]
+        } else {
+            ramps
+                .and_then(|t| t.gain.as_ref())
+                .map(|a| a.as_slice())
+                .unwrap_or(&[])
+        };
         let mut clip_ramp = RampCursor::new();
         let pan_gains_quad = pan_gain_quad(
             ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
@@ -1571,6 +1579,31 @@ mod tests {
                 "sample {i}: got {} want {want}",
                 frame[0]
             );
+        }
+    }
+
+    #[test]
+    fn live_automation_ownership_bypasses_the_compiled_gain_ramp() {
+        use crate::plugins::automation::AbsParamEvent;
+        let data = Arc::new(RtClipData { channels: 1, data: vec![1.0; 64] });
+        let clip = RtClip {
+            start: 0, offset: 0, len: 64, gain: 1.0,
+            fade_in: 0, fade_out: 0, samples: data,
+        };
+        let params = Arc::new(ParamTable::with_slots(1));
+        params.set_gain_linear(0, 0.5);
+        params.set_pan(0, -1.0);
+        params.set_gain_automation_owner(0, Some(7));
+        let mut graph = RtGraph::new(vec![RtTrack::clips(0, vec![clip])], 1, params);
+        graph.set_gain_ramps(vec![Some(Arc::new(vec![
+            AbsParamEvent { sample: 0, value: 0.25 },
+            AbsParamEvent { sample: 64, value: 0.25 },
+        ]))]);
+
+        let mut out = vec![0.0f32; 64 * 2];
+        render(&mut graph, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        for frame in out.chunks_exact(2) {
+            assert!((frame[0] - 0.5).abs() < 1e-6, "live fader must be audible exactly once");
         }
     }
 

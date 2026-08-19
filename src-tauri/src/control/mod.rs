@@ -976,7 +976,7 @@ pub(crate) mod testutil {
             to: serde_json::json!(0.0),
         };
         let key = CoalesceKey::for_op(&op).expect("a gain Set folds by key");
-        let _stale = gesture.begin("test fader drag".into(), op::Actor::User);
+        let _stale = gesture.begin("test fader drag".into(), op::Actor::User, 0);
         gesture
             .0
             .lock()
@@ -1185,6 +1185,8 @@ struct OpenGesture {
     /// are live side-channel writes, deliberately absent from `last`: the
     /// persisted base fader must not move while automation is recorded.
     live_gain_tracks: Vec<String>,
+    /// Automation pass active when the gesture opened.
+    automation_pass: u64,
     /// Union of the persist effects of every commit folded into this
     /// gesture, executed ONCE at `close_gesture` (I-8). Deferring is what
     /// turns "one project.json write per rAF batch" into "one per drag".
@@ -1252,15 +1254,20 @@ impl GestureState {
     /// Consumed by the automation recorder (Touch/Latch) on the ENGINE
     /// CONTROL THREAD, which is why this exists at all: that thread holds a
     /// clone of the same `Arc<GestureState>` `ControlPlane` does.
-    pub fn is_track_gain_touched(&self, track_id: &str) -> bool {
+    pub fn track_gain_touch_pass(&self, track_id: &str) -> Option<u64> {
         let guard = self.0.lock();
-        let Some(g) = guard.as_ref() else { return false };
-        g.live_gain_tracks.iter().any(|id| id == track_id)
+        let g = guard.as_ref()?;
+        let touched = g.live_gain_tracks.iter().any(|id| id == track_id)
             || g.last.iter().any(|(key, _)| {
                 key.kind == "set"
                     && key.path == Some(op::PropPath::Gain)
                     && matches!(&key.target, CoalesceTarget::Object(op::ObjectRef::Track(id)) if id.as_str() == track_id)
-            })
+            });
+        touched.then_some(g.automation_pass)
+    }
+
+    pub fn is_track_gain_touched(&self, track_id: &str) -> bool {
+        self.track_gain_touch_pass(track_id).is_some()
     }
 
     /// Run live automation-control writes while the matching gesture mutex
@@ -1269,13 +1276,13 @@ impl GestureState {
     /// value has landed. Returns false when there is no matching gesture.
     fn control_live_track_gains<F>(&self, actor: &op::Actor, track_ids: &[String], f: F) -> bool
     where
-        F: FnOnce(),
+        F: FnOnce(u64),
     {
         let mut guard = self.0.lock();
         let Some(g) = guard.as_mut().filter(|g| &g.actor == actor) else {
             return false;
         };
-        f();
+        f(g.automation_pass);
         for id in track_ids {
             if !g.live_gain_tracks.contains(id) {
                 g.live_gain_tracks.push(id.clone());
@@ -1288,7 +1295,7 @@ impl GestureState {
     /// and handed back to the caller to finish committing — `GestureState`
     /// has no `ControlPlane` handle of its own to synthesize/emit the
     /// auto-closed batch.
-    fn begin(&self, label: String, actor: op::Actor) -> (String, Option<OpenGesture>) {
+    fn begin(&self, label: String, actor: op::Actor, automation_pass: u64) -> (String, Option<OpenGesture>) {
         let mut guard = self.0.lock();
         let stale = guard.take();
         let run = uuid::Uuid::new_v4().to_string();
@@ -1299,6 +1306,7 @@ impl GestureState {
             last: Vec::new(),
             label,
             live_gain_tracks: Vec::new(),
+            automation_pass,
             persist: session::PersistEffect::default(),
             epoch: 0,
         });
@@ -1935,6 +1943,13 @@ impl ControlPlane {
                     self.engine
                         .request::<Vec<Clip>>(|reply| ControlMsg::StopRecording { reply })?;
                 }
+                // Freeze transport first, then capture the automation boundary.
+                // A repeated Stop therefore carries `active_pass = false` and
+                // cannot mint a Write point or undo entry.
+                let automation_active = self.shared.playing.swap(false, Relaxed);
+                let automation_stop_at = self.shared.position.load(Relaxed);
+                let stopped_pass = automation_active
+                    .then(|| crate::audio::rt::advance_automation_pass(&self.shared.automation_pass));
                 let meta = op::TxMeta::user("transport stop").transient();
                 self.commit_with(
                     meta,
@@ -1948,8 +1963,11 @@ impl ControlPlane {
                     },
                     false,
                 )?;
-                self.engine.send(ControlMsg::FinishAutomationStop);
-                self.shared.playing.store(false, Relaxed);
+                self.engine.send(ControlMsg::FinishAutomationStop {
+                    at: automation_stop_at,
+                    active_pass: automation_active,
+                    stopped_pass,
+                });
                 self.clear_launch_audible();
             }
             TransportAction::Seek { position_samples } => {
@@ -2891,7 +2909,7 @@ impl ControlPlane {
         };
         let live_ids: Vec<String> = recording_gains.iter().map(|(id, _)| id.clone()).collect();
         let live_controlled = !recording_gains.is_empty()
-            && self.gesture.control_live_track_gains(&meta.actor, &live_ids, || {
+            && self.gesture.control_live_track_gains(&meta.actor, &live_ids, |automation_pass| {
                 let tables = self.tables.lock();
                 for (track_id, gain_db) in &recording_gains {
                     if let Some(&slot) = tables.slots.get(track_id.as_str()) {
@@ -2899,6 +2917,7 @@ impl ControlPlane {
                             slot,
                             crate::audio::mixer::db_to_linear(*gain_db),
                         );
+                        tables.params.set_gain_automation_owner(slot, Some(automation_pass));
                     }
                 }
             });
@@ -3739,7 +3758,7 @@ impl ControlPlane {
     /// shut for good. Always `Actor::User` — gestures are a frontend-only
     /// concept today; no MCP tool opens one.
     pub fn gesture_begin(&self, label: String) -> Result<String, String> {
-        let (id, stale) = self.gesture.begin(label, op::Actor::User);
+        let (id, stale) = self.gesture.begin(label, op::Actor::User, self.shared.automation_pass.load(Relaxed));
         if let Some(stale) = stale {
             self.close_gesture(stale);
         }
@@ -3820,6 +3839,8 @@ impl ControlPlane {
         let gesture_persist = gesture.persist;
         let gesture_epoch = gesture.epoch;
         if !gesture.live_gain_tracks.is_empty() {
+            let release_sample = self.shared.position.load(Relaxed);
+            let automation_pass = gesture.automation_pass;
             let final_values = {
                 let tables = self.tables.lock();
                 gesture
@@ -3829,7 +3850,12 @@ impl ControlPlane {
                         let &slot = tables.slots.get(track_id.as_str())?;
                         let (live, base) = tables.params.gain_pair_linear(slot);
                         let multiplier = crate::audio::rt::relative_gain_multiplier(live, base);
-                        Some((track_id.clone(), multiplier))
+                        Some(crate::audio::engine::AutomationTouchEndpoint {
+                            track_id: track_id.clone(),
+                            value: multiplier,
+                            sample: release_sample,
+                            pass: automation_pass,
+                        })
                     })
                     .collect()
             };
@@ -6610,6 +6636,29 @@ mod tests {
     // ---- Plan E Task 14: gesture IPC ---------------------------------------
 
     #[test]
+    fn transport_stop_freezes_playing_before_capturing_the_automation_boundary() {
+        let (plane, engine_rx, _events) = test_plane_with_tracks(&["t-1"]);
+        plane.shared.position.store(1_234, Relaxed);
+        plane.shared.playing.store(true, Relaxed);
+        plane.transport(TransportAction::Stop).unwrap();
+        assert!(!plane.shared.playing.load(Relaxed));
+        assert_eq!(plane.shared.automation_pass.load(Relaxed), 1, "pass rotates before Stop returns");
+        let first = engine_rx.try_iter().find_map(|msg| match msg {
+            ControlMsg::FinishAutomationStop { at, active_pass, .. } => Some((at, active_pass)),
+            _ => None,
+        }).expect("active Stop boundary");
+        assert_eq!(first, (1_234, true));
+
+        plane.shared.position.store(2_468, Relaxed);
+        plane.transport(TransportAction::Stop).unwrap();
+        let repeated = engine_rx.try_iter().find_map(|msg| match msg {
+            ControlMsg::FinishAutomationStop { at, active_pass, .. } => Some((at, active_pass)),
+            _ => None,
+        }).expect("repeated Stop boundary");
+        assert_eq!(repeated, (2_468, false));
+    }
+
+    #[test]
     fn recording_mode_gain_gesture_controls_live_gain_without_moving_the_base_fader() {
         let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
         {
@@ -6630,6 +6679,8 @@ mod tests {
             .params
             .set_base_gain_linear(slot, crate::audio::mixer::db_to_linear(-12.0));
         plane.shared.playing.store(true, Relaxed);
+        plane.shared.position.store(1_234, Relaxed);
+        plane.shared.automation_pass.store(7, Relaxed);
 
         plane.gesture_begin("gain drag".into()).unwrap();
         plane
@@ -6662,9 +6713,11 @@ mod tests {
             })
             .collect();
         assert_eq!(touch_finishes.len(), 1);
-        assert_eq!(touch_finishes[0][0].0, "t-1");
+        assert_eq!(touch_finishes[0][0].track_id, "t-1");
+        assert_eq!(touch_finishes[0][0].sample, 1_234);
+        assert_eq!(touch_finishes[0][0].pass, 7);
         assert!(
-            (touch_finishes[0][0].1 - crate::audio::mixer::db_to_linear(6.0)).abs() < 1e-5,
+            (touch_finishes[0][0].value - crate::audio::mixer::db_to_linear(6.0)).abs() < 1e-5,
             "-12 dB base to -6 dB live is a ~2x multiplier"
         );
         assert!(plane.take_last_gesture_batch().is_none());

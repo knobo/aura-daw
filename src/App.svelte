@@ -58,11 +58,18 @@
   onMount(() => {
     let automationRefresh: Promise<unknown> = Promise.resolve();
     const stopAutomationChanged = backend.on("automation://changed", ({ trackId }) => {
-      automationRefresh = automationRefresh.then(async () => {
-        await Promise.all([automation.reload(), modulation.reload()]);
-        const gain = modulation.bindingsFor({ kind: "trackParam", trackId, param: "gain" })[0];
-        if (gain) modulation.show(trackId, gain.id);
-      });
+      automationRefresh = automationRefresh
+        .then(async () => {
+          await Promise.all([automation.reload(), modulation.reload()]);
+          const gain = modulation.bindingsFor({ kind: "trackParam", trackId, param: "gain" })[0];
+          if (gain) modulation.show(trackId, gain.id);
+        })
+        .catch((error) => console.warn("[aura] automation refresh failed", error));
+    });
+    const stopAutomationHistoryChanged = backend.on("project://changed", () => {
+      automationRefresh = automationRefresh
+        .then(() => Promise.all([automation.reload(), modulation.reload()]))
+        .catch((error) => console.warn("[aura] automation refresh failed", error));
     });
     prefs.init(); // restore persisted preferences before anything paints or boots
     theme.bootstrap(prefs.values.theme); // paint the right colours on frame one
@@ -92,6 +99,7 @@
       stopMeterStream();
       generation.dispose();
       stopAutomationChanged();
+      stopAutomationHistoryChanged();
     };
   });
 

@@ -30,10 +30,9 @@ before picking G1 back up**:
    its selected targets, and an explicit Enabled/Bypass control for the
    automation-track source remain follow-up work. A later PR must also add
    external MIDI-controller mapping for automatable parameters, with both a
-   MIDI Learn workflow and manual Set Value/mapping configuration; no DOM test
-   environment
-   (nothing inside a `.svelte` file is covered by any test — both of
-   Track D's real bugs lived there). (The non-blocking CLAP param path is
+   MIDI Learn workflow and manual Set Value/mapping configuration. The DOM
+   test environment landed in PR #80 and this feature has component coverage.
+   (The non-blocking CLAP param path is
    closed, branch `clap-nonblocking-params` — see the Track D handoff.)
 2. **Plan F carry-forwards (undo)** — read the Plan F handoff in
    `docs/PHASE4-PLAN.md` first, and do not touch `engine::rebuild`, the

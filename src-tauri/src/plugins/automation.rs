@@ -966,6 +966,10 @@ impl AutomationRecorder {
     /// Snapshot a pass for an atomic commit attempt without consuming it.
     /// `finish` is called only after the transaction succeeds; ordinary
     /// commit errors therefore leave the points available for retry.
+    pub fn is_latch_armed(&self, track_id: &str) -> bool {
+        self.latch_armed.get(track_id).copied().unwrap_or(false)
+    }
+
     pub fn pending(&self, track_id: &str) -> Option<Vec<AutomationPoint>> {
         self.in_progress.get(track_id).filter(|p| !p.is_empty()).cloned()
     }

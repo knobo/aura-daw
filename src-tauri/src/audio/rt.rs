@@ -25,6 +25,26 @@ pub const FLAG_SOLO: u32 = 1 << 1;
 /// Track is a live launch target — mixer must hear it even if another
 /// track is soloed or this one is muted.
 pub const FLAG_LAUNCH: u32 = 1 << 2;
+/// A live Write/Touch/Latch controller owns track gain. While set, the
+/// mixer bypasses the compiled gain lane so the fader value is heard
+/// exactly once (the lane remains a relative multiplier when read back).
+pub const NO_GAIN_AUTOMATION_OWNER: u64 = u64::MAX;
+
+#[inline]
+pub fn advance_automation_pass(pass: &AtomicU64) -> u64 {
+    loop {
+        let observed = pass.load(Ordering::Acquire);
+        let current = if observed == NO_GAIN_AUTOMATION_OWNER { 0 } else { observed };
+        let incremented = current.wrapping_add(1);
+        let next = if incremented == NO_GAIN_AUTOMATION_OWNER { 0 } else { incremented };
+        if pass
+            .compare_exchange_weak(observed, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return current;
+        }
+    }
+}
 
 /// Relative automation value for a coherent live/base gain snapshot. Every
 /// finite positive base is meaningful, including subnormal values; only zero
@@ -57,6 +77,8 @@ pub struct SharedRt {
     pub position: AtomicU64,
     pub playing: AtomicBool,
     pub recording: AtomicBool,
+    /// Monotonic automation-pass identity carried by gesture endpoints.
+    pub automation_pass: AtomicU64,
     /// Actual engine/stream sample rate.
     pub sample_rate: AtomicU32,
     pub loop_enabled: AtomicBool,
@@ -145,6 +167,7 @@ impl Default for SharedRt {
             position: AtomicU64::new(0),
             playing: AtomicBool::new(false),
             recording: AtomicBool::new(false),
+            automation_pass: AtomicU64::new(0),
             sample_rate: AtomicU32::new(48_000),
             loop_enabled: AtomicBool::new(false),
             loop_start: AtomicU64::new(0),
@@ -243,6 +266,7 @@ pub struct ParamTable {
     pub base_gain: Vec<AtomicU32>,
     /// Even = stable; odd = a live/base writer is in progress.
     gain_seq: Vec<AtomicU32>,
+    gain_automation_owner: Vec<AtomicU64>,
     pub pan: Vec<AtomicU32>,
     pub flags: Vec<AtomicU32>,
     pub any_solo: AtomicBool,
@@ -267,6 +291,9 @@ impl ParamTable {
             gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
             base_gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
             gain_seq: (0..n).map(|_| AtomicU32::new(0)).collect(),
+            gain_automation_owner: (0..n)
+                .map(|_| AtomicU64::new(NO_GAIN_AUTOMATION_OWNER))
+                .collect(),
             pan: (0..n).map(|_| AtomicU32::new(0.0f32.to_bits())).collect(),
             flags: (0..n).map(|_| AtomicU32::new(0)).collect(),
             any_solo: AtomicBool::new(false),
@@ -367,6 +394,29 @@ impl ParamTable {
         }
     }
 
+    pub fn set_gain_automation_owner(&self, slot: usize, pass: Option<u64>) {
+        let Some(owner) = self.gain_automation_owner.get(slot) else { return };
+        owner.store(pass.unwrap_or(NO_GAIN_AUTOMATION_OWNER), Ordering::Release);
+    }
+
+    #[inline]
+    pub fn gain_automation_owner(&self, slot: usize) -> Option<u64> {
+        let pass = self.gain_automation_owner.get(slot)?.load(Ordering::Acquire);
+        (pass != NO_GAIN_AUTOMATION_OWNER).then_some(pass)
+    }
+
+    pub fn clear_gain_automation_owner_if(&self, slot: usize, expected_pass: u64) -> bool {
+        let Some(owner) = self.gain_automation_owner.get(slot) else { return false };
+        owner
+            .compare_exchange(
+                expected_pass,
+                NO_GAIN_AUTOMATION_OWNER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
     pub fn set_flag(&self, slot: usize, flag: u32, on: bool) {
         if slot < self.len() {
             if on {
@@ -383,6 +433,8 @@ impl ParamTable {
             self.gain[slot].store(1.0f32.to_bits(), Ordering::Relaxed);
             self.pan[slot].store(0.0f32.to_bits(), Ordering::Relaxed);
             self.flags[slot].store(0, Ordering::Relaxed);
+            self.gain_automation_owner[slot]
+                .store(NO_GAIN_AUTOMATION_OWNER, Ordering::Relaxed);
         }
     }
 }
@@ -771,6 +823,40 @@ mod tests {
             assert_eq!(live, base);
         }
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn automation_pass_advance_skips_the_reserved_owner_sentinel_at_wrap() {
+        let pass = AtomicU64::new(NO_GAIN_AUTOMATION_OWNER - 2);
+        assert_eq!(advance_automation_pass(&pass), NO_GAIN_AUTOMATION_OWNER - 2);
+        assert_eq!(pass.load(Ordering::Relaxed), NO_GAIN_AUTOMATION_OWNER - 1);
+        assert_eq!(advance_automation_pass(&pass), NO_GAIN_AUTOMATION_OWNER - 1);
+        assert_eq!(pass.load(Ordering::Relaxed), 0);
+        assert_eq!(advance_automation_pass(&pass), 0);
+        assert_eq!(pass.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn automation_owner_compare_clear_cannot_erase_a_newer_pass() {
+        let table = Arc::new(ParamTable::with_slots(1));
+        table.set_gain_automation_owner(0, Some(7));
+        let cleanup_table = table.clone();
+        let (observed_tx, observed_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let cleanup = std::thread::spawn(move || {
+            let observed = cleanup_table.gain_automation_owner(0).unwrap();
+            observed_tx.send(observed).unwrap();
+            continue_rx.recv().unwrap();
+            cleanup_table.clear_gain_automation_owner_if(0, observed)
+        });
+
+        assert_eq!(observed_rx.recv().unwrap(), 7);
+        table.set_gain_automation_owner(0, Some(8));
+        continue_tx.send(()).unwrap();
+
+        assert!(!cleanup.join().unwrap(), "stale cleanup must lose the CAS");
+        assert_eq!(table.gain_automation_owner(0), Some(8));
+        assert!(table.gain_automation_owner(0).is_some(), "the same owner atomic keeps RT bypass active");
     }
 
     #[test]

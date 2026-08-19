@@ -881,19 +881,6 @@ pub fn set_track_arm(
     )
 }
 
-#[tauri::command]
-pub fn set_track_automation_mode(
-    track_id: String,
-    mode: crate::audio::types::AutomationMode,
-    control: State<'_, Arc<ControlPlane>>,
-) -> Result<TrackState, String> {
-    single_mix_change(
-        &control,
-        TrackMixChange { automation_mode: Some(mode), ..TrackMixChange::new(track_id) },
-        "set automation mode",
-    )
-}
-
 // ---------------------------------------------------------------------------
 // Sampler commands (phase 2, sampler zone; names frozen). The parser/types
 // live in [`sampler`]; engine playback integration is the owning agent's job.

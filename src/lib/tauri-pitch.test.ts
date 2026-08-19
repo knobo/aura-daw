@@ -62,4 +62,12 @@ describe("TauriBackend pitch subscription", () => {
     channel.onmessage({ frames: [], deviceRate: 0, listening: false, rehearseHold: false });
     expect(onBatch).not.toHaveBeenCalled();
   });
+
+  it("routes automation mode through the existing batched mix command", async () => {
+    await backend.setTrackAutomationMode("t-1", "touch");
+    expect(invoke).toHaveBeenCalledWith("set_track_mix", {
+      changes: [{ trackId: "t-1", automationMode: "touch" }],
+    });
+    expect(invoke).not.toHaveBeenCalledWith("set_track_automation_mode", expect.anything());
+  });
 });

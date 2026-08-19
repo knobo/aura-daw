@@ -21,7 +21,7 @@
 //! block. Which track they reach is a slot the CONTROL thread resolves
 //! (`follow_live_in_target`); the callback only reads one atomic.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
@@ -124,6 +124,14 @@ pub enum RtEvent {
     ReachedEnd { at: u64 },
 }
 
+#[derive(Debug, Clone)]
+pub struct AutomationTouchEndpoint {
+    pub track_id: String,
+    pub value: f32,
+    pub sample: u64,
+    pub pass: u64,
+}
+
 pub enum ControlMsg {
     Subscribe(Box<dyn MeterSink>),
     /// Reload missing samples/pyramids and swap in a freshly built graph.
@@ -132,11 +140,10 @@ pub enum ControlMsg {
     Rebuild,
     /// Explicit automation pass boundary. Unlike a sampled playing->stopped
     /// edge this cannot be lost when Stop and Play happen between ticks.
-    FinishAutomationStop,
-    /// Gesture-close boundary plus each track.s final relative live value.
-    /// Carrying the value makes even a gesture shorter than one 2 ms engine
-    /// tick record its endpoint. The engine filters to current Touch tracks.
-    FinishAutomationTouch(Vec<(String, f32)>),
+    FinishAutomationStop { at: u64, active_pass: bool, stopped_pass: Option<u64> },
+    /// Gesture-close boundary with the release position and pass identity.
+    /// The engine filters stale endpoints after an overtaking Stop.
+    FinishAutomationTouch(Vec<AutomationTouchEndpoint>),
     /// Which tracks/clips are routed to hardware MIDI-out, followed by a
     /// rebuild. Its own message rather than a field on `Rebuild` because
     /// routing is app config: it never arrives through a commit, so the
@@ -279,6 +286,8 @@ pub fn start(
                 automation_epoch: 0,
                 was_playing: false,
                 pending_automation_finish: Vec::new(),
+                pending_automation_stops: VecDeque::new(),
+                deferred_automation_endpoints: Vec::new(),
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
                 external_routing: Arc::new(crate::midi_out::RoutedOut::default()),
@@ -992,6 +1001,13 @@ fn stale_sources(clips: &[Clip], cache: &HashMap<SourceId, CachedSource>) -> Vec
 // Control thread
 // ---------------------------------------------------------------------------
 
+struct PendingAutomationStop {
+    pass: u64,
+    awaiting: Vec<String>,
+    endpoints: Vec<AutomationTouchEndpoint>,
+    boundary: Vec<(String, u32, crate::audio::types::AutomationMode, bool, f32)>,
+}
+
 struct Control {
     shared: Arc<SharedRt>,
     /// Control-side view of the CURRENT graph's tables (round-2 §2.4) — see
@@ -1125,6 +1141,10 @@ struct Control {
     /// on the next tick. Never committed inside `rebuild` itself: see the
     /// enqueue site for why re-entering a rebuild from one is not safe.
     pending_automation_finish: Vec<String>,
+    /// Explicit Stop remains pending while a closed gesture.s release
+    /// endpoint is still in flight, so it joins the same automation pass.
+    pending_automation_stops: VecDeque<PendingAutomationStop>,
+    deferred_automation_endpoints: Vec<AutomationTouchEndpoint>,
     /// The hardware MIDI-in seam. Held as an `Arc` rather than reached
     /// through `midi_in::hub()` at each call site so tests can drive the
     /// engine against their own hub; `start` binds the process-global one.
@@ -1381,45 +1401,23 @@ impl Control {
         match msg {
             ControlMsg::Subscribe(sink) => self.sinks.push((sink, 0)),
             ControlMsg::Rebuild => self.rebuild(),
-            ControlMsg::FinishAutomationStop => {
-                self.finish_automation_recording_for_stop();
-                self.was_playing = self.shared.playing.load(Relaxed);
+            ControlMsg::FinishAutomationStop { at, active_pass, stopped_pass } => {
+                self.queue_automation_stop(at, true, active_pass, stopped_pass);
             }
-            ControlMsg::FinishAutomationTouch(track_values) => {
-                let final_tick = if self.shared.playing.load(Relaxed) {
-                    self.tempo_map
-                        .as_ref()
-                        .map(|map| map.samples_to_tick(self.shared.position.load(Relaxed)) as u32)
-                } else {
-                    None
-                };
-                for (track_id, final_value) in track_values {
-                    let mode = self
-                        .slots
-                        .get(track_id.as_str())
-                        .and_then(|&slot| self.automation_modes.get(slot))
-                        .copied();
-                    if matches!(
-                        mode,
-                        Some(
-                            super::types::AutomationMode::Touch
-                                | super::types::AutomationMode::Latch
-                        )
-                    ) {
-                        if let (Some(tick), Some(mode)) = (final_tick, mode) {
-                            // The close endpoint is also Latch.s final touched
-                            // value, so it arms/updates Latch even if the whole
-                            // gesture fit between periodic control ticks.
-                            self.automation_recorder.sample(
-                                &track_id,
-                                tick,
-                                mode,
-                                true,
-                                final_value,
-                            );
-                        }
-                        if mode == Some(super::types::AutomationMode::Touch) {
-                            self.finish_automation_recording_for_track(&track_id);
+            ControlMsg::FinishAutomationTouch(endpoints) => {
+                for endpoint in endpoints {
+                    if let Some(stop) = self
+                        .pending_automation_stops
+                        .iter_mut()
+                        .find(|stop| stop.pass == endpoint.pass)
+                    {
+                        stop.awaiting.retain(|track_id| track_id != &endpoint.track_id);
+                        stop.endpoints.push(endpoint);
+                    } else if endpoint.pass == self.shared.automation_pass.load(Relaxed) {
+                        if self.pending_automation_stops.is_empty() {
+                            self.process_automation_touch_endpoint(endpoint);
+                        } else {
+                            self.deferred_automation_endpoints.push(endpoint);
                         }
                     }
                 }
@@ -1902,6 +1900,9 @@ impl Control {
         if document_changed {
             self.automation_recorder.reset();
             self.pending_automation_finish.clear();
+            self.pending_automation_stops.clear();
+            self.deferred_automation_endpoints.clear();
+            super::rt::advance_automation_pass(&self.shared.automation_pass);
             self.was_playing = self.shared.playing.load(Relaxed);
         }
         let mut ended: Vec<String> = Vec::new();
@@ -2138,6 +2139,9 @@ impl Control {
     /// Only READS `self.gesture` (`is_track_gain_touched`); never commits
     /// anything itself — Task 10 owns `finish` + the commit at pass-end.
     fn drive_automation_recording(&mut self) {
+        if !self.pending_automation_stops.is_empty() {
+            return;
+        }
         if !self.shared.playing.load(Relaxed) {
             return;
         }
@@ -2150,9 +2154,19 @@ impl Control {
                 mode,
                 crate::audio::types::AutomationMode::Off | crate::audio::types::AutomationMode::Read
             ) {
+                self.params.set_gain_automation_owner(slot, None);
                 continue;
             }
-            let touched = self.gesture.is_track_gain_touched(track_id.as_str());
+            let touch_pass = self.gesture.track_gain_touch_pass(track_id.as_str());
+            let touched = touch_pass.is_some();
+            if mode == crate::audio::types::AutomationMode::Write {
+                self.params.set_gain_automation_owner(
+                    slot,
+                    Some(self.shared.automation_pass.load(Relaxed)),
+                );
+            } else if let Some(pass) = touch_pass {
+                self.params.set_gain_automation_owner(slot, Some(pass));
+            }
             let (live_gain, base_gain) = self.params.gain_pair_linear(slot);
             let multiplier = super::rt::relative_gain_multiplier(live_gain, base_gain);
             self.automation_recorder
@@ -2170,27 +2184,152 @@ impl Control {
     ///   run there).
     /// * TOUCH GESTURE RELEASE — gesture close sends an explicit per-track
     ///   finish message, giving every Touch gesture its own undo boundary.
+    fn queue_automation_stop(&mut self, at: u64, sample_boundary: bool, active_pass: bool, stopped_pass: Option<u64>) {
+        self.was_playing = false;
+        if !active_pass {
+            return;
+        }
+        let pass = stopped_pass.unwrap_or_else(|| super::rt::advance_automation_pass(&self.shared.automation_pass));
+        let tick = self.tempo_map.as_ref().map(|map| map.samples_to_tick(at) as u32);
+        let mut awaiting = Vec::new();
+        let mut boundary = Vec::new();
+        for (track_id, &slot) in &self.slots {
+            let Some(&mode) = self.automation_modes.get(slot) else { continue };
+            let owned = self.params.gain_automation_owner(slot) == Some(pass);
+            let touched = self.gesture.track_gain_touch_pass(track_id.as_str()) == Some(pass);
+            let missing_endpoint = match mode {
+                crate::audio::types::AutomationMode::Touch => owned && !touched,
+                crate::audio::types::AutomationMode::Latch => {
+                    owned && !touched && !self.automation_recorder.is_latch_armed(track_id.as_str())
+                }
+                _ => false,
+            };
+            if missing_endpoint {
+                awaiting.push(track_id.as_str().to_string());
+            }
+            let samples_boundary = match mode {
+                crate::audio::types::AutomationMode::Write => true,
+                crate::audio::types::AutomationMode::Touch => touched,
+                crate::audio::types::AutomationMode::Latch => owned,
+                _ => false,
+            };
+            if sample_boundary && samples_boundary {
+                if let Some(tick) = tick {
+                    let (live, base) = self.params.gain_pair_linear(slot);
+                    boundary.push((
+                        track_id.as_str().to_string(),
+                        tick,
+                        mode,
+                        touched,
+                        super::rt::relative_gain_multiplier(live, base),
+                    ));
+                }
+            }
+        }
+
+        let mut endpoints = Vec::new();
+        let mut still_deferred = Vec::new();
+        for endpoint in std::mem::take(&mut self.deferred_automation_endpoints) {
+            if endpoint.pass == pass {
+                awaiting.retain(|track_id| track_id != &endpoint.track_id);
+                endpoints.push(endpoint);
+            } else {
+                still_deferred.push(endpoint);
+            }
+        }
+        self.deferred_automation_endpoints = still_deferred;
+        self.pending_automation_stops.push_back(PendingAutomationStop {
+            pass,
+            awaiting,
+            endpoints,
+            boundary,
+        });
+    }
+
+    fn process_automation_touch_endpoint(&mut self, endpoint: AutomationTouchEndpoint) {
+        let endpoint_pass = endpoint.pass;
+        let Some(&slot) = self.slots.get(endpoint.track_id.as_str()) else { return };
+        let Some(&mode) = self.automation_modes.get(slot) else { return };
+        if !matches!(mode, super::types::AutomationMode::Touch | super::types::AutomationMode::Latch) {
+            return;
+        }
+        if let Some(map) = &self.tempo_map {
+            self.automation_recorder.sample(
+                &endpoint.track_id,
+                map.samples_to_tick(endpoint.sample) as u32,
+                mode,
+                true,
+                endpoint.value,
+            );
+        }
+        if mode == super::types::AutomationMode::Touch {
+            self.finish_touch_automation_recording_for_track(&endpoint.track_id);
+            self.params.clear_gain_automation_owner_if(slot, endpoint_pass);
+        } else {
+            self.params.set_gain_automation_owner(slot, Some(endpoint_pass));
+        }
+    }
+
     fn finish_ended_automation_passes(&mut self) {
         let playing = self.shared.playing.load(Relaxed);
         let stopped = self.was_playing && !playing;
         self.was_playing = playing;
-        if stopped {
-            self.finish_automation_recording_for_stop();
+        if stopped && self.pending_automation_stops.is_empty() {
+            self.queue_automation_stop(self.shared.position.load(Relaxed), false, true, None);
         }
         for track_id in std::mem::take(&mut self.pending_automation_finish) {
             self.finish_automation_recording_for_track(&track_id);
         }
+        while self
+            .pending_automation_stops
+            .front()
+            .is_some_and(|stop| stop.awaiting.is_empty())
+        {
+            let stop = self.pending_automation_stops.pop_front().expect("checked");
+            self.finish_automation_stopped_pass(stop);
+        }
+        if self.pending_automation_stops.is_empty() {
+            for endpoint in std::mem::take(&mut self.deferred_automation_endpoints) {
+                if endpoint.pass == self.shared.automation_pass.load(Relaxed) {
+                    self.process_automation_touch_endpoint(endpoint);
+                }
+            }
+        }
     }
 
-    /// Ends EVERY track's pass — the transport-stop trigger. Tracks with
-    /// nothing recorded fall out on `finish`'s own empty guard, so this
-    /// costs one hash lookup per track and commits nothing for the
-    /// (overwhelmingly common) case where no track was in a recording mode.
-    fn finish_automation_recording_for_stop(&mut self) {
-        let ids: Vec<String> = self.slots.keys().map(|id| id.as_str().to_string()).collect();
-        for track_id in ids {
-            self.finish_automation_recording_for_track(&track_id);
+    fn finish_automation_stopped_pass(&mut self, stop: PendingAutomationStop) {
+        for endpoint in stop.endpoints {
+            let Some(&slot) = self.slots.get(endpoint.track_id.as_str()) else { continue };
+            let Some(&mode) = self.automation_modes.get(slot) else { continue };
+            if matches!(mode, crate::audio::types::AutomationMode::Touch | crate::audio::types::AutomationMode::Latch) {
+                if let Some(map) = &self.tempo_map {
+                    self.automation_recorder.sample(
+                        &endpoint.track_id,
+                        map.samples_to_tick(endpoint.sample) as u32,
+                        mode,
+                        true,
+                        endpoint.value,
+                    );
+                }
+            }
         }
+        for (track_id, tick, mode, touched, value) in stop.boundary {
+            self.automation_recorder.sample(&track_id, tick, mode, touched, value);
+        }
+        let tracks: Vec<(String, usize, crate::audio::types::AutomationMode)> = self
+            .slots
+            .iter()
+            .filter_map(|(id, &slot)| self.automation_modes.get(slot).copied().map(|mode| (id.as_str().to_string(), slot, mode)))
+            .collect();
+        for (track_id, slot, mode) in tracks {
+            if mode == crate::audio::types::AutomationMode::Touch {
+                self.finish_touch_automation_recording_for_track(&track_id);
+            } else {
+                self.finish_automation_recording_for_track(&track_id);
+            }
+            self.params.clear_gain_automation_owner_if(slot, stop.pass);
+        }
+        self.was_playing = false;
     }
 
     /// Ends `track_id`'s recording pass and commits what it accumulated as
@@ -2217,13 +2356,30 @@ impl Control {
     /// inventing one here would have written a SECOND lane the UI never
     /// shows and the compile step would fight with.
     fn finish_automation_recording_for_track(&mut self, track_id: &str) {
-        self.finish_automation_recording_for_track_after(track_id, || {});
+        self.finish_automation_recording_for_track_after_mode(track_id, false, || {});
+    }
+
+    fn finish_touch_automation_recording_for_track(&mut self, track_id: &str) {
+        self.finish_automation_recording_for_track_after_mode(track_id, true, || {});
     }
 
     /// Test seam: `before_commit` runs after the recorder snapshot but before
     /// `Session::transact` takes the lock. The epoch check itself remains
     /// inside that transaction, closing the project-open race completely.
+    #[cfg(test)]
     fn finish_automation_recording_for_track_after<F>(&mut self, track_id: &str, before_commit: F)
+    where
+        F: FnOnce(),
+    {
+        self.finish_automation_recording_for_track_after_mode(track_id, false, before_commit);
+    }
+
+    fn finish_automation_recording_for_track_after_mode<F>(
+        &mut self,
+        track_id: &str,
+        resume_pre_existing_curve: bool,
+        before_commit: F,
+    )
     where
         F: FnOnce(),
     {
@@ -2258,8 +2414,37 @@ impl Control {
                         param_id: TRACK_PARAM_GAIN,
                         points: Vec::new(),
                     });
+                let old_value_at = |tick: u32| {
+                    let idx = lane.points.partition_point(|p| p.tick <= tick);
+                    if idx == 0 {
+                        lane.points[0].value
+                    } else if idx == lane.points.len() {
+                        lane.points[idx - 1].value
+                    } else {
+                        let a = &lane.points[idx - 1];
+                        let b = &lane.points[idx];
+                        let span = (b.tick - a.tick) as f32;
+                        a.value + (b.value - a.value) * (tick - a.tick) as f32 / span
+                    }
+                };
+                let before = (resume_pre_existing_curve && start > 0 && !lane.points.is_empty())
+                    .then(|| {
+                        let tick = start - 1;
+                        crate::plugins::automation::AutomationPoint { tick, value: old_value_at(tick) }
+                    });
+                let after = (resume_pre_existing_curve && end < u32::MAX && !lane.points.is_empty())
+                    .then(|| {
+                        let tick = end + 1;
+                        crate::plugins::automation::AutomationPoint { tick, value: old_value_at(tick) }
+                    });
                 lane.points.retain(|p| p.tick < start || p.tick > end);
                 lane.points.extend(new_points);
+                if let Some(point) = before {
+                    lane.points.push(point);
+                }
+                if let Some(point) = after {
+                    lane.points.push(point);
+                }
                 crate::plugins::automation::normalize_lane(&mut lane)?;
                 tx.apply(op::Op::AutomationSetLane { key: lane.id.clone(), lane: Some(lane) })
             },
@@ -2523,7 +2708,7 @@ impl Control {
         }
         self.shared.playing.store(false, Relaxed);
         self.shared.position.store(at, Relaxed);
-        self.finish_automation_recording_for_stop();
+        self.queue_automation_stop(at, true, true, None);
         // `position_samples` stays a bare RT atomic, never an op — there is
         // no `PropPath` for it (the six Transport paths are TransportState/
         // LoopEnabled/LoopStartSamples/LoopEndSamples/StopAtEnd/SampleRate,
@@ -3276,7 +3461,7 @@ impl Control {
             self.clear_countin();
             self.shared.recording.store(false, Relaxed);
             self.shared.playing.store(false, Relaxed);
-            self.finish_automation_recording_for_stop();
+            self.queue_automation_stop(self.shared.position.load(Relaxed), true, true, None);
             if writers.is_empty() && capture.is_none() {
                 return Ok(Vec::new());
             }
@@ -3324,7 +3509,7 @@ impl Control {
 
         self.shared.recording.store(false, Relaxed);
         self.shared.playing.store(false, Relaxed);
-        self.finish_automation_recording_for_stop();
+        self.queue_automation_stop(self.shared.position.load(Relaxed), true, true, None);
         let track_ids = std::mem::take(&mut self.rec_track_ids);
 
         // §4.4: "the op is the registration, never the recording itself" —
@@ -4373,6 +4558,8 @@ mod tests {
             automation_epoch: 0,
             was_playing: false,
             pending_automation_finish: Vec::new(),
+            pending_automation_stops: VecDeque::new(),
+            deferred_automation_endpoints: Vec::new(),
             // Its OWN hub, never the process-global one: these tests would
             // otherwise race every other test that selects a routing target.
             live_in_hub: Arc::new(MidiInHub::new()),
@@ -4608,6 +4795,16 @@ mod tests {
         ctl.finish_ended_automation_passes();
     }
 
+    fn touch_endpoint(track_id: &str, value: f32, sample: u64) -> AutomationTouchEndpoint {
+        AutomationTouchEndpoint { track_id: track_id.into(), value, sample, pass: 0 }
+    }
+
+    fn automation_stop(ctl: &mut Control) {
+        let at = ctl.shared.position.load(Relaxed);
+        ctl.handle(ControlMsg::FinishAutomationStop { at, active_pass: true, stopped_pass: None });
+        ctl.finish_ended_automation_passes();
+    }
+
     fn point_at(lane: &crate::plugins::automation::AutomationLane, tick: u32) -> f32 {
         lane.points
             .iter()
@@ -4671,6 +4868,26 @@ mod tests {
     /// nothing — no op, no undo entry, no rebuild, and above all no empty
     /// lane minted for a track that has none.
     #[test]
+    fn stop_while_already_stopped_does_not_create_a_write_point_or_undo() {
+        let (mut ctl, session) = bare_control();
+        seed_recording_track(&session, "t-1", AutomationMode::Write, &[(3840, 0.25)]);
+        ctl.rebuild();
+        let slot = *ctl.tables.lock().slots.get("t-1").unwrap();
+        ctl.params.set_gain_linear(slot, 0.5);
+        ctl.shared.position.store(1_200, Relaxed);
+        let undo_before = ctl.committer.log().depths().0;
+        let pass_before = ctl.shared.automation_pass.load(Relaxed);
+
+        ctl.handle(ControlMsg::FinishAutomationStop { at: 1_200, active_pass: false, stopped_pass: None });
+        ctl.finish_ended_automation_passes();
+
+        assert_eq!(ctl.committer.log().depths().0, undo_before);
+        assert_eq!(ctl.shared.automation_pass.load(Relaxed), pass_before);
+        assert!(ctl.pending_automation_stops.is_empty());
+        assert!(gain_lane(&session, "t-1").points.iter().all(|point| point.tick != 48));
+    }
+
+    #[test]
     fn a_pass_with_no_samples_commits_nothing() {
         let (mut ctl, session) = bare_control();
         {
@@ -4724,7 +4941,7 @@ mod tests {
         }
         crate::control::testutil::release_gesture(&ctl.gesture);
         let undo_before = ctl.committer.log().depths().0;
-        ctl.handle(ControlMsg::FinishAutomationTouch(vec![("t-1".into(), 0.5)]));
+        ctl.handle(ControlMsg::FinishAutomationTouch(vec![touch_endpoint("t-1", 0.5, ctl.shared.position.load(Relaxed))]));
         assert_eq!(
             ctl.committer.log().depths().0,
             undo_before + 1,
@@ -4736,6 +4953,11 @@ mod tests {
 
         let lane = gain_lane(&session, "t-1");
         assert!((point_at(&lane, 96) - 0.5).abs() < 1e-6, "the touched range was recorded");
+        let old_at_resume = 1.0 + (0.9 - 1.0) * (97.0 / 144.0);
+        assert!(
+            (point_at(&lane, 97) - old_at_resume).abs() < 1e-6,
+            "the old curve resumes on the first tick after release instead of interpolating across the untouched gap"
+        );
         for tick in [144u32, 192] {
             assert!(
                 (point_at(&lane, tick) - 0.9).abs() < 1e-6,
@@ -4743,6 +4965,31 @@ mod tests {
             );
         }
         assert!((point_at(&lane, 3840) - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn touch_preserves_the_pre_existing_curve_immediately_before_the_recorded_range() {
+        let (mut ctl, session) = bare_control();
+        seed_recording_track(
+            &session,
+            "t-1",
+            AutomationMode::Touch,
+            &[(0, 1.0), (48, 0.8), (192, 0.8), (3840, 0.25)],
+        );
+        ctl.rebuild();
+        let slot = *ctl.tables.lock().slots.get("t-1").unwrap();
+        ctl.params.set_gain_linear(slot, 0.5);
+        ctl.shared.playing.store(true, Relaxed);
+        crate::control::testutil::touch_track_gain(&ctl.gesture, "t-1");
+        automation_tick(&mut ctl, 2_400); // tick 96: touch starts after old point at 48
+        automation_tick(&mut ctl, 3_600); // tick 144
+        crate::control::testutil::release_gesture(&ctl.gesture);
+        ctl.handle(ControlMsg::FinishAutomationTouch(vec![touch_endpoint("t-1", 0.5, 3_600)]));
+
+        let lane = gain_lane(&session, "t-1");
+        assert!((point_at(&lane, 95) - 0.8).abs() < 1e-6, "old curve is pinned at start-1");
+        assert!((point_at(&lane, 96) - 0.5).abs() < 1e-6, "touch begins exactly at start");
+        assert!((point_at(&lane, 48) - 0.8).abs() < 1e-6);
     }
 
     #[test]
@@ -4755,7 +5002,7 @@ mod tests {
 
         let undo_before = ctl.committer.log().depths().0;
         // No periodic recorder tick occurred between gesture begin and end.
-        ctl.handle(ControlMsg::FinishAutomationTouch(vec![("t-1".into(), 1.75)]));
+        ctl.handle(ControlMsg::FinishAutomationTouch(vec![touch_endpoint("t-1", 1.75, ctl.shared.position.load(Relaxed))]));
 
         assert_eq!(ctl.committer.log().depths().0, undo_before + 1);
         assert!((point_at(&gain_lane(&session, "t-1"), 48) - 1.75).abs() < 1e-6);
@@ -4772,17 +5019,178 @@ mod tests {
         let undo_before = ctl.committer.log().depths().0;
 
         // No periodic tick saw the touch; the endpoint must arm Latch.
-        ctl.handle(ControlMsg::FinishAutomationTouch(vec![("t-1".into(), 1.75)]));
+        ctl.handle(ControlMsg::FinishAutomationTouch(vec![touch_endpoint("t-1", 1.75, ctl.shared.position.load(Relaxed))]));
         assert_eq!(ctl.committer.log().depths().0, undo_before, "Latch is not finished at release");
+        assert_eq!(
+            ctl.params.gain_automation_owner(slot),
+            Some(0),
+            "Latch keeps audible ownership after release"
+        );
 
         ctl.params.set_gain_linear(slot, 0.25); // unrelated live change after release
         automation_tick(&mut ctl, 2_400); // tick 96 must hold 1.75
-        ctl.handle(ControlMsg::FinishAutomationStop);
+        automation_stop(&mut ctl);
 
         assert_eq!(ctl.committer.log().depths().0, undo_before + 1);
         let lane = gain_lane(&session, "t-1");
         assert!((point_at(&lane, 48) - 1.75).abs() < 1e-6);
         assert!((point_at(&lane, 96) - 1.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stop_overtaking_a_queued_touch_or_latch_release_keeps_one_complete_pass() {
+        for mode in [AutomationMode::Touch, AutomationMode::Latch] {
+            let (mut ctl, session) = bare_control();
+            seed_recording_track(&session, "t-1", mode, &[(3840, 0.25)]);
+            ctl.rebuild();
+            let slot = *ctl.tables.lock().slots.get("t-1").unwrap();
+            ctl.params.set_gain_linear(slot, 0.5);
+            ctl.params.set_gain_automation_owner(slot, Some(0));
+            ctl.shared.playing.store(true, Relaxed);
+            let endpoint = touch_endpoint("t-1", 0.5, 1_200);
+            let undo_before = ctl.committer.log().depths().0;
+
+            ctl.handle(ControlMsg::FinishAutomationStop { at: 2_400, active_pass: true, stopped_pass: None });
+            assert_eq!(ctl.shared.automation_pass.load(Relaxed), 1, "public pass rotates immediately");
+            ctl.shared.playing.store(false, Relaxed);
+            ctl.finish_ended_automation_passes();
+            assert_eq!(ctl.committer.log().depths().0, undo_before, "{mode:?}: Stop waits across a full engine tick for the queued release");
+            assert!(!ctl.pending_automation_stops.is_empty());
+
+            ctl.shared.playing.store(true, Relaxed);
+            automation_tick(&mut ctl, 3_600);
+            ctl.params.set_gain_automation_owner(slot, Some(1));
+            let new_endpoint = AutomationTouchEndpoint {
+                track_id: "t-1".into(),
+                value: 0.75,
+                sample: 3_600,
+                pass: 1,
+            };
+            ctl.handle(ControlMsg::FinishAutomationTouch(vec![new_endpoint]));
+            assert_eq!(ctl.deferred_automation_endpoints.len(), 1, "new pass endpoint is deferred, never merged into stopped pass");
+
+            ctl.handle(ControlMsg::FinishAutomationStop {
+                at: 3_600,
+                active_pass: true,
+                stopped_pass: None,
+            });
+            ctl.shared.playing.store(false, Relaxed);
+            ctl.finish_ended_automation_passes();
+            assert_eq!(ctl.shared.automation_pass.load(Relaxed), 2);
+            assert_eq!(ctl.pending_automation_stops.len(), 2, "both stopped passes wait in order behind pass 0.s late endpoint");
+
+            ctl.handle(ControlMsg::FinishAutomationTouch(vec![endpoint.clone()]));
+            ctl.finish_ended_automation_passes();
+
+            let expected_undo = undo_before + 2;
+            assert_eq!(ctl.committer.log().depths().0, expected_undo, "{mode:?}: passes remain distinct");
+            let lane = gain_lane(&session, "t-1");
+            assert!((point_at(&lane, 48) - 0.5).abs() < 1e-6, "{mode:?}: old release endpoint retained");
+            assert!((point_at(&lane, 144) - 0.75).abs() < 1e-6, "{mode:?}: second stopped pass retained its endpoint");
+            assert!(ctl.pending_automation_stops.is_empty());
+
+            ctl.shared.playing.store(true, Relaxed);
+            ctl.handle(ControlMsg::FinishAutomationTouch(vec![endpoint]));
+            assert_eq!(ctl.committer.log().depths().0, expected_undo, "{mode:?}: stale endpoint cannot split the undo pass");
+        }
+    }
+
+    #[test]
+    fn automation_endpoints_match_their_pass_across_reserved_sentinel_wrap() {
+        let (mut ctl, session) = bare_control();
+        seed_recording_track(&session, "t-1", AutomationMode::Touch, &[(3840, 0.25)]);
+        ctl.rebuild();
+        let slot = *ctl.tables.lock().slots.get("t-1").unwrap();
+        let old_pass = crate::audio::rt::NO_GAIN_AUTOMATION_OWNER - 1;
+        ctl.shared.automation_pass.store(old_pass, Relaxed);
+        ctl.params.set_gain_automation_owner(slot, Some(old_pass));
+        ctl.shared.playing.store(true, Relaxed);
+        let undo_before = ctl.committer.log().depths().0;
+
+        ctl.handle(ControlMsg::FinishAutomationStop {
+            at: 2_400,
+            active_pass: true,
+            stopped_pass: None,
+        });
+        ctl.shared.playing.store(false, Relaxed);
+        ctl.finish_ended_automation_passes();
+        assert_eq!(ctl.shared.automation_pass.load(Relaxed), 0);
+        assert_eq!(ctl.pending_automation_stops[0].pass, old_pass);
+
+        ctl.params.set_gain_automation_owner(slot, Some(0));
+        ctl.handle(ControlMsg::FinishAutomationTouch(vec![AutomationTouchEndpoint {
+            track_id: "t-1".into(),
+            value: 0.75,
+            sample: 3_600,
+            pass: 0,
+        }]));
+        assert_eq!(ctl.deferred_automation_endpoints.len(), 1);
+
+        ctl.handle(ControlMsg::FinishAutomationTouch(vec![AutomationTouchEndpoint {
+            track_id: "t-1".into(),
+            value: 0.5,
+            sample: 1_200,
+            pass: old_pass,
+        }]));
+        ctl.finish_ended_automation_passes();
+
+        assert!(ctl.pending_automation_stops.is_empty());
+        assert!(ctl.deferred_automation_endpoints.is_empty());
+        assert_eq!(ctl.params.gain_automation_owner(slot), None);
+        assert_eq!(ctl.committer.log().depths().0, undo_before + 2);
+        let lane = gain_lane(&session, "t-1");
+        assert!((point_at(&lane, 48) - 0.5).abs() < 1e-6);
+        assert!((point_at(&lane, 144) - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stopped_automation_pass_ownership_does_not_make_a_no_touch_next_pass_wait() {
+        for mode in [AutomationMode::Touch, AutomationMode::Latch] {
+            let (mut ctl, session) = bare_control();
+            seed_recording_track(&session, "t-1", mode, &[(3840, 0.25)]);
+            ctl.rebuild();
+            let slot = *ctl.tables.lock().slots.get("t-1").unwrap();
+            ctl.params.set_gain_linear(slot, 0.5);
+            ctl.params.set_gain_automation_owner(slot, Some(0));
+            ctl.shared.playing.store(true, Relaxed);
+            let late_pass_zero = touch_endpoint("t-1", 0.5, 1_200);
+            let undo_before = ctl.committer.log().depths().0;
+
+            ctl.handle(ControlMsg::FinishAutomationStop {
+                at: 2_400,
+                active_pass: true,
+                stopped_pass: None,
+            });
+            ctl.shared.playing.store(false, Relaxed);
+            ctl.finish_ended_automation_passes();
+            assert_eq!(ctl.shared.automation_pass.load(Relaxed), 1);
+            assert_eq!(ctl.pending_automation_stops.len(), 1);
+            assert_eq!(ctl.pending_automation_stops[0].awaiting, vec!["t-1"]);
+
+            // Pass 1 starts and stops without a fader gesture. The stale
+            // audible owner still belongs to pass 0, so pass 1 must not
+            // invent an endpoint expectation or an undo entry.
+            ctl.shared.playing.store(true, Relaxed);
+            ctl.handle(ControlMsg::FinishAutomationStop {
+                at: 3_600,
+                active_pass: true,
+                stopped_pass: None,
+            });
+            ctl.shared.playing.store(false, Relaxed);
+            ctl.finish_ended_automation_passes();
+            assert_eq!(ctl.shared.automation_pass.load(Relaxed), 2);
+            assert_eq!(ctl.pending_automation_stops.len(), 2);
+            assert!(ctl.pending_automation_stops[1].awaiting.is_empty(), "{mode:?}: pass 1 has no endpoint to await");
+
+            ctl.handle(ControlMsg::FinishAutomationTouch(vec![late_pass_zero]));
+            ctl.finish_ended_automation_passes();
+
+            assert!(ctl.pending_automation_stops.is_empty(), "{mode:?}: FIFO fully drains");
+            assert_eq!(ctl.committer.log().depths().0, undo_before + 1, "{mode:?}: only pass 0 commits");
+            let lane = gain_lane(&session, "t-1");
+            assert!((point_at(&lane, 48) - 0.5).abs() < 1e-6, "{mode:?}: late pass 0 endpoint retained");
+            assert!(lane.points.iter().all(|point| point.tick != 144), "{mode:?}: empty pass 1 records no boundary");
+        }
     }
 
     #[test]
@@ -4885,7 +5293,7 @@ mod tests {
         automation_tick(&mut ctl, 1_200);
 
         let undo_before = ctl.committer.log().depths().0;
-        ctl.handle(ControlMsg::FinishAutomationStop);
+        automation_stop(&mut ctl);
         assert_eq!(ctl.committer.log().depths().0, undo_before + 1);
 
         // Simulate an immediate Play before the periodic edge detector ever
@@ -4893,7 +5301,7 @@ mod tests {
         ctl.shared.playing.store(true, Relaxed);
         ctl.params.set_gain_linear(slot, 0.25);
         automation_tick(&mut ctl, 2_400);
-        ctl.handle(ControlMsg::FinishAutomationStop);
+        automation_stop(&mut ctl);
         assert_eq!(ctl.committer.log().depths().0, undo_before + 2);
 
         let lane = gain_lane(&session, "t-1");
@@ -4927,7 +5335,7 @@ mod tests {
         let slot = *ctl.tables.lock().slots.get("t-1").unwrap();
         ctl.params.set_gain_linear(slot, 0.25);
         automation_tick(&mut ctl, 2_400);
-        ctl.handle(ControlMsg::FinishAutomationStop);
+        automation_stop(&mut ctl);
 
         let lane = gain_lane(&session, "t-1");
         assert!(lane.points.iter().all(|point| point.tick != 0));

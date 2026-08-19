@@ -41,10 +41,10 @@
     gap: 6px;
   }
   .tog {
-    flex: 1;
-    min-width: 46px;
+    flex: 1 1 0;
+    min-width: 0;
     height: 20px;
-    padding: 0 7px;
+    padding: 0 4px;
     font-family: var(--font-mono);
     font-size: 9px;
     border-radius: 3px;

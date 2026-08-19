@@ -168,7 +168,7 @@ git commit -m "feat(automation): add AutomationMode enum and TrackState.automati
 
 ---
 
-### Task 2: `PropPath::AutomationMode` — read/write/apply/rebuild-trigger wiring, `TrackMixChange`, `set_track_automation_mode` command
+### Task 2: `PropPath::AutomationMode` — read/write/apply/rebuild-trigger wiring through existing `set_track_mix`
 
 **Files:**
 - Modify: `src-tauri/src/control/op.rs:353-354` (`PropPath` enum)
@@ -179,20 +179,17 @@ git commit -m "feat(automation): add AutomationMode enum and TrackState.automati
 - Modify: `src-tauri/src/control/mod.rs:496-514` (param_writes no-op match),
   `apply_mix_changes` (~line 1399-1418)
 - Modify: `src-tauri/src/control/ops.rs:21-41` (`TrackMixChange`)
-- Modify: `src-tauri/src/audio/mod.rs:851-862` (add `set_track_automation_mode`
-  next to `set_track_arm`)
-- Modify: `src-tauri/src/lib.rs:227` area (`invoke_handler` registration list
-  — add `control::set_track_automation_mode` next to `control::set_track_mix`)
+- Use the already registered `control::set_track_mix` Tauri command; do not add
+  a per-property command name.
 - Test: `src-tauri/src/control/mod.rs` (mirror the existing
   `set_track_mix_emits_project_changed_with_updated_tracks` test at
   `control/mod.rs:6050` and the gesture-fold test at `control/mod.rs:6244`)
 
 **Interfaces:**
 - Consumes: `AutomationMode` (Task 1).
-- Produces: `PropPath::AutomationMode`, `TrackMixChange.automation_mode:
-  Option<AutomationMode>`, Tauri command `set_track_automation_mode(track_id:
-  String, mode: AutomationMode)`. Task 4 (frontend) calls this command by
-  name.
+- Produces: `PropPath::AutomationMode` and `TrackMixChange.automation_mode:
+  Option<AutomationMode>`. Task 4 sends that field through the existing batched
+  `set_track_mix` command.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -371,38 +368,12 @@ In `src-tauri/src/control/mod.rs`, in `fn apply_mix_changes` (starts line
         }
 ```
 
-- [ ] **Step 10: Add the Tauri command**
+- [ ] **Step 10: Reuse the existing Tauri batch command**
 
-In `src-tauri/src/audio/mod.rs`, immediately after `set_track_arm`
-(ends line 862), add:
+Do not add or register a new command. `automation_mode` is another optional
+field on `TrackMixChange`, sent through the already registered `set_track_mix`.
 
-```rust
-#[tauri::command]
-pub fn set_track_automation_mode(
-    track_id: String,
-    mode: crate::audio::types::AutomationMode,
-    control: State<'_, Arc<ControlPlane>>,
-) -> Result<TrackState, String> {
-    single_mix_change(
-        &control,
-        TrackMixChange { automation_mode: Some(mode), ..TrackMixChange::new(track_id) },
-        "set automation mode",
-    )
-}
-```
-
-- [ ] **Step 11: Register the command**
-
-In `src-tauri/src/lib.rs`, find the `invoke_handler` list that includes
-`control::set_track_mix` (near line 227) and add
-`control::set_track_automation_mode,` next to it. (If `set_track_gain`/
-`set_track_mute`/etc. live under a different module path than
-`control::` in that list — check the exact prefix used for
-`set_track_mute` right above/below line 227 and match it; `audio::mod.rs`'s
-commands may be re-exported under `control::` or under `audio::` in
-`lib.rs` — follow whichever the neighboring per-field commands use.)
-
-- [ ] **Step 12: Run test to verify it passes**
+- [ ] **Step 11: Run test to verify it passes**
 
 Run: `timeout 120 cargo test --manifest-path src-tauri/Cargo.toml automation_mode -- --nocapture`
 Expected: PASS (both new tests).
@@ -634,15 +605,16 @@ impl), add:
 
 ```typescript
   async setTrackAutomationMode(trackId: string, mode: AutomationMode) {
-    await invoke("set_track_automation_mode", { trackId, mode });
+    await invoke<TrackState[]>("set_track_mix", {
+      changes: [{ trackId, automationMode: mode }],
+    });
   }
 ```
 
 - [ ] **Step 5: Add the demo/mock backend method**
 
-In `src/lib/demo.ts`, find how `set_track_arm` (or another per-field mix
-command) is mocked and add a matching case for `"set_track_automation_mode"`
-that updates the demo store's in-memory track and returns it, following
+In `src/lib/demo.ts`, implement the adapter method by updating the demo store in memory; no command-name
+switch is needed because the demo backend implements the typed Backend interface, following
 that file's existing pattern exactly (read the surrounding 20 lines around
 the `"set_track_mix"` reference at demo.ts:3453 before writing this).
 

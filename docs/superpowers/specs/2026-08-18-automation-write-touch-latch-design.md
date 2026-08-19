@@ -83,11 +83,12 @@ matches live playback exactly (same requirement Track D's close-out task
 already enforced for track-gain generally). `Read` (the default) is
 today's behavior, unchanged: the lane is always compiled and applied.
 
-`Write` / `Touch` / `Latch` also compile and apply the STORED lane exactly
-like `Read` — the mode only changes whether NEW points get recorded into
-that lane during playback (§4). A track in Write mode with an empty lane
-plays silently-unautomated (gain stays at the live fader value) until a
-recording pass adds points, exactly as an empty lane behaves today.
+`Write` / `Touch` / `Latch` still compile the stored lane, but live recording
+ownership temporarily bypasses that compiled gain ramp. This makes the audible
+gain follow the fader exactly once while Write/Touch owns it and while Latch
+holds its last touched value. On release/Stop, ownership ends and the newly
+committed relative lane resumes normal Read-style playback. A track in Write
+mode with an empty lane stays at the live fader value until a pass adds points.
 
 ## 4. Recording (Write / Touch / Latch)
 
