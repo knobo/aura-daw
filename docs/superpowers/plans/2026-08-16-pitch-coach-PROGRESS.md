@@ -21,7 +21,8 @@ documentation and all commits are English.
 | On `main` | **Phase 2**: PR #58 `7c3cb87` (panel, frame bus, lane geometry, prefs, `pitch_unsubscribe`) |
 | On `main` | **Phase 3**: PR #61 `c14916d` (per-note scoring, stored pitch curve, take report) |
 | On `main` | **Clip View Action**: PR #87 `25af6ae` (explicit pitch analysis action on audio clips, APTF rebuild + PitchCoach report cache invalidation) |
-| Next | Pitch as data / sing-along (`docs/backlog/pitch-as-data.md`): melody extraction from audio clip → MIDI clip, or offline pitch correction (`docs/backlog/pitch-correction-autotune.md`) |
+| In branch | **Melody Extraction**: `pitch_extract_melody`, `segment_pitch_to_notes`, `apply_extracted_melody`, `extractMelodyFromAudio`, and "EXTRACT MELODY" in ClipView. |
+| Next | Pitch as data / sing-along (`docs/pitch-track.md`): Arrangement pitch child lane, offline pitch correction (`docs/backlog/pitch-correction-autotune.md`), voice calibration |
 
 ## Status
 

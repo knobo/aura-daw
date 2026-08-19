@@ -132,6 +132,7 @@ class MidiStore {
 
   async init() {
     this.subscribeToTakes();
+    this.subscribeToProjectChanges();
     try {
       this.applySnapshot(await backend.getProjectState());
     } catch (err) {
@@ -149,6 +150,15 @@ class MidiStore {
     backend.on("recording://state", (rs) => {
       if (rs.recording || !rs.midiClipId) return;
       void this.adoptTake(rs.midiClipId);
+    });
+  }
+
+  private projectSubscribed = false;
+  private subscribeToProjectChanges() {
+    if (this.projectSubscribed) return;
+    this.projectSubscribed = true;
+    backend.on("project://changed", () => {
+      void this.refresh();
     });
   }
 

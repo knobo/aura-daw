@@ -693,6 +693,94 @@ pub async fn pitch_score(
     .map_err(|e| e.to_string())?
 }
 
+/// Argument of `pitch_extract_melody`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractMelodyRequest {
+    pub clip_id: String,
+    pub target_track_id: Option<String>,
+    pub quantize_grid: Option<u32>,
+    pub min_note_ms: Option<f32>,
+    pub set_as_pitch_reference: Option<bool>,
+}
+
+/// Reply of `pitch_extract_melody`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractMelodyReply {
+    pub track_id: String,
+    pub clip_id: String,
+    pub note_count: usize,
+    pub created_track: bool,
+}
+
+/// Extract melody from an audio clip into a new or targeted MIDI clip.
+///
+/// Ensures the APTF pitch track is analysed, segments voiced frames into
+/// discrete notes (with duration filtering, semitone quantization and optional
+/// grid snap), and commits the resulting MIDI clip via the op log.
+#[tauri::command]
+pub async fn pitch_extract_melody(
+    request: ExtractMelodyRequest,
+    state: State<'_, AudioState>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<ExtractMelodyReply, String> {
+    let (dir, clip) = clip_for_pitch(&state, &request.clip_id)?;
+    let project_rate = state.shared.sample_rate.load(Relaxed).max(1);
+
+    let (tempo_map, clip_start_ticks) = {
+        let session = state.session.lock();
+        let midi = &session.midi;
+        let map = crate::midi::TempoMap::new(midi.ppq, midi.tempo_events.clone(), project_rate)
+            .map_err(|e| format!("tempo map: {e}"))?;
+        let start_ticks = map.samples_to_tick(clip.timeline_start_samples);
+        (map, start_ticks)
+    };
+
+    let min_note_ms = request.min_note_ms;
+    let quantize_grid = request.quantize_grid;
+    let track_name = format!("{} Melody", clip.name);
+
+    let (notes, length_ticks) = tauri::async_runtime::spawn_blocking(move || {
+        let track = ensure_pitch_track(&dir, &clip)?;
+        let frames = pitch_frames_on_timeline(&track, &clip, project_rate);
+        control::pitch_coach::segment_pitch_to_notes(
+            &frames,
+            project_rate,
+            &tempo_map,
+            min_note_ms,
+            quantize_grid,
+            clip_start_ticks,
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let note_count = notes.len();
+    let (midi_clip, created_track) = control.apply_extracted_melody(
+        notes,
+        length_ticks,
+        request.target_track_id.clone(),
+        clip_start_ticks,
+        &track_name,
+    )?;
+
+    if request.set_as_pitch_reference.unwrap_or(false) {
+        let target_id = midi_clip.track_id.to_string();
+        let _ = state.engine()?.request(|reply| ControlMsg::SetPitchReference {
+            track_id: Some(target_id),
+            reply,
+        });
+    }
+
+    Ok(ExtractMelodyReply {
+        track_id: midi_clip.track_id.to_string(),
+        clip_id: midi_clip.id.to_string(),
+        note_count,
+        created_track: created_track.is_some(),
+    })
+}
+
 /// Pitch-batch bridge (control thread -> Tauri IPC channel).
 struct ChannelPitchSink(Channel<PitchFrameBatch>);
 

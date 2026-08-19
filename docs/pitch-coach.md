@@ -161,3 +161,28 @@ the format on speculation; see [`backlog/pitch-as-data.md`](backlog/pitch-as-dat
 for the four decisions that shape it, and
 [`backlog/pitch-correction-autotune.md`](backlog/pitch-correction-autotune.md)
 for what detection would need before it could drive pitch correction.
+
+## Voice Configuration, Registers, and Calibration (Challenges & Roadmap)
+
+### 1. Vocal Registers & Octave Adaptation
+* **Voice Registers:** Human vocal ranges vary widely:
+  - *Bass/Baritone:* E2 (82 Hz) – E4 (330 Hz)
+  - *Tenor/Alto:* C3 (130 Hz) – F5 (698 Hz)
+  - *Soprano:* C4 (261 Hz) – C6 (1046 Hz)
+* **Octave Displacement:** Extracting a melody from a high vocal stem (e.g. pop/female lead in C4–C5) and transposing down 1 octave (-12 ST) allows singing in a comfortable male chest voice. However, dropping an entire song by 12 semitones can push the lowest notes down to E2–A2 (80–110 Hz), which can be at the absolute physiological limit of non-bass singers.
+* **Pitch Coach Octave Folding:** Pitch Coach uses octave folding (`diff - 12 * round(diff/12)`), so singers hitting the correct pitch class in any octave receive full scores.
+
+### 2. Low-Frequency Detection Limits (80 Hz High-Pass)
+* The RT decimation filter (`src-tauri/src/audio/decimate.rs`) includes an 80 Hz one-pole high-pass filter to reject microphone rumble and DC offset.
+* This attenuates fundamental frequencies below E2 (~82 Hz), causing the detector to latch onto the 2nd harmonic (160+ Hz) for very low notes.
+* *Future improvement:* Lower the decimation HP filter cutoff to 50–55 Hz (allowing C2/D2 fundamental detection down to 65 Hz) or provide an input profile setting.
+
+### 3. Interactive Vocal Calibration & Auto-Detection
+* **Calibration Flow ("Sing these notes"):** A guided range calibration test where the user sings a few reference prompts to detect their lowest comfortable pitch, highest pitch, and natural tessitura.
+* **Audio Stem Profile Detection:** Heuristics or sidecar analysis on imported vocal stems to recommend optimal transposition or target voice range.
+
+### 4. Polyphonic & AI-Generated Stems (Suno / Udio / Choirs)
+* Stem splitting on complex AI tracks (e.g. from Suno or Udio) often yields vocal stems with mixed male/female duets, multi-part backing harmonies, and choir stacks.
+* Monophonic YIN pitch detection is designed for single-voice input and may jump between voices or track the loudest harmonic in dense choral passages.
+* *Future hybrid AI + DSP direction:* Integrating neural multi-pitch or vocal lead separation (e.g. BasicPitch, CREPE, or lead vocal demixing) to isolate the primary melodic line before DSP segmentation.
+

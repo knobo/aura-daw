@@ -418,6 +418,23 @@ export interface PitchState {
   deviceRate: number;
 }
 
+/** Argument of `pitch_extract_melody`. */
+export interface ExtractMelodyRequest {
+  clipId: string;
+  targetTrackId?: string | null;
+  quantizeGrid?: number | null;
+  minNoteMs?: number | null;
+  setAsPitchReference?: boolean | null;
+}
+
+/** Reply of `pitch_extract_melody`. */
+export interface ExtractMelodyReply {
+  trackId: string;
+  clipId: string;
+  noteCount: number;
+  createdTrack: boolean;
+}
+
 // ── project.schema.json ─────────────────────────────────────────────────────
 
 /** Who committed a transaction (control::op::Actor, externally-tagged serde

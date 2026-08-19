@@ -152,7 +152,7 @@ pub(crate) fn parse_hum_result(
 /// pure (no lock, no store access) — the prepare-outside-the-transaction
 /// half of [`apply_hum_notes`]/[`ControlPlane::apply_hum_clip`] (Plan E
 /// Task 8).
-fn prepare_hum_notes(
+pub(crate) fn prepare_hum_notes(
     mut notes: Vec<MidiNote>,
     length_ticks: u64,
 ) -> Result<(Vec<MidiNote>, u64), String> {
@@ -182,7 +182,7 @@ fn prepare_hum_notes(
 /// the production path with the full rebuild/persist/emit effect pipeline —
 /// this is what turns hum's old under-lock disk write and missing
 /// `project://changed` emit into effects executed AFTER the lock drops).
-fn commit_hum_clip(
+pub(crate) fn commit_hum_clip(
     tx: &mut Tx<'_>,
     notes: Vec<MidiNote>,
     length_ticks: u64,
@@ -412,6 +412,31 @@ impl ControlPlane {
         let (notes, length_ticks) = prepare_hum_notes(notes, length_ticks)?;
         let mut outcome = None;
         self.commit(TxMeta::system("hum-to-song apply"), |tx| {
+            outcome = Some(commit_hum_clip(
+                tx,
+                notes.clone(),
+                length_ticks,
+                track_id.clone(),
+                at_ticks,
+                name,
+            )?);
+            Ok(())
+        })?;
+        Ok(outcome.expect("commit_hum_clip sets outcome on every Ok(())"))
+    }
+
+    /// Land extracted melody notes as a MIDI clip (with user-attributed undo entry).
+    pub fn apply_extracted_melody(
+        &self,
+        notes: Vec<MidiNote>,
+        length_ticks: u64,
+        track_id: Option<String>,
+        at_ticks: u64,
+        name: &str,
+    ) -> Result<(MidiClip, Option<TrackState>), String> {
+        let (notes, length_ticks) = prepare_hum_notes(notes, length_ticks)?;
+        let mut outcome = None;
+        self.commit(TxMeta::user("extract melody to midi"), |tx| {
             outcome = Some(commit_hum_clip(
                 tx,
                 notes.clone(),
@@ -1314,4 +1339,40 @@ echo '{"type":"done","result":{"kind":"humToMidi","ppq":960,"bpm":120,"lengthTic
         assert!(notes.len() >= 4, "a plausible melody: {notes:?}");
         assert!(length >= notes.last().map(|n| n.tick as u64).unwrap_or(0));
     }
+
+    #[test]
+    fn apply_extracted_melody_creates_track_and_clip() {
+        let (cp, _parent) = test_control_plane("extract_test");
+        let notes = vec![
+            MidiNote {
+                tick: 0,
+                length_ticks: 480,
+                key: 60,
+                velocity: 90,
+                channel: 0,
+                note_id: crate::ids::NoteId(0),
+            },
+            MidiNote {
+                tick: 480,
+                length_ticks: 480,
+                key: 64,
+                velocity: 95,
+                channel: 0,
+                note_id: crate::ids::NoteId(0),
+            },
+        ];
+        let (clip, track) = cp
+            .apply_extracted_melody(notes, 1920, None, 960, "Vocal Take Melody")
+            .unwrap();
+
+        assert_eq!(clip.name, "Vocal Take Melody");
+        assert_eq!(clip.timeline_start_ticks, 960);
+        assert_eq!(clip.length_ticks, 1920);
+        assert_eq!(clip.notes.len(), 2);
+        assert_eq!(clip.notes[0].note_id, crate::ids::NoteId(1));
+        assert_eq!(clip.notes[1].note_id, crate::ids::NoteId(2));
+        assert!(track.is_some());
+        assert_eq!(track.unwrap().name, "Vocal Take Melody");
+    }
 }
+

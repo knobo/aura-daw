@@ -205,6 +205,7 @@ pub fn run() {
             audio::pitch_score,
             audio::pitch_track,
             audio::pitch_analyze_clip,
+            audio::pitch_extract_melody,
             // ---- audio: tracks ----
             audio::add_track,
             audio::remove_track,
