@@ -336,6 +336,19 @@ const DEMO_PLUGINS: PluginDescriptor[] = [
     hasNoteInput: false,
     categories: ["audio-effect", "compressor"],
   },
+  {
+    uid: "clap:/usr/lib/clap/IRVerb.clap#com.airwindows.irverb",
+    format: "clap",
+    name: "IRVerb",
+    vendor: "Airwindows",
+    version: "2.0.1",
+    path: "/usr/lib/clap/IRVerb.clap",
+    isInstrument: false,
+    audioInputs: 2,
+    audioOutputs: 2,
+    hasNoteInput: false,
+    categories: ["audio-effect", "reverb", "convolution"],
+  },
 ];
 
 /** Fresh per-instance parameter list for a demo plugin uid. */
@@ -389,6 +402,19 @@ function demoPluginParams(uid: string): PluginParamInfo[] {
       );
     }
     return params;
+  }
+  if (uid.includes("irverb")) {
+    return [
+      p(0, "Mix", 0, 1, 0.35),
+      p(1, "Pre-delay", 0, 200, 25),
+      p(2, "Decay", 0.1, 10, 2.4),
+      p(3, "Room Size", 0, 1, 0.6),
+      p(4, "Low Cut", 20, 500, 80),
+      p(5, "High Cut", 1000, 20000, 12000),
+      p(6, "Early Reflections", 0, 1, 0.7),
+      p(7, "Diffusion", 0, 1, 0.5),
+      p(8, "IR Select", 0, 5, 0, 6),
+    ];
   }
   return [];
 }
