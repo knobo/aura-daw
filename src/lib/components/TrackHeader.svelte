@@ -749,6 +749,15 @@
     letter-spacing: 0.04em;
     cursor: pointer;
   }
+  .status.arm,
+  .status.mute,
+  .status.solo {
+    flex: none;
+    width: 20px;
+    min-width: 0;
+    padding: 0;
+    text-align: center;
+  }
   .status.arm.on {
     color: var(--text-on-accent);
     background: rgb(var(--red-rgb) / 0.8);
