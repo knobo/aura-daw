@@ -512,6 +512,18 @@ impl Tx<'_> {
         &self.session.midi
     }
 
+    /// Same as [`Tx::store`], for the automation-lane view — what
+    /// `Op::AutomationSetLane` upserts into and `automation_get` reads.
+    /// Exists for the same TOCTOU reason [`Tx::store`] does: the engine's
+    /// automation recorder (audio/engine.rs, Task 10) MERGES a recorded
+    /// pass into the track's existing lane, and reading that lane through a
+    /// separate `session.lock()` outside the closure would let a manual
+    /// lane edit land in between and be silently clobbered by the merged
+    /// whole-lane replace this transaction then applies.
+    pub fn automation(&self) -> &AutomationDoc {
+        &self.session.automation
+    }
+
     /// The document epoch this transaction runs under — read inside the
     /// closure, under the SAME lock `apply` writes through, so an undo can
     /// refuse to apply an entry popped under a DIFFERENT document (C-1
@@ -3386,12 +3398,18 @@ mod tests {
     #[test]
     fn automation_set_lane_inserts_and_inverse_deletes() {
         let m = parking_lot::Mutex::new(Session::new(Store::default(), MidiStore::default()));
-        let lane = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 1.0 }]);
+        let lane = test_lane("a-1", vec![AutomationPoint { tick: 0, value: 2.0 }]);
         let c = Session::transact(&m, TxMeta::user("set lane"), |tx| {
             tx.apply(Op::AutomationSetLane { key: "a-1".into(), lane: Some(lane.clone()) })
         })
         .unwrap();
-        assert_eq!(m.lock().automation.lanes, vec![lane]);
+        {
+            let s = m.lock();
+            assert_eq!(s.automation.lanes, vec![lane.clone()]);
+            assert_eq!(s.automation.lanes[0].points[0].value, 2.0);
+            assert_eq!(s.modulation.curves[0].points[0].value, 2.0);
+            assert_eq!(s.modulation.bindings[0].domain, crate::modulation::model::Domain::Native);
+        }
         assert!(c.effect.persist.automation, "lane write must persist automation");
         assert!(
             c.effect.rebuild,

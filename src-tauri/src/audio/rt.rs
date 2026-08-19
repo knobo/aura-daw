@@ -26,6 +26,13 @@ pub const FLAG_SOLO: u32 = 1 << 1;
 /// track is soloed or this one is muted.
 pub const FLAG_LAUNCH: u32 = 1 << 2;
 
+/// Relative automation value for a coherent live/base gain snapshot. Every
+/// finite positive base is meaningful, including subnormal values; only zero
+/// or non-finite bases use the safe silence fallback.
+pub fn relative_gain_multiplier(live: f32, base: f32) -> f32 {
+    if base.is_finite() && base > 0.0 { live / base } else { 0.0 }
+}
+
 /// One-shot shadow playhead for a drive-clip launch. Launched tracks
 /// render at `pos` instead of the arrangement playhead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,7 +237,12 @@ impl SharedRt {
 /// argument), and a rebuild always sizes the fresh table to the CURRENT
 /// track count, however wide that gets.
 pub struct ParamTable {
+    /// Current live fader value (gestures may override it without moving the document base).
     pub gain: Vec<AtomicU32>,
+    /// Persisted base-fader value used as the denominator for relative gain recording.
+    pub base_gain: Vec<AtomicU32>,
+    /// Even = stable; odd = a live/base writer is in progress.
+    gain_seq: Vec<AtomicU32>,
     pub pan: Vec<AtomicU32>,
     pub flags: Vec<AtomicU32>,
     pub any_solo: AtomicBool,
@@ -253,6 +265,8 @@ impl ParamTable {
     pub fn with_slots(n: usize) -> Self {
         Self {
             gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            base_gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
+            gain_seq: (0..n).map(|_| AtomicU32::new(0)).collect(),
             pan: (0..n).map(|_| AtomicU32::new(0.0f32.to_bits())).collect(),
             flags: (0..n).map(|_| AtomicU32::new(0)).collect(),
             any_solo: AtomicBool::new(false),
@@ -267,14 +281,84 @@ impl ParamTable {
         self.gain.is_empty()
     }
 
-    pub fn set_gain_linear(&self, slot: usize, gain: f32) {
-        if slot < self.len() {
-            self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+    fn begin_gain_write(&self, slot: usize) -> Option<&AtomicU32> {
+        let seq = self.gain_seq.get(slot)?;
+        loop {
+            let current = seq.load(Ordering::Acquire);
+            if current & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            if seq
+                .compare_exchange_weak(
+                    current,
+                    current.wrapping_add(1),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Some(seq);
+            }
         }
+    }
+
+    fn end_gain_write(seq: &AtomicU32) {
+        seq.fetch_add(1, Ordering::Release);
+    }
+
+    pub fn set_gain_linear(&self, slot: usize, gain: f32) {
+        let Some(seq) = self.begin_gain_write(slot) else { return };
+        self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+        Self::end_gain_write(seq);
     }
 
     pub fn gain_linear(&self, slot: usize) -> f32 {
         self.gain.get(slot).map_or(1.0, |g| f32::from_bits(g.load(Ordering::Relaxed)))
+    }
+
+    pub fn set_base_gain_linear(&self, slot: usize, gain: f32) {
+        let Some(seq) = self.begin_gain_write(slot) else { return };
+        self.base_gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+        Self::end_gain_write(seq);
+    }
+
+    /// Publish a persisted fader change as one coherent live/base pair.
+    pub fn set_gain_pair_linear(&self, slot: usize, gain: f32) {
+        let Some(seq) = self.begin_gain_write(slot) else { return };
+        let bits = gain.to_bits();
+        self.gain[slot].store(bits, Ordering::Relaxed);
+        self.base_gain[slot].store(bits, Ordering::Relaxed);
+        Self::end_gain_write(seq);
+    }
+
+    /// Coherent snapshot for relative automation recording.
+    pub fn gain_pair_linear(&self, slot: usize) -> (f32, f32) {
+        let (Some(seq), Some(live), Some(base)) = (
+            self.gain_seq.get(slot),
+            self.gain.get(slot),
+            self.base_gain.get(slot),
+        ) else {
+            return (1.0, 1.0);
+        };
+        loop {
+            let before = seq.load(Ordering::Acquire);
+            if before & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let live = f32::from_bits(live.load(Ordering::Relaxed));
+            let base = f32::from_bits(base.load(Ordering::Relaxed));
+            if seq.load(Ordering::Acquire) == before {
+                return (live, base);
+            }
+        }
+    }
+
+    pub fn base_gain_linear(&self, slot: usize) -> f32 {
+        self.base_gain
+            .get(slot)
+            .map_or(1.0, |g| f32::from_bits(g.load(Ordering::Relaxed)))
     }
 
     pub fn set_pan(&self, slot: usize, pan: f32) {
@@ -671,6 +755,30 @@ mod tests {
         let t = ParamTable::with_slots(4);
         t.set_gain_linear(2, 0.5);
         assert_eq!(t.gain_linear(2), 0.5);
+    }
+
+    #[test]
+    fn coherent_gain_pair_never_observes_a_torn_persisted_write() {
+        let table = Arc::new(ParamTable::with_slots(1));
+        let writer = table.clone();
+        let thread = std::thread::spawn(move || {
+            for i in 0..50_000 {
+                writer.set_gain_pair_linear(0, if i % 2 == 0 { 2.0 } else { 4.0 });
+            }
+        });
+        for _ in 0..50_000 {
+            let (live, base) = table.gain_pair_linear(0);
+            assert_eq!(live, base);
+        }
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn relative_gain_divides_by_every_finite_positive_base() {
+        let subnormal = f32::MIN_POSITIVE / 2.0;
+        assert_eq!(relative_gain_multiplier(subnormal * 2.0, subnormal), 2.0);
+        assert_eq!(relative_gain_multiplier(1.0, 0.0), 0.0);
+        assert_eq!(relative_gain_multiplier(1.0, f32::NAN), 0.0);
     }
 
     #[test]

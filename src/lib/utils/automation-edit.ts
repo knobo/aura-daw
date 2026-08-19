@@ -14,6 +14,19 @@ export interface Pt {
   value: number;
 }
 
+/** Positive power-of-two display ceiling for native gain multipliers.
+ * The editor always exposes boost space (minimum 2x), and when the current
+ * peak reaches a ceiling it advances to the next one so upward drags remain
+ * possible without first changing another control. */
+export function positiveValueCeiling(points: Pt[]): number {
+  const peak = points.reduce(
+    (max, point) => (Number.isFinite(point.value) ? Math.max(max, point.value) : max),
+    1,
+  );
+  const ceiling = Math.max(2, 2 ** Math.ceil(Math.log2(peak)));
+  return ceiling <= peak ? ceiling * 2 : ceiling;
+}
+
 /** Index of the point within `radiusPx` of (tick, value) in SCREEN space,
  * or -1. `tickPerPx`/`valuePerPx` convert the radius into domain units. */
 export function hitTest(

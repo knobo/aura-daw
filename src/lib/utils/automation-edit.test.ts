@@ -1,11 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { deletePoint, hitTest, insertPoint, movePoint, type Pt } from "./automation-edit";
+import { deletePoint, hitTest, insertPoint, movePoint, positiveValueCeiling, type Pt } from "./automation-edit";
 
 const pts: Pt[] = [
   { tick: 0, value: 1 },
   { tick: 960, value: 0.5 },
   { tick: 3840, value: 0 },
 ];
+
+describe("positiveValueCeiling", () => {
+  it("always leaves boost-authoring headroom", () => {
+    expect(positiveValueCeiling([])).toBe(2);
+    expect(positiveValueCeiling(pts)).toBe(2);
+  });
+  it("expands boost lanes without clamping their values", () => {
+    expect(positiveValueCeiling([{ tick: 0, value: 1.995 }])).toBe(2);
+    expect(positiveValueCeiling([{ tick: 0, value: 2 }])).toBe(4);
+    expect(positiveValueCeiling([{ tick: 0, value: 3 }])).toBe(4);
+  });
+});
 
 describe("hitTest", () => {
   it("finds the point under the cursor within the radius", () => {

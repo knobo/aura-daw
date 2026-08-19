@@ -81,12 +81,13 @@
   --body-glow: 0.05;
 
   /* type */
-  --font-mono: "SFMono-Regular", "JetBrains Mono", "Cascadia Mono", ui-monospace,
-    "Menlo", "Consolas", monospace;
+  --font-mono:
+    "SFMono-Regular", "JetBrains Mono", "Cascadia Mono", ui-monospace, "Menlo",
+    "Consolas", monospace;
   --font-ui: "Inter", "SF Pro Text", system-ui, "Segoe UI", sans-serif;
 
   /* chrome metrics */
-  --track-height: 88px;
+  --track-height: 132px;
   /* --lane-collapsed / --lane-group-height are NOT declared here: a folded
      lane and a group header are the same height on purpose (both read as
      "one strip standing in for something bigger"), and that height is
@@ -94,7 +95,7 @@
      numbers the grid canvas and the marquee measure against. main.ts sets
      both properties from those constants before the app mounts, so there is
      one number to change instead of two kept in sync by a comment. */
-  --rail-width: 268px;
+  --rail-width: 320px;
   --ruler-height: 34px;
 }
 
@@ -115,8 +116,16 @@ body {
 
 body {
   background:
-    radial-gradient(1200px 500px at 75% -10%, rgb(var(--cyan-rgb) / var(--body-glow)), transparent 60%),
-    radial-gradient(900px 500px at 10% 110%, rgb(var(--magenta-rgb) / calc(var(--body-glow) * 0.9)), transparent 60%),
+    radial-gradient(
+      1200px 500px at 75% -10%,
+      rgb(var(--cyan-rgb) / var(--body-glow)),
+      transparent 60%
+    ),
+    radial-gradient(
+      900px 500px at 10% 110%,
+      rgb(var(--magenta-rgb) / calc(var(--body-glow) * 0.9)),
+      transparent 60%
+    ),
     var(--bg-0);
   color: var(--text);
   font-family: var(--font-ui);

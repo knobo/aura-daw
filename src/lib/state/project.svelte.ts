@@ -292,9 +292,9 @@ class ProjectStore {
    * a mismatch is a no-op so a late end cannot close a different
    * gesture. Omitting the id keeps the old close-whatever contract.
    * Safe to call even without a matching `beginGesture`. */
-  endGesture(id?: string) {
+  async endGesture(id?: string): Promise<void> {
     if (id == null) return;
-    void backend.gestureEnd?.(id);
+    await backend.gestureEnd?.(id);
   }
 
   // ── clips ──

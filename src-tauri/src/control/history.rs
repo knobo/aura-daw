@@ -524,6 +524,10 @@ impl JournalWriter {
 pub enum HistoryMode {
     /// A fresh edit: record it (clearing redo, applying the 350 ms merge).
     Record,
+    /// A finished explicit boundary (for example one automation recording
+    /// pass). Record it, but never let the 350 ms fallback merge it with an
+    /// adjacent pass that deliberately has its own undo boundary.
+    RecordDistinct,
     /// This commit IS an undo or a redo. It is still journaled — replay
     /// must see it, it is a real mutation — but it must not create a new
     /// history entry: `ControlPlane::undo`/`redo` migrate the ORIGINAL
@@ -668,13 +672,23 @@ impl HistoryLog {
             // Journal FIRST, unconditionally: an undo/redo is a mutation and
             // replay must see it, even though it creates no new history entry.
             self.journal.lock().append_batch(rev, epoch, &committed.meta, &committed.ops);
-            if mode == HistoryMode::Record {
-                self.history.lock().record(HistoryEntry::from_committed(
+            let entry = match mode {
+                HistoryMode::Record => Some(HistoryEntry::from_committed(
                     &committed.meta,
                     &committed.ops,
                     &committed.inverses,
                     rev,
-                ));
+                )),
+                HistoryMode::RecordDistinct => Some(HistoryEntry::from_gesture(
+                    &committed.meta,
+                    &committed.ops,
+                    &committed.inverses,
+                    rev,
+                )),
+                HistoryMode::Replay => None,
+            };
+            if let Some(entry) = entry {
+                self.history.lock().record(entry);
             }
             self.versions.lock().record(committed)
         };

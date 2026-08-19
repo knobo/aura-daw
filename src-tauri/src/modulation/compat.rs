@@ -137,7 +137,7 @@ pub fn lane_to_pair(lane: &AutomationLane, existing: Option<&Binding>) -> (Curve
         Some(track_id) => (
             TargetRef::TrackParam { track_id: track_id.to_string(), param: TrackParam::Gain },
             BindingMode::Multiply,
-            Domain::Normalized,
+            Domain::Native,
             None,
         ),
         None => {

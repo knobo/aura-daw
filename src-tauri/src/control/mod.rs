@@ -469,7 +469,7 @@ impl Committer {
             for (tid, path, value) in &committed.effect.param_writes {
                 let Some(&slot) = tables.slots.get(tid) else { continue };
                 match path {
-                    op::PropPath::Gain => tables.params.set_gain_linear(slot, *value),
+                    op::PropPath::Gain => tables.params.set_gain_pair_linear(slot, *value),
                     op::PropPath::Pan => tables.params.set_pan(slot, *value),
                     op::PropPath::Muted => tables.params.set_flag(slot, FLAG_MUTE, *value != 0.0),
                     op::PropPath::Soloed => tables.params.set_flag(slot, FLAG_SOLO, *value != 0.0),
@@ -961,6 +961,35 @@ pub(crate) mod testutil {
             Arc::new(history::HistoryLog::new()),
         )
     }
+
+    /// Put `gesture` into the state an open fader drag on `track_id` leaves
+    /// behind — a gesture open with a gain `Set` already folded into it, so
+    /// [`GestureState::is_track_gain_touched`] reads `true`. For fixtures
+    /// that have no `ControlPlane` to run a real `gesture_begin` +
+    /// `set_track_mix` through (the engine's `bare_control`, whose
+    /// automation Touch/Latch tests need exactly this and nothing else).
+    pub fn touch_track_gain(gesture: &GestureState, track_id: &str) {
+        let op = op::Op::Set {
+            object: op::ObjectRef::Track(track_id.into()),
+            path: op::PropPath::Gain,
+            from: serde_json::Value::Null,
+            to: serde_json::json!(0.0),
+        };
+        let key = CoalesceKey::for_op(&op).expect("a gain Set folds by key");
+        let _stale = gesture.begin("test fader drag".into(), op::Actor::User);
+        gesture
+            .0
+            .lock()
+            .as_mut()
+            .expect("just opened")
+            .last
+            .push((key, op));
+    }
+
+    /// Close whatever [`touch_track_gain`] opened — the pointerup half.
+    pub fn release_gesture(gesture: &GestureState) {
+        let _closed = gesture.end(None);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1152,6 +1181,10 @@ struct OpenGesture {
     /// recent fold (overwritten every time the key reappears).
     last: Vec<(CoalesceKey, op::Op)>,
     label: String,
+    /// Track faders this gesture controls as Write/Touch/Latch input. They
+    /// are live side-channel writes, deliberately absent from `last`: the
+    /// persisted base fader must not move while automation is recorded.
+    live_gain_tracks: Vec<String>,
     /// Union of the persist effects of every commit folded into this
     /// gesture, executed ONCE at `close_gesture` (I-8). Deferring is what
     /// turns "one project.json write per rAF batch" into "one per drag".
@@ -1222,11 +1255,33 @@ impl GestureState {
     pub fn is_track_gain_touched(&self, track_id: &str) -> bool {
         let guard = self.0.lock();
         let Some(g) = guard.as_ref() else { return false };
-        g.last.iter().any(|(key, _)| {
-            key.kind == "set"
-                && key.path == Some(op::PropPath::Gain)
-                && matches!(&key.target, CoalesceTarget::Object(op::ObjectRef::Track(id)) if id.as_str() == track_id)
-        })
+        g.live_gain_tracks.iter().any(|id| id == track_id)
+            || g.last.iter().any(|(key, _)| {
+                key.kind == "set"
+                    && key.path == Some(op::PropPath::Gain)
+                    && matches!(&key.target, CoalesceTarget::Object(op::ObjectRef::Track(id)) if id.as_str() == track_id)
+            })
+    }
+
+    /// Run live automation-control writes while the matching gesture mutex
+    /// is held. This makes mark + RT-table write atomic against gesture_end:
+    /// the engine can never receive a Touch-finish before the final fader
+    /// value has landed. Returns false when there is no matching gesture.
+    fn control_live_track_gains<F>(&self, actor: &op::Actor, track_ids: &[String], f: F) -> bool
+    where
+        F: FnOnce(),
+    {
+        let mut guard = self.0.lock();
+        let Some(g) = guard.as_mut().filter(|g| &g.actor == actor) else {
+            return false;
+        };
+        f();
+        for id in track_ids {
+            if !g.live_gain_tracks.contains(id) {
+                g.live_gain_tracks.push(id.clone());
+            }
+        }
+        true
     }
 
     /// Opens a new gesture. If one was already open, it's taken (closed)
@@ -1243,6 +1298,7 @@ impl GestureState {
             baselines: Vec::new(),
             last: Vec::new(),
             label,
+            live_gain_tracks: Vec::new(),
             persist: session::PersistEffect::default(),
             epoch: 0,
         });
@@ -1403,6 +1459,15 @@ pub(crate) fn forward_params_to_host(instance: &str, format: &str, changes: &[(u
         }
         _ => {}
     }
+}
+
+fn records_automation(mode: crate::audio::types::AutomationMode) -> bool {
+    matches!(
+        mode,
+        crate::audio::types::AutomationMode::Write
+            | crate::audio::types::AutomationMode::Touch
+            | crate::audio::types::AutomationMode::Latch
+    )
 }
 
 /// Build a property-addressed `Op::Set` for a track. `from` is advisory
@@ -1883,6 +1948,7 @@ impl ControlPlane {
                     },
                     false,
                 )?;
+                self.engine.send(ControlMsg::FinishAutomationStop);
                 self.shared.playing.store(false, Relaxed);
                 self.clear_launch_audible();
             }
@@ -2784,7 +2850,7 @@ impl ControlPlane {
     /// audible yet invisible in the mixer.
     pub fn set_track_mix(
         &self,
-        changes: Vec<TrackMixChange>,
+        mut changes: Vec<TrackMixChange>,
         meta: op::TxMeta,
     ) -> Result<Vec<TrackState>, String> {
         // Validate every id BEFORE writing anything: `Session::transact`
@@ -2802,6 +2868,56 @@ impl ControlPlane {
                 }
             }
         }
+        // While playback is writing automation, an open fader gesture is a
+        // LIVE automation controller. The persisted gain remains the base
+        // fader and the recorded lane becomes its relative multiplier;
+        // committing this gain as a normal Set would both move the base and
+        // write the same movement into the lane (double attenuation and two
+        // undo entries). Non-gesture callers and stopped transport retain
+        // the ordinary document-edit behaviour.
+        let recording_gains: Vec<(String, f64)> = if self.shared.playing.load(Relaxed) {
+            let session = self.session.lock();
+            changes
+                .iter()
+                .filter_map(|c| {
+                    let gain = c.gain_db?;
+                    let track = session.store.tracks.iter().find(|t| t.id == c.track_id)?;
+                    records_automation(track.automation_mode)
+                        .then(|| (c.track_id.clone(), gain.clamp(-160.0, 24.0)))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let live_ids: Vec<String> = recording_gains.iter().map(|(id, _)| id.clone()).collect();
+        let live_controlled = !recording_gains.is_empty()
+            && self.gesture.control_live_track_gains(&meta.actor, &live_ids, || {
+                let tables = self.tables.lock();
+                for (track_id, gain_db) in &recording_gains {
+                    if let Some(&slot) = tables.slots.get(track_id.as_str()) {
+                        tables.params.set_gain_linear(
+                            slot,
+                            crate::audio::mixer::db_to_linear(*gain_db),
+                        );
+                    }
+                }
+            });
+        if live_controlled {
+            for change in &mut changes {
+                if live_ids.iter().any(|id| id == &change.track_id) {
+                    change.gain_db = None;
+                }
+            }
+        }
+        let has_document_changes = changes.iter().any(|c| {
+            c.gain_db.is_some()
+                || c.pan.is_some()
+                || c.muted.is_some()
+                || c.soloed.is_some()
+                || c.armed.is_some()
+                || c.automation_mode.is_some()
+        });
+
         // Plan E Task 14 (fix round 1, Finding 2): the actor-match check,
         // the transient commit, and the fold into the gesture's accumulator
         // now happen while `GestureState::commit_transient_and_fold` holds
@@ -2814,16 +2930,18 @@ impl ControlPlane {
         // keeps the ORIGINAL `meta` available for the non-gesture fallback
         // below — whether `commit_transient_and_fold`'s inner closure ever
         // runs is a RUNTIME decision this code can't make ahead of time.
-        let gesture_meta = meta.clone();
-        let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
-            self.commit_transient_for_gesture(gesture_meta, |tx| apply_mix_changes(&changes, tx))
-        });
-        match gesture_result {
-            Some(result) => {
-                result?;
-            }
-            None => {
-                self.commit(meta, |tx| apply_mix_changes(&changes, tx))?;
+        if has_document_changes {
+            let gesture_meta = meta.clone();
+            let gesture_result = self.gesture.commit_transient_and_fold(&meta.actor, || {
+                self.commit_transient_for_gesture(gesture_meta, |tx| apply_mix_changes(&changes, tx))
+            });
+            match gesture_result {
+                Some(result) => {
+                    result?;
+                }
+                None => {
+                    self.commit(meta, |tx| apply_mix_changes(&changes, tx))?;
+                }
             }
         }
         // Re-lock (a fresh acquisition, separate from the pre-check and the
@@ -3701,6 +3819,22 @@ impl ControlPlane {
         // the destructuring that follows.
         let gesture_persist = gesture.persist;
         let gesture_epoch = gesture.epoch;
+        if !gesture.live_gain_tracks.is_empty() {
+            let final_values = {
+                let tables = self.tables.lock();
+                gesture
+                    .live_gain_tracks
+                    .iter()
+                    .filter_map(|track_id| {
+                        let &slot = tables.slots.get(track_id.as_str())?;
+                        let (live, base) = tables.params.gain_pair_linear(slot);
+                        let multiplier = crate::audio::rt::relative_gain_multiplier(live, base);
+                        Some((track_id.clone(), multiplier))
+                    })
+                    .collect()
+            };
+            self.engine.send(ControlMsg::FinishAutomationTouch(final_values));
+        }
         if gesture.last.is_empty() {
             // Fix round 1, Important-1: a folded commit's OWN ops can net
             // to nothing (session.rs's `fold_ops` elides a same-key Set
@@ -6474,6 +6608,67 @@ mod tests {
     }
 
     // ---- Plan E Task 14: gesture IPC ---------------------------------------
+
+    #[test]
+    fn recording_mode_gain_gesture_controls_live_gain_without_moving_the_base_fader() {
+        let (plane, engine_rx, events) = test_plane_with_tracks(&["t-1"]);
+        {
+            let mut session = plane.session().lock();
+            let track = &mut session.store.tracks[0];
+            track.gain_db = -12.0;
+            track.automation_mode = AutomationMode::Touch;
+        }
+        let slot = *plane.tables.lock().slots.get("t-1").unwrap();
+        plane
+            .tables
+            .lock()
+            .params
+            .set_gain_linear(slot, crate::audio::mixer::db_to_linear(-12.0));
+        plane
+            .tables
+            .lock()
+            .params
+            .set_base_gain_linear(slot, crate::audio::mixer::db_to_linear(-12.0));
+        plane.shared.playing.store(true, Relaxed);
+
+        plane.gesture_begin("gain drag".into()).unwrap();
+        plane
+            .set_track_mix(
+                vec![TrackMixChange {
+                    gain_db: Some(-6.0),
+                    ..TrackMixChange::new("t-1")
+                }],
+                TxMeta::user("set gain"),
+            )
+            .unwrap();
+
+        assert_eq!(plane.session().lock().store.tracks[0].gain_db, -12.0);
+        assert_eq!(plane.history_depths(), (0, 0));
+        assert!(plane.gesture.is_track_gain_touched("t-1"));
+        assert!(
+            (plane.tables.lock().params.gain_linear(slot)
+                - crate::audio::mixer::db_to_linear(-6.0))
+                .abs()
+                < 1e-6
+        );
+        assert!(events.lock().iter().all(|(name, _)| name != "project://changed"));
+
+        plane.gesture_end().unwrap();
+        let touch_finishes: Vec<_> = engine_rx
+            .try_iter()
+            .filter_map(|msg| match msg {
+                ControlMsg::FinishAutomationTouch(ids) => Some(ids),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(touch_finishes.len(), 1);
+        assert_eq!(touch_finishes[0][0].0, "t-1");
+        assert!(
+            (touch_finishes[0][0].1 - crate::audio::mixer::db_to_linear(6.0)).abs() < 1e-5,
+            "-12 dB base to -6 dB live is a ~2x multiplier"
+        );
+        assert!(plane.take_last_gesture_batch().is_none());
+    }
 
     /// The brief's core TDD case: begin -> 5x `set_track_mix` gain on ONE
     /// track -> end produces exactly ONE history-bound batch whose inverse

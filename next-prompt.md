@@ -24,8 +24,14 @@ before picking G1 back up**:
 1. **Track D leftovers (automation)** — pick one, read the Track D handoff
    in `docs/PHASE4-PLAN.md` first: plugin-param automation is not applied
    in a bounce (`audio::offline::build_graph`'s documented divergence);
-   write/touch/latch automation modes (currently a flat lane always
-   overrides the knob for the whole playthrough); no DOM test environment
+   write/touch/latch automation modes (partially implemented on the current
+   feature branch for gain lanes on regular audio/MIDI tracks); recording
+   gestures into a **separate automation track**, routing that recording to
+   its selected targets, and an explicit Enabled/Bypass control for the
+   automation-track source remain follow-up work. A later PR must also add
+   external MIDI-controller mapping for automatable parameters, with both a
+   MIDI Learn workflow and manual Set Value/mapping configuration; no DOM test
+   environment
    (nothing inside a `.svelte` file is covered by any test — both of
    Track D's real bugs lived there). (The non-blocking CLAP param path is
    closed, branch `clap-nonblocking-params` — see the Track D handoff.)

@@ -8,6 +8,7 @@ import {
   LANE_COLLAPSED_PX,
   LANE_HEIGHT_PX,
   nearestTrackIndexAtY,
+  RAIL_WIDTH_PX,
   trackBand,
   trackIndexAtY,
 } from "./lane-layout";
@@ -52,6 +53,14 @@ describe("groupOf", () => {
   });
 });
 
+describe("expanded rail metrics", () => {
+  it("pins the 320px rail, 132px expanded row, and unchanged 22px fold", () => {
+    expect(RAIL_WIDTH_PX).toBe(320);
+    expect(LANE_HEIGHT_PX).toBe(132);
+    expect(LANE_COLLAPSED_PX).toBe(22);
+  });
+});
+
 describe("buildLaneLayout", () => {
   it("stacks plain lanes at the full height", () => {
     const l = layout([track("t1"), track("t2"), track("t3")]);
@@ -76,7 +85,12 @@ describe("buildLaneLayout", () => {
 
   it("emits a header row for a group and keeps its members below it", () => {
     const l = layout([track("t1"), track("t2", "Drums"), track("t3", "Drums")]);
-    expect(l.rows.map((r) => r.kind)).toEqual(["track", "group", "track", "track"]);
+    expect(l.rows.map((r) => r.kind)).toEqual([
+      "track",
+      "group",
+      "track",
+      "track",
+    ]);
     const header = l.rows[1];
     expect(header.kind === "group" && header.trackIds).toEqual(["t2", "t3"]);
     expect(header.height).toBe(GROUP_HEADER_PX);
@@ -86,7 +100,11 @@ describe("buildLaneLayout", () => {
   });
 
   it("paints no member rows for a folded group", () => {
-    const l = layout([track("t1"), track("t2", "Drums"), track("t3", "Drums")], [], ["Drums"]);
+    const l = layout(
+      [track("t1"), track("t2", "Drums"), track("t3", "Drums")],
+      [],
+      ["Drums"],
+    );
     expect(l.rows.map((r) => r.kind)).toEqual(["track", "group"]);
     expect(l.totalHeight).toBe(LANE_HEIGHT_PX + GROUP_HEADER_PX);
     // Crucially, hidden lanes get NO entry in the id map: nothing may try
@@ -102,7 +120,9 @@ describe("buildLaneLayout", () => {
     // TRACK index, so this is the field that must stay honest.
     const l = layout([track("t1", "Drums"), track("t2", "Drums"), track("t3")]);
     const rows = l.rows.filter((r) => r.kind === "track");
-    expect(rows.map((r) => r.kind === "track" && r.trackIndex)).toEqual([0, 1, 2]);
+    expect(rows.map((r) => r.kind === "track" && r.trackIndex)).toEqual([
+      0, 1, 2,
+    ]);
     expect(l.rows[0].kind).toBe("group"); // the group header shifted them
   });
 
@@ -115,7 +135,9 @@ describe("buildLaneLayout", () => {
     const l = layout([track("t1", "Drums"), track("t2"), track("t3", "Drums")]);
     const headers = l.rows.filter((r) => r.kind === "group");
     expect(headers).toHaveLength(2);
-    expect(headers.every((h) => h.kind === "group" && h.group === "Drums")).toBe(true);
+    expect(
+      headers.every((h) => h.kind === "group" && h.group === "Drums"),
+    ).toBe(true);
   });
 
   it("is empty, not broken, with no tracks", () => {

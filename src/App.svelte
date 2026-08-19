@@ -12,6 +12,7 @@
   import { instruments } from "./lib/state/instruments.svelte";
   import { plugins } from "./lib/state/plugins.svelte";
   import { automation } from "./lib/state/automation.svelte";
+  import { backend } from "./lib/tauri";
   import { modulation } from "./lib/state/modulation.svelte";
   import { mcp } from "./lib/state/mcp.svelte";
   import { startMeterStream, stopMeterStream } from "./lib/state/meters.svelte";
@@ -55,6 +56,14 @@
   import { loadUserThemes } from "./lib/theme/load";
 
   onMount(() => {
+    let automationRefresh: Promise<unknown> = Promise.resolve();
+    const stopAutomationChanged = backend.on("automation://changed", ({ trackId }) => {
+      automationRefresh = automationRefresh.then(async () => {
+        await Promise.all([automation.reload(), modulation.reload()]);
+        const gain = modulation.bindingsFor({ kind: "trackParam", trackId, param: "gain" })[0];
+        if (gain) modulation.show(trackId, gain.id);
+      });
+    });
     prefs.init(); // restore persisted preferences before anything paints or boots
     theme.bootstrap(prefs.values.theme); // paint the right colours on frame one
     void (async () => {
@@ -82,6 +91,7 @@
     return () => {
       stopMeterStream();
       generation.dispose();
+      stopAutomationChanged();
     };
   });
 

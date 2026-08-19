@@ -13,10 +13,10 @@
 
   const MODES: { value: AutomationMode; label: string; title: string }[] = [
     { value: "off", label: "Off", title: "Automation off — bypass the lane" },
-    { value: "read", label: "R", title: "Read — always apply the lane" },
-    { value: "write", label: "W", title: "Write — continuously record while playing" },
-    { value: "touch", label: "T", title: "Touch — record while the fader is held" },
-    { value: "latch", label: "L", title: "Latch — record while held, then hold the last value" },
+    { value: "read", label: "Read", title: "Read — always apply the lane" },
+    { value: "write", label: "Write", title: "Write — continuously record while playing" },
+    { value: "touch", label: "Touch", title: "Touch — record while the fader is held" },
+    { value: "latch", label: "Latch", title: "Latch — record while held, then hold the last value" },
   ];
 </script>
 
@@ -36,11 +36,15 @@
 <style>
   .automode {
     display: flex;
-    gap: 2px;
+    flex: 1;
+    min-width: 0;
+    gap: 6px;
   }
   .tog {
-    width: 20px;
-    height: 18px;
+    flex: 1;
+    min-width: 46px;
+    height: 20px;
+    padding: 0 7px;
     font-family: var(--font-mono);
     font-size: 9px;
     border-radius: 3px;

@@ -368,15 +368,29 @@ Required by R2. This section is the contract for the rounds after this one;
 4. **Curve shapes.** The per-point shape column in the AMEV chunk, plus
    `hold`/`bezier` in `segment_value` and handles in the editor.
 5. **Automation recording (write/touch/latch).** A control-thread recorder
-   writing gestures into curves. This is where "the RT path doesn't
-   distinguish live vs. played-back automation" (SCALABILITY §"Parameter
-   automation model") finally becomes true.
+   writing gestures into curves. The first slice records gain gestures on
+   regular audio/MIDI tracks. The finished slice also records directly into
+   separate automation tracks, routes each take through that track's selected
+   bindings, and gives the automation-track source an explicit Enabled/Bypass
+   control. Until then, the separate automation track is a drawn-curve source,
+   not a recording destination. This is where "the RT path doesn't distinguish
+   live vs. played-back automation" (SCALABILITY §"Parameter automation
+   model") finally becomes true.
 6. **Sample-accurate plugin params.** Round-2 §8's wait-free param ring;
    removes ruling 2's ≤2 ms granularity.
 7. **Lazy expansion.** Replace §5's bounded expansion with per-block
    evaluation from the source objects, removing `MAX_EVENTS_PER_BINDING`.
 8. **Per-voice modulation.** Uses the sounding-instance address
    `(ClipId, ContentId, NoteId)` that round-2 §5 already recorded.
+
+**External MIDI control is a separate follow-up, not part of the first
+write/touch/latch PR.** Every parameter exposed as an automation target must
+also be eligible for MIDI-controller mapping. The UI needs both a **MIDI Learn**
+workflow (move a hardware control to bind it) and a manual **Set Value / mapping
+configuration** workflow for selecting and editing the MIDI input and its
+target value/range without Learn. The resulting live control can then feed the
+same write/touch/latch recorder; this must not introduce a second automation
+target model.
 
 ## 9. Non-goals this round
 

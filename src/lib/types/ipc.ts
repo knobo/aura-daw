@@ -1368,6 +1368,7 @@ export interface AuraEventMap {
   "sidecar://done": SidecarDoneEvent;
   "sidecar://error": SidecarErrorEvent;
   "project://changed": Project;
+  "automation://changed": { trackId: string };
   "mcp://confirm-requested": PendingConfirmation;
   "export://progress": ExportProgressEvent;
   "export://done": ExportDoneEvent;

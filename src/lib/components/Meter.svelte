@@ -23,6 +23,17 @@
   let canvas: HTMLCanvasElement;
   let clipLatched = $state(false);
 
+  function resetClip() {
+    clipLatched = false;
+  }
+
+  function onMeterKeydown(event: KeyboardEvent) {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      resetClip();
+    }
+  }
+
   interface Lane {
     disp: number; // displayed peak dB
     rms: number; // displayed rms dB
@@ -160,7 +171,11 @@
   bind:this={canvas}
   class="meter"
   style:height="{height}px"
-  onclick={() => (clipLatched = false)}
+  role="button"
+  tabindex="0"
+  aria-label="Track level meter; activate to reset clip indicator"
+  onclick={resetClip}
+  onkeydown={onMeterKeydown}
   title="dBFS · click to reset clip"
 ></canvas>
 
