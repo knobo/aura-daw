@@ -133,24 +133,33 @@ class PluginsStore {
     this.error = null;
     try {
       await backend.pluginRemove(instanceId);
-      // Unbind any track that pointed at the removed instance (the engine
-      // falls back to PolySynth for dangling refs; keep the UI truthful).
-      const ref = `plugin:${instanceId}`;
-      for (const t of project.tracks) {
-        if (t.instrumentId === ref) {
-          try {
-            await backend.setTrackInstrument(t.id, null);
-          } catch {
-            /* dangling ref clears are best-effort */
-          }
-          project.patchTrackLocal(t.id, { instrumentId: null });
-        }
-      }
-      this.instances = this.instances.filter((i) => i.id !== instanceId);
-      if (this.openInstanceId === instanceId) this.closeParams();
     } catch (err) {
       this.error = String(err);
+      // Still clean up locally — the instance may be a zombie that
+      // the backend can't find but still shows in the UI.
     }
+    // Unbind any track that pointed at the removed instance (the engine
+    // falls back to PolySynth for dangling refs; keep the UI truthful).
+    const ref = `plugin:${instanceId}`;
+    for (const t of project.tracks) {
+      if (t.instrumentId === ref) {
+        try {
+          await backend.setTrackInstrument(t.id, null);
+        } catch {
+          /* dangling ref clears are best-effort */
+        }
+        project.patchTrackLocal(t.id, { instrumentId: null });
+      }
+    }
+    this.instances = this.instances.filter((i) => i.id !== instanceId);
+    // Also remove from any track's insert slots
+    for (const t of project.tracks) {
+      const inserts = (t.inserts ?? []).filter((s) => s.instanceId !== instanceId);
+      if (inserts.length !== (t.inserts ?? []).length) {
+        project.patchTrackLocal(t.id, { inserts });
+      }
+    }
+    if (this.openInstanceId === instanceId) this.closeParams();
   }
 
   private async refreshInstances() {
