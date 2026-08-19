@@ -312,9 +312,9 @@
               MIDI OUT
             </label>
           {/if}
-          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title="Record arm" onclick={() => project.toggleArm(track.id)}>Arm</button>
-          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title="Mute" onclick={() => project.toggleMute(track.id)}>Mute</button>
-          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title="Solo" onclick={() => project.toggleSolo(track.id)}>Solo</button>
+          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title="Record arm" onclick={() => project.toggleArm(track.id)}>A</button>
+          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title="Mute" onclick={() => project.toggleMute(track.id)}>M</button>
+          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title="Solo" onclick={() => project.toggleSolo(track.id)}>S</button>
         </div>
 
         <div class="automation-row">
