@@ -256,6 +256,8 @@ pub fn start(
                 param_writes: Vec::new(),
                 automation_modes: Vec::new(),
                 tempo_map: None,
+                slots: HashMap::new(),
+                params: Arc::new(ParamTable::default()),
                 automation_recorder: crate::plugins::automation::AutomationRecorder::new(),
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
@@ -1063,6 +1065,24 @@ struct Control {
     /// this every tick to convert automation points without re-deriving the
     /// map or touching the session lock.
     tempo_map: Option<crate::midi::TempoMap>,
+    /// Slot map, refreshed every rebuild alongside `automation_modes` and
+    /// `tempo_map` (same block, `rebuild`'s `derive_slots` call) — a
+    /// lock-free copy of the same `TrackId -> usize` mapping `GraphTables`
+    /// publishes, kept here so `drive_automation_recording` (Task 9) can
+    /// read it every control-thread tick without taking `self.tables`'
+    /// mutex on that hot path.
+    slots: HashMap<crate::ids::TrackId, usize>,
+    /// Lock-free copy of the SAME `Arc<ParamTable>` `GraphTables` publishes
+    /// under `self.tables` — cloning the `Arc` here (not the table) means a
+    /// live knob write through `self.tables.lock().params` (e.g.
+    /// `ControlPlane::commit_with_rebuild_full`) lands on this exact
+    /// object too, since `ParamTable`'s fields are atomics with their own
+    /// interior mutability; only a REBUILD swaps in a new `ParamTable`,
+    /// which is exactly when this field is refreshed (same shape the RT
+    /// callback already relies on via its own `Arc<ParamTable>` clone).
+    /// Read every control-thread tick by `drive_automation_recording`
+    /// (Task 9) so that tick never takes `self.tables`' mutex.
+    params: Arc<ParamTable>,
     /// Write/Touch/Latch point recorder (Task 6) — fed once per
     /// control-thread tick by `drive_automation_recording` (Task 9) for
     /// every playing track whose cached mode isn't Off/Read. Task 10 calls
@@ -1753,6 +1773,12 @@ impl Control {
         self.param_automation = param_driver;
         self.tempo_map = tempo_map;
         self.automation_modes = automation_modes;
+        // Same slot map AND same `Arc<ParamTable>` `GraphTables` just
+        // published under `self.tables` (above) — cloned here, not read
+        // back through that lock, so `drive_automation_recording`'s tick
+        // can stay lock-free (Task 9 review).
+        self.slots = slots.clone();
+        self.params = params.clone();
 
         let Some((slots_s, mut tracks)) = assembled else { return };
         // The rows were assembled against S's slot map; the tables just
@@ -1933,16 +1959,15 @@ impl Control {
     /// `automation_recorder`, once per control-thread tick, for any track
     /// whose cached mode (Task 8's `automation_modes`) is Write/Touch/Latch.
     /// Mirrors `drive_param_automation`'s guard shape exactly (same
-    /// `shared.playing`/`shared.position` reads): only while the transport
-    /// plays, and bails out with no `tempo_map` (no automation lanes or
-    /// modulation compiled this rebuild, so there is nothing to convert
-    /// ticks against).
+    /// `shared.playing`/`shared.position` reads, zero locks taken): only
+    /// while the transport plays, and bails out with no `tempo_map` (no
+    /// automation lanes or modulation compiled this rebuild, so there is
+    /// nothing to convert ticks against).
     ///
-    /// Reads `self.tables` (the SAME published `slots`/`params` the RT/host
-    /// side already reads) rather than caching its own slot map — one lock,
-    /// once per tick, is cheap on the control thread and keeps a single
-    /// source of truth for "what slot is this track" instead of a second
-    /// copy that could drift from the one `rebuild` publishes.
+    /// Reads only `self.slots`/`self.params` — lock-free copies `rebuild`
+    /// refreshes alongside `automation_modes`/`tempo_map`, not
+    /// `self.tables` (whose mutex this tick never takes, same zero-lock
+    /// hot path Task 8 set up for the other two caches).
     ///
     /// Only READS `self.gesture` (`is_track_gain_touched`); never commits
     /// anything itself — Task 10 owns `finish` + the commit at pass-end.
@@ -1953,8 +1978,7 @@ impl Control {
         let Some(map) = &self.tempo_map else { return };
         let pos = self.shared.position.load(Relaxed);
         let tick = map.samples_to_tick(pos) as u32;
-        let tables = self.tables.lock();
-        for (track_id, &slot) in &tables.slots {
+        for (track_id, &slot) in &self.slots {
             let Some(&mode) = self.automation_modes.get(slot) else { continue };
             if matches!(
                 mode,
@@ -1963,7 +1987,7 @@ impl Control {
                 continue;
             }
             let touched = self.gesture.is_track_gain_touched(track_id.as_str());
-            let value = tables.params.gain_linear(slot);
+            let value = self.params.gain_linear(slot);
             self.automation_recorder.sample(track_id.as_str(), tick, mode, touched, value);
         }
     }
@@ -4041,6 +4065,8 @@ mod tests {
             param_writes: Vec::new(),
             automation_modes: Vec::new(),
             tempo_map: None,
+            slots: HashMap::new(),
+            params: Arc::new(ParamTable::default()),
             automation_recorder: crate::plugins::automation::AutomationRecorder::new(),
             // Its OWN hub, never the process-global one: these tests would
             // otherwise race every other test that selects a routing target.
