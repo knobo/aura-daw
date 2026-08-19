@@ -256,6 +256,7 @@ pub fn start(
                 param_writes: Vec::new(),
                 automation_modes: Vec::new(),
                 tempo_map: None,
+                automation_recorder: crate::plugins::automation::AutomationRecorder::new(),
                 live_in_hub: midi_in::hub().clone(),
                 live_in_target: None,
                 external_routing: Arc::new(crate::midi_out::RoutedOut::default()),
@@ -1035,7 +1036,6 @@ struct Control {
     ///
     /// Consumed by the Write/Touch/Latch automation recorder (Task 9); held
     /// here from Task 7 so the sharing seam lands in one reviewable change.
-    #[allow(dead_code, reason = "read by the automation recorder wiring (Task 9)")]
     gesture: Arc<crate::control::GestureState>,
     /// "Document birth" closure, installed post-construction by `lib.rs`
     /// once `ControlPlane` exists (`ControlMsg::SetEnsureProject`'s doc) —
@@ -1063,6 +1063,13 @@ struct Control {
     /// this every tick to convert automation points without re-deriving the
     /// map or touching the session lock.
     tempo_map: Option<crate::midi::TempoMap>,
+    /// Write/Touch/Latch point recorder (Task 6) — fed once per
+    /// control-thread tick by `drive_automation_recording` (Task 9) for
+    /// every playing track whose cached mode isn't Off/Read. Task 10 calls
+    /// `finish` at pass-end and commits the result; this field only
+    /// accumulates in-progress samples, it never itself touches the
+    /// document.
+    automation_recorder: crate::plugins::automation::AutomationRecorder,
     /// The hardware MIDI-in seam. Held as an `Arc` rather than reached
     /// through `midi_in::hub()` at each call site so tests can drive the
     /// engine against their own hub; `start` binds the process-global one.
@@ -1292,6 +1299,7 @@ impl Control {
             self.drain_meters();
             self.drain_rt_events();
             self.drive_param_automation();
+            self.drive_automation_recording();
             self.headless_advance();
             self.pump_pitch_frames();
             self.pump_meter_frames();
@@ -1919,6 +1927,45 @@ impl Control {
             crate::control::forward_params_to_host(&batch[0].instance, &batch[0].format, &changes);
         }
         self.param_writes = writes;
+    }
+
+    /// Samples every playing track's live fader value into
+    /// `automation_recorder`, once per control-thread tick, for any track
+    /// whose cached mode (Task 8's `automation_modes`) is Write/Touch/Latch.
+    /// Mirrors `drive_param_automation`'s guard shape exactly (same
+    /// `shared.playing`/`shared.position` reads): only while the transport
+    /// plays, and bails out with no `tempo_map` (no automation lanes or
+    /// modulation compiled this rebuild, so there is nothing to convert
+    /// ticks against).
+    ///
+    /// Reads `self.tables` (the SAME published `slots`/`params` the RT/host
+    /// side already reads) rather than caching its own slot map — one lock,
+    /// once per tick, is cheap on the control thread and keeps a single
+    /// source of truth for "what slot is this track" instead of a second
+    /// copy that could drift from the one `rebuild` publishes.
+    ///
+    /// Only READS `self.gesture` (`is_track_gain_touched`); never commits
+    /// anything itself — Task 10 owns `finish` + the commit at pass-end.
+    fn drive_automation_recording(&mut self) {
+        if !self.shared.playing.load(Relaxed) {
+            return;
+        }
+        let Some(map) = &self.tempo_map else { return };
+        let pos = self.shared.position.load(Relaxed);
+        let tick = map.samples_to_tick(pos) as u32;
+        let tables = self.tables.lock();
+        for (track_id, &slot) in &tables.slots {
+            let Some(&mode) = self.automation_modes.get(slot) else { continue };
+            if matches!(
+                mode,
+                crate::audio::types::AutomationMode::Off | crate::audio::types::AutomationMode::Read
+            ) {
+                continue;
+            }
+            let touched = self.gesture.is_track_gain_touched(track_id.as_str());
+            let value = tables.params.gain_linear(slot);
+            self.automation_recorder.sample(track_id.as_str(), tick, mode, touched, value);
+        }
     }
 
     /// Decode any clip sources missing from the cache (at the engine rate,
@@ -3994,6 +4041,7 @@ mod tests {
             param_writes: Vec::new(),
             automation_modes: Vec::new(),
             tempo_map: None,
+            automation_recorder: crate::plugins::automation::AutomationRecorder::new(),
             // Its OWN hub, never the process-global one: these tests would
             // otherwise race every other test that selects a routing target.
             live_in_hub: Arc::new(MidiInHub::new()),
@@ -4103,6 +4151,67 @@ mod tests {
         session.lock().store.tracks[0].automation_mode = AutomationMode::Write;
         ctl.rebuild();
         assert_eq!(ctl.automation_modes, vec![AutomationMode::Write]);
+    }
+
+    /// Task 9: every control-thread tick, a Write-mode track's live gain
+    /// gets sampled into `automation_recorder` — no gesture needed, unlike
+    /// Touch/Latch, since Write always records while playing.
+    #[test]
+    fn drive_automation_recording_samples_a_write_mode_track_every_tick() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.automation_mode = AutomationMode::Write;
+            s.store.tracks.push(t);
+            // A non-empty lane is what makes `compile_automation` build a
+            // real `TempoMap` — content doesn't matter, only that the
+            // tempo-map compile path runs (mirrors
+            // `rebuild_compiles_track_gain_lanes_by_slot`'s fixture).
+            s.automation.lanes.push(test_lane("l1", "track:ghost", 0));
+        }
+        ctl.rebuild();
+        assert!(ctl.tempo_map.is_some(), "fixture must exercise the real tempo-map compile path");
+
+        // A live gain distinct from the stored document value (1.0 for
+        // 0 dB) — automation samples the LIVE table, not the document.
+        {
+            let slot = *ctl.tables.lock().slots.get("t-1").expect("t-1 has a slot");
+            ctl.tables.lock().params.set_gain_linear(slot, 0.5);
+        }
+
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(0, Relaxed);
+
+        ctl.drive_automation_recording();
+        let recorded = ctl.automation_recorder.finish("t-1");
+        assert!(recorded.is_some(), "Write mode must have sampled this tick");
+        let points = recorded.unwrap();
+        assert_eq!(points.len(), 1);
+        assert!((points[0].value - 0.5).abs() < 1e-6, "sampled the LIVE gain, not the stored one");
+    }
+
+    /// A stopped transport samples nothing — automation recording only
+    /// happens while the transport plays, same guard shape as
+    /// `drive_param_automation`.
+    #[test]
+    fn drive_automation_recording_does_nothing_when_stopped() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.automation_mode = AutomationMode::Write;
+            s.store.tracks.push(t);
+            s.automation.lanes.push(test_lane("l1", "track:ghost", 0));
+        }
+        ctl.rebuild();
+        assert!(ctl.tempo_map.is_some());
+
+        ctl.shared.playing.store(false, Relaxed);
+        ctl.shared.position.store(0, Relaxed);
+
+        ctl.drive_automation_recording();
+        assert!(ctl.automation_recorder.finish("t-1").is_none());
     }
 
     /// Seed a hosted instance and a 0→1 lane on its param 7, spanning one
