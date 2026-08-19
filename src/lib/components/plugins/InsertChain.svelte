@@ -144,7 +144,7 @@
 
   <div class="slots" role="list" aria-label="Effect chain">
     {#if insertSlots.length === 0}
-      <div class="empty silk">No effects — + to add reverb, EQ, compressor…</div>
+      <span class="empty silk">+ add effect</span>
     {:else}
       {#each insertSlots as slot (slot.id)}
         {@const inst = slotInstance(slot)}
@@ -228,14 +228,14 @@
   .chain {
     display: flex;
     flex-direction: column;
-    gap: 4px;
-    padding: 3px 0;
+    gap: 2px;
+    padding: 1px 0;
   }
   .chainhead {
     display: flex;
     align-items: center;
     gap: 6px;
-    min-height: 0;
+    min-height: 14px;
   }
   .label {
     font-size: 8px;
@@ -339,23 +339,24 @@
   .slots {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
   }
   .empty {
-    padding: 2px 0;
-    font-size: 9px;
-    line-height: 1.35;
+    font-size: 8px;
+    color: var(--text-faint);
+    padding: 1px 0;
+    cursor: default;
   }
 
   .slot {
     display: flex;
     align-items: center;
-    gap: 5px;
-    padding: 3px 6px;
-    border-radius: 4px;
+    gap: 4px;
+    padding: 2px 5px;
+    border-radius: 3px;
     border: var(--border-width) solid rgb(var(--violet-rgb) / 0.18);
     background: rgb(var(--bg-1-rgb) / 0.5);
-    min-height: 20px;
+    min-height: 18px;
   }
   .slot.bypassed {
     opacity: 0.5;

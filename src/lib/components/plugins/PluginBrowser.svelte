@@ -2,22 +2,28 @@
   /**
    * Plugin browser: scan trigger (plugin_scan), discovered CLAP/LV2 list
    * with format badges, instantiation onto midi tracks (plugin_instantiate +
-   * set_track_instrument "plugin:<id>" refs), fuzzy search, and the
-   * live-instance rack with stub/active/crashed status badges, rebinding,
-   * params and removal.
+   * set_track_instrument "plugin:<id>" refs), insert-FX onto audio/midi
+   * tracks, fuzzy search, and the live-instance rack with stub/active/crashed
+   * status badges, rebinding, params and removal.
    */
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { openPluginParams } from "../../state/plugin-panel";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
+  import { backend } from "../../tauri";
   import type { PluginDescriptor, PluginInstanceInfo } from "../../types/ipc";
   import { tracksBoundToInstance } from "../../utils/plugin-binding";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   let instrumentsOnly = $state(true);
   let searchQuery = $state("");
+  let busy = $state<Record<string, boolean>>({});
 
   const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
+  /** Tracks that accept effect inserts: audio and MIDI only. */
+  const insertTracks = $derived(
+    project.tracks.filter((t) => t.kind === "audio" || t.kind === "midi"),
+  );
 
   /** All plugins matching the instrument/effect filter. */
   const kindFiltered = $derived(
@@ -46,6 +52,19 @@
     const trackId = sel.value === "-" ? null : sel.value;
     sel.value = "";
     void plugins.instantiate(desc.uid, trackId);
+  }
+
+  /** Add an effect as an insert-FX slot on the selected track. */
+  async function onInsertEffect(uid: string, trackId: string) {
+    const key = `${uid}:${trackId}`;
+    busy[key] = true;
+    try {
+      await backend.insertAdd?.(trackId, uid);
+    } catch (err) {
+      console.error("[aura] insert_add failed:", err);
+    } finally {
+      busy[key] = false;
+    }
   }
 
   function onBind(inst: PluginInstanceInfo, e: Event) {
@@ -134,6 +153,24 @@
               {/each}
             </select>
           </div>
+        {:else}
+          <div class="row">
+            <select
+              title="Add {desc.name} as an insert effect"
+              disabled={!!busy[`${desc.uid}:sel`]}
+              onchange={(e) => {
+                const sel = e.currentTarget as HTMLSelectElement;
+                const trackId = sel.value;
+                sel.value = "";
+                if (trackId) void onInsertEffect(desc.uid, trackId);
+              }}
+            >
+              <option value="">add to track…</option>
+              {#each insertTracks as t (t.id)}
+                <option value={t.id}>→ {t.name}</option>
+              {/each}
+            </select>
+          </div>
         {/if}
       </div>
     {/each}
@@ -189,6 +226,9 @@
 
   {#if midiTracks.length === 0}
     <div class="hint silk">no midi tracks yet — add one with "+ midi" in the track rail</div>
+  {/if}
+  {#if insertTracks.length === 0}
+    <div class="hint silk">no audio or midi tracks — add one to insert effects</div>
   {/if}
 </div>
 

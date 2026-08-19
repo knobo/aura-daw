@@ -780,9 +780,8 @@
     height: auto;
     min-height: 0;
     padding-left: 20px;
-    border-top: var(--border-width) solid rgb(var(--edge-rgb) / 0.08);
-    margin-top: 2px;
-    padding-top: 2px;
+    padding-top: 1px;
+    padding-bottom: 1px;
   }
   .level-area {
     flex: 1;
