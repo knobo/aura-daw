@@ -47,6 +47,16 @@ class LanesView {
   /** Which group's name is being edited inline ("" = none). */
   renamingGroup = $state("");
 
+  /** Selected track ids (4.5 — bulk M/S/A). A gesture, not a document: not
+   * persisted, not part of `PersistedFolds`. Mirrors `clipSelection`'s
+   * replace-the-Set convention so `$state` reactivity actually fires — a
+   * mutated-in-place Set is invisible to Svelte. */
+  selection = $state<Set<string>>(new Set());
+  /** Anchor for shift-extend — the last id a plain click or ctrl-toggle
+   * landed on. Independent of `selection` itself: toggling a lane OFF
+   * still moves the anchor there, same as clip selection's `apply`. */
+  #anchor: string | null = null;
+
   /** The dir the currently loaded fold state came from, so `sync` can tell
    * "same project, don't reload" from "project changed, swap folds". */
   #loadedFor: string | null | undefined = undefined;
@@ -96,6 +106,59 @@ class LanesView {
     this.#save();
   }
 
+  isSelected(trackId: string): boolean {
+    return this.selection.has(trackId);
+  }
+
+  selectOnly(trackId: string) {
+    this.selection = new Set([trackId]);
+    this.#anchor = trackId;
+  }
+
+  toggleSelected(trackId: string) {
+    const next = new Set(this.selection);
+    if (!next.delete(trackId)) next.add(trackId);
+    this.selection = next;
+    this.#anchor = trackId;
+  }
+
+  /** Shift-click: the contiguous run between the anchor and `trackId` over
+   * `orderedTrackIds` (the VISIBLE order — a folded group's hidden members
+   * must not get swept in). No anchor yet, or the anchor/target fell off
+   * the given order (a folded group, a deleted lane), falls back to
+   * selecting just `trackId` — the same "can't extend, so start over"
+   * shift-click already does at the clip level. */
+  extendTo(trackId: string, orderedTrackIds: string[]) {
+    const anchor = this.#anchor;
+    const ai = anchor ? orderedTrackIds.indexOf(anchor) : -1;
+    const ti = orderedTrackIds.indexOf(trackId);
+    if (ai < 0 || ti < 0) {
+      this.selection = new Set([trackId]);
+      return;
+    }
+    const [lo, hi] = ai <= ti ? [ai, ti] : [ti, ai];
+    this.selection = new Set(orderedTrackIds.slice(lo, hi + 1));
+    // Anchor stays put — a second shift-click re-extends from the same
+    // origin, matching how a text/file selection behaves.
+  }
+
+  clearSelection() {
+    this.selection = new Set();
+    this.#anchor = null;
+  }
+
+  /** Select every member of a lane group — the group header's "select
+   * all of mine" gesture. */
+  selectGroup(group: string) {
+    this.selection = new Set(
+      project.tracks.filter((t) => t.group?.trim() === group).map((t) => t.id),
+    );
+  }
+
+  selectAll() {
+    this.selection = new Set(project.tracks.map((t) => t.id));
+  }
+
   /**
    * Load the folds belonging to the currently open project, and drop
    * references to tracks and groups that no longer exist.
@@ -115,6 +178,11 @@ class LanesView {
       this.dropIndicator = null;
       this.renamingTrackId = "";
       this.renamingGroup = "";
+      // A selection is a gesture over THIS document; the new one starts
+      // with nothing selected rather than inheriting ids that happen to
+      // collide with the old project's.
+      this.selection = new Set();
+      this.#anchor = null;
     }
     const liveTracks = new Set(project.tracks.map((t) => t.id));
     const liveGroups = new Set(
@@ -124,6 +192,8 @@ class LanesView {
     const groups = new Set([...this.collapsedGroups].filter((g) => liveGroups.has(g)));
     if (tracks.size !== this.collapsedTracks.size) this.collapsedTracks = tracks;
     if (groups.size !== this.collapsedGroups.size) this.collapsedGroups = groups;
+    const selected = new Set([...this.selection].filter((id) => liveTracks.has(id)));
+    if (selected.size !== this.selection.size) this.selection = selected;
   }
 
   #load(dir: string | null) {

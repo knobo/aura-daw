@@ -16,8 +16,26 @@
   import { project } from "../state/project.svelte";
   import { ui, DOCK_SHORTCUT } from "../state/ui.svelte";
   import { formatDb, linToDb } from "../utils/format";
+  import { bulkTriState, bulkableTracks, fieldValues, nextBulkValue, type BulkField } from "../utils/lane-bulk";
   import type { AudioDevice } from "../types/ipc";
   import Meter from "./Meter.svelte";
+
+  // Project-wide M/S/A (4.5): every track that has a mute/solo/arm control
+  // at all — automation lanes don't, so they never count toward "all".
+  const bulkTracks = $derived(bulkableTracks(project.tracks));
+  const muteState = $derived(bulkTriState(fieldValues(bulkTracks, "muted")));
+  const soloState = $derived(bulkTriState(fieldValues(bulkTracks, "soloed")));
+  const armState = $derived(bulkTriState(fieldValues(bulkTracks, "armed")));
+
+  function pressBulk(field: BulkField) {
+    if (bulkTracks.length === 0) return;
+    const value = nextBulkValue(fieldValues(bulkTracks, field));
+    void project.setTracksState(
+      bulkTracks.map((t) => t.id),
+      field,
+      value,
+    );
+  }
 
   let inputs = $state<AudioDevice[]>([]);
   let outputs = $state<AudioDevice[]>([]);
@@ -75,6 +93,40 @@
       <Meter trackId="master" height={22} scale />
     </div>
     <span class="db mono" bind:this={dbEl}>-∞</span>
+  </div>
+
+  <div class="section lanesbulk" role="group" aria-label="Mute, solo and arm every lane">
+    <span class="silk">lanes</span>
+    <button
+      class="bulk mute"
+      class:on={muteState === "on"}
+      class:mixed={muteState === "mixed"}
+      role="checkbox"
+      aria-checked={muteState === "mixed" ? "mixed" : muteState === "on"}
+      title="Mute all {bulkTracks.length} tracks"
+      aria-label="Mute all tracks"
+      onclick={() => pressBulk("muted")}>M</button
+    >
+    <button
+      class="bulk solo"
+      class:on={soloState === "on"}
+      class:mixed={soloState === "mixed"}
+      role="checkbox"
+      aria-checked={soloState === "mixed" ? "mixed" : soloState === "on"}
+      title="Solo all {bulkTracks.length} tracks"
+      aria-label="Solo all tracks"
+      onclick={() => pressBulk("soloed")}>S</button
+    >
+    <button
+      class="bulk arm"
+      class:on={armState === "on"}
+      class:mixed={armState === "mixed"}
+      role="checkbox"
+      aria-checked={armState === "mixed" ? "mixed" : armState === "on"}
+      title="Arm all {bulkTracks.length} tracks"
+      aria-label="Arm all tracks"
+      onclick={() => pressBulk("armed")}>A</button
+    >
   </div>
 
   <div class="section io">
@@ -177,6 +229,58 @@
     width: 48px;
     color: var(--text);
     text-align: right;
+  }
+
+  .lanesbulk {
+    gap: 6px;
+    padding-left: 4px;
+    border-left: var(--border-width) solid var(--glass-border);
+  }
+  .bulk {
+    width: 20px;
+    height: 20px;
+    flex: none;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    border-radius: 4px;
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.7);
+    color: var(--text-faint);
+    cursor: pointer;
+    padding: 0;
+  }
+  .bulk.mute.on {
+    color: var(--bg-0);
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .bulk.solo.on {
+    color: var(--bg-0);
+    background: var(--cyan);
+    border-color: var(--cyan);
+  }
+  .bulk.arm.on {
+    color: var(--text-on-accent);
+    background: rgb(var(--red-rgb) / 0.8);
+    border-color: var(--red);
+  }
+  /* Mixed: a quieter tell than full-on, same family as LaneGroupHeader's —
+     tinted outline, no fill, so "some of these" never reads as "all of
+     these". */
+  .bulk.mute.mixed {
+    color: var(--amber);
+    border-style: dashed;
+    border-color: var(--amber);
+  }
+  .bulk.solo.mixed {
+    color: var(--cyan);
+    border-style: dashed;
+    border-color: var(--cyan);
+  }
+  .bulk.arm.mixed {
+    color: var(--red);
+    border-style: dashed;
+    border-color: var(--red);
   }
 
   .io {

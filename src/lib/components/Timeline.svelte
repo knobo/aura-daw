@@ -67,6 +67,13 @@
     }),
   );
 
+  /** Visible lane order (painted rows only — a folded group's hidden
+   * members are not in this list) — what lane shift-click range-extends
+   * over, so a shift-click can never reach into a fold. */
+  const visibleTrackIds = $derived(
+    layout.rows.filter((r) => r.kind === "track").map((r) => r.track.id),
+  );
+
   // Fold state belongs to a project, so it has to follow project switches
   // and forget tracks and groups that are gone. Cheap and idempotent.
   $effect(() => {
@@ -916,7 +923,11 @@
     <div class="bodyinner">
     <div
       class="rail"
-      role="presentation"
+      role="grid"
+      aria-label="Tracks"
+      aria-multiselectable="true"
+      aria-rowcount={project.tracks.length}
+      tabindex="-1"
       onpointerdown={onRailPointerDown}
       onpointermove={onRailPointerMove}
       onpointerup={onRailPointerUp}
@@ -927,7 +938,12 @@
         {#if row.kind === "group"}
           <LaneGroupHeader {row} />
         {:else}
-          <TrackHeader track={row.track} index={row.trackIndex} collapsed={row.collapsed} />
+          <TrackHeader
+            track={row.track}
+            index={row.trackIndex}
+            collapsed={row.collapsed}
+            orderedTrackIds={visibleTrackIds}
+          />
         {/if}
       {/each}
       <div class="addrow">
