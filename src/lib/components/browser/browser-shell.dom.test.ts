@@ -116,3 +116,70 @@ describe("BrowserShell", () => {
     expect(list.getAttribute("aria-activedescendant")).toBe("browser-row-item-g2-0");
   });
 });
+
+describe("BrowserShell collapse-all (design §8.1)", () => {
+  const foldAll = () => screen.getByRole("button", { name: /collapse all|expand all/i });
+
+  it("offers a collapse-all button that folds every group", async () => {
+    render(BrowserShellHarness);
+    expect(screen.getByText("Alpha")).toBeTruthy();
+
+    await fireEvent.click(foldAll());
+
+    expect(screen.queryByText("Alpha")).toBeNull();
+    expect(screen.queryByText("Charlie")).toBeNull();
+  });
+
+  it("flips to expand-all once anything is folded, and unfolds everything", async () => {
+    render(BrowserShellHarness);
+    await fireEvent.click(foldAll());
+    expect(foldAll().getAttribute("aria-label")).toMatch(/expand all/i);
+
+    await fireEvent.click(foldAll());
+
+    expect(foldAll().getAttribute("aria-label")).toMatch(/collapse all/i);
+    expect(screen.getByText("Alpha")).toBeTruthy();
+  });
+
+  it("says 'expand all' when only one of several groups is folded", async () => {
+    render(BrowserShellHarness);
+    const list = screen.getByRole("tree");
+    list.focus();
+    await fireEvent.keyDown(list, { key: "ArrowLeft" }); // fold Group 1 only
+
+    expect(foldAll().getAttribute("aria-label")).toMatch(/expand all/i);
+    expect(screen.getByText("Charlie")).toBeTruthy();
+  });
+
+  it("is absent for a browser that passes no fold-all handler", () => {
+    render(BrowserShellHarness, { props: { foldAll: false } });
+    expect(screen.queryByRole("button", { name: /collapse all|expand all/i })).toBeNull();
+  });
+});
+
+describe("BrowserShell search folds (design §8.1)", () => {
+  it("reveals a folded group's matching rows while a query is active", async () => {
+    render(BrowserShellHarness);
+    const list = screen.getByRole("tree");
+    list.focus();
+    await fireEvent.keyDown(list, { key: "ArrowLeft" }); // fold Group 1
+    expect(screen.queryByText("Alpha")).toBeNull();
+
+    await fireEvent.input(screen.getByRole("textbox"), { target: { value: "alpha" } });
+
+    expect(screen.getByText("Alpha")).toBeTruthy();
+  });
+
+  it("restores the user's own folds when the query clears", async () => {
+    render(BrowserShellHarness);
+    const list = screen.getByRole("tree");
+    list.focus();
+    await fireEvent.keyDown(list, { key: "ArrowLeft" }); // fold Group 1
+
+    const search = screen.getByRole("textbox");
+    await fireEvent.input(search, { target: { value: "alpha" } });
+    await fireEvent.input(search, { target: { value: "" } });
+
+    expect(screen.queryByText("Alpha")).toBeNull();
+  });
+});

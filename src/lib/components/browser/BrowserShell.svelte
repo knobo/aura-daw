@@ -19,6 +19,8 @@
     rows,
     onToggleGroup,
     onActivate,
+    anyCollapsed = false,
+    onFoldAll,
     children,
     role: listRole = "tree",
   }: {
@@ -29,6 +31,13 @@
     rows: BrowserRowRef[];
     onToggleGroup?: (groupKey: string, expand: boolean) => void;
     onActivate?: (row: BrowserRowRef) => void;
+    /** Drives the fold-all button's label: any group folded means the next
+     * press unfolds, matching `lanes.anyCollapsed()` so the two surfaces
+     * never disagree about what one button does. */
+    anyCollapsed?: boolean;
+    /** Omit to leave the button out — a browser with no groups has nothing
+     * to fold. */
+    onFoldAll?: (collapse: boolean) => void;
     children: Snippet<[{ activeId: string | null; setActive: (row: BrowserRowRef) => void }]>;
     role?: "listbox" | "tree";
   } = $props();
@@ -136,6 +145,17 @@
       aria-label={placeholder}
       onkeydown={onSearchKeydown}
     />
+    {#if onFoldAll}
+      <button
+        type="button"
+        class="foldall mono"
+        aria-label={anyCollapsed ? "Expand all groups" : "Collapse all groups"}
+        title={anyCollapsed ? "Expand all groups" : "Collapse all groups"}
+        onclick={() => onFoldAll?.(!anyCollapsed)}
+      >
+        <span aria-hidden="true">{anyCollapsed ? "⌄" : "⌃"}</span>
+      </button>
+    {/if}
     {#if filters}
       <div class="chips">{@render filters()}</div>
     {/if}
@@ -191,6 +211,27 @@
   .search::placeholder {
     color: var(--text-faint);
   }
+  .foldall {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font-size: 11px;
+    line-height: 1;
+    border-radius: 5px;
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.7);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .foldall:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+  }
+
   .chips {
     display: flex;
     align-items: center;
