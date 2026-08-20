@@ -5,6 +5,7 @@
    * between transport snapshots (120 FPS-capable — it never touches Svelte
    * reactivity inside the loop).
    */
+  import { untrack } from "svelte";
   import { backend } from "../tauri";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
@@ -189,6 +190,25 @@
     }
   });
 
+  // Follow while STOPPED. The rAF tick above only follows while rolling,
+  // so "rewind to start" (or any seek, or a stop that snaps the playhead
+  // back) used to leave the view wherever it was. Keyed on the transport
+  // snapshot rather than the interpolated position: while stopped the two
+  // are the same number, and the snapshot is the only one that is
+  // reactive — so this fires on seeks and nothing else. Scrolling away by
+  // hand does not change it, which is why the view stays put afterwards.
+  // untrack the reveal itself: `revealSamples` READS `view.viewStart` and
+  // may WRITE it, so a tracked call would re-run on every scroll — and
+  // then yank the view back the instant the user scrolled away, which is
+  // the exact behaviour this effect must not have.
+  $effect(() => {
+    const pos = transport.snap.positionSamples;
+    untrack(() => {
+      if (transport.isPlaying || !view.follow) return;
+      view.revealSamples(pos);
+    });
+  });
+
   // ── playhead (rAF, reactivity-free hot path) ──
 
   $effect(() => {
@@ -200,10 +220,8 @@
 
       // auto-follow: page-scroll when the playhead leaves the right edge
       if (transport.isPlaying && view.follow) {
-        if (x > view.width * 0.92 || x < -4) {
-          view.scrollToSamples(pos - view.width * 0.08 * view.spp);
-          x = (pos - view.viewStart) / view.spp;
-        }
+        view.revealSamples(pos);
+        x = (pos - view.viewStart) / view.spp;
       }
 
       const visible = x >= -1 && x <= view.width + 1;
