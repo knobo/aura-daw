@@ -33,20 +33,59 @@ theme-token rule, or the test gates.
 | `6b259b4` | **Follow the playhead on seek.** Both follow paths share `view.revealSamples`: reveal if off screen, do nothing if already visible. The stopped path is a `$effect` on `transport.snap.positionSamples` with the reveal **untracked** — `revealSamples` reads and writes `view.viewStart`, so a tracked call would yank the view back on every user scroll. |
 | `b9d529c` | **Shared browser layer** `src/lib/components/browser/`: `browser-model.ts` (ranking / grouping / row flattening / keyboard index), `BrowserShell`, `BrowserSection`, `BrowserRow`, `ParamChip`, `EmptyState`, `FavoriteToggle`, `browser-folds.ts`. Migrated `InstrumentBrowser`, `SamplesRoot`, `PresetsRoot`; `LibraryPanel` is a pure delegator. |
 | `f8755a9` | **Lane multi-select + bulk M/S/A** from three entry points. Value rule in `lane-bulk.ts`; whole batch in one gesture. The rail is an ARIA layout grid with roving tabindex. |
+| `3469ce3` | **PR 5 groundwork — the rack projection and a shell that folds as one.** `utils/plugin-rack.ts` (§5.1 projection + `rackCounts` + `rackByTrack`, 18 tests), `utils/plugin-browse.ts` (§5.2 section tree + §5.3 `rankQuickPick`, 22 tests), the two-layer `FoldState` in `browser/browser-folds.ts` (§8.1, 20 tests) and `BrowserShell`'s single fold-all button (15 shell DOM tests). All pure and tested — **no component renders any of it yet**. |
 | `7e6bc0b` | **Plugin catalog** at `dirs::config_dir()/aura/plugin-catalog.json`: persistent scan cache seeded in `plugins::init()`, incremental `plugin_scan` (path+mtime+size), favourites / recents / tags / pinnedParams. Three additive commands: `plugin_catalog_get`, `plugin_catalog_update`, `plugin_scan_status`. |
 
 Verified at that point: `cargo test -- --test-threads=1` 1319 + integration
 0 failed; `vitest` 941 across 87 files; `svelte-check` 0 errors 0 warnings;
 `npm run build` green.
 
+## The owner's round-three asks (2026-08-20, second ear-check)
+
+The owner saw PRs 1–4 in the app, said it looks good, and asked for three
+more things. All three are written up as **design §9** and folded into
+**PR 5** as plan §5.4 — read those, not this summary:
+
+1. **Active plugins must not live at the bottom of a scroll.** "Nå må man
+   scrolle ned til bunnen for å få tak i aktive. Jeg tenker de kanskje
+   skulle vært i eget panel." Design §9.1 lays out three options and
+   recommends (a): one panel, `RACK` is the DEFAULT mode whenever the
+   project has instances. **Whether it deserves its own dock panel instead
+   is the owner's call — ask before building (b) or (c).**
+2. **"Bare effekter", like "bare instrumenter".** The `instrumentsOnly`
+   checkbox is a two-state control over a three-state question. Design
+   §9.2: an `ALL` / `INST` / `FX` chip row plus `★` / `⏱` toggles.
+3. **More to search on — e.g. "type".** Design §9.3: `categories[]` IS
+   "type" and already ranks, so add the catalog's user `tags[]` to the
+   rank keys, and at most a single `format:` prefix. No query DSL, and
+   explicitly no I/O-count filter.
+
 ## Do this next
 
-1. **PR 5 — the Plugin Manager.** Plan §"PR 5". Browse mode and rack mode in
-   one shell, plus the `Ctrl+P` quick picker. The rack is the thing no other
-   DAW has: a project-wide ledger of every live instance, its placements, its
-   automated params, and — critically — the orphans and crashed instances
-   nothing else in the app will ever show you. Fold in **collapse-all /
-   expand-all** (design §8.1) since it is shell work.
+1. **PR 5 — the Plugin Manager.** Plan §"PR 5", and note §5.4 and the
+   progress table: the pure layer is DONE and committed at `3469ce3`.
+   What is left is `PluginManager.svelte` (browse + rack in one shell,
+   mode in `localStorage`), `PluginQuickPick.svelte` with its `Ctrl+P`
+   wiring, `plugin-manager.dom.test.ts`, and the §9 asks above. The rack
+   is the thing no other DAW has: a project-wide ledger of every live
+   instance, its placements, its automated params, and — critically — the
+   orphans and crashed instances nothing else in the app will ever show
+   you. Collapse-all/expand-all (design §8.1) is already built into
+   `BrowserShell` — wire it, do not rebuild it.
+
+   **Wiring notes for the component work** (all verified this session):
+   `PluginBrowser` mounts at `Dock.svelte:90` and is what the manager
+   replaces. `Ctrl+P` belongs in `App.svelte`'s existing ctrl/meta block
+   (~line 186), NOT a second global keydown listener. The "selected
+   track" for add-actions is `lanes.selection` / its anchor. Insert
+   bypass goes through `backend.insertSetBypass(trackId, slotId, on)` —
+   see `InsertChain.svelte:46`. Actions available on the store:
+   `plugins.instantiate/insertEffect/bind/remove/openParams`,
+   `toggleFavorite/noteUsed/setTags/setPinnedParams`.
+
+   **Scope call already made:** browse mode gets NO Zyn patches section,
+   though plan §5.2 lists one — the "Do not" below forbids that migration
+   and a section here would be exactly it.
 2. **PR 6 — automation as an inventory.** Plan §"PR 6": the matrix, pinned
    params in `PluginParamPanel`, and the lane-info plugin strip that turns
    `TrackHeader`'s FX chip into `ParamChip` jump targets.

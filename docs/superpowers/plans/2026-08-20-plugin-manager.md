@@ -11,8 +11,29 @@ Branch: `feat/plugin-manager` · Worktree: `.worktrees/plugin-manager`
 | 2 | Lane multi-select + group/global M/S/A | in flight |
 | 3 | Backend catalog, persistent + incremental scan cache | in flight |
 | 4 | `browser/` primitives + migrate five browsers | in flight |
-| 5 | Plugin Manager: browse/rack modes + quick picker | blocked on 3, 4 |
+| 5 | Plugin Manager: browse/rack modes + quick picker | **in flight** — groundwork `3469ce3` |
 | 6 | Automation matrix, pinned params, lane-info indicator | blocked on 4, 5 |
+
+### PR 5 progress
+
+Landed in `3469ce3`, all pure and tested, no component yet renders it:
+
+- `src/lib/utils/plugin-rack.ts` — §5.1's projection plus `rackCounts` and
+  `rackByTrack` (18 tests).
+- `src/lib/utils/plugin-browse.ts` — §5.2's section tree and §5.3's
+  `rankQuickPick` (22 tests).
+- `src/lib/components/browser/browser-folds.ts` — the two-layer `FoldState`
+  for design §8.1 (20 tests), and `BrowserShell`'s fold-all button
+  (15 shell DOM tests; the two that could have passed vacuously were
+  sabotage-verified).
+
+Still to build: `PluginManager.svelte`, `PluginQuickPick.svelte` + its
+`Ctrl+P` wiring, `plugin-manager.dom.test.ts`, and the §9 asks below.
+
+**Scope call made:** browse mode gets **no Zyn patches section**, though
+§5.2 lists one. `next-prompt.md`'s "Do not" forbids putting that
+virtualised ~1318-row list onto `BrowserRow`/`BrowserSection`, and a
+section here would be exactly that migration.
 
 ## PR 5 — the Plugin Manager
 
@@ -68,6 +89,33 @@ adds to the selected track as its instrument; `Shift+Enter` adds as an
 insert; `Esc` closes. Registers through the existing dock/shortcut
 mechanism (see `DOCK_SHORTCUT` in `src/lib/state/ui.svelte.ts`) — do not
 add a second global keydown listener.
+
+### 5.4 Round-three asks — design §9 (fold into this PR)
+
+**§9.1 Active before inactive.** The owner's complaint is concrete: the
+live instances sit under the whole scanned list, so reaching your own four
+plugins means scrolling past two hundred you do not have. The browse/rack
+toggle answers the scroll; whether the rack deserves its OWN dock panel is
+the owner's call between design §9.1's three options. **Recommended and
+assumed until told otherwise: option (a)** — one panel, `RACK` is the
+default mode whenever the project has at least one instance, `BROWSE` one
+click away, choice sticky per project in `localStorage`.
+
+**§9.2 A three-way kind filter.** Today's `instrumentsOnly` checkbox is a
+two-state control over a three-state question — "effects only" is
+unreachable. `BrowserShell`'s `filters` slot gets `ALL` / `INST` / `FX`
+(exclusive, one always on), plus independent `★` and `⏱` narrowing
+toggles. Chip state joins the mode and the folds in `localStorage`. A
+filter narrows the SAME section tree; it does not switch to another one,
+so an emptied section disappears on its own.
+
+**§9.3 Search what the user actually typed.** `name`, `vendor` and
+`categories[]` already rank — `categories[]` IS "type", so that ask is
+half-answered. Add the catalog's user `tags[]` to the rank keys (two lines
+in `plugin-browse.ts`'s `RANK_KEYS`, plus tests), and, if PR 5 has room, a
+single `format:` prefix parsed in `browser-model.ts`. Nothing more
+elaborate: a query DSL is a worse answer than a chip. Do NOT build an
+I/O-count filter.
 
 ## PR 6 — automation as an inventory
 

@@ -268,3 +268,107 @@ Fold 8.1 into PR 5 (it is shell work and the manager is the surface that
 needs it most). 8.2 becomes its own PR 7, after 5 and 6 — it touches
 every browser and the sampler/plugin hosts, and it should not be what
 delays the manager.
+
+---
+
+## 9. Round-three asks (owner, 2026-08-20, second ear-check)
+
+Three asks, all pointing the same way: **the plugin panel is organised
+around browsing, and browsing is the least urgent thing you do there.**
+
+### 9.1 Active instances must not live at the bottom of a scroll
+
+> "Så må det være lettere å få tilgang til aktive plugins vs browsing av
+> inaktive. Nå må man scrolle ned til bunnen for å få tak i aktive. Jeg
+> tenker de kanskje skulle vært i eget panel."
+
+Today `PluginBrowser.svelte` renders the whole scanned list first and the
+live-instance rack underneath it, so reaching the four plugins that are
+actually in your project means scrolling past two hundred that are not.
+That is backwards: the scanned list is a catalogue you visit occasionally,
+the instances are your project.
+
+§3's browse/rack toggle already answers the scroll. What it does not yet
+settle is the owner's stronger reading — *eget panel*. Three options, and
+this is the owner's call:
+
+| Option | For | Against |
+|---|---|---|
+| **(a) One panel, RACK is the default** whenever the project has at least one instance; BROWSE is one click away and the choice sticks per project | No new dock tab, no new shortcut, and it makes the first thing you see the thing you came for | Browse and rack are never on screen together |
+| (b) Two dock tabs — PLUGINS (browse) and RACK — each with its own shortcut | Both reachable by muscle memory; each gets full height | A second shortcut to learn, and the dock tab strip is already eight wide |
+| (c) Split the panel: rack on top, browse below, with a draggable divider | Both visible at once, which is how you work when building a chain | The dock is ~340 px wide; two stacked scroll regions in it is cramped |
+
+**Recommendation: (a).** It is the smallest change that fixes the actual
+complaint, and "the panel opens on what my project contains" is a better
+default than any arrangement of two lists. If it still feels wrong in the
+app, (c) is the natural escalation — (b) spends a shortcut on a problem
+(a) already solves.
+
+Whichever wins, the rack must also be reachable *from* a track: the
+lane-info plugin strip (§6.3 of the plan) is the other half of this ask.
+
+### 9.2 Filter chips, including "effects only"
+
+> "Så tenker jeg at plugin browseren skulle hatt muligheten til å vise
+> "bare effekter", slik som vi kan vise "bare instrumenter"."
+
+Today's `instrumentsOnly` checkbox is a two-state control over a
+three-state question, so "show me only effects" is unreachable — you can
+have instruments, or you can have everything.
+
+Replace it with a proper chip row in `BrowserShell`'s `filters` slot:
+
+```
+  ⌕ search…            [ ALL ] [ INST ] [ FX ]   ★  ⏱  ⚙
+```
+
+- **Kind** — `ALL` / `INST` / `FX`, exclusive, one always on. This is the
+  ask, and a three-way segmented control is the honest shape for it.
+- **★ Favourites only** and **⏱ Recent only** — independent toggles that
+  narrow to those sections. They already exist as sections; as filters
+  they answer "just show me my shortlist" without scrolling.
+- Chip state is view state: `localStorage`, alongside the mode and the
+  folds. Not the catalog, not the op log.
+
+Note the interaction with §5.2's sections: with `FX` active the
+Instruments section is empty and disappears on its own — a filter narrows
+the same section tree rather than switching to a different one.
+
+### 9.3 More to search on than a name
+
+> "Og kanskje andre nyttige søke-funksjoner (hvis det finnes noe annet å
+> søke på. For eksempel "type")."
+
+What a `PluginDescriptor` actually carries, and what each field is worth
+searching:
+
+| Field | Searchable? | Notes |
+|---|---|---|
+| `name` | yes, already | Primary, highest weight |
+| `vendor` | yes, already | "show me everything by Calf" is a real query |
+| `categories[]` | yes, already | This IS "type" — `Reverb`, `Synth`, `Sampler` |
+| `format` | **as a facet** | `clap:` / `lv2:` prefix, not free text |
+| `uid`, `path` | no | Machine identity; noise in a ranked list |
+| `audioInputs` / `audioOutputs` | **as a facet** | "something that takes stereo in" |
+| `hasNoteInput` | **as a facet** | Overlaps `isInstrument`; probably redundant |
+| user `tags[]` (catalog) | yes | The user's own vocabulary — rank it high |
+
+So "type" is already searchable as a category, and the chip row of §9.2 is
+the better surface for it than a query language. Beyond that, add:
+
+- **Tags to the ranked fields.** The catalog already stores them (§4.1);
+  nothing searches them yet. A user who tagged six plugins "Live rig"
+  should find them by typing it.
+- **A `format:` prefix** in the search field — `format:lv2 reverb`. One
+  prefix, parsed in `browser-model.ts` and unit-tested, not a query DSL.
+  Anything more elaborate than this is a worse answer than a chip.
+
+Explicitly NOT worth building: an I/O-count filter. It sounds precise and
+is almost never the question you actually have.
+
+### 9.4 Delivery
+
+9.1 and 9.2 fold into **PR 5** — both are shell and manager work, and 9.1
+is the whole point of the panel. 9.3's tag ranking joins them (it is two
+lines in the rank keys); the `format:` prefix is small enough to ride
+along but is the first thing to cut if PR 5 grows.
