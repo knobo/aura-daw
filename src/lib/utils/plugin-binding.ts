@@ -16,6 +16,13 @@ export function tracksBoundToInstance<
   return tracks.filter((t) => t.kind === "midi" && t.instrumentId === ref);
 }
 
+/** Tracks where an instance sits as an insert-FX slot (not instrument-bound). */
+export function tracksWithInsert<
+  T extends { inserts?: readonly { instanceId: string }[] | null },
+>(tracks: readonly T[], instanceId: string): T[] {
+  return tracks.filter((t) => (t.inserts ?? []).some((s) => s.instanceId === instanceId));
+}
+
 /** Stable caption for instance / params / patches: the bound track, not the
  * selected one. "connection: Midi 5" or "unbound". */
 export function instanceConnectionLabel(

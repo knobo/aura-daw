@@ -52,6 +52,7 @@ import {
   type PluginDescriptor,
   type PluginInstanceInfo,
   type PluginListResult,
+  type InsertSlot,
   type PluginParamChange,
   type PluginParamInfo,
   type PitchFrame,
@@ -335,6 +336,19 @@ const DEMO_PLUGINS: PluginDescriptor[] = [
     hasNoteInput: false,
     categories: ["audio-effect", "compressor"],
   },
+  {
+    uid: "clap:/usr/lib/clap/IRVerb.clap#com.airwindows.irverb",
+    format: "clap",
+    name: "IRVerb",
+    vendor: "Airwindows",
+    version: "2.0.1",
+    path: "/usr/lib/clap/IRVerb.clap",
+    isInstrument: false,
+    audioInputs: 2,
+    audioOutputs: 2,
+    hasNoteInput: false,
+    categories: ["audio-effect", "reverb", "convolution"],
+  },
 ];
 
 /** Fresh per-instance parameter list for a demo plugin uid. */
@@ -388,6 +402,19 @@ function demoPluginParams(uid: string): PluginParamInfo[] {
       );
     }
     return params;
+  }
+  if (uid.includes("irverb")) {
+    return [
+      p(0, "Mix", 0, 1, 0.35),
+      p(1, "Pre-delay", 0, 200, 25),
+      p(2, "Decay", 0.1, 10, 2.4),
+      p(3, "Room Size", 0, 1, 0.6),
+      p(4, "Low Cut", 20, 500, 80),
+      p(5, "High Cut", 1000, 20000, 12000),
+      p(6, "Early Reflections", 0, 1, 0.7),
+      p(7, "Diffusion", 0, 1, 0.5),
+      p(8, "IR Select", 0, 5, 0, 6),
+    ];
   }
   return [];
 }
@@ -696,6 +723,7 @@ export class DemoBackend implements Backend {
       automationMode: init.automationMode ?? "read",
       color: init.color ?? "#52e5ff",
       instrumentId: init.instrumentId ?? null,
+      inserts: init.inserts ?? [],
     };
   }
 
@@ -2642,9 +2670,6 @@ export class DemoBackend implements Backend {
     if (!this.pluginScanned) throw new Error("no plugin scan yet — call plugin_scan first");
     const desc = this.pluginDescriptors.find((d) => d.uid === uid);
     if (!desc) throw new Error(`unknown plugin uid: ${uid}`);
-    if (!desc.isInstrument) {
-      throw new Error(`${desc.name} is an effect; v1 hosts instruments on midi tracks only`);
-    }
     const info: PluginInstanceInfo = {
       id: uuid(),
       uid: desc.uid,
@@ -2704,6 +2729,55 @@ export class DemoBackend implements Backend {
       }, 160);
     }
     return params.map((p) => ({ ...p }));
+  }
+
+  // ── insert-FX slots (Plan G1) ──
+
+  async insertAdd(trackId: string, uid: string, index?: number): Promise<InsertSlot> {
+    const desc = this.pluginDescriptors.find((d) => d.uid === uid);
+    if (!desc) throw new Error(`unknown plugin uid: ${uid}`);
+    const track = this.track(trackId);
+    if (!track) throw new Error(`unknown track: ${trackId}`);
+    // Instantiate the plugin instance (reuse the real instantiate path)
+    const inst = await this.pluginInstantiate(uid);
+    const slot: InsertSlot = { id: uuid(), instanceId: inst.id, bypassed: false };
+    const slots = [...(track.inserts ?? [])];
+    const idx = index ?? slots.length;
+    slots.splice(idx, 0, slot);
+    track.inserts = slots;
+    this.resyncAudio();
+    return { ...slot };
+  }
+
+  async insertRemove(trackId: string, slotId: string): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    const slot = (track.inserts ?? []).find((s) => s.id === slotId);
+    if (!slot) return;
+    // Remove the plugin instance too
+    await this.pluginRemove(slot.instanceId).catch(() => {});
+    track.inserts = (track.inserts ?? []).filter((s) => s.id !== slotId);
+    this.resyncAudio();
+  }
+
+  async insertReorder(trackId: string, slotId: string, toIndex: number): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    const slots = track.inserts ?? [];
+    const idx = slots.findIndex((s) => s.id === slotId);
+    if (idx < 0) return;
+    const copy = [...slots];
+    const [slot] = copy.splice(idx, 1);
+    copy.splice(Math.min(toIndex, copy.length), 0, slot);
+    track.inserts = copy;
+    this.resyncAudio();
+  }
+
+  async insertSetBypass(trackId: string, slotId: string, bypassed: boolean): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    track.inserts = (track.inserts ?? []).map((s) => (s.id === slotId ? { ...s, bypassed } : s));
+    this.resyncAudio();
   }
 
   // ── phase 2: open-kind generation jobs ──

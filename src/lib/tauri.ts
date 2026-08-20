@@ -24,6 +24,7 @@ import type {
   ComposerGenerateRequest,
   ComposerSuggestion,
   Curve,
+  InsertSlot,
   ModulationSnapshot,
   EvolveOptions,
   ExportCapabilities,
@@ -354,6 +355,17 @@ export interface Backend {
   pluginGetParams(instanceId: string): Promise<PluginParamInfo[]>;
   /** Batched (D-03): one invoke carries N parameter changes. */
   pluginSetParam(instanceId: string, changes: PluginParamChange[]): Promise<PluginParamInfo[]>;
+
+  // ── insert-FX slots (Plan G1) ──
+
+  /** Add an effect as an insert slot on a track. */
+  insertAdd?(trackId: string, uid: string, index?: number): Promise<InsertSlot>;
+  /** Remove one insert slot and its plugin instance. */
+  insertRemove?(trackId: string, slotId: string): Promise<void>;
+  /** Reorder one insert slot on a track. */
+  insertReorder?(trackId: string, slotId: string, toIndex: number): Promise<void>;
+  /** Set bypass on one insert slot. */
+  insertSetBypass?(trackId: string, slotId: string, bypassed: boolean): Promise<void>;
 
   // ── wave 1.5 ──
 
@@ -875,6 +887,21 @@ class TauriBackend implements Backend {
   }
   pluginSetParam(instanceId: string, changes: PluginParamChange[]) {
     return invoke<PluginParamInfo[]>("plugin_set_param", { instanceId, changes });
+  }
+
+  // ── insert-FX slots ──
+
+  insertAdd(trackId: string, uid: string, index?: number) {
+    return invoke<InsertSlot>("insert_add", { trackId, uid, index });
+  }
+  insertRemove(trackId: string, slotId: string) {
+    return invoke<void>("insert_remove", { trackId, slotId });
+  }
+  insertReorder(trackId: string, slotId: string, toIndex: number) {
+    return invoke<void>("insert_reorder", { trackId, slotId, toIndex });
+  }
+  insertSetBypass(trackId: string, slotId: string, bypassed: boolean) {
+    return invoke<void>("insert_set_bypass", { trackId, slotId, bypassed });
   }
 
   // ── wave 1.5 ──

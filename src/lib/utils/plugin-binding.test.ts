@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { instanceConnectionLabel, tracksBoundToInstance } from "./plugin-binding";
+import {
+  instanceConnectionLabel,
+  tracksBoundToInstance,
+  tracksWithInsert,
+} from "./plugin-binding";
 
 const audio = (id: string, name: string, instrumentId?: string | null) => ({
   id,
@@ -62,5 +66,35 @@ describe("instanceConnectionLabel", () => {
         "zyn-1",
       ),
     ).toBe("connection: Midi 2 · Midi 5");
+  });
+});
+
+describe("tracksWithInsert", () => {
+  const withInsert = (id: string, name: string, inserts: { instanceId: string }[] | null) => ({
+    id,
+    name,
+    kind: "audio" as const,
+    inserts,
+  });
+
+  it("returns the track whose insert slot names the instance", () => {
+    const t = withInsert("a1", "Audio 1", [{ instanceId: "fx-1" }]);
+    const tracks = [
+      withInsert("a2", "Audio 2", [{ instanceId: "fx-2" }]),
+      t,
+      withInsert("a3", "Audio 3", null),
+    ];
+    expect(tracksWithInsert(tracks, "fx-1")).toEqual([t]);
+  });
+
+  it("returns nothing when no track inserts the instance", () => {
+    const tracks = [withInsert("a1", "Audio 1", [{ instanceId: "fx-2" }])];
+    expect(tracksWithInsert(tracks, "fx-1")).toEqual([]);
+  });
+
+  it("tolerates tracks with no inserts field", () => {
+    const t = withInsert("a1", "Audio 1", [{ instanceId: "fx-1" }]);
+    const empty = { id: "a2", name: "Audio 2", kind: "midi" as const, inserts: undefined };
+    expect(tracksWithInsert([empty, t], "fx-1")).toEqual([t]);
   });
 });

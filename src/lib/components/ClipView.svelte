@@ -156,14 +156,33 @@
     void clipDrag.end();
   }
 
-  // ── open in external editor ──
-  // Double-click hands the clip's source file off to the OS's default app
-  // for its file type — the audio-clip analogue of MidiClipView's
-  // double-click-opens-piano-roll.
+  // ── double-click / context menu ──
+  // Double-click opens the plugin manager (effect chain access).
+  // Right-click shows a menu with "open in external editor", add effect, etc.
+  let menuOpen = $state(false);
+
   function onDblClick(e: MouseEvent) {
     e.stopPropagation();
     if ((e.target as HTMLElement).closest("button")) return;
+    // Focus the plugin manager in the dock — the user brought audio in,
+    // the most likely next step is adding an effect.
+    ui.dock = "plugins";
+  }
+
+  function onContextMenu(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    menuOpen = true;
+  }
+
+  function openExternalEditor() {
+    menuOpen = false;
     void project.openInExternalEditor(clip.id);
+  }
+
+  function onAddEffect() {
+    menuOpen = false;
+    ui.dock = "plugins";
   }
 
   function onKeydown(e: KeyboardEvent) {
@@ -192,13 +211,14 @@
     style:width="{Math.max(6, widthPx)}px"
     style:--clip-color={track.color}
     role="button"
-    aria-label="Clip {clip.name} — double-click to open in external editor"
+    aria-label="Clip {clip.name} — double-click to manage effects, right-click for more"
     tabindex="0"
     onpointerdown={onPointerDown}
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
     onpointercancel={() => clipDrag.cancel()}
     ondblclick={onDblClick}
+    oncontextmenu={onContextMenu}
     onkeydown={onKeydown}
   >
     <canvas bind:this={canvas} class="wave" style:left="{visL}px" style:width="{visW}px"></canvas>
@@ -263,6 +283,17 @@
         <div class="pbar">
           <div class="pfill" style:width="{job.progress * 100}%"></div>
         </div>
+      </div>
+    {/if}
+    {#if menuOpen}
+      <div class="clipmenu-backdrop" role="presentation" onpointerdown={() => (menuOpen = false)}></div>
+      <div class="clipmenu" role="menu" style:left="{Math.max(visL + 4, 4)}px">
+        <button type="button" role="menuitem" onclick={openExternalEditor}>
+          Open in external editor
+        </button>
+        <button type="button" role="menuitem" onclick={onAddEffect}>
+          Add effect to track…
+        </button>
       </div>
     {/if}
   </div>
@@ -481,5 +512,36 @@
     background: linear-gradient(90deg, var(--cyan), var(--magenta));
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.5);
     transition: width 180ms linear;
+  }
+
+  /* ── context menu ── */
+
+  .clipmenu-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 30;
+  }
+  .clipmenu {
+    position: absolute;
+    top: 16px;
+    z-index: 31;
+    display: flex;
+    flex-direction: column;
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 4px;
+    background: rgb(var(--bg-1-rgb) / 0.96);
+    box-shadow: 0 4px 14px rgb(var(--shadow-rgb) / 0.4);
+    overflow: hidden;
+  }
+  .clipmenu button {
+    all: unset;
+    padding: 5px 10px;
+    font-size: 10px;
+    color: var(--text);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .clipmenu button:hover {
+    background: color-mix(in srgb, var(--clip-color) 25%, transparent);
   }
 </style>

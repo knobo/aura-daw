@@ -268,7 +268,26 @@ impl Lv2Host {
         rate: u32,
     ) -> Result<Box<dyn LiveInstrument>, String> {
         let instance_id = instance_id.to_string();
-        plugin_main().run(move |ctx| make_node(world_mut(ctx), &instance_id, rate))?
+        Ok(Box::new(plugin_main().run(move |ctx| {
+            make_node(world_mut(ctx), &instance_id, rate)
+        })??))
+    }
+
+    /// Instantiate an RT-ready **effect** node for a registered instance in
+    /// [`IoMode::Replace`] (de-interleave the strip's audio into the plugin's
+    /// audio inputs, assign its main out). Plan G1 Task 7: the insert-chain
+    /// sibling of [`Self::make_node`].
+    pub fn make_effect_node(
+        &self,
+        instance_id: &str,
+        rate: u32,
+    ) -> Result<Box<dyn AudioProcessor>, String> {
+        let instance_id = instance_id.to_string();
+        let mut node = plugin_main().run(move |ctx| {
+            make_node(world_mut(ctx), &instance_id, rate)
+        })??;
+        node.set_io_mode(IoMode::Replace);
+        Ok(Box::new(node))
     }
 
     /// True when the host thread has a registration for `instance_id`
@@ -436,7 +455,7 @@ fn make_node(
     inner: &mut WorldInner,
     instance_id: &str,
     rate: u32,
-) -> Result<Box<dyn LiveInstrument>, String> {
+) -> Result<Lv2Node, String> {
     let WorldInner { features, instances, .. } = inner;
     let inst = instances
         .get_mut(instance_id)
@@ -471,7 +490,7 @@ fn make_node(
         "lv2 host: node ready for instance {instance_id} ({} @ {rate} Hz)",
         inst.plugin.uri()
     );
-    Ok(Box::new(node))
+    Ok(node)
 }
 
 /// Ensure the registration's main-thread shadow instance exists (with any

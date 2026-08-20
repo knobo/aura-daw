@@ -1,9 +1,9 @@
-//! Insert-FX nodes compiled onto the mixer strip (Plan G1 Task 5).
+//! Insert-FX nodes compiled onto the mixer strip (Plan G1 Task 5 + Task 7).
 //!
 //! Document slots (`InsertSlot`) become [`InsertNode`]s. The mixer walks
-//! them after the source sum and before the fader. Hosting a real CLAP/LV2
-//! processor is Task 7 (`insert_node_for`); this module resolves unknown
-//! or unhosted instances to skip/`None`.
+//! them after the source sum and before the fader. Real CLAP/LV2 effect
+//! processors are hosted via [`crate::plugins::insert_node_for`] (Task 7);
+//! instances that cannot be hosted are skipped (dry strip).
 
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet};
@@ -73,7 +73,11 @@ impl InsertNodeCell {
 /// matching registry entry or skips. Task 7 fills `resolve_with`'s `make`.
 #[derive(Default)]
 pub struct InsertNodeRegistry {
-    entries: HashMap<String, (String, Arc<InsertNodeCell>)>,
+    /// `instance_id -> (key, latency, cell)`. Latency is read once at build
+    /// time (the node's `latency_samples()`) and cached alongside the cell so
+    /// `compile_inserts` can fill `InsertNode::latency` without touching the
+    /// cell (which would race the RT thread once a snapshot holds it).
+    entries: HashMap<String, (String, usize, Arc<InsertNodeCell>)>,
 }
 
 impl InsertNodeRegistry {
@@ -86,15 +90,26 @@ impl InsertNodeRegistry {
         key: &str,
         make: impl FnOnce() -> Option<Box<dyn AudioProcessor>>,
     ) -> Option<Arc<InsertNodeCell>> {
-        if let Some((k, cell)) = self.entries.get(instance_id) {
+        if let Some((k, _, cell)) = self.entries.get(instance_id) {
             if k == key {
                 return Some(cell.clone());
             }
         }
-        let cell = InsertNodeCell::new(make()?);
+        let node = make()?;
+        let latency = node.latency_samples();
+        let cell = InsertNodeCell::new(node);
         self.entries
-            .insert(instance_id.to_string(), (key.to_string(), cell.clone()));
+            .insert(instance_id.to_string(), (key.to_string(), latency, cell.clone()));
         Some(cell)
+    }
+
+    /// The cached latency for an instance (0 when unknown). Read on the
+    /// control thread after `resolve_with`, before the graph is published.
+    pub fn latency_of(&self, instance_id: &str) -> usize {
+        self.entries
+            .get(instance_id)
+            .map(|(_, lat, _)| *lat)
+            .unwrap_or(0)
     }
 
     /// Drop entries for instances that no longer sit on any insert chain.
@@ -112,23 +127,32 @@ impl InsertNodeRegistry {
 
     /// The node key currently registered for an instance (test/diagnostic aid).
     pub fn key_of(&self, instance_id: &str) -> Option<&str> {
-        self.entries.get(instance_id).map(|(k, _)| k.as_str())
+        self.entries.get(instance_id).map(|(k, _, _)| k.as_str())
     }
 }
 
 /// Compile document insert slots to per-track [`InsertNode`] chains.
 ///
-/// Unknown `instance_id`s (not in `PluginDoc`) and unhosted instances
-/// (nothing already in `nodes` for the computed key) are skipped. Does
-/// **not** instantiate CLAP/LV2 — that is Task 7's `insert_node_for`.
+/// Unknown `instance_id`s (not in `PluginDoc`) and instances that cannot be
+/// hosted (inactive, or the host cannot build a node — see
+/// [`crate::plugins::insert_node_for`]) are skipped. Nodes are cached in
+/// `nodes` by `instance_id` + a key carrying the rate/state-rev/status so a
+/// rebuilt graph reuses the same processor (delay tails, plugin memory) and
+/// a state or rate change retires the old one.
+///
+/// The second return value lists instance ids that are **marked `"active"`
+/// in the document but whose node could NOT be built** (host failure) — the
+/// strip plays dry and the caller must surface this to the user (e.g. flip
+/// the row to `"crashed"`) rather than leaving a misleading green "active".
 pub fn compile_inserts(
     tracks: &[TrackState],
     plugins: &PluginDoc,
     rate: u32,
     nodes: &mut InsertNodeRegistry,
-) -> HashMap<TrackId, Vec<InsertNode>> {
+) -> (HashMap<TrackId, Vec<InsertNode>>, Vec<String>) {
     let mut out = HashMap::new();
     let mut used: HashSet<String> = HashSet::new();
+    let mut failed: Vec<String> = Vec::new();
     for t in tracks {
         let mut chain = Vec::new();
         for slot in &t.inserts {
@@ -145,17 +169,23 @@ pub fn compile_inserts(
             };
             let rev = plugins.state_rev.get(&slot.instance_id).copied().unwrap_or(0);
             let key = format!("insert:{}@{rate}#{rev}!{}", slot.instance_id, row.status);
-            let Some(proc) = nodes.resolve_with(&slot.instance_id, &key, || None) else {
+            let Some(proc) = nodes.resolve_with(&slot.instance_id, &key, || {
+                crate::plugins::insert_node_for(plugins, &slot.instance_id, rate)
+            }) else {
+                // Active-but-unhosted: the instance claims to be live but the
+                // host couldn't produce a node — a real, user-visible failure.
+                if row.status == "active" {
+                    failed.push(slot.instance_id.clone());
+                }
                 continue;
             };
+            let latency = nodes.latency_of(&slot.instance_id);
             used.insert(slot.instance_id.clone());
             chain.push(InsertNode {
                 slot_id: slot.id.clone(),
                 instance_id: slot.instance_id.clone(),
                 bypassed: slot.bypassed,
-                // Task 7 fills this from the host. Reading the cell here
-                // would race the RT thread if a snapshot already holds it.
-                latency: 0,
+                latency,
                 proc,
             });
         }
@@ -164,7 +194,7 @@ pub fn compile_inserts(
         }
     }
     nodes.retain_instances(&used);
-    out
+    (out, failed)
 }
 
 /// Test double: each sample *= 0.5. Mixer bypass is [`InsertNode::bypassed`],
@@ -300,7 +330,7 @@ mod tests {
             bypassed: false,
         });
         let mut nodes = InsertNodeRegistry::default();
-        let map = compile_inserts(&[t], &PluginDoc::default(), 48_000, &mut nodes);
+        let (map, _failed) = compile_inserts(&[t], &PluginDoc::default(), 48_000, &mut nodes);
         assert!(map.is_empty());
         assert!(nodes.is_empty());
     }
@@ -339,9 +369,42 @@ mod tests {
             bypassed: false,
         });
 
-        let map = compile_inserts(&[t], &plugins, 48_000, &mut nodes);
+        let (map, _failed) = compile_inserts(&[t], &plugins, 48_000, &mut nodes);
         let chain = map.get("t1").expect("one chain for t1");
         assert_eq!(chain.len(), 1, "duplicate instance_id must compile to one node, not two");
         assert_eq!(chain[0].slot_id, "s1", "first slot in document order wins");
+    }
+
+    /// An instance marked `"active"` in the document whose node the host
+    /// cannot build (here: an unhostable format) must be REPORTED back to the
+    /// caller so it can flip the row to `"crashed"` — the user must see that
+    /// the plugin won't work, not a silent dry strip behind a green "active".
+    #[test]
+    fn compile_inserts_reports_active_instances_whose_node_failed() {
+        let mut plugins = PluginDoc::default();
+        plugins.instances.push(crate::plugins::PluginInstanceInfo {
+            id: "p-1".into(),
+            uid: "clap:/x.clap#fx".into(),
+            name: "Fx".into(),
+            format: "unknown".into(),
+            status: "active".into(),
+            track_id: Some("t1".into()),
+        });
+        let mut t = crate::audio::types::testutil::test_track("t1");
+        t.inserts.push(crate::audio::types::InsertSlot {
+            id: "s1".into(),
+            instance_id: "p-1".into(),
+            bypassed: false,
+        });
+
+        let mut nodes = InsertNodeRegistry::default();
+        let (map, failed) = compile_inserts(&[t], &plugins, 48_000, &mut nodes);
+
+        assert!(map.is_empty(), "no node can be built for the unhostable instance");
+        assert_eq!(
+            failed,
+            vec!["p-1".to_string()],
+            "an active-but-unhosted instance is reported as failed"
+        );
     }
 }

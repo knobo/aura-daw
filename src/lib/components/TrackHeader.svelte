@@ -20,6 +20,7 @@
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
+  import InsertChain from "./plugins/InsertChain.svelte";
 
   let {
     track,
@@ -28,6 +29,7 @@
   }: { track: TrackState; index: number; collapsed?: boolean } = $props();
   let pickerOpen = $state(false);
   let groupMenuOpen = $state(false);
+  let fxPopoverOpen = $state(false);
 
   // ── rename ──
   // The editor is opened by double-clicking the name, which is the gesture
@@ -258,6 +260,22 @@
           <span class="kindchip mono">Audio track</span>
         {/if}
         {#if !isAutomation}
+          <span class="picker">
+            <button
+              class="status fxchip"
+              class:on={fxPopoverOpen}
+              title={(track.inserts?.length ?? 0) > 0 ? `Effects (${track.inserts!.length})` : "Add effects"}
+              aria-haspopup="menu"
+              aria-expanded={fxPopoverOpen}
+              aria-pressed={fxPopoverOpen}
+              onclick={() => (fxPopoverOpen = !fxPopoverOpen)}
+            >
+              FX{(track.inserts?.length ?? 0) > 0 ? ` ${track.inserts!.length}` : ""}
+            </button>
+            {#if fxPopoverOpen}
+              <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
+            {/if}
+          </span>
           <span class="picker metadata-lanes">
             <button class="status lanes" class:on={modulation.hasVisible(track.id) || pickerOpen} title="Show or add automation lanes" aria-haspopup="menu" aria-expanded={pickerOpen} aria-pressed={modulation.hasVisible(track.id)} onclick={() => (pickerOpen = !pickerOpen)}>Lanes</button>
             {#if pickerOpen}<LanePickerMenu {track} onclose={() => (pickerOpen = false)} />{/if}
@@ -294,9 +312,9 @@
               MIDI OUT
             </label>
           {/if}
-          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title="Record arm" onclick={() => project.toggleArm(track.id)}>Arm</button>
-          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title="Mute" onclick={() => project.toggleMute(track.id)}>Mute</button>
-          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title="Solo" onclick={() => project.toggleSolo(track.id)}>Solo</button>
+          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title="Record arm" onclick={() => project.toggleArm(track.id)}>A</button>
+          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title="Mute" onclick={() => project.toggleMute(track.id)}>M</button>
+          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title="Solo" onclick={() => project.toggleSolo(track.id)}>S</button>
         </div>
 
         <div class="automation-row">
@@ -731,6 +749,15 @@
     letter-spacing: 0.04em;
     cursor: pointer;
   }
+  .status.arm,
+  .status.mute,
+  .status.solo {
+    flex: none;
+    width: 20px;
+    min-width: 0;
+    padding: 0;
+    text-align: center;
+  }
   .status.arm.on {
     color: var(--text-on-accent);
     background: rgb(var(--red-rgb) / 0.8);
@@ -750,6 +777,15 @@
     color: var(--bg-0);
     background: var(--magenta);
     border-color: var(--magenta);
+  }
+  .status.fxchip {
+    min-width: 32px;
+  }
+  .status.fxchip.on {
+    color: var(--bg-0);
+    background: var(--violet);
+    border-color: var(--violet);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
   }
   .automation-row {
     height: 20px;
