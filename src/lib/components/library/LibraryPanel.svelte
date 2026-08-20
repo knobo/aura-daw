@@ -5,6 +5,13 @@
    * patches). The panel is chrome: it lists, auditions and drags; every
    * mutation it can cause is an existing, channel-routed command, so a drop
    * is undoable for free.
+   *
+   * This shell is a pure delegator (each root owns its own list, search and
+   * grouping) so it doesn't mount `components/browser/BrowserShell` itself
+   * — SamplesRoot and PresetsRoot do that individually. The root switch
+   * below is restyled onto the same filter-chip vocabulary `BrowserShell`
+   * uses elsewhere, so it reads as one family even though it isn't one
+   * of its instances.
    */
   import { library, type LibraryRoot } from "../../state/library.svelte";
   import SamplesRoot from "./SamplesRoot.svelte";

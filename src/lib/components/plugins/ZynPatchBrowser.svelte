@@ -1,42 +1,54 @@
 <script lang="ts">
   /**
    * ZynAddSubFX patch browser: the full .xiz bank list (zyn_list_patches,
-   * ~1318 entries) grouped by bank, searchable, and windowed — only the
-   * visible rows render DOM (constraint §10.12), so the list stays light.
+   * ~1318 entries) grouped by bank, searchable, foldable per bank, and
+   * windowed — only the visible rows render DOM (constraint §10.12) — so
+   * the list stays light even with every bank expanded.
+   *
+   * Ranking/grouping/fold-flattening come from the shared
+   * `components/browser/browser-model.ts`, but the row markup is hand-
+   * rolled rather than `BrowserShell`/`BrowserRow`: those mount every row
+   * unconditionally, which is exactly what this file exists to avoid at
+   * this row count. Search box and status line intentionally mirror
+   * `BrowserShell`'s vocabulary so it still *reads* as the same browser.
+   *
    * Clicking a patch loads it (zyn_load_patch) and the store re-binds the
    * owning track so the change is audible without a restart.
    */
   import { zyn } from "../../state/zynpatches.svelte";
   import type { ZynPatch } from "../../types/ipc";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
+  import { loadFolds, saveFolds } from "../browser/browser-folds";
+  import { type BrowserGroup, flattenRows, groupItems, rankItems } from "../browser/browser-model";
+  import EmptyState from "../browser/EmptyState.svelte";
+
+  const FOLDS_KEY = "zyn-patches";
 
   let search = $state("");
   let scroller: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
   let viewH = $state(400);
+  let collapsed = $state(loadFolds(FOLDS_KEY));
 
   const ROW_H = 24;
   const OVERSCAN = 8;
 
-  type Row = { kind: "bank"; bank: string; count: number } | { kind: "patch"; patch: ZynPatch };
+  const ranked = $derived(
+    rankItems(zyn.patches, search, [
+      { value: (p: ZynPatch) => p.name, weight: 2 },
+      { value: (p: ZynPatch) => p.bank, weight: 1 },
+    ]),
+  );
+  const groups = $derived(groupItems(ranked, (p) => p.bank));
+  const groupByKey = $derived(new Map(groups.map((g) => [g.key, g] as const)));
+  const rows = $derived(flattenRows(groups, collapsed));
 
-  const rows = $derived.by((): Row[] => {
-    const q = search.trim().toLowerCase();
-    const out: Row[] = [];
-    let currentBank = "";
-    let headerAt = -1;
-    for (const p of zyn.patches) {
-      if (q && !p.name.toLowerCase().includes(q) && !p.bank.toLowerCase().includes(q)) continue;
-      if (p.bank !== currentBank) {
-        currentBank = p.bank;
-        headerAt = out.length;
-        out.push({ kind: "bank", bank: p.bank, count: 0 });
-      }
-      out.push({ kind: "patch", patch: p });
-      (out[headerAt] as { count: number }).count++;
-    }
-    return out;
-  });
+  function toggleBank(key: string) {
+    const next = new Set(collapsed);
+    if (!next.delete(key)) next.add(key);
+    collapsed = next;
+    saveFolds(FOLDS_KEY, next);
+  }
 
   const first = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN));
   const visibleCount = $derived(Math.ceil(viewH / ROW_H) + OVERSCAN * 2);
@@ -57,6 +69,10 @@
   async function pick(patch: ZynPatch) {
     if (!inst || zyn.busyPath) return;
     await zyn.load(inst.id, patch);
+  }
+
+  function bankOf(key: string): BrowserGroup<ZynPatch> | undefined {
+    return groupByKey.get(key);
   }
 </script>
 
@@ -90,35 +106,50 @@
   {#if zyn.loading}
     <div class="note silk">reading banks…</div>
   {:else if rows.length === 0}
-    <div class="note silk">{zyn.patches.length === 0 ? "no zyn banks found on this machine" : "no match — clear the search"}</div>
+    <EmptyState
+      message={zyn.patches.length === 0
+        ? "No Zyn banks found on this machine."
+        : `No match for "${search}" — clear the search.`}
+    />
   {/if}
 
   <div class="list" bind:this={scroller} onscroll={() => (scrollTop = scroller?.scrollTop ?? 0)}>
     <div class="spacer" style:height="{rows.length * ROW_H}px">
       <div class="window" style:transform="translateY({first * ROW_H}px)">
         {#each slice as row, i (first + i)}
-          {#if row.kind === "bank"}
-            <div class="bank mono" style:height="{ROW_H}px">
-              <span class="bname">▤ {row.bank.replace(/_/g, " ")}</span>
-              <span class="bcount silk">{row.count}</span>
-            </div>
-          {:else}
+          {#if row.kind === "group"}
+            {@const bank = bankOf(row.groupKey)}
             <button
-              class="patch mono"
-              class:loaded={loadedPath === row.patch.path}
-              class:busy={zyn.busyPath === row.patch.path}
+              class="bank mono"
               style:height="{ROW_H}px"
-              title="{row.patch.bank} / {row.patch.name} — load into {inst?.name ?? 'Zyn'}"
-              onclick={() => pick(row.patch)}
+              aria-expanded={!collapsed.has(row.groupKey)}
+              title="{collapsed.has(row.groupKey) ? 'Expand' : 'Collapse'} {row.groupKey}"
+              onclick={() => toggleBank(row.groupKey)}
             >
-              <span class="pnum silk">{String(row.patch.program).padStart(3, "0")}</span>
-              <span class="pname">{row.patch.name}</span>
-              {#if zyn.busyPath === row.patch.path}
-                <span class="spin">◌</span>
-              {:else if loadedPath === row.patch.path}
-                <span class="check">⌁ live</span>
-              {/if}
+              <span class="disclosure" aria-hidden="true">{collapsed.has(row.groupKey) ? "▸" : "▾"}</span>
+              <span class="bname">{row.groupKey.replace(/_/g, " ")}</span>
+              <span class="bcount silk">{bank?.items.length ?? 0}</span>
             </button>
+          {:else}
+            {@const patch = bankOf(row.groupKey)?.items[row.itemIndex]}
+            {#if patch}
+              <button
+                class="patch mono"
+                class:loaded={loadedPath === patch.path}
+                class:busy={zyn.busyPath === patch.path}
+                style:height="{ROW_H}px"
+                title="{patch.bank} / {patch.name} — load into {inst?.name ?? 'Zyn'}"
+                onclick={() => pick(patch)}
+              >
+                <span class="pnum silk">{String(patch.program).padStart(3, "0")}</span>
+                <span class="pname">{patch.name}</span>
+                {#if zyn.busyPath === patch.path}
+                  <span class="spin">◌</span>
+                {:else if loadedPath === patch.path}
+                  <span class="check">⌁ live</span>
+                {/if}
+              </button>
+            {/if}
           {/if}
         {/each}
       </div>
@@ -217,16 +248,28 @@
   }
 
   .bank {
+    width: 100%;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     padding: 0 9px;
     font-size: 9px;
     letter-spacing: 0.16em;
     text-transform: uppercase;
     color: var(--violet);
     background: rgb(var(--violet-rgb) / 0.06);
+    border: none;
     border-bottom: var(--border-width) solid rgb(var(--violet-rgb) / 0.12);
+    cursor: pointer;
+    text-align: left;
+  }
+  .bank:hover {
+    background: rgb(var(--violet-rgb) / 0.12);
+  }
+  .disclosure {
+    flex: none;
+    width: 8px;
+    font-size: 8px;
   }
   .bname {
     flex: 1;
