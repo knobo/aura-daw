@@ -187,6 +187,13 @@ struct FaderCtx<'a> {
     ramp: &'a [AbsParamEvent],
     pan: PanGains,
     on: bool,
+    /// This track's PDC delay in samples (0 when no compensating delay). The
+    /// strip's `DelayLine` shifts the audio by this many samples AFTER the
+    /// insert chain, so the fader/pan automation ramps applied here must read
+    /// the SOURCE position (`pos + i - pdc_delay`) — otherwise an automated
+    /// move on a latency-compensated track would be heard `pdc_delay` samples
+    /// early (see `audio::pdc`).
+    pdc_delay: u64,
 }
 
 /// Shared fader: `gain * ramp * pan`, mute, mix into `out`, fold meters.
@@ -205,7 +212,10 @@ fn apply_fader(
     acc: &mut TrackAccum,
 ) {
     for i in 0..run {
-        let g = ctx.gain * ramp_cursor.value(ctx.ramp, pos + i as u64).unwrap_or(1.0);
+        let g = ctx.gain
+            * ramp_cursor
+                .value(ctx.ramp, pos.saturating_add(i as u64).saturating_sub(ctx.pdc_delay))
+                .unwrap_or(1.0);
         let (gl, gr) = lerp_pan(ctx.pan.gl0, ctx.pan.gr0, ctx.pan.gl1, ctx.pan.gr1, f + i, pan_last);
         let mut l = buf[i * 2] * g * gl;
         let mut r = buf[i * 2 + 1] * g * gr;
@@ -539,15 +549,17 @@ fn render_impl(
         };
         let mut clip_ramp = RampCursor::new();
 
+        let pdc_delay = tr.pdc.as_ref().map_or(0u64, |d| d.delay() as u64);
         let pan_gains_quad = pan_gain_quad(
             ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
             pan,
             (gl_atomic, gr_atomic),
-            frame_pos(track_base, 0, track_lp),
-            frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp),
+            frame_pos(track_base, 0, track_lp).saturating_sub(pdc_delay),
+            frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp)
+                .saturating_sub(pdc_delay),
         );
         let pan_last = frames.saturating_sub(1);
-        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on };
+        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on, pdc_delay };
 
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
         prime_live(tr, track_disc, live_in_events);
@@ -695,15 +707,18 @@ pub fn render_live_input_only(
                 .unwrap_or(&[])
         };
         let mut clip_ramp = RampCursor::new();
+        let pdc_delay = tr.pdc.as_ref().map_or(0u64, |d| d.delay() as u64);
         let pan_gains_quad = pan_gain_quad(
             ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
             pan,
             (gl_atomic, gr_atomic),
-            base_pos,
-            base_pos.saturating_add(frames.saturating_sub(1) as u64),
+            base_pos.saturating_sub(pdc_delay),
+            base_pos
+                .saturating_add(frames.saturating_sub(1) as u64)
+                .saturating_sub(pdc_delay),
         );
         let pan_last = frames.saturating_sub(1);
-        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on };
+        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on, pdc_delay };
 
         prime_live(tr, false, live_in.events);
 

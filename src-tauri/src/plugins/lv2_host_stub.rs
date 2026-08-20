@@ -15,7 +15,7 @@
 //! here — and that path is already designed to keep the row, its params and
 //! its state blob while rendering silence (see `state`'s data-safety rules).
 
-use crate::audio::dsp::LiveInstrument;
+use crate::audio::dsp::{AudioProcessor, LiveInstrument};
 
 use super::descriptor::ParamInfo;
 use super::state::StateBlob;
@@ -68,6 +68,14 @@ impl Lv2Host {
         _instance_id: &str,
         _rate: u32,
     ) -> Result<Box<dyn LiveInstrument>, String> {
+        Err(UNAVAILABLE.into())
+    }
+
+    pub fn make_effect_node(
+        &self,
+        _instance_id: &str,
+        _rate: u32,
+    ) -> Result<Box<dyn AudioProcessor>, String> {
         Err(UNAVAILABLE.into())
     }
 

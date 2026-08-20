@@ -47,7 +47,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 
-use crate::audio::dsp::LiveInstrument;
+use crate::audio::dsp::{AudioProcessor, LiveInstrument};
 pub use descriptor::{ParamInfo, PluginDescriptor, PluginInstanceInfo};
 
 /// How a hosted plugin node mixes its main output into the process block.
@@ -149,6 +149,47 @@ pub fn live_node_for(
         info.status
     );
     Some(Box::new(host::StubPluginNode::new()) as Box<dyn LiveInstrument>)
+}
+
+/// Plan G1 Task 7: resolve an insert-FX instance into a real RT **effect**
+/// node ([`AudioProcessor`] in [`IoMode::Replace`]). Returns `None` for
+/// unknown instances and for instances that are not `"active"` — the caller
+/// (`audio::insert::compile_inserts`) skips the slot, leaving the strip dry.
+/// Mirrors [`live_node_for`], but for the insert chain (effects only) instead
+/// of the instrument slot.
+pub fn insert_node_for(
+    doc: &crate::control::session::PluginDoc,
+    instance_id: &str,
+    rate: u32,
+) -> Option<Box<dyn AudioProcessor>> {
+    let info = doc.instances.iter().find(|r| r.id == instance_id)?.clone();
+    if info.status != "active" {
+        log::info!(
+            "plugins: insert instance {instance_id} is not active ({}); skipping",
+            info.status
+        );
+        return None;
+    }
+    match info.format.as_str() {
+        "clap" => match clap_host::activate_effect_node(instance_id, rate) {
+            Ok(node) => Some(node),
+            Err(e) => {
+                log::warn!("plugins: CLAP effect node for {instance_id} unavailable ({e})");
+                None
+            }
+        },
+        "lv2" => match lv2_host::global().make_effect_node(instance_id, rate) {
+            Ok(node) => Some(node),
+            Err(e) => {
+                log::warn!("plugins: LV2 effect node for {instance_id} unavailable ({e})");
+                None
+            }
+        },
+        _ => {
+            log::warn!("plugins: unsupported format '{}' for insert {instance_id}", info.format);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

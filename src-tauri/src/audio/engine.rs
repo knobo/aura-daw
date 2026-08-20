@@ -267,6 +267,7 @@ pub fn start(
                 cache: HashMap::new(),
                 cache_rate: 0,
                 live_nodes: Default::default(),
+                insert_nodes: Default::default(),
                 accum: MeterAccum::default(),
                 gen_maps: GenerationMaps::default(),
                 sinks: Vec::new(),
@@ -1044,6 +1045,11 @@ struct Control {
     /// plugin instances survive rebuilds); entries are created/replaced here
     /// on the control thread and freed here when the last snapshot retires.
     live_nodes: crate::midi::playback::LiveNodeRegistry,
+    /// Insert-FX processors (Plan G1) keyed by `instance_id`, shared between
+    /// successive graph snapshots exactly like `live_nodes` so a plugin's
+    /// delay tails / memory survive rebuilds. Built by `compile_inserts` on
+    /// this (control) thread; freed here when the last snapshot retires.
+    insert_nodes: crate::audio::insert::InsertNodeRegistry,
     accum: MeterAccum,
     /// generation -> slot map window for the meter fold (Task 6); published
     /// alongside `tables` on every rebuild, pinned across a recording so a
@@ -1703,6 +1709,7 @@ impl Control {
         // session -> leaf, never the reverse, and the leaf is never held
         // across another acquisition).
         let mut assembled: Option<(HashMap<crate::ids::TrackId, usize>, Vec<RtTrack>)> = None;
+        let mut failed_inserts: Vec<String> = Vec::new();
         if !headless {
             // Headless keeps its narrow scope [I5]: tables are enough to
             // serve knob writes and recording resolution with no output
@@ -1765,6 +1772,70 @@ impl Control {
                 &mut tracks,
                 live_in_target.as_deref(),
             );
+            // INSERT-FX (Plan G1 Task 7): compile the document insert slots
+            // into RT processors and attach each chain to the row that
+            // actually carries the track's audio — the live row when one
+            // exists (a midi instrument), else the clips row (audio track,
+            // or a frozen midi return). A chain is attached to EXACTLY one
+            // row per track (G-7: one instance, one slot, one node — a
+            // second attachment would run the same processor twice per
+            // block). Latency is populated on each `InsertNode` so the PDC
+            // pass (`audio::pdc::compile_pdc`) can align paths; attaching
+            // the resulting `DelayLine`s is a separate follow-up (pdc.rs
+            // documents the automation-ramp offset that must be resolved
+            // first).
+            let (mut compiled, failed) = crate::audio::insert::compile_inserts(
+                &s.tracks,
+                &s.plugins,
+                self.cache_rate,
+                &mut self.insert_nodes,
+            );
+            failed_inserts = failed;
+            // Per-mixer-slot (declared, applied) insert latency, for PDC.
+            let mut declared = vec![0usize; slots_s.len()];
+            let mut applied = vec![0usize; slots_s.len()];
+            for t in s.tracks.iter() {
+                let Some(chain) = compiled.remove(&t.id) else { continue };
+                if chain.is_empty() {
+                    continue;
+                }
+                let Some(&slot) = slots_s.get(&t.id) else { continue };
+                let (d, a) = chain.iter().fold((0usize, 0usize), |(d, a), n| {
+                    (d + n.latency, a + if n.bypassed { 0 } else { n.latency })
+                });
+                if slot < declared.len() {
+                    declared[slot] = d;
+                    applied[slot] = a;
+                }
+                let idx = tracks
+                    .iter()
+                    .position(|r| r.slot == slot && r.live.is_some())
+                    .or_else(|| tracks.iter().position(|r| r.slot == slot));
+                if let Some(i) = idx {
+                    tracks[i].inserts = chain;
+                }
+            }
+            // PDC (Plan G1 Task 6/7): pad every track's path up to the
+            // slowest sibling's so latency-reporting inserts land in step at
+            // the master. Zero delay = no DelayLine (and no automation-ramp
+            // offset in the mixer).
+            let pdc = crate::audio::pdc::compile_pdc(&declared, &applied);
+            for (slot, &delay) in pdc.iter().enumerate() {
+                if delay == 0 {
+                    continue;
+                }
+                let idx = tracks
+                    .iter()
+                    .position(|r| r.slot == slot && r.live.is_some())
+                    .or_else(|| tracks.iter().position(|r| r.slot == slot));
+                if let Some(i) = idx {
+                    tracks[i].pdc = Some(crate::audio::pdc::DelayLine::new(
+                        delay,
+                        crate::audio::rt::MAX_LIVE_BLOCK,
+                        2,
+                    ));
+                }
+            }
             // The timeline boundary belongs to the material, so it is
             // derived exactly where the material is assembled — same helper
             // the offline bounce uses, so live and export agree on where the
@@ -1984,6 +2055,25 @@ impl Control {
             // next tick, after `drain_retired` has freed queue space.
             self.rebuild_pending = true;
             log::warn!("audio: graph queue full, rebuild retried next tick");
+        }
+
+        // Surface insert-node build failures to the UI: an instance marked
+        // "active" whose node the host could not build plays dry — flip it to
+        // "crashed" so the frontend stops showing a misleading green "active".
+        if !failed_inserts.is_empty() {
+            let mut session = self.session.lock();
+            let mut changed = false;
+            for id in &failed_inserts {
+                if let Some(r) = session.plugins.instances.iter_mut().find(|r| &r.id == id) {
+                    if r.status == "active" {
+                        r.status = "crashed".into();
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                session.republish_full();
+            }
         }
     }
 
@@ -4537,6 +4627,7 @@ mod tests {
             cache: HashMap::new(),
             cache_rate: 0,
             live_nodes: Default::default(),
+            insert_nodes: Default::default(),
             accum: MeterAccum::default(),
             gen_maps: GenerationMaps::default(),
             sinks: Vec::new(),
@@ -5509,6 +5600,89 @@ mod tests {
             graph.tracks.iter().any(|t| t.slot == 0 && t.live.is_some()),
             "an armed empty midi track has a node to play"
         );
+    }
+
+    /// Plan G1 Task 7 — the bug this closes: a plugin on an AUDIO track must
+    /// actually process the track's audio. Before Task 7 the insert chain was
+    /// never compiled into the graph (`compile_inserts` resolved every slot to
+    /// `None` and `rebuild` never called it), so a chosen effect was silently
+    /// inaudible. This renders a DC clip through a `GainHalfEffect` insert,
+    /// end to end through a real `rebuild`, and asserts the output is halved.
+    #[test]
+    fn audio_track_insert_plugin_processes_the_clip_audio() {
+        use crate::audio::mixer;
+        use crate::audio::transport::LoopSpec;
+        use crate::audio::types::InsertSlot;
+        use crate::ids::SourceId;
+
+        let (mut ctl, session) = bare_control();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        // Match the engine rate so `ensure_loaded` keeps the seeded cache.
+        ctl.cache_rate = 48_000;
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.inserts.push(InsertSlot {
+                id: "slot-1".into(),
+                instance_id: "inst-1".into(),
+                bypassed: false,
+            });
+            s.store.tracks.push(t);
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "inst-1".into(),
+                uid: "clap:/x.clap#fx".into(),
+                name: "Gain Half".into(),
+                format: "clap".into(),
+                status: "stub".into(),
+                track_id: Some("t-1".into()),
+            });
+            let mut c = crate::audio::types::testutil::test_clip("c-1", "t-1");
+            c.source_id = SourceId::from("s-1");
+            c.source_path = "audio/s-1.wav".into();
+            c.length_samples = 64;
+            c.source_length_samples = 64;
+            s.store.clips.push(c);
+            s.republish_full();
+        }
+        // The test doubles stand in for the real WAV decode and CLAP host,
+        // which a headless test cannot run: a DC-1.0 mono source, and the
+        // gain-halving insert processor seeded under the exact key
+        // `compile_inserts` will compute.
+        ctl.cache.insert(
+            SourceId::from("s-1"),
+            CachedSource {
+                source_path: "audio/s-1.wav".into(),
+                data: std::sync::Arc::new(RtClipData { channels: 1, data: vec![1.0; 64] }),
+            },
+        );
+        ctl.insert_nodes
+            .resolve_with("inst-1", "insert:inst-1@48000#0!stub", || {
+                Some(Box::new(crate::audio::insert::GainHalfEffect { bypassed: false }))
+            })
+            .expect("seed the insert node");
+
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+        ctl.rebuild();
+
+        let mut graph = graph_rx.pop().expect("the rebuild published a graph").into_box();
+        assert_eq!(
+            graph.tracks.iter().filter(|t| t.slot == 0 && t.inserts.len() == 1).count(),
+            1,
+            "the audio track's row carries the compiled insert chain"
+        );
+
+        // Hard-left so the left channel carries the full (halved) signal.
+        graph.params.set_pan(0, -1.0);
+        let mut out = vec![0.0f32; 64 * 2];
+        let dropped = mixer::render(&mut graph, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert_eq!(dropped, 0);
+        // DC 1.0 -> GainHalfEffect 0.5 -> fader 1.0 -> pan hard left.
+        assert!((out[0] - 0.5).abs() < 1e-6, "insert halved the clip, got {}", out[0]);
+        assert!(out[1].abs() < 1e-6, "hard left keeps the right channel silent");
     }
 
     /// Plan F Task 6 — the Plan A deferral's own pin, and the reason this

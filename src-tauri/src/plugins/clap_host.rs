@@ -610,6 +610,21 @@ pub fn activate_node(instance_id: &str, rate: u32) -> Result<Box<dyn LiveInstrum
     Ok(Box::new(node))
 }
 
+/// Activate an insert-FX instance at `rate` and hand out an RT **effect** node
+/// in [`IoMode::Replace`] (de-interleave the strip's audio into the plugin's
+/// inputs, assign its main out). ENGINE CONTROL THREAD ONLY. Plan G1 Task 7:
+/// the insert-chain sibling of [`activate_node`] — the effect's `HostRole` was
+/// already fixed at [`instantiate_effect`]; this only flips the IO mode.
+pub fn activate_effect_node(
+    instance_id: &str,
+    rate: u32,
+) -> Result<Box<dyn AuraAudioProcessor>, String> {
+    let id = instance_id.to_string();
+    let mut node = plugin_main().run(move |ctx| world(ctx).activate_node(&id, rate))??;
+    node.set_io_mode(IoMode::Replace);
+    Ok(Box::new(node))
+}
+
 /// Batched param set: mirrors values + forwards through the RT ring (active
 /// node) or a main-thread flush (inactive). Returns the updated list.
 pub fn set_params(instance_id: &str, changes: Vec<ParamChange>) -> Result<Vec<ParamInfo>, String> {
