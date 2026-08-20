@@ -207,3 +207,64 @@ bar (project-wide, with a distinct "some lanes are muted" tri-state).
 MIDI Learn itself (the chip shows mapping state; nothing binds a
 controller yet — that is the Track D follow-up), plugin sandboxing,
 plugin-format support beyond CLAP/LV2, and a stock FX suite.
+
+---
+
+## 8. Round-two asks (owner, 2026-08-20, after the first ear-check)
+
+The owner reviewed PRs 1–4 in the app and approved the direction, with an
+explicit steer: **do not let the existing UI set the ceiling.** If AURA is
+going to win on interface, the answer has to be better than what the other
+DAWs do, not consistent with what AURA already does. Where this design and
+the current app disagree, the design wins — and where the current app is
+merely adequate, that is not a reason to keep it.
+
+### 8.1 Collapse all / expand all
+
+`BrowserShell` gains a single control that folds or unfolds every group at
+once. One button, not two: its label and icon reflect what the next press
+will do, following `lanes.anyCollapsed()`'s existing "any folded → the
+press unfolds" rule so the two surfaces agree.
+
+Search interacts with it: while a query is active, matching groups
+auto-expand so results are never hidden behind a fold, and clearing the
+query restores the user's own fold state rather than leaving everything
+open. Store the pre-search folds; do not overwrite them.
+
+### 8.2 Audition preview
+
+Partly built already, inconsistently:
+
+| Surface | Today |
+|---|---|
+| `InstrumentBrowser` | A mini keyboard per row, `sampler_preview_note` |
+| `PresetsRoot` | Click an instrument row → middle C |
+| `SamplesRoot` | Click an audio row → `library.audition(path)` |
+| `PluginBrowser`, `ZynPatchBrowser` | Nothing |
+
+Unify it into one behaviour every browser inherits from `BrowserRow`:
+**double-click a row to hear it.** C3 for anything pitched, the sample
+itself for audio. Single click keeps its current meaning everywhere, so
+nothing existing breaks; the mini keyboard stays for picking a *specific*
+pitch, since that is a different question from "what does this sound
+like".
+
+Auditioning a plugin or a Zyn patch means instantiating it, which is not
+free — instantiate lazily into a single reusable preview slot, tear it
+down on a timer, and never let a preview become a project edit (no op, no
+dirty flag), the rule `SamplesRoot`'s audition already documents.
+
+**A preference gates it.** New `browserAudition` pref in
+`src/lib/prefs/schema.ts` — the existing `clipOpenAutoplay` is the
+precedent, including its default: audition is **off** until asked for,
+because a browser that makes noise when you did not ask is the fastest
+way to lose someone. Surface a mute toggle in the shell's chip row too;
+a preference dialog is the wrong distance away when the answer changes
+every few minutes.
+
+### 8.3 Delivery
+
+Fold 8.1 into PR 5 (it is shell work and the manager is the surface that
+needs it most). 8.2 becomes its own PR 7, after 5 and 6 — it touches
+every browser and the sampler/plugin hosts, and it should not be what
+delays the manager.

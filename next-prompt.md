@@ -1,100 +1,94 @@
-# Next: core-functionality leftovers — automation (Track D) and undo (Plan F)
+# Next: plugin management (PR 5–7) on `feat/plugin-manager`
 
-`origin/main` is the baseline. Branch from there. Subagent-driven,
-task-by-task. Reply to the user in Norwegian — they write Norwegian;
-the repo documentation is English.
+Reply to the user in Norwegian — they write Norwegian; the repo
+documentation is English.
 
-**Correction (2026-08-18, ADR 0007):** PR #65 (Composer Plan H1) merged
-into `main` at `63cb7fa` (06:27) — the "open, not merged into main" framing
-below is stale. The owner ear-checked it the same day: generation works;
-one bug (MIDI-out to Hydrogen) needed its own PR — **fixed and merged
-2026-08-18 as PR #77 (`55257e8`)**; it turned out to be eight bugs. See the
-Landed table.
-**The owner's explicit steer: Composer is a bonus feature — do not pick up
-H2+ without being asked. Focus is core functionality (G-series and other
-core tracks).** Details: memory `aura-composer-deprioritized-2026-08-18`.
+**You are mid-track, not starting one.** The branch `feat/plugin-manager`
+(worktree `.worktrees/plugin-manager`, branched from `origin/main` at
+`3178073`) has four commits landed locally and NOT yet pushed or opened as
+PRs. Read these two before touching anything:
 
-**Correction (2026-08-18, ADR 0007):** G1 Task 6 (PDC) landed as PR #71 — see the
-Landed table. The owner steered the NEXT session toward core leftovers
-that are automation- or undo-related rather than G1 Task 7, so **do that
-before picking G1 back up**:
+- Design: [`docs/superpowers/specs/2026-08-20-plugin-manager-design.md`](docs/superpowers/specs/2026-08-20-plugin-manager-design.md)
+  — §3.1 defines the signature element, §8 carries the owner's round-two asks.
+- Plan: [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
+  — PR 5 and PR 6 are specified there in implementable detail.
 
-**Do this:**
+## The owner's standing steer (2026-08-20)
 
-1. **Track D leftovers (automation)** — pick one, read the Track D handoff
-   in `docs/PHASE4-PLAN.md` first: plugin-param automation is not applied
-   in a bounce (`audio::offline::build_graph`'s documented divergence);
-   write/touch/latch automation modes for track gain lanes **landed in PR #85**;
-   recording gestures into a **separate automation track**, routing that recording to
-   its selected targets, and an explicit Enabled/Bypass control for the
-   automation-track source remain follow-up work. A later PR must also add
-   external MIDI-controller mapping for automatable parameters, with both a
-   MIDI Learn workflow and manual Set Value/mapping configuration. The DOM
-   test environment landed in PR #80 and this feature has component coverage.
-   (The non-blocking CLAP param path is
-   closed, branch `clap-nonblocking-params` — see the Track D handoff.)
-2. **Plan F carry-forwards (undo)** — read the Plan F handoff in
-   `docs/PHASE4-PLAN.md` first, and do not touch `engine::rebuild`, the
-   journal reader or the version graph without it: the live-document
-   B-tree, I-1 option (a), no journal auto-apply. The read-only version-graph
-   browser is implemented by PR #82 on `codex/undo-version-graph-ui`; do not duplicate it.
+> "Ikke kjenn på begrensninger i UI design i forhold til hva som ligger der
+> fra før. Hvis vi skal vinne må vi lage en løsning som er bedre enn hva
+> andre har."
 
-**Do not:** start Composer H2–H6 (deprioritized — ask the owner first);
-start G1 Task 7 or G2/G3/G4 before finishing at least one automation/undo
-leftover above; write a stock FX suite; bump `OP_FORMAT_VERSION`; restart
-a landed track (A–F, Plan F, G1 Tasks 1–6, Pitch Coach phases 1–3, the
-lanes UX track, the theme system, Composer H1).
+**Do not let the existing UI set the ceiling.** The bet is that AURA wins
+on interface. Where this design and the current app disagree, the design
+wins; where the current app is merely adequate, that is not a reason to
+keep it. This overrides the usual "follow existing patterns" instinct for
+UI work on this track — it does NOT override the frozen IPC surface, the
+theme-token rule, or the test gates.
 
-**In flight: nothing.** (Corrected 2026-08-18: an earlier revision of this
-section described `worktree-fix-midi-out` as unmerged with no PR — it merged as
-PR #77 `55257e8`, and the CI fix that followed it merged as PR #78 `2b00e91`.
-Kept below because the root cause is worth knowing before touching MIDI output.)
+## Done on this branch (do not redo)
 
-The MIDI-out-to-Hydrogen bug from the Composer ear-check turned out to be eight
-bugs. The root cause was not the notes: the clock
-engine's drift tolerance (a flat 20 ms) was smaller than PipeWire's default
-1024-frame block at 48 kHz, so it re-cued the external device with
-`Stop`/`SongPosition`/`Continue` about **1500 times a second** — measured 31 676
-re-cue triples against 22 429 clock pulses, down to **1** after the fix. Nothing
-downstream could play, and the flood dropped notes as collateral. Also: the
-per-note MIDI channel was dropped on the way out (GM drums on channel 10 went out
-on channel 1), a routed track doubled itself with AURA's internal synth, and a
-deleted-then-undone routed track went permanently silent.
+| Commit | What |
+|---|---|
+| `6b259b4` | **Follow the playhead on seek.** Both follow paths share `view.revealSamples`: reveal if off screen, do nothing if already visible. The stopped path is a `$effect` on `transport.snap.positionSamples` with the reveal **untracked** — `revealSamples` reads and writes `view.viewStart`, so a tracked call would yank the view back on every user scroll. |
+| `b9d529c` | **Shared browser layer** `src/lib/components/browser/`: `browser-model.ts` (ranking / grouping / row flattening / keyboard index), `BrowserShell`, `BrowserSection`, `BrowserRow`, `ParamChip`, `EmptyState`, `FavoriteToggle`, `browser-folds.ts`. Migrated `InstrumentBrowser`, `SamplesRoot`, `PresetsRoot`; `LibraryPanel` is a pure delegator. |
+| `f8755a9` | **Lane multi-select + bulk M/S/A** from three entry points. Value rule in `lane-bulk.ts`; whole batch in one gesture. The rail is an ARIA layout grid with roving tabindex. |
+| `7e6bc0b` | **Plugin catalog** at `dirs::config_dir()/aura/plugin-catalog.json`: persistent scan cache seeded in `plugins::init()`, incremental `plugin_scan` (path+mtime+size), favourites / recents / tags / pinnedParams. Three additive commands: `plugin_catalog_get`, `plugin_catalog_update`, `plugin_scan_status`. |
 
-Rust 1250/0 and the frontend gate were green locally; the owner merged #77 on
-that evidence before CI finished, so **no full CI run ever covered this diff** —
-and the runner has no `/dev/snd/seq`, so the ALSA-seq tests skip there anyway.
-The first `main` run after #78 is the first real CI signal on it. **Read
-[`docs/handoff/midi-out-note-channel.md`](docs/handoff/midi-out-note-channel.md)
-before touching MIDI output**; it carries the full status, a recommended route
-(open the PR, the ear-check still owed, the piano-roll channel gap worth filing,
-two decisions that are the owner's), and the environment traps that cost hours
-(`pipewire-pulse` wedging looks exactly like an audio-path regression and fails 20
-tests).
+Verified at that point: `cargo test -- --test-threads=1` 1319 + integration
+0 failed; `vitest` 941 across 87 files; `svelte-check` 0 errors 0 warnings;
+`npm run build` green.
 
-PR #71 (G1 Task 6, PDC), PR #70 (clip-delete keydown fix), PR #72 (this file),
-PR #73 (node_modules untracked, see below) and PR #75 (non-blocking CLAP params)
-all merged 2026-08-18. Latest on `main`: `31e3234`. Next branch
-(Track D or Plan F leftover) starts fresh from `origin/main`. Stale
-worktrees for merged branches can be ignored — but keep the branches
-`feat/pitch-coach`, `feat/pitch-coach-panel`, `plan-f-history`,
-`worktree-lanes-ux` and `worktree-fix-midi-out`, whose per-commit or squashed
-SHAs are cited in the handoffs. (`worktree-fix-midi-out` in particular: #77 was
-squash-merged, so the seven per-commit SHAs the MIDI-output handoff cites exist
-on that branch and nowhere else. Deleting it silently breaks every one of them.)
+## Do this next
 
-**node_modules (2026-08-18):** was accidentally committed as a
-self-referential symlink in PR #65 — untracked in PR #73. If a worktree
-still has the broken symlink (npm/vite/vitest fail immediately, or
-`node_modules` resolves to itself), `rm node_modules && npm install`
-fixes it; this should not recur now that it is gitignored-and-actually-
-untracked. Likely explains at least some of the disk-instability worktree
-confusion from earlier today.
+1. **PR 5 — the Plugin Manager.** Plan §"PR 5". Browse mode and rack mode in
+   one shell, plus the `Ctrl+P` quick picker. The rack is the thing no other
+   DAW has: a project-wide ledger of every live instance, its placements, its
+   automated params, and — critically — the orphans and crashed instances
+   nothing else in the app will ever show you. Fold in **collapse-all /
+   expand-all** (design §8.1) since it is shell work.
+2. **PR 6 — automation as an inventory.** Plan §"PR 6": the matrix, pinned
+   params in `PluginParamPanel`, and the lane-info plugin strip that turns
+   `TrackHeader`'s FX chip into `ParamChip` jump targets.
+3. **PR 7 — unified audition** (design §8.2). Double-click any row to hear
+   it, gated behind a new `browserAudition` pref defaulting **off**
+   (`clipOpenAutoplay` is the precedent). Do this last: it touches every
+   browser plus the sampler and plugin hosts, and must not delay the manager.
 
-This file is the briefing after `/clear`. History and leftovers that
-are not every task's business live under [`docs/handoff/`](docs/handoff/).
-Trust those files / the code over this file if they disagree, and update
-this file (marked correction, ADR 0007) if they do.
+**Do not:** wire the favourite star to anything other than the catalog
+commands that already exist; migrate `ZynPatchBrowser` onto
+`BrowserRow`/`BrowserSection` (it is virtualised for ~1318 rows — its own
+header comment explains why, and those components mount unconditionally);
+bump `OP_FORMAT_VERSION`; break a frozen command name.
+
+## Traps on this branch
+
+- **`no-literals` lives at `src/lib/theme/no-literals.test.ts`**, not under
+  `components/`. It globs `../components/**/*.svelte`, so every new
+  component is covered. Raw colour literals fail CI; use theme tokens.
+- **Global focus ring and `prefers-reduced-motion` are already handled in
+  `src/app.css`** (`:where(button, input, select, [tabindex]):focus-visible`
+  and a global reduce block). Do not re-implement them per component.
+- **`display: contents` is not safe here.** This app ships on WebKitGTK via
+  Tauri, which has a history of dropping such elements from the
+  accessibility tree. Use a real flex container.
+- **Parallel `cargo test` intermittently SIGSEGVs.** Pre-existing: Cardinal's
+  exit-time CLAP teardown corrupts the heap — see `scan_worker.rs:234` and
+  `:274`, which predate this branch. Use `-- --test-threads=1` for a clean
+  signal.
+- **Before any new `*.dom.test.ts`**, read the Global Constraints in
+  [`2026-08-18-dom-test-environment.md`](docs/superpowers/plans/2026-08-18-dom-test-environment.md).
+  jsdom has no Pointer Capture API at all, `getBoundingClientRect()` returns
+  an all-zero rect, and Svelte 5 `$state` proxies throw on `structuredClone`.
+- **`src-tauri/node_modules/.vite/vitest/…/_svelte_metadata.json` is still
+  tracked in git** — a leftover from PR #65 that PR #73's untracking missed.
+  Worth its own tiny PR; do not fold it into this track.
+
+## Older context
+
+The pre-existing briefing (Track D automation leftovers, Plan F undo
+carry-forwards, the MIDI-output handoff, the Composer deprioritisation)
+still applies once this track lands. It is preserved below.
 
 ## Landed (do not restart)
 
