@@ -26,8 +26,15 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "publisher": "knobo",
+    "shortDescription": "AURA — Digital Audio Workstation",
+    "windows": {
+      "nsis": {
+        "installMode": "both"
+      }
+    }
   }
 }

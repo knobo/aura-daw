@@ -215,14 +215,25 @@ fn plan_export(req: &ExportRequest, have_ffmpeg: bool) -> Result<ExportPlan, Str
 // ffmpeg detection (once) + conversion
 // ---------------------------------------------------------------------------
 
+/// Executable names to look for, in order. Windows needs the extension: the
+/// bare name never names a file there, so probing only `ffmpeg` would report
+/// "not found" on a machine that has it installed and leave the Windows build
+/// permanently WAV-only.
+#[cfg(target_os = "windows")]
+const FFMPEG_NAMES: &[&str] = &["ffmpeg.exe", "ffmpeg"];
+#[cfg(not(target_os = "windows"))]
+const FFMPEG_NAMES: &[&str] = &["ffmpeg"];
+
 /// Find an executable `ffmpeg` in a PATH-shaped variable (injected for the
 /// missing-ffmpeg tests; production passes the process PATH).
 fn find_ffmpeg_in(path_var: Option<&OsStr>) -> Option<PathBuf> {
     let path = path_var?;
     for dir in std::env::split_paths(path) {
-        let cand = dir.join("ffmpeg");
-        if is_executable(&cand) {
-            return Some(cand);
+        for name in FFMPEG_NAMES {
+            let cand = dir.join(name);
+            if is_executable(&cand) {
+                return Some(cand);
+            }
         }
     }
     None
@@ -251,9 +262,13 @@ pub fn ffmpeg_path() -> Option<&'static PathBuf> {
 }
 
 fn missing_ffmpeg_error(what: &str) -> String {
+    #[cfg(target_os = "windows")]
+    const HOW: &str = "install it (`winget install ffmpeg`) and make sure it is on PATH";
+    #[cfg(not(target_os = "windows"))]
+    const HOW: &str = "install it (Debian/Ubuntu: `apt install ffmpeg`)";
     format!(
         "exporting {what} requires ffmpeg, which was not found on PATH — \
-         install it (Debian/Ubuntu: `apt install ffmpeg`) or export WAV instead"
+         {HOW} or export WAV instead"
     )
 }
 

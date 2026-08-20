@@ -289,6 +289,12 @@ Prerequisites:
   sudo apt install liblilv-dev
   ```
 
+  This is also why LV2 is a Cargo feature (`lv2`, on by default): `lilv-sys`
+  has no build script and links the system `lilv-0` directly, which cannot be
+  satisfied on Windows. Building with `--no-default-features` drops LV2 and
+  leaves CLAP as the only hosted format — see
+  [Windows builds](#windows-builds).
+
 - **ffmpeg** — compressed-format import (mp3/ogg/aac/m4a…) and export
   (mp3/flac/ogg/m4a). WAV import/export works without it.
 
@@ -330,6 +336,44 @@ npx tauri dev --config '{"build":{"devUrl":"http://localhost:1430","beforeDevCom
 (generation, infilling, instrument building included) produces deterministic
 placeholder output — the whole generate → import → hear-it loop works with zero
 model stacks.
+
+### Windows builds
+
+Linux is the development platform; Windows is a build target. CI produces a
+Windows x64 installer on every `v*` tag and on demand
+([`.github/workflows/release-windows.yml`](.github/workflows/release-windows.yml)
+→ Actions → *Release (Windows)* → *Run workflow*). Tag runs attach the NSIS
+`-setup.exe` and the MSI to a **draft** GitHub release; manual runs leave them
+as workflow artifacts.
+
+To build one yourself on Windows:
+
+```powershell
+npm ci
+npx tauri build -- --no-default-features --locked
+```
+
+`--no-default-features` is not optional there. It turns off the `lv2` feature,
+because `livi` → `lilv-sys` has no build script and links the system `lilv-0`,
+which does not exist on Windows. The flag rides the `--` passthrough:
+`tauri build` has no `--no-default-features` of its own.
+
+What that costs on Windows:
+
+- **No LV2 hosting.** `plugins::lv2_host` resolves to a stub, the LV2 scan
+  returns nothing, and no `lv2` plugin can be instantiated. CLAP is the only
+  hosted format. A project saved on Linux still opens: its LV2 instance rows,
+  parameter snapshots and state blobs are kept intact and render silence
+  (`plugins::state`'s data-safety rules), so reopening it on Linux restores
+  everything.
+- **No ffmpeg on PATH by default**, so export is WAV-only until you install
+  one. Import of compressed formats needs it too.
+- The Python sidecars (AI features) are not bundled on any platform; they need
+  their own environment.
+
+CLAP plugins are looked up in the standard Windows roots —
+`%LOCALAPPDATA%\Programs\Common\CLAP` and `%COMMONPROGRAMFILES%\CLAP` — plus
+`CLAP_PATH` (semicolon-separated on Windows).
 
 ### Troubleshooting (Linux/GPU): white flash / webview reload under load
 

@@ -116,6 +116,13 @@ Some tests are **gated** and skip politely when their requirements are absent:
 - **Plugin tests** (Zyn acceptance + state round-trip, CLAP lifecycle, LV2
   params) need `zynaddsubfx-lv2`, `dpf-plugins-clap`/`dpf-plugins-lv2`,
   `mda-lv2` installed via apt. A skipped plugin test prints why.
+- **The LV2 half is a Cargo feature** (`lv2`, on by default). Windows cannot
+  link `lilv-sys`, so the Windows release builds with
+  `--no-default-features` and `plugins::lv2_host` becomes the stub in
+  `lv2_host_stub.rs`. If you touch anything under `plugins/`, run
+  `cargo check --no-default-features --all-targets` too — the PR suite does,
+  and it is the only thing standing between a gating slip and a red tag
+  build.
 - **Real-model integration tests** (`src-tauri/tests/real_models.rs`) drive the
   actual Demucs/ACE-Step models:
 
