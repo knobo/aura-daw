@@ -2,21 +2,36 @@
  * Plugin host mirror (phase 3): scanned CLAP/LV2 descriptors, live instance
  * registry, and the generic-parameter bridge. Built purely against the six
  * frozen commands (plugin_scan/list/instantiate/remove/get_params/set_param)
- * plus set_track_instrument's additive "plugin:<instanceId>" refs.
+ * plus set_track_instrument's additive "plugin:<instanceId>" refs, plus the
+ * additive machine-global catalog trio (plugin_catalog_get/update,
+ * plugin_scan_status — spec 4.1) mirrored below as `catalog`/`scanStatus`.
  *
  * Param writes follow the D-03 batching rule: knob drags coalesce into ONE
  * plugin_set_param invoke per animation frame (a changes[] array), never one
- * invoke per input event.
+ * invoke per input event. Catalog writes follow the same rule in spirit but
+ * simplified (short trailing debounce, no rAF/gesture) — see `queuePatch`.
  */
 
 import { backend } from "../tauri";
 import { project } from "./project.svelte";
 import type {
+  PluginCatalog,
+  PluginCatalogPatch,
   PluginDescriptor,
   PluginInstanceInfo,
   PluginParamChange,
   PluginParamInfo,
+  PluginScanStatus,
 } from "../types/ipc";
+
+const EMPTY_CATALOG: PluginCatalog = {
+  version: 1,
+  scan: { entries: [] },
+  favorites: [],
+  recents: [],
+  tags: {},
+  pinnedParams: {},
+};
 
 class PluginsStore {
   /** Last scan result (empty until a scan ran). */
@@ -67,9 +82,124 @@ class PluginsStore {
       this.descriptors = res.plugins;
       this.scanned = res.scanned;
       this.applyInstances(res.instances);
+      await this.loadCatalog();
     } catch (err) {
       // plugin_list absent = pre-phase-3 engine; stay quietly empty.
       console.warn("[aura] plugin_list failed:", err);
+    }
+  }
+
+  // ── plugin catalog (machine-global, persistent — plugins::catalog) ──
+
+  /** Machine-global catalog mirror: scan cache metadata + favorites/
+   * recents/tags/pinned params. NOT project state. */
+  catalog = $state<PluginCatalog>(EMPTY_CATALOG);
+  /** "cache from N ago, M bundles changed", refreshed alongside the catalog. */
+  scanStatus = $state<PluginScanStatus | null>(null);
+
+  async loadCatalog() {
+    try {
+      const cat = await backend.pluginCatalogGet?.();
+      if (cat) this.catalog = cat;
+    } catch (err) {
+      console.warn("[aura] plugin_catalog_get failed:", err);
+    }
+    try {
+      const status = await backend.pluginScanStatus?.();
+      if (status) this.scanStatus = status;
+    } catch (err) {
+      console.warn("[aura] plugin_scan_status failed:", err);
+    }
+  }
+
+  isFavorite(uid: string): boolean {
+    return this.catalog.favorites.includes(uid);
+  }
+
+  toggleFavorite(uid: string) {
+    const on = !this.isFavorite(uid);
+    this.catalog = {
+      ...this.catalog,
+      favorites: on
+        ? [...new Set([...this.catalog.favorites, uid])]
+        : this.catalog.favorites.filter((u) => u !== uid),
+    };
+    this.queuePatch({ setFavorite: { uid, on } });
+  }
+
+  /** Record real use (called from `instantiate`/`insertEffect`) so "recent"
+   * reflects what actually got used, not just browsed. Caps/de-dupes
+   * exactly like the backend reducer — the optimistic local copy and the
+   * eventual persisted one agree. */
+  noteUsed(uid: string) {
+    const rest = this.catalog.recents.filter((r) => r.uid !== uid);
+    this.catalog = {
+      ...this.catalog,
+      recents: [{ uid, usedAt: Math.floor(Date.now() / 1000) }, ...rest].slice(0, 40),
+    };
+    this.queuePatch({ noteUsed: uid });
+  }
+
+  setTags(uid: string, tags: string[]) {
+    const nextTags = { ...this.catalog.tags };
+    if (tags.length === 0) delete nextTags[uid];
+    else nextTags[uid] = [...tags];
+    this.catalog = { ...this.catalog, tags: nextTags };
+    this.queuePatch({ setTags: { uid, tags } });
+  }
+
+  setPinnedParams(uid: string, ids: number[]) {
+    const capped = [...new Set(ids)].slice(0, 8);
+    const next = { ...this.catalog.pinnedParams };
+    if (capped.length === 0) delete next[uid];
+    else next[uid] = capped;
+    this.catalog = { ...this.catalog, pinnedParams: next };
+    this.queuePatch({ setPinnedParams: { uid, paramIds: ids } });
+  }
+
+  pinnedParamsFor(uid: string): number[] {
+    return this.catalog.pinnedParams[uid] ?? [];
+  }
+
+  forgetRecent(uid: string) {
+    this.catalog = {
+      ...this.catalog,
+      recents: this.catalog.recents.filter((r) => r.uid !== uid),
+    };
+    this.queuePatch({ forgetRecent: uid });
+  }
+
+  clearRecents() {
+    this.catalog = { ...this.catalog, recents: [] };
+    this.queuePatch({ clearRecents: true });
+  }
+
+  // Coalesced catalog writes (D-03 discipline, simplified — a catalog write
+  // is not a knob drag, so a short trailing debounce is enough: no rAF, no
+  // gesture boundary). `catalog` above is updated OPTIMISTICALLY and
+  // immediately by every action; this queue only governs how often the
+  // backend actually persists, merging same-shape patches last-write-wins
+  // (mirrors the `pending` Map used for param writes below).
+  private pendingPatch: PluginCatalogPatch = {};
+  private patchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private queuePatch(patch: PluginCatalogPatch) {
+    this.pendingPatch = { ...this.pendingPatch, ...patch };
+    if (this.patchTimer == null) {
+      this.patchTimer = setTimeout(() => void this.flushPatch(), 200);
+    }
+  }
+
+  private async flushPatch(): Promise<void> {
+    this.patchTimer = null;
+    if (Object.keys(this.pendingPatch).length === 0) return;
+    const patch = this.pendingPatch;
+    this.pendingPatch = {};
+    try {
+      const cat = await backend.pluginCatalogUpdate?.(patch);
+      if (cat) this.catalog = cat;
+    } catch (err) {
+      console.warn("[aura] plugin_catalog_update failed:", err);
     }
   }
 
@@ -97,6 +227,7 @@ class PluginsStore {
     try {
       const inst = await backend.pluginInstantiate(uid);
       this.instances = [...this.instances, inst];
+      this.noteUsed(uid);
       if (trackId) await this.bind(inst.id, trackId);
       // Status may flip stub → active once the host thread brings the DSP up;
       // re-pull the registry shortly after (single shot, not a poll loop).
@@ -148,6 +279,7 @@ class PluginsStore {
         if (!existing.some((s) => s.id === slot.id)) {
           project.patchTrackLocal(trackId, { inserts: [...existing, slot] });
         }
+        this.noteUsed(uid);
       }
       await this.refreshInstances();
       // The rebuild that compiles the insert runs after the commit returns;

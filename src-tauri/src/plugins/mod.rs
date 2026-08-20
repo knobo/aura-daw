@@ -2,6 +2,9 @@
 //!
 //! * [`descriptor`] — wire types (`plugin-descriptor` / `plugin-state`
 //!   schemas).
+//! * [`catalog`]    — the machine-global, persistent plugin catalog
+//!   (`plugin-catalog.json`): scan cache + favorites/recents/tags/pinned
+//!   params, and the incremental-rescan planner `scan.rs` drives.
 //! * [`scan`]       — discovery: LV2 world (metadata-only, safe) + CLAP
 //!   search paths (via the sacrificial [`scan_worker`] subprocess).
 //! * [`host`]       — the ONE shared plugin main thread (`aura-plugin-host`)
@@ -25,6 +28,7 @@
 //! binding into a live node.
 
 pub mod automation;
+pub mod catalog;
 pub mod clap_host;
 pub mod descriptor;
 pub mod host;
@@ -198,11 +202,25 @@ pub fn insert_node_for(
 
 pub struct PluginState {
     registry: Arc<Mutex<PluginRegistry>>,
+    /// The persistent catalog (scan cache + favorites/recents/tags/pinned
+    /// params) — loaded once in [`init`], mutated in memory by
+    /// `plugin_catalog_update` / `plugin_scan`, and written back to disk on
+    /// every mutation. A SEPARATE lock from `registry` (not a field on
+    /// [`PluginRegistry`]) on purpose: `PluginRegistry` is constructed as a
+    /// bare struct literal by test scaffolding elsewhere in the crate
+    /// (`control::mod`'s engine-hook tests), and growing that struct's
+    /// public shape would break every such call site outside this module's
+    /// ownership. Machine-global, NOT part of `Session` — same "filesystem
+    /// probe, not document state" reasoning as `registry.scanned`.
+    catalog: Arc<Mutex<catalog::PluginCatalog>>,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self { registry: Arc::new(Mutex::new(PluginRegistry::default())) }
+        Self {
+            registry: Arc::new(Mutex::new(PluginRegistry::default())),
+            catalog: Arc::new(Mutex::new(catalog::PluginCatalog::default())),
+        }
     }
 }
 
@@ -214,13 +232,31 @@ impl Default for PluginState {
 /// order — so it can't be done here).
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let state = app.state::<PluginState>();
+    // Load the persistent catalog and seed the registry's scan cache from
+    // it (the whole point of the catalog — PR spec 4.1.B): after this,
+    // `plugin_list` returns a populated list and `scanned: true` on the
+    // FIRST frame after launch, instead of an empty list until the user
+    // rescans by hand.
+    let disk_catalog = catalog::load();
+    let seeded = disk_catalog.scan.entries.len();
+    if !disk_catalog.scan.entries.is_empty() {
+        state.registry.lock().scanned = Some(
+            disk_catalog
+                .scan
+                .entries
+                .iter()
+                .map(|e| e.descriptor.clone())
+                .collect(),
+        );
+    }
+    *state.catalog.lock() = disk_catalog;
     register_registry(state.registry.clone());
     // The production host-state bridge (ARCHITECTURE §15.3 "State"): project
     // save/open serializes live CLAP/LV2 instance state through the shared
     // plugin main thread. Registered here so `state::save_into_project` /
     // `reactivate_restored` reach the real hosts.
     state::register_state_bridge(Arc::new(state::FormatStateBridge));
-    log::info!("plugins::init — registry + state bridge published (scan is on-demand)");
+    log::info!("plugins::init — registry + state bridge published; catalog seeded {seeded} cached descriptors");
     Ok(())
 }
 
@@ -252,12 +288,81 @@ pub struct PluginListResult {
 #[tauri::command]
 pub async fn plugin_scan(state: State<'_, PluginState>) -> Result<Vec<PluginDescriptor>, String> {
     log::info!("plugin scan: requested");
-    let found = tauri::async_runtime::spawn_blocking(scan::scan_all)
+    let prev_entries = state.catalog.lock().scan.entries.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || scan::scan_incremental(prev_entries))
         .await
         .map_err(|e| format!("plugin scan task failed: {e}"))?;
-    state.registry.lock().scanned = Some(found.clone());
-    log::info!("plugin scan: returning {} descriptors to the webview", found.len());
-    Ok(found)
+    state.registry.lock().scanned = Some(result.descriptors.clone());
+    let merged_catalog = {
+        let mut cat = state.catalog.lock();
+        cat.scan = catalog::ScanCache {
+            scanned_at: Some(catalog::now_secs()),
+            entries: result.entries,
+        };
+        cat.clone()
+    };
+    if let Err(e) = catalog::save(&merged_catalog) {
+        log::warn!("plugin catalog: failed to persist after scan: {e}");
+    }
+    log::info!(
+        "plugin scan: returning {} descriptors to the webview",
+        result.descriptors.len()
+    );
+    Ok(result.descriptors)
+}
+
+/// Additive command D (spec 4.1): read the full persistent catalog.
+#[tauri::command]
+pub fn plugin_catalog_get(state: State<'_, PluginState>) -> Result<catalog::PluginCatalog, String> {
+    Ok(state.catalog.lock().clone())
+}
+
+/// Additive command D: apply one patch and persist. Returns the FULL merged
+/// catalog so the frontend never guesses at the result (spec 4.1).
+#[tauri::command]
+pub fn plugin_catalog_update(
+    patch: catalog::PluginCatalogPatch,
+    state: State<'_, PluginState>,
+) -> Result<catalog::PluginCatalog, String> {
+    let now = catalog::now_secs();
+    let merged = {
+        let mut cat = state.catalog.lock();
+        *cat = catalog::apply_patch(cat.clone(), &patch, now);
+        cat.clone()
+    };
+    catalog::save(&merged)?;
+    Ok(merged)
+}
+
+/// Additive command D: "cache from N ago, M bundles changed" without
+/// actually rescanning — stats the same CLAP bundles `plugin_scan` would,
+/// classifies them against the cached catalog, and reports counts only.
+#[tauri::command]
+pub fn plugin_scan_status(
+    state: State<'_, PluginState>,
+) -> Result<catalog::PluginScanStatus, String> {
+    let (scanned_at, cached_clap) = {
+        let cat = state.catalog.lock();
+        let cached_clap: Vec<catalog::CatalogEntry> = cat
+            .scan
+            .entries
+            .iter()
+            .filter(|e| e.descriptor.format == "clap")
+            .cloned()
+            .collect();
+        (cat.scan.scanned_at, cached_clap)
+    };
+    let roots = scan::clap_search_paths();
+    let bundles = scan::find_clap_bundles(&roots);
+    let discovered: Vec<catalog::BundleStat> =
+        bundles.iter().filter_map(|b| scan::stat_bundle(b)).collect();
+    let plan = catalog::plan_rescan(&cached_clap, &discovered);
+    Ok(catalog::PluginScanStatus {
+        scanned_at,
+        cached: plan.reused.len(),
+        stale: plan.to_scan.len(),
+        missing: plan.missing,
+    })
 }
 
 #[tauri::command]

@@ -54,11 +54,14 @@ import type {
   LaunchMap,
   LaunchSnapshot,
   OpenSidecarEvent,
+  PluginCatalog,
+  PluginCatalogPatch,
   PluginDescriptor,
   PluginInstanceInfo,
   PluginListResult,
   PluginParamChange,
   PluginParamInfo,
+  PluginScanStatus,
   PaletteView,
   PasteRequest,
   PasteResult,
@@ -355,6 +358,17 @@ export interface Backend {
   pluginGetParams(instanceId: string): Promise<PluginParamInfo[]>;
   /** Batched (D-03): one invoke carries N parameter changes. */
   pluginSetParam(instanceId: string, changes: PluginParamChange[]): Promise<PluginParamInfo[]>;
+
+  // ── plugin catalog (machine-global, persistent — additive) ──
+
+  /** Read the full persistent catalog (scan cache + favorites/recents/tags/
+   * pinned params). Optional: an older engine build may not have it yet. */
+  pluginCatalogGet?(): Promise<PluginCatalog>;
+  /** Apply one patch and persist; returns the FULL merged catalog so the
+   * frontend never guesses at the result. */
+  pluginCatalogUpdate?(patch: PluginCatalogPatch): Promise<PluginCatalog>;
+  /** "cache from N ago, M bundles changed" without actually rescanning. */
+  pluginScanStatus?(): Promise<PluginScanStatus>;
 
   // ── insert-FX slots (Plan G1) ──
 
@@ -887,6 +901,18 @@ class TauriBackend implements Backend {
   }
   pluginSetParam(instanceId: string, changes: PluginParamChange[]) {
     return invoke<PluginParamInfo[]>("plugin_set_param", { instanceId, changes });
+  }
+
+  // ── plugin catalog ──
+
+  pluginCatalogGet() {
+    return invoke<PluginCatalog>("plugin_catalog_get");
+  }
+  pluginCatalogUpdate(patch: PluginCatalogPatch) {
+    return invoke<PluginCatalog>("plugin_catalog_update", { patch });
+  }
+  pluginScanStatus() {
+    return invoke<PluginScanStatus>("plugin_scan_status");
   }
 
   // ── insert-FX slots ──

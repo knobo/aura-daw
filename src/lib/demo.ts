@@ -49,12 +49,15 @@ import {
   type OpenSidecarEvent,
   type PaletteView,
   type PendingConfirmation,
+  type PluginCatalog,
+  type PluginCatalogPatch,
   type PluginDescriptor,
   type PluginInstanceInfo,
   type PluginListResult,
   type InsertSlot,
   type PluginParamChange,
   type PluginParamInfo,
+  type PluginScanStatus,
   type PitchFrame,
   type PitchFrameBatch,
   type PitchPoint,
@@ -643,6 +646,17 @@ export class DemoBackend implements Backend {
   private pluginParams = new Map<string, PluginParamInfo[]>();
   /** Coalesced audio re-schedule after param edits (knob-drag safe). */
   private pluginResyncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** In-memory mirror of the machine-global catalog (browser demo mode has
+   * no disk to persist to — mirrors `plugins::catalog::PluginCatalog`'s
+   * shape and reducer caps only, never written anywhere). */
+  private pluginCatalog: PluginCatalog = {
+    version: 1,
+    scan: { scannedAt: undefined, entries: [] },
+    favorites: [],
+    recents: [],
+    tags: {},
+    pinnedParams: {},
+  };
 
   // wave 1.5 — export / loop-jam / zyn patches
   private exportJobs = new Map<string, ExportJobStatus>();
@@ -2654,6 +2668,13 @@ export class DemoBackend implements Backend {
     await new Promise((r) => setTimeout(r, 650 + Math.random() * 350));
     this.pluginDescriptors = DEMO_PLUGINS.map((d) => ({ ...d }));
     this.pluginScanned = true;
+    // Seed the demo catalog's scan cache too, so pluginCatalogGet/
+    // pluginScanStatus reflect a real scan having happened (no real
+    // filesystem here, so entries carry no meaningful path/mtime/size).
+    this.pluginCatalog.scan = {
+      scannedAt: Math.floor(Date.now() / 1000),
+      entries: this.pluginDescriptors.map((d) => ({ descriptor: { ...d }, path: d.path ?? "", mtime: 0, size: 0 })),
+    };
     return this.pluginDescriptors.map((d) => ({ ...d }));
   }
 
@@ -2729,6 +2750,69 @@ export class DemoBackend implements Backend {
       }, 160);
     }
     return params.map((p) => ({ ...p }));
+  }
+
+  // ── plugin catalog (machine-global, persistent — mirrors plugins::catalog) ──
+
+  private static readonly RECENTS_CAP = 40;
+  private static readonly PINNED_PARAMS_CAP = 8;
+
+  async pluginCatalogGet(): Promise<PluginCatalog> {
+    return structuredClone(this.pluginCatalog);
+  }
+
+  async pluginCatalogUpdate(patch: PluginCatalogPatch): Promise<PluginCatalog> {
+    const cat = this.pluginCatalog;
+    if (patch.setFavorite) {
+      const { uid, on } = patch.setFavorite;
+      cat.favorites = on
+        ? [...new Set([...cat.favorites, uid])]
+        : cat.favorites.filter((u) => u !== uid);
+    }
+    if (patch.noteUsed) {
+      const uid = patch.noteUsed;
+      const rest = cat.recents.filter((r) => r.uid !== uid);
+      cat.recents = [{ uid, usedAt: Math.floor(Date.now() / 1000) }, ...rest].slice(
+        0,
+        DemoBackend.RECENTS_CAP,
+      );
+    }
+    if (patch.setTags) {
+      const { uid, tags } = patch.setTags;
+      if (tags.length === 0) {
+        delete cat.tags[uid];
+      } else {
+        cat.tags[uid] = [...tags];
+      }
+    }
+    if (patch.setPinnedParams) {
+      const { uid, paramIds } = patch.setPinnedParams;
+      const capped = [...new Set(paramIds)].slice(0, DemoBackend.PINNED_PARAMS_CAP);
+      if (capped.length === 0) {
+        delete cat.pinnedParams[uid];
+      } else {
+        cat.pinnedParams[uid] = capped;
+      }
+    }
+    if (patch.forgetRecent) {
+      const uid = patch.forgetRecent;
+      cat.recents = cat.recents.filter((r) => r.uid !== uid);
+    }
+    if (patch.clearRecents) {
+      cat.recents = [];
+    }
+    return structuredClone(this.pluginCatalog);
+  }
+
+  async pluginScanStatus(): Promise<PluginScanStatus> {
+    // No real bundles/filesystem in demo mode — "everything is cached,
+    // nothing is stale or missing" is the honest answer once a scan ran.
+    return {
+      scannedAt: this.pluginCatalog.scan.scannedAt,
+      cached: this.pluginCatalog.scan.entries.length,
+      stale: 0,
+      missing: 0,
+    };
   }
 
   // ── insert-FX slots (Plan G1) ──

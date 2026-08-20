@@ -872,6 +872,16 @@ tools (`list_plugins`, `set_plugin_param`) are noted in PHASE3-PLAN §6,
 not registered — loop and plugin state are visible to agents through
 `get_project_state`/`plugin_list` equivalents on the control plane.
 
+Plugin manager (spec `2026-08-20-plugin-manager-design.md` §4.1) additions —
+the machine-global, persistent plugin catalog (`plugins::catalog`,
+`plugin-catalog.schema.json`), NOT project state: `plugin_catalog_get`
+(read the full catalog), `plugin_catalog_update` (apply one all-optional
+patch — favorite/note-used/tags/pinned-params/forget-recent/clear-recents —
+and return the full merged catalog), `plugin_scan_status` (cache age +
+cached/stale/missing counts, without rescanning). `plugin_scan` itself stays
+signature-frozen but is now incremental: bundles whose `(path, mtime, size)`
+still match the cached catalog are reused without a re-dlopen.
+
 ## 16. The Composer: a pure theory library + one harmony document — Plan H1
 
 Product doc: `docs/backlog/composer-assistant.md`. Plan and rulings:

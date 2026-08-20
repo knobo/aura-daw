@@ -320,6 +320,9 @@ pub fn run() {
             // ---- plugins (phase 3 — ARCHITECTURE §15) ----
             plugins::plugin_scan,
             plugins::plugin_list,
+            plugins::plugin_catalog_get,
+            plugins::plugin_catalog_update,
+            plugins::plugin_scan_status,
             plugins::plugin_instantiate,
             plugins::plugin_remove,
             plugins::plugin_get_params,
