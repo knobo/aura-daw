@@ -723,6 +723,7 @@ export class DemoBackend implements Backend {
       automationMode: init.automationMode ?? "read",
       color: init.color ?? "#52e5ff",
       instrumentId: init.instrumentId ?? null,
+      inserts: init.inserts ?? [],
     };
   }
 
@@ -2732,54 +2733,51 @@ export class DemoBackend implements Backend {
 
   // ── insert-FX slots (Plan G1) ──
 
-  private insertSlots = new Map<string, InsertSlot[]>();
-
   async insertAdd(trackId: string, uid: string, index?: number): Promise<InsertSlot> {
     const desc = this.pluginDescriptors.find((d) => d.uid === uid);
     if (!desc) throw new Error(`unknown plugin uid: ${uid}`);
-    // Ensure the track's insert list exists
-    if (!this.insertSlots.has(trackId)) this.insertSlots.set(trackId, []);
-    const slots = [...(this.insertSlots.get(trackId) ?? [])];
+    const track = this.track(trackId);
+    if (!track) throw new Error(`unknown track: ${trackId}`);
     // Instantiate the plugin instance (reuse the real instantiate path)
     const inst = await this.pluginInstantiate(uid);
     const slot: InsertSlot = { id: uuid(), instanceId: inst.id, bypassed: false };
+    const slots = [...(track.inserts ?? [])];
     const idx = index ?? slots.length;
     slots.splice(idx, 0, slot);
-    this.insertSlots.set(trackId, slots);
+    track.inserts = slots;
+    this.resyncAudio();
     return { ...slot };
   }
 
   async insertRemove(trackId: string, slotId: string): Promise<void> {
-    const slots = this.insertSlots.get(trackId);
-    if (!slots) return;
-    const slot = slots.find((s) => s.id === slotId);
+    const track = this.track(trackId);
+    if (!track) return;
+    const slot = (track.inserts ?? []).find((s) => s.id === slotId);
     if (!slot) return;
     // Remove the plugin instance too
     await this.pluginRemove(slot.instanceId).catch(() => {});
-    this.insertSlots.set(
-      trackId,
-      slots.filter((s) => s.id !== slotId),
-    );
+    track.inserts = (track.inserts ?? []).filter((s) => s.id !== slotId);
+    this.resyncAudio();
   }
 
   async insertReorder(trackId: string, slotId: string, toIndex: number): Promise<void> {
-    const slots = this.insertSlots.get(trackId);
-    if (!slots) return;
+    const track = this.track(trackId);
+    if (!track) return;
+    const slots = track.inserts ?? [];
     const idx = slots.findIndex((s) => s.id === slotId);
     if (idx < 0) return;
     const copy = [...slots];
     const [slot] = copy.splice(idx, 1);
     copy.splice(Math.min(toIndex, copy.length), 0, slot);
-    this.insertSlots.set(trackId, copy);
+    track.inserts = copy;
+    this.resyncAudio();
   }
 
   async insertSetBypass(trackId: string, slotId: string, bypassed: boolean): Promise<void> {
-    const slots = this.insertSlots.get(trackId);
-    if (!slots) return;
-    this.insertSlots.set(
-      trackId,
-      slots.map((s) => (s.id === slotId ? { ...s, bypassed } : s)),
-    );
+    const track = this.track(trackId);
+    if (!track) return;
+    track.inserts = (track.inserts ?? []).map((s) => (s.id === slotId ? { ...s, bypassed } : s));
+    this.resyncAudio();
   }
 
   // ── phase 2: open-kind generation jobs ──

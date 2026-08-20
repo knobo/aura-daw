@@ -11,9 +11,8 @@
   import { openPluginParams } from "../../state/plugin-panel";
   import { toasts } from "../../state/toasts.svelte";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
-  import { backend } from "../../tauri";
   import type { PluginDescriptor, PluginInstanceInfo } from "../../types/ipc";
-  import { tracksBoundToInstance } from "../../utils/plugin-binding";
+  import { tracksBoundToInstance, tracksWithInsert } from "../../utils/plugin-binding";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   let instrumentsOnly = $state(true);
@@ -60,7 +59,7 @@
     const key = `${uid}:${trackId}`;
     busy[key] = true;
     try {
-      await backend.insertAdd?.(trackId, uid);
+      await plugins.insertEffect(trackId, uid);
     } catch (err) {
       console.error("[aura] insert_add failed:", err);
       toasts.error("INSERT FAILED", String(err));
@@ -81,6 +80,11 @@
 
   function isBound(inst: PluginInstanceInfo): boolean {
     return tracksBoundToInstance(project.tracks, inst.id).length > 0;
+  }
+
+  /** Insert-FX instances live on a track's `inserts`, not `instrumentId`. */
+  function insertedOn(inst: PluginInstanceInfo): string[] {
+    return tracksWithInsert(project.tracks, inst.id).map((t) => t.name);
   }
 </script>
 
@@ -211,12 +215,16 @@
                 ▤ PATCHES
               </button>
             {/if}
-            <select title="Bind to a MIDI track" onchange={(e) => onBind(inst, e)}>
-              <option value="">{isBound(inst) ? "rebind…" : "bind to track…"}</option>
-              {#each midiTracks as t (t.id)}
-                <option value={t.id}>{t.name}{boundTo(inst, t.id) ? " ✓" : ""}</option>
-              {/each}
-            </select>
+            {#if insertedOn(inst).length > 0}
+              <span class="inserted silk" title="Inserted on this track">insert: {insertedOn(inst).join(" · ")}</span>
+            {:else}
+              <select title="Bind to a MIDI track" onchange={(e) => onBind(inst, e)}>
+                <option value="">{isBound(inst) ? "rebind…" : "bind to track…"}</option>
+                {#each midiTracks as t (t.id)}
+                  <option value={t.id}>{t.name}{boundTo(inst, t.id) ? " ✓" : ""}</option>
+                {/each}
+              </select>
+            {/if}
           </div>
           <div class="row">
             <PluginConnectionBadge instanceId={inst.id} />
@@ -275,6 +283,12 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    /* Keep the search box pinned while the plugin list scrolls under it. */
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    padding: 2px 0 6px;
+    background: rgb(var(--bg-sunken-rgb) / 0.97);
   }
   .search {
     flex: 1;
@@ -447,6 +461,17 @@
     border-radius: 4px;
     font-size: 10px;
     padding: 4px 6px;
+  }
+
+  .inserted {
+    flex: 1;
+    min-width: 0;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: var(--cyan);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 
   .params {

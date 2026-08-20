@@ -129,6 +129,38 @@ class PluginsStore {
     }
   }
 
+  /**
+   * Add an effect as an insert-FX slot on a track (insert_add). The backend
+   * commits the instance and the slot in one transaction; `insert_add`
+   * returns only the slot, so (a) surface the slot on the track immediately
+   * and (b) re-pull the registry so the new instance appears in the rack for
+   * its params to be tunable. The local slot write is idempotent by slot id
+   * so the real app's authoritative `project://changed` snapshot can't
+   * append a duplicate, and it is what makes demo mode (which has no
+   * `project://changed` round-trip) show the slot at all.
+   */
+  async insertEffect(trackId: string, uid: string): Promise<void> {
+    this.error = null;
+    try {
+      const slot = await backend.insertAdd?.(trackId, uid);
+      if (slot) {
+        const existing = project.trackById(trackId)?.inserts ?? [];
+        if (!existing.some((s) => s.id === slot.id)) {
+          project.patchTrackLocal(trackId, { inserts: [...existing, slot] });
+        }
+      }
+      await this.refreshInstances();
+      // The rebuild that compiles the insert runs after the commit returns;
+      // if the host fails to build the node the engine flips the row to
+      // "crashed" and republishes — re-pull shortly after (single shot, not a
+      // poll) so the UI stops showing a misleading "active" badge.
+      setTimeout(() => void this.refreshInstances(), 1400);
+    } catch (err) {
+      this.error = String(err);
+      throw err;
+    }
+  }
+
   async remove(instanceId: string) {
     this.error = null;
     try {

@@ -31,7 +31,7 @@
     const key = `add:${uid}`;
     busy[key] = true;
     try {
-      await backend.insertAdd?.(track.id, uid);
+      await plugins.insertEffect(track.id, uid);
     } catch (err) {
       console.error("[aura] insert_add failed:", err);
       toasts.error("INSERT FAILED", String(err));
@@ -79,10 +79,22 @@
 
   // ── add-effect sub-picker ──
   let showPicker = $state(false);
+  let filter = $state("");
 
   // Pre-close if the track is gone or has no inserts
   const fxPlugins = $derived(
     plugins.descriptors.filter((d) => !d.isInstrument && plugins.scanned),
+  );
+  const filteredFx = $derived(
+    fxPlugins.filter((d) => {
+      const q = filter.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        d.name.toLowerCase().includes(q) ||
+        (d.vendor ?? "").toLowerCase().includes(q) ||
+        d.uid.toLowerCase().includes(q)
+      );
+    }),
   );
   const scanNeeded = $derived(!plugins.scanned && !plugins.scanning);
   const hasEffects = $derived(insertSlots.length > 0);
@@ -99,7 +111,7 @@
         onclick={() => (showPicker = true)}
         disabled={plugins.scanning}
       >
-        +{plugins.scanning ? " scan\u2026" : ""}
+        +{plugins.scanning ? " scan…" : ""}
       </button>
     {/if}
   </div>
@@ -108,24 +120,33 @@
     <div class="picker-panel">
       {#if scanNeeded}
         <button class="scanbtn" onclick={() => { void plugins.scan(); showPicker = false; }}>
-          Scan for plugins\u2026
+          Scan for plugins…
         </button>
-      {:else if fxPlugins.length === 0}
-        <span class="empty-silk">No effects found</span>
       {:else}
-        {#each fxPlugins as desc (desc.uid)}
-          <button
-            class="fxitem"
-            disabled={!!busy[`add:${desc.uid}`]}
-            onclick={() => { void addEffect(desc.uid); showPicker = false; }}
-          >
-            <span class="fbadge mono {desc.format}">{desc.format}</span>
-            <span class="fname">{desc.name}</span>
-          </button>
-        {/each}
+        <input
+          class="filter-input"
+          type="text"
+          placeholder="filter effects…"
+          bind:value={filter}
+          aria-label="Filter effects"
+        />
+        {#if filteredFx.length === 0}
+          <span class="empty-silk">{fxPlugins.length === 0 ? "No effects found" : "No effects match"}</span>
+        {:else}
+          {#each filteredFx as desc (desc.uid)}
+            <button
+              class="fxitem"
+              disabled={!!busy[`add:${desc.uid}`]}
+              onclick={() => { void addEffect(desc.uid); showPicker = false; }}
+            >
+              <span class="fbadge mono {desc.format}">{desc.format}</span>
+              <span class="fname">{desc.name}</span>
+            </button>
+          {/each}
+        {/if}
       {/if}
       <button class="backbtn mono" onclick={() => (showPicker = false)}>
-        \u2190 Back
+        ← Back
       </button>
     </div>
   {:else}
@@ -146,6 +167,14 @@
                   {slot.bypassed ? "B" : "A"}
                 </button>
                 <span class="fbadge mono {inst.format}">{inst.format}</span>
+                {#if inst.status !== "active"}
+                  <span
+                    class="slot-status mono {inst.status}"
+                    title="This plugin is {inst.status} — it will not process audio"
+                  >
+                    {inst.status}
+                  </span>
+                {/if}
                 <button class="pname" onclick={() => onOpenParams(inst.id)}>
                   {inst.name}
                 </button>
@@ -155,22 +184,22 @@
                   onclick={() => removeSlot(slot)}
                   disabled={!!busy[slot.id]}
                 >
-                  \u00d7
+                  ×
                 </button>
               </div>
               {#if insertSlots.length > 1}
                 <div class="slot-arrows">
                   {#if insertSlots.indexOf(slot) > 0}
-                    <button class="arrowbtn" onclick={() => moveSlot(slot.id, insertSlots.indexOf(slot) - 1)}>\u2191</button>
+                    <button class="arrowbtn" onclick={() => moveSlot(slot.id, insertSlots.indexOf(slot) - 1)}>↑</button>
                   {/if}
                   {#if insertSlots.indexOf(slot) < insertSlots.length - 1}
-                    <button class="arrowbtn" onclick={() => moveSlot(slot.id, insertSlots.indexOf(slot) + 1)}>\u2193</button>
+                    <button class="arrowbtn" onclick={() => moveSlot(slot.id, insertSlots.indexOf(slot) + 1)}>↓</button>
                   {/if}
                 </div>
               {/if}
             {:else}
-              <span class="unknown-silk">{slot.instanceId.slice(0, 8)}\u2026</span>
-              <button class="del mono" onclick={() => removeSlot(slot)}>\u00d7</button>
+              <span class="unknown-silk">{slot.instanceId.slice(0, 8)}…</span>
+              <button class="del mono" onclick={() => removeSlot(slot)}>×</button>
             {/if}
           </div>
         {/each}
@@ -238,6 +267,26 @@
     display: flex;
     flex-direction: column;
     gap: 3px;
+  }
+  .filter-input {
+    /* Keep the filter box pinned while the effect list scrolls under it. */
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    margin-bottom: 2px;
+    padding: 4px 7px;
+    font-size: 10px;
+    color: var(--text);
+    background: rgb(var(--bg-sunken-rgb) / 0.98);
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 4px;
+    outline: none;
+  }
+  .filter-input:focus {
+    border-color: var(--cyan-dim);
+  }
+  .filter-input::placeholder {
+    color: var(--text-faint);
   }
   .fxitem {
     display: flex;
@@ -371,6 +420,26 @@
     color: var(--violet);
     border-color: rgb(var(--violet-rgb) / 0.4);
     background: rgb(var(--violet-rgb) / 0.08);
+  }
+
+  .slot-status {
+    flex: none;
+    font-size: 7px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    padding: 1px 4px;
+    border-radius: 2px;
+    border: var(--border-width) solid;
+  }
+  .slot-status.stub {
+    color: var(--amber);
+    border-color: rgb(var(--amber-rgb) / 0.4);
+    background: rgb(var(--amber-rgb) / 0.1);
+  }
+  .slot-status.crashed {
+    color: var(--red);
+    border-color: rgb(var(--red-rgb) / 0.45);
+    background: rgb(var(--red-rgb) / 0.12);
   }
 
   .pname {
