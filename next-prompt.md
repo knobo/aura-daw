@@ -70,6 +70,25 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
    a name button — this was a judgment call, not pixel-verified); and
    MATRIX mode (does grouping by parameter read as useful, does the
    fourth mode chip fit the row at 480 px).
+3. **Performance leftover from Step 6's final review, not yet actioned:**
+   the lane strip re-runs a full `buildRack` per mounted track header on
+   every knob-drag frame. `LanePluginStrip.svelte`'s `devices` derived
+   reads `plugins.paramInfo`, so it subscribes to `paramCache`; `setParam`
+   replaces the whole `paramCache` object at input-event rate
+   (`plugins.svelte.ts:487`). Every mounted header's `devices` therefore
+   invalidates on every drag frame, and each recompute is
+   `buildRack({ instances: <all>, tracks: [track], bindings: <all> })` —
+   one `RackEntry` allocated per *global* instance, per track. At 30
+   tracks / 60 instances that's ~1800 objects per frame. The fix is to
+   split the derived so the join and the values have different dependency
+   surfaces (structure from inert stand-ins, values layered on top — the
+   same shape `instanceIds` already uses for the `ensureParams` effect),
+   or to memoize the rack once per `(instances, bindings)` identity and
+   share it across strips. Fold in the related deferred minor:
+   `cacheParams` spreading `paramCache` on every `setParam` is the cheap
+   half of the same path, and fixing it alone buys almost nothing. Do
+   **not** implement this unless asked — it was deliberately documented,
+   not fixed, in the final review that closed Step 6.
 
 **Native GUI leftovers (do not start unless asked):** X11 embed /
 Wayland embed; out-of-process isolation (SCALABILITY step 4); LV2
