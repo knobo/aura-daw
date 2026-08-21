@@ -6,16 +6,29 @@
  */
 import { lanes } from "../state/lanes.svelte";
 import { modulation } from "../state/modulation.svelte";
+import { toasts } from "../state/toasts.svelte";
 import type { TargetRef } from "../types/ipc";
 
 /** Reveal the automation lane for `target` on `trackId`: unfold the lane if
  * it is folded, show (or mint) the binding's overlay, and scroll the track's
- * header into view. `initialNormalized` seeds a freshly minted curve. */
+ * header into view. `initialNormalized` seeds a freshly minted curve.
+ *
+ * `trackId` is empty for an orphaned instance — `plugins.bind()` nulls out
+ * the *previous* instance's `trackId` on a rebind, and the rack's "Not on
+ * any track" bucket exists precisely because that state is reachable.
+ * `modulation.pickTarget` does not validate the track, so minting here
+ * would file a real curve+binding under a track key nothing can ever look
+ * up again — reachable, invisible, unreachable, undoable only by luck.
+ * Refuse instead, and say so, so the click is not silently inert. */
 export async function revealParamLane(
   trackId: string,
   target: TargetRef,
   initialNormalized?: number,
 ): Promise<void> {
+  if (!trackId) {
+    toasts.error("NOT ON A TRACK", "This plugin isn't on a track, so there's no lane to put automation on.");
+    return;
+  }
   try {
     if (lanes.isTrackCollapsed(trackId)) lanes.toggleTrack(trackId);
 

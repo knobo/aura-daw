@@ -22,7 +22,7 @@
   import { openPluginParams } from "../../state/plugin-panel";
   import { revealParamLane } from "../../utils/lane-reveal";
   import { paramNormalized } from "../../utils/plugin-params";
-  import { buildLaneStrip, fitLaneStrip, type StripDevice } from "../../utils/lane-strip";
+  import { buildLaneStrip, fitLaneStrip, type StripChip, type StripDevice } from "../../utils/lane-strip";
   import ParamChip from "../browser/ParamChip.svelte";
 
   let {
@@ -122,6 +122,16 @@
       info ? paramNormalized(info) : undefined,
     );
   }
+
+  // A "plain" chip (pinned but not yet automated) MINTS the lane on click;
+  // an "automated" one jumps to what's already there — the same branch
+  // `PluginParamPanel`'s `chipTitle` makes on `pluginBound`, just read off
+  // `chip.state` instead since the strip never opens the panel.
+  function chipTitle(chip: StripChip): string {
+    return chip.state === "automated"
+      ? `Jump to ${chip.label}'s lane`
+      : `Create an automation lane for ${chip.label}`;
+  }
 </script>
 
 {#if fit.shown.length > 0}
@@ -149,7 +159,7 @@
               value={0}
               format={() => chip.valueText}
               state={chip.state}
-              title="Jump to {chip.label}'s lane"
+              title={chipTitle(chip)}
               onclick={() => onChipClick(d.instanceId, chip.paramId)}
             />
           {/each}

@@ -81,6 +81,18 @@ pinned param chips at the top of `PluginParamPanel.svelte`
   `flex-wrap: nowrap; overflow: hidden` as the belt-and-braces. Measuring
   a 132 px header via `getBoundingClientRect()` is fragile and returns
   zeros under jsdom regardless — the brief ruled it out.
+- **A pinned param DUPLICATES into its own group instead of moving there** —
+  an undocumented deviation the final review caught. §6.2 says pinned
+  params "sort to the top under a `Pinned` heading", which reads as a
+  move; the shipped panel instead renders a pinned param in both the
+  `Pinned` section AND its real "Group / Name" section below, deliberately
+  (`plugin-param-panel.dom.test.ts`: "pinning is a shortcut, not a move").
+  Defensible — a move would make a param harder to find in its own group
+  the moment you pin it, exactly backwards from what pinning is for — and
+  probably the better call, but it was never surfaced as a scope call the
+  way its siblings above were. Cost if it's wrong: a busier panel (every
+  pin costs one extra row) and a "why is Level listed twice" support
+  question, neither of which showed up in review or the owner's ear-check.
 
 ## Step 5 — the Plugin Manager
 
