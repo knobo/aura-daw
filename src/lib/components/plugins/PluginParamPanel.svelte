@@ -11,6 +11,13 @@
   import { modulation } from "../../state/modulation.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import type { PluginParamInfo } from "../../types/ipc";
+  import {
+    formatParamValue,
+    paramGroupName,
+    paramNormalized,
+    paramUnit,
+    shortParamName,
+  } from "../../utils/plugin-params";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
 
   interface ParamGroup {
@@ -22,9 +29,8 @@
     const out: ParamGroup[] = [];
     const index = new Map<string, ParamGroup>();
     for (const p of plugins.params) {
-      const cut = p.name.indexOf(" / ");
-      const label = cut > 0 ? p.name.slice(0, cut) : "parameters";
-      const short = cut > 0 ? p.name.slice(cut + 3) : p.name;
+      const label = paramGroupName(p.name);
+      const short = shortParamName(p.name);
       let g = index.get(label);
       if (!g) {
         g = { label, params: [] };
@@ -67,25 +73,13 @@
     return Array.from({ length: n }, (_, i) => p.min + i * step);
   }
   function pct(p: PluginParamInfo): number {
-    return p.max === p.min ? 0 : ((p.value - p.min) / (p.max - p.min)) * 100;
+    return paramNormalized(p) * 100;
   }
   function fmt(p: PluginParamInfo, v = p.value): string {
-    const name = p.name.toLowerCase();
-    if ((p.steps ?? 0) > 0) return String(Math.round(v));
-    if (name.includes("cutoff") || name.includes("freq"))
-      return v >= 1000 ? `${(v / 1000).toFixed(2)}k` : `${Math.round(v)}`;
-    if (Math.abs(p.max) <= 1 && Math.abs(p.min) <= 1) return v.toFixed(2);
-    return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(1);
+    return formatParamValue(p, v);
   }
   function unitOf(p: PluginParamInfo): string {
-    const name = p.name.toLowerCase();
-    if ((p.steps ?? 0) > 0) return "";
-    if (name.includes("cutoff") || name.includes("freq")) return "hz";
-    if (name.includes("detune")) return "ct";
-    if (name.includes("attack") || name.includes("release") || name.includes("decay")) return "s";
-    if (name.includes("pan")) return "";
-    if (p.min === 0 && p.max === 1) return "";
-    return "";
+    return paramUnit(p);
   }
 
   function onSlide(p: PluginParamInfo, e: Event) {

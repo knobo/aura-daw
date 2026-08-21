@@ -315,6 +315,7 @@
   aria-label="Lane {index + 1}: {track.name}"
   aria-rowindex={index + 1}
   data-track-row={track.id}
+  data-track-id={track.id}
   tabindex={rowTabIndex}
   onclick={onHeaderClick}
   onkeydown={onHeaderKeydown}

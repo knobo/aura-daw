@@ -53,6 +53,48 @@ class PluginsStore {
   paramsLoading = $state(false);
   paramError = $state<string | null>(null);
 
+  /** instanceId → its enumerated params. Lazily filled by `ensureParams`,
+   *  and kept in step with `params` whenever the open instance loads. */
+  paramCache = $state<Record<string, PluginParamInfo[]>>({});
+  /** In-flight `ensureParams` calls, keyed by instance id, so concurrent
+   *  callers for the same instance share one backend round trip. Not
+   *  reactive — it is a bookkeeping detail, not paint state. */
+  #ensureParamsInFlight = new Map<string, Promise<void>>();
+
+  /** Mirror a params array into `paramCache` for `instanceId`. The single
+   *  place `params`'s "cache stays in step" contract is implemented, so the
+   *  three call sites (openParams, the rAF param-write batch, resetParam)
+   *  don't each repeat it. */
+  private cacheParams(instanceId: string, params: PluginParamInfo[]) {
+    if (!instanceId) return;
+    this.paramCache = { ...this.paramCache, [instanceId]: params };
+  }
+
+  /** Enumerate this instance's params once and cache them. Concurrent calls
+   *  for the same instance share one in-flight request. Never throws. */
+  async ensureParams(instanceId: string): Promise<void> {
+    if (this.paramCache[instanceId]) return;
+    const inFlight = this.#ensureParamsInFlight.get(instanceId);
+    if (inFlight) return inFlight;
+    const promise = (async () => {
+      try {
+        const params = await backend.pluginGetParams(instanceId);
+        this.cacheParams(instanceId, params);
+      } catch (err) {
+        console.warn("[aura] plugin_get_params failed:", err);
+      }
+    })().finally(() => {
+      this.#ensureParamsInFlight.delete(instanceId);
+    });
+    this.#ensureParamsInFlight.set(instanceId, promise);
+    return promise;
+  }
+
+  /** Cached metadata for one param, or undefined if not enumerated yet. */
+  paramInfo(instanceId: string, paramId: number): PluginParamInfo | undefined {
+    return this.paramCache[instanceId]?.find((p) => p.id === paramId);
+  }
+
   /** uid of the instantiate in flight (row spinner). */
   busyUid = $state<string | null>(null);
 
@@ -90,6 +132,13 @@ class PluginsStore {
     this.instances = list;
     if (this.openInstanceId && !list.some((i) => i.id === this.openInstanceId)) {
       this.closeParams();
+    }
+    const live = new Set(list.map((i) => i.id));
+    const stale = Object.keys(this.paramCache).filter((id) => !live.has(id));
+    if (stale.length > 0) {
+      const next = { ...this.paramCache };
+      for (const id of stale) delete next[id];
+      this.paramCache = next;
     }
   }
 
@@ -357,6 +406,11 @@ class PluginsStore {
       delete next[instanceId];
       this.guiById = next;
     }
+    if (this.paramCache[instanceId] !== undefined) {
+      const next = { ...this.paramCache };
+      delete next[instanceId];
+      this.paramCache = next;
+    }
     // Also remove from any track's insert slots
     for (const t of project.tracks) {
       const inserts = (t.inserts ?? []).filter((s) => s.instanceId !== instanceId);
@@ -386,6 +440,7 @@ class PluginsStore {
     this.paramsLoading = true;
     try {
       this.params = await backend.pluginGetParams(instanceId);
+      this.cacheParams(instanceId, this.params);
     } catch (err) {
       this.paramError = String(err);
     } finally {
@@ -402,6 +457,7 @@ class PluginsStore {
     if (!id) return;
     try {
       this.params = await backend.pluginGetParams(id);
+      this.cacheParams(id, this.params);
       this.paramError = null;
     } catch (err) {
       this.paramError = String(err);
@@ -429,6 +485,7 @@ class PluginsStore {
     this.params = this.params.map((p) =>
       p.id === paramId ? { ...p, value: Math.min(p.max, Math.max(p.min, value)) } : p,
     );
+    this.cacheParams(this.openInstanceId, this.params);
     this.pending.set(paramId, value);
     if (this.rafId == null) {
       this.rafId = requestAnimationFrame(() => {
