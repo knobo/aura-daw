@@ -26,6 +26,7 @@
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
   import InsertChain from "./plugins/InsertChain.svelte";
+  import LanePluginStrip from "./plugins/LanePluginStrip.svelte";
 
   let {
     track,
@@ -363,6 +364,7 @@
           onclick={() => pressToggle("soloed")}>S</button
         >
       {/if}
+      <LanePluginStrip {track} folded />
       <button
         class="foldbtn mono"
         aria-expanded="false"
@@ -399,6 +401,7 @@
           <span class="kindchip mono">Audio track</span>
         {/if}
         {#if !isAutomation}
+          <LanePluginStrip {track} onoverflow={() => (fxPopoverOpen = true)} />
           <span class="picker">
             <button
               class="status fxchip"
