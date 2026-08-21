@@ -74,6 +74,50 @@ export interface ThemeTokens {
   glowScale: string;
   /** Alpha of the two radial washes on `body`; `0` flattens the background. */
   bodyGlow: string;
+  /**
+   * Opacity of the CHROME panels — today the right dock — as opposed to
+   * `glassAlpha`, which governs floating glass like dialogs and popovers.
+   *
+   * They are separate because they answer different questions. A dialog is
+   * temporary and *should* let you see what it covers. A side panel you work
+   * in for an hour should not: a translucent one puts the timeline grid
+   * behind its own text, and it is the reason the dock cannot be docked —
+   * something you can see through reads as floating over the layout rather
+   * than as part of it. Set this to `1` and the panel becomes a real wall,
+   * which is what the "dock the side panel" preference then has to push
+   * against.
+   */
+  panelAlpha: string;
+
+  /* ── materials: what a surface is MADE OF, as opposed to what colour it is ──
+   *
+   * The palette above answers "what colour is this panel". These five answer
+   * "is it milled aluminium, moulded plastic, or flat vector" — and they are
+   * what let one palette ship as both a flat theme and a hardware theme. The
+   * virtual key light is fixed at top-centre, the convention every real
+   * front panel is photographed under, so a raised face is lighter along its
+   * top edge and casts downward. All four scalars are 0..1 and all four at
+   * `0` collapse to exactly the flat look AURA had before they existed —
+   * which is what the high-contrast themes rely on. */
+  /** Strength of the lit top edge and shadowed bottom edge on a raised face
+   * (and inverted, the lip of a recessed well). This is the token that reads
+   * as "moulded" — it is the edge, not the shadow under it. */
+  bevel: string;
+  /** Depth multiplier on the shadow a raised element CASTS on the panel
+   * behind it. Separate from `bevel` because a thick-edged button lying flat
+   * on the panel and a thin card floating above it are different objects. */
+  relief: string;
+  /** Strength of the specular gradient down a face — the sweep of reflected
+   * light that makes a knob cap read as domed rather than as a circle. */
+  sheen: string;
+  /** Opacity of the micro-texture overlay: the fine speckle of bead-blasted
+   * metal or moulded plastic. Cheap to ignore, and the single cue that most
+   * separates "photograph of hardware" from "rectangle with a gradient". */
+  grain: string;
+  /** Corner radius of controls — buttons, chips, wells. A length, because it
+   * is a physical dimension rather than a strength: hard-edged rack gear and
+   * soft-cornered consumer plastic differ here and nowhere else. */
+  ctrlRadius: string;
 }
 
 export const COLOR_KEYS = [
@@ -85,13 +129,24 @@ export const COLOR_KEYS = [
   "shadow",
 ] as const satisfies readonly (keyof ThemeTokens)[];
 
+/** The material group, named separately because it is the axis a theme
+ * author tunes as a set: all five together are one material, and mixing
+ * half of one with half of another is how a panel stops looking real. */
+export const MATERIAL_KEYS = [
+  "bevel", "relief", "sheen", "grain", "ctrlRadius",
+] as const satisfies readonly (keyof ThemeTokens)[];
+
 export const AFFORDANCE_KEYS = [
   "borderWidth", "focusWidth", "glassBlur", "glassAlpha", "glowScale", "bodyGlow",
+  "panelAlpha",
+  ...MATERIAL_KEYS,
 ] as const satisfies readonly (keyof ThemeTokens)[];
 
 /** The affordances measured as a bare number rather than a CSS length. */
 export const UNITLESS_AFFORDANCE_KEYS: readonly (keyof ThemeTokens)[] = [
-  "glassAlpha", "glowScale", "bodyGlow",
+  "glassAlpha", "glowScale", "bodyGlow", "panelAlpha",
+  // The four material strengths are ratios; `ctrlRadius` alone is a length.
+  "bevel", "relief", "sheen", "grain",
 ];
 
 /** Every key a theme must define — the runtime half of the interface. */
@@ -130,8 +185,19 @@ export function alpha(color: string, a: number): string {
   return `rgb(${r} ${g} ${b} / ${Math.round(out * 1000) / 1000})`;
 }
 
-/** A unitless token as a number, falling back rather than emitting `NaN`. */
+/**
+ * A unitless token as a number, falling back rather than emitting `NaN`.
+ *
+ * The blank check is not redundant: `Number("")` is `0`, not `NaN`, so an
+ * empty string would sail past `isFinite` and be taken as a real zero. For
+ * these particular tokens zero is the most destructive value there is — a
+ * `glassAlpha` or `panelAlpha` of 0 is an invisible panel — and blank is
+ * reachable, because the boot cache in theme.svelte.ts only checks that a
+ * token IS a string before painting it. A missing value must degrade to the
+ * fallback, never to "transparent".
+ */
 function number(value: string, fallback: number): number {
+  if (value.trim() === "") return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -167,6 +233,16 @@ export function toCssVars(t: ThemeTokens): Record<string, string> {
   // so every existing var() call site keeps working untouched.
   vars["--glass-base-rgb"] = rgbTriple(t.glass);
   vars["--glass"] = alpha(t.glass, number(t.glassAlpha, 1));
+
+  // The chrome panel fill, and — derived, not declared — the blur behind it.
+  // A backdrop-filter on a fully opaque surface is pure cost: it blurs pixels
+  // nobody can see, on the largest always-on surface in the app. Deriving it
+  // here rather than asking themes to keep two keys in step is why a theme
+  // cannot get this pairing wrong, unlike `glassBlur`/`glassAlpha`, which it
+  // still can (and which a test has to police).
+  const panelAlpha = number(t.panelAlpha, 1);
+  vars["--panel"] = alpha(t.glass, panelAlpha);
+  vars["--panel-blur"] = panelAlpha >= 1 ? "0px" : t.glassBlur;
   vars["--glass-border"] = alpha(t.edge, 0.12);
   vars["--grid-line"] = alpha(t.line, 0.09);
   vars["--grid-line-strong"] = alpha(t.line, 0.2);

@@ -1,5 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { alpha, applyTokens, rgbTriple, toCssVars, type ThemeTokens } from "./tokens";
+import {
+  AFFORDANCE_KEYS,
+  MATERIAL_KEYS,
+  TOKEN_KEYS,
+  UNITLESS_AFFORDANCE_KEYS,
+  alpha,
+  applyTokens,
+  rgbTriple,
+  toCssVars,
+  type ThemeTokens,
+} from "./tokens";
 
 /** A minimal, fully-populated token set — every test here uses this. */
 const T: ThemeTokens = {
@@ -36,6 +46,12 @@ const T: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+  panelAlpha: "0.88",
+  bevel: "0.4",
+  relief: "0.55",
+  sheen: "0.3",
+  grain: "0.1",
+  ctrlRadius: "6px",
 };
 
 describe("rgbTriple", () => {
@@ -117,5 +133,68 @@ describe("applyTokens", () => {
     expect(set.get("--cyan")).toBe("#52e5ff");
     expect(set.get("--cyan-rgb")).toBe("82 229 255");
     expect(set.size).toBe(Object.keys(toCssVars(T)).length);
+  });
+});
+
+describe("the material tokens", () => {
+  const vars = toCssVars(T);
+
+  // The material scalars ride the same affordance path as `glowScale`: they
+  // are emitted verbatim, and app.css does the arithmetic. If they ever
+  // acquired an `-rgb` twin it would mean they had been misfiled as colours.
+  it("emits each material scalar as a bare custom property", () => {
+    expect(vars["--bevel"]).toBe("0.4");
+    expect(vars["--relief"]).toBe("0.55");
+    expect(vars["--sheen"]).toBe("0.3");
+    expect(vars["--grain"]).toBe("0.1");
+    expect(vars["--ctrl-radius"]).toBe("6px");
+  });
+
+  it("does not treat them as colours", () => {
+    for (const key of ["--bevel", "--relief", "--sheen", "--grain", "--ctrl-radius"]) {
+      expect(vars[key + "-rgb"], key).toBeUndefined();
+    }
+  });
+
+  it("lists every material key as an affordance, so parse.ts validates them", () => {
+    for (const key of MATERIAL_KEYS) {
+      expect(AFFORDANCE_KEYS as readonly string[]).toContain(key);
+      expect(TOKEN_KEYS as readonly string[]).toContain(key);
+    }
+  });
+
+  // A theme file may say `"bevel": "0.5"` but never `"bevel": "0.5px"`, and
+  // `ctrlRadius` is the one that goes the other way. Getting this backwards
+  // would make every material override in a user theme silently drop.
+  it("counts the four strengths as unitless and the radius as a length", () => {
+    expect(UNITLESS_AFFORDANCE_KEYS).toContain("bevel");
+    expect(UNITLESS_AFFORDANCE_KEYS).toContain("relief");
+    expect(UNITLESS_AFFORDANCE_KEYS).toContain("sheen");
+    expect(UNITLESS_AFFORDANCE_KEYS).toContain("grain");
+    expect(UNITLESS_AFFORDANCE_KEYS).not.toContain("ctrlRadius");
+  });
+});
+
+describe("the chrome panel fill", () => {
+  it("mixes the panel colour at the theme's panel alpha", () => {
+    expect(toCssVars({ ...T, panelAlpha: "0.5" })["--panel"]).toBe("rgb(13 17 30 / 0.5)");
+  });
+
+  /**
+   * The pairing `glassBlur`/`glassAlpha` needs a test to police is DERIVED
+   * here instead, so a theme cannot get it wrong: a backdrop-filter behind a
+   * fully opaque surface blurs pixels nobody can see, and the dock is the
+   * largest always-on surface in the app.
+   */
+  it("drops the blur once the panel is opaque", () => {
+    expect(toCssVars({ ...T, panelAlpha: "1", glassBlur: "18px" })["--panel-blur"]).toBe("0px");
+  });
+
+  it("keeps the blur while the panel is see-through", () => {
+    expect(toCssVars({ ...T, panelAlpha: "0.88", glassBlur: "18px" })["--panel-blur"]).toBe("18px");
+  });
+
+  it("treats a nonsense alpha as opaque rather than emitting NaN", () => {
+    expect(toCssVars({ ...T, panelAlpha: "" })["--panel-blur"]).toBe("0px");
   });
 });

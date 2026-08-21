@@ -352,7 +352,7 @@
 
 <div class="app">
   <TransportBar />
-  <div class="main">
+  <div class="main" class:docked={prefs.values.dockSide === "docked"}>
     <Timeline />
     <Dock />
   </div>
@@ -388,5 +388,12 @@
     position: relative;
     display: flex;
     flex-direction: column;
+  }
+  /* Docked side panel: the row becomes two columns and the timeline takes
+     what is left, instead of the dock hanging over it. Timeline is already
+     `flex: 1`, so flipping the direction is the whole layout change — the
+     dock stops being `position: absolute` on its own side (Dock.svelte). */
+  .main.docked {
+    flex-direction: row;
   }
 </style>

@@ -80,6 +80,82 @@
   --glow-scale: 1;
   --body-glow: 0.05;
 
+  /* materials (see ThemeTokens) — the theme sets these five scalars */
+  --bevel: 0.4;
+  --relief: 0.55;
+  --sheen: 0.3;
+  --grain: 0.1;
+  --ctrl-radius: 6px;
+
+  /* ────────────────────────────────────────────────────────────────────────
+     Material composites — derived from the five scalars above, and the only
+     place the "what does a raised thing look like" decision is made.
+
+     These are whole `box-shadow` and `background-image` VALUES rather than
+     ingredients, so a component writes
+
+         box-shadow: var(--bevel-raised), var(--relief-2);
+         background-image: var(--sheen-face);
+
+     and inherits every theme's material for free. They live in CSS rather
+     than in tokens.ts for the same reason `calc(12px * var(--glow-scale))`
+     does: the theme owns the STRENGTH, the stylesheet owns the shape.
+
+     The virtual key light is fixed at top-centre — every real front panel is
+     lit that way — so a raised face is lit along its top lip and shadowed
+     along its bottom, and an inset well is exactly that inverted. The
+     highlight is white because a specular highlight is the colour of the
+     light; the shadow is `--shadow`, which is why Studio Ivory's warm brown
+     shadow makes its cream panels read as an object and a black one would
+     make them read as cut-out holes.
+     ──────────────────────────────────────────────────────────────────────── */
+
+  /* the two lips */
+  --bevel-hi: rgb(255 255 255 / calc(var(--bevel) * 0.34));
+  --bevel-lo: rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.55));
+
+  /* a face standing proud of the panel: lit top lip, shadowed bottom lip */
+  --bevel-raised:
+    inset 0 var(--border-width) 0 0 var(--bevel-hi),
+    inset 0 calc(-1 * var(--border-width)) 0 0 var(--bevel-lo);
+  /* the same edge inverted, plus the soft occlusion a recess collects */
+  --bevel-inset:
+    inset 0 var(--border-width) calc(1px + 4px * var(--bevel)) 0
+      rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.7)),
+    inset 0 calc(-1 * var(--border-width)) 0 0 var(--bevel-hi);
+
+  /* cast shadow at three heights: sitting on, lifted off, floating above */
+  --relief-1: 0 1px 1px rgb(var(--shadow-rgb) / calc(var(--relief) * 0.35));
+  --relief-2:
+    0 1px 1px rgb(var(--shadow-rgb) / calc(var(--relief) * 0.3)),
+    0 calc(3px * var(--relief)) calc(7px * var(--relief))
+      rgb(var(--shadow-rgb) / calc(var(--relief) * 0.42));
+  --relief-3:
+    0 1px 2px rgb(var(--shadow-rgb) / calc(var(--relief) * 0.3)),
+    0 calc(8px * var(--relief)) calc(22px * var(--relief))
+      rgb(var(--shadow-rgb) / calc(var(--relief) * 0.5));
+
+  /* the specular sweep down a face — bright at the top, dark at the foot */
+  --sheen-face: linear-gradient(
+    180deg,
+    rgb(255 255 255 / calc(var(--sheen) * 0.13)) 0%,
+    rgb(255 255 255 / calc(var(--sheen) * 0.035)) 45%,
+    rgb(var(--shadow-rgb) / calc(var(--sheen) * 0.16)) 100%
+  );
+  /* the same sweep for a dome (a knob cap): the highlight sits off-centre */
+  --sheen-dome: radial-gradient(
+    120% 120% at 32% 12%,
+    rgb(255 255 255 / calc(var(--sheen) * 0.34)) 0%,
+    rgb(255 255 255 / calc(var(--sheen) * 0.06)) 38%,
+    rgb(var(--shadow-rgb) / calc(var(--sheen) * 0.22)) 100%
+  );
+
+  /* Bead-blast / moulded-plastic speckle. An inline feTurbulence rather than
+     a bitmap so it costs nothing to ship, tiles seamlessly (stitchTiles) and
+     stays crisp at any interface zoom. Applied via `.grain`, which blends it
+     over the surface rather than painting grey on top of it. */
+  --grain-tex: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+
   /* type */
   --font-mono:
     "SFMono-Regular", "JetBrains Mono", "Cascadia Mono", ui-monospace, "Menlo",
@@ -156,6 +232,151 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* ── material utilities ───────────────────────────────────────────────────
+   For markup written against the material system from the start (the knob,
+   the transport caps). Existing components opt in through the composite
+   vars above instead, because Svelte's scoped selectors outrank a bare
+   global class and silently win the `background` declaration.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* A control face standing proud of the panel behind it. */
+.raised {
+  position: relative;
+  border-radius: var(--ctrl-radius);
+  background-color: var(--bg-2);
+  background-image: var(--sheen-face);
+  box-shadow: var(--bevel-raised), var(--relief-2);
+}
+
+/* Pressed: the face drops into the panel and its cast shadow collapses.
+   The 1px nudge is what sells it — a button that changes colour without
+   moving reads as a state change, not as a press. */
+.raised.pressed,
+.raised:active {
+  background-image: var(--sheen-face), linear-gradient(rgb(var(--shadow-rgb) / 0.28), rgb(var(--shadow-rgb) / 0.28));
+  box-shadow: var(--bevel-inset), var(--relief-1);
+  transform: translateY(calc(1px * var(--relief)));
+}
+
+/* A well cut INTO the panel: displays, meters, timecode, sunken tracks. */
+.inset {
+  border-radius: var(--ctrl-radius);
+  background-color: var(--bg-sunken);
+  box-shadow: var(--bevel-inset);
+}
+
+/* ── module blocks ────────────────────────────────────────────────────────
+   The front-panel layout language: a window is not one flat surface but a
+   grid of separate MODULE blocks, each a top-lit face sitting in a darker
+   gutter, each wearing its name on a tab at its top-left.
+
+   Two things make this read as hardware rather than as cards, and both are
+   easy to get wrong:
+
+   1. The GUTTER must be darker than the face (`--bg-0` behind `--bg-1`).
+      Cards on a page share their parent's background and are separated by
+      whitespace; objects on a panel are separated by shadow. A rack whose
+      ground matches its modules reads as boxes drawn on paper no matter how
+      much bevel the modules carry.
+   2. The FACE GRADIENT does more work than the bevel. `--sheen-face` is the
+      cue that sells it — a flat fill with a crisp lit edge still looks like
+      a div, which is why Rack Slate runs `sheen` at 0.85.
+
+   Every value here is a material token, so the same markup is painted steel
+   under Rack Slate, milled aluminium under Console Noir, and plain flat
+   boxes under either high-contrast theme.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* The gutter the modules sit in. */
+.module-rack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 5px;
+  background: var(--bg-0);
+}
+
+/* One module: a face standing proud of the gutter. */
+.module {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--ctrl-radius);
+  /* `bg-2`, not `bg-1`: a module has to stand proud of BOTH the gutter under
+     it and the panel the rack is mounted in, and on most themes the dock is
+     already at `bg-1`. Level with its host, the face disappears and only the
+     gutter strips between blocks read. */
+  background-color: var(--bg-2);
+  background-image: var(--sheen-face);
+  box-shadow: var(--bevel-raised), var(--relief-2);
+}
+
+/* The name tab. `align-self: flex-start` is what makes it a TAB rather than
+   a title bar: it takes only the width of its own label, so the module face
+   continues past it along the top edge — the detail that reads as a physical
+   legend plate rather than as a card header. */
+.module-head {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 3px 10px;
+  border-radius: var(--ctrl-radius) var(--ctrl-radius) 0 0;
+  background-color: var(--bg-3);
+  background-image: var(--sheen-face);
+  box-shadow: inset 0 var(--border-width) 0 0 var(--bevel-hi), var(--relief-1);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--text-mid);
+  white-space: nowrap;
+}
+
+/* A module whose function is switched ON. The tab lights; the face does not
+   — on real gear the legend is what carries the state, and lighting the
+   whole panel would leave nowhere for selection to show. */
+.module.lit > .module-head {
+  color: var(--cyan);
+  box-shadow:
+    inset 0 var(--border-width) 0 0 var(--bevel-hi),
+    inset 0 -2px 0 0 var(--cyan),
+    var(--relief-1);
+}
+
+.module-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px 7px;
+  min-width: 0;
+}
+
+/* A row of controls across a module face, the way a hardware section lays
+   its knobs out: evenly spaced, labels under each. */
+.module-controls {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+/* Surface speckle. An overlay child rather than a background layer so it
+   composites over whatever gradient the element already carries, and
+   `pointer-events: none` so it never eats a click on the control beneath. */
+.grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-image: var(--grain-tex);
+  opacity: var(--grain);
+  mix-blend-mode: overlay;
+  pointer-events: none;
+}
+
 /* focus ring — visible, on-palette */
 :where(button, input, select, [tabindex]):focus-visible {
   outline: var(--focus-width) solid var(--cyan);
@@ -187,6 +408,8 @@ input[type="range"].fader {
 input[type="range"].fader::-webkit-slider-runnable-track {
   height: 3px;
   border-radius: 2px;
+  /* The unfilled part of the slot is a routed groove, not a painted line. */
+  box-shadow: var(--bevel-inset);
   background: linear-gradient(
     to right,
     var(--fader-fill, var(--cyan)) 0%,
@@ -202,7 +425,10 @@ input[type="range"].fader::-webkit-slider-thumb {
   margin-top: -5px;
   border-radius: 1px;
   background: var(--text);
-  box-shadow: 0 0 calc(6px * var(--glow-scale)) rgb(var(--text-rgb) / 0.5);
+  background-image: var(--sheen-face);
+  box-shadow:
+    0 0 calc(6px * var(--glow-scale)) rgb(var(--text-rgb) / 0.5),
+    var(--relief-1);
 }
 input[type="range"].fader::-moz-range-track {
   height: 3px;

@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Left-rail track header: color stripe, name, arm/mute/solo, gain fader
-   * with dB readout, pan, and a compact per-track VU meter.
+   * with dB readout, a pan knob, and a compact per-track VU meter.
    */
   import type { TrackState } from "../types/ipc";
   import { project } from "../state/project.svelte";
@@ -17,6 +17,7 @@
   import { groupOf } from "../utils/lane-layout";
   import { focusAndSelect } from "../utils/focusAndSelect";
   import Meter from "./Meter.svelte";
+  import Knob from "./controls/Knob.svelte";
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
@@ -144,10 +145,6 @@
   function onGain(e: Event) {
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
     queueGestureWrite(() => project.setGain(track.id, v));
-  }
-  function onPan(e: Event) {
-    const v = parseFloat((e.currentTarget as HTMLInputElement).value);
-    queueGestureWrite(() => project.setPan(track.id, v));
   }
 
   function formatPan(value: number): string {
@@ -330,11 +327,25 @@
               <input class="fader" type="range" min="-60" max="12" step="0.1" value={track.gainDb} style:--fader-pct="{gainPct}%" style:--fader-fill={track.color} aria-label="Gain for {track.name}" oninput={onGain} onpointerdown={onGainPointerDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} />
               <output class="value mono">{formatDb(track.gainDb)}</output>
             </label>
-            <label class="level-control pan-control">
+            <!-- Pan is the one genuinely rotary parameter on a channel
+                 strip — bipolar, centre-detented, adjusted in small amounts —
+                 so it is the one that gets a knob rather than a slot. -->
+            <div class="level-control pan-control">
               <span class="control-label">Pan</span>
-              <input class="fader pan" type="range" min="-1" max="1" step="0.01" value={track.pan} style:--fader-pct="{((track.pan + 1) / 2) * 100}%" style:--fader-fill="var(--violet)" aria-label="Pan for {track.name}" oninput={onPan} onpointerdown={onPanPointerDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} ondblclick={() => project.setPan(track.id, 0)} />
+              <Knob
+                value={track.pan}
+                min={-1}
+                max={1}
+                bipolar
+                size={20}
+                color="var(--violet)"
+                ariaLabel="Pan for {track.name}"
+                oninput={(v) => queueGestureWrite(() => project.setPan(track.id, v))}
+                onstart={onPanPointerDown}
+                onend={onGestureEnd}
+              />
               <output class="value pan-value mono">{formatPan(track.pan)}</output>
-            </label>
+            </div>
           </div>
         </section>
       {/if}
@@ -841,7 +852,10 @@
     flex: 1.3;
   }
   .pan-control {
-    flex: 1;
+    flex: none;
+  }
+  .level-control .pan-value {
+    width: 24px;
   }
   .control-label {
     flex: none;
@@ -857,9 +871,6 @@
     color: var(--text-dim);
     font-size: 8px;
     text-align: right;
-  }
-  .level-control .pan-value {
-    width: 24px;
   }
   .targets {
     margin-left: 20px;
