@@ -102,9 +102,13 @@
     }
   }
 
+  // Alt+click is the bypass modifier. On the instrument device (no bypass
+  // concept) it must do NOTHING, not silently fall through to opening
+  // params — a modifier that means something else on one device in the
+  // same row is worse than a modifier that's a no-op there.
   function onNameClick(d: StripDevice, e: MouseEvent) {
-    if (e.altKey && d.kind === "insert") {
-      void toggleBypass(d);
+    if (e.altKey) {
+      if (d.kind === "insert") void toggleBypass(d);
       return;
     }
     void openPluginParams(d.instanceId);
@@ -152,6 +156,10 @@
         </span>
       {/if}
     {/each}
+    <!-- Gated on `onoverflow` too: the folded strip (dots only, per the
+         winner spec) is deliberately given no `onoverflow` handler, so a
+         folded lane with more than `maxEntries` devices just caps at the
+         dots it can show — intentional, not a missed affordance. -->
     {#if fit.overflow > 0 && onoverflow}
       <button type="button" class="overflow mono" title="Show the rest of the chain" onclick={() => onoverflow?.()}>
         +{fit.overflow}

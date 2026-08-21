@@ -154,13 +154,13 @@ describe("LanePluginStrip", () => {
     expect(openPluginParams).not.toHaveBeenCalled();
   });
 
-  it("Alt+click on the instrument name does nothing bypass-related — it opens params", async () => {
+  it("Alt+click on the instrument name does nothing — no bypass, no params open", async () => {
     render(LanePluginStrip, { props: { track: track() } });
 
     await fireEvent.click(screen.getByRole("button", { name: /^synth$/i }), { altKey: true });
 
     expect(insertSetBypass).not.toHaveBeenCalled();
-    expect(openPluginParams).toHaveBeenCalledWith("i1");
+    expect(openPluginParams).not.toHaveBeenCalled();
   });
 
   it("shows +N for the overflow and hands its click to the parent", async () => {
