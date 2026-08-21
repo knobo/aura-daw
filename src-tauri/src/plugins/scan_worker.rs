@@ -102,11 +102,26 @@ pub fn scan_clap_subprocess(roots: &[PathBuf]) -> Vec<PluginDescriptor> {
         // We ARE the worker (defensive: never spawn recursively).
         return scan::scan_clap_paths(roots);
     }
+    scan_clap_subprocess_for(&bundles)
+}
+
+/// Same launch/respawn/crash-containment discipline as
+/// [`scan_clap_subprocess`], but over an EXPLICIT bundle list instead of
+/// discovering one — the incremental rescan (`scan::scan_incremental`)
+/// already knows exactly which bundles are new or changed, and must not pay
+/// for (or dlopen) the ones it doesn't.
+pub fn scan_clap_subprocess_for(bundles: &[PathBuf]) -> Vec<PluginDescriptor> {
+    if bundles.is_empty() {
+        return Vec::new();
+    }
+    if is_worker_invocation() {
+        return scan::scan_clap_bundles_in_process(bundles);
+    }
     match WorkerCommand::current_exe() {
-        Some(cmd) => scan_with_worker(&bundles, &cmd),
+        Some(cmd) => scan_with_worker(bundles, &cmd),
         None => {
             log::warn!("plugin scan: cannot resolve current exe; falling back to in-process CLAP scan");
-            scan::scan_clap_paths(roots)
+            scan::scan_clap_bundles_in_process(bundles)
         }
     }
 }

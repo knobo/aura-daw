@@ -116,6 +116,18 @@ const invokes = {
   samplerListInstruments: vi.fn(async () => []),
   zynListPatches: vi.fn(async () => []),
   pluginList: vi.fn(async () => ({ plugins: [], instances: [], scanned: true })),
+  pluginInstantiate: vi.fn(async (uid: string) => ({
+    id: "new-1",
+    uid,
+    name: "Surge XT",
+    format: "clap" as const,
+    status: "active" as const,
+  })),
+  insertAdd: vi.fn(async (_trackId: string, _uid: string) => ({
+    id: "slot-1",
+    instanceId: "fx-1",
+    bypassed: false,
+  })),
 };
 
 const mockBackend = { mode: "tauri" as const, on: () => () => {}, ...invokes };
@@ -375,5 +387,54 @@ describe("dropOnTrack — presets", () => {
     );
     expect(invokes.zynLoadPatch).not.toHaveBeenCalled();
     expect(lastToast().title).toContain("ZYN");
+  });
+});
+
+describe("dropOnTrack — plugins", () => {
+  it("instantiates an instrument onto a MIDI track", async () => {
+    project.tracks = [midiTrack("m1")];
+    await library.dropOnTrack(
+      { kind: "pluginInstrument", uid: "clap:surge", name: "Surge XT" },
+      "m1",
+      0,
+    );
+    expect(invokes.pluginInstantiate).toHaveBeenCalledWith("clap:surge");
+    expect(invokes.setTrackInstrument).toHaveBeenCalledWith("m1", "plugin:new-1");
+  });
+
+  it("refuses to drop an instrument on an audio track", async () => {
+    project.tracks = [audioTrack("t1")];
+    await library.dropOnTrack(
+      { kind: "pluginInstrument", uid: "clap:surge", name: "Surge XT" },
+      "t1",
+      0,
+    );
+    expect(invokes.pluginInstantiate).not.toHaveBeenCalled();
+    expect(lastToast().title).toContain("MIDI TRACK");
+  });
+
+  it("inserts an effect on an audio track", async () => {
+    project.tracks = [audioTrack("t1")];
+    await library.dropOnTrack(
+      { kind: "pluginEffect", uid: "clap:verb", name: "Calf Reverb" },
+      "t1",
+      0,
+    );
+    expect(invokes.insertAdd).toHaveBeenCalledWith("t1", "clap:verb");
+  });
+
+  it("binds an existing instance to a MIDI track", async () => {
+    project.tracks = [midiTrack("m1")];
+    plugins.instances = [
+      {
+        id: "i1",
+        uid: "clap:surge",
+        name: "Surge XT",
+        format: "clap",
+        status: "active",
+      },
+    ];
+    await library.dropOnTrack({ kind: "pluginInstance", instanceId: "i1", name: "Surge XT" }, "m1", 0);
+    expect(invokes.setTrackInstrument).toHaveBeenCalledWith("m1", "plugin:i1");
   });
 });

@@ -34,7 +34,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, unbounded, Sender};
 
@@ -148,11 +148,30 @@ pub fn plugin_main() -> &'static PluginMainThread {
             .name("aura-plugin-host".into())
             .spawn(move || {
                 let mut ctx = MainCtx::new();
+                let tick_period = Duration::from_millis(30);
+                let mut next_tick = Instant::now() + tick_period;
                 loop {
-                    match rx.recv_timeout(Duration::from_millis(30)) {
-                        Ok(MainMsg::Run(f)) => f(&mut ctx),
+                    let wait = next_tick.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(wait) {
+                        Ok(MainMsg::Run(f)) => {
+                            f(&mut ctx);
+                            loop {
+                                if Instant::now() >= next_tick {
+                                    ctx.tick();
+                                    next_tick = Instant::now() + tick_period;
+                                }
+                                match rx.try_recv() {
+                                    Ok(MainMsg::Run(g)) => g(&mut ctx),
+                                    Ok(MainMsg::Shutdown) => return,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
                         Ok(MainMsg::Shutdown) => break,
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => ctx.tick(),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            ctx.tick();
+                            next_tick = Instant::now() + tick_period;
+                        }
                         Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
@@ -264,5 +283,39 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(ticks.load(Ordering::Relaxed) > 0, "ticker ran on idle");
+    }
+
+    /// Live sessions post onto this thread faster than the 30 ms idle
+    /// timeout (param rings, workers, graph rebuilds). Tickers drive LV2
+    /// ui:idleInterface / CLAP timers — if they only run on Timeout, a
+    /// busy queue starves the native GUI and DPF never maps the window.
+    #[test]
+    fn ticker_still_runs_when_the_request_queue_is_busy() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+
+        let ticks = Arc::new(AtomicU32::new(0));
+        let t = ticks.clone();
+        plugin_main()
+            .run(move |ctx| {
+                ctx.add_ticker(
+                    "busy-tick",
+                    Box::new(move |_| {
+                        t.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            })
+            .unwrap();
+
+        for _ in 0..80 {
+            plugin_main().post(|_| std::thread::sleep(std::time::Duration::from_millis(8)));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        plugin_main().run(|_| ()).unwrap();
+        let n = ticks.load(Ordering::Relaxed);
+        assert!(
+            n >= 2,
+            "ticker must fire under a busy Run queue (got {n}); otherwise ui:idleInterface never runs"
+        );
     }
 }

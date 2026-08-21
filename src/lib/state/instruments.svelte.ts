@@ -13,6 +13,8 @@ class InstrumentsStore {
   error = $state<string | null>(null);
   /** Instrument row whose keys are being auditioned (UI highlight). */
   previewingId = $state<string | null>(null);
+  /** MIDI key currently held by previewDown, if any. */
+  previewingKey = $state<number | null>(null);
 
   byId(id: string | null | undefined): InstrumentInfo | undefined {
     return id ? this.list.find((i) => i.id === id) : undefined;
@@ -62,6 +64,32 @@ class InstrumentsStore {
       setTimeout(() => {
         if (this.previewingId === instrumentId) this.previewingId = null;
       }, 350);
+    }
+  }
+
+  /** Note-on for hold-to-play. Sounds until `previewUp`. */
+  async previewDown(instrumentId: string, key: number, velocity = 100) {
+    if (this.previewingKey != null) await this.previewUp();
+    this.previewingId = instrumentId;
+    this.previewingKey = key;
+    try {
+      await backend.samplerPreviewNoteOn(instrumentId, key, velocity);
+    } catch (err) {
+      console.warn("[aura] sampler_preview_note_on failed:", err);
+      this.previewingId = null;
+      this.previewingKey = null;
+    }
+  }
+
+  async previewUp() {
+    const key = this.previewingKey;
+    this.previewingId = null;
+    this.previewingKey = null;
+    if (key == null) return;
+    try {
+      await backend.samplerPreviewNoteOff(key);
+    } catch (err) {
+      console.warn("[aura] sampler_preview_note_off failed:", err);
     }
   }
 }

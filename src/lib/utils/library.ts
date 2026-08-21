@@ -37,7 +37,10 @@ export type LibraryDragPayload =
   | { kind: "projectAudioClip"; clipId: string }
   | { kind: "projectMidiClip"; clipId: string }
   | { kind: "samplerInstrument"; instrumentId: string; name: string }
-  | { kind: "zynPatch"; patch: ZynPatch };
+  | { kind: "zynPatch"; patch: ZynPatch }
+  | { kind: "pluginInstrument"; uid: string; name: string }
+  | { kind: "pluginEffect"; uid: string; name: string }
+  | { kind: "pluginInstance"; instanceId: string; name: string };
 
 const KINDS = [
   "sampleFile",
@@ -45,6 +48,9 @@ const KINDS = [
   "projectMidiClip",
   "samplerInstrument",
   "zynPatch",
+  "pluginInstrument",
+  "pluginEffect",
+  "pluginInstance",
 ] as const;
 
 /** Structural slices of DataTransfer, so these are testable without a DOM. */

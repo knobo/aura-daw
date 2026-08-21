@@ -49,12 +49,15 @@ import {
   type OpenSidecarEvent,
   type PaletteView,
   type PendingConfirmation,
+  type PluginCatalog,
+  type PluginCatalogPatch,
   type PluginDescriptor,
   type PluginInstanceInfo,
   type PluginListResult,
   type InsertSlot,
   type PluginParamChange,
   type PluginParamInfo,
+  type PluginScanStatus,
   type PitchFrame,
   type PitchFrameBatch,
   type PitchPoint,
@@ -635,6 +638,8 @@ export class DemoBackend implements Backend {
   private mcpPending = new Map<string, PendingConfirmation & { apply?: () => void }>();
   private mcpScriptStarted = false;
   private audioCtx: AudioContext | null = null;
+  /** Stop the currently held sampler/plugin preview voice, if any. */
+  private previewStop: (() => void) | null = null;
 
   // phase 3 — plugins (mirrors the backend PluginRegistry semantics)
   private pluginScanned = false;
@@ -643,6 +648,17 @@ export class DemoBackend implements Backend {
   private pluginParams = new Map<string, PluginParamInfo[]>();
   /** Coalesced audio re-schedule after param edits (knob-drag safe). */
   private pluginResyncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** In-memory mirror of the machine-global catalog (browser demo mode has
+   * no disk to persist to — mirrors `plugins::catalog::PluginCatalog`'s
+   * shape and reducer caps only, never written anywhere). */
+  private pluginCatalog: PluginCatalog = {
+    version: 1,
+    scan: { scannedAt: undefined, entries: [] },
+    favorites: [],
+    recents: [],
+    tags: {},
+    pinnedParams: {},
+  };
 
   // wave 1.5 — export / loop-jam / zyn patches
   private exportJobs = new Map<string, ExportJobStatus>();
@@ -2584,6 +2600,21 @@ export class DemoBackend implements Backend {
 
   /** Browser preview: a tiny hand-rolled subtractive synth via WebAudio. */
   async samplerPreviewNote(instrumentId: string, key: number, velocity: number): Promise<void> {
+    this.startPreviewVoice(instrumentId, key, velocity, false);
+  }
+
+  async samplerPreviewNoteOn(instrumentId: string, key: number, velocity: number): Promise<void> {
+    this.startPreviewVoice(instrumentId, key, velocity, true);
+  }
+
+  async samplerPreviewNoteOff(_key: number): Promise<void> {
+    this.previewStop?.();
+    this.previewStop = null;
+  }
+
+  private startPreviewVoice(instrumentId: string, key: number, velocity: number, hold: boolean) {
+    this.previewStop?.();
+    this.previewStop = null;
     const inst = this.instruments.find((i) => i.id === instrumentId);
     const ctx = this.ensureCtx();
     const now = ctx.currentTime;
@@ -2594,7 +2625,9 @@ export class DemoBackend implements Backend {
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0, now);
     gain.gain.linearRampToValueAtTime(0.22 * vel, now + 0.008);
-    gain.gain.exponentialRampToValueAtTime(0.0004, now + (bells ? 1.4 : 0.7));
+    if (!hold) {
+      gain.gain.exponentialRampToValueAtTime(0.0004, now + (bells ? 1.4 : 0.7));
+    }
     const filter = ctx.createBiquadFilter();
     filter.type = "lowpass";
     filter.frequency.setValueAtTime(Math.min(14000, freq * (bells ? 9 : 5)), now);
@@ -2603,6 +2636,7 @@ export class DemoBackend implements Backend {
     gain.connect(ctx.destination);
     filter.connect(gain);
 
+    const oscs: OscillatorNode[] = [];
     for (const detune of bells ? [0] : [-7, 6]) {
       const osc = ctx.createOscillator();
       osc.type = bells ? "sine" : "sawtooth";
@@ -2610,19 +2644,35 @@ export class DemoBackend implements Backend {
       osc.detune.value = detune;
       osc.connect(filter);
       osc.start(now);
-      osc.stop(now + 1.6);
+      if (!hold) osc.stop(now + 1.6);
+      oscs.push(osc);
     }
     if (bells) {
       const partial = ctx.createOscillator();
       partial.type = "sine";
-      partial.frequency.value = freq * 2.76; // inharmonic shimmer
+      partial.frequency.value = freq * 2.76;
       const pg = ctx.createGain();
       pg.gain.setValueAtTime(0.08 * vel, now);
-      pg.gain.exponentialRampToValueAtTime(0.0003, now + 0.9);
+      if (!hold) pg.gain.exponentialRampToValueAtTime(0.0003, now + 0.9);
       partial.connect(pg);
       pg.connect(ctx.destination);
       partial.start(now);
-      partial.stop(now + 1.0);
+      if (!hold) partial.stop(now + 1.0);
+      oscs.push(partial);
+    }
+    if (hold) {
+      this.previewStop = () => {
+        const t = ctx.currentTime;
+        gain.gain.cancelScheduledValues(t);
+        gain.gain.setTargetAtTime(0.0001, t, 0.04);
+        for (const osc of oscs) {
+          try {
+            osc.stop(t + 0.15);
+          } catch {
+            /* already stopped */
+          }
+        }
+      };
     }
   }
 
@@ -2654,14 +2704,27 @@ export class DemoBackend implements Backend {
     await new Promise((r) => setTimeout(r, 650 + Math.random() * 350));
     this.pluginDescriptors = DEMO_PLUGINS.map((d) => ({ ...d }));
     this.pluginScanned = true;
+    // Seed the demo catalog's scan cache too, so pluginCatalogGet/
+    // pluginScanStatus reflect a real scan having happened (no real
+    // filesystem here, so entries carry no meaningful path/mtime/size).
+    this.pluginCatalog.scan = {
+      scannedAt: Math.floor(Date.now() / 1000),
+      entries: this.pluginDescriptors.map((d) => ({ descriptor: { ...d }, path: d.path ?? "", mtime: 0, size: 0 })),
+    };
     return this.pluginDescriptors.map((d) => ({ ...d }));
   }
 
   async pluginList(): Promise<PluginListResult> {
+    const instances = [...this.pluginInstances.values()].map((i) => ({ ...i }));
+    const gui: Record<string, boolean> = {};
+    for (const inst of instances) {
+      gui[inst.id] = /zyn|glbars/i.test(inst.name) || /zyn|glbars/i.test(inst.uid);
+    }
     return {
       plugins: this.pluginDescriptors.map((d) => ({ ...d })),
-      instances: [...this.pluginInstances.values()].map((i) => ({ ...i })),
+      instances,
       scanned: this.pluginScanned,
+      gui,
     };
   }
 
@@ -2707,6 +2770,41 @@ export class DemoBackend implements Backend {
     return (this.pluginParams.get(instanceId) ?? []).map((p) => ({ ...p }));
   }
 
+  async pluginShowGui(instanceId: string): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+  }
+
+  async pluginSetGuiOnTop(_enabled: boolean): Promise<void> {}
+
+  async pluginPreviewNote(instanceId: string, key: number, velocity: number): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+    const bound = this.tracks.find(
+      (t) => t.kind === "midi" && t.instrumentId === `plugin:${instanceId}`,
+    );
+    if (!bound) {
+      throw new Error(`plugin instance ${instanceId} is not bound to a midi track`);
+    }
+    await this.samplerPreviewNote(`plugin:${instanceId}`, key, velocity);
+  }
+
+  async pluginPreviewNoteOn(instanceId: string, key: number, velocity: number): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+    const bound = this.tracks.find(
+      (t) => t.kind === "midi" && t.instrumentId === `plugin:${instanceId}`,
+    );
+    if (!bound) {
+      throw new Error(`plugin instance ${instanceId} is not bound to a midi track`);
+    }
+    await this.samplerPreviewNoteOn(`plugin:${instanceId}`, key, velocity);
+  }
+
+  async pluginPreviewNoteOff(): Promise<void> {
+    await this.samplerPreviewNoteOff(0);
+  }
+
   async pluginSetParam(
     instanceId: string,
     changes: PluginParamChange[],
@@ -2729,6 +2827,69 @@ export class DemoBackend implements Backend {
       }, 160);
     }
     return params.map((p) => ({ ...p }));
+  }
+
+  // ── plugin catalog (machine-global, persistent — mirrors plugins::catalog) ──
+
+  private static readonly RECENTS_CAP = 40;
+  private static readonly PINNED_PARAMS_CAP = 8;
+
+  async pluginCatalogGet(): Promise<PluginCatalog> {
+    return structuredClone(this.pluginCatalog);
+  }
+
+  async pluginCatalogUpdate(patch: PluginCatalogPatch): Promise<PluginCatalog> {
+    const cat = this.pluginCatalog;
+    if (patch.setFavorite) {
+      const { uid, on } = patch.setFavorite;
+      cat.favorites = on
+        ? [...new Set([...cat.favorites, uid])]
+        : cat.favorites.filter((u) => u !== uid);
+    }
+    if (patch.noteUsed) {
+      const uid = patch.noteUsed;
+      const rest = cat.recents.filter((r) => r.uid !== uid);
+      cat.recents = [{ uid, usedAt: Math.floor(Date.now() / 1000) }, ...rest].slice(
+        0,
+        DemoBackend.RECENTS_CAP,
+      );
+    }
+    if (patch.setTags) {
+      const { uid, tags } = patch.setTags;
+      if (tags.length === 0) {
+        delete cat.tags[uid];
+      } else {
+        cat.tags[uid] = [...tags];
+      }
+    }
+    if (patch.setPinnedParams) {
+      const { uid, paramIds } = patch.setPinnedParams;
+      const capped = [...new Set(paramIds)].slice(0, DemoBackend.PINNED_PARAMS_CAP);
+      if (capped.length === 0) {
+        delete cat.pinnedParams[uid];
+      } else {
+        cat.pinnedParams[uid] = capped;
+      }
+    }
+    if (patch.forgetRecent) {
+      const uid = patch.forgetRecent;
+      cat.recents = cat.recents.filter((r) => r.uid !== uid);
+    }
+    if (patch.clearRecents) {
+      cat.recents = [];
+    }
+    return structuredClone(this.pluginCatalog);
+  }
+
+  async pluginScanStatus(): Promise<PluginScanStatus> {
+    // No real bundles/filesystem in demo mode — "everything is cached,
+    // nothing is stale or missing" is the honest answer once a scan ran.
+    return {
+      scannedAt: this.pluginCatalog.scan.scannedAt,
+      cached: this.pluginCatalog.scan.entries.length,
+      stale: 0,
+      missing: 0,
+    };
   }
 
   // ── insert-FX slots (Plan G1) ──

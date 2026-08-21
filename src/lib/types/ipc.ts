@@ -1060,6 +1060,75 @@ export interface PluginListResult {
   plugins: PluginDescriptor[];
   instances: PluginInstanceInfo[];
   scanned: boolean;
+  /** Instance id → native floating GUI available (additive). */
+  gui?: Record<string, boolean>;
+}
+
+// ── plugin-catalog (machine-global, persistent — plugins::catalog) ─────────
+
+/** One cached scan result: a descriptor plus the bundle stat it was read
+ * from, so the backend can tell "unchanged" from "needs a re-read" without
+ * dlopening anything. LV2 entries (no single stat-able bundle file) carry
+ * `path: ""` and `mtime`/`size: 0`. Mirrors `plugins::catalog::CatalogEntry`. */
+export interface PluginCatalogEntry {
+  descriptor: PluginDescriptor;
+  path: string;
+  mtime: number;
+  size: number;
+}
+
+/** One recents entry — `usedAt` is unix seconds. Mirrors
+ * `plugins::catalog::PluginRecent`. */
+export interface PluginRecent {
+  uid: string;
+  usedAt: number;
+}
+
+/** The machine-global plugin catalog (`plugin_catalog_get`): persistent scan
+ * cache + user curation. NOT project state — this lives at
+ * `dirs::config_dir()/aura/plugin-catalog.json`, one file per machine.
+ * Mirrors `plugins::catalog::PluginCatalog`. */
+export interface PluginCatalog {
+  version: number;
+  scan: {
+    /** Unix seconds of the last successful scan; absent before AURA has
+     * ever scanned on this machine. */
+    scannedAt?: number;
+    entries: PluginCatalogEntry[];
+  };
+  /** Favorited plugin uids. */
+  favorites: string[];
+  /** Most-recently-used first, capped at 40, de-duped by uid. */
+  recents: PluginRecent[];
+  /** uid -> free-text tags. */
+  tags: Record<string, string[]>;
+  /** uid -> pinned param ids, capped at 8 per uid. */
+  pinnedParams: Record<string, number[]>;
+}
+
+/** `plugin_catalog_update`'s patch: all-optional so the surface stays at
+ * ONE additive command instead of growing one per field. Applying a patch
+ * returns the FULL merged catalog. Mirrors
+ * `plugins::catalog::PluginCatalogPatch`. */
+export interface PluginCatalogPatch {
+  setFavorite?: { uid: string; on: boolean };
+  noteUsed?: string;
+  setTags?: { uid: string; tags: string[] };
+  setPinnedParams?: { uid: string; paramIds: number[] };
+  forgetRecent?: string;
+  clearRecents?: boolean;
+}
+
+/** `plugin_scan_status`: "cache from N ago, M bundles changed" without
+ * actually rescanning. Mirrors `plugins::catalog::PluginScanStatus`. */
+export interface PluginScanStatus {
+  scannedAt?: number;
+  /** Descriptors the cache can still vouch for (bundle stat unchanged). */
+  cached: number;
+  /** Bundle paths that are new or changed since the cached scan. */
+  stale: number;
+  /** Cached entries whose bundle no longer exists on disk. */
+  missing: number;
 }
 
 /** One insert-FX slot on a track (Plan G1). Mirrors

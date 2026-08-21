@@ -82,7 +82,7 @@ midir = "0.11"
 # /usr/lib/clap/*.clap. Zone P1 builds the process/params host on this.
 clack-host = "0.1"
 clack-extensions = { version = "0.1", features = [
-    "clack-host", "params", "audio-ports", "note-ports", "state", "gui", "latency",
+    "clack-host", "params", "audio-ports", "note-ports", "state", "gui", "latency", "timer",
 ] }
 # LV2: livi wraps lilv (SYSTEM liblilv-dev REQUIRED — Ubuntu:
 # `apt install liblilv-dev`; livi::Features provides urid/options/bufsize +

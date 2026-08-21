@@ -59,6 +59,8 @@ export interface PrefValues {
   theme: string;
   /** Whether the right panel takes layout space or floats over the timeline. */
   dockSide: "overlay" | "docked";
+  /** Keep native plugin editor windows above the AURA window. */
+  pluginGuiOnTop: boolean;
 }
 
 /** Tolerance option ids, in order of strictness. */
@@ -314,6 +316,14 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     label: "Theme",
     blurb:
       "Colours and contrast for the whole interface. Custom themes are JSON files in the folder below; add or edit one and restart AURA to see it here.",
+  },
+  pluginGuiOnTop: {
+    kind: "boolean",
+    default: true,
+    category: "interface",
+    label: "Keep plugin GUI on top",
+    blurb:
+      "Native plugin editor windows stay above AURA so they don't vanish behind the DAW. Turn off if you want them to stack like ordinary windows. Applies immediately, including already-open editors.",
   },
 };
 

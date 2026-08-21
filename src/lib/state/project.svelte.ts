@@ -183,17 +183,21 @@ class ProjectStore {
   async toggleArm(trackId: string) {
     const t = this.trackById(trackId);
     if (!t) return;
-    this.patchTrack(trackId, { armed: !t.armed });
-    await backend.setTrackArm(trackId, !t.armed);
-    // Ruling 1's UX bridge: arming a MIDI track routes the keyboard to it;
-    // disarming clears the route. `armed` stays the document flag, the
-    // routing target is a separate app-config selection (no op).
-    // Disarming only clears the route when THIS track holds it: with two
-    // MIDI tracks armed the route belongs to the last one armed, and
-    // disarming the other used to take the keyboard away from it silently
-    // (whole-track review).
+    await this.setArmed(trackId, !t.armed);
+  }
+  /** Set arm to an absolute value; no-op (no invoke) when already there —
+   * same convention as `setMute`/`setSolo`. Carries `toggleArm`'s MIDI-
+   * routing glue (Ruling 1): arming a MIDI track routes the keyboard to it,
+   * disarming clears the route, and disarming only clears it when THIS
+   * track holds it (two armed MIDI tracks: the route is the last one
+   * armed's, and disarming the other must not steal it away). */
+  async setArmed(trackId: string, armed: boolean) {
+    const t = this.trackById(trackId);
+    if (!t || t.armed === armed) return;
+    this.patchTrack(trackId, { armed });
+    await backend.setTrackArm(trackId, armed);
     if (t.kind === "midi") {
-      if (!t.armed) {
+      if (armed) {
         await midiIo.setInputTrack(trackId);
       } else if (midiIo.targetTrackId === trackId) {
         await midiIo.setInputTrack(null);
@@ -295,6 +299,43 @@ class ProjectStore {
   async endGesture(id?: string): Promise<void> {
     if (id == null) return;
     await backend.gestureEnd?.(id);
+  }
+
+  /**
+   * Set mute/solo/arm to ONE value across many tracks at once (4.5's bulk
+   * M/S/A) — the whole batch as one gesture, so twelve lanes cost one undo
+   * step instead of twelve. `value` is an absolute target, not a toggle:
+   * the caller (`nextBulkValue` in lane-bulk.ts) has already decided what
+   * "press M on a mixed selection" should mean, so this never has to guess
+   * per-track and risk flipping half of them the wrong way.
+   *
+   * Mirrors the fader gesture pattern in TrackHeader.svelte: open the
+   * gesture, await every write, THEN close it — closing first would let the
+   * backend see the boundary end before the last `setMute`/`setSolo`/
+   * `setArmed` invoke has landed.
+   */
+  async setTracksState(
+    trackIds: string[],
+    field: "muted" | "soloed" | "armed",
+    value: boolean,
+  ): Promise<void> {
+    if (trackIds.length === 0) return;
+    const setter =
+      field === "muted" ? this.setMute.bind(this)
+      : field === "soloed" ? this.setSolo.bind(this)
+      : this.setArmed.bind(this);
+    const VERB: Record<typeof field, [on: string, off: string]> = {
+      muted: ["mute", "unmute"],
+      soloed: ["solo", "unsolo"],
+      armed: ["arm", "disarm"],
+    };
+    const label = `${VERB[field][value ? 0 : 1]} ${trackIds.length} lanes`;
+    const gid = await this.beginGesture(label);
+    try {
+      await Promise.all(trackIds.map((id) => setter(id, value)));
+    } finally {
+      await this.endGesture(gid);
+    }
   }
 
   // ── clips ──
