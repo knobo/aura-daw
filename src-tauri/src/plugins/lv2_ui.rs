@@ -143,6 +143,14 @@ impl Drop for DlLib {
 pub struct OpenLv2Gui {
     _lib: DlLib,
     descriptor: *const Lv2uiDescriptor,
+    /// Resolved ONCE at open, not per idle tick. `extension_data` is a
+    /// pure function of the descriptor — the LV2 spec has it return a
+    /// static pointer for a given URI — so re-querying it 66 times a
+    /// second bought nothing and cost a readable log: Carla prints a line
+    /// per call, and a ~40 minute session with one editor open produced
+    /// 155k of them, burying every other message in the dev log.
+    show_iface: Option<Lv2uiShowInterface>,
+    idle_iface: Option<Lv2uiIdleInterface>,
     handle: *mut c_void,
     /// Kept alive so `ui_write` can read the instance id.
     #[allow(dead_code)]
@@ -182,8 +190,7 @@ impl OpenLv2Gui {
                 }
             }
         }
-        let idle = unsafe { show_idle_ifaces(self.descriptor) }.1;
-        let Some(idle) = idle else {
+        let Some(idle) = self.idle_iface else {
             return self.visible || self.ext_child.is_some();
         };
         let rc = unsafe { idle.idle.map(|f| f(self.handle)).unwrap_or(0) };
@@ -200,8 +207,7 @@ impl OpenLv2Gui {
     }
 
     pub fn show(&mut self) -> Result<(), String> {
-        let (show, _) = unsafe { show_idle_ifaces(self.descriptor) };
-        let Some(show) = show else {
+        let Some(show) = self.show_iface else {
             return Err("ui has no ui:showInterface".into());
         };
         let status = unsafe { show.show.map(|f| f(self.handle)).unwrap_or(-1) };
@@ -213,8 +219,7 @@ impl OpenLv2Gui {
     }
 
     fn hide(&mut self) {
-        let (show, _) = unsafe { show_idle_ifaces(self.descriptor) };
-        if let Some(show) = show {
+        if let Some(show) = self.show_iface {
             unsafe { show.hide.map(|f| f(self.handle)) };
         }
         self.kill_ext();
@@ -416,8 +421,8 @@ fn try_open_ui(
     if descriptor.is_null() {
         return Err(format!("lv2ui_descriptor did not list {}", want.unwrap_or(path)));
     }
-    let (show, _idle) = unsafe { show_idle_ifaces(descriptor) };
-    if show.is_none() {
+    let (show_iface, idle_iface) = unsafe { show_idle_ifaces(descriptor) };
+    if show_iface.is_none() {
         return Err("ui exports no ui:showInterface".into());
     }
 
@@ -491,6 +496,8 @@ fn try_open_ui(
     let mut gui = OpenLv2Gui {
         _lib: lib,
         descriptor,
+        show_iface,
+        idle_iface,
         handle,
         controller,
         _urid_inner: urid_inner,

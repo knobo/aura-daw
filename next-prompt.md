@@ -91,6 +91,12 @@ unless asked.
 - **Parallel `cargo test` intermittently SIGSEGVs** (Cardinal CLAP
   teardown). Use `-- --test-threads=1`. Never `cargo test` and `tauri
   dev` on the same `src-tauri/target/`.
+- **If the dev log is 99% `[carla] lv2ui_extension_data(...)`, it is not
+  this branch's fault and it is fixed** — `OpenLv2Gui` re-queried the LV2
+  UI's show/idle interfaces on every 30 ms tick, ~66 Carla log lines a
+  second per open editor. Now resolved once at open. If the pattern comes
+  back, look for a new per-tick `extension_data` caller before assuming
+  Carla is just noisy.
 - **Before any new `*.dom.test.ts`**, read
   [`2026-08-18-dom-test-environment.md`](docs/superpowers/plans/2026-08-18-dom-test-environment.md).
   jsdom has no Pointer Capture, `getBoundingClientRect()` is zeros,
