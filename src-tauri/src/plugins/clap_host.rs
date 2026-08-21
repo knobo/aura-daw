@@ -925,9 +925,10 @@ fn open_floating_gui(hosted: &mut Hosted) -> Result<(), String> {
     }
     let title = CString::new(format!("AURA — {}", hosted.name)).unwrap_or_else(|_| CString::new("AURA").unwrap());
     gui.suggest_title(&mut handle, &title);
+    // Mark created before show: a failed show must retry show, not create.
+    hosted.gui_created = true;
     gui.show(&mut handle)
         .map_err(|e| format!("clap: gui.show failed for {}: {e}", hosted.name))?;
-    hosted.gui_created = true;
     hosted.gui_visible = true;
     set_gui_transient(hosted);
     super::wm_stack::apply_to_open_plugin_windows(super::wm_stack::on_top());

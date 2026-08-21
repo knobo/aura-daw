@@ -16,8 +16,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static ON_TOP: AtomicBool = AtomicBool::new(true);
 
-pub fn set_on_top(on: bool) {
+pub fn set_flag(on: bool) {
     ON_TOP.store(on, Ordering::Relaxed);
+}
+
+pub fn set_on_top(on: bool) {
+    set_flag(on);
     apply_to_open_plugin_windows(on);
 }
 

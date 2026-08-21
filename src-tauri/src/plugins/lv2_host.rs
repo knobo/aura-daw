@@ -45,6 +45,7 @@
 //! (registry: instance removed; engine: PolySynth) and AURA never crashes.
 
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
 use std::os::raw::c_void;
 use std::sync::{Arc, OnceLock};
 
@@ -567,6 +568,13 @@ fn make_node(
     inst.live_handle = Some(instance.raw().instance().handle());
     let plugin = inst.plugin.clone();
     inst.osc_port = capture_osc_port(&mut instance, features, &plugin);
+    if let Some(gui) = inst.gui.as_mut() {
+        if inst.osc_port > 0 {
+            if let Err(e) = gui.attach_osc_gui(inst.osc_port) {
+                log::warn!("lv2 ui: reattach osc after node rebuild failed ({e})");
+            }
+        }
+    }
     let latency_port = inst.latency_port;
     let node = Lv2Node::new(instance, features, param_rx, latency_port, instance_id);
     log::info!(
@@ -732,7 +740,7 @@ const ALL_NOTES_OFF: [u8; 3] = [0xB0, 123, 0];
 /// preallocated on the plugin main thread; `process`/`queue_event`/
 /// `all_notes_off` run on the RT thread under the §2.1 contract.
 pub struct Lv2Node {
-    instance: livi::Instance,
+    instance: ManuallyDrop<livi::Instance>,
     midi_urid: Urid,
     /// Atom-sequence inputs; `[0]` carries this block's MIDI, the rest stay
     /// empty (cleared once at build).
@@ -785,7 +793,7 @@ impl Lv2Node {
             param_rx,
             dropped_events: 0,
             run_errors: 0,
-            instance,
+            instance: ManuallyDrop::new(instance),
             io_mode: IoMode::Add,
             latency_port,
             instance_id: instance_id.to_string(),
@@ -971,12 +979,21 @@ impl LiveInstrument for Lv2Node {
 impl Drop for Lv2Node {
     fn drop(&mut self) {
         let id = std::mem::take(&mut self.instance_id);
+        // Move the DSP onto plugin-main so instance-access / idle cannot
+        // run against a freed handle. post (not run): graph swaps on the
+        // engine control thread must not block.
+        // SAFETY: Drop is the only destructor; we never read `instance`
+        // after taking it.
+        let instance = unsafe { ManuallyDrop::take(&mut self.instance) };
         plugin_main().post(move |ctx| {
             if let Some(inner) = ctx.slot_mut::<Lv2World>(SLOT).inner.as_mut() {
                 if let Some(inst) = inner.instances.get_mut(&id) {
                     inst.live_handle = None;
+                    inst.osc_port = 0;
+                    inst.gui = None;
                 }
             }
+            drop(instance);
         });
     }
 }

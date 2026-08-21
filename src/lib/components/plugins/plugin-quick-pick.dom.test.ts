@@ -113,6 +113,17 @@ describe("PluginQuickPick", () => {
     expect(insertEffect).toHaveBeenCalledWith("t1", "u-vital");
   });
 
+  it("clicking an effect adds it as an insert", async () => {
+    render(PluginQuickPick);
+    const reverb = screen.getAllByRole("option").find((el) =>
+      (el.textContent ?? "").includes("Calf Reverb"),
+    );
+    expect(reverb).toBeTruthy();
+    await fireEvent.click(reverb!);
+    expect(insertEffect).toHaveBeenCalledWith("t1", "u-verb");
+    expect(instantiate).not.toHaveBeenCalled();
+  });
+
   it("Escape closes the picker", async () => {
     render(PluginQuickPick);
     await fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });

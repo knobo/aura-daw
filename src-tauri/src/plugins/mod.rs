@@ -377,11 +377,14 @@ pub fn plugin_list(
     state: State<'_, PluginState>,
     control: State<'_, Arc<crate::control::ControlPlane>>,
 ) -> Result<PluginListResult, String> {
-    let reg = state.registry.lock();
+    let (plugins, scanned) = {
+        let reg = state.registry.lock();
+        (reg.scanned.clone().unwrap_or_default(), reg.scanned.is_some())
+    };
     Ok(PluginListResult {
-        plugins: reg.scanned.clone().unwrap_or_default(),
+        plugins,
         instances: control.plugin_rows(),
-        scanned: reg.scanned.is_some(),
+        scanned,
         gui: gui_flags(),
     })
 }
@@ -709,12 +712,13 @@ pub fn plugin_show_gui(instance_id: String, control: State<'_, Arc<crate::contro
 /// Additive: INTERFACE pref `pluginGuiOnTop`. Live — already-open editors follow.
 #[tauri::command]
 pub fn plugin_set_gui_on_top(enabled: bool) {
-    wm_stack::set_on_top(enabled);
-    // CLAP `set_transient` only runs on the plugin-main thread. When the
-    // pref turns on, re-apply it to already-created floating editors.
+    wm_stack::set_flag(enabled);
+    // CLAP set_transient first so untitled editors become findable
+    // (WM_TRANSIENT_FOR) before we pin via EWMH.
     if enabled {
         let _ = clap_host::reapply_gui_transient();
     }
+    wm_stack::apply_to_open_plugin_windows(enabled);
 }
 
 /// Plan G1: add an effect as an insert slot on a track. Prepare-outside

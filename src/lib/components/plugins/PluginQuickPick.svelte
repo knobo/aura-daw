@@ -94,7 +94,8 @@
         break;
       case "Enter":
         e.preventDefault();
-        void commit(e.shiftKey);
+        if (!active) break;
+        void commit(e.shiftKey || !active.isInstrument);
         break;
     }
   }
@@ -147,7 +148,7 @@
           class:on={i === cursor}
           role="option"
           aria-selected={i === cursor}
-          onclick={() => pick(d, false)}
+          onclick={() => pick(d, !d.isInstrument)}
         >
           <span class="badge mono {d.format}">{d.format}</span>
           <span class="name">{d.name}</span>
