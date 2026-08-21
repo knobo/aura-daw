@@ -5,30 +5,26 @@ Branch: `feat/plugin-manager` · Worktree: `.worktrees/plugin-manager`
 
 ## Status
 
+Squash-merged to `main` as PR #93 (`e1ec61f`, 2026-08-21). Branch from
+`origin/main`. Do not reopen `feat/plugin-manager`.
+
 | PR | Scope | State |
 |---|---|---|
-| 1 | Playhead follow on seek (`view.revealSamples`) | **done** — `6b259b4` |
-| 2 | Lane multi-select + group/global M/S/A | in flight |
-| 3 | Backend catalog, persistent + incremental scan cache | in flight |
-| 4 | `browser/` primitives + migrate five browsers | in flight |
-| 5 | Plugin Manager: browse/rack modes + quick picker | **in flight** — groundwork `3469ce3` |
-| 6 | Automation matrix, pinned params, lane-info indicator | blocked on 4, 5 |
+| 1 | Playhead follow on seek (`view.revealSamples`) | **done** — in #93 |
+| 2 | Lane multi-select + group/global M/S/A | **done** — in #93 |
+| 3 | Backend catalog, persistent + incremental scan cache | **done** — in #93 |
+| 4 | `browser/` primitives + migrate instruments/samples/presets | **done** — in #93 |
+| 5 | Plugin Manager: browse/split/rack + Ctrl+P frecency + native GUI | **done** — PR #93 |
+| 6 | Automation matrix, pinned params, lane-info strip (winner §3.4) | **next** |
+| 7 | Unified audition (`browserAudition` pref, default off) | blocked on 6 |
 
-### PR 5 progress
+### PR 5 as shipped
 
-Landed in `3469ce3`, all pure and tested, no component yet renders it:
-
-- `src/lib/utils/plugin-rack.ts` — §5.1's projection plus `rackCounts` and
-  `rackByTrack` (18 tests).
-- `src/lib/utils/plugin-browse.ts` — §5.2's section tree and §5.3's
-  `rankQuickPick` (22 tests).
-- `src/lib/components/browser/browser-folds.ts` — the two-layer `FoldState`
-  for design §8.1 (20 tests), and `BrowserShell`'s fold-all button
-  (15 shell DOM tests; the two that could have passed vacuously were
-  sabotage-verified).
-
-Still to build: `PluginManager.svelte`, `PluginQuickPick.svelte` + its
-`Ctrl+P` wiring, `plugin-manager.dom.test.ts`, and the §9 asks below.
+`PluginManager.svelte` (browse / split / rack), `PluginQuickPick.svelte` +
+`Ctrl+P`, facets (ALL/INST/FX, format + category chips, ★/⏱), frecency,
+native floating editors (`plugin_show_gui`), live on-top pref
+(`plugin_set_gui_on_top`). Review follow-up for LV2 GUI lifetime and
+QuickPick click-to-insert is in the same squash.
 
 **Scope call made:** browse mode gets **no Zyn patches section**, though
 §5.2 lists one. `next-prompt.md`'s "Do not" forbids putting that
