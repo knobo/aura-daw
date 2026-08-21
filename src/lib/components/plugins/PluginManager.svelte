@@ -23,7 +23,6 @@
   import ParamChip from "../browser/ParamChip.svelte";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
   import AutomationMatrix from "./AutomationMatrix.svelte";
-  import { buildMatrix } from "../../utils/automation-matrix";
   import {
     buildBrowseSections,
     filterByFacets,
@@ -196,20 +195,12 @@
         : rackFolds.anyCollapsed(rackKeys) || browseFolds.anyCollapsed(browseKeys),
   );
 
-  // Recomputed independently of `AutomationMatrix`'s own internal build —
-  // the footer needs the count and the matrix owns its own render state;
-  // both are cheap pure projections over the same inputs.
-  const matrixCount = $derived(
-    mode === "matrix"
-      ? buildMatrix({
-          bindings: modulation.bindings,
-          instances: plugins.instances,
-          tracks: project.tracks,
-          visible: modulation.visible,
-          paramInfo: (instanceId, paramId) => plugins.paramInfo(instanceId, paramId),
-        }).length
-      : 0,
-  );
+  // `AutomationMatrix` reports its own row count out via `onCount` — the
+  // footer needs the number but must not recompute `buildMatrix` a second
+  // time (unlike `rack`, computed once below and shared by `rackGroups`
+  // and `rackCounts(rack)`, a second independent build here could drift
+  // from the matrix's own if the projection rules ever change).
+  let matrixCount = $state(0);
 
   const status = $derived.by(() => {
     if (mode === "matrix") {
@@ -399,7 +390,7 @@
     <!-- The search box and facet chips are catalog filters; the matrix
          isn't the catalog, so they'd be dead controls here. -->
     <div class="panes">
-      <AutomationMatrix />
+      <AutomationMatrix onCount={(n) => (matrixCount = n)} />
     </div>
     <div class="status silk">{status}</div>
   {:else if !plugins.scanned && !plugins.scanning && plugins.descriptors.length === 0}

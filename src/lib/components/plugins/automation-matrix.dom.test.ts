@@ -10,6 +10,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { Binding, PluginInstanceInfo, PluginParamInfo, TrackState } from "../../types/ipc";
 
 vi.stubGlobal("localStorage", {
@@ -146,5 +147,48 @@ describe("AutomationMatrix", () => {
     await fireEvent.click(screen.getByText("Bass"));
 
     expect(modulation.isBindingVisible("t1", "b1")).toBe(true);
+  });
+
+  it("re-requests ensureParams only when the automated instance SET changes — not on a row click or a paramCache write", async () => {
+    plugins.instances = [inst("i-alpha", "u-a", "Alpha")];
+    project.tracks = [track("t1", "Bass", { instrumentId: "plugin:i-alpha" })];
+    modulation.bindings = [pluginBinding("b1", "i-alpha", 12)];
+
+    const ensureParamsSpy = vi.spyOn(plugins, "ensureParams");
+    try {
+      render(AutomationMatrix);
+      await waitFor(() => expect(ensureParamsSpy).toHaveBeenCalledTimes(1));
+      expect(ensureParamsSpy).toHaveBeenCalledWith("i-alpha");
+
+      // A row click flips `modulation.visible` (via `revealParamLane` →
+      // `modulation.show`), which changes `rows` (laneVisible) but not
+      // the SET of automated instance ids — must not re-run ensureParams.
+      await fireEvent.click(screen.getByText("Bass"));
+      await tick();
+      expect(ensureParamsSpy).toHaveBeenCalledTimes(1);
+
+      // A paramCache write (what a knob drag on an open param panel does)
+      // changes `rows` (valueText) but not instance-id membership either.
+      plugins.paramCache = {
+        ...plugins.paramCache,
+        "i-alpha": [
+          { id: 12, name: "Filter / Cutoff", min: 20, max: 20000, default: 1000, value: 999, steps: 0 },
+        ],
+      };
+      await tick();
+      expect(ensureParamsSpy).toHaveBeenCalledTimes(1);
+
+      // Adding a new automated instance DOES change membership — this
+      // must re-run ensureParams (for both ids — the effect loop always
+      // iterates the current set, not just what's new).
+      plugins.instances = [...plugins.instances, inst("i-zeta", "u-z", "Zeta")];
+      project.tracks = [...project.tracks, track("t2", "Lead", { instrumentId: "plugin:i-zeta" })];
+      modulation.bindings = [...modulation.bindings, pluginBinding("b2", "i-zeta", 12)];
+
+      await waitFor(() => expect(ensureParamsSpy).toHaveBeenCalledWith("i-zeta"));
+      expect(ensureParamsSpy.mock.calls.length).toBeGreaterThan(1);
+    } finally {
+      ensureParamsSpy.mockRestore();
+    }
   });
 });

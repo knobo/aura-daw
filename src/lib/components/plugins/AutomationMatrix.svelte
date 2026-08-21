@@ -6,6 +6,7 @@
    * moves in this project, in one list. Clicking a row reveals that
    * parameter's lane.
    */
+  import { untrack } from "svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { modulation } from "../../state/modulation.svelte";
@@ -17,6 +18,14 @@
   import BrowserRow from "../browser/BrowserRow.svelte";
   import EmptyState from "../browser/EmptyState.svelte";
   import ParamChip from "../browser/ParamChip.svelte";
+
+  /** `onCount` reports the row total out (the footer's "N params move" —
+   * `PluginManager.svelte` needs the number but must not recompute
+   * `buildMatrix` a second time just to get it). */
+  let { onCount }: { onCount?: (n: number) => void } = $props();
+
+  /** Inert stand-in for `MatrixInput.visible` — see `instanceIds` below. */
+  const EMPTY_VISIBLE: ReadonlyMap<string, ReadonlySet<string>> = new Map();
 
   const rows = $derived(
     buildMatrix({
@@ -32,13 +41,51 @@
   const folds = new FoldController("plugins-matrix");
   const collapsed = $derived(folds.collapsed);
 
-  // Fill in names/values for whatever isn't cached yet. `ensureParams`
-  // dedups in-flight requests itself, so calling it for the same instance
-  // id every time `rows` recomputes is cheap — it only round-trips once.
+  // Which instance ids need `ensureParams`, computed SEPARATELY from
+  // `rows`. `rows` also depends on `plugins.paramCache` (via `paramInfo`)
+  // and `modulation.visible` — both change on nearly every row click
+  // (`revealParamLane` → `modulation.show`) and on every knob-drag input
+  // event while some param panel is open elsewhere. `buildMatrix` always
+  // returns a fresh array, and Svelte 5 `$derived` invalidates whatever
+  // reads it on ANY dependency touch, not on array-content equality — so
+  // an effect that reads `rows` would re-run on those unrelated changes
+  // too. Row MEMBERSHIP (which bindings survive, and their instanceId)
+  // never depends on paramInfo/visible, only on bindings/instances/tracks,
+  // so build with inert stand-ins for the two value-carrying inputs.
+  const instanceIds = $derived(
+    new Set(
+      buildMatrix({
+        bindings: modulation.bindings,
+        instances: plugins.instances,
+        tracks: project.tracks,
+        visible: EMPTY_VISIBLE,
+        paramInfo: () => undefined,
+      })
+        .map((r) => r.instanceId)
+        .filter((id): id is string => id !== null),
+    ),
+  );
+
+  // The membership split above is necessary but not sufficient:
+  // `plugins.ensureParams`'s own dedup guard (`if (this.paramCache[id])
+  // return;`) reads `paramCache` SYNCHRONOUSLY, and a reactive read that
+  // happens inside an `$effect` body — even buried inside a function the
+  // effect merely calls — makes that effect depend on it too. Calling
+  // `ensureParams` un-`untrack`ed here would silently resubscribe this
+  // effect to `paramCache` and reintroduce the exact bug the `instanceIds`
+  // split above exists to avoid (verified by hand: removing the `untrack`
+  // makes the DOM test "re-requests ensureParams only when..." fail with
+  // an extra call after the very first `ensureParams` resolution, since
+  // its resolve is what writes `paramCache`).
   $effect(() => {
-    for (const instanceId of new Set(rows.map((r) => r.instanceId))) {
-      if (instanceId) void plugins.ensureParams(instanceId);
-    }
+    const ids = instanceIds;
+    untrack(() => {
+      for (const instanceId of ids) void plugins.ensureParams(instanceId);
+    });
+  });
+
+  $effect(() => {
+    onCount?.(rows.length);
   });
 
   function onRowClick(row: MatrixRow) {
