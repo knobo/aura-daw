@@ -8,7 +8,14 @@ Branch: `feat/plugin-manager` · Worktree: `.worktrees/plugin-manager`
 Squash-merged to `main` as PR #93 (`e1ec61f`, 2026-08-21). Branch from
 `origin/main`. Do not reopen `feat/plugin-manager`.
 
-| PR | Scope | State |
+**Two numbering schemes, and they are unrelated.** "Step N" below is a
+slice of THIS plan. `#NN` is a GitHub pull request, numbered repo-wide
+across every track. They do not line up and never will: Steps 1–5 all
+shipped inside the single squash `#93`. Say "Step 6" for the work and
+"#93" for the pull request — never "PR 6", which reads as a GitHub number
+that does not exist.
+
+| Step | Scope | State |
 |---|---|---|
 | 1 | Playhead follow on seek (`view.revealSamples`) | **done** — in #93 |
 | 2 | Lane multi-select + group/global M/S/A | **done** — in #93 |
@@ -18,7 +25,7 @@ Squash-merged to `main` as PR #93 (`e1ec61f`, 2026-08-21). Branch from
 | 6 | Automation matrix, pinned params, lane-info strip (winner §3.4) | **next** |
 | 7 | Unified audition (`browserAudition` pref, default off) | blocked on 6 |
 
-### PR 5 as shipped
+### Step 5 as shipped
 
 `PluginManager.svelte` (browse / split / rack), `PluginQuickPick.svelte` +
 `Ctrl+P`, facets (ALL/INST/FX, format + category chips, ★/⏱), frecency,
@@ -31,7 +38,7 @@ QuickPick click-to-insert is in the same squash.
 virtualised ~1318-row list onto `BrowserRow`/`BrowserSection`, and a
 section here would be exactly that migration.
 
-## PR 5 — the Plugin Manager
+## Step 5 — the Plugin Manager
 
 ### 5.1 The rack projection — `src/lib/utils/plugin-rack.ts`
 
@@ -108,12 +115,12 @@ so an emptied section disappears on its own.
 **§9.3 Search what the user actually typed.** `name`, `vendor` and
 `categories[]` already rank — `categories[]` IS "type", so that ask is
 half-answered. Add the catalog's user `tags[]` to the rank keys (two lines
-in `plugin-browse.ts`'s `RANK_KEYS`, plus tests), and, if PR 5 has room, a
+in `plugin-browse.ts`'s `RANK_KEYS`, plus tests), and, if Step 5 has room, a
 single `format:` prefix parsed in `browser-model.ts`. Nothing more
 elaborate: a query DSL is a worse answer than a chip. Do NOT build an
 I/O-count filter.
 
-## PR 6 — automation as an inventory
+## Step 6 — automation as an inventory
 
 ### 6.1 The matrix — `AutomationMatrix.svelte`
 

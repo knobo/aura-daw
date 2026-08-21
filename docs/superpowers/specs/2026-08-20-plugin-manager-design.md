@@ -193,7 +193,7 @@ bar (project-wide, with a distinct "some lanes are muted" tri-state).
 
 ## 6. Delivery
 
-| PR | Scope | Depends on |
+| Step | Scope | Depends on |
 |---|---|---|
 | 1 | Playhead follow on seek | — |
 | 2 | Lane multi-select + group/global M/S/A | — |
@@ -212,7 +212,7 @@ plugin-format support beyond CLAP/LV2, and a stock FX suite.
 
 ## 8. Round-two asks (owner, 2026-08-20, after the first ear-check)
 
-The owner reviewed PRs 1–4 in the app and approved the direction, with an
+The owner reviewed Steps 1–4 in the app and approved the direction, with an
 explicit steer: **do not let the existing UI set the ceiling.** If AURA is
 going to win on interface, the answer has to be better than what the other
 DAWs do, not consistent with what AURA already does. Where this design and
@@ -264,8 +264,8 @@ every few minutes.
 
 ### 8.3 Delivery
 
-Fold 8.1 into PR 5 (it is shell work and the manager is the surface that
-needs it most). 8.2 becomes its own PR 7, after 5 and 6 — it touches
+Fold 8.1 into Step 5 (it is shell work and the manager is the surface that
+needs it most). 8.2 becomes its own Step 7, after 5 and 6 — it touches
 every browser and the sampler/plugin hosts, and it should not be what
 delays the manager.
 
@@ -368,7 +368,7 @@ is almost never the question you actually have.
 
 ### 9.4 Delivery
 
-9.1 and 9.2 fold into **PR 5** — both are shell and manager work, and 9.1
+9.1 and 9.2 fold into **Step 5** — both are shell and manager work, and 9.1
 is the whole point of the panel. 9.3's tag ranking joins them (it is two
 lines in the rank keys); the `format:` prefix is small enough to ride
-along but is the first thing to cut if PR 5 grows.
+along but is the first thing to cut if Step 5 grows.
