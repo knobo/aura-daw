@@ -1,17 +1,16 @@
-# Next: plugin management (PR 5–7) on `feat/plugin-manager`
+# Next: plugin manager PR 6 (automation inventory) from `origin/main`
 
 Reply to the user in Norwegian — they write Norwegian; the repo
 documentation is English.
 
-**You are mid-track, not starting one.** The branch `feat/plugin-manager`
-(worktree `.worktrees/plugin-manager`, branched from `origin/main` at
-`3178073`) has four commits landed locally and NOT yet pushed or opened as
-PRs. Read these two before touching anything:
+`origin/main` is the baseline (`e1ec61f`, PR #93 squash). Branch from
+there. Do **not** reopen `feat/plugin-manager` — it was squash-merged.
 
-- Design: [`docs/superpowers/specs/2026-08-20-plugin-manager-design.md`](docs/superpowers/specs/2026-08-20-plugin-manager-design.md)
-  — §3.1 defines the signature element, §8 carries the owner's round-two asks.
-- Plan: [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
-  — PR 5 and PR 6 are specified there in implementable detail.
+Read these before touching plugin UI:
+
+- Winner spec (layout that shipped): [`docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md)
+- Original design (catalog, rack, chips, frozen IPC): [`docs/superpowers/specs/2026-08-20-plugin-manager-design.md`](docs/superpowers/specs/2026-08-20-plugin-manager-design.md)
+- Plan (PR 6 is specified in implementable detail): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
 
 ## The owner's standing steer (2026-08-20)
 
@@ -19,120 +18,91 @@ PRs. Read these two before touching anything:
 > fra før. Hvis vi skal vinne må vi lage en løsning som er bedre enn hva
 > andre har."
 
-**Do not let the existing UI set the ceiling.** The bet is that AURA wins
-on interface. Where this design and the current app disagree, the design
-wins; where the current app is merely adequate, that is not a reason to
-keep it. This overrides the usual "follow existing patterns" instinct for
-UI work on this track — it does NOT override the frozen IPC surface, the
-theme-token rule, or the test gates.
+**Do not let the existing UI set the ceiling.** This overrides the usual
+"follow existing patterns" instinct for UI work on this track — it does
+NOT override the frozen IPC surface, the theme-token rule, or the test
+gates.
 
-## Done on this branch (do not redo)
+## Landed — PR #93 (do not redo)
 
-| Commit | What |
+Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
+`:41717`, catalog seeded, persisted instances restored.
+
+| What | Where |
 |---|---|
-| `6b259b4` | **Follow the playhead on seek.** Both follow paths share `view.revealSamples`: reveal if off screen, do nothing if already visible. The stopped path is a `$effect` on `transport.snap.positionSamples` with the reveal **untracked** — `revealSamples` reads and writes `view.viewStart`, so a tracked call would yank the view back on every user scroll. |
-| `b9d529c` | **Shared browser layer** `src/lib/components/browser/`: `browser-model.ts` (ranking / grouping / row flattening / keyboard index), `BrowserShell`, `BrowserSection`, `BrowserRow`, `ParamChip`, `EmptyState`, `FavoriteToggle`, `browser-folds.ts`. Migrated `InstrumentBrowser`, `SamplesRoot`, `PresetsRoot`; `LibraryPanel` is a pure delegator. |
-| `f8755a9` | **Lane multi-select + bulk M/S/A** from three entry points. Value rule in `lane-bulk.ts`; whole batch in one gesture. The rail is an ARIA layout grid with roving tabindex. |
-| `3469ce3` | **PR 5 groundwork — the rack projection and a shell that folds as one.** `utils/plugin-rack.ts` (§5.1 projection + `rackCounts` + `rackByTrack`, 18 tests), `utils/plugin-browse.ts` (§5.2 section tree + §5.3 `rankQuickPick`, 22 tests), the two-layer `FoldState` in `browser/browser-folds.ts` (§8.1, 20 tests) and `BrowserShell`'s single fold-all button (15 shell DOM tests). All pure and tested — **no component renders any of it yet**. |
-| `7e6bc0b` | **Plugin catalog** at `dirs::config_dir()/aura/plugin-catalog.json`: persistent scan cache seeded in `plugins::init()`, incremental `plugin_scan` (path+mtime+size), favourites / recents / tags / pinnedParams. Three additive commands: `plugin_catalog_get`, `plugin_catalog_update`, `plugin_scan_status`. |
+| Timeline follow-on-seek | `view.revealSamples` |
+| Shared `browser/` layer | instruments / samples / presets migrated |
+| Lane multi-select + bulk M/S/A | `lane-bulk.ts`, ARIA grid |
+| Plugin catalog | `plugin-catalog.json`, incremental scan, `plugin_catalog_*` |
+| Plugin Manager | browse / **split** / rack. Split is default when the project has instances. Facets: ALL/INST/FX, format + category chips, ★/⏱. Dock widens to 480 on the plugins tab. |
+| Ctrl+P quick-pick | frecency (`aura.plugin.frecency`). Click/Enter follow the descriptor (effects insert; Shift+Enter forces insert). |
+| Native floating GUI | CLAP `clap.gui`, LV2 `ui:showInterface`, Zyn via `zynaddsubfx-ext-gui` (no `--embed`). Additive IPC: `plugin_show_gui`. GUI button next to PARAMS, hidden if no editor. |
+| On-top pref | INTERFACE `pluginGuiOnTop` (default on). Live toggle: EWMH ClientMessage + `WM_TRANSIENT_FOR`. Additive IPC: `plugin_set_gui_on_top`. |
+| Review follow-up in the squash | LV2 Drop moves DSP onto plugin-main and closes the editor before free; `make_node` re-attaches ext-gui; CLAP `gui_created` after `create`; `plugin_list` drops the registry lock before `gui_flags`. |
 
-Verified at that point: `cargo test -- --test-threads=1` 1319 + integration
-0 failed; `vitest` 941 across 87 files; `svelte-check` 0 errors 0 warnings;
-`npm run build` green.
-
-## The owner's round-three asks (2026-08-20, second ear-check)
-
-The owner saw PRs 1–4 in the app, said it looks good, and asked for three
-more things. All three are written up as **design §9** and folded into
-**PR 5** as plan §5.4 — read those, not this summary:
-
-1. **Active plugins must not live at the bottom of a scroll.** "Nå må man
-   scrolle ned til bunnen for å få tak i aktive. Jeg tenker de kanskje
-   skulle vært i eget panel." Design §9.1 lays out three options and
-   recommends (a): one panel, `RACK` is the DEFAULT mode whenever the
-   project has instances. **Whether it deserves its own dock panel instead
-   is the owner's call — ask before building (b) or (c).**
-2. **"Bare effekter", like "bare instrumenter".** The `instrumentsOnly`
-   checkbox is a two-state control over a three-state question. Design
-   §9.2: an `ALL` / `INST` / `FX` chip row plus `★` / `⏱` toggles.
-3. **More to search on — e.g. "type".** Design §9.3: `categories[]` IS
-   "type" and already ranks, so add the catalog's user `tags[]` to the
-   rank keys, and at most a single `format:` prefix. No query DSL, and
-   explicitly no I/O-count filter.
+**Scope calls already made:** no Zyn patches section in browse (virtualised
+~1318-row list stays on `ZynPatchBrowser`); no second dock tab; no
+`OP_FORMAT_VERSION` bump; favourite star talks only to catalog commands.
 
 ## Do this next
 
-1. **PR 5 — the Plugin Manager.** Plan §"PR 5", and note §5.4 and the
-   progress table: the pure layer is DONE and committed at `3469ce3`.
-   What is left is `PluginManager.svelte` (browse + rack in one shell,
-   mode in `localStorage`), `PluginQuickPick.svelte` with its `Ctrl+P`
-   wiring, `plugin-manager.dom.test.ts`, and the §9 asks above. The rack
-   is the thing no other DAW has: a project-wide ledger of every live
-   instance, its placements, its automated params, and — critically — the
-   orphans and crashed instances nothing else in the app will ever show
-   you. Collapse-all/expand-all (design §8.1) is already built into
-   `BrowserShell` — wire it, do not rebuild it.
+1. **PR 6 — automation as an inventory.** Plan §"PR 6". The winner spec
+   promoted **§3.4 the lane strip** (Bitwig's chain, compressed) onto the
+   same pass — `TrackHeader` instrument + inserts as status dots and
+   pinned/automated `ParamChip` jump targets, overflow `+N`, folded lane
+   = dots only. Also: `AutomationMatrix.svelte` (same rack projection,
+   grouped by parameter), and pinned params at the top of
+   `PluginParamPanel`. Constraint: `--track-height` is 132 px; chips
+   overflow, they do not wrap.
+2. **PR 7 — unified audition** (design §8.2). Double-click any browser
+   row to hear it, gated behind a new `browserAudition` pref defaulting
+   **off**. Last on this track: it touches every browser plus sampler and
+   plugin hosts.
+3. **Owner ear-check still owed** on the live *Keep plugin GUI on top*
+   toggle (open editor → Preferences off/on → window follows, no restart)
+   and on SPLIT vs BROWSE/RACK. DPF may print `Parent Window Id missing`
+   (expected: v1 has no XEmbed parent). Zyn may log `Sending key 'state'
+   to UI failed` until the editor is actually open.
 
-   **Wiring notes for the component work** (all verified this session):
-   `PluginBrowser` mounts at `Dock.svelte:90` and is what the manager
-   replaces. `Ctrl+P` belongs in `App.svelte`'s existing ctrl/meta block
-   (~line 186), NOT a second global keydown listener. The "selected
-   track" for add-actions is `lanes.selection` / its anchor. Insert
-   bypass goes through `backend.insertSetBypass(trackId, slotId, on)` —
-   see `InsertChain.svelte:46`. Actions available on the store:
-   `plugins.instantiate/insertEffect/bind/remove/openParams`,
-   `toggleFavorite/noteUsed/setTags/setPinnedParams`.
+**Native GUI leftovers (do not start unless asked):** X11 embed /
+Wayland embed; out-of-process isolation (SCALABILITY step 4); LV2
+`save_state` still snapshots the shadow instance, so OSC tweaks on the
+live DSP are not what project save sees. `docs/ARCHITECTURE.md` §15.4
+and `docs/SCALABILITY.md` step 3 do not yet list `plugin_show_gui` /
+`plugin_set_gui_on_top` or mark step 3 paid — a docs-only follow-up.
 
-   **Scope call already made:** browse mode gets NO Zyn patches section,
-   though plan §5.2 lists one — the "Do not" below forbids that migration
-   and a section here would be exactly it.
-2. **PR 6 — automation as an inventory.** Plan §"PR 6": the matrix, pinned
-   params in `PluginParamPanel`, and the lane-info plugin strip that turns
-   `TrackHeader`'s FX chip into `ParamChip` jump targets.
-3. **PR 7 — unified audition** (design §8.2). Double-click any row to hear
-   it, gated behind a new `browserAudition` pref defaulting **off**
-   (`clipOpenAutoplay` is the precedent). Do this last: it touches every
-   browser plus the sampler and plugin hosts, and must not delay the manager.
+**Do not:** rebuild PluginManager / Ctrl+P / catalog / floating GUI;
+migrate `ZynPatchBrowser` onto `BrowserRow`/`BrowserSection`; bump
+`OP_FORMAT_VERSION`; break a frozen command name; start Composer H2+
+unless asked.
 
-**Do not:** wire the favourite star to anything other than the catalog
-commands that already exist; migrate `ZynPatchBrowser` onto
-`BrowserRow`/`BrowserSection` (it is virtualised for ~1318 rows — its own
-header comment explains why, and those components mount unconditionally);
-bump `OP_FORMAT_VERSION`; break a frozen command name.
-
-## Traps on this branch
+## Traps
 
 - **`no-literals` lives at `src/lib/theme/no-literals.test.ts`**, not under
-  `components/`. It globs `../components/**/*.svelte`, so every new
-  component is covered. Raw colour literals fail CI; use theme tokens.
-- **Global focus ring and `prefers-reduced-motion` are already handled in
-  `src/app.css`** (`:where(button, input, select, [tabindex]):focus-visible`
-  and a global reduce block). Do not re-implement them per component.
-- **`display: contents` is not safe here.** This app ships on WebKitGTK via
-  Tauri, which has a history of dropping such elements from the
-  accessibility tree. Use a real flex container.
-- **Parallel `cargo test` intermittently SIGSEGVs.** Pre-existing: Cardinal's
-  exit-time CLAP teardown corrupts the heap — see `scan_worker.rs:234` and
-  `:274`, which predate this branch. Use `-- --test-threads=1` for a clean
-  signal.
-- **Before any new `*.dom.test.ts`**, read the Global Constraints in
+  `components/`. Raw colour literals fail CI; use theme tokens.
+- **Global focus ring and `prefers-reduced-motion` are already in
+  `src/app.css`.** Do not re-implement them per component.
+- **`display: contents` is not safe here** (WebKitGTK). Use a real flex
+  container.
+- **Parallel `cargo test` intermittently SIGSEGVs** (Cardinal CLAP
+  teardown). Use `-- --test-threads=1`. Never `cargo test` and `tauri
+  dev` on the same `src-tauri/target/`.
+- **Before any new `*.dom.test.ts`**, read
   [`2026-08-18-dom-test-environment.md`](docs/superpowers/plans/2026-08-18-dom-test-environment.md).
-  jsdom has no Pointer Capture API at all, `getBoundingClientRect()` returns
-  an all-zero rect, and Svelte 5 `$state` proxies throw on `structuredClone`.
-- **`src-tauri/node_modules/.vite/vitest/…/_svelte_metadata.json` is still
-  tracked in git** — a leftover from PR #65 that PR #73's untracking missed.
-  Worth its own tiny PR; do not fold it into this track.
+  jsdom has no Pointer Capture, `getBoundingClientRect()` is zeros,
+  Svelte 5 `$state` proxies throw on `structuredClone`.
 
 ## Older context
 
 The pre-existing briefing (Track D automation leftovers, Plan F undo
 carry-forwards, the MIDI-output handoff, the Composer deprioritisation)
-still applies once this track lands. It is preserved below.
+still applies. It is preserved below.
 
 ## Landed (do not restart)
 
 | What | Pointer |
 |---|---|
+| **Plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md). Next is PR 6 (lane strip + matrix + pinned params), not a redo of the manager. |
 | **Pitch analysis action on clip view** — analyse clip button on selected audio clips, persisted APTF cache rebuild, teardown/generation guards, and PitchCoach report cache invalidation | PR #87 `25af6ae`. |
 | **Write / Touch / Latch automation modes** — Off / Read / Write / Touch / Latch per track, real-time control-thread point recorder, single-op commit on stop/release with undo | PR #85 `d496903`. Design spec: [`2026-08-18-automation-write-touch-latch-design.md`](docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md). Plan: [`2026-08-18-automation-write-touch-latch.md`](docs/superpowers/plans/2026-08-18-automation-write-touch-latch.md) |
 | **MIDI output — per-track and per-clip patchbay routing** | PR #84 `cbbc240`. Handoff: [`midi-output.md`](docs/midi-output.md) |
