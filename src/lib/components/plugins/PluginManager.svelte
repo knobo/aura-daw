@@ -22,6 +22,8 @@
   import EmptyState from "../browser/EmptyState.svelte";
   import ParamChip from "../browser/ParamChip.svelte";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
+  import AutomationMatrix from "./AutomationMatrix.svelte";
+  import { buildMatrix } from "../../utils/automation-matrix";
   import {
     buildBrowseSections,
     filterByFacets,
@@ -194,7 +196,25 @@
         : rackFolds.anyCollapsed(rackKeys) || browseFolds.anyCollapsed(browseKeys),
   );
 
+  // Recomputed independently of `AutomationMatrix`'s own internal build —
+  // the footer needs the count and the matrix owns its own render state;
+  // both are cheap pure projections over the same inputs.
+  const matrixCount = $derived(
+    mode === "matrix"
+      ? buildMatrix({
+          bindings: modulation.bindings,
+          instances: plugins.instances,
+          tracks: project.tracks,
+          visible: modulation.visible,
+          paramInfo: (instanceId, paramId) => plugins.paramInfo(instanceId, paramId),
+        }).length
+      : 0,
+  );
+
   const status = $derived.by(() => {
+    if (mode === "matrix") {
+      return matrixCount === 1 ? "1 param moves" : `${matrixCount} params move`;
+    }
     const n = filteredDescriptors.length;
     const catalog = `${n} plugin${n === 1 ? "" : "s"}`;
     if (mode === "browse") return catalog;
@@ -356,6 +376,15 @@
       >
         RACK
       </button>
+      <button
+        type="button"
+        class="chip mono"
+        class:on={mode === "matrix"}
+        aria-pressed={mode === "matrix"}
+        onclick={() => persist({ mode: "matrix" })}
+      >
+        MATRIX
+      </button>
     </div>
   </div>
 
@@ -366,7 +395,14 @@
     <div class="err silk" role="alert">{plugins.error}</div>
   {/if}
 
-  {#if !plugins.scanned && !plugins.scanning && plugins.descriptors.length === 0}
+  {#if mode === "matrix"}
+    <!-- The search box and facet chips are catalog filters; the matrix
+         isn't the catalog, so they'd be dead controls here. -->
+    <div class="panes">
+      <AutomationMatrix />
+    </div>
+    <div class="status silk">{status}</div>
+  {:else if !plugins.scanned && !plugins.scanning && plugins.descriptors.length === 0}
     <EmptyState
       message="No plugins yet. Scan to find your CLAP and LV2 installs."
       action={{ label: "SCAN PLUGINS", onclick: () => plugins.scan() }}

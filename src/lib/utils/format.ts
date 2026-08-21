@@ -37,3 +37,11 @@ export function formatDb(db: number): string {
   if (db <= -90) return "-∞";
   return `${db > 0 ? "+" : ""}${db.toFixed(1)}`;
 }
+
+/** -1..+1 pan → "C" / "34L" / "34R". Extracted from `TrackHeader.svelte`'s
+ * private `formatPan` (design §6.1) so the automation matrix can render the
+ * exact same text for a track's pan curve. */
+export function formatPan(value: number): string {
+  if (Math.abs(value) < 0.005) return "C";
+  return String(Math.round(Math.abs(value) * 100)) + (value < 0 ? "L" : "R");
+}

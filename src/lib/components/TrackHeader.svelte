@@ -15,7 +15,7 @@
   import { library } from "../state/library.svelte";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { midiIo } from "../state/midiio.svelte";
-  import { formatDb } from "../utils/format";
+  import { formatDb, formatPan } from "../utils/format";
   import { groupOf } from "../utils/lane-layout";
   import { focusAndSelect } from "../utils/focusAndSelect";
   import { selectionModeFor } from "../utils/selection-modifiers";
@@ -157,11 +157,6 @@
   function onGain(e: Event) {
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
     queueGestureWrite(() => project.setGain(track.id, v));
-  }
-
-  function formatPan(value: number): string {
-    if (Math.abs(value) < 0.005) return "C";
-    return String(Math.round(Math.abs(value) * 100)) + (value < 0 ? "L" : "R");
   }
 
   /** Gesture boundaries (Plan E Task 14): explicit begin/end brackets a

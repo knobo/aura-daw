@@ -15,4 +15,9 @@ describe("initialManagerMode (winner spec §5)", () => {
     expect(initialManagerMode("rack", 0)).toBe("rack");
     expect(initialManagerMode("split", 0)).toBe("split");
   });
+
+  it("keeps a stored 'matrix' choice — the instance-count default never picks it on its own", () => {
+    expect(initialManagerMode("matrix", 0)).toBe("matrix");
+    expect(initialManagerMode("matrix", 4)).toBe("matrix");
+  });
 });
