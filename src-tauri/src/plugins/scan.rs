@@ -9,8 +9,10 @@
 //! discovery is safe in-process (lilv reads Turtle metadata; plugin
 //! binaries are NOT loaded until instantiation).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use super::catalog::{self, BundleStat, CatalogEntry};
 use super::descriptor::{clap_uid, lv2_uid, PluginDescriptor};
 
 // ---------------------------------------------------------------------------
@@ -204,6 +206,95 @@ pub fn scan_all() -> Vec<PluginDescriptor> {
         clap_started.elapsed()
     );
     out
+}
+
+/// `stat` one discovered bundle into the identity [`catalog::plan_rescan`]
+/// compares against the cache. `None` when the stat call itself fails
+/// (permissions, a symlink that vanished between discovery and stat, …) —
+/// the caller then treats the bundle as simply not discovered this round,
+/// which is the same outcome as if `find_clap_bundles` hadn't found it.
+pub fn stat_bundle(path: &Path) -> Option<BundleStat> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some(BundleStat { path: path.to_string_lossy().into_owned(), mtime, size: meta.len() })
+}
+
+/// Result of [`scan_incremental`]: the flat descriptor list `plugin_scan`
+/// returns to the webview, plus the catalog entries it should persist.
+pub struct IncrementalScanResult {
+    pub descriptors: Vec<PluginDescriptor>,
+    pub entries: Vec<CatalogEntry>,
+}
+
+/// The incremental twin of [`scan_all`] (PR spec 4.1.C): LV2 is always
+/// rescanned in full — it's metadata-only and safe in-process, so there is
+/// no crash risk to amortize and no reason to trust a cache over a fresh
+/// world read. CLAP bundles are stat'd first; a bundle whose
+/// `(path, mtime, size)` still matches a cached entry is reused verbatim
+/// (never dlopened again), and only new/changed bundles are handed to the
+/// sacrificial worker. Cache entries for bundles no longer on disk are
+/// dropped — never reused, never rescanned.
+pub fn scan_incremental(cached: Vec<CatalogEntry>) -> IncrementalScanResult {
+    let started = std::time::Instant::now();
+
+    let lv2 = scan_lv2();
+    let lv2_entries: Vec<CatalogEntry> = lv2
+        .iter()
+        .map(|d| CatalogEntry {
+            descriptor: d.clone(),
+            path: d.path.clone().unwrap_or_default(),
+            mtime: 0,
+            size: 0,
+        })
+        .collect();
+    log::info!("plugin scan (incremental): lv2 half done — {} plugins", lv2.len());
+
+    let cached_clap: Vec<CatalogEntry> = cached
+        .into_iter()
+        .filter(|e| e.descriptor.format == "clap")
+        .collect();
+    let roots = clap_search_paths();
+    let bundles = find_clap_bundles(&roots);
+    let discovered: Vec<BundleStat> = bundles.iter().filter_map(|b| stat_bundle(b)).collect();
+    let plan = catalog::plan_rescan(&cached_clap, &discovered);
+
+    let to_scan: Vec<PathBuf> = plan.to_scan.iter().map(PathBuf::from).collect();
+    let fresh = super::scan_worker::scan_clap_subprocess_for(&to_scan);
+    let stat_by_path: HashMap<&str, &BundleStat> =
+        discovered.iter().map(|s| (s.path.as_str(), s)).collect();
+    let fresh_entries: Vec<CatalogEntry> = fresh
+        .iter()
+        .map(|d| {
+            let path = d.path.clone().unwrap_or_default();
+            let (mtime, size) = stat_by_path
+                .get(path.as_str())
+                .map(|s| (s.mtime, s.size))
+                .unwrap_or((0, 0));
+            CatalogEntry { descriptor: d.clone(), path, mtime, size }
+        })
+        .collect();
+    log::info!(
+        "plugin scan (incremental): clap half done — {} cached hit, {} rescanned, {} missing dropped, in {:?}",
+        plan.reused.len(),
+        fresh.len(),
+        plan.missing,
+        started.elapsed()
+    );
+
+    let mut descriptors = lv2;
+    descriptors.extend(plan.reused.iter().map(|e| e.descriptor.clone()));
+    descriptors.extend(fresh);
+
+    let mut entries = lv2_entries;
+    entries.extend(plan.reused);
+    entries.extend(fresh_entries);
+
+    IncrementalScanResult { descriptors, entries }
 }
 
 #[cfg(test)]

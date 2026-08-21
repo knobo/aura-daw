@@ -5,6 +5,7 @@
    * between transport snapshots (120 FPS-capable — it never touches Svelte
    * reactivity inside the loop).
    */
+  import { untrack } from "svelte";
   import { backend } from "../tauri";
   import { project } from "../state/project.svelte";
   import { transport } from "../state/transport.svelte";
@@ -64,6 +65,13 @@
       collapsedTracks: lanes.collapsedTracks,
       collapsedGroups: lanes.collapsedGroups,
     }),
+  );
+
+  /** Visible lane order (painted rows only — a folded group's hidden
+   * members are not in this list) — what lane shift-click range-extends
+   * over, so a shift-click can never reach into a fold. */
+  const visibleTrackIds = $derived(
+    layout.rows.filter((r) => r.kind === "track").map((r) => r.track.id),
   );
 
   // Fold state belongs to a project, so it has to follow project switches
@@ -189,6 +197,25 @@
     }
   });
 
+  // Follow while STOPPED. The rAF tick above only follows while rolling,
+  // so "rewind to start" (or any seek, or a stop that snaps the playhead
+  // back) used to leave the view wherever it was. Keyed on the transport
+  // snapshot rather than the interpolated position: while stopped the two
+  // are the same number, and the snapshot is the only one that is
+  // reactive — so this fires on seeks and nothing else. Scrolling away by
+  // hand does not change it, which is why the view stays put afterwards.
+  // untrack the reveal itself: `revealSamples` READS `view.viewStart` and
+  // may WRITE it, so a tracked call would re-run on every scroll — and
+  // then yank the view back the instant the user scrolled away, which is
+  // the exact behaviour this effect must not have.
+  $effect(() => {
+    const pos = transport.snap.positionSamples;
+    untrack(() => {
+      if (transport.isPlaying || !view.follow) return;
+      view.revealSamples(pos);
+    });
+  });
+
   // ── playhead (rAF, reactivity-free hot path) ──
 
   $effect(() => {
@@ -200,10 +227,8 @@
 
       // auto-follow: page-scroll when the playhead leaves the right edge
       if (transport.isPlaying && view.follow) {
-        if (x > view.width * 0.92 || x < -4) {
-          view.scrollToSamples(pos - view.width * 0.08 * view.spp);
-          x = (pos - view.viewStart) / view.spp;
-        }
+        view.revealSamples(pos);
+        x = (pos - view.viewStart) / view.spp;
       }
 
       const visible = x >= -1 && x <= view.width + 1;
@@ -898,7 +923,11 @@
     <div class="bodyinner">
     <div
       class="rail"
-      role="presentation"
+      role="grid"
+      aria-label="Tracks"
+      aria-multiselectable="true"
+      aria-rowcount={project.tracks.length}
+      tabindex="-1"
       onpointerdown={onRailPointerDown}
       onpointermove={onRailPointerMove}
       onpointerup={onRailPointerUp}
@@ -909,7 +938,12 @@
         {#if row.kind === "group"}
           <LaneGroupHeader {row} />
         {:else}
-          <TrackHeader track={row.track} index={row.trackIndex} collapsed={row.collapsed} />
+          <TrackHeader
+            track={row.track}
+            index={row.trackIndex}
+            collapsed={row.collapsed}
+            orderedTrackIds={visibleTrackIds}
+          />
         {/if}
       {/each}
       <div class="addrow">
@@ -1122,6 +1156,10 @@
   .timeline {
     flex: 1;
     min-height: 0;
+    /* Also the cross-axis floor: with the side panel docked, `.main` is a
+       ROW and an unconstrained flex item refuses to shrink past its content,
+       pushing the dock off-screen. */
+    min-width: 0;
     display: flex;
     flex-direction: column;
     background: var(--bg-0);

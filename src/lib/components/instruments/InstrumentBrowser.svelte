@@ -4,11 +4,23 @@
    * mini keyboard audition per instrument (sampler_preview_note), assignment
    * to midi tracks (set_track_instrument), and the "generate instrument"
    * bridge into AI Studio (stableAudioSfz).
+   *
+   * Built on the shared browser layer (`components/browser/`): grouped by
+   * the bank folder each instrument's .sfz lives in — the one grouping
+   * that's actually true about a flat sampler bank.
    */
   import { instruments } from "../../state/instruments.svelte";
   import { project } from "../../state/project.svelte";
   import { openStudio } from "../../state/ui.svelte";
   import type { InstrumentInfo } from "../../types/ipc";
+  import { FoldController } from "../browser/fold-controller.svelte";
+  import { type BrowserRowRef, flattenRows, groupItems, rankItems, rowId } from "../browser/browser-model";
+  import BrowserShell from "../browser/BrowserShell.svelte";
+  import BrowserSection from "../browser/BrowserSection.svelte";
+  import BrowserRow from "../browser/BrowserRow.svelte";
+  import EmptyState from "../browser/EmptyState.svelte";
+
+  const FOLDS_KEY = "instruments";
 
   const midiTracks = $derived(project.tracks.filter((t) => t.kind === "midi"));
 
@@ -16,9 +28,19 @@
   const KEY_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
   const keyName = (k: number) => `${KEY_NAMES[k % 12]}${Math.floor(k / 12) - 1}`;
 
+  /** The immediate folder an instrument's .sfz lives in — the closest
+   * thing a flat sampler bank has to a category. */
+  function bankFolder(inst: InstrumentInfo): string {
+    const parts = inst.sfzPath.split(/[/\\]/).filter(Boolean);
+    parts.pop();
+    return parts.pop() ?? "instruments";
+  }
+
   function assignedTracks(inst: InstrumentInfo): string {
-    const names = midiTracks.filter((t) => t.instrumentId === inst.id).map((t) => t.name);
-    return names.join(" · ");
+    return midiTracks
+      .filter((t) => t.instrumentId === inst.id)
+      .map((t) => t.name)
+      .join(" · ");
   }
 
   function onAssign(inst: InstrumentInfo, e: Event) {
@@ -26,6 +48,35 @@
     if (trackId) void instruments.assign(trackId, inst.id);
     (e.currentTarget as HTMLSelectElement).value = "";
   }
+
+  let query = $state("");
+  const folds = new FoldController(FOLDS_KEY);
+  $effect(() => folds.syncQuery(query));
+
+  const ranked = $derived(
+    rankItems(instruments.list, query, [
+      { value: (i: InstrumentInfo) => i.name, weight: 2 },
+      { value: (i: InstrumentInfo) => i.sfzPath, weight: 1 },
+    ]),
+  );
+  const groups = $derived(groupItems(ranked, bankFolder));
+  const collapsed = $derived(folds.collapsed);
+  const groupKeys = $derived(groups.map((g) => g.key));
+  const rows = $derived(flattenRows(groups, collapsed));
+
+  function toggleGroup(key: string, expand: boolean) {
+    folds.toggle(key, expand);
+  }
+
+  function onActivate(row: BrowserRowRef) {
+    if (row.kind === "group") {
+      toggleGroup(row.groupKey, collapsed.has(row.groupKey));
+    }
+  }
+
+  const status = $derived(
+    `${instruments.list.length} instrument${instruments.list.length === 1 ? "" : "s"}`,
+  );
 </script>
 
 <div class="browser">
@@ -34,56 +85,112 @@
   </button>
 
   {#if instruments.error}
-    <div class="err silk">{instruments.error}</div>
+    <div class="err silk" role="alert">{instruments.error}</div>
   {/if}
 
   {#if instruments.list.length === 0}
-    <div class="empty silk">
-      {instruments.loading ? "loading bank…" : "bank empty — generate one, or load an .sfz via MCP"}
-    </div>
-  {/if}
-
-  <div class="list">
-    {#each instruments.list as inst (inst.id)}
-      <div class="inst" class:previewing={instruments.previewingId === inst.id}>
-        <div class="row top">
-          <span class="iname">{inst.name}</span>
-          <span class="regions silk">{inst.regionCount} rgn</span>
-        </div>
-        <div class="row range silk">
-          {#if inst.keyLow != null && inst.keyHigh != null}
-            {keyName(inst.keyLow)} – {keyName(inst.keyHigh)}
-          {/if}
-          <span class="path mono" title={inst.sfzPath}>{inst.sfzPath.split("/").pop()}</span>
-        </div>
-
-        <div class="row audition" role="group" aria-label="Audition {inst.name}">
-          {#each AUDITION_KEYS as k (k)}
-            <button
-              class="pkey mono"
-              class:black={[1, 3, 6, 8, 10].includes(k % 12)}
-              title="Preview {keyName(k)}"
-              onclick={() => instruments.preview(inst.id, k)}
-            >
-              {keyName(k)}
-            </button>
-          {/each}
-        </div>
-
-        <div class="row bind">
-          <select title="Bind to a MIDI track" onchange={(e) => onAssign(inst, e)}>
-            <option value="">assign to track…</option>
-            {#each midiTracks as t (t.id)}
-              <option value={t.id}>{t.name}{t.instrumentId === inst.id ? " ✓" : ""}</option>
+    <EmptyState
+      message={instruments.loading
+        ? "Loading bank…"
+        : "No instruments yet. Generate one above, or load an .sfz via MCP."}
+    />
+  {:else}
+    <BrowserShell
+      bind:query
+      placeholder="search instruments…"
+      {status}
+      {rows}
+      onToggleGroup={toggleGroup}
+      {onActivate}
+      anyCollapsed={folds.anyCollapsed(groupKeys)}
+      onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
+    >
+      {#snippet children({ activeId, setActive })}
+        {#if rows.length === 0}
+          <EmptyState message={`No match for "${query}" — try a different search.`} />
+        {/if}
+        {#each groups as g (g.key)}
+          {@const headerId = rowId({ kind: "group", groupKey: g.key, itemIndex: -1 })}
+          <BrowserSection
+            id={headerId}
+            label={g.label}
+            count={g.items.length}
+            expanded={!collapsed.has(g.key)}
+            active={activeId === headerId}
+            onToggle={() => {
+              setActive({ kind: "group", groupKey: g.key, itemIndex: -1 });
+              toggleGroup(g.key, collapsed.has(g.key));
+            }}
+          >
+            {#each g.items as inst, i (inst.id)}
+              {@const rowIdStr = rowId({ kind: "item", groupKey: g.key, itemIndex: i })}
+              <BrowserRow
+                id={rowIdStr}
+                label={inst.name}
+                meta={inst.keyLow != null && inst.keyHigh != null
+                  ? `${keyName(inst.keyLow)}–${keyName(inst.keyHigh)}`
+                  : ""}
+                active={activeId === rowIdStr}
+                selected={instruments.previewingId === inst.id}
+                onclick={() => {
+                  setActive({ kind: "item", groupKey: g.key, itemIndex: i });
+                }}
+                onpointerdown={(e) => {
+                  if (e.button !== 0) return;
+                  (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+                  void instruments.previewDown(inst.id, 60);
+                }}
+                onpointerup={() => void instruments.previewUp()}
+                onpointercancel={() => void instruments.previewUp()}
+              >
+                {#snippet badge()}
+                  <span class="regions silk">{inst.regionCount} rgn</span>
+                {/snippet}
+                {#snippet actions()}
+                  <div class="audition" role="group" aria-label="Audition {inst.name}">
+                    {#each AUDITION_KEYS as k (k)}
+                      <button
+                        class="pkey mono"
+                        class:black={[1, 3, 6, 8, 10].includes(k % 12)}
+                        title="Preview {keyName(k)} — hold to play"
+                        onpointerdown={(e) => {
+                          e.stopPropagation();
+                          e.preventDefault();
+                          (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+                          void instruments.previewDown(inst.id, k);
+                        }}
+                        onpointerup={(e) => {
+                          e.stopPropagation();
+                          void instruments.previewUp();
+                        }}
+                        onpointercancel={() => void instruments.previewUp()}
+                      >
+                        {keyName(k)}
+                      </button>
+                    {/each}
+                  </div>
+                  <select
+                    title="Bind to a MIDI track"
+                    onclick={(e) => e.stopPropagation()}
+                    onpointerdown={(e) => e.stopPropagation()}
+                    onchange={(e) => onAssign(inst, e)}
+                  >
+                    <option value="">assign to track…</option>
+                    {#each midiTracks as t (t.id)}
+                      <option value={t.id}>{t.name}{t.instrumentId === inst.id ? " ✓" : ""}</option>
+                    {/each}
+                  </select>
+                  {#if assignedTracks(inst)}
+                    <span class="bound silk" title="Bound tracks">⌁ {assignedTracks(inst)}</span>
+                  {/if}
+                {/snippet}
+              </BrowserRow>
             {/each}
-          </select>
-          {#if assignedTracks(inst)}
-            <span class="bound silk" title="Bound tracks">⌁ {assignedTracks(inst)}</span>
-          {/if}
-        </div>
-      </div>
-    {/each}
-  </div>
+          </BrowserSection>
+        {/each}
+      {/snippet}
+    </BrowserShell>
+  {/if}
 
   {#if midiTracks.length === 0}
     <div class="hint silk">no midi tracks yet — add one with “+ midi” in the track rail</div>
@@ -97,11 +204,10 @@
     gap: 10px;
     flex: 1;
     min-height: 0;
-    overflow-y: auto;
-    padding-right: 2px;
   }
 
   .gen {
+    flex: none;
     padding: 8px 10px;
     font-size: 10px;
     letter-spacing: 0.16em;
@@ -121,64 +227,22 @@
   }
 
   .err {
+    flex: none;
     color: var(--red);
   }
-  .empty,
   .hint {
-    padding: 8px 0;
+    flex: none;
+    padding: 4px 0;
   }
 
-  .list {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .inst {
-    border: var(--border-width) solid var(--glass-border);
-    border-radius: 6px;
-    background: rgb(var(--bg-1-rgb) / 0.6);
-    padding: 8px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    transition: border-color 150ms, box-shadow 150ms;
-  }
-  .inst.previewing {
-    border-color: var(--cyan-dim);
-    box-shadow: 0 0 calc(12px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.2);
-  }
-
-  .row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .iname {
-    flex: 1;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--text);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
   .regions {
     color: var(--text-faint);
   }
-  .range {
-    justify-content: space-between;
-  }
-  .path {
-    font-size: 9px;
-    color: var(--text-faint);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-width: 60%;
-  }
 
   .audition {
+    display: flex;
     gap: 3px;
+    width: 100%;
   }
   .pkey {
     flex: 1;
@@ -204,7 +268,7 @@
     filter: brightness(1.3);
   }
 
-  .bind select {
+  select {
     flex: 1;
     min-width: 0;
     background: rgb(var(--bg-0-rgb) / 0.7);

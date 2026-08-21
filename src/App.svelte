@@ -50,6 +50,7 @@
   import { launch } from "./lib/state/launch.svelte";
   import LaunchMapPanel from "./lib/components/launch/LaunchMapPanel.svelte";
   import Toasts from "./lib/components/Toasts.svelte";
+  import PluginQuickPick from "./lib/components/plugins/PluginQuickPick.svelte";
   import { rehearseKeyMatches, rehearseKeyReleases } from "./lib/components/pitch/panel-logic";
   import { releaseRehearse, setRehearseSource } from "./lib/state/rehearse.svelte";
   import { theme } from "./lib/theme/theme.svelte";
@@ -198,6 +199,11 @@
       if (k === "n") {
         e.preventDefault();
         projectops.requestNew();
+        return;
+      }
+      if (k === "p") {
+        e.preventDefault();
+        ui.pluginPickerOpen = !ui.pluginPickerOpen;
         return;
       }
     }
@@ -352,7 +358,7 @@
 
 <div class="app">
   <TransportBar />
-  <div class="main">
+  <div class="main" class:docked={prefs.values.dockSide === "docked"}>
     <Timeline />
     <Dock />
   </div>
@@ -370,6 +376,9 @@
 <PreferencesDialog />
 <LaunchMapPanel />
 <Toasts />
+{#if ui.pluginPickerOpen}
+  <PluginQuickPick />
+{/if}
 
 <style>
   .app {
@@ -388,5 +397,12 @@
     position: relative;
     display: flex;
     flex-direction: column;
+  }
+  /* Docked side panel: the row becomes two columns and the timeline takes
+     what is left, instead of the dock hanging over it. Timeline is already
+     `flex: 1`, so flipping the direction is the whole layout change — the
+     dock stops being `position: absolute` on its own side (Dock.svelte). */
+  .main.docked {
+    flex-direction: row;
   }
 </style>

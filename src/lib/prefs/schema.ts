@@ -57,6 +57,10 @@ export interface PrefValues {
   /** Active theme id. A plain string, not a union: user themes are
    * discovered at runtime, so the catalogue is not knowable here. */
   theme: string;
+  /** Whether the right panel takes layout space or floats over the timeline. */
+  dockSide: "overlay" | "docked";
+  /** Keep native plugin editor windows above the AURA window. */
+  pluginGuiOnTop: boolean;
 }
 
 /** Tolerance option ids, in order of strictness. */
@@ -292,6 +296,18 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
       { value: "full", label: "FULL" },
     ],
   },
+  dockSide: {
+    kind: "enum",
+    default: "overlay",
+    options: [
+      { value: "overlay", label: "FLOAT OVER" },
+      { value: "docked", label: "DOCK BESIDE" },
+    ],
+    category: "interface",
+    label: "Side panel",
+    blurb:
+      "Whether the right panel floats over the timeline or takes its own column beside it. Docking suits an opaque panel — with a translucent theme you can see the timeline through it, so floating costs you nothing.",
+  },
   theme: {
     kind: "choice",
     default: "aura-dark",
@@ -300,6 +316,14 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     label: "Theme",
     blurb:
       "Colours and contrast for the whole interface. Custom themes are JSON files in the folder below; add or edit one and restart AURA to see it here.",
+  },
+  pluginGuiOnTop: {
+    kind: "boolean",
+    default: true,
+    category: "interface",
+    label: "Keep plugin GUI on top",
+    blurb:
+      "Native plugin editor windows stay above AURA so they don't vanish behind the DAW. Turn off if you want them to stack like ordinary windows. Applies immediately, including already-open editors.",
   },
 };
 

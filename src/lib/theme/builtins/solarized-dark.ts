@@ -44,4 +44,15 @@ export const SOLARIZED_DARK_TOKENS: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+  // Barely translucent — Solarized's surfaces are close in value,
+  // so a see-through panel muddies more than it reveals.
+  panelAlpha: "0.92",
+
+  // material — Solarized is a deliberately low-contrast palette, so its material stays
+  // quiet enough not to fight it.
+  bevel: "0.3",
+  relief: "0.4",
+  sheen: "0.25",
+  grain: "0.06",
+  ctrlRadius: "5px",
 };

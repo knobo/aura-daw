@@ -123,6 +123,14 @@
     {#if inst}
       <span class="badge mono {inst.format}">{inst.format}</span>
       <span class="status mono {inst.status}">{inst.status}</span>
+      {#if plugins.hasGui(inst.id)}
+        <button
+          type="button"
+          class="guibtn mono"
+          title="Open native plugin GUI"
+          onclick={() => void plugins.showGui(inst.id)}
+        >GUI</button>
+      {/if}
     {/if}
   </div>
   {#if inst}
@@ -296,6 +304,23 @@
   .status.crashed {
     color: var(--red);
     background: rgb(var(--red-rgb) / 0.12);
+  }
+
+  .guibtn {
+    flex: none;
+    padding: 2px 6px;
+    font-size: 8px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    border-radius: 3px;
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-2-rgb) / 0.6);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .guibtn:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
   }
 
   .note {

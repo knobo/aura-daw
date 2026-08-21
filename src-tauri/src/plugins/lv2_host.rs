@@ -45,6 +45,8 @@
 //! (registry: instance removed; engine: PolySynth) and AURA never crashes.
 
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
+use std::os::raw::c_void;
 use std::sync::{Arc, OnceLock};
 
 use crate::audio::dsp::{AudioProcessor, LiveInstrument, ProcessBlock};
@@ -108,6 +110,14 @@ struct HostInstance {
     loaded_blob: Option<StateBlob>,
     /// Control-output port index for `lv2:latency` (or name fallback).
     latency_port: Option<livi::PortIndex>,
+    /// Plugin has a `ui:showInterface` UI (probed at register).
+    has_gui: bool,
+    /// Open native window, if any.
+    gui: Option<super::lv2_ui::OpenLv2Gui>,
+    /// LV2_Handle of the live RT instance, when a node is out.
+    live_handle: Option<*mut c_void>,
+    /// Zyn `osc_port` control-output: the lo server of THIS dsp instance.
+    osc_port: u32,
 }
 
 /// The slot's world, built on first use (PLUGIN MAIN THREAD ONLY).
@@ -144,8 +154,22 @@ fn ensure_ticker(ctx: &mut MainCtx) {
     ctx.add_ticker(
         SLOT,
         Box::new(|ctx| {
-            if let Some(inner) = ctx.slot_mut::<Lv2World>(SLOT).inner.as_ref() {
+            if let Some(inner) = ctx.slot_mut::<Lv2World>(SLOT).inner.as_mut() {
                 inner.features.worker_manager().run_workers();
+                let mut closed = Vec::new();
+                for (id, inst) in inner.instances.iter_mut() {
+                    if let Some(gui) = inst.gui.as_mut() {
+                        if !gui.idle() {
+                            closed.push(id.clone());
+                        }
+                    }
+                }
+                for id in closed {
+                    if let Some(inst) = inner.instances.get_mut(&id) {
+                        inst.gui = None;
+                    }
+                    log::info!("lv2 ui: {id} closed its window");
+                }
             }
         }),
     );
@@ -344,6 +368,58 @@ impl Lv2Host {
         let instance_id = instance_id.to_string();
         plugin_main().run(move |ctx| load_state(world_mut(ctx), &instance_id, blob))?
     }
+
+    /// True when the hosted LV2 plugin has a `ui:showInterface` UI (v1 —
+    /// no XEmbed / Gtk embed).
+    pub fn has_gui(&self, instance_id: &str) -> Result<bool, String> {
+        let instance_id = instance_id.to_string();
+        plugin_main().run(move |ctx| {
+            ctx.slot_mut::<Lv2World>(SLOT)
+                .inner
+                .as_ref()
+                .and_then(|inner| inner.instances.get(&instance_id))
+                .is_some_and(|inst| inst.has_gui)
+        })
+    }
+
+    /// Open the plugin-owned floating editor (`ui:showInterface`).
+    pub fn show_gui(&self, instance_id: &str) -> Result<(), String> {
+        let instance_id = instance_id.to_string();
+        plugin_main().run(move |ctx| show_gui(world_mut(ctx), &instance_id))?
+    }
+
+    /// True when a showInterface window is currently instantiated (may be
+    /// waiting for the first successful idle). Tests use this to catch the
+    /// DPF trap where idle() returns non-zero *before* the window is mapped.
+    pub fn gui_is_open(&self, instance_id: &str) -> Result<bool, String> {
+        let instance_id = instance_id.to_string();
+        plugin_main().run(move |ctx| {
+            ctx.slot_mut::<Lv2World>(SLOT)
+                .inner
+                .as_ref()
+                .and_then(|inner| inner.instances.get(&instance_id))
+                .is_some_and(|inst| inst.gui.is_some())
+        })
+    }
+
+    /// Snapshot of which hosted LV2 instances have a showInterface UI.
+    pub fn gui_flags(&self) -> HashMap<String, bool> {
+        plugin_main()
+            .run(|ctx| {
+                ctx.slot_mut::<Lv2World>(SLOT)
+                    .inner
+                    .as_ref()
+                    .map(|inner| {
+                        inner
+                            .instances
+                            .iter()
+                            .map(|(id, inst)| (id.clone(), inst.has_gui))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +471,7 @@ fn register(
     let latency_port = find_latency_port(&inner.world, &plugin);
     let params = control_port_params(&plugin);
     let values = params.iter().map(|p| (p.id, p.value as f32)).collect();
+    let has_gui = super::lv2_ui::plugin_has_show_ui(&plugin);
     inner.instances.insert(
         instance_id,
         HostInstance {
@@ -404,6 +481,10 @@ fn register(
             shadow: None,
             loaded_blob: None,
             latency_port,
+            has_gui,
+            gui: None,
+            live_handle: None,
+            osc_port: 0,
         },
     );
     Ok(params)
@@ -484,8 +565,18 @@ fn make_node(
     }
     let (param_tx, param_rx) = rtrb::RingBuffer::new(PARAM_RING_CAPACITY);
     inst.param_tx = Some(param_tx);
+    inst.live_handle = Some(instance.raw().instance().handle());
+    let plugin = inst.plugin.clone();
+    inst.osc_port = capture_osc_port(&mut instance, features, &plugin);
+    if let Some(gui) = inst.gui.as_mut() {
+        if inst.osc_port > 0 {
+            if let Err(e) = gui.attach_osc_gui(inst.osc_port) {
+                log::warn!("lv2 ui: reattach osc after node rebuild failed ({e})");
+            }
+        }
+    }
     let latency_port = inst.latency_port;
-    let node = Lv2Node::new(instance, features, param_rx, latency_port);
+    let node = Lv2Node::new(instance, features, param_rx, latency_port, instance_id);
     log::info!(
         "lv2 host: node ready for instance {instance_id} ({} @ {rate} Hz)",
         inst.plugin.uri()
@@ -508,6 +599,12 @@ fn ensure_shadow<'a>(
             super::state::apply_lv2_state_blob(&mut shadow, features, blob)?;
         }
         inst.shadow = Some(shadow);
+        if inst.osc_port == 0 {
+            let plugin = inst.plugin.clone();
+            if let Some(s) = inst.shadow.as_mut() {
+                inst.osc_port = capture_osc_port(s, features, &plugin);
+            }
+        }
     }
     Ok(inst.shadow.as_mut().expect("just built"))
 }
@@ -519,6 +616,94 @@ fn save_state(inner: &mut WorldInner, instance_id: &str) -> Result<Option<StateB
         .ok_or_else(|| format!("LV2 instance not registered with the host: {instance_id}"))?;
     let shadow = ensure_shadow(features, inst)?;
     super::state::lv2_state_blob(shadow, features)
+}
+
+fn show_gui(inner: &mut WorldInner, instance_id: &str) -> Result<(), String> {
+    let WorldInner { features, instances, .. } = inner;
+    let inst = instances.get_mut(instance_id).ok_or_else(|| {
+        format!("LV2 instance not registered with the host: {instance_id}")
+    })?;
+    if let Some(gui) = inst.gui.as_mut() {
+        return gui.show();
+    }
+    if !inst.has_gui {
+        return Err(format!("{} has no ui:showInterface", inst.plugin.uri()));
+    }
+    let handle = if let Some(h) = inst.live_handle {
+        h
+    } else {
+        ensure_shadow(features, inst)?.raw().instance().handle()
+    };
+    if inst.osc_port == 0 {
+        let plugin = inst.plugin.clone();
+        if let Some(shadow) = inst.shadow.as_mut() {
+            inst.osc_port = capture_osc_port(shadow, features, &plugin);
+        }
+    }
+    let osc_port = inst.osc_port;
+    let mut gui = super::lv2_ui::open_show_interface(
+        &inst.plugin,
+        instance_id,
+        handle,
+        SHADOW_RATE as f32,
+    )?;
+    // Zyn: DPF ExternalWindow never draws. Launch the OSC GUI against the
+    // hosted instance's lo server (no --embed: v1 is floating, not XEmbed).
+    if osc_port > 0 {
+        gui.attach_osc_gui(osc_port)?;
+    } else {
+        log::warn!(
+            "lv2 ui: {} has no osc_port yet; showInterface window may stay empty",
+            inst.plugin.uri()
+        );
+    }
+    inst.gui = Some(gui);
+    Ok(())
+}
+
+fn osc_port_index(plugin: &livi::Plugin) -> Option<livi::PortIndex> {
+    plugin
+        .ports_with_type(livi::PortType::ControlOutput)
+        .find(|p| p.symbol == "osc_port")
+        .map(|p| p.index)
+}
+
+/// Run 1 block so DPF copies output params (Zyn `osc_port`) onto LV2 ports,
+/// then read it. 0 if the plugin has no such port or run fails.
+fn capture_osc_port(
+    instance: &mut livi::Instance,
+    features: &Arc<livi::Features>,
+    plugin: &livi::Plugin,
+) -> u32 {
+    let Some(idx) = osc_port_index(plugin) else {
+        return 0;
+    };
+    let before = instance.control_output(idx);
+    if let Some(v) = before {
+        if v >= 1.0 {
+            return v.round() as u32;
+        }
+    }
+    let n = 8usize;
+    let mut l = vec![0.0f32; n];
+    let mut r = vec![0.0f32; n];
+    let atom_in = livi::event::LV2AtomSequence::new(features, 1024);
+    let mut atom_out = livi::event::LV2AtomSequence::new(features, 1024);
+    // Zyn (the only plugin with osc_port) is stereo-out + one atom in/out.
+    // Avoid a match on output count: livi's PortConnections type is generic
+    // over the iterator, so the arms would not unify.
+    let ports = livi::EmptyPortConnections::new()
+        .with_audio_outputs([l.as_mut_slice(), r.as_mut_slice()].into_iter())
+        .with_atom_sequence_inputs(std::iter::once(&atom_in))
+        .with_atom_sequence_outputs(std::iter::once(&mut atom_out));
+    if let Err(e) = unsafe { instance.run(n, ports) } {
+        log::warn!("lv2 ui: 1-frame run to read osc_port failed ({e})");
+        return 0;
+    }
+    instance
+        .control_output(idx)
+        .map(|v| v.max(0.0).round() as u32)
+        .unwrap_or(0)
 }
 
 fn load_state(inner: &mut WorldInner, instance_id: &str, blob: StateBlob) -> Result<(), String> {
@@ -555,7 +740,7 @@ const ALL_NOTES_OFF: [u8; 3] = [0xB0, 123, 0];
 /// preallocated on the plugin main thread; `process`/`queue_event`/
 /// `all_notes_off` run on the RT thread under the §2.1 contract.
 pub struct Lv2Node {
-    instance: livi::Instance,
+    instance: ManuallyDrop<livi::Instance>,
     midi_urid: Urid,
     /// Atom-sequence inputs; `[0]` carries this block's MIDI, the rest stay
     /// empty (cleared once at build).
@@ -573,6 +758,7 @@ pub struct Lv2Node {
     io_mode: IoMode,
     /// Control-output port reporting latency (if any).
     latency_port: Option<livi::PortIndex>,
+    instance_id: String,
 }
 
 /// `lv2_raw::LV2Urid` (a plain `u32`) — livi exposes it only through
@@ -587,6 +773,7 @@ impl Lv2Node {
         features: &std::sync::Arc<livi::Features>,
         param_rx: rtrb::Consumer<ParamChange>,
         latency_port: Option<livi::PortIndex>,
+        instance_id: &str,
     ) -> Self {
         let counts = instance.port_counts();
         let buffers = |n: usize| vec![vec![0.0f32; MAX_LIVE_BLOCK]; n];
@@ -606,9 +793,10 @@ impl Lv2Node {
             param_rx,
             dropped_events: 0,
             run_errors: 0,
-            instance,
+            instance: ManuallyDrop::new(instance),
             io_mode: IoMode::Add,
             latency_port,
+            instance_id: instance_id.to_string(),
         }
     }
 
@@ -785,6 +973,28 @@ impl LiveInstrument for Lv2Node {
         // Delivered at the start of the next `process` block. CC 123 is a
         // release (voices enter their release phase), not a hard kill.
         self.push_midi(0, &ALL_NOTES_OFF);
+    }
+}
+
+impl Drop for Lv2Node {
+    fn drop(&mut self) {
+        let id = std::mem::take(&mut self.instance_id);
+        // Move the DSP onto plugin-main so instance-access / idle cannot
+        // run against a freed handle. post (not run): graph swaps on the
+        // engine control thread must not block.
+        // SAFETY: Drop is the only destructor; we never read `instance`
+        // after taking it.
+        let instance = unsafe { ManuallyDrop::take(&mut self.instance) };
+        plugin_main().post(move |ctx| {
+            if let Some(inner) = ctx.slot_mut::<Lv2World>(SLOT).inner.as_mut() {
+                if let Some(inst) = inner.instances.get_mut(&id) {
+                    inst.live_handle = None;
+                    inst.osc_port = 0;
+                    inst.gui = None;
+                }
+            }
+            drop(instance);
+        });
     }
 }
 
@@ -1281,7 +1491,7 @@ mod tests {
                 let instance = unsafe { inst.plugin.instantiate(features.clone(), 48_000.0) }
                     .expect("instantiate");
                 let (_tx, rx) = rtrb::RingBuffer::new(PARAM_RING_CAPACITY);
-                let mut n = Lv2Node::new(instance, features, rx, inst.latency_port);
+                let mut n = Lv2Node::new(instance, features, rx, inst.latency_port, &id2);
                 n.set_io_mode(IoMode::Replace);
                 n
             })
@@ -1331,5 +1541,128 @@ mod tests {
 
         drop(node);
         host.unregister_instance(&id);
+    }
+
+    /// ZynAddSubFX is the v1 LV2 GUI canary (ARCHITECTURE §15.3): the UI
+    /// bundle only offers ui:showInterface (+ idle). Probe is metadata +
+    /// extension_data; mapping a window is display-gated.
+    #[test]
+    fn zyn_reports_show_interface_gui() {
+        let host = global();
+        let id = format!("gui-{}", uuid::Uuid::new_v4());
+        match host.register_instance(&id, &format!("lv2:{ZYN_URI}")) {
+            Err(e) => {
+                eprintln!("skipping: ZynAddSubFX not hostable ({e})");
+                return;
+            }
+            Ok(_) => {}
+        }
+        assert!(
+            host.has_gui(&id).expect("probe"),
+            "Zyn UI must advertise ui:showInterface"
+        );
+        assert_eq!(host.has_gui("no-such-lv2-gui").expect("unknown"), false);
+
+        let display = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if display {
+            host.show_gui(&id)
+                .expect("showInterface opens Zyn's native window on the hosted instance");
+        } else {
+            eprintln!("note: no DISPLAY/WAYLAND_DISPLAY; skip show_gui");
+        }
+
+        host.unregister_instance(&id);
+        plugin_main().run(|_| ()).unwrap();
+        assert!(
+            host.show_gui(&id).is_err(),
+            "removed instance must not keep a gui"
+        );
+        assert_eq!(host.has_gui(&id).expect("gone"), false);
+    }
+
+    /// DPF's LV2 UI prints "Parent Window Id missing, host should be using
+    /// ui:showInterface..." on instantiate (stdout, not a failure). Its
+    /// idle() then returns non-zero until the window is mapped. Treating
+    /// that as "user closed" destroys the UI before it appears.
+    #[test]
+    fn zyn_gui_survives_dpf_idle_before_map() {
+        let host = global();
+        let id = format!("gui-idle-{}", uuid::Uuid::new_v4());
+        if host.register_instance(&id, &format!("lv2:{ZYN_URI}")).is_err() {
+            eprintln!("skipping: ZynAddSubFX not hostable");
+            return;
+        }
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            eprintln!("skipping: no display");
+            host.unregister_instance(&id);
+            return;
+        }
+        host.show_gui(&id).expect("show");
+        assert!(host.gui_is_open(&id).expect("open"), "gui held after show");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        plugin_main().run(|_| ()).unwrap();
+        assert!(
+            host.gui_is_open(&id).expect("still open"),
+            "DPF idle()!=0 before map must not destroy the showInterface window"
+        );
+        host.unregister_instance(&id);
+        plugin_main().run(|_| ()).unwrap();
+        assert!(!host.gui_is_open(&id).expect("gone"));
+    }
+
+    fn ext_gui_pids() -> Vec<u32> {
+        let out = std::process::Command::new("pgrep")
+            .args(["-f", "zynaddsubfx-ext-gui"])
+            .output();
+        let Ok(out) = out else {
+            return Vec::new();
+        };
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+
+    /// Zyn's LV2 UI is DPF ExternalWindow: it does not draw itself. It
+    /// launches `zynaddsubfx-ext-gui osc.udp://localhost:<osc_port>/` once
+    /// the host delivers the `osc_port` control-output. ZamVerb works
+    /// because it has a real clap.gui window; Zyn does not.
+    #[test]
+    fn zyn_show_gui_starts_ext_gui_against_the_hosted_osc_port() {
+        let host = global();
+        let id = format!("gui-osc-{}", uuid::Uuid::new_v4());
+        if host.register_instance(&id, &format!("lv2:{ZYN_URI}")).is_err() {
+            eprintln!("skipping: ZynAddSubFX not hostable");
+            return;
+        }
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            eprintln!("skipping: no display");
+            host.unregister_instance(&id);
+            return;
+        }
+        let before = ext_gui_pids();
+        host.show_gui(&id).expect("show");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        plugin_main().run(|_| ()).unwrap();
+        let after = ext_gui_pids();
+        let spawned = after.iter().any(|p| !before.contains(p));
+        host.unregister_instance(&id);
+        plugin_main().run(|_| ()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            spawned,
+            "zynaddsubfx-ext-gui must start against the hosted instance OSC port \
+             (before={before:?} after={after:?})"
+        );
+    }
+
+    #[test]
+    fn lv2_show_gui_rejects_unknown_instance() {
+        let err = global().show_gui("no-such-instance").expect_err("unknown id");
+        assert!(
+            err.contains("unknown") || err.contains("no-such") || err.contains("not registered"),
+            "polite unknown-instance error, got: {err}"
+        );
     }
 }

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "aura://ipc/plugin-catalog.schema.json",
+  "title": "PluginCatalog",
+  "description": "Machine-global, persistent plugin catalog (plugin_catalog_get / plugin_catalog_update): the scan cache plus user curation (favorites/recents/tags/pinned params). Lives at dirs::config_dir()/aura/plugin-catalog.json — NOT project state, one file per machine. Emitter contract: readers must tolerate unknown fields (D-06 discipline — deliberately no additionalProperties:false).",
+  "type": "object",
+  "required": ["version", "scan", "favorites", "recents", "tags", "pinnedParams"],
+  "properties": {
+    "version": {
+      "type": "integer",
+      "description": "Schema version. A file with any other version is treated as absent (empty catalog) rather than migrated."
+    },
+    "scan": {
+      "type": "object",
+      "required": ["entries"],
+      "properties": {
+        "scannedAt": {
+          "type": "integer",
+          "description": "Unix seconds of the last successful plugin_scan. Absent before AURA has ever scanned on this machine."
+        },
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["descriptor", "path", "mtime", "size"],
+            "properties": {
+              "descriptor": { "$ref": "aura://ipc/plugin-descriptor.schema.json" },
+              "path": {
+                "type": "string",
+                "description": "Bundle file this descriptor was read from (CLAP); empty string for LV2, which has no single stat-able bundle file."
+              },
+              "mtime": { "type": "integer", "description": "Bundle modification time, unix seconds. 0 for LV2." },
+              "size": { "type": "integer", "description": "Bundle size in bytes. 0 for LV2." }
+            }
+          }
+        }
+      }
+    },
+    "favorites": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Favorited plugin uids."
+    },
+    "recents": {
+      "type": "array",
+      "description": "Most-recently-used first; capped at 40 and de-duplicated by uid (a re-use moves the existing entry to the front).",
+      "items": {
+        "type": "object",
+        "required": ["uid", "usedAt"],
+        "properties": {
+          "uid": { "type": "string" },
+          "usedAt": { "type": "integer", "description": "Unix seconds." }
+        }
+      }
+    },
+    "tags": {
+      "type": "object",
+      "description": "uid -> free-text tags.",
+      "additionalProperties": { "type": "array", "items": { "type": "string" } }
+    },
+    "pinnedParams": {
+      "type": "object",
+      "description": "uid -> pinned param ids, capped at 8 per uid.",
+      "additionalProperties": { "type": "array", "items": { "type": "integer" } }
+    }
+  }
+}

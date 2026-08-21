@@ -1,7 +1,7 @@
 <script lang="ts">
   /**
    * Left-rail track header: color stripe, name, arm/mute/solo, gain fader
-   * with dB readout, pan, and a compact per-track VU meter.
+   * with dB readout, a pan knob, and a compact per-track VU meter.
    */
   import type { TrackState } from "../types/ipc";
   import { project } from "../state/project.svelte";
@@ -12,11 +12,16 @@
   import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
   import { lanes } from "../state/lanes.svelte";
+  import { library } from "../state/library.svelte";
+  import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { midiIo } from "../state/midiio.svelte";
   import { formatDb } from "../utils/format";
   import { groupOf } from "../utils/lane-layout";
   import { focusAndSelect } from "../utils/focusAndSelect";
+  import { selectionModeFor } from "../utils/selection-modifiers";
+  import { bulkableTracks, fieldValues, nextBulkValue, type BulkField } from "../utils/lane-bulk";
   import Meter from "./Meter.svelte";
+  import Knob from "./controls/Knob.svelte";
   import LanePickerMenu from "./LanePickerMenu.svelte";
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
@@ -26,7 +31,15 @@
     track,
     index,
     collapsed = false,
-  }: { track: TrackState; index: number; collapsed?: boolean } = $props();
+    orderedTrackIds,
+  }: {
+    track: TrackState;
+    index: number;
+    collapsed?: boolean;
+    /** Visible lane order (Timeline's `layout`, track rows only) — what a
+     * shift-click range-extends over. */
+    orderedTrackIds: string[];
+  } = $props();
   let pickerOpen = $state(false);
   let groupMenuOpen = $state(false);
   let fxPopoverOpen = $state(false);
@@ -145,10 +158,6 @@
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
     queueGestureWrite(() => project.setGain(track.id, v));
   }
-  function onPan(e: Event) {
-    const v = parseFloat((e.currentTarget as HTMLInputElement).value);
-    queueGestureWrite(() => project.setPan(track.id, v));
-  }
 
   function formatPan(value: number): string {
     if (Math.abs(value) < 0.005) return "C";
@@ -169,6 +178,123 @@
   function onGestureEnd() {
     closeGesture();
   }
+
+  // ── selection (4.5) ──
+  // Clicking blank header space selects the lane; clicking a control inside
+  // it must not ALSO select — a button, a fader, the rename input and the
+  // drag grip all have their own meaning for a click, and stacking
+  // "and select this lane" on top of every one of them would surprise more
+  // than it would help.
+  //
+  // `selectionModeFor` reads only `shiftKey`/`ctrlKey`/`metaKey`, which
+  // `KeyboardEvent` carries too — it is reused as-is for the keyboard path
+  // below rather than duplicated or widened.
+  function applySelectionGesture(e: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }) {
+    const mode = selectionModeFor(e);
+    if (mode === "add") lanes.extendTo(track.id, orderedTrackIds);
+    // Lane selection only defines three gestures (plain/ctrl/shift), unlike
+    // clip selection's four — shift+ctrl subtract has no lane analogue yet,
+    // so it folds into toggle rather than being silently ignored.
+    else if (mode === "toggle" || mode === "subtract") lanes.toggleSelected(track.id);
+    else lanes.selectOnly(track.id);
+  }
+
+  function onHeaderClick(e: MouseEvent) {
+    const el = e.target as HTMLElement;
+    if (el.closest("button, input, select, a, [data-lane-grip]")) return;
+    applySelectionGesture(e);
+  }
+
+  /**
+   * Row-level keyboard: Space/Enter select (with the same modifiers as a
+   * click), Ctrl/Cmd+A selects every lane, and Up/Down move focus to the
+   * next painted row by id (`orderedTrackIds`, not `nextElementSibling` —
+   * a folded group sits between two rows in the DOM and must not eat an
+   * arrow-press). Guarded to the ROW itself (`e.target === e.currentTarget`):
+   * without it, Space on the mute button or Ctrl+A while renaming a lane
+   * would bubble here and hijack a keystroke that already means something
+   * to the focused child.
+   */
+  function onHeaderKeydown(e: KeyboardEvent) {
+    if (e.target !== e.currentTarget) return;
+    if (e.key === " " || e.key === "Enter") {
+      e.preventDefault();
+      applySelectionGesture(e);
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+      e.preventDefault();
+      lanes.selectAll();
+      return;
+    }
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      const i = orderedTrackIds.indexOf(track.id);
+      const nextId = i < 0 ? undefined : orderedTrackIds[i + (e.key === "ArrowDown" ? 1 : -1)];
+      if (!nextId) return;
+      e.preventDefault();
+      const grid = (e.currentTarget as HTMLElement).closest('[role="grid"]');
+      grid?.querySelector<HTMLElement>(`[data-track-row="${nextId}"]`)?.focus();
+    }
+  }
+
+  /** Roving tabindex: the selected row(s) are reachable by Tab; with
+   * nothing selected, the FIRST row is — a grid must always have exactly
+   * one entry point, or Tab skips over the lane list entirely. */
+  const rowTabIndex = $derived(
+    lanes.isSelected(track.id) || (lanes.selection.size === 0 && index === 0) ? 0 : -1,
+  );
+
+  /** This lane's own M/S/A applies to the whole selection once the lane is
+   * PART of a multi-lane selection — one lane selected behaves exactly like
+   * no selection at all. */
+  const inBulkSelection = $derived(lanes.isSelected(track.id) && lanes.selection.size > 1);
+  const bulkTargets = $derived(
+    inBulkSelection ? bulkableTracks(project.tracks, lanes.selection) : [],
+  );
+
+  function pressToggle(field: BulkField) {
+    if (inBulkSelection) {
+      const value = nextBulkValue(fieldValues(bulkTargets, field));
+      void project.setTracksState(
+        bulkTargets.map((t) => t.id),
+        field,
+        value,
+      );
+    } else if (field === "muted") {
+      void project.toggleMute(track.id);
+    } else if (field === "soloed") {
+      void project.toggleSolo(track.id);
+    } else {
+      void project.toggleArm(track.id);
+    }
+  }
+
+  function bulkTitle(verb: string): string {
+    return inBulkSelection ? `${verb} ${bulkTargets.length} selected lanes` : verb;
+  }
+
+  let dropHover = $state(false);
+
+  function onHeaderDragOver(e: DragEvent) {
+    if (track.kind === "automation") return;
+    if (!hasLibraryDrag(e.dataTransfer)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    dropHover = true;
+  }
+
+  function onHeaderDragLeave() {
+    dropHover = false;
+  }
+
+  function onHeaderDrop(e: DragEvent) {
+    dropHover = false;
+    if (track.kind === "automation") return;
+    const payload = decodeLibraryDrag(e.dataTransfer);
+    if (!payload) return;
+    e.preventDefault();
+    void library.dropOnTrack(payload, track.id, 0);
+  }
 </script>
 
 <div
@@ -178,7 +304,20 @@
   class:collapsed
   class:grouped={group !== null}
   class:dragging={lanes.draggingTrackId === track.id}
+  class:selected={lanes.isSelected(track.id)}
+  class:drop={dropHover}
+  ondragover={onHeaderDragOver}
+  ondragleave={onHeaderDragLeave}
+  ondrop={onHeaderDrop}
   style:--track-color={track.color}
+  role="row"
+  aria-selected={lanes.isSelected(track.id)}
+  aria-label="Lane {index + 1}: {track.name}"
+  aria-rowindex={index + 1}
+  data-track-row={track.id}
+  tabindex={rowTabIndex}
+  onclick={onHeaderClick}
+  onkeydown={onHeaderKeydown}
 >
   <!-- The colour stripe doubles as the drag handle: it is already the
        lane's identity, it runs the full height, and it costs no layout.
@@ -194,7 +333,7 @@
     <!-- Folded: one strip. Everything here has to survive at 22 px, so it
          is the name plus the two toggles people scan for (mute, solo) and
          nothing else. -->
-    <div class="strip">
+    <div class="strip" role="gridcell">
       <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
       {#if renaming}
         <input
@@ -214,14 +353,18 @@
         <button
           class="tog mute"
           class:on={track.muted}
-          title="Mute"
-          onclick={() => project.toggleMute(track.id)}>M</button
+          aria-pressed={track.muted}
+          title={bulkTitle("Mute")}
+          aria-label={bulkTitle("Mute")}
+          onclick={() => pressToggle("muted")}>M</button
         >
         <button
           class="tog solo"
           class:on={track.soloed}
-          title="Solo"
-          onclick={() => project.toggleSolo(track.id)}>S</button
+          aria-pressed={track.soloed}
+          title={bulkTitle("Solo")}
+          aria-label={bulkTitle("Solo")}
+          onclick={() => pressToggle("soloed")}>S</button
         >
       {/if}
       <button
@@ -234,7 +377,7 @@
     </div>
   {:else}
     <div class="body">
-      <div class="identity-row">
+      <div class="identity-row" role="gridcell" aria-label="Identity for {track.name}">
         <button class="foldbtn mono" aria-expanded="true" title="Fold lane to a strip" aria-label="Fold lane {track.name}" onclick={() => lanes.toggleTrack(track.id)}>▾</button>
         <span class="idx mono">{String(index + 1).padStart(2, "0")}</span>
         {#if renaming}
@@ -245,7 +388,7 @@
         <button class="del" title="Remove track" aria-label="Remove track {track.name}" onclick={() => project.removeTrack(track.id)}>×</button>
       </div>
 
-      <div class="metadata-row">
+      <div class="metadata-row" role="gridcell" aria-label="Routing and FX for {track.name}">
         <span class="picker">
           <button class="groupchip mono" class:on={group !== null} aria-haspopup="menu" aria-expanded={groupMenuOpen} aria-label={group ? "Change lane group " + group : "Add lane to a group"} title={group ? "Lane group: " + group : "Add this lane to a group"} onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ? "Group · " + group : "Group · none"}</button>
           {#if groupMenuOpen}<LaneGroupMenu {track} onclose={() => (groupMenuOpen = false)} />{/if}
@@ -284,7 +427,7 @@
       </div>
 
       {#if isAutomation}
-        <section class="targets" aria-label="Automation targets for {track.name}">
+        <div class="targets" role="gridcell" aria-label="Automation targets for {track.name}">
           <div class="section-head">
             <span class="section-label mono">Targets</span>
             <span class="picker">
@@ -303,26 +446,26 @@
               <button class="todel" title="Remove target" aria-label="Remove {targetLabel(b)}" onclick={() => modulation.removeBinding(b.id)}>×</button>
             </div>
           {/each}
-        </section>
+        </div>
       {:else}
-        <div class="status-row" role="group" aria-label="Mix status for {track.name}">
+        <div class="status-row" role="gridcell" aria-label="Mix status for {track.name}">
           {#if track.kind === "midi"}
             <label class="midiout-check mono" title="Publiser som egen MIDI-utgang i Carla/ALSA patchbay">
               <input type="checkbox" checked={midiIo.isVirtualTrack(track.id)} onchange={(e) => void midiIo.setTrackVirtualOutput(track.id, e.currentTarget.checked)} />
               MIDI OUT
             </label>
           {/if}
-          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title="Record arm" onclick={() => project.toggleArm(track.id)}>A</button>
-          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title="Mute" onclick={() => project.toggleMute(track.id)}>M</button>
-          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title="Solo" onclick={() => project.toggleSolo(track.id)}>S</button>
+          <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title={bulkTitle("Record arm")} aria-label={bulkTitle("Record arm")} onclick={() => pressToggle("armed")}>A</button>
+          <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title={bulkTitle("Mute")} aria-label={bulkTitle("Mute")} onclick={() => pressToggle("muted")}>M</button>
+          <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title={bulkTitle("Solo")} aria-label={bulkTitle("Solo")} onclick={() => pressToggle("soloed")}>S</button>
         </div>
 
-        <div class="automation-row">
+        <div class="automation-row" role="gridcell" aria-label="Automation mode for {track.name}">
           <span class="section-label mono">Automation</span>
           <AutomationModeSelector mode={track.automationMode} onchange={(mode) => project.setAutomationMode(track.id, mode)} />
         </div>
 
-        <section class="level-area" aria-label="Level controls for {track.name}">
+        <div class="level-area" role="gridcell" aria-label="Level controls for {track.name}">
           <div class="level-head"><span class="section-label mono">Level</span><Meter trackId={track.id} height={8} /></div>
           <div class="level-controls">
             <label class="level-control gain-control">
@@ -330,13 +473,27 @@
               <input class="fader" type="range" min="-60" max="12" step="0.1" value={track.gainDb} style:--fader-pct="{gainPct}%" style:--fader-fill={track.color} aria-label="Gain for {track.name}" oninput={onGain} onpointerdown={onGainPointerDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} />
               <output class="value mono">{formatDb(track.gainDb)}</output>
             </label>
-            <label class="level-control pan-control">
+            <!-- Pan is the one genuinely rotary parameter on a channel
+                 strip — bipolar, centre-detented, adjusted in small amounts —
+                 so it is the one that gets a knob rather than a slot. -->
+            <div class="level-control pan-control">
               <span class="control-label">Pan</span>
-              <input class="fader pan" type="range" min="-1" max="1" step="0.01" value={track.pan} style:--fader-pct="{((track.pan + 1) / 2) * 100}%" style:--fader-fill="var(--violet)" aria-label="Pan for {track.name}" oninput={onPan} onpointerdown={onPanPointerDown} onpointerup={onGestureEnd} onpointercancel={onGestureEnd} ondblclick={() => project.setPan(track.id, 0)} />
+              <Knob
+                value={track.pan}
+                min={-1}
+                max={1}
+                bipolar
+                size={20}
+                color="var(--violet)"
+                ariaLabel="Pan for {track.name}"
+                oninput={(v) => queueGestureWrite(() => project.setPan(track.id, v))}
+                onstart={onPanPointerDown}
+                onend={onGestureEnd}
+              />
               <output class="value pan-value mono">{formatPan(track.pan)}</output>
-            </label>
+            </div>
           </div>
-        </section>
+        </div>
       {/if}
     </div>
   {/if}
@@ -375,6 +532,34 @@
      indicator — not the original row — is what the eye follows. */
   .header.dragging {
     opacity: 0.4;
+  }
+  /* Restrained on purpose: a full accent fill would fight the colour
+     stripe for "what is this lane's identity", so selection is a thin
+     inset edge plus a faint wash, both off the same token. */
+  .header.selected {
+    box-shadow: inset 2px 0 0 0 var(--cyan-dim);
+    background: linear-gradient(
+      to right,
+      rgb(var(--cyan-rgb) / 0.1),
+      rgb(var(--bg-1-rgb) / 0.15)
+    );
+  }
+  .header.drop {
+    outline: 2px solid var(--cyan);
+    outline-offset: -2px;
+  }
+  /* Keyboard focus ring — an OUTLINE, deliberately not another box-shadow,
+     so it stays visually distinct from `.selected`'s wash/edge and the two
+     compose cleanly when a focused row is also selected. */
+  .header:focus-visible {
+    outline: 2px solid var(--cyan);
+    outline-offset: -2px;
+    z-index: 1;
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .header {
+      transition: outline-color 100ms linear, box-shadow 100ms linear;
+    }
   }
 
   /* ── folded lane ── */
@@ -841,7 +1026,10 @@
     flex: 1.3;
   }
   .pan-control {
-    flex: 1;
+    flex: none;
+  }
+  .level-control .pan-value {
+    width: 24px;
   }
   .control-label {
     flex: none;
@@ -857,9 +1045,6 @@
     color: var(--text-dim);
     font-size: 8px;
     text-align: right;
-  }
-  .level-control .pan-value {
-    width: 24px;
   }
   .targets {
     margin-left: 20px;

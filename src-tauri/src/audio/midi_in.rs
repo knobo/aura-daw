@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -210,6 +211,121 @@ pub fn hub() -> &'static Arc<MidiInHub> {
     HUB.get_or_init(|| Arc::new(MidiInHub::new()))
 }
 
+/// How long a plugin-patch audition holds C3 before note-off. Sampler
+/// preview uses 0.6 s; this is the same "tap the key" length.
+const PREVIEW_HOLD: Duration = Duration::from_millis(500);
+
+/// Bumped on every `fire_preview_note` so an in-flight note-off thread
+/// belonging to an older audition bails instead of cutting the new one
+/// or restoring a stale MIDI-in target.
+static PREVIEW_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Inject a note-on into the live-in hub, routing to `track_id` if it is
+/// not already the target. Returns the previous target so the caller can
+/// restore it after the matching note-off.
+///
+/// Same path hardware monitoring uses: with the transport stopped, the
+/// engine's `render_live_input_only` arm still sounds the routed slot.
+pub fn preview_note_on(
+    hub: &MidiInHub,
+    track_id: &str,
+    key: u8,
+    velocity: u8,
+) -> Result<Option<String>, String> {
+    if key > 127 {
+        return Err(format!("key out of range: {key}"));
+    }
+    let prev = hub.target_track();
+    if prev.as_deref() != Some(track_id) {
+        hub.set_target_track(Some(track_id.to_string()));
+    }
+    // Cut a previous audition on this slot, then the new note.
+    hub.push(LiveMidiEvent::all_off());
+    if !hub.push(LiveMidiEvent::note_on(key, velocity.clamp(1, 127))) {
+        if prev.as_deref() != Some(track_id) {
+            hub.set_target_track(prev);
+        }
+        return Err("preview note queue full — engine not running?".into());
+    }
+    Ok(prev)
+}
+
+/// Note-on plus a delayed note-off that restores the previous MIDI-in
+/// target. Used by `plugin_preview_note`; tests call `preview_note_on`
+/// directly so they stay instant.
+pub fn fire_preview_note(
+    hub: &Arc<MidiInHub>,
+    track_id: &str,
+    key: u8,
+    velocity: u8,
+) -> Result<(), String> {
+    let prev = preview_note_on(hub, track_id, key, velocity)?;
+    let gen = PREVIEW_GEN.fetch_add(1, Relaxed) + 1;
+    let restore = (prev.as_deref() != Some(track_id)).then_some(prev);
+    let restore_now = restore.clone();
+    let hub_thread = Arc::clone(hub);
+    match std::thread::Builder::new()
+        .name("plugin-preview-off".into())
+        .spawn(move || {
+            std::thread::sleep(PREVIEW_HOLD);
+            if PREVIEW_GEN.load(Relaxed) != gen {
+                return;
+            }
+            hub_thread.push(LiveMidiEvent::note_off(key));
+            if let Some(prev) = restore {
+                if PREVIEW_GEN.load(Relaxed) != gen {
+                    return;
+                }
+                hub_thread.set_target_track(prev);
+            }
+        }) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            hub.push(LiveMidiEvent::note_off(key));
+            if let Some(prev) = restore_now {
+                hub.set_target_track(prev);
+            }
+            Err(format!("preview note-off thread: {e}"))
+        }
+    }
+}
+
+struct PreviewHold {
+    prev: Option<String>,
+    stole: bool,
+    key: u8,
+}
+
+static PREVIEW_HOLD_STATE: Mutex<Option<PreviewHold>> = Mutex::new(None);
+
+/// Start a held preview note. A previous hold on this hub is released first.
+pub fn begin_preview_hold(
+    hub: &MidiInHub,
+    track_id: &str,
+    key: u8,
+    velocity: u8,
+) -> Result<(), String> {
+    end_preview_hold(hub);
+    let prev = preview_note_on(hub, track_id, key, velocity)?;
+    *PREVIEW_HOLD_STATE.lock() = Some(PreviewHold {
+        stole: prev.as_deref() != Some(track_id),
+        prev,
+        key,
+    });
+    Ok(())
+}
+
+/// Release the held preview note and restore MIDI-in routing if we stole it.
+pub fn end_preview_hold(hub: &MidiInHub) {
+    let Some(hold) = PREVIEW_HOLD_STATE.lock().take() else {
+        return;
+    };
+    hub.push(LiveMidiEvent::note_off(hold.key));
+    if hold.stole {
+        hub.set_target_track(hold.prev);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +409,62 @@ mod tests {
         hub.set_target_track(Some("ghost".into()));
         hub.refresh_target(1, &tables);
         assert_eq!(hub.target_slot(), None);
+    }
+
+    fn last_event(rx: &mut rtrb::Consumer<LiveMidiEvent>) -> Option<LiveMidiEvent> {
+        let mut last = None;
+        while let Ok(ev) = rx.pop() {
+            last = Some(ev);
+        }
+        last
+    }
+
+    #[test]
+    fn preview_note_on_routes_c3_to_the_named_track() {
+        let hub = MidiInHub::new();
+        let (tx, mut rx) = rtrb::RingBuffer::new(16);
+        hub.install_producer(tx);
+        let prev = preview_note_on(&hub, "t-bass", 60, 100).unwrap();
+        assert!(prev.is_none(), "nothing was routed yet");
+        assert_eq!(hub.target_track().as_deref(), Some("t-bass"));
+        assert_eq!(last_event(&mut rx), Some(LiveMidiEvent::note_on(60, 100)));
+    }
+
+    #[test]
+    fn preview_note_on_keeps_an_existing_target_on_the_same_track() {
+        let hub = MidiInHub::new();
+        let (tx, _rx) = rtrb::RingBuffer::new(16);
+        hub.install_producer(tx);
+        hub.set_target_track(Some("t-bass".into()));
+        let prev = preview_note_on(&hub, "t-bass", 60, 100).unwrap();
+        assert_eq!(prev.as_deref(), Some("t-bass"));
+        assert_eq!(hub.target_track().as_deref(), Some("t-bass"));
+    }
+
+    #[test]
+    fn preview_note_on_rejects_out_of_range_keys() {
+        let hub = MidiInHub::new();
+        let (tx, _rx) = rtrb::RingBuffer::new(8);
+        hub.install_producer(tx);
+        let err = preview_note_on(&hub, "t-bass", 128, 100).unwrap_err();
+        assert!(err.contains("key"), "got: {err}");
+        assert!(hub.target_track().is_none(), "a rejected key must not steal routing");
+    }
+
+    #[test]
+    fn begin_and_end_preview_hold_is_a_note_on_then_off() {
+        let hub = MidiInHub::new();
+        let (tx, mut rx) = rtrb::RingBuffer::new(16);
+        hub.install_producer(tx);
+        begin_preview_hold(&hub, "t-bass", 60, 100).unwrap();
+        assert_eq!(last_event(&mut rx), Some(LiveMidiEvent::note_on(60, 100)));
+        end_preview_hold(&hub);
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.pop() {
+            kinds.push(ev.kind);
+        }
+        assert!(kinds.contains(&EV_NOTE_OFF), "release must send note-off, got {kinds:?}");
+        assert!(hub.target_track().is_none(), "hold must restore routing on release");
     }
 
     #[test]

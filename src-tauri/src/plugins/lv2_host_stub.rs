@@ -102,4 +102,20 @@ impl Lv2Host {
     pub fn load_state(&self, _instance_id: &str, _blob: StateBlob) -> Result<(), String> {
         Err(UNAVAILABLE.into())
     }
+
+    pub fn has_gui(&self, _instance_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    pub fn show_gui(&self, _instance_id: &str) -> Result<(), String> {
+        Err(UNAVAILABLE.into())
+    }
+
+    pub fn gui_is_open(&self, _instance_id: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    pub fn gui_flags(&self) -> std::collections::HashMap<String, bool> {
+        std::collections::HashMap::new()
+    }
 }

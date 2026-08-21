@@ -67,6 +67,9 @@ describe("library drag payloads", () => {
       { kind: "projectMidiClip", clipId: "m1" },
       { kind: "samplerInstrument", instrumentId: "i1", name: "Piano" },
       { kind: "zynPatch", patch: { bank: "Arpeggios", name: "Arp 1", program: 1, path: "/a.xiz" } },
+      { kind: "pluginInstrument", uid: "clap:surge", name: "Surge XT" },
+      { kind: "pluginEffect", uid: "clap:verb", name: "Calf Reverb" },
+      { kind: "pluginInstance", instanceId: "i1", name: "Surge XT" },
     ] as const;
     for (const p of payloads) {
       const dt = fakeDataTransfer();

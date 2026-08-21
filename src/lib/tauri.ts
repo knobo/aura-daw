@@ -56,11 +56,14 @@ import type {
   LaunchMap,
   LaunchSnapshot,
   OpenSidecarEvent,
+  PluginCatalog,
+  PluginCatalogPatch,
   PluginDescriptor,
   PluginInstanceInfo,
   PluginListResult,
   PluginParamChange,
   PluginParamInfo,
+  PluginScanStatus,
   PaletteView,
   PasteRequest,
   PasteResult,
@@ -340,6 +343,9 @@ export interface Backend {
   samplerLoadInstrument(sfzPath: string, name?: string | null): Promise<InstrumentInfo>;
   samplerListInstruments(): Promise<InstrumentInfo[]>;
   samplerPreviewNote(instrumentId: string, key: number, velocity: number): Promise<void>;
+  /** Held audition: sounds until `samplerPreviewNoteOff`. */
+  samplerPreviewNoteOn(instrumentId: string, key: number, velocity: number): Promise<void>;
+  samplerPreviewNoteOff(key: number): Promise<void>;
   setTrackInstrument(trackId: string, instrumentId: string | null): Promise<TrackState>;
 
   // open-kind generation jobs (sidecar-job-v2)
@@ -359,6 +365,28 @@ export interface Backend {
   pluginGetParams(instanceId: string): Promise<PluginParamInfo[]>;
   /** Batched (D-03): one invoke carries N parameter changes. */
   pluginSetParam(instanceId: string, changes: PluginParamChange[]): Promise<PluginParamInfo[]>;
+  /**
+   * Play a one-shot note (C3 unless the caller picks another key) through a
+   * live plugin instance's bound midi track. Not a project edit.
+   */
+  pluginPreviewNote(instanceId: string, key: number, velocity: number): Promise<void>;
+  pluginPreviewNoteOn(instanceId: string, key: number, velocity: number): Promise<void>;
+  pluginPreviewNoteOff(): Promise<void>;
+  /** Open the native plugin-owned floating editor for a hosted instance. */
+  pluginShowGui?(instanceId: string): Promise<void>;
+  /** INTERFACE pref: keep plugin editor windows above AURA. */
+  pluginSetGuiOnTop?(enabled: boolean): Promise<void>;
+
+  // ── plugin catalog (machine-global, persistent — additive) ──
+
+  /** Read the full persistent catalog (scan cache + favorites/recents/tags/
+   * pinned params). Optional: an older engine build may not have it yet. */
+  pluginCatalogGet?(): Promise<PluginCatalog>;
+  /** Apply one patch and persist; returns the FULL merged catalog so the
+   * frontend never guesses at the result. */
+  pluginCatalogUpdate?(patch: PluginCatalogPatch): Promise<PluginCatalog>;
+  /** "cache from N ago, M bundles changed" without actually rescanning. */
+  pluginScanStatus?(): Promise<PluginScanStatus>;
 
   // ── insert-FX slots (Plan G1) ──
 
@@ -861,6 +889,12 @@ class TauriBackend implements Backend {
   async samplerPreviewNote(instrumentId: string, key: number, velocity: number) {
     await invoke("sampler_preview_note", { instrumentId, key, velocity });
   }
+  async samplerPreviewNoteOn(instrumentId: string, key: number, velocity: number) {
+    await invoke("sampler_preview_note_on", { instrumentId, key, velocity });
+  }
+  async samplerPreviewNoteOff(key: number) {
+    await invoke("sampler_preview_note_off", { key });
+  }
   setTrackInstrument(trackId: string, instrumentId: string | null) {
     return invoke<TrackState>("set_track_instrument", { trackId, instrumentId });
   }
@@ -894,6 +928,33 @@ class TauriBackend implements Backend {
   }
   pluginSetParam(instanceId: string, changes: PluginParamChange[]) {
     return invoke<PluginParamInfo[]>("plugin_set_param", { instanceId, changes });
+  }
+  async pluginPreviewNote(instanceId: string, key: number, velocity: number) {
+    await invoke("plugin_preview_note", { instanceId, key, velocity });
+  }
+  async pluginPreviewNoteOn(instanceId: string, key: number, velocity: number) {
+    await invoke("plugin_preview_note_on", { instanceId, key, velocity });
+  }
+  async pluginPreviewNoteOff() {
+    await invoke("plugin_preview_note_off");
+  }
+  async pluginShowGui(instanceId: string) {
+    await invoke("plugin_show_gui", { instanceId });
+  }
+  async pluginSetGuiOnTop(enabled: boolean) {
+    await invoke("plugin_set_gui_on_top", { enabled });
+  }
+
+  // ── plugin catalog ──
+
+  pluginCatalogGet() {
+    return invoke<PluginCatalog>("plugin_catalog_get");
+  }
+  pluginCatalogUpdate(patch: PluginCatalogPatch) {
+    return invoke<PluginCatalog>("plugin_catalog_update", { patch });
+  }
+  pluginScanStatus() {
+    return invoke<PluginScanStatus>("plugin_scan_status");
   }
 
   // ── insert-FX slots ──

@@ -544,9 +544,17 @@
     const k = keyFromEvent(e);
     if (k < 0 || k > 127) return;
     heldKey = k;
-    audition(k, 104);
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    if (track?.instrumentId && !track.instrumentId.startsWith("plugin:")) {
+      void instruments.previewDown(track.instrumentId, k, 104);
+    } else {
+      audition(k, 104);
+    }
   }
   function onKeysUp() {
+    if (track?.instrumentId && !track.instrumentId.startsWith("plugin:")) {
+      void instruments.previewUp();
+    }
     heldKey = -1;
   }
 

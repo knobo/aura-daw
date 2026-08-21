@@ -507,6 +507,10 @@
     border-right: none;
     border-top: none;
     position: relative;
+    /* The bar is the front panel everything else is mounted behind: a lit
+       top lip and a cast shadow onto the timeline under it. */
+    background-image: var(--sheen-face);
+    box-shadow: inset 0 var(--border-width) 0 0 var(--bevel-hi), var(--relief-3);
     /* Above Dock (30) and PanelResizeHandle (40): `z-index` here opens a
        stacking context, so the ⋯ menu's own z-index only sorts INSIDE the
        bar — this value is what the whole bar, dropdown included, competes
@@ -546,20 +550,41 @@
     gap: 6px;
   }
   .tbtn {
+    position: relative;
     width: 34px;
     height: 30px;
     display: grid;
     place-items: center;
-    border-radius: 5px;
+    border-radius: var(--ctrl-radius);
     border: var(--border-width) solid var(--glass-border);
-    background: rgb(var(--bg-2-rgb) / 0.5);
+    background-color: rgb(var(--bg-2-rgb) / 0.5);
+    background-image: var(--sheen-face);
+    box-shadow: var(--bevel-raised), var(--relief-2);
     color: var(--text-dim);
     cursor: pointer;
-    transition: color 120ms, border-color 120ms, box-shadow 120ms;
+    transition: color 120ms, border-color 120ms, box-shadow 120ms, transform 90ms;
+  }
+  /* Moulded speckle over the face. Absolutely positioned, so the grid's
+     `place-items` never sees it as a second item to centre. */
+  .tbtn::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background-image: var(--grain-tex);
+    opacity: var(--grain);
+    mix-blend-mode: overlay;
+    pointer-events: none;
   }
   .tbtn:hover {
     color: var(--text);
     border-color: rgb(var(--edge-rgb) / 0.3);
+  }
+  /* A press is a MOVE, not a colour change: the cap drops into the panel
+     and the shadow it was casting collapses under it. */
+  .tbtn:active {
+    transform: translateY(calc(1px * var(--relief)));
+    box-shadow: var(--bevel-inset), var(--relief-1);
   }
   .tbtn.play.active {
     color: var(--cyan);
@@ -599,9 +624,11 @@
     align-items: baseline;
     gap: 12px;
     padding: 4px 14px;
-    border-radius: 6px;
+    border-radius: var(--ctrl-radius);
     border: var(--border-width) solid var(--glass-border);
     background: rgb(var(--bg-0-rgb) / 0.75);
+    /* A recessed display window: the lip runs the other way round. */
+    box-shadow: var(--bevel-inset);
   }
   .clock {
     font-size: 21px;

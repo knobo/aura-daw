@@ -9,6 +9,13 @@ import { project } from "./project.svelte";
 const MIN_SPP = 16; // extreme zoom-in
 const MAX_SPP = 65536; // extreme zoom-out
 
+/** Fraction of the viewport a revealed position is placed at, measured
+ * from the left edge — a little lead-in so the playhead has somewhere to
+ * go after a page-scroll. */
+const LEAD_FRAC = 0.08;
+/** Everything left of this fraction counts as visible; past it, page. */
+const VISIBLE_FRAC = 0.92;
+
 class TimelineView {
   /** samples per CSS pixel */
   spp = $state(1200);
@@ -39,6 +46,25 @@ class TimelineView {
 
   scrollToSamples(samples: number) {
     this.viewStart = Math.max(0, samples);
+  }
+
+  /**
+   * Bring `samples` on screen, and do nothing when it is already there.
+   *
+   * Both follow paths run through this: the rAF tick while rolling, and
+   * the seek handler while stopped. The "already there" half is what makes
+   * the stopped path safe — without it, following would yank the view back
+   * every time the user scrolled away to look at something.
+   *
+   * The trailing margin (position past 92% of the viewport counts as off
+   * screen) is what makes playback page ahead BEFORE the playhead hits the
+   * right edge, rather than after.
+   */
+  revealSamples(samples: number) {
+    const span = this.width * this.spp;
+    const x = (samples - this.viewStart) / this.spp;
+    if (x >= 0 && x <= this.width * VISIBLE_FRAC) return;
+    this.scrollToSamples(samples - span * LEAD_FRAC);
   }
 
   /** Zoom keeping the sample under cursor-x fixed on screen. */

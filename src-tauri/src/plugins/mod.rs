@@ -2,6 +2,9 @@
 //!
 //! * [`descriptor`] — wire types (`plugin-descriptor` / `plugin-state`
 //!   schemas).
+//! * [`catalog`]    — the machine-global, persistent plugin catalog
+//!   (`plugin-catalog.json`): scan cache + favorites/recents/tags/pinned
+//!   params, and the incremental-rescan planner `scan.rs` drives.
 //! * [`scan`]       — discovery: LV2 world (metadata-only, safe) + CLAP
 //!   search paths (via the sacrificial [`scan_worker`] subprocess).
 //! * [`host`]       — the ONE shared plugin main thread (`aura-plugin-host`)
@@ -25,11 +28,14 @@
 //! binding into a live node.
 
 pub mod automation;
+pub mod catalog;
 pub mod clap_host;
 pub mod descriptor;
 pub mod host;
 #[cfg(feature = "lv2")]
 pub mod lv2_host;
+#[cfg(feature = "lv2")]
+mod lv2_ui;
 /// Without the `lv2` feature (Windows: no system lilv to link) the stub takes
 /// the module's place, so every LV2 call site below compiles unchanged.
 #[cfg(not(feature = "lv2"))]
@@ -37,6 +43,7 @@ pub mod lv2_host;
 pub mod lv2_host;
 pub mod patches;
 pub mod scan;
+pub mod wm_stack;
 pub mod scan_worker;
 pub mod state;
 pub mod stderr_guard;
@@ -198,11 +205,25 @@ pub fn insert_node_for(
 
 pub struct PluginState {
     registry: Arc<Mutex<PluginRegistry>>,
+    /// The persistent catalog (scan cache + favorites/recents/tags/pinned
+    /// params) — loaded once in [`init`], mutated in memory by
+    /// `plugin_catalog_update` / `plugin_scan`, and written back to disk on
+    /// every mutation. A SEPARATE lock from `registry` (not a field on
+    /// [`PluginRegistry`]) on purpose: `PluginRegistry` is constructed as a
+    /// bare struct literal by test scaffolding elsewhere in the crate
+    /// (`control::mod`'s engine-hook tests), and growing that struct's
+    /// public shape would break every such call site outside this module's
+    /// ownership. Machine-global, NOT part of `Session` — same "filesystem
+    /// probe, not document state" reasoning as `registry.scanned`.
+    catalog: Arc<Mutex<catalog::PluginCatalog>>,
 }
 
 impl Default for PluginState {
     fn default() -> Self {
-        Self { registry: Arc::new(Mutex::new(PluginRegistry::default())) }
+        Self {
+            registry: Arc::new(Mutex::new(PluginRegistry::default())),
+            catalog: Arc::new(Mutex::new(catalog::PluginCatalog::default())),
+        }
     }
 }
 
@@ -214,13 +235,31 @@ impl Default for PluginState {
 /// order — so it can't be done here).
 pub fn init(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let state = app.state::<PluginState>();
+    // Load the persistent catalog and seed the registry's scan cache from
+    // it (the whole point of the catalog — PR spec 4.1.B): after this,
+    // `plugin_list` returns a populated list and `scanned: true` on the
+    // FIRST frame after launch, instead of an empty list until the user
+    // rescans by hand.
+    let disk_catalog = catalog::load();
+    let seeded = disk_catalog.scan.entries.len();
+    if !disk_catalog.scan.entries.is_empty() {
+        state.registry.lock().scanned = Some(
+            disk_catalog
+                .scan
+                .entries
+                .iter()
+                .map(|e| e.descriptor.clone())
+                .collect(),
+        );
+    }
+    *state.catalog.lock() = disk_catalog;
     register_registry(state.registry.clone());
     // The production host-state bridge (ARCHITECTURE §15.3 "State"): project
     // save/open serializes live CLAP/LV2 instance state through the shared
     // plugin main thread. Registered here so `state::save_into_project` /
     // `reactivate_restored` reach the real hosts.
     state::register_state_bridge(Arc::new(state::FormatStateBridge));
-    log::info!("plugins::init — registry + state bridge published (scan is on-demand)");
+    log::info!("plugins::init — registry + state bridge published; catalog seeded {seeded} cached descriptors");
     Ok(())
 }
 
@@ -239,6 +278,10 @@ pub struct PluginListResult {
     pub plugins: Vec<PluginDescriptor>,
     pub instances: Vec<PluginInstanceInfo>,
     pub scanned: bool,
+    /// Instance id → native floating GUI available. Additive (D-06); not
+    /// document state — probed from the live host.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub gui: std::collections::HashMap<String, bool>,
 }
 
 /// Scan LV2 + CLAP search paths. Runs on a blocking worker (the CLAP half
@@ -252,12 +295,81 @@ pub struct PluginListResult {
 #[tauri::command]
 pub async fn plugin_scan(state: State<'_, PluginState>) -> Result<Vec<PluginDescriptor>, String> {
     log::info!("plugin scan: requested");
-    let found = tauri::async_runtime::spawn_blocking(scan::scan_all)
+    let prev_entries = state.catalog.lock().scan.entries.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || scan::scan_incremental(prev_entries))
         .await
         .map_err(|e| format!("plugin scan task failed: {e}"))?;
-    state.registry.lock().scanned = Some(found.clone());
-    log::info!("plugin scan: returning {} descriptors to the webview", found.len());
-    Ok(found)
+    state.registry.lock().scanned = Some(result.descriptors.clone());
+    let merged_catalog = {
+        let mut cat = state.catalog.lock();
+        cat.scan = catalog::ScanCache {
+            scanned_at: Some(catalog::now_secs()),
+            entries: result.entries,
+        };
+        cat.clone()
+    };
+    if let Err(e) = catalog::save(&merged_catalog) {
+        log::warn!("plugin catalog: failed to persist after scan: {e}");
+    }
+    log::info!(
+        "plugin scan: returning {} descriptors to the webview",
+        result.descriptors.len()
+    );
+    Ok(result.descriptors)
+}
+
+/// Additive command D (spec 4.1): read the full persistent catalog.
+#[tauri::command]
+pub fn plugin_catalog_get(state: State<'_, PluginState>) -> Result<catalog::PluginCatalog, String> {
+    Ok(state.catalog.lock().clone())
+}
+
+/// Additive command D: apply one patch and persist. Returns the FULL merged
+/// catalog so the frontend never guesses at the result (spec 4.1).
+#[tauri::command]
+pub fn plugin_catalog_update(
+    patch: catalog::PluginCatalogPatch,
+    state: State<'_, PluginState>,
+) -> Result<catalog::PluginCatalog, String> {
+    let now = catalog::now_secs();
+    let merged = {
+        let mut cat = state.catalog.lock();
+        *cat = catalog::apply_patch(cat.clone(), &patch, now);
+        cat.clone()
+    };
+    catalog::save(&merged)?;
+    Ok(merged)
+}
+
+/// Additive command D: "cache from N ago, M bundles changed" without
+/// actually rescanning — stats the same CLAP bundles `plugin_scan` would,
+/// classifies them against the cached catalog, and reports counts only.
+#[tauri::command]
+pub fn plugin_scan_status(
+    state: State<'_, PluginState>,
+) -> Result<catalog::PluginScanStatus, String> {
+    let (scanned_at, cached_clap) = {
+        let cat = state.catalog.lock();
+        let cached_clap: Vec<catalog::CatalogEntry> = cat
+            .scan
+            .entries
+            .iter()
+            .filter(|e| e.descriptor.format == "clap")
+            .cloned()
+            .collect();
+        (cat.scan.scanned_at, cached_clap)
+    };
+    let roots = scan::clap_search_paths();
+    let bundles = scan::find_clap_bundles(&roots);
+    let discovered: Vec<catalog::BundleStat> =
+        bundles.iter().filter_map(|b| scan::stat_bundle(b)).collect();
+    let plan = catalog::plan_rescan(&cached_clap, &discovered);
+    Ok(catalog::PluginScanStatus {
+        scanned_at,
+        cached: plan.reused.len(),
+        stale: plan.to_scan.len(),
+        missing: plan.missing,
+    })
 }
 
 #[tauri::command]
@@ -265,11 +377,15 @@ pub fn plugin_list(
     state: State<'_, PluginState>,
     control: State<'_, Arc<crate::control::ControlPlane>>,
 ) -> Result<PluginListResult, String> {
-    let reg = state.registry.lock();
+    let (plugins, scanned) = {
+        let reg = state.registry.lock();
+        (reg.scanned.clone().unwrap_or_default(), reg.scanned.is_some())
+    };
     Ok(PluginListResult {
-        plugins: reg.scanned.clone().unwrap_or_default(),
+        plugins,
         instances: control.plugin_rows(),
-        scanned: reg.scanned.is_some(),
+        scanned,
+        gui: gui_flags(),
     })
 }
 
@@ -497,6 +613,114 @@ pub fn plugin_set_param(
         .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))
 }
 
+/// Which midi track hosts this instance as its instrument
+/// (`instrumentId = "plugin:<id>"`). Insert-only placements are ignored —
+/// they have no note input to audition through.
+pub fn midi_track_bound_to_plugin(
+    tracks: &[crate::audio::types::TrackState],
+    instance_id: &str,
+) -> Option<String> {
+    let want = format!("plugin:{instance_id}");
+    tracks
+        .iter()
+        .find(|t| t.kind == "midi" && t.instrument_id.as_deref() == Some(want.as_str()))
+        .map(|t| t.id.as_str().to_string())
+}
+
+/// Play a one-shot note through a live plugin instance's bound midi track.
+/// No op, no dirty flag: the note rides the existing live-in hub (the same
+/// path hardware monitoring uses), so a stopped transport still sounds it.
+/// The instance must already be on a midi track — this does not instantiate
+/// a preview slot of its own.
+#[tauri::command]
+pub fn plugin_preview_note(
+    instance_id: String,
+    key: u8,
+    velocity: u8,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    if !control.plugin_exists(&instance_id) {
+        return Err(format!("unknown plugin instance: {instance_id}"));
+    }
+    let track_id = {
+        let session = control.session().lock();
+        midi_track_bound_to_plugin(&session.store.tracks, &instance_id).ok_or_else(|| {
+            format!("plugin instance {instance_id} is not bound to a midi track")
+        })?
+    };
+    crate::audio::midi_in::fire_preview_note(
+        crate::audio::midi_in::hub(),
+        &track_id,
+        key,
+        velocity,
+    )
+}
+
+/// Held plugin audition: note-on until `plugin_preview_note_off`.
+#[tauri::command]
+pub fn plugin_preview_note_on(
+    instance_id: String,
+    key: u8,
+    velocity: u8,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    if !control.plugin_exists(&instance_id) {
+        return Err(format!("unknown plugin instance: {instance_id}"));
+    }
+    let track_id = {
+        let session = control.session().lock();
+        midi_track_bound_to_plugin(&session.store.tracks, &instance_id).ok_or_else(|| {
+            format!("plugin instance {instance_id} is not bound to a midi track")
+        })?
+    };
+    crate::audio::midi_in::begin_preview_hold(
+        crate::audio::midi_in::hub(),
+        &track_id,
+        key,
+        velocity,
+    )
+}
+
+#[tauri::command]
+pub fn plugin_preview_note_off() -> Result<(), String> {
+    crate::audio::midi_in::end_preview_hold(crate::audio::midi_in::hub());
+    Ok(())
+}
+
+fn gui_flags() -> std::collections::HashMap<String, bool> {
+    let mut gui = clap_host::gui_flags();
+    if let Some(host) = lv2_host::try_global() {
+        gui.extend(host.gui_flags());
+    }
+    gui
+}
+
+/// Open the native plugin-owned floating editor for a live hosted instance
+/// (CLAP `clap.gui` floating / LV2 `ui:showInterface`). Additive command.
+#[tauri::command]
+pub fn plugin_show_gui(instance_id: String, control: State<'_, Arc<crate::control::ControlPlane>>) -> Result<(), String> {
+    let row = control
+        .plugin_row(&instance_id)
+        .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))?;
+    match row.format.as_str() {
+        "clap" => clap_host::show_gui(&instance_id),
+        "lv2" => lv2_host::global().show_gui(&instance_id),
+        other => Err(format!("{other} instances have no native gui host")),
+    }
+}
+
+/// Additive: INTERFACE pref `pluginGuiOnTop`. Live — already-open editors follow.
+#[tauri::command]
+pub fn plugin_set_gui_on_top(enabled: bool) {
+    wm_stack::set_flag(enabled);
+    // CLAP set_transient first so untitled editors become findable
+    // (WM_TRANSIENT_FOR) before we pin via EWMH.
+    if enabled {
+        let _ = clap_host::reapply_gui_transient();
+    }
+    wm_stack::apply_to_open_plugin_windows(enabled);
+}
+
 /// Plan G1: add an effect as an insert slot on a track. Prepare-outside
 /// (same shape as `plugin_instantiate`): host instantiate first, then one
 /// commit with `PluginAdd` + `InsertAdd`. Orphan host cleanup on commit failure.
@@ -685,5 +909,29 @@ mod tests {
             err.contains("effect") || err.contains("instruments"),
             "plugin_instantiate stays instrument-only, got: {err}"
         );
+    }
+
+    fn midi_track(id: &str, instrument_id: Option<&str>) -> crate::audio::types::TrackState {
+        let mut t = crate::audio::types::testutil::test_track(id);
+        t.kind = "midi".into();
+        t.instrument_id = instrument_id.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn midi_track_bound_to_plugin_finds_the_instrument_host() {
+        let tracks = [
+            midi_track("t-other", Some("plugin:other")),
+            midi_track("t-bass", Some("plugin:zyn-1")),
+        ];
+        assert_eq!(midi_track_bound_to_plugin(&tracks, "zyn-1").as_deref(), Some("t-bass"));
+    }
+
+    #[test]
+    fn midi_track_bound_to_plugin_ignores_audio_and_unbound() {
+        let mut audio = crate::audio::types::testutil::test_track("t-audio");
+        audio.instrument_id = Some("plugin:zyn-1".into());
+        let tracks = [audio, midi_track("t-midi", None)];
+        assert_eq!(midi_track_bound_to_plugin(&tracks, "zyn-1"), None);
     }
 }
