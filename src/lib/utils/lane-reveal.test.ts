@@ -84,8 +84,14 @@ describe("revealParamLane", () => {
   });
 
   it("is harmless when the track header element is missing from the DOM", async () => {
-    vi.stubGlobal("document", { querySelector: () => null });
+    const querySelector = vi.fn(() => null);
+    vi.stubGlobal("CSS", { escape: (s: string) => s });
+    vi.stubGlobal("document", { querySelector });
     await expect(revealParamLane("t1", TARGET)).resolves.toBeUndefined();
+    // Prove the null-element branch (querySelector -> null, then
+    // el?.scrollIntoView?.() short-circuiting) was actually exercised,
+    // not skipped by CSS.escape throwing before querySelector ran.
+    expect(querySelector).toHaveBeenCalledWith('[data-track-id="t1"]');
   });
 
   it("is harmless when the found element has no scrollIntoView (jsdom)", async () => {

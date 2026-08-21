@@ -3,7 +3,7 @@
  * that lets a strip/chip render a plugin's params without that instance
  * being the OPEN one. Follows `plugins-insert.test.ts`'s mocking pattern.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const pluginGetParams = vi.fn();
 const pluginRemove = vi.fn();
@@ -39,6 +39,15 @@ beforeEach(() => {
   plugins.paramCache = {};
   plugins.openInstanceId = "";
   plugins.params = [];
+  // setParam schedules an rAF-batched write; stub it as a no-op (never
+  // fires) so these mirror assertions only exercise the SYNCHRONOUS local
+  // update, not the backend round trip (already covered elsewhere).
+  vi.stubGlobal("requestAnimationFrame", (_cb: FrameRequestCallback) => 1);
+  vi.stubGlobal("cancelAnimationFrame", (_id: number) => {});
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
 });
 
 describe("ensureParams", () => {
@@ -98,5 +107,30 @@ describe("ensureParams", () => {
 
     await plugins.remove("inst-1");
     expect(plugins.paramCache["inst-1"]).toBeUndefined();
+  });
+});
+
+describe("setParam / resetParam mirror", () => {
+  it("setParam mirrors the optimistic local write into paramCache[openInstanceId]", () => {
+    plugins.openInstanceId = "inst-1";
+    plugins.params = [{ id: 1, name: "Cutoff", min: 0, max: 1, default: 0.5, value: 0.5, steps: 0 }];
+    plugins.paramCache = { "inst-1": [...plugins.params] };
+
+    plugins.setParam(1, 0.9);
+
+    expect(plugins.paramCache["inst-1"]).toEqual(plugins.params);
+    expect(plugins.paramInfo("inst-1", 1)?.value).toBeCloseTo(0.9);
+  });
+
+  it("resetParam (delegates to setParam) mirrors the reset value into paramCache", () => {
+    const param = { id: 1, name: "Cutoff", min: 0, max: 1, default: 0.5, value: 0.9, steps: 0 };
+    plugins.openInstanceId = "inst-1";
+    plugins.params = [param];
+    plugins.paramCache = { "inst-1": [{ ...param }] };
+
+    plugins.resetParam(param);
+
+    expect(plugins.paramCache["inst-1"]?.[0].value).toBe(0.5);
+    expect(plugins.paramInfo("inst-1", 1)?.value).toBe(0.5);
   });
 });
