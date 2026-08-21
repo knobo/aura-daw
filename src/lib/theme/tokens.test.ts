@@ -46,6 +46,7 @@ const T: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+  panelAlpha: "0.88",
   bevel: "0.4",
   relief: "0.55",
   sheen: "0.3",
@@ -171,5 +172,29 @@ describe("the material tokens", () => {
     expect(UNITLESS_AFFORDANCE_KEYS).toContain("sheen");
     expect(UNITLESS_AFFORDANCE_KEYS).toContain("grain");
     expect(UNITLESS_AFFORDANCE_KEYS).not.toContain("ctrlRadius");
+  });
+});
+
+describe("the chrome panel fill", () => {
+  it("mixes the panel colour at the theme's panel alpha", () => {
+    expect(toCssVars({ ...T, panelAlpha: "0.5" })["--panel"]).toBe("rgb(13 17 30 / 0.5)");
+  });
+
+  /**
+   * The pairing `glassBlur`/`glassAlpha` needs a test to police is DERIVED
+   * here instead, so a theme cannot get it wrong: a backdrop-filter behind a
+   * fully opaque surface blurs pixels nobody can see, and the dock is the
+   * largest always-on surface in the app.
+   */
+  it("drops the blur once the panel is opaque", () => {
+    expect(toCssVars({ ...T, panelAlpha: "1", glassBlur: "18px" })["--panel-blur"]).toBe("0px");
+  });
+
+  it("keeps the blur while the panel is see-through", () => {
+    expect(toCssVars({ ...T, panelAlpha: "0.88", glassBlur: "18px" })["--panel-blur"]).toBe("18px");
+  });
+
+  it("treats a nonsense alpha as opaque rather than emitting NaN", () => {
+    expect(toCssVars({ ...T, panelAlpha: "" })["--panel-blur"]).toBe("0px");
   });
 });

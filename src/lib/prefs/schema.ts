@@ -57,6 +57,8 @@ export interface PrefValues {
   /** Active theme id. A plain string, not a union: user themes are
    * discovered at runtime, so the catalogue is not knowable here. */
   theme: string;
+  /** Whether the right panel takes layout space or floats over the timeline. */
+  dockSide: "overlay" | "docked";
 }
 
 /** Tolerance option ids, in order of strictness. */
@@ -291,6 +293,18 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
       { value: "confirmDestructive", label: "CONFIRM" },
       { value: "full", label: "FULL" },
     ],
+  },
+  dockSide: {
+    kind: "enum",
+    default: "overlay",
+    options: [
+      { value: "overlay", label: "FLOAT OVER" },
+      { value: "docked", label: "DOCK BESIDE" },
+    ],
+    category: "interface",
+    label: "Side panel",
+    blurb:
+      "Whether the right panel floats over the timeline or takes its own column beside it. Docking suits an opaque panel — with a translucent theme you can see the timeline through it, so floating costs you nothing.",
   },
   theme: {
     kind: "choice",

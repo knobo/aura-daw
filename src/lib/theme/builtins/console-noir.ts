@@ -65,6 +65,8 @@ export const CONSOLE_NOIR_TOKENS: ThemeTokens = {
   // Not zero — see the note above about LEDs.
   glowScale: "0.25",
   bodyGlow: "0.02",
+  // Milled metal is not a window.
+  panelAlpha: "1",
 
   // material — the point of the theme. Everything near the top of its range:
   // hard machined edges, a deep cast shadow, a strong sheen down each face,

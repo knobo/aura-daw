@@ -265,6 +265,104 @@ body {
   box-shadow: var(--bevel-inset);
 }
 
+/* ── module blocks ────────────────────────────────────────────────────────
+   The front-panel layout language: a window is not one flat surface but a
+   grid of separate MODULE blocks, each a top-lit face sitting in a darker
+   gutter, each wearing its name on a tab at its top-left.
+
+   Two things make this read as hardware rather than as cards, and both are
+   easy to get wrong:
+
+   1. The GUTTER must be darker than the face (`--bg-0` behind `--bg-1`).
+      Cards on a page share their parent's background and are separated by
+      whitespace; objects on a panel are separated by shadow. A rack whose
+      ground matches its modules reads as boxes drawn on paper no matter how
+      much bevel the modules carry.
+   2. The FACE GRADIENT does more work than the bevel. `--sheen-face` is the
+      cue that sells it — a flat fill with a crisp lit edge still looks like
+      a div, which is why Rack Slate runs `sheen` at 0.85.
+
+   Every value here is a material token, so the same markup is painted steel
+   under Rack Slate, milled aluminium under Console Noir, and plain flat
+   boxes under either high-contrast theme.
+   ─────────────────────────────────────────────────────────────────────── */
+
+/* The gutter the modules sit in. */
+.module-rack {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 5px;
+  background: var(--bg-0);
+}
+
+/* One module: a face standing proud of the gutter. */
+.module {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--ctrl-radius);
+  /* `bg-2`, not `bg-1`: a module has to stand proud of BOTH the gutter under
+     it and the panel the rack is mounted in, and on most themes the dock is
+     already at `bg-1`. Level with its host, the face disappears and only the
+     gutter strips between blocks read. */
+  background-color: var(--bg-2);
+  background-image: var(--sheen-face);
+  box-shadow: var(--bevel-raised), var(--relief-2);
+}
+
+/* The name tab. `align-self: flex-start` is what makes it a TAB rather than
+   a title bar: it takes only the width of its own label, so the module face
+   continues past it along the top edge — the detail that reads as a physical
+   legend plate rather than as a card header. */
+.module-head {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 3px 10px;
+  border-radius: var(--ctrl-radius) var(--ctrl-radius) 0 0;
+  background-color: var(--bg-3);
+  background-image: var(--sheen-face);
+  box-shadow: inset 0 var(--border-width) 0 0 var(--bevel-hi), var(--relief-1);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
+  color: var(--text-mid);
+  white-space: nowrap;
+}
+
+/* A module whose function is switched ON. The tab lights; the face does not
+   — on real gear the legend is what carries the state, and lighting the
+   whole panel would leave nowhere for selection to show. */
+.module.lit > .module-head {
+  color: var(--cyan);
+  box-shadow:
+    inset 0 var(--border-width) 0 0 var(--bevel-hi),
+    inset 0 -2px 0 0 var(--cyan),
+    var(--relief-1);
+}
+
+.module-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px 7px;
+  min-width: 0;
+}
+
+/* A row of controls across a module face, the way a hardware section lays
+   its knobs out: evenly spaced, labels under each. */
+.module-controls {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
 /* Surface speckle. An overlay child rather than a background layer so it
    composites over whatever gradient the element already carries, and
    `pointer-events: none` so it never eats a click on the control beneath. */

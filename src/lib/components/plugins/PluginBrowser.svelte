@@ -128,14 +128,15 @@
 
   <div class="list">
     {#each shown as desc (desc.uid)}
-      <div class="plug" class:fx={!desc.isInstrument}>
-        <div class="row top">
+      <div class="plug module" class:fx={!desc.isInstrument}>
+        <div class="module-head">
           <span class="badge mono {desc.format}">{desc.format}</span>
           <span class="pname" title={desc.path ?? desc.uid}>{desc.name}</span>
           {#if plugins.busyUid === desc.uid}
             <span class="busy mono">◌</span>
           {/if}
         </div>
+        <div class="module-body">
         <div class="row meta silk">
           <span class="vendor">{desc.vendor ?? "unknown vendor"}</span>
           {#if desc.version}<span>v{desc.version}</span>{/if}
@@ -178,6 +179,7 @@
             </select>
           </div>
         {/if}
+        </div>
       </div>
     {/each}
   </div>
@@ -190,8 +192,12 @@
     <div class="rackhead silk">instances</div>
     <div class="list">
       {#each plugins.instances as inst (inst.id)}
-        <div class="inst" class:crashed={inst.status === "crashed"}>
-          <div class="row top">
+        <div
+          class="inst module"
+          class:crashed={inst.status === "crashed"}
+          class:lit={inst.status === "active"}
+        >
+          <div class="module-head">
             <span class="badge mono {inst.format}">{inst.format}</span>
             <span class="pname" title={inst.uid}>{inst.name}</span>
             <span class="status mono {inst.status}" title="Instance status">{inst.status}</span>
@@ -202,6 +208,7 @@
               onclick={() => plugins.remove(inst.id)}>×</button
             >
           </div>
+          <div class="module-body">
           <div class="row">
             <button class="params mono" onclick={() => void openPluginParams(inst.id)}>
               ⚙ PARAMS
@@ -229,6 +236,7 @@
           <div class="row">
             <PluginConnectionBadge instanceId={inst.id} />
           </div>
+          </div>
         </div>
       {/each}
     </div>
@@ -246,7 +254,7 @@
   .browser {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 7px;
     flex: 1;
     min-height: 0;
     overflow-y: auto;
@@ -264,15 +272,28 @@
     font-size: 10px;
     letter-spacing: 0.16em;
     border: none;
-    border-radius: 5px;
+    border-radius: var(--ctrl-radius);
     cursor: pointer;
-    color: var(--bg-0);
-    background: linear-gradient(100deg, var(--violet), var(--magenta));
-    box-shadow: 0 0 calc(14px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.25);
-    transition: filter 120ms;
+    /* Was a fixed violet→magenta gradient — the one control in the panel
+       that ignored the theme, and glaring under any palette that is not
+       AURA Dark. It is now a lit key: the accent as a face, with the
+       material's own bevel and cast shadow. */
+    color: var(--text-on-accent);
+    background-color: var(--cyan);
+    background-image: var(--sheen-face);
+    box-shadow:
+      var(--bevel-raised),
+      var(--relief-2),
+      0 0 calc(14px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.3);
+    transition: filter 120ms, box-shadow 120ms, transform 90ms;
   }
   .scan:hover:not(:disabled) {
     filter: brightness(1.15);
+  }
+  /* A lit key still presses in. */
+  .scan:active:not(:disabled) {
+    transform: translateY(calc(1px * var(--relief)));
+    box-shadow: var(--bevel-inset), var(--relief-1);
   }
   .scan:disabled {
     opacity: 0.6;
@@ -327,26 +348,40 @@
     padding: 8px 0;
   }
 
+  /* The list is a RACK: the gutter behind the blocks is what makes them
+     read as separate objects rather than as bordered rows. `.module`,
+     `.module-head` and `.module-body` in app.css carry the rest — face
+     gradient, name tab, bevel — so nothing here paints a surface. */
   .list {
     display: flex;
     flex-direction: column;
-    gap: 8px;
+    gap: 5px;
+    padding: 5px;
+    border-radius: var(--ctrl-radius);
+    background: var(--bg-0);
   }
-  .plug,
-  .inst {
-    border: var(--border-width) solid var(--glass-border);
-    border-radius: 6px;
-    background: rgb(var(--bg-1-rgb) / 0.6);
-    padding: 8px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
+  /* Effects are shown alongside instruments; dimming the whole block is the
+     one thing that still separates them at a glance now that both wear the
+     same panel. */
   .plug.fx {
     opacity: 0.85;
   }
-  .inst {
-    border-color: rgb(var(--violet-rgb) / 0.22);
+  /* A crashed instance is the one state the FACE carries rather than the
+     tab: it is a fault, not a mode, and it should be visible without
+     reading the badge. */
+  .inst.crashed {
+    background-color: rgb(var(--red-rgb) / 0.09);
+  }
+  /* The tab is `white-space: nowrap`, so a long plugin name has to be told
+     it may shrink or the tab runs off the module. */
+  .module-head .pname {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .module-head .del,
+  .module-head .status,
+  .module-head .badge {
+    flex: none;
   }
   .inst.crashed {
     border-color: rgb(var(--red-rgb) / 0.4);
@@ -355,7 +390,7 @@
   .row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
   .pname {
     flex: 1;

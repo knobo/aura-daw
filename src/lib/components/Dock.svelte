@@ -1,10 +1,18 @@
 <script lang="ts">
   /**
-   * Right dock: slide-in glass drawer hosting AI Studio, the instrument
-   * browser and the MCP control panel. Overlays the timeline; toggled from
-   * the transport bar chips.
+   * Right dock: slide-in drawer hosting AI Studio, the instrument browser
+   * and the MCP control panel. Toggled from the transport bar chips.
+   *
+   * It sits in one of two layouts, chosen by the `dockSide` preference. As
+   * an OVERLAY it floats above the timeline and casts leftward onto it — the
+   * original behaviour, and the right one for a translucent theme, where you
+   * can see what you are covering. DOCKED, it is a static flex item and the
+   * timeline gets the remaining width, which is what an opaque panel wants:
+   * a wall you cannot see through should not be hiding half the arrangement.
+   * The layout switch itself lives in App.svelte, which owns the row.
    */
   import { DOCK_SHORTCUT, ui, type DockTab } from "../state/ui.svelte";
+  import { prefs } from "../prefs/prefs.svelte";
   import { DOCK_RESIZE } from "../utils/panel-resize";
   import PanelResizeHandle from "./PanelResizeHandle.svelte";
   import { mcp } from "../state/mcp.svelte";
@@ -22,6 +30,8 @@
   import MidiPanel from "./midi/MidiPanel.svelte";
   import HistoryPanel from "./history/HistoryPanel.svelte";
   import { historyBrowser } from "../state/history.svelte";
+
+  const docked = $derived(prefs.values.dockSide === "docked");
 
   function selectTab(tab: Exclude<DockTab, "">) {
     ui.dock = tab;
@@ -42,7 +52,7 @@
 </script>
 
 {#if ui.dock}
-  <aside class="dock glass" aria-label="Side panel" style:width="{ui.dockWidth}px">
+  <aside class="dock glass" class:docked aria-label="Side panel" style:width="{ui.dockWidth}px">
     <PanelResizeHandle
       axis="x"
       size={ui.dockWidth}
@@ -113,13 +123,32 @@
     border-top: none;
     border-bottom: none;
     border-right: none;
-    background: rgb(var(--bg-sunken-rgb) / 0.88);
-    /* The dock slides in OVER the timeline rather than replacing part of
-       it, so it casts leftward onto what it covers. */
+    /* Fill and blur are the theme's call (`panelAlpha`), not a hard-coded
+       0.88. `--panel-blur` is DERIVED from that alpha, so an opaque panel
+       cannot also be paying for a backdrop-filter over the largest
+       always-on surface in the app. `.glass` still sets its own blur, so
+       this overrides it rather than relying on order. */
+    background: var(--panel);
+    backdrop-filter: blur(var(--panel-blur)) saturate(1.2);
+    -webkit-backdrop-filter: blur(var(--panel-blur)) saturate(1.2);
+    /* Floating: the dock hangs OVER the timeline, so it casts leftward onto
+       what it covers. */
     box-shadow: calc(-6px * var(--relief)) 0 calc(20px * var(--relief))
       rgb(var(--shadow-rgb) / calc(var(--relief) * 0.45));
     animation: dock-in 160ms ease-out;
   }
+  /* Docked: a column in the row, so `position` and the overlay's cast
+     shadow both come off. It keeps a hard left edge instead — the seam
+     between two panels that meet, rather than one floating above another. */
+  .dock.docked {
+    position: relative;
+    inset: auto;
+    flex: none;
+    box-shadow: none;
+    border-left: var(--border-width) solid var(--glass-border);
+    animation: none;
+  }
+
   @keyframes dock-in {
     from {
       transform: translateX(24px);
@@ -205,6 +234,6 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
-    padding: 12px;
+    padding: 8px;
   }
 </style>

@@ -1122,6 +1122,10 @@
   .timeline {
     flex: 1;
     min-height: 0;
+    /* Also the cross-axis floor: with the side panel docked, `.main` is a
+       ROW and an unconstrained flex item refuses to shrink past its content,
+       pushing the dock off-screen. */
+    min-width: 0;
     display: flex;
     flex-direction: column;
     background: var(--bg-0);

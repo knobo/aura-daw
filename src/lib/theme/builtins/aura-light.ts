@@ -44,6 +44,9 @@ export const AURA_LIGHT_TOKENS: ThemeTokens = {
   glassAlpha: "1",
   glowScale: "0",
   bodyGlow: "0",
+  // Opaque, like this theme's glass already is: a light theme that made
+  // its dialogs solid has no reason to leave the side panel see-through.
+  panelAlpha: "1",
 
   // material — A light panel shows a bevel more readily than a dark one, so the edge is
   // pulled back a touch while the sheen comes up.

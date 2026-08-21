@@ -1,6 +1,6 @@
 # Themes in AURA
 
-AURA features a full, tokenised theme system supporting ten built-in themes and user-authored JSON themes from disk. Every visual element—from UI chrome, panels, and dialogs to canvas-rendered timeline tracks, piano roll notes, and audio meters—is styled strictly through reactive theme tokens.
+AURA features a full, tokenised theme system supporting eleven built-in themes and user-authored JSON themes from disk. Every visual element—from UI chrome, panels, and dialogs to canvas-rendered timeline tracks, piano roll notes, and audio meters—is styled strictly through reactive theme tokens.
 
 A theme controls two independent things. Its **palette** says what colour a
 surface is. Its **material** says what that surface is made of — milled
@@ -32,7 +32,8 @@ AURA ships with eight built-in themes:
 7. **Nord** (`nord`): Arctic north-bluish palette built from Polar Night, Snow Storm, Frost, and Aurora hues.
 8. **Gruvbox Dark** (`gruvbox-dark`): Retro warm groove palette with earthy backgrounds and pastel accents.
 9. **Console Noir** (`console-noir`): The flagship material theme — a machined outboard rack unit in bead-blasted graphite, with an amber lamp as the primary interactive colour instead of a neon glow. Solid panels, deep bevels, heavy grain.
-10. **Studio Ivory** (`studio-ivory`): The light half of the material pair — cream injection-moulded plastic with softer corners, a satin sheen, and a warm brown shadow rather than a black one.
+10. **Rack Slate** (`rack-slate`): Cool steel modules on a dark gutter, lit by one orange lamp — the front-panel idiom, where the window is a grid of separate module blocks rather than one flat surface. The theme the `.module` layout language (§7) was tuned against.
+11. **Studio Ivory** (`studio-ivory`): The light half of the material pair — cream injection-moulded plastic with softer corners, a satin sheen, and a warm brown shadow rather than a black one.
 
 ---
 
@@ -70,7 +71,8 @@ User themes are standard JSON files. The filename stem (e.g. `midnight-neon.json
     "relief": "0.8",
     "sheen": "0.6",
     "grain": "0.3",
-    "ctrlRadius": "3px"
+    "ctrlRadius": "3px",
+    "panelAlpha": "1"
   }
 }
 ```
@@ -149,6 +151,23 @@ Percentage channels (`rgb(80% 50% 20%)`), `none`, and the CSS named colours are 
 | `glassAlpha` | Opacity of the glass panel fill, `0`–`1` | `0.62` | `1` |
 | `glowScale` | Multiplier on every glow radius; `0` removes all glow | `1` | `0` |
 | `bodyGlow` | Opacity of body atmospheric radial gradient | `0.05` | `0` |
+| `panelAlpha` | Opacity of the CHROME panels — the right dock. Distinct from `glassAlpha`, which governs floating glass | `0.88` | `1` |
+
+`panelAlpha` is separate from `glassAlpha` because the two answer different
+questions. A dialog is temporary and *should* let you see what it covers; a
+side panel you work in for an hour should not — a translucent one puts the
+timeline grid behind its own text. It is also what makes docking possible:
+something you can see through reads as floating over the layout rather than
+as part of it, which is why the **Side panel** preference (Preferences →
+Interface) offers *float over* and *dock beside*. Docking suits an opaque
+theme; with a see-through one, floating costs you nothing.
+
+The blur behind the panel is **derived**, not declared: at `panelAlpha: 1`
+the engine emits `--panel-blur: 0px` on its own. A `backdrop-filter` behind a
+fully opaque surface blurs pixels nobody can see, on the largest always-on
+surface in the app — so unlike the `glassBlur`/`glassAlpha` pairing, which a
+theme can still get wrong and which a test has to police, this one cannot be
+got wrong at all.
 
 The five **material** tokens (`bevel`, `relief`, `sheen`, `grain`,
 `ctrlRadius`) validate on this same path but are documented on their own
@@ -239,7 +258,57 @@ text, so they belong to the same family of decisions as `glassBlur` and
 
 ---
 
-## 7. Exporting Themes
+## 7. Module Blocks
+
+The material tokens say what a *surface* is made of. `.module` says how a
+**panel is laid out**: not one flat plane, but a grid of separate blocks,
+each a top-lit face sitting in a darker gutter, each wearing its name on a
+tab at its top-left. It is the idiom every hardware-style plugin uses, and
+the plugin browser is built from it.
+
+```html
+<div class="module-rack">
+  <div class="module lit">
+    <div class="module-head">CLAP  Surge XT</div>
+    <div class="module-body"> … controls … </div>
+  </div>
+</div>
+```
+
+| Class | Role |
+|---|---|
+| `.module-rack` | The gutter the blocks sit in. Paints `--bg-0`. |
+| `.module` | One block: a `--bg-2` face with the theme's sheen, bevel and cast shadow. |
+| `.module-head` | The name tab. `align-self: flex-start`, so it takes only its label's width and the face continues past it — the detail that reads as a legend plate rather than a card header. |
+| `.module.lit` | The block's function is switched ON: the **tab** lights, not the face. On real gear the legend carries the state, and lighting the whole panel leaves nowhere for selection to show. |
+| `.module-body` | The contents. |
+| `.module-controls` | A row of controls across the face, wrapping. |
+
+Two things make this read as hardware rather than as cards, and both are
+easy to get wrong:
+
+1. **The gutter must be darker than the face.** Cards on a page share their
+   parent's background and are separated by whitespace; objects on a panel
+   are separated by shadow. A rack whose ground matches its modules reads as
+   boxes drawn on paper no matter how much bevel they carry. A test holds
+   Rack Slate's `bg0` clearly below its `bg1` for this reason.
+2. **The face gradient does more work than the bevel.** `--sheen-face` is the
+   cue that sells it — a flat fill with a crisp lit edge still looks like a
+   `div`. Rack Slate runs `sheen` at 0.85, the highest of any built-in, and a
+   test keeps it there.
+
+The surface ramp matters too: a module is `--bg-2` and its tab `--bg-3`, so
+each step stands proud of the panel *and* of the block beneath it. Set a
+module to `--bg-1` and on most themes it goes level with the dock behind it
+and vanishes.
+
+Because every value is a token, the same markup is painted steel under Rack
+Slate, milled aluminium under Console Noir, and plain flat boxes under either
+high-contrast theme — no variants, no per-theme markup.
+
+---
+
+## 8. Exporting Themes
 
 To quickly create a custom theme, navigate to **Preferences** → **Interface** and click **EXPORT CURRENT THEME…**.
 
@@ -249,7 +318,7 @@ Exporting never overwrites: if that name is taken, the next free one is used (`a
 
 ---
 
-## 8. Reloading & Error Handling
+## 9. Reloading & Error Handling
 
 - **Discovery**: When AURA launches, it scans the themes directory and registers all valid user themes. Adding or deleting a `.json` file requires restarting AURA to discover the file.
 - **Robust Validation**: The theme parser never crashes. If a file contains invalid JSON or lacks a `name`, it is skipped, and a toast notification informs you of the failure. If an individual token has an invalid color or unknown name, only that key is ignored while the rest of the theme loads safely against its base.

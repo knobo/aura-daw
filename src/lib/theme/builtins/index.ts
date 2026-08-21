@@ -9,6 +9,7 @@ import { AURA_DARK_TOKENS } from "./aura-dark";
 import { AURA_LIGHT_TOKENS } from "./aura-light";
 import { CONSOLE_NOIR_TOKENS } from "./console-noir";
 import { STUDIO_IVORY_TOKENS } from "./studio-ivory";
+import { RACK_SLATE_TOKENS } from "./rack-slate";
 import { HIGH_CONTRAST_DARK_TOKENS } from "./high-contrast-dark";
 import { HIGH_CONTRAST_LIGHT_TOKENS } from "./high-contrast-light";
 import { SOLARIZED_DARK_TOKENS } from "./solarized-dark";
@@ -36,6 +37,7 @@ export const AURA_DARK = builtin("aura-dark", "AURA Dark", AURA_DARK_TOKENS);
 export const AURA_LIGHT = builtin("aura-light", "AURA Light", AURA_LIGHT_TOKENS);
 export const CONSOLE_NOIR = builtin("console-noir", "Console Noir", CONSOLE_NOIR_TOKENS);
 export const STUDIO_IVORY = builtin("studio-ivory", "Studio Ivory", STUDIO_IVORY_TOKENS);
+export const RACK_SLATE = builtin("rack-slate", "Rack Slate", RACK_SLATE_TOKENS);
 export const HIGH_CONTRAST_DARK = builtin(
   "high-contrast-dark",
   "High Contrast Dark",
@@ -58,6 +60,7 @@ export const GRUVBOX_DARK = builtin("gruvbox-dark", "Gruvbox Dark", GRUVBOX_DARK
 export const BUILTIN_THEMES: readonly Theme[] = [
   AURA_DARK,
   AURA_LIGHT,
+  RACK_SLATE,
   CONSOLE_NOIR,
   STUDIO_IVORY,
   HIGH_CONTRAST_DARK,
@@ -82,6 +85,7 @@ export type BuiltinId =
   | "aura-light"
   | "console-noir"
   | "studio-ivory"
+  | "rack-slate"
   | "high-contrast-dark"
   | "high-contrast-light"
   | "solarized-dark"

@@ -49,6 +49,8 @@ export const AURA_DARK_TOKENS: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+  // Keeps the drawer the translucent glass it has always been.
+  panelAlpha: "0.88",
 
   // material — The house theme keeps its glass and its glow; the material is only just
   // enough to give a button an edge for the light to catch on.

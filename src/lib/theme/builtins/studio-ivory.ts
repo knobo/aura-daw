@@ -61,6 +61,8 @@ export const STUDIO_IVORY_TOKENS: ThemeTokens = {
   // Nothing on a plastic box emits light.
   glowScale: "0",
   bodyGlow: "0",
+  // Moulded plastic is not a window either.
+  panelAlpha: "1",
 
   // material — moulded rather than milled: a softer bevel, a shallower cast
   // shadow, satin sheen, fine plastic texture, and a generous 9px corner.

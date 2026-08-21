@@ -6,6 +6,7 @@ import {
   BUILTIN_THEMES,
   CONSOLE_NOIR,
   DEFAULT_THEME_ID,
+  RACK_SLATE,
   STUDIO_IVORY,
 } from "./index";
 
@@ -174,5 +175,73 @@ describe("the material themes", () => {
         expect(theme.tokens[key], `${theme.id}.${key}`).toBeDefined();
       }
     }
+  });
+});
+
+describe("the chrome panel alpha", () => {
+  it("is a 0..1 ratio on every built-in", () => {
+    for (const theme of BUILTIN_THEMES) {
+      const n = Number(theme.tokens.panelAlpha);
+      expect(Number.isFinite(n), theme.id).toBe(true);
+      expect(n, theme.id).toBeGreaterThanOrEqual(0);
+      expect(n, theme.id).toBeLessThanOrEqual(1);
+    }
+  });
+
+  // A see-through side panel is a readability problem, not a style: you are
+  // reading text in it with the timeline grid running behind the words. The
+  // themes that exist for readability must not do that.
+  it("is fully opaque on the high-contrast themes", () => {
+    for (const theme of BUILTIN_THEMES) {
+      if (!theme.id.startsWith("high-contrast")) continue;
+      expect(theme.tokens.panelAlpha, theme.id).toBe("1");
+    }
+  });
+
+  // Every theme that already committed to solid surfaces should carry that
+  // through to the dock; a solid app with one translucent panel reads as a
+  // mistake rather than as a choice.
+  it("follows glassAlpha wherever a theme has committed to solid surfaces", () => {
+    for (const theme of BUILTIN_THEMES) {
+      if (theme.tokens.glassAlpha !== "1") continue;
+      expect(theme.tokens.panelAlpha, theme.id).toBe("1");
+    }
+  });
+});
+
+describe("Rack Slate", () => {
+  // The gutter is the whole trick behind the module blocks: cards on a page
+  // share their parent's background and are separated by whitespace, objects
+  // on a panel are separated by shadow. If bg0 ever stops being clearly
+  // darker than bg1, `.module-rack` silently stops reading as hardware.
+  it("keeps the gutter clearly darker than the module face", () => {
+    const lum = (c: string) => {
+      const h = c.slice(1);
+      return [0, 2, 4].reduce((n, i) => n + parseInt(h.slice(i, i + 2), 16), 0);
+    };
+    expect(lum(RACK_SLATE.tokens.bg1) - lum(RACK_SLATE.tokens.bg0)).toBeGreaterThan(40);
+  });
+
+  // The face gradient carries more of the "physical panel" read than the
+  // bevel does, so this theme is the one that must lean on it hardest.
+  it("runs the highest sheen of any built-in", () => {
+    for (const theme of BUILTIN_THEMES) {
+      if (theme === RACK_SLATE) continue;
+      expect(Number(RACK_SLATE.tokens.sheen), theme.id).toBeGreaterThanOrEqual(
+        Number(theme.tokens.sheen),
+      );
+    }
+  });
+
+  it("is opaque all the way through, so the dock can be docked", () => {
+    expect(RACK_SLATE.tokens.glassAlpha).toBe("1");
+    expect(RACK_SLATE.tokens.glassBlur).toBe("0px");
+    expect(RACK_SLATE.tokens.panelAlpha).toBe("1");
+  });
+
+  // One lamp. A second saturated accent competing with the orange is what
+  // turns a front panel back into a website.
+  it("points the primary-interactive slot at its one accent", () => {
+    expect(RACK_SLATE.tokens.cyan).toBe(RACK_SLATE.tokens.orange);
   });
 });

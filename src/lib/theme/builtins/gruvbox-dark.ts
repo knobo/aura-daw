@@ -44,6 +44,8 @@ export const GRUVBOX_DARK_TOKENS: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+  // Opaque: a retro palette has no glass in it.
+  panelAlpha: "1",
 
   // material — Gruvbox is retro and warm, so it takes the grainiest surface of the
   // borrowed palettes and the hardest corners.

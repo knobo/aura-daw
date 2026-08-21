@@ -45,6 +45,8 @@ export const HIGH_CONTRAST_LIGHT_TOKENS: ThemeTokens = {
   glassAlpha: "1",
   glowScale: "0",
   bodyGlow: "0",
+  // Opaque, like every other surface here.
+  panelAlpha: "1",
 
   // material — Flat on purpose — the note in high-contrast-dark is the reason.
   bevel: "0",

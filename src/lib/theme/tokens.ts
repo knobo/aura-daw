@@ -74,6 +74,20 @@ export interface ThemeTokens {
   glowScale: string;
   /** Alpha of the two radial washes on `body`; `0` flattens the background. */
   bodyGlow: string;
+  /**
+   * Opacity of the CHROME panels — today the right dock — as opposed to
+   * `glassAlpha`, which governs floating glass like dialogs and popovers.
+   *
+   * They are separate because they answer different questions. A dialog is
+   * temporary and *should* let you see what it covers. A side panel you work
+   * in for an hour should not: a translucent one puts the timeline grid
+   * behind its own text, and it is the reason the dock cannot be docked —
+   * something you can see through reads as floating over the layout rather
+   * than as part of it. Set this to `1` and the panel becomes a real wall,
+   * which is what the "dock the side panel" preference then has to push
+   * against.
+   */
+  panelAlpha: string;
 
   /* ── materials: what a surface is MADE OF, as opposed to what colour it is ──
    *
@@ -124,12 +138,13 @@ export const MATERIAL_KEYS = [
 
 export const AFFORDANCE_KEYS = [
   "borderWidth", "focusWidth", "glassBlur", "glassAlpha", "glowScale", "bodyGlow",
+  "panelAlpha",
   ...MATERIAL_KEYS,
 ] as const satisfies readonly (keyof ThemeTokens)[];
 
 /** The affordances measured as a bare number rather than a CSS length. */
 export const UNITLESS_AFFORDANCE_KEYS: readonly (keyof ThemeTokens)[] = [
-  "glassAlpha", "glowScale", "bodyGlow",
+  "glassAlpha", "glowScale", "bodyGlow", "panelAlpha",
   // The four material strengths are ratios; `ctrlRadius` alone is a length.
   "bevel", "relief", "sheen", "grain",
 ];
@@ -170,8 +185,19 @@ export function alpha(color: string, a: number): string {
   return `rgb(${r} ${g} ${b} / ${Math.round(out * 1000) / 1000})`;
 }
 
-/** A unitless token as a number, falling back rather than emitting `NaN`. */
+/**
+ * A unitless token as a number, falling back rather than emitting `NaN`.
+ *
+ * The blank check is not redundant: `Number("")` is `0`, not `NaN`, so an
+ * empty string would sail past `isFinite` and be taken as a real zero. For
+ * these particular tokens zero is the most destructive value there is — a
+ * `glassAlpha` or `panelAlpha` of 0 is an invisible panel — and blank is
+ * reachable, because the boot cache in theme.svelte.ts only checks that a
+ * token IS a string before painting it. A missing value must degrade to the
+ * fallback, never to "transparent".
+ */
 function number(value: string, fallback: number): number {
+  if (value.trim() === "") return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
@@ -207,6 +233,16 @@ export function toCssVars(t: ThemeTokens): Record<string, string> {
   // so every existing var() call site keeps working untouched.
   vars["--glass-base-rgb"] = rgbTriple(t.glass);
   vars["--glass"] = alpha(t.glass, number(t.glassAlpha, 1));
+
+  // The chrome panel fill, and — derived, not declared — the blur behind it.
+  // A backdrop-filter on a fully opaque surface is pure cost: it blurs pixels
+  // nobody can see, on the largest always-on surface in the app. Deriving it
+  // here rather than asking themes to keep two keys in step is why a theme
+  // cannot get this pairing wrong, unlike `glassBlur`/`glassAlpha`, which it
+  // still can (and which a test has to police).
+  const panelAlpha = number(t.panelAlpha, 1);
+  vars["--panel"] = alpha(t.glass, panelAlpha);
+  vars["--panel-blur"] = panelAlpha >= 1 ? "0px" : t.glassBlur;
   vars["--glass-border"] = alpha(t.edge, 0.12);
   vars["--grid-line"] = alpha(t.line, 0.09);
   vars["--grid-line-strong"] = alpha(t.line, 0.2);
