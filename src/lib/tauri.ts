@@ -30,6 +30,8 @@ import type {
   ExportCapabilities,
   ExportJobStatus,
   ExportRequest,
+  ExtractMelodyReply,
+  ExtractMelodyRequest,
   HarmonyView,
   HistoryOverview,
   HistoryStep,
@@ -154,6 +156,8 @@ export interface Backend {
    * frame count. The only way to give a take recorded before the live fold
    * existed a curve. */
   pitchAnalyzeClip(clipId: string): Promise<number>;
+  /** Extract monophonic MIDI melody from an audio clip. */
+  pitchExtractMelody(request: ExtractMelodyRequest): Promise<ExtractMelodyReply>;
 
   // waveform tiles — raw AWTF binary
   getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer>;
@@ -622,6 +626,9 @@ class TauriBackend implements Backend {
   }
   async pitchAnalyzeClip(clipId: string) {
     return await invoke<number>("pitch_analyze_clip", { clipId });
+  }
+  async pitchExtractMelody(request: ExtractMelodyRequest) {
+    return await invoke<ExtractMelodyReply>("pitch_extract_melody", { request });
   }
 
   async getWaveformTile(req: WaveformTileRequest): Promise<ArrayBuffer> {

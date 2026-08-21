@@ -1,16 +1,20 @@
-# Next: plugin manager PR 6 (automation inventory) from `origin/main`
+# Next: plugin manager Step 6 (automation inventory) from `origin/main`
 
 Reply to the user in Norwegian — they write Norwegian; the repo
 documentation is English.
 
-`origin/main` is the baseline (`e1ec61f`, PR #93 squash). Branch from
-there. Do **not** reopen `feat/plugin-manager` — it was squash-merged.
+`origin/main` is the baseline (`e1ec61f`, PR #93 squash). Cut a fresh
+branch in its **own worktree** from it — `git worktree add
+.worktrees/<name> -b <branch> origin/main` — never reusing an existing
+worktree and never branching from whatever is checked out. See
+[`CLAUDE.md`](CLAUDE.md) for why both halves matter. Do **not** reopen
+`feat/plugin-manager` — it was squash-merged.
 
 Read these before touching plugin UI:
 
 - Winner spec (layout that shipped): [`docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md)
 - Original design (catalog, rack, chips, frozen IPC): [`docs/superpowers/specs/2026-08-20-plugin-manager-design.md`](docs/superpowers/specs/2026-08-20-plugin-manager-design.md)
-- Plan (PR 6 is specified in implementable detail): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
+- Plan (Step 6 is specified in implementable detail): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
 
 ## The owner's standing steer (2026-08-20)
 
@@ -46,7 +50,7 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
 
 ## Do this next
 
-1. **PR 6 — automation as an inventory.** Plan §"PR 6". The winner spec
+1. **Step 6 — automation as an inventory.** Plan §"Step 6". The winner spec
    promoted **§3.4 the lane strip** (Bitwig's chain, compressed) onto the
    same pass — `TrackHeader` instrument + inserts as status dots and
    pinned/automated `ParamChip` jump targets, overflow `+N`, folded lane
@@ -54,7 +58,7 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
    grouped by parameter), and pinned params at the top of
    `PluginParamPanel`. Constraint: `--track-height` is 132 px; chips
    overflow, they do not wrap.
-2. **PR 7 — unified audition** (design §8.2). Double-click any browser
+2. **Step 7 — unified audition** (design §8.2). Double-click any browser
    row to hear it, gated behind a new `browserAudition` pref defaulting
    **off**. Last on this track: it touches every browser plus sampler and
    plugin hosts.
@@ -102,7 +106,8 @@ still applies. It is preserved below.
 
 | What | Pointer |
 |---|---|
-| **Plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md). Next is PR 6 (lane strip + matrix + pinned params), not a redo of the manager. |
+| **Plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md). Next is Step 6 (lane strip + matrix + pinned params), not a redo of the manager. |
+| **Extract melody to MIDI** — segmenting audio clip pitch frames to editable MIDI clip, auto-creating/targeting MIDI tracks with undo, and selecting as Pitch Coach reference track | PR #91. Product doc: [`pitch-track.md`](docs/pitch-track.md) |
 | **Pitch analysis action on clip view** — analyse clip button on selected audio clips, persisted APTF cache rebuild, teardown/generation guards, and PitchCoach report cache invalidation | PR #87 `25af6ae`. |
 | **Write / Touch / Latch automation modes** — Off / Read / Write / Touch / Latch per track, real-time control-thread point recorder, single-op commit on stop/release with undo | PR #85 `d496903`. Design spec: [`2026-08-18-automation-write-touch-latch-design.md`](docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md). Plan: [`2026-08-18-automation-write-touch-latch.md`](docs/superpowers/plans/2026-08-18-automation-write-touch-latch.md) |
 | **MIDI output — per-track and per-clip patchbay routing** | PR #84 `cbbc240`. Handoff: [`midi-output.md`](docs/midi-output.md) |
@@ -133,19 +138,9 @@ still applies. It is preserved below.
 - **MIDI-out to Hydrogen bug** — found during the Composer H1 ear-check
   (2026-08-18), not yet filed or scoped. Needs its own small PR; do not fold
   it into G-series or Composer work.
-- **Sing-along from any song** — new owner ask (2026-08-17), and the reason
-  melody extraction outranks the auto-tune work: import → split stems →
-  melody from the vocal stem → sing against it in the coach. Three of four
-  steps are landed. Settle two things before building: does the detector
-  survive a Demucs stem (an afternoon, no new code), and tempo alignment
-  (`import.rs` detects no tempo, so a tick-based reference lands wrong).
-  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md).
-- **Pitch as data** — new owner ask (2026-08-17). Melody extraction from an
-  existing clip (→ MIDI clip) and the continuous pitch track (→ `APTF`, from
-  Pitch Coach Task 14). **If you are about to implement Task 14, read
-  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md) first**: four
-  decisions are due before that format ships, and one of them (a provenance
-  byte for causal-vs-centred smoothing) is free now and a migration later.
+- **Sing-along from any song (Melody extraction landed)** — 4-step flow (import → split stems → extract melody to MIDI → sing in Pitch Coach) is now complete. Remaining pitch work: Arrangement pitch child lane, offline pitch correction, vocal calibration.
+  [`pitch-track.md`](docs/pitch-track.md).
+- **Pitch as data / Arrangement pitch lane** — see [`pitch-track.md`](docs/pitch-track.md) for the persistent child lane on audio tracks.
 - **Pitch correction / auto-tune** — new owner ask (2026-08-17), NOT part of
   the Pitch Coach plan. Detection is done; a formant-preserving shifter and
   a correction policy are not. Offline-first staged path and the four
@@ -191,7 +186,7 @@ still applies. It is preserved below.
   leads, not verdicts.
 - **Owner ear-checks** (no suite substitutes): automation fade during play (Track D); MIDI note-out / Hydrogen / keyboard record (Track B). Insert FX is not ear-checkable until Task 7 wires `compile_inserts` into `engine::rebuild` (Task 5 landed the mixer walk itself but nothing calls it yet). **Pitch Coach R3 is done** — `cargo run --example pitch_check` reproduces it; a sustained vowel gave no octave errors in 1312 frames. **Pitch Coach phase 2 was ear-checked 2026-08-17** and it found a real bug (the lane was not drawn while stopped, so the reference notes seemed to appear only on record). Fixed in the same PR — but the fix itself has not been heard yet, so one more pass with a microphone is owed.
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no journal auto-apply. The read-only version-graph browser was implemented by PR #82 on `codex/undo-version-graph-ui`; the ordered follow-up is the guarded linear `Undo to here` contract documented in the Plan F handoff. Read the Plan F handoff in `docs/PHASE4-PLAN.md` before touching snapshots, the journal reader, the version graph, or `engine::rebuild`. Branch `plan-f-history` is kept so cited SHAs resolve.
-- **Track D leftovers:** plugin-param bounce, write/touch/latch, no DOM test env. (Non-blocking CLAP param path closed 2026-08-18, PR #75, branch `clap-nonblocking-params` — see the Track D handoff. A post-merge `/code-review` found two accepted-not-fixed trade-offs from that PR, recorded in the Track D handoff and in both new tests' doc comments — not new work items unless someone picks them up: `post_params` posts into `plugin_main()`'s **unbounded** channel with no back-pressure, so a slow concurrent `run()` (any instantiate/save_state/remove, CLAP or LV2) can let automation writes pile up and drain as an audible catch-up burst — parity with an LV2 risk that already existed, not a new one, and a real fix is a `plugin_main()`-level design question out of scope for a param-write PR; and the two new timing tests wedge that same process-wide singleton, safe only under this repo's `--test-threads=1` CI convention. Follow-up doc+test commit: PR #76, branch `clap-nonblocking-params-followup` — **still open, merge it before starting new Track D work.**) Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
+- **Track D leftovers:** plugin-param bounce, write/touch/latch, no DOM test env. (Non-blocking CLAP param path closed 2026-08-18, PR #75, branch `clap-nonblocking-params` — see the Track D handoff. A post-merge `/code-review` found two accepted-not-fixed trade-offs from that PR, recorded in the Track D handoff and in both new tests' doc comments — not new work items unless someone picks them up: `post_params` posts into `plugin_main()`'s **unbounded** channel with no back-pressure, so a slow concurrent `run()` (any instantiate/save_state/remove, CLAP or LV2) can let automation writes pile up and drain as an audible catch-up burst — parity with an LV2 risk that already existed, not a new one, and a real fix is a `plugin_main()`-level design question out of scope for a param-write PR; and the two new timing tests wedge that same process-wide singleton, safe only under this repo's `--test-threads=1` CI convention. Follow-up doc+test commit: PR #76, branch `clap-nonblocking-params-followup` — **merged 2026-08-18.**) Details: `docs/PHASE4-PLAN.md` "Track D handoff" and [`docs/handoff/plan-e-review.md`](docs/handoff/plan-e-review.md).
 - **Modulation design §8** — the ordered path to the finished system (ports, modulators, macros, curve shapes, recording, sample-accurate plugin params, lazy expansion, per-voice modulation):
   [`docs/superpowers/specs/2026-08-15-modulation-system-design.md` §8](docs/superpowers/specs/2026-08-15-modulation-system-design.md#8-the-path-to-the-finished-system).
   ADR 0008. Handoff: `docs/PHASE4-PLAN.md` "Track F handoff". Do not restate §8 here (R2).
