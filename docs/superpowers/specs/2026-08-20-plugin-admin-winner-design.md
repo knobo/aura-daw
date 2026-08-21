@@ -5,11 +5,11 @@ Supersedes the *layout* calls in [`2026-08-20-plugin-manager-design.md`](2026-08
 
 Owner steer (same day): do not pick one job. All four must be world-class, the 340 px dock does not set the ceiling, write the spec and ship something to ear-check.
 
-## 1. Why we lose today if we stop at PR 5
+## 1. Why we lose today if we stop at Step 5
 
-PR 5 as built is a good *AURA* panel. It is not yet a reason to leave Ableton, Bitwig, or Reaper.
+Step 5 as built is a good *AURA* panel. It is not yet a reason to leave Ableton, Bitwig, or Reaper.
 
-| Job | Best in class | What they actually steal | PR 5 today |
+| Job | Best in class | What they actually steal | Step 5 today |
 |---|---|---|---|
 | Add in the flow | Raycast / VS Code / Reaper Shift+F | Type 3 letters, **frecency** (how often × how recent), Enter commits, the overlay is the product | Ctrl+P ranks favourites then recents then fuzzy. No frequency. No "add to *this* track" in the row. |
 | Find among hundreds | Ableton Live 12 | Tags as **AND across groups, OR inside a group**. Seven colour Collections. Rank/most-used. Preview. | ALL/INST/FX + ★/⏱ + `format:` prefix. Categories are a tree, not facets. |
@@ -96,7 +96,7 @@ TrackHeader's FX chip becomes a strip:
 - Status dot on the name (stub / active / crashed).
 - Up to two pinned-or-automated param chips per device; click jumps to the lane or offers to create one.
 - Folded lane: dots only, no chips.
-- This is plan §6.3, promoted from "PR 6 later" to the same winner track. It can ship a beat after the split if the header fights `--track-height`, but it is not optional in the spec.
+- This is plan §6.3, promoted from "Step 6 later" to the same winner track. It can ship a beat after the split if the header fights `--track-height`, but it is not optional in the spec.
 
 Bypass stays on the rack row *and* on the strip (click the name with Alt, or a small BYP on hover). One without the other is how Ableton and FL split your brain.
 
@@ -157,7 +157,7 @@ Frecency table is a *separate* key (`aura.plugin.frecency`), machine-global like
 - Cubase MediaBay attribute database.
 - A second dock tab (option b). Shortcut strip is already nine wide.
 - I/O-count filters.
-- Audition-on-browse that makes noise by default (still PR 7, pref off).
+- Audition-on-browse that makes noise by default (still Step 7, pref off).
 - Migrating Zyn's 1318-row virtual list onto `BrowserRow`.
 - Floating OS windows this pass. Tear-off is the escalation if SPLIT-in-dock still feels like a drawer after the ear-check.
 
@@ -182,13 +182,13 @@ Frecency table is a *separate* key (`aura.plugin.frecency`), machine-global like
 4. Frecency in `rankQuickPick` / Ctrl+P, with the destination spelled on the row.
 5. Opening the plugins tab widens a still-default dock to 480.
 
-**Next pass (ear-check 2)** — lane strip (Bitwig), Collections if asked, audition pref (PR 7), saved patches (Logic).
+**Next pass (ear-check 2)** — lane strip (Bitwig), Collections if asked, audition pref (Step 7), saved patches (Logic).
 
 ## 9. PR Plan
 
-| PR | Title | Depends | Notes |
+| Step | Title | Depends | Notes |
 |---|---|---|---|
-| 5b | Split + facets + frecency + wider plugins dock | PR 5 groundwork | This pass. No IPC. |
+| 5b | Split + facets + frecency + wider plugins dock | Step 5 groundwork | This pass. No IPC. |
 | 6 | Lane plugin strip + automation matrix | 5b | Header density is the risk. |
 | 7 | Unified audition, pref default off | 5b | Touches every browser. |
 

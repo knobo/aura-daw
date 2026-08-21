@@ -1,4 +1,4 @@
-# Next: plugin manager PR 6 (automation inventory) from `origin/main`
+# Next: plugin manager Step 6 (automation inventory) from `origin/main`
 
 Reply to the user in Norwegian — they write Norwegian; the repo
 documentation is English.
@@ -10,7 +10,7 @@ Read these before touching plugin UI:
 
 - Winner spec (layout that shipped): [`docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md)
 - Original design (catalog, rack, chips, frozen IPC): [`docs/superpowers/specs/2026-08-20-plugin-manager-design.md`](docs/superpowers/specs/2026-08-20-plugin-manager-design.md)
-- Plan (PR 6 is specified in implementable detail): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
+- Plan (Step 6 is specified in implementable detail): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
 
 ## The owner's standing steer (2026-08-20)
 
@@ -46,7 +46,7 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
 
 ## Do this next
 
-1. **PR 6 — automation as an inventory.** Plan §"PR 6". The winner spec
+1. **Step 6 — automation as an inventory.** Plan §"Step 6". The winner spec
    promoted **§3.4 the lane strip** (Bitwig's chain, compressed) onto the
    same pass — `TrackHeader` instrument + inserts as status dots and
    pinned/automated `ParamChip` jump targets, overflow `+N`, folded lane
@@ -54,7 +54,7 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
    grouped by parameter), and pinned params at the top of
    `PluginParamPanel`. Constraint: `--track-height` is 132 px; chips
    overflow, they do not wrap.
-2. **PR 7 — unified audition** (design §8.2). Double-click any browser
+2. **Step 7 — unified audition** (design §8.2). Double-click any browser
    row to hear it, gated behind a new `browserAudition` pref defaulting
    **off**. Last on this track: it touches every browser plus sampler and
    plugin hosts.
@@ -102,7 +102,7 @@ still applies. It is preserved below.
 
 | What | Pointer |
 |---|---|
-| **Plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md). Next is PR 6 (lane strip + matrix + pinned params), not a redo of the manager. |
+| **Plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md). Next is Step 6 (lane strip + matrix + pinned params), not a redo of the manager. |
 | **Pitch analysis action on clip view** — analyse clip button on selected audio clips, persisted APTF cache rebuild, teardown/generation guards, and PitchCoach report cache invalidation | PR #87 `25af6ae`. |
 | **Write / Touch / Latch automation modes** — Off / Read / Write / Touch / Latch per track, real-time control-thread point recorder, single-op commit on stop/release with undo | PR #85 `d496903`. Design spec: [`2026-08-18-automation-write-touch-latch-design.md`](docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md). Plan: [`2026-08-18-automation-write-touch-latch.md`](docs/superpowers/plans/2026-08-18-automation-write-touch-latch.md) |
 | **MIDI output — per-track and per-clip patchbay routing** | PR #84 `cbbc240`. Handoff: [`midi-output.md`](docs/midi-output.md) |
