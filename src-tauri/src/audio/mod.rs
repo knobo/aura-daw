@@ -767,10 +767,20 @@ pub async fn pitch_extract_melody(
 
     if request.set_as_pitch_reference.unwrap_or(false) {
         let target_id = midi_clip.track_id.to_string();
-        let _ = state.engine()?.request(|reply| ControlMsg::SetPitchReference {
-            track_id: Some(target_id),
-            reply,
-        });
+        // Best-effort, and deliberately not `?`: the clip is already committed
+        // and persisted by this point, so a stopped engine must not make the
+        // caller report the extraction itself as failed.
+        match state.engine() {
+            Ok(engine) => {
+                if let Err(e) = engine.request(|reply| ControlMsg::SetPitchReference {
+                    track_id: Some(target_id),
+                    reply,
+                }) {
+                    eprintln!("[pitch] melody extracted but not set as reference: {e}");
+                }
+            }
+            Err(e) => eprintln!("[pitch] melody extracted but not set as reference: {e}"),
+        }
     }
 
     Ok(ExtractMelodyReply {
