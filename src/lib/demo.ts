@@ -24,6 +24,8 @@ import {
   type ExportJobStatus,
   type ExportRequest,
   type ExportResult,
+  type ExtractMelodyReply,
+  type ExtractMelodyRequest,
   type GeneratedClipInfo,
   type GenJobResult,
   type HarmonyDoc,
@@ -1584,6 +1586,47 @@ export class DemoBackend implements Backend {
     const clip = this.clips.find((c) => c.id === clipId);
     if (!clip) throw new Error(`unknown audio clip ${clipId}`);
     return Math.max(1, Math.floor(clip.lengthSamples / Math.round(SR / 100)));
+  }
+
+  async pitchExtractMelody(request: ExtractMelodyRequest): Promise<ExtractMelodyReply> {
+    const clip = this.clips.find((c) => c.id === request.clipId);
+    if (!clip) throw new Error(`unknown audio clip ${request.clipId}`);
+    let track = this.tracks.find((t) => t.id === request.targetTrackId);
+    let createdTrack = false;
+    if (!track) {
+      track = await this.addTrack({ name: `${clip.name} Melody`, kind: "midi" });
+      createdTrack = true;
+    }
+    const startTicks = Math.round(this.samplesToTicks(clip.timelineStartSamples));
+    const lengthTicks = Math.max(PPQ * 4, Math.round(this.samplesToTicks(clip.lengthSamples)));
+    const noteCount = 4;
+    const notes: MidiNote[] = [
+      { tick: 0, lengthTicks: PPQ, key: 60, velocity: 96, channel: 0, noteId: 1 },
+      { tick: PPQ, lengthTicks: PPQ, key: 62, velocity: 96, channel: 0, noteId: 2 },
+      { tick: PPQ * 2, lengthTicks: PPQ, key: 64, velocity: 96, channel: 0, noteId: 3 },
+      { tick: PPQ * 3, lengthTicks: PPQ, key: 65, velocity: 96, channel: 0, noteId: 4 },
+    ];
+    const midiClip: MidiClip = {
+      id: `mclip-ext-${Math.random().toString(36).slice(2, 8)}`,
+      trackId: track.id,
+      name: `${clip.name} Melody`,
+      timelineStartTicks: startTicks,
+      lengthTicks,
+      notes,
+    };
+    this.midiClips.push(midiClip);
+    if (request.setAsPitchReference) {
+      this.pitchReferenceTrackId = track.id;
+      this.emitPitchState();
+    }
+    const proj = await this.getProject();
+    this.emit("project://changed", proj);
+    return {
+      trackId: track.id,
+      clipId: midiClip.id,
+      noteCount,
+      createdTrack,
+    };
   }
 
   private emitPitchState() {

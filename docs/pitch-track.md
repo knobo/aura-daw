@@ -282,9 +282,9 @@ Correction:
 ## 12. Delivery order
 
 1. **Landed:** detector, APTF persistence, Pitch Coach, scoring.
-2. Arrangement pitch child lane.
-3. Centred offline analysis.
-4. APTF segmentation to an undoable MIDI clip.
+2. **Landed:** APTF segmentation to an undoable MIDI clip ("Extract melody to MIDI").
+3. Arrangement pitch child lane.
+4. Centred offline analysis.
 5. MIDI target overlay.
 6. Pitch-edit schemas, ops, persistence, trim/split/copy semantics.
 7. Segment editor.

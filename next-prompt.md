@@ -107,6 +107,7 @@ still applies. It is preserved below.
 | What | Pointer |
 |---|---|
 | **Plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md). Next is Step 6 (lane strip + matrix + pinned params), not a redo of the manager. |
+| **Extract melody to MIDI** — segmenting audio clip pitch frames to editable MIDI clip, auto-creating/targeting MIDI tracks with undo, and selecting as Pitch Coach reference track | PR #91. Product doc: [`pitch-track.md`](docs/pitch-track.md) |
 | **Pitch analysis action on clip view** — analyse clip button on selected audio clips, persisted APTF cache rebuild, teardown/generation guards, and PitchCoach report cache invalidation | PR #87 `25af6ae`. |
 | **Write / Touch / Latch automation modes** — Off / Read / Write / Touch / Latch per track, real-time control-thread point recorder, single-op commit on stop/release with undo | PR #85 `d496903`. Design spec: [`2026-08-18-automation-write-touch-latch-design.md`](docs/superpowers/specs/2026-08-18-automation-write-touch-latch-design.md). Plan: [`2026-08-18-automation-write-touch-latch.md`](docs/superpowers/plans/2026-08-18-automation-write-touch-latch.md) |
 | **MIDI output — per-track and per-clip patchbay routing** | PR #84 `cbbc240`. Handoff: [`midi-output.md`](docs/midi-output.md) |
@@ -137,19 +138,9 @@ still applies. It is preserved below.
 - **MIDI-out to Hydrogen bug** — found during the Composer H1 ear-check
   (2026-08-18), not yet filed or scoped. Needs its own small PR; do not fold
   it into G-series or Composer work.
-- **Sing-along from any song** — new owner ask (2026-08-17), and the reason
-  melody extraction outranks the auto-tune work: import → split stems →
-  melody from the vocal stem → sing against it in the coach. Three of four
-  steps are landed. Settle two things before building: does the detector
-  survive a Demucs stem (an afternoon, no new code), and tempo alignment
-  (`import.rs` detects no tempo, so a tick-based reference lands wrong).
-  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md).
-- **Pitch as data** — new owner ask (2026-08-17). Melody extraction from an
-  existing clip (→ MIDI clip) and the continuous pitch track (→ `APTF`, from
-  Pitch Coach Task 14). **If you are about to implement Task 14, read
-  [`pitch-as-data.md`](docs/backlog/pitch-as-data.md) first**: four
-  decisions are due before that format ships, and one of them (a provenance
-  byte for causal-vs-centred smoothing) is free now and a migration later.
+- **Sing-along from any song (Melody extraction landed)** — 4-step flow (import → split stems → extract melody to MIDI → sing in Pitch Coach) is now complete. Remaining pitch work: Arrangement pitch child lane, offline pitch correction, vocal calibration.
+  [`pitch-track.md`](docs/pitch-track.md).
+- **Pitch as data / Arrangement pitch lane** — see [`pitch-track.md`](docs/pitch-track.md) for the persistent child lane on audio tracks.
 - **Pitch correction / auto-tune** — new owner ask (2026-08-17), NOT part of
   the Pitch Coach plan. Detection is done; a formant-preserving shifter and
   a correction policy are not. Offline-first staged path and the four

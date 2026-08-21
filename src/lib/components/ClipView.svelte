@@ -15,9 +15,11 @@
   import { clipSelection } from "../state/clip-selection.svelte";
   import { clipDrag } from "../state/clip-drag.svelte";
   import { launch } from "../state/launch.svelte";
+  import { midi } from "../state/midi.svelte";
   import { toasts } from "../state/toasts.svelte";
   import { backend } from "../tauri";
   import { analyzePitchTrack, type PitchAnalysisState } from "../pitch/analyze";
+  import { extractMelodyFromAudio, type MelodyExtractionState } from "../pitch/extract";
   import { invalidatePitchCache } from "../state/pitch.svelte";
   import { selectionModeFor } from "../utils/selection-modifiers";
   import { buildPeakColumns } from "../render/tiles";
@@ -38,12 +40,15 @@
   const job = $derived(jobs.jobForClip(clip.id));
   let pitchAnalysis = $state<PitchAnalysisState>({ phase: "idle" });
   let analysisGeneration = 0;
+  let melodyExtraction = $state<MelodyExtractionState>({ phase: "idle" });
+  let extractionGeneration = 0;
 
   $effect(() => {
     void clip.id;
     return () => {
-      // Invalidate in-flight analysis callbacks when this view unmounts or changes clip
+      // Invalidate in-flight callbacks when this view unmounts or changes clip
       analysisGeneration++;
+      extractionGeneration++;
     };
   });
 
@@ -60,6 +65,31 @@
         toasts.error("PITCH ANALYSIS FAILED", state.message);
       }
     });
+  }
+
+  async function extractMelody() {
+    if (melodyExtraction.phase === "extracting") return;
+    const gen = ++extractionGeneration;
+    await extractMelodyFromAudio(
+      { clipId: clip.id, setAsPitchReference: true },
+      (req) => backend.pitchExtractMelody(req),
+      async (state) => {
+        if (gen !== extractionGeneration) return;
+        melodyExtraction = state;
+        if (state.phase === "done") {
+          invalidatePitchCache(clip.id);
+          await Promise.all([project.reload(), midi.refresh()]);
+          midi.select(state.reply.clipId);
+          midi.flash(state.reply.clipId);
+          toasts.success(
+            "MELODY EXTRACTED",
+            `${clip.name}: created MIDI melody with ${state.reply.noteCount} notes`,
+          );
+        } else if (state.phase === "error") {
+          toasts.error("MELODY EXTRACTION FAILED", state.message);
+        }
+      },
+    );
   }
 
   // ── waveform painting ──
@@ -245,30 +275,56 @@
       >
         <span class="spark">✦</span> SPLIT STEMS
       </button>
-      <button
-        class="pitch-action mono"
-        type="button"
-        class:error={pitchAnalysis.phase === "error"}
-        disabled={pitchAnalysis.phase === "analyzing"}
-        title={pitchAnalysis.phase === "error"
-          ? `Pitch analysis failed: ${pitchAnalysis.message}. Click to retry.`
-          : "Analyse this audio clip and persist its APTF pitch track"}
-        aria-live="polite"
-        onclick={(e) => {
-          e.stopPropagation();
-          void analyzePitch();
-        }}
-      >
-        {#if pitchAnalysis.phase === "analyzing"}
-          ANALYSING PITCH…
-        {:else if pitchAnalysis.phase === "done"}
-          ✓ PITCH READY · {pitchAnalysis.frames}
-        {:else if pitchAnalysis.phase === "error"}
-          RETRY PITCH
-        {:else}
-          ANALYSE PITCH
-        {/if}
-      </button>
+      <div class="clip-actions" style:left="{visL + 5}px">
+        <button
+          class="pitch-action mono"
+          type="button"
+          class:error={pitchAnalysis.phase === "error"}
+          disabled={pitchAnalysis.phase === "analyzing"}
+          title={pitchAnalysis.phase === "error"
+            ? `Pitch analysis failed: ${pitchAnalysis.message}. Click to retry.`
+            : "Analyse this audio clip and persist its APTF pitch track"}
+          aria-live="polite"
+          onclick={(e) => {
+            e.stopPropagation();
+            void analyzePitch();
+          }}
+        >
+          {#if pitchAnalysis.phase === "analyzing"}
+            ANALYSING PITCH…
+          {:else if pitchAnalysis.phase === "done"}
+            ✓ PITCH READY · {pitchAnalysis.frames}
+          {:else if pitchAnalysis.phase === "error"}
+            RETRY PITCH
+          {:else}
+            ANALYSE PITCH
+          {/if}
+        </button>
+        <button
+          class="melody-action mono"
+          type="button"
+          class:error={melodyExtraction.phase === "error"}
+          disabled={melodyExtraction.phase === "extracting"}
+          title={melodyExtraction.phase === "error"
+            ? `Melody extraction failed: ${melodyExtraction.message}. Click to retry.`
+            : "Extract monophonic MIDI melody from this audio clip into a MIDI clip"}
+          aria-live="polite"
+          onclick={(e) => {
+            e.stopPropagation();
+            void extractMelody();
+          }}
+        >
+          {#if melodyExtraction.phase === "extracting"}
+            EXTRACTING MELODY…
+          {:else if melodyExtraction.phase === "done"}
+            ✓ MELODY ({melodyExtraction.reply.noteCount})
+          {:else if melodyExtraction.phase === "error"}
+            RETRY MELODY
+          {:else}
+            EXTRACT MELODY
+          {/if}
+        </button>
+      </div>
     {/if}
 
     {#if job}
@@ -385,11 +441,16 @@
     filter: brightness(1.15);
     transform: translateY(-1px);
   }
-  .pitch-action {
+  .clip-actions {
     position: absolute;
-    left: 5px;
     bottom: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
     z-index: 1;
+  }
+  .pitch-action,
+  .melody-action {
     padding: 3px 7px;
     border-radius: 4px;
     border: var(--border-width) solid color-mix(in srgb, var(--cyan) 55%, var(--glass-border));
@@ -399,15 +460,25 @@
     letter-spacing: 0.1em;
     cursor: pointer;
   }
+  .melody-action {
+    border-color: color-mix(in srgb, var(--magenta) 55%, var(--glass-border));
+    color: var(--magenta);
+  }
   .pitch-action:hover:not(:disabled) {
     border-color: var(--cyan);
     filter: brightness(1.15);
   }
-  .pitch-action:disabled {
+  .melody-action:hover:not(:disabled) {
+    border-color: var(--magenta);
+    filter: brightness(1.15);
+  }
+  .pitch-action:disabled,
+  .melody-action:disabled {
     cursor: wait;
     color: var(--text-faint);
   }
-  .pitch-action.error {
+  .pitch-action.error,
+  .melody-action.error {
     border-color: var(--red);
     color: var(--red);
   }

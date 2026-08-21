@@ -20,6 +20,7 @@
 use crate::audio::pitch::PitchFrame;
 use crate::ids::NoteId;
 use crate::midi::schedule::AbsNote;
+use crate::midi::{MidiNote, TempoMap};
 
 /// The first 70 ms of a note is free: a consonant, a breath or a scoop into
 /// the note is not a pitch error.
@@ -53,6 +54,16 @@ const CHORD_ONSET_MS: f32 = 30.0;
 /// line is a guess. A legato overhang of a few ticks is not a chord; a drone
 /// held under the tune covers its whole length and is.
 const AMBIGUOUS_OVERLAP: f32 = 0.5;
+
+// Note segmentation constants (matching `sidecars/hum_to_midi.py`):
+/// Pitch jump (in semitones from segment median) that triggers a note split.
+pub const SPLIT_SEMITONES: f32 = 0.8;
+/// Consecutive unvoiced frames needed to close a note segment.
+pub const MIN_GAP_FRAMES: usize = 2;
+/// Default minimum note duration in milliseconds (shorter segments are dropped as noise).
+pub const DEFAULT_MIN_NOTE_MS: f32 = 80.0;
+/// Kernel width for the None-aware median filter on voiced pitch frames.
+pub const MEDIAN_KERNEL: usize = 5;
 
 /// How one reference note was sung.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -585,6 +596,167 @@ fn std_dev(values: &[f32]) -> f32 {
     var.sqrt()
 }
 
+/// Filter voiced pitch frames with a 5-tap None-aware median filter over the MIDI
+/// series, matching `sidecars/hum_to_midi.py`'s `median_filter_track`.
+pub fn median_filter_voiced_frames(frames: &[PitchFrame]) -> Vec<f32> {
+    let half = MEDIAN_KERNEL / 2;
+    let mut out = Vec::with_capacity(frames.len());
+    for (i, f) in frames.iter().enumerate() {
+        if !f.voiced || f.midi <= 0.0 {
+            out.push(0.0);
+            continue;
+        }
+        let start = i.saturating_sub(half);
+        let end = (i + half + 1).min(frames.len());
+        let mut window: Vec<f32> = frames[start..end]
+            .iter()
+            .filter(|w| w.voiced && w.midi > 0.0)
+            .map(|w| w.midi)
+            .collect();
+        if window.is_empty() {
+            out.push(f.midi);
+        } else {
+            out.push(median(&mut window));
+        }
+    }
+    out
+}
+
+/// Segment pitch frames into discrete musical notes and calculate note length/positions.
+///
+/// Returns `(notes, clip_length_ticks)` where `MidiNote.tick` is relative to
+/// `clip_timeline_start_ticks`.
+pub fn segment_pitch_to_notes(
+    frames: &[PitchFrame],
+    rate: u32,
+    tempo_map: &TempoMap,
+    min_note_ms: Option<f32>,
+    quantize_grid: Option<u32>,
+    clip_timeline_start_ticks: u64,
+) -> Result<(Vec<MidiNote>, u64), String> {
+    if frames.is_empty() {
+        return Err("no pitch frames provided to segment".into());
+    }
+    let min_note_ms = min_note_ms.unwrap_or(DEFAULT_MIN_NOTE_MS);
+    let min_note_samples = ms_to_samples(min_note_ms, rate);
+    let hop_samples = if frames.len() > 1 {
+        frames[1].sample.saturating_sub(frames[0].sample).max(1)
+    } else {
+        ms_to_samples(10.0, rate).max(1)
+    };
+
+    let smoothed_midi = median_filter_voiced_frames(frames);
+
+    struct Segment {
+        start_sample: u64,
+        last_sample: u64,
+        midi_values: Vec<f32>,
+        rms_values: Vec<f32>,
+    }
+
+    let mut raw_notes: Vec<(u64, u64, u64, u64, u8, f32)> = Vec::new();
+    let mut cur: Option<Segment> = None;
+    let mut gap = 0usize;
+
+    let mut close = |cur_seg: Option<Segment>, end_sample: u64| -> Option<Segment> {
+        if let Some(mut s) = cur_seg {
+            let dur = end_sample.saturating_sub(s.start_sample);
+            if dur >= min_note_samples && !s.midi_values.is_empty() {
+                let med_midi = median(&mut s.midi_values);
+                let med_rms = median(&mut s.rms_values);
+                let key = med_midi.round().clamp(0.0, 127.0) as u8;
+                let mut start_tick = tempo_map.samples_to_tick(s.start_sample);
+                let end_tick = tempo_map.samples_to_tick(end_sample);
+                if let Some(g) = quantize_grid {
+                    if g > 0 {
+                        let bar_ticks = (tempo_map.ppq() * 4) as u64;
+                        if bar_ticks % (g as u64) == 0 {
+                            let step = bar_ticks / (g as u64);
+                            start_tick = ((start_tick + step / 2) / step) * step;
+                        }
+                    }
+                }
+                let len_ticks = end_tick.saturating_sub(start_tick).max(1);
+                raw_notes.push((s.start_sample, end_sample, start_tick, len_ticks, key, med_rms));
+            }
+        }
+        None
+    };
+
+    for (f, &v) in frames.iter().zip(&smoothed_midi) {
+        if !f.voiced || v <= 0.0 {
+            gap += 1;
+            if cur.is_some() && gap >= MIN_GAP_FRAMES {
+                let last = cur.as_ref().unwrap().last_sample;
+                cur = close(cur, last + hop_samples);
+            }
+            continue;
+        }
+        gap = 0;
+        if let Some(ref mut s) = cur {
+            let mut tmp = s.midi_values.clone();
+            let cur_med = median(&mut tmp);
+            if (v - cur_med).abs() > SPLIT_SEMITONES {
+                let last = s.last_sample;
+                cur = close(cur.take(), last + hop_samples);
+            }
+        }
+        match cur {
+            None => {
+                cur = Some(Segment {
+                    start_sample: f.sample,
+                    last_sample: f.sample,
+                    midi_values: vec![v],
+                    rms_values: vec![f.rms],
+                });
+            }
+            Some(ref mut s) => {
+                s.midi_values.push(v);
+                s.rms_values.push(f.rms);
+                s.last_sample = f.sample;
+            }
+        }
+    }
+    if let Some(s) = cur {
+        let last = s.last_sample;
+        close(Some(s), last + hop_samples);
+    }
+
+    if raw_notes.is_empty() {
+        return Err("no melody detected in clip — no voiced segments met the minimum note duration".into());
+    }
+
+    let max_rms = raw_notes.iter().map(|n| n.5).fold(0.0f32, f32::max);
+    let mut notes = Vec::with_capacity(raw_notes.len());
+    for (_, _, start_tick, len_ticks, key, med_rms) in &raw_notes {
+        let vel = if max_rms > 0.0 {
+            (50.0 + 65.0 * (*med_rms / max_rms)).round().clamp(1.0, 127.0) as u8
+        } else {
+            96
+        };
+        let rel_tick = start_tick.saturating_sub(clip_timeline_start_ticks) as u32;
+        notes.push(MidiNote {
+            tick: rel_tick,
+            length_ticks: *len_ticks as u32,
+            key: *key,
+            velocity: vel,
+            channel: 0,
+            note_id: NoteId(0),
+        });
+    }
+
+    notes.sort_by_key(|n| (n.tick, n.key));
+    let end = notes
+        .iter()
+        .map(|n| n.tick as u64 + n.length_ticks as u64)
+        .max()
+        .unwrap_or(0);
+    let bar = (tempo_map.ppq() * 4) as u64;
+    let length_ticks = ((end + bar - 1) / bar) * bar;
+
+    Ok((notes, length_ticks.max(end).max(bar)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,5 +1184,186 @@ mod tests {
             "one good frame inside a miss does not rescue it"
         );
     }
+
+    #[test]
+    fn segment_pitch_single_held_tone() {
+        let tempo_map = TempoMap::from_v1(120.0, RATE).unwrap();
+        // 1.0 second of A4 (440 Hz / midi 69.0) starting at 500 ms
+        let mut frames = Vec::new();
+        // 500 ms of silence
+        for i in 0..50 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 0.0,
+                midi: 0.0,
+                clarity: 0.0,
+                rms: 0.001,
+                voiced: false,
+            });
+        }
+        // 1000 ms of A4
+        for i in 50..150 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 440.0,
+                midi: 69.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+        // 500 ms of silence
+        for i in 150..200 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 0.0,
+                midi: 0.0,
+                clarity: 0.0,
+                rms: 0.001,
+                voiced: false,
+            });
+        }
+
+        let (notes, length_ticks) = segment_pitch_to_notes(&frames, RATE, &tempo_map, Some(80.0), None, 0).unwrap();
+        assert_eq!(notes.len(), 1, "expected 1 note");
+        let n = &notes[0];
+        assert_eq!(n.key, 69, "key should be A4 (69)");
+        // 500 ms at 120 bpm = 1 beat = 960 ticks
+        // 1000 ms = 2 beats = 1920 ticks
+        assert!((n.tick as i64 - 960).abs() <= 20, "tick should be ~960, got {}", n.tick);
+        assert!((n.length_ticks as i64 - 1920).abs() <= 50, "length should be ~1920, got {}", n.length_ticks);
+        assert!(length_ticks >= 3840, "clip length should be at least 1 bar (3840 ticks)");
+    }
+
+    #[test]
+    fn segment_pitch_three_note_sequence() {
+        let tempo_map = TempoMap::from_v1(120.0, RATE).unwrap();
+        // A4 (69) -> C5 (72) -> E5 (76) separated by short silences
+        let mut frames = Vec::new();
+        // Note 1: A4 (0..400 ms)
+        for i in 0..40 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 440.0,
+                midi: 69.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+        // Silence (400..500 ms)
+        for i in 40..50 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 0.0,
+                midi: 0.0,
+                clarity: 0.0,
+                rms: 0.001,
+                voiced: false,
+            });
+        }
+        // Note 2: C5 (500..900 ms)
+        for i in 50..90 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 523.25,
+                midi: 72.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+        // Silence (900..1000 ms)
+        for i in 90..100 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 0.0,
+                midi: 0.0,
+                clarity: 0.0,
+                rms: 0.001,
+                voiced: false,
+            });
+        }
+        // Note 3: E5 (1000..1400 ms)
+        for i in 100..140 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 659.25,
+                midi: 76.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+
+        let (notes, _) = segment_pitch_to_notes(&frames, RATE, &tempo_map, Some(80.0), None, 0).unwrap();
+        assert_eq!(notes.len(), 3, "expected 3 notes");
+        assert_eq!(notes[0].key, 69);
+        assert_eq!(notes[1].key, 72);
+        assert_eq!(notes[2].key, 76);
+    }
+
+    #[test]
+    fn segment_pitch_splits_on_pitch_jump_without_silence() {
+        let tempo_map = TempoMap::from_v1(120.0, RATE).unwrap();
+        // Slurred notes without gap: A4 (69) directly into B4 (71)
+        let mut frames = Vec::new();
+        for i in 0..30 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 440.0,
+                midi: 69.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+        for i in 30..60 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 493.88,
+                midi: 71.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+
+        let (notes, _) = segment_pitch_to_notes(&frames, RATE, &tempo_map, Some(80.0), None, 0).unwrap();
+        assert_eq!(notes.len(), 2, "expected 2 notes from pitch jump");
+        assert_eq!(notes[0].key, 69);
+        assert_eq!(notes[1].key, 71);
+    }
+
+    #[test]
+    fn segment_pitch_drops_short_blips_and_pure_noise() {
+        let tempo_map = TempoMap::from_v1(120.0, RATE).unwrap();
+        // Only 30 ms of sound (3 frames) -> shorter than 80 ms min_note_ms
+        let mut frames = Vec::new();
+        for i in 0..3 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 440.0,
+                midi: 69.0,
+                clarity: 0.95,
+                rms: 0.4,
+                voiced: true,
+            });
+        }
+        for i in 3..20 {
+            frames.push(PitchFrame {
+                sample: (i * HOP) as u64,
+                hz: 0.0,
+                midi: 0.0,
+                clarity: 0.0,
+                rms: 0.001,
+                voiced: false,
+            });
+        }
+
+        let res = segment_pitch_to_notes(&frames, RATE, &tempo_map, Some(80.0), None, 0);
+        assert!(res.is_err(), "short blip must be rejected as no melody");
+    }
 }
+
 
