@@ -3,8 +3,12 @@
 Reply to the user in Norwegian — they write Norwegian; the repo
 documentation is English.
 
-`origin/main` is the baseline (`e1ec61f`, PR #93 squash). Branch from
-there. Do **not** reopen `feat/plugin-manager` — it was squash-merged.
+`origin/main` is the baseline (`e1ec61f`, PR #93 squash). Cut a fresh
+branch in its **own worktree** from it — `git worktree add
+.worktrees/<name> -b <branch> origin/main` — never reusing an existing
+worktree and never branching from whatever is checked out. See
+[`CLAUDE.md`](CLAUDE.md) for why both halves matter. Do **not** reopen
+`feat/plugin-manager` — it was squash-merged.
 
 Read these before touching plugin UI:
 
