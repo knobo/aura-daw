@@ -149,6 +149,14 @@
     border-right: none;
     border-bottom: none;
     position: relative;
+    /* The master strip is the bottom of the same chassis as the transport
+       bar. Its cast shadow goes UP, onto the timeline above it, which is
+       why it cannot just reuse `--relief-3`. */
+    background-image: var(--sheen-face);
+    box-shadow:
+      inset 0 var(--border-width) 0 0 var(--bevel-hi),
+      0 calc(-4px * var(--relief)) calc(16px * var(--relief))
+        rgb(var(--shadow-rgb) / calc(var(--relief) * 0.4));
     z-index: 20;
   }
 

@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { TOKEN_KEYS } from "../tokens";
-import { AURA_DARK, BUILTIN_BY_ID, BUILTIN_THEMES, DEFAULT_THEME_ID } from "./index";
+import { MATERIAL_KEYS, TOKEN_KEYS } from "../tokens";
+import {
+  AURA_DARK,
+  BUILTIN_BY_ID,
+  BUILTIN_THEMES,
+  CONSOLE_NOIR,
+  DEFAULT_THEME_ID,
+  STUDIO_IVORY,
+} from "./index";
 
 describe("the built-in registry", () => {
   it("defaults to aura-dark, and aura-dark is registered first", () => {
@@ -82,6 +89,89 @@ describe("the flat themes", () => {
     for (const theme of BUILTIN_THEMES) {
       if (theme.tokens.glassBlur === "0px") {
         expect(theme.tokens.glassAlpha, theme.id).toBe("1");
+      }
+    }
+  });
+});
+
+describe("the material layer", () => {
+  const STRENGTHS = ["bevel", "relief", "sheen", "grain"] as const;
+
+  it("keeps every material strength inside 0..1", () => {
+    for (const theme of BUILTIN_THEMES) {
+      for (const key of STRENGTHS) {
+        const n = Number(theme.tokens[key]);
+        expect(Number.isFinite(n), `${theme.id}.${key}`).toBe(true);
+        expect(n, `${theme.id}.${key}`).toBeGreaterThanOrEqual(0);
+        expect(n, `${theme.id}.${key}`).toBeLessThanOrEqual(1);
+      }
+    }
+  });
+
+  it("gives every built-in a control radius in px", () => {
+    for (const theme of BUILTIN_THEMES) {
+      expect(theme.tokens.ctrlRadius, theme.id).toMatch(/^\d+(\.\d+)?px$/);
+    }
+  });
+
+  // The high-contrast themes already zero `glassBlur` and `glowScale`, and
+  // the material tokens belong to the same family of decisions: a bevel is a
+  // low-contrast cue by construction and grain is literal noise across text.
+  // A theme that flattens one and not the other is half-done.
+  it("flattens the material wherever glow is switched off for contrast", () => {
+    for (const theme of BUILTIN_THEMES) {
+      if (!theme.id.startsWith("high-contrast")) continue;
+      for (const key of STRENGTHS) {
+        expect(theme.tokens[key], `${theme.id}.${key}`).toBe("0");
+      }
+    }
+  });
+});
+
+describe("the material themes", () => {
+  // These two are the reason the material tokens exist. If their material
+  // ever drifts down to the house theme's, they have stopped earning their
+  // place in the picker and are just two more palettes.
+  it("push the material well past the house theme", () => {
+    for (const theme of [CONSOLE_NOIR, STUDIO_IVORY]) {
+      expect(Number(theme.tokens.bevel), theme.id).toBeGreaterThan(
+        Number(AURA_DARK.tokens.bevel),
+      );
+      expect(Number(theme.tokens.grain), theme.id).toBeGreaterThan(
+        Number(AURA_DARK.tokens.grain),
+      );
+    }
+  });
+
+  // Milled metal is not frosted glass. Both themes make a claim about what
+  // the surface is made of, and translucency contradicts it.
+  it("are solid, not glass", () => {
+    for (const theme of [CONSOLE_NOIR, STUDIO_IVORY]) {
+      expect(theme.tokens.glassBlur, theme.id).toBe("0px");
+      expect(theme.tokens.glassAlpha, theme.id).toBe("1");
+    }
+  });
+
+  // Studio Ivory's warm shadow is most of why its cream panels read as an
+  // object rather than as holes cut in a page; it is a design decision, not
+  // a typo for #000000.
+  it("give Studio Ivory a warm shadow rather than a black one", () => {
+    expect(STUDIO_IVORY.tokens.shadow).toBe("#3a3227");
+  });
+
+  it("run Studio Ivory's surface ramp upward from the panel", () => {
+    // On a light theme "more raised" means lighter, not brighter: bg3 must
+    // sit above bg2, which must sit above the panel they lie on.
+    const hex = (c: string) => parseInt(c.slice(1), 16);
+    expect(hex(STUDIO_IVORY.tokens.bg3)).toBeGreaterThan(hex(STUDIO_IVORY.tokens.bg2));
+    expect(hex(STUDIO_IVORY.tokens.bg2)).toBeGreaterThan(hex(STUDIO_IVORY.tokens.bg1));
+  });
+
+  it("registers both in the picker and keeps the material keys complete", () => {
+    for (const theme of [CONSOLE_NOIR, STUDIO_IVORY]) {
+      expect(BUILTIN_THEMES, theme.id).toContain(theme);
+      for (const key of MATERIAL_KEYS) {
+        expect(theme.tokens[key], `${theme.id}.${key}`).toBeDefined();
       }
     }
   });

@@ -49,4 +49,12 @@ export const AURA_DARK_TOKENS: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+
+  // material — The house theme keeps its glass and its glow; the material is only just
+  // enough to give a button an edge for the light to catch on.
+  bevel: "0.4",
+  relief: "0.55",
+  sheen: "0.3",
+  grain: "0.1",
+  ctrlRadius: "6px",
 };

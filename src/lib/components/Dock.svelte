@@ -114,6 +114,10 @@
     border-bottom: none;
     border-right: none;
     background: rgb(var(--bg-sunken-rgb) / 0.88);
+    /* The dock slides in OVER the timeline rather than replacing part of
+       it, so it casts leftward onto what it covers. */
+    box-shadow: calc(-6px * var(--relief)) 0 calc(20px * var(--relief))
+      rgb(var(--shadow-rgb) / calc(var(--relief) * 0.45));
     animation: dock-in 160ms ease-out;
   }
   @keyframes dock-in {
@@ -153,6 +157,11 @@
     color: var(--cyan);
     border-bottom-color: var(--cyan);
     text-shadow: 0 0 calc(8px * var(--glow-scale)) var(--cyan-dim);
+    /* The active tab is the key that is pressed IN: it sits in the panel
+       rather than on it, which is what makes the row read as hardware. */
+    border-radius: var(--ctrl-radius) var(--ctrl-radius) 0 0;
+    background-color: rgb(var(--bg-2-rgb) / 0.55);
+    box-shadow: var(--bevel-inset);
   }
   .key {
     margin-left: 4px;

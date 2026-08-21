@@ -50,4 +50,12 @@ export const HIGH_CONTRAST_DARK_TOKENS: ThemeTokens = {
   glassAlpha: "1",
   glowScale: "0",
   bodyGlow: "0",
+
+  // material — Flat on purpose, exactly as `glassBlur` and `glowScale` are here: a bevel
+  // is a low-contrast cue by construction, and grain is noise across text.
+  bevel: "0",
+  relief: "0",
+  sheen: "0",
+  grain: "0",
+  ctrlRadius: "4px",
 };

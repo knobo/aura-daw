@@ -7,6 +7,8 @@
 import type { ThemeTokens } from "../tokens";
 import { AURA_DARK_TOKENS } from "./aura-dark";
 import { AURA_LIGHT_TOKENS } from "./aura-light";
+import { CONSOLE_NOIR_TOKENS } from "./console-noir";
+import { STUDIO_IVORY_TOKENS } from "./studio-ivory";
 import { HIGH_CONTRAST_DARK_TOKENS } from "./high-contrast-dark";
 import { HIGH_CONTRAST_LIGHT_TOKENS } from "./high-contrast-light";
 import { SOLARIZED_DARK_TOKENS } from "./solarized-dark";
@@ -32,6 +34,8 @@ function builtin(id: string, name: string, tokens: ThemeTokens): Theme {
 
 export const AURA_DARK = builtin("aura-dark", "AURA Dark", AURA_DARK_TOKENS);
 export const AURA_LIGHT = builtin("aura-light", "AURA Light", AURA_LIGHT_TOKENS);
+export const CONSOLE_NOIR = builtin("console-noir", "Console Noir", CONSOLE_NOIR_TOKENS);
+export const STUDIO_IVORY = builtin("studio-ivory", "Studio Ivory", STUDIO_IVORY_TOKENS);
 export const HIGH_CONTRAST_DARK = builtin(
   "high-contrast-dark",
   "High Contrast Dark",
@@ -47,11 +51,15 @@ export const SOLARIZED_LIGHT = builtin("solarized-light", "Solarized Light", SOL
 export const NORD = builtin("nord", "Nord", NORD_TOKENS);
 export const GRUVBOX_DARK = builtin("gruvbox-dark", "Gruvbox Dark", GRUVBOX_DARK_TOKENS);
 
-// Picker order: the house theme, then the two accessibility themes — they
-// are why this exists and should not be buried — then the borrowed palettes.
+// Picker order: the house themes, then the two material themes — they are
+// the showcase for the material tokens and the first thing worth trying —
+// then the two accessibility themes, which are why this exists and should
+// not be buried, and finally the borrowed palettes.
 export const BUILTIN_THEMES: readonly Theme[] = [
   AURA_DARK,
   AURA_LIGHT,
+  CONSOLE_NOIR,
+  STUDIO_IVORY,
   HIGH_CONTRAST_DARK,
   HIGH_CONTRAST_LIGHT,
   SOLARIZED_DARK,
@@ -72,6 +80,8 @@ export const BUILTIN_BY_ID: Readonly<Record<string, Theme>> = Object.assign(
 export type BuiltinId =
   | "aura-dark"
   | "aura-light"
+  | "console-noir"
+  | "studio-ivory"
   | "high-contrast-dark"
   | "high-contrast-light"
   | "solarized-dark"

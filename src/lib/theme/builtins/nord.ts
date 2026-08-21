@@ -44,4 +44,11 @@ export const NORD_TOKENS: ThemeTokens = {
   glassAlpha: "0.62",
   glowScale: "1",
   bodyGlow: "0.05",
+
+  // material — Nord's flat arctic surfaces take a soft, matte relief.
+  bevel: "0.35",
+  relief: "0.45",
+  sheen: "0.3",
+  grain: "0.08",
+  ctrlRadius: "6px",
 };

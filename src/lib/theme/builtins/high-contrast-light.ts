@@ -45,4 +45,11 @@ export const HIGH_CONTRAST_LIGHT_TOKENS: ThemeTokens = {
   glassAlpha: "1",
   glowScale: "0",
   bodyGlow: "0",
+
+  // material — Flat on purpose — the note in high-contrast-dark is the reason.
+  bevel: "0",
+  relief: "0",
+  sheen: "0",
+  grain: "0",
+  ctrlRadius: "4px",
 };

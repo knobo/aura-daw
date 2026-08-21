@@ -1,6 +1,11 @@
 # Themes in AURA
 
-AURA features a full, tokenised theme system supporting eight built-in themes and user-authored JSON themes from disk. Every visual element—from UI chrome, panels, and dialogs to canvas-rendered timeline tracks, piano roll notes, and audio meters—is styled strictly through reactive theme tokens.
+AURA features a full, tokenised theme system supporting ten built-in themes and user-authored JSON themes from disk. Every visual element—from UI chrome, panels, and dialogs to canvas-rendered timeline tracks, piano roll notes, and audio meters—is styled strictly through reactive theme tokens.
+
+A theme controls two independent things. Its **palette** says what colour a
+surface is. Its **material** says what that surface is made of — milled
+aluminium, moulded plastic, or flat vector — and that is what makes one
+palette shippable as both a flat theme and a hardware theme. See §6.
 
 ---
 
@@ -26,6 +31,8 @@ AURA ships with eight built-in themes:
 6. **Solarized Light** (`solarized-light`): Warm paper-like light palette with solarized accents and high-legibility text.
 7. **Nord** (`nord`): Arctic north-bluish palette built from Polar Night, Snow Storm, Frost, and Aurora hues.
 8. **Gruvbox Dark** (`gruvbox-dark`): Retro warm groove palette with earthy backgrounds and pastel accents.
+9. **Console Noir** (`console-noir`): The flagship material theme — a machined outboard rack unit in bead-blasted graphite, with an amber lamp as the primary interactive colour instead of a neon glow. Solid panels, deep bevels, heavy grain.
+10. **Studio Ivory** (`studio-ivory`): The light half of the material pair — cream injection-moulded plastic with softer corners, a satin sheen, and a warm brown shadow rather than a black one.
 
 ---
 
@@ -58,10 +65,19 @@ User themes are standard JSON files. The filename stem (e.g. `midnight-neon.json
     "bg1": "#0b0e17",
     "borderWidth": "2px",
     "glassBlur": "0px",
-    "glassAlpha": "1"
+    "glassAlpha": "1",
+    "bevel": "0.9",
+    "relief": "0.8",
+    "sheen": "0.6",
+    "grain": "0.3",
+    "ctrlRadius": "3px"
   }
 }
 ```
+
+The last five keys are the material layer (§6). Because material is
+independent of palette, that block alone turns any theme it is pasted into
+from a flat one into a hardware one — the colours need not change at all.
 
 ### Properties
 - `name` *(required, string)*: Human-readable display name shown in the preferences dropdown.
@@ -134,13 +150,96 @@ Percentage channels (`rgb(80% 50% 20%)`), `none`, and the CSS named colours are 
 | `glowScale` | Multiplier on every glow radius; `0` removes all glow | `1` | `0` |
 | `bodyGlow` | Opacity of body atmospheric radial gradient | `0.05` | `0` |
 
+The five **material** tokens (`bevel`, `relief`, `sheen`, `grain`,
+`ctrlRadius`) validate on this same path but are documented on their own
+in §6, since they are tuned as a set rather than one at a time.
+
 `glowScale` is a multiplier rather than a radius because each glow keeps its own designed size — a 22px bloom under a dialog and a 6px rim on a fader thumb are not the same effect — and because a radius animation needs its two ends to stay apart. Set it to `0.5` to halve every glow, or `0` to remove them.
 
 Pair `glassAlpha: "1"` with `glassBlur: "0px"`. A panel that is translucent but unblurred shows the raw timeline grid through its own text, so a theme turning off the frosting wants solid panels; the built-ins all follow this, and a test enforces it.
 
 ---
 
-## 6. Exporting Themes
+## 6. Material Tokens
+
+The five material tokens describe how a surface catches light. They are
+deliberately orthogonal to the palette: changing them restyles every control
+in the app without touching a single colour, and setting all four strengths
+to `0` gives exactly the flat look AURA had before they existed.
+
+The virtual key light is fixed at top-centre — the angle every real front
+panel is photographed under — so a raised face is lit along its top edge and
+casts downward, and a recessed well is that same edge inverted.
+
+| Token | Range | Description |
+|---|---|---|
+| `bevel` | `0`–`1` | Strength of the lit top edge and shadowed bottom edge on a raised face. This is the token that reads as "moulded": it is the edge itself, not the shadow under it. |
+| `relief` | `0`–`1` | Depth of the shadow a raised element CASTS on the panel behind it. Separate from `bevel` because a thick-edged button lying flat on a panel and a thin card floating above it are different objects. |
+| `sheen` | `0`–`1` | Strength of the specular gradient down a face — the sweep of reflected light that makes a knob cap read as domed rather than as a circle. |
+| `grain` | `0`–`1` | Opacity of the micro-texture overlay: the fine speckle of bead-blasted metal or moulded plastic. The single cue that most separates "photograph of hardware" from "rectangle with a gradient". |
+| `ctrlRadius` | a length | Corner radius of controls. A length rather than a strength, because hard-edged rack gear and soft-cornered consumer plastic differ here and nowhere else. |
+
+### Built-in material at a glance
+
+| Theme | `bevel` | `relief` | `sheen` | `grain` | `ctrlRadius` |
+|---|---|---|---|---|---|
+| AURA Dark | 0.4 | 0.55 | 0.3 | 0.1 | 6px |
+| AURA Light | 0.35 | 0.4 | 0.35 | 0.08 | 6px |
+| Console Noir | 0.95 | 0.9 | 0.7 | 0.38 | 3px |
+| Studio Ivory | 0.85 | 0.65 | 0.55 | 0.28 | 9px |
+| High Contrast (both) | 0 | 0 | 0 | 0 | 4px |
+| Solarized (both) | 0.3 | 0.35–0.4 | 0.25–0.3 | 0.06 | 5px |
+| Nord | 0.35 | 0.45 | 0.3 | 0.08 | 6px |
+| Gruvbox Dark | 0.45 | 0.5 | 0.28 | 0.16 | 4px |
+
+### Writing CSS against the material
+
+Components never read the five scalars directly. `src/app.css` derives a set
+of ready-made composites from them, and that is the only place the "what does
+a raised thing look like" decision is made:
+
+| Variable | Use |
+|---|---|
+| `--bevel-raised` / `--bevel-inset` | The lit/shadowed lips of a face, and the same inverted for a well. |
+| `--relief-1` / `--relief-2` / `--relief-3` | Cast shadow at three heights: sitting on, lifted off, floating above. |
+| `--sheen-face` / `--sheen-dome` | The specular sweep down a flat face, and across a dome. |
+| `--grain-tex` | The tiling speckle texture, applied at `opacity: var(--grain)`. |
+
+So a control writes:
+
+```css
+.my-button {
+  border-radius: var(--ctrl-radius);
+  background-image: var(--sheen-face);
+  box-shadow: var(--bevel-raised), var(--relief-2);
+}
+.my-button:active {
+  box-shadow: var(--bevel-inset), var(--relief-1);
+  transform: translateY(calc(1px * var(--relief)));
+}
+```
+
+and inherits every theme's material for free. `app.css` also ships `.raised`,
+`.inset` and `.grain` utility classes for markup written against the system
+from the start — but note that a Svelte component's scoped selectors outrank
+a bare global class, so an existing component opts in through the composite
+variables instead.
+
+> **Naming caution.** This project imports Tailwind, which ships bare
+> utilities such as `.ring`. A plain `class="ring"` inside a component picks
+> that utility up and Svelte's scoping does not prevent it — the element still
+> carries the bare class name. Prefix component class names.
+
+### Accessibility
+
+The high-contrast themes zero all four strengths, and a test enforces it. A
+bevel is a low-contrast cue by construction and grain is literal noise across
+text, so they belong to the same family of decisions as `glassBlur` and
+`glowScale`; a theme that flattens one and not the other is half-done.
+
+---
+
+## 7. Exporting Themes
 
 To quickly create a custom theme, navigate to **Preferences** → **Interface** and click **EXPORT CURRENT THEME…**.
 
@@ -150,7 +249,7 @@ Exporting never overwrites: if that name is taken, the next free one is used (`a
 
 ---
 
-## 7. Reloading & Error Handling
+## 8. Reloading & Error Handling
 
 - **Discovery**: When AURA launches, it scans the themes directory and registers all valid user themes. Adding or deleting a `.json` file requires restarting AURA to discover the file.
 - **Robust Validation**: The theme parser never crashes. If a file contains invalid JSON or lacks a `name`, it is skipped, and a toast notification informs you of the failure. If an individual token has an invalid color or unknown name, only that key is ignored while the rest of the theme loads safely against its base.

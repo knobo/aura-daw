@@ -44,4 +44,12 @@ export const AURA_LIGHT_TOKENS: ThemeTokens = {
   glassAlpha: "1",
   glowScale: "0",
   bodyGlow: "0",
+
+  // material — A light panel shows a bevel more readily than a dark one, so the edge is
+  // pulled back a touch while the sheen comes up.
+  bevel: "0.35",
+  relief: "0.4",
+  sheen: "0.35",
+  grain: "0.08",
+  ctrlRadius: "6px",
 };
