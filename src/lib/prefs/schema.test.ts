@@ -46,10 +46,13 @@ describe("PREF_SCHEMA integrity", () => {
         "mcpDefaultMode",
         "metronome",
         "countInBars",
+        "pluginGuiOnTop",
       ]),
     );
     expect(PREF_SCHEMA.clipOpenAutoplay.default).toBe(false);
     expect(PREF_SCHEMA.mcpDefaultMode.default).toBe("confirmDestructive");
+    expect(PREF_SCHEMA.pluginGuiOnTop.default).toBe(true);
+    expect(PREF_SCHEMA.pluginGuiOnTop.category).toBe("interface");
   });
 
   it("declares how many recent projects the menu shows", () => {

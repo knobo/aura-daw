@@ -34,6 +34,8 @@ pub mod descriptor;
 pub mod host;
 #[cfg(feature = "lv2")]
 pub mod lv2_host;
+#[cfg(feature = "lv2")]
+mod lv2_ui;
 /// Without the `lv2` feature (Windows: no system lilv to link) the stub takes
 /// the module's place, so every LV2 call site below compiles unchanged.
 #[cfg(not(feature = "lv2"))]
@@ -41,6 +43,7 @@ pub mod lv2_host;
 pub mod lv2_host;
 pub mod patches;
 pub mod scan;
+pub mod wm_stack;
 pub mod scan_worker;
 pub mod state;
 pub mod stderr_guard;
@@ -275,6 +278,10 @@ pub struct PluginListResult {
     pub plugins: Vec<PluginDescriptor>,
     pub instances: Vec<PluginInstanceInfo>,
     pub scanned: bool,
+    /// Instance id → native floating GUI available. Additive (D-06); not
+    /// document state — probed from the live host.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub gui: std::collections::HashMap<String, bool>,
 }
 
 /// Scan LV2 + CLAP search paths. Runs on a blocking worker (the CLAP half
@@ -375,6 +382,7 @@ pub fn plugin_list(
         plugins: reg.scanned.clone().unwrap_or_default(),
         instances: control.plugin_rows(),
         scanned: reg.scanned.is_some(),
+        gui: gui_flags(),
     })
 }
 
@@ -602,6 +610,113 @@ pub fn plugin_set_param(
         .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))
 }
 
+/// Which midi track hosts this instance as its instrument
+/// (`instrumentId = "plugin:<id>"`). Insert-only placements are ignored —
+/// they have no note input to audition through.
+pub fn midi_track_bound_to_plugin(
+    tracks: &[crate::audio::types::TrackState],
+    instance_id: &str,
+) -> Option<String> {
+    let want = format!("plugin:{instance_id}");
+    tracks
+        .iter()
+        .find(|t| t.kind == "midi" && t.instrument_id.as_deref() == Some(want.as_str()))
+        .map(|t| t.id.as_str().to_string())
+}
+
+/// Play a one-shot note through a live plugin instance's bound midi track.
+/// No op, no dirty flag: the note rides the existing live-in hub (the same
+/// path hardware monitoring uses), so a stopped transport still sounds it.
+/// The instance must already be on a midi track — this does not instantiate
+/// a preview slot of its own.
+#[tauri::command]
+pub fn plugin_preview_note(
+    instance_id: String,
+    key: u8,
+    velocity: u8,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    if !control.plugin_exists(&instance_id) {
+        return Err(format!("unknown plugin instance: {instance_id}"));
+    }
+    let track_id = {
+        let session = control.session().lock();
+        midi_track_bound_to_plugin(&session.store.tracks, &instance_id).ok_or_else(|| {
+            format!("plugin instance {instance_id} is not bound to a midi track")
+        })?
+    };
+    crate::audio::midi_in::fire_preview_note(
+        crate::audio::midi_in::hub(),
+        &track_id,
+        key,
+        velocity,
+    )
+}
+
+/// Held plugin audition: note-on until `plugin_preview_note_off`.
+#[tauri::command]
+pub fn plugin_preview_note_on(
+    instance_id: String,
+    key: u8,
+    velocity: u8,
+    control: State<'_, Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    if !control.plugin_exists(&instance_id) {
+        return Err(format!("unknown plugin instance: {instance_id}"));
+    }
+    let track_id = {
+        let session = control.session().lock();
+        midi_track_bound_to_plugin(&session.store.tracks, &instance_id).ok_or_else(|| {
+            format!("plugin instance {instance_id} is not bound to a midi track")
+        })?
+    };
+    crate::audio::midi_in::begin_preview_hold(
+        crate::audio::midi_in::hub(),
+        &track_id,
+        key,
+        velocity,
+    )
+}
+
+#[tauri::command]
+pub fn plugin_preview_note_off() -> Result<(), String> {
+    crate::audio::midi_in::end_preview_hold(crate::audio::midi_in::hub());
+    Ok(())
+}
+
+fn gui_flags() -> std::collections::HashMap<String, bool> {
+    let mut gui = clap_host::gui_flags();
+    if let Some(host) = lv2_host::try_global() {
+        gui.extend(host.gui_flags());
+    }
+    gui
+}
+
+/// Open the native plugin-owned floating editor for a live hosted instance
+/// (CLAP `clap.gui` floating / LV2 `ui:showInterface`). Additive command.
+#[tauri::command]
+pub fn plugin_show_gui(instance_id: String, control: State<'_, Arc<crate::control::ControlPlane>>) -> Result<(), String> {
+    let row = control
+        .plugin_row(&instance_id)
+        .ok_or_else(|| format!("unknown plugin instance: {instance_id}"))?;
+    match row.format.as_str() {
+        "clap" => clap_host::show_gui(&instance_id),
+        "lv2" => lv2_host::global().show_gui(&instance_id),
+        other => Err(format!("{other} instances have no native gui host")),
+    }
+}
+
+/// Additive: INTERFACE pref `pluginGuiOnTop`. Live — already-open editors follow.
+#[tauri::command]
+pub fn plugin_set_gui_on_top(enabled: bool) {
+    wm_stack::set_on_top(enabled);
+    // CLAP `set_transient` only runs on the plugin-main thread. When the
+    // pref turns on, re-apply it to already-created floating editors.
+    if enabled {
+        let _ = clap_host::reapply_gui_transient();
+    }
+}
+
 /// Plan G1: add an effect as an insert slot on a track. Prepare-outside
 /// (same shape as `plugin_instantiate`): host instantiate first, then one
 /// commit with `PluginAdd` + `InsertAdd`. Orphan host cleanup on commit failure.
@@ -790,5 +905,29 @@ mod tests {
             err.contains("effect") || err.contains("instruments"),
             "plugin_instantiate stays instrument-only, got: {err}"
         );
+    }
+
+    fn midi_track(id: &str, instrument_id: Option<&str>) -> crate::audio::types::TrackState {
+        let mut t = crate::audio::types::testutil::test_track(id);
+        t.kind = "midi".into();
+        t.instrument_id = instrument_id.map(str::to_string);
+        t
+    }
+
+    #[test]
+    fn midi_track_bound_to_plugin_finds_the_instrument_host() {
+        let tracks = [
+            midi_track("t-other", Some("plugin:other")),
+            midi_track("t-bass", Some("plugin:zyn-1")),
+        ];
+        assert_eq!(midi_track_bound_to_plugin(&tracks, "zyn-1").as_deref(), Some("t-bass"));
+    }
+
+    #[test]
+    fn midi_track_bound_to_plugin_ignores_audio_and_unbound() {
+        let mut audio = crate::audio::types::testutil::test_track("t-audio");
+        audio.instrument_id = Some("plugin:zyn-1".into());
+        let tracks = [audio, midi_track("t-midi", None)];
+        assert_eq!(midi_track_bound_to_plugin(&tracks, "zyn-1"), None);
     }
 }

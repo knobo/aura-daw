@@ -12,23 +12,48 @@
    * this row count. Search box and status line intentionally mirror
    * `BrowserShell`'s vocabulary so it still *reads* as the same browser.
    *
-   * Clicking a patch loads it (zyn_load_patch) and the store re-binds the
-   * owning track so the change is audible without a restart.
+   * Clicking a patch loads it (zyn_load_patch). Double-click also plays C3
+   * through the bound track so the new sound can be heard without the
+   * piano roll — load is still a project edit; the note is not.
    */
   import { zyn } from "../../state/zynpatches.svelte";
   import type { ZynPatch } from "../../types/ipc";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
-  import { loadFolds, saveFolds } from "../browser/browser-folds";
+  import { FoldController } from "../browser/fold-controller.svelte";
   import { type BrowserGroup, flattenRows, groupItems, rankItems } from "../browser/browser-model";
   import EmptyState from "../browser/EmptyState.svelte";
 
-  const FOLDS_KEY = "zyn-patches";
+  const FAV_KEY = "aura.zyn.patch-favorites";
+
+  function loadPatchFavs(): Set<string> {
+    try {
+      const raw = localStorage.getItem(FAV_KEY);
+      if (!raw) return new Set();
+      const parsed: unknown = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return new Set();
+      return new Set(parsed.filter((x): x is string => typeof x === "string"));
+    } catch {
+      return new Set();
+    }
+  }
+
+  function savePatchFavs(favs: ReadonlySet<string>) {
+    try {
+      localStorage.setItem(FAV_KEY, JSON.stringify([...favs]));
+    } catch {
+      /* quota — starring still works this session */
+    }
+  }
 
   let search = $state("");
+  let favOnly = $state(false);
+  let favorites = $state(loadPatchFavs());
   let scroller: HTMLDivElement | undefined = $state();
   let scrollTop = $state(0);
   let viewH = $state(400);
-  let collapsed = $state(loadFolds(FOLDS_KEY));
+  const folds = new FoldController("zyn-patches");
+  $effect(() => folds.syncQuery(search));
+  const collapsed = $derived(folds.collapsed);
 
   const ROW_H = 24;
   const OVERSCAN = 8;
@@ -37,17 +62,22 @@
     rankItems(zyn.patches, search, [
       { value: (p: ZynPatch) => p.name, weight: 2 },
       { value: (p: ZynPatch) => p.bank, weight: 1 },
-    ]),
+    ]).filter((p) => !favOnly || favorites.has(p.path)),
   );
   const groups = $derived(groupItems(ranked, (p) => p.bank));
+  const groupKeys = $derived(groups.map((g) => g.key));
   const groupByKey = $derived(new Map(groups.map((g) => [g.key, g] as const)));
   const rows = $derived(flattenRows(groups, collapsed));
 
   function toggleBank(key: string) {
-    const next = new Set(collapsed);
-    if (!next.delete(key)) next.add(key);
-    collapsed = next;
-    saveFolds(FOLDS_KEY, next);
+    folds.toggle(key, collapsed.has(key));
+  }
+
+  function toggleFav(path: string) {
+    const next = new Set(favorites);
+    if (!next.delete(path)) next.add(path);
+    favorites = next;
+    savePatchFavs(next);
   }
 
   const first = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN));
@@ -71,6 +101,35 @@
     await zyn.load(inst.id, patch);
   }
 
+  async function audition(patch: ZynPatch) {
+    if (!inst || inst.status !== "active") return;
+    await zyn.audition(inst.id, patch);
+  }
+
+  let holdTimer: ReturnType<typeof setTimeout> | null = null;
+  let holding = false;
+
+  function onPatchPointerDown(patch: ZynPatch, e: PointerEvent) {
+    if (e.button !== 0 || !inst || inst.status !== "active") return;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    holdTimer = setTimeout(() => {
+      holdTimer = null;
+      holding = true;
+      void audition(patch);
+    }, 160);
+  }
+
+  function onPatchPointerUp() {
+    if (holdTimer) {
+      clearTimeout(holdTimer);
+      holdTimer = null;
+    }
+    if (holding) {
+      holding = false;
+      void zyn.previewUp();
+    }
+  }
+
   function bankOf(key: string): BrowserGroup<ZynPatch> | undefined {
     return groupByKey.get(key);
   }
@@ -88,13 +147,34 @@
     </div>
   {/if}
 
-  <input
-    type="text"
-    class="search mono"
-    placeholder="⌕ search {zyn.patches.length} patches…"
-    bind:value={search}
-    spellcheck="false"
-  />
+  <div class="tools">
+    <input
+      type="text"
+      class="search mono"
+      placeholder="⌕ search {zyn.patches.length} patches…"
+      bind:value={search}
+      spellcheck="false"
+    />
+    <button
+      type="button"
+      class="foldall mono"
+      aria-label={folds.anyCollapsed(groupKeys) ? "Expand all groups" : "Collapse all groups"}
+      title={folds.anyCollapsed(groupKeys) ? "Expand all groups" : "Collapse all groups"}
+      onclick={() => folds.setAll(groupKeys, !folds.anyCollapsed(groupKeys))}
+    >
+      <span aria-hidden="true">{folds.anyCollapsed(groupKeys) ? "⌄" : "⌃"}</span>
+    </button>
+    <button
+      type="button"
+      class="chip mono"
+      class:on={favOnly}
+      aria-pressed={favOnly}
+      title="Favourites only"
+      onclick={() => (favOnly = !favOnly)}
+    >
+      ★
+    </button>
+  </div>
 
   {#if zyn.error}
     <div class="err silk" role="alert">{zyn.error}</div>
@@ -133,22 +213,40 @@
           {:else}
             {@const patch = bankOf(row.groupKey)?.items[row.itemIndex]}
             {#if patch}
-              <button
+              <div
                 class="patch mono"
                 class:loaded={loadedPath === patch.path}
                 class:busy={zyn.busyPath === patch.path}
                 style:height="{ROW_H}px"
-                title="{patch.bank} / {patch.name} — load into {inst?.name ?? 'Zyn'}"
-                onclick={() => pick(patch)}
               >
-                <span class="pnum silk">{String(patch.program).padStart(3, "0")}</span>
-                <span class="pname">{patch.name}</span>
-                {#if zyn.busyPath === patch.path}
-                  <span class="spin">◌</span>
-                {:else if loadedPath === patch.path}
-                  <span class="check">⌁ live</span>
-                {/if}
-              </button>
+                <button
+                  type="button"
+                  class="pload"
+                  title="{patch.bank} / {patch.name} — click to load, hold to hear C3"
+                  onclick={() => pick(patch)}
+                  onpointerdown={(e) => onPatchPointerDown(patch, e)}
+                  onpointerup={onPatchPointerUp}
+                  onpointercancel={onPatchPointerUp}
+                >
+                  <span class="pnum silk">{String(patch.program).padStart(3, "0")}</span>
+                  <span class="pname">{patch.name}</span>
+                  {#if zyn.busyPath === patch.path}
+                    <span class="spin">◌</span>
+                  {:else if loadedPath === patch.path}
+                    <span class="check">⌁ live</span>
+                  {/if}
+                </button>
+                <button
+                  type="button"
+                  class="star"
+                  class:on={favorites.has(patch.path)}
+                  aria-pressed={favorites.has(patch.path)}
+                  title={favorites.has(patch.path) ? "Remove from favourites" : "Add to favourites"}
+                  onclick={() => toggleFav(patch.path)}
+                >
+                  {favorites.has(patch.path) ? "★" : "☆"}
+                </button>
+              </div>
             {/if}
           {/if}
         {/each}
@@ -157,7 +255,7 @@
   </div>
 
   <div class="foot silk">
-    loading a patch re-binds its track so the new sound reaches the engine
+    click loads · hold to hear C3 on the bound track
   </div>
 </div>
 
@@ -208,8 +306,15 @@
     letter-spacing: 0.1em;
   }
 
-  .search {
+  .tools {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     flex: none;
+  }
+  .search {
+    flex: 1;
+    min-width: 0;
     background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text);
     border: var(--border-width) solid var(--glass-border);
@@ -219,6 +324,39 @@
   }
   .search:focus {
     border-color: var(--violet);
+  }
+  .foldall {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    font-size: 11px;
+    border-radius: 4px;
+    border: var(--border-width) solid var(--glass-border);
+    background: rgb(var(--bg-0-rgb) / 0.7);
+    color: var(--text-dim);
+    cursor: pointer;
+  }
+  .foldall:hover {
+    color: var(--cyan);
+    border-color: var(--cyan-dim);
+  }
+  .chip {
+    flex: none;
+    border: var(--border-width) solid var(--glass-border);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--text-faint);
+    font-size: 9px;
+    padding: 3px 8px;
+    cursor: pointer;
+  }
+  .chip.on {
+    color: var(--amber);
+    border-color: var(--amber);
   }
 
   .note,
@@ -282,14 +420,9 @@
     width: 100%;
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 0 9px 0 16px;
-    font-size: 10px;
-    border: none;
+    padding: 0 4px 0 16px;
     background: transparent;
     color: var(--text-dim);
-    cursor: pointer;
-    text-align: left;
   }
   .patch:hover {
     background: rgb(var(--cyan-rgb) / 0.06);
@@ -300,6 +433,36 @@
     background: rgb(var(--cyan-rgb) / 0.07);
   }
   .patch.busy {
+    color: var(--amber);
+  }
+  .pload {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    height: 100%;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .star {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+    font-size: 11px;
+  }
+  .star.on,
+  .star:hover {
     color: var(--amber);
   }
   .pnum {

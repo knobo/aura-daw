@@ -21,6 +21,7 @@
     onActivate,
     anyCollapsed = false,
     onFoldAll,
+    chrome = true,
     children,
     role: listRole = "tree",
   }: {
@@ -38,6 +39,9 @@
     /** Omit to leave the button out — a browser with no groups has nothing
      * to fold. */
     onFoldAll?: (collapse: boolean) => void;
+    /** False = list only. Plugin Manager draws a shared toolbar above a
+     * split rack/browse, so a second search field would be a lie. */
+    chrome?: boolean;
     children: Snippet<[{ activeId: string | null; setActive: (row: BrowserRowRef) => void }]>;
     role?: "listbox" | "tree";
   } = $props();
@@ -135,6 +139,7 @@
 </script>
 
 <div class="shell">
+  {#if chrome}
   <div class="toolbar">
     <input
       bind:this={searchEl}
@@ -160,6 +165,7 @@
       <div class="chips">{@render filters()}</div>
     {/if}
   </div>
+  {/if}
 
   <!-- svelte-ignore a11y_no_noninteractive_tabindex -- `role` is dynamic
        (tree/listbox), so the linter can't see it's a widget role that
@@ -175,7 +181,9 @@
     {@render children({ activeId, setActive })}
   </div>
 
+  {#if chrome}
   <div class="status silk">{status}</div>
+  {/if}
 </div>
 
 <style>

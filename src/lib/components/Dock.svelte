@@ -23,7 +23,7 @@
   import HumPanel from "./hum/HumPanel.svelte";
   import LibraryPanel from "./library/LibraryPanel.svelte";
   import InstrumentBrowser from "./instruments/InstrumentBrowser.svelte";
-  import PluginBrowser from "./plugins/PluginBrowser.svelte";
+  import PluginManager from "./plugins/PluginManager.svelte";
   import PluginParamPanel from "./plugins/PluginParamPanel.svelte";
   import ZynPatchBrowser from "./plugins/ZynPatchBrowser.svelte";
   import McpPanel from "./mcp/McpPanel.svelte";
@@ -32,6 +32,15 @@
   import { historyBrowser } from "../state/history.svelte";
 
   const docked = $derived(prefs.values.dockSide === "docked");
+
+  let pluginsWidened = false;
+
+  $effect(() => {
+    if (ui.dock === "plugins" && !pluginsWidened && ui.dockWidth < 420) {
+      ui.dockWidth = 480;
+      pluginsWidened = true;
+    }
+  });
 
   function selectTab(tab: Exclude<DockTab, "">) {
     ui.dock = tab;
@@ -97,7 +106,7 @@
         {:else if plugins.openInstanceId}
           <PluginParamPanel />
         {:else}
-          <PluginBrowser />
+          <PluginManager />
         {/if}
       {:else if ui.dock === "mcp"}
         <McpPanel />

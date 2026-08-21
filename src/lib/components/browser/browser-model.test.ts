@@ -6,6 +6,7 @@ import {
   fuzzyScore,
   groupItems,
   nextIndex,
+  parseSearchQuery,
   rankItems,
   rowId,
 } from "./browser-model";
@@ -209,5 +210,23 @@ describe("rowId", () => {
     expect(rowId(g)).not.toBe(rowId(i));
     expect(rowId(g)).toBe(rowId({ ...g }));
     expect(rowId(i)).toBe(rowId({ ...i }));
+  });
+});
+
+describe("parseSearchQuery (design §9.3)", () => {
+  it("leaves a plain query as text with no format facet", () => {
+    expect(parseSearchQuery("reverb")).toEqual({ text: "reverb" });
+  });
+
+  it("strips a format: prefix and lowercases the value", () => {
+    expect(parseSearchQuery("format:LV2 reverb")).toEqual({ text: "reverb", format: "lv2" });
+  });
+
+  it("treats a format-only query as a facet with empty text", () => {
+    expect(parseSearchQuery("format:clap")).toEqual({ text: "", format: "clap" });
+  });
+
+  it("ignores a format: with no value", () => {
+    expect(parseSearchQuery("format: reverb")).toEqual({ text: "format: reverb" });
   });
 });

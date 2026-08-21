@@ -75,6 +75,26 @@ export interface RankField<T> {
  * tie-break — "then label" in the spec). An empty query is "show
  * everything, unranked": the original order is returned unchanged.
  */
+/**
+ * One prefix, not a query language (design §9.3). `format:lv2 reverb`
+ * means "LV2 plugins matching reverb"; a bare `format:clap` is the facet
+ * with no further text. Anything that isn't `format:<token>` is left as
+ * the ranked query so the other browsers can keep calling `rankItems`
+ * unchanged.
+ */
+export interface ParsedQuery {
+  text: string;
+  format?: string;
+}
+
+export function parseSearchQuery(query: string): ParsedQuery {
+  const match = query.match(/\bformat:(\S+)/i);
+  if (!match) return { text: query.trim() };
+  const format = match[1].toLowerCase();
+  const text = query.replace(match[0], " ").replace(/\s+/g, " ").trim();
+  return { text, format };
+}
+
 export function rankItems<T>(items: T[], query: string, keys: RankField<T>[]): T[] {
   if (!query.trim()) return items.slice();
   const primary = keys[0]?.value ?? (() => "");

@@ -13,6 +13,7 @@
  */
 
 import { backend } from "../tauri";
+import { prefs } from "../prefs/prefs.svelte";
 import { project } from "./project.svelte";
 import type {
   PluginCatalog,
@@ -55,6 +56,22 @@ class PluginsStore {
   /** uid of the instantiate in flight (row spinner). */
   busyUid = $state<string | null>(null);
 
+  /** Instance id → native floating GUI available (from plugin_list.gui). */
+  guiById = $state<Record<string, boolean>>({});
+
+  hasGui(instanceId: string): boolean {
+    return !!this.guiById[instanceId];
+  }
+
+  async showGui(instanceId: string) {
+    this.error = null;
+    try {
+      await backend.pluginShowGui?.(instanceId);
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
   byId(instanceId: string | null | undefined): PluginInstanceInfo | undefined {
     return instanceId ? this.instances.find((i) => i.id === instanceId) : undefined;
   }
@@ -76,12 +93,30 @@ class PluginsStore {
     }
   }
 
+  private guiOnTopWired = false;
+
+  private pushGuiOnTop(enabled: boolean) {
+    const p = backend.pluginSetGuiOnTop?.(enabled);
+    if (p) {
+      void p.catch((err) => console.warn("[aura] plugin_set_gui_on_top failed:", err));
+    }
+  }
+
+  private wireGuiOnTop() {
+    if (this.guiOnTopWired) return;
+    this.guiOnTopWired = true;
+    prefs.onChange("pluginGuiOnTop", (enabled) => this.pushGuiOnTop(enabled));
+  }
+
   async refresh() {
+    this.wireGuiOnTop();
+    this.pushGuiOnTop(prefs.values.pluginGuiOnTop);
     try {
       const res = await backend.pluginList();
       this.descriptors = res.plugins;
       this.scanned = res.scanned;
       this.applyInstances(res.instances);
+      this.guiById = res.gui ?? {};
       await this.loadCatalog();
     } catch (err) {
       // plugin_list absent = pre-phase-3 engine; stay quietly empty.
@@ -229,6 +264,7 @@ class PluginsStore {
       this.instances = [...this.instances, inst];
       this.noteUsed(uid);
       if (trackId) await this.bind(inst.id, trackId);
+      void this.refreshInstances();
       // Status may flip stub → active once the host thread brings the DSP up;
       // re-pull the registry shortly after (single shot, not a poll loop).
       setTimeout(() => void this.refreshInstances(), 1400);
@@ -316,6 +352,11 @@ class PluginsStore {
       }
     }
     this.instances = this.instances.filter((i) => i.id !== instanceId);
+    if (this.guiById[instanceId] !== undefined) {
+      const next = { ...this.guiById };
+      delete next[instanceId];
+      this.guiById = next;
+    }
     // Also remove from any track's insert slots
     for (const t of project.tracks) {
       const inserts = (t.inserts ?? []).filter((s) => s.instanceId !== instanceId);
@@ -330,6 +371,7 @@ class PluginsStore {
     try {
       const res = await backend.pluginList();
       this.applyInstances(res.instances);
+      this.guiById = res.gui ?? {};
     } catch {
       /* transient */
     }

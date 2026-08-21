@@ -13,7 +13,7 @@
   import { project } from "../../state/project.svelte";
   import { openStudio } from "../../state/ui.svelte";
   import type { InstrumentInfo } from "../../types/ipc";
-  import { loadFolds, saveFolds } from "../browser/browser-folds";
+  import { FoldController } from "../browser/fold-controller.svelte";
   import { type BrowserRowRef, flattenRows, groupItems, rankItems, rowId } from "../browser/browser-model";
   import BrowserShell from "../browser/BrowserShell.svelte";
   import BrowserSection from "../browser/BrowserSection.svelte";
@@ -50,7 +50,8 @@
   }
 
   let query = $state("");
-  let collapsed = $state(loadFolds(FOLDS_KEY));
+  const folds = new FoldController(FOLDS_KEY);
+  $effect(() => folds.syncQuery(query));
 
   const ranked = $derived(
     rankItems(instruments.list, query, [
@@ -59,14 +60,12 @@
     ]),
   );
   const groups = $derived(groupItems(ranked, bankFolder));
+  const collapsed = $derived(folds.collapsed);
+  const groupKeys = $derived(groups.map((g) => g.key));
   const rows = $derived(flattenRows(groups, collapsed));
 
   function toggleGroup(key: string, expand: boolean) {
-    const next = new Set(collapsed);
-    if (expand) next.delete(key);
-    else next.add(key);
-    collapsed = next;
-    saveFolds(FOLDS_KEY, next);
+    folds.toggle(key, expand);
   }
 
   function onActivate(row: BrowserRowRef) {
@@ -103,6 +102,8 @@
       {rows}
       onToggleGroup={toggleGroup}
       {onActivate}
+      anyCollapsed={folds.anyCollapsed(groupKeys)}
+      onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
     >
       {#snippet children({ activeId, setActive })}
         {#if rows.length === 0}
@@ -133,8 +134,14 @@
                 selected={instruments.previewingId === inst.id}
                 onclick={() => {
                   setActive({ kind: "item", groupKey: g.key, itemIndex: i });
-                  instruments.preview(inst.id, 60);
                 }}
+                onpointerdown={(e) => {
+                  if (e.button !== 0) return;
+                  (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+                  void instruments.previewDown(inst.id, 60);
+                }}
+                onpointerup={() => void instruments.previewUp()}
+                onpointercancel={() => void instruments.previewUp()}
               >
                 {#snippet badge()}
                   <span class="regions silk">{inst.regionCount} rgn</span>
@@ -145,11 +152,18 @@
                       <button
                         class="pkey mono"
                         class:black={[1, 3, 6, 8, 10].includes(k % 12)}
-                        title="Preview {keyName(k)}"
-                        onclick={(e) => {
+                        title="Preview {keyName(k)} — hold to play"
+                        onpointerdown={(e) => {
                           e.stopPropagation();
-                          instruments.preview(inst.id, k);
+                          e.preventDefault();
+                          (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+                          void instruments.previewDown(inst.id, k);
                         }}
+                        onpointerup={(e) => {
+                          e.stopPropagation();
+                          void instruments.previewUp();
+                        }}
+                        onpointercancel={() => void instruments.previewUp()}
                       >
                         {keyName(k)}
                       </button>
@@ -158,6 +172,7 @@
                   <select
                     title="Bind to a MIDI track"
                     onclick={(e) => e.stopPropagation()}
+                    onpointerdown={(e) => e.stopPropagation()}
                     onchange={(e) => onAssign(inst, e)}
                   >
                     <option value="">assign to track…</option>

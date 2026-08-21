@@ -246,6 +246,41 @@ class LibraryStore {
         );
         return;
       }
+
+      case "pluginInstrument": {
+        if (track.kind !== "midi") {
+          toasts.info("NEEDS A MIDI TRACK", `${payload.name} is an instrument — drop it on a MIDI track`);
+          return;
+        }
+        const inst = await plugins.instantiate(payload.uid, trackId);
+        if (!inst) {
+          toasts.error("PLUGIN FAILED", plugins.error ?? "instantiate failed");
+        }
+        return;
+      }
+
+      case "pluginEffect": {
+        if (track.kind !== "audio" && track.kind !== "midi") {
+          toasts.info("NEEDS A TRACK", `${payload.name} is an effect — drop it on an audio or MIDI track`);
+          return;
+        }
+        try {
+          await plugins.insertEffect(trackId, payload.uid);
+        } catch (err) {
+          toasts.error("INSERT FAILED", String(err));
+        }
+        return;
+      }
+
+      case "pluginInstance": {
+        if (track.kind !== "midi") {
+          toasts.info("NEEDS A MIDI TRACK", `${payload.name} is an instrument — drop it on a MIDI track`);
+          return;
+        }
+        await plugins.bind(payload.instanceId, trackId);
+        if (plugins.error) toasts.error("BIND FAILED", plugins.error);
+        return;
+      }
     }
   }
 

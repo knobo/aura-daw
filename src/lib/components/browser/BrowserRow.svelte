@@ -26,6 +26,9 @@
     active = false,
     draggable = false,
     onclick,
+    onpointerdown,
+    onpointerup,
+    onpointercancel,
     ondragstart,
     actions,
   }: {
@@ -42,6 +45,9 @@
     active?: boolean;
     draggable?: boolean;
     onclick?: () => void;
+    onpointerdown?: (e: PointerEvent) => void;
+    onpointerup?: (e: PointerEvent) => void;
+    onpointercancel?: (e: PointerEvent) => void;
     ondragstart?: (e: DragEvent) => void;
     actions?: Snippet;
   } = $props();
@@ -59,6 +65,9 @@
   {draggable}
   title={label}
   onclick={() => onclick?.()}
+  onpointerdown={(e) => onpointerdown?.(e)}
+  onpointerup={(e) => onpointerup?.(e)}
+  onpointercancel={(e) => onpointercancel?.(e)}
   onkeydown={(e) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();

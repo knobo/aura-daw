@@ -25,12 +25,16 @@
 
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use clack_extensions::audio_ports::{AudioPortFlags, AudioPortInfoBuffer, PluginAudioPorts};
+use clack_extensions::gui::{GuiApiType, GuiConfiguration, HostGui, HostGuiImpl, PluginGui};
 use clack_extensions::latency::PluginLatency;
 use clack_extensions::note_ports::{NoteDialect, NotePortInfoBuffer, PluginNotePorts};
 use clack_extensions::params::{ParamInfoFlags, ParamInfoBuffer, PluginParams};
 use clack_extensions::state::PluginState as PluginStateExt;
+use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::events::event_types::{MidiEvent, NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::events::Match;
 use clack_host::prelude::*;
@@ -56,7 +60,23 @@ const SLOT: &str = "clap";
 // ---------------------------------------------------------------------------
 
 struct AuraShared {
-    callback_requested: std::sync::atomic::AtomicBool,
+    callback_requested: AtomicBool,
+    gui_closed: AtomicBool,
+    gui_destroyed: AtomicBool,
+    gui_show_requested: AtomicBool,
+    gui_hide_requested: AtomicBool,
+}
+
+impl AuraShared {
+    fn new() -> Self {
+        Self {
+            callback_requested: AtomicBool::new(false),
+            gui_closed: AtomicBool::new(false),
+            gui_destroyed: AtomicBool::new(false),
+            gui_show_requested: AtomicBool::new(false),
+            gui_hide_requested: AtomicBool::new(false),
+        }
+    }
 }
 
 impl<'a> SharedHandler<'a> for AuraShared {
@@ -68,8 +88,75 @@ impl<'a> SharedHandler<'a> for AuraShared {
         // Instrument nodes are always processed while their track is live.
     }
     fn request_callback(&self) {
-        self.callback_requested
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.callback_requested.store(true, Ordering::Relaxed);
+    }
+}
+
+impl HostGuiImpl for AuraShared {
+    fn resize_hints_changed(&self) {}
+    fn request_resize(&self, _new_size: clack_extensions::gui::GuiSize) -> Result<(), HostError> {
+        // Floating windows size themselves; embedding is out of v1.
+        Ok(())
+    }
+    fn request_show(&self) -> Result<(), HostError> {
+        self.gui_show_requested.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    fn request_hide(&self) -> Result<(), HostError> {
+        self.gui_hide_requested.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+    fn closed(&self, was_destroyed: bool) {
+        self.gui_closed.store(true, Ordering::Relaxed);
+        if was_destroyed {
+            self.gui_destroyed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+struct ClapTimer {
+    id: TimerId,
+    period: Duration,
+    next: Instant,
+}
+
+struct AuraMainThread {
+    timers: Vec<ClapTimer>,
+    next_id: u32,
+}
+
+impl Default for AuraMainThread {
+    fn default() -> Self {
+        Self { timers: Vec::new(), next_id: 1 }
+    }
+}
+
+impl MainThreadHandler<'_> for AuraMainThread {}
+
+impl HostTimerImpl for AuraMainThread {
+    fn register_timer(&mut self, period_ms: u32) -> Result<TimerId, HostError> {
+        let id = TimerId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let period = Duration::from_millis(u64::from(period_ms.max(16)));
+        self.timers.push(ClapTimer { id, period, next: Instant::now() + period });
+        Ok(id)
+    }
+    fn unregister_timer(&mut self, timer_id: TimerId) -> Result<(), HostError> {
+        self.timers.retain(|t| t.id != timer_id);
+        Ok(())
+    }
+}
+
+impl AuraMainThread {
+    fn due_timers(&mut self, now: Instant) -> Vec<TimerId> {
+        let mut due = Vec::new();
+        for t in &mut self.timers {
+            if now >= t.next {
+                due.push(t.id);
+                t.next = now + t.period;
+            }
+        }
+        due
     }
 }
 
@@ -77,8 +164,12 @@ struct AuraClapHost;
 
 impl HostHandlers for AuraClapHost {
     type Shared<'a> = AuraShared;
-    type MainThread<'a> = ();
+    type MainThread<'a> = AuraMainThread;
     type AudioProcessor<'a> = ();
+
+    fn declare_extensions(builder: &mut HostExtensions<Self>, _shared: &Self::Shared<'_>) {
+        builder.register::<HostGui>().register::<HostTimer>();
+    }
 }
 
 fn host_info() -> HostInfo {
@@ -117,6 +208,12 @@ struct Hosted {
     param_tx: Option<rtrb::Producer<ParamCmd>>,
     /// True while a `ClapNode` holds the audio processor.
     node_out: bool,
+    /// Plugin implements clap.gui floating (probed at instantiate).
+    has_gui: bool,
+    /// `gui.create` has been called and not yet `destroy`ed.
+    gui_created: bool,
+    gui_visible: bool,
+    name: String,
 }
 
 #[derive(Default)]
@@ -137,14 +234,45 @@ fn ensure_ticker(ctx: &mut MainCtx) {
     ctx.add_ticker(
         SLOT,
         Box::new(|ctx| {
+            let now = Instant::now();
             let w = world(ctx);
             for hosted in w.hosted.values_mut().chain(w.graveyard.values_mut()) {
                 let requested = hosted.instance.access_shared_handler(|s| {
-                    s.callback_requested
-                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    s.callback_requested.swap(false, Ordering::Relaxed)
                 });
                 if requested {
                     hosted.instance.call_on_main_thread_callback();
+                }
+
+                let due = hosted.instance.access_handler_mut(|mt| mt.due_timers(now));
+                if !due.is_empty() {
+                    if let Some(timer_ext) =
+                        hosted.instance.plugin_shared_handle().get_extension::<PluginTimer>()
+                    {
+                        let mut handle = hosted.instance.plugin_handle();
+                        for id in due {
+                            timer_ext.on_timer(&mut handle, id);
+                        }
+                    }
+                }
+
+                let (closed, destroyed, show_req, hide_req) =
+                    hosted.instance.access_shared_handler(|s| {
+                        (
+                            s.gui_closed.swap(false, Ordering::Relaxed),
+                            s.gui_destroyed.swap(false, Ordering::Relaxed),
+                            s.gui_show_requested.swap(false, Ordering::Relaxed),
+                            s.gui_hide_requested.swap(false, Ordering::Relaxed),
+                        )
+                    });
+                if destroyed {
+                    destroy_gui(hosted);
+                } else if closed {
+                    hosted.gui_visible = false;
+                } else if show_req && hosted.gui_created {
+                    let _ = show_created_gui(hosted);
+                } else if hide_req && hosted.gui_created {
+                    hide_created_gui(hosted);
                 }
             }
         }),
@@ -193,8 +321,8 @@ impl ClapWorld {
         let entry = self.entry(&path)?.clone();
         let c_id = CString::new(clap_id.clone()).map_err(|_| "bad plugin id".to_string())?;
         let mut instance = PluginInstance::<AuraClapHost>::new(
-            |_| AuraShared { callback_requested: std::sync::atomic::AtomicBool::new(false) },
-            |_| (),
+            |_| AuraShared::new(),
+            |_| AuraMainThread::default(),
             &entry,
             &c_id,
             &host_info(),
@@ -203,10 +331,23 @@ impl ClapWorld {
 
         let layout = negotiate_ports(&mut instance, &clap_id, role)?;
         let (params, cookies) = enumerate_params(&mut instance);
+        let has_gui = probe_floating_gui(&mut instance);
+        let name = clap_id.clone();
 
         self.hosted.insert(
             instance_id.to_string(),
-            Hosted { instance, layout, params: params.clone(), cookies, param_tx: None, node_out: false },
+            Hosted {
+                instance,
+                layout,
+                params: params.clone(),
+                cookies,
+                param_tx: None,
+                node_out: false,
+                has_gui,
+                gui_created: false,
+                gui_visible: false,
+                name,
+            },
         );
         log::info!(
             "clap: instantiated {clap_id} as {instance_id} ({role:?}, {} params)",
@@ -291,6 +432,7 @@ impl ClapWorld {
             hosted.node_out = false;
             hosted.param_tx = None;
         } else if let Some(mut hosted) = self.graveyard.remove(instance_id) {
+            destroy_gui(&mut hosted);
             hosted.instance.deactivate(stopped);
             log::info!("clap: destroyed removed instance {instance_id} after node retirement");
         }
@@ -299,15 +441,33 @@ impl ClapWorld {
     }
 
     fn remove(&mut self, instance_id: &str) -> Result<(), String> {
-        let hosted = self
+        let mut hosted = self
             .hosted
             .remove(instance_id)
             .ok_or_else(|| format!("clap: unknown instance {instance_id}"))?;
+        destroy_gui(&mut hosted);
         if hosted.node_out {
             // Node still holds the processor; destroy when it returns.
             self.graveyard.insert(instance_id.to_string(), hosted);
         }
         Ok(())
+    }
+
+    fn has_gui(&self, instance_id: &str) -> bool {
+        self.hosted.get(instance_id).is_some_and(|h| h.has_gui)
+    }
+
+    fn show_gui(&mut self, instance_id: &str) -> Result<(), String> {
+        let hosted = self.hosted_mut(instance_id)?;
+        open_floating_gui(hosted)
+    }
+
+    fn reapply_gui_transient(&mut self) {
+        for hosted in self.hosted.values_mut() {
+            if hosted.gui_created {
+                set_gui_transient(hosted);
+            }
+        }
     }
 
     fn set_params(&mut self, instance_id: &str, changes: &[ParamChange]) -> Result<Vec<ParamInfo>, String> {
@@ -671,6 +831,163 @@ pub fn save_state(instance_id: &str) -> Result<Vec<u8>, String> {
 pub fn load_state(instance_id: &str, data: Vec<u8>) -> Result<(), String> {
     let id = instance_id.to_string();
     plugin_main().run(move |ctx| world(ctx).load_state(&id, &data))?
+}
+
+/// True when the hosted CLAP instance implements `clap.gui` and supports a
+/// floating window (v1 — no embed).
+pub fn has_gui(instance_id: &str) -> Result<bool, String> {
+    let id = instance_id.to_string();
+    plugin_main().run(move |ctx| world(ctx).has_gui(&id))
+}
+
+/// Open (or re-show) the plugin-owned floating editor for this instance.
+pub fn show_gui(instance_id: &str) -> Result<(), String> {
+    let id = instance_id.to_string();
+    plugin_main().run(move |ctx| {
+        ensure_ticker(ctx);
+        world(ctx).show_gui(&id)
+    })?
+}
+
+/// Re-run `clap.gui` `set_transient` on every created floating editor.
+/// Used when the INTERFACE pref turns on-top back on without recreating
+/// the GUI (toggle used to be restart-only).
+pub fn reapply_gui_transient() -> Result<(), String> {
+    plugin_main().run(|ctx| world(ctx).reapply_gui_transient())
+}
+
+/// Snapshot of which hosted CLAP instances have a floating GUI, one
+/// plugin-main round-trip (for `plugin_list`'s additive `gui` map).
+pub fn gui_flags() -> HashMap<String, bool> {
+    plugin_main()
+        .run(|ctx| {
+            world(ctx)
+                .hosted
+                .iter()
+                .map(|(id, h)| (id.clone(), h.has_gui))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn probe_floating_gui(instance: &mut PluginInstance<AuraClapHost>) -> bool {
+    let Some(gui) = instance.plugin_shared_handle().get_extension::<PluginGui>() else {
+        return false;
+    };
+    let mut handle = instance.plugin_handle();
+    if let Some(pref) = gui.get_preferred_api(&mut handle) {
+        if pref.is_floating && gui.is_api_supported(&mut handle, pref) {
+            return true;
+        }
+    }
+    for api in [GuiApiType::X11, GuiApiType::WAYLAND] {
+        let cfg = GuiConfiguration { api_type: api, is_floating: true };
+        if gui.is_api_supported(&mut handle, cfg) {
+            return true;
+        }
+    }
+    false
+}
+
+fn open_floating_gui(hosted: &mut Hosted) -> Result<(), String> {
+    if !hosted.has_gui {
+        return Err(format!("clap: {} has no floating gui", hosted.name));
+    }
+    if hosted.gui_created {
+        return show_created_gui(hosted);
+    }
+    let Some(gui) = hosted.instance.plugin_shared_handle().get_extension::<PluginGui>() else {
+        return Err(format!("clap: {} lost clap.gui", hosted.name));
+    };
+    let mut handle = hosted.instance.plugin_handle();
+    let mut created = false;
+    if let Some(pref) = gui.get_preferred_api(&mut handle) {
+        if pref.is_floating && gui.is_api_supported(&mut handle, pref) {
+            gui.create(&mut handle, pref)
+                .map_err(|e| format!("clap: gui.create failed for {}: {e}", hosted.name))?;
+            created = true;
+        }
+    }
+    if !created {
+        let mut opened = false;
+        for api in [GuiApiType::X11, GuiApiType::WAYLAND] {
+            let cfg = GuiConfiguration { api_type: api, is_floating: true };
+            if gui.is_api_supported(&mut handle, cfg) {
+                gui.create(&mut handle, cfg)
+                    .map_err(|e| format!("clap: gui.create failed for {}: {e}", hosted.name))?;
+                opened = true;
+                break;
+            }
+        }
+        if !opened {
+            return Err(format!("clap: {} rejected every floating gui API", hosted.name));
+        }
+    }
+    let title = CString::new(format!("AURA — {}", hosted.name)).unwrap_or_else(|_| CString::new("AURA").unwrap());
+    gui.suggest_title(&mut handle, &title);
+    gui.show(&mut handle)
+        .map_err(|e| format!("clap: gui.show failed for {}: {e}", hosted.name))?;
+    hosted.gui_created = true;
+    hosted.gui_visible = true;
+    set_gui_transient(hosted);
+    super::wm_stack::apply_to_open_plugin_windows(super::wm_stack::on_top());
+    log::info!("clap: opened floating gui for {}", hosted.name);
+    Ok(())
+}
+
+fn set_gui_transient(hosted: &mut Hosted) {
+    if !super::wm_stack::on_top() {
+        return;
+    }
+    let Some(gui) = hosted.instance.plugin_shared_handle().get_extension::<PluginGui>() else {
+        return;
+    };
+    let Some(xid) = super::wm_stack::aura_x11_id() else {
+        return;
+    };
+    let mut handle = hosted.instance.plugin_handle();
+    // SAFETY: xid is a live X11 window of this process (the AURA host).
+    // The plugin GUI is destroyed before we exit.
+    let _ = unsafe {
+        gui.set_transient(
+            &mut handle,
+            clack_extensions::gui::Window::from_x11_handle(xid as std::os::raw::c_ulong),
+        )
+    };
+}
+
+fn show_created_gui(hosted: &mut Hosted) -> Result<(), String> {
+    let Some(gui) = hosted.instance.plugin_shared_handle().get_extension::<PluginGui>() else {
+        return Err(format!("clap: {} lost clap.gui", hosted.name));
+    };
+    let mut handle = hosted.instance.plugin_handle();
+    gui.show(&mut handle)
+        .map_err(|e| format!("clap: gui.show failed for {}: {e}", hosted.name))?;
+    hosted.gui_visible = true;
+    set_gui_transient(hosted);
+    super::wm_stack::apply_to_open_plugin_windows(super::wm_stack::on_top());
+    Ok(())
+}
+
+fn hide_created_gui(hosted: &mut Hosted) {
+    if let Some(gui) = hosted.instance.plugin_shared_handle().get_extension::<PluginGui>() {
+        let mut handle = hosted.instance.plugin_handle();
+        let _ = gui.hide(&mut handle);
+    }
+    hosted.gui_visible = false;
+}
+
+fn destroy_gui(hosted: &mut Hosted) {
+    if !hosted.gui_created {
+        hosted.gui_visible = false;
+        return;
+    }
+    if let Some(gui) = hosted.instance.plugin_shared_handle().get_extension::<PluginGui>() {
+        let mut handle = hosted.instance.plugin_handle();
+        gui.destroy(&mut handle);
+    }
+    hosted.gui_created = false;
+    hosted.gui_visible = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1503,5 +1820,56 @@ mod tests {
         drop(g);
         plugin_main().run(|_| ()).unwrap();
         let _ = remove(&info.id);
+    }
+
+    fn glbars_uid() -> Option<String> {
+        installed().into_iter().find(|d| {
+            d.uid.contains("glBars")
+                || d.uid.contains("studio.kx.distrho.glBars")
+                || d.name.contains("glBars")
+        }).map(|d| d.uid)
+    }
+
+    /// glBars is the v1 CLAP GUI canary (ARCHITECTURE §15.3): clap.gui
+    /// floating, same hosted instance the generic param panel talks to.
+    /// Probe is headless (extension + floating API); actually mapping a
+    /// window needs a display and is gated below.
+    #[test]
+    fn glbars_reports_floating_gui_when_installed() {
+        let Some(uid) = glbars_uid() else {
+            eprintln!("skipping: glBars.clap not installed");
+            return;
+        };
+        let id = format!("gui-{}", uuid::Uuid::new_v4());
+        instantiate_effect(&id, &uid).expect("glBars hosts as an effect");
+        assert!(
+            has_gui(&id).expect("probe"),
+            "glBars must advertise a floating clap.gui ({uid})"
+        );
+        assert_eq!(has_gui("no-such-clap-gui").expect("unknown"), false);
+
+        let display = std::env::var_os("DISPLAY").is_some()
+            || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        if display {
+            show_gui(&id).expect("show floating gui on the hosted instance");
+        } else {
+            eprintln!("note: no DISPLAY/WAYLAND_DISPLAY; skip show_gui");
+        }
+
+        remove(&id).expect("remove destroys any open gui");
+        assert!(
+            show_gui(&id).is_err(),
+            "removed instance must not keep a gui"
+        );
+        assert_eq!(has_gui(&id).expect("gone"), false);
+    }
+
+    #[test]
+    fn show_gui_rejects_unknown_instance() {
+        let err = show_gui("no-such-instance").expect_err("unknown id");
+        assert!(
+            err.contains("unknown") || err.contains("no-such"),
+            "polite unknown-instance error, got: {err}"
+        );
     }
 }

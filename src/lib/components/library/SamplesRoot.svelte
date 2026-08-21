@@ -16,7 +16,7 @@
   import { library } from "../../state/library.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { encodeLibraryDrag } from "../../utils/library";
-  import { loadFolds, saveFolds } from "../browser/browser-folds";
+  import { FoldController } from "../browser/fold-controller.svelte";
   import { flattenRows, groupItems, rankItems, rowId } from "../browser/browser-model";
   import BrowserShell from "../browser/BrowserShell.svelte";
   import BrowserSection from "../browser/BrowserSection.svelte";
@@ -38,21 +38,20 @@
 
   const FOLDS_KEY = "samples";
   let query = $state("");
-  let collapsed = $state(loadFolds(FOLDS_KEY));
+  const folds = new FoldController(FOLDS_KEY);
+  $effect(() => folds.syncQuery(query));
 
   const ranked = $derived(rankItems(library.entries, query, [{ value: (e: LibraryEntry) => e.name }]));
   const groups = $derived(
     groupItems(ranked, (e) => (e.kind === "dir" ? "Folders" : "Audio files")),
   );
+  const collapsed = $derived(folds.collapsed);
+  const groupKeys = $derived(groups.map((g) => g.key));
   const rows = $derived(flattenRows(groups, collapsed));
   const status = $derived(`${library.entries.length} item${library.entries.length === 1 ? "" : "s"}`);
 
   function toggleGroup(key: string, expand: boolean) {
-    const next = new Set(collapsed);
-    if (expand) next.delete(key);
-    else next.add(key);
-    collapsed = next;
-    saveFolds(FOLDS_KEY, next);
+    folds.toggle(key, expand);
   }
 
   function openEntry(e: LibraryEntry) {
@@ -96,6 +95,8 @@
       onActivate={(row) => {
         if (row.kind === "group") toggleGroup(row.groupKey, collapsed.has(row.groupKey));
       }}
+      anyCollapsed={folds.anyCollapsed(groupKeys)}
+      onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
     >
       {#snippet children({ activeId, setActive })}
         {#if library.loading}

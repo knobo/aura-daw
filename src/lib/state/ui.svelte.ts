@@ -32,6 +32,8 @@ export const ui = $state({
   rollHeight: 340,
   /** Right dock width, CSS px. User-dragged (left edge); session only. */
   dockWidth: 340,
+  /** Ctrl+P plugin quick picker overlay. */
+  pluginPickerOpen: false,
 });
 
 // Interface zoom lives in the preferences store (prefs.values.uiZoom) —

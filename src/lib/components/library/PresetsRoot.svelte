@@ -17,7 +17,7 @@
   import { zyn } from "../../state/zynpatches.svelte";
   import { backend } from "../../tauri";
   import { encodeLibraryDrag } from "../../utils/library";
-  import { loadFolds, saveFolds } from "../browser/browser-folds";
+  import { FoldController } from "../browser/fold-controller.svelte";
   import { flattenRows, groupItems, rankItems, rowId } from "../browser/browser-model";
   import BrowserShell from "../browser/BrowserShell.svelte";
   import BrowserSection from "../browser/BrowserSection.svelte";
@@ -46,18 +46,15 @@
   }
 
   const foldsKey = $derived(`presets-${section}`);
-  let collapsed = $state(loadFolds(`presets-${INITIAL_SECTION}`));
-  $effect(() => {
-    collapsed = loadFolds(foldsKey);
-  });
+  const folds = new FoldController(`presets-${INITIAL_SECTION}`);
+  $effect(() => folds.retarget(foldsKey));
+  $effect(() => folds.syncQuery(query));
 
   function toggleGroup(key: string, expand: boolean) {
-    const next = new Set(collapsed);
-    if (expand) next.delete(key);
-    else next.add(key);
-    collapsed = next;
-    saveFolds(foldsKey, next);
+    folds.toggle(key, expand);
   }
+
+  const collapsed = $derived(folds.collapsed);
 
   const instrumentGroups = $derived(
     groupItems(
@@ -78,6 +75,9 @@
   const instrumentRows = $derived(flattenRows(instrumentGroups, collapsed));
   const patchRows = $derived(flattenRows(patchGroups, collapsed));
   const rows = $derived(section === "instruments" ? instrumentRows : patchRows);
+  const groupKeys = $derived(
+    (section === "instruments" ? instrumentGroups : patchGroups).map((g) => g.key),
+  );
   const status = $derived(
     section === "instruments"
       ? `${instruments.list.length} instrument${instruments.list.length === 1 ? "" : "s"}`
@@ -94,6 +94,8 @@
   onActivate={(row) => {
     if (row.kind === "group") toggleGroup(row.groupKey, collapsed.has(row.groupKey));
   }}
+  anyCollapsed={folds.anyCollapsed(groupKeys)}
+  onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
 >
   {#snippet filters()}
     <button

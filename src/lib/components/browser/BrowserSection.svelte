@@ -13,6 +13,7 @@
     count,
     expanded,
     active = false,
+    depth = 0,
     onToggle,
     children,
   }: {
@@ -21,12 +22,14 @@
     count: number;
     expanded: boolean;
     active?: boolean;
+    /** Indent for a category child under Instruments/Effects. */
+    depth?: number;
     onToggle: () => void;
     children: Snippet;
   } = $props();
 </script>
 
-<div class="section">
+<div class="section" style:padding-left="{depth * 12}px">
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
     {id}

@@ -1060,6 +1060,8 @@ export interface PluginListResult {
   plugins: PluginDescriptor[];
   instances: PluginInstanceInfo[];
   scanned: boolean;
+  /** Instance id → native floating GUI available (additive). */
+  gui?: Record<string, boolean>;
 }
 
 // ── plugin-catalog (machine-global, persistent — plugins::catalog) ─────────

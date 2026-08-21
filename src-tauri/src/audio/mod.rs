@@ -933,6 +933,37 @@ pub fn sampler_preview_note(
     handle.play(compiled, key, velocity.clamp(1, 127))
 }
 
+/// Held sampler audition: note-on until `sampler_preview_note_off`.
+#[tauri::command]
+pub fn sampler_preview_note_on(
+    instrument_id: String,
+    key: u8,
+    velocity: u8,
+    state: State<'_, AudioState>,
+) -> Result<(), String> {
+    if key > 127 {
+        return Err(format!("key out of range: {key}"));
+    }
+    let compiled = state
+        .samplers
+        .lock()
+        .compiled(&instrument_id)
+        .ok_or_else(|| format!("unknown instrument: {instrument_id}"))?;
+    let handle = state.preview.get_or_init(|| sampler_preview::start("ui"));
+    handle.note_on(compiled, key, velocity.clamp(1, 127))
+}
+
+#[tauri::command]
+pub fn sampler_preview_note_off(key: u8, state: State<'_, AudioState>) -> Result<(), String> {
+    if key > 127 {
+        return Err(format!("key out of range: {key}"));
+    }
+    match state.preview.get() {
+        Some(h) => h.note_off(key),
+        None => Ok(()),
+    }
+}
+
 /// Audition a LIBRARY FILE — no project, no clip, no document. The Gate-safe
 /// preview category (`sampler_preview_note`, `midi_input`'s live monitoring):
 /// no op, no document field, no dirty flag. Plays at most

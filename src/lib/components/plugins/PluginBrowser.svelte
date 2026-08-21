@@ -213,6 +213,13 @@
             <button class="params mono" onclick={() => void openPluginParams(inst.id)}>
               ⚙ PARAMS
             </button>
+            {#if plugins.hasGui(inst.id)}
+              <button
+                class="params mono"
+                title="Open native plugin GUI"
+                onclick={() => void plugins.showGui(inst.id)}
+              >GUI</button>
+            {/if}
             {#if isZynInstance(inst)}
               <button
                 class="patches mono"

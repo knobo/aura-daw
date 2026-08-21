@@ -638,6 +638,8 @@ export class DemoBackend implements Backend {
   private mcpPending = new Map<string, PendingConfirmation & { apply?: () => void }>();
   private mcpScriptStarted = false;
   private audioCtx: AudioContext | null = null;
+  /** Stop the currently held sampler/plugin preview voice, if any. */
+  private previewStop: (() => void) | null = null;
 
   // phase 3 — plugins (mirrors the backend PluginRegistry semantics)
   private pluginScanned = false;
@@ -2598,6 +2600,21 @@ export class DemoBackend implements Backend {
 
   /** Browser preview: a tiny hand-rolled subtractive synth via WebAudio. */
   async samplerPreviewNote(instrumentId: string, key: number, velocity: number): Promise<void> {
+    this.startPreviewVoice(instrumentId, key, velocity, false);
+  }
+
+  async samplerPreviewNoteOn(instrumentId: string, key: number, velocity: number): Promise<void> {
+    this.startPreviewVoice(instrumentId, key, velocity, true);
+  }
+
+  async samplerPreviewNoteOff(_key: number): Promise<void> {
+    this.previewStop?.();
+    this.previewStop = null;
+  }
+
+  private startPreviewVoice(instrumentId: string, key: number, velocity: number, hold: boolean) {
+    this.previewStop?.();
+    this.previewStop = null;
     const inst = this.instruments.find((i) => i.id === instrumentId);
     const ctx = this.ensureCtx();
     const now = ctx.currentTime;
@@ -2608,7 +2625,9 @@ export class DemoBackend implements Backend {
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(0, now);
     gain.gain.linearRampToValueAtTime(0.22 * vel, now + 0.008);
-    gain.gain.exponentialRampToValueAtTime(0.0004, now + (bells ? 1.4 : 0.7));
+    if (!hold) {
+      gain.gain.exponentialRampToValueAtTime(0.0004, now + (bells ? 1.4 : 0.7));
+    }
     const filter = ctx.createBiquadFilter();
     filter.type = "lowpass";
     filter.frequency.setValueAtTime(Math.min(14000, freq * (bells ? 9 : 5)), now);
@@ -2617,6 +2636,7 @@ export class DemoBackend implements Backend {
     gain.connect(ctx.destination);
     filter.connect(gain);
 
+    const oscs: OscillatorNode[] = [];
     for (const detune of bells ? [0] : [-7, 6]) {
       const osc = ctx.createOscillator();
       osc.type = bells ? "sine" : "sawtooth";
@@ -2624,19 +2644,35 @@ export class DemoBackend implements Backend {
       osc.detune.value = detune;
       osc.connect(filter);
       osc.start(now);
-      osc.stop(now + 1.6);
+      if (!hold) osc.stop(now + 1.6);
+      oscs.push(osc);
     }
     if (bells) {
       const partial = ctx.createOscillator();
       partial.type = "sine";
-      partial.frequency.value = freq * 2.76; // inharmonic shimmer
+      partial.frequency.value = freq * 2.76;
       const pg = ctx.createGain();
       pg.gain.setValueAtTime(0.08 * vel, now);
-      pg.gain.exponentialRampToValueAtTime(0.0003, now + 0.9);
+      if (!hold) pg.gain.exponentialRampToValueAtTime(0.0003, now + 0.9);
       partial.connect(pg);
       pg.connect(ctx.destination);
       partial.start(now);
-      partial.stop(now + 1.0);
+      if (!hold) partial.stop(now + 1.0);
+      oscs.push(partial);
+    }
+    if (hold) {
+      this.previewStop = () => {
+        const t = ctx.currentTime;
+        gain.gain.cancelScheduledValues(t);
+        gain.gain.setTargetAtTime(0.0001, t, 0.04);
+        for (const osc of oscs) {
+          try {
+            osc.stop(t + 0.15);
+          } catch {
+            /* already stopped */
+          }
+        }
+      };
     }
   }
 
@@ -2679,10 +2715,16 @@ export class DemoBackend implements Backend {
   }
 
   async pluginList(): Promise<PluginListResult> {
+    const instances = [...this.pluginInstances.values()].map((i) => ({ ...i }));
+    const gui: Record<string, boolean> = {};
+    for (const inst of instances) {
+      gui[inst.id] = /zyn|glbars/i.test(inst.name) || /zyn|glbars/i.test(inst.uid);
+    }
     return {
       plugins: this.pluginDescriptors.map((d) => ({ ...d })),
-      instances: [...this.pluginInstances.values()].map((i) => ({ ...i })),
+      instances,
       scanned: this.pluginScanned,
+      gui,
     };
   }
 
@@ -2726,6 +2768,41 @@ export class DemoBackend implements Backend {
       throw new Error(`unknown plugin instance: ${instanceId}`);
     }
     return (this.pluginParams.get(instanceId) ?? []).map((p) => ({ ...p }));
+  }
+
+  async pluginShowGui(instanceId: string): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+  }
+
+  async pluginSetGuiOnTop(_enabled: boolean): Promise<void> {}
+
+  async pluginPreviewNote(instanceId: string, key: number, velocity: number): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+    const bound = this.tracks.find(
+      (t) => t.kind === "midi" && t.instrumentId === `plugin:${instanceId}`,
+    );
+    if (!bound) {
+      throw new Error(`plugin instance ${instanceId} is not bound to a midi track`);
+    }
+    await this.samplerPreviewNote(`plugin:${instanceId}`, key, velocity);
+  }
+
+  async pluginPreviewNoteOn(instanceId: string, key: number, velocity: number): Promise<void> {
+    const inst = this.pluginInstances.get(instanceId);
+    if (!inst) throw new Error(`unknown plugin instance: ${instanceId}`);
+    const bound = this.tracks.find(
+      (t) => t.kind === "midi" && t.instrumentId === `plugin:${instanceId}`,
+    );
+    if (!bound) {
+      throw new Error(`plugin instance ${instanceId} is not bound to a midi track`);
+    }
+    await this.samplerPreviewNoteOn(`plugin:${instanceId}`, key, velocity);
+  }
+
+  async pluginPreviewNoteOff(): Promise<void> {
+    await this.samplerPreviewNoteOff(0);
   }
 
   async pluginSetParam(

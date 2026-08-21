@@ -12,6 +12,8 @@
   import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
   import { lanes } from "../state/lanes.svelte";
+  import { library } from "../state/library.svelte";
+  import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { midiIo } from "../state/midiio.svelte";
   import { formatDb } from "../utils/format";
   import { groupOf } from "../utils/lane-layout";
@@ -270,6 +272,29 @@
   function bulkTitle(verb: string): string {
     return inBulkSelection ? `${verb} ${bulkTargets.length} selected lanes` : verb;
   }
+
+  let dropHover = $state(false);
+
+  function onHeaderDragOver(e: DragEvent) {
+    if (track.kind === "automation") return;
+    if (!hasLibraryDrag(e.dataTransfer)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "copy";
+    dropHover = true;
+  }
+
+  function onHeaderDragLeave() {
+    dropHover = false;
+  }
+
+  function onHeaderDrop(e: DragEvent) {
+    dropHover = false;
+    if (track.kind === "automation") return;
+    const payload = decodeLibraryDrag(e.dataTransfer);
+    if (!payload) return;
+    e.preventDefault();
+    void library.dropOnTrack(payload, track.id, 0);
+  }
 </script>
 
 <div
@@ -280,6 +305,10 @@
   class:grouped={group !== null}
   class:dragging={lanes.draggingTrackId === track.id}
   class:selected={lanes.isSelected(track.id)}
+  class:drop={dropHover}
+  ondragover={onHeaderDragOver}
+  ondragleave={onHeaderDragLeave}
+  ondrop={onHeaderDrop}
   style:--track-color={track.color}
   role="row"
   aria-selected={lanes.isSelected(track.id)}
@@ -514,6 +543,10 @@
       rgb(var(--cyan-rgb) / 0.1),
       rgb(var(--bg-1-rgb) / 0.15)
     );
+  }
+  .header.drop {
+    outline: 2px solid var(--cyan);
+    outline-offset: -2px;
   }
   /* Keyboard focus ring — an OUTLINE, deliberately not another box-shadow,
      so it stays visually distinct from `.selected`'s wash/edge and the two

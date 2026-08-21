@@ -31,6 +31,9 @@ class ZynPatchStore {
   loaded = $state<Record<string, ZynPatch>>({});
   /** Patch path with a load in flight. */
   busyPath = $state<string | null>(null);
+  /** In-flight load, so a double-click can await the click's own invoke. */
+  private inflight: Promise<boolean> | null = null;
+  private inflightKey: string | null = null;
 
   get openInstance(): PluginInstanceInfo | undefined {
     return plugins.byId(this.openInstanceId);
@@ -64,6 +67,23 @@ class ZynPatchStore {
    * which retires the instance's live node and rebuilds it — no rebind here.
    */
   async load(instanceId: string, patch: ZynPatch): Promise<boolean> {
+    const key = `${instanceId}:${patch.path}`;
+    if (this.inflight && this.inflightKey === key) return this.inflight;
+    if (this.loaded[instanceId]?.path === patch.path) return true;
+    const run = this.performLoad(instanceId, patch);
+    this.inflight = run;
+    this.inflightKey = key;
+    try {
+      return await run;
+    } finally {
+      if (this.inflight === run) {
+        this.inflight = null;
+        this.inflightKey = null;
+      }
+    }
+  }
+
+  private async performLoad(instanceId: string, patch: ZynPatch): Promise<boolean> {
     this.busyPath = patch.path;
     this.error = null;
     try {
@@ -76,6 +96,50 @@ class ZynPatchStore {
     } finally {
       this.busyPath = null;
     }
+  }
+
+  /**
+   * Hear the live instance: C3 through the bound midi track. Not a document
+   * edit — the note rides the live-in hub the hardware monitor already uses.
+   */
+  async preview(instanceId: string): Promise<void> {
+    try {
+      await backend.pluginPreviewNote(instanceId, 60, 100);
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  async previewDown(instanceId: string): Promise<void> {
+    try {
+      await backend.pluginPreviewNoteOn(instanceId, 60, 100);
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  async previewUp(): Promise<void> {
+    try {
+      await backend.pluginPreviewNoteOff();
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  /**
+   * Load (if needed) then hold C3. Pair with `previewUp` on pointer-up so a
+   * long patch can actually ring out.
+   *
+   * `zyn_load_patch` queues a graph rebuild (new RT node keyed by state
+   * rev). The note has to land on that node, not the one being retired, so
+   * a fresh load waits a beat for the engine control thread to swap.
+   */
+  async audition(instanceId: string, patch: ZynPatch): Promise<void> {
+    const already = this.loaded[instanceId]?.path === patch.path;
+    const ok = await this.load(instanceId, patch);
+    if (!ok) return;
+    if (!already) await new Promise((r) => setTimeout(r, 150));
+    await this.previewDown(instanceId);
   }
 
   // ── hum-to-song suggestion: "give the melody a Zyn plucked/lead voice" ──

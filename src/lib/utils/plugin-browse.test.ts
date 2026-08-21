@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import type { PluginDescriptor } from "../types/ipc";
 import {
   buildBrowseSections,
+  filterByFacets,
+  filterByKind,
+  filterSections,
+  listCategoryFacets,
+  pruneUnavailableFacets,
   rankQuickPick,
   visibleSections,
   type BrowseSection,
@@ -154,6 +159,43 @@ describe("buildBrowseSections", () => {
     });
     expect(names(sections, "inst:Synth")).toEqual(["Surge"]);
   });
+
+  it("matches on category — that is what 'type' searches", () => {
+    const sections = build({
+      descriptors: [
+        desc("u1", "Surge", { categories: ["Synth"] }),
+        desc("u2", "TX16", { categories: ["Sampler"] }),
+      ],
+      query: "sampler",
+    });
+    expect(names(sections, "inst:Sampler")).toEqual(["TX16"]);
+    expect(keys(sections)).not.toContain("inst:Synth");
+  });
+
+  it("matches on the catalog's user tags", () => {
+    const sections = build({
+      descriptors: [
+        desc("u1", "Surge", { categories: ["Synth"] }),
+        desc("u2", "Vital", { categories: ["Synth"] }),
+      ],
+      tags: { u1: ["Live rig"] },
+      query: "live rig",
+    });
+    expect(names(sections, "inst:Synth")).toEqual(["Surge"]);
+  });
+
+  it("a format: prefix keeps only that format, then ranks the rest of the query", () => {
+    const sections = build({
+      descriptors: [
+        desc("u1", "Surge", { categories: ["Synth"] }),
+        desc("u2", "Calf Reverb", { isInstrument: false, format: "lv2", categories: ["Reverb"] }),
+        desc("u3", "Airwindows Reverb", { isInstrument: false, format: "clap", categories: ["Reverb"] }),
+      ],
+      query: "format:lv2 reverb",
+    });
+    expect(names(sections, "fx:Reverb")).toEqual(["Calf Reverb"]);
+    expect(keys(sections)).not.toContain("inst");
+  });
 });
 
 describe("visibleSections", () => {
@@ -247,5 +289,124 @@ describe("rankQuickPick", () => {
 
   it("returns nothing when the query matches nothing", () => {
     expect(pick({ descriptors: [desc("u1", "Alpha")], favorites: ["u1"], query: "zzz" })).toEqual([]);
+  });
+
+  it("honours a format: prefix", () => {
+    expect(
+      pick({
+        descriptors: [desc("u1", "Surge"), desc("u2", "Calf", { format: "lv2", isInstrument: false })],
+        query: "format:lv2",
+      }),
+    ).toEqual(["Calf"]);
+  });
+
+  it("lets a frequently used unstarred plugin climb past a starred one used once", () => {
+    const now = 1_700_000_000_000;
+    expect(
+      pick({
+        descriptors: [desc("u1", "Starred"), desc("u2", "Daily")],
+        favorites: ["u1"],
+        now,
+        frecency: {
+          u1: { count: 1, lastUsedAt: now - 40 * 86_400_000 },
+          u2: { count: 5, lastUsedAt: now - 3_600_000 },
+        },
+      }),
+    ).toEqual(["Daily", "Starred"]);
+  });
+});
+
+describe("filterByFacets (winner spec §3.2)", () => {
+  const pool = [
+    desc("u1", "Surge", { categories: ["Synth"] }),
+    fx("u2", "Calf Reverb", ["Reverb"]),
+    desc("u3", "TX16", { categories: ["Sampler"] }),
+    desc("u4", "Calf Filter", { isInstrument: false, format: "lv2", categories: ["Filter", "EQ"] }),
+  ];
+
+  it("AND across groups: FX + LV2 keeps only the LV2 effect", () => {
+    expect(
+      filterByFacets(pool, { kind: "fx", formats: ["lv2"] }).map((d) => d.name),
+    ).toEqual(["Calf Filter"]);
+  });
+
+  it("OR inside the type group: Reverb or Synth keeps both", () => {
+    expect(
+      filterByFacets(pool, { kind: "all", categories: ["Reverb", "Synth"] }).map((d) => d.name),
+    ).toEqual(["Surge", "Calf Reverb"]);
+  });
+
+  it("an empty format/type group is no constraint", () => {
+    expect(filterByFacets(pool, { kind: "all" }).map((d) => d.name)).toEqual(pool.map((d) => d.name));
+  });
+
+  it("lists unique categories from the scan, sorted", () => {
+    expect(listCategoryFacets(pool)).toEqual(["EQ", "Filter", "Reverb", "Sampler", "Synth"]);
+  });
+
+  it("lists only categories that still have a hit after the kind filter", () => {
+    expect(listCategoryFacets(filterByKind(pool, "inst"))).toEqual(["Sampler", "Synth"]);
+    expect(listCategoryFacets(filterByKind(pool, "fx"))).toEqual(["EQ", "Filter", "Reverb"]);
+  });
+});
+
+describe("pruneUnavailableFacets", () => {
+  it("drops a selected type that the current kind can no longer produce", () => {
+    expect(pruneUnavailableFacets(["EQ", "Synth"], ["Sampler", "Synth"])).toEqual(["Synth"]);
+  });
+
+  it("keeps the selection when every chip is still on the row", () => {
+    expect(pruneUnavailableFacets(["Synth"], ["Sampler", "Synth"])).toEqual(["Synth"]);
+  });
+});
+
+describe("filterByKind (design §9.2)", () => {
+  const pool = [
+    desc("u1", "Surge"),
+    fx("u2", "Reverb", ["Reverb"]),
+    desc("u3", "Vital"),
+  ];
+
+  it("ALL keeps instruments and effects", () => {
+    expect(filterByKind(pool, "all").map((d) => d.name)).toEqual(["Surge", "Reverb", "Vital"]);
+  });
+
+  it("INST keeps only instruments", () => {
+    expect(filterByKind(pool, "inst").map((d) => d.name)).toEqual(["Surge", "Vital"]);
+  });
+
+  it("FX keeps only effects — the state today's checkbox cannot reach", () => {
+    expect(filterByKind(pool, "fx").map((d) => d.name)).toEqual(["Reverb"]);
+  });
+});
+
+describe("filterSections (design §9.2)", () => {
+  const tree = () =>
+    build({
+      descriptors: [
+        desc("u1", "Surge", { categories: ["Synth"] }),
+        fx("u2", "Calf", ["Reverb"]),
+      ],
+      favorites: ["u1"],
+      recents: [{ uid: "u2", usedAt: 1 }],
+    });
+
+  it("keeps the whole tree when neither shortlist toggle is on", () => {
+    expect(keys(filterSections(tree(), {}))).toEqual(keys(tree()));
+  });
+
+  it("favourites-only drops every section that is not Favourites", () => {
+    expect(keys(filterSections(tree(), { favoritesOnly: true }))).toEqual(["fav"]);
+  });
+
+  it("recents-only drops every section that is not Recent", () => {
+    expect(keys(filterSections(tree(), { recentsOnly: true }))).toEqual(["recent"]);
+  });
+
+  it("both shortlist toggles keep both those sections", () => {
+    expect(keys(filterSections(tree(), { favoritesOnly: true, recentsOnly: true }))).toEqual([
+      "fav",
+      "recent",
+    ]);
   });
 });
