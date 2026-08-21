@@ -1,4 +1,4 @@
-# Next: plugin manager Step 6 (automation inventory) from `origin/main`
+# Next: plugin manager Step 7 (unified audition) from `origin/main`
 
 Reply to the user in Norwegian — they write Norwegian; the repo
 documentation is English.
@@ -14,7 +14,8 @@ Read these before touching plugin UI:
 
 - Winner spec (layout that shipped): [`docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md`](docs/superpowers/specs/2026-08-20-plugin-admin-winner-design.md)
 - Original design (catalog, rack, chips, frozen IPC): [`docs/superpowers/specs/2026-08-20-plugin-manager-design.md`](docs/superpowers/specs/2026-08-20-plugin-manager-design.md)
-- Plan (Step 6 is specified in implementable detail): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
+- Plan (status table + Step 6 as shipped; Step 7 is one line there — its
+  detail is design §8.2, the "Original design" link above): [`docs/superpowers/plans/2026-08-20-plugin-manager.md`](docs/superpowers/plans/2026-08-20-plugin-manager.md)
 
 ## The owner's standing steer (2026-08-20)
 
@@ -43,6 +44,10 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
 | Native floating GUI | CLAP `clap.gui`, LV2 `ui:showInterface`, Zyn via `zynaddsubfx-ext-gui` (no `--embed`). Additive IPC: `plugin_show_gui`. GUI button next to PARAMS, hidden if no editor. |
 | On-top pref | INTERFACE `pluginGuiOnTop` (default on). Live toggle: EWMH ClientMessage + `WM_TRANSIENT_FOR`. Additive IPC: `plugin_set_gui_on_top`. |
 | Review follow-up in the squash | LV2 Drop moves DSP onto plugin-main and closes the editor before free; `make_node` re-attaches ext-gui; CLAP `gui_created` after `create`; `plugin_list` drops the registry lock before `gui_flags`. |
+| Param cache + shared lane reveal (Step 6) | `plugins.svelte.ts` gained a lazy per-instance `paramCache` over the frozen `plugin_get_params` (no plugin needs to be open to read its param names/values any more); `utils/lane-reveal.ts`'s `revealParamLane` (unfold the lane, `modulation.pickTarget`, scroll `[data-track-id]` on `TrackHeader`'s root) is the one jump every chip below calls. Branch `feat/plugin-automation-inventory`, PR #98 (squash SHA pending — PR still open). |
+| Automation matrix (Step 6) | `AutomationMatrix.svelte` + `utils/automation-matrix.ts` — the rack projection grouped by parameter instead of instance. Lives as a 4th `ManagerMode` (`"matrix"`) alongside BROWSE/SPLIT/RACK, not a second dock tab. |
+| Pinned params (Step 6) | `PluginParamPanel.svelte`: every param row is a `ParamChip`; pinned ones (`catalog.pinnedParams[uid]`, max 8) sort into a `Pinned` section up top. A chip creates or jumps to the param's automation lane. |
+| Lane plugin strip (Step 6) | `LanePluginStrip.svelte` + `utils/lane-strip.ts`, wired into `TrackHeader.svelte`'s `.metadata-row` (both the unfolded and folded/collapsed branches). The FX chip survived rather than being replaced — the strip sits between the instrument chip and FX, and its `+N` overflow button opens `InsertChain`. Folded lane renders dots only, no name button. |
 
 **Scope calls already made:** no Zyn patches section in browse (virtualised
 ~1318-row list stays on `ZynPatchBrowser`); no second dock tab; no
@@ -50,23 +55,21 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
 
 ## Do this next
 
-1. **Step 6 — automation as an inventory.** Plan §"Step 6". The winner spec
-   promoted **§3.4 the lane strip** (Bitwig's chain, compressed) onto the
-   same pass — `TrackHeader` instrument + inserts as status dots and
-   pinned/automated `ParamChip` jump targets, overflow `+N`, folded lane
-   = dots only. Also: `AutomationMatrix.svelte` (same rack projection,
-   grouped by parameter), and pinned params at the top of
-   `PluginParamPanel`. Constraint: `--track-height` is 132 px; chips
-   overflow, they do not wrap.
-2. **Step 7 — unified audition** (design §8.2). Double-click any browser
+1. **Step 7 — unified audition** (design §8.2). Double-click any browser
    row to hear it, gated behind a new `browserAudition` pref defaulting
    **off**. Last on this track: it touches every browser plus sampler and
    plugin hosts.
-3. **Owner ear-check still owed** on the live *Keep plugin GUI on top*
+2. **Owner ear-check still owed** on the live *Keep plugin GUI on top*
    toggle (open editor → Preferences off/on → window follows, no restart)
    and on SPLIT vs BROWSE/RACK. DPF may print `Parent Window Id missing`
    (expected: v1 has no XEmbed parent). Zyn may log `Sending key 'state'
-   to UI failed` until the editor is actually open.
+   to UI failed` until the editor is actually open. **New from Step 6,
+   also owed:** the lane strip at `--track-height: 132px` on a narrow
+   window (does a long plugin/instrument name push the FX chip out of
+   the row?); the folded-lane dots (status + name legible enough without
+   a name button — this was a judgment call, not pixel-verified); and
+   MATRIX mode (does grouping by parameter read as useful, does the
+   fourth mode chip fit the row at 480 px).
 
 **Native GUI leftovers (do not start unless asked):** X11 embed /
 Wayland embed; out-of-process isolation (SCALABILITY step 4); LV2
@@ -95,6 +98,29 @@ unless asked.
   [`2026-08-18-dom-test-environment.md`](docs/superpowers/plans/2026-08-18-dom-test-environment.md).
   jsdom has no Pointer Capture, `getBoundingClientRect()` is zeros,
   Svelte 5 `$state` proxies throw on `structuredClone`.
+- **A Svelte 5 `$effect` tracks reactive reads made anywhere inside its
+  callback, including deep inside a function it merely calls.** Splitting
+  a `$derived` so the effect only reads a narrower value is not enough by
+  itself if the effect's body then calls something (e.g. a store method)
+  that synchronously reads other reactive state internally — that read
+  still gets attributed to the effect, so it re-fires on unrelated churn.
+  Wrap the actual side-effecting call in `svelte`'s `untrack(...)`, after
+  reading the narrowed dependency outside it. (`AutomationMatrix.svelte`
+  and `LanePluginStrip.svelte` both hit this with `plugins.ensureParams`
+  reading `paramCache`; both now follow the same
+  read-then-`untrack`-the-call shape.)
+- **`CSS` is not a global under the `unit` (node) vitest project.**
+  `CSS.escape(...)` throws a `ReferenceError` before a stubbed
+  `querySelector` is ever called; if that throw lands inside a `try/catch`
+  the test can pass for the wrong reason (the "missing element" branch
+  never actually runs). Stub `CSS.escape` explicitly alongside `document`
+  in any test that exercises a `[data-*]` selector built with it.
+- **`formatParamValue` special-cases any param name containing "cutoff"
+  or "freq"** as a frequency (rounds to an integer + `"hz"` unit). A test
+  fixture named e.g. `"Filter / Cutoff"` silently gets frequency
+  formatting instead of the plain `toFixed(2)` you were expecting — pick a
+  fixture name without those substrings unless you're testing the
+  frequency path on purpose.
 
 ## Older context
 
