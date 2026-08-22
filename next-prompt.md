@@ -37,16 +37,23 @@ the PR immediately — draft is fine. An unpushed claim is not a claim, and
 two agents finishing the same task is the most expensive failure this
 project has had.
 
-**4. Release the claim when you land.** Merging your PR removes your row
-and moves the work into [`docs/LANDED.md`](docs/LANDED.md) with a pointer
+**4. Release the claim in the PR that lands the work** — merging does
+not do it for you. The last commit before you merge deletes your row and
+moves the outcome into [`docs/LANDED.md`](docs/LANDED.md) with a pointer
 to its backlog file. If you abandon a job, delete your row in its own
 small PR so the next agent can pick it up.
+
+A row left behind is worse than no table: it points at a branch that no
+longer exists, and the next agent cannot tell a stale row from live work.
+The first PR to use this table left its own row behind, which is how this
+sentence got written — if you find a row whose branch is gone from
+`git ls-remote --heads origin`, delete it.
 
 ## Active claims
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Release a claim in the landing PR, not "on merge" | `docs/claim-release-on-land` | 2026-08-22 | This PR. Its last commit removes this row. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
