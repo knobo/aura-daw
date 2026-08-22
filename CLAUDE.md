@@ -39,7 +39,9 @@ is claimed, what is free, and which backlog file holds the detail.
 
 Add your row to its *Active claims* table, commit that **as the first
 commit on your branch**, push, and open the PR — draft is fine. Only then
-start implementing.
+start implementing. Delete the row again in the last commit before you
+merge: merging does not clean the table up for you, and a row pointing at
+a branch that no longer exists is indistinguishable from live work.
 
 This is not bookkeeping. On 2026-08-21 two agents worked the same task in
 the same worktree at the same time; one finished, gates green, and
