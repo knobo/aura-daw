@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Point the Windows backlog at PR #62 instead of calling it unknown | `docs/windows-build-pr62` | 2026-08-22 | Docs only. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -87,7 +87,7 @@ Plan G2; the native-GUI embed work.
 | Pitch — Coach, extraction, correction | [`docs/backlog/pitch.md`](docs/backlog/pitch.md) |
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |
 | History, undo, automation, modulation | [`docs/backlog/history-and-automation.md`](docs/backlog/history-and-automation.md) |
-| Windows build (status unclear — verify first) | [`docs/backlog/windows-build.md`](docs/backlog/windows-build.md) |
+| Windows build (open in PR #62) | [`docs/backlog/windows-build.md`](docs/backlog/windows-build.md) |
 | Everything else, by product area | [`docs/backlog/`](docs/backlog/) |
 
 ## Index
