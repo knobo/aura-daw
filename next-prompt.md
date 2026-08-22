@@ -88,6 +88,7 @@ Plan G2; the native-GUI embed work.
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |
 | History, undo, automation, modulation | [`docs/backlog/history-and-automation.md`](docs/backlog/history-and-automation.md) |
 | Windows build (open in PR #62) | [`docs/backlog/windows-build.md`](docs/backlog/windows-build.md) |
+| Linux packaging (`.deb`, not AppImage) | [`docs/backlog/linux-packaging.md`](docs/backlog/linux-packaging.md) |
 | Everything else, by product area | [`docs/backlog/`](docs/backlog/) |
 
 ## Index
