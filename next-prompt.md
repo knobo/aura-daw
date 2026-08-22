@@ -46,7 +46,7 @@ small PR so the next agent can pick it up.
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Worktree + claim protocol; split the backlog out of this file | `docs/worktree-claims-protocol` | 2026-08-22 | This PR. Merging it removes this row. |
+| Release a claim in the landing PR, not "on merge" | `docs/claim-release-on-land` | 2026-08-22 | This PR. Its last commit removes this row. |
 
 ## Next up — unclaimed
 
