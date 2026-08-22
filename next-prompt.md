@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Step 6 follow-up: `revealParamLane` orphan guard | `fix/lane-reveal-orphan-guard` | 2026-08-22 | PR #98 squashed four minutes before its own fix wave was pushed, so the merge blocker never reached main. Code only, plus two backlog leftovers. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
