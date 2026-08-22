@@ -29,9 +29,13 @@ README and CONTRIBUTING.
 
 ## Before it merges
 
-**The branch is 41 commits behind `origin/main`** and has not been
-touched since 2026-08-17. Merge `origin/main` in and re-run the gates
-before reviewing anything below.
+**The branch is 43 commits behind `origin/main`** (re-measured 2026-08-22
+against `main` at `76d1a39`) and has not been touched since 2026-08-17.
+Merge `origin/main` in and re-run the gates before reviewing anything
+below. Only one file conflicts: `src-tauri/src/plugins/scan.rs`, which
+`main` changed in #93. Everything else auto-merges — but the branch also
+edits README and CONTRIBUTING, and #103 rewrote the Quickstart in both,
+so read the merged prose rather than trusting a clean merge.
 
 Four of the five review points raised on 2026-08-17 are still live on the
 branch head. Line numbers verified 2026-08-22.
@@ -42,7 +46,10 @@ branch head. Line numbers verified 2026-08-22.
    every platform, so a local Linux `tauri build` now runs the AppImage
    bundler (which downloads `linuxdeploy` mid-build) and emits deb/rpm
    with no `depends` and no sidecar resources. Scope it via
-   `tauri.windows.conf.json` or `"targets": ["nsis", "msi"]`.
+   `tauri.windows.conf.json` or `"targets": ["nsis", "msi"]`. The Linux
+   side of this is its own track —
+   [`linux-packaging.md`](linux-packaging.md), which decides *against*
+   AppImage and for `.deb`.
 3. **`control/export.rs:291`** still hard-codes ``apt install ffmpeg`` in
    `capabilities()` — one function away from the new platform-aware `HOW`
    at `:268`, which the PR did add.
