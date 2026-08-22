@@ -1,0 +1,19 @@
+# CPU-only AI sidecar stack — installed by `scripts/setup.sh --python`.
+#
+# Everything here runs without a GPU. The heavy model stack (torch, Demucs,
+# ACE-Step) is in requirements-models.txt because it needs the PyTorch cu126
+# index and several GB of downloads.
+#
+# Install into the venv the app looks for by name:
+#   uv venv .venv-sidecars --python 3.12
+#   VIRTUAL_ENV=$PWD/.venv-sidecars uv pip install -r sidecars/requirements.txt
+
+# AMT MIDI infilling (amt_infill_worker.py) — the anticipation model runs fine
+# on CPU.
+git+https://github.com/jthickstun/anticipation.git
+mido
+transformers
+
+# Hum-to-song pitch tracking (hum_to_midi.py). Optional: the worker degrades to
+# a pure-Python tracker when librosa is absent, so a failure here is not fatal.
+librosa

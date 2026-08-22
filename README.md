@@ -267,10 +267,26 @@ See [docs/themes.md](docs/themes.md).
 
 ## Quickstart
 
+One command installs everything below and skips whatever you already have:
+
+```sh
+scripts/setup.sh            # system packages + Node deps + Rust check
+scripts/setup.sh --check    # report what's missing, install nothing
+scripts/setup.sh --all      # + plugin instruments + the Python AI stack
+```
+
+Then `npm run tauri dev`. The rest of this section is what that script does, for
+when you'd rather do it by hand or you're not on a dpkg-based distro.
+
 Prerequisites:
 
 - **Rust** (stable toolchain, via [rustup](https://rustup.rs))
-- **Node.js 18+** and npm
+- **Node.js 18–24** (`.nvmrc` pins 24; `nvm use` picks it up).
+
+  Node 25+ builds and runs the app fine but fails the jsdom tests — Node 25
+  ships an always-on built-in `localStorage` that shadows jsdom's own and
+  leaves a stub without `.clear()`. Run `npm test` on 24 or older.
+
 - **Linux system packages** (for building Tauri):
 
   ```sh
