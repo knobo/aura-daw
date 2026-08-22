@@ -31,3 +31,38 @@ list` shows them and `git worktree remove` cleans them up.
 
 Name the worktree after the work (`.worktrees/automation-matrix`), not
 after the ticket or the date.
+
+## Claim the job in `next-prompt.md` before you start it
+
+Read [`next-prompt.md`](next-prompt.md) first. It is the dispatcher: what
+is claimed, what is free, and which backlog file holds the detail.
+
+Add your row to its *Active claims* table, commit that **as the first
+commit on your branch**, push, and open the PR — draft is fine. Only then
+start implementing.
+
+This is not bookkeeping. On 2026-08-21 two agents worked the same task in
+the same worktree at the same time; one finished, gates green, and
+discovered its files being reverted underneath it by the other. Nothing
+in git could say which change belonged to which agent, and one session's
+work was thrown away. A claim is what makes that visible before the work
+starts rather than after.
+
+An unpushed claim is not a claim. And because a claim only reaches
+`main` when its PR merges, checking for in-flight work means checking the
+open PRs and remote branches too:
+
+```sh
+gh pr list --state open
+git ls-remote --heads origin
+git worktree list
+```
+
+## Keep `next-prompt.md` small
+
+Detail belongs in [`docs/backlog/`](docs/backlog/), one file per track;
+rules that bind all work belong in
+[`docs/STANDING-CONSTRAINTS.md`](docs/STANDING-CONSTRAINTS.md); things
+that cost you time belong in [`docs/TRAPS.md`](docs/TRAPS.md); what
+merged belongs in [`docs/LANDED.md`](docs/LANDED.md). If you are writing
+a paragraph into `next-prompt.md`, it belongs somewhere else.
