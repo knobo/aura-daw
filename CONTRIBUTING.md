@@ -11,13 +11,16 @@ Prerequisites and system packages are in the [README](README.md#quickstart).
 Short version:
 
 ```sh
-sudo apt install libasound2-dev libwebkit2gtk-4.1-dev build-essential \
-  curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev \
-  librsvg2-dev liblilv-dev ffmpeg
-npm install
+scripts/setup.sh --all   # apt packages, Node deps, Rust check, plugins, Python
 npm run tauri dev        # full app (vite on port 1420, strictPort)
 npx vite                 # browser-only demo mode (mock engine, no Rust build)
 ```
+
+`scripts/setup.sh` is idempotent and installs only what's absent; `--check`
+reports without touching anything. Drop `--all` for just the build essentials.
+
+Use Node 18–24 (`.nvmrc` pins 24). On Node 25 the app builds and runs, but
+`npm test` fails: Node 25's built-in `localStorage` global shadows jsdom's.
 
 `AURA_SIDECAR_SIMULATE=1` makes every AI worker produce deterministic
 placeholder output — develop AI-adjacent features without any model stack.

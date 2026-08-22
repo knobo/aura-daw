@@ -1,0 +1,16 @@
+# Heavy GPU model stack — installed by `scripts/setup.sh --models`.
+#
+# torch/torchaudio are NOT listed here. They must be installed first from the
+# cu126 index, or the packages below pull a CPU-only wheel in transitively:
+#   VIRTUAL_ENV=$PWD/.venv-sidecars uv pip install \
+#     --index-url https://download.pytorch.org/whl/cu126 torch torchaudio
+#
+# This is the stack the env-gated integration tests were verified against
+# (src-tauri/tests/real_models.rs, run with AURA_REAL_MODELS=1).
+
+# Stem separation (demucs_split.py)
+demucs
+
+# Music generation (ace_step_worker.py). On smaller GPUs the 3.5B pipeline
+# fits in ~7 GB VRAM with sequential offload — see README#ai-features.
+git+https://github.com/ace-step/ACE-Step.git

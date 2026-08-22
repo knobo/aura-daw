@@ -1,2 +1,9 @@
+# pnpm 10 refuses to run dependency install scripts unless they are approved
+# here. esbuild's script only unpacks the platform binary that vite's build
+# needs, so approving it is safe; leaving it unapproved is what makes
+# `pnpm run build` fail with a missing esbuild binary on some platforms.
+#
+# This file previously held the literal placeholder text `set this to true or
+# false` as the value, which pnpm silently treats as not-true.
 allowBuilds:
-  esbuild: set this to true or false
+  esbuild: true
