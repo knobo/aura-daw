@@ -90,6 +90,23 @@ Squash `e1ec61f`. CI green (frontend + rust). `tauri dev` booted: MCP on
    **not** implement this unless asked — it was deliberately documented,
    not fixed, in the final review that closed Step 6.
 
+4. **Two findings from a SECOND final review of Step 6, not in the tree.**
+   Two SDD controller sessions ran this plan concurrently in the same
+   worktree (see the trap below). Each ran its own whole-branch review and
+   got a different finding set; only one set landed. These two are real,
+   small, and unactioned — pick them up with the performance item above,
+   or fold them into Step 7's first pass:
+   - `plugins.svelte.ts` — write `paramCache` **per property** instead of
+     spreading the whole object on every `setParam`. This is the cheap half
+     of item 3 and is only worth doing together with it.
+   - `AutomationMatrix.svelte` — the matrix is a grouped, expandable list
+     and should carry `role="tree"` semantics rather than plain rows, the
+     way the lane rail already does (`role="grid"`, `aria-multiselectable`).
+   The full diff of that session's fix wave is at
+   `/tmp/claude-1000/-home-knobo-prog-dav/ee3ea041-89bc-4a7f-97cc-8e3349b8d5b6/scratchpad/uncommitted-at-4c94081.patch`
+   — a tmp path, so treat it as gone and re-derive from the two bullets
+   above if it has been cleaned up.
+
 **Native GUI leftovers (do not start unless asked):** X11 embed /
 Wayland embed; out-of-process isolation (SCALABILITY step 4); LV2
 `save_state` still snapshots the shadow instance, so OSC tweaks on the
@@ -104,6 +121,18 @@ unless asked.
 
 ## Traps
 
+- **One SDD controller per plan per worktree.** Step 6 was run by two
+  controller sessions at once, both starting from this file's then-current
+  job line. They shared `.worktrees/plugin-automation-inventory` and the
+  same ledger. Each finished the tasks, ran its own whole-branch review,
+  got a *different* finding set, dispatched its own fix wave — and then
+  each saw the other's edits revert its own and concluded the other was an
+  intruder. Cost: two final reviews, two fix waves, one reset, and a STOP
+  in the ledger. Nothing was lost, but only because both waves backed the
+  tree up before touching it. Before starting a plan, run `ListAgents` and
+  check `.superpowers/sdd/<plan>/progress.md` for a live ledger — a ledger
+  whose last line is a dispatch, with a recent mtime, means someone else is
+  mid-flight.
 - **`no-literals` lives at `src/lib/theme/no-literals.test.ts`**, not under
   `components/`. Raw colour literals fail CI; use theme tokens.
 - **Global focus ring and `prefers-reduced-motion` are already in
