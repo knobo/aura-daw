@@ -25,6 +25,7 @@
     value,
     format = (v: number) => String(v),
     state = "plain",
+    title,
     onclick,
   }: {
     label: string;
@@ -32,6 +33,9 @@
     /** The chip doesn't guess at units — the caller says "62%" vs "1.2 kHz". */
     format?: (value: number) => string;
     state?: ParamChipState;
+    /** Hover text — the accessible name (aria-label) already says the state,
+     * so this is free to say what a click *does* instead ("Jump to…"). */
+    title?: string;
     onclick?: () => void;
   } = $props();
 
@@ -43,13 +47,13 @@
 </script>
 
 {#if onclick}
-  <button type="button" class="chip mono state-{state}" aria-label={spokenLabel} onclick={() => onclick?.()}>
+  <button type="button" class="chip mono state-{state}" aria-label={spokenLabel} {title} onclick={() => onclick?.()}>
     <span class="rail" aria-hidden="true"></span>
     <span class="label">{label}</span>
     <span class="value">{formatted}</span>
   </button>
 {:else}
-  <span class="chip mono state-{state}" aria-label={spokenLabel}>
+  <span class="chip mono state-{state}" aria-label={spokenLabel} {title}>
     <span class="rail" aria-hidden="true"></span>
     <span class="label">{label}</span>
     <span class="value">{formatted}</span>

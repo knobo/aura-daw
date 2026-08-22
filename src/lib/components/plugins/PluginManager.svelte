@@ -22,6 +22,7 @@
   import EmptyState from "../browser/EmptyState.svelte";
   import ParamChip from "../browser/ParamChip.svelte";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
+  import AutomationMatrix from "./AutomationMatrix.svelte";
   import {
     buildBrowseSections,
     filterByFacets,
@@ -194,7 +195,17 @@
         : rackFolds.anyCollapsed(rackKeys) || browseFolds.anyCollapsed(browseKeys),
   );
 
+  // `AutomationMatrix` reports its own row count out via `onCount` — the
+  // footer needs the number but must not recompute `buildMatrix` a second
+  // time (unlike `rack`, computed once below and shared by `rackGroups`
+  // and `rackCounts(rack)`, a second independent build here could drift
+  // from the matrix's own if the projection rules ever change).
+  let matrixCount = $state(0);
+
   const status = $derived.by(() => {
+    if (mode === "matrix") {
+      return matrixCount === 1 ? "1 param moves" : `${matrixCount} params move`;
+    }
     const n = filteredDescriptors.length;
     const catalog = `${n} plugin${n === 1 ? "" : "s"}`;
     if (mode === "browse") return catalog;
@@ -356,6 +367,15 @@
       >
         RACK
       </button>
+      <button
+        type="button"
+        class="chip mono"
+        class:on={mode === "matrix"}
+        aria-pressed={mode === "matrix"}
+        onclick={() => persist({ mode: "matrix" })}
+      >
+        MATRIX
+      </button>
     </div>
   </div>
 
@@ -366,7 +386,14 @@
     <div class="err silk" role="alert">{plugins.error}</div>
   {/if}
 
-  {#if !plugins.scanned && !plugins.scanning && plugins.descriptors.length === 0}
+  {#if mode === "matrix"}
+    <!-- The search box and facet chips are catalog filters; the matrix
+         isn't the catalog, so they'd be dead controls here. -->
+    <div class="panes">
+      <AutomationMatrix onCount={(n) => (matrixCount = n)} />
+    </div>
+    <div class="status silk">{status}</div>
+  {:else if !plugins.scanned && !plugins.scanning && plugins.descriptors.length === 0}
     <EmptyState
       message="No plugins yet. Scan to find your CLAP and LV2 installs."
       action={{ label: "SCAN PLUGINS", onclick: () => plugins.scan() }}

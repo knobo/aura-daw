@@ -8,7 +8,7 @@ import type { PluginFormat } from "../types/ipc";
 import type { KindFilter } from "./plugin-browse";
 
 export type { KindFilter };
-export type ManagerMode = "browse" | "split" | "rack";
+export type ManagerMode = "browse" | "split" | "rack" | "matrix";
 
 export interface ManagerView {
   mode: ManagerMode;
@@ -42,7 +42,9 @@ export function initialManagerMode(
   stored: ManagerMode | undefined,
   instanceCount: number,
 ): ManagerMode {
-  if (stored === "browse" || stored === "split" || stored === "rack") return stored;
+  if (stored === "browse" || stored === "split" || stored === "rack" || stored === "matrix") {
+    return stored;
+  }
   return instanceCount > 0 ? "split" : "browse";
 }
 
@@ -54,7 +56,9 @@ export function loadManagerView(projectDir: string | null): Partial<ManagerView>
     if (!parsed || typeof parsed !== "object") return {};
     const o = parsed as Record<string, unknown>;
     const view: Partial<ManagerView> = {};
-    if (o.mode === "browse" || o.mode === "split" || o.mode === "rack") view.mode = o.mode;
+    if (o.mode === "browse" || o.mode === "split" || o.mode === "rack" || o.mode === "matrix") {
+      view.mode = o.mode;
+    }
     if (o.kind === "all" || o.kind === "inst" || o.kind === "fx") view.kind = o.kind;
     if (typeof o.favoritesOnly === "boolean") view.favoritesOnly = o.favoritesOnly;
     if (typeof o.recentsOnly === "boolean") view.recentsOnly = o.recentsOnly;

@@ -22,8 +22,8 @@ that does not exist.
 | 3 | Backend catalog, persistent + incremental scan cache | **done** — in #93 |
 | 4 | `browser/` primitives + migrate instruments/samples/presets | **done** — in #93 |
 | 5 | Plugin Manager: browse/split/rack + Ctrl+P frecency + native GUI | **done** — PR #93 |
-| 6 | Automation matrix, pinned params, lane-info strip (winner §3.4) | **next** |
-| 7 | Unified audition (`browserAudition` pref, default off) | blocked on 6 |
+| 6 | Automation matrix, pinned params, lane-info strip (winner §3.4) | **done** — PR #98 (open, not yet merged) |
+| 7 | Unified audition (`browserAudition` pref, default off) | **next** |
 
 ### Step 5 as shipped
 
@@ -37,6 +37,50 @@ QuickPick click-to-insert is in the same squash.
 §5.2 lists one. `next-prompt.md`'s "Do not" forbids putting that
 virtualised ~1318-row list onto `BrowserRow`/`BrowserSection`, and a
 section here would be exactly that migration.
+
+### Step 6 as shipped
+
+`AutomationMatrix.svelte` (a 4th `ManagerMode`, grouped by parameter),
+pinned param chips at the top of `PluginParamPanel.svelte`
+(`catalog.pinnedParams[uid]`, max 8), and `LanePluginStrip.svelte` inside
+`TrackHeader.svelte`. Branch `feat/plugin-automation-inventory`, PR #98
+(squash SHA pending — the PR is still open).
+
+**Scope calls and deviations from the plan's own text:**
+
+- **A lazy per-instance param cache.** §6.1 and §6.3 both need a plugin's
+  param names and current values without that plugin being open, but
+  `plugins.params` only ever held the *open* instance's params — the plan
+  never says where the others come from. `plugins.svelte.ts` gained a
+  `paramCache`, filled lazily per instance by the existing, frozen
+  `plugin_get_params` command. No new command, no `OP_FORMAT_VERSION`
+  bump. Cost: one extra round trip per instance the first time it's shown
+  in the matrix or the strip, and its cached value can go stale until
+  something refreshes it.
+- **`revealParamLane(trackId, target)` is the one shared jump.** §6.1 says
+  clicking a matrix row "reveals the lane and scrolls to it", but no
+  vertical-reveal API existed (`view.revealSamples` is horizontal-only).
+  The util unfolds the lane if folded, calls `modulation.pickTarget`
+  (shows the existing binding, or mints one), then scrolls a new
+  `data-track-id` attribute on `TrackHeader`'s root element into view. All
+  three jump sites — the matrix row, the param-panel chip, and the
+  lane-strip chip — call this one function, not three bespoke handlers.
+- **The matrix is a 4th `ManagerMode`** (`"matrix"`), not a second dock
+  tab. The winner spec §6 explicitly refuses a second dock tab but says
+  nothing against a 4th mode chip alongside BROWSE/SPLIT/RACK.
+- **The FX chip survives; the plan's "becomes" reading is only partly
+  honoured.** §6.3 reads as "the FX chip becomes the strip", but the FX
+  chip is the only way to open `InsertChain` and the only affordance on a
+  track with no inserts at all. The strip renders inside the existing
+  `.metadata-row`, between the instrument chip and the FX chip; the
+  strip's own `+N` overflow button opens `InsertChain`, same as the FX
+  chip always did. No new header row — `--track-height` stays 132 px.
+- **The overflow budget is a constant, not a DOM measurement.**
+  `fitLaneStrip(devices, {maxEntries, chipsPerEntry})` takes `{2, 2}`
+  unfolded and `{4, 0}` folded (dots only), backed by
+  `flex-wrap: nowrap; overflow: hidden` as the belt-and-braces. Measuring
+  a 132 px header via `getBoundingClientRect()` is fragile and returns
+  zeros under jsdom regardless — the brief ruled it out.
 
 ## Step 5 — the Plugin Manager
 

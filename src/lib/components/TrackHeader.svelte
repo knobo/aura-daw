@@ -15,7 +15,7 @@
   import { library } from "../state/library.svelte";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { midiIo } from "../state/midiio.svelte";
-  import { formatDb } from "../utils/format";
+  import { formatDb, formatPan } from "../utils/format";
   import { groupOf } from "../utils/lane-layout";
   import { focusAndSelect } from "../utils/focusAndSelect";
   import { selectionModeFor } from "../utils/selection-modifiers";
@@ -26,6 +26,7 @@
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
   import InsertChain from "./plugins/InsertChain.svelte";
+  import LanePluginStrip from "./plugins/LanePluginStrip.svelte";
 
   let {
     track,
@@ -157,11 +158,6 @@
   function onGain(e: Event) {
     const v = parseFloat((e.currentTarget as HTMLInputElement).value);
     queueGestureWrite(() => project.setGain(track.id, v));
-  }
-
-  function formatPan(value: number): string {
-    if (Math.abs(value) < 0.005) return "C";
-    return String(Math.round(Math.abs(value) * 100)) + (value < 0 ? "L" : "R");
   }
 
   /** Gesture boundaries (Plan E Task 14): explicit begin/end brackets a
@@ -315,6 +311,7 @@
   aria-label="Lane {index + 1}: {track.name}"
   aria-rowindex={index + 1}
   data-track-row={track.id}
+  data-track-id={track.id}
   tabindex={rowTabIndex}
   onclick={onHeaderClick}
   onkeydown={onHeaderKeydown}
@@ -367,6 +364,7 @@
           onclick={() => pressToggle("soloed")}>S</button
         >
       {/if}
+      <LanePluginStrip {track} folded />
       <button
         class="foldbtn mono"
         aria-expanded="false"
@@ -403,6 +401,7 @@
           <span class="kindchip mono">Audio track</span>
         {/if}
         {#if !isAutomation}
+          <LanePluginStrip {track} onoverflow={() => (fxPopoverOpen = true)} />
           <span class="picker">
             <button
               class="status fxchip"
