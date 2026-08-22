@@ -10,7 +10,8 @@
  * none of that plan's jsdom workarounds are needed here.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
 import type { PluginInstanceInfo, TrackState } from "../../types/ipc";
 
 vi.stubGlobal("localStorage", {
@@ -136,6 +137,30 @@ describe("LanePluginStrip", () => {
     );
   });
 
+  it("titles a chip by whether the click creates or jumps to the lane", () => {
+    // Gain (pinned, no binding) is "plain" — a click MINTS the lane.
+    render(LanePluginStrip, { props: { track: track() } });
+    expect(screen.getByRole("button", { name: /gain/i }).getAttribute("title")).toBe(
+      "Create an automation lane for Gain",
+    );
+  });
+
+  it("titles an already-automated chip as a jump, not a create", () => {
+    modulation.bindings = [
+      {
+        id: "b1",
+        source: { kind: "curve", curveId: "c1" },
+        target: { kind: "pluginParam", instanceId: "i1", paramId: 3 },
+        mode: "absolute",
+        depth: 1,
+      },
+    ];
+    render(LanePluginStrip, { props: { track: track() } });
+    expect(screen.getByRole("button", { name: /gain/i }).getAttribute("title")).toBe(
+      "Jump to Gain's lane",
+    );
+  });
+
   it("a plain click on an insert name opens the params panel", async () => {
     render(LanePluginStrip, { props: { track: track() } });
 
@@ -171,6 +196,52 @@ describe("LanePluginStrip", () => {
     await fireEvent.click(overflowBtn);
 
     expect(onoverflow).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-requests ensureParams only when the strip's device SET changes — not on a chip click or a paramCache write", async () => {
+    // Same membership-only-derived + `untrack` shape as
+    // `AutomationMatrix.svelte` (see that component's dom test, the model
+    // for this one) — the ledger records an earlier version of this exact
+    // pattern as the branch's most expensive mistake, so this is the
+    // regression test the matrix already has and the strip didn't.
+    const ensureParamsSpy = vi.spyOn(plugins, "ensureParams");
+    try {
+      const { rerender } = render(LanePluginStrip, { props: { track: track() } });
+      await waitFor(() => expect(ensureParamsSpy).toHaveBeenCalledTimes(3));
+      expect(ensureParamsSpy).toHaveBeenCalledWith("i1");
+      expect(ensureParamsSpy).toHaveBeenCalledWith("i2");
+      expect(ensureParamsSpy).toHaveBeenCalledWith("i3");
+
+      // A chip click flips a lane's visibility (via the mocked
+      // `revealParamLane`) — it must not touch device membership.
+      await fireEvent.click(screen.getByRole("button", { name: /gain/i }));
+      await tick();
+      expect(ensureParamsSpy).toHaveBeenCalledTimes(3);
+
+      // A paramCache write (what a knob drag on an open param panel does)
+      // changes chip VALUES, not which instances are on this chain.
+      plugins.paramCache = {
+        ...plugins.paramCache,
+        i1: [{ id: 3, name: "Gain", min: 0, max: 1, default: 0.5, value: 0.9 }],
+      };
+      await tick();
+      expect(ensureParamsSpy).toHaveBeenCalledTimes(3);
+
+      // Adding a fourth device to the chain DOES change membership — this
+      // must re-run ensureParams (the effect loop re-iterates the whole
+      // current set, not just the newcomer, same as the matrix's test).
+      plugins.instances = [...plugins.instances, inst("i4", "u-new", "New", "active")];
+      const grown: TrackState = {
+        ...track(),
+        inserts: [...(track().inserts ?? []), { id: "s3", instanceId: "i4", bypassed: false }],
+      };
+      await rerender({ track: grown });
+
+      await waitFor(() => expect(ensureParamsSpy).toHaveBeenCalledWith("i4"));
+      expect(ensureParamsSpy.mock.calls.length).toBeGreaterThan(3);
+    } finally {
+      ensureParamsSpy.mockRestore();
+    }
   });
 
   it("renders nothing for a track with no plugin devices", () => {

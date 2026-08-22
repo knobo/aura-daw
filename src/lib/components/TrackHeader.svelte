@@ -363,8 +363,8 @@
           aria-label={bulkTitle("Solo")}
           onclick={() => pressToggle("soloed")}>S</button
         >
+        <LanePluginStrip {track} folded />
       {/if}
-      <LanePluginStrip {track} folded />
       <button
         class="foldbtn mono"
         aria-expanded="false"

@@ -12,7 +12,7 @@ Two PRs, one track. Details, scope calls and what is left:
 
 | What | Where |
 |---|---|
-| **Step 6 — automation as an inventory** | PR #98. Param cache + shared lane reveal (`plugins.svelte.ts` `paramCache` over the frozen `plugin_get_params`; `utils/lane-reveal.ts`'s `revealParamLane`), `AutomationMatrix.svelte` + `utils/automation-matrix.ts` as a 4th `ManagerMode`, pinned params in `PluginParamPanel.svelte`, and `LanePluginStrip.svelte` + `utils/lane-strip.ts` in `TrackHeader.svelte`'s `.metadata-row`. |
+| **Step 6 — automation as an inventory** | PR #98, amended by PR #105. Param cache + shared lane reveal (`plugins.svelte.ts` `paramCache` over the frozen `plugin_get_params`; `utils/lane-reveal.ts`'s `revealParamLane`), `AutomationMatrix.svelte` + `utils/automation-matrix.ts` as a 4th `ManagerMode`, pinned params in `PluginParamPanel.svelte`, and `LanePluginStrip.svelte` + `utils/lane-strip.ts` in `TrackHeader.svelte`'s `.metadata-row`. #98 was squashed four minutes before its own fix wave was pushed, so its final review's merge blocker landed separately in #105: `revealParamLane` now refuses an empty `trackId` instead of minting a curve and a binding no lane can show. |
 | **Step 5 — plugin manager + native floating GUI** — catalog, browse/split/rack, Ctrl+P frecency, CLAP/LV2/Zyn editors, live on-top pref | PR #93 `e1ec61f`. Winner spec: [`2026-08-20-plugin-admin-winner-design.md`](superpowers/specs/2026-08-20-plugin-admin-winner-design.md). Plan: [`2026-08-20-plugin-manager.md`](superpowers/plans/2026-08-20-plugin-manager.md). |
 | Timeline follow-on-seek | `view.revealSamples` (in PR #93) |
 | Shared `browser/` layer | instruments / samples / presets migrated (in PR #93) |
