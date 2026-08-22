@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Point the Windows backlog at PR #62 instead of calling it unknown | `docs/windows-build-pr62` | 2026-08-22 | Docs only. |
 
 ## Next up — unclaimed
 
