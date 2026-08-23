@@ -67,6 +67,7 @@ const { plugins } = await import("../../state/plugins.svelte");
 const { project } = await import("../../state/project.svelte");
 const { lanes } = await import("../../state/lanes.svelte");
 const { modulation } = await import("../../state/modulation.svelte");
+const { audition } = await import("../../state/audition.svelte");
 
 function desc(
   uid: string,
@@ -137,6 +138,8 @@ beforeEach(() => {
   project.projectDir = null;
   lanes.clearSelection();
   modulation.bindings = [];
+  audition.enabled = false;
+  audition.lastSilentReason = null;
 });
 
 afterEach(() => {
@@ -144,6 +147,8 @@ afterEach(() => {
   plugins.descriptors = [];
   plugins.instances = [];
   plugins.scanned = false;
+  audition.enabled = false;
+  audition.lastSilentReason = null;
 });
 
 describe("PluginManager default mode (winner spec §3.3)", () => {
@@ -275,5 +280,34 @@ describe("PluginManager collapse-all", () => {
 
     expect(screen.queryByText("Surge XT")).toBeNull();
     expect(screen.getByText("Instruments")).toBeTruthy();
+  });
+});
+
+describe("PluginManager audition (design §8.2, ruling R-3)", () => {
+  it("clears a stale silent reason left by a different browser on mount", () => {
+    // A double-click in, say, Presets can set this global singleton and
+    // never clear it (no decay timer — see audition.svelte.ts). Without a
+    // mount-time reset, the manager would open already showing someone
+    // else's stale reason.
+    audition.lastSilentReason = "open a Zyn instance to audition its patches";
+    render(PluginManager);
+
+    expect(audition.lastSilentReason).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("double-clicking a catalog row with no live instance goes silent, never instantiates (R-3)", async () => {
+    audition.enabled = true;
+    render(PluginManager);
+
+    const row = screen.getByText("Surge XT").closest(".row");
+    if (!row) throw new Error("catalog row not found");
+    await fireEvent.dblClick(row);
+
+    expect(pluginInstantiate).not.toHaveBeenCalled();
+    expect(audition.lastSilentReason).toBe("no live instance of this plugin to audition");
+    expect(screen.getByRole("status").textContent).toBe(
+      "no live instance of this plugin to audition",
+    );
   });
 });
