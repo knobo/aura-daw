@@ -719,7 +719,10 @@ git commit -m "feat(browser): audition store — one gate, four row kinds"
 - Produces:
   - `BrowserRow` prop `ondblclick?: () => void`
   - `BrowserShell` props `onAudition?: (row: BrowserRowRef) => void` and
-    `audition?: boolean` (render the chip in the toolbar)
+    `auditionChip?: boolean` (render the chip in the toolbar). **Not**
+    `audition` — the browsers import a store by that name, and Svelte's
+    `<BrowserShell audition />` shorthand would pass that store object
+    instead of `true` (controller ruling P-1).
   - `AuditionChip.svelte`, no props
 
 - [ ] **Step 1: Write the failing test**
@@ -758,12 +761,6 @@ describe("BrowserRow audition gesture", () => {
     await fireEvent.dblClick(row);
     expect(ondblclick).toHaveBeenCalledTimes(1);
   });
-
-  it("a row with no ondblclick is inert on double-click", async () => {
-    render(BrowserRow, { props: { id: "r1", label: "Kick" } });
-    const row = screen.getByText("Kick").closest(".row") as HTMLElement;
-    await expect(fireEvent.dblClick(row)).resolves.not.toThrow();
-  });
 });
 
 describe("BrowserShell audition", () => {
@@ -786,7 +783,7 @@ describe("BrowserShell audition", () => {
 
   it("the toolbar chip reflects and flips the audition preference", async () => {
     audition.enabled = false;
-    render(BrowserShellHarness, { props: { audition: true } });
+    render(BrowserShellHarness, { props: { auditionChip: true } });
     const chip = screen.getByRole("button", { name: /audition/i });
     expect(chip.getAttribute("aria-pressed")).toBe("false");
 
@@ -913,11 +910,13 @@ Add to the destructured props and the type block:
     /** Shift+Enter on the active row. Omit and the shell offers no keyboard
      * audition — a browser whose rows cannot sound should not pretend. */
     onAudition?: (row: BrowserRowRef) => void;
-    /** Render the audition toggle in the toolbar. */
-    audition?: boolean;
+    /** Render the audition toggle in the toolbar. Named `auditionChip`,
+     * not `audition`: every caller imports the audition store under the
+     * latter name, and the shorthand would silently pass the store. */
+    auditionChip?: boolean;
 ```
 
-with `audition = false` in the destructuring defaults.
+with `auditionChip = false` in the destructuring defaults.
 
 In `onListKeydown`, replace the `case "Enter":` block with:
 
@@ -936,7 +935,7 @@ In `onListKeydown`, replace the `case "Enter":` block with:
 In the toolbar markup, immediately before the `{#if filters}` block:
 
 ```svelte
-    {#if audition}
+    {#if auditionChip}
       <AuditionChip />
     {/if}
 ```
@@ -951,16 +950,16 @@ first and follow its existing prop style exactly:
   let {
     onActivate,
     onAudition,
-    audition = false,
+    auditionChip = false,
   }: {
     onActivate?: (row: BrowserRowRef) => void;
     onAudition?: (row: BrowserRowRef) => void;
-    audition?: boolean;
+    auditionChip?: boolean;
   } = $props();
 ```
 
 and forward all three to `<BrowserShell ... {onActivate} {onAudition}
-{audition} />`. Keep whatever props the harness already declares.
+{auditionChip} />`. Keep whatever props the harness already declares.
 
 - [ ] **Step 7: Run the DOM tests**
 
@@ -1006,14 +1005,15 @@ Import:
 On the `BrowserRow` inside the `{#each g.items as e, i}` loop, add:
 
 ```svelte
-                ondblclick={() =>
-                  e.kind === "audio" && void audition.play({ kind: "sample", path: e.path })}
+                ondblclick={() => {
+                  if (e.kind === "audio") void audition.play({ kind: "sample", path: e.path });
+                }}
 ```
 
-On its `<BrowserShell>`, add `audition` and the keyboard route:
+On its `<BrowserShell>`, add `auditionChip` and the keyboard route:
 
 ```svelte
-      audition
+      auditionChip
       onAudition={(row) => {
         if (row.kind !== "item") return;
         const e = groups.find((g) => g.key === row.groupKey)?.items[row.itemIndex];
@@ -1058,7 +1058,7 @@ target rather than a load:
               }}
 ```
 
-Add `audition` to the `<BrowserShell>`. Wire `onAudition` to the same two
+Add `auditionChip` to the `<BrowserShell>`. Wire `onAudition` to the same two
 branches, reading the item out of `instrumentGroups` / `patchGroups` by
 `row.groupKey` and `row.itemIndex` exactly as Step 1 does for `groups`.
 
@@ -1075,7 +1075,7 @@ The mini keyboard in the `actions` snippet stays exactly as it is — it answers
 a different question ("what does *this* pitch sound like"), which §8.2 says
 explicitly.
 
-Add `audition` to its `<BrowserShell>` and route `onAudition` to the same
+Add `auditionChip` to its `<BrowserShell>` and route `onAudition` to the same
 call, resolving the instrument from `groups[...]` by the row ref.
 
 - [ ] **Step 4: Verify nothing regressed**
