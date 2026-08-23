@@ -614,7 +614,11 @@ class AuditionStore {
     return prefs.values.browserAudition;
   }
   set enabled(on: boolean) {
-    prefs.values.browserAudition = on;
+    // `prefs.set`, never `prefs.values.x = on`: only `set` validates,
+    // writes through to the `aura.prefs` blob and notifies `onChange`
+    // subscribers. A direct field write is reactive but does not persist,
+    // so the toolbar chip would silently forget itself on restart.
+    prefs.set("browserAudition", on);
   }
 
   async play(target: AuditionTarget): Promise<void> {
@@ -691,10 +695,11 @@ mocked test object trips the optional call, keep the `?.` and adjust the mock.
 timeout 300 npx vitest run src/lib/state/audition.test.ts
 ```
 
-Expected: PASS, 10 tests. If the `prefs` import pulls `localStorage` into the
-node project and throws, check how `src/lib/prefs/prefs.test.ts` sets that up
-and follow the same setup — do not stop importing `prefs`, since R-2 depends
-on it.
+Expected: PASS, 10 tests. Importing `prefs` in the node project is safe:
+`src/lib/utils/prefs.ts`'s `storage()` returns `undefined` when there is no
+`localStorage` and every read/write degrades to "no preference" rather than
+throwing. Do not stub storage, and do not stop importing `prefs` — ruling R-2
+depends on that single source of truth.
 
 - [ ] **Step 5: Commit**
 
