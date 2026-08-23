@@ -147,6 +147,37 @@ describe("PluginParamPanel follows automation", () => {
     expect(screen.queryByText("AUTO")).toBeNull();
   });
 
+  it("puts the thumb back where automation has it after a drag on a driven row", async () => {
+    plugins.params = [param(1, "Filter / Level", 0.5)];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.8 }]);
+    render(PluginParamPanel);
+    const fader = screen.getByRole("slider", { name: /^Filter \/ Level/ }) as HTMLInputElement;
+
+    await fireEvent.input(fader, { target: { value: "0.3" } });
+    // A held or flat lane repeats the same value every frame, so nothing
+    // reassigns and Svelte will not push the binding back (`set_value`
+    // early-returns on an unchanged value). Without an explicit resync the
+    // thumb sits at 0.3 while chip, fill and aria-label all say 0.80 — and
+    // the plugin snaps back to 0.80 within REASSERT_TICKS with nothing on
+    // screen saying so.
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.8 }]);
+    expect(fader.value).toBe("0.8");
+    expect(screen.getByRole("button", { name: "Level, 0.80" })).toBeTruthy();
+  });
+
+  it("shows the nearest step on a driven enum row instead of rendering blank", () => {
+    // 4 steps over 0..1 => options at 0, 1/3, 2/3, 1. A ramp sits between
+    // them, and a <select> whose value matches no option renders with
+    // selectedIndex -1, i.e. empty. 0.4 is unambiguously nearest 1/3 —
+    // avoid a midpoint, where float error alone decides the winner.
+    plugins.params = [{ id: 1, name: "Filter / Mode", min: 0, max: 1, default: 0, value: 0, steps: 4 }];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.4 }]);
+    render(PluginParamPanel);
+    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    expect(select.selectedIndex).not.toBe(-1);
+    expect(Number(select.value)).toBeCloseTo(1 / 3, 5);
+  });
+
   it("still writes to the real param id from a driven row", async () => {
     plugins.params = [param(4, "Filter / Level", 0.5)];
     paramFollow.apply([{ instanceId: "i1", index: 4, value: 0.8 }]);

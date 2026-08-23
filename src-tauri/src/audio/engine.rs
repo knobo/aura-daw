@@ -2258,22 +2258,6 @@ impl Control {
         (ramps, driver, Some(map))
     }
 
-    /// Track D: apply plugin-parameter automation at this thread's own tick
-    /// (≤2 ms), never on the audio callback — a host param write is a
-    /// blocking round-trip and is banned there ([C1]).
-    ///
-    /// The writes go to the HOST ONLY, never to the document. That is the
-    /// point, not an omission: automation OVERRIDES the stored knob value
-    /// during playback, while the document keeps what the user set (which is
-    /// what gets saved and what the param panel shows). Routing these
-    /// through the channel would either trip the M-3 transient invariant
-    /// (`ObjectRef::Plugin` is a field history entries address) or push an
-    /// undo entry and a `project.json` write every 2 ms. Recorded in
-    /// `docs/SIDE-CHANNEL-INVENTORY.md`.
-    ///
-    /// Only while the transport is playing: a stopped transport leaves the
-    /// last automated value in place, which is what the user sees and hears
-    /// until they move the knob or reload the project.
     /// Fold a tick's writes into the driven-param read-back, upserting by
     /// (instance, index). Linear in both — a tick writes one entry per
     /// automated param, and the set holds one per automated param, so both
@@ -2297,6 +2281,29 @@ impl Control {
         }
     }
 
+    /// Track D: apply plugin-parameter automation at this thread's own tick
+    /// (≤2 ms), never on the audio callback — a host param write is a
+    /// blocking round-trip and is banned there ([C1]).
+    ///
+    /// The writes go to the HOST ONLY, never to the document. That is the
+    /// point, not an omission: automation OVERRIDES the stored knob value
+    /// during playback, while the document keeps what the user set (which is
+    /// what gets saved). Routing these through the channel would either trip
+    /// the M-3 transient invariant
+    /// (`ObjectRef::Plugin` is a field history entries address) or push an
+    /// undo entry and a `project.json` write every 2 ms. Recorded in
+    /// `docs/SIDE-CHANNEL-INVENTORY.md`.
+    ///
+    /// Only while the transport is playing: a stopped transport leaves the
+    /// last automated value in place, which is what the user sees and hears
+    /// until they move the knob or reload the project.
+    ///
+    /// `driven_params` publishes these same values for the UI to paint while
+    /// they are live (the param panel follows them, then returns to the
+    /// document on stop). Note the asymmetry that has always been here: the
+    /// PLUGIN keeps the last automated value after a stop, so the panel and
+    /// the plugin can disagree until something writes the param. Recorded in
+    /// `docs/SIDE-CHANNEL-INVENTORY.md`.
     fn drive_param_automation(&mut self) {
         if self.param_automation.is_empty() || !self.shared.playing.load(Relaxed) {
             // Nothing is driving these any more, so the UI must stop

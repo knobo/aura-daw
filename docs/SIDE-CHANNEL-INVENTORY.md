@@ -364,6 +364,14 @@ those files move:
     them with an AUTO flag while the transport rolls, falling back to the
     document the moment it stops. Display only — nothing reads that
     read-back back into the document.
+    - The asymmetry that remains, unchanged by that panel work: a STOP
+      clears the read-back, so the panel returns to the document value while
+      the PLUGIN still holds the last automated one. The panel is right about
+      what will be saved and wrong about what the plugin has, until something
+      writes the param. Closing it needs the driver to hand the param back on
+      stop (a host write per automated param, plus a rule for which value
+      wins), which is the same read/write-arbitration question
+      fader-follows-automation and write/touch/latch raise.
   - A flat automated param is RE-ASSERTED every ~0.5 s
     (`ParamAutomationDriver::REASSERT_TICKS`), because the host is not ours
     alone — the plugin's own GUI, a patch load or a knob drag can move the

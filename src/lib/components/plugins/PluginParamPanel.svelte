@@ -118,6 +118,15 @@
     const step = (p.max - p.min) / (n - 1);
     return Array.from({ length: n }, (_, i) => p.min + i * step);
   }
+  /** The option closest to `v`. A `<select>` can only DISPLAY a value that is
+   * one of its options — Svelte sets `selectedIndex = -1` for anything else
+   * and the row renders blank. A document value is always an exact step, but
+   * an automation ramp walks straight through the gaps between them, so a
+   * driven enum row has to be snapped to something showable. */
+  function nearestEnumValue(p: PluginParamInfo, v: number): number {
+    const vals = enumValues(p);
+    return vals.reduce((best, c) => (Math.abs(c - v) < Math.abs(best - v) ? c : best), vals[0]);
+  }
   function pct(p: PluginParamInfo): number {
     return paramNormalized(p) * 100;
   }
@@ -145,11 +154,35 @@
     return d !== p;
   }
 
+  /** Put a control back on the value automation is holding it at.
+   *
+   * A range input keeps whatever position the user dragged it to, and Svelte
+   * will NOT push the binding back when the expression has not changed —
+   * `set_value` early-returns on an unchanged value. A held or flat lane
+   * repeats the same value every frame, and every lane the plugin-param UI
+   * mints starts flat, so that is the common case, not an edge: without this
+   * the thumb sits at the user's value while the chip, the fill and the
+   * aria-label all say the driven one, and the plugin snaps back within
+   * `REASSERT_TICKS` (~0.5 s) with nothing on screen saying so.
+   *
+   * The write still reaches the document — ruling 2 keeps the user's value,
+   * and it takes effect once the transport stops. The thumb snapping back is
+   * exactly what the parameter itself does. */
+  function resyncIfDriven(p: PluginParamInfo, el: HTMLInputElement | HTMLSelectElement) {
+    const v = paramFollow.valueFor(plugins.openInstanceId, p.id);
+    if (v === undefined) return;
+    el.value = String(isEnum(p) ? nearestEnumValue(p, v) : v);
+  }
+
   function onSlide(p: PluginParamInfo, e: Event) {
-    plugins.setParam(p.id, parseFloat((e.currentTarget as HTMLInputElement).value));
+    const el = e.currentTarget as HTMLInputElement;
+    plugins.setParam(p.id, parseFloat(el.value));
+    resyncIfDriven(p, el);
   }
   function onEnum(p: PluginParamInfo, e: Event) {
-    plugins.setParam(p.id, parseFloat((e.currentTarget as HTMLSelectElement).value));
+    const el = e.currentTarget as HTMLSelectElement;
+    plugins.setParam(p.id, parseFloat(el.value));
+    resyncIfDriven(p, el);
   }
   function pluginBound(paramId: number): boolean {
     return (
@@ -237,7 +270,7 @@
   {#snippet paramRow(p: PluginParamInfo, short: string)}
     {@const d = shown(p)}
     {@const auto = isDriven(p, d)}
-    <div class="param" class:auto>
+    <div class="param">
       <!-- The removed `.pname` used to carry "{p.name} (id {p.id})" as its
            title. The fader below still says it for a continuous param, but
            a toggle/enum row renders no fader — this row-level title is the
@@ -258,8 +291,11 @@
         {#if auto}
           <!-- Why the control below will not stay where you put it: ruling 2
                says automation OVERRIDES the knob during playback. The write
-               still lands in the document, and the plugin gets it back when
-               the transport stops. -->
+               still lands in the document — which is what gets saved, and
+               what this panel shows again once the transport stops. The
+               PLUGIN keeps the last automated value until something writes
+               it (engine.rs `drive_param_automation`), so stopping is not
+               itself a hand-back; that asymmetry predates this panel. -->
           <span
             class="autoflag mono"
             title="Automation is driving {p.name} — the panel follows the lane until the transport stops"
@@ -276,7 +312,11 @@
             {d.value >= (p.min + p.max) / 2 ? "ON" : "OFF"}
           </button>
         {:else if isEnum(p)}
-          <select class="enum mono" value={d.value} onchange={(e) => onEnum(p, e)}>
+          <select
+            class="enum mono"
+            value={auto ? nearestEnumValue(p, d.value) : d.value}
+            onchange={(e) => onEnum(p, e)}
+          >
             {#each enumValues(p) as v, i (i)}
               <option value={v}>{fmt(p, v)}</option>
             {/each}

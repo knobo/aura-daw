@@ -980,7 +980,14 @@ instantiation per automated instance, seeded from the live one's
   not the tick's deltas, because `tick` suppresses a value it already sent
   — and the panel paints them with an AUTO flag and a magenta fader fill.
   Cleared when the transport stops and when a rebuild replaces the driver,
-  which is how the UI knows to hand the param back to the document. No
+  which is how the UI knows to hand the param back to the document — the
+  panel, not the plugin: a stop leaves the last automated value in the host,
+  so panel and plugin can still disagree afterwards (recorded in
+  `docs/SIDE-CHANNEL-INVENTORY.md`, unchanged by this work).
+  A driven control is also re-synced after a user edit: a range input keeps
+  the position it was dragged to and Svelte will not push an unchanged
+  binding back, so without that the thumb sat at the user's value while the
+  rest of the row read the driven one. No
   second evaluation of the curve exists, frontend or backend, so the panel
   cannot disagree with what the plugin actually got. Ruling 2 itself is
   unchanged: the writes are still host-only and the document still keeps
