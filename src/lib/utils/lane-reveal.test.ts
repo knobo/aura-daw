@@ -14,6 +14,7 @@ const toggleTrack = vi.fn();
 const pickTarget = vi.fn();
 const isBindingVisible = vi.fn();
 const show = vi.fn();
+const toastError = vi.fn();
 
 vi.mock("../state/lanes.svelte", () => ({
   lanes: {
@@ -27,6 +28,12 @@ vi.mock("../state/modulation.svelte", () => ({
     pickTarget: (...a: unknown[]) => pickTarget(...a),
     isBindingVisible: (...a: unknown[]) => isBindingVisible(...a),
     show: (...a: unknown[]) => show(...a),
+  },
+}));
+
+vi.mock("../state/toasts.svelte", () => ({
+  toasts: {
+    error: (...a: unknown[]) => toastError(...a),
   },
 }));
 
@@ -54,6 +61,23 @@ afterEach(() => {
 });
 
 describe("revealParamLane", () => {
+  it("does nothing but surface a toast when trackId is empty (an orphaned instance)", async () => {
+    await revealParamLane("", TARGET);
+
+    // No fold check, no mint, no show — an empty trackId must not reach
+    // ANY of the store calls this helper otherwise makes, mirroring the
+    // real bug: `pickTarget` doesn't validate the track and would happily
+    // commit a curve+binding filed under a track key nothing can find.
+    expect(isTrackCollapsed).not.toHaveBeenCalled();
+    expect(toggleTrack).not.toHaveBeenCalled();
+    expect(pickTarget).not.toHaveBeenCalled();
+    expect(show).not.toHaveBeenCalled();
+    expect(toastError).toHaveBeenCalledWith(
+      "NOT ON A TRACK",
+      "This plugin isn't on a track, so there's no lane to put automation on.",
+    );
+  });
+
   it("unfolds a folded lane before revealing it", async () => {
     isTrackCollapsed.mockReturnValue(true);
     await revealParamLane("t1", TARGET);

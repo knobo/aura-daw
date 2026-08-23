@@ -140,6 +140,24 @@ describe("PluginParamPanel param chips", () => {
       0.5,
     );
   });
+
+  it("carries the chip's title in the fuller 'Group / Name' form, same referent as the A button", () => {
+    plugins.params = [param(1, "Filter / Level", 0.5)];
+    render(PluginParamPanel);
+    expect(screen.getByRole("button", { name: "Level, 0.50" }).getAttribute("title")).toBe(
+      "Create automation lane for Filter / Level",
+    );
+    expect(screen.getByTitle("Automate Filter / Level")).toBeTruthy();
+  });
+
+  it("keeps the full 'Group / Name (id N)' discoverable on a toggle/enum row, which renders no fader", () => {
+    // The removed `.pname` used to carry this text; a toggle/enum param has
+    // no fader to fall back to, so it must survive somewhere else on the row.
+    plugins.params = [{ id: 7, name: "Mode / Bypass", min: 0, max: 1, default: 0, value: 1, steps: 2 }];
+    render(PluginParamPanel);
+    const toggleBtn = screen.getByTitle("Toggle Bypass");
+    expect(toggleBtn.closest(".prow")?.getAttribute("title")).toBe("Mode / Bypass (id 7)");
+  });
 });
 
 describe("PluginParamPanel pinned section", () => {

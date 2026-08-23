@@ -159,13 +159,22 @@
   }
 
   function jumpToLane(p: PluginParamInfo) {
+    // `revealParamLane` itself guards an empty `trackId` (an orphaned
+    // instance — `plugins.bind()` nulls the *previous* instance's trackId
+    // on a rebind) and toasts instead of minting an unreachable curve, so
+    // this stays the same `?? ""` pass-through the automate button uses —
+    // no second guard to keep in sync with the shared one.
     const target: TargetRef = { kind: "pluginParam", instanceId: plugins.openInstanceId, paramId: p.id };
     void revealParamLane(plugins.openInstance?.trackId ?? "", target, paramNormalized(p));
   }
-  function chipTitle(p: PluginParamInfo, short: string): string {
+  // Fuller form ("Group / Name"), matching the `A` button's `title` below —
+  // a hover tooltip has no width budget to protect the way the chip's own
+  // rendered label does, and the short name alone is ambiguous between two
+  // params of the same name in different groups (e.g. two "Level"s).
+  function chipTitle(p: PluginParamInfo): string {
     return pluginBound(p.id)
-      ? `Jump to the automation lane for ${short}`
-      : `Create automation lane for ${short}`;
+      ? `Jump to the automation lane for ${p.name}`
+      : `Create automation lane for ${p.name}`;
   }
 </script>
 
@@ -209,14 +218,20 @@
 
   {#snippet paramRow(p: PluginParamInfo, short: string)}
     <div class="param">
-      <div class="prow">
+      <!-- The removed `.pname` used to carry "{p.name} (id {p.id})" as its
+           title. The fader below still says it for a continuous param, but
+           a toggle/enum row renders no fader — this row-level title is the
+           one place that full name + id stays discoverable for every param
+           shape, without fighting the chip's own click-affordance title
+           (an element's own `title` wins over an ancestor's on hover). -->
+      <div class="prow" title="{p.name} (id {p.id})">
         <div class="chipwrap">
           <ParamChip
             label={short}
             value={p.value}
             format={() => formatParamDisplay(p)}
             state={pluginBound(p.id) ? "automated" : "plain"}
-            title={chipTitle(p, short)}
+            title={chipTitle(p)}
             onclick={() => jumpToLane(p)}
           />
         </div>

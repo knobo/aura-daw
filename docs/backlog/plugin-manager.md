@@ -102,6 +102,19 @@ either.
   once per `(instances, bindings)` identity and share it across strips.
   Fixing only the `cacheParams` whole-object write buys almost nothing on
   its own.
+- **Two findings from a second final review of Step 6, never landed.**
+  Step 6 was run by two SDD controller sessions at once in the same
+  worktree — the collision the claim protocol in
+  [`../../next-prompt.md`](../../next-prompt.md) now exists to prevent.
+  Each ran its own whole-branch review and got a different finding set;
+  only one landed. These two are real, small, and unactioned:
+  - `plugins.svelte.ts` — write `paramCache` **per property** instead of
+    spreading the whole object on every `setParam`. Only worth doing
+    together with the performance item above, which is the same path.
+  - `AutomationMatrix.svelte` — the matrix is a grouped, expandable list
+    and should carry `role="tree"` semantics rather than plain rows, the
+    way the lane rail already carries `role="grid"` and
+    `aria-multiselectable`.
 
 ## Do not
 
