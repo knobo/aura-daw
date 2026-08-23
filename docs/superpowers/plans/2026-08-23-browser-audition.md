@@ -1176,9 +1176,9 @@ R-3 in force: a descriptor with nothing live stays silent. Do not add an
 - [ ] **Step 3: The chip in the manager's own toolbar**
 
 `PluginManager` passes `chrome={false}` to `BrowserShell`, so the shell draws
-no toolbar and the chip has to go in the manager's own chip row. Add it as the
-last chip in the row that holds `ALL` / `INST` / `FX` / `CLAP` / `LV2` / `★` /
-`⏱`:
+no toolbar and the chip has to go in the manager's own chip row. That row is
+`<div class="chips primary">`, and its last child today is the `⏱` recents
+chip. Add the component as the new last child, inside that div:
 
 ```svelte
         <AuditionChip />
@@ -1186,9 +1186,13 @@ last chip in the row that holds `ALL` / `INST` / `FX` / `CLAP` / `LV2` / `★` /
 
 - [ ] **Step 4: Surface the silent reason**
 
-A double-click that makes no sound with no explanation reads as a bug. Below
-the chip row (next to wherever the manager already renders its status/error
-line — read the file and follow it), add:
+A double-click that makes no sound with no explanation reads as a bug. The
+manager already renders two sibling notices near the top of its markup —
+`{#if plugins.scanError}` and `{#if plugins.error}`, both
+`<div class="err silk" role="alert">`. Add a third beside them, in the same
+place, but as a `status` rather than an `alert`: "no live instance of this
+plugin to audition" is an ordinary answer, not an error, and `role="alert"`
+would interrupt a screen reader for it.
 
 ```svelte
     {#if audition.lastSilentReason}
@@ -1197,7 +1201,9 @@ line — read the file and follow it), add:
 ```
 
 and a `.note` rule in `<style>` using existing tokens only — copy the shape of
-`SamplesRoot.svelte`'s `.note` rule rather than inventing colours.
+`SamplesRoot.svelte`'s `.note` rule rather than inventing colours. If the
+manager's existing `.err` rule already carries the layout you need, reuse the
+`silk` class and add only what differs.
 
 - [ ] **Step 5: `ZynPatchBrowser`**
 
