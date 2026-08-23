@@ -42,6 +42,7 @@ vi.mock("../../tauri", () => ({
 const { default: ZynPatchBrowser } = await import("./ZynPatchBrowser.svelte");
 const { zyn } = await import("../../state/zynpatches.svelte");
 const { plugins } = await import("../../state/plugins.svelte");
+const { audition } = await import("../../state/audition.svelte");
 
 const patch: ZynPatch = { bank: "Pads", name: "Warm Pad", program: 1, path: "/p.xiz" };
 
@@ -67,6 +68,7 @@ beforeEach(() => {
   zyn.loaded = {};
   zyn.openInstanceId = "zyn-1";
   plugins.instances = [inst()];
+  audition.enabled = false;
 });
 
 afterEach(() => {
@@ -74,6 +76,7 @@ afterEach(() => {
   zyn.patches = [];
   zyn.openInstanceId = "";
   plugins.instances = [];
+  audition.enabled = false;
 });
 
 function loadButton() {
@@ -98,5 +101,28 @@ describe("ZynPatchBrowser patch audition", () => {
     });
     await fireEvent.pointerUp(btn);
     await waitFor(() => expect(pluginPreviewNoteOff).toHaveBeenCalled());
+  });
+
+  it("double-click does nothing while the audition preference is off — an audition must never load a patch", async () => {
+    audition.enabled = false;
+    render(ZynPatchBrowser);
+    await fireEvent.dblClick(loadButton());
+    // Give any (wrongly) in-flight async work a chance to reach the
+    // backend before asserting the negative.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(zynLoadPatch).not.toHaveBeenCalled();
+    expect(pluginPreviewNoteOn).not.toHaveBeenCalled();
+  });
+
+  it("double-click plays the patch through the bound instance when the preference is on", async () => {
+    audition.enabled = true;
+    render(ZynPatchBrowser);
+    await fireEvent.dblClick(loadButton());
+    await waitFor(() => expect(zynLoadPatch).toHaveBeenCalledWith("zyn-1", "/p.xiz"), {
+      timeout: 500,
+    });
+    await waitFor(() => expect(pluginPreviewNoteOn).toHaveBeenCalledWith("zyn-1", 60, 100), {
+      timeout: 500,
+    });
   });
 });

@@ -5,6 +5,7 @@
    * (what exists), browse below (what could). Ctrl+P is the add-in-the-flow
    * surface; the lane strip is the Bitwig job (next pass).
    */
+  import { onMount } from "svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { lanes } from "../../state/lanes.svelte";
@@ -57,6 +58,17 @@
   /** Which projectDir the chips were loaded for — a snapshot that writes
    * the same dir must not clobber a chip the user just pressed. */
   let loadedFor: string | null | undefined;
+
+  // `lastSilentReason` is a global singleton with no decay (unlike
+  // `sounding`) — it's cleared only by the next successful `play()`
+  // anywhere in the app. This panel remounts fresh on every dock-tab
+  // switch, so without this it can open already showing a stale reason
+  // left behind by a double-click in a *different* browser (e.g. Presets).
+  // Clearing on mount means the notice only ever reports something the
+  // user did in this panel.
+  onMount(() => {
+    audition.lastSilentReason = null;
+  });
 
   $effect(() => {
     const dir = project.projectDir;
@@ -769,9 +781,6 @@
 
   .err {
     color: var(--red);
-  }
-  .note {
-    color: var(--text-faint);
   }
 
   .badge {

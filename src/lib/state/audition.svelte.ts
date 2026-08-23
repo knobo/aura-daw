@@ -37,7 +37,14 @@ class AuditionStore {
   sounding = $state<string | null>(null);
   /** Why the last attempt made no sound, when it made none. A UI hint, not
    * an error state: "no live instance of this plugin to audition" is a
-   * perfectly ordinary answer. */
+   * perfectly ordinary answer.
+   *
+   * Unlike `sounding`, this field has no decay timer — it is cleared only
+   * by the next successful `play()` anywhere in the app, from any browser.
+   * A component that renders it is therefore responsible for clearing it
+   * on its own mount, or a reason left behind by a double-click in some
+   * other browser can surface as a stale message the moment this one
+   * mounts (see `PluginManager.svelte`'s `onMount`). */
   lastSilentReason = $state<string | null>(null);
 
   /** True while a sample is on the preview stream, so `stop` knows whether
