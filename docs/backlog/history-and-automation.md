@@ -14,9 +14,9 @@ Product doc: [`automation-audible-and-ui.md`](automation-audible-and-ui.md).
 
 - **Plan F carry-forwards:** live-document B-tree, I-1 option (a), no
   journal auto-apply. The read-only version-graph browser landed (PR #82,
-  branch `codex/undo-version-graph-ui`); the ordered follow-up is the
-  guarded linear `Undo to here` contract documented in the Plan F
-  handoff. Branch `plan-f-history` is kept so cited SHAs resolve.
+  branch `codex/undo-version-graph-ui`); the guarded linear `Undo to here`
+  contract documented in the Plan F handoff landed too (PR #107,
+  2026-08-23). Branch `plan-f-history` is kept so cited SHAs resolve.
 - **Track D leftovers:** plugin-param bounce, write/touch/latch. The
   non-blocking CLAP param path closed 2026-08-18 (PR #75, branch
   `clap-nonblocking-params`; doc+test follow-up PR #76 on branch

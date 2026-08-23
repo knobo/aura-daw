@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| `Undo to here` (Plan F ordered next step) | `feat/undo-to-here` | 2026-08-23 | Guarded linear undo-to-revision: backend validates and steps under `history_gate`, epoch+rev guarded, redo chain preserved, then the HISTORY-dock action. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
