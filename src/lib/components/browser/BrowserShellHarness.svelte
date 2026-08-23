@@ -28,11 +28,15 @@
     onActivate,
     onToggleGroup,
     foldAll = true,
+    onAudition,
+    auditionChip = false,
   }: {
     onActivate?: (row: BrowserRowRef) => void;
     onToggleGroup?: (groupKey: string, expand: boolean) => void;
     /** Off for the "a browser with no groups gets no button" case. */
     foldAll?: boolean;
+    onAudition?: (row: BrowserRowRef) => void;
+    auditionChip?: boolean;
   } = $props();
 
   const ALL: BrowserGroup<string>[] = [
@@ -75,6 +79,8 @@
   {rows}
   onToggleGroup={toggle}
   onActivate={activate}
+  {onAudition}
+  {auditionChip}
   anyCollapsed={anyFolded(folds, groupKeys)}
   onFoldAll={foldAll ? (collapse) => (folds = setAllCollapsed(folds, groupKeys, collapse)) : undefined}
 >
