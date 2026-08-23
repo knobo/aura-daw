@@ -53,17 +53,23 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| G2 — bus tracks + sends | `feat/bus-sends` | 2026-08-23 | Shared reverb/echo returns. → [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md) |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
 1. **Owner ear-checks** are owed on several landed tracks. No suite
-   substitutes for them; each backlog file lists its own.
-2. **G1 Tasks 7–10** — on HOLD until an automation/undo leftover is done
-   (owner steer, 2026-08-18). → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
+   substitutes for them; each backlog file lists its own. The newest is
+   G2's: one reverb on a bus, several tracks sent into it, one room —
+   then export and confirm the WAV has it.
+2. **G3 — sidechain edges** (bass ducks the pads). The graph now has
+   buses and sends; a sidechain is the third routing primitive.
+   → [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)
+3. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
+   is live in both the engine and the bounce.
+   → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
-Plan G2; the native-GUI embed work.
+Plan G4 (envelope-follower modulators); the native-GUI embed work.
 
 ## Read before your first commit
 
@@ -79,7 +85,8 @@ Plan G2; the native-GUI embed work.
 | Track | File |
 |---|---|
 | Plugin manager (preview slot open) | [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md) |
-| Insert FX / sends / PDC (Plan G1) | [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md) |
+| Mixer graph — inserts, sends, sidechain (Plan G; G3 next) | [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md) |
+| Insert FX / PDC task list (Plan G1) | [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md) |
 | Pitch — Coach, extraction, correction | [`docs/backlog/pitch.md`](docs/backlog/pitch.md) |
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |
 | History, undo, automation, modulation | [`docs/backlog/history-and-automation.md`](docs/backlog/history-and-automation.md) |

@@ -60,6 +60,27 @@ session burns an hour on something a sentence would have prevented.
   teardown). Use `-- --test-threads=1`. Never run `cargo test` and `tauri
   dev` against the same `src-tauri/target/`.
 
+## Audio engine
+
+- **`ParamTable::default()` has 64 mixer slots and ZERO send lanes.** An
+  unknown send index reads back as UNITY (`send_amount_linear`'s
+  fallback), so a mixer test that builds its graph with the default
+  table will see every send at full amount and pass whatever amount it
+  meant to assert. Size the table with
+  `ParamTable::with_slots_and_sends(n, sends)` in any test that touches
+  a send.
+- **A bus is panned by the BALANCE law, not the constant-power one**
+  (`mixer::balance_gains` vs `pan_gains`). A return's input is an
+  already-panned stereo sum; running it through constant-power again
+  would take a second 3 dB off at centre, so a unity send would come
+  back quieter than the dry signal it copied. If you add another
+  sum-carrying strip, it wants `balance_gains` too.
+- **A PRE-fader send is pre-PAN as well as pre-gain.** It leaves the
+  strip before the fader does anything at all, so its copy is the
+  unpanned source — which is louder at centre than the dry path is.
+  That is the standard behaviour, not a bug, and there is a test
+  pinning it (`a_pre_fader_tap_is_pre_pan_too`).
+
 ## Runtime noise that is not your bug
 
 - **If the dev log is 99% `[carla] lv2ui_extension_data(...)`, it is not
