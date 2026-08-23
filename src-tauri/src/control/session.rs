@@ -1670,9 +1670,13 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown track: {track_id}"))?;
             {
                 let track = &session.store.tracks[track_idx];
-                if track.kind != "audio" && track.kind != "midi" {
+                // Plan G2 added `bus` here: a return's WHOLE PURPOSE is to
+                // carry an insert chain — the shared reverb lives on the
+                // bus, not on the tracks sending into it. What still has no
+                // strip to put a plugin on is an automation track.
+                if !crate::audio::types::is_mixer_track(track) {
                     return Err(format!(
-                        "inserts are only legal on audio|midi tracks, not {}",
+                        "inserts are only legal on audio|midi|bus tracks, not {}",
                         track.kind
                     ));
                 }
@@ -4706,6 +4710,25 @@ mod tests {
         bus.kind = "bus".into();
         session.store.tracks.push(bus);
         parking_lot::Mutex::new(session)
+    }
+
+    /// Plan G2: a return exists to HOLD the shared effect, so the insert
+    /// guard has to admit it. Shipped rejecting `bus` once — the reverb had
+    /// nowhere to live, which is the whole feature.
+    #[test]
+    fn insert_add_accepts_a_bus_because_that_is_where_the_shared_effect_lives() {
+        let m = session_with_a_bus();
+        let c = commit(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "b-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        });
+        assert!(c.effect.rebuild);
+        let session = m.lock();
+        let bus = session.store.tracks.iter().find(|t| t.id == "b-1").unwrap();
+        assert_eq!(bus.inserts[0].id, "s-1");
     }
 
     #[test]
