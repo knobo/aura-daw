@@ -266,6 +266,173 @@ fn undo_and_redo_commits_are_journaled_but_create_no_new_history_entry() {
 }
 
 // ---------------------------------------------------------------------------
+// undo to here (Plan F carry-forward (e), ordered next step)
+// ---------------------------------------------------------------------------
+
+/// Four edits, then a walk back to the second one: the document is the one
+/// that revision describes, every step in between is on the redo stack in
+/// the right order, and redoing twice puts the document back.
+#[test]
+fn undo_to_walks_back_to_a_revision_and_leaves_a_redo_chain() {
+    let f = fixture();
+    let parent = tmp_parent("undoto-roundtrip");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let t = add_track(&f.cp, "Audio");
+
+    // Distinct labels so the 350 ms same-key merge cannot fold them.
+    for (label, gain) in [("g1", -3.0), ("g2", -6.0), ("g3", -9.0)] {
+        f.cp.commit(TxMeta::user(label), |tx| tx.apply(set_gain(&t, gain))).unwrap();
+    }
+    let path = f.log.undo_path();
+    assert_eq!(path.revs.len(), 4, "add track + three gain edits");
+    let target = path.revs[1]; // the state after g1
+
+    let out = f.cp.undo_to(target, path.epoch, path.head()).expect("undo to here");
+    assert_eq!(out.steps, 2, "g3 and g2 are undone; g1 stays applied");
+    assert_eq!(gain_of(&f.cp, &t), -3.0, "the document is the one revision g1 describes");
+    assert_eq!(f.log.depths(), (2, 2), "two steps left to undo, two to redo");
+    assert_eq!(f.log.undo_path().head(), Some(target), "the head is now the target");
+
+    // The redo chain is ordered, not merely present.
+    assert_eq!(f.cp.redo().unwrap().as_deref(), Some("g2"));
+    assert_eq!(f.cp.redo().unwrap().as_deref(), Some("g3"));
+    assert_eq!(gain_of(&f.cp, &t), -9.0, "redo restores the walked-back edits");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// Selecting the head is legal and does nothing — the document is already
+/// the one that revision describes.
+#[test]
+fn undo_to_the_head_revision_is_a_no_op() {
+    let f = fixture();
+    let parent = tmp_parent("undoto-head");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let t = add_track(&f.cp, "Audio");
+    f.cp.commit(TxMeta::user("gain"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+
+    let path = f.log.undo_path();
+    let out = f.cp.undo_to(path.head().unwrap(), path.epoch, path.head()).unwrap();
+    assert_eq!(out.steps, 0);
+    assert_eq!(out.label, None);
+    assert_eq!(gain_of(&f.cp, &t), -6.0);
+    assert_eq!(f.log.depths(), (2, 0), "nothing moved between the stacks");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// STALE TARGET: the ancestry moved between the read and the request (a new
+/// edit landed). The request carries the head it saw, so it aborts whole —
+/// no partial walk, no consumed step.
+#[test]
+fn undo_to_aborts_when_the_undo_head_moved_under_it() {
+    let f = fixture();
+    let parent = tmp_parent("undoto-stale");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let t = add_track(&f.cp, "Audio");
+    f.cp.commit(TxMeta::user("g1"), |tx| tx.apply(set_gain(&t, -3.0))).unwrap();
+    let path = f.log.undo_path();
+    let target = path.revs[1];
+
+    // Something else commits before the request arrives.
+    f.cp.commit(TxMeta::user("g2"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+
+    let err = f.cp.undo_to(target, path.epoch, path.head()).unwrap_err();
+    assert!(err.contains("changed"), "the message must say the history moved: {err}");
+    assert_eq!(gain_of(&f.cp, &t), -6.0, "nothing was applied");
+    assert_eq!(f.log.depths(), (3, 0), "no step was consumed");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// EVICTION / off-path target: a revision that is not on the undo stack is
+/// refused. An already-undone step is the reachable case (it sits on the
+/// redo stack); a bottom-evicted one behaves identically because both are
+/// simply absent from `undo_revs`.
+#[test]
+fn undo_to_refuses_a_revision_that_is_not_on_the_undo_path() {
+    let f = fixture();
+    let parent = tmp_parent("undoto-offpath");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let t = add_track(&f.cp, "Audio");
+    f.cp.commit(TxMeta::user("g1"), |tx| tx.apply(set_gain(&t, -3.0))).unwrap();
+    f.cp.commit(TxMeta::user("g2"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+    let gone = f.log.undo_path().head().unwrap(); // g2's rev
+
+    f.cp.undo().unwrap(); // g2 moves to the redo stack
+    let path = f.log.undo_path();
+    assert!(!path.revs.contains(&gone));
+
+    let err = f.cp.undo_to(gone, path.epoch, path.head()).unwrap_err();
+    assert!(err.contains("not on the undo path"), "unexpected message: {err}");
+    assert_eq!(gain_of(&f.cp, &t), -3.0, "nothing was applied");
+    assert_eq!(f.log.depths(), (2, 1), "the stacks are untouched");
+
+    // A revision that never existed is refused the same way.
+    let err = f.cp.undo_to(9_999, path.epoch, path.head()).unwrap_err();
+    assert!(err.contains("not on the undo path"), "unexpected message: {err}");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// EPOCH SWAP: the document was replaced between the read and the request.
+/// The epoch guard refuses before any op is applied — undoing across a
+/// document swap is corruption, not undo (`History::clear`'s doc).
+#[test]
+fn undo_to_aborts_when_the_document_was_swapped() {
+    let f = fixture();
+    let parent = tmp_parent("undoto-epoch");
+    f.cp.create_project(parent.to_str().unwrap(), "A").unwrap();
+    let t = add_track(&f.cp, "Audio");
+    f.cp.commit(TxMeta::user("g1"), |tx| tx.apply(set_gain(&t, -3.0))).unwrap();
+    let path = f.log.undo_path();
+    let target = path.revs[1];
+
+    // A second project = a document swap = an epoch boundary.
+    f.cp.create_project(parent.to_str().unwrap(), "B").unwrap();
+    assert_eq!(f.log.depths(), (0, 0), "the swap cleared history");
+
+    let err = f.cp.undo_to(target, path.epoch, path.head()).unwrap_err();
+    assert!(err.contains("epoch"), "the message must name the swap: {err}");
+    assert_eq!(f.log.depths(), (0, 0), "nothing was pushed onto the new document's stacks");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// Every step is an ORDINARY undo commit: journaled, `HistoryMode::Replay`,
+/// no new history entry. Two steps = two journal batches, not one.
+#[test]
+fn undo_to_journals_one_batch_per_step_and_creates_no_history_entry() {
+    let f = fixture();
+    let parent = tmp_parent("undoto-journal");
+    let project = f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let dir = std::path::PathBuf::from(project.path.unwrap());
+    let t = add_track(&f.cp, "Audio");
+    f.cp.commit(TxMeta::user("g1"), |tx| tx.apply(set_gain(&t, -3.0))).unwrap();
+    f.cp.commit(TxMeta::user("g2"), |tx| tx.apply(set_gain(&t, -6.0))).unwrap();
+    let before = batches(&journal_lines(&dir)).len();
+
+    let path = f.log.undo_path();
+    let target = path.revs[0];
+    let out = f.cp.undo_to(target, path.epoch, path.head()).unwrap();
+    assert_eq!(out.steps, 2);
+    assert_eq!(out.label.as_deref(), Some("g1"), "the label of the LAST step undone");
+
+    let lines = journal_lines(&dir);
+    let after = batches(&lines).len();
+    assert_eq!(after - before, 2, "one journal batch per undo step");
+    assert_eq!(f.log.depths(), (1, 2), "two entries migrated, none created");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+// ---------------------------------------------------------------------------
 // the 350 ms fallback, through the real commit path
 // ---------------------------------------------------------------------------
 

@@ -3615,6 +3615,20 @@ impl ControlPlane {
             self.close_gesture(g);
         }
         let _gate = self.history_gate.lock();
+        self.undo_step()
+    }
+
+    /// One undo step with the gate ALREADY HELD — the shared body of
+    /// [`Self::undo`] and [`Self::undo_to`]. `history_gate` is a plain
+    /// `parking_lot::Mutex` and is not reentrant, so a caller that holds it
+    /// must never route back through [`Self::undo`].
+    ///
+    /// Everything the single-step contract promises still holds here: the
+    /// entry's inverses go through the normal commit path (journaled, own
+    /// rebuild, `project://changed`), `HistoryMode::Replay` suppresses a new
+    /// history entry, the ORIGINAL entry migrates onto the redo stack, and a
+    /// failed commit puts it back untouched.
+    fn undo_step(&self) -> Result<Option<String>, String> {
         let Some((entry, popped_epoch)) = self.committer.log().pop_undo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
@@ -3673,6 +3687,104 @@ impl ControlPlane {
                 Err(e)
             }
         }
+    }
+
+    /// Walk the linear undo ancestry back to `target_rev` — the Plan F
+    /// carry-forward (e) "ordered next step".
+    ///
+    /// SEMANTICS: EXCLUSIVE. Every undo entry ABOVE `target_rev` is undone;
+    /// `target_rev` itself stays applied, so the document ends as the one
+    /// `materialize_version(target_rev)` describes — the document the
+    /// HISTORY dock's detail pane is showing when the user picks that row.
+    /// Picking the head is therefore a successful no-op.
+    ///
+    /// THE GUARDS, and what each is for:
+    /// * `expected_epoch` — the document must still be the one the caller
+    ///   read. Undoing across a document swap is corruption, not undo
+    ///   (`History::clear`'s doc). Checked here AND again per step inside
+    ///   `commit_replay`, which is what makes "nothing applied" true rather
+    ///   than merely "nothing recorded".
+    /// * `expected_head_rev` — the undo ancestry must not have moved. NOT
+    ///   `Session::rev`: transient commits (transport play/stop, gesture
+    ///   folds) bump that without touching this stack, so guarding on it
+    ///   would abort because the user pressed play.
+    /// * `target_rev` must be ON the current undo path. An already-undone
+    ///   step (now on the redo stack) and a bottom-evicted one
+    ///   (`UNDO_STACK_LIMIT`) are both simply absent, and both are refused
+    ///   with the same message: the request describes an ancestry this
+    ///   document does not have.
+    ///
+    /// ONE GATE FOR THE WHOLE WALK: `history_gate` is taken once and held
+    /// across every step, so a concurrent `undo`/`redo` cannot interleave
+    /// into the middle of a walk. The gate is not reentrant, hence
+    /// [`Self::undo_step`] rather than [`Self::undo`].
+    ///
+    /// M-4, an open gesture is closed FIRST, exactly as [`Self::undo`] does
+    /// — the drag becomes the finished step it already looks like. That
+    /// close records a fresh entry, which MOVES the head, so a walk
+    /// requested mid-drag then fails its own head guard and the user
+    /// retries against the ancestry they can now see. Aborting is the right
+    /// answer: the row they clicked was chosen before the drag existed.
+    ///
+    /// PARTIAL WALKS ARE REPORTED, NOT HIDDEN. Each step is a real
+    /// committed transaction; if step `k` fails (an epoch swap landing
+    /// mid-walk is the reachable case), the `k-1` steps before it stay
+    /// applied and the error says so. The caller re-reads the overview.
+    pub fn undo_to(
+        &self,
+        target_rev: u64,
+        expected_epoch: u64,
+        expected_head_rev: Option<u64>,
+    ) -> Result<UndoToOutcome, String> {
+        if let Some(g) = self.gesture.end(None) {
+            self.close_gesture(g);
+        }
+        let _gate = self.history_gate.lock();
+
+        let path = self.committer.log().undo_path();
+        if path.epoch != expected_epoch {
+            return Err(format!(
+                "the project was replaced under this request (epoch {expected_epoch} -> {}) \
+                 — nothing applied",
+                path.epoch
+            ));
+        }
+        if path.head() != expected_head_rev {
+            return Err(format!(
+                "the edit history changed under this request (head {:?} -> {:?}) \
+                 — nothing applied",
+                expected_head_rev,
+                path.head()
+            ));
+        }
+        let Some(at) = path.revs.iter().position(|r| *r == target_rev) else {
+            return Err(format!(
+                "revision {target_rev} is not on the undo path — it was undone already, \
+                 or dropped from the {} most recent steps history keeps",
+                history::UNDO_STACK_LIMIT
+            ));
+        };
+        let steps = path.revs.len() - 1 - at;
+
+        let mut label = None;
+        for done in 0..steps {
+            match self.undo_step() {
+                Ok(Some(l)) => label = Some(l),
+                Ok(None) => {
+                    return Err(format!(
+                        "the undo history ran out after {done} of {steps} steps — \
+                         stopped at the earliest step it still keeps"
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "undo to revision {target_rev} stopped after {done} of {steps} \
+                         steps: {e}"
+                    ))
+                }
+            }
+        }
+        Ok(UndoToOutcome { steps, label })
     }
 
     /// Apply a recorded op list through the normal commit path in
@@ -5146,6 +5258,19 @@ pub struct HistoryStep {
     pub label: Option<String>,
     pub undo_depth: usize,
     pub redo_depth: usize,
+}
+
+/// What a completed [`ControlPlane::undo_to`] walk did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoToOutcome {
+    /// How many undo steps were applied. 0 is a legal, successful answer:
+    /// the target was already the head.
+    pub steps: usize,
+    /// The label of the LAST step undone — what a toast shows ("back to
+    /// <label>" is wrong; this is the step the walk ended on). `None` when
+    /// `steps == 0`.
+    pub label: Option<String>,
 }
 
 /// Read-only product surface over Plan F's retained version chain.
