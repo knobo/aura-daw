@@ -5297,6 +5297,18 @@ pub struct HistoryVersion {
     /// not: the undo commits themselves, anything already undone (now on the
     /// redo stack), and anything dropped by `UNDO_STACK_LIMIT` while the
     /// version graph still keeps it.
+    ///
+    /// A HINT, not a guarantee: `history_overview` reads this row from the
+    /// `versions` mutex and the undo path it is checked against from a
+    /// separate, later acquisition of the `history`/`epoch` mutexes (see
+    /// that function's doc). A commit landing between the two can retain a
+    /// new row or move the path out from under it, so this bit can be one
+    /// refresh stale — set (or unset) for a row that no longer matches by
+    /// the time the response reaches the renderer. Safe regardless: the
+    /// walk itself re-reads a fresh `undo_path()` under `history_gate` and
+    /// refuses a `target_rev` that has fallen off it, so a stale bit can
+    /// only mis-enable or mis-disable a button for one refresh — it can
+    /// never cause `history_undo_to` to apply the wrong edit.
     pub on_undo_path: bool,
 }
 
@@ -5332,6 +5344,19 @@ pub struct HistoryVersionDetail {
     pub automation_lane_count: usize,
 }
 
+/// TWO SEPARATE LOCK ACQUISITIONS, NOT MERGED: `control.version_overview()`
+/// takes `HistoryLog`'s `versions` mutex and releases it; `control.undo_path()`
+/// then separately takes `epoch`/`history`. Zipping `on_undo_path` onto the
+/// version list therefore pairs two reads from different instants — see
+/// [`HistoryVersion::on_undo_path`] for the (benign) consequence. This is
+/// deliberate, not an oversight: `control/history.rs`'s module doc makes
+/// `history`, `journal` and `versions` a binding invariant that they are
+/// NEVER held at the same time (each is a leaf, entered only after the
+/// others have been released). Reading `versions` and `undo_path` under one
+/// combined hold would mean nesting one inside the other for the first time
+/// anywhere in the module, which is the kind of new lock-order edge that
+/// wants its own PR and its own argument, not a side effect of adding two
+/// display fields to a read-only overview.
 #[tauri::command]
 pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOverview {
     let (stats, versions) = control.version_overview();
