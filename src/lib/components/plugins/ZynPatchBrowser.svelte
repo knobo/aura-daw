@@ -17,6 +17,10 @@
    * piano roll — load is still a project edit; the note is not.
    */
   import { zyn } from "../../state/zynpatches.svelte";
+  // Aliased: this file already declares a local `audition(patch)` helper
+  // (the hold-to-preview function below) — importing the shared store
+  // under its usual name would collide with that declaration.
+  import { audition as auditionStore } from "../../state/audition.svelte";
   import type { ZynPatch } from "../../types/ipc";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
   import { FoldController } from "../browser/fold-controller.svelte";
@@ -227,6 +231,18 @@
                   onpointerdown={(e) => onPatchPointerDown(patch, e)}
                   onpointerup={onPatchPointerUp}
                   onpointercancel={onPatchPointerUp}
+                  ondblclick={() => {
+                    if (!auditionStore.enabled) return;
+                    if (!inst || inst.status !== "active") {
+                      void auditionStore.play({
+                        kind: "silent",
+                        reason: "no live Zyn instance to audition through",
+                      });
+                      return;
+                    }
+                    void zyn.audition(inst.id, patch);
+                    setTimeout(() => void zyn.previewUp(), 700);
+                  }}
                 >
                   <span class="pnum silk">{String(patch.program).padStart(3, "0")}</span>
                   <span class="pname">{patch.name}</span>

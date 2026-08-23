@@ -12,6 +12,7 @@
   import { openPluginParams } from "../../state/plugin-panel";
   import { toasts } from "../../state/toasts.svelte";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
+  import { audition } from "../../state/audition.svelte";
   import { backend } from "../../tauri";
   import type { PluginDescriptor, PluginFormat, TrackState } from "../../types/ipc";
   import { FoldController } from "../browser/fold-controller.svelte";
@@ -21,8 +22,10 @@
   import BrowserRow from "../browser/BrowserRow.svelte";
   import EmptyState from "../browser/EmptyState.svelte";
   import ParamChip from "../browser/ParamChip.svelte";
+  import AuditionChip from "../browser/AuditionChip.svelte";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
   import AutomationMatrix from "./AutomationMatrix.svelte";
+  import { resolveDescriptorTarget, resolvePluginInstanceTarget } from "../../utils/audition-target";
   import {
     buildBrowseSections,
     filterByFacets,
@@ -385,6 +388,9 @@
   {#if plugins.error}
     <div class="err silk" role="alert">{plugins.error}</div>
   {/if}
+  {#if audition.lastSilentReason}
+    <div class="note silk" role="status">{audition.lastSilentReason}</div>
+  {/if}
 
   {#if mode === "matrix"}
     <!-- The search box and facet chips are catalog filters; the matrix
@@ -424,6 +430,7 @@
         <button type="button" class="chip mono" class:on={formats.includes("lv2")} aria-pressed={formats.includes("lv2")} onclick={() => toggleFormat("lv2")}>LV2</button>
         <button type="button" class="chip mono" class:on={favoritesOnly} aria-pressed={favoritesOnly} title="Favourites only" onclick={() => persist({ favoritesOnly: !favoritesOnly })}>★</button>
         <button type="button" class="chip mono" class:on={recentsOnly} aria-pressed={recentsOnly} title="Recent only" onclick={() => persist({ recentsOnly: !recentsOnly })}>⏱</button>
+        <AuditionChip />
       </div>
     </div>
     {#if typeFacets.length > 0}
@@ -468,6 +475,8 @@
                     }
                   }}
                   onclick={() => void openPluginParams(inst.id)}
+                  ondblclick={() =>
+                    void audition.play(resolvePluginInstanceTarget(inst.id, project.tracks))}
                 >
                   {#snippet badge()}
                     <span class="dot {inst.status}" title={inst.status} aria-hidden="true"></span>
@@ -553,6 +562,10 @@
                   onclick={() => {
                     setActive({ kind: "item", groupKey: s.key, itemIndex: i });
                   }}
+                  ondblclick={() =>
+                    void audition.play(
+                      resolveDescriptorTarget(d.uid, plugins.instances, project.tracks),
+                    )}
                 >
                   {#snippet badge()}
                     <span class="badge mono {d.format}">{d.format}</span>
@@ -756,6 +769,9 @@
 
   .err {
     color: var(--red);
+  }
+  .note {
+    color: var(--text-faint);
   }
 
   .badge {
