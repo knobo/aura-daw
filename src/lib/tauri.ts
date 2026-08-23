@@ -80,6 +80,7 @@ import type {
   TrackState,
   TranscribeRequest,
   TransportState,
+  UndoToOutcome,
   UserThemeFile,
   WaveformTileRequest,
   ZynPatch,
@@ -291,6 +292,8 @@ export interface Backend {
   historyOverview?(): Promise<HistoryOverview>;
   /** Materialize one retained revision and return a summary, never state. */
   historyVersion?(rev: number): Promise<HistoryVersionDetail | null>;
+  /** Walk the undo ancestry back to `targetRev`; real engine only. */
+  historyUndoTo?(targetRev: number, expectedEpoch: number, expectedHeadRev: number | null): Promise<UndoToOutcome>;
 
   // midi (all musical positions are integer ticks at the project ppq)
   setTempoMap(
@@ -796,6 +799,9 @@ class TauriBackend implements Backend {
   }
   historyOverview() {
     return invoke<HistoryOverview>("history_overview");
+  }
+  historyUndoTo(targetRev: number, expectedEpoch: number, expectedHeadRev: number | null) {
+    return invoke<UndoToOutcome>("history_undo_to", { targetRev, expectedEpoch, expectedHeadRev });
   }
   historyVersion(rev: number) {
     return invoke<HistoryVersionDetail | null>("history_version", { rev });

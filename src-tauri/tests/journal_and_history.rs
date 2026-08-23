@@ -397,7 +397,12 @@ fn undo_to_aborts_when_the_document_was_swapped() {
     assert_eq!(f.log.depths(), (0, 0), "the swap cleared history");
 
     let err = f.cp.undo_to(target, path.epoch, path.head()).unwrap_err();
+    // Load-bearing: proves the EPOCH guard fired (not the head guard, which
+    // would also reject this call since B's empty stack has no head to match).
     assert!(err.contains("epoch"), "the message must name the swap: {err}");
+    // Not load-bearing: the swap already emptied the stacks (asserted above,
+    // before this call), so this holds whether or not the guard did anything —
+    // it only reconfirms undo_to did not somehow push onto B's history.
     assert_eq!(f.log.depths(), (0, 0), "nothing was pushed onto the new document's stacks");
 
     f.eng.send(ControlMsg::Shutdown);

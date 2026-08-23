@@ -3701,9 +3701,13 @@ impl ControlPlane {
     /// THE GUARDS, and what each is for:
     /// * `expected_epoch` — the document must still be the one the caller
     ///   read. Undoing across a document swap is corruption, not undo
-    ///   (`History::clear`'s doc). Checked here AND again per step inside
-    ///   `commit_replay`, which is what makes "nothing applied" true rather
-    ///   than merely "nothing recorded".
+    ///   (`History::clear`'s doc). Checked here against the caller's value,
+    ///   and independently per step inside `commit_replay` — which re-checks
+    ///   the epoch observed at POP time, not `expected_epoch` itself. That
+    ///   second check is still enough: any epoch boundary clears the undo
+    ///   stack, so once this guard has passed, a step that still manages to
+    ///   pop something proves the epoch has not moved since. That is what
+    ///   makes "nothing applied" true rather than merely "nothing recorded".
     /// * `expected_head_rev` — the undo ancestry must not have moved. NOT
     ///   `Session::rev`: transient commits (transport play/stop, gesture
     ///   folds) bump that without touching this stack, so guarding on it
@@ -3772,8 +3776,8 @@ impl ControlPlane {
                 Ok(Some(l)) => label = Some(l),
                 Ok(None) => {
                     return Err(format!(
-                        "the undo history ran out after {done} of {steps} steps — \
-                         stopped at the earliest step it still keeps"
+                        "the document was replaced under this request after {done} of {steps} \
+                         steps — nothing left to undo"
                     ))
                 }
                 Err(e) => {
@@ -3850,6 +3854,12 @@ impl ControlPlane {
 
     pub fn version_overview(&self) -> (vergraph::VersionStats, Vec<vergraph::VersionItem>) {
         self.committer.log().version_overview()
+    }
+
+    /// The linear undo ancestry, for the browsing surface's `Undo to here`
+    /// affordance and the guard pair it must hand back.
+    pub fn undo_path(&self) -> history::UndoPath {
+        self.committer.log().undo_path()
     }
 
     pub fn materialize_version(&self, rev: u64) -> Option<SessionSnapshot> {
@@ -5282,6 +5292,12 @@ pub struct HistoryVersion {
     pub charged_bytes: usize,
     pub label: String,
     pub actor: String,
+    /// True when this revision is on the CURRENT linear undo ancestry, i.e.
+    /// when `history_undo_to` will accept it. Retained revisions that are
+    /// not: the undo commits themselves, anything already undone (now on the
+    /// redo stack), and anything dropped by `UNDO_STACK_LIMIT` while the
+    /// version graph still keeps it.
+    pub on_undo_path: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5293,6 +5309,16 @@ pub struct HistoryOverview {
     pub materialized: usize,
     pub replay_only: usize,
     pub versions: Vec<HistoryVersion>,
+    /// The document epoch these versions belong to. Handed back verbatim by
+    /// `history_undo_to` so the backend can refuse a request that was
+    /// composed against a document that has since been replaced.
+    pub epoch: u64,
+    /// The revision a plain undo would consume next — the head of the undo
+    /// ancestry, `None` when there is nothing to undo. The second half of
+    /// the guard pair. NOT the live `Session::rev`: transient commits
+    /// (transport play/stop, gesture folds) move that without touching the
+    /// undo stack.
+    pub head_rev: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5310,6 +5336,8 @@ pub struct HistoryVersionDetail {
 pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOverview {
     let (stats, versions) = control.version_overview();
     let (undo_depth, redo_depth) = control.history_depths();
+    let path = control.undo_path();
+    let on_path: std::collections::HashSet<u64> = path.revs.iter().copied().collect();
     HistoryOverview {
         undo_depth,
         redo_depth,
@@ -5319,6 +5347,7 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
         versions: versions
             .into_iter()
             .map(|v| HistoryVersion {
+                on_undo_path: on_path.contains(&v.rev),
                 rev: v.rev,
                 materialized: v.materialized,
                 charged_bytes: v.charged_bytes,
@@ -5326,6 +5355,8 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
                 actor: v.actor,
             })
             .collect(),
+        epoch: path.epoch,
+        head_rev: path.head(),
     }
 }
 
@@ -5390,6 +5421,29 @@ pub async fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, 
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Walk the undo ancestry back to `target_rev` (Plan F carry-forward (e)) —
+/// thin delegate over [`ControlPlane::undo_to`]. Additive command; `undo`
+/// and `redo` are untouched.
+///
+/// `expected_epoch` / `expected_head_rev` are the values the caller read
+/// from [`history_overview`]. The backend refuses the walk if either has
+/// moved — the renderer never decides that, it only reports what it saw.
+///
+/// Async for [`undo`]'s reason (I-6), and more so: this is N undos, any one
+/// of which can re-instantiate a plugin.
+#[tauri::command]
+pub async fn history_undo_to(
+    target_rev: u64,
+    expected_epoch: u64,
+    expected_head_rev: Option<u64>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<UndoToOutcome, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.undo_to(target_rev, expected_epoch, expected_head_rev))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Import an audio file as a clip (STUB until zone B lands).
