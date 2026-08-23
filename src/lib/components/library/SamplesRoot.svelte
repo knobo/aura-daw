@@ -14,6 +14,7 @@
    */
   import { onMount } from "svelte";
   import { library } from "../../state/library.svelte";
+  import { audition } from "../../state/audition.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { encodeLibraryDrag } from "../../utils/library";
   import { FoldController } from "../browser/fold-controller.svelte";
@@ -97,6 +98,12 @@
       }}
       anyCollapsed={folds.anyCollapsed(groupKeys)}
       onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
+      auditionChip
+      onAudition={(row) => {
+        if (row.kind !== "item") return;
+        const e = groups.find((g) => g.key === row.groupKey)?.items[row.itemIndex];
+        if (e?.kind === "audio") void audition.play({ kind: "sample", path: e.path });
+      }}
     >
       {#snippet children({ activeId, setActive })}
         {#if library.loading}
@@ -137,6 +144,9 @@
                 onclick={() => {
                   setActive({ kind: "item", groupKey: g.key, itemIndex: i });
                   openEntry(e);
+                }}
+                ondblclick={() => {
+                  if (e.kind === "audio") void audition.play({ kind: "sample", path: e.path });
                 }}
               />
             {/each}

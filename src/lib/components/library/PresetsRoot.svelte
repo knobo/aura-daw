@@ -15,7 +15,10 @@
   import { onMount } from "svelte";
   import { instruments } from "../../state/instruments.svelte";
   import { zyn } from "../../state/zynpatches.svelte";
+  import { project } from "../../state/project.svelte";
   import { backend } from "../../tauri";
+  import { audition } from "../../state/audition.svelte";
+  import { AUDITION_KEY, resolvePluginInstanceTarget } from "../../utils/audition-target";
   import { encodeLibraryDrag } from "../../utils/library";
   import { FoldController } from "../browser/fold-controller.svelte";
   import { flattenRows, groupItems, rankItems, rowId } from "../browser/browser-model";
@@ -96,6 +99,23 @@
   }}
   anyCollapsed={folds.anyCollapsed(groupKeys)}
   onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
+  auditionChip
+  onAudition={(row) => {
+    if (row.kind !== "item") return;
+    if (section === "instruments") {
+      const i = instrumentGroups.find((g) => g.key === row.groupKey)?.items[row.itemIndex];
+      if (i) void audition.play({ kind: "instrument", instrumentId: i.id, key: AUDITION_KEY });
+    } else {
+      const p = patchGroups.find((g) => g.key === row.groupKey)?.items[row.itemIndex];
+      if (!p) return;
+      const open = zyn.openInstance;
+      void audition.play(
+        open
+          ? resolvePluginInstanceTarget(open.id, project.tracks)
+          : { kind: "silent", reason: "open a Zyn instance to audition its patches" },
+      );
+    }
+  }}
 >
   {#snippet filters()}
     <button
@@ -189,6 +209,14 @@
               ondragstart={(e) =>
                 e.dataTransfer && encodeLibraryDrag(e.dataTransfer, { kind: "zynPatch", patch: p })}
               onclick={() => setActive({ kind: "item", groupKey: g.key, itemIndex: idx })}
+              ondblclick={() => {
+                const open = zyn.openInstance;
+                void audition.play(
+                  open
+                    ? resolvePluginInstanceTarget(open.id, project.tracks)
+                    : { kind: "silent", reason: "open a Zyn instance to audition its patches" },
+                );
+              }}
             />
           {/each}
         </BrowserSection>
