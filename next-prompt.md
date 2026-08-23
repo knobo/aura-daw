@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Step 7 — unified audition (plugin track) | `feat/browser-audition` | 2026-08-23 | Double-click any browser row to hear it, behind `browserAudition` (default off). Design §8.2. |
 
 ## Next up — unclaimed
 
