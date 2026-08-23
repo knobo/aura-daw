@@ -291,6 +291,7 @@ pub fn start(
                 ensure_project_fn: None,
                 param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
                 param_writes: Vec::new(),
+                driven_params: Vec::new(),
                 automation_modes: Vec::new(),
                 tempo_map: None,
                 slots: HashMap::new(),
@@ -1108,6 +1109,17 @@ struct Control {
     /// Reused scratch for `param_automation.tick` so the tick allocates
     /// nothing steady-state.
     param_writes: Vec<crate::plugins::automation::ParamWrite>,
+    /// What the driver has most recently written to the host, per
+    /// (instance, param index) — the read-back `pump_meter_frames` ships so
+    /// an open param panel can paint the value automation is actually
+    /// holding instead of the document's (Track D ruling 2).
+    ///
+    /// An UPSERT set, not the tick's deltas: `tick` suppresses a value it
+    /// already sent (`EPSILON`/`REASSERT_TICKS`), so a frame carrying only
+    /// this tick's writes would blank a held param 60 times a second.
+    /// Cleared whenever the transport stops or a rebuild replaces the
+    /// driver, which is exactly when the UI must stop following.
+    driven_params: Vec<crate::audio::types::DrivenParam>,
     /// Slot-indexed automation mode, refreshed every rebuild from
     /// `store.tracks` — read every control-thread tick by
     /// `drive_automation_recording` (Task 9) without touching the session
@@ -2033,6 +2045,10 @@ impl Control {
         }
         self.pending_automation_finish.append(&mut ended);
         self.param_automation = param_driver;
+        // The lanes just changed under us: any read-back naming a param this
+        // rebuild no longer drives is now a lie. Drop the set and let the
+        // next tick refill it from the new driver.
+        self.driven_params.clear();
         self.tempo_map = tempo_map;
         self.automation_modes = automation_modes;
         self.base_gains = base_gains;
@@ -2258,13 +2274,41 @@ impl Control {
     /// Only while the transport is playing: a stopped transport leaves the
     /// last automated value in place, which is what the user sees and hears
     /// until they move the knob or reload the project.
+    /// Fold a tick's writes into the driven-param read-back, upserting by
+    /// (instance, index). Linear in both — a tick writes one entry per
+    /// automated param, and the set holds one per automated param, so both
+    /// are the count of plugin-param lanes, not of params.
+    fn absorb_driven(
+        driven: &mut Vec<crate::audio::types::DrivenParam>,
+        writes: &[crate::plugins::automation::ParamWrite],
+    ) {
+        for w in writes {
+            match driven
+                .iter_mut()
+                .find(|d| d.index == w.index && d.instance_id == w.instance)
+            {
+                Some(existing) => existing.value = w.value,
+                None => driven.push(crate::audio::types::DrivenParam {
+                    instance_id: w.instance.clone(),
+                    index: w.index,
+                    value: w.value,
+                }),
+            }
+        }
+    }
+
     fn drive_param_automation(&mut self) {
         if self.param_automation.is_empty() || !self.shared.playing.load(Relaxed) {
+            // Nothing is driving these any more, so the UI must stop
+            // following: a stale read-back would pin the panel to the last
+            // automated value while the user turns the knob underneath it.
+            self.driven_params.clear();
             return;
         }
         let pos = self.shared.position.load(Relaxed);
         let mut writes = std::mem::take(&mut self.param_writes);
         self.param_automation.tick(pos, &mut writes);
+        Self::absorb_driven(&mut self.driven_params, &writes);
         // ONE host call per instance per tick (review I-2): `tick` hands its
         // writes out grouped by instance, so a contiguous run IS a plugin's
         // whole batch. If that grouping ever regressed this would still be
@@ -2773,7 +2817,13 @@ impl Control {
             session.store.tracks.iter().map(|t| t.id.clone()).collect()
         };
         let position = self.shared.position.load(Relaxed);
-        let frame = self.accum.take_frame(0, &order, position);
+        let mut frame = self.accum.take_frame(0, &order, position);
+        // The driven-param read-back rides the meter frame rather than a
+        // channel of its own: it is display state sampled at the same 60 Hz,
+        // about the same instant `position_samples` names. Empty (one clone
+        // of an empty Vec) whenever nothing is automated or the transport is
+        // stopped, which is the overwhelmingly common case.
+        frame.driven_params = self.driven_params.clone();
         self.sinks.retain_mut(|(sink, seq)| {
             let mut f = frame.clone();
             f.seq = *seq;
@@ -4718,6 +4768,7 @@ mod tests {
             ensure_project_fn: None,
             param_automation: crate::plugins::automation::ParamAutomationDriver::empty(),
             param_writes: Vec::new(),
+            driven_params: Vec::new(),
             automation_modes: Vec::new(),
             tempo_map: None,
             slots: HashMap::new(),
@@ -5582,6 +5633,123 @@ mod tests {
         let w = &ctl.param_writes[0];
         assert_eq!((w.instance.as_str(), w.format.as_str(), w.index), ("inst-1", "lv2", 7));
         assert!((w.value - 0.5).abs() < 1e-3, "interpolated at the transport position: {}", w.value);
+    }
+
+    /// Track D ruling 2 keeps plugin-param automation OUT of the document,
+    /// so the panel had nothing to paint but the stored value while the
+    /// parameter moved. `driven_params` is that read-back — the driver's own
+    /// write, not a second evaluation of the curve.
+    #[test]
+    fn the_driven_param_read_back_carries_what_the_driver_wrote() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(48_000, Relaxed); // halfway up the ramp
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+
+        assert_eq!(ctl.driven_params.len(), 1, "one automated param, one read-back entry");
+        let d = &ctl.driven_params[0];
+        assert_eq!((d.instance_id.as_str(), d.index), ("inst-1", 7));
+        assert_eq!(d.value, ctl.param_writes[0].value, "the read-back IS the host write");
+    }
+
+    /// The read-back is an UPSERT set, not the tick's deltas. `tick`
+    /// suppresses a value it already sent, so a frame built from this tick's
+    /// writes alone would blank a held param 60 times a second — the panel
+    /// would flicker back to the document value between changes.
+    #[test]
+    fn a_held_param_stays_in_the_read_back_across_a_silent_tick() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(48_000, Relaxed);
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+        let driven = ctl.driven_params[0].value;
+
+        // Same position again: the value has not changed, so the driver
+        // suppresses the write (EPSILON) and emits nothing at all.
+        ctl.drive_param_automation();
+        assert!(ctl.param_writes.is_empty(), "the tick suppressed the unchanged value");
+        assert_eq!(ctl.driven_params.len(), 1, "…and the read-back still holds it");
+        assert_eq!(ctl.driven_params[0].value, driven);
+
+        // Move up the ramp: the same entry is updated, not duplicated.
+        ctl.shared.position.store(72_000, Relaxed);
+        ctl.drive_param_automation();
+        assert_eq!(ctl.driven_params.len(), 1, "upserted by (instance, index)");
+        assert!(ctl.driven_params[0].value > driven, "and it followed the ramp up");
+    }
+
+    /// Stopping is what tells the UI to stop following: with the transport
+    /// parked the user's own knob turns own the parameter again, and a stale
+    /// read-back would pin the panel to the last automated value.
+    #[test]
+    fn stopping_the_transport_clears_the_driven_param_read_back() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(48_000, Relaxed);
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+        assert_eq!(ctl.driven_params.len(), 1);
+
+        ctl.shared.playing.store(false, Relaxed);
+        ctl.drive_param_automation();
+        assert!(ctl.driven_params.is_empty(), "a stopped transport drives nothing");
+    }
+
+    /// A rebuild can drop the very lane an entry names. Keeping the entry
+    /// would leave the panel following a param nothing drives any more.
+    #[test]
+    fn a_rebuild_drops_a_read_back_for_a_lane_that_is_gone() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(48_000, Relaxed);
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+        assert_eq!(ctl.driven_params.len(), 1, "the read-back is populated first");
+
+        session.lock().automation.lanes.clear();
+        ctl.rebuild();
+
+        assert!(ctl.param_automation.is_empty(), "the lane is gone");
+        assert!(ctl.driven_params.is_empty(), "so is its read-back");
+    }
+
+    /// The read-back reaches the UI on the meter frame, at the same 60 Hz and
+    /// about the same instant `position_samples` names — no second channel.
+    #[test]
+    fn the_meter_frame_ships_the_driven_param_read_back() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        seed_plugin_lane(&session);
+        ctl.shared.playing.store(true, Relaxed);
+        ctl.shared.position.store(48_000, Relaxed);
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        tx.send(ControlMsg::Subscribe(Box::new(CountingSink(
+            Arc::new(AtomicUsize::new(0)),
+            frames.clone(),
+        ))))
+        .unwrap();
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+        // `run` set `last_frame` at construction, so one immediate iteration
+        // is inside the 60 Hz interval — age it and pump explicitly.
+        ctl.last_frame = Instant::now() - FRAME_INTERVAL * 2;
+        ctl.pump_meter_frames();
+
+        let got = frames.lock();
+        let frame = got.last().expect("one frame was pushed");
+        assert_eq!(frame.driven_params.len(), 1, "the frame carries the read-back");
+        assert_eq!(frame.driven_params[0].instance_id, "inst-1");
+        assert_eq!(frame.driven_params[0].index, 7);
     }
 
     /// The other half of the same guard: a STOPPED transport writes nothing,

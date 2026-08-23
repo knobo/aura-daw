@@ -85,6 +85,35 @@ pub struct MeterFrame {
     pub tracks: Vec<TrackMeter>,
     /// Master bus meter (track_id == "master").
     pub master: TrackMeter,
+    /// Plugin params the engine's `ParamAutomationDriver` is currently
+    /// driving, with the value it last wrote to the host. Empty whenever
+    /// the transport is stopped or nothing is automated — which is also how
+    /// the UI knows to stop following (see `DrivenParam`).
+    #[serde(default)]
+    pub driven_params: Vec<DrivenParam>,
+}
+
+/// One plugin parameter under automation control right now, as the engine
+/// last wrote it to the host.
+///
+/// Track D ruling 2 sends plugin-param automation to the HOST ONLY — the
+/// document keeps whatever the user set — so the param panel painted the
+/// document while the parameter itself moved. This is the read-back that
+/// closes that gap: the driver's own values, not a second evaluation of the
+/// curve, so the panel cannot disagree with what the plugin got.
+///
+/// Display state, never document state: nothing persists these, and a
+/// stopped transport clears them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrivenParam {
+    /// Plugin instance id (`PluginDoc` row id — what `plugin_get_params`
+    /// and `plugin_set_param` address).
+    pub instance_id: String,
+    /// Host parameter index, the same id `plugin_get_params` reports.
+    pub index: u32,
+    /// Value in the parameter's native host units.
+    pub value: f32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -555,10 +584,16 @@ mod tests {
             position_samples: 2,
             tracks: vec![],
             master: TrackMeter { track_id: "master".into(), ..Default::default() },
+            driven_params: vec![DrivenParam {
+                instance_id: "inst-1".into(),
+                index: 7,
+                value: 0.5,
+            }],
         };
         let v = serde_json::to_value(&m).unwrap();
         assert!(v["master"].get("peakL").is_some());
         assert!(v["master"].get("trackId").is_some());
+        assert!(v["drivenParams"][0].get("instanceId").is_some());
     }
 
     #[test]

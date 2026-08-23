@@ -230,6 +230,10 @@ impl MeterAccum {
                 clipped: self.master_peak[0] >= CLIP_THRESHOLD
                     || self.master_peak[1] >= CLIP_THRESHOLD,
             },
+            // The accumulator only knows about audio. The driven-param
+            // read-back is the control thread's business, so `pump_meter_frames`
+            // fills it in on the way out.
+            driven_params: Vec::new(),
         };
         *self = MeterAccum::default();
         frame
