@@ -26,6 +26,7 @@
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
   import InsertChain from "./plugins/InsertChain.svelte";
+  import SendRack from "./plugins/SendRack.svelte";
   import LanePluginStrip from "./plugins/LanePluginStrip.svelte";
 
   let {
@@ -44,6 +45,8 @@
   let pickerOpen = $state(false);
   let groupMenuOpen = $state(false);
   let fxPopoverOpen = $state(false);
+  /** Plan G2: the sends popover (bus returns this track feeds). */
+  let sendPopoverOpen = $state(false);
 
   // ── rename ──
   // The editor is opened by double-clicking the name, which is the gesture
@@ -397,6 +400,8 @@
           <button class="instchip mono" class:bound={!!instrument} class:plugin={!!pluginInst} class:stub={pluginInst?.status === "stub"} class:crashed={pluginInst?.status === "crashed"} title={pluginInst ? "Open plugin parameters for " + pluginInst.name : instrument ? "Open instrument browser for " + instrument.name : "Assign an instrument"} onclick={openInstrumentPanel}>
             {#if pluginInst}Instrument · {patch?.name ?? pluginInst.name}{:else if instrument}Instrument · {instrument.name}{:else}Instrument · polysynth{/if}
           </button>
+        {:else if track.kind === "bus"}
+          <span class="kindchip bus-kind mono">Return bus</span>
         {:else}
           <span class="kindchip mono">Audio track</span>
         {/if}
@@ -418,6 +423,26 @@
               <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
             {/if}
           </span>
+          {#if track.kind !== "bus"}
+            <span class="picker">
+              <button
+                class="status sendchip"
+                class:on={sendPopoverOpen}
+                title={(track.sends?.length ?? 0) > 0
+                  ? `Sends (${track.sends!.length})`
+                  : "Send this track into a bus"}
+                aria-haspopup="menu"
+                aria-expanded={sendPopoverOpen}
+                aria-pressed={sendPopoverOpen}
+                onclick={() => (sendPopoverOpen = !sendPopoverOpen)}
+              >
+                SEND{(track.sends?.length ?? 0) > 0 ? ` ${track.sends!.length}` : ""}
+              </button>
+              {#if sendPopoverOpen}
+                <SendRack {track} onclose={() => (sendPopoverOpen = false)} />
+              {/if}
+            </span>
+          {/if}
           <span class="picker metadata-lanes">
             <button class="status lanes" class:on={modulation.hasVisible(track.id) || pickerOpen} title="Show or add automation lanes" aria-haspopup="menu" aria-expanded={pickerOpen} aria-pressed={modulation.hasVisible(track.id)} onclick={() => (pickerOpen = !pickerOpen)}>Lanes</button>
             {#if pickerOpen}<LanePickerMenu {track} onclose={() => (pickerOpen = false)} />{/if}
@@ -910,6 +935,10 @@
     color: var(--violet);
     border-color: rgb(var(--violet-rgb) / 0.35);
   }
+  .bus-kind {
+    color: var(--cyan);
+    border-color: rgb(var(--cyan-rgb) / 0.35);
+  }
   .midiout-check {
     display: inline-flex;
     align-items: center;
@@ -982,6 +1011,15 @@
     background: var(--violet);
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
+  .status.sendchip {
+    min-width: 40px;
+  }
+  .status.sendchip.on {
+    color: var(--bg-0);
+    background: var(--cyan);
+    border-color: var(--cyan);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35);
   }
   /* The divider between "what this lane is doing" and "what its
      automation is doing". Cosmetic, so it is aria-hidden. */

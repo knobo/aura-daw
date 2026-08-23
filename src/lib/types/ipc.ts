@@ -177,6 +177,9 @@ export interface TrackState {
   instrumentId?: string | null;
   /** Ordered insert-FX slots (Plan G1). Empty on pre-G1 files. */
   inserts?: InsertSlot[] | null;
+  /** Send edges into bus tracks (Plan G2). Empty on pre-G2 files. Only
+   * audio|midi tracks send; a bus is a destination, never a source. */
+  sends?: SendSlot[] | null;
   /** Lane group this track displays under, as the group's own NAME (the
    * group is its name — there is no separate group row to look up). Absent
    * or null = ungrouped. Display grouping only: it never affects routing,
@@ -1157,6 +1160,20 @@ export interface InsertSlot {
   instanceId: string;
   /** True when the slot is bypassed (dsp skipped). */
   bypassed: boolean;
+}
+
+/** One send edge (Plan G2): a copy of this track's signal into a bus track.
+ * Mirrors `audio::types::SendSlot`. */
+export interface SendSlot {
+  /** Send identity, stable across reorder and rebuilds. */
+  id: string;
+  /** Track id of the bus this send feeds. */
+  dest: string;
+  /** Amount in dB; -160 encodes -inf. 0 = unity, the default for a new send. */
+  amountDb: number;
+  /** false (default) taps post-fader — the send follows the fader and the
+   * mute. true taps post-insert/pre-fader. */
+  preFader: boolean;
 }
 
 // ── automation (plugins::automation) ────────────────────────────────────────
