@@ -270,6 +270,11 @@ pub struct ParamTable {
     pub pan: Vec<AtomicU32>,
     pub flags: Vec<AtomicU32>,
     pub any_solo: AtomicBool,
+    /// Live send amounts as LINEAR gain, indexed by
+    /// `types::derive_send_slots` (Plan G2). A send knob is a mix change,
+    /// so it is an atomic store here — never a graph rebuild (§10). Sized
+    /// per-graph like every other lane in this table.
+    pub send_amount: Vec<AtomicU32>,
 }
 
 /// `ParamTable::default() == with_slots(0)` would be wrong for tests that
@@ -287,6 +292,14 @@ impl ParamTable {
     /// bounds-check against the actual size (out-of-range writes are
     /// dropped, matching the old `MAX_TRACKS` guards).
     pub fn with_slots(n: usize) -> Self {
+        Self::with_slots_and_sends(n, 0)
+    }
+
+    /// [`Self::with_slots`] plus `sends` send-amount lanes (Plan G2). Send
+    /// amounts default to unity so a lane the rebuild forgot to populate is
+    /// audible rather than silently dead — the same "neutral is the
+    /// default" rule the gain lanes follow.
+    pub fn with_slots_and_sends(n: usize, sends: usize) -> Self {
         Self {
             gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
             base_gain: (0..n).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
@@ -297,7 +310,27 @@ impl ParamTable {
             pan: (0..n).map(|_| AtomicU32::new(0.0f32.to_bits())).collect(),
             flags: (0..n).map(|_| AtomicU32::new(0)).collect(),
             any_solo: AtomicBool::new(false),
+            send_amount: (0..sends).map(|_| AtomicU32::new(1.0f32.to_bits())).collect(),
         }
+    }
+
+    /// Store one send's amount as linear gain. Out-of-range indices are
+    /// dropped, exactly like the slot-indexed setters — a knob write can
+    /// race a rebuild that renumbered the sends, and dropping the write is
+    /// correct there (the rebuild already read the document value).
+    pub fn set_send_amount_linear(&self, idx: usize, amount: f32) {
+        if let Some(a) = self.send_amount.get(idx) {
+            a.store(amount.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Read one send's amount. Unity for an unknown index: a compiled edge
+    /// whose lane vanished must not silently mute the return.
+    #[inline]
+    pub fn send_amount_linear(&self, idx: usize) -> f32 {
+        self.send_amount
+            .get(idx)
+            .map_or(1.0, |a| f32::from_bits(a.load(Ordering::Relaxed)))
     }
 
     pub fn len(&self) -> usize {
@@ -535,12 +568,31 @@ pub struct RtTrack {
     pub live: Option<LiveSource>,
     /// Compiled insert chain (document order). Empty = dry strip.
     pub inserts: Vec<InsertNode>,
+    /// Compiled send edges into `RtGraph::buses` (Plan G2). Empty = this
+    /// track only feeds the master.
+    pub sends: Vec<RtSend>,
     /// Compensating delay (Task 6): pads this track's path up to the
     /// slowest sibling's (see `pdc::compile_pdc`), applied on the mixer
     /// strip after inserts and before the fader. `None` = no compensation
     /// needed (this track IS the slowest path, or PDC isn't wired up yet —
     /// Task 6 adds the primitive; attaching it during graph build is Task 7).
     pub pdc: Option<DelayLine>,
+    /// Plan G2: delay on the DIRECT-to-master path only — applied after the
+    /// send taps and after the fader, so the dry signal lands in step with
+    /// the returns coming back from latency-carrying buses.
+    ///
+    /// Why a SECOND delay line and not a bigger `pdc`: `pdc` sits before
+    /// the taps, so growing it would delay the sends by the same amount and
+    /// move the whole return with the dry signal — the two would never
+    /// converge. The taps must leave at the source-aligned time; only what
+    /// continues straight to the master waits for the buses.
+    pub master_pdc: Option<DelayLine>,
+    /// Carry state across the `MAX_LIVE_BLOCK` windows of ONE callback block
+    /// (Plan G2). It lives on the ROW, not in a parallel vector on the
+    /// graph: a parallel vector has to be sized at construction, and every
+    /// caller that pushes a row afterwards (several tests do) would silently
+    /// lose that row's meters. Reset at the top of every render.
+    pub win: TrackWindow,
 }
 
 impl RtTrack {
@@ -551,9 +603,59 @@ impl RtTrack {
             clips,
             live: None,
             inserts: Vec::new(),
+            sends: Vec::new(),
             pdc: None,
+            master_pdc: None,
+            win: TrackWindow::default(),
         }
     }
+}
+
+/// One compiled send edge (Plan G2): a copy of the source strip's signal,
+/// scaled by a live amount, added into a bus accumulator.
+pub struct RtSend {
+    /// Index into `RtGraph::buses`. Compiled, so the RT thread never
+    /// resolves a track id.
+    pub bus: usize,
+    /// Index into `ParamTable::send_amount`. Read once per run, exactly
+    /// like the fader gain — no smoothing, same convention.
+    pub amount: usize,
+    /// Tap point (see `types::SendSlot::pre_fader`).
+    pub pre_fader: bool,
+}
+
+/// One compiled bus/return strip (Plan G2). Its SOURCE is the accumulator
+/// that this block's send taps wrote into; from there it is an ordinary
+/// strip — inserts, compensating delay, fader, meters, master.
+pub struct RtBus {
+    /// Index into `ParamTable`: a bus has a fader, a pan, a mute and a
+    /// meter lane like any other strip.
+    pub slot: usize,
+    /// Compiled insert chain (document order) — this is where the shared
+    /// convolution reverb actually lives.
+    pub inserts: Vec<InsertNode>,
+    /// Compensating delay so every return lands at the master in step with
+    /// the dry paths (which wait via `RtTrack::master_pdc`) and with each
+    /// other. `None` = this bus IS the slowest return.
+    pub pdc: Option<DelayLine>,
+    /// Window carry state, for the same reason `RtTrack::win` exists.
+    pub win: TrackWindow,
+}
+
+/// One strip's carry state across the windows of a single callback block
+/// (Plan G2 — see `RtTrack::win`). Reset at the top of every render.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TrackWindow {
+    /// This run follows a discontinuity (seek, stop→play, loop wrap), so
+    /// the live node owes an `all_notes_off` before it processes.
+    pub disc: bool,
+    /// Meter fold for the whole block: peak is a running max, sum-of-squares
+    /// a running sum, so folding window by window gives the same numbers the
+    /// single-pass version produced.
+    pub pk_l: f32,
+    pub pk_r: f32,
+    pub ss_l: f32,
+    pub ss_r: f32,
 }
 
 /// One slot's compiled built-in-param ramps. `None` means the atomic
@@ -566,10 +668,25 @@ pub struct TrackRamps {
 
 pub struct RtGraph {
     pub tracks: Vec<RtTrack>,
+    /// Compiled bus/return strips (Plan G2), rendered AFTER every track in
+    /// each window so their accumulators are complete. Empty on a project
+    /// with no buses, which is byte-for-byte today's graph.
+    pub buses: Vec<RtBus>,
     /// Preallocated stereo strip buffer (`MAX_LIVE_BLOCK * 2`, always).
     /// Clips + live sum here, then inserts REPLACE, then the shared fader.
     /// Allocated at BUILD time on the control thread — never on the RT path.
     pub track_buf: Vec<f32>,
+    /// Post-fader stereo scratch (`MAX_LIVE_BLOCK * 2`, always). The fader
+    /// writes here instead of straight into `out` so a POST-fader send has
+    /// something to tap and so `RtTrack::master_pdc` can delay the dry path
+    /// after the tap. Preallocated at BUILD time, like `track_buf`.
+    pub post_buf: Vec<f32>,
+    /// Per-bus input accumulators, `buses.len() * MAX_LIVE_BLOCK * 2`
+    /// interleaved stereo frames. Zeroed per window, written by the send
+    /// taps, consumed by the bus pass. Preallocated at BUILD time; empty
+    /// when the graph has no buses, so a project without returns allocates
+    /// nothing extra.
+    pub bus_buf: Vec<f32>,
     /// Monotonic graph generation; meter blocks echo it (Task 6).
     pub generation: u64,
     /// THIS graph's parameters — round-2 §2.4: the param table versions
@@ -611,7 +728,21 @@ impl RtGraph {
     /// Build a snapshot, always allocating the strip `track_buf`
     /// (unified clip/live/insert path).
     pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
+        Self::with_buses(tracks, Vec::new(), generation, params)
+    }
+
+    /// [`Self::new`] plus compiled bus strips (Plan G2). Sizes the per-bus
+    /// accumulators here, on the control thread — the RT pass only ever
+    /// zeroes and adds into them.
+    pub fn with_buses(
+        tracks: Vec<RtTrack>,
+        buses: Vec<RtBus>,
+        generation: u64,
+        params: Arc<ParamTable>,
+    ) -> Self {
         let track_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
+        let post_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
+        let bus_buf = vec![0.0; buses.len() * MAX_LIVE_BLOCK * 2];
         let n_chunks = (params.len() + METER_CHUNK_SLOTS - 1) / METER_CHUNK_SLOTS;
         let n_chunks = n_chunks.max(1);
         let meter_scratch = (0..n_chunks)
@@ -623,7 +754,10 @@ impl RtGraph {
             .collect();
         Self {
             tracks,
+            buses,
             track_buf,
+            post_buf,
+            bus_buf,
             generation,
             params,
             meter_scratch,
@@ -702,6 +836,11 @@ pub struct GraphTables {
     pub generation: u64,
     pub params: Arc<ParamTable>,
     pub slots: HashMap<TrackId, usize>,
+    /// `SendSlot::id` -> index into `ParamTable::send_amount` (Plan G2),
+    /// derived by `types::derive_send_slots` in the same rebuild that built
+    /// `params`. This is what turns a send-amount knob write into an atomic
+    /// store instead of a graph rebuild — the send half of `slots`.
+    pub send_slots: HashMap<String, usize>,
 }
 
 /// `Mutex` (not `RwLock`): writes are rare (once per rebuild) and reads are
@@ -744,6 +883,7 @@ impl GraphTables {
             generation: 0,
             params: Arc::new(ParamTable::default()),
             slots: HashMap::new(),
+            send_slots: HashMap::new(),
         }))
     }
 }

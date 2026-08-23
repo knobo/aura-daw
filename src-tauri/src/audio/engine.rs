@@ -50,6 +50,19 @@ use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
 
+/// The row that carries a mixer slot's AUDIO. A midi track has two rows in
+/// the assembled graph — a clips row and a live-instrument row — and the
+/// insert chain, the compensating delays and the send taps must all attach
+/// to exactly one of them (G-7: attaching twice runs the same processor,
+/// and now the same tap, twice per block). The live row wins when both
+/// exist; an audio track has only the clips row.
+fn audio_row_for(tracks: &[RtTrack], slot: usize) -> Option<usize> {
+    tracks
+        .iter()
+        .position(|r| r.slot == slot && r.live.is_some())
+        .or_else(|| tracks.iter().position(|r| r.slot == slot))
+}
+
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
 /// Recording ring headroom, seconds of audio per track.
@@ -1710,6 +1723,10 @@ impl Control {
         // across another acquisition).
         let mut assembled: Option<(HashMap<crate::ids::TrackId, usize>, Vec<RtTrack>)> = None;
         let mut failed_inserts: Vec<String> = Vec::new();
+        // Plan G2: the routing half of the assembly. Bus strips carry their
+        // document ids alongside, and the send edges stay UNRESOLVED until
+        // phase 2 has read the live send-slot map — see `audio::bus`.
+        let mut routing: Option<crate::audio::bus::RoutingPlan> = None;
         if !headless {
             // Headless keeps its narrow scope [I5]: tables are enough to
             // serve knob writes and recording resolution with no output
@@ -1724,6 +1741,13 @@ impl Control {
                 let Some(&slot) = slots_s.get(&t.id) else {
                     continue; // automation tracks own no mixer slot or RtTrack
                 };
+                if crate::audio::types::is_bus_track(t) {
+                    // A bus owns a mixer slot but no SOURCE row: it is fed by
+                    // sends and compiled into `RtGraph::buses` below. Pushing
+                    // an empty clips row for it would put a second writer on
+                    // its meter lane (Plan G2).
+                    continue;
+                }
                 let clips = s
                     .clips
                     .iter()
@@ -1779,11 +1803,7 @@ impl Control {
             // or a frozen midi return). A chain is attached to EXACTLY one
             // row per track (G-7: one instance, one slot, one node — a
             // second attachment would run the same processor twice per
-            // block). Latency is populated on each `InsertNode` so the PDC
-            // pass (`audio::pdc::compile_pdc`) can align paths; attaching
-            // the resulting `DelayLine`s is a separate follow-up (pdc.rs
-            // documents the automation-ramp offset that must be resolved
-            // first).
+            // block).
             let (mut compiled, failed) = crate::audio::insert::compile_inserts(
                 &s.tracks,
                 &s.plugins,
@@ -1791,51 +1811,51 @@ impl Control {
                 &mut self.insert_nodes,
             );
             failed_inserts = failed;
-            // Per-mixer-slot (declared, applied) insert latency, for PDC.
-            let mut declared = vec![0usize; slots_s.len()];
-            let mut applied = vec![0usize; slots_s.len()];
+            // ROUTING (Plan G2): bus strips and send edges, plus the two
+            // compensating delays they need. This MOVES the bus tracks'
+            // chains out of `compiled`, so what is left below is exactly the
+            // source-track chains that still want a row. See `audio::bus`
+            // for why the dry path and the sends wait different amounts.
+            let plan = crate::audio::bus::compile_routing(
+                &s.tracks,
+                &slots_s,
+                &mut compiled,
+                slots_s.len(),
+                crate::audio::rt::MAX_LIVE_BLOCK,
+            );
+            // Attach a compiled chain to the row carrying this track's
+            // audio. The live row wins when both exist.
             for t in s.tracks.iter() {
-                let Some(chain) = compiled.remove(&t.id) else { continue };
-                if chain.is_empty() {
-                    continue;
-                }
                 let Some(&slot) = slots_s.get(&t.id) else { continue };
-                let (d, a) = chain.iter().fold((0usize, 0usize), |(d, a), n| {
-                    (d + n.latency, a + if n.bypassed { 0 } else { n.latency })
-                });
-                if slot < declared.len() {
-                    declared[slot] = d;
-                    applied[slot] = a;
-                }
-                let idx = tracks
-                    .iter()
-                    .position(|r| r.slot == slot && r.live.is_some())
-                    .or_else(|| tracks.iter().position(|r| r.slot == slot));
-                if let Some(i) = idx {
-                    tracks[i].inserts = chain;
+                let Some(i) = audio_row_for(&tracks, slot) else { continue };
+                if let Some(chain) = compiled.remove(&t.id) {
+                    if !chain.is_empty() {
+                        tracks[i].inserts = chain;
+                    }
                 }
             }
-            // PDC (Plan G1 Task 6/7): pad every track's path up to the
-            // slowest sibling's so latency-reporting inserts land in step at
-            // the master. Zero delay = no DelayLine (and no automation-ramp
+            // PDC (Plan G1 Task 6/7 + G2): pad every source path up to the
+            // slowest sibling's, then pad the DRY path up to the slowest
+            // return. Zero delay = no DelayLine (and no automation-ramp
             // offset in the mixer).
-            let pdc = crate::audio::pdc::compile_pdc(&declared, &applied);
-            for (slot, &delay) in pdc.iter().enumerate() {
-                if delay == 0 {
-                    continue;
-                }
-                let idx = tracks
-                    .iter()
-                    .position(|r| r.slot == slot && r.live.is_some())
-                    .or_else(|| tracks.iter().position(|r| r.slot == slot));
-                if let Some(i) = idx {
+            for (slot, &delay) in plan.track_pdc.iter().enumerate() {
+                let Some(i) = audio_row_for(&tracks, slot) else { continue };
+                if delay > 0 {
                     tracks[i].pdc = Some(crate::audio::pdc::DelayLine::new(
                         delay,
                         crate::audio::rt::MAX_LIVE_BLOCK,
                         2,
                     ));
                 }
+                if plan.master_delay > 0 {
+                    tracks[i].master_pdc = Some(crate::audio::pdc::DelayLine::new(
+                        plan.master_delay,
+                        crate::audio::rt::MAX_LIVE_BLOCK,
+                        2,
+                    ));
+                }
             }
+            routing = Some(plan);
             // The timeline boundary belongs to the material, so it is
             // derived exactly where the material is assembled — same helper
             // the offline bounce uses, so live and export agree on where the
@@ -1877,14 +1897,22 @@ impl Control {
         // enumerated sites where a command swaps the document and
         // republishes a few statements later; there, live truth is what [C1]
         // requires and the image is momentarily behind it.
-        let (params, slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
+        let (params, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
             let session = self.session.lock(); // read-only: param VALUES + slot map + automation compile — short, no assembly
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
+            // Plan G2: the send-amount lanes are derived from the LIVE
+            // document for the same reason the slot map is — a send added
+            // during phase 1 must reach this rebuild's table, or its knob
+            // would resolve into a lane no graph reads.
+            let send_slots = crate::audio::types::derive_send_slots(&store.tracks);
             // Sized to mixer slots, not store track count: automation tracks
             // take no slot (design §3.6) and must not shift later rows.
             let n_slots = mixer_slot_count(&store.tracks);
-            let params = Arc::new(ParamTable::with_slots(n_slots));
+            let params = Arc::new(ParamTable::with_slots_and_sends(
+                n_slots,
+                crate::audio::types::send_slot_count(&store.tracks),
+            ));
             for t in store.tracks.iter() {
                 let Some(&slot) = slots.get(&t.id) else { continue };
                 let base_gain = mixer::db_to_linear(t.gain_db);
@@ -1892,6 +1920,10 @@ impl Control {
                 params.set_pan(slot, t.pan as f32);
                 params.set_flag(slot, super::rt::FLAG_MUTE, t.muted);
                 params.set_flag(slot, super::rt::FLAG_SOLO, t.soloed);
+                for snd in &t.sends {
+                    let Some(&idx) = send_slots.get(&snd.id) else { continue };
+                    params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
+                }
             }
             let launch_ids = crate::midi::launch::runtime().audible_tracks();
             for t in store.tracks.iter() {
@@ -1907,6 +1939,7 @@ impl Control {
                 generation: self.generation,
                 params: params.clone(),
                 slots: slots.clone(),
+                send_slots: send_slots.clone(),
             };
             // Same generation, same slot map, published alongside the
             // tables (Task 6) — the meter fold resolves blocks under
@@ -1942,7 +1975,7 @@ impl Control {
                 self.cache_rate,
                 self.shared.song_end.load(Relaxed),
             );
-            (params, slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks)
+            (params, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks)
         };
         // Task 10, pass-end trigger 2 (mode change — spec §4.5): a track
         // that WAS Write/Touch/Latch and no longer is has just ended its
@@ -2032,7 +2065,25 @@ impl Control {
             }
         });
 
-        let mut g = RtGraph::new(tracks, self.generation, params);
+        // Plan G2: finish the routing against the LIVE maps. Bus slots are
+        // re-keyed like the track rows, but a bus whose track vanished is
+        // PARKED (`usize::MAX`, which the render skips) rather than removed
+        // — removing it would renumber `RtSend::bus` under every edge that
+        // already points past it, and this graph is transient anyway.
+        let mut buses = Vec::new();
+        if let Some(plan) = routing {
+            buses = plan.buses;
+            for (bus, id) in buses.iter_mut().zip(plan.bus_ids.iter()) {
+                bus.slot = slots.get(id).copied().unwrap_or(usize::MAX);
+            }
+            for (tid, edges) in plan.sends.iter() {
+                let Some(&slot) = slots.get(tid) else { continue };
+                let Some(i) = audio_row_for(&tracks, slot) else { continue };
+                tracks[i].sends = edges.iter().filter_map(|e| e.resolve(&send_slots)).collect();
+            }
+        }
+
+        let mut g = RtGraph::with_buses(tracks, buses, self.generation, params);
         // RCU: the ramp table is attached BEFORE the graph is published, so
         // the callback only ever sees a snapshot whose ramps already belong
         // to it — and a retired graph keeps reading its own table, exactly
@@ -4121,6 +4172,9 @@ mod tests {
     fn live_graph(node: RecordingNode, generation: u64) -> RtGraph {
         let cell = crate::audio::rt::LiveNodeCell::new(Box::new(node));
         let tr = RtTrack {
+            sends: Vec::new(),
+            master_pdc: None,
+            win: Default::default(),
             slot: 0,
             clips: Vec::new(),
             live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(Vec::new()) }),
@@ -4174,6 +4228,9 @@ mod tests {
         let cell = crate::audio::rt::LiveNodeCell::new(Box::new(synth));
         RtGraph::new(
             vec![RtTrack {
+                sends: Vec::new(),
+                master_pdc: None,
+                win: Default::default(),
                 slot,
                 clips: Vec::new(),
                 live: Some(crate::audio::rt::LiveSource { node: cell, events: Arc::new(events) }),
@@ -4199,6 +4256,9 @@ mod tests {
             let mut synth = crate::midi::synth::PolySynth::new();
             crate::audio::dsp::AudioProcessor::prepare(&mut synth, 48_000, crate::audio::rt::MAX_LIVE_BLOCK);
             RtTrack {
+                sends: Vec::new(),
+                master_pdc: None,
+                win: Default::default(),
                 slot,
                 clips: Vec::new(),
                 live: Some(crate::audio::rt::LiveSource {
@@ -4564,6 +4624,7 @@ mod tests {
     fn spin_up() -> (EngineHandle, Arc<SharedRt>, SharedGraphTables, Arc<Mutex<Session>>) {
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            send_slots: Default::default(),
             generation: 0,
             params: Arc::new(ParamTable::default()),
             slots: HashMap::new(),
@@ -4603,6 +4664,7 @@ mod tests {
     fn bare_control_with_tx() -> (Control, Arc<Mutex<Session>>, Sender<ControlMsg>) {
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            send_slots: Default::default(),
             generation: 0,
             params: Arc::new(ParamTable::default()),
             slots: HashMap::new(),
@@ -4679,6 +4741,7 @@ mod tests {
 
     fn test_track(id: &str) -> super::super::types::TrackState {
         super::super::types::TrackState {
+            sends: Vec::new(),
             id: id.into(),
             name: id.into(),
             kind: "audio".into(),
@@ -6364,6 +6427,7 @@ mod tests {
             // Slots are derived state now (round-2 §2.4) — pushing the row
             // and sending Rebuild is what seeds slot 0, not a direct alloc.
             s.tracks.push(super::super::types::TrackState {
+                sends: Vec::new(),
                 id: "t1".into(),
                 name: "Track 1".into(),
                 kind: "audio".into(),
@@ -7443,6 +7507,7 @@ mod tests {
             let s = &mut session.store;
             s.project_dir = Some(dir.clone());
             s.tracks.push(super::super::types::TrackState {
+                sends: Vec::new(),
                 id: "t1".into(),
                 name: "T1".into(),
                 kind: "audio".into(),
@@ -7539,6 +7604,7 @@ mod tests {
             let s = &mut session.store;
             s.project_dir = Some(dir.clone());
             s.tracks.push(super::super::types::TrackState {
+                sends: Vec::new(),
                 id: "t1".into(),
                 name: "T1".into(),
                 kind: "audio".into(),

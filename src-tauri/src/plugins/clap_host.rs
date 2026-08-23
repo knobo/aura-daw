@@ -1745,6 +1745,7 @@ mod tests {
         // One midi track bound to the plugin instance, playing C3 for a beat.
         let mut store = Store::default();
         let mut t = TrackState {
+            sends: Vec::new(),
             id: "m1".into(),
             name: "m1".into(),
             kind: "midi".into(),

@@ -232,7 +232,10 @@ pub fn append_from_with_input(
                         clips: Vec::new(),
                         live: Some(LiveSource { node, events: Arc::new(events) }),
                         inserts: Vec::new(),
+                        sends: Vec::new(),
                         pdc: None,
+                        master_pdc: None,
+                        win: Default::default(),
                     });
                 }
             }
@@ -265,7 +268,10 @@ pub fn append_from_with_input(
                         clips: Vec::new(),
                         live: Some(LiveSource { node, events: Arc::new(Vec::new()) }),
                         inserts: Vec::new(),
+                        sends: Vec::new(),
                         pdc: None,
+                        master_pdc: None,
+                        win: Default::default(),
                     });
                 }
             }
@@ -411,6 +417,7 @@ mod tests {
 
     fn track(id: &str, kind: &str) -> TrackState {
         TrackState {
+            sends: Vec::new(),
             id: id.into(),
             name: id.into(),
             kind: kind.into(),

@@ -97,7 +97,11 @@ pub fn build_graph(
     // automation tracks take no slot) — using the default here silently
     // dropped every track at slot >= 64 from offline export.
     let n_slots = mixer_slot_count(&store.tracks);
-    let params = Arc::new(ParamTable::with_slots(n_slots));
+    let send_slots = crate::audio::types::derive_send_slots(&store.tracks);
+    let params = Arc::new(ParamTable::with_slots_and_sends(
+        n_slots,
+        crate::audio::types::send_slot_count(&store.tracks),
+    ));
     let mut tracks: Vec<RtTrack> = Vec::with_capacity(n_slots);
     for t in &store.tracks {
         let Some(&slot) = slots.get(&t.id) else { continue };
@@ -105,6 +109,15 @@ pub fn build_graph(
         params.set_pan(slot, t.pan as f32);
         params.set_flag(slot, FLAG_MUTE, t.muted);
         params.set_flag(slot, FLAG_SOLO, t.soloed);
+        for snd in &t.sends {
+            let Some(&idx) = send_slots.get(&snd.id) else { continue };
+            params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
+        }
+        if crate::audio::types::is_bus_track(t) {
+            // Fed by sends, compiled into `RtGraph::buses` below — no
+            // source row (Plan G2), exactly as in `engine::rebuild`.
+            continue;
+        }
         let clips: Vec<RtClip> = store
             .clips
             .iter()
@@ -165,8 +178,64 @@ pub fn build_graph(
         &mut tracks,
     );
 
+    // INSERT FX + ROUTING (Plan G1 Task 8 / G2). The bounce walks the same
+    // strip the live engine does — inserts, the two compensating delays,
+    // sends and bus returns — because an export that silently drops the
+    // reverb is not the song the user heard.
+    //
+    // The nodes come from the SAME process-wide plugin instances the live
+    // engine uses (`plugins::insert_node_for`), which is the pre-existing
+    // arrangement for offline INSTRUMENT nodes a few lines above, with the
+    // same caveat this module's header already documents: a bounce sees
+    // whatever param values the host instance currently holds.
+    let mut insert_nodes = crate::audio::insert::InsertNodeRegistry::default();
+    let (mut chains, _failed) =
+        crate::audio::insert::compile_inserts(&store.tracks, plugins, rate, &mut insert_nodes);
+    let plan = crate::audio::bus::compile_routing(
+        &store.tracks,
+        &slots,
+        &mut chains,
+        n_slots,
+        crate::audio::rt::MAX_LIVE_BLOCK,
+    );
+    let row_for = |tracks: &[RtTrack], slot: usize| -> Option<usize> {
+        tracks
+            .iter()
+            .position(|r| r.slot == slot && r.live.is_some())
+            .or_else(|| tracks.iter().position(|r| r.slot == slot))
+    };
+    for t in &store.tracks {
+        let Some(&slot) = slots.get(&t.id) else { continue };
+        let Some(i) = row_for(&tracks, slot) else { continue };
+        if let Some(chain) = chains.remove(&t.id) {
+            if !chain.is_empty() {
+                tracks[i].inserts = chain;
+            }
+        }
+        if let Some(edges) = plan.sends.get(&t.id) {
+            tracks[i].sends = edges.iter().filter_map(|e| e.resolve(&send_slots)).collect();
+        }
+    }
+    for (slot, &delay) in plan.track_pdc.iter().enumerate() {
+        let Some(i) = row_for(&tracks, slot) else { continue };
+        if delay > 0 {
+            tracks[i].pdc = Some(crate::audio::pdc::DelayLine::new(
+                delay,
+                crate::audio::rt::MAX_LIVE_BLOCK,
+                2,
+            ));
+        }
+        if plan.master_delay > 0 {
+            tracks[i].master_pdc = Some(crate::audio::pdc::DelayLine::new(
+                plan.master_delay,
+                crate::audio::rt::MAX_LIVE_BLOCK,
+                2,
+            ));
+        }
+    }
+
     let end_samples = song_end(&tracks);
-    let mut graph = RtGraph::new(tracks, 0, params);
+    let mut graph = RtGraph::with_buses(tracks, plan.buses, 0, params);
     // RCU: attach the table BEFORE the graph is handed to the renderer,
     // matching `engine::rebuild` (Track D ruling 1).
     graph.set_track_ramps(compile_track_ramps(
@@ -285,6 +354,7 @@ mod tests {
 
     fn track(id: &str, kind: &str) -> TrackState {
         TrackState {
+            sends: Vec::new(),
             id: id.into(),
             name: id.into(),
             kind: kind.into(),
@@ -366,6 +436,74 @@ mod tests {
         // The tail after the last release is silent (no hung voices).
         let tail_start = (383_400 + 10_000) * 2;
         assert_eq!(peak(&a[tail_start..]), 0.0, "release tail decays to silence");
+    }
+
+    /// Plan G2: the BOUNCE walks the same routing the live engine does. A
+    /// unity post-fader send into an empty return doubles the material — if
+    /// export ignored sends, the exported song would be missing exactly the
+    /// reverb the user mixed with.
+    #[test]
+    fn a_send_into_an_empty_bus_reaches_the_offline_bounce() {
+        const RATE: u32 = 48_000;
+        let (store, midi) = demo_project();
+        let (mut routed, _) = demo_project();
+        let render_all = |store: &Store| {
+            let mut og = build_graph(
+                store,
+                &midi,
+                &crate::control::session::PluginDoc::default(),
+                &Default::default(),
+                &Default::default(),
+                None,
+                RATE,
+            );
+            render(&mut og.graph, 0, og.end_samples, RATE, 1.0, &mut |_, _| {})
+        };
+        let dry = render_all(&store);
+
+        routed.tracks.push(track("verb", "bus"));
+        for t in routed.tracks.iter_mut().filter(|t| t.kind == "midi") {
+            t.sends.push(crate::audio::types::SendSlot {
+                id: format!("snd-{}", t.id.as_str()),
+                dest: "verb".into(),
+                amount_db: 0.0,
+                pre_fader: false,
+            });
+        }
+        let wet = render_all(&routed);
+
+        assert_eq!(wet.len(), dry.len());
+        assert!(peak(&dry) > 0.05, "the dry bounce is audible to begin with");
+        for (i, (w, d)) in wet.iter().zip(dry.iter()).enumerate() {
+            assert!(
+                (w - 2.0 * d).abs() < 1e-5,
+                "sample {i}: dry {d} + an equally loud return should be {}, got {w}",
+                2.0 * d
+            );
+        }
+    }
+
+    /// A bus takes a mixer slot but NO source row — it is fed by sends. Two
+    /// rows for one slot would put a second writer on its meter lane.
+    #[test]
+    fn a_bus_track_gets_a_strip_but_no_source_row() {
+        const RATE: u32 = 48_000;
+        let mut store = Store::default();
+        store.tracks.push(track("a", "audio"));
+        store.tracks.push(track("verb", "bus"));
+        let og = build_graph(
+            &store,
+            &MidiStore::default(),
+            &crate::control::session::PluginDoc::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            RATE,
+        );
+        assert_eq!(og.graph.buses.len(), 1, "the bus compiles to a return strip");
+        assert_eq!(og.graph.buses[0].slot, 1);
+        assert_eq!(og.graph.tracks.len(), 1, "and to no source row");
+        assert_eq!(og.graph.tracks[0].slot, 0);
     }
 
     /// Region rendering semantics: length is exact, notes starting BEFORE the
@@ -581,6 +719,7 @@ mod tests {
         const RATE: u32 = 48_000;
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
             automation_mode: AutomationMode::Off,
             ..track("t-1", "audio")
         });
@@ -628,6 +767,7 @@ mod tests {
         const RATE: u32 = 48_000;
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
             automation_mode: AutomationMode::Read,
             ..track("t-1", "audio")
         });

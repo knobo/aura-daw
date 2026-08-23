@@ -18,6 +18,7 @@
 //! registered in the frozen `lib.rs`), the managed `AudioState`, and the
 //! `init` hook that starts the engine control thread.
 
+pub mod bus;
 pub mod decimate;
 pub mod dsp;
 pub mod engine;
@@ -860,6 +861,63 @@ pub fn remove_track(
     control: State<'_, Arc<ControlPlane>>,
 ) -> Result<(), String> {
     control.remove_track(&track_id, control::op::TxMeta::user("remove track"))
+}
+
+// ---------------------------------------------------------------------------
+// Sends (Plan G2) — a copy of a track's signal into a bus track, so many
+// sources can share one reverb/echo instead of paying for N rooms.
+// ---------------------------------------------------------------------------
+
+/// Add a send from `track_id` into the bus `dest`. Lands at unity, post-fader.
+#[tauri::command]
+pub fn send_add(
+    track_id: String,
+    dest: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<crate::audio::types::SendSlot, String> {
+    control.send_add(&track_id, &dest, control::op::TxMeta::user("add send"))
+}
+
+#[tauri::command]
+pub fn send_remove(
+    track_id: String,
+    send_id: String,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.send_remove(&track_id, &send_id, control::op::TxMeta::user("remove send"))
+}
+
+/// Set a send's amount in dB (-160 = -inf). A mix change: this is a param
+/// write, never a graph rebuild, so it is safe to call per knob frame.
+#[tauri::command]
+pub fn send_set_amount(
+    track_id: String,
+    send_id: String,
+    amount_db: f64,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.send_set_amount(
+        &track_id,
+        &send_id,
+        amount_db,
+        control::op::TxMeta::user("send amount"),
+    )
+}
+
+/// Move a send's tap between post-fader (default) and pre-fader.
+#[tauri::command]
+pub fn send_set_pre_fader(
+    track_id: String,
+    send_id: String,
+    pre_fader: bool,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.send_set_pre_fader(
+        &track_id,
+        &send_id,
+        pre_fader,
+        control::op::TxMeta::user("send tap point"),
+    )
 }
 
 #[tauri::command]

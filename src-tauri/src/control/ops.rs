@@ -93,14 +93,20 @@ pub(crate) fn new_track_row(
     kind: Option<String>,
 ) -> Result<(TrackState, usize), String> {
     let kind = kind.unwrap_or_else(|| "audio".into());
-    if !matches!(kind.as_str(), "audio" | "midi" | "automation") {
+    if !matches!(kind.as_str(), "audio" | "midi" | "automation" | "bus") {
         return Err(format!("unsupported track kind: {kind}"));
     }
     let n = store.tracks.len();
     let id = uuid::Uuid::new_v4().to_string();
     let track = TrackState {
         id: id.into(),
-        name: name.unwrap_or_else(|| format!("Track {}", n + 1)),
+        name: name.unwrap_or_else(|| {
+            if kind == "bus" {
+                format!("Bus {}", store.tracks.iter().filter(|t| t.kind == "bus").count() + 1)
+            } else {
+                format!("Track {}", n + 1)
+            }
+        }),
         kind,
         gain_db: 0.0,
         pan: 0.0,
@@ -110,6 +116,7 @@ pub(crate) fn new_track_row(
         color: TRACK_COLORS[n % TRACK_COLORS.len()].into(),
         instrument_id: None,
         inserts: Vec::new(),
+        sends: Vec::new(),
         // Ungrouped: a new track lands at the end of the list, outside every
         // group. Dropping it into one is an explicit gesture (`arrange_lanes`).
         group: None,
@@ -120,9 +127,10 @@ pub(crate) fn new_track_row(
 
 /// Create a track in the store. STRUCTURAL — the caller must send
 /// `ControlMsg::Rebuild` afterwards (the next rebuild derives the row's
-/// slot and populates its params — round-2 §2.4). `kind`: "audio" (default)
-/// or "midi" (phase 2) or "automation" (Track F; no mixer slot). "bus"
-/// is reserved. Used directly by callers that
+/// slot and populates its params — round-2 §2.4). `kind`: "audio" (default),
+/// "midi" (phase 2), "automation" (Track F; no mixer slot), or "bus" (Plan
+/// G2 — a return: no clips, no instrument, an insert chain fed by other
+/// tracks' sends). Used directly by callers that
 /// mutate the store outside the transaction channel (currently only
 /// `seed_demo_project`, which builds several tracks under one lock before
 /// any engine/event side effect); the frozen `add_track` COMMAND goes
@@ -207,9 +215,23 @@ mod tests {
     #[test]
     fn add_track_rejects_unknown_kind_and_accepts_midi() {
         let mut store = store_with_tracks(0);
-        assert!(add_track(&mut store, None, Some("bus".into())).is_err());
+        assert!(add_track(&mut store, None, Some("reverb".into())).is_err());
         let t = add_track(&mut store, None, Some("midi".into())).unwrap();
         assert_eq!(t.kind, "midi");
+    }
+
+    /// Plan G2 lifted the `bus` rejection: a return is a real track kind
+    /// now, and it names itself "Bus N" rather than "Track N" so the two
+    /// populations stay tellable apart in the lane list.
+    #[test]
+    fn add_track_accepts_bus_kind_and_names_it_by_bus_count() {
+        let mut store = store_with_tracks(2);
+        let a = add_track(&mut store, None, Some("bus".into())).unwrap();
+        assert_eq!(a.kind, "bus");
+        assert_eq!(a.name, "Bus 1");
+        let b = add_track(&mut store, None, Some("bus".into())).unwrap();
+        assert_eq!(b.name, "Bus 2");
+        assert!(b.sends.is_empty(), "a bus is a destination, never a source");
     }
 
     #[test]

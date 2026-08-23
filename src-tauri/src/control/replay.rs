@@ -1125,6 +1125,7 @@ mod tests {
         let session = Mutex::new(Session::new(Store::default(), MidiStore::default()));
         let add = |id: &str, index: usize| Op::TrackAdd {
             track: crate::audio::types::TrackState {
+                sends: Vec::new(),
                 id: id.into(),
                 name: "T".into(),
                 kind: "audio".into(),

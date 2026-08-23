@@ -314,6 +314,37 @@ pub enum Op {
         slot_id: String,
         bypassed: bool,
     },
+    /// Plan G2: append/insert one send edge on a track. Inverse is
+    /// `SendRemove` with the store-truth index. Additive; does not bump
+    /// `OP_FORMAT_VERSION`.
+    SendAdd {
+        track_id: crate::ids::TrackId,
+        slot: crate::audio::types::SendSlot,
+        index: usize,
+    },
+    /// Plan G2: remove one send edge by `slot.id` (store truth wins over
+    /// advisory `index`). Inverse is `SendAdd` at the store-truth position.
+    SendRemove {
+        track_id: crate::ids::TrackId,
+        slot: crate::audio::types::SendSlot,
+        index: usize,
+    },
+    /// Plan G2: set a send's amount. A MIX change, not a structural one —
+    /// it resolves to an atomic store in `ParamTable::send_amount` and
+    /// schedules NO rebuild (§10). Inverse carries the previous dB value.
+    SendSetAmount {
+        track_id: crate::ids::TrackId,
+        send_id: String,
+        amount_db: f64,
+    },
+    /// Plan G2: move a send's tap between post-fader (default) and
+    /// pre-fader. STRUCTURAL — it changes where the wire leaves the strip —
+    /// so unlike the amount it rebuilds. Inverse carries the previous bool.
+    SendSetPreFader {
+        track_id: crate::ids::TrackId,
+        send_id: String,
+        pre_fader: bool,
+    },
     /// Lanes UX: reorder the whole track list in one op. `order` is the
     /// complete new display order and MUST be a permutation of the store's
     /// current track ids — `apply_raw` rejects anything else rather than
@@ -525,6 +556,7 @@ mod tests {
 
         // TrackAdd with real TrackState: verify wire form and round-trip.
         let track = crate::audio::types::TrackState {
+            sends: Vec::new(),
             id: "t-2".into(),
             name: "Audio Track".into(),
             kind: "audio".into(),

@@ -52,6 +52,22 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     (theta.cos(), theta.sin())
 }
 
+/// BALANCE law, used by bus/return strips (Plan G2): center = UNITY on both
+/// channels, moving off center attenuates the far side to zero.
+///
+/// Why a return does not use [`pan_gains`]: a bus's input is an already-
+/// panned stereo sum, not a mono source being placed in the field.
+/// Constant-power would take another 3 dB off it at center, so a send at
+/// unity would come back 3 dB down and "0 dB send into a 0 dB return"
+/// would not mean what every mixing desk means by it. This is the same
+/// distinction consoles draw between a channel's PAN and a stereo
+/// channel's BALANCE.
+#[inline]
+pub fn balance_gains(pan: f32) -> (f32, f32) {
+    let p = pan.clamp(-1.0, 1.0);
+    ((1.0 - p).min(1.0), (1.0 + p).min(1.0))
+}
+
 /// Solo/mute resolution: when any track is soloed only soloed tracks sound;
 /// mute always silences its own track (mute wins over its own solo, and
 /// over a live launch target — an explicitly muted track stays silent even
@@ -163,18 +179,22 @@ struct PanGains {
 /// `pan_gains` is two trig calls; per-sample evaluation would cost ~3M
 /// sin/cos per second at 32 tracks for a difference nobody can hear (design
 /// §6.1) — deliberate divergence from gain's per-sample `RampCursor`.
+///
+/// `law` is the pan law to evaluate a ramp point under — [`pan_gains`] for a
+/// source strip, [`balance_gains`] for a bus (Plan G2).
 fn pan_gain_quad(
     pan_ramp: Option<&[AbsParamEvent]>,
     pan: f32,
     atomic: (f32, f32),
     first_pos: u64,
     last_pos: u64,
+    law: fn(f32) -> (f32, f32),
 ) -> PanGains {
     match pan_ramp {
         Some(events) if !events.is_empty() => {
             let p0 = value_at(events, first_pos).unwrap_or(pan);
             let p1 = value_at(events, last_pos).unwrap_or(pan);
-            let (a, b) = (pan_gains(p0), pan_gains(p1));
+            let (a, b) = (law(p0), law(p1));
             PanGains { gl0: a.0, gr0: a.1, gl1: b.0, gr1: b.1 }
         }
         _ => PanGains { gl0: atomic.0, gr0: atomic.1, gl1: atomic.0, gr1: atomic.1 },
@@ -196,10 +216,17 @@ struct FaderCtx<'a> {
     pdc_delay: u64,
 }
 
-/// Shared fader: `gain * ramp * pan`, mute, mix into `out`, fold meters.
-/// One implementation for clips, live, and the insert chain.
+/// Shared fader: `gain * ramp * pan`, mute, REPLACE into `post`, fold
+/// meters. One implementation for clips, live, and the insert chain.
+///
+/// Plan G2 moved the destination from `out` to a stereo `post` scratch. Two
+/// things need the faded signal before it reaches the master: a POST-fader
+/// send has to tap it, and `RtTrack::master_pdc` has to delay it (after
+/// that tap) so the dry path lands in step with the returns. Neither is
+/// expressible while the fader is adding straight into a mixed-down,
+/// `out_ch`-wide master buffer. [`mix_post_into`] does the adding.
 #[allow(clippy::too_many_arguments)]
-fn apply_fader(
+fn apply_fader_into(
     buf: &[f32],
     run: usize,
     f: usize,
@@ -207,8 +234,7 @@ fn apply_fader(
     ctx: &FaderCtx<'_>,
     pan_last: usize,
     ramp_cursor: &mut RampCursor,
-    out: &mut [f32],
-    out_ch: usize,
+    post: &mut [f32],
     acc: &mut TrackAccum,
 ) {
     for i in 0..run {
@@ -224,7 +250,33 @@ fn apply_fader(
             r = 0.0;
         }
         acc.fold(l, r);
-        mix_out(out, f + i, out_ch, l, r);
+        post[i * 2] = l;
+        post[i * 2 + 1] = r;
+    }
+}
+
+/// Add a stereo `post` run into the `out_ch`-wide master at frame `f`.
+#[inline]
+fn mix_post_into(out: &mut [f32], f: usize, out_ch: usize, post: &[f32], run: usize) {
+    for i in 0..run {
+        mix_out(out, f + i, out_ch, post[i * 2], post[i * 2 + 1]);
+    }
+}
+
+/// Add `src * amount` into a bus accumulator run starting at `at` frames
+/// into the window. RT-safe: a bounded add, no allocation, no branching per
+/// sample beyond the slice bounds.
+#[inline]
+fn tap_into_bus(bus: &mut [f32], at: usize, src: &[f32], run: usize, amount: f32) {
+    if amount == 0.0 {
+        return;
+    }
+    let base = at * 2;
+    if bus.len() < base + run * 2 {
+        return;
+    }
+    for i in 0..run * 2 {
+        bus[base + i] += src[i] * amount;
     }
 }
 
@@ -321,6 +373,33 @@ fn process_inserts(
     if let Some(d) = tr.pdc.as_mut() {
         d.process(buf);
     }
+}
+
+/// Where this track's playhead is for THIS block, and whether that position
+/// is a discontinuity. Factored out (Plan G2) because the windowed render
+/// needs the answer twice: once in the prologue, to decide whether the live
+/// node owes an `all_notes_off` before the block's first run, and again per
+/// window, to place the runs. A launched track renders at the drive-clip
+/// shadow playhead with no loop; a launch that just ended is itself a
+/// discontinuity back to the arrangement playhead.
+#[inline]
+fn track_playhead(
+    flags: u32,
+    launch: Option<LaunchPlayhead>,
+    base_pos: u64,
+    lp: &LoopSpec,
+    discontinuity: bool,
+) -> (u64, &LoopSpec, bool) {
+    let flagged = flags & FLAG_LAUNCH != 0;
+    if flagged {
+        if let Some(ov) = launch {
+            if !ov.ended {
+                return (ov.pos, &LoopSpec::OFF, ov.discontinuity);
+            }
+            return (base_pos, lp, true);
+        }
+    }
+    (base_pos, lp, discontinuity)
 }
 
 fn live_all_notes_off(tr: &RtTrack) {
@@ -494,7 +573,16 @@ fn render_impl(
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
-    let RtGraph { tracks, track_buf, meter_scratch, track_ramps, .. } = graph;
+    let RtGraph {
+        tracks,
+        buses,
+        track_buf,
+        post_buf,
+        bus_buf,
+        meter_scratch,
+        track_ramps,
+        ..
+    } = graph;
     let track_ramps: &[super::rt::TrackRamps] = track_ramps;
 
     // Reset this callback's chunk templates in place (Task 7: preallocated
@@ -504,116 +592,290 @@ fn render_impl(
         chunk.base_slot = (i * METER_CHUNK_SLOTS) as u32;
     }
 
+    // PROLOGUE (Plan G2). Two things used to be block-lifetime locals inside
+    // the per-track body and now have to survive the window loop below:
+    //
+    //  * the meter fold, because a track is visited once per window;
+    //  * the "this run follows a discontinuity" flag, because a loop wrap
+    //    landing exactly on a window boundary carries into the next window.
+    //
+    // `prime_live` moves here for the same reason and a sharper one: it
+    // queues THIS BLOCK's hardware MIDI-in events into the node and may fire
+    // `all_notes_off`. Left inside the window loop it would deliver every
+    // live-in event once per window.
     for tr in tracks.iter_mut() {
+        tr.win = super::rt::TrackWindow::default();
         if tr.slot >= n_slots {
             continue;
         }
-        let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
-        let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
         let flags = params.flags[tr.slot].load(Relaxed);
-        let flagged = flags & FLAG_LAUNCH != 0;
-        let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive && !ov.ended);
-        let overlaying = flagged && launch.is_some_and(|ov| !ov.ended);
-        let ending = flagged && launch.is_some_and(|ov| ov.ended);
-        let on = if exclusive && !flagged {
-            false
-        } else {
-            audible_with_launch(
-                flags & FLAG_MUTE != 0,
-                flags & FLAG_SOLO != 0,
-                any_solo,
-                flagged,
-            )
-        };
-        let (track_base, track_lp, track_disc) = if overlaying {
-            let ov = launch.unwrap();
-            (ov.pos, &LoopSpec::OFF, ov.discontinuity)
-        } else if ending {
-            (base_pos, lp, true)
-        } else {
-            (base_pos, lp, discontinuity)
-        };
-        let (gl_atomic, gr_atomic) = pan_gains(pan);
-        let mut acc = TrackAccum::default();
-
-        // Track D: this snapshot's compiled gain automation for the slot.
-        // RT-safe: a slice read + an index walk, no allocation, no locks.
-        let ramps = track_ramps.get(tr.slot);
-        let ramp: &[AbsParamEvent] = if params.gain_automation_owner(tr.slot).is_some() {
-            &[]
-        } else {
-            ramps
-                .and_then(|t| t.gain.as_ref())
-                .map(|a| a.as_slice())
-                .unwrap_or(&[])
-        };
-        let mut clip_ramp = RampCursor::new();
-
-        let pdc_delay = tr.pdc.as_ref().map_or(0u64, |d| d.delay() as u64);
-        let pan_gains_quad = pan_gain_quad(
-            ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
-            pan,
-            (gl_atomic, gr_atomic),
-            frame_pos(track_base, 0, track_lp).saturating_sub(pdc_delay),
-            frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp)
-                .saturating_sub(pdc_delay),
-        );
-        let pan_last = frames.saturating_sub(1);
-        let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on, pdc_delay };
-
+        let (_, _, track_disc) = track_playhead(flags, launch, base_pos, lp, discontinuity);
+        tr.win.disc = track_disc;
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
         prime_live(tr, track_disc, live_in_events);
+    }
+    for bus in buses.iter_mut() {
+        bus.win = super::rt::TrackWindow::default();
+    }
 
-        // Unified strip, in runs of MAX_LIVE_BLOCK so track_buf stays
-        // preallocated. A loop wrap is a run boundary (`frame_pos` / LoopSpec).
-        let mut run_discontinuity = track_disc;
-        let mut f = 0usize;
-        while f < frames {
-            let pos = frame_pos(track_base, f as u64, track_lp);
-            let mut run = (frames - f).min(MAX_LIVE_BLOCK);
-            let mut wraps = false;
-            if track_lp.active() && pos < track_lp.end {
-                let to_end = (track_lp.end - pos) as usize;
-                if to_end <= run {
-                    run = to_end;
-                    wraps = true;
-                }
+    // WINDOWED RENDER (Plan G2). A bus cannot run until every track that
+    // sends into it has contributed, so the loops invert: windows outside,
+    // tracks inside, then the bus pass. The window is `MAX_LIVE_BLOCK`,
+    // which is what bounds `bus_buf` — the RT thread never sizes a buffer.
+    //
+    // A callback block of `MAX_LIVE_BLOCK` frames or fewer (every real one:
+    // cpal quanta here are 128–2048) makes this loop run exactly ONCE, so
+    // the strip below is the pre-G2 strip with the send taps added. Only a
+    // block larger than the window splits, and then the pan lerp still
+    // interpolates over the WHOLE block, because `f`, `pan_last` and the
+    // pan quad are all block-global.
+    let pan_last = frames.saturating_sub(1);
+    let mut w0 = 0usize;
+    while w0 < frames {
+        let w_len = (frames - w0).min(MAX_LIVE_BLOCK);
+        let w_end = w0 + w_len;
+
+        // Every bus starts the window empty; the taps below add into it.
+        for b in 0..buses.len() {
+            let base = b * MAX_LIVE_BLOCK * 2;
+            if let Some(slice) = bus_buf.get_mut(base..base + w_len * 2) {
+                slice.fill(0.0);
             }
-            if run == 0 || track_buf.len() < run * 2 {
-                break;
-            }
-            let buf = &mut track_buf[..run * 2];
-            buf.fill(0.0);
-            if !tr.clips.is_empty() {
-                for i in 0..run {
-                    let p = frame_pos(track_base, (f + i) as u64, track_lp);
-                    let mut l = 0.0f32;
-                    let mut r = 0.0f32;
-                    for clip in &tr.clips {
-                        let s = clip_sample(clip, p);
-                        l += s[0];
-                        r += s[1];
-                    }
-                    buf[i * 2] = l;
-                    buf[i * 2 + 1] = r;
-                }
-            }
-            render_live_into(tr, buf, pos, run, sample_rate, run_discontinuity, steady_base);
-            process_inserts(tr, buf, sample_rate, steady_base);
-            apply_fader(buf, run, f, pos, &fader, pan_last, &mut clip_ramp, out, out_ch, &mut acc);
-            if wraps {
-                live_all_notes_off(tr);
-                run_discontinuity = true;
-            } else {
-                run_discontinuity = false;
-            }
-            f += run;
         }
 
+        for tr in tracks.iter_mut() {
+            if tr.slot >= n_slots {
+                continue;
+            }
+            let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
+            let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
+            let flags = params.flags[tr.slot].load(Relaxed);
+            let flagged = flags & FLAG_LAUNCH != 0;
+            let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive && !ov.ended);
+            let on = if exclusive && !flagged {
+                false
+            } else {
+                audible_with_launch(
+                    flags & FLAG_MUTE != 0,
+                    flags & FLAG_SOLO != 0,
+                    any_solo,
+                    flagged,
+                )
+            };
+            let (track_base, track_lp, _) =
+                track_playhead(flags, launch, base_pos, lp, discontinuity);
+            let (gl_atomic, gr_atomic) = pan_gains(pan);
+            let mut acc = TrackAccum::default();
+
+            // Track D: this snapshot's compiled gain automation for the slot.
+            // RT-safe: a slice read + an index walk, no allocation, no locks.
+            let ramps = track_ramps.get(tr.slot);
+            let ramp: &[AbsParamEvent] = if params.gain_automation_owner(tr.slot).is_some() {
+                &[]
+            } else {
+                ramps
+                    .and_then(|t| t.gain.as_ref())
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[])
+            };
+            let mut clip_ramp = RampCursor::new();
+
+            let pdc_delay = tr.pdc.as_ref().map_or(0u64, |d| d.delay() as u64);
+            let pan_gains_quad = pan_gain_quad(
+                ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
+                pan,
+                (gl_atomic, gr_atomic),
+                frame_pos(track_base, 0, track_lp).saturating_sub(pdc_delay),
+                frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp)
+                    .saturating_sub(pdc_delay),
+                pan_gains,
+            );
+            let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on, pdc_delay };
+
+            // Unified strip, in runs of MAX_LIVE_BLOCK so track_buf stays
+            // preallocated. A loop wrap is a run boundary (`frame_pos` /
+            // LoopSpec); so is the window edge.
+            let mut f = w0;
+            while f < w_end {
+                let pos = frame_pos(track_base, f as u64, track_lp);
+                let mut run = (w_end - f).min(MAX_LIVE_BLOCK);
+                let mut wraps = false;
+                if track_lp.active() && pos < track_lp.end {
+                    let to_end = (track_lp.end - pos) as usize;
+                    if to_end <= run {
+                        run = to_end;
+                        wraps = true;
+                    }
+                }
+                if run == 0 || track_buf.len() < run * 2 || post_buf.len() < run * 2 {
+                    break;
+                }
+                let run_disc = tr.win.disc;
+                let buf = &mut track_buf[..run * 2];
+                buf.fill(0.0);
+                if !tr.clips.is_empty() {
+                    for i in 0..run {
+                        let p = frame_pos(track_base, (f + i) as u64, track_lp);
+                        let mut l = 0.0f32;
+                        let mut r = 0.0f32;
+                        for clip in &tr.clips {
+                            let s = clip_sample(clip, p);
+                            l += s[0];
+                            r += s[1];
+                        }
+                        buf[i * 2] = l;
+                        buf[i * 2 + 1] = r;
+                    }
+                }
+                render_live_into(tr, buf, pos, run, sample_rate, run_disc, steady_base);
+                process_inserts(tr, buf, sample_rate, steady_base);
+                // PRE-fader taps leave here: post-insert, source-aligned by
+                // `RtTrack::pdc`, before the fader and before `master_pdc`.
+                // Every sender therefore reaches a bus at the same latency,
+                // which is what makes one delay line per bus enough.
+                for snd in tr.sends.iter().filter(|s| s.pre_fader) {
+                    let base = snd.bus * MAX_LIVE_BLOCK * 2;
+                    if let Some(slice) = bus_buf.get_mut(base..base + w_len * 2) {
+                        tap_into_bus(
+                            slice,
+                            f - w0,
+                            buf,
+                            run,
+                            params.send_amount_linear(snd.amount),
+                        );
+                    }
+                }
+                let post = &mut post_buf[..run * 2];
+                apply_fader_into(buf, run, f, pos, &fader, pan_last, &mut clip_ramp, post, &mut acc);
+                // POST-fader taps follow the fader and the mute, which is
+                // what a reverb send normally wants — and they leave BEFORE
+                // `master_pdc`, so they are aligned with the pre-fader taps.
+                for snd in tr.sends.iter().filter(|s| !s.pre_fader) {
+                    let base = snd.bus * MAX_LIVE_BLOCK * 2;
+                    if let Some(slice) = bus_buf.get_mut(base..base + w_len * 2) {
+                        tap_into_bus(
+                            slice,
+                            f - w0,
+                            post,
+                            run,
+                            params.send_amount_linear(snd.amount),
+                        );
+                    }
+                }
+                if let Some(d) = tr.master_pdc.as_mut() {
+                    d.process(post);
+                }
+                mix_post_into(out, f, out_ch, post, run);
+                if wraps {
+                    live_all_notes_off(tr);
+                }
+                tr.win.disc = wraps;
+                f += run;
+            }
+
+            tr.win.pk_l = tr.win.pk_l.max(acc.pk_l);
+            tr.win.pk_r = tr.win.pk_r.max(acc.pk_r);
+            tr.win.ss_l += acc.ss_l;
+            tr.win.ss_r += acc.ss_r;
+        }
+
+        // BUS PASS (Plan G2). Every tap for this window has landed, so each
+        // return is now an ordinary strip whose source happens to be an
+        // accumulator: inserts (the shared reverb), the compensating delay
+        // that lines the return up with the dry paths, then fader and meters.
+        for (bi, bus) in buses.iter_mut().enumerate() {
+            if bus.slot >= n_slots {
+                continue;
+            }
+            let base = bi * MAX_LIVE_BLOCK * 2;
+            let gain = f32::from_bits(params.gain[bus.slot].load(Relaxed));
+            let pan = f32::from_bits(params.pan[bus.slot].load(Relaxed));
+            let flags = params.flags[bus.slot].load(Relaxed);
+            // A return is silenced by its OWN mute only. Soloing a vocal
+            // must not take its reverb with it — that is Live's default and
+            // the only one that makes solo usable on a project with returns.
+            let on = flags & FLAG_MUTE == 0;
+            let (gl_atomic, gr_atomic) = balance_gains(pan);
+            let ramps = track_ramps.get(bus.slot);
+            let ramp: &[AbsParamEvent] = if params.gain_automation_owner(bus.slot).is_some() {
+                &[]
+            } else {
+                ramps
+                    .and_then(|t| t.gain.as_ref())
+                    .map(|a| a.as_slice())
+                    .unwrap_or(&[])
+            };
+            let mut bus_ramp = RampCursor::new();
+            let pdc_delay = bus.pdc.as_ref().map_or(0u64, |d| d.delay() as u64);
+            let pan_gains_quad = pan_gain_quad(
+                ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
+                pan,
+                (gl_atomic, gr_atomic),
+                frame_pos(base_pos, 0, lp).saturating_sub(pdc_delay),
+                frame_pos(base_pos, frames.saturating_sub(1) as u64, lp)
+                    .saturating_sub(pdc_delay),
+                balance_gains,
+            );
+            let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on, pdc_delay };
+            let mut acc = TrackAccum::default();
+
+            let mut f = w0;
+            while f < w_end {
+                let run = (w_end - f).min(MAX_LIVE_BLOCK);
+                if run == 0 || post_buf.len() < run * 2 {
+                    break;
+                }
+                let at = (f - w0) * 2;
+                let Some(bbuf) = bus_buf.get_mut(base + at..base + at + run * 2) else { break };
+                for insert in &bus.inserts {
+                    if insert.bypassed {
+                        continue;
+                    }
+                    // SAFETY: same RCU contract as the track chain — see
+                    // `InsertNodeCell`.
+                    let proc = unsafe { insert.proc.rt_mut() };
+                    let mut io =
+                        ProcessBlock { samples: bbuf, channels: 2, sample_rate, steady: steady_base };
+                    proc.process(&mut io);
+                }
+                if let Some(d) = bus.pdc.as_mut() {
+                    d.process(bbuf);
+                }
+                let pos = frame_pos(base_pos, f as u64, lp);
+                let post = &mut post_buf[..run * 2];
+                apply_fader_into(bbuf, run, f, pos, &fader, pan_last, &mut bus_ramp, post, &mut acc);
+                mix_post_into(out, f, out_ch, post, run);
+                f += run;
+            }
+
+            bus.win.pk_l = bus.win.pk_l.max(acc.pk_l);
+            bus.win.pk_r = bus.win.pk_r.max(acc.pk_r);
+            bus.win.ss_l += acc.ss_l;
+            bus.win.ss_r += acc.ss_r;
+        }
+
+        w0 = w_end;
+    }
+
+    // Meter lanes, once per block — folded across every window.
+    for tr in tracks.iter() {
+        if tr.slot >= n_slots {
+            continue;
+        }
         let chunk_idx = tr.slot / METER_CHUNK_SLOTS;
         let lane = tr.slot % METER_CHUNK_SLOTS;
         if let Some(chunk) = meter_scratch.get_mut(chunk_idx) {
-            chunk.set_slot_local(lane, acc.pk_l, acc.pk_r, acc.ss_l, acc.ss_r);
+            chunk.set_slot_local(lane, tr.win.pk_l, tr.win.pk_r, tr.win.ss_l, tr.win.ss_r);
+        }
+    }
+    for bus in buses.iter() {
+        if bus.slot >= n_slots {
+            continue;
+        }
+        let chunk_idx = bus.slot / METER_CHUNK_SLOTS;
+        let lane = bus.slot % METER_CHUNK_SLOTS;
+        if let Some(chunk) = meter_scratch.get_mut(chunk_idx) {
+            chunk.set_slot_local(lane, bus.win.pk_l, bus.win.pk_r, bus.win.ss_l, bus.win.ss_r);
         }
     }
 
@@ -670,7 +932,7 @@ pub fn render_live_input_only(
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
-    let RtGraph { tracks, track_buf, meter_scratch, track_ramps, .. } = graph;
+    let RtGraph { tracks, track_buf, post_buf, meter_scratch, track_ramps, .. } = graph;
     let track_ramps: &[super::rt::TrackRamps] = track_ramps;
 
     for (i, chunk) in meter_scratch.iter_mut().enumerate() {
@@ -716,6 +978,7 @@ pub fn render_live_input_only(
             base_pos
                 .saturating_add(frames.saturating_sub(1) as u64)
                 .saturating_sub(pdc_delay),
+            pan_gains,
         );
         let pan_last = frames.saturating_sub(1);
         let fader = FaderCtx { gain, ramp, pan: pan_gains_quad, on, pdc_delay };
@@ -725,7 +988,7 @@ pub fn render_live_input_only(
         let mut f = 0usize;
         while f < frames {
             let run = (frames - f).min(MAX_LIVE_BLOCK);
-            if run == 0 || track_buf.len() < run * 2 {
+            if run == 0 || track_buf.len() < run * 2 || post_buf.len() < run * 2 {
                 break;
             }
             let buf = &mut track_buf[..run * 2];
@@ -744,7 +1007,22 @@ pub fn render_live_input_only(
                 node.process(&mut io);
             }
             process_inserts(tr, buf, sample_rate, Some(steady_base));
-            apply_fader(buf, run, f, base_pos + f as u64, &fader, pan_last, &mut clip_ramp, out, out_ch, &mut acc);
+            // Monitoring has no bus pass and no `master_pdc`: a stopped
+            // transport is not mixing returns, so the faded run goes
+            // straight from the scratch into the master.
+            let post = &mut post_buf[..run * 2];
+            apply_fader_into(
+                buf,
+                run,
+                f,
+                base_pos + f as u64,
+                &fader,
+                pan_last,
+                &mut clip_ramp,
+                post,
+                &mut acc,
+            );
+            mix_post_into(out, f, out_ch, post, run);
             f += run;
         }
 
@@ -785,7 +1063,7 @@ mod tests {
     use super::super::pdc::DelayLine;
     use super::super::rt::ParamTable;
     use super::super::rt::RtClipData;
-    use super::super::rt::RtTrack;
+    use super::super::rt::{RtBus, RtSend, RtTrack};
     use std::sync::Arc;
 
     fn clip(start: u64, offset: u64, len: u64, data: Vec<f32>, channels: u16) -> RtClip {
@@ -1120,6 +1398,250 @@ mod tests {
         assert!(left[0].abs() < 1e-6, "nothing at t=0");
     }
 
+    // ---- sends and bus returns (Plan G2) ----
+
+    /// A graph with returns and ONE send lane. The lane count matters:
+    /// `ParamTable::default()` has zero of them, and an unknown send index
+    /// reads back as unity — which would make every amount assertion below
+    /// pass for the wrong reason.
+    fn graph_with_bus(tracks: Vec<RtTrack>, buses: Vec<RtBus>) -> RtGraph {
+        RtGraph::with_buses(tracks, buses, 1, Arc::new(ParamTable::with_slots_and_sends(64, 1)))
+    }
+
+    fn empty_bus(slot: usize) -> RtBus {
+        RtBus { slot, inserts: Vec::new(), pdc: None, win: Default::default() }
+    }
+
+    /// Unity send into an empty (pass-through) bus: the master hears the dry
+    /// signal AND the return, i.e. exactly twice the dry signal. This is the
+    /// end-to-end shape of "one reverb, many sources" with the reverb
+    /// removed, so nothing but the routing is under test.
+    #[test]
+    fn a_unity_send_into_an_empty_bus_doubles_the_signal() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 1.0);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!((out[0] - 2.0).abs() < 1e-6, "dry + unity return = 2.0, got {}", out[0]);
+    }
+
+    /// A CENTRED return comes back at the amount you dialled — no hidden
+    /// 3 dB. The bus uses the balance law, not constant-power: its input is
+    /// an already-panned stereo sum, and taking another 3 dB off it would
+    /// make "unity send into a unity return" quieter than the dry signal.
+    #[test]
+    fn a_centred_return_is_not_attenuated_by_the_pan_law() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        // Both strips centred (the default). The track pays the
+        // constant-power -3 dB once, at its own fader; the return carries
+        // that already-panned signal and must not pay it a second time.
+        g.params.set_send_amount_linear(0, 1.0);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let dry = std::f32::consts::FRAC_1_SQRT_2; // centred track
+        assert!(
+            (out[0] - 2.0 * dry).abs() < 1e-6,
+            "dry {dry} + an equally loud return, got {}",
+            out[0]
+        );
+    }
+
+    /// A PRE-fader tap is pre-pan as well as pre-gain — it leaves the strip
+    /// before the fader does anything at all. Pinned because "pre-fader"
+    /// reads like it might only mean pre-GAIN.
+    #[test]
+    fn a_pre_fader_tap_is_pre_pan_too() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: true });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        g.params.set_send_amount_linear(0, 1.0);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let dry = std::f32::consts::FRAC_1_SQRT_2;
+        assert!(
+            (out[0] - (dry + 1.0)).abs() < 1e-6,
+            "centred dry {dry} + an UNPANNED 1.0 tap, got {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn balance_law_is_unity_at_centre_and_one_sided_at_the_extremes() {
+        let (l, r) = balance_gains(0.0);
+        assert!((l - 1.0).abs() < 1e-6 && (r - 1.0).abs() < 1e-6);
+        let (l, r) = balance_gains(-1.0);
+        assert!((l - 1.0).abs() < 1e-6 && r.abs() < 1e-6);
+        let (l, r) = balance_gains(1.0);
+        assert!(l.abs() < 1e-6 && (r - 1.0).abs() < 1e-6);
+    }
+
+    /// The amount is a live parameter, not a rebuild: writing the atomic
+    /// between two renders changes the next block and nothing else.
+    #[test]
+    fn the_send_amount_scales_the_return_without_a_rebuild() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 0.25);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!((out[0] - 1.25).abs() < 1e-6, "dry + 0.25 return, got {}", out[0]);
+        g.params.set_send_amount_linear(0, 0.0);
+        let mut out2 = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out2, 2);
+        assert!((out2[0] - 1.0).abs() < 1e-6, "return off, dry only, got {}", out2[0]);
+    }
+
+    /// An insert on the BUS processes the return and leaves the dry path
+    /// alone — the whole point of a shared effect.
+    #[test]
+    fn a_bus_insert_processes_only_the_return() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut bus = empty_bus(1);
+        bus.inserts.push(crate::audio::insert::InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency: 0,
+            proc: crate::audio::insert::InsertNodeCell::new(Box::new(GainHalfEffect {
+                bypassed: false,
+            })),
+        });
+        let mut g = graph_with_bus(vec![track], vec![bus]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 1.0);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!((out[0] - 1.5).abs() < 1e-6, "dry 1.0 + halved return 0.5, got {}", out[0]);
+    }
+
+    /// Post-fader (the default) means the mute takes the send with it;
+    /// pre-fader means the return survives pulling the dry signal out. Both
+    /// tap BEFORE `master_pdc`, so they stay aligned with each other.
+    #[test]
+    fn a_muted_track_still_feeds_a_pre_fader_send_but_not_a_post_fader_one() {
+        for (pre_fader, expected) in [(false, 0.0f32), (true, 1.0)] {
+            let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+            track.sends.push(RtSend { bus: 0, amount: 0, pre_fader });
+            let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+            g.params.set_pan(0, -1.0);
+            g.params.set_pan(1, -1.0);
+            g.params.set_send_amount_linear(0, 1.0);
+            g.params.set_flag(0, FLAG_MUTE, true);
+            let mut out = vec![0.0f32; 8];
+            render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+            assert!(
+                (out[0] - expected).abs() < 1e-6,
+                "pre_fader={pre_fader}: expected {expected}, got {}",
+                out[0]
+            );
+        }
+    }
+
+    /// Soloing a track must NOT take the returns with it — solo the vocal
+    /// and you still hear its reverb. A bus answers to its own mute only.
+    #[test]
+    fn a_return_stays_audible_under_someone_else_s_solo() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 1.0);
+        g.params.set_flag(0, FLAG_SOLO, true);
+        g.params.any_solo.store(true, Relaxed);
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!((out[0] - 2.0).abs() < 1e-6, "dry + return under solo, got {}", out[0]);
+
+        g.params.set_flag(1, FLAG_MUTE, true);
+        let mut muted = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut muted, 2);
+        assert!((muted[0] - 1.0).abs() < 1e-6, "muting the bus DOES silence it, got {}", muted[0]);
+    }
+
+    /// A latency-reporting insert on the bus makes the return late. The dry
+    /// path waits for it via `master_pdc`, so the two land on the same
+    /// sample instead of smearing into a flam.
+    #[test]
+    fn a_latency_carrying_return_and_the_dry_path_land_together() {
+        let mut dummy = LatencyDummy::new(256);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut track = RtTrack::clips(0, vec![impulse_clip()]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: true });
+        // `compile_routing` would derive this: the slowest return declares
+        // 256, so the dry path waits 256 and the bus itself waits nothing.
+        track.master_pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        let mut bus = empty_bus(1);
+        bus.inserts.push(crate::audio::insert::InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency: 256,
+            proc: crate::audio::insert::InsertNodeCell::new(Box::new(dummy)),
+        });
+        let mut g = graph_with_bus(vec![track], vec![bus]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 1.0);
+        let mut out = vec![0.0f32; 1024 * 2];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(left[..256].iter().all(|v| v.abs() < 1e-6), "nothing before the compensation");
+        assert!(
+            (left[256] - 2.0).abs() < 1e-4,
+            "dry and return coincide at 256 (2.0), got {}",
+            left[256]
+        );
+    }
+
+    /// The window loop only exists so `bus_buf` can be a fixed size. A block
+    /// LARGER than one window must still render every frame exactly once,
+    /// with the returns intact — this is the only path that runs the loop
+    /// more than once, so nothing else would catch an off-by-one in it.
+    #[test]
+    fn a_block_longer_than_one_window_still_routes_every_frame() {
+        let frames = MAX_LIVE_BLOCK + 777;
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, frames as u64, vec![1.0; frames], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 1.0);
+        let mut out = vec![0.0f32; frames * 2];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        for (i, v) in out.iter().step_by(2).enumerate() {
+            assert!((v - 2.0).abs() < 1e-6, "frame {i}: dry + return = 2.0, got {v}");
+        }
+    }
+
+    /// The bus writes its OWN meter lane, and the track that fed it keeps
+    /// writing its own — a return is a visible strip, not an invisible sum.
+    #[test]
+    fn a_bus_meters_its_return_on_its_own_slot() {
+        let mut track = RtTrack::clips(0, vec![clip(0, 0, 4, vec![1.0; 4], 1)]);
+        track.sends.push(RtSend { bus: 0, amount: 0, pre_fader: false });
+        let mut g = graph_with_bus(vec![track], vec![empty_bus(1)]);
+        g.params.set_pan(0, -1.0);
+        g.params.set_pan(1, -1.0);
+        g.params.set_send_amount_linear(0, 0.5);
+        let mut out = vec![0.0f32; 8];
+        let blocks = render_with_meters(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let blk = blocks[0];
+        assert!((blk.peak[0][0] - 1.0).abs() < 1e-6, "track lane, got {}", blk.peak[0][0]);
+        assert!((blk.peak[1][0] - 0.5).abs() < 1e-6, "bus lane, got {}", blk.peak[1][0]);
+    }
+
     #[test]
     fn clips_and_live_are_summed_before_inserts() {
         use super::super::dsp::AudioProcessor;
@@ -1273,6 +1795,9 @@ mod tests {
         let mut synth = PolySynth::new();
         synth.prepare(rate, super::super::rt::MAX_LIVE_BLOCK);
         RtTrack {
+            sends: Vec::new(),
+            master_pdc: None,
+            win: Default::default(),
             slot,
             clips: Vec::new(),
             live: Some(LiveSource {
@@ -1441,6 +1966,9 @@ mod tests {
     fn non_rt_render_never_hands_a_decreasing_steady_across_a_loop_wrap() {
         let state = Arc::new(parking_lot::Mutex::new(FallbackState::default()));
         let tr = RtTrack {
+            sends: Vec::new(),
+            master_pdc: None,
+            win: Default::default(),
             slot: 0,
             clips: Vec::new(),
             live: Some(LiveSource {

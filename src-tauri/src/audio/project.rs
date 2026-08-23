@@ -421,6 +421,7 @@ mod tests {
         assert!(!dir.join("project.json.tmp").exists(), "tmp renamed away");
 
         project.tracks.push(TrackState {
+            sends: Vec::new(),
             id: "11111111-1111-4111-8111-111111111111".into(),
             name: "Vocals".into(),
             kind: "audio".into(),
@@ -478,6 +479,7 @@ mod tests {
 
     fn track_n(i: usize) -> TrackState {
         TrackState {
+            sends: Vec::new(),
             id: format!("t{i}").into(),
             name: format!("T{i}"),
             kind: "audio".into(),

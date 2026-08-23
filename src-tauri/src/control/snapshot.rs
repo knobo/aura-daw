@@ -147,6 +147,7 @@ impl ChangeSet {
     /// · AutomationSetLane→automation · PluginAdd/PluginSetState→plugins
     /// · PluginRemove→plugins+tracks (G-10 insert sweep)
     /// · InsertAdd/Remove/Reorder/SetBypass→tracks · TrackReorder→tracks
+    /// · SendAdd/Remove/SetAmount/SetPreFader→tracks
     /// · HarmonySet→harmony
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
@@ -219,6 +220,15 @@ impl ChangeSet {
                 | Op::InsertRemove { .. }
                 | Op::InsertReorder { .. }
                 | Op::InsertSetBypass { .. } => {
+                    cs.tracks = true;
+                }
+                // Plan G2: the send list lives on TrackState too — including
+                // `SendSetAmount`, which is a param write for the ENGINE but
+                // still a document mutation the snapshot must re-derive.
+                Op::SendAdd { .. }
+                | Op::SendRemove { .. }
+                | Op::SendSetAmount { .. }
+                | Op::SendSetPreFader { .. } => {
                     cs.tracks = true;
                 }
                 // Lanes UX: reorder rewrites `store.tracks` wholesale. Only
@@ -541,6 +551,7 @@ mod tests {
 
     fn track(id: &str) -> TrackState {
         TrackState {
+            sends: Vec::new(),
             id: id.into(),
             name: format!("Track {id}"),
             kind: "midi".into(),
