@@ -37,6 +37,7 @@ vi.mock("../../utils/lane-reveal", () => ({
 const { default: PluginParamPanel } = await import("./PluginParamPanel.svelte");
 const { plugins } = await import("../../state/plugins.svelte");
 const { modulation } = await import("../../state/modulation.svelte");
+const { paramFollow } = await import("../../state/param-follow.svelte");
 const { toasts } = await import("../../state/toasts.svelte");
 
 const UID = "clap:/usr/lib/clap/glBars.clap#studio.kx.distrho.glBars";
@@ -83,6 +84,7 @@ beforeEach(() => {
   plugins.guiById = {};
   plugins.catalog = emptyCatalog();
   modulation.bindings = [];
+  paramFollow.reset();
 });
 
 afterEach(() => {
@@ -92,6 +94,67 @@ afterEach(() => {
   plugins.instances = [];
   plugins.guiById = {};
   plugins.catalog = emptyCatalog();
+  paramFollow.reset();
+});
+
+/**
+ * Track D ruling 2 drives plugin-param automation HOST-ONLY, so while a lane
+ * holds a param the document value this panel paints is NOT what the plugin
+ * has. `paramFollow` carries the engine's own read-back; these cover that the
+ * panel paints it, says so, and hands the param back when it stops.
+ */
+describe("PluginParamPanel follows automation", () => {
+  it("paints the driven value, not the document's, while automation holds a param", () => {
+    plugins.params = [param(1, "Filter / Level", 0.5)];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.8 }]);
+    render(PluginParamPanel);
+    expect(screen.getByRole("button", { name: "Level, 0.80" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Filter / Level (0.80)" })).toBeTruthy();
+  });
+
+  it("flags the row so the fader refusing to stay put is explained, not mysterious", () => {
+    plugins.params = [param(1, "Filter / Level", 0.5), param(2, "Filter / Res", 0.25)];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.8 }]);
+    render(PluginParamPanel);
+    const flags = screen.getAllByText("AUTO");
+    expect(flags.length).toBe(1);
+    expect(flags[0].getAttribute("title")).toContain("Filter / Level");
+  });
+
+  it("leaves an unautomated param on the document value", () => {
+    plugins.params = [param(1, "Filter / Level", 0.5), param(2, "Filter / Res", 0.25)];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.8 }]);
+    render(PluginParamPanel);
+    expect(screen.getByRole("button", { name: "Res, 0.25" })).toBeTruthy();
+  });
+
+  it("ignores a read-back for a DIFFERENT instance", () => {
+    plugins.params = [param(1, "Filter / Level", 0.5)];
+    paramFollow.apply([{ instanceId: "i-other", index: 1, value: 0.8 }]);
+    render(PluginParamPanel);
+    expect(screen.getByRole("button", { name: "Level, 0.50" })).toBeTruthy();
+    expect(screen.queryByText("AUTO")).toBeNull();
+  });
+
+  it("hands the param back to the document when the transport stops", async () => {
+    plugins.params = [param(1, "Filter / Level", 0.5)];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 0.8 }]);
+    render(PluginParamPanel);
+    expect(screen.getByRole("button", { name: "Level, 0.80" })).toBeTruthy();
+
+    paramFollow.apply([]); // a stopped transport ships an empty read-back
+    expect(await screen.findByRole("button", { name: "Level, 0.50" })).toBeTruthy();
+    expect(screen.queryByText("AUTO")).toBeNull();
+  });
+
+  it("still writes to the real param id from a driven row", async () => {
+    plugins.params = [param(4, "Filter / Level", 0.5)];
+    paramFollow.apply([{ instanceId: "i1", index: 4, value: 0.8 }]);
+    render(PluginParamPanel);
+    const fader = screen.getByRole("slider", { name: /^Filter \/ Level/ });
+    await fireEvent.input(fader, { target: { value: "0.3" } });
+    expect(plugins.params[0].value).toBe(0.3);
+  });
 });
 
 describe("PluginParamPanel native GUI", () => {

@@ -9,6 +9,7 @@
    * one plugin_set_param per frame regardless of drag rate.
    */
   import { modulation } from "../../state/modulation.svelte";
+  import { paramFollow } from "../../state/param-follow.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { toasts } from "../../state/toasts.svelte";
   import type { PluginParamInfo, TargetRef } from "../../types/ipc";
@@ -127,6 +128,23 @@
     return paramUnit(p);
   }
 
+  /** The param as it should be PAINTED. Plugin-param automation is driven
+   * host-only (Track D ruling 2), so while a lane holds a param the document
+   * value this panel used to show is not what the plugin has — the engine's
+   * read-back is. Returns the SAME object when nothing drives it, which is
+   * what `isDriven` tests and what keeps a still panel allocation-free.
+   *
+   * Identity (`id`, `min`, `max`, `steps`, `default`) is untouched, so every
+   * write still addresses the real param and a reset still resets to the real
+   * default. */
+  function shown(p: PluginParamInfo): PluginParamInfo {
+    const v = paramFollow.valueFor(plugins.openInstanceId, p.id);
+    return v === undefined ? p : { ...p, value: v };
+  }
+  function isDriven(p: PluginParamInfo, d: PluginParamInfo): boolean {
+    return d !== p;
+  }
+
   function onSlide(p: PluginParamInfo, e: Event) {
     plugins.setParam(p.id, parseFloat((e.currentTarget as HTMLInputElement).value));
   }
@@ -217,7 +235,9 @@
   {/if}
 
   {#snippet paramRow(p: PluginParamInfo, short: string)}
-    <div class="param">
+    {@const d = shown(p)}
+    {@const auto = isDriven(p, d)}
+    <div class="param" class:auto>
       <!-- The removed `.pname` used to carry "{p.name} (id {p.id})" as its
            title. The fader below still says it for a continuous param, but
            a toggle/enum row renders no fader — this row-level title is the
@@ -228,24 +248,35 @@
         <div class="chipwrap">
           <ParamChip
             label={short}
-            value={p.value}
-            format={() => formatParamDisplay(p)}
+            value={d.value}
+            format={() => formatParamDisplay(d)}
             state={pluginBound(p.id) ? "automated" : "plain"}
             title={chipTitle(p)}
             onclick={() => jumpToLane(p)}
           />
         </div>
+        {#if auto}
+          <!-- Why the control below will not stay where you put it: ruling 2
+               says automation OVERRIDES the knob during playback. The write
+               still lands in the document, and the plugin gets it back when
+               the transport stops. -->
+          <span
+            class="autoflag mono"
+            title="Automation is driving {p.name} — the panel follows the lane until the transport stops"
+            >AUTO</span
+          >
+        {/if}
         {#if isToggle(p)}
           <button
             class="toggle mono"
-            class:on={p.value >= (p.min + p.max) / 2}
+            class:on={d.value >= (p.min + p.max) / 2}
             title="Toggle {short}"
-            onclick={() => plugins.setParam(p.id, p.value >= (p.min + p.max) / 2 ? p.min : p.max)}
+            onclick={() => plugins.setParam(p.id, d.value >= (p.min + p.max) / 2 ? p.min : p.max)}
           >
-            {p.value >= (p.min + p.max) / 2 ? "ON" : "OFF"}
+            {d.value >= (p.min + p.max) / 2 ? "ON" : "OFF"}
           </button>
         {:else if isEnum(p)}
-          <select class="enum mono" value={p.value} onchange={(e) => onEnum(p, e)}>
+          <select class="enum mono" value={d.value} onchange={(e) => onEnum(p, e)}>
             {#each enumValues(p) as v, i (i)}
               <option value={v}>{fmt(p, v)}</option>
             {/each}
@@ -275,10 +306,10 @@
           min={p.min}
           max={p.max}
           step={sliderStep(p)}
-          value={p.value}
-          style:--fader-pct="{pct(p)}%"
-          style:--fader-fill="var(--cyan)"
-          aria-label="{p.name} ({fmt(p)}{unitOf(p)})"
+          value={d.value}
+          style:--fader-pct="{pct(d)}%"
+          style:--fader-fill={auto ? "var(--magenta)" : "var(--cyan)"}
+          aria-label="{p.name} ({fmt(d)}{unitOf(d)})"
           title="{p.name} — double-click resets to {fmt(p, p.default)}"
           oninput={(e) => onSlide(p, e)}
           onpointerdown={() => plugins.beginParamGesture()}
@@ -553,6 +584,22 @@
     background: var(--violet);
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
+
+  /* "Automation has this one" — magenta, the colour PR #32 gave the
+     automation-visible toggle, so the whole app says automation in one hue.
+     A label rather than a button: there is nothing to click, it is a
+     statement about why the fader below will not stay put. */
+  .autoflag {
+    flex: none;
+    padding: 0 3px;
+    line-height: 14px;
+    font-size: 8px;
+    letter-spacing: 0.06em;
+    border-radius: 3px;
+    border: var(--border-width) solid rgb(var(--magenta-rgb) / 0.45);
+    background: rgb(var(--magenta-rgb) / 0.14);
+    color: var(--magenta);
   }
 
   /* Pin toggle — same small-button language as `.autobtn`, amber for the

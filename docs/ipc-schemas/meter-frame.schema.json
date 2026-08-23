@@ -23,11 +23,37 @@
     "master": {
       "description": "Master bus meter (trackId == \"master\").",
       "$ref": "#/$defs/trackMeter"
+    },
+    "drivenParams": {
+      "description": "Plugin params the engine's automation driver is holding right now, with the value it last wrote to the host. Plugin-param automation is host-only (Track D ruling 2), so this read-back is the only thing that says what a parameter is actually doing; the document keeps whatever the user set. Empty whenever the transport is stopped, nothing is automated, or a rebuild has just replaced the driver — which is also how a UI knows to stop following. Display state: nothing persists it.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/drivenParam" }
     }
   },
   "required": ["seq", "positionSamples", "tracks", "master"],
   "additionalProperties": false,
   "$defs": {
+    "drivenParam": {
+      "title": "DrivenParam",
+      "type": "object",
+      "properties": {
+        "instanceId": {
+          "description": "Plugin instance id — what plugin_get_params and plugin_set_param address.",
+          "type": "string"
+        },
+        "index": {
+          "description": "Host parameter index, the same id plugin_get_params reports.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "value": {
+          "description": "Value in the parameter's native host units (same units as PluginParamInfo.value).",
+          "type": "number"
+        }
+      },
+      "required": ["instanceId", "index", "value"],
+      "additionalProperties": false
+    },
     "trackMeter": {
       "title": "TrackMeter",
       "type": "object",
