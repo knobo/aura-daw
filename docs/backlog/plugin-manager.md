@@ -92,7 +92,7 @@ The merged branches `feat/plugin-manager` (Step 5),
 |---|---|
 | The gesture | `BrowserRow`'s `ondblclick`, plus Shift+Enter on `BrowserShell` for keyboard parity. Single click is untouched everywhere (ruling R-1). |
 | The gate | `browserAudition` pref, default off, plus `AuditionChip.svelte` in every browser toolbar. The chip writes the pref — there is no second session mute (ruling R-2). |
-| The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops. |
+| The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops. `ZynPatchBrowser` is the exception: it plays through `zyn.audition(inst.id, patch)` directly and routes only the preference check and the silent-reason path through the shared store, because loading the patch has to happen before any note can sound. |
 | Catalog plugins | A descriptor borrows a live, track-bound instance of the same plugin if one exists; otherwise silent with a reason. Instantiating to preview would commit `Op::PluginAdd` (ruling R-3). |
 
 ## Leftovers — do not start unless asked

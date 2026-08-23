@@ -26,6 +26,7 @@
   import { FoldController } from "../browser/fold-controller.svelte";
   import { type BrowserGroup, flattenRows, groupItems, rankItems } from "../browser/browser-model";
   import EmptyState from "../browser/EmptyState.svelte";
+  import AuditionChip from "../browser/AuditionChip.svelte";
 
   const FAV_KEY = "aura.zyn.patch-favorites";
 
@@ -168,6 +169,7 @@
     >
       <span aria-hidden="true">{folds.anyCollapsed(groupKeys) ? "⌄" : "⌃"}</span>
     </button>
+    <AuditionChip />
     <button
       type="button"
       class="chip mono"

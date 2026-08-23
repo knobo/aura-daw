@@ -125,4 +125,12 @@ describe("ZynPatchBrowser patch audition", () => {
       timeout: 500,
     });
   });
+
+  it("the toolbar's audition chip flips the shared preference — this browser is not stuck reading it from elsewhere", async () => {
+    render(ZynPatchBrowser);
+    const chip = screen.getByRole("button", { name: /audition on double-click/i });
+    expect(audition.enabled).toBe(false);
+    await fireEvent.click(chip);
+    expect(audition.enabled).toBe(true);
+  });
 });
