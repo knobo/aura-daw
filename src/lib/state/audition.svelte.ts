@@ -44,6 +44,15 @@ class AuditionStore {
    * `library_audition_stop` has anything to release. */
   #sampleSounding = false;
   #decay: ReturnType<typeof setTimeout> | null = null;
+  /** Bumped by every `play()`/`stop()` call. Each `play()` captures its own
+   * value and checks it after every `await`: if some later call has since
+   * bumped the counter, this one has been superseded and must not touch
+   * `sounding`/`#sampleSounding` — otherwise a stale IPC round-trip that
+   * resolves after a newer one can resurrect the row it lost to (fix for
+   * the overlapping-play race: two rows auditioned in quick succession
+   * must never both end up sounding, and the highlight must always land on
+   * the last one clicked, not whichever happened to resolve last). */
+  #gen = 0;
 
   get enabled(): boolean {
     return prefs.values.browserAudition;
@@ -62,29 +71,44 @@ class AuditionStore {
       this.lastSilentReason = target.reason;
       return;
     }
+    // This call now owns the generation. Anything still in flight from an
+    // earlier call — including the `#release()` below, and including a
+    // concurrent external `stop()` — checks against `#gen` and backs off
+    // once it sees a newer one has taken over.
+    const token = ++this.#gen;
     // Whatever was sounding gets cut first: two overlapping auditions tell
     // you nothing about either one.
-    await this.stop();
+    await this.#release();
+    if (token !== this.#gen) return; // superseded again while releasing
     this.lastSilentReason = null;
     try {
       switch (target.kind) {
         case "sample":
-          await backend.libraryAudition?.(target.path);
+          // Set *before* the await, not after: a `stop()` (or a newer
+          // `play()`'s `#release()`) that runs while this call is still
+          // waiting on the backend must see that there is a sample stream
+          // to cut, not find `#sampleSounding` still false and skip it.
           this.#sampleSounding = true;
+          await backend.libraryAudition?.(target.path);
+          if (token !== this.#gen) return; // a newer play()/stop() won
           this.#light(target.path);
           break;
         case "instrument":
           await backend.samplerPreviewNote(target.instrumentId, target.key, AUDITION_VELOCITY);
+          if (token !== this.#gen) return;
           this.#light(target.instrumentId);
           break;
         case "pluginInstance":
           await backend.pluginPreviewNote(target.instanceId, target.key, AUDITION_VELOCITY);
+          if (token !== this.#gen) return;
           this.#light(target.instanceId);
           break;
       }
     } catch (err) {
       // A preview that cannot sound is a hint, never a thrown error that
-      // takes a click handler down with it.
+      // takes a click handler down with it. But if a newer call has since
+      // taken over, this stale failure must not clobber its state either.
+      if (token !== this.#gen) return;
       this.sounding = null;
       this.#sampleSounding = false;
       this.lastSilentReason = String(err);
@@ -92,6 +116,19 @@ class AuditionStore {
   }
 
   async stop(): Promise<void> {
+    // Supersede whatever `play()` may still be in flight — its pending
+    // `await`s will see `#gen` has moved on and stand down instead of
+    // starting (or re-lighting) after this `stop()` already ran.
+    this.#gen++;
+    await this.#release();
+  }
+
+  /** The actual teardown: clear the decay timer, clear the highlight, and
+   * release the sample stream if one is open. Shared by `stop()` and by
+   * `play()`'s own cut-the-previous-one-off step. Does not touch `#gen` —
+   * the caller owns that, since `play()` must keep the generation it just
+   * claimed rather than immediately superseding itself. */
+  async #release(): Promise<void> {
     if (this.#decay) {
       clearTimeout(this.#decay);
       this.#decay = null;
