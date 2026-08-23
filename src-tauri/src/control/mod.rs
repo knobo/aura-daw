@@ -46,7 +46,7 @@ use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState}
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
-pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
+pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter, UndoPath};
 pub use ops::{LaneArrangement, TrackMixChange};
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};

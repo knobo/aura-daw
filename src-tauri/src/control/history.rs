@@ -312,6 +312,23 @@ impl History {
     pub fn redo_len(&self) -> usize {
         self.redo.len()
     }
+
+    /// The `rev` of the entry a plain undo would pop — `None` when there is
+    /// nothing to undo. This is the HEAD of the linear undo ancestry, and
+    /// the value `ControlPlane::undo_to` guards on. NOT `Session::rev`:
+    /// that one advances on transient commits (transport play/stop, gesture
+    /// folds), which do not touch this stack at all.
+    pub fn head_rev(&self) -> Option<u64> {
+        self.undo.back().map(|e| e.rev)
+    }
+
+    /// Every revision currently on the undo path, oldest first — the stack's
+    /// own ascending order (see [`Self::record`]'s insertion rule). An entry
+    /// that has been undone is on the redo stack and is deliberately absent:
+    /// it is no longer part of the ancestry the document sits on.
+    pub fn undo_revs(&self) -> Vec<u64> {
+        self.undo.iter().map(|e| e.rev).collect()
+    }
 }
 
 /// The 350 ms same-key merge predicate. Both entries must carry a key
@@ -533,6 +550,23 @@ pub enum HistoryMode {
     /// history entry: `ControlPlane::undo`/`redo` migrate the ORIGINAL
     /// entry between the stacks instead.
     Replay,
+}
+
+/// The linear undo ancestry as one atomic observation: the epoch it was read
+/// under, and the revisions on it (oldest first). Read as ONE step so a
+/// caller cannot pair revisions from one document with the epoch of another
+/// — the same reason [`HistoryLog::pop_undo`] returns its epoch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UndoPath {
+    pub epoch: u64,
+    pub revs: Vec<u64>,
+}
+
+impl UndoPath {
+    /// The revision a plain undo would consume next.
+    pub fn head(&self) -> Option<u64> {
+        self.revs.last().copied()
+    }
 }
 
 /// History + journal behind one handle, shared by every `Committer`.
@@ -877,6 +911,17 @@ impl HistoryLog {
     pub fn depths(&self) -> (usize, usize) {
         let h = self.history.lock();
         (h.undo_len(), h.redo_len())
+    }
+
+    /// The undo ancestry and the epoch it belongs to, read under the module's
+    /// `epoch -> history` order so the pair is consistent with respect to a
+    /// concurrent [`Self::epoch_boundary`] — an interleaved boundary either
+    /// clears the stack before this read (empty path, new epoch) or lands
+    /// after it (the caller's later guard sees the epoch move).
+    pub fn undo_path(&self) -> UndoPath {
+        let epoch = self.epoch.lock();
+        let revs = self.history.lock().undo_revs();
+        UndoPath { epoch: *epoch, revs }
     }
 
     pub fn journal_path(&self) -> Option<PathBuf> {
@@ -1397,5 +1442,38 @@ mod tests {
         assert_eq!(log.depths(), (1, 0), "and back again");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_revs_are_reported_oldest_first_and_head_is_the_top() {
+        let mut h = History::new();
+        for rev in [4u64, 5, 6] {
+            h.record(HistoryEntry::from_committed(
+                &TxMeta::user(format!("edit {rev}")),
+                &[],
+                &[],
+                rev,
+            ));
+        }
+        assert_eq!(h.undo_revs(), vec![4, 5, 6], "ascending, the stack's own order");
+        assert_eq!(h.head_rev(), Some(6), "the head is what a plain undo would pop");
+    }
+
+    #[test]
+    fn an_empty_undo_stack_has_no_head_and_no_revs() {
+        let h = History::new();
+        assert_eq!(h.head_rev(), None);
+        assert!(h.undo_revs().is_empty());
+    }
+
+    #[test]
+    fn undo_revs_forget_an_entry_that_moved_to_the_redo_stack() {
+        let mut h = History::new();
+        h.record(HistoryEntry::from_committed(&TxMeta::user("a"), &[], &[], 1));
+        h.record(HistoryEntry::from_committed(&TxMeta::user("b"), &[], &[], 2));
+        let popped = h.pop_undo().expect("an entry to undo");
+        h.push_redo(popped);
+        assert_eq!(h.undo_revs(), vec![1], "an undone step is no longer on the undo path");
+        assert_eq!(h.head_rev(), Some(1));
     }
 }
