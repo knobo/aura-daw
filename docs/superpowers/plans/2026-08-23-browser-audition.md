@@ -59,7 +59,7 @@ Copy these into your head before Task 1; every task inherits them.
 
 ## Rulings this plan makes (and why)
 
-Two things §8.2 leaves open. Both are settled here so no task has to guess.
+Four things §8.2 leaves open. All are settled here so no task has to guess.
 
 **R-1: the pref gates the new double-click gesture only. Existing
 single-click and hold-to-play audition behaviour is untouched.** §8.2 says
@@ -78,6 +78,32 @@ independent switches that can disagree ("the pref says on, the chip says
 muted") is a state-machine the user has to hold in their head. The chip
 writes `prefs.values.browserAudition` directly, so there is exactly one truth
 and the Preferences dialog and the chip always agree.
+
+**R-4: a row whose single click already sounds the same note does not get
+`ondblclick` — it gets Shift+Enter only.** A real mouse double-click dispatches
+`click`, `click`, `dblclick` in that order, so wiring the gesture onto a row
+whose `onclick` already fires a one-shot sampler note produces three notes in
+under 250 ms: a flam, not a feature. Two rows are in that position and both
+keep their existing gesture instead — `PresetsRoot`'s instrument rows
+(`samplerPreviewNote` on click) and `InstrumentBrowser`'s rows (hold-to-play
+on `pointerdown`). Every other row is safe and gets the full gesture, because
+its click either makes no sound or is idempotent:
+
+| Row | What its single click does today | `ondblclick`? |
+|---|---|---|
+| `SamplesRoot` audio | `library.audition` — the backend releases the previous audition first, so repeats restart rather than stack | yes |
+| `SamplesRoot` folder | navigates; re-navigating to the same path is idempotent | no — not audible |
+| `PresetsRoot` instrument | one-shot `samplerPreviewNote` C3 | **no — flam** |
+| `PresetsRoot` zyn patch | `pick` → `zyn.load`, guarded by `busyPath` | yes |
+| `InstrumentBrowser` row | hold-to-play note-on/off via pointer handlers | **no — flam** |
+| `PluginManager` rack | opens the params panel; opening twice is idempotent | yes |
+| `PluginManager` browse | moves the keyboard cursor only | yes |
+| `ZynPatchBrowser` patch | `pick` → `zyn.load`, guarded | yes |
+
+The two excluded rows still reach the store through `BrowserShell`'s
+`onAudition` (Shift+Enter), so the keyboard route is uniform even where the
+mouse gesture is not. Whether their legacy click-to-sound should move behind
+the preference is the same open ear-check question R-1 records.
 
 **R-3: a catalog plugin row that has no live, track-bound instance is not
 auditionable in this step.** `plugin_preview_note` requires an instance that
@@ -1041,12 +1067,10 @@ Import:
 (check `plugins` / `project` are not already imported in this file before
 adding a duplicate import).
 
-On the instrument `BrowserRow`:
-
-```svelte
-              ondblclick={() =>
-                void audition.play({ kind: "instrument", instrumentId: i.id, key: AUDITION_KEY })}
-```
+On the instrument `BrowserRow`: **nothing.** Ruling R-4 — its `onclick`
+already fires `samplerPreviewNote(i.id, 60, 100)`, and a double-click would
+sound that note three times. Its audition route is `onAudition` (Shift+Enter),
+wired on the shell below.
 
 On the patch `BrowserRow` — a Zyn patch can only be heard through a live Zyn
 instance, and *loading* one is an edit, so the honest answer here is a silent
@@ -1069,12 +1093,10 @@ branches, reading the item out of `instrumentGroups` / `patchGroups` by
 
 - [ ] **Step 3: `InstrumentBrowser` — instrument rows**
 
-Import `audition` and `AUDITION_KEY` as above, then on the `BrowserRow`:
-
-```svelte
-                ondblclick={() =>
-                  void audition.play({ kind: "instrument", instrumentId: inst.id, key: AUDITION_KEY })}
-```
+Import `audition` and `AUDITION_KEY` as above. Add **no** `ondblclick` here:
+ruling R-4 — these rows already sound on `pointerdown` (hold-to-play), so the
+`click, click, dblclick` sequence would flam. The keyboard route below is the
+whole of this file's new gesture.
 
 The mini keyboard in the `actions` snippet stays exactly as it is — it answers
 a different question ("what does *this* pitch sound like"), which §8.2 says
