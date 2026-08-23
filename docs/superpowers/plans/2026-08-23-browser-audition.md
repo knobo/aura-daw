@@ -1327,12 +1327,22 @@ Then add to the **Leftovers** section:
 And to the **Owner ear-checks still owed** section:
 
 ```markdown
-- **From Step 7:** does double-click-to-audition feel right at C3, and is
-  1200 ms the right decay for the row highlight? And the R-1 question the
-  plan did not answer: `SamplesRoot` still auditions on *single* click and
-  `InstrumentBrowser` still sounds on hold, both regardless of the new
-  preference, because gating them would delete shipped behaviour. Should the
-  preference own those too?
+- **From Step 7**, four things no suite can answer:
+  - Does double-click-to-audition feel right at C3, and is 1200 ms the right
+    decay for the row highlight?
+  - Does the chip's off-state glyph `♪̸` actually render in WebKitGTK? It is
+    a combining character and was never seen in the real app — if it looks
+    broken, fall back to `♪` and let the `on` class carry the state.
+  - The R-1 question the plan deliberately did not answer: `SamplesRoot`
+    still auditions on *single* click and `InstrumentBrowser` still sounds on
+    hold, both regardless of the new preference, because gating them would
+    have deleted shipped behaviour. Should the preference own those too?
+  - The R-4 consequence: because a real double-click fires `click, click,
+    dblclick`, `PresetsRoot`'s instrument rows and `InstrumentBrowser`'s rows
+    were given no double-click at all — they reach the store only through
+    Shift+Enter, which *is* pref-gated while their mouse preview is not. Is
+    that asymmetry acceptable, or should those rows get the gesture with the
+    flam solved another way?
 ```
 
 - [ ] **Step 4: Record it in `docs/LANDED.md`**
