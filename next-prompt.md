@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Live param-panel follow (Track D leftover) | `feat/param-panel-follow` | 2026-08-23 | Ruling 2's recorded consequence: while automation drives a plugin param the open panel keeps showing the document value. Publish the driver's own writes on the 60 Hz meter frame and paint them. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 

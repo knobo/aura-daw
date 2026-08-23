@@ -88,32 +88,35 @@ Details in `docs/PHASE4-PLAN.md`'s "Track D handoff".
   live host instance happens to hold. Track-gain lanes DO export
   correctly. The fix needs private per-render plugin instances — see the
   handoff and the note on `audio::offline::build_graph`.
-- **The non-blocking CLAP param path.** `clap_host::set_params` is
-  `plugin_main().run(…)`, a blocking round-trip; `lv2_host::set_params`
-  already posts, so only CLAP blocks. Writes are batched per instance per
-  tick, but an active ramp on two instances still costs ~1000 blocking
-  round-trips/s onto the plugin-main thread that also serves the param
-  panel, `instantiate` and `save_state`. Wanted: a fire-and-forget
-  sibling to `set_params` plus a driver that uses it. **Owner: the
-  plugin-host path.**
+- ~~**The non-blocking CLAP param path.**~~ → **closed 2026-08-18**
+  (PR #75 `clap-nonblocking-params`, doc+test follow-up PR #76):
+  `clap_host::post_params` is the fire-and-forget sibling and
+  `forward_params_to_host`'s CLAP arm calls it. Two trade-offs were
+  accepted, not fixed — `post_params` posts into `plugin_main()`'s
+  unbounded channel, and the timing tests wedge that process-wide
+  singleton; both are recorded in `PHASE4-PLAN.md`'s Track D handoff.
 - **An automated plugin param is PINNED for the whole playthrough**, not
   just while a knob is held. Track F shipped the curve editor (lane
-  picker + overlay), so a plugin param *can* have a drawn curve now —
-  the remaining gap is write/touch/latch, not "no way to draw". Turn
-  that param in the plugin's own GUI during playback and it snaps back
-  within ~0.5 s and stays, while AURA's panel still shows the new
-  value. Intended scope (automation overrides the knob), but say so
-  plainly.
+  picker + overlay), so a plugin param *can* have a drawn curve now, and
+  write/touch/latch landed for track gain (PR #85) — the remaining gap is
+  write/touch/latch for PLUGIN PARAMS. Turn such a param in the plugin's
+  own GUI during playback and it snaps back within ~0.5 s and stays.
+  Intended scope (automation overrides the knob); no longer silent, since
+  the panel now paints the driven value with an AUTO flag
+  (`feat/param-panel-follow`) instead of the document's.
 - ~~**`gesture_end` has no id — it closes whatever is open.**~~ →
   **closed by PR #47** (`a93cfa7`): `gesture_begin` returns the
   gesture's run id; `gesture_end(id)` no-ops on mismatch (omitting `id`
   keeps the old close-whatever contract). Async callers (plugin knobs,
   library stamp, lane/envelope delete+commit, clip-drag, faders, tempo)
   hold the token across the await.
-- **No DOM test environment exists** (no jsdom/testing-library), so nothing
-  inside a `.svelte` file is covered by any test. Both of Track D's real
-  frontend bugs lived in event handlers and both were found by reading.
-  Move async-ordering logic into a store where it can be tested.
+- ~~**No DOM test environment exists** (no jsdom/testing-library), so
+  nothing inside a `.svelte` file is covered by any test.~~ → **closed by
+  PR #80** (jsdom + testing-library; `*.dom.test.ts`, 121 mounted tests as
+  of 2026-08-23). The lesson it was written for still stands and is not
+  closed by a test runner: both of Track D's real frontend bugs lived in
+  event handlers and both were found by READING, so async-ordering logic
+  belongs in a store where a plain unit test can reach it.
 - ~~**Two UI minors** — `movePoint` deleted a neighbour on a tick
   collision, and `.tog.auto.on` was byte-identical to `.tog.arm.on`.~~
   → **closed by PR #32** (`feat/lowhanging-fl-fruits`): a colliding

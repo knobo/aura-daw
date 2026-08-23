@@ -34,7 +34,10 @@ Product doc: [`automation-audible-and-ui.md`](automation-audible-and-ui.md).
   failed step's push-back leaves `undo` momentarily non-ascending. That
   window predates PR #107 and exists identically in `undo`'s and
   `redo`'s failure arms.
-- **Track D leftovers:** plugin-param bounce, write/touch/latch. The
+- **Track D leftovers:** plugin-param bounce; write/touch/latch for PLUGIN
+  PARAMS (the track-gain half landed, PR #85). The panel-follow leftover is
+  closed — the engine publishes what its driver wrote
+  (`MeterFrame.drivenParams`) and the param panel paints it, PR #108. The
   non-blocking CLAP param path closed 2026-08-18 (PR #75, branch
   `clap-nonblocking-params`; doc+test follow-up PR #76 on branch
   `clap-nonblocking-params-followup` merged the same day). A post-merge review recorded two accepted-not-fixed trade-offs —
@@ -64,3 +67,10 @@ Product doc: [`automation-audible-and-ui.md`](automation-audible-and-ui.md).
 ## Ear-check
 
 Automation fade during play (Track D).
+
+Eye-check owed with it, on the same playthrough (PR #108): draw a curve on
+a hosted plugin's param, open its param panel, press play. The fader should
+follow the lane in magenta with an AUTO flag beside the chip, and drop back
+to the stored value the moment the transport stops. The suite proves the
+engine publishes the values and the panel paints what it is handed; nobody
+has yet watched it move.

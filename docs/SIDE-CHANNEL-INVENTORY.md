@@ -358,16 +358,22 @@ those files move:
   recorded so they are not mistaken for bugs:
   - After playing an automated section the plugin's live value can differ
     from the document's stored value until the next project load or user
-    edit; the document is authoritative on save, and the param panel shows
-    the document. Making the panel follow automation live is deferred.
+    edit; the document is authoritative on save. The param panel no longer
+    hides that: the driver's writes are published on the meter frame
+    (`MeterFrame.drivenParams`, `pump_meter_frames`) and the panel paints
+    them with an AUTO flag while the transport rolls, falling back to the
+    document the moment it stops. Display only — nothing reads that
+    read-back back into the document.
   - A flat automated param is RE-ASSERTED every ~0.5 s
     (`ParamAutomationDriver::REASSERT_TICKS`), because the host is not ours
     alone — the plugin's own GUI, a patch load or a knob drag can move the
     param behind our back and a flat lane would otherwise never correct it.
     While the user HOLDS a knob on such a param during playback, the
-    plugin's GUI and the audio therefore snap back at 2 Hz (our own param
-    panel does not fight it). This is the gap write/touch/latch automation
-    modes fill; those are an explicit non-goal of the Track D plan.
+    plugin's GUI and the audio therefore snap back at 2 Hz — and AURA's own
+    panel now shows the re-asserted value rather than the knob's, so the
+    snap-back is visible instead of silent. This is the gap write/touch/latch
+    automation modes fill (landed for track gain, PR #85; still open for
+    plugin params).
   - **Export does not evaluate plugin-param lanes at all**, and a bounce
     captures whatever value the live host instance holds — most recently,
     whatever the last playthrough left there. There is one copy of a plugin

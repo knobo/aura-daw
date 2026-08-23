@@ -973,8 +973,18 @@ instantiation per automated instance, seeded from the live one's
   mint case the barrier exists for has no lane id yet.
 - **Fader-follows-automation** (ruling 6) — needs read/write arbitration.
 - **A dedicated, resizable automation row** (ruling 8).
-- **Live param-panel follow** (ruling 2) — the open panel shows the
-  document, not the automated value.
+- ~~**Live param-panel follow** (ruling 2) — the open panel shows the
+  document, not the automated value.~~ → **closed on
+  `feat/param-panel-follow`**: the driver's own writes are folded per
+  (instance, param index) into `MeterFrame.drivenParams` — an upsert SET,
+  not the tick's deltas, because `tick` suppresses a value it already sent
+  — and the panel paints them with an AUTO flag and a magenta fader fill.
+  Cleared when the transport stops and when a rebuild replaces the driver,
+  which is how the UI knows to hand the param back to the document. No
+  second evaluation of the curve exists, frontend or backend, so the panel
+  cannot disagree with what the plugin actually got. Ruling 2 itself is
+  unchanged: the writes are still host-only and the document still keeps
+  what the user set.
 - **Write/touch/latch automation modes** — the non-goal with a live
   consequence, and it is NOT a transient one. **Every plugin-param lane
   this UI can create is FLAT**: the "A" button
