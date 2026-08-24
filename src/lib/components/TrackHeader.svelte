@@ -27,6 +27,7 @@
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
   import InsertChain from "./plugins/InsertChain.svelte";
   import SendRack from "./plugins/SendRack.svelte";
+  import OutputPicker from "./plugins/OutputPicker.svelte";
   import LanePluginStrip from "./plugins/LanePluginStrip.svelte";
 
   let {
@@ -47,6 +48,8 @@
   let fxPopoverOpen = $state(false);
   /** Plan G2: the sends popover (bus returns this track feeds). */
   let sendPopoverOpen = $state(false);
+  /** Plan G2: the output picker (where this track's signal GOES). */
+  let outPopoverOpen = $state(false);
 
   // ── rename ──
   // The editor is opened by double-clicking the name, which is the gesture
@@ -136,6 +139,11 @@
   function onDepthDown() {
     openGesture("depth drag");
   }
+
+  /** The bus this track is routed into, if any (Plan G2). */
+  const outTarget = $derived(
+    track.output ? project.tracks.find((t) => t.id === track.output) : undefined,
+  );
 
   const gainPct = $derived(((track.gainDb + 60) / 72) * 100);
   const instrument = $derived(
@@ -421,6 +429,24 @@
             </button>
             {#if fxPopoverOpen}
               <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
+            {/if}
+          </span>
+          <span class="picker">
+            <button
+              class="status outchip"
+              class:on={outPopoverOpen}
+              class:routed={!!track.output}
+              title={outTarget
+                ? `Output: ${outTarget.name} — this track does not reach the master directly`
+                : "Output: Master"}
+              aria-haspopup="menu"
+              aria-expanded={outPopoverOpen}
+              onclick={() => (outPopoverOpen = !outPopoverOpen)}
+            >
+              →{outTarget ? ` ${outTarget.name}` : " MASTER"}
+            </button>
+            {#if outPopoverOpen}
+              <OutputPicker {track} onclose={() => (outPopoverOpen = false)} />
             {/if}
           </span>
           {#if track.kind !== "bus"}
@@ -1011,6 +1037,22 @@
     background: var(--violet);
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
+  .status.outchip {
+    min-width: 40px;
+    max-width: 96px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .status.outchip.routed {
+    color: var(--amber);
+    border-color: rgb(var(--amber-rgb) / 0.45);
+  }
+  .status.outchip.on {
+    color: var(--bg-0);
+    background: var(--amber);
+    border-color: var(--amber);
   }
   .status.sendchip {
     min-width: 40px;

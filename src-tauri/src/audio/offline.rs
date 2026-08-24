@@ -213,7 +213,10 @@ pub fn build_graph(
             }
         }
         if let Some(edges) = plan.sends.get(&t.id) {
-            tracks[i].sends = edges.iter().filter_map(|e| e.resolve(&send_slots)).collect();
+            tracks[i].sends = edges
+                .iter()
+                .filter_map(|e| e.resolve(&send_slots, crate::audio::rt::MAX_LIVE_BLOCK))
+                .collect();
         }
     }
     for (slot, &delay) in plan.track_pdc.iter().enumerate() {
@@ -225,17 +228,30 @@ pub fn build_graph(
                 2,
             ));
         }
-        if plan.master_delay > 0 {
-            tracks[i].master_pdc = Some(crate::audio::pdc::DelayLine::new(
-                plan.master_delay,
+        let out_delay = plan.out_delay.get(slot).copied().unwrap_or(0);
+        if out_delay > 0 {
+            tracks[i].out_pdc = Some(crate::audio::pdc::DelayLine::new(
+                out_delay,
                 crate::audio::rt::MAX_LIVE_BLOCK,
                 2,
             ));
         }
+        tracks[i].output = plan.output.get(slot).copied().flatten();
+    }
+
+    // A bus sends like any other node; its edges land on the return strip.
+    let mut buses = plan.buses;
+    for (bi, id) in plan.bus_ids.iter().enumerate() {
+        if let Some(edges) = plan.sends.get(id) {
+            buses[bi].sends = edges
+                .iter()
+                .filter_map(|e| e.resolve(&send_slots, crate::audio::rt::MAX_LIVE_BLOCK))
+                .collect();
+        }
     }
 
     let end_samples = song_end(&tracks);
-    let mut graph = RtGraph::with_buses(tracks, plan.buses, 0, params);
+    let mut graph = RtGraph::with_buses(tracks, buses, 0, params);
     // RCU: attach the table BEFORE the graph is handed to the renderer,
     // matching `engine::rebuild` (Track D ruling 1).
     graph.set_track_ramps(compile_track_ramps(
@@ -355,6 +371,7 @@ mod tests {
     fn track(id: &str, kind: &str) -> TrackState {
         TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: id.into(),
             kind: kind.into(),
@@ -481,6 +498,51 @@ mod tests {
                 2.0 * d
             );
         }
+    }
+
+    /// Plan G2: output routing reaches the bounce too. A routed track goes
+    /// through the bus and NOT to the master, so the exported mix has one
+    /// copy — the same thing the live engine does.
+    #[test]
+    fn a_routed_track_reaches_the_bounce_through_its_bus_only() {
+        const RATE: u32 = 48_000;
+        let (store, midi) = demo_project();
+        let (mut routed, _) = demo_project();
+        let render_all = |store: &Store| {
+            let mut og = build_graph(
+                store,
+                &midi,
+                &crate::control::session::PluginDoc::default(),
+                &Default::default(),
+                &Default::default(),
+                None,
+                RATE,
+            );
+            render(&mut og.graph, 0, og.end_samples, RATE, 1.0, &mut |_, _| {})
+        };
+        let direct = render_all(&store);
+
+        routed.tracks.push(track("group", "bus"));
+        for t in routed.tracks.iter_mut().filter(|t| t.kind == "midi") {
+            t.output = Some("group".into());
+        }
+        let grouped = render_all(&routed);
+
+        assert!(peak(&direct) > 0.05, "the direct bounce is audible to begin with");
+        for (i, (g, d)) in grouped.iter().zip(direct.iter()).enumerate() {
+            assert!(
+                (g - d).abs() < 1e-5,
+                "sample {i}: routing through an empty bus changes nothing, got {g} vs {d}"
+            );
+        }
+
+        // And muting the bus takes the whole group with it — proof the
+        // signal really is going through it rather than around it.
+        if let Some(b) = routed.tracks.iter_mut().find(|t| t.kind == "bus") {
+            b.muted = true;
+        }
+        let silenced = render_all(&routed);
+        assert_eq!(peak(&silenced), 0.0, "muting the group bus silences the bounce");
     }
 
     /// A bus takes a mixer slot but NO source row — it is fed by sends. Two
@@ -720,6 +782,7 @@ mod tests {
         let mut store = Store::default();
         store.tracks.push(TrackState {
             sends: Vec::new(),
+            output: None,
             automation_mode: AutomationMode::Off,
             ..track("t-1", "audio")
         });
@@ -768,6 +831,7 @@ mod tests {
         let mut store = Store::default();
         store.tracks.push(TrackState {
             sends: Vec::new(),
+            output: None,
             automation_mode: AutomationMode::Read,
             ..track("t-1", "audio")
         });

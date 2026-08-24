@@ -1807,12 +1807,11 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown track: {track_id}"))?;
             {
                 let track = &session.store.tracks[track_idx];
-                if !crate::audio::types::is_source_track(track) {
-                    // A bus does not send. G2 ships no bus-to-bus edge: a
-                    // cycle is only legal through an explicit one-block
-                    // delay node (`SCALABILITY` §1), and there isn't one.
+                if !crate::audio::types::is_mixer_track(track) {
+                    // An automation track renders no audio, so it has
+                    // nothing to copy.
                     return Err(format!(
-                        "sends are only legal on audio|midi tracks, not {}",
+                        "sends are only legal on audio|midi|bus tracks, not {}",
                         track.kind
                     ));
                 }
@@ -1838,6 +1837,17 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                     // destination" true, which is what the send list shows.
                     return Err(format!("track already sends to {}", slot.dest));
                 }
+            }
+            // A bus may feed another bus — a drum bus into a mix bus is the
+            // ordinary case — but not in a loop. A cycle is only meaningful
+            // through an explicit one-block delay node (`SCALABILITY` §1),
+            // and there isn't one, so this is a rejection and not a
+            // silently-inserted delay.
+            if crate::audio::bus::would_cycle(&session.store.tracks, track_id, &slot.dest) {
+                return Err(format!(
+                    "sending {track_id} to {} would close a routing loop",
+                    slot.dest
+                ));
             }
             let track = &mut session.store.tracks[track_idx];
             let idx = (*index).min(track.sends.len());
@@ -1898,6 +1908,37 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 send_id: send_id.clone(),
                 amount_db: previous,
             })
+        }
+        Op::TrackSetOutput { track_id, output } => {
+            let known = session.store.tracks.iter().any(|t| &t.id == track_id);
+            if !known {
+                return Err(format!("unknown track: {track_id}"));
+            }
+            if let Some(dest) = output {
+                match session.store.tracks.iter().find(|t| &t.id == dest) {
+                    None => return Err(format!("unknown output destination: {dest}")),
+                    Some(t) if !crate::audio::types::is_bus_track(t) => {
+                        return Err(format!("output destination {dest} is not a bus track"))
+                    }
+                    Some(_) => {}
+                }
+                if crate::audio::bus::would_cycle(&session.store.tracks, track_id, dest) {
+                    return Err(format!(
+                        "routing {track_id} into {dest} would close a routing loop"
+                    ));
+                }
+            }
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let previous = track.output.clone();
+            track.output = output.clone();
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::TrackSetOutput { track_id: track_id.clone(), output: previous })
         }
         Op::SendSetPreFader { track_id, send_id, pre_fader } => {
             let track = session
@@ -2469,6 +2510,7 @@ mod tests {
         let mut store = Store::default();
         store.tracks.push(TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: "Track 1".into(),
             kind: "audio".into(),
@@ -4751,7 +4793,8 @@ mod tests {
     #[test]
     fn send_add_rejects_a_bus_source_a_non_bus_destination_and_a_duplicate() {
         let m = session_with_a_bus();
-        // A bus does not send: G2 ships no bus-to-bus edge.
+        // A bus DOES send (that is bus-to-bus, and it is the ordinary
+        // drum-bus-into-mix-bus case) — but not into itself.
         assert!(commit_err(&m, |tx| {
             tx.apply(Op::SendAdd {
                 track_id: "b-1".into(),
@@ -4759,7 +4802,23 @@ mod tests {
                 index: 0,
             })
         })
-        .contains("only legal on audio|midi"));
+        .contains("would close a routing loop"));
+        // An automation track renders no audio, so it has nothing to copy.
+        {
+            let mut session = m.lock();
+            let mut auto = session.store.tracks[0].clone();
+            auto.id = "auto-1".into();
+            auto.kind = "automation".into();
+            session.store.tracks.push(auto);
+        }
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "auto-1".into(),
+                slot: send("s-a", "b-1"),
+                index: 0,
+            })
+        })
+        .contains("only legal on audio|midi|bus"));
         // The destination has to exist...
         assert!(commit_err(&m, |tx| {
             tx.apply(Op::SendAdd {
@@ -4800,6 +4859,92 @@ mod tests {
     /// The amount is a MIX change: it must reach the RT param table and must
     /// NOT schedule a rebuild. Rebuilding per knob frame is exactly what
     /// round-2 §2.4 forbids, and this is the pin that says so.
+    // ---- output routing (Plan G2) ----
+
+    #[test]
+    fn track_set_output_routes_into_a_bus_and_the_inverse_restores_the_master() {
+        let m = session_with_a_bus();
+        let c = commit(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "t-1".into(), output: Some("b-1".into()) })
+        });
+        assert!(c.effect.rebuild, "REBUILD PIN: an output edge moves in the graph");
+        assert_eq!(m.lock().store.tracks[0].output.as_ref().map(|o| o.as_str()), Some("b-1"));
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(m.lock().store.tracks[0].output.is_none(), "undo goes back to the master");
+    }
+
+    #[test]
+    fn track_set_output_rejects_an_unknown_and_a_non_bus_destination() {
+        let m = session_with_a_bus();
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "t-1".into(), output: Some("nope".into()) })
+        })
+        .contains("unknown output destination"));
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "t-1".into(), output: Some("t-1".into()) })
+        })
+        .contains("not a bus track"));
+    }
+
+    /// A loop is only meaningful through an explicit one-block delay node
+    /// (`SCALABILITY` §1) and there isn't one, so closing one is a
+    /// rejection — not a silently inserted delay, and not a hang.
+    #[test]
+    fn a_routing_loop_is_refused_on_both_edge_kinds() {
+        let m = session_with_a_bus();
+        // A second bus, so there is something to loop with.
+        {
+            let mut session = m.lock();
+            let mut b2 = session.store.tracks[1].clone();
+            b2.id = "b-2".into();
+            session.store.tracks.push(b2);
+        }
+        commit(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "b-1".into(), output: Some("b-2".into()) })
+        });
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "b-2".into(), output: Some("b-1".into()) })
+        })
+        .contains("would close a routing loop"));
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "b-2".into(),
+                slot: send("s-loop", "b-1"),
+                index: 0,
+            })
+        })
+        .contains("would close a routing loop"));
+        assert_eq!(
+            m.lock().store.tracks[2].output.as_ref().map(|o| o.as_str()),
+            None,
+            "a rejected op leaves the document untouched"
+        );
+    }
+
+    /// A bus feeding another bus is the ordinary case (drum bus into mix
+    /// bus), so both edge kinds have to accept it.
+    #[test]
+    fn a_bus_may_feed_another_bus() {
+        let m = session_with_a_bus();
+        {
+            let mut session = m.lock();
+            let mut b2 = session.store.tracks[1].clone();
+            b2.id = "b-2".into();
+            session.store.tracks.push(b2);
+        }
+        commit(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "b-1".into(), output: Some("b-2".into()) })?;
+            tx.apply(Op::SendAdd {
+                track_id: "b-1".into(),
+                slot: send("s-1", "b-2"),
+                index: 0,
+            })
+        });
+        let session = m.lock();
+        assert_eq!(session.store.tracks[1].output.as_ref().map(|o| o.as_str()), Some("b-2"));
+        assert_eq!(session.store.tracks[1].sends.len(), 1);
+    }
+
     #[test]
     fn send_set_amount_is_a_param_write_and_not_a_rebuild() {
         let m = session_with_a_bus();

@@ -74,6 +74,11 @@
         }
       }
     },
+    "output": {
+      "description": "Where this track's fader output GOES (Plan G2): the track id of a bus track, or absent/null for the master. An output is a MOVE, not a copy — a routed track no longer reaches the master. Buses may point at other buses as long as the result stays acyclic.",
+      "type": ["string", "null"],
+      "format": "uuid"
+    },
     "sends": {
       "description": "Send edges into bus tracks (Plan G2): a copy of this track's signal at an amount, so many sources can share one reverb/echo. Only audio|midi tracks send; a bus does not. Absent means empty.",
       "type": "array",

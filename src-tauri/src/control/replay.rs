@@ -1126,6 +1126,7 @@ mod tests {
         let add = |id: &str, index: usize| Op::TrackAdd {
             track: crate::audio::types::TrackState {
                 sends: Vec::new(),
+                output: None,
                 id: id.into(),
                 name: "T".into(),
                 kind: "audio".into(),

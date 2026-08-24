@@ -3023,6 +3023,18 @@ export class DemoBackend implements Backend {
     this.resyncAudio();
   }
 
+  async trackSetOutput(trackId: string, output: string | null): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    if (output !== null) {
+      const bus = this.track(output);
+      if (!bus || bus.kind !== "bus") throw new Error(`${output} is not a bus track`);
+      if (output === trackId) throw new Error("a track cannot feed itself");
+    }
+    track.output = output;
+    this.resyncAudio();
+  }
+
   // ── phase 2: open-kind generation jobs ──
 
   async sidecarRunJob(

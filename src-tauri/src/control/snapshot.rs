@@ -147,7 +147,7 @@ impl ChangeSet {
     /// · AutomationSetLane→automation · PluginAdd/PluginSetState→plugins
     /// · PluginRemove→plugins+tracks (G-10 insert sweep)
     /// · InsertAdd/Remove/Reorder/SetBypass→tracks · TrackReorder→tracks
-    /// · SendAdd/Remove/SetAmount/SetPreFader→tracks
+    /// · SendAdd/Remove/SetAmount/SetPreFader/TrackSetOutput→tracks
     /// · HarmonySet→harmony
     pub fn from_ops(ops: &[Op]) -> Self {
         let mut cs = ChangeSet::default();
@@ -228,7 +228,8 @@ impl ChangeSet {
                 Op::SendAdd { .. }
                 | Op::SendRemove { .. }
                 | Op::SendSetAmount { .. }
-                | Op::SendSetPreFader { .. } => {
+                | Op::SendSetPreFader { .. }
+                | Op::TrackSetOutput { .. } => {
                     cs.tracks = true;
                 }
                 // Lanes UX: reorder rewrites `store.tracks` wholesale. Only
@@ -552,6 +553,7 @@ mod tests {
     fn track(id: &str) -> TrackState {
         TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: format!("Track {id}"),
             kind: "midi".into(),

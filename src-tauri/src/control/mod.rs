@@ -2520,7 +2520,7 @@ impl ControlPlane {
         // slots leave with the row; PluginRemove then drops the instances
         // (G-10 sweep is a no-op). Undo applies inverses in reverse:
         // PluginAdds then TrackAdd (with inserts).
-        let (track, clip_ids, insert_removes, send_removes) = {
+        let (track, clip_ids, insert_removes, send_removes, output_resets) = {
             let session = self.session.lock();
             let track = session
                 .store
@@ -2556,16 +2556,28 @@ impl ControlPlane {
             // in the SAME commit so one undo brings the bus and its wiring
             // back together.
             let mut send_removes = Vec::new();
+            let mut output_resets = Vec::new();
             for t in &session.store.tracks {
                 for snd in &t.sends {
                     if snd.dest.as_str() == id {
                         send_removes.push((t.id.clone(), snd.clone()));
                     }
                 }
+                // Same argument for the OUTPUT edge: a track routed into a
+                // bus that is going away must fall back to the master here,
+                // in this commit, so one undo restores both. Left alone it
+                // would compile to the master anyway — but silently, and
+                // the document would keep naming a track that is gone.
+                if t.output.as_ref().is_some_and(|o| o.as_str() == id) {
+                    output_resets.push(t.id.clone());
+                }
             }
-            (track, clip_ids, insert_removes, send_removes)
+            (track, clip_ids, insert_removes, send_removes, output_resets)
         };
         self.commit(meta, |tx| {
+            for track_id in output_resets {
+                tx.apply(op::Op::TrackSetOutput { track_id, output: None })?;
+            }
             for (track_id, slot) in send_removes {
                 tx.apply(op::Op::SendRemove { track_id, slot, index: 0 })?;
             }
@@ -2921,6 +2933,22 @@ impl ControlPlane {
                 self.commit(meta, |tx| tx.apply(make_op()))?;
             }
         }
+        Ok(())
+    }
+
+    /// Plan G2: point a track's output at a bus, or back at the master
+    /// (`output: None`). A MOVE, not a copy — the track stops reaching the
+    /// master. Rejected if it would close a routing loop.
+    pub fn track_set_output(
+        &self,
+        track_id: &str,
+        output: Option<&str>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let output = output.map(crate::ids::TrackId::from);
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::TrackSetOutput { track_id: track_id.into(), output })
+        })?;
         Ok(())
     }
 
@@ -6632,6 +6660,35 @@ mod tests {
         );
     }
 
+    /// Removing a bus takes the OUTPUT edges pointing at it too, in the
+    /// same commit. Left alone the compiler would fall back to the master
+    /// silently, and the document would keep naming a track that is gone.
+    #[test]
+    fn removing_a_bus_re_routes_tracks_that_output_into_it() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        plane.track_set_output("t-1", Some("b-1"), TxMeta::user("route")).unwrap();
+        assert_eq!(
+            plane.session().lock().store.tracks[0].output.as_ref().map(|o| o.as_str()),
+            Some("b-1")
+        );
+
+        plane.remove_track("b-1", TxMeta::user("remove bus")).unwrap();
+        assert!(
+            plane.session().lock().store.tracks[0].output.is_none(),
+            "the routed track falls back to the master"
+        );
+
+        plane.undo().unwrap();
+        let session = plane.session().lock();
+        assert!(session.store.tracks.iter().any(|t| t.id == "b-1"), "the bus is back");
+        assert_eq!(
+            session.store.tracks[0].output.as_ref().map(|o| o.as_str()),
+            Some("b-1"),
+            "and so is the routing"
+        );
+    }
+
     /// A send knob is a MIX change: it must reach the RT table without
     /// scheduling a rebuild (§10 — rebuilding per knob frame at 500 tracks
     /// is what round-2 §2.4 forbids).
@@ -8729,6 +8786,7 @@ mod tests {
         for (id, name) in [("pad", "Demo Pad"), ("lead", "Demo Lead"), ("bass", "Demo Bass")] {
             store.tracks.push(TrackState {
                 sends: Vec::new(),
+                output: None,
                 id: id.into(),
                 name: name.into(),
                 kind: "midi".into(),
@@ -8839,6 +8897,7 @@ mod tests {
         for (slot, id) in ["pad", "lead", "bass"].iter().enumerate() {
             store.tracks.push(TrackState {
                 sends: Vec::new(),
+                output: None,
                 id: (*id).into(),
                 name: (*id).into(),
                 kind: "midi".into(),

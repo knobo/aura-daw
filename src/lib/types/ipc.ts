@@ -177,9 +177,13 @@ export interface TrackState {
   instrumentId?: string | null;
   /** Ordered insert-FX slots (Plan G1). Empty on pre-G1 files. */
   inserts?: InsertSlot[] | null;
-  /** Send edges into bus tracks (Plan G2). Empty on pre-G2 files. Only
-   * audio|midi tracks send; a bus is a destination, never a source. */
+  /** Send edges into bus tracks (Plan G2) — COPIES of this track's signal.
+   * Empty on pre-G2 files. Buses send too (a drum bus into a mix bus). */
   sends?: SendSlot[] | null;
+  /** Where this track's fader output GOES (Plan G2): a bus track's id, or
+   * absent/null for the master. An output is a MOVE, not a copy — a routed
+   * track no longer reaches the master. */
+  output?: string | null;
   /** Lane group this track displays under, as the group's own NAME (the
    * group is its name — there is no separate group row to look up). Absent
    * or null = ungrouped. Display grouping only: it never affects routing,

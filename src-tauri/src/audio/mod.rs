@@ -904,6 +904,21 @@ pub fn send_set_amount(
     )
 }
 
+/// Point a track's output at a bus, or back at the master (`output: null`).
+/// A MOVE, not a copy: the track stops reaching the master.
+#[tauri::command]
+pub fn track_set_output(
+    track_id: String,
+    output: Option<String>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.track_set_output(
+        &track_id,
+        output.as_deref(),
+        control::op::TxMeta::user("set track output"),
+    )
+}
+
 /// Move a send's tap between post-fader (default) and pre-fader.
 #[tauri::command]
 pub fn send_set_pre_fader(

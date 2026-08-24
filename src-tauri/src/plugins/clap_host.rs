@@ -1746,6 +1746,7 @@ mod tests {
         let mut store = Store::default();
         let mut t = TrackState {
             sends: Vec::new(),
+            output: None,
             id: "m1".into(),
             name: "m1".into(),
             kind: "midi".into(),

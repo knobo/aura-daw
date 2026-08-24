@@ -413,6 +413,9 @@ export interface Backend {
   sendSetAmount?(trackId: string, sendId: string, amountDb: number): Promise<void>;
   /** Move a send's tap between post-fader (false) and pre-fader (true). */
   sendSetPreFader?(trackId: string, sendId: string, preFader: boolean): Promise<void>;
+  /** Point a track's output at a bus, or back at the master (`null`). A
+   * MOVE, not a copy: the track stops reaching the master. */
+  trackSetOutput?(trackId: string, output: string | null): Promise<void>;
 
   // ── wave 1.5 ──
 
@@ -1003,6 +1006,9 @@ class TauriBackend implements Backend {
   }
   sendSetPreFader(trackId: string, sendId: string, preFader: boolean) {
     return invoke<void>("send_set_pre_fader", { trackId, sendId, preFader });
+  }
+  trackSetOutput(trackId: string, output: string | null) {
+    return invoke<void>("track_set_output", { trackId, output });
   }
 
   // ── wave 1.5 ──

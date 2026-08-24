@@ -156,6 +156,22 @@ pub struct TrackState {
     /// cycle would need an explicit one-block delay node, `SCALABILITY` §1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sends: Vec<SendSlot>,
+    /// Where this track's fader output GOES (Plan G2). `None`/absent = the
+    /// master, which is what every pre-G2 project means and the default for
+    /// a new track.
+    ///
+    /// An output is a MOVE, not a copy: a track routed to a bus stops
+    /// reaching the master and is heard through that bus instead. That is
+    /// the difference between a submix (a drum bus: eight things compressed
+    /// together) and a [send](SendSlot) (a shared reverb: everyone still
+    /// heard dry). Conflating the two is the mistake `audio::bus`'s module
+    /// doc is about.
+    ///
+    /// Buses may point at other buses — a drum bus into a mix bus is the
+    /// ordinary case — as long as the result stays acyclic
+    /// (`audio::bus::would_cycle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<TrackId>,
     /// Lane group this track belongs to, as the group's own display NAME —
     /// the group IS its name, so there is no second document collection to
     /// keep in sync, no orphan-group GC, and no id→name lookup for the UI.
@@ -444,6 +460,7 @@ pub(crate) mod testutil {
     pub fn test_track(id: &str) -> TrackState {
         TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: "New Track".into(),
             kind: "audio".into(),

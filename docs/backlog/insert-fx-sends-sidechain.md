@@ -286,12 +286,11 @@ The parts worth knowing before touching this:
 
 - **Two compensating delays, and they are not interchangeable.**
   `RtTrack::pdc` (G1) aligns the SOURCES and sits BEFORE the send taps,
-  so every sender reaches a bus at the same latency — that is what lets
-  one delay line per bus be enough instead of one per edge.
-  `RtTrack::master_pdc` sits AFTER the taps and makes the dry path wait
-  for the slowest return. Growing `pdc` instead would delay the sends by
-  the same amount and dry and wet would never converge.
-  `audio::bus`'s module doc has the diagram.
+  so every source leaves at the same time — that is what makes most edge
+  delays zero. `RtTrack::out_pdc` sits AFTER the taps and pads only the
+  output path. Growing `pdc` instead would delay the sends by the same
+  amount and dry and wet would never converge. `audio::bus`'s module doc
+  has the diagram.
 - **The render loops inverted.** A bus cannot run until every track that
   feeds it has contributed, so `mixer::render_impl` is now windows of
   `MAX_LIVE_BLOCK` outside, tracks inside, then the bus pass. The window
@@ -313,17 +312,36 @@ The parts worth knowing before touching this:
   had for instrument nodes: a bounce sees whatever param values the live
   host instance currently holds (`audio::offline`'s header).
 
+### Output routing landed with it (owner steer, 2026-08-24)
+
+The first ear-check found the gap immediately: "lyden går ut fra bussen
+OG fra sporet — to strømmer der vi bare skulle hatt én". That is correct
+for a send and wrong for what the owner wanted, so G2 grew the second
+primitive rather than a "double output" toggle, which would have
+conflated the two.
+
+`TrackState.output` names a bus, or `None` for the master. It is a MOVE:
+a routed track no longer reaches the master. Buses route too, so a drum
+bus into a mix bus works, and the compiler is a real DAG:
+
+- `bus::compile_routing` topologically sorts the buses (over BOTH edge
+  kinds) so the renderer's single forward pass is enough.
+- `bus::would_cycle` rejects a loop at the op layer — both `SendAdd` and
+  `TrackSetOutput` — because a cycle is only meaningful through an
+  explicit one-block delay node (`SCALABILITY` §1) and there isn't one.
+  A hand-edited cycle is dropped at compile time rather than hung on.
+- PDC is per EDGE now: each sink has an arrival target and every edge
+  into it is padded up. That is what lets a track's dry path wait for a
+  slow reverb while its own send into that reverb leaves immediately.
+
 Deliberately NOT in G2, in the order they are likely to be wanted:
 
-1. **Bus-to-bus edges.** A reverb into a delay is a legal DAG, but the
-   compiler assumes two levels: `master_delay` is a single number, and
-   per-edge alignment would be needed the moment a bus can feed a bus.
-   Cycles stay illegal without an explicit one-block delay node
-   (`SCALABILITY` §1). `Op::SendAdd` rejects a bus source today.
-2. **Send-amount automation.** The lane exists and is automatable in
+1. **Send-amount automation.** The lane exists and is automatable in
    shape; nothing addresses it from `AutomationDoc` yet.
-3. **Reordering sends.** The list is document-ordered and there is no
+2. **Reordering sends.** The list is document-ordered and there is no
    `SendReorder` — order does not affect the sum, so this is cosmetic.
+3. **Feedback routing** (a cycle through a deliberate one-block delay
+   node). Rejected today; needs the delay node first.
 4. **G3 sidechain edges** and **G4 envelope followers**, unchanged from
    the plan above.
 

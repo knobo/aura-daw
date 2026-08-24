@@ -1847,13 +1847,15 @@ impl Control {
                         2,
                     ));
                 }
-                if plan.master_delay > 0 {
-                    tracks[i].master_pdc = Some(crate::audio::pdc::DelayLine::new(
-                        plan.master_delay,
+                let out_delay = plan.out_delay.get(slot).copied().unwrap_or(0);
+                if out_delay > 0 {
+                    tracks[i].out_pdc = Some(crate::audio::pdc::DelayLine::new(
+                        out_delay,
                         crate::audio::rt::MAX_LIVE_BLOCK,
                         2,
                     ));
                 }
+                tracks[i].output = plan.output.get(slot).copied().flatten();
             }
             routing = Some(plan);
             // The timeline boundary belongs to the material, so it is
@@ -2072,14 +2074,25 @@ impl Control {
         // already points past it, and this graph is transient anyway.
         let mut buses = Vec::new();
         if let Some(plan) = routing {
-            buses = plan.buses;
-            for (bus, id) in buses.iter_mut().zip(plan.bus_ids.iter()) {
+            let crate::audio::bus::RoutingPlan { buses: planned, bus_ids, sends, .. } = plan;
+            buses = planned;
+            for (bus, id) in buses.iter_mut().zip(bus_ids.iter()) {
                 bus.slot = slots.get(id).copied().unwrap_or(usize::MAX);
             }
-            for (tid, edges) in plan.sends.iter() {
+            for (tid, edges) in sends.iter() {
+                let resolved: Vec<crate::audio::rt::RtSend> = edges
+                    .iter()
+                    .filter_map(|e| e.resolve(&send_slots, crate::audio::rt::MAX_LIVE_BLOCK))
+                    .collect();
+                // A bus sends like any other node, so the edges land on
+                // whichever kind of strip owns this id.
+                if let Some(bi) = bus_ids.iter().position(|id| id == tid) {
+                    buses[bi].sends = resolved;
+                    continue;
+                }
                 let Some(&slot) = slots.get(tid) else { continue };
                 let Some(i) = audio_row_for(&tracks, slot) else { continue };
-                tracks[i].sends = edges.iter().filter_map(|e| e.resolve(&send_slots)).collect();
+                tracks[i].sends = resolved;
             }
         }
 
@@ -4173,7 +4186,8 @@ mod tests {
         let cell = crate::audio::rt::LiveNodeCell::new(Box::new(node));
         let tr = RtTrack {
             sends: Vec::new(),
-            master_pdc: None,
+            out_pdc: None,
+            output: None,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),
@@ -4229,7 +4243,8 @@ mod tests {
         RtGraph::new(
             vec![RtTrack {
                 sends: Vec::new(),
-                master_pdc: None,
+                out_pdc: None,
+                output: None,
                 win: Default::default(),
                 slot,
                 clips: Vec::new(),
@@ -4257,7 +4272,8 @@ mod tests {
             crate::audio::dsp::AudioProcessor::prepare(&mut synth, 48_000, crate::audio::rt::MAX_LIVE_BLOCK);
             RtTrack {
                 sends: Vec::new(),
-                master_pdc: None,
+                out_pdc: None,
+                output: None,
                 win: Default::default(),
                 slot,
                 clips: Vec::new(),
@@ -4742,6 +4758,7 @@ mod tests {
     fn test_track(id: &str) -> super::super::types::TrackState {
         super::super::types::TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: id.into(),
             kind: "audio".into(),
@@ -6428,6 +6445,7 @@ mod tests {
             // and sending Rebuild is what seeds slot 0, not a direct alloc.
             s.tracks.push(super::super::types::TrackState {
                 sends: Vec::new(),
+                output: None,
                 id: "t1".into(),
                 name: "Track 1".into(),
                 kind: "audio".into(),
@@ -7508,6 +7526,7 @@ mod tests {
             s.project_dir = Some(dir.clone());
             s.tracks.push(super::super::types::TrackState {
                 sends: Vec::new(),
+                output: None,
                 id: "t1".into(),
                 name: "T1".into(),
                 kind: "audio".into(),
@@ -7605,6 +7624,7 @@ mod tests {
             s.project_dir = Some(dir.clone());
             s.tracks.push(super::super::types::TrackState {
                 sends: Vec::new(),
+                output: None,
                 id: "t1".into(),
                 name: "T1".into(),
                 kind: "audio".into(),

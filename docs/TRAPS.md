@@ -81,6 +81,14 @@ session burns an hour on something a sentence would have prevented.
   That is the standard behaviour, not a bug, and there is a test
   pinning it (`a_pre_fader_tap_is_pre_pan_too`).
 
+- **A send and an output are different wires, and the difference is
+  audible.** A send COPIES (the source still reaches the master); an
+  output MOVES (it does not). The first ear-check of G2 reported "two
+  streams where there should be one" and it was neither a bug nor a
+  volume problem — it was a send being asked to do an output's job. If
+  someone wants "only through the bus", the answer is
+  `TrackState.output`, not a send with the fader pulled down.
+
 ## Runtime noise that is not your bug
 
 - **If the dev log is 99% `[carla] lv2ui_extension_data(...)`, it is not

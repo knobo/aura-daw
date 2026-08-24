@@ -337,6 +337,17 @@ pub enum Op {
         send_id: String,
         amount_db: f64,
     },
+    /// Plan G2: point a track's OUTPUT at a bus, or back at the master
+    /// (`None`). Structural — it moves an edge in the graph. Inverse
+    /// carries the previous destination.
+    ///
+    /// This is a MOVE, not a copy: unlike `SendAdd`, the track stops
+    /// reaching the master. See `audio::bus`'s module doc for why the two
+    /// are separate ops rather than one with a flag.
+    TrackSetOutput {
+        track_id: crate::ids::TrackId,
+        output: Option<crate::ids::TrackId>,
+    },
     /// Plan G2: move a send's tap between post-fader (default) and
     /// pre-fader. STRUCTURAL — it changes where the wire leaves the strip —
     /// so unlike the amount it rebuilds. Inverse carries the previous bool.
@@ -557,6 +568,7 @@ mod tests {
         // TrackAdd with real TrackState: verify wire form and round-trip.
         let track = crate::audio::types::TrackState {
             sends: Vec::new(),
+            output: None,
             id: "t-2".into(),
             name: "Audio Track".into(),
             kind: "audio".into(),

@@ -506,6 +506,9 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             | Op::SendSetPreFader { track_id, send_id, .. } => {
                 track_id.as_str().len() + send_id.len()
             }
+            Op::TrackSetOutput { track_id, output } => {
+                track_id.as_str().len() + output.as_ref().map_or(0, |o| o.as_str().len())
+            }
             // Lanes UX: a whole-list order carries one id string per track,
             // plus the Vec's own allocation. Charged honestly because the
             // op scales with track count — unlike the fixed-size insert ops
@@ -624,6 +627,7 @@ mod tests {
     fn track(id: &str) -> crate::audio::types::TrackState {
         crate::audio::types::TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: format!("Track {id}"),
             kind: "midi".into(),

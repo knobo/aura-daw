@@ -577,16 +577,19 @@ pub struct RtTrack {
     /// needed (this track IS the slowest path, or PDC isn't wired up yet —
     /// Task 6 adds the primitive; attaching it during graph build is Task 7).
     pub pdc: Option<DelayLine>,
-    /// Plan G2: delay on the DIRECT-to-master path only — applied after the
-    /// send taps and after the fader, so the dry signal lands in step with
-    /// the returns coming back from latency-carrying buses.
+    /// Plan G2: delay on this track's OUTPUT path — applied after the send
+    /// taps and after the fader, so only what continues to the destination
+    /// waits for whatever else arrives there.
     ///
     /// Why a SECOND delay line and not a bigger `pdc`: `pdc` sits before
     /// the taps, so growing it would delay the sends by the same amount and
     /// move the whole return with the dry signal — the two would never
-    /// converge. The taps must leave at the source-aligned time; only what
-    /// continues straight to the master waits for the buses.
-    pub master_pdc: Option<DelayLine>,
+    /// converge. The taps must leave at the source-aligned time; only the
+    /// output path waits.
+    pub out_pdc: Option<DelayLine>,
+    /// Where this track's fader output goes: an index into
+    /// `RtGraph::buses`, or `None` for the master.
+    pub output: Option<usize>,
     /// Carry state across the `MAX_LIVE_BLOCK` windows of ONE callback block
     /// (Plan G2). It lives on the ROW, not in a parallel vector on the
     /// graph: a parallel vector has to be sized at construction, and every
@@ -605,7 +608,8 @@ impl RtTrack {
             inserts: Vec::new(),
             sends: Vec::new(),
             pdc: None,
-            master_pdc: None,
+            out_pdc: None,
+            output: None,
             win: TrackWindow::default(),
         }
     }
@@ -622,6 +626,11 @@ pub struct RtSend {
     pub amount: usize,
     /// Tap point (see `types::SendSlot::pre_fader`).
     pub pre_fader: bool,
+    /// Compensation for THIS EDGE: what the copy waits so it reaches the
+    /// bus in step with that bus's other inputs. `None` (the common case)
+    /// when everything arriving there is already aligned — see
+    /// `audio::bus`'s module doc for when it is not.
+    pub delay: Option<DelayLine>,
 }
 
 /// One compiled bus/return strip (Plan G2). Its SOURCE is the accumulator
@@ -634,10 +643,18 @@ pub struct RtBus {
     /// Compiled insert chain (document order) — this is where the shared
     /// convolution reverb actually lives.
     pub inserts: Vec<InsertNode>,
-    /// Compensating delay so every return lands at the master in step with
-    /// the dry paths (which wait via `RtTrack::master_pdc`) and with each
-    /// other. `None` = this bus IS the slowest return.
-    pub pdc: Option<DelayLine>,
+    /// Copies this bus peels off into OTHER buses. A bus is an ordinary
+    /// node in the routing graph, so it sends like anything else.
+    pub sends: Vec<RtSend>,
+    /// Where this bus's fader output goes: an index into `RtGraph::buses`,
+    /// or `None` for the master. Always a LATER index than this bus's own —
+    /// `bus::compile_routing` hands the renderer a topological order, so one
+    /// forward pass is enough and a cycle cannot be expressed.
+    pub output: Option<usize>,
+    /// Compensation on this bus's OUTPUT path, applied after its send taps
+    /// so only what continues downstream waits. `None` = nothing at its
+    /// destination is slower than this.
+    pub out_pdc: Option<DelayLine>,
     /// Window carry state, for the same reason `RtTrack::win` exists.
     pub win: TrackWindow,
 }
@@ -678,7 +695,7 @@ pub struct RtGraph {
     pub track_buf: Vec<f32>,
     /// Post-fader stereo scratch (`MAX_LIVE_BLOCK * 2`, always). The fader
     /// writes here instead of straight into `out` so a POST-fader send has
-    /// something to tap and so `RtTrack::master_pdc` can delay the dry path
+    /// something to tap and so `RtTrack::out_pdc` can delay the dry path
     /// after the tap. Preallocated at BUILD time, like `track_buf`.
     pub post_buf: Vec<f32>,
     /// Per-bus input accumulators, `buses.len() * MAX_LIVE_BLOCK * 2`
@@ -687,6 +704,11 @@ pub struct RtGraph {
     /// when the graph has no buses, so a project without returns allocates
     /// nothing extra.
     pub bus_buf: Vec<f32>,
+    /// Scratch for one send tap (`MAX_LIVE_BLOCK * 2`). A tap is a COPY that
+    /// may carry its own compensating delay, so it cannot be scaled straight
+    /// out of the strip buffer into the accumulator. Preallocated at BUILD
+    /// time; empty when the graph has no buses.
+    pub tap_buf: Vec<f32>,
     /// Monotonic graph generation; meter blocks echo it (Task 6).
     pub generation: u64,
     /// THIS graph's parameters — round-2 §2.4: the param table versions
@@ -743,6 +765,7 @@ impl RtGraph {
         let track_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let post_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let bus_buf = vec![0.0; buses.len() * MAX_LIVE_BLOCK * 2];
+        let tap_buf = vec![0.0; if buses.is_empty() { 0 } else { MAX_LIVE_BLOCK * 2 }];
         let n_chunks = (params.len() + METER_CHUNK_SLOTS - 1) / METER_CHUNK_SLOTS;
         let n_chunks = n_chunks.max(1);
         let meter_scratch = (0..n_chunks)
@@ -758,6 +781,7 @@ impl RtGraph {
             track_buf,
             post_buf,
             bus_buf,
+            tap_buf,
             generation,
             params,
             meter_scratch,

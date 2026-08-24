@@ -1474,7 +1474,8 @@ mod tests {
         ];
         let track = RtTrack {
             sends: Vec::new(),
-            master_pdc: None,
+            out_pdc: None,
+            output: None,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),
@@ -1562,7 +1563,8 @@ mod tests {
             Box::new(GainAutomatedNode::new(Box::new(ConstSource), ev.clone(), 0));
         let track = RtTrack {
             sends: Vec::new(),
-            master_pdc: None,
+            out_pdc: None,
+            output: None,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),

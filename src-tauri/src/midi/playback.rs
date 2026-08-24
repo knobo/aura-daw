@@ -234,7 +234,8 @@ pub fn append_from_with_input(
                         inserts: Vec::new(),
                         sends: Vec::new(),
                         pdc: None,
-                        master_pdc: None,
+                        out_pdc: None,
+                        output: None,
                         win: Default::default(),
                     });
                 }
@@ -270,7 +271,8 @@ pub fn append_from_with_input(
                         inserts: Vec::new(),
                         sends: Vec::new(),
                         pdc: None,
-                        master_pdc: None,
+                        out_pdc: None,
+                        output: None,
                         win: Default::default(),
                     });
                 }
@@ -418,6 +420,7 @@ mod tests {
     fn track(id: &str, kind: &str) -> TrackState {
         TrackState {
             sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: id.into(),
             kind: kind.into(),

@@ -212,6 +212,7 @@ pub fn run() {
             audio::send_remove,
             audio::send_set_amount,
             audio::send_set_pre_fader,
+            audio::track_set_output,
             audio::remove_track,
             audio::get_tracks,
             audio::set_track_gain,

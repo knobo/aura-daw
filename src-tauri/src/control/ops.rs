@@ -117,6 +117,9 @@ pub(crate) fn new_track_row(
         instrument_id: None,
         inserts: Vec::new(),
         sends: Vec::new(),
+        // A new track goes to the master. Routing it into a bus is an
+        // explicit gesture, like joining a lane group.
+        output: None,
         // Ungrouped: a new track lands at the end of the list, outside every
         // group. Dropping it into one is an explicit gesture (`arrange_lanes`).
         group: None,

@@ -57,6 +57,7 @@ const SEED_IDS: [&str; 3] = ["t-1", "t-2", "t-3"];
 fn test_track(id: &str) -> TrackState {
     TrackState {
         sends: Vec::new(),
+        output: None,
         id: id.into(),
         name: format!("Track {id}"),
         kind: "audio".into(),
