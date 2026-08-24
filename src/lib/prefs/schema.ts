@@ -25,6 +25,8 @@ export const PREF_CATEGORIES: readonly { id: PrefCategoryId; label: string }[] =
 export interface PrefValues {
   /** Start playback automatically when a MIDI clip opens in the piano roll. */
   clipOpenAutoplay: boolean;
+  /** Double-click a browser row to hear it. Off until asked for. */
+  browserAudition: boolean;
   /** Flash notes (piano roll, keys, clip bodies) as the playhead hits them. */
   noteFlash: boolean;
   /** Interface zoom factor (CSS `zoom` on the shell). */
@@ -160,6 +162,14 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     category: "editing",
     label: "Play clip when opened",
     blurb: "Start looping playback the moment a MIDI clip opens in the piano roll.",
+  },
+  browserAudition: {
+    kind: "boolean",
+    default: false,
+    category: "library",
+    label: "Audition on double-click",
+    blurb:
+      "Double-click a row in any browser to hear it — a sample plays, an instrument or plugin sounds C3. Never edits the project.",
   },
   noteFlash: {
     kind: "boolean",

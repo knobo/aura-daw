@@ -46,7 +46,7 @@ use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState}
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
-pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
+pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter, UndoPath};
 pub use ops::{LaneArrangement, TrackMixChange};
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
@@ -521,6 +521,15 @@ impl Committer {
                     | op::PropPath::SampleRate
                     | op::PropPath::Param { .. } => {}
                 }
+            }
+            // Plan G2: send amounts, resolved through the CURRENT
+            // `send_slots` for the same reason the track writes resolve
+            // through `slots` — an id with no lane yet (the send was added
+            // by a commit whose rebuild has not run) is skipped, and that
+            // rebuild will populate the lane from the document anyway.
+            for (send_id, amount) in &committed.effect.send_writes {
+                let Some(&idx) = tables.send_slots.get(send_id) else { continue };
+                tables.params.set_send_amount_linear(idx, *amount);
             }
             if let Some(any_solo) = committed.effect.any_solo {
                 tables.params.any_solo.store(any_solo, Relaxed);
@@ -1007,6 +1016,10 @@ enum CoalesceTarget {
     AutomationLane(String),
     /// Modulation graph keys (`Curve::id` / `Binding::id` / `AutomationClip::id`).
     ModulationKey(String),
+    /// `SendSlot::id` (Plan G2) — keyed by the SEND, not by its track: two
+    /// sends on one track are two independent knobs and must not fold into
+    /// each other.
+    Send(String),
 }
 
 /// The coalescing key a gesture folds by: the op's discriminant + the
@@ -1068,6 +1081,15 @@ impl CoalesceKey {
             op::Op::TempoSet { .. } => Some(Self {
                 kind: "tempoSet",
                 target: CoalesceTarget::Object(op::ObjectRef::Transport),
+                path: None,
+            }),
+            // Plan G2: a send knob drags like a fader, so it folds like one
+            // — a run of amount writes on ONE send is one undo step. The
+            // op is absolute-valued (it carries `amount_db`), which is what
+            // makes discarding the intermediates sound.
+            op::Op::SendSetAmount { send_id, .. } => Some(Self {
+                kind: "sendSetAmount",
+                target: CoalesceTarget::Send(send_id.clone()),
                 path: None,
             }),
             _ => None,
@@ -2498,7 +2520,7 @@ impl ControlPlane {
         // slots leave with the row; PluginRemove then drops the instances
         // (G-10 sweep is a no-op). Undo applies inverses in reverse:
         // PluginAdds then TrackAdd (with inserts).
-        let (track, clip_ids, insert_removes) = {
+        let (track, clip_ids, insert_removes, send_removes, output_resets) = {
             let session = self.session.lock();
             let track = session
                 .store
@@ -2527,9 +2549,38 @@ impl ControlPlane {
                 let params = session.plugins.params.get(&row.id).cloned().unwrap_or_default();
                 insert_removes.push((row, blob, params));
             }
-            (track, clip_ids, insert_removes)
+            // Plan G2: every send POINTING AT this track. Removing a bus
+            // must not leave dangling wires behind — the compiler would drop
+            // them silently, but the send list on the source track would go
+            // on showing a row whose destination no longer exists. Removed
+            // in the SAME commit so one undo brings the bus and its wiring
+            // back together.
+            let mut send_removes = Vec::new();
+            let mut output_resets = Vec::new();
+            for t in &session.store.tracks {
+                for snd in &t.sends {
+                    if snd.dest.as_str() == id {
+                        send_removes.push((t.id.clone(), snd.clone()));
+                    }
+                }
+                // Same argument for the OUTPUT edge: a track routed into a
+                // bus that is going away must fall back to the master here,
+                // in this commit, so one undo restores both. Left alone it
+                // would compile to the master anyway — but silently, and
+                // the document would keep naming a track that is gone.
+                if t.output.as_ref().is_some_and(|o| o.as_str() == id) {
+                    output_resets.push(t.id.clone());
+                }
+            }
+            (track, clip_ids, insert_removes, send_removes, output_resets)
         };
         self.commit(meta, |tx| {
+            for track_id in output_resets {
+                tx.apply(op::Op::TrackSetOutput { track_id, output: None })?;
+            }
+            for (track_id, slot) in send_removes {
+                tx.apply(op::Op::SendRemove { track_id, slot, index: 0 })?;
+            }
             tx.apply(op::Op::TrackRemove {
                 track,
                 index: 0,
@@ -2797,6 +2848,124 @@ impl ControlPlane {
                 track_id: track_id.into(),
                 slot_id: slot_id.into(),
                 bypassed,
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G2: add a send from `track_id` into the bus `dest`. The id is
+    /// minted here (a uuid, stable across reorder — `SCALABILITY` §2), and
+    /// the send lands at unity so adding it is audible; `send_set_amount`
+    /// dials it from there. Returns the row that was stored.
+    pub fn send_add(
+        &self,
+        track_id: &str,
+        dest: &str,
+        meta: op::TxMeta,
+    ) -> Result<crate::audio::types::SendSlot, String> {
+        let slot = crate::audio::types::SendSlot {
+            id: uuid::Uuid::new_v4().to_string(),
+            dest: dest.into(),
+            amount_db: 0.0,
+            pre_fader: false,
+        };
+        let out = slot.clone();
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::SendAdd {
+                track_id: track_id.into(),
+                slot,
+                index: usize::MAX,
+            })
+        })?;
+        Ok(out)
+    }
+
+    /// Plan G2: remove one send edge.
+    pub fn send_remove(&self, track_id: &str, send_id: &str, meta: op::TxMeta) -> Result<(), String> {
+        let slot = {
+            let session = self.session.lock();
+            session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?
+                .sends
+                .iter()
+                .find(|s| s.id == send_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown send: {send_id}"))?
+        };
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::SendRemove { track_id: track_id.into(), slot, index: 0 })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G2: set a send's amount in dB. A MIX change — the commit
+    /// resolves it into `ParamTable::send_amount` and schedules NO rebuild.
+    pub fn send_set_amount(
+        &self,
+        track_id: &str,
+        send_id: &str,
+        amount_db: f64,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let make_op = || op::Op::SendSetAmount {
+            track_id: track_id.into(),
+            send_id: send_id.into(),
+            amount_db,
+        };
+        // Same shape as `set_track_mix`'s fader path: inside an open
+        // gesture the write is transient and folds into the batch, so a
+        // knob DRAG is one undo step and one persist; outside one it is an
+        // ordinary commit. Whether a gesture is open is a runtime fact, so
+        // both closures have to exist.
+        let gesture_meta = meta.clone();
+        let folded = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| tx.apply(make_op()))
+        });
+        match folded {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| tx.apply(make_op()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Plan G2: point a track's output at a bus, or back at the master
+    /// (`output: None`). A MOVE, not a copy — the track stops reaching the
+    /// master. Rejected if it would close a routing loop.
+    pub fn track_set_output(
+        &self,
+        track_id: &str,
+        output: Option<&str>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let output = output.map(crate::ids::TrackId::from);
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::TrackSetOutput { track_id: track_id.into(), output })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G2: move a send's tap between post-fader and pre-fader
+    /// (structural — it changes where the wire leaves the strip).
+    pub fn send_set_pre_fader(
+        &self,
+        track_id: &str,
+        send_id: &str,
+        pre_fader: bool,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::SendSetPreFader {
+                track_id: track_id.into(),
+                send_id: send_id.into(),
+                pre_fader,
             })
         })?;
         Ok(())
@@ -3615,6 +3784,26 @@ impl ControlPlane {
             self.close_gesture(g);
         }
         let _gate = self.history_gate.lock();
+        self.undo_step()
+    }
+
+    /// One undo step with the gate ALREADY HELD — the body of
+    /// [`Self::undo`]. `history_gate` is a plain `parking_lot::Mutex` and is
+    /// not reentrant, so a caller that holds it must never route back
+    /// through [`Self::undo`].
+    ///
+    /// THE POP HERE IS UNCONDITIONAL, and that is right for a single step:
+    /// Ctrl+Z means "undo whatever is on top NOW", so a commit that landed a
+    /// moment ago is a legitimate thing to consume. A multi-step walk means
+    /// something else — "undo these particular revisions" — and uses
+    /// [`Self::undo_walk_step`] for exactly that reason (C-1).
+    ///
+    /// Everything the single-step contract promises still holds here: the
+    /// entry's inverses go through the normal commit path (journaled, own
+    /// rebuild, `project://changed`), `HistoryMode::Replay` suppresses a new
+    /// history entry, the ORIGINAL entry migrates onto the redo stack, and a
+    /// failed commit puts it back untouched.
+    fn undo_step(&self) -> Result<Option<String>, String> {
         let Some((entry, popped_epoch)) = self.committer.log().pop_undo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
@@ -3670,6 +3859,208 @@ impl ControlPlane {
             }
             Err(e) => {
                 self.committer.log().push_redo(entry, popped_epoch);
+                Err(e)
+            }
+        }
+    }
+
+    /// Walk the linear undo ancestry back to `target_rev` — the Plan F
+    /// carry-forward (e) "ordered next step".
+    ///
+    /// SEMANTICS: EXCLUSIVE. Every undo entry ABOVE `target_rev` is undone;
+    /// `target_rev` itself stays applied, so the document ends as the one
+    /// `materialize_version(target_rev)` describes — the document the
+    /// HISTORY dock's detail pane is showing when the user picks that row.
+    /// Picking the head is therefore a successful no-op.
+    ///
+    /// THE GUARDS, and what each is for:
+    /// * `expected_epoch` — the document must still be the one the caller
+    ///   read. Undoing across a document swap is corruption, not undo
+    ///   (`History::clear`'s doc). Checked here once, and then ENFORCED
+    ///   AGAIN AT EVERY STEP: [`Self::undo_walk_step`] compares the epoch
+    ///   each entry was popped under against THIS value and aborts if they
+    ///   differ, before anything is applied.
+    ///
+    ///   That per-step check is a real guard, not belt-and-braces (I-1,
+    ///   whole-branch review). It replaces an inference that does not hold —
+    ///   "a boundary clears the undo stack, so a step that still pops
+    ///   something proves the epoch has not moved". A boundary followed by a
+    ///   FRESH EDIT on the new document leaves a poppable entry again, and
+    ///   `commit_replay` only compares that entry against the epoch IT was
+    ///   popped under (both new, so it passes). The walk would then keep
+    ///   undoing edits belonging to a document the user never targeted, one
+    ///   step at a time, and report success. Comparing against the CALLER's
+    ///   epoch is what makes "nothing applied after the swap" true.
+    /// * `expected_head_rev` — the undo ancestry must not have moved. NOT
+    ///   `Session::rev`: transient commits (transport play/stop, gesture
+    ///   folds) bump that without touching this stack, so guarding on it
+    ///   would abort because the user pressed play.
+    /// * `target_rev` must be ON the current undo path. An already-undone
+    ///   step (now on the redo stack) and a bottom-evicted one
+    ///   (`UNDO_STACK_LIMIT`) are both simply absent, and both are refused
+    ///   with the same message: the request describes an ancestry this
+    ///   document does not have.
+    ///
+    /// ONE GATE FOR THE WHOLE WALK: `history_gate` is taken once and held
+    /// across every step, so a concurrent `undo`/`redo` cannot interleave
+    /// into the middle of a walk. The gate is not reentrant, hence
+    /// [`Self::undo_walk_step`] rather than [`Self::undo`].
+    ///
+    /// THE WALK CONSUMES A ROUTE, NOT A COUNT (C-1, whole-branch review).
+    /// The gate serialises this against `undo`/`redo` and nothing else — it
+    /// does NOT gate ordinary commits, and this app has several that arrive
+    /// off the UI thread: `commit_recording_finalize` commits `Actor::Engine`
+    /// non-transiently from the engine control thread, MCP agent tools
+    /// commit on their own threads, an automation write pass commits on
+    /// release. Any of those landing between two steps pushes a fresh entry
+    /// onto the back of the undo stack. A walk that trusted a precomputed
+    /// step count would undo THAT entry — an edit nobody asked to undo —
+    /// then stop one step short of the target and report success anyway,
+    /// with the redo chain it had been building cleared by the same
+    /// `History::record`. So the walk instead plans the exact revisions to
+    /// consume, highest first, and every step pops CONDITIONALLY
+    /// (`HistoryLog::pop_undo_if`): it consumes the revision it planned to,
+    /// or nothing at all and the walk stops and says so.
+    ///
+    /// M-4, an open gesture is closed FIRST, exactly as [`Self::undo`] does
+    /// — the drag becomes the finished step it already looks like. That
+    /// close records a fresh entry, which MOVES the head, so a walk
+    /// requested mid-drag then fails its own head guard and the user
+    /// retries against the ancestry they can now see. Aborting is the right
+    /// answer: the row they clicked was chosen before the drag existed.
+    ///
+    /// PARTIAL WALKS ARE REPORTED, NOT HIDDEN. Each step is a real
+    /// committed transaction, so there is nothing to roll back to: if step
+    /// `k` stops the walk — its commit failed, the epoch moved, or the undo
+    /// stack no longer offers the revision that step planned to consume —
+    /// the `k` steps before it STAY APPLIED, and the error says how many of
+    /// how many were applied and why it stopped. The caller re-reads the
+    /// overview AND re-pulls its stores, because the document moved
+    /// (`projectops.undoTo`'s failure path does exactly that).
+    pub fn undo_to(
+        &self,
+        target_rev: u64,
+        expected_epoch: u64,
+        expected_head_rev: Option<u64>,
+    ) -> Result<UndoToOutcome, String> {
+        if let Some(g) = self.gesture.end(None) {
+            self.close_gesture(g);
+        }
+        let _gate = self.history_gate.lock();
+
+        let path = self.committer.log().undo_path();
+        if path.epoch != expected_epoch {
+            return Err(format!(
+                "the project was replaced under this request (epoch {expected_epoch} -> {}) \
+                 — nothing applied",
+                path.epoch
+            ));
+        }
+        if path.head() != expected_head_rev {
+            return Err(format!(
+                "the edit history changed under this request (head {:?} -> {:?}) \
+                 — nothing applied",
+                expected_head_rev,
+                path.head()
+            ));
+        }
+        let Some(at) = path.revs.iter().position(|r| *r == target_rev) else {
+            return Err(format!(
+                "revision {target_rev} is not on the undo path — it was undone already, \
+                 or dropped from the {} most recent steps history keeps",
+                history::UNDO_STACK_LIMIT
+            ));
+        };
+        // THE ROUTE: the revisions ABOVE the target, highest first — the
+        // exact entries this walk intends to consume, in the order it
+        // intends to consume them. Exclusive semantics, so `target_rev`
+        // itself is not on it. This list, not its length, is what the loop
+        // walks (C-1).
+        let route: Vec<u64> = path.revs[at + 1..].iter().rev().copied().collect();
+        let steps = route.len();
+
+        let mut label = None;
+        for (done, want) in route.iter().enumerate() {
+            match self.undo_walk_step(*want, expected_epoch) {
+                Ok(Some(l)) => label = Some(l),
+                // M-2: "nothing popped" is no longer one specific story. The
+                // stack did not offer `want` — a commit landed on top of it
+                // mid-walk, or the entry was dropped on its way back by
+                // `push_redo`'s epoch guard. Name the observation, not a
+                // guess at the cause, and say what stayed applied.
+                Ok(None) => {
+                    return Err(format!(
+                        "undo to revision {target_rev} stopped after {done} of {steps} steps: \
+                         the undo stack no longer offers revision {want}, which this step \
+                         planned to consume — the edit history moved under the walk. The \
+                         {done} steps already applied stay applied."
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "undo to revision {target_rev} stopped after {done} of {steps} \
+                         steps: {e}. The {done} steps already applied stay applied."
+                    ))
+                }
+            }
+        }
+        Ok(UndoToOutcome { steps, label })
+    }
+
+    /// One step of an [`Self::undo_to`] walk: [`Self::undo_step`] for a
+    /// PLANNED revision, with the gate already held.
+    ///
+    /// Two differences from `undo_step`, both of which exist only because a
+    /// walk is several steps long while `history_gate` gates only other
+    /// `undo`/`redo` commands (C-1):
+    ///
+    /// * THE POP IS CONDITIONAL. `pop_undo_if(want)` consumes the revision
+    ///   this step planned to consume or nothing at all — never "whatever is
+    ///   on the back now", which after a concurrent commit is a fresh edit
+    ///   the user never asked to undo. `Ok(None)` is that refusal, and it is
+    ///   deliberately distinguishable from a failed commit: the caller
+    ///   reports "the history moved" rather than a commit error.
+    /// * THE POPPED EPOCH IS CHECKED AGAINST THE CALLER'S. `commit_replay`
+    ///   compares an entry against the epoch IT was popped under, which
+    ///   cannot notice that the whole document was swapped mid-walk and then
+    ///   edited: the new document's fresh entry pops under the new epoch and
+    ///   agrees with itself. Comparing against the epoch `undo_to`
+    ///   VALIDATED is what stops the walk at the boundary. The entry goes
+    ///   straight back with `push_undo_unchanged` (whose own guard drops it
+    ///   if it belongs to a document that is gone) — a refused step must not
+    ///   consume a history entry.
+    ///
+    /// Everything the single-step contract promises still holds: the
+    /// inverses go through the normal commit path (journaled, own rebuild,
+    /// `project://changed`), `HistoryMode::Replay` suppresses a new history
+    /// entry, the ORIGINAL entry migrates onto the redo stack, and a failed
+    /// commit puts it back untouched.
+    fn undo_walk_step(&self, want: u64, expected_epoch: u64) -> Result<Option<String>, String> {
+        let Some((entry, popped_epoch)) = self.committer.log().pop_undo_if(want) else {
+            return Ok(None);
+        };
+        if popped_epoch != expected_epoch {
+            self.committer.log().push_undo_unchanged(entry, popped_epoch);
+            return Err(format!(
+                "the project was replaced under this walk (epoch {expected_epoch} -> \
+                 {popped_epoch})"
+            ));
+        }
+        let meta = op::TxMeta {
+            actor: op::Actor::User,
+            run: entry.run.clone(),
+            label: format!("undo: {}", entry.label),
+            transient: false,
+        };
+        let ops = entry.inverses.clone();
+        match self.commit_replay(meta, ops, popped_epoch) {
+            Ok(()) => {
+                let label = entry.label.clone();
+                self.committer.log().push_redo(entry, popped_epoch);
+                Ok(Some(label))
+            }
+            Err(e) => {
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
                 Err(e)
             }
         }
@@ -3738,6 +4129,12 @@ impl ControlPlane {
 
     pub fn version_overview(&self) -> (vergraph::VersionStats, Vec<vergraph::VersionItem>) {
         self.committer.log().version_overview()
+    }
+
+    /// The linear undo ancestry, for the browsing surface's `Undo to here`
+    /// affordance and the guard pair it must hand back.
+    pub fn undo_path(&self) -> history::UndoPath {
+        self.committer.log().undo_path()
     }
 
     pub fn materialize_version(&self, rev: u64) -> Option<SessionSnapshot> {
@@ -5148,6 +5545,19 @@ pub struct HistoryStep {
     pub redo_depth: usize,
 }
 
+/// What a completed [`ControlPlane::undo_to`] walk did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoToOutcome {
+    /// How many undo steps were applied. 0 is a legal, successful answer:
+    /// the target was already the head.
+    pub steps: usize,
+    /// The label of the LAST step undone — what a toast shows ("back to
+    /// <label>" is wrong; this is the step the walk ended on). `None` when
+    /// `steps == 0`.
+    pub label: Option<String>,
+}
+
 /// Read-only product surface over Plan F's retained version chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5157,6 +5567,24 @@ pub struct HistoryVersion {
     pub charged_bytes: usize,
     pub label: String,
     pub actor: String,
+    /// True when this revision is on the CURRENT linear undo ancestry, i.e.
+    /// when `history_undo_to` will accept it. Retained revisions that are
+    /// not: the undo commits themselves, anything already undone (now on the
+    /// redo stack), and anything dropped by `UNDO_STACK_LIMIT` while the
+    /// version graph still keeps it.
+    ///
+    /// A HINT, not a guarantee: `history_overview` reads this row from the
+    /// `versions` mutex and the undo path it is checked against from a
+    /// separate, later acquisition of the `history`/`epoch` mutexes (see
+    /// that function's doc). A commit landing between the two can retain a
+    /// new row or move the path out from under it, so this bit can be one
+    /// refresh stale — set (or unset) for a row that no longer matches by
+    /// the time the response reaches the renderer. Safe regardless: the
+    /// walk itself re-reads a fresh `undo_path()` under `history_gate` and
+    /// refuses a `target_rev` that has fallen off it, so a stale bit can
+    /// only mis-enable or mis-disable a button for one refresh — it can
+    /// never cause `history_undo_to` to apply the wrong edit.
+    pub on_undo_path: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5168,6 +5596,16 @@ pub struct HistoryOverview {
     pub materialized: usize,
     pub replay_only: usize,
     pub versions: Vec<HistoryVersion>,
+    /// The document epoch these versions belong to. Handed back verbatim by
+    /// `history_undo_to` so the backend can refuse a request that was
+    /// composed against a document that has since been replaced.
+    pub epoch: u64,
+    /// The revision a plain undo would consume next — the head of the undo
+    /// ancestry, `None` when there is nothing to undo. The second half of
+    /// the guard pair. NOT the live `Session::rev`: transient commits
+    /// (transport play/stop, gesture folds) move that without touching the
+    /// undo stack.
+    pub head_rev: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5181,10 +5619,25 @@ pub struct HistoryVersionDetail {
     pub automation_lane_count: usize,
 }
 
+/// TWO SEPARATE LOCK ACQUISITIONS, NOT MERGED: `control.version_overview()`
+/// takes `HistoryLog`'s `versions` mutex and releases it; `control.undo_path()`
+/// then separately takes `epoch`/`history`. Zipping `on_undo_path` onto the
+/// version list therefore pairs two reads from different instants — see
+/// [`HistoryVersion::on_undo_path`] for the (benign) consequence. This is
+/// deliberate, not an oversight: `control/history.rs`'s module doc makes
+/// `history`, `journal` and `versions` a binding invariant that they are
+/// NEVER held at the same time (each is a leaf, entered only after the
+/// others have been released). Reading `versions` and `undo_path` under one
+/// combined hold would mean nesting one inside the other for the first time
+/// anywhere in the module, which is the kind of new lock-order edge that
+/// wants its own PR and its own argument, not a side effect of adding two
+/// display fields to a read-only overview.
 #[tauri::command]
 pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOverview {
     let (stats, versions) = control.version_overview();
     let (undo_depth, redo_depth) = control.history_depths();
+    let path = control.undo_path();
+    let on_path: std::collections::HashSet<u64> = path.revs.iter().copied().collect();
     HistoryOverview {
         undo_depth,
         redo_depth,
@@ -5194,6 +5647,7 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
         versions: versions
             .into_iter()
             .map(|v| HistoryVersion {
+                on_undo_path: on_path.contains(&v.rev),
                 rev: v.rev,
                 materialized: v.materialized,
                 charged_bytes: v.charged_bytes,
@@ -5201,6 +5655,8 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
                 actor: v.actor,
             })
             .collect(),
+        epoch: path.epoch,
+        head_rev: path.head(),
     }
 }
 
@@ -5265,6 +5721,29 @@ pub async fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, 
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Walk the undo ancestry back to `target_rev` (Plan F carry-forward (e)) —
+/// thin delegate over [`ControlPlane::undo_to`]. Additive command; `undo`
+/// and `redo` are untouched.
+///
+/// `expected_epoch` / `expected_head_rev` are the values the caller read
+/// from [`history_overview`]. The backend refuses the walk if either has
+/// moved — the renderer never decides that, it only reports what it saw.
+///
+/// Async for [`undo`]'s reason (I-6), and more so: this is N undos, any one
+/// of which can re-instantiate a plugin.
+#[tauri::command]
+pub async fn history_undo_to(
+    target_rev: u64,
+    expected_epoch: u64,
+    expected_head_rev: Option<u64>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<UndoToOutcome, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.undo_to(target_rev, expected_epoch, expected_head_rev))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Import an audio file as a clip (STUB until zone B lands).
@@ -5356,6 +5835,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            send_slots: Default::default(),
             generation: 1,
             params: Arc::new(ParamTable::default()),
             slots: derive_slots(&session.lock().store.tracks),
@@ -5524,6 +6004,7 @@ mod tests {
         let gen1_slots: std::collections::HashMap<TrackId, usize> =
             [(track_x.clone(), 0)].into_iter().collect();
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            send_slots: Default::default(),
             generation: 1,
             params: gen1_params.clone(),
             slots: gen1_slots,
@@ -5562,7 +6043,12 @@ mod tests {
         let gen2_slots: std::collections::HashMap<TrackId, usize> =
             [(track_y.clone(), 0)].into_iter().collect();
         *tables.lock() =
-            GraphTables { generation: 2, params: gen2_params.clone(), slots: gen2_slots };
+            GraphTables {
+                generation: 2,
+                params: gen2_params.clone(),
+                slots: gen2_slots,
+                send_slots: Default::default(),
+            };
 
         // A param write to Y (through the real channel) must resolve
         // through gen-2's CURRENT table.
@@ -6142,6 +6628,98 @@ mod tests {
     /// Controller ruling 2: removing the only soloed track through the
     /// channel must recompute the store-wide `any_solo` RT atomic (old
     /// `remove_track`, audio/mod.rs:378, did this too).
+    /// Plan G2: removing a BUS takes every wire pointing at it with it, in
+    /// the SAME commit. Left behind, those rows name a destination that no
+    /// longer exists: the compiler drops the edge silently, but the send
+    /// list on the source track keeps showing it. One undo brings the bus
+    /// and its wiring back together.
+    #[test]
+    fn removing_a_bus_removes_the_sends_that_pointed_at_it() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        let send = plane.send_add("t-1", "b-1", TxMeta::user("add send")).unwrap();
+        assert_eq!(plane.session().lock().store.tracks[0].sends.len(), 1);
+
+        plane.remove_track("b-1", TxMeta::user("remove bus")).unwrap();
+        {
+            let session = plane.session().lock();
+            assert!(session.store.tracks.iter().all(|t| t.id != "b-1"));
+            assert!(
+                session.store.tracks[0].sends.is_empty(),
+                "the wire goes with the bus, not after it"
+            );
+        }
+
+        plane.undo().unwrap();
+        let session = plane.session().lock();
+        assert!(session.store.tracks.iter().any(|t| t.id == "b-1"), "the bus is back");
+        assert_eq!(
+            session.store.tracks[0].sends.first().map(|s| s.id.clone()),
+            Some(send.id),
+            "and so is the wire, with its own id"
+        );
+    }
+
+    /// Removing a bus takes the OUTPUT edges pointing at it too, in the
+    /// same commit. Left alone the compiler would fall back to the master
+    /// silently, and the document would keep naming a track that is gone.
+    #[test]
+    fn removing_a_bus_re_routes_tracks_that_output_into_it() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        plane.track_set_output("t-1", Some("b-1"), TxMeta::user("route")).unwrap();
+        assert_eq!(
+            plane.session().lock().store.tracks[0].output.as_ref().map(|o| o.as_str()),
+            Some("b-1")
+        );
+
+        plane.remove_track("b-1", TxMeta::user("remove bus")).unwrap();
+        assert!(
+            plane.session().lock().store.tracks[0].output.is_none(),
+            "the routed track falls back to the master"
+        );
+
+        plane.undo().unwrap();
+        let session = plane.session().lock();
+        assert!(session.store.tracks.iter().any(|t| t.id == "b-1"), "the bus is back");
+        assert_eq!(
+            session.store.tracks[0].output.as_ref().map(|o| o.as_str()),
+            Some("b-1"),
+            "and so is the routing"
+        );
+    }
+
+    /// A send knob is a MIX change: it must reach the RT table without
+    /// scheduling a rebuild (§10 — rebuilding per knob frame at 500 tracks
+    /// is what round-2 §2.4 forbids).
+    #[test]
+    fn send_set_amount_writes_the_param_table_and_queues_no_rebuild() {
+        let (plane, engine_rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        let send = plane.send_add("t-1", "b-1", TxMeta::user("add send")).unwrap();
+        // The add IS structural; drain its rebuild so the assertion below is
+        // about the knob and nothing else. There is no engine here to
+        // republish tables, so publish the send lane by hand — exactly what
+        // `engine::rebuild` would have derived for this document.
+        while engine_rx.try_recv().is_ok() {}
+        {
+            let mut tables = plane.tables.lock();
+            tables.params = Arc::new(ParamTable::with_slots_and_sends(2, 1));
+            tables.send_slots.insert(send.id.clone(), 0);
+        }
+
+        plane.send_set_amount("t-1", &send.id, -6.0, TxMeta::user("send amount")).unwrap();
+        assert!(
+            engine_rx.try_recv().is_err(),
+            "NO-REBUILD PIN: a send knob must not queue a graph rebuild"
+        );
+        let expected = crate::audio::mixer::db_to_linear(-6.0);
+        assert!(
+            (plane.tables.lock().params.send_amount_linear(0) - expected).abs() < 1e-9,
+            "the amount reached the RT table"
+        );
+    }
+
     #[test]
     fn remove_track_recomputes_any_solo() {
         let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
@@ -8207,6 +8785,8 @@ mod tests {
         let mut store = Store::default();
         for (id, name) in [("pad", "Demo Pad"), ("lead", "Demo Lead"), ("bass", "Demo Bass")] {
             store.tracks.push(TrackState {
+                sends: Vec::new(),
+                output: None,
                 id: id.into(),
                 name: name.into(),
                 kind: "midi".into(),
@@ -8316,6 +8896,8 @@ mod tests {
         let mut store = Store::default();
         for (slot, id) in ["pad", "lead", "bass"].iter().enumerate() {
             store.tracks.push(TrackState {
+                sends: Vec::new(),
+                output: None,
                 id: (*id).into(),
                 name: (*id).into(),
                 kind: "midi".into(),

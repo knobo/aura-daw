@@ -575,6 +575,13 @@ impl Tx<'_> {
 pub struct EngineEffect {
     pub rebuild: bool,
     pub param_writes: Vec<(TrackId, PropPath, f32)>,
+    /// Plan G2: `(send_id, linear_amount)` — the send half of
+    /// `param_writes`. Keyed by `SendSlot::id`, not by track+index, for the
+    /// same reason the track writes are keyed by `TrackId`: the send-amount
+    /// lane is per-graph-generation state the session never sees, and
+    /// `ControlPlane::commit` resolves the id through the CURRENT
+    /// `GraphTables::send_slots` once the session lock is released.
+    pub send_writes: Vec<(String, f32)>,
     pub any_solo: Option<bool>,
     /// Which stores to persist to disk, executed by `ControlPlane::commit`
     /// (Task 6) AFTER the session lock is released — see `PersistEffect`.
@@ -1663,9 +1670,13 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown track: {track_id}"))?;
             {
                 let track = &session.store.tracks[track_idx];
-                if track.kind != "audio" && track.kind != "midi" {
+                // Plan G2 added `bus` here: a return's WHOLE PURPOSE is to
+                // carry an insert chain — the shared reverb lives on the
+                // bus, not on the tracks sending into it. What still has no
+                // strip to put a plugin on is an automation track.
+                if !crate::audio::types::is_mixer_track(track) {
                     return Err(format!(
-                        "inserts are only legal on audio|midi tracks, not {}",
+                        "inserts are only legal on audio|midi|bus tracks, not {}",
                         track.kind
                     ));
                 }
@@ -1778,6 +1789,177 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 track_id: track_id.clone(),
                 slot_id: slot_id.clone(),
                 bypassed: previous,
+            })
+        }
+        // Plan G2: send edges on TrackState.
+        Op::SendAdd { track_id, slot, index } => {
+            let dest_is_bus = session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id == slot.dest)
+                .map(crate::audio::types::is_bus_track);
+            let track_idx = session
+                .store
+                .tracks
+                .iter()
+                .position(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            {
+                let track = &session.store.tracks[track_idx];
+                if !crate::audio::types::is_mixer_track(track) {
+                    // An automation track renders no audio, so it has
+                    // nothing to copy.
+                    return Err(format!(
+                        "sends are only legal on audio|midi|bus tracks, not {}",
+                        track.kind
+                    ));
+                }
+                if slot.id.is_empty() {
+                    return Err("send id must not be empty".into());
+                }
+                match dest_is_bus {
+                    None => return Err(format!("unknown send destination: {}", slot.dest)),
+                    Some(false) => {
+                        return Err(format!(
+                            "send destination {} is not a bus track",
+                            slot.dest
+                        ))
+                    }
+                    Some(true) => {}
+                }
+                if track.sends.iter().any(|s| s.id == slot.id) {
+                    return Err(format!("duplicate send id: {}", slot.id));
+                }
+                if track.sends.iter().any(|s| s.dest == slot.dest) {
+                    // Two edges into one bus is legal audio and useless UI:
+                    // the amounts just sum. Rejecting keeps "one row per
+                    // destination" true, which is what the send list shows.
+                    return Err(format!("track already sends to {}", slot.dest));
+                }
+            }
+            // A bus may feed another bus — a drum bus into a mix bus is the
+            // ordinary case — but not in a loop. A cycle is only meaningful
+            // through an explicit one-block delay node (`SCALABILITY` §1),
+            // and there isn't one, so this is a rejection and not a
+            // silently-inserted delay.
+            if crate::audio::bus::would_cycle(&session.store.tracks, track_id, &slot.dest) {
+                return Err(format!(
+                    "sending {track_id} to {} would close a routing loop",
+                    slot.dest
+                ));
+            }
+            let track = &mut session.store.tracks[track_idx];
+            let idx = (*index).min(track.sends.len());
+            track.sends.insert(idx, slot.clone());
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::SendRemove {
+                track_id: track_id.clone(),
+                slot: slot.clone(),
+                index: idx,
+            })
+        }
+        Op::SendRemove { track_id, slot, .. } => {
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let pos = track
+                .sends
+                .iter()
+                .position(|s| s.id == slot.id)
+                .ok_or_else(|| format!("unknown send: {}", slot.id))?;
+            let removed = track.sends.remove(pos);
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::SendAdd {
+                track_id: track_id.clone(),
+                slot: removed,
+                index: pos,
+            })
+        }
+        Op::SendSetAmount { track_id, send_id, amount_db } => {
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let send = track
+                .sends
+                .iter_mut()
+                .find(|s| &s.id == send_id)
+                .ok_or_else(|| format!("unknown send: {send_id}"))?;
+            let previous = send.amount_db;
+            send.amount_db = *amount_db;
+            // NO `effect.rebuild`: a send knob is a mix change, and mix
+            // changes are param-table writes (§10). Rebuilding per knob
+            // frame at 500 tracks is exactly what round-2 §2.4 forbids.
+            effect.send_writes.push((
+                send_id.clone(),
+                crate::audio::mixer::db_to_linear(*amount_db),
+            ));
+            effect.persist.project = true;
+            Ok(Op::SendSetAmount {
+                track_id: track_id.clone(),
+                send_id: send_id.clone(),
+                amount_db: previous,
+            })
+        }
+        Op::TrackSetOutput { track_id, output } => {
+            let known = session.store.tracks.iter().any(|t| &t.id == track_id);
+            if !known {
+                return Err(format!("unknown track: {track_id}"));
+            }
+            if let Some(dest) = output {
+                match session.store.tracks.iter().find(|t| &t.id == dest) {
+                    None => return Err(format!("unknown output destination: {dest}")),
+                    Some(t) if !crate::audio::types::is_bus_track(t) => {
+                        return Err(format!("output destination {dest} is not a bus track"))
+                    }
+                    Some(_) => {}
+                }
+                if crate::audio::bus::would_cycle(&session.store.tracks, track_id, dest) {
+                    return Err(format!(
+                        "routing {track_id} into {dest} would close a routing loop"
+                    ));
+                }
+            }
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let previous = track.output.clone();
+            track.output = output.clone();
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::TrackSetOutput { track_id: track_id.clone(), output: previous })
+        }
+        Op::SendSetPreFader { track_id, send_id, pre_fader } => {
+            let track = session
+                .store
+                .tracks
+                .iter_mut()
+                .find(|t| &t.id == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?;
+            let send = track
+                .sends
+                .iter_mut()
+                .find(|s| &s.id == send_id)
+                .ok_or_else(|| format!("unknown send: {send_id}"))?;
+            let previous = send.pre_fader;
+            send.pre_fader = *pre_fader;
+            effect.rebuild = true;
+            effect.persist.project = true;
+            Ok(Op::SendSetPreFader {
+                track_id: track_id.clone(),
+                send_id: send_id.clone(),
+                pre_fader: previous,
             })
         }
         Op::TrackReorder { order } => {
@@ -2327,6 +2509,8 @@ mod tests {
     fn session_with_one_track(id: &str) -> Session {
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: "Track 1".into(),
             kind: "audio".into(),
@@ -4546,6 +4730,274 @@ mod tests {
             })
         })
         .contains("automation"));
+    }
+
+    // ---- sends / bus returns (Plan G2) ----
+
+    fn send(id: &str, dest: &str) -> crate::audio::types::SendSlot {
+        crate::audio::types::SendSlot {
+            id: id.into(),
+            dest: dest.into(),
+            amount_db: 0.0,
+            pre_fader: false,
+        }
+    }
+
+    /// The one-track fixture plus a bus to send into.
+    fn session_with_a_bus() -> parking_lot::Mutex<Session> {
+        let mut session = session_with_one_track("t-1");
+        let mut bus = session.store.tracks[0].clone();
+        bus.id = "b-1".into();
+        bus.name = "Bus 1".into();
+        bus.kind = "bus".into();
+        session.store.tracks.push(bus);
+        parking_lot::Mutex::new(session)
+    }
+
+    /// Plan G2: a return exists to HOLD the shared effect, so the insert
+    /// guard has to admit it. Shipped rejecting `bus` once — the reverb had
+    /// nowhere to live, which is the whole feature.
+    #[test]
+    fn insert_add_accepts_a_bus_because_that_is_where_the_shared_effect_lives() {
+        let m = session_with_a_bus();
+        let c = commit(&m, |tx| {
+            tx.apply(Op::InsertAdd {
+                track_id: "b-1".into(),
+                slot: slot("s-1", "p-1"),
+                index: 0,
+            })
+        });
+        assert!(c.effect.rebuild);
+        let session = m.lock();
+        let bus = session.store.tracks.iter().find(|t| t.id == "b-1").unwrap();
+        assert_eq!(bus.inserts[0].id, "s-1");
+    }
+
+    #[test]
+    fn send_add_appends_rebuilds_and_the_inverse_removes() {
+        let m = session_with_a_bus();
+        let c = commit(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-1", "b-1"),
+                index: usize::MAX,
+            })
+        });
+        assert!(c.effect.rebuild, "REBUILD PIN: the graph gains an edge");
+        assert!(c.effect.send_writes.is_empty(), "adding is structural, not a knob write");
+        assert_eq!(m.lock().store.tracks[0].sends[0].dest.as_str(), "b-1");
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(m.lock().store.tracks[0].sends.is_empty(), "undo removes the send");
+    }
+
+    #[test]
+    fn send_add_rejects_a_bus_source_a_non_bus_destination_and_a_duplicate() {
+        let m = session_with_a_bus();
+        // A bus DOES send (that is bus-to-bus, and it is the ordinary
+        // drum-bus-into-mix-bus case) — but not into itself.
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "b-1".into(),
+                slot: send("s-x", "b-1"),
+                index: 0,
+            })
+        })
+        .contains("would close a routing loop"));
+        // An automation track renders no audio, so it has nothing to copy.
+        {
+            let mut session = m.lock();
+            let mut auto = session.store.tracks[0].clone();
+            auto.id = "auto-1".into();
+            auto.kind = "automation".into();
+            session.store.tracks.push(auto);
+        }
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "auto-1".into(),
+                slot: send("s-a", "b-1"),
+                index: 0,
+            })
+        })
+        .contains("only legal on audio|midi|bus"));
+        // The destination has to exist...
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-x", "nope"),
+                index: 0,
+            })
+        })
+        .contains("unknown send destination"));
+        // ...and has to be a bus.
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-x", "t-1"),
+                index: 0,
+            })
+        })
+        .contains("not a bus track"));
+        commit(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-1", "b-1"),
+                index: 0,
+            })
+        });
+        // One row per destination — two edges into one bus just sum, and a
+        // list that shows the same return twice is a UI lie.
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-2", "b-1"),
+                index: 0,
+            })
+        })
+        .contains("already sends to"));
+    }
+
+    /// The amount is a MIX change: it must reach the RT param table and must
+    /// NOT schedule a rebuild. Rebuilding per knob frame is exactly what
+    /// round-2 §2.4 forbids, and this is the pin that says so.
+    // ---- output routing (Plan G2) ----
+
+    #[test]
+    fn track_set_output_routes_into_a_bus_and_the_inverse_restores_the_master() {
+        let m = session_with_a_bus();
+        let c = commit(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "t-1".into(), output: Some("b-1".into()) })
+        });
+        assert!(c.effect.rebuild, "REBUILD PIN: an output edge moves in the graph");
+        assert_eq!(m.lock().store.tracks[0].output.as_ref().map(|o| o.as_str()), Some("b-1"));
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(m.lock().store.tracks[0].output.is_none(), "undo goes back to the master");
+    }
+
+    #[test]
+    fn track_set_output_rejects_an_unknown_and_a_non_bus_destination() {
+        let m = session_with_a_bus();
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "t-1".into(), output: Some("nope".into()) })
+        })
+        .contains("unknown output destination"));
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "t-1".into(), output: Some("t-1".into()) })
+        })
+        .contains("not a bus track"));
+    }
+
+    /// A loop is only meaningful through an explicit one-block delay node
+    /// (`SCALABILITY` §1) and there isn't one, so closing one is a
+    /// rejection — not a silently inserted delay, and not a hang.
+    #[test]
+    fn a_routing_loop_is_refused_on_both_edge_kinds() {
+        let m = session_with_a_bus();
+        // A second bus, so there is something to loop with.
+        {
+            let mut session = m.lock();
+            let mut b2 = session.store.tracks[1].clone();
+            b2.id = "b-2".into();
+            session.store.tracks.push(b2);
+        }
+        commit(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "b-1".into(), output: Some("b-2".into()) })
+        });
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "b-2".into(), output: Some("b-1".into()) })
+        })
+        .contains("would close a routing loop"));
+        assert!(commit_err(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "b-2".into(),
+                slot: send("s-loop", "b-1"),
+                index: 0,
+            })
+        })
+        .contains("would close a routing loop"));
+        assert_eq!(
+            m.lock().store.tracks[2].output.as_ref().map(|o| o.as_str()),
+            None,
+            "a rejected op leaves the document untouched"
+        );
+    }
+
+    /// A bus feeding another bus is the ordinary case (drum bus into mix
+    /// bus), so both edge kinds have to accept it.
+    #[test]
+    fn a_bus_may_feed_another_bus() {
+        let m = session_with_a_bus();
+        {
+            let mut session = m.lock();
+            let mut b2 = session.store.tracks[1].clone();
+            b2.id = "b-2".into();
+            session.store.tracks.push(b2);
+        }
+        commit(&m, |tx| {
+            tx.apply(Op::TrackSetOutput { track_id: "b-1".into(), output: Some("b-2".into()) })?;
+            tx.apply(Op::SendAdd {
+                track_id: "b-1".into(),
+                slot: send("s-1", "b-2"),
+                index: 0,
+            })
+        });
+        let session = m.lock();
+        assert_eq!(session.store.tracks[1].output.as_ref().map(|o| o.as_str()), Some("b-2"));
+        assert_eq!(session.store.tracks[1].sends.len(), 1);
+    }
+
+    #[test]
+    fn send_set_amount_is_a_param_write_and_not_a_rebuild() {
+        let m = session_with_a_bus();
+        commit(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-1", "b-1"),
+                index: 0,
+            })
+        });
+        let c = commit(&m, |tx| {
+            tx.apply(Op::SendSetAmount {
+                track_id: "t-1".into(),
+                send_id: "s-1".into(),
+                amount_db: -6.0,
+            })
+        });
+        assert!(!c.effect.rebuild, "NO-REBUILD PIN: a send knob is a param write");
+        assert_eq!(c.effect.send_writes.len(), 1);
+        assert_eq!(c.effect.send_writes[0].0, "s-1");
+        let expected = crate::audio::mixer::db_to_linear(-6.0);
+        assert!((c.effect.send_writes[0].1 - expected).abs() < 1e-9);
+        assert!((m.lock().store.tracks[0].sends[0].amount_db + 6.0).abs() < 1e-9);
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(
+            m.lock().store.tracks[0].sends[0].amount_db.abs() < 1e-9,
+            "undo restores the previous dB"
+        );
+    }
+
+    /// The tap point IS structural — it changes where the wire leaves the
+    /// strip — so unlike the amount it rebuilds.
+    #[test]
+    fn send_set_pre_fader_is_a_rebuild() {
+        let m = session_with_a_bus();
+        commit(&m, |tx| {
+            tx.apply(Op::SendAdd {
+                track_id: "t-1".into(),
+                slot: send("s-1", "b-1"),
+                index: 0,
+            })
+        });
+        let c = commit(&m, |tx| {
+            tx.apply(Op::SendSetPreFader {
+                track_id: "t-1".into(),
+                send_id: "s-1".into(),
+                pre_fader: true,
+            })
+        });
+        assert!(c.effect.rebuild, "REBUILD PIN: the tap moves in the graph");
+        assert!(m.lock().store.tracks[0].sends[0].pre_fader);
+        commit(&m, |tx| tx.apply(c.inverses[0].clone()));
+        assert!(!m.lock().store.tracks[0].sends[0].pre_fader, "undo restores the tap point");
     }
 
     #[test]

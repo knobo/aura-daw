@@ -1148,6 +1148,8 @@ mod tests {
 
     fn midi_track(id: &str, instrument_id: Option<String>) -> TrackState {
         TrackState {
+            sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: id.into(),
             kind: "midi".into(),

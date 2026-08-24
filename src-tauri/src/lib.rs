@@ -208,6 +208,11 @@ pub fn run() {
             audio::pitch_extract_melody,
             // ---- audio: tracks ----
             audio::add_track,
+            audio::send_add,
+            audio::send_remove,
+            audio::send_set_amount,
+            audio::send_set_pre_fader,
+            audio::track_set_output,
             audio::remove_track,
             audio::get_tracks,
             audio::set_track_gain,
@@ -250,6 +255,7 @@ pub fn run() {
             control::redo,
             control::history_overview,
             control::history_version,
+            control::history_undo_to,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----

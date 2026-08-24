@@ -177,6 +177,13 @@ export interface TrackState {
   instrumentId?: string | null;
   /** Ordered insert-FX slots (Plan G1). Empty on pre-G1 files. */
   inserts?: InsertSlot[] | null;
+  /** Send edges into bus tracks (Plan G2) — COPIES of this track's signal.
+   * Empty on pre-G2 files. Buses send too (a drum bus into a mix bus). */
+  sends?: SendSlot[] | null;
+  /** Where this track's fader output GOES (Plan G2): a bus track's id, or
+   * absent/null for the master. An output is a MOVE, not a copy — a routed
+   * track no longer reaches the master. */
+  output?: string | null;
   /** Lane group this track displays under, as the group's own NAME (the
    * group is its name — there is no separate group row to look up). Absent
    * or null = ungrouped. Display grouping only: it never affects routing,
@@ -1159,6 +1166,20 @@ export interface InsertSlot {
   bypassed: boolean;
 }
 
+/** One send edge (Plan G2): a copy of this track's signal into a bus track.
+ * Mirrors `audio::types::SendSlot`. */
+export interface SendSlot {
+  /** Send identity, stable across reorder and rebuilds. */
+  id: string;
+  /** Track id of the bus this send feeds. */
+  dest: string;
+  /** Amount in dB; -160 encodes -inf. 0 = unity, the default for a new send. */
+  amountDb: number;
+  /** false (default) taps post-fader — the send follows the fader and the
+   * mute. true taps post-insert/pre-fader. */
+  preFader: boolean;
+}
+
 // ── automation (plugins::automation) ────────────────────────────────────────
 
 /** One automation breakpoint in MUSICAL time (ticks @ project ppq). Between
@@ -1437,6 +1458,8 @@ export interface HistoryVersion {
   chargedBytes: number;
   label: string;
   actor: string;
+  /** True when `historyUndoTo` will accept this revision. */
+  onUndoPath: boolean;
 }
 
 export interface HistoryOverview {
@@ -1447,6 +1470,10 @@ export interface HistoryOverview {
   replayOnly: number;
   /** Newest first. */
   versions: HistoryVersion[];
+  /** Handed back verbatim by `historyUndoTo` — the document guard. */
+  epoch: number;
+  /** The revision a plain undo would consume next — the history guard. */
+  headRev: number | null;
 }
 
 export interface HistoryVersionDetail {
@@ -1456,6 +1483,13 @@ export interface HistoryVersionDetail {
   audioClipCount: number;
   midiClipCount: number;
   automationLaneCount: number;
+}
+
+export interface UndoToOutcome {
+  /** How many steps were undone. 0 means the target was already the head. */
+  steps: number;
+  /** The label of the last step undone; null when `steps` is 0. */
+  label: string | null;
 }
 
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────

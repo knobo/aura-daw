@@ -7,7 +7,7 @@
  * does not touch pointer capture or getBoundingClientRect.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import type { PluginDescriptor, PluginInstanceInfo, TrackState } from "../../types/ipc";
 
 vi.stubGlobal("localStorage", {
@@ -46,6 +46,7 @@ const insertAdd = vi.fn(async (trackId: string, uid: string) => ({
 }));
 
 const pluginShowGui = vi.fn(async (_instanceId: string) => {});
+const pluginPreviewNote = vi.fn(async (_instanceId: string, _key: number, _velocity: number) => {});
 
 vi.mock("../../tauri", () => ({
   backend: {
@@ -54,6 +55,7 @@ vi.mock("../../tauri", () => ({
     pluginScan: () => Promise.resolve([]),
     pluginInstantiate: (...args: [string]) => pluginInstantiate(...args),
     insertAdd: (...args: [string, string]) => insertAdd(...args),
+    pluginPreviewNote: (...args: [string, number, number]) => pluginPreviewNote(...args),
     pluginRemove: () => Promise.resolve(),
     insertSetBypass: () => Promise.resolve(),
     setTrackInstrument: (...args: [string, string | null]) => setTrackInstrument(...args),
@@ -67,6 +69,7 @@ const { plugins } = await import("../../state/plugins.svelte");
 const { project } = await import("../../state/project.svelte");
 const { lanes } = await import("../../state/lanes.svelte");
 const { modulation } = await import("../../state/modulation.svelte");
+const { audition } = await import("../../state/audition.svelte");
 
 function desc(
   uid: string,
@@ -122,6 +125,7 @@ beforeEach(() => {
   pluginInstantiate.mockClear();
   insertAdd.mockClear();
   pluginShowGui.mockClear();
+  pluginPreviewNote.mockClear();
   plugins.guiById = {};
   plugins.descriptors = [
     desc("u-surge", "Surge XT", { categories: ["Synth"] }),
@@ -137,6 +141,8 @@ beforeEach(() => {
   project.projectDir = null;
   lanes.clearSelection();
   modulation.bindings = [];
+  audition.enabled = false;
+  audition.lastSilentReason = null;
 });
 
 afterEach(() => {
@@ -144,6 +150,8 @@ afterEach(() => {
   plugins.descriptors = [];
   plugins.instances = [];
   plugins.scanned = false;
+  audition.enabled = false;
+  audition.lastSilentReason = null;
 });
 
 describe("PluginManager default mode (winner spec §3.3)", () => {
@@ -275,5 +283,56 @@ describe("PluginManager collapse-all", () => {
 
     expect(screen.queryByText("Surge XT")).toBeNull();
     expect(screen.getByText("Instruments")).toBeTruthy();
+  });
+});
+
+describe("PluginManager audition (design §8.2, ruling R-3)", () => {
+  it("clears a stale silent reason left by a different browser on mount", () => {
+    // A double-click in, say, Presets can set this global singleton and
+    // never clear it (no decay timer — see audition.svelte.ts). Without a
+    // mount-time reset, the manager would open already showing someone
+    // else's stale reason.
+    audition.lastSilentReason = "open a Zyn instance to audition its patches";
+    render(PluginManager);
+
+    expect(audition.lastSilentReason).toBeNull();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("double-clicking a catalog row with no live instance goes silent, never instantiates (R-3)", async () => {
+    audition.enabled = true;
+    render(PluginManager);
+
+    const row = screen.getByText("Surge XT").closest(".row");
+    if (!row) throw new Error("catalog row not found");
+    await fireEvent.dblClick(row);
+
+    expect(pluginInstantiate).not.toHaveBeenCalled();
+    expect(audition.lastSilentReason).toBe("no live instance of this plugin to audition");
+    expect(screen.getByRole("status").textContent).toBe(
+      "no live instance of this plugin to audition",
+    );
+  });
+
+  it("Shift+Enter on a catalog row reaches the preview path in split mode — the default whenever instances exist", async () => {
+    // Regression: onAudition/onActivate used to branch on `mode ===
+    // "browse"`, but the catalog BrowserShell renders under `showBrowse`
+    // (browse OR split), and split is the default here. That left
+    // Shift+Enter silently falling into the (unreachable) rack branch.
+    plugins.instances = [inst("i1", "u-surge", "Surge XT")];
+    project.tracks = [track("t1", "Bass", { instrumentId: "plugin:i1" })];
+    audition.enabled = true;
+    render(PluginManager);
+    expect(screen.getByRole("button", { name: /^split$/i }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+
+    const tree = screen.getByRole("tree");
+    const row = within(tree).getByText("Surge XT").closest(".row");
+    if (!row) throw new Error("catalog row not found");
+    await fireEvent.click(row);
+    await fireEvent.keyDown(tree, { key: "Enter", shiftKey: true });
+
+    await waitFor(() => expect(pluginPreviewNote).toHaveBeenCalledWith("i1", 60, 100));
   });
 });

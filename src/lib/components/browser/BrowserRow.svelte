@@ -26,6 +26,7 @@
     active = false,
     draggable = false,
     onclick,
+    ondblclick,
     onpointerdown,
     onpointerup,
     onpointercancel,
@@ -45,6 +46,9 @@
     active?: boolean;
     draggable?: boolean;
     onclick?: () => void;
+    /** Audition: hear this row. Double-click, never single — single click
+     * keeps whatever meaning it already had in each browser (design §8.2). */
+    ondblclick?: () => void;
     onpointerdown?: (e: PointerEvent) => void;
     onpointerup?: (e: PointerEvent) => void;
     onpointercancel?: (e: PointerEvent) => void;
@@ -65,11 +69,12 @@
   {draggable}
   title={label}
   onclick={() => onclick?.()}
+  ondblclick={() => ondblclick?.()}
   onpointerdown={(e) => onpointerdown?.(e)}
   onpointerup={(e) => onpointerup?.(e)}
   onpointercancel={(e) => onpointercancel?.(e)}
   onkeydown={(e) => {
-    if (e.key === "Enter" || e.key === " ") {
+    if ((e.key === "Enter" && !e.shiftKey) || e.key === " ") {
       e.preventDefault();
       onclick?.();
     }

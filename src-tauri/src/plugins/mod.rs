@@ -743,9 +743,11 @@ pub async fn insert_add(
                 .iter()
                 .find(|t| t.id.as_str() == track_id)
                 .ok_or_else(|| format!("unknown track: {track_id}"))?;
-            if t.kind != "audio" && t.kind != "midi" {
+            // Plan G2: a bus IS an insert host — that is what a return is.
+            // Mirrors the same guard in `session::apply_raw`'s `InsertAdd`.
+            if !crate::audio::types::is_mixer_track(t) {
                 return Err(format!(
-                    "inserts are only legal on audio|midi tracks, not {}",
+                    "inserts are only legal on audio|midi|bus tracks, not {}",
                     t.kind
                 ));
             }

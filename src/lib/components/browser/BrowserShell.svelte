@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
   import { type BrowserRowRef, nextIndex, rowId } from "./browser-model";
+  import AuditionChip from "./AuditionChip.svelte";
 
   /**
    * The frame every browser shares: search, filter chips, a scrollable
@@ -19,9 +20,11 @@
     rows,
     onToggleGroup,
     onActivate,
+    onAudition,
     anyCollapsed = false,
     onFoldAll,
     chrome = true,
+    auditionChip = false,
     children,
     role: listRole = "tree",
   }: {
@@ -32,6 +35,9 @@
     rows: BrowserRowRef[];
     onToggleGroup?: (groupKey: string, expand: boolean) => void;
     onActivate?: (row: BrowserRowRef) => void;
+    /** Shift+Enter on the active row. Omit and the shell offers no keyboard
+     * audition — a browser whose rows cannot sound should not pretend. */
+    onAudition?: (row: BrowserRowRef) => void;
     /** Drives the fold-all button's label: any group folded means the next
      * press unfolds, matching `lanes.anyCollapsed()` so the two surfaces
      * never disagree about what one button does. */
@@ -42,6 +48,10 @@
     /** False = list only. Plugin Manager draws a shared toolbar above a
      * split rack/browse, so a second search field would be a lie. */
     chrome?: boolean;
+    /** Render the audition toggle in the toolbar. Named `auditionChip`,
+     * not `audition`: every caller imports the audition store under the
+     * latter name, and the shorthand would silently pass the store. */
+    auditionChip?: boolean;
     children: Snippet<[{ activeId: string | null; setActive: (row: BrowserRowRef) => void }]>;
     role?: "listbox" | "tree";
   } = $props();
@@ -123,7 +133,10 @@
       case "Enter":
         if (activeRow) {
           e.preventDefault();
-          onActivate?.(activeRow);
+          // Shift+Enter is the keyboard's double-click: a browser row that
+          // can only be heard with a mouse is not reachable at all.
+          if (e.shiftKey) onAudition?.(activeRow);
+          else onActivate?.(activeRow);
         }
         break;
     }
@@ -160,6 +173,9 @@
       >
         <span aria-hidden="true">{anyCollapsed ? "⌄" : "⌃"}</span>
       </button>
+    {/if}
+    {#if auditionChip}
+      <AuditionChip />
     {/if}
     {#if filters}
       <div class="chips">{@render filters()}</div>

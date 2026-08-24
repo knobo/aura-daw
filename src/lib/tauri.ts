@@ -25,6 +25,7 @@ import type {
   ComposerSuggestion,
   Curve,
   InsertSlot,
+  SendSlot,
   ModulationSnapshot,
   EvolveOptions,
   ExportCapabilities,
@@ -80,6 +81,7 @@ import type {
   TrackState,
   TranscribeRequest,
   TransportState,
+  UndoToOutcome,
   UserThemeFile,
   WaveformTileRequest,
   ZynPatch,
@@ -291,6 +293,8 @@ export interface Backend {
   historyOverview?(): Promise<HistoryOverview>;
   /** Materialize one retained revision and return a summary, never state. */
   historyVersion?(rev: number): Promise<HistoryVersionDetail | null>;
+  /** Walk the undo ancestry back to `targetRev`; real engine only. */
+  historyUndoTo?(targetRev: number, expectedEpoch: number, expectedHeadRev: number | null): Promise<UndoToOutcome>;
 
   // midi (all musical positions are integer ticks at the project ppq)
   setTempoMap(
@@ -398,6 +402,20 @@ export interface Backend {
   insertReorder?(trackId: string, slotId: string, toIndex: number): Promise<void>;
   /** Set bypass on one insert slot. */
   insertSetBypass?(trackId: string, slotId: string, bypassed: boolean): Promise<void>;
+
+  // ── sends / bus returns (Plan G2) ──
+
+  /** Add a send from `trackId` into the bus `dest`. Unity, post-fader. */
+  sendAdd?(trackId: string, dest: string): Promise<SendSlot>;
+  /** Remove one send edge. */
+  sendRemove?(trackId: string, sendId: string): Promise<void>;
+  /** Set a send's amount in dB. A mix change — safe per knob frame. */
+  sendSetAmount?(trackId: string, sendId: string, amountDb: number): Promise<void>;
+  /** Move a send's tap between post-fader (false) and pre-fader (true). */
+  sendSetPreFader?(trackId: string, sendId: string, preFader: boolean): Promise<void>;
+  /** Point a track's output at a bus, or back at the master (`null`). A
+   * MOVE, not a copy: the track stops reaching the master. */
+  trackSetOutput?(trackId: string, output: string | null): Promise<void>;
 
   // ── wave 1.5 ──
 
@@ -797,6 +815,9 @@ class TauriBackend implements Backend {
   historyOverview() {
     return invoke<HistoryOverview>("history_overview");
   }
+  historyUndoTo(targetRev: number, expectedEpoch: number, expectedHeadRev: number | null) {
+    return invoke<UndoToOutcome>("history_undo_to", { targetRev, expectedEpoch, expectedHeadRev });
+  }
   historyVersion(rev: number) {
     return invoke<HistoryVersionDetail | null>("history_version", { rev });
   }
@@ -970,6 +991,24 @@ class TauriBackend implements Backend {
   }
   insertSetBypass(trackId: string, slotId: string, bypassed: boolean) {
     return invoke<void>("insert_set_bypass", { trackId, slotId, bypassed });
+  }
+
+  // ── sends / bus returns ──
+
+  sendAdd(trackId: string, dest: string) {
+    return invoke<SendSlot>("send_add", { trackId, dest });
+  }
+  sendRemove(trackId: string, sendId: string) {
+    return invoke<void>("send_remove", { trackId, sendId });
+  }
+  sendSetAmount(trackId: string, sendId: string, amountDb: number) {
+    return invoke<void>("send_set_amount", { trackId, sendId, amountDb });
+  }
+  sendSetPreFader(trackId: string, sendId: string, preFader: boolean) {
+    return invoke<void>("send_set_pre_fader", { trackId, sendId, preFader });
+  }
+  trackSetOutput(trackId: string, output: string | null) {
+    return invoke<void>("track_set_output", { trackId, output });
   }
 
   // ── wave 1.5 ──

@@ -32,6 +32,8 @@ use aura_lib::midi::MidiStore;
 
 fn test_track(id: &TrackId) -> TrackState {
     TrackState {
+        sends: Vec::new(),
+        output: None,
         id: id.clone(),
         name: format!("Track {id}"),
         kind: "audio".into(),

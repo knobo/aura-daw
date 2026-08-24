@@ -93,6 +93,15 @@ describe("PREF_SCHEMA integrity", () => {
     expect(values).toContain("none");
     expect(coercePref(PREF_SCHEMA.pitchRehearseKey, "none")).toBe("none");
   });
+
+  it("browserAudition is a boolean that defaults off", () => {
+    const def = PREF_SCHEMA.browserAudition;
+    expect(def.kind).toBe("boolean");
+    // Default OFF is the whole point: a browser that makes noise you did
+    // not ask for is the fastest way to lose someone (design §8.2).
+    expect(def.default).toBe(false);
+    expect(def.category).toBe("library");
+  });
 });
 
 describe("coercePref", () => {

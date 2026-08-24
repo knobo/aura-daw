@@ -5,21 +5,22 @@ Plan: [`2026-08-16-plan-g1-insert-fx-pdc.md`](../superpowers/plans/2026-08-16-pl
 Product cut: [`insert-fx-sends-sidechain.md`](insert-fx-sends-sidechain.md).
 Handoff: [`g1-insert-fx.md`](../handoff/g1-insert-fx.md).
 
-Tasks 1–6 have landed; see [`../LANDED.md`](../LANDED.md).
+Tasks 1–8 have landed; see [`../LANDED.md`](../LANDED.md). Task 7
+(rebuild wiring) landed in PR #90; Task 8's OFFLINE half landed with
+Plan G2 in PR #109 — the bounce now walks insert chains and the routing
+graph through the same compile step the engine uses.
 
-## Open — Tasks 7–10
+## Open — Tasks 9–10
 
-**HOLD** until an automation/undo leftover is done (owner steer,
-2026-08-18). Then: rebuild/offline wiring, IPC+UI, handoff.
+What is left is Task 9's insert UI polish and Task 10's handoff. The
+audio path itself is live in both the engine and the bounce.
 
-- **Do not jump to Task 9 (UI) before Task 7 wires the mixer into
-  rebuild.** `compile_inserts` landed in Task 5 but nothing calls it, so
-  an insert is still silent end-to-end — the G-11 note in the handoff.
-- **Task 6's known gap for Task 7 to pick up:** PDC is applied after
-  inserts but before the fader, so once wired, a track's automation ramps
-  will read the wrong playhead position by its own PDC delay. Documented
-  in `pdc.rs`'s module doc.
-- `RtTrack::pdc` is still `None` everywhere in production.
+- **Task 6's known gap is closed:** the fader/pan ramp lookup subtracts
+  the strip's own PDC delay (`FaderCtx::pdc_delay`), so a
+  latency-compensated track no longer reads automation for the wrong
+  playhead position.
+- `RtTrack::pdc` and `RtTrack::master_pdc` are both populated in
+  production now, from `audio::bus::compile_routing`.
 
 ## Deferred minors
 
@@ -27,5 +28,5 @@ Listed in [`g1-insert-fx.md`](../handoff/g1-insert-fx.md).
 
 ## Ear-check
 
-Insert FX is **not** ear-checkable until Task 7 wires `compile_inserts`
-into `engine::rebuild`.
+Owed, not blocked: load an effect on a track and confirm it processes,
+live and in an export.
