@@ -161,6 +161,23 @@ The merged branches `feat/plugin-manager` (Step 5),
   `ZynPatchBrowser`'s much smaller chips (8-9 px font, transparent), so it
   will render visibly taller and filled next to them — one for the same
   ear-check as the `♪̸` glyph.
+- **The Zyn double-click normally makes no sound on the first try:** click 1
+  of the two clicks that precede a real `dblclick` already starts
+  `pick()` → `zyn.load`, which sets `zyn.busyPath` and awaits IPC; the
+  `dblclick` lands while `busyPath` is still set and the `busyPath` guard
+  (correctly) bails, so only a *repeat* double-click on an already-loaded
+  patch — where `zyn.load` short-circuits and never sets `busyPath` —
+  actually sounds C3. Fixing it needs a public `whenLoaded(instanceId,
+  path)` on the zyn store so the handler can join the in-flight load
+  instead of bailing (`inflight` is private today). This file's header
+  comment and the Step 7 dispatch row both still say double-click plays
+  C3 — true only on the second attempt, left as-is rather than hedged.
+- **`ZynPatchBrowser` renders `zyn.error` but never
+  `auditionStore.lastSilentReason`,** so both of its silent branches ("no
+  live Zyn instance", "instance not on a midi track") are invisible in
+  that browser, while the reason string can still surface later as a
+  stale message in `PluginManager`'s status line. Rendering it here also
+  needs a mount-time clear, the way `PluginManager` already has one.
 
 ## Do not
 

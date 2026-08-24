@@ -316,7 +316,12 @@
       toggleGroup(row.groupKey, browseCollapsed.has(row.groupKey) || rackCollapsed.has(row.groupKey));
       return;
     }
-    if (mode === "browse") {
+    // `showBrowse`, not `mode === "browse"`: this row comes from the one
+    // `<BrowserShell>`, which renders under `{#if showBrowse}` — true for
+    // both "browse" and "split", and "split" is the default whenever the
+    // project already has instances. Branching on `mode` alone left
+    // Enter-to-add dead in the common case.
+    if (showBrowse) {
       const section = browseShown.find((s) => s.key === row.groupKey);
       const d = section?.items[row.itemIndex];
       if (d) void addDescriptor(d, !d.isInstrument);
@@ -327,19 +332,16 @@
     if (entry) void openPluginParams(entry.instance.id);
   }
 
-  // Shift+Enter's target: the same resolvers the rows' own `ondblclick`
-  // handlers use, mirroring `onActivate`'s browse-vs-rack split above.
+  // Shift+Enter's target: the same resolver the catalog rows' own
+  // `ondblclick` handler uses. No rack branch: rack rows render `BrowserRow`
+  // directly with no `BrowserShell`, so no keyboard path can ever hand this
+  // a rack row ref — the `<BrowserShell>` this is wired to only ever holds
+  // `browseRows`.
   function onAudition(row: BrowserRowRef) {
     if (row.kind !== "item") return;
-    if (mode === "browse") {
-      const section = browseShown.find((s) => s.key === row.groupKey);
-      const d = section?.items[row.itemIndex];
-      if (d) void audition.play(resolveDescriptorTarget(d.uid, plugins.instances, project.tracks));
-      return;
-    }
-    const group = rackGroups.find((g) => g.key === row.groupKey);
-    const entry = group?.items[row.itemIndex];
-    if (entry) void audition.play(resolvePluginInstanceTarget(entry.instance.id, project.tracks));
+    const section = browseShown.find((s) => s.key === row.groupKey);
+    const d = section?.items[row.itemIndex];
+    if (d) void audition.play(resolveDescriptorTarget(d.uid, plugins.instances, project.tracks));
   }
 
   async function toggleBypass(entry: RackEntry) {
