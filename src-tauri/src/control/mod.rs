@@ -3618,10 +3618,16 @@ impl ControlPlane {
         self.undo_step()
     }
 
-    /// One undo step with the gate ALREADY HELD — the shared body of
-    /// [`Self::undo`] and [`Self::undo_to`]. `history_gate` is a plain
-    /// `parking_lot::Mutex` and is not reentrant, so a caller that holds it
-    /// must never route back through [`Self::undo`].
+    /// One undo step with the gate ALREADY HELD — the body of
+    /// [`Self::undo`]. `history_gate` is a plain `parking_lot::Mutex` and is
+    /// not reentrant, so a caller that holds it must never route back
+    /// through [`Self::undo`].
+    ///
+    /// THE POP HERE IS UNCONDITIONAL, and that is right for a single step:
+    /// Ctrl+Z means "undo whatever is on top NOW", so a commit that landed a
+    /// moment ago is a legitimate thing to consume. A multi-step walk means
+    /// something else — "undo these particular revisions" — and uses
+    /// [`Self::undo_walk_step`] for exactly that reason (C-1).
     ///
     /// Everything the single-step contract promises still holds here: the
     /// entry's inverses go through the normal commit path (journaled, own
@@ -3701,13 +3707,21 @@ impl ControlPlane {
     /// THE GUARDS, and what each is for:
     /// * `expected_epoch` — the document must still be the one the caller
     ///   read. Undoing across a document swap is corruption, not undo
-    ///   (`History::clear`'s doc). Checked here against the caller's value,
-    ///   and independently per step inside `commit_replay` — which re-checks
-    ///   the epoch observed at POP time, not `expected_epoch` itself. That
-    ///   second check is still enough: any epoch boundary clears the undo
-    ///   stack, so once this guard has passed, a step that still manages to
-    ///   pop something proves the epoch has not moved since. That is what
-    ///   makes "nothing applied" true rather than merely "nothing recorded".
+    ///   (`History::clear`'s doc). Checked here once, and then ENFORCED
+    ///   AGAIN AT EVERY STEP: [`Self::undo_walk_step`] compares the epoch
+    ///   each entry was popped under against THIS value and aborts if they
+    ///   differ, before anything is applied.
+    ///
+    ///   That per-step check is a real guard, not belt-and-braces (I-1,
+    ///   whole-branch review). It replaces an inference that does not hold —
+    ///   "a boundary clears the undo stack, so a step that still pops
+    ///   something proves the epoch has not moved". A boundary followed by a
+    ///   FRESH EDIT on the new document leaves a poppable entry again, and
+    ///   `commit_replay` only compares that entry against the epoch IT was
+    ///   popped under (both new, so it passes). The walk would then keep
+    ///   undoing edits belonging to a document the user never targeted, one
+    ///   step at a time, and report success. Comparing against the CALLER's
+    ///   epoch is what makes "nothing applied after the swap" true.
     /// * `expected_head_rev` — the undo ancestry must not have moved. NOT
     ///   `Session::rev`: transient commits (transport play/stop, gesture
     ///   folds) bump that without touching this stack, so guarding on it
@@ -3721,7 +3735,23 @@ impl ControlPlane {
     /// ONE GATE FOR THE WHOLE WALK: `history_gate` is taken once and held
     /// across every step, so a concurrent `undo`/`redo` cannot interleave
     /// into the middle of a walk. The gate is not reentrant, hence
-    /// [`Self::undo_step`] rather than [`Self::undo`].
+    /// [`Self::undo_walk_step`] rather than [`Self::undo`].
+    ///
+    /// THE WALK CONSUMES A ROUTE, NOT A COUNT (C-1, whole-branch review).
+    /// The gate serialises this against `undo`/`redo` and nothing else — it
+    /// does NOT gate ordinary commits, and this app has several that arrive
+    /// off the UI thread: `commit_recording_finalize` commits `Actor::Engine`
+    /// non-transiently from the engine control thread, MCP agent tools
+    /// commit on their own threads, an automation write pass commits on
+    /// release. Any of those landing between two steps pushes a fresh entry
+    /// onto the back of the undo stack. A walk that trusted a precomputed
+    /// step count would undo THAT entry — an edit nobody asked to undo —
+    /// then stop one step short of the target and report success anyway,
+    /// with the redo chain it had been building cleared by the same
+    /// `History::record`. So the walk instead plans the exact revisions to
+    /// consume, highest first, and every step pops CONDITIONALLY
+    /// (`HistoryLog::pop_undo_if`): it consumes the revision it planned to,
+    /// or nothing at all and the walk stops and says so.
     ///
     /// M-4, an open gesture is closed FIRST, exactly as [`Self::undo`] does
     /// — the drag becomes the finished step it already looks like. That
@@ -3731,9 +3761,13 @@ impl ControlPlane {
     /// answer: the row they clicked was chosen before the drag existed.
     ///
     /// PARTIAL WALKS ARE REPORTED, NOT HIDDEN. Each step is a real
-    /// committed transaction; if step `k` fails (an epoch swap landing
-    /// mid-walk is the reachable case), the `k-1` steps before it stay
-    /// applied and the error says so. The caller re-reads the overview.
+    /// committed transaction, so there is nothing to roll back to: if step
+    /// `k` stops the walk — its commit failed, the epoch moved, or the undo
+    /// stack no longer offers the revision that step planned to consume —
+    /// the `k` steps before it STAY APPLIED, and the error says how many of
+    /// how many were applied and why it stopped. The caller re-reads the
+    /// overview AND re-pulls its stores, because the document moved
+    /// (`projectops.undoTo`'s failure path does exactly that).
     pub fn undo_to(
         &self,
         target_rev: u64,
@@ -3768,27 +3802,99 @@ impl ControlPlane {
                 history::UNDO_STACK_LIMIT
             ));
         };
-        let steps = path.revs.len() - 1 - at;
+        // THE ROUTE: the revisions ABOVE the target, highest first — the
+        // exact entries this walk intends to consume, in the order it
+        // intends to consume them. Exclusive semantics, so `target_rev`
+        // itself is not on it. This list, not its length, is what the loop
+        // walks (C-1).
+        let route: Vec<u64> = path.revs[at + 1..].iter().rev().copied().collect();
+        let steps = route.len();
 
         let mut label = None;
-        for done in 0..steps {
-            match self.undo_step() {
+        for (done, want) in route.iter().enumerate() {
+            match self.undo_walk_step(*want, expected_epoch) {
                 Ok(Some(l)) => label = Some(l),
+                // M-2: "nothing popped" is no longer one specific story. The
+                // stack did not offer `want` — a commit landed on top of it
+                // mid-walk, or the entry was dropped on its way back by
+                // `push_redo`'s epoch guard. Name the observation, not a
+                // guess at the cause, and say what stayed applied.
                 Ok(None) => {
                     return Err(format!(
-                        "the document was replaced under this request after {done} of {steps} \
-                         steps — nothing left to undo"
+                        "undo to revision {target_rev} stopped after {done} of {steps} steps: \
+                         the undo stack no longer offers revision {want}, which this step \
+                         planned to consume — the edit history moved under the walk. The \
+                         {done} steps already applied stay applied."
                     ))
                 }
                 Err(e) => {
                     return Err(format!(
                         "undo to revision {target_rev} stopped after {done} of {steps} \
-                         steps: {e}"
+                         steps: {e}. The {done} steps already applied stay applied."
                     ))
                 }
             }
         }
         Ok(UndoToOutcome { steps, label })
+    }
+
+    /// One step of an [`Self::undo_to`] walk: [`Self::undo_step`] for a
+    /// PLANNED revision, with the gate already held.
+    ///
+    /// Two differences from `undo_step`, both of which exist only because a
+    /// walk is several steps long while `history_gate` gates only other
+    /// `undo`/`redo` commands (C-1):
+    ///
+    /// * THE POP IS CONDITIONAL. `pop_undo_if(want)` consumes the revision
+    ///   this step planned to consume or nothing at all — never "whatever is
+    ///   on the back now", which after a concurrent commit is a fresh edit
+    ///   the user never asked to undo. `Ok(None)` is that refusal, and it is
+    ///   deliberately distinguishable from a failed commit: the caller
+    ///   reports "the history moved" rather than a commit error.
+    /// * THE POPPED EPOCH IS CHECKED AGAINST THE CALLER'S. `commit_replay`
+    ///   compares an entry against the epoch IT was popped under, which
+    ///   cannot notice that the whole document was swapped mid-walk and then
+    ///   edited: the new document's fresh entry pops under the new epoch and
+    ///   agrees with itself. Comparing against the epoch `undo_to`
+    ///   VALIDATED is what stops the walk at the boundary. The entry goes
+    ///   straight back with `push_undo_unchanged` (whose own guard drops it
+    ///   if it belongs to a document that is gone) — a refused step must not
+    ///   consume a history entry.
+    ///
+    /// Everything the single-step contract promises still holds: the
+    /// inverses go through the normal commit path (journaled, own rebuild,
+    /// `project://changed`), `HistoryMode::Replay` suppresses a new history
+    /// entry, the ORIGINAL entry migrates onto the redo stack, and a failed
+    /// commit puts it back untouched.
+    fn undo_walk_step(&self, want: u64, expected_epoch: u64) -> Result<Option<String>, String> {
+        let Some((entry, popped_epoch)) = self.committer.log().pop_undo_if(want) else {
+            return Ok(None);
+        };
+        if popped_epoch != expected_epoch {
+            self.committer.log().push_undo_unchanged(entry, popped_epoch);
+            return Err(format!(
+                "the project was replaced under this walk (epoch {expected_epoch} -> \
+                 {popped_epoch})"
+            ));
+        }
+        let meta = op::TxMeta {
+            actor: op::Actor::User,
+            run: entry.run.clone(),
+            label: format!("undo: {}", entry.label),
+            transient: false,
+        };
+        let ops = entry.inverses.clone();
+        match self.commit_replay(meta, ops, popped_epoch) {
+            Ok(()) => {
+                let label = entry.label.clone();
+                self.committer.log().push_redo(entry, popped_epoch);
+                Ok(Some(label))
+            }
+            Err(e) => {
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
+                Err(e)
+            }
+        }
     }
 
     /// Apply a recorded op list through the normal commit path in

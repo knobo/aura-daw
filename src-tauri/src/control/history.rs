@@ -267,6 +267,35 @@ impl History {
         self.undo.pop_back()
     }
 
+    /// [`Self::pop_undo`] with a revision to match: pop the back entry ONLY
+    /// if it is the one the caller planned to consume, otherwise pop nothing
+    /// and leave the stack exactly as it was.
+    ///
+    /// WHY IT EXISTS (C-1, whole-branch review). A MULTI-STEP walk
+    /// (`ControlPlane::undo_to`) plans its route from ONE reading of this
+    /// stack and then undoes it a step at a time. `history_gate` serialises
+    /// that walk against other `undo`/`redo` commands, but it does NOT gate
+    /// ordinary commits — the engine control thread's recording finalize, an
+    /// MCP agent tool, an automation write pass on release all commit
+    /// without it. Such a commit lands as a fresh entry on the BACK (see
+    /// [`Self::record`]), and an unconditional `pop_undo` on the next
+    /// iteration would consume THAT: an edit the user never asked to undo,
+    /// with the revision the step was aiming at left applied and the walk
+    /// still reporting success. [`Self::record`] also clears `redo`, so the
+    /// chain the walk was building would be gone too.
+    ///
+    /// The check and the pop are ONE step under the history lock, which is
+    /// what makes it a guard rather than a hint: a concurrent `record`
+    /// either lands BEFORE the check (the revs disagree, nothing is popped,
+    /// and the walk stops and reports how far it got) or AFTER the pop (and
+    /// is simply not consumed by this step).
+    pub fn pop_undo_if(&mut self, rev: u64) -> Option<HistoryEntry> {
+        if self.undo.back()?.rev != rev {
+            return None;
+        }
+        self.undo.pop_back()
+    }
+
     /// Pop the next step to redo. The caller applies its `ops`.
     pub fn pop_redo(&mut self) -> Option<HistoryEntry> {
         self.redo.pop_back()
@@ -313,19 +342,18 @@ impl History {
         self.redo.len()
     }
 
-    /// The `rev` of the entry a plain undo would pop — `None` when there is
-    /// nothing to undo. This is the HEAD of the linear undo ancestry, and
-    /// the value `ControlPlane::undo_to` guards on. NOT `Session::rev`:
-    /// that one advances on transient commits (transport play/stop, gesture
-    /// folds), which do not touch this stack at all.
-    pub fn head_rev(&self) -> Option<u64> {
-        self.undo.back().map(|e| e.rev)
-    }
-
     /// Every revision currently on the undo path, oldest first — the stack's
     /// own ascending order (see [`Self::record`]'s insertion rule). An entry
     /// that has been undone is on the redo stack and is deliberately absent:
     /// it is no longer part of the ancestry the document sits on.
+    ///
+    /// THE HEAD OF THE ANCESTRY IS THE LAST ELEMENT, and this is the only
+    /// place it is defined (M-1, whole-branch review). A separate
+    /// `head_rev()` accessor used to sit here beside it; it read
+    /// `self.undo.back()` while [`UndoPath::head`] read `revs.last()`, two
+    /// definitions of one concept that nothing forced to agree. The walk
+    /// guards on the head, so a drift between them would be a guard that
+    /// passes against a head the walk is not actually standing on.
     pub fn undo_revs(&self) -> Vec<u64> {
         self.undo.iter().map(|e| e.rev).collect()
     }
@@ -848,6 +876,23 @@ impl HistoryLog {
     pub fn pop_undo(&self) -> Option<(HistoryEntry, u64)> {
         let epoch = self.epoch.lock();
         let entry = self.history.lock().pop_undo()?;
+        Some((entry, *epoch))
+    }
+
+    /// [`Self::pop_undo`] restricted to ONE revision — the conditional pop a
+    /// multi-step walk needs. See [`History::pop_undo_if`] for why the
+    /// unconditional form is wrong there: `history_gate` does not gate
+    /// ordinary commits, so "the back of the stack" is not necessarily the
+    /// entry the walk planned to consume.
+    ///
+    /// Same lock shape as [`Self::pop_undo`] (`epoch` then `history`, the
+    /// module's binding order) and the same return shape — the entry plus
+    /// the epoch it was popped under, so the caller can hand that epoch back
+    /// to [`Self::push_redo`] / [`Self::push_undo_unchanged`] and compare it
+    /// against the one it validated the request against.
+    pub fn pop_undo_if(&self, rev: u64) -> Option<(HistoryEntry, u64)> {
+        let epoch = self.epoch.lock();
+        let entry = self.history.lock().pop_undo_if(rev)?;
         Some((entry, *epoch))
     }
 
@@ -1456,14 +1501,45 @@ mod tests {
             ));
         }
         assert_eq!(h.undo_revs(), vec![4, 5, 6], "ascending, the stack's own order");
-        assert_eq!(h.head_rev(), Some(6), "the head is what a plain undo would pop");
+        assert_eq!(
+            h.undo_revs().last().copied(),
+            Some(6),
+            "the head is the LAST reported rev — what a plain undo would pop"
+        );
     }
 
     #[test]
     fn an_empty_undo_stack_has_no_head_and_no_revs() {
         let h = History::new();
-        assert_eq!(h.head_rev(), None);
         assert!(h.undo_revs().is_empty());
+        assert_eq!(h.undo_revs().last().copied(), None, "no path, no head");
+    }
+
+    /// C-1's guard in isolation: a walk's step must consume the revision it
+    /// PLANNED to consume or nothing at all. `history_gate` does not gate
+    /// ordinary commits, so between two steps of a walk a fresh entry can
+    /// land on the back — and an unconditional pop would then undo an edit
+    /// the user never asked to undo.
+    #[test]
+    fn a_conditional_pop_refuses_a_revision_it_did_not_plan_to_consume() {
+        let mut h = History::new();
+        for rev in [4u64, 5, 6] {
+            h.record(HistoryEntry::from_committed(&TxMeta::user(format!("edit {rev}")), &[], &[], rev));
+        }
+
+        // A fresh commit lands while a walk planned to consume rev 6.
+        h.record(HistoryEntry::from_committed(&TxMeta::user("interloper"), &[], &[], 7));
+        assert!(h.pop_undo_if(6).is_none(), "the back is rev 7, not the planned rev 6");
+        assert_eq!(h.undo_revs(), vec![4, 5, 6, 7], "a refused pop leaves the stack untouched");
+
+        // The matching rev pops, and only it.
+        let e = h.pop_undo_if(7).expect("the back IS rev 7");
+        assert_eq!((e.rev, e.label.as_str()), (7, "interloper"));
+        assert_eq!(h.undo_revs(), vec![4, 5, 6], "exactly one entry left the stack");
+
+        // An empty stack offers nothing, without panicking on the back.
+        let mut empty = History::new();
+        assert!(empty.pop_undo_if(1).is_none());
     }
 
     #[test]
@@ -1474,6 +1550,6 @@ mod tests {
         let popped = h.pop_undo().expect("an entry to undo");
         h.push_redo(popped);
         assert_eq!(h.undo_revs(), vec![1], "an undone step is no longer on the undo path");
-        assert_eq!(h.head_rev(), Some(1));
+        assert_eq!(h.undo_revs().last().copied(), Some(1), "the head fell back one step");
     }
 }

@@ -424,7 +424,31 @@ describe("undo to here (Task 4)", () => {
 
     expect(lastToast().title).toBe("UNDO TO HERE FAILED");
     expect(lastToast().kind).toBe("error");
-    expect(invokes.getProjectState).not.toHaveBeenCalled();
+  });
+
+  /**
+   * I-2 (whole-branch review). `undo_to` leaves the steps it applied before
+   * a mid-walk abort APPLIED, so a rejection does NOT mean "nothing
+   * happened". `project` and `midi` self-heal off `project://changed`, but
+   * automation, modulation, launch and an open plugin's params only refresh
+   * in `repull()` — so without one here a partial walk leaves the automation
+   * lanes and the param panel showing pre-walk values.
+   */
+  it("re-pulls the stores a partial walk left stale, then rethrows", async () => {
+    const { plugins } = await import("./plugins.svelte");
+    plugins.openInstanceId = "inst-1";
+    invokes.historyUndoTo.mockRejectedValueOnce(
+      new Error("stopped after 1 of 3 steps: the edit history moved under the walk"),
+    );
+
+    await expect(projectops.undoTo(8, 4, 9)).rejects.toThrow("stopped after 1 of 3 steps");
+
+    expect(invokes.getProjectState).toHaveBeenCalled();
+    expect(invokes.automationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.modulationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginList).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginGetParams).toHaveBeenCalledWith("inst-1");
+    expect(lastToast().title).toBe("UNDO TO HERE FAILED");
   });
 });
 

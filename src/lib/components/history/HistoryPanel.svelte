@@ -46,7 +46,7 @@
     </button>
   </header>
 
-  <p class="intro">Each row is an edit kept by the project. Select one to inspect it, then use Undo to here to walk the project back to it.</p>
+  <p class="intro">Each row is an edit kept by the project. Select one to inspect it, then use Undo to here to walk the project back to it — or Undo and Redo to step one edit at a time.</p>
 
   {#if !historyBrowser.available}
     <p class="empty mono">History is available in the desktop app.</p>

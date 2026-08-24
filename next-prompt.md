@@ -57,8 +57,10 @@ sentence got written — if you find a row whose branch is gone from
 
 ## Next up — unclaimed
 
-1. **Step 7 — unified audition** (plugin track) — **claimed** by PR #106
-   on `feat/browser-audition` (2026-08-23). → [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md)
+1. **Step 7 — unified audition** (plugin track). Double-click any browser
+   row to hear it, behind a new `browserAudition` pref defaulting off.
+   Last step on that track; it touches every browser plus sampler and
+   plugin hosts. → [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md)
 2. **Owner ear-checks** are owed on several landed tracks. No suite
    substitutes for them; each backlog file lists its own.
 3. **G1 Tasks 7–10** — on HOLD until an automation/undo leftover is done

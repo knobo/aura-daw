@@ -250,6 +250,16 @@ class ProjectOpsStore {
       toasts.info("UNDO", `${out.steps} steps back to r${targetRev}`);
       return true;
     } catch (err) {
+      // A REJECTED WALK CAN STILL HAVE MOVED THE DOCUMENT (I-2, whole-branch
+      // review). `undo_to` leaves the steps it applied before the abort
+      // APPLIED — that is its documented contract, not a bug — so the
+      // failure path has the same stale-store problem the success path does.
+      // `project` and `midi` self-heal off `project://changed`, but
+      // automation, modulation, launch and an open plugin's params only
+      // refresh in `repull()`; without this, a partial walk leaves the
+      // automation lanes and the param panel showing pre-walk values. That
+      // is M-3's regression again, on the other branch.
+      await this.repull();
       toasts.error("UNDO TO HERE FAILED", String(err));
       throw err;
     }

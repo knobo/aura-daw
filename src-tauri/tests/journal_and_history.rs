@@ -17,8 +17,8 @@ use aura_lib::audio::rt::{GraphTables, SharedRt};
 use aura_lib::audio::types::Store;
 use aura_lib::control::op::{ObjectRef, Op, PropPath, TxMeta};
 use aura_lib::control::{
-    ops, Committer, ControlPlane, EventEmitter, HistoryLog, Session, TrackMixChange,
-    TransportAction,
+    ops, Committed, Committer, ControlPlane, EventEmitter, HistoryLog, HistoryMode, Session,
+    TrackMixChange, TransportAction,
 };
 use aura_lib::midi::MidiStore;
 use aura_lib::sidecars::jobs::JobManager;
@@ -44,6 +44,21 @@ struct Fix {
 }
 
 fn fixture() -> Fix {
+    fixture_with_emitter(Box::new(|_e, _p| {}))
+}
+
+/// [`fixture`], but with a say in what the `ControlPlane`'s event emitter
+/// does.
+///
+/// WHY THIS EXISTS: `project://changed` is emitted SYNCHRONOUSLY on the
+/// committing thread at the end of every non-transient commit, with no lock
+/// held (`commit_with_rebuild`). That makes it the one place a
+/// single-threaded test can act BETWEEN two steps of an `undo_to` walk —
+/// which is where the concurrency C-1 is about actually lands, and which
+/// would otherwise need a second thread plus a scheduler willing to
+/// cooperate. Every other test in this file passes the no-op emitter
+/// [`fixture`] supplies.
+fn fixture_with_emitter(emit: EventEmitter) -> Fix {
     let shared = Arc::new(SharedRt::default());
     let tables = GraphTables::empty();
     let session = Arc::new(Mutex::new(Session::new(Store::default(), MidiStore::default())));
@@ -72,7 +87,7 @@ fn fixture() -> Fix {
         tables,
         eng.clone(),
         Arc::new(JobManager::new(2, std::time::Duration::ZERO)),
-        Box::new(|_e, _p| {}),
+        emit,
         log.clone(),
         gesture,
     ));
@@ -432,6 +447,101 @@ fn undo_to_journals_one_batch_per_step_and_creates_no_history_entry() {
     let after = batches(&lines).len();
     assert_eq!(after - before, 2, "one journal batch per undo step");
     assert_eq!(f.log.depths(), (1, 2), "two entries migrated, none created");
+
+    f.eng.send(ControlMsg::Shutdown);
+    let _ = std::fs::remove_dir_all(&parent);
+}
+
+/// A MID-WALK ABORT KEEPS ITS APPLIED PREFIX (C-1, whole-branch review).
+///
+/// `history_gate` serialises a walk against other `undo`/`redo` commands and
+/// against NOTHING ELSE — ordinary commits land without it, from the engine
+/// control thread, an MCP agent tool, or an automation write pass on
+/// release. This drives exactly that: one commit is recorded onto the undo
+/// stack from inside the `project://changed` emit of the walk's FIRST step,
+/// which is precisely "between two steps".
+///
+/// WHAT THE FIX BUYS. A walk that trusted a precomputed step count would pop
+/// whatever the back holds, so step 2 would undo the RACING commit — an edit
+/// nobody asked to undo — leave `gb` applied, and still return
+/// `Ok(UndoToOutcome { steps: 2 })`. With the conditional pop, step 2
+/// consumes the revision it planned to or nothing, so the walk stops and
+/// reports honestly. What it does NOT do is roll back: step 1 was a real
+/// committed transaction and stays applied, which is the documented
+/// contract this test pins alongside the stacks.
+#[test]
+fn undo_to_stops_when_a_commit_lands_between_two_steps_of_the_walk() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::OnceLock;
+
+    /// The racing commit, plus the sink to record it into. Filled in only
+    /// after the fixture and its setup edits exist — the emitter closure has
+    /// to be built before either of them does.
+    struct Racer {
+        log: Arc<HistoryLog>,
+        batch: Committed,
+    }
+    let racer: Arc<OnceLock<Racer>> = Arc::new(OnceLock::new());
+    let armed = Arc::new(AtomicBool::new(false));
+
+    let (slot, arm) = (racer.clone(), armed.clone());
+    let f = fixture_with_emitter(Box::new(move |event: &str, _p| {
+        // One shot, on the first commit the walk makes.
+        if event != "project://changed" || !arm.swap(false, Ordering::SeqCst) {
+            return;
+        }
+        let r = slot.get().expect("armed only once the racer exists");
+        r.log.record_commit(&r.batch, HistoryMode::Record);
+    }));
+
+    let parent = tmp_parent("undoto-raced");
+    f.cp.create_project(parent.to_str().unwrap(), "P").unwrap();
+    let a = add_track(&f.cp, "A");
+    let b = add_track(&f.cp, "B");
+    // Distinct labels AND distinct coalesce keys, so nothing merges.
+    f.cp.commit(TxMeta::user("ga1"), |tx| tx.apply(set_gain(&a, -1.0))).unwrap();
+    f.cp.commit(TxMeta::user("gb"), |tx| tx.apply(set_gain(&b, -6.0))).unwrap();
+    let last = f.cp.commit(TxMeta::user("ga2"), |tx| tx.apply(set_gain(&a, -3.0))).unwrap();
+
+    // A genuine batch, re-labelled and given a rev above everything on the
+    // stack — what any committer that is not holding `history_gate` puts
+    // there. It goes in through the production sink, so it inserts by rev
+    // and clears redo exactly as a real commit would.
+    let _ = racer.set(Racer {
+        log: f.log.clone(),
+        batch: Committed { rev: last.rev + 1_000, meta: TxMeta::user("raced the walk"), ..last },
+    });
+
+    let path = f.log.undo_path();
+    assert_eq!(path.revs.len(), 5, "two adds + three gain edits");
+    let target = path.revs[2]; // the state after ga1: undo ga2, then gb
+    let gb_rev = path.revs[3];
+
+    armed.store(true, Ordering::SeqCst);
+    let err = f.cp.undo_to(target, path.epoch, path.head()).unwrap_err();
+    assert!(err.contains("stopped after 1 of 2 steps"), "the error must say how far it got: {err}");
+    assert!(
+        err.contains(&format!("no longer offers revision {gb_rev}")),
+        "…and which revision the stack stopped offering: {err}"
+    );
+    assert!(err.contains("stay applied"), "…and that the prefix is still applied: {err}");
+
+    // THE APPLIED PREFIX STAYS APPLIED: step 1 (undo ga2) really happened.
+    // -1.0 is ga1's value, not a default, so this cannot pass by accident.
+    assert_eq!(gain_of(&f.cp, &a), -1.0, "the step before the abort is not rolled back");
+    // AND THE RACING COMMIT WAS NOT UNDONE — the bug C-1 describes.
+    assert_eq!(gain_of(&f.cp, &b), -6.0, "gb was never consumed by a step aimed elsewhere");
+
+    // NOTHING LOST, NOTHING DOUBLE-CONSUMED: five entries on the undo stack
+    // (the four the walk did not reach, plus the racing commit) and the one
+    // step the walk did apply, on the redo stack.
+    assert_eq!(f.log.depths(), (5, 1));
+    let revs = f.log.undo_path().revs;
+    assert!(revs.contains(&gb_rev), "the refused step is still there to undo: {revs:?}");
+    assert_eq!(revs.last().copied(), Some(last.rev + 1_000), "the racer is the new head");
+    assert_eq!(f.cp.redo().unwrap().as_deref(), Some("ga2"), "the applied step is redoable");
+    assert_eq!(gain_of(&f.cp, &a), -3.0, "and redo puts the walked-back edit back");
+    assert_eq!(f.log.depths(), (6, 0), "every entry is accounted for");
 
     f.eng.send(ControlMsg::Shutdown);
     let _ = std::fs::remove_dir_all(&parent);
