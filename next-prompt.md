@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| JIT-fused fader + triple-buffer publish + RT bench harness | `feat/jit-fused-fader` | 2026-08-24 | New standalone `aura-engine/` crate — `src-tauri/Cargo.toml` stays frozen. → [`docs/backlog/jit-engine.md`](docs/backlog/jit-engine.md) |
 
 ## Next up — unclaimed
 
