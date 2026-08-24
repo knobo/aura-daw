@@ -188,9 +188,29 @@ pub fn build_graph(
     // arrangement for offline INSTRUMENT nodes a few lines above, with the
     // same caveat this module's header already documents: a bounce sees
     // whatever param values the host instance currently holds.
+    //
+    // KNOWN HOLE, inherited from that arrangement and now widened to
+    // effects: a format host refuses a SECOND live node for an instance
+    // that already has one out (`clap_host`'s `node_out` guard). While the
+    // engine is holding a plugin, this bounce cannot build its own node for
+    // it, and the slot renders DRY. There is no silent-failure path for
+    // that here — it is logged loudly below — but the honest fix is
+    // per-bounce PRIVATE instances (`clap_host`/`lv2_host` API work, the
+    // node-graph round), not a workaround in this file: reusing the live
+    // node would let a bounce and the RT thread process the same plugin
+    // concurrently.
     let mut insert_nodes = crate::audio::insert::InsertNodeRegistry::default();
-    let (mut chains, _failed) =
+    let (mut chains, failed) =
         crate::audio::insert::compile_inserts(&store.tracks, plugins, rate, &mut insert_nodes);
+    if !failed.is_empty() {
+        log::warn!(
+            "offline render: {} insert instance(s) could not be hosted for this bounce and \
+             render DRY ({}). A plugin the live engine is holding cannot be activated twice — \
+             stop the engine and bounce again for a wet export.",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
     let plan = crate::audio::bus::compile_routing(
         &store.tracks,
         &slots,

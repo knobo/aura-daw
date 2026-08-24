@@ -308,9 +308,19 @@ The parts worth knowing before touching this:
   `SendSetAmount` folds into an open gesture the way a fader does.
 - **The offline bounce now walks insert chains too**, which is G1 Task
   8's offline half. Without it an export would have dropped exactly the
-  reverb the user mixed with. It shares the caveat this module already
-  had for instrument nodes: a bounce sees whatever param values the live
-  host instance currently holds (`audio::offline`'s header).
+  reverb the user mixed with.
+
+  **Two caveats, both inherited from the offline INSTRUMENT path and now
+  widened to effects.** A bounce sees whatever param values the live host
+  instance currently holds (`audio::offline`'s header). And a format host
+  refuses a SECOND live node for an instance that already has one out
+  (`clap_host`'s `node_out` guard), so **while the engine is holding a
+  plugin, the bounce cannot build its own node for it and that slot
+  renders dry**. It is logged loudly rather than silently dropped, but
+  the honest fix is per-bounce PRIVATE instances — a `clap_host` /
+  `lv2_host` API addition scheduled with the node-graph round, not
+  something this file can work around: reusing the live node would let a
+  bounce and the RT thread process one plugin concurrently.
 
 ### Output routing landed with it (owner steer, 2026-08-24)
 

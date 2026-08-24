@@ -399,19 +399,23 @@
 
       <div class="metadata-row" role="gridcell" aria-label="Routing and FX for {track.name}">
         <span class="picker">
-          <button class="groupchip mono" class:on={group !== null} aria-haspopup="menu" aria-expanded={groupMenuOpen} aria-label={group ? "Change lane group " + group : "Add lane to a group"} title={group ? "Lane group: " + group : "Add this lane to a group"} onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ? "Group · " + group : "Group · none"}</button>
+          <!-- Owner note (2026-08-24): the word "Group" was on every lane
+               whether or not the lane had one. The VALUE is the news; the
+               word is what the tooltip is for. Ungrouped shows a dim
+               placeholder so the control is still findable. -->
+          <button class="groupchip mono" class:on={group !== null} aria-haspopup="menu" aria-expanded={groupMenuOpen} aria-label={group ? "Change lane group " + group : "Add lane to a group"} title={group ? "Lane group: " + group : "Add this lane to a group"} onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ?? "GRP"}</button>
           {#if groupMenuOpen}<LaneGroupMenu {track} onclose={() => (groupMenuOpen = false)} />{/if}
         </span>
         {#if isAutomation}
-          <span class="kindchip automation-kind mono">Automation track</span>
+          <span class="kindchip automation-kind mono" title="Automation track — drives bindings, renders no audio">⌁</span>
         {:else if track.kind === "midi"}
           <button class="instchip mono" class:bound={!!instrument} class:plugin={!!pluginInst} class:stub={pluginInst?.status === "stub"} class:crashed={pluginInst?.status === "crashed"} title={pluginInst ? "Open plugin parameters for " + pluginInst.name : instrument ? "Open instrument browser for " + instrument.name : "Assign an instrument"} onclick={openInstrumentPanel}>
             {#if pluginInst}Instrument · {patch?.name ?? pluginInst.name}{:else if instrument}Instrument · {instrument.name}{:else}Instrument · polysynth{/if}
           </button>
         {:else if track.kind === "bus"}
-          <span class="kindchip bus-kind mono">Return bus</span>
+          <span class="kindchip bus-kind mono" title="Return bus — fed by other tracks' sends and outputs">B</span>
         {:else}
-          <span class="kindchip mono">Audio track</span>
+          <span class="kindchip mono" title="Audio track">A</span>
         {/if}
         {#if !isAutomation}
           <LanePluginStrip {track} onoverflow={() => (fxPopoverOpen = true)} />
@@ -942,15 +946,19 @@
     height: 17px;
   }
   .metadata-row .groupchip {
-    max-width: 112px;
+    max-width: 96px;
   }
   .metadata-row .instchip {
     flex: 1;
     max-width: none;
   }
   .kindchip {
-    min-width: 0;
-    padding: 2px 6px;
+    /* A one-letter badge now (owner note, 2026-08-24), so it sizes like
+       one instead of reserving room for "Automation track". */
+    flex: none;
+    min-width: 15px;
+    text-align: center;
+    padding: 2px 4px;
     border: var(--border-width) solid rgb(var(--edge-rgb) / 0.18);
     border-radius: 3px;
     color: var(--text-faint);
