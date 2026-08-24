@@ -57,13 +57,9 @@ sentence got written — if you find a row whose branch is gone from
 
 ## Next up — unclaimed
 
-1. **Step 7 — unified audition** (plugin track). Double-click any browser
-   row to hear it, behind a new `browserAudition` pref defaulting off.
-   Last step on that track; it touches every browser plus sampler and
-   plugin hosts. → [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md)
-2. **Owner ear-checks** are owed on several landed tracks. No suite
+1. **Owner ear-checks** are owed on several landed tracks. No suite
    substitutes for them; each backlog file lists its own.
-3. **G1 Tasks 7–10** — on HOLD until an automation/undo leftover is done
+2. **G1 Tasks 7–10** — on HOLD until an automation/undo leftover is done
    (owner steer, 2026-08-18). → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
@@ -82,7 +78,7 @@ Plan G2; the native-GUI embed work.
 
 | Track | File |
 |---|---|
-| Plugin manager (Step 7 next) | [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md) |
+| Plugin manager (preview slot open) | [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md) |
 | Insert FX / sends / PDC (Plan G1) | [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md) |
 | Pitch — Coach, extraction, correction | [`docs/backlog/pitch.md`](docs/backlog/pitch.md) |
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |

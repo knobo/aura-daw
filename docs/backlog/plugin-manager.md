@@ -7,7 +7,7 @@ Spec: [`2026-08-20-plugin-admin-winner-design.md`](../superpowers/specs/2026-08-
 Plan: [`2026-08-20-plugin-manager.md`](../superpowers/plans/2026-08-20-plugin-manager.md)
 — status table plus "Step 6 as shipped".
 
-Steps 1–6 have landed; see [`../LANDED.md`](../LANDED.md).
+Steps 1–7 have landed; see [`../LANDED.md`](../LANDED.md).
 
 ## The owner's standing steer (2026-08-20)
 
@@ -20,14 +20,6 @@ Steps 1–6 have landed; see [`../LANDED.md`](../LANDED.md).
 NOT override the frozen IPC surface, the theme-token rule, or the test
 gates.
 
-## Next — Step 7, unified audition
-
-Design §8.2. Double-click any browser row to hear it, gated behind a new
-`browserAudition` pref defaulting **off**. Last on this track: it touches
-every browser plus sampler and plugin hosts. The plan's status table
-carries one line for it; the implementable detail is design §8.2, not the
-plan.
-
 ## Owner ear-checks still owed
 
 - The live *Keep plugin GUI on top* toggle: open an editor → Preferences
@@ -39,6 +31,22 @@ plan.
   name button — a judgment call, not pixel-verified); and MATRIX mode
   (does grouping by parameter read as useful, does the fourth mode chip
   fit the row at 480 px).
+- **From Step 7**, four things no suite can answer:
+  - Does double-click-to-audition feel right at C3, and is 1200 ms the right
+    decay for the row highlight?
+  - Does the chip's off-state glyph `♪̸` actually render in WebKitGTK? It is
+    a combining character and was never seen in the real app — if it looks
+    broken, fall back to `♪` and let the `on` class carry the state.
+  - The R-1 question the plan deliberately did not answer: `SamplesRoot`
+    still auditions on *single* click and `InstrumentBrowser` still sounds on
+    hold, both regardless of the new preference, because gating them would
+    have deleted shipped behaviour. Should the preference own those too?
+  - The R-4 consequence: because a real double-click fires `click, click,
+    dblclick`, `PresetsRoot`'s instrument rows and `InstrumentBrowser`'s rows
+    were given no double-click at all — they reach the store only through
+    Shift+Enter, which *is* pref-gated while their mouse preview is not. Is
+    that asymmetry acceptable, or should those rows get the gesture with the
+    flam solved another way?
 
 ## Scope calls already made — do not relitigate without a reason
 
@@ -53,9 +61,9 @@ plan.
 ## What shipped, in detail
 
 Kept here because the identifiers are hard to rediscover from the diff.
-The merged branches `feat/plugin-manager` (Step 5) and
-`feat/plugin-automation-inventory` (Step 6) are **spent** — do not reopen
-either.
+The merged branches `feat/plugin-manager` (Step 5),
+`feat/plugin-automation-inventory` (Step 6) and `feat/browser-audition`
+(Step 7) are **spent** — do not reopen any of them.
 
 **Step 5 (PR #93):**
 
@@ -77,6 +85,15 @@ either.
 | Automation matrix | `AutomationMatrix.svelte` + `utils/automation-matrix.ts`: the rack projection grouped by parameter instead of by instance, as a 4th `ManagerMode` (`"matrix"`). |
 | Pinned params | `PluginParamPanel.svelte`: every param row is a `ParamChip`; pinned ones (`catalog.pinnedParams[uid]`, max 8) sort into a `Pinned` section up top. A pinned param is *duplicated* there, not moved out of its own group — pinning is a shortcut, not a move. |
 | Lane plugin strip | `LanePluginStrip.svelte` + `utils/lane-strip.ts` in `TrackHeader.svelte`'s `.metadata-row`, both the unfolded and folded branches. The strip sits between the instrument chip and FX; its `+N` overflow opens `InsertChain`. Folded lane renders dots only, no name button. |
+
+**Step 7 (PR #106):**
+
+| Piece | Detail |
+|---|---|
+| The gesture | `BrowserRow`'s `ondblclick`, plus Shift+Enter on `BrowserShell` for keyboard parity. Single click is untouched everywhere (ruling R-1). |
+| The gate | `browserAudition` pref, default off, plus `AuditionChip.svelte` in every browser toolbar. The chip writes the pref — there is no second session mute (ruling R-2). |
+| The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops — including in `ZynPatchBrowser`, whose double-click plays through the same shared store as every other browser and contributes only the note; its pre-existing single-click load (`zyn_load_patch`) remains a project edit, as it always was. |
+| Catalog plugins | A descriptor borrows a live, track-bound instance of the same plugin if one exists; otherwise silent with a reason. Instantiating to preview would commit `Op::PluginAdd` (ruling R-3). |
 
 ## Leftovers — do not start unless asked
 
@@ -115,6 +132,52 @@ either.
     and should carry `role="tree"` semantics rather than plain rows, the
     way the lane rail already carries `role="grid"` and
     `aria-multiselectable`.
+- **The document-free plugin preview slot.** §8.2 asks for a lazily
+  instantiated, reusable preview slot so a catalog plugin can be heard
+  without being added to the project. Step 7 deliberately did not build it:
+  `plugin_preview_note` routes through the instance's bound midi track, so
+  reaching a bare descriptor means `plugin_instantiate` — an `Op::PluginAdd`
+  with an undo entry, which an audition must never be. Doing it properly is
+  backend work: host an instance outside the document and render it into the
+  preview stream that `audio/sampler_preview.rs` already owns, with a single
+  reusable slot and teardown on a timer. Additive IPC. Owner scoped it out of
+  Step 7 on 2026-08-23.
+- **`audition.sounding` has no consumer.** No row lights up when the new
+  gesture fires — wiring it needs a second visual on rack rows, which
+  already use `selected` for the open instance.
+- **`PresetsRoot`'s zyn patch rows audition whichever patch is *loaded*,**
+  ignoring which row was clicked, and render no silent reason when there
+  is no open Zyn instance.
+- **`library.auditioning` and the audition store both own the sample
+  preview stream** and can disagree about what is playing; the store
+  should probably route samples through `library.audition()` instead of
+  the backend directly.
+- **`InstrumentBrowser` sounds on `pointerdown` with no hold delay,** so
+  the R-4 table's description of it as "hold-to-play" is wrong — worth
+  correcting there and putting to the owner as the sharpest form of the
+  R-1 question.
+- **`AuditionChip` is sized for `BrowserShell`'s toolbar** (24 px, 5 px
+  radius, translucent) but also sits among `PluginManager`'s and
+  `ZynPatchBrowser`'s much smaller chips (8-9 px font, transparent), so it
+  will render visibly taller and filled next to them — one for the same
+  ear-check as the `♪̸` glyph.
+- **The Zyn double-click normally makes no sound on the first try:** click 1
+  of the two clicks that precede a real `dblclick` already starts
+  `pick()` → `zyn.load`, which sets `zyn.busyPath` and awaits IPC; the
+  `dblclick` lands while `busyPath` is still set and the `busyPath` guard
+  (correctly) bails, so only a *repeat* double-click on an already-loaded
+  patch — where `zyn.load` short-circuits and never sets `busyPath` —
+  actually sounds C3. Fixing it needs a public `whenLoaded(instanceId,
+  path)` on the zyn store so the handler can join the in-flight load
+  instead of bailing (`inflight` is private today). This file's header
+  comment and the Step 7 dispatch row both still say double-click plays
+  C3 — true only on the second attempt, left as-is rather than hedged.
+- **`ZynPatchBrowser` renders `zyn.error` but never
+  `auditionStore.lastSilentReason`,** so both of its silent branches ("no
+  live Zyn instance", "instance not on a midi track") are invisible in
+  that browser, while the reason string can still surface later as a
+  stale message in `PluginManager`'s status line. Rendering it here also
+  needs a mount-time clear, the way `PluginManager` already has one.
 
 ## Do not
 

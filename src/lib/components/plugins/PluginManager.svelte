@@ -5,6 +5,7 @@
    * (what exists), browse below (what could). Ctrl+P is the add-in-the-flow
    * surface; the lane strip is the Bitwig job (next pass).
    */
+  import { onMount } from "svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { lanes } from "../../state/lanes.svelte";
@@ -12,6 +13,7 @@
   import { openPluginParams } from "../../state/plugin-panel";
   import { toasts } from "../../state/toasts.svelte";
   import { zyn, isZynInstance } from "../../state/zynpatches.svelte";
+  import { audition } from "../../state/audition.svelte";
   import { backend } from "../../tauri";
   import type { PluginDescriptor, PluginFormat, TrackState } from "../../types/ipc";
   import { FoldController } from "../browser/fold-controller.svelte";
@@ -21,8 +23,10 @@
   import BrowserRow from "../browser/BrowserRow.svelte";
   import EmptyState from "../browser/EmptyState.svelte";
   import ParamChip from "../browser/ParamChip.svelte";
+  import AuditionChip from "../browser/AuditionChip.svelte";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
   import AutomationMatrix from "./AutomationMatrix.svelte";
+  import { resolveDescriptorTarget, resolvePluginInstanceTarget } from "../../utils/audition-target";
   import {
     buildBrowseSections,
     filterByFacets,
@@ -54,6 +58,17 @@
   /** Which projectDir the chips were loaded for — a snapshot that writes
    * the same dir must not clobber a chip the user just pressed. */
   let loadedFor: string | null | undefined;
+
+  // `lastSilentReason` is a global singleton with no decay (unlike
+  // `sounding`) — it's cleared only by the next successful `play()`
+  // anywhere in the app. This panel remounts fresh on every dock-tab
+  // switch, so without this it can open already showing a stale reason
+  // left behind by a double-click in a *different* browser (e.g. Presets).
+  // Clearing on mount means the notice only ever reports something the
+  // user did in this panel.
+  onMount(() => {
+    audition.lastSilentReason = null;
+  });
 
   $effect(() => {
     const dir = project.projectDir;
@@ -301,7 +316,12 @@
       toggleGroup(row.groupKey, browseCollapsed.has(row.groupKey) || rackCollapsed.has(row.groupKey));
       return;
     }
-    if (mode === "browse") {
+    // `showBrowse`, not `mode === "browse"`: this row comes from the one
+    // `<BrowserShell>`, which renders under `{#if showBrowse}` — true for
+    // both "browse" and "split", and "split" is the default whenever the
+    // project already has instances. Branching on `mode` alone left
+    // Enter-to-add dead in the common case.
+    if (showBrowse) {
       const section = browseShown.find((s) => s.key === row.groupKey);
       const d = section?.items[row.itemIndex];
       if (d) void addDescriptor(d, !d.isInstrument);
@@ -310,6 +330,18 @@
     const group = rackGroups.find((g) => g.key === row.groupKey);
     const entry = group?.items[row.itemIndex];
     if (entry) void openPluginParams(entry.instance.id);
+  }
+
+  // Shift+Enter's target: the same resolver the catalog rows' own
+  // `ondblclick` handler uses. No rack branch: rack rows render `BrowserRow`
+  // directly with no `BrowserShell`, so no keyboard path can ever hand this
+  // a rack row ref — the `<BrowserShell>` this is wired to only ever holds
+  // `browseRows`.
+  function onAudition(row: BrowserRowRef) {
+    if (row.kind !== "item") return;
+    const section = browseShown.find((s) => s.key === row.groupKey);
+    const d = section?.items[row.itemIndex];
+    if (d) void audition.play(resolveDescriptorTarget(d.uid, plugins.instances, project.tracks));
   }
 
   async function toggleBypass(entry: RackEntry) {
@@ -385,6 +417,9 @@
   {#if plugins.error}
     <div class="err silk" role="alert">{plugins.error}</div>
   {/if}
+  {#if audition.lastSilentReason}
+    <div class="silk" role="status">{audition.lastSilentReason}</div>
+  {/if}
 
   {#if mode === "matrix"}
     <!-- The search box and facet chips are catalog filters; the matrix
@@ -424,6 +459,7 @@
         <button type="button" class="chip mono" class:on={formats.includes("lv2")} aria-pressed={formats.includes("lv2")} onclick={() => toggleFormat("lv2")}>LV2</button>
         <button type="button" class="chip mono" class:on={favoritesOnly} aria-pressed={favoritesOnly} title="Favourites only" onclick={() => persist({ favoritesOnly: !favoritesOnly })}>★</button>
         <button type="button" class="chip mono" class:on={recentsOnly} aria-pressed={recentsOnly} title="Recent only" onclick={() => persist({ recentsOnly: !recentsOnly })}>⏱</button>
+        <AuditionChip />
       </div>
     </div>
     {#if typeFacets.length > 0}
@@ -468,6 +504,8 @@
                     }
                   }}
                   onclick={() => void openPluginParams(inst.id)}
+                  ondblclick={() =>
+                    void audition.play(resolvePluginInstanceTarget(inst.id, project.tracks))}
                 >
                   {#snippet badge()}
                     <span class="dot {inst.status}" title={inst.status} aria-hidden="true"></span>
@@ -512,6 +550,7 @@
             rows={browseRows}
             onToggleGroup={toggleGroup}
             {onActivate}
+            {onAudition}
             anyCollapsed={browseFolds.anyCollapsed(browseKeys)}
             onFoldAll={(collapse) => browseFolds.setAll(browseKeys, collapse)}
           >
@@ -553,6 +592,10 @@
                   onclick={() => {
                     setActive({ kind: "item", groupKey: s.key, itemIndex: i });
                   }}
+                  ondblclick={() =>
+                    void audition.play(
+                      resolveDescriptorTarget(d.uid, plugins.instances, project.tracks),
+                    )}
                 >
                   {#snippet badge()}
                     <span class="badge mono {d.format}">{d.format}</span>

@@ -12,6 +12,8 @@
   import { instruments } from "../../state/instruments.svelte";
   import { project } from "../../state/project.svelte";
   import { openStudio } from "../../state/ui.svelte";
+  import { audition } from "../../state/audition.svelte";
+  import { AUDITION_KEY } from "../../utils/audition-target";
   import type { InstrumentInfo } from "../../types/ipc";
   import { FoldController } from "../browser/fold-controller.svelte";
   import { type BrowserRowRef, flattenRows, groupItems, rankItems, rowId } from "../browser/browser-model";
@@ -104,6 +106,12 @@
       {onActivate}
       anyCollapsed={folds.anyCollapsed(groupKeys)}
       onFoldAll={(collapse) => folds.setAll(groupKeys, collapse)}
+      auditionChip
+      onAudition={(row) => {
+        if (row.kind !== "item") return;
+        const inst = groups.find((g) => g.key === row.groupKey)?.items[row.itemIndex];
+        if (inst) void audition.play({ kind: "instrument", instrumentId: inst.id, key: AUDITION_KEY });
+      }}
     >
       {#snippet children({ activeId, setActive })}
         {#if rows.length === 0}

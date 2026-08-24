@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
-import type { PluginInstanceInfo, ZynPatch } from "../../types/ipc";
+import type { PluginInstanceInfo, TrackState, ZynPatch } from "../../types/ipc";
 
 vi.stubGlobal("localStorage", {
   getItem: () => null,
@@ -42,6 +42,8 @@ vi.mock("../../tauri", () => ({
 const { default: ZynPatchBrowser } = await import("./ZynPatchBrowser.svelte");
 const { zyn } = await import("../../state/zynpatches.svelte");
 const { plugins } = await import("../../state/plugins.svelte");
+const { audition } = await import("../../state/audition.svelte");
+const { project } = await import("../../state/project.svelte");
 
 const patch: ZynPatch = { bank: "Pads", name: "Warm Pad", program: 1, path: "/p.xiz" };
 
@@ -52,6 +54,25 @@ function inst(): PluginInstanceInfo {
     name: "ZynAddSubFX",
     format: "lv2",
     status: "active",
+  };
+}
+
+// The shared audition store's `resolvePluginInstanceTarget` only reaches
+// `plugin_preview_note` for an instance bound to a midi track — the same
+// precondition every other browser's audition gesture already respects.
+function boundTrack(): TrackState {
+  return {
+    id: "t1",
+    name: "Synth",
+    kind: "midi",
+    gainDb: 0,
+    pan: 0,
+    muted: false,
+    soloed: false,
+    armed: false,
+    automationMode: "read",
+    color: "#38bdf8",
+    instrumentId: "plugin:zyn-1",
   };
 }
 
@@ -67,6 +88,8 @@ beforeEach(() => {
   zyn.loaded = {};
   zyn.openInstanceId = "zyn-1";
   plugins.instances = [inst()];
+  project.tracks = [boundTrack()];
+  audition.enabled = false;
 });
 
 afterEach(() => {
@@ -74,6 +97,8 @@ afterEach(() => {
   zyn.patches = [];
   zyn.openInstanceId = "";
   plugins.instances = [];
+  project.tracks = [];
+  audition.enabled = false;
 });
 
 function loadButton() {
@@ -98,5 +123,36 @@ describe("ZynPatchBrowser patch audition", () => {
     });
     await fireEvent.pointerUp(btn);
     await waitFor(() => expect(pluginPreviewNoteOff).toHaveBeenCalled());
+  });
+
+  it("double-click does nothing while the audition preference is off — an audition must never load a patch", async () => {
+    audition.enabled = false;
+    render(ZynPatchBrowser);
+    await fireEvent.dblClick(loadButton());
+    // Give any (wrongly) in-flight async work a chance to reach the
+    // backend before asserting the negative.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(zynLoadPatch).not.toHaveBeenCalled();
+    expect(pluginPreviewNoteOn).not.toHaveBeenCalled();
+  });
+
+  it("double-click plays a preview note through the bound instance without loading the patch again when the preference is on", async () => {
+    audition.enabled = true;
+    render(ZynPatchBrowser);
+    await fireEvent.dblClick(loadButton());
+    await waitFor(() => expect(pluginPreviewNote).toHaveBeenCalledWith("zyn-1", 60, 100), {
+      timeout: 500,
+    });
+    // A real double-click already ran the two clicks' `pick(patch)` before
+    // this fires; the audition handler itself must never load a second time.
+    expect(zynLoadPatch).not.toHaveBeenCalled();
+  });
+
+  it("the toolbar's audition chip flips the shared preference — this browser is not stuck reading it from elsewhere", async () => {
+    render(ZynPatchBrowser);
+    const chip = screen.getByRole("button", { name: /audition on double-click/i });
+    expect(audition.enabled).toBe(false);
+    await fireEvent.click(chip);
+    expect(audition.enabled).toBe(true);
   });
 });

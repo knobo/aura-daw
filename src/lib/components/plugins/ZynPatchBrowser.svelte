@@ -17,11 +17,18 @@
    * piano roll — load is still a project edit; the note is not.
    */
   import { zyn } from "../../state/zynpatches.svelte";
+  // Aliased: this file already declares a local `audition(patch)` helper
+  // (the hold-to-preview function below) — importing the shared store
+  // under its usual name would collide with that declaration.
+  import { audition as auditionStore } from "../../state/audition.svelte";
+  import { project } from "../../state/project.svelte";
+  import { resolvePluginInstanceTarget } from "../../utils/audition-target";
   import type { ZynPatch } from "../../types/ipc";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
   import { FoldController } from "../browser/fold-controller.svelte";
   import { type BrowserGroup, flattenRows, groupItems, rankItems } from "../browser/browser-model";
   import EmptyState from "../browser/EmptyState.svelte";
+  import AuditionChip from "../browser/AuditionChip.svelte";
 
   const FAV_KEY = "aura.zyn.patch-favorites";
 
@@ -164,6 +171,7 @@
     >
       <span aria-hidden="true">{folds.anyCollapsed(groupKeys) ? "⌄" : "⌃"}</span>
     </button>
+    <AuditionChip />
     <button
       type="button"
       class="chip mono"
@@ -227,6 +235,22 @@
                   onpointerdown={(e) => onPatchPointerDown(patch, e)}
                   onpointerup={onPatchPointerUp}
                   onpointercancel={onPatchPointerUp}
+                  ondblclick={() => {
+                    if (!auditionStore.enabled) return;
+                    if (!inst || inst.status !== "active") {
+                      void auditionStore.play({
+                        kind: "silent",
+                        reason: "no live Zyn instance to audition through",
+                      });
+                      return;
+                    }
+                    // A real double-click already ran `pick(patch)` twice
+                    // (once per click) before this fires — loading again
+                    // here would be a second, redundant `zyn_load_patch`.
+                    // This handler contributes only the note.
+                    if (zyn.busyPath) return;
+                    void auditionStore.play(resolvePluginInstanceTarget(inst.id, project.tracks));
+                  }}
                 >
                   <span class="pnum silk">{String(patch.program).padStart(3, "0")}</span>
                   <span class="pname">{patch.name}</span>
