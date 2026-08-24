@@ -77,7 +77,7 @@ singer. It does not exercise the Tauri command layer.
 
 ```sh
 cd src-tauri && cargo test   # 1376 tests (1340 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-23, corrected from a stale 1261 — Step 7 (unified browser audition) touched no Rust; the prior count was just out of date)
-npm test                     # 1248 frontend tests (1126 unit + 122 DOM-mounted; vitest; counted 2026-08-23 after Step 7 (unified browser audition) landed)
+npm test                     # 1249 frontend tests (1126 unit + 123 DOM-mounted; vitest; counted 2026-08-24 after Step 7 (unified browser audition)'s whole-branch fix wave)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```

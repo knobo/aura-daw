@@ -67,7 +67,7 @@ describe("resolveDescriptorTarget", () => {
   });
 
   it("ignores a non-active instance", () => {
-    const instances = [inst("p1", "urn:zyn", "failed")];
+    const instances = [inst("p1", "urn:zyn", "crashed")];
     const tracks = [track("t1", "plugin:p1")];
     expect(resolveDescriptorTarget("urn:zyn", instances, tracks).kind).toBe("silent");
   });
@@ -81,7 +81,7 @@ describe("resolveDescriptorTarget", () => {
   });
 
   it("prefers the first active bound instance when several match", () => {
-    const instances = [inst("p1", "urn:zyn", "failed"), inst("p2", "urn:zyn")];
+    const instances = [inst("p1", "urn:zyn", "stub"), inst("p2", "urn:zyn")];
     const tracks = [track("t1", "plugin:p1"), track("t2", "plugin:p2")];
     const got = resolveDescriptorTarget("urn:zyn", instances, tracks);
     expect(got).toEqual({ kind: "pluginInstance", instanceId: "p2", key: AUDITION_KEY });

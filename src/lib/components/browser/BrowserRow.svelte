@@ -74,7 +74,7 @@
   onpointerup={(e) => onpointerup?.(e)}
   onpointercancel={(e) => onpointercancel?.(e)}
   onkeydown={(e) => {
-    if (e.key === "Enter" || e.key === " ") {
+    if ((e.key === "Enter" && !e.shiftKey) || e.key === " ") {
       e.preventDefault();
       onclick?.();
     }

@@ -92,7 +92,7 @@ The merged branches `feat/plugin-manager` (Step 5),
 |---|---|
 | The gesture | `BrowserRow`'s `ondblclick`, plus Shift+Enter on `BrowserShell` for keyboard parity. Single click is untouched everywhere (ruling R-1). |
 | The gate | `browserAudition` pref, default off, plus `AuditionChip.svelte` in every browser toolbar. The chip writes the pref — there is no second session mute (ruling R-2). |
-| The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops. `ZynPatchBrowser` is the exception: it plays through `zyn.audition(inst.id, patch)` directly and routes only the preference check and the silent-reason path through the shared store, because loading the patch has to happen before any note can sound. |
+| The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops — including in `ZynPatchBrowser`, whose double-click plays through the same shared store as every other browser and contributes only the note; its pre-existing single-click load (`zyn_load_patch`) remains a project edit, as it always was. |
 | Catalog plugins | A descriptor borrows a live, track-bound instance of the same plugin if one exists; otherwise silent with a reason. Instantiating to preview would commit `Op::PluginAdd` (ruling R-3). |
 
 ## Leftovers — do not start unless asked
@@ -142,6 +142,25 @@ The merged branches `feat/plugin-manager` (Step 5),
   preview stream that `audio/sampler_preview.rs` already owns, with a single
   reusable slot and teardown on a timer. Additive IPC. Owner scoped it out of
   Step 7 on 2026-08-23.
+- **`audition.sounding` has no consumer.** No row lights up when the new
+  gesture fires — wiring it needs a second visual on rack rows, which
+  already use `selected` for the open instance.
+- **`PresetsRoot`'s zyn patch rows audition whichever patch is *loaded*,**
+  ignoring which row was clicked, and render no silent reason when there
+  is no open Zyn instance.
+- **`library.auditioning` and the audition store both own the sample
+  preview stream** and can disagree about what is playing; the store
+  should probably route samples through `library.audition()` instead of
+  the backend directly.
+- **`InstrumentBrowser` sounds on `pointerdown` with no hold delay,** so
+  the R-4 table's description of it as "hold-to-play" is wrong — worth
+  correcting there and putting to the owner as the sharpest form of the
+  R-1 question.
+- **`AuditionChip` is sized for `BrowserShell`'s toolbar** (24 px, 5 px
+  radius, translucent) but also sits among `PluginManager`'s and
+  `ZynPatchBrowser`'s much smaller chips (8-9 px font, transparent), so it
+  will render visibly taller and filled next to them — one for the same
+  ear-check as the `♪̸` glyph.
 
 ## Do not
 

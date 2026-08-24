@@ -33,7 +33,12 @@ const AUDITION_VELOCITY = 100;
 
 class AuditionStore {
   /** Opaque id of what last sounded — sample path, instrument id, or
-   * instance id. Rows compare their own id against it to light up. */
+   * instance id. Rows compare their own id against it to light up.
+   *
+   * No consumer renders this yet — no row lights up on the new gesture
+   * today. The decay timer and the `#gen` supersession logic below are
+   * correct but currently unobserved; wiring a visual is deferred (see
+   * `docs/backlog/plugin-manager.md`'s Leftovers). */
   sounding = $state<string | null>(null);
   /** Why the last attempt made no sound, when it made none. A UI hint, not
    * an error state: "no live instance of this plugin to audition" is a
@@ -74,29 +79,36 @@ class AuditionStore {
 
   async play(target: AuditionTarget): Promise<void> {
     if (!this.enabled) return;
-    if (target.kind === "silent") {
-      this.lastSilentReason = target.reason;
-      return;
-    }
     // This call now owns the generation. Anything still in flight from an
     // earlier call — including the `#release()` below, and including a
     // concurrent external `stop()` — checks against `#gen` and backs off
     // once it sees a newer one has taken over.
     const token = ++this.#gen;
     // Whatever was sounding gets cut first: two overlapping auditions tell
-    // you nothing about either one.
+    // you nothing about either one — and a "no live instance to audition"
+    // notice must not land while a previous sample keeps ringing, so this
+    // runs before the `silent` branch below, not after it.
     await this.#release();
     if (token !== this.#gen) return; // superseded again while releasing
+    if (target.kind === "silent") {
+      this.lastSilentReason = target.reason;
+      return;
+    }
     this.lastSilentReason = null;
     try {
       switch (target.kind) {
         case "sample":
+          // Only claim the stream — and only light the row — when there is
+          // actually a backend to play it: the browser-demo build has no
+          // `libraryAudition`, and reporting a sounding row for a sound
+          // that never happened is worse than staying silent.
+          if (!backend.libraryAudition) break;
           // Set *before* the await, not after: a `stop()` (or a newer
           // `play()`'s `#release()`) that runs while this call is still
           // waiting on the backend must see that there is a sample stream
           // to cut, not find `#sampleSounding` still false and skip it.
           this.#sampleSounding = true;
-          await backend.libraryAudition?.(target.path);
+          await backend.libraryAudition(target.path);
           if (token !== this.#gen) return; // a newer play()/stop() won
           this.#light(target.path);
           break;

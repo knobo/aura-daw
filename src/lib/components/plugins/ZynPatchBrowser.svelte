@@ -21,6 +21,8 @@
   // (the hold-to-preview function below) — importing the shared store
   // under its usual name would collide with that declaration.
   import { audition as auditionStore } from "../../state/audition.svelte";
+  import { project } from "../../state/project.svelte";
+  import { resolvePluginInstanceTarget } from "../../utils/audition-target";
   import type { ZynPatch } from "../../types/ipc";
   import PluginConnectionBadge from "./PluginConnectionBadge.svelte";
   import { FoldController } from "../browser/fold-controller.svelte";
@@ -242,8 +244,12 @@
                       });
                       return;
                     }
-                    void zyn.audition(inst.id, patch);
-                    setTimeout(() => void zyn.previewUp(), 700);
+                    // A real double-click already ran `pick(patch)` twice
+                    // (once per click) before this fires — loading again
+                    // here would be a second, redundant `zyn_load_patch`.
+                    // This handler contributes only the note.
+                    if (zyn.busyPath) return;
+                    void auditionStore.play(resolvePluginInstanceTarget(inst.id, project.tracks));
                   }}
                 >
                   <span class="pnum silk">{String(patch.program).padStart(3, "0")}</span>

@@ -327,6 +327,21 @@
     if (entry) void openPluginParams(entry.instance.id);
   }
 
+  // Shift+Enter's target: the same resolvers the rows' own `ondblclick`
+  // handlers use, mirroring `onActivate`'s browse-vs-rack split above.
+  function onAudition(row: BrowserRowRef) {
+    if (row.kind !== "item") return;
+    if (mode === "browse") {
+      const section = browseShown.find((s) => s.key === row.groupKey);
+      const d = section?.items[row.itemIndex];
+      if (d) void audition.play(resolveDescriptorTarget(d.uid, plugins.instances, project.tracks));
+      return;
+    }
+    const group = rackGroups.find((g) => g.key === row.groupKey);
+    const entry = group?.items[row.itemIndex];
+    if (entry) void audition.play(resolvePluginInstanceTarget(entry.instance.id, project.tracks));
+  }
+
   async function toggleBypass(entry: RackEntry) {
     const place = entry.placements.find((p) => p.kind === "insert");
     if (!place || place.kind !== "insert") return;
@@ -401,7 +416,7 @@
     <div class="err silk" role="alert">{plugins.error}</div>
   {/if}
   {#if audition.lastSilentReason}
-    <div class="note silk" role="status">{audition.lastSilentReason}</div>
+    <div class="silk" role="status">{audition.lastSilentReason}</div>
   {/if}
 
   {#if mode === "matrix"}
@@ -533,6 +548,7 @@
             rows={browseRows}
             onToggleGroup={toggleGroup}
             {onActivate}
+            {onAudition}
             anyCollapsed={browseFolds.anyCollapsed(browseKeys)}
             onFoldAll={(collapse) => browseFolds.setAll(browseKeys, collapse)}
           >
