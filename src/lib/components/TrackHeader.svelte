@@ -447,7 +447,7 @@
           {/each}
         </div>
       {:else}
-        <div class="status-row" role="gridcell" aria-label="Mix status for {track.name}">
+        <div class="status-row" role="gridcell" aria-label="Mix status and automation for {track.name}">
           {#if track.kind === "midi"}
             <label class="midiout-check mono" title="Publiser som egen MIDI-utgang i Carla/ALSA patchbay">
               <input type="checkbox" checked={midiIo.isVirtualTrack(track.id)} onchange={(e) => void midiIo.setTrackVirtualOutput(track.id, e.currentTarget.checked)} />
@@ -457,11 +457,16 @@
           <button class="status arm" class:on={track.armed} aria-pressed={track.armed} title={bulkTitle("Record arm")} aria-label={bulkTitle("Record arm")} onclick={() => pressToggle("armed")}>A</button>
           <button class="status mute" class:on={track.muted} aria-pressed={track.muted} title={bulkTitle("Mute")} aria-label={bulkTitle("Mute")} onclick={() => pressToggle("muted")}>M</button>
           <button class="status solo" class:on={track.soloed} aria-pressed={track.soloed} title={bulkTitle("Solo")} aria-label={bulkTitle("Solo")} onclick={() => pressToggle("soloed")}>S</button>
-        </div>
-
-        <div class="automation-row" role="gridcell" aria-label="Automation mode for {track.name}">
-          <span class="section-label mono">Automation</span>
-          <AutomationModeSelector mode={track.automationMode} onchange={(mode) => project.setAutomationMode(track.id, mode)} />
+          <!-- Owner note (2026-08-24): the single-letter controls belong on
+               ONE line. The rule is the meaningful separation between two
+               groups that answer different questions — what this lane is
+               doing right now (A/M/S) versus what its automation lane is
+               doing (O/R/W/T/L). -->
+          <span class="chip-rule" aria-hidden="true"></span>
+          <span class="chip-group">
+            <span class="section-label mono" title="Automation mode">Auto</span>
+            <AutomationModeSelector mode={track.automationMode} onchange={(mode) => project.setAutomationMode(track.id, mode)} />
+          </span>
         </div>
 
         <div class="level-area" role="gridcell" aria-label="Level controls for {track.name}">
@@ -851,12 +856,17 @@
   }
   .identity-row,
   .metadata-row,
-  .status-row,
-  .automation-row {
+  .status-row {
     display: flex;
     align-items: center;
     min-width: 0;
     flex: none;
+    /* A safety valve, not the layout: everything fits one line on a normal
+       lane, but a midi track carries an extra MIDI OUT control in this row
+       and a narrow lane would otherwise push the automation chips out of
+       the header entirely. */
+    flex-wrap: wrap;
+    row-gap: 2px;
   }
   .identity-row {
     height: 17px;
@@ -915,15 +925,17 @@
     accent-color: var(--cyan);
   }
   .status-row {
-    height: 19px;
+    min-height: 19px;
     gap: 4px;
     padding-left: 20px;
   }
+  /* The two groups sit on one line, so the chips size to their content
+     instead of each stretching to a third of the row. */
   .status {
-    flex: 1;
-    min-width: 48px;
+    flex: 0 0 auto;
+    min-width: 22px;
     height: 19px;
-    padding: 0 8px;
+    padding: 0 7px;
     border-radius: 3px;
     border: var(--border-width) solid rgb(var(--edge-rgb) / 0.18);
     background: transparent;
@@ -971,10 +983,21 @@
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
   }
-  .automation-row {
-    height: 20px;
-    gap: 8px;
-    padding-left: 20px;
+  /* The divider between "what this lane is doing" and "what its
+     automation is doing". Cosmetic, so it is aria-hidden. */
+  .chip-rule {
+    flex: none;
+    width: var(--border-width);
+    align-self: stretch;
+    min-height: 13px;
+    margin: 0 3px;
+    background: rgb(var(--edge-rgb) / 0.25);
+  }
+  .chip-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
   }
   .section-label {
     flex: none;
@@ -983,8 +1006,8 @@
     letter-spacing: 0.14em;
     text-transform: uppercase;
   }
-  .automation-row .section-label {
-    width: 62px;
+  .chip-group .section-label {
+    flex: none;
   }
   .level-area {
     flex: 1;
