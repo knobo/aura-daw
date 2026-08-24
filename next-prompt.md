@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Automation-mode chips: letters, not words | `fix/automation-mode-chips` | 2026-08-24 | Owner UI note — the track header carries five mode words per lane. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
