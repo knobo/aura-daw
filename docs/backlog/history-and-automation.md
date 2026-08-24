@@ -17,6 +17,23 @@ Product doc: [`automation-audible-and-ui.md`](automation-audible-and-ui.md).
   branch `codex/undo-version-graph-ui`); the guarded linear `Undo to here`
   contract documented in the Plan F handoff landed too (PR #107,
   2026-08-23). Branch `plan-f-history` is kept so cited SHAs resolve.
+- **`Undo to here` leftovers** (PR #107's own reviews recorded these as
+  accepted, not fixed — **not work items unless someone picks them up**).
+  `history_gate` serialises undo, redo and a walk against each other but
+  NOT against ordinary commits, so a walk *notices* an interleaving
+  rather than preventing it: `pop_undo_if` refuses the step whose
+  revision is no longer on top, and the steps already applied stay
+  applied. All-or-nothing would need a different mechanism — a snapshot
+  restore, or gating commits on `history_gate` — and that is a design
+  question, not a follow-up patch. Two smaller ones: the per-step
+  epoch-mismatch branch has no test (it is reachable with the same
+  event-emitter device `undo_to_stops_when_a_commit_lands_between_two_steps_of_the_walk`
+  already builds), and `History::push_undo_unchanged`'s doc still claims
+  "nothing can have been recorded in between", which the same
+  ungated-commit premise weakens — a racer landing between a pop and a
+  failed step's push-back leaves `undo` momentarily non-ascending. That
+  window predates PR #107 and exists identically in `undo`'s and
+  `redo`'s failure arms.
 - **Track D leftovers:** plugin-param bounce, write/touch/latch. The
   non-blocking CLAP param path closed 2026-08-18 (PR #75, branch
   `clap-nonblocking-params`; doc+test follow-up PR #76 on branch
