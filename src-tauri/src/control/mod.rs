@@ -522,6 +522,15 @@ impl Committer {
                     | op::PropPath::Param { .. } => {}
                 }
             }
+            // Plan G2: send amounts, resolved through the CURRENT
+            // `send_slots` for the same reason the track writes resolve
+            // through `slots` — an id with no lane yet (the send was added
+            // by a commit whose rebuild has not run) is skipped, and that
+            // rebuild will populate the lane from the document anyway.
+            for (send_id, amount) in &committed.effect.send_writes {
+                let Some(&idx) = tables.send_slots.get(send_id) else { continue };
+                tables.params.set_send_amount_linear(idx, *amount);
+            }
             if let Some(any_solo) = committed.effect.any_solo {
                 tables.params.any_solo.store(any_solo, Relaxed);
             }
@@ -1007,6 +1016,10 @@ enum CoalesceTarget {
     AutomationLane(String),
     /// Modulation graph keys (`Curve::id` / `Binding::id` / `AutomationClip::id`).
     ModulationKey(String),
+    /// `SendSlot::id` (Plan G2) — keyed by the SEND, not by its track: two
+    /// sends on one track are two independent knobs and must not fold into
+    /// each other.
+    Send(String),
 }
 
 /// The coalescing key a gesture folds by: the op's discriminant + the
@@ -1068,6 +1081,15 @@ impl CoalesceKey {
             op::Op::TempoSet { .. } => Some(Self {
                 kind: "tempoSet",
                 target: CoalesceTarget::Object(op::ObjectRef::Transport),
+                path: None,
+            }),
+            // Plan G2: a send knob drags like a fader, so it folds like one
+            // — a run of amount writes on ONE send is one undo step. The
+            // op is absolute-valued (it carries `amount_db`), which is what
+            // makes discarding the intermediates sound.
+            op::Op::SendSetAmount { send_id, .. } => Some(Self {
+                kind: "sendSetAmount",
+                target: CoalesceTarget::Send(send_id.clone()),
                 path: None,
             }),
             _ => None,
@@ -2498,7 +2520,7 @@ impl ControlPlane {
         // slots leave with the row; PluginRemove then drops the instances
         // (G-10 sweep is a no-op). Undo applies inverses in reverse:
         // PluginAdds then TrackAdd (with inserts).
-        let (track, clip_ids, insert_removes) = {
+        let (track, clip_ids, insert_removes, send_removes, output_resets) = {
             let session = self.session.lock();
             let track = session
                 .store
@@ -2527,9 +2549,38 @@ impl ControlPlane {
                 let params = session.plugins.params.get(&row.id).cloned().unwrap_or_default();
                 insert_removes.push((row, blob, params));
             }
-            (track, clip_ids, insert_removes)
+            // Plan G2: every send POINTING AT this track. Removing a bus
+            // must not leave dangling wires behind — the compiler would drop
+            // them silently, but the send list on the source track would go
+            // on showing a row whose destination no longer exists. Removed
+            // in the SAME commit so one undo brings the bus and its wiring
+            // back together.
+            let mut send_removes = Vec::new();
+            let mut output_resets = Vec::new();
+            for t in &session.store.tracks {
+                for snd in &t.sends {
+                    if snd.dest.as_str() == id {
+                        send_removes.push((t.id.clone(), snd.clone()));
+                    }
+                }
+                // Same argument for the OUTPUT edge: a track routed into a
+                // bus that is going away must fall back to the master here,
+                // in this commit, so one undo restores both. Left alone it
+                // would compile to the master anyway — but silently, and
+                // the document would keep naming a track that is gone.
+                if t.output.as_ref().is_some_and(|o| o.as_str() == id) {
+                    output_resets.push(t.id.clone());
+                }
+            }
+            (track, clip_ids, insert_removes, send_removes, output_resets)
         };
         self.commit(meta, |tx| {
+            for track_id in output_resets {
+                tx.apply(op::Op::TrackSetOutput { track_id, output: None })?;
+            }
+            for (track_id, slot) in send_removes {
+                tx.apply(op::Op::SendRemove { track_id, slot, index: 0 })?;
+            }
             tx.apply(op::Op::TrackRemove {
                 track,
                 index: 0,
@@ -2797,6 +2848,124 @@ impl ControlPlane {
                 track_id: track_id.into(),
                 slot_id: slot_id.into(),
                 bypassed,
+            })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G2: add a send from `track_id` into the bus `dest`. The id is
+    /// minted here (a uuid, stable across reorder — `SCALABILITY` §2), and
+    /// the send lands at unity so adding it is audible; `send_set_amount`
+    /// dials it from there. Returns the row that was stored.
+    pub fn send_add(
+        &self,
+        track_id: &str,
+        dest: &str,
+        meta: op::TxMeta,
+    ) -> Result<crate::audio::types::SendSlot, String> {
+        let slot = crate::audio::types::SendSlot {
+            id: uuid::Uuid::new_v4().to_string(),
+            dest: dest.into(),
+            amount_db: 0.0,
+            pre_fader: false,
+        };
+        let out = slot.clone();
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::SendAdd {
+                track_id: track_id.into(),
+                slot,
+                index: usize::MAX,
+            })
+        })?;
+        Ok(out)
+    }
+
+    /// Plan G2: remove one send edge.
+    pub fn send_remove(&self, track_id: &str, send_id: &str, meta: op::TxMeta) -> Result<(), String> {
+        let slot = {
+            let session = self.session.lock();
+            session
+                .store
+                .tracks
+                .iter()
+                .find(|t| t.id.as_str() == track_id)
+                .ok_or_else(|| format!("unknown track: {track_id}"))?
+                .sends
+                .iter()
+                .find(|s| s.id == send_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown send: {send_id}"))?
+        };
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::SendRemove { track_id: track_id.into(), slot, index: 0 })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G2: set a send's amount in dB. A MIX change — the commit
+    /// resolves it into `ParamTable::send_amount` and schedules NO rebuild.
+    pub fn send_set_amount(
+        &self,
+        track_id: &str,
+        send_id: &str,
+        amount_db: f64,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let make_op = || op::Op::SendSetAmount {
+            track_id: track_id.into(),
+            send_id: send_id.into(),
+            amount_db,
+        };
+        // Same shape as `set_track_mix`'s fader path: inside an open
+        // gesture the write is transient and folds into the batch, so a
+        // knob DRAG is one undo step and one persist; outside one it is an
+        // ordinary commit. Whether a gesture is open is a runtime fact, so
+        // both closures have to exist.
+        let gesture_meta = meta.clone();
+        let folded = self.gesture.commit_transient_and_fold(&meta.actor, || {
+            self.commit_transient_for_gesture(gesture_meta, |tx| tx.apply(make_op()))
+        });
+        match folded {
+            Some(result) => {
+                result?;
+            }
+            None => {
+                self.commit(meta, |tx| tx.apply(make_op()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Plan G2: point a track's output at a bus, or back at the master
+    /// (`output: None`). A MOVE, not a copy — the track stops reaching the
+    /// master. Rejected if it would close a routing loop.
+    pub fn track_set_output(
+        &self,
+        track_id: &str,
+        output: Option<&str>,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        let output = output.map(crate::ids::TrackId::from);
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::TrackSetOutput { track_id: track_id.into(), output })
+        })?;
+        Ok(())
+    }
+
+    /// Plan G2: move a send's tap between post-fader and pre-fader
+    /// (structural — it changes where the wire leaves the strip).
+    pub fn send_set_pre_fader(
+        &self,
+        track_id: &str,
+        send_id: &str,
+        pre_fader: bool,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::SendSetPreFader {
+                track_id: track_id.into(),
+                send_id: send_id.into(),
+                pre_fader,
             })
         })?;
         Ok(())
@@ -5666,6 +5835,7 @@ mod tests {
         let session = Arc::new(Mutex::new(Session::new(store, MidiStore::default())));
         let shared = Arc::new(SharedRt::default());
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            send_slots: Default::default(),
             generation: 1,
             params: Arc::new(ParamTable::default()),
             slots: derive_slots(&session.lock().store.tracks),
@@ -5834,6 +6004,7 @@ mod tests {
         let gen1_slots: std::collections::HashMap<TrackId, usize> =
             [(track_x.clone(), 0)].into_iter().collect();
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
+            send_slots: Default::default(),
             generation: 1,
             params: gen1_params.clone(),
             slots: gen1_slots,
@@ -5872,7 +6043,12 @@ mod tests {
         let gen2_slots: std::collections::HashMap<TrackId, usize> =
             [(track_y.clone(), 0)].into_iter().collect();
         *tables.lock() =
-            GraphTables { generation: 2, params: gen2_params.clone(), slots: gen2_slots };
+            GraphTables {
+                generation: 2,
+                params: gen2_params.clone(),
+                slots: gen2_slots,
+                send_slots: Default::default(),
+            };
 
         // A param write to Y (through the real channel) must resolve
         // through gen-2's CURRENT table.
@@ -6452,6 +6628,98 @@ mod tests {
     /// Controller ruling 2: removing the only soloed track through the
     /// channel must recompute the store-wide `any_solo` RT atomic (old
     /// `remove_track`, audio/mod.rs:378, did this too).
+    /// Plan G2: removing a BUS takes every wire pointing at it with it, in
+    /// the SAME commit. Left behind, those rows name a destination that no
+    /// longer exists: the compiler drops the edge silently, but the send
+    /// list on the source track keeps showing it. One undo brings the bus
+    /// and its wiring back together.
+    #[test]
+    fn removing_a_bus_removes_the_sends_that_pointed_at_it() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        let send = plane.send_add("t-1", "b-1", TxMeta::user("add send")).unwrap();
+        assert_eq!(plane.session().lock().store.tracks[0].sends.len(), 1);
+
+        plane.remove_track("b-1", TxMeta::user("remove bus")).unwrap();
+        {
+            let session = plane.session().lock();
+            assert!(session.store.tracks.iter().all(|t| t.id != "b-1"));
+            assert!(
+                session.store.tracks[0].sends.is_empty(),
+                "the wire goes with the bus, not after it"
+            );
+        }
+
+        plane.undo().unwrap();
+        let session = plane.session().lock();
+        assert!(session.store.tracks.iter().any(|t| t.id == "b-1"), "the bus is back");
+        assert_eq!(
+            session.store.tracks[0].sends.first().map(|s| s.id.clone()),
+            Some(send.id),
+            "and so is the wire, with its own id"
+        );
+    }
+
+    /// Removing a bus takes the OUTPUT edges pointing at it too, in the
+    /// same commit. Left alone the compiler would fall back to the master
+    /// silently, and the document would keep naming a track that is gone.
+    #[test]
+    fn removing_a_bus_re_routes_tracks_that_output_into_it() {
+        let (plane, _rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        plane.track_set_output("t-1", Some("b-1"), TxMeta::user("route")).unwrap();
+        assert_eq!(
+            plane.session().lock().store.tracks[0].output.as_ref().map(|o| o.as_str()),
+            Some("b-1")
+        );
+
+        plane.remove_track("b-1", TxMeta::user("remove bus")).unwrap();
+        assert!(
+            plane.session().lock().store.tracks[0].output.is_none(),
+            "the routed track falls back to the master"
+        );
+
+        plane.undo().unwrap();
+        let session = plane.session().lock();
+        assert!(session.store.tracks.iter().any(|t| t.id == "b-1"), "the bus is back");
+        assert_eq!(
+            session.store.tracks[0].output.as_ref().map(|o| o.as_str()),
+            Some("b-1"),
+            "and so is the routing"
+        );
+    }
+
+    /// A send knob is a MIX change: it must reach the RT table without
+    /// scheduling a rebuild (§10 — rebuilding per knob frame at 500 tracks
+    /// is what round-2 §2.4 forbids).
+    #[test]
+    fn send_set_amount_writes_the_param_table_and_queues_no_rebuild() {
+        let (plane, engine_rx, _ev) = test_plane_with_tracks(&["t-1", "b-1"]);
+        plane.session().lock().store.tracks[1].kind = "bus".into();
+        let send = plane.send_add("t-1", "b-1", TxMeta::user("add send")).unwrap();
+        // The add IS structural; drain its rebuild so the assertion below is
+        // about the knob and nothing else. There is no engine here to
+        // republish tables, so publish the send lane by hand — exactly what
+        // `engine::rebuild` would have derived for this document.
+        while engine_rx.try_recv().is_ok() {}
+        {
+            let mut tables = plane.tables.lock();
+            tables.params = Arc::new(ParamTable::with_slots_and_sends(2, 1));
+            tables.send_slots.insert(send.id.clone(), 0);
+        }
+
+        plane.send_set_amount("t-1", &send.id, -6.0, TxMeta::user("send amount")).unwrap();
+        assert!(
+            engine_rx.try_recv().is_err(),
+            "NO-REBUILD PIN: a send knob must not queue a graph rebuild"
+        );
+        let expected = crate::audio::mixer::db_to_linear(-6.0);
+        assert!(
+            (plane.tables.lock().params.send_amount_linear(0) - expected).abs() < 1e-9,
+            "the amount reached the RT table"
+        );
+    }
+
     #[test]
     fn remove_track_recomputes_any_solo() {
         let (plane, _engine_rx, _events) = test_plane_with_tracks(&["t-1", "t-2"]);
@@ -8517,6 +8785,8 @@ mod tests {
         let mut store = Store::default();
         for (id, name) in [("pad", "Demo Pad"), ("lead", "Demo Lead"), ("bass", "Demo Bass")] {
             store.tracks.push(TrackState {
+                sends: Vec::new(),
+                output: None,
                 id: id.into(),
                 name: name.into(),
                 kind: "midi".into(),
@@ -8626,6 +8896,8 @@ mod tests {
         let mut store = Store::default();
         for (slot, id) in ["pad", "lead", "bass"].iter().enumerate() {
             store.tracks.push(TrackState {
+                sends: Vec::new(),
+                output: None,
                 id: (*id).into(),
                 name: (*id).into(),
                 kind: "midi".into(),

@@ -498,6 +498,17 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
             Op::InsertSetBypass { track_id, slot_id, .. } => {
                 track_id.as_str().len() + slot_id.len()
             }
+            // Plan G2: a send row is two ids plus fixed-size fields.
+            Op::SendAdd { track_id, slot, .. } | Op::SendRemove { track_id, slot, .. } => {
+                track_id.as_str().len() + slot.id.len() + slot.dest.as_str().len()
+            }
+            Op::SendSetAmount { track_id, send_id, .. }
+            | Op::SendSetPreFader { track_id, send_id, .. } => {
+                track_id.as_str().len() + send_id.len()
+            }
+            Op::TrackSetOutput { track_id, output } => {
+                track_id.as_str().len() + output.as_ref().map_or(0, |o| o.as_str().len())
+            }
             // Lanes UX: a whole-list order carries one id string per track,
             // plus the Vec's own allocation. Charged honestly because the
             // op scales with track count — unlike the fixed-size insert ops
@@ -615,6 +626,8 @@ mod tests {
 
     fn track(id: &str) -> crate::audio::types::TrackState {
         crate::audio::types::TrackState {
+            sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: format!("Track {id}"),
             kind: "midi".into(),

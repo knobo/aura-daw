@@ -9,10 +9,10 @@ still needs its own research → plan → gates round (round-2 §8, PDC-before-
 sends). This doc freezes *what* we host and in which order, so the next
 agent does not invent a stock FX suite or ship sends without PDC.
 
-Status: **G1 plan in `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`.**
-Tasks 1–4 landed (PR #52 + PR #55 `118ae23`). Continue at Task 5
-(mixer strip). Do not start G2/G3/G4 until G1 lands. Handoff:
-`docs/handoff/g1-insert-fx.md`.
+Status: **G1 landed; G2 landed (PR #109). Next is G3 (sidechain edges).**
+G1 plan: `docs/superpowers/plans/2026-08-16-plan-g1-insert-fx-pdc.md`.
+Handoff: `docs/handoff/g1-insert-fx.md`. What G2 actually shipped, and
+what it deliberately did not, is at the bottom of this file.
 
 ## What AURA has today
 
@@ -274,3 +274,87 @@ this doc must not lose:
   `LiveInstrument` seams.
 - `src-tauri/src/audio/mixer.rs` — today's linear walk, the thing G1
   replaces with a schedule executor.
+
+## What G2 shipped (2026-08-23, PR #109)
+
+`kind: "bus"` is a real track kind, `TrackState.sends` is a list of
+`{id, dest, amountDb, preFader}` edges, and both the live engine and the
+offline bounce render them through one shared compile step,
+`audio::bus::compile_routing`.
+
+The parts worth knowing before touching this:
+
+- **Two compensating delays, and they are not interchangeable.**
+  `RtTrack::pdc` (G1) aligns the SOURCES and sits BEFORE the send taps,
+  so every source leaves at the same time — that is what makes most edge
+  delays zero. `RtTrack::out_pdc` sits AFTER the taps and pads only the
+  output path. Growing `pdc` instead would delay the sends by the same
+  amount and dry and wet would never converge. `audio::bus`'s module doc
+  has the diagram.
+- **The render loops inverted.** A bus cannot run until every track that
+  feeds it has contributed, so `mixer::render_impl` is now windows of
+  `MAX_LIVE_BLOCK` outside, tracks inside, then the bus pass. The window
+  is what bounds `bus_buf` — the RT thread still never sizes a buffer.
+  A block of `MAX_LIVE_BLOCK` frames or fewer (every real one: cpal
+  quanta here are 128–2048) runs that loop exactly once, so the strip is
+  the pre-G2 strip plus the taps.
+- **A return uses the balance pan law**, not constant-power. See
+  `docs/TRAPS.md`.
+- **A return answers to its own mute only.** Soloing a vocal must not
+  take its reverb with it; that is Live's default and the only one that
+  makes solo usable on a project with returns.
+- **The amount is a param lane, not a rebuild.** `ParamTable::send_amount`
+  + `GraphTables::send_slots`, resolved by `SendSlot::id`, and
+  `SendSetAmount` folds into an open gesture the way a fader does.
+- **The offline bounce now walks insert chains too**, which is G1 Task
+  8's offline half. Without it an export would have dropped exactly the
+  reverb the user mixed with.
+
+  **Two caveats, both inherited from the offline INSTRUMENT path and now
+  widened to effects.** A bounce sees whatever param values the live host
+  instance currently holds (`audio::offline`'s header). And a format host
+  refuses a SECOND live node for an instance that already has one out
+  (`clap_host`'s `node_out` guard), so **while the engine is holding a
+  plugin, the bounce cannot build its own node for it and that slot
+  renders dry**. It is logged loudly rather than silently dropped, but
+  the honest fix is per-bounce PRIVATE instances — a `clap_host` /
+  `lv2_host` API addition scheduled with the node-graph round, not
+  something this file can work around: reusing the live node would let a
+  bounce and the RT thread process one plugin concurrently.
+
+### Output routing landed with it (owner steer, 2026-08-24)
+
+The first ear-check found the gap immediately: "lyden går ut fra bussen
+OG fra sporet — to strømmer der vi bare skulle hatt én". That is correct
+for a send and wrong for what the owner wanted, so G2 grew the second
+primitive rather than a "double output" toggle, which would have
+conflated the two.
+
+`TrackState.output` names a bus, or `None` for the master. It is a MOVE:
+a routed track no longer reaches the master. Buses route too, so a drum
+bus into a mix bus works, and the compiler is a real DAG:
+
+- `bus::compile_routing` topologically sorts the buses (over BOTH edge
+  kinds) so the renderer's single forward pass is enough.
+- `bus::would_cycle` rejects a loop at the op layer — both `SendAdd` and
+  `TrackSetOutput` — because a cycle is only meaningful through an
+  explicit one-block delay node (`SCALABILITY` §1) and there isn't one.
+  A hand-edited cycle is dropped at compile time rather than hung on.
+- PDC is per EDGE now: each sink has an arrival target and every edge
+  into it is padded up. That is what lets a track's dry path wait for a
+  slow reverb while its own send into that reverb leaves immediately.
+
+Deliberately NOT in G2, in the order they are likely to be wanted:
+
+1. **Send-amount automation.** The lane exists and is automatable in
+   shape; nothing addresses it from `AutomationDoc` yet.
+2. **Reordering sends.** The list is document-ordered and there is no
+   `SendReorder` — order does not affect the sum, so this is cosmetic.
+3. **Feedback routing** (a cycle through a deliberate one-block delay
+   node). Rejected today; needs the delay node first.
+4. **G3 sidechain edges** and **G4 envelope followers**, unchanged from
+   the plan above.
+
+Owner ear-check owed: create a bus, load a convolution reverb on it,
+send two or three tracks in, and confirm it sounds like one room — then
+export and confirm the WAV has it.

@@ -402,6 +402,17 @@
     await project.addTrack({ name: `MIDI ${project.tracks.length + 1}`, color, kind: "midi" });
   }
 
+  /** Plan G2: a return track — no clips, no instrument, an insert chain fed
+   * by other tracks' sends. One convolution reverb, many sources, one room. */
+  async function addBusTrack() {
+    const color = theme.tokens.trackPalette[project.tracks.length % theme.tokens.trackPalette.length];
+    await project.addTrack({
+      name: `Bus ${project.tracks.filter((t) => t.kind === "bus").length + 1}`,
+      color,
+      kind: "bus",
+    });
+  }
+
   async function addAutomationTrack() {
     const color = theme.tokens.trackPalette[project.tracks.length % theme.tokens.trackPalette.length];
     await project.addTrack({
@@ -950,6 +961,7 @@
         <button class="add mono" onclick={addTrack}>+ AUDIO</button>
         <button class="add midi mono" onclick={addMidiTrack}>+ MIDI</button>
         <button class="add auto mono" onclick={addAutomationTrack}>+ AUTO</button>
+        <button class="add bus mono" onclick={addBusTrack} title="Add a return bus — send tracks into it and put one shared reverb on it">+ BUS</button>
       </div>
       {#if project.tracks.length > 1}
         <div class="foldrow">
@@ -1437,6 +1449,10 @@
   .add.auto:hover {
     color: var(--violet);
     border-color: rgb(var(--violet-rgb) / 0.45);
+  }
+  .add.bus:hover {
+    color: var(--cyan);
+    border-color: rgb(var(--cyan-rgb) / 0.45);
   }
   .lane.midilane {
     background:

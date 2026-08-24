@@ -1473,6 +1473,10 @@ mod tests {
             AbsNoteEvent { sample: 200_000, key: 69, velocity: 0, channel: 0 },
         ];
         let track = RtTrack {
+            sends: Vec::new(),
+            out_pdc: None,
+            output: None,
+            win: Default::default(),
             slot: 0,
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(events) }),
@@ -1558,6 +1562,10 @@ mod tests {
         let node: Box<dyn LiveInstrument> =
             Box::new(GainAutomatedNode::new(Box::new(ConstSource), ev.clone(), 0));
         let track = RtTrack {
+            sends: Vec::new(),
+            out_pdc: None,
+            output: None,
+            win: Default::default(),
             slot: 0,
             clips: Vec::new(),
             live: Some(LiveSource { node: LiveNodeCell::new(node), events: Arc::new(vec![]) }),

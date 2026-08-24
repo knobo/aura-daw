@@ -307,6 +307,8 @@ fn a_routed_track_stops_sounding_its_internal_instrument() {
     let mut store = Store::default();
     for id in ["t-out", "t-in"] {
         store.tracks.push(TrackState {
+            sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: id.into(),
             kind: "midi".into(),
@@ -396,6 +398,8 @@ fn a_routed_clip_is_subtracted_from_its_tracks_internal_voice() {
 
     let mut store = Store::default();
     store.tracks.push(TrackState {
+        sends: Vec::new(),
+        output: None,
         id: "t-1".into(),
         name: "t-1".into(),
         kind: "midi".into(),

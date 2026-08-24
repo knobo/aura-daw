@@ -126,8 +126,10 @@ pub enum AutomationMode {
 pub struct TrackState {
     pub id: TrackId,
     pub name: String,
-    /// "audio" | "midi" | "automation" ("bus" reserved). Automation tracks
-    /// hold clips that drive bindings; they take no mixer slot (design §3.6).
+    /// "audio" | "midi" | "automation" | "bus". Automation tracks hold
+    /// clips that drive bindings; they take no mixer slot (design §3.6).
+    /// A `bus` track (Plan G2) is a return: no clips, no instrument, only
+    /// an insert chain fed by other tracks' sends, mixing into master.
     pub kind: String,
     /// Fader gain in dB (-inf encoded as -160.0).
     pub gain_db: f64,
@@ -147,6 +149,29 @@ pub struct TrackState {
     /// Ordered insert-FX slots (Plan G1). Empty on pre-G1 files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inserts: Vec<InsertSlot>,
+    /// Sends into bus tracks (Plan G2) — a copy of this track's signal at
+    /// an amount, so many sources can share ONE reverb/echo instance
+    /// instead of paying for (and hearing) N different rooms. Empty on
+    /// pre-G2 files. Buses do not send (G2 ships no bus-to-bus edge; a
+    /// cycle would need an explicit one-block delay node, `SCALABILITY` §1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<SendSlot>,
+    /// Where this track's fader output GOES (Plan G2). `None`/absent = the
+    /// master, which is what every pre-G2 project means and the default for
+    /// a new track.
+    ///
+    /// An output is a MOVE, not a copy: a track routed to a bus stops
+    /// reaching the master and is heard through that bus instead. That is
+    /// the difference between a submix (a drum bus: eight things compressed
+    /// together) and a [send](SendSlot) (a shared reverb: everyone still
+    /// heard dry). Conflating the two is the mistake `audio::bus`'s module
+    /// doc is about.
+    ///
+    /// Buses may point at other buses — a drum bus into a mix bus is the
+    /// ordinary case — as long as the result stays acyclic
+    /// (`audio::bus::would_cycle`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<TrackId>,
     /// Lane group this track belongs to, as the group's own display NAME —
     /// the group IS its name, so there is no second document collection to
     /// keep in sync, no orphan-group GC, and no id→name lookup for the UI.
@@ -169,6 +194,36 @@ pub struct TrackState {
     /// always-on behavior — no migration needed.
     #[serde(default)]
     pub automation_mode: AutomationMode,
+}
+
+/// One send edge (Plan G2): a copy of this track's signal, at `amount_db`,
+/// into the bus track named by `dest`.
+///
+/// The data model is an EDGE WITH AN AMOUNT, not a special effect type —
+/// that is what every DAW's aux send / return track actually is, and it is
+/// what lets one convolution reverb serve twenty sources.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendSlot {
+    /// Stable across reorder and across rebuilds — never a list index
+    /// (`SCALABILITY` §2: undo and automation must survive a reorder).
+    pub id: String,
+    /// The `kind: "bus"` track this send feeds.
+    pub dest: TrackId,
+    /// Send amount in dB, -160.0 encoding -inf — the same encoding as
+    /// `TrackState::gain_db`, so one `db_to_linear` serves both. A new send
+    /// lands at unity so adding it is audible; dial it back from there.
+    #[serde(default)]
+    pub amount_db: f64,
+    /// Tap point. `false` (the default) is POST-fader: the send follows the
+    /// track fader and its mute, which is what a reverb send normally
+    /// wants. `true` taps post-insert/pre-fader, so the send survives
+    /// pulling the dry signal out of the mix.
+    ///
+    /// Structural (it changes where the wire leaves the strip), unlike
+    /// `amount_db`, which is a live parameter write.
+    #[serde(default)]
+    pub pre_fader: bool,
 }
 
 /// One insert-FX slot on a track. `id` is stable across reorder; `instance_id`
@@ -289,8 +344,22 @@ pub struct Store {
 
 /// True when the track occupies a mixer slot (everything except
 /// `kind: "automation"`, which drives bindings and renders no audio).
+/// Bus tracks DO take a slot — they have a fader, a pan, a mute and a
+/// meter lane like any other strip; what they lack is a source.
 pub fn is_mixer_track(track: &TrackState) -> bool {
     track.kind != "automation"
+}
+
+/// True for a return/bus track (Plan G2): no clips, no instrument, fed
+/// only by other tracks' sends.
+pub fn is_bus_track(track: &TrackState) -> bool {
+    track.kind == "bus"
+}
+
+/// True when the track can carry clips and an instrument — i.e. it is a
+/// SOURCE in the mixer graph. A bus is a sink for sends only.
+pub fn is_source_track(track: &TrackState) -> bool {
+    matches!(track.kind.as_str(), "audio" | "midi")
 }
 
 /// Number of mixer slots for `tracks` — every non-automation row, including
@@ -317,6 +386,39 @@ pub fn derive_slots(tracks: &[TrackState]) -> HashMap<TrackId, usize> {
         .enumerate()
         .map(|(i, t)| (t.id.clone(), i))
         .collect()
+}
+
+/// Derive SEND-amount parameter slots from document order, exactly the way
+/// [`derive_slots`] derives mixer slots (Plan G2): pure, per-rebuild, no
+/// stored allocation state. A send's amount is a live parameter — dragging
+/// the knob must be an atomic store, never a graph rebuild (§10) — so it
+/// needs an index into this rebuild's `ParamTable::send_amount`.
+///
+/// Keyed by `SendSlot::id` alone: send ids are uuids, unique across the
+/// session, so the map does not need the track to disambiguate and the
+/// control side can resolve a knob write from the send id it was given.
+/// Sends whose `dest` is not a bus are still numbered here — the compiler
+/// drops the EDGE, but leaving a hole in the numbering would make the map
+/// depend on the destination's kind, which is exactly the kind of coupling
+/// that silently re-points a live knob when a track changes kind.
+pub fn derive_send_slots(tracks: &[TrackState]) -> HashMap<String, usize> {
+    let mut out = HashMap::new();
+    let mut n = 0usize;
+    for t in tracks {
+        for s in &t.sends {
+            out.insert(s.id.clone(), n);
+            n += 1;
+        }
+    }
+    out
+}
+
+/// Number of send-amount parameter slots for `tracks` — every send row,
+/// including any whose id is a duplicate (sizing by
+/// `derive_send_slots(...).len()` would undercount, the same trap
+/// [`mixer_slot_count`] documents).
+pub fn send_slot_count(tracks: &[TrackState]) -> usize {
+    tracks.iter().map(|t| t.sends.len()).sum()
 }
 
 impl Store {
@@ -357,6 +459,8 @@ pub(crate) mod testutil {
 
     pub fn test_track(id: &str) -> TrackState {
         TrackState {
+            sends: Vec::new(),
+            output: None,
             id: id.into(),
             name: "New Track".into(),
             kind: "audio".into(),

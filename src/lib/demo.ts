@@ -57,6 +57,7 @@ import {
   type PluginInstanceInfo,
   type PluginListResult,
   type InsertSlot,
+  type SendSlot,
   type PluginParamChange,
   type PluginParamInfo,
   type PluginScanStatus,
@@ -2981,6 +2982,56 @@ export class DemoBackend implements Backend {
     const track = this.track(trackId);
     if (!track) return;
     track.inserts = (track.inserts ?? []).map((s) => (s.id === slotId ? { ...s, bypassed } : s));
+    this.resyncAudio();
+  }
+
+  // ── sends / bus returns (Plan G2) ──
+  // Document-level only: demo mode has no mixer graph, so a send is visible
+  // and editable but inaudible — same deal as an insert here.
+
+  async sendAdd(trackId: string, dest: string): Promise<SendSlot> {
+    const track = this.track(trackId);
+    if (!track) throw new Error(`unknown track: ${trackId}`);
+    const bus = this.track(dest);
+    if (!bus || bus.kind !== "bus") throw new Error(`send destination ${dest} is not a bus track`);
+    if ((track.sends ?? []).some((s) => s.dest === dest)) {
+      throw new Error(`track already sends to ${dest}`);
+    }
+    const slot: SendSlot = { id: uuid(), dest, amountDb: 0, preFader: false };
+    track.sends = [...(track.sends ?? []), slot];
+    this.resyncAudio();
+    return slot;
+  }
+
+  async sendRemove(trackId: string, sendId: string): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    track.sends = (track.sends ?? []).filter((s) => s.id !== sendId);
+    this.resyncAudio();
+  }
+
+  async sendSetAmount(trackId: string, sendId: string, amountDb: number): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    track.sends = (track.sends ?? []).map((s) => (s.id === sendId ? { ...s, amountDb } : s));
+  }
+
+  async sendSetPreFader(trackId: string, sendId: string, preFader: boolean): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    track.sends = (track.sends ?? []).map((s) => (s.id === sendId ? { ...s, preFader } : s));
+    this.resyncAudio();
+  }
+
+  async trackSetOutput(trackId: string, output: string | null): Promise<void> {
+    const track = this.track(trackId);
+    if (!track) return;
+    if (output !== null) {
+      const bus = this.track(output);
+      if (!bus || bus.kind !== "bus") throw new Error(`${output} is not a bus track`);
+      if (output === trackId) throw new Error("a track cannot feed itself");
+    }
+    track.output = output;
     this.resyncAudio();
   }
 

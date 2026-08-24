@@ -1044,6 +1044,8 @@ mod tests {
     fn track_add(id: &str) -> Op {
         Op::TrackAdd {
             track: crate::audio::types::TrackState {
+                sends: Vec::new(),
+                output: None,
                 id: id.into(),
                 name: id.into(),
                 kind: "audio".into(),

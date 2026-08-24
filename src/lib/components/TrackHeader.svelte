@@ -26,6 +26,8 @@
   import LaneGroupMenu from "./LaneGroupMenu.svelte";
   import AutomationModeSelector from "./AutomationModeSelector.svelte";
   import InsertChain from "./plugins/InsertChain.svelte";
+  import SendRack from "./plugins/SendRack.svelte";
+  import OutputPicker from "./plugins/OutputPicker.svelte";
   import LanePluginStrip from "./plugins/LanePluginStrip.svelte";
 
   let {
@@ -44,6 +46,10 @@
   let pickerOpen = $state(false);
   let groupMenuOpen = $state(false);
   let fxPopoverOpen = $state(false);
+  /** Plan G2: the sends popover (bus returns this track feeds). */
+  let sendPopoverOpen = $state(false);
+  /** Plan G2: the output picker (where this track's signal GOES). */
+  let outPopoverOpen = $state(false);
 
   // ── rename ──
   // The editor is opened by double-clicking the name, which is the gesture
@@ -133,6 +139,11 @@
   function onDepthDown() {
     openGesture("depth drag");
   }
+
+  /** The bus this track is routed into, if any (Plan G2). */
+  const outTarget = $derived(
+    track.output ? project.tracks.find((t) => t.id === track.output) : undefined,
+  );
 
   const gainPct = $derived(((track.gainDb + 60) / 72) * 100);
   const instrument = $derived(
@@ -388,17 +399,23 @@
 
       <div class="metadata-row" role="gridcell" aria-label="Routing and FX for {track.name}">
         <span class="picker">
-          <button class="groupchip mono" class:on={group !== null} aria-haspopup="menu" aria-expanded={groupMenuOpen} aria-label={group ? "Change lane group " + group : "Add lane to a group"} title={group ? "Lane group: " + group : "Add this lane to a group"} onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ? "Group · " + group : "Group · none"}</button>
+          <!-- Owner note (2026-08-24): the word "Group" was on every lane
+               whether or not the lane had one. The VALUE is the news; the
+               word is what the tooltip is for. Ungrouped shows a dim
+               placeholder so the control is still findable. -->
+          <button class="groupchip mono" class:on={group !== null} aria-haspopup="menu" aria-expanded={groupMenuOpen} aria-label={group ? "Change lane group " + group : "Add lane to a group"} title={group ? "Lane group: " + group : "Add this lane to a group"} onclick={() => (groupMenuOpen = !groupMenuOpen)}>{group ?? "GRP"}</button>
           {#if groupMenuOpen}<LaneGroupMenu {track} onclose={() => (groupMenuOpen = false)} />{/if}
         </span>
         {#if isAutomation}
-          <span class="kindchip automation-kind mono">Automation track</span>
+          <span class="kindchip automation-kind mono" title="Automation track — drives bindings, renders no audio">⌁</span>
         {:else if track.kind === "midi"}
           <button class="instchip mono" class:bound={!!instrument} class:plugin={!!pluginInst} class:stub={pluginInst?.status === "stub"} class:crashed={pluginInst?.status === "crashed"} title={pluginInst ? "Open plugin parameters for " + pluginInst.name : instrument ? "Open instrument browser for " + instrument.name : "Assign an instrument"} onclick={openInstrumentPanel}>
             {#if pluginInst}Instrument · {patch?.name ?? pluginInst.name}{:else if instrument}Instrument · {instrument.name}{:else}Instrument · polysynth{/if}
           </button>
+        {:else if track.kind === "bus"}
+          <span class="kindchip bus-kind mono" title="Return bus — fed by other tracks' sends and outputs">B</span>
         {:else}
-          <span class="kindchip mono">Audio track</span>
+          <span class="kindchip mono" title="Audio track">A</span>
         {/if}
         {#if !isAutomation}
           <LanePluginStrip {track} onoverflow={() => (fxPopoverOpen = true)} />
@@ -418,6 +435,44 @@
               <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
             {/if}
           </span>
+          <span class="picker">
+            <button
+              class="status outchip"
+              class:on={outPopoverOpen}
+              class:routed={!!track.output}
+              title={outTarget
+                ? `Output: ${outTarget.name} — this track does not reach the master directly`
+                : "Output: Master"}
+              aria-haspopup="menu"
+              aria-expanded={outPopoverOpen}
+              onclick={() => (outPopoverOpen = !outPopoverOpen)}
+            >
+              →{outTarget ? ` ${outTarget.name}` : " MASTER"}
+            </button>
+            {#if outPopoverOpen}
+              <OutputPicker {track} onclose={() => (outPopoverOpen = false)} />
+            {/if}
+          </span>
+          {#if track.kind !== "bus"}
+            <span class="picker">
+              <button
+                class="status sendchip"
+                class:on={sendPopoverOpen}
+                title={(track.sends?.length ?? 0) > 0
+                  ? `Sends (${track.sends!.length})`
+                  : "Send this track into a bus"}
+                aria-haspopup="menu"
+                aria-expanded={sendPopoverOpen}
+                aria-pressed={sendPopoverOpen}
+                onclick={() => (sendPopoverOpen = !sendPopoverOpen)}
+              >
+                SEND{(track.sends?.length ?? 0) > 0 ? ` ${track.sends!.length}` : ""}
+              </button>
+              {#if sendPopoverOpen}
+                <SendRack {track} onclose={() => (sendPopoverOpen = false)} />
+              {/if}
+            </span>
+          {/if}
           <span class="picker metadata-lanes">
             <button class="status lanes" class:on={modulation.hasVisible(track.id) || pickerOpen} title="Show or add automation lanes" aria-haspopup="menu" aria-expanded={pickerOpen} aria-pressed={modulation.hasVisible(track.id)} onclick={() => (pickerOpen = !pickerOpen)}>Lanes</button>
             {#if pickerOpen}<LanePickerMenu {track} onclose={() => (pickerOpen = false)} />{/if}
@@ -891,15 +946,19 @@
     height: 17px;
   }
   .metadata-row .groupchip {
-    max-width: 112px;
+    max-width: 96px;
   }
   .metadata-row .instchip {
     flex: 1;
     max-width: none;
   }
   .kindchip {
-    min-width: 0;
-    padding: 2px 6px;
+    /* A one-letter badge now (owner note, 2026-08-24), so it sizes like
+       one instead of reserving room for "Automation track". */
+    flex: none;
+    min-width: 15px;
+    text-align: center;
+    padding: 2px 4px;
     border: var(--border-width) solid rgb(var(--edge-rgb) / 0.18);
     border-radius: 3px;
     color: var(--text-faint);
@@ -909,6 +968,10 @@
   .automation-kind {
     color: var(--violet);
     border-color: rgb(var(--violet-rgb) / 0.35);
+  }
+  .bus-kind {
+    color: var(--cyan);
+    border-color: rgb(var(--cyan-rgb) / 0.35);
   }
   .midiout-check {
     display: inline-flex;
@@ -982,6 +1045,31 @@
     background: var(--violet);
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
+  .status.outchip {
+    min-width: 40px;
+    max-width: 96px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .status.outchip.routed {
+    color: var(--amber);
+    border-color: rgb(var(--amber-rgb) / 0.45);
+  }
+  .status.outchip.on {
+    color: var(--bg-0);
+    background: var(--amber);
+    border-color: var(--amber);
+  }
+  .status.sendchip {
+    min-width: 40px;
+  }
+  .status.sendchip.on {
+    color: var(--bg-0);
+    background: var(--cyan);
+    border-color: var(--cyan);
+    box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--cyan-rgb) / 0.35);
   }
   /* The divider between "what this lane is doing" and "what its
      automation is doing". Cosmetic, so it is aria-hidden. */

@@ -2433,6 +2433,8 @@ mod tests {
 
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
+            output: None,
             id: "t-1".into(),
             name: "t-1".into(),
             kind: "midi".into(),
@@ -2557,6 +2559,8 @@ mod tests {
 
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
+            output: None,
             id: "t-1".into(),
             name: "t-1".into(),
             kind: "midi".into(),
@@ -2664,6 +2668,8 @@ mod tests {
 
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
+            output: None,
             id: "t-1".into(),
             name: "t-1".into(),
             kind: "midi".into(),
@@ -3179,6 +3185,8 @@ mod tests {
 
         let mut store = Store::default();
         store.tracks.push(TrackState {
+            sends: Vec::new(),
+            output: None,
             id: "t-1".into(),
             name: "t-1".into(),
             kind: "midi".into(),

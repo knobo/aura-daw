@@ -19,6 +19,16 @@ Two PRs, one track. Details, scope calls and what is left:
 | Shared `browser/` layer | instruments / samples / presets migrated (in PR #93) |
 | Lane multi-select + bulk M/S/A | `lane-bulk.ts`, ARIA grid (in PR #93) |
 
+## Mixer graph — insert FX, sends, returns (Plan G)
+
+Product cut, what shipped and what did not:
+[`backlog/insert-fx-sends-sidechain.md`](backlog/insert-fx-sends-sidechain.md).
+
+| What | Where |
+|---|---|
+| **G2 — bus tracks, sends AND output routing.** Two primitives, kept apart on purpose: a send is a COPY (shared reverb, everyone still heard dry), an output is a MOVE (a submix — the track stops reaching the master). Buses route and send too, so a drum bus into a mix bus works; the compiler is a real DAG with a topological order and cycle rejection (`bus::would_cycle`), and PDC is per EDGE so a dry path can wait for a slow return while its own send into that return leaves immediately. `kind: "bus"` returns, `TrackState.sends` + `TrackState.output` edges, `audio::bus::compile_routing` shared by the engine and the bounce, two compensating delays (source alignment before the taps, dry-path alignment after them), a windowed render so the bus pass can run after every tap, the balance pan law on returns, send amount as a `ParamTable` lane (no rebuild per knob frame), a SENDS rack on the track header and `+ BUS`. Also closes G1 Task 8's offline half: the bounce now walks insert chains. **Owner ear-check owed** — one convolution reverb, several sources, one room, then export. | PR #109 |
+| G1 Task 7 — inserts wired into `engine::rebuild` (effects audible on audio and MIDI tracks) | PR #90 |
+
 ## Everything else
 
 | What | Pointer |
