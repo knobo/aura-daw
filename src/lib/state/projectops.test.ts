@@ -25,6 +25,14 @@ const invokes = {
     (): Promise<{ label: string | null; undoDepth: number; redoDepth: number }> =>
       Promise.resolve({ label: "set gain", undoDepth: 1, redoDepth: 0 }),
   ),
+  historyUndoTo: vi.fn(
+    (
+      _targetRev: number,
+      _expectedEpoch: number,
+      _expectedHeadRev: number | null,
+    ): Promise<{ steps: number; label: string | null }> =>
+      Promise.resolve({ steps: 2, label: "move clip" }),
+  ),
   getProjectState: vi.fn(() =>
     Promise.resolve({
       projectName: "Loaded",
@@ -363,6 +371,84 @@ describe("undo / redo (Plan E Task 17)", () => {
     expect(invokes.automationGet).toHaveBeenCalledTimes(1);
     expect(invokes.modulationGet).toHaveBeenCalledTimes(1);
     expect(invokes.pluginList).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("undo to here (Task 4)", () => {
+  it("does nothing when the backend has no op log (demo mode)", async () => {
+    const saved = mockBackend.historyUndoTo;
+    // The optional-method pattern: the demo backend simply omits it.
+    // @ts-expect-error deliberately removing an optional method
+    delete mockBackend.historyUndoTo;
+
+    const result = await projectops.undoTo(8, 4, 9);
+
+    expect(result).toBe(false);
+    expect(invokes.getProjectState).not.toHaveBeenCalled();
+    expect(toasts.list).toHaveLength(0);
+    mockBackend.historyUndoTo = saved;
+  });
+
+  it("is silent, and re-pulls nothing, when the target is already the head (steps === 0)", async () => {
+    invokes.historyUndoTo.mockResolvedValueOnce({ steps: 0, label: null });
+
+    const result = await projectops.undoTo(9, 4, 9);
+
+    expect(result).toBe(true);
+    expect(invokes.getProjectState).not.toHaveBeenCalled();
+    expect(toasts.list).toHaveLength(0);
+  });
+
+  it("re-pulls and toasts the destination by revision, never by out.label, when the walk moved", async () => {
+    invokes.historyUndoTo.mockResolvedValueOnce({ steps: 2, label: "trim clip" });
+
+    const result = await projectops.undoTo(8, 4, 9);
+
+    expect(invokes.historyUndoTo).toHaveBeenCalledWith(8, 4, 9);
+    expect(result).toBe(true);
+    expect(invokes.getProjectState).toHaveBeenCalled();
+    expect(lastToast().title).toBe("UNDO");
+    // The destination is the revision the caller asked for (r8), not the
+    // backend's `out.label` ("trim clip" — the last step undone, which for
+    // a multi-step walk names the wrong edit for "where you landed").
+    expect(lastToast().lines).toEqual(["2 steps back to r8"]);
+    expect(lastToast().lines.join(" ")).not.toContain("trim clip");
+  });
+
+  it("toasts the failure and rethrows so the caller can render the reason", async () => {
+    invokes.historyUndoTo.mockRejectedValueOnce(new Error("the edit history changed under this request"));
+
+    await expect(projectops.undoTo(8, 4, 9)).rejects.toThrow(
+      "the edit history changed under this request",
+    );
+
+    expect(lastToast().title).toBe("UNDO TO HERE FAILED");
+    expect(lastToast().kind).toBe("error");
+  });
+
+  /**
+   * I-2 (whole-branch review). `undo_to` leaves the steps it applied before
+   * a mid-walk abort APPLIED, so a rejection does NOT mean "nothing
+   * happened". `project` and `midi` self-heal off `project://changed`, but
+   * automation, modulation, launch and an open plugin's params only refresh
+   * in `repull()` — so without one here a partial walk leaves the automation
+   * lanes and the param panel showing pre-walk values.
+   */
+  it("re-pulls the stores a partial walk left stale, then rethrows", async () => {
+    const { plugins } = await import("./plugins.svelte");
+    plugins.openInstanceId = "inst-1";
+    invokes.historyUndoTo.mockRejectedValueOnce(
+      new Error("stopped after 1 of 3 steps: the edit history moved under the walk"),
+    );
+
+    await expect(projectops.undoTo(8, 4, 9)).rejects.toThrow("stopped after 1 of 3 steps");
+
+    expect(invokes.getProjectState).toHaveBeenCalled();
+    expect(invokes.automationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.modulationGet).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginList).toHaveBeenCalledTimes(1);
+    expect(invokes.pluginGetParams).toHaveBeenCalledWith("inst-1");
+    expect(lastToast().title).toBe("UNDO TO HERE FAILED");
   });
 });
 

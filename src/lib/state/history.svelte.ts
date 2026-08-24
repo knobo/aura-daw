@@ -1,4 +1,5 @@
 import { backend } from "../tauri";
+import { projectops } from "./projectops.svelte";
 import type { HistoryOverview, HistoryVersionDetail } from "../types/ipc";
 
 class HistoryBrowser {
@@ -62,6 +63,41 @@ class HistoryBrowser {
       this.detail = null;
       this.error = String(err);
     }
+  }
+
+  /** The selected row, or null. */
+  get selected() {
+    return this.overview?.versions.find((v) => v.rev === this.selectedRev) ?? null;
+  }
+
+  /**
+   * `Undo to here` is offered for a selected revision that is on the undo
+   * ancestry and is not already the head (walking to the head is a no-op).
+   * `onUndoPath` is only a hint — the backend re-validates under its own
+   * lock and can still refuse, so `undoToSelected` below still has to
+   * handle a real rejection, not treat this as authority.
+   */
+  get canUndoToSelected() {
+    const s = this.selected;
+    return Boolean(s?.onUndoPath && this.overview && s.rev !== this.overview.headRev);
+  }
+
+  async undoToSelected() {
+    const o = this.overview;
+    const rev = this.selectedRev;
+    if (!o || rev == null || !this.canUndoToSelected) return;
+    this.error = null;
+    let failure: string | null = null;
+    try {
+      await projectops.undoTo(rev, o.epoch, o.headRev);
+    } catch (err) {
+      failure = String(err);
+    }
+    // ORDER MATTERS: `loadOnce` clears `error` on its way in, so a refused
+    // walk's reason is assigned AFTER the refresh, not in a `finally` before
+    // it — otherwise the panel refreshes the message away in the same tick.
+    await this.refresh();
+    if (failure) this.error = failure;
   }
 }
 

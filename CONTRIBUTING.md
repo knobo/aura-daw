@@ -76,8 +76,8 @@ singer. It does not exercise the Tauri command layer.
 ## Running the tests
 
 ```sh
-cd src-tauri && cargo test   # 1261 tests (1225 lib + 36 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-18 after G1 Task 5 merged into the Composer, Plan H1)
-npm test                     # 1215 frontend tests (1105 unit + 110 DOM-mounted; vitest; counted 2026-08-21 after Step 6 (automation as an inventory) landed)
+cd src-tauri && cargo test   # 1387 tests (1344 lib + 43 integration, plus 2 #[ignore]d plugin repros; counted 2026-08-24 after PR #107 (Undo to here) landed)
+npm test                     # 1231 frontend tests (1111 unit + 120 DOM-mounted; vitest; counted 2026-08-24 after PR #107 (Undo to here) landed)
 npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```

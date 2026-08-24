@@ -250,6 +250,7 @@ pub fn run() {
             control::redo,
             control::history_overview,
             control::history_version,
+            control::history_undo_to,
             control::import_audio_clip,
             control::seed_demo_project,
             // ---- control plane: wave 1 features ----

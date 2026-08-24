@@ -22,6 +22,7 @@ Two PRs, one track. Details, scope calls and what is left:
 
 | What | Pointer |
 |---|---|
+| **`Undo to here`** — guarded linear walk back to a retained revision: `ControlPlane::undo_to` validates the target against the live undo path and the caller's observed `(epoch, head rev)`, then repeats the ordinary undo step under one `history_gate` hold; additive `history_undo_to` command, `onUndoPath`/`epoch`/`headRev` on the overview, and the action in the HISTORY dock | PR #107. Contract: `PHASE4-PLAN.md` "Plan F handoff" carry-forward (e). Plan: [`2026-08-23-undo-to-here.md`](superpowers/plans/2026-08-23-undo-to-here.md) |
 | **Extract melody to MIDI** — segmenting audio clip pitch frames to editable MIDI clip, auto-creating/targeting MIDI tracks with undo, and selecting as Pitch Coach reference track | PR #91. Product doc: [`pitch-track.md`](pitch-track.md) |
 | **Pitch analysis action on clip view** — analyse clip button on selected audio clips, persisted APTF cache rebuild, teardown/generation guards, and PitchCoach report cache invalidation | PR #87 `25af6ae`. |
 | **Write / Touch / Latch automation modes** — Off / Read / Write / Touch / Latch per track, real-time control-thread point recorder, single-op commit on stop/release with undo | PR #85 `d496903`. Design spec: [`2026-08-18-automation-write-touch-latch-design.md`](superpowers/specs/2026-08-18-automation-write-touch-latch-design.md). Plan: [`2026-08-18-automation-write-touch-latch.md`](superpowers/plans/2026-08-18-automation-write-touch-latch.md) |
