@@ -7,6 +7,7 @@
    * parameter's lane.
    */
   import { untrack } from "svelte";
+  import { paramFollow } from "../../state/param-follow.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { modulation } from "../../state/modulation.svelte";
@@ -33,7 +34,14 @@
       instances: plugins.instances,
       tracks: project.tracks,
       visible: modulation.visible,
-      paramInfo: (instanceId, paramId) => plugins.paramInfo(instanceId, paramId),
+      // Painted values follow automation while it is driving them, so this
+      // chip cannot read 0.80 while the param panel's chip for the same
+      // param reads 0.30 (Track D ruling 2 — the document is not what the
+      // plugin has during playback).
+      paramInfo: (instanceId, paramId) => {
+        const info = plugins.paramInfo(instanceId, paramId);
+        return info && paramFollow.overlay(instanceId, info);
+      },
     }),
   );
   const groups = $derived(matrixByParam(rows));

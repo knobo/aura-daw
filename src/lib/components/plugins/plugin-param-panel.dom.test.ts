@@ -178,7 +178,26 @@ describe("PluginParamPanel follows automation", () => {
     expect(Number(select.value)).toBeCloseTo(1 / 3, 5);
   });
 
-  it("still writes to the real param id from a driven row", async () => {
+  it("lets a driven toggle reach BOTH states — it flips the document, not the display", async () => {
+    // A flat lane holds the param at max while the document sits at min: the
+    // button reads ON (what the plugin has) but the stored value is OFF.
+    // Deriving the write from the DISPLAYED value would send `min` — which
+    // the document already is — so the click would be a silent no-op forever
+    // and the stored value could never reach the automated state.
+    plugins.params = [{ id: 1, name: "Filter / Bypass", min: 0, max: 1, default: 0, value: 0, steps: 2 }];
+    paramFollow.apply([{ instanceId: "i1", index: 1, value: 1 }]);
+    render(PluginParamPanel);
+    const toggle = screen.getByTitle("Toggle Bypass");
+    expect(toggle.textContent?.trim()).toBe("ON"); // the plugin's value, not the document's
+
+    await fireEvent.click(toggle);
+    expect(plugins.params[0].value).toBe(1); // the document reached the automated state
+
+    await fireEvent.click(screen.getByTitle("Toggle Bypass"));
+    expect(plugins.params[0].value).toBe(0); // …and back
+  });
+
+  it("still writes to the real param id from a driven row", async () =>{
     plugins.params = [param(4, "Filter / Level", 0.5)];
     paramFollow.apply([{ instanceId: "i1", index: 4, value: 0.8 }]);
     render(PluginParamPanel);

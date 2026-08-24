@@ -112,7 +112,7 @@ Details in `docs/PHASE4-PLAN.md`'s "Track D handoff".
   hold the token across the await.
 - ~~**No DOM test environment exists** (no jsdom/testing-library), so
   nothing inside a `.svelte` file is covered by any test.~~ → **closed by
-  PR #80** (jsdom + testing-library; `*.dom.test.ts`, 121 mounted tests as
+  PR #80** (jsdom + testing-library; `*.dom.test.ts`, 126 mounted tests as
   of 2026-08-23). The lesson it was written for still stands and is not
   closed by a test runner: both of Track D's real frontend bugs lived in
   event handlers and both were found by READING, so async-ordering logic

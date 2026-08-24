@@ -147,8 +147,7 @@
    * write still addresses the real param and a reset still resets to the real
    * default. */
   function shown(p: PluginParamInfo): PluginParamInfo {
-    const v = paramFollow.valueFor(plugins.openInstanceId, p.id);
-    return v === undefined ? p : { ...p, value: v };
+    return paramFollow.overlay(plugins.openInstanceId, p);
   }
   function isDriven(p: PluginParamInfo, d: PluginParamInfo): boolean {
     return d !== p;
@@ -303,11 +302,19 @@
           >
         {/if}
         {#if isToggle(p)}
+          <!-- Label from the DRIVEN value (what the plugin has), but the
+               write flips the DOCUMENT's. Deriving both from the driven one
+               makes the click a no-op whenever document and automation
+               already disagree — it would write the negation of what is
+               displayed, which the document may already be — leaving the
+               stored value unable to reach the automated state at all until
+               the transport stops. The fader and the enum have no such
+               problem: there the user names the target value directly. -->
           <button
             class="toggle mono"
             class:on={d.value >= (p.min + p.max) / 2}
             title="Toggle {short}"
-            onclick={() => plugins.setParam(p.id, d.value >= (p.min + p.max) / 2 ? p.min : p.max)}
+            onclick={() => plugins.setParam(p.id, p.value >= (p.min + p.max) / 2 ? p.min : p.max)}
           >
             {d.value >= (p.min + p.max) / 2 ? "ON" : "OFF"}
           </button>

@@ -47,6 +47,7 @@ const { default: LanePluginStrip } = await import("./LanePluginStrip.svelte");
 const { plugins } = await import("../../state/plugins.svelte");
 const { project } = await import("../../state/project.svelte");
 const { modulation } = await import("../../state/modulation.svelte");
+const { paramFollow } = await import("../../state/param-follow.svelte");
 
 function inst(id: string, uid: string, name: string, status: PluginInstanceInfo["status"]): PluginInstanceInfo {
   return { id, uid, name, format: "clap", status };
@@ -89,6 +90,7 @@ beforeEach(() => {
   plugins.paramCache = { i1: [{ id: 3, name: "Gain", min: 0, max: 1, default: 0.5, value: 0.5 }] };
   project.tracks = [track()];
   modulation.bindings = [];
+  paramFollow.reset();
 });
 
 afterEach(() => {
@@ -98,6 +100,7 @@ afterEach(() => {
   plugins.paramCache = {};
   project.tracks = [];
   modulation.bindings = [];
+  paramFollow.reset();
 });
 
 describe("LanePluginStrip", () => {
@@ -122,6 +125,19 @@ describe("LanePluginStrip", () => {
     const dots = screen.getAllByRole("img");
     expect(dots.length).toBe(3);
     expect(container.querySelectorAll("button").length).toBe(0);
+  });
+
+  it("a pinned chip paints the driven value, not the document's, while automation holds it", async () => {
+    // Same read-back the param panel follows (Track D ruling 2). If only the
+    // panel followed it, this chip would read 0.50 while the panel's chip for
+    // the very same param read 0.80 — the confusion this closed, on a second
+    // surface.
+    paramFollow.apply([{ instanceId: "i1", index: 3, value: 0.8 }]);
+    render(LanePluginStrip, { props: { track: track() } });
+    expect(screen.getByRole("button", { name: "Gain, 0.80" })).toBeTruthy();
+
+    paramFollow.apply([]); // transport stops
+    expect(await screen.findByRole("button", { name: "Gain, 0.50" })).toBeTruthy();
   });
 
   it("a chip click reaches revealParamLane with the right target", async () => {

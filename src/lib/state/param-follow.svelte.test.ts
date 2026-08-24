@@ -69,6 +69,22 @@ describe("paramFollow", () => {
     expect(paramFollow.valueFor("i1", 7)).toBe(0.2500001);
   });
 
+  it("overlay returns the SAME object when nothing drives the param", () => {
+    const info = { id: 7, name: "Filter / Cut", min: 0, max: 1, default: 0, value: 0.3 };
+    expect(paramFollow.overlay("i1", info)).toBe(info);
+  });
+
+  it("overlay swaps in the driven value and keeps every identity field", () => {
+    const info = { id: 7, name: "Filter / Cut", min: 0, max: 1, default: 0.25, value: 0.3, steps: 4 };
+    paramFollow.apply([{ instanceId: "i1", index: 7, value: 0.8 }]);
+    const painted = paramFollow.overlay("i1", info);
+    expect(painted.value).toBe(0.8);
+    // Identity has to survive: callers write to `id` and reset to `default`.
+    expect({ ...painted, value: info.value }).toEqual(info);
+    // Another instance's param of the same index is untouched.
+    expect(paramFollow.overlay("i2", info)).toBe(info);
+  });
+
   it("reassigns when a param joins or leaves at the same count", () => {
     paramFollow.apply([driven("i1", 7, 0.25)]);
     const held = paramFollow.driven;

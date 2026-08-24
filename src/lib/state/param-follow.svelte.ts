@@ -18,7 +18,7 @@
  * and costs one length check.
  */
 
-import type { DrivenParam } from "../types/ipc";
+import type { DrivenParam, PluginParamInfo } from "../types/ipc";
 
 /** Map key for one (instance, host param index) pair. A space cannot occur
  * in a param index, so no instance id can collide with another's. */
@@ -55,6 +55,19 @@ class ParamFollowStore {
     const map = new Map<string, number>();
     for (const d of next) map.set(key(d.instanceId, d.index), d.value);
     this.driven = map;
+  }
+
+  /** The param as it should be PAINTED: the same object when nothing drives
+   * it, a copy carrying the driven value when something does. Identity
+   * (`id`, `min`, `max`, `steps`, `default`, `name`) is untouched, so a
+   * caller can still write to the real param and reset to the real default.
+   *
+   * Every surface that paints a plugin param value goes through here — the
+   * param panel, the lane strip's pinned chips and the automation matrix —
+   * so two of them cannot end up disagreeing about the same parameter. */
+  overlay(instanceId: string, info: PluginParamInfo): PluginParamInfo {
+    const v = this.valueFor(instanceId, info.id);
+    return v === undefined ? info : { ...info, value: v };
   }
 
   /** Drop everything — the meter stream is gone, so nothing is following. */

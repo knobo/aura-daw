@@ -2259,9 +2259,13 @@ impl Control {
     }
 
     /// Fold a tick's writes into the driven-param read-back, upserting by
-    /// (instance, index). Linear in both — a tick writes one entry per
-    /// automated param, and the set holds one per automated param, so both
-    /// are the count of plugin-param lanes, not of params.
+    /// (instance, index).
+    ///
+    /// A scan of `driven` per write, so O(writes x set) — and both are the
+    /// count of plugin-param LANES, not of params, which is why quadratic is
+    /// fine here at today's scale (the `u32` index compares first and
+    /// short-circuits most candidates). Say it plainly rather than call it
+    /// linear: someone raising the lane count needs to know which it is.
     fn absorb_driven(
         driven: &mut Vec<crate::audio::types::DrivenParam>,
         writes: &[crate::plugins::automation::ParamWrite],

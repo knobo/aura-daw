@@ -987,7 +987,12 @@ instantiation per automated instance, seeded from the live one's
   A driven control is also re-synced after a user edit: a range input keeps
   the position it was dragged to and Svelte will not push an unchanged
   binding back, so without that the thumb sat at the user's value while the
-  rest of the row read the driven one. No
+  rest of the row read the driven one. Every surface that paints a plugin
+  param value goes through `paramFollow.overlay` — the panel, the lane
+  strip's pinned chips and the automation matrix — so two of them cannot
+  disagree about one parameter; a driven toggle's LABEL follows the read-back
+  while its write still flips the DOCUMENT, or the click could never move the
+  stored value to where automation already holds it. No
   second evaluation of the curve exists, frontend or backend, so the panel
   cannot disagree with what the plugin actually got. Ruling 2 itself is
   unchanged: the writes are still host-only and the document still keeps
