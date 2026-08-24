@@ -2,4 +2,4 @@
 
 pub mod triple_buffer;
 
-pub use triple_buffer::{triple_buffer, Input, Output};
+pub use triple_buffer::{from_slots, triple_buffer, Input, Output};

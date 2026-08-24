@@ -227,7 +227,7 @@ mod tests {
         // Deterministic, and not a constant — a constant input hides index
         // bugs, because every frame looks like every other frame.
         (0..frames * 2)
-            .map(|i| ((i as f32 * 0.37).sin() * 0.8))
+            .map(|i| (i as f32 * 0.37).sin() * 0.8)
             .collect()
     }
 

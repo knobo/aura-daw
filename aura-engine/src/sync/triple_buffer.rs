@@ -87,22 +87,29 @@ pub struct Output<T> {
     idx: u32,
 }
 
-/// Build a triple buffer holding three clones of `initial`.
+/// Build a triple buffer from three values.
 ///
 /// This is the **only** allocation in the type's whole lifetime: three `T` in
 /// one `Arc`. `publish`/`read` never allocate, and never free.
-pub fn triple_buffer<T: Clone>(initial: T) -> (Input<T>, Output<T>) {
+///
+/// Three separate values rather than three clones because the interesting
+/// payloads are not `Clone`: a compiled JIT module, a plugin handle, a set of
+/// preallocated buffers. `Option<T>` with two `None`s is the usual shape —
+/// the slots that have not been filled yet cost nothing.
+pub fn from_slots<T>(slots: [T; 3]) -> (Input<T>, Output<T>) {
+    let [a, b, c] = slots;
     let shared = Arc::new(Shared {
-        slots: [
-            UnsafeCell::new(initial.clone()),
-            UnsafeCell::new(initial.clone()),
-            UnsafeCell::new(initial),
-        ],
+        slots: [UnsafeCell::new(a), UnsafeCell::new(b), UnsafeCell::new(c)],
         // Slot 2 is the handoff, clean: the reader has not been given
         // anything new, so its first `read` returns its own slot 1.
         handoff: AtomicU32::new(2),
     });
     (Input { shared: Arc::clone(&shared), idx: 0 }, Output { shared, idx: 1 })
+}
+
+/// [`from_slots`] with three clones of one value.
+pub fn triple_buffer<T: Clone>(initial: T) -> (Input<T>, Output<T>) {
+    from_slots([initial.clone(), initial.clone(), initial])
 }
 
 impl<T> Input<T> {
@@ -126,10 +133,22 @@ impl<T> Input<T> {
         self.idx = previous & IDX_MASK;
     }
 
-    /// Convenience: overwrite the slot and publish it.
+    /// Convenience: overwrite the slot and publish it. The value that was in
+    /// the slot is dropped **here**, on the writer's thread.
     pub fn write(&mut self, value: T) {
         *self.slot() = value;
         self.publish();
+    }
+
+    /// Swap a fresh value into the slot and hand back what was there, without
+    /// publishing.
+    ///
+    /// This is how a payload whose destructor may not run on the audio thread
+    /// gets reclaimed: two publishes after a value was handed over, the writer
+    /// owns it again and can dispose of it deliberately. See
+    /// `jit::Kernels::release`.
+    pub fn replace(&mut self, value: T) -> T {
+        std::mem::replace(self.slot(), value)
     }
 }
 

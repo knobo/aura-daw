@@ -1,0 +1,47 @@
+//! Can this machine JIT at all, and what does it cost?
+//!
+//! `cargo run --release --example jit-probe`
+//!
+//! Worth having as its own binary because the answer is a **platform**
+//! question, not a code one: `cranelift-jit` needs a writable-then-executable
+//! mapping, and the one build this project ships that has never been near one
+//! is the Windows release worker (it builds with `--no-default-features` and
+//! has no audio device to test against either). Before any of this is wired
+//! into `src-tauri`, this is the program to run on the target.
+
+use std::time::Instant;
+
+fn main() {
+    let started = Instant::now();
+    match aura_engine::jit::Kernels::compile() {
+        Ok(k) => {
+            println!("cranelift targeted this host in {:?}", started.elapsed());
+            // Render one block through the flat kernel, so the report is
+            // "compiled AND ran" rather than "compiled".
+            let frames = 256usize;
+            let buf: Vec<f32> = (0..frames * 2).map(|i| (i as f32 * 0.05).sin()).collect();
+            let s = aura_engine::strip::Strip {
+                gain: 0.8,
+                ramp: &[],
+                pan: aura_engine::strip::PanQuad {
+                    gl0: 0.7071,
+                    gr0: 0.7071,
+                    gl1: 0.7071,
+                    gr1: 0.7071,
+                },
+                audible: true,
+                pdc_delay: 0,
+            };
+            let plan = aura_engine::strip::plan(&s, 0, frames, 0, frames - 1);
+            let mut out = vec![0.0f32; frames * 2];
+            let mut acc = aura_engine::dsp::Accum::default();
+            let ran = k.run(&plan, &buf, 0, &mut out, 2, &mut acc);
+            println!("kernel ran: {ran}, peak L {:.4} R {:.4}", acc.pk_l, acc.pk_r);
+            std::mem::forget(k);
+        }
+        Err(e) => {
+            println!("NOT SUPPORTED on this host: {e}");
+            std::process::exit(1);
+        }
+    }
+}
