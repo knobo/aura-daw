@@ -46,7 +46,7 @@ use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState}
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
-pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter};
+pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter, UndoPath};
 pub use ops::{LaneArrangement, TrackMixChange};
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
 pub use snapshot::{ChangeSet, MidiSnapshot, SessionSnapshot};
@@ -3615,6 +3615,26 @@ impl ControlPlane {
             self.close_gesture(g);
         }
         let _gate = self.history_gate.lock();
+        self.undo_step()
+    }
+
+    /// One undo step with the gate ALREADY HELD — the body of
+    /// [`Self::undo`]. `history_gate` is a plain `parking_lot::Mutex` and is
+    /// not reentrant, so a caller that holds it must never route back
+    /// through [`Self::undo`].
+    ///
+    /// THE POP HERE IS UNCONDITIONAL, and that is right for a single step:
+    /// Ctrl+Z means "undo whatever is on top NOW", so a commit that landed a
+    /// moment ago is a legitimate thing to consume. A multi-step walk means
+    /// something else — "undo these particular revisions" — and uses
+    /// [`Self::undo_walk_step`] for exactly that reason (C-1).
+    ///
+    /// Everything the single-step contract promises still holds here: the
+    /// entry's inverses go through the normal commit path (journaled, own
+    /// rebuild, `project://changed`), `HistoryMode::Replay` suppresses a new
+    /// history entry, the ORIGINAL entry migrates onto the redo stack, and a
+    /// failed commit puts it back untouched.
+    fn undo_step(&self) -> Result<Option<String>, String> {
         let Some((entry, popped_epoch)) = self.committer.log().pop_undo() else { return Ok(None) };
         let meta = op::TxMeta {
             actor: op::Actor::User,
@@ -3670,6 +3690,208 @@ impl ControlPlane {
             }
             Err(e) => {
                 self.committer.log().push_redo(entry, popped_epoch);
+                Err(e)
+            }
+        }
+    }
+
+    /// Walk the linear undo ancestry back to `target_rev` — the Plan F
+    /// carry-forward (e) "ordered next step".
+    ///
+    /// SEMANTICS: EXCLUSIVE. Every undo entry ABOVE `target_rev` is undone;
+    /// `target_rev` itself stays applied, so the document ends as the one
+    /// `materialize_version(target_rev)` describes — the document the
+    /// HISTORY dock's detail pane is showing when the user picks that row.
+    /// Picking the head is therefore a successful no-op.
+    ///
+    /// THE GUARDS, and what each is for:
+    /// * `expected_epoch` — the document must still be the one the caller
+    ///   read. Undoing across a document swap is corruption, not undo
+    ///   (`History::clear`'s doc). Checked here once, and then ENFORCED
+    ///   AGAIN AT EVERY STEP: [`Self::undo_walk_step`] compares the epoch
+    ///   each entry was popped under against THIS value and aborts if they
+    ///   differ, before anything is applied.
+    ///
+    ///   That per-step check is a real guard, not belt-and-braces (I-1,
+    ///   whole-branch review). It replaces an inference that does not hold —
+    ///   "a boundary clears the undo stack, so a step that still pops
+    ///   something proves the epoch has not moved". A boundary followed by a
+    ///   FRESH EDIT on the new document leaves a poppable entry again, and
+    ///   `commit_replay` only compares that entry against the epoch IT was
+    ///   popped under (both new, so it passes). The walk would then keep
+    ///   undoing edits belonging to a document the user never targeted, one
+    ///   step at a time, and report success. Comparing against the CALLER's
+    ///   epoch is what makes "nothing applied after the swap" true.
+    /// * `expected_head_rev` — the undo ancestry must not have moved. NOT
+    ///   `Session::rev`: transient commits (transport play/stop, gesture
+    ///   folds) bump that without touching this stack, so guarding on it
+    ///   would abort because the user pressed play.
+    /// * `target_rev` must be ON the current undo path. An already-undone
+    ///   step (now on the redo stack) and a bottom-evicted one
+    ///   (`UNDO_STACK_LIMIT`) are both simply absent, and both are refused
+    ///   with the same message: the request describes an ancestry this
+    ///   document does not have.
+    ///
+    /// ONE GATE FOR THE WHOLE WALK: `history_gate` is taken once and held
+    /// across every step, so a concurrent `undo`/`redo` cannot interleave
+    /// into the middle of a walk. The gate is not reentrant, hence
+    /// [`Self::undo_walk_step`] rather than [`Self::undo`].
+    ///
+    /// THE WALK CONSUMES A ROUTE, NOT A COUNT (C-1, whole-branch review).
+    /// The gate serialises this against `undo`/`redo` and nothing else — it
+    /// does NOT gate ordinary commits, and this app has several that arrive
+    /// off the UI thread: `commit_recording_finalize` commits `Actor::Engine`
+    /// non-transiently from the engine control thread, MCP agent tools
+    /// commit on their own threads, an automation write pass commits on
+    /// release. Any of those landing between two steps pushes a fresh entry
+    /// onto the back of the undo stack. A walk that trusted a precomputed
+    /// step count would undo THAT entry — an edit nobody asked to undo —
+    /// then stop one step short of the target and report success anyway,
+    /// with the redo chain it had been building cleared by the same
+    /// `History::record`. So the walk instead plans the exact revisions to
+    /// consume, highest first, and every step pops CONDITIONALLY
+    /// (`HistoryLog::pop_undo_if`): it consumes the revision it planned to,
+    /// or nothing at all and the walk stops and says so.
+    ///
+    /// M-4, an open gesture is closed FIRST, exactly as [`Self::undo`] does
+    /// — the drag becomes the finished step it already looks like. That
+    /// close records a fresh entry, which MOVES the head, so a walk
+    /// requested mid-drag then fails its own head guard and the user
+    /// retries against the ancestry they can now see. Aborting is the right
+    /// answer: the row they clicked was chosen before the drag existed.
+    ///
+    /// PARTIAL WALKS ARE REPORTED, NOT HIDDEN. Each step is a real
+    /// committed transaction, so there is nothing to roll back to: if step
+    /// `k` stops the walk — its commit failed, the epoch moved, or the undo
+    /// stack no longer offers the revision that step planned to consume —
+    /// the `k` steps before it STAY APPLIED, and the error says how many of
+    /// how many were applied and why it stopped. The caller re-reads the
+    /// overview AND re-pulls its stores, because the document moved
+    /// (`projectops.undoTo`'s failure path does exactly that).
+    pub fn undo_to(
+        &self,
+        target_rev: u64,
+        expected_epoch: u64,
+        expected_head_rev: Option<u64>,
+    ) -> Result<UndoToOutcome, String> {
+        if let Some(g) = self.gesture.end(None) {
+            self.close_gesture(g);
+        }
+        let _gate = self.history_gate.lock();
+
+        let path = self.committer.log().undo_path();
+        if path.epoch != expected_epoch {
+            return Err(format!(
+                "the project was replaced under this request (epoch {expected_epoch} -> {}) \
+                 — nothing applied",
+                path.epoch
+            ));
+        }
+        if path.head() != expected_head_rev {
+            return Err(format!(
+                "the edit history changed under this request (head {:?} -> {:?}) \
+                 — nothing applied",
+                expected_head_rev,
+                path.head()
+            ));
+        }
+        let Some(at) = path.revs.iter().position(|r| *r == target_rev) else {
+            return Err(format!(
+                "revision {target_rev} is not on the undo path — it was undone already, \
+                 or dropped from the {} most recent steps history keeps",
+                history::UNDO_STACK_LIMIT
+            ));
+        };
+        // THE ROUTE: the revisions ABOVE the target, highest first — the
+        // exact entries this walk intends to consume, in the order it
+        // intends to consume them. Exclusive semantics, so `target_rev`
+        // itself is not on it. This list, not its length, is what the loop
+        // walks (C-1).
+        let route: Vec<u64> = path.revs[at + 1..].iter().rev().copied().collect();
+        let steps = route.len();
+
+        let mut label = None;
+        for (done, want) in route.iter().enumerate() {
+            match self.undo_walk_step(*want, expected_epoch) {
+                Ok(Some(l)) => label = Some(l),
+                // M-2: "nothing popped" is no longer one specific story. The
+                // stack did not offer `want` — a commit landed on top of it
+                // mid-walk, or the entry was dropped on its way back by
+                // `push_redo`'s epoch guard. Name the observation, not a
+                // guess at the cause, and say what stayed applied.
+                Ok(None) => {
+                    return Err(format!(
+                        "undo to revision {target_rev} stopped after {done} of {steps} steps: \
+                         the undo stack no longer offers revision {want}, which this step \
+                         planned to consume — the edit history moved under the walk. The \
+                         {done} steps already applied stay applied."
+                    ))
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "undo to revision {target_rev} stopped after {done} of {steps} \
+                         steps: {e}. The {done} steps already applied stay applied."
+                    ))
+                }
+            }
+        }
+        Ok(UndoToOutcome { steps, label })
+    }
+
+    /// One step of an [`Self::undo_to`] walk: [`Self::undo_step`] for a
+    /// PLANNED revision, with the gate already held.
+    ///
+    /// Two differences from `undo_step`, both of which exist only because a
+    /// walk is several steps long while `history_gate` gates only other
+    /// `undo`/`redo` commands (C-1):
+    ///
+    /// * THE POP IS CONDITIONAL. `pop_undo_if(want)` consumes the revision
+    ///   this step planned to consume or nothing at all — never "whatever is
+    ///   on the back now", which after a concurrent commit is a fresh edit
+    ///   the user never asked to undo. `Ok(None)` is that refusal, and it is
+    ///   deliberately distinguishable from a failed commit: the caller
+    ///   reports "the history moved" rather than a commit error.
+    /// * THE POPPED EPOCH IS CHECKED AGAINST THE CALLER'S. `commit_replay`
+    ///   compares an entry against the epoch IT was popped under, which
+    ///   cannot notice that the whole document was swapped mid-walk and then
+    ///   edited: the new document's fresh entry pops under the new epoch and
+    ///   agrees with itself. Comparing against the epoch `undo_to`
+    ///   VALIDATED is what stops the walk at the boundary. The entry goes
+    ///   straight back with `push_undo_unchanged` (whose own guard drops it
+    ///   if it belongs to a document that is gone) — a refused step must not
+    ///   consume a history entry.
+    ///
+    /// Everything the single-step contract promises still holds: the
+    /// inverses go through the normal commit path (journaled, own rebuild,
+    /// `project://changed`), `HistoryMode::Replay` suppresses a new history
+    /// entry, the ORIGINAL entry migrates onto the redo stack, and a failed
+    /// commit puts it back untouched.
+    fn undo_walk_step(&self, want: u64, expected_epoch: u64) -> Result<Option<String>, String> {
+        let Some((entry, popped_epoch)) = self.committer.log().pop_undo_if(want) else {
+            return Ok(None);
+        };
+        if popped_epoch != expected_epoch {
+            self.committer.log().push_undo_unchanged(entry, popped_epoch);
+            return Err(format!(
+                "the project was replaced under this walk (epoch {expected_epoch} -> \
+                 {popped_epoch})"
+            ));
+        }
+        let meta = op::TxMeta {
+            actor: op::Actor::User,
+            run: entry.run.clone(),
+            label: format!("undo: {}", entry.label),
+            transient: false,
+        };
+        let ops = entry.inverses.clone();
+        match self.commit_replay(meta, ops, popped_epoch) {
+            Ok(()) => {
+                let label = entry.label.clone();
+                self.committer.log().push_redo(entry, popped_epoch);
+                Ok(Some(label))
+            }
+            Err(e) => {
+                self.committer.log().push_undo_unchanged(entry, popped_epoch);
                 Err(e)
             }
         }
@@ -3738,6 +3960,12 @@ impl ControlPlane {
 
     pub fn version_overview(&self) -> (vergraph::VersionStats, Vec<vergraph::VersionItem>) {
         self.committer.log().version_overview()
+    }
+
+    /// The linear undo ancestry, for the browsing surface's `Undo to here`
+    /// affordance and the guard pair it must hand back.
+    pub fn undo_path(&self) -> history::UndoPath {
+        self.committer.log().undo_path()
     }
 
     pub fn materialize_version(&self, rev: u64) -> Option<SessionSnapshot> {
@@ -5148,6 +5376,19 @@ pub struct HistoryStep {
     pub redo_depth: usize,
 }
 
+/// What a completed [`ControlPlane::undo_to`] walk did.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoToOutcome {
+    /// How many undo steps were applied. 0 is a legal, successful answer:
+    /// the target was already the head.
+    pub steps: usize,
+    /// The label of the LAST step undone — what a toast shows ("back to
+    /// <label>" is wrong; this is the step the walk ended on). `None` when
+    /// `steps == 0`.
+    pub label: Option<String>,
+}
+
 /// Read-only product surface over Plan F's retained version chain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -5157,6 +5398,24 @@ pub struct HistoryVersion {
     pub charged_bytes: usize,
     pub label: String,
     pub actor: String,
+    /// True when this revision is on the CURRENT linear undo ancestry, i.e.
+    /// when `history_undo_to` will accept it. Retained revisions that are
+    /// not: the undo commits themselves, anything already undone (now on the
+    /// redo stack), and anything dropped by `UNDO_STACK_LIMIT` while the
+    /// version graph still keeps it.
+    ///
+    /// A HINT, not a guarantee: `history_overview` reads this row from the
+    /// `versions` mutex and the undo path it is checked against from a
+    /// separate, later acquisition of the `history`/`epoch` mutexes (see
+    /// that function's doc). A commit landing between the two can retain a
+    /// new row or move the path out from under it, so this bit can be one
+    /// refresh stale — set (or unset) for a row that no longer matches by
+    /// the time the response reaches the renderer. Safe regardless: the
+    /// walk itself re-reads a fresh `undo_path()` under `history_gate` and
+    /// refuses a `target_rev` that has fallen off it, so a stale bit can
+    /// only mis-enable or mis-disable a button for one refresh — it can
+    /// never cause `history_undo_to` to apply the wrong edit.
+    pub on_undo_path: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5168,6 +5427,16 @@ pub struct HistoryOverview {
     pub materialized: usize,
     pub replay_only: usize,
     pub versions: Vec<HistoryVersion>,
+    /// The document epoch these versions belong to. Handed back verbatim by
+    /// `history_undo_to` so the backend can refuse a request that was
+    /// composed against a document that has since been replaced.
+    pub epoch: u64,
+    /// The revision a plain undo would consume next — the head of the undo
+    /// ancestry, `None` when there is nothing to undo. The second half of
+    /// the guard pair. NOT the live `Session::rev`: transient commits
+    /// (transport play/stop, gesture folds) move that without touching the
+    /// undo stack.
+    pub head_rev: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5181,10 +5450,25 @@ pub struct HistoryVersionDetail {
     pub automation_lane_count: usize,
 }
 
+/// TWO SEPARATE LOCK ACQUISITIONS, NOT MERGED: `control.version_overview()`
+/// takes `HistoryLog`'s `versions` mutex and releases it; `control.undo_path()`
+/// then separately takes `epoch`/`history`. Zipping `on_undo_path` onto the
+/// version list therefore pairs two reads from different instants — see
+/// [`HistoryVersion::on_undo_path`] for the (benign) consequence. This is
+/// deliberate, not an oversight: `control/history.rs`'s module doc makes
+/// `history`, `journal` and `versions` a binding invariant that they are
+/// NEVER held at the same time (each is a leaf, entered only after the
+/// others have been released). Reading `versions` and `undo_path` under one
+/// combined hold would mean nesting one inside the other for the first time
+/// anywhere in the module, which is the kind of new lock-order edge that
+/// wants its own PR and its own argument, not a side effect of adding two
+/// display fields to a read-only overview.
 #[tauri::command]
 pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOverview {
     let (stats, versions) = control.version_overview();
     let (undo_depth, redo_depth) = control.history_depths();
+    let path = control.undo_path();
+    let on_path: std::collections::HashSet<u64> = path.revs.iter().copied().collect();
     HistoryOverview {
         undo_depth,
         redo_depth,
@@ -5194,6 +5478,7 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
         versions: versions
             .into_iter()
             .map(|v| HistoryVersion {
+                on_undo_path: on_path.contains(&v.rev),
                 rev: v.rev,
                 materialized: v.materialized,
                 charged_bytes: v.charged_bytes,
@@ -5201,6 +5486,8 @@ pub fn history_overview(control: State<'_, Arc<ControlPlane>>) -> HistoryOvervie
                 actor: v.actor,
             })
             .collect(),
+        epoch: path.epoch,
+        head_rev: path.head(),
     }
 }
 
@@ -5265,6 +5552,29 @@ pub async fn redo(control: State<'_, Arc<ControlPlane>>) -> Result<HistoryStep, 
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// Walk the undo ancestry back to `target_rev` (Plan F carry-forward (e)) —
+/// thin delegate over [`ControlPlane::undo_to`]. Additive command; `undo`
+/// and `redo` are untouched.
+///
+/// `expected_epoch` / `expected_head_rev` are the values the caller read
+/// from [`history_overview`]. The backend refuses the walk if either has
+/// moved — the renderer never decides that, it only reports what it saw.
+///
+/// Async for [`undo`]'s reason (I-6), and more so: this is N undos, any one
+/// of which can re-instantiate a plugin.
+#[tauri::command]
+pub async fn history_undo_to(
+    target_rev: u64,
+    expected_epoch: u64,
+    expected_head_rev: Option<u64>,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<UndoToOutcome, String> {
+    let cp = control.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || cp.undo_to(target_rev, expected_epoch, expected_head_rev))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Import an audio file as a clip (STUB until zone B lands).

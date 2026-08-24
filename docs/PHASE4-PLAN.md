@@ -705,6 +705,16 @@ R-3 (Task 10), L-4 (Tasks 9+11), L-5 (Task 8).
   arbitrary branch checkout or direct snapshot replacement as part of that
   step: those still require a separate mutation, persistence and undo contract.
 
+  **Ordered next step — DONE (2026-08-23, PR #107).** `history_undo_to`
+  walks the linear undo ancestry: validation and stepping in
+  `ControlPlane::undo_to` under one `history_gate` hold, guarded on the
+  observed `(epoch, head rev)` pair, N ordinary undo commits so the redo
+  chain, the journal and `project://changed` behave exactly as N presses of
+  Ctrl+Z. Semantics are EXCLUSIVE (the target revision stays applied — the
+  document the detail pane shows). Arbitrary branch checkout and direct
+  snapshot replacement remain out of scope and still need their own
+  mutation, persistence and undo contract.
+
 Also recorded from the review follow-up on this branch: `ChangeSet::from_ops`
 flags modulation+automation on `TrackAdd`/`TrackRemove` and on
 `Modulation*`/`AutomationClipSet`; `midi.dirty` clears only when the live

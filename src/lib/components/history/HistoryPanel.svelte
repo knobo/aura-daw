@@ -46,7 +46,7 @@
     </button>
   </header>
 
-  <p class="intro">Each row is an edit kept by the project. Select one to inspect it; use Undo or Redo to change the project.</p>
+  <p class="intro">Each row is an edit kept by the project. Select one to inspect it, then use Undo to here to walk the project back to it — or Undo and Redo to step one edit at a time.</p>
 
   {#if !historyBrowser.available}
     <p class="empty mono">History is available in the desktop app.</p>
@@ -98,6 +98,16 @@
             <div><dt>MIDI CLIPS</dt><dd>{historyBrowser.detail.midiClipCount}</dd></div>
             <div><dt>AUTOMATION</dt><dd>{historyBrowser.detail.automationLaneCount}</dd></div>
           </dl>
+          <button
+            class="undoto"
+            disabled={!historyBrowser.canUndoToSelected || historyBrowser.loading}
+            title={historyBrowser.canUndoToSelected
+              ? "Undo every step after this revision"
+              : "Only a revision still on the undo path can be walked back to"}
+            onclick={() => void historyBrowser.undoToSelected()}
+          >
+            UNDO TO HERE
+          </button>
         </section>
       {/if}
     {/if}
@@ -126,6 +136,7 @@
   .kind { flex: none; color: var(--text-faint); font-size: 8px; letter-spacing: .1em; }
   .detail { flex: none; padding: 10px; border: 1px solid var(--glass-border); border-radius: 5px; background: var(--bg-sunken); }
   .detail dl { margin: 0; flex-wrap: wrap; gap: 8px 16px; }
+  .undoto { margin-top: 10px; width: 100%; height: 30px; border-radius: 4px; font-size: 9px; letter-spacing: .08em; }
   .detail dl div { gap: 6px; }
   dt { color: var(--text-faint); font-size: 9px; }
   dd { margin: 0; color: var(--text); }

@@ -1437,6 +1437,8 @@ export interface HistoryVersion {
   chargedBytes: number;
   label: string;
   actor: string;
+  /** True when `historyUndoTo` will accept this revision. */
+  onUndoPath: boolean;
 }
 
 export interface HistoryOverview {
@@ -1447,6 +1449,10 @@ export interface HistoryOverview {
   replayOnly: number;
   /** Newest first. */
   versions: HistoryVersion[];
+  /** Handed back verbatim by `historyUndoTo` — the document guard. */
+  epoch: number;
+  /** The revision a plain undo would consume next — the history guard. */
+  headRev: number | null;
 }
 
 export interface HistoryVersionDetail {
@@ -1456,6 +1462,13 @@ export interface HistoryVersionDetail {
   audioClipCount: number;
   midiClipCount: number;
   automationLaneCount: number;
+}
+
+export interface UndoToOutcome {
+  /** How many steps were undone. 0 means the target was already the head. */
+  steps: number;
+  /** The label of the last step undone; null when `steps` is 0. */
+  label: string | null;
 }
 
 // ── app events (frozen names, §3.4) ─────────────────────────────────────────

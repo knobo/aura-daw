@@ -21,9 +21,11 @@ beforeEach(() => {
     retainedBytes: 384,
     materialized: 1,
     replayOnly: 1,
+    epoch: 4,
+    headRev: 9,
     versions: [
-      { rev: 9, materialized: false, chargedBytes: 128, label: "set gain", actor: "You" },
-      { rev: 8, materialized: true, chargedBytes: 256, label: "move clip", actor: "You" },
+      { rev: 9, materialized: false, chargedBytes: 128, label: "set gain", actor: "You", onUndoPath: true },
+      { rev: 8, materialized: true, chargedBytes: 256, label: "move clip", actor: "You", onUndoPath: true },
     ],
   });
   historyVersion.mockResolvedValue({
@@ -83,7 +85,8 @@ describe("history browser", () => {
 
     expect(historyOverview).toHaveBeenCalledOnce();
     release({
-      undoDepth: 0, redoDepth: 0, retainedBytes: 0, materialized: 0, replayOnly: 0, versions: [],
+      undoDepth: 0, redoDepth: 0, retainedBytes: 0, materialized: 0, replayOnly: 0,
+      epoch: 4, headRev: null, versions: [],
     });
     await Promise.all([fromTab, fromMount]);
     expect(historyOverview).toHaveBeenCalledOnce();

@@ -26,6 +26,16 @@ session burns an hour on something a sentence would have prevented.
   reading `paramCache`; both now follow the same
   read-then-`untrack`-the-call shape.)
 
+## Backend
+
+- **`Session::rev` is not "the current revision" for a history guard.**
+  Transient commits — `transport play`, `transport stop`, `transport set
+  loop`, every mid-gesture fold — go through `transact` and bump `rev`
+  without reaching the undo stack. A guard built on it aborts because the
+  user pressed play. The undo ancestry's own head (`HistoryLog::undo_path()`
+  → `UndoPath::head()`) is the value that means "the history has not moved";
+  it is what `history_undo_to` guards on.
+
 ## Tests
 
 - **Before any new `*.dom.test.ts`**, read

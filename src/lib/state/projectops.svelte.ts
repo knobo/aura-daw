@@ -228,6 +228,43 @@ class ProjectOpsStore {
     await this.step("redo");
   }
 
+  /**
+   * Walk the undo ancestry back to `targetRev` (Plan F carry-forward (e)).
+   * Thin: the backend validates the target and owns the stepping — this
+   * passes the guard pair the caller observed and reports the outcome.
+   *
+   * The toast deliberately does NOT restate `out.label`: that field is the
+   * backend's honest report of the LAST STEP UNDONE, which for a walk back
+   * to the oldest retained edit is that edit's own label — wrong copy for
+   * "where you landed". `targetRev` is the row the caller actually asked
+   * for, so it (not `out.label`) names the destination here; `out.steps` is
+   * still the backend's honest count of how far the walk went.
+   */
+  async undoTo(targetRev: number, expectedEpoch: number, expectedHeadRev: number | null) {
+    const call = backend.historyUndoTo;
+    if (!call) return false; // demo backend: no op log to walk
+    try {
+      const out = await call.call(backend, targetRev, expectedEpoch, expectedHeadRev);
+      if (out.steps === 0) return true; // already there — nothing to announce
+      await this.repull();
+      toasts.info("UNDO", `${out.steps} steps back to r${targetRev}`);
+      return true;
+    } catch (err) {
+      // A REJECTED WALK CAN STILL HAVE MOVED THE DOCUMENT (I-2, whole-branch
+      // review). `undo_to` leaves the steps it applied before the abort
+      // APPLIED — that is its documented contract, not a bug — so the
+      // failure path has the same stale-store problem the success path does.
+      // `project` and `midi` self-heal off `project://changed`, but
+      // automation, modulation, launch and an open plugin's params only
+      // refresh in `repull()`; without this, a partial walk leaves the
+      // automation lanes and the param panel showing pre-walk values. That
+      // is M-3's regression again, on the other branch.
+      await this.repull();
+      toasts.error("UNDO TO HERE FAILED", String(err));
+      throw err;
+    }
+  }
+
   private async step(dir: "undo" | "redo") {
     const call = dir === "undo" ? backend.undo : backend.redo;
     if (!call) return; // demo backend: no op log to walk
