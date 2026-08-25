@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| JIT-fused fader + triple-buffer publish + RT bench harness | `feat/jit-fused-fader` | 2026-08-24 | New standalone `aura-engine/` crate — `src-tauri/Cargo.toml` stays frozen. → [`docs/backlog/jit-engine.md`](docs/backlog/jit-engine.md) |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -69,7 +69,11 @@ sentence got written — if you find a row whose branch is gone from
    → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
-Plan G4 (envelope-follower modulators); the native-GUI embed work.
+Plan G4 (envelope-follower modulators); the native-GUI embed work;
+wiring `aura-engine`'s JIT kernel into `mixer::render` — it needs
+cranelift in the frozen `src-tauri/Cargo.toml` and a Windows fallback,
+which is an owner call, not a task
+([`docs/backlog/jit-engine.md`](docs/backlog/jit-engine.md)).
 
 ## Read before your first commit
 
@@ -91,6 +95,7 @@ Plan G4 (envelope-follower modulators); the native-GUI embed work.
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |
 | History, undo, automation, modulation | [`docs/backlog/history-and-automation.md`](docs/backlog/history-and-automation.md) |
 | Windows build (open in PR #62) | [`docs/backlog/windows-build.md`](docs/backlog/windows-build.md) |
+| RT engine / JIT fader kernel (`aura-engine/`, landed; wiring is owner-gated) | [`docs/backlog/jit-engine.md`](docs/backlog/jit-engine.md) |
 | Everything else, by product area | [`docs/backlog/`](docs/backlog/) |
 
 ## Index

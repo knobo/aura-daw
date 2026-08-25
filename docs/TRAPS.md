@@ -60,6 +60,29 @@ session burns an hour on something a sentence would have prevented.
   teardown). Use `-- --test-threads=1`. Never run `cargo test` and `tauri
   dev` against the same `src-tauri/target/`.
 
+## Tooling and gates
+
+- **`cargo fmt --check` is red on `main` and always has been.** CONTRIBUTING
+  says "rustfmt defaults", but no `rustfmt.toml` is checked in and the house
+  style is denser than the defaults (struct literals on one line, ~100 cols).
+  Running `cargo fmt` to "fix" your crate reformats hundreds of unrelated
+  lines and buries your diff. Reproduce on `main` in the same worktree before
+  believing a fmt failure is yours; match the surrounding style by hand
+  instead.
+- **Several clippy lints are deny-by-default and CI did not catch them**
+  until the `engine` job existed. `approx_constant` is the one that bites:
+  writing `0.7071` for a centre-pan gain is an *error*, not a warning, and it
+  is right to be — the mixer's own tests use
+  `std::f32::consts::FRAC_1_SQRT_2`. Note the `rust` job does **not** run
+  clippy on `src-tauri`, only the `engine` job does on `aura-engine`.
+- **A stale `target/criterion/` silently mixes runs.** Criterion keys results
+  by benchmark *name*, so renaming a benchmark leaves the old directory in
+  place and `estimates.json` for the old name still parses fine. A report
+  built by globbing that tree can quote a number measured against code that
+  no longer exists — which happened here, with `apply_fader` and
+  `apply_fader_into` sitting side by side. `rm -rf target/criterion` before a
+  run whose numbers you intend to publish.
+
 ## Audio engine
 
 - **`ParamTable::default()` has 64 mixer slots and ZERO send lanes.** An
