@@ -5,12 +5,16 @@
 //! | | what it measures |
 //! |---|---|
 //! | `multipass` | the un-fused node-graph shape `jit.md` asks to be compared against |
-//! | `apply_fader` | **the baseline** — a verbatim port of what the app runs today |
+//! | `apply_fader_into` | **the baseline** — a verbatim port of what the app runs today |
 //! | `fused_scalar` | the plan, compiled by rustc: how much of the win is the *algorithm* |
 //! | `jit` | the plan, compiled by cranelift into SSE: how much is the *code generator* |
 //!
+//! Every variant renders into a post-fader buffer and then mixes that into
+//! the master through `mix_post_into`, which is the shape `mixer::render_impl`
+//! has had since Plan G2 — the fader's own loop no longer touches the master.
+//!
 //! Reporting `jit` against `multipass` alone would be dishonest — it credits
-//! the JIT with beating a straw man. Reporting it against `apply_fader` is the
+//! the JIT with beating a straw man. Reporting it against `apply_fader_into` is the
 //! real claim, and reporting `fused_scalar` next to it is what stops that
 //! claim from being mis-attributed.
 //!
@@ -19,13 +23,18 @@
 //! outside, because it happens once on the control thread.
 
 use aura_engine::automation::{AbsParamEvent, RampCursor};
-use aura_engine::dsp::{apply_fader, fused_scalar, multipass, Accum};
+use aura_engine::dsp::{apply_fader_into, fused_scalar, mix_post_into, multipass, Accum};
 use aura_engine::jit::Kernels;
 use aura_engine::strip::{plan, PanQuad, Strip};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
 
 const TRACKS: usize = 32;
+
+/// Centre pan, equal-power — the −3 dB the app's `mixer::pan_gains(0.0)`
+/// returns. Spelled as the constant rather than `0.7071` so the pan law here
+/// is the same value the mixer's own tests assert.
+const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 fn signal(frames: usize) -> Vec<f32> {
     (0..frames)
@@ -40,7 +49,7 @@ fn fader_move() -> Vec<AbsParamEvent> {
 }
 
 fn flat_pan() -> PanQuad {
-    PanQuad { gl0: 0.7071, gr0: 0.7071, gl1: 0.7071, gr1: 0.7071 }
+    PanQuad { gl0: CENTRE, gr0: CENTRE, gl1: CENTRE, gr1: CENTRE }
 }
 
 fn moving_pan() -> PanQuad {
@@ -78,37 +87,27 @@ fn bench(c: &mut Criterion) {
             // engine's cost actually scales in.
             group.throughput(Throughput::Elements((frames * TRACKS) as u64));
 
-            let mut out = vec![0.0; frames * 2];
-            let mut scratch = vec![0.0; frames * 2];
+            let mut post = vec![0.0; frames * 2];
+            let mut master = vec![0.0; frames * 2];
 
             group.bench_function(BenchmarkId::new("multipass", frames), |b| {
                 b.iter(|| {
-                    out.fill(0.0);
+                    master.fill(0.0);
                     let mut acc = Accum::default();
                     for s in &all {
-                        multipass(
-                            s,
-                            &buf,
-                            frames,
-                            pos,
-                            0,
-                            last,
-                            &mut scratch,
-                            &mut out,
-                            2,
-                            &mut acc,
-                        );
+                        multipass(s, &buf, frames, pos, 0, last, &mut post, &mut acc);
+                        mix_post_into(&mut master, 0, 2, &post, frames);
                     }
                     black_box(acc);
                 })
             });
 
-            group.bench_function(BenchmarkId::new("apply_fader", frames), |b| {
+            group.bench_function(BenchmarkId::new("apply_fader_into", frames), |b| {
                 b.iter(|| {
-                    out.fill(0.0);
+                    master.fill(0.0);
                     let mut acc = Accum::default();
                     for s in &all {
-                        apply_fader(
+                        apply_fader_into(
                             s,
                             &buf,
                             frames,
@@ -116,10 +115,10 @@ fn bench(c: &mut Criterion) {
                             0,
                             last,
                             &mut RampCursor::new(),
-                            &mut out,
-                            2,
+                            &mut post,
                             &mut acc,
                         );
+                        mix_post_into(&mut master, 0, 2, &post, frames);
                     }
                     black_box(acc);
                 })
@@ -127,11 +126,12 @@ fn bench(c: &mut Criterion) {
 
             group.bench_function(BenchmarkId::new("fused_scalar", frames), |b| {
                 b.iter(|| {
-                    out.fill(0.0);
+                    master.fill(0.0);
                     let mut acc = Accum::default();
                     for s in &all {
                         let p = plan(s, pos, frames, 0, last);
-                        fused_scalar(&p, &buf, 0, &mut out, 2, &mut acc);
+                        fused_scalar(&p, &buf, &mut post, &mut acc);
+                        mix_post_into(&mut master, 0, 2, &post, frames);
                     }
                     black_box(acc);
                 })
@@ -139,13 +139,28 @@ fn bench(c: &mut Criterion) {
 
             group.bench_function(BenchmarkId::new("jit", frames), |b| {
                 b.iter(|| {
-                    out.fill(0.0);
+                    master.fill(0.0);
                     let mut acc = Accum::default();
                     for s in &all {
                         let p = plan(s, pos, frames, 0, last);
-                        assert!(kernels.run(&p, &buf, 0, &mut out, 2, &mut acc));
+                        assert!(kernels.run(&p, &buf, &mut post, &mut acc));
+                        mix_post_into(&mut master, 0, 2, &post, frames);
                     }
                     black_box(acc);
+                })
+            });
+
+            // The master-mix pass on its own. All four contenders pay it and
+            // none of them can avoid it, so a speedup quoted on the full path
+            // is diluted by a constant — this is the number that lets a reader
+            // subtract it instead of guessing.
+            group.bench_function(BenchmarkId::new("master_mix_only", frames), |b| {
+                b.iter(|| {
+                    master.fill(0.0);
+                    for _ in 0..TRACKS {
+                        mix_post_into(&mut master, 0, 2, &post, frames);
+                    }
+                    black_box(master[0]);
                 })
             });
 

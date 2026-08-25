@@ -6,9 +6,10 @@ publish = false
 description = "AURA RT primitives: triple-buffer publish, allocation telemetry, and a Cranelift-fused track-strip kernel"
 
 # STANDALONE crate, deliberately outside the Tauri app. `src-tauri/Cargo.toml`
-# is a frozen file, and cranelift is ~40 transitive crates — a dependency
-# decision for the owner, not a side effect of a task. Nothing in `src-tauri/`
-# depends on this crate yet; see docs/backlog/jit-engine.md.
+# is a frozen file, and cranelift is 34 transitive crates for the library alone
+# (`cargo tree -e normal`; 118 packages in the lockfile once criterion counts) —
+# a dependency decision for the owner, not a side effect of a task. Nothing in
+# `src-tauri/` depends on this crate yet; see docs/backlog/jit-engine.md.
 
 [lib]
 name = "aura_engine"

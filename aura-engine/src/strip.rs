@@ -1,6 +1,6 @@
 //! What one track strip does to one run of samples, described as data.
 //!
-//! `mixer::apply_fader` decides this per SAMPLE: it asks the ramp cursor for a
+//! `mixer::apply_fader_into` decides this per SAMPLE: it asks the ramp cursor for a
 //! value, lerps the pan, branches on mute, and does it 512 times. Every one of
 //! those decisions is the same for long stretches of the block, and the stretch
 //! boundaries are known before the loop starts — they are the automation
@@ -25,7 +25,7 @@ use crate::automation::{value_at, AbsParamEvent};
 /// out_l += in_l * g(i) * gl(i)
 /// ```
 ///
-/// The multiply order is `(in * g) * gl`, matching `apply_fader` exactly, so
+/// The multiply order is `(in * g) * gl`, matching `apply_fader_into` exactly, so
 /// the flat case (`dg == dgl == dgr == 0`) is **bit-identical** to today's
 /// mixer rather than merely close.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -91,7 +91,7 @@ pub struct Plan {
     /// The block had more breakpoints than [`MAX_SEGMENTS`] can hold.
     ///
     /// NOT an error and NOT a truncation: the caller must fall back to the
-    /// per-sample path ([`crate::dsp::apply_fader`]) for this block, which is
+    /// per-sample path ([`crate::dsp::apply_fader_into`]) for this block, which is
     /// always correct and merely slower. Silently dropping breakpoints would
     /// make automation stop moving on exactly the busiest lanes.
     pub overflowed: bool,
@@ -127,7 +127,7 @@ impl Plan {
 }
 
 /// Everything about a strip's fader for one run, in the terms
-/// `mixer::apply_fader` already takes.
+/// `mixer::apply_fader_into` already takes.
 #[derive(Clone, Copy, Debug)]
 pub struct Strip<'a> {
     /// Fader gain (the atomic `ParamTable::gain`).
@@ -172,7 +172,7 @@ impl PanQuad {
 ///
 /// `pos` is the absolute sample position of the run's first frame; `frames` is
 /// its length; `pan_index` is the frame index the pan lerp counts from
-/// (`f` in `apply_fader`) and `pan_last` its denominator — the two are the
+/// (`f` in `apply_fader_into`) and `pan_last` its denominator — the two are the
 /// block's, not the run's, because pan interpolates across the whole callback
 /// block while a loop wrap can split it into several runs.
 ///
@@ -202,7 +202,7 @@ pub fn plan(strip: &Strip<'_>, pos: u64, frames: usize, pan_index: usize, pan_la
     let gr_at_run = strip.pan.gr0 + dgr * pan_base;
 
     if strip.ramp.is_empty() {
-        // No ramp: `apply_fader`'s `unwrap_or(1.0)` means the fader value is
+        // No ramp: `apply_fader_into`'s `unwrap_or(1.0)` means the fader value is
         // the whole gain, exactly.
         out.push(Segment {
             offset: 0,

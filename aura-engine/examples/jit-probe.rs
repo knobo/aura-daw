@@ -11,6 +11,11 @@
 
 use std::time::Instant;
 
+/// Centre pan, equal-power — the −3 dB the app's `mixer::pan_gains(0.0)`
+/// returns. Spelled as the constant rather than `0.7071` so the pan law here
+/// is the same value the mixer's own tests assert.
+const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
 fn main() {
     let started = Instant::now();
     match aura_engine::jit::Kernels::compile() {
@@ -24,18 +29,18 @@ fn main() {
                 gain: 0.8,
                 ramp: &[],
                 pan: aura_engine::strip::PanQuad {
-                    gl0: 0.7071,
-                    gr0: 0.7071,
-                    gl1: 0.7071,
-                    gr1: 0.7071,
+                    gl0: CENTRE,
+                    gr0: CENTRE,
+                    gl1: CENTRE,
+                    gr1: CENTRE,
                 },
                 audible: true,
                 pdc_delay: 0,
             };
             let plan = aura_engine::strip::plan(&s, 0, frames, 0, frames - 1);
-            let mut out = vec![0.0f32; frames * 2];
+            let mut post = vec![0.0f32; frames * 2];
             let mut acc = aura_engine::dsp::Accum::default();
-            let ran = k.run(&plan, &buf, 0, &mut out, 2, &mut acc);
+            let ran = k.run(&plan, &buf, &mut post, &mut acc);
             println!("kernel ran: {ran}, peak L {:.4} R {:.4}", acc.pk_l, acc.pk_r);
             std::mem::forget(k);
         }

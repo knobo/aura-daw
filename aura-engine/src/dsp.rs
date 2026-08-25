@@ -1,7 +1,7 @@
 //! Three ways to run one track strip over one block, so the JIT has something
 //! honest to be compared against.
 //!
-//! * [`apply_fader`] — a verbatim port of `mixer::apply_fader`. **The
+//! * [`apply_fader_into`] — a verbatim port of `mixer::apply_fader_into`. **The
 //!   baseline.** Any speedup claim in this crate is against this function,
 //!   because this is the code that runs in the app today.
 //! * [`multipass`] — the un-fused shape `jit.md` asks to be compared: gain,
@@ -10,7 +10,7 @@
 //!   against.
 //! * [`fused_scalar`] — the [`crate::strip::Plan`] run as straight-line scalar
 //!   Rust. **The control.** It has the JIT's algorithm and none of its
-//!   machinery, so `fused_scalar` vs. `apply_fader` measures the *plan*, and
+//!   machinery, so `fused_scalar` vs. `apply_fader_into` measures the *plan*, and
 //!   the JIT vs. `fused_scalar` measures the *code generation*. Reporting only
 //!   "JIT vs. baseline" would credit the compiler with the algorithm's win.
 
@@ -58,16 +58,38 @@ fn mix_out(out: &mut [f32], frame: usize, out_ch: usize, l: f32, r: f32) {
     }
 }
 
-/// **The baseline.** Verbatim port of `mixer::apply_fader`: per-sample ramp
-/// lookup, per-sample pan lerp (including its per-sample divide), a branch on
-/// mute, meters, and the mix into `out`.
+/// `mixer::mix_post_into` — add a stereo post-fader run into the `out_ch`-wide
+/// master.
+///
+/// Ported because it is what the fader stopped doing. Plan G2 (bus tracks and
+/// sends) split the strip in two: the fader now writes a contiguous stereo
+/// **post-fader buffer**, and routing — master, a bus, a send tap, the output
+/// PDC — reads that buffer afterwards. Which means the channel-count and
+/// accumulate-vs-overwrite questions left the fader entirely, and the kernel
+/// this crate generates got simpler for it: contiguous stereo stores, no
+/// read-modify-write, and no reason to refuse a mono device.
+pub fn mix_post_into(out: &mut [f32], f: usize, out_ch: usize, post: &[f32], run: usize) {
+    for i in 0..run {
+        mix_out(out, f + i, out_ch, post[i * 2], post[i * 2 + 1]);
+    }
+}
+
+/// **The baseline.** Verbatim port of `mixer::apply_fader_into`: per-sample
+/// ramp lookup, per-sample pan lerp (including its per-sample divide), a
+/// branch on mute, meters, and the write into the post-fader buffer.
 ///
 /// Kept structurally identical to the original — same order of operations,
 /// same `unwrap_or(1.0)`, same `saturating_*` on the ramp position. If the
 /// mixer's loop changes, this must change with it or the benchmark stops
-/// meaning anything.
+/// meaning anything. (It already has once: Plan G2 turned the accumulate into
+/// `out` into a write into `post`.)
+///
+/// `post` is the run's own buffer, indexed from 0 — while the pan lerp counts
+/// from `pan_index`, which is the frame's position in the whole callback
+/// block. The two indices are genuinely different and the mixer keeps them
+/// apart the same way.
 #[allow(clippy::too_many_arguments)]
-pub fn apply_fader(
+pub fn apply_fader_into(
     strip: &Strip<'_>,
     buf: &[f32],
     frames: usize,
@@ -75,8 +97,7 @@ pub fn apply_fader(
     pan_index: usize,
     pan_last: usize,
     cursor: &mut RampCursor,
-    out: &mut [f32],
-    out_ch: usize,
+    post: &mut [f32],
     acc: &mut Accum,
 ) {
     for i in 0..frames {
@@ -102,17 +123,18 @@ pub fn apply_fader(
             r = 0.0;
         }
         acc.fold(l, r);
-        mix_out(out, pan_index + i, out_ch, l, r);
+        post[i * 2] = l;
+        post[i * 2 + 1] = r;
     }
 }
 
-/// The un-fused shape: four passes over `scratch`, one per stage.
+/// The un-fused shape: four passes over `post`, one per stage.
 ///
-/// `scratch` must hold `2 * frames` samples and is clobbered. Provided by the
-/// caller precisely because a node graph that allocated its own edge buffers
-/// per block would be disqualified before the timing started — so the
-/// comparison is against a multi-pass graph that is *already* RT-legal, not a
-/// straw man.
+/// No caller-provided scratch any more, and not for tidiness: Plan G2 gave the
+/// fader a post-fader buffer of its own, so the multi-pass shape can stage its
+/// work in the destination. That removes the last excuse a naive graph had for
+/// allocating per block, which makes it a fairer opponent rather than a weaker
+/// one.
 #[allow(clippy::too_many_arguments)]
 pub fn multipass(
     strip: &Strip<'_>,
@@ -121,25 +143,25 @@ pub fn multipass(
     pos: u64,
     pan_index: usize,
     pan_last: usize,
-    scratch: &mut [f32],
-    out: &mut [f32],
-    out_ch: usize,
+    post: &mut [f32],
     acc: &mut Accum,
 ) {
     let n = frames * 2;
     if !strip.audible {
-        // A muted strip still folds zeros and adds nothing — same observable
-        // result as the baseline's branch, without pretending the pass is free.
-        for i in 0..frames {
+        // A muted strip still folds zeros and still has to CLEAR the post
+        // buffer: it is an overwrite target that sends and routing read
+        // afterwards, so skipping it would leak the previous run's audio into
+        // this one.
+        post[..n].fill(0.0);
+        for _ in 0..frames {
             acc.fold(0.0, 0.0);
-            mix_out(out, pan_index + i, out_ch, 0.0, 0.0);
         }
         return;
     }
 
     // Pass 1 — gain.
     for i in 0..n {
-        scratch[i] = buf[i] * strip.gain;
+        post[i] = buf[i] * strip.gain;
     }
     // Pass 2 — the automation ramp.
     if !strip.ramp.is_empty() {
@@ -148,8 +170,8 @@ pub fn multipass(
             let v = cursor
                 .value(strip.ramp, pos.saturating_add(i as u64).saturating_sub(strip.pdc_delay))
                 .unwrap_or(1.0);
-            scratch[i * 2] *= v;
-            scratch[i * 2 + 1] *= v;
+            post[i * 2] *= v;
+            post[i * 2 + 1] *= v;
         }
     }
     // Pass 3 — pan.
@@ -162,36 +184,25 @@ pub fn multipass(
             pan_index + i,
             pan_last,
         );
-        scratch[i * 2] *= gl;
-        scratch[i * 2 + 1] *= gr;
+        post[i * 2] *= gl;
+        post[i * 2 + 1] *= gr;
     }
-    // Pass 4 — meters and the mix into the output.
+    // Pass 4 — meters.
     for i in 0..frames {
-        let (l, r) = (scratch[i * 2], scratch[i * 2 + 1]);
-        acc.fold(l, r);
-        mix_out(out, pan_index + i, out_ch, l, r);
+        acc.fold(post[i * 2], post[i * 2 + 1]);
     }
 }
 
 /// **The control.** The plan run as straight-line scalar Rust: same algorithm
 /// as the JIT kernels, compiled by rustc.
-///
-/// `out` is indexed from `pan_index` exactly as the baseline does, so the two
-/// write the same frames.
-pub fn fused_scalar(
-    plan: &Plan,
-    buf: &[f32],
-    pan_index: usize,
-    out: &mut [f32],
-    out_ch: usize,
-    acc: &mut Accum,
-) {
+pub fn fused_scalar(plan: &Plan, buf: &[f32], post: &mut [f32], acc: &mut Accum) {
     if plan.silent {
-        // Folding zeros cannot move a peak (`max` against a non-negative
-        // running value) and adds nothing to the sums, and mixing zeros adds
-        // nothing to the output. So the silent strip is genuinely a no-op —
-        // the baseline's `l = 0.0; r = 0.0` costs a full pass to reach the
-        // same place.
+        // Not a no-op, and this is the one place the Plan G2 merge changed a
+        // conclusion: `post` is an overwrite target read afterwards by the
+        // sends and the routing, so a muted strip has to clear it. Folding
+        // zeros into the meters, on the other hand, genuinely cannot move a
+        // peak (`max` against a non-negative running value) or a sum.
+        post.fill(0.0);
         return;
     }
     for seg in plan.segments() {
@@ -203,7 +214,8 @@ pub fn fused_scalar(
             let l = buf[frame * 2] * g * (c.gl0 + c.dgl * fi);
             let r = buf[frame * 2 + 1] * g * (c.gr0 + c.dgr * fi);
             acc.fold(l, r);
-            mix_out(out, pan_index + frame, out_ch, l, r);
+            post[frame * 2] = l;
+            post[frame * 2 + 1] = r;
         }
     }
 }
@@ -226,18 +238,20 @@ mod tests {
     fn noise(frames: usize) -> Vec<f32> {
         // Deterministic, and not a constant — a constant input hides index
         // bugs, because every frame looks like every other frame.
-        (0..frames * 2)
-            .map(|i| (i as f32 * 0.37).sin() * 0.8)
-            .collect()
+        (0..frames * 2).map(|i| (i as f32 * 0.37).sin() * 0.8).collect()
     }
 
+    /// The same run through all three implementations. `post` starts as a
+    /// recognisable non-zero pattern in every case, so a path that forgets to
+    /// write a frame is caught instead of matching a zeroed buffer by luck.
     fn run3(strip: &Strip<'_>, frames: usize, pos: u64) -> [(Vec<f32>, Accum); 3] {
         let buf = noise(frames);
         let pan_last = frames - 1;
+        let dirty = vec![-7.5f32; frames * 2];
 
-        let mut out_a = vec![0.0; frames * 2];
+        let mut post_a = dirty.clone();
         let mut acc_a = Accum::default();
-        apply_fader(
+        apply_fader_into(
             strip,
             &buf,
             frames,
@@ -245,22 +259,20 @@ mod tests {
             0,
             pan_last,
             &mut RampCursor::new(),
-            &mut out_a,
-            2,
+            &mut post_a,
             &mut acc_a,
         );
 
-        let mut out_b = vec![0.0; frames * 2];
+        let mut post_b = dirty.clone();
         let mut acc_b = Accum::default();
-        let mut scratch = vec![0.0; frames * 2];
-        multipass(strip, &buf, frames, pos, 0, pan_last, &mut scratch, &mut out_b, 2, &mut acc_b);
+        multipass(strip, &buf, frames, pos, 0, pan_last, &mut post_b, &mut acc_b);
 
         let p = plan(strip, pos, frames, 0, pan_last);
-        let mut out_c = vec![0.0; frames * 2];
+        let mut post_c = dirty;
         let mut acc_c = Accum::default();
-        fused_scalar(&p, &buf, 0, &mut out_c, 2, &mut acc_c);
+        fused_scalar(&p, &buf, &mut post_c, &mut acc_c);
 
-        [(out_a, acc_a), (out_b, acc_b), (out_c, acc_c)]
+        [(post_a, acc_a), (post_b, acc_b), (post_c, acc_c)]
     }
 
     fn assert_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
@@ -333,7 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn a_muted_strip_leaves_the_output_and_the_meters_alone() {
+    fn a_muted_strip_clears_the_post_buffer_rather_than_skipping_it() {
+        // The Plan G2 seam makes this load-bearing: `post` is read afterwards
+        // by the sends and by routing, so a muted strip that left the buffer
+        // alone would leak the PREVIOUS run's audio into this one — a
+        // once-per-block burst of stale signal on a track the user muted.
         let s = Strip {
             gain: 1.0,
             ramp: &[],
@@ -342,9 +358,9 @@ mod tests {
             pdc_delay: 0,
         };
         let [(a, aa), (b, ab), (c, ac)] = run3(&s, 256, 0);
-        assert!(a.iter().all(|&x| x == 0.0));
+        assert!(a.iter().all(|&x| x == 0.0), "the baseline writes silence");
         assert_eq!(a, b);
-        assert_eq!(a, c, "the no-op fast path must be observably a no-op");
+        assert_eq!(a, c, "the fused path must clear, not skip");
         assert_eq!((aa, ab), (Accum::default(), Accum::default()));
         assert_eq!(ac, Accum::default());
     }
@@ -360,41 +376,21 @@ mod tests {
             pdc_delay: 192,
         };
         let [(a, _), (b, _), (c, _)] = run3(&s, 512, 256);
-        assert_eq!(a, b);
-        assert_close(&a, &c, 1e-5, "pdc-shifted ramp");
+        assert_close(&a, &b, 1e-6, "pdc-shifted ramp, multipass");
+        assert_close(&a, &c, 1e-5, "pdc-shifted ramp, fused");
     }
 
     #[test]
-    fn mono_output_downmixes_the_same_way() {
-        let s = Strip {
-            gain: 0.8,
-            ramp: &[],
-            pan: PanQuad { gl0: 1.0, gr0: 0.2, gl1: 1.0, gr1: 0.2 },
-            audible: true,
-            pdc_delay: 0,
-        };
-        let frames = 128;
-        let buf = noise(frames);
-        let p = plan(&s, 0, frames, 0, frames - 1);
+    fn mixing_a_post_run_into_a_mono_master_downmixes() {
+        // The channel-count question now lives here rather than in the fader,
+        // which is why the kernels no longer have to care about it.
+        let post = [1.0f32, 0.5, -0.25, 0.75];
+        let mut mono = vec![0.0f32; 2];
+        mix_post_into(&mut mono, 0, 1, &post, 2);
+        assert_eq!(mono, vec![0.75, 0.25]);
 
-        let mut out_a = vec![0.0; frames];
-        let mut acc_a = Accum::default();
-        apply_fader(
-            &s,
-            &buf,
-            frames,
-            0,
-            0,
-            frames - 1,
-            &mut RampCursor::new(),
-            &mut out_a,
-            1,
-            &mut acc_a,
-        );
-        let mut out_c = vec![0.0; frames];
-        let mut acc_c = Accum::default();
-        fused_scalar(&p, &buf, 0, &mut out_c, 1, &mut acc_c);
-        assert_eq!(out_a, out_c);
-        assert_eq!(acc_a, acc_c);
+        let mut stereo = vec![10.0f32; 4];
+        mix_post_into(&mut stereo, 0, 2, &post, 2);
+        assert_eq!(stereo, vec![11.0, 10.5, 9.75, 10.75], "the master ACCUMULATES");
     }
 }

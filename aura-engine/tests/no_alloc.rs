@@ -12,7 +12,7 @@
 //! anything else is asserted.
 
 use aura_engine::automation::{AbsParamEvent, RampCursor};
-use aura_engine::dsp::{apply_fader, fused_scalar, multipass, Accum};
+use aura_engine::dsp::{apply_fader_into, fused_scalar, mix_post_into, multipass, Accum};
 use aura_engine::jit::Kernels;
 use aura_engine::metrics::{assert_no_alloc, counting_is_active, measure, AllocCounter, Telemetry};
 use aura_engine::strip::{plan, PanQuad, Strip};
@@ -22,6 +22,12 @@ use aura_engine::sync::triple_buffer;
 static ALLOC: AllocCounter = AllocCounter::new();
 
 const FRAMES: usize = 512;
+
+/// Centre pan, equal-power — the −3 dB the app's `mixer::pan_gains(0.0)`
+/// returns. Spelled as the constant rather than `0.7071` so the pan law here
+/// is the same value the mixer's own tests assert.
+const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
 const TRACKS: usize = 32;
 
 fn signal() -> Vec<f32> {
@@ -50,7 +56,7 @@ fn strips<'a>(ramp: &'a [AbsParamEvent]) -> Vec<Strip<'a>> {
             pan: if n % 2 == 0 {
                 PanQuad { gl0: 0.98, gr0: 0.19, gl1: 0.19, gr1: 0.98 }
             } else {
-                PanQuad { gl0: 0.7071, gr0: 0.7071, gl1: 0.7071, gr1: 0.7071 }
+                PanQuad { gl0: CENTRE, gr0: CENTRE, gl1: CENTRE, gr1: CENTRE }
             },
             audible: n % 8 != 7,
             pdc_delay: if n % 5 == 0 { 128 } else { 0 },
@@ -101,16 +107,22 @@ fn the_jit_kernels_do_not_allocate_while_rendering() {
     let ramp = fader_move();
     let all = strips(&ramp);
     let buf = signal();
-    let mut out = vec![0.0; FRAMES * 2];
+    let mut post = vec![0.0; FRAMES * 2];
+    let mut master = vec![0.0; FRAMES * 2];
     let mut acc = Accum::default();
 
     assert_no_alloc("plan + JIT kernels, 32 tracks", || {
         for s in &all {
             let p = plan(s, 1024, FRAMES, 0, FRAMES - 1);
-            assert!(kernels.run(&p, &buf, 0, &mut out, 2, &mut acc));
+            assert!(kernels.run(&p, &buf, &mut post, &mut acc));
+            mix_post_into(&mut master, 0, 2, &post, FRAMES);
         }
     });
-    assert!(out.iter().any(|&x| x != 0.0), "a no-op cannot be RT-safe by doing nothing");
+    // The master, not `post`: `post` is per-strip and the last strip in this
+    // set is a muted one, so it ends the loop full of the silence that strip
+    // correctly wrote. A no-op cannot be RT-safe by doing nothing.
+    assert!(master.iter().any(|&x| x != 0.0), "nothing reached the master");
+    assert!(acc.pk_l > 0.0 && acc.pk_r > 0.0, "the meters saw nothing");
 }
 
 #[test]
@@ -120,13 +132,12 @@ fn the_scalar_paths_do_not_allocate_either() {
     let ramp = fader_move();
     let all = strips(&ramp);
     let buf = signal();
-    let mut out = vec![0.0; FRAMES * 2];
-    let mut scratch = vec![0.0; FRAMES * 2];
+    let mut post = vec![0.0; FRAMES * 2];
     let mut acc = Accum::default();
 
-    assert_no_alloc("mixer::apply_fader port", || {
+    assert_no_alloc("mixer::apply_fader_into port", || {
         for s in &all {
-            apply_fader(
+            apply_fader_into(
                 s,
                 &buf,
                 FRAMES,
@@ -134,8 +145,7 @@ fn the_scalar_paths_do_not_allocate_either() {
                 0,
                 FRAMES - 1,
                 &mut RampCursor::new(),
-                &mut out,
-                2,
+                &mut post,
                 &mut acc,
             );
         }
@@ -143,23 +153,12 @@ fn the_scalar_paths_do_not_allocate_either() {
     assert_no_alloc("fused_scalar", || {
         for s in &all {
             let p = plan(s, 1024, FRAMES, 0, FRAMES - 1);
-            fused_scalar(&p, &buf, 0, &mut out, 2, &mut acc);
+            fused_scalar(&p, &buf, &mut post, &mut acc);
         }
     });
-    assert_no_alloc("multipass with caller-owned scratch", || {
+    assert_no_alloc("multipass", || {
         for s in &all {
-            multipass(
-                s,
-                &buf,
-                FRAMES,
-                1024,
-                0,
-                FRAMES - 1,
-                &mut scratch,
-                &mut out,
-                2,
-                &mut acc,
-            );
+            multipass(s, &buf, FRAMES, 1024, 0, FRAMES - 1, &mut post, &mut acc);
         }
     });
 }
@@ -173,7 +172,10 @@ fn publishing_and_reading_a_triple_buffer_does_not_allocate() {
             tx.slot()[n % 64] = n as f32;
             tx.publish();
             let v = rx.read();
-            assert!(v[0] == 0.0 || v[0] > 0.0);
+            // Every value the writer ever put in slot 0 is a non-negative
+            // `n as f32`. Reading anything else would mean the reader saw a
+            // slot mid-write — the race this buffer exists to prevent.
+            assert!(v[0] >= 0.0, "reader saw a torn slot: {}", v[0]);
         }
     });
 }
@@ -206,17 +208,19 @@ fn a_whole_callback_block_allocates_nothing() {
     let ramp = fader_move();
     let all = strips(&ramp);
     let buf = signal();
-    let mut out = vec![0.0; FRAMES * 2];
+    let mut post = vec![0.0; FRAMES * 2];
+    let mut master = vec![0.0; FRAMES * 2];
 
     let (_, stats) = measure(|| {
         for block in 0..64u64 {
             let table = krx.read().as_ref().expect("published before the first block");
             let started = telemetry.start(FRAMES as u32);
-            out.fill(0.0);
+            master.fill(0.0);
             let mut acc = Accum::default();
             for s in &all {
                 let p = plan(s, block * FRAMES as u64, FRAMES, 0, FRAMES - 1);
-                assert!(table.run(&p, &buf, 0, &mut out, 2, &mut acc));
+                assert!(table.run(&p, &buf, &mut post, &mut acc));
+                mix_post_into(&mut master, 0, 2, &post, FRAMES);
             }
             let _late = telemetry.finish(started);
             ttx.write(telemetry.snapshot());

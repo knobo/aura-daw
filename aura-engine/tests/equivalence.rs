@@ -5,7 +5,7 @@
 //! * **vs. [`dsp::fused_scalar`] — bit-identical.** Same algorithm, same
 //!   operation order; the only difference is who emitted the code. Anything
 //!   less than equality here is a codegen bug, so the test says `assert_eq`.
-//! * **vs. [`dsp::apply_fader`] — equal within 1e-5 relative.** The plan
+//! * **vs. [`dsp::apply_fader_into`] — equal within 1e-5 relative.** The plan
 //!   replaces per-sample interpolation with an affine form and folds the fader
 //!   into the coefficients, which moves the last bits. Except in the flat case,
 //!   where it is exact — and that is asserted as equality, because the flat
@@ -18,9 +18,14 @@
 //! addition associative. The tolerance on the meters is 1e-4 absolute.
 
 use aura_engine::automation::{AbsParamEvent, RampCursor};
-use aura_engine::dsp::{apply_fader, fused_scalar, Accum};
+use aura_engine::dsp::{apply_fader_into, fused_scalar, mix_post_into, Accum};
 use aura_engine::jit::{Kernels, Shape};
 use aura_engine::strip::{plan, Coef, PanQuad, Strip};
+
+/// Centre pan, equal-power — the −3 dB the app's `mixer::pan_gains(0.0)`
+/// returns. Spelled as the constant rather than `0.7071` so the pan law here
+/// is the same value the mixer's own tests assert.
+const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// Compiled once for the whole suite: `Kernels::compile` is a register
 /// allocator run, and the table is read-only afterwards.
@@ -50,14 +55,21 @@ fn signal(frames: usize) -> Vec<f32> {
 }
 
 struct Run {
-    out: Vec<f32>,
+    post: Vec<f32>,
     acc: Accum,
 }
 
-fn baseline(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64, out_ch: usize) -> Run {
-    let mut out = vec![0.0; frames * out_ch];
+/// Every run starts from a recognisably dirty `post`, because the buffer is an
+/// OVERWRITE target: a path that skips a frame would match a zeroed buffer by
+/// luck and leak the previous run's audio in production.
+fn dirty(frames: usize) -> Vec<f32> {
+    vec![-7.5; frames * 2]
+}
+
+fn baseline(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64) -> Run {
+    let mut post = dirty(frames);
     let mut acc = Accum::default();
-    apply_fader(
+    apply_fader_into(
         s,
         buf,
         frames,
@@ -65,30 +77,29 @@ fn baseline(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64, out_ch: usize) 
         0,
         frames - 1,
         &mut RampCursor::new(),
-        &mut out,
-        out_ch,
+        &mut post,
         &mut acc,
     );
-    Run { out, acc }
+    Run { post, acc }
 }
 
-fn scalar(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64, out_ch: usize) -> Run {
+fn scalar(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64) -> Run {
     let p = plan(s, pos, frames, 0, frames - 1);
-    let mut out = vec![0.0; frames * out_ch];
+    let mut post = dirty(frames);
     let mut acc = Accum::default();
-    fused_scalar(&p, buf, 0, &mut out, out_ch, &mut acc);
-    Run { out, acc }
+    fused_scalar(&p, buf, &mut post, &mut acc);
+    Run { post, acc }
 }
 
-fn jit(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64, out_ch: usize) -> Run {
+fn jit(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64) -> Run {
     let p = plan(s, pos, frames, 0, frames - 1);
-    let mut out = vec![0.0; frames * out_ch];
+    let mut post = dirty(frames);
     let mut acc = Accum::default();
     assert!(
-        kernels().run(&p, buf, 0, &mut out, out_ch, &mut acc),
+        kernels().run(&p, buf, &mut post, &mut acc),
         "the kernels declined a plan this test expects them to take"
     );
-    Run { out, acc }
+    Run { post, acc }
 }
 
 fn assert_samples_close(a: &[f32], b: &[f32], tol: f32, what: &str) {
@@ -111,7 +122,7 @@ fn assert_meters_close(a: &Accum, b: &Accum, what: &str) {
 }
 
 fn flat_pan() -> PanQuad {
-    PanQuad { gl0: 0.7071, gr0: 0.7071, gl1: 0.7071, gr1: 0.7071 }
+    PanQuad { gl0: CENTRE, gr0: CENTRE, gl1: CENTRE, gr1: CENTRE }
 }
 
 fn moving_pan() -> PanQuad {
@@ -140,9 +151,9 @@ fn the_host_can_be_targeted_at_all() {
 fn flat_strips_are_bit_identical_to_the_mixer() {
     let buf = signal(512);
     let s = Strip { gain: 0.62, ramp: &[], pan: flat_pan(), audible: true, pdc_delay: 0 };
-    let b = baseline(&s, &buf, 512, 0, 2);
-    let j = jit(&s, &buf, 512, 0, 2);
-    assert_eq!(b.out, j.out, "the common case must not change the sound at all");
+    let b = baseline(&s, &buf, 512, 0);
+    let j = jit(&s, &buf, 512, 0);
+    assert_eq!(b.post, j.post, "the common case must not change the sound at all");
     assert_eq!(b.acc.pk_l, j.acc.pk_l);
     assert_eq!(b.acc.pk_r, j.acc.pk_r);
     // Only the sums reassociate.
@@ -172,9 +183,9 @@ fn the_jit_matches_the_scalar_plan_bit_for_bit() {
             Strip { gain: 0.73, ramp: &r, pan: moving_pan(), audible: true, pdc_delay: 192 },
         ),
     ] {
-        let sc = scalar(&s, &buf, 512, 256, 2);
-        let j = jit(&s, &buf, 512, 256, 2);
-        assert_eq!(sc.out, j.out, "{name}: cranelift and rustc must agree exactly");
+        let sc = scalar(&s, &buf, 512, 256);
+        let j = jit(&s, &buf, 512, 256);
+        assert_eq!(sc.post, j.post, "{name}: cranelift and rustc must agree exactly");
         assert_eq!(sc.acc.pk_l, j.acc.pk_l, "{name}: peak L");
         assert_eq!(sc.acc.pk_r, j.acc.pk_r, "{name}: peak R");
         assert_meters_close(&sc.acc, &j.acc, name);
@@ -186,9 +197,9 @@ fn ramped_and_panned_strips_track_the_mixer_within_rounding() {
     let buf = signal(512);
     let r = fader_move();
     let s = Strip { gain: 0.73, ramp: &r, pan: moving_pan(), audible: true, pdc_delay: 0 };
-    let b = baseline(&s, &buf, 512, 0, 2);
-    let j = jit(&s, &buf, 512, 0, 2);
-    assert_samples_close(&b.out, &j.out, 1e-5, "ramped+panned");
+    let b = baseline(&s, &buf, 512, 0);
+    let j = jit(&s, &buf, 512, 0);
+    assert_samples_close(&b.post, &j.post, 1e-5, "ramped+panned");
     assert_meters_close(&b.acc, &j.acc, "ramped+panned meters");
 }
 
@@ -202,12 +213,12 @@ fn odd_block_sizes_render_every_frame() {
     for frames in [1, 2, 3, 7, 63, 127, 129, 511] {
         let buf = signal(frames);
         let s = Strip { gain: 0.9, ramp: &r, pan: moving_pan(), audible: true, pdc_delay: 0 };
-        let sc = scalar(&s, &buf, frames, 0, 2);
-        let j = jit(&s, &buf, frames, 0, 2);
-        assert_eq!(sc.out, j.out, "{frames} frames");
+        let sc = scalar(&s, &buf, frames, 0);
+        let j = jit(&s, &buf, frames, 0);
+        assert_eq!(sc.post, j.post, "{frames} frames");
         assert!(
-            j.out.iter().any(|&x| x != 0.0) || frames == 0,
-            "{frames} frames: nothing was written"
+            j.post.iter().all(|&x| x != -7.5),
+            "{frames} frames: a frame was left at its dirty value"
         );
     }
 }
@@ -224,79 +235,108 @@ fn every_segment_of_a_multi_breakpoint_block_is_rendered() {
     let p = plan(&s, 0, 512, 0, 511);
     assert!(p.segments().len() > 1, "the test needs a multi-segment plan");
     assert!(!p.overflowed);
-    let sc = scalar(&s, &buf, 512, 0, 2);
-    let j = jit(&s, &buf, 512, 0, 2);
-    assert_eq!(sc.out, j.out);
-    let b = baseline(&s, &buf, 512, 0, 2);
-    assert_samples_close(&b.out, &j.out, 1e-5, "multi-segment");
+    let sc = scalar(&s, &buf, 512, 0);
+    let j = jit(&s, &buf, 512, 0);
+    assert_eq!(sc.post, j.post);
+    let b = baseline(&s, &buf, 512, 0);
+    assert_samples_close(&b.post, &j.post, 1e-5, "multi-segment");
 }
 
 #[test]
-fn a_muted_strip_writes_nothing() {
+fn a_muted_strip_clears_the_post_buffer() {
+    // Not "writes nothing" — `post` is read after the fader by the sends and
+    // by routing, so a muted strip that skipped it would send the previous
+    // run's audio to the master once per block.
     let buf = signal(256);
     let s = Strip { gain: 1.0, ramp: &[], pan: flat_pan(), audible: false, pdc_delay: 0 };
-    let b = baseline(&s, &buf, 256, 0, 2);
-    let j = jit(&s, &buf, 256, 0, 2);
-    assert!(b.out.iter().all(|&x| x == 0.0));
-    assert_eq!(b.out, j.out);
+    let b = baseline(&s, &buf, 256, 0);
+    let j = jit(&s, &buf, 256, 0);
+    assert!(b.post.iter().all(|&x| x == 0.0), "the baseline writes silence");
+    assert_eq!(b.post, j.post);
     assert_eq!(j.acc, Accum::default());
 }
 
 #[test]
-fn the_kernels_add_into_the_output_rather_than_overwrite_it() {
-    // Every track after the first mixes on top of what is already there. A
-    // kernel that stored instead of accumulating would silence every track but
-    // the last, which is exactly the kind of bug a single-track test misses.
+fn the_kernels_overwrite_the_post_buffer_rather_than_accumulate() {
+    // The direction this assertion points in flipped with Plan G2. The fader
+    // used to add into the shared master, so accumulating was the contract;
+    // now it fills a per-run buffer that routing reads, so ADDING would double
+    // every track on the second block it rendered.
     let buf = signal(128);
     let s = Strip { gain: 0.5, ramp: &[], pan: flat_pan(), audible: true, pdc_delay: 0 };
     let p = plan(&s, 0, 128, 0, 127);
-    let mut out = vec![0.0; 256];
+    let mut post = vec![-7.5; 256];
     let mut acc = Accum::default();
-    assert!(kernels().run(&p, &buf, 0, &mut out, 2, &mut acc));
-    let once = out.clone();
-    assert!(kernels().run(&p, &buf, 0, &mut out, 2, &mut acc));
-    for (i, (single, twice)) in once.iter().zip(&out).enumerate() {
-        assert!((twice - single * 2.0).abs() < 1e-6, "frame {i}: {twice} vs {}", single * 2.0);
-    }
+    assert!(kernels().run(&p, &buf, &mut post, &mut acc));
+    let once = post.clone();
+    assert!(kernels().run(&p, &buf, &mut post, &mut acc));
+    assert_eq!(once, post, "a second run must produce the same samples, not twice them");
 }
 
 #[test]
-fn a_run_placed_later_in_the_block_lands_at_the_right_offset() {
-    // A loop wrap splits a callback block into runs; the second run writes at
-    // `pan_index` frames in. Writing at 0 instead would double the first half
-    // of the block and drop the second.
+fn pan_index_moves_the_pan_and_not_the_output_index() {
+    // A loop wrap splits a callback block into runs. The second run's audio
+    // starts at index 0 of its OWN post buffer, but its pan must continue from
+    // where the first run left off — the mixer keeps `f` (block-relative) and
+    // the buffer index (run-relative) apart, and so must the plan.
     let frames = 64;
     let buf = signal(frames);
-    let s = Strip { gain: 1.0, ramp: &[], pan: flat_pan(), audible: true, pdc_delay: 0 };
-    let p = plan(&s, 0, frames, frames, 2 * frames - 1);
-    let mut out = vec![0.0; 2 * frames * 2];
+    let s = Strip { gain: 1.0, ramp: &[], pan: moving_pan(), audible: true, pdc_delay: 0 };
+
+    // Same run, planned as if it were the first half of a 128-frame block and
+    // then as if it were the second half.
+    let first = plan(&s, 0, frames, 0, 2 * frames - 1);
+    let second = plan(&s, 0, frames, frames, 2 * frames - 1);
+    let mut post_a = dirty(frames);
+    let mut post_b = dirty(frames);
     let mut acc = Accum::default();
-    assert!(kernels().run(&p, &buf, frames, &mut out, 2, &mut acc));
-    assert!(out[..frames * 2].iter().all(|&x| x == 0.0), "the first half must be untouched");
-    assert!(out[frames * 2..].iter().any(|&x| x != 0.0), "the second half must be written");
+    assert!(kernels().run(&first, &buf, &mut post_a, &mut acc));
+    assert!(kernels().run(&second, &buf, &mut post_b, &mut acc));
+
+    assert!(post_a.iter().all(|&x| x != -7.5), "the first run filled its buffer from 0");
+    assert!(post_b.iter().all(|&x| x != -7.5), "so did the second");
+    assert_ne!(post_a, post_b, "the pan must have moved between the two halves");
+    // And against the mixer, for the half that is easy to get wrong.
+    let mut post_ref = dirty(frames);
+    let mut acc_ref = Accum::default();
+    apply_fader_into(
+        &s,
+        &buf,
+        frames,
+        0,
+        frames,
+        2 * frames - 1,
+        &mut RampCursor::new(),
+        &mut post_ref,
+        &mut acc_ref,
+    );
+    assert_samples_close(&post_ref, &post_b, 1e-5, "second half of a wrapped block");
 }
 
 #[test]
 fn the_kernels_decline_what_they_cannot_render() {
     let buf = signal(64);
-    let s = Strip { gain: 1.0, ramp: &[], pan: flat_pan(), audible: true, pdc_delay: 0 };
-    let p = plan(&s, 0, 64, 0, 63);
-    let mut out = vec![0.0; 64];
-    let mut acc = Accum::default();
-    // Mono output: not a kernel shape, and it must SAY so rather than write
-    // stereo pairs into a mono buffer.
-    assert!(!kernels().run(&p, &buf, 0, &mut out, 1, &mut acc));
-    assert!(out.iter().all(|&x| x == 0.0), "a declined plan must write nothing");
-
-    // Too many breakpoints for the plan: same contract.
+    // Too many breakpoints for the plan to hold: the kernels must SAY so,
+    // because the alternative is a post buffer left at whatever it held.
     let dense: Vec<_> =
         (0..300).map(|n| AbsParamEvent { sample: n * 2, value: (n % 2) as f32 }).collect();
     let s = Strip { gain: 1.0, ramp: &dense, pan: flat_pan(), audible: true, pdc_delay: 0 };
     let p = plan(&s, 0, 64, 0, 63);
     assert!(p.overflowed);
-    let mut out = vec![0.0; 128];
-    assert!(!kernels().run(&p, &buf, 0, &mut out, 2, &mut acc));
-    assert!(out.iter().all(|&x| x == 0.0));
+    let mut post = vec![-7.5; 128];
+    let mut acc = Accum::default();
+    assert!(!kernels().run(&p, &buf, &mut post, &mut acc));
+    assert!(post.iter().all(|&x| x == -7.5), "a declined plan must not touch the buffer");
+
+    // A mono master used to be declined too. It is not the fader's business
+    // any more — `mix_post_into` downmixes, after the kernel has run.
+    let s = Strip { gain: 1.0, ramp: &[], pan: flat_pan(), audible: true, pdc_delay: 0 };
+    let p = plan(&s, 0, 64, 0, 63);
+    let mut post = vec![0.0; 128];
+    assert!(kernels().run(&p, &buf, &mut post, &mut acc));
+    let mut mono = vec![0.0; 64];
+    mix_post_into(&mut mono, 0, 1, &post, 64);
+    assert!(mono.iter().any(|&x| x != 0.0));
 }
 
 #[test]
@@ -311,10 +351,10 @@ fn shape_selection_follows_the_coefficients() {
 
 #[test]
 fn a_full_stereo_mix_of_many_strips_agrees_with_the_mixer() {
-    // The integration shape: 24 tracks, a mix of automated and static, summed
-    // into one output buffer, compared against the same sum through
-    // `apply_fader`. This is the number that would change if the JIT path were
-    // wired into `mixer::render`.
+    // The integration shape: 24 tracks, a mix of automated and static, each
+    // through the fader into its own post buffer and then into the master —
+    // the same two steps `mixer::render_impl` takes. This is the number that
+    // would change if the JIT path were wired in.
     let frames = 480;
     let r = fader_move();
     let strips: Vec<Strip<'_>> = (0..24)
@@ -328,10 +368,11 @@ fn a_full_stereo_mix_of_many_strips_agrees_with_the_mixer() {
         .collect();
     let buf = signal(frames);
 
-    let mut out_b = vec![0.0; frames * 2];
+    let mut master_b = vec![0.0; frames * 2];
+    let mut post = dirty(frames);
     let mut acc_b = Accum::default();
     for s in &strips {
-        apply_fader(
+        apply_fader_into(
             s,
             &buf,
             frames,
@@ -339,18 +380,20 @@ fn a_full_stereo_mix_of_many_strips_agrees_with_the_mixer() {
             0,
             frames - 1,
             &mut RampCursor::new(),
-            &mut out_b,
-            2,
+            &mut post,
             &mut acc_b,
         );
+        mix_post_into(&mut master_b, 0, 2, &post, frames);
     }
 
-    let mut out_j = vec![0.0; frames * 2];
+    let mut master_j = vec![0.0; frames * 2];
+    let mut post = dirty(frames);
     let mut acc_j = Accum::default();
     for s in &strips {
         let p = plan(s, 1024, frames, 0, frames - 1);
-        assert!(kernels().run(&p, &buf, 0, &mut out_j, 2, &mut acc_j));
+        assert!(kernels().run(&p, &buf, &mut post, &mut acc_j));
+        mix_post_into(&mut master_j, 0, 2, &post, frames);
     }
 
-    assert_samples_close(&out_b, &out_j, 1e-5, "24-track mix");
+    assert_samples_close(&master_b, &master_j, 1e-5, "24-track mix");
 }

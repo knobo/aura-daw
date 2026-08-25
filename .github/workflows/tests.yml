@@ -94,3 +94,46 @@ jobs:
           cargo test --locked -- --test-threads=1 \
             --skip select_nonexistent_port_is_graceful_err \
             --skip opening_a_nonexistent_output_port_is_a_graceful_error
+
+  engine:
+    name: RT engine (aura-engine)
+    runs-on: ubuntu-24.04
+    # Its own job, not a step in `rust`: `aura-engine` is a standalone crate
+    # with its own lockfile (`src-tauri/Cargo.toml` is frozen — see
+    # docs/backlog/jit-engine.md), and it needs NONE of the apt list above.
+    # No ALSA, no webkit, no ffmpeg: it is pure Rust plus cranelift, so it
+    # starts while `rust` is still installing packages.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aura-engine -> target
+
+      # Clippy is gated here and not on `src-tauri` because this crate was
+      # written clean and can stay that way; `approx_constant` is deny-by-
+      # default and already caught a pan constant spelled `0.7071` instead of
+      # `FRAC_1_SQRT_2`.
+      - name: cargo clippy
+        working-directory: aura-engine
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The equivalence tests are the whole claim of this crate: the JIT kernel
+      # renders what `mixer::apply_fader_into` renders. They are worth nothing
+      # if nothing runs them, and the crate is outside the workspace the `rust`
+      # job builds.
+      - name: cargo test
+        working-directory: aura-engine
+        run: cargo test --locked --all-targets
+
+      # Compiling the benches is not the same as running them (a runner's
+      # timings are noise), but a bench that stopped compiling is a real break
+      # and this is where it shows up cheaply.
+      - name: benches compile
+        working-directory: aura-engine
+        run: cargo bench --locked --no-run

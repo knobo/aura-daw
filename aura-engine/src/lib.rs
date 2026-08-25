@@ -11,7 +11,7 @@
 //!   audio thread" into a test, and per-block latency/xrun telemetry.
 //! * [`strip`] — one track strip's fader work for one block, as data: the
 //!   automation breakpoints cut the block into straight-line stretches.
-//! * [`dsp`] — the baseline (a verbatim port of `mixer::apply_fader`), the
+//! * [`dsp`] — the baseline (a verbatim port of `mixer::apply_fader_into`), the
 //!   un-fused multi-pass shape, and the plan run as scalar Rust.
 //! * [`jit`] — Cranelift kernels for the same plan, specialised per shape.
 //!

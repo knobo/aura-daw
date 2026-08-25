@@ -5,7 +5,7 @@
 //! baseline this crate benchmarks against has to be the code that actually
 //! runs in the app, or the comparison measures the port instead of the
 //! change. If the app's interpolation ever changes, this file is the one that
-//! has to move with it — `dsp::apply_fader`'s doc says so too.
+//! has to move with it — `dsp::apply_fader_into`'s doc says so too.
 
 /// One breakpoint on a compiled lane: absolute sample position, value.
 #[derive(Clone, Copy, Debug, PartialEq)]

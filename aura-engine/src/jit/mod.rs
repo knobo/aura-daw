@@ -2,7 +2,7 @@
 //!
 //! ## What is actually being fused, and why it is worth doing
 //!
-//! `mixer::apply_fader` runs one loop per track per block, and inside that
+//! `mixer::apply_fader_into` runs one loop per track per block, and inside that
 //! loop, per sample, it:
 //!
 //! 1. asks a [`crate::automation::RampCursor`] for the gain — a `while` over a
@@ -189,42 +189,38 @@ impl Kernels {
 
     /// Whether this table can run `plan` at all.
     ///
-    /// Two cases fall back to [`crate::dsp::apply_fader`], and both are the
-    /// caller's business rather than an error:
+    /// One case falls back to [`crate::dsp::apply_fader_into`], and it is the
+    /// caller's business rather than an error: `plan.overflowed`, meaning more
+    /// automation breakpoints inside the block than the plan holds.
     ///
-    /// * `plan.overflowed` — more automation breakpoints in the block than the
-    ///   plan holds.
-    /// * `out_ch != 2` — the kernels write a contiguous interleaved stereo
-    ///   pair. A mono or >2-channel output needs strided or downmixed stores,
-    ///   which is a second pair of kernels earning nothing: every device this
-    ///   engine opens is stereo, and `mixer::mix_out` already treats anything
-    ///   above channel 1 as silent.
-    pub fn can_run(plan: &Plan, out_ch: usize) -> bool {
-        out_ch == 2 && !plan.overflowed
+    /// Output channel count used to be a second case. It stopped being one
+    /// when Plan G2 split the strip: the fader writes contiguous stereo into a
+    /// post-fader buffer, and the master's channel count is
+    /// `mixer::mix_post_into`'s problem now.
+    pub fn can_run(plan: &Plan) -> bool {
+        !plan.overflowed
     }
 
-    /// Run a plan. Audio thread. No allocation, no locking, no branching per
-    /// sample.
+    /// Run a plan into a post-fader buffer. Audio thread. No allocation, no
+    /// locking, no branching per sample.
+    ///
+    /// `post` must hold the whole run (`frames * 2` samples) — the mixer
+    /// slices it to `run * 2` before calling, and so must every caller here,
+    /// because a muted strip clears exactly what it is given.
     ///
     /// Returns false when [`Self::can_run`] says this plan is not for the
-    /// kernels — the caller must then use the scalar path, and a caller that
-    /// ignores the return value would silently drop a block of audio.
-    #[must_use = "false means the block was NOT rendered; fall back to the scalar path"]
-    pub fn run(
-        &self,
-        plan: &Plan,
-        buf: &[f32],
-        pan_index: usize,
-        out: &mut [f32],
-        out_ch: usize,
-        acc: &mut Accum,
-    ) -> bool {
-        if !Self::can_run(plan, out_ch) {
+    /// kernels; the caller must then use the scalar path. A caller that
+    /// ignored the return value would leave the previous run's audio in
+    /// `post`, which routing would then send to the master.
+    #[must_use = "false means the run was NOT rendered; fall back to the scalar path"]
+    pub fn run(&self, plan: &Plan, buf: &[f32], post: &mut [f32], acc: &mut Accum) -> bool {
+        if !Self::can_run(plan) {
             return false;
         }
         if plan.silent {
-            // Same reasoning as `dsp::fused_scalar`: folding and mixing zeros
-            // cannot change either the meters or the output.
+            // Clear, do not skip: `post` is an overwrite target that the sends
+            // and the routing read after the fader.
+            post.fill(0.0);
             return true;
         }
         for seg in plan.segments() {
@@ -234,8 +230,7 @@ impl Kernels {
             if even > 0 {
                 let mut lanes = [0.0f32; 8];
                 let inp = &buf[seg.offset * 2..(seg.offset + even) * 2];
-                let out_from = (pan_index + seg.offset) * 2;
-                let outp = &mut out[out_from..out_from + even * 2];
+                let outp = &mut post[seg.offset * 2..(seg.offset + even) * 2];
                 let f = self.kernel(Shape::of(&c));
                 // SAFETY: `inp` and `outp` are slices of exactly `even`
                 // frames — sliced above, so a wrong length is a panic here
@@ -243,7 +238,13 @@ impl Kernels {
                 // floats and `lanes` is 8, matching `KernelFn`'s contract, and
                 // `even` is even by construction.
                 unsafe {
-                    f(inp.as_ptr(), outp.as_mut_ptr(), even as i64, coef.as_ptr(), lanes.as_mut_ptr());
+                    f(
+                        inp.as_ptr(),
+                        outp.as_mut_ptr(),
+                        even as i64,
+                        coef.as_ptr(),
+                        lanes.as_mut_ptr(),
+                    );
                 }
                 // Reduce the four vector lanes into the two channels. Lanes
                 // 0/2 are left, 1/3 right — the buffer's own interleaving.
@@ -263,9 +264,8 @@ impl Kernels {
                 let l = buf[frame * 2] * g * (c.gl0 + c.dgl * fi);
                 let r = buf[frame * 2 + 1] * g * (c.gr0 + c.dgr * fi);
                 acc.fold(l, r);
-                let o = (pan_index + frame) * 2;
-                out[o] += l;
-                out[o + 1] += r;
+                post[frame * 2] = l;
+                post[frame * 2 + 1] = r;
             }
         }
         true
@@ -309,8 +309,8 @@ fn cg<E: std::fmt::Debug>(e: E) -> JitError {
 /// gv   = [g0, g0, g0, g0]      + [dg, dg, dg, dg]     * iv
 /// pv   = [gl0, gr0, gl0, gr0]  + [dgl, dgr, dgl, dgr] * iv
 /// x    = load  [l_i, r_i, l_i+1, r_i+1]
-/// prod = (x * gv) * pv                 // same order as `apply_fader`
-/// store  load(out) + prod
+/// prod = (x * gv) * pv                 // same order as `apply_fader_into`
+/// store  prod                          // post-fader buffer: overwrite
 /// pk   = max(pk, |prod|)  ;  ss += prod * prod
 /// iv  += [2, 2, 2, 2]     ;  i  += 2
 /// ```
@@ -433,13 +433,14 @@ fn emit(
             (b.ins().fadd(gv_base, step_g), b.ins().fadd(pv_base, step_p))
         }
     };
-    // `(x * g) * pan` — the multiply order `apply_fader` uses. Reassociating
+    // `(x * g) * pan` — the multiply order `apply_fader_into` uses. Reassociating
     // it would move the last bit and cost the flat case its bit-identity.
     let scaled = b.ins().fmul(x, gv);
     let prod = b.ins().fmul(scaled, pv);
-    let prev = b.ins().load(f32x4, flags, dst, 0);
-    let sum = b.ins().fadd(prev, prod);
-    b.ins().store(flags, sum, dst, 0);
+    // Overwrite, not accumulate. Plan G2's post-fader buffer is what removed
+    // the load half of a read-modify-write from every iteration of every
+    // track — the mixer's own loop got the same saving.
+    b.ins().store(flags, prod, dst, 0);
 
     let pk = b.use_var(v_pk);
     let mag = b.ins().fabs(prod);

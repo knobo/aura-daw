@@ -24,6 +24,11 @@ use aura_engine::jit::Kernels;
 use aura_engine::strip::{plan, PanQuad, Strip};
 use aura_engine::sync::from_slots;
 
+/// Centre pan, equal-power — the −3 dB the app's `mixer::pan_gains(0.0)`
+/// returns. Spelled as the constant rather than `0.7071` so the pan law here
+/// is the same value the mixer's own tests assert.
+const CENTRE: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
 fn table() -> Kernels {
     Kernels::compile().expect("cranelift could not target this host")
 }
@@ -34,15 +39,15 @@ fn render_one_block(k: &Kernels) -> Vec<f32> {
     let s = Strip {
         gain: 0.8,
         ramp: &[],
-        pan: PanQuad { gl0: 0.7071, gr0: 0.7071, gl1: 0.7071, gr1: 0.7071 },
+        pan: PanQuad { gl0: CENTRE, gr0: CENTRE, gl1: CENTRE, gr1: CENTRE },
         audible: true,
         pdc_delay: 0,
     };
     let p = plan(&s, 0, frames, 0, frames - 1);
-    let mut out = vec![0.0; frames * 2];
+    let mut post = vec![0.0; frames * 2];
     let mut acc = Accum::default();
-    assert!(k.run(&p, &buf, 0, &mut out, 2, &mut acc));
-    out
+    assert!(k.run(&p, &buf, &mut post, &mut acc));
+    post
 }
 
 #[test]
