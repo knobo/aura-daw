@@ -228,6 +228,22 @@ export interface MeterFrame {
   positionSamples: number;
   tracks: TrackMeter[];
   master: TrackMeter;
+  /** Plugin params automation is driving right now, as the engine last wrote
+   * them to the host. Empty while the transport is stopped or nothing is
+   * automated. Absent on a backend that predates the field. */
+  drivenParams?: DrivenParam[];
+}
+
+/** One plugin parameter under automation control, with the value the engine
+ * last wrote to the host. Display state, never document state: plugin-param
+ * automation is host-only (Track D ruling 2), so this is the only thing that
+ * says what the parameter is actually doing. */
+export interface DrivenParam {
+  instanceId: string;
+  /** Host parameter index — the same id `plugin_get_params` reports. */
+  index: number;
+  /** Native host units, like `PluginParamInfo.value`. */
+  value: number;
 }
 
 // ── recording-command.schema.json ───────────────────────────────────────────

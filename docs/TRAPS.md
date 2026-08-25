@@ -59,6 +59,25 @@ session burns an hour on something a sentence would have prevented.
 - **Parallel `cargo test` intermittently SIGSEGVs** (Cardinal CLAP
   teardown). Use `-- --test-threads=1`. Never run `cargo test` and `tauri
   dev` against the same `src-tauri/target/`.
+- **Do not run `cargo fmt`.** This tree is not rustfmt-default-formatted:
+  `cargo fmt --check` wants to rewrite ~40 files it has no business in,
+  and nothing gates on it (`.github/workflows/tests.yml` runs the four
+  suites, not fmt or clippy). Match the style of the code around you
+  instead — a formatting run would bury your diff.
+- **A controlled `<input>`/`<select>` fed a value that repeats does NOT get
+  pushed back after the user moves it.** Svelte's `set_value` early-returns
+  when the bound expression equals the last value it set (an `||`, so the
+  element's own drifted value does not save you). Feed a control from a 60 Hz
+  read-back that plateaus — an automation hold, a flat lane — and the DOM
+  keeps the user's drag while every other part of the row paints the real
+  value. Re-assert `el.value` in the handler. And a `<select>` given a value
+  that is not one of its options renders BLANK (`selectedIndex = -1`), so
+  snap to the nearest option before binding.
+- **A param fader's accessible name is the FULL "Group / Name", not the
+  short label the chip shows.** The chip is `"Level, 0.50"`; the slider
+  beside it is `"Filter / Level (0.50)"`. A `getByRole("slider", {name:
+  /^Level/})` finds nothing, and the failure reads like the value being
+  wrong rather than the query.
 
 ## Audio engine
 
