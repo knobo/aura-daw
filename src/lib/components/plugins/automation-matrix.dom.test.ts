@@ -40,6 +40,7 @@ const { plugins } = await import("../../state/plugins.svelte");
 const { project } = await import("../../state/project.svelte");
 const { lanes } = await import("../../state/lanes.svelte");
 const { modulation } = await import("../../state/modulation.svelte");
+const { paramFollow } = await import("../../state/param-follow.svelte");
 
 function track(id: string, name: string, extra: Partial<TrackState> = {}): TrackState {
   return {
@@ -91,6 +92,7 @@ beforeEach(() => {
   lanes.collapsedTracks = new Set();
   modulation.bindings = [];
   modulation.visible = new Map();
+  paramFollow.reset();
 });
 
 afterEach(() => {
@@ -100,6 +102,7 @@ afterEach(() => {
   project.tracks = [];
   modulation.bindings = [];
   modulation.visible = new Map();
+  paramFollow.reset();
 });
 
 describe("AutomationMatrix", () => {
@@ -134,6 +137,30 @@ describe("AutomationMatrix", () => {
     expect(section.textContent).toContain("2");
     expect(within(section.parentElement as HTMLElement).getByText("Bass")).toBeTruthy();
     expect(within(section.parentElement as HTMLElement).getByText("Lead")).toBeTruthy();
+  });
+
+  it("a row's chip paints the driven value while automation holds the param", async () => {
+    plugins.instances = [inst("i-alpha", "u-a", "Alpha")];
+    project.tracks = [track("t1", "Bass", { instrumentId: "plugin:i-alpha" })];
+    modulation.bindings = [pluginBinding("b1", "i-alpha", 12)];
+    // NOT named "Cutoff"/"*freq*": `formatParamValue` special-cases those as
+    // frequencies (integer + "hz"), so 0.8 would render as "1hz" and the
+    // assertion below would be about formatting, not about the read-back.
+    // See docs/TRAPS.md.
+    plugins.paramCache = {
+      "i-alpha": [{ id: 12, name: "Drive", min: 0, max: 1, default: 0, value: 0.3 }],
+    };
+    paramFollow.apply([{ instanceId: "i-alpha", index: 12, value: 0.8 }]);
+
+    const { container } = render(AutomationMatrix);
+
+    // The matrix reads the same param cache the panel does, so it must read
+    // it through the same read-back — otherwise this row and the panel
+    // disagree about one parameter (Track D ruling 2).
+    await waitFor(() => {
+      if (!container.textContent?.includes("0.80")) throw new Error("no driven value yet");
+    });
+    expect(container.textContent).not.toContain("0.30");
   });
 
   it("clicking a row reveals that binding's lane through the real modulation store", async () => {

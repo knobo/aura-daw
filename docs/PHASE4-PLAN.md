@@ -973,8 +973,30 @@ instantiation per automated instance, seeded from the live one's
   mint case the barrier exists for has no lane id yet.
 - **Fader-follows-automation** (ruling 6) — needs read/write arbitration.
 - **A dedicated, resizable automation row** (ruling 8).
-- **Live param-panel follow** (ruling 2) — the open panel shows the
-  document, not the automated value.
+- ~~**Live param-panel follow** (ruling 2) — the open panel shows the
+  document, not the automated value.~~ → **closed on
+  `feat/param-panel-follow`**: the driver's own writes are folded per
+  (instance, param index) into `MeterFrame.drivenParams` — an upsert SET,
+  not the tick's deltas, because `tick` suppresses a value it already sent
+  — and the panel paints them with an AUTO flag and a magenta fader fill.
+  Cleared when the transport stops and when a rebuild replaces the driver,
+  which is how the UI knows to hand the param back to the document — the
+  panel, not the plugin: a stop leaves the last automated value in the host,
+  so panel and plugin can still disagree afterwards (recorded in
+  `docs/SIDE-CHANNEL-INVENTORY.md`, unchanged by this work).
+  A driven control is also re-synced after a user edit: a range input keeps
+  the position it was dragged to and Svelte will not push an unchanged
+  binding back, so without that the thumb sat at the user's value while the
+  rest of the row read the driven one. Every surface that paints a plugin
+  param value goes through `paramFollow.overlay` — the panel, the lane
+  strip's pinned chips and the automation matrix — so two of them cannot
+  disagree about one parameter; a driven toggle's LABEL follows the read-back
+  while its write still flips the DOCUMENT, or the click could never move the
+  stored value to where automation already holds it. No
+  second evaluation of the curve exists, frontend or backend, so the panel
+  cannot disagree with what the plugin actually got. Ruling 2 itself is
+  unchanged: the writes are still host-only and the document still keeps
+  what the user set.
 - **Write/touch/latch automation modes** — the non-goal with a live
   consequence, and it is NOT a transient one. **Every plugin-param lane
   this UI can create is FLAT**: the "A" button

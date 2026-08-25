@@ -7,6 +7,7 @@
 
 import { backend } from "../tauri";
 import type { MeterFrame, TrackMeter } from "../types/ipc";
+import { paramFollow } from "./param-follow.svelte";
 import { transport } from "./transport.svelte";
 
 let latest: MeterFrame | null = null;
@@ -31,6 +32,11 @@ export async function startMeterStream(): Promise<void> {
       for (const t of frame.tracks) byTrack.set(t.trackId, t);
       byTrack.set("master", frame.master);
       transport.syncFromMeters(frame.positionSamples);
+      // The one reactive hand-off out of this callback besides the playhead:
+      // `paramFollow.apply` is a no-op unless the driven set actually
+      // changed, so a project with no plugin automation pays a length check
+      // per frame and invalidates nothing.
+      paramFollow.apply(frame.drivenParams);
     });
   } catch (err) {
     console.warn("[aura] subscribe_meters failed:", err);
@@ -42,4 +48,7 @@ export function stopMeterStream(): void {
   unsubscribe = null;
   latest = null;
   byTrack.clear();
+  // No stream, no read-back: leaving the last frame's set behind would pin
+  // the param panel to values nothing is driving any more.
+  paramFollow.reset();
 }

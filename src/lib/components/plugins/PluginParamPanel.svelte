@@ -9,6 +9,7 @@
    * one plugin_set_param per frame regardless of drag rate.
    */
   import { modulation } from "../../state/modulation.svelte";
+  import { paramFollow } from "../../state/param-follow.svelte";
   import { plugins } from "../../state/plugins.svelte";
   import { toasts } from "../../state/toasts.svelte";
   import type { PluginParamInfo, TargetRef } from "../../types/ipc";
@@ -117,6 +118,15 @@
     const step = (p.max - p.min) / (n - 1);
     return Array.from({ length: n }, (_, i) => p.min + i * step);
   }
+  /** The option closest to `v`. A `<select>` can only DISPLAY a value that is
+   * one of its options — Svelte sets `selectedIndex = -1` for anything else
+   * and the row renders blank. A document value is always an exact step, but
+   * an automation ramp walks straight through the gaps between them, so a
+   * driven enum row has to be snapped to something showable. */
+  function nearestEnumValue(p: PluginParamInfo, v: number): number {
+    const vals = enumValues(p);
+    return vals.reduce((best, c) => (Math.abs(c - v) < Math.abs(best - v) ? c : best), vals[0]);
+  }
   function pct(p: PluginParamInfo): number {
     return paramNormalized(p) * 100;
   }
@@ -127,11 +137,51 @@
     return paramUnit(p);
   }
 
+  /** The param as it should be PAINTED. Plugin-param automation is driven
+   * host-only (Track D ruling 2), so while a lane holds a param the document
+   * value this panel used to show is not what the plugin has — the engine's
+   * read-back is. Returns the SAME object when nothing drives it, which is
+   * what `isDriven` tests and what keeps a still panel allocation-free.
+   *
+   * Identity (`id`, `min`, `max`, `steps`, `default`) is untouched, so every
+   * write still addresses the real param and a reset still resets to the real
+   * default. */
+  function shown(p: PluginParamInfo): PluginParamInfo {
+    return paramFollow.overlay(plugins.openInstanceId, p);
+  }
+  function isDriven(p: PluginParamInfo, d: PluginParamInfo): boolean {
+    return d !== p;
+  }
+
+  /** Put a control back on the value automation is holding it at.
+   *
+   * A range input keeps whatever position the user dragged it to, and Svelte
+   * will NOT push the binding back when the expression has not changed —
+   * `set_value` early-returns on an unchanged value. A held or flat lane
+   * repeats the same value every frame, and every lane the plugin-param UI
+   * mints starts flat, so that is the common case, not an edge: without this
+   * the thumb sits at the user's value while the chip, the fill and the
+   * aria-label all say the driven one, and the plugin snaps back within
+   * `REASSERT_TICKS` (~0.5 s) with nothing on screen saying so.
+   *
+   * The write still reaches the document — ruling 2 keeps the user's value,
+   * and it takes effect once the transport stops. The thumb snapping back is
+   * exactly what the parameter itself does. */
+  function resyncIfDriven(p: PluginParamInfo, el: HTMLInputElement | HTMLSelectElement) {
+    const v = paramFollow.valueFor(plugins.openInstanceId, p.id);
+    if (v === undefined) return;
+    el.value = String(isEnum(p) ? nearestEnumValue(p, v) : v);
+  }
+
   function onSlide(p: PluginParamInfo, e: Event) {
-    plugins.setParam(p.id, parseFloat((e.currentTarget as HTMLInputElement).value));
+    const el = e.currentTarget as HTMLInputElement;
+    plugins.setParam(p.id, parseFloat(el.value));
+    resyncIfDriven(p, el);
   }
   function onEnum(p: PluginParamInfo, e: Event) {
-    plugins.setParam(p.id, parseFloat((e.currentTarget as HTMLSelectElement).value));
+    const el = e.currentTarget as HTMLSelectElement;
+    plugins.setParam(p.id, parseFloat(el.value));
+    resyncIfDriven(p, el);
   }
   function pluginBound(paramId: number): boolean {
     return (
@@ -217,6 +267,8 @@
   {/if}
 
   {#snippet paramRow(p: PluginParamInfo, short: string)}
+    {@const d = shown(p)}
+    {@const auto = isDriven(p, d)}
     <div class="param">
       <!-- The removed `.pname` used to carry "{p.name} (id {p.id})" as its
            title. The fader below still says it for a continuous param, but
@@ -228,24 +280,50 @@
         <div class="chipwrap">
           <ParamChip
             label={short}
-            value={p.value}
-            format={() => formatParamDisplay(p)}
+            value={d.value}
+            format={() => formatParamDisplay(d)}
             state={pluginBound(p.id) ? "automated" : "plain"}
             title={chipTitle(p)}
             onclick={() => jumpToLane(p)}
           />
         </div>
+        {#if auto}
+          <!-- Why the control below will not stay where you put it: ruling 2
+               says automation OVERRIDES the knob during playback. The write
+               still lands in the document — which is what gets saved, and
+               what this panel shows again once the transport stops. The
+               PLUGIN keeps the last automated value until something writes
+               it (engine.rs `drive_param_automation`), so stopping is not
+               itself a hand-back; that asymmetry predates this panel. -->
+          <span
+            class="autoflag mono"
+            title="Automation is driving {p.name} — the panel follows the lane until the transport stops"
+            >AUTO</span
+          >
+        {/if}
         {#if isToggle(p)}
+          <!-- Label from the DRIVEN value (what the plugin has), but the
+               write flips the DOCUMENT's. Deriving both from the driven one
+               makes the click a no-op whenever document and automation
+               already disagree — it would write the negation of what is
+               displayed, which the document may already be — leaving the
+               stored value unable to reach the automated state at all until
+               the transport stops. The fader and the enum have no such
+               problem: there the user names the target value directly. -->
           <button
             class="toggle mono"
-            class:on={p.value >= (p.min + p.max) / 2}
+            class:on={d.value >= (p.min + p.max) / 2}
             title="Toggle {short}"
             onclick={() => plugins.setParam(p.id, p.value >= (p.min + p.max) / 2 ? p.min : p.max)}
           >
-            {p.value >= (p.min + p.max) / 2 ? "ON" : "OFF"}
+            {d.value >= (p.min + p.max) / 2 ? "ON" : "OFF"}
           </button>
         {:else if isEnum(p)}
-          <select class="enum mono" value={p.value} onchange={(e) => onEnum(p, e)}>
+          <select
+            class="enum mono"
+            value={auto ? nearestEnumValue(p, d.value) : d.value}
+            onchange={(e) => onEnum(p, e)}
+          >
             {#each enumValues(p) as v, i (i)}
               <option value={v}>{fmt(p, v)}</option>
             {/each}
@@ -275,10 +353,10 @@
           min={p.min}
           max={p.max}
           step={sliderStep(p)}
-          value={p.value}
-          style:--fader-pct="{pct(p)}%"
-          style:--fader-fill="var(--cyan)"
-          aria-label="{p.name} ({fmt(p)}{unitOf(p)})"
+          value={d.value}
+          style:--fader-pct="{pct(d)}%"
+          style:--fader-fill={auto ? "var(--magenta)" : "var(--cyan)"}
+          aria-label="{p.name} ({fmt(d)}{unitOf(d)})"
           title="{p.name} — double-click resets to {fmt(p, p.default)}"
           oninput={(e) => onSlide(p, e)}
           onpointerdown={() => plugins.beginParamGesture()}
@@ -553,6 +631,22 @@
     background: var(--violet);
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
+
+  /* "Automation has this one" — magenta, the colour PR #32 gave the
+     automation-visible toggle, so the whole app says automation in one hue.
+     A label rather than a button: there is nothing to click, it is a
+     statement about why the fader below will not stay put. */
+  .autoflag {
+    flex: none;
+    padding: 0 3px;
+    line-height: 14px;
+    font-size: 8px;
+    letter-spacing: 0.06em;
+    border-radius: 3px;
+    border: var(--border-width) solid rgb(var(--magenta-rgb) / 0.45);
+    background: rgb(var(--magenta-rgb) / 0.14);
+    color: var(--magenta);
   }
 
   /* Pin toggle — same small-button language as `.autobtn`, amber for the
