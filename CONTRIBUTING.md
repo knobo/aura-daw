@@ -99,6 +99,11 @@ Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
 Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
 before filing an engine, transport, loopjam or meter failure as a regression.
 
+Counts, measured 2026-08-26 on `fix/lv2-port-props` with a pinned ALSA
+sink: **1440 backend** (1397 lib + 43 integration, 2 `#[ignore]`d plugin
+repros, 16 plugin-gated tests skipped politely) in ~103 s, and **1295
+frontend** across 118 files in ~7 s.
+
 The engine tests are not the only casualty. A Bluetooth sink also makes the
 engine open its output stream at **44 100 Hz** where an ALSA sink gives it
 48 000, and the stream open commits that rate into the document
