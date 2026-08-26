@@ -87,9 +87,47 @@ described here only.
   the same MIDI track. The rest of the product cut is still open.
 - Two-instance coexistence (fixed MCP port 41717 collides today — dynamic
   port + discovery needed before "copy between instances" is fully real).
-- MIDI launch **sustain**: overlapping voices so retriggering a scene
-  does not cut the previous one (`midi-launch.md`). Third play mode
-  after GATE/ONE-SHOT. Wait until v0.1 has been used.
+- **Control surface** — a virtual mixer / pad deck (knobs, gauges,
+  mute/solo, N×M pads that breathe with the waveform, Add-all
+  recipes, LPD8 template). Host chrome, not a plugin. Track:
+  `control-surface.md`. **v0.1 landed** (PR #113), and v0.2's stop slice
+  went with it — `launch_stop`, Escape as stop-everything, toggle pads that
+  cut their own clip. Everything past that (project-owned layout, hardware
+  map, templates) moved into Plan V below, because it is the same work.
+- **Plan V — players: the deck becomes an instrument.** [track V]
+  → [`plan-v-players.md`](plan-v-players.md), design +
+  rulings V-1…V-12 in
+  [`2026-08-26-plan-v-players-design.md`](../superpowers/specs/2026-08-26-plan-v-players-design.md),
+  engine audit in [`13-players-and-performance.md`](../research/13-players-and-performance.md).
+
+  The largest track since Plan G, and the one the owner asked for by name:
+  a pad that holds a WAV played **raw** (bypassing the track it came from),
+  or a MIDI clip with an **instrument of its own that no track owns**; decks
+  that mix and match; **knobs that belong to no track**; and **recording
+  what you play into editable clips and curves**, not a mixdown.
+
+  It needs a second time base. Today the engine has the transport plus one
+  bolted-on shadow playhead — a single atomic set, so two pads cannot sound
+  at once; a hardware pad *moves* the arrangement; `LaunchTarget::Clip` is
+  MIDI-only; and `ParamDriver::tick` reads automation at the transport
+  position while the overlay plays somewhere else (a silent bug today).
+  **MIDI launch v0.1's mechanism is a prototype and Plan V retires it** —
+  including `midi-launch.md`'s sustain/overlapping-voices item, which is
+  V3, not a third play mode.
+
+  What makes this a plan rather than a rewrite: the modulation design's §8
+  already reserved every arm it needs — ports (§8.1, "the arm ADR 0004
+  reserved"), macros (§8.3), automation recording into automation tracks
+  (§8.5), per-voice modulation (§8.8) — and `Source::ClipEnvelope` is
+  already a curve owned by clip content and resolved per placement. A pad
+  press is an ephemeral placement; that one sentence is the whole design.
+
+  Cuts, in a fixed order: **V1** `MixNode` as the compiler's input
+  (behaviour-neutral, byte-identical bounce as the gate) · **V2** one real
+  player, overlay deleted · **V3** polyphony, choke, quantized start ·
+  **V4** per-node automation clock · **V5** macros · **V6** recording ·
+  **V7** pad inspector + `Op::ControlSurfaceSet` · **V8** hardware map and
+  templates. V1 is unclaimed and is where the next agent starts.
 
 ## Sequencing notes
 

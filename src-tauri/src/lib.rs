@@ -308,6 +308,7 @@ pub fn run() {
             midi::launch::launch_set_drive_focus,
             midi::launch::launch_set_map,
             midi::launch::launch_fire,
+            midi::launch::launch_stop,
             midi::launch::launch_learn_arm,
             midi::launch::launch_learn_take,
             // ---- library & browser (Track E, additive) ----

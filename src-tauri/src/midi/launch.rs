@@ -941,6 +941,17 @@ pub struct LearnNote {
     pub channel: u8,
 }
 
+/// Stop the launch overlay. Additive and idempotent: pressing it with
+/// nothing launched is a no-op, so the frontend's stop-all can call it
+/// unconditionally.
+#[tauri::command]
+pub fn launch_stop(
+    control: tauri::State<'_, std::sync::Arc<crate::control::ControlPlane>>,
+) -> Result<(), String> {
+    control.stop_launch_overlay();
+    Ok(())
+}
+
 #[tauri::command]
 pub fn launch_learn_arm(id: Option<String>) {
     runtime().set_learning(id);

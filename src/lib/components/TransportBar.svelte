@@ -123,6 +123,15 @@
       onClick: () => (ui.bottomPanel = ui.bottomPanel === "pitch" ? "roll" : "pitch"),
     },
     {
+      id: "surface",
+      kind: "chip",
+      priority: 9,
+      label: "SURFACE",
+      title: "Control surface — mixer, pads, gauges",
+      on: ui.bottomPanel === "surface",
+      onClick: () => (ui.bottomPanel = ui.bottomPanel === "surface" ? "roll" : "surface"),
+    },
+    {
       id: "lib",
       kind: "chip",
       priority: 5,

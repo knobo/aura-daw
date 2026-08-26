@@ -55,6 +55,7 @@ carry punch-in/out and markers too:
 | Key | Does |
 |---|---|
 | `Space` | Play / pause |
+| `Esc` | **Stop every sound**: the arrangement, a clip launched from a pad or the launch map, and a browser audition. Keeps the playhead where it is |
 | `Home` / `End` | Jump to start / to the end of the material |
 | `←` / `→` | Move the playhead one **bar**, landing on the grid line |
 | `Shift` + `←` / `→` | Same, one **beat** |
@@ -253,6 +254,17 @@ through ffmpeg — full song or loop region, with sample-rate, bit-depth, master
 gain and tail options:
 
 ![Export dialog: bounce done, export-complete toast](docs/screenshots/export-dialog.png)
+
+### Control surface
+
+The **SURFACE** bottom panel is a virtual mixer and pad deck: analog VU
+gauges, milled faders, mute/solo/arm lamps, and an N×M pad grid whose
+pads breathe with the track's waveform. **Add all** / **Add all tracks** /
+**Add all clips** / **Add all automations** populate it from the open
+project; anything unwanted is removable. An **AKAI LPD8** template stamps
+an 8-knob + 2×4 pad homage faceplate (the layout algebra is the foundation
+for a later hardware map). Pads fire MIDI clips through the existing
+launch map (shadow playhead — the arrangement loop stays put).
 
 ### Themes and accessibility
 

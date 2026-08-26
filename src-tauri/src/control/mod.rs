@@ -1824,6 +1824,15 @@ impl ControlPlane {
         self.shared.clear_launch();
     }
 
+    /// Cut whatever is on the launch overlay (Escape / stop-all). Ends it
+    /// exactly the way reaching the clip's end does, so the release path the
+    /// drive thread already owns clears FLAG_LAUNCH and emits
+    /// `LaunchFired { playing: false }` — one code path, one behaviour.
+    /// Returns true when something was actually sounding.
+    pub fn stop_launch_overlay(&self) -> bool {
+        self.shared.end_launch()
+    }
+
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
     /// sync, no `loaded_dir`, no disk — `automation_get`'s entire body.
     pub fn automation_lanes(&self) -> Vec<crate::plugins::automation::AutomationLane> {

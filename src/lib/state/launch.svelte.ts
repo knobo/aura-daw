@@ -236,6 +236,23 @@ class LaunchStore {
     }
   }
 
+  /**
+   * Cut the shadow playhead. A previewed clip sounds with the transport
+   * stopped (the engine renders the overlay exclusively), so nothing else
+   * silences it — this is the only way back to quiet short of waiting for
+   * the clip to end. Optimistic: the engine's own
+   * `launch://fired {playing:false}` confirms.
+   */
+  async stopOverlay() {
+    this.overlay = null;
+    if (!backend.launchStop) return;
+    try {
+      await backend.launchStop();
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
   focus(id: string) {
     const b = this.bindings.find((x) => x.id === id);
     if (!b) return;

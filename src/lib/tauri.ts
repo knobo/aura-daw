@@ -509,6 +509,9 @@ export interface Backend {
   launchSetDriveFocus?(clipId: string | null): Promise<void>;
   launchSetMap?(id: string, map: LaunchMap | null): Promise<LaunchSnapshot>;
   launchFire?(id: string, bypass?: boolean): Promise<void>;
+  /** Cut whatever is on the launch overlay. Idempotent — safe to call with
+   * nothing launched, which is what lets stop-all call it unconditionally. */
+  launchStop?(): Promise<void>;
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
 
@@ -1152,6 +1155,9 @@ class TauriBackend implements Backend {
   }
   async launchFire(id: string, bypass?: boolean) {
     await invoke("launch_fire", { id, bypass: bypass ?? false });
+  }
+  async launchStop() {
+    await invoke("launch_stop");
   }
   async launchLearnArm(id: string | null) {
     await invoke("launch_learn_arm", { id });

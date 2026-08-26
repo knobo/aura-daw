@@ -27,6 +27,7 @@
   import { toasts } from "../../state/toasts.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import HScrollbar from "../HScrollbar.svelte";
+  import BottomPanelTabs from "../surface/BottomPanelTabs.svelte";
   import { canvasPos } from "../../utils/canvas-pos";
   import {
     applyMarquee,
@@ -1021,12 +1022,7 @@
       onresize={(px) => (ui.rollHeight = px)}
     />
     <header class="head">
-      <!-- Bottom-panel tabs. The pitch side carries the mirror pair, so the
-           two panels swap from either one. -->
-      <div class="tabs" role="group" aria-label="Bottom panel">
-        <button class="tabchip mono on" aria-current="page">ROLL</button>
-        <button class="tabchip mono" title="Pitch Coach" onclick={() => (ui.bottomPanel = "pitch")}>PITCH</button>
-      </div>
+      <BottomPanelTabs current="roll" />
       <span class="dot" style:background={color}></span>
       <span class="title mono">{clip.name}</span>
       <span class="silk">on {track?.name ?? "?"}</span>
@@ -1209,6 +1205,20 @@
       nudge, ±pitch (shift = octave) · ctrl+wheel zoom
     </footer>
   </div>
+{:else}
+  <div class="roll glass" style:height="{ui.rollHeight}px">
+    <PanelResizeHandle
+      axis="y"
+      size={ui.rollHeight}
+      spec={ROLL_RESIZE}
+      label="Resize piano roll"
+      onresize={(px) => (ui.rollHeight = px)}
+    />
+    <header class="head">
+      <BottomPanelTabs current="roll" />
+      <span class="silk">open a MIDI clip to edit notes</span>
+    </header>
+  </div>
 {/if}
 
 <style>
@@ -1233,28 +1243,6 @@
     padding: 0 12px;
     border-bottom: var(--border-width) solid var(--glass-border);
     flex: none;
-  }
-  .tabs {
-    display: flex;
-    gap: 2px;
-  }
-  .tabchip {
-    font-family: var(--font-mono);
-    font-size: 9px;
-    letter-spacing: 0.18em;
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: var(--border-width) solid transparent;
-    background: transparent;
-    color: var(--text-dim);
-    cursor: pointer;
-  }
-  .tabchip:hover {
-    color: var(--text);
-  }
-  .tabchip.on {
-    color: var(--cyan);
-    border-color: var(--cyan-dim);
   }
   .dot {
     width: 8px;

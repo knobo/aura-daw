@@ -23,6 +23,10 @@
 # Claude Code: agent worktree checkouts are local scratch state (skills are tracked)
 /.claude/worktrees/
 
+# Feature worktrees cut from origin/main (CLAUDE.md). Same no-trailing-slash
+# rule as the rest of this file: a `.worktrees` symlink must stay ignored.
+/.worktrees
+
 # Local project data / caches
 *.wav.tmp
 project.json.v1.bak
