@@ -270,11 +270,27 @@ mod tests {
                 reads_r.fetch_add(1, Ordering::Relaxed);
             }
         });
-        for n in 1..50_000u64 {
+        let mut n = 0u64;
+        while n < 50_000 {
+            n += 1;
             i.write(Pair { a: n, b: n * 2 });
+        }
+        // Do NOT stop on the write count alone. In release those 50 000
+        // publishes take well under a millisecond, and on a 2-core runner with
+        // no spare core the reader thread may not have been scheduled even
+        // once by the time `stop` is set — leaving `reads == 0` and failing the
+        // very assertion that is supposed to prove this test was not vacuous.
+        // Green on a 32-core box, red on CI; the concurrency was the fiction,
+        // not the buffer. Keep publishing (yielding, so a single-core machine
+        // also makes progress) until the reader has demonstrably run, which
+        // turns the assertion from a race into a guarantee.
+        while reads.load(Ordering::Relaxed) < 1_000 {
+            n += 1;
+            i.write(Pair { a: n, b: n * 2 });
+            std::thread::yield_now();
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().expect("reader panicked");
-        assert!(reads.load(Ordering::Relaxed) > 0);
+        assert!(reads.load(Ordering::Relaxed) >= 1_000, "the reader never ran");
     }
 }

@@ -88,6 +88,15 @@ session burns an hour on something a sentence would have prevented.
   is right to be — the mixer's own tests use
   `std::f32::consts::FRAC_1_SQRT_2`. Note the `rust` job does **not** run
   clippy on `src-tauri`, only the `engine` job does on `aura-engine`.
+- **A concurrency test that stops on the WRITER's count can be vacuous on a
+  small runner.** `triple_buffer`'s torn-read test published 50 000 values
+  then asserted the reader had read at least once. In release that takes well
+  under a millisecond, and on a 2-core GitHub runner with every other lib test
+  competing, the reader thread was never scheduled — so `reads == 0` failed
+  the assertion whose whole job was proving the test wasn't vacuous. Green on
+  a 32-core box, red on CI, and NOT reproducible locally even pinned to two
+  cores. Gate the stop condition on what the OTHER thread has observed, and
+  `yield_now()` so a single-core machine still progresses.
 - **A benchmark fixture smaller than production measures nothing.**
   `TrackRamps::gain` is compiled **session-wide** at graph rebuild, so a real
   automation lane is thousands of breakpoints. `benches/kernel.rs` used 64 and
