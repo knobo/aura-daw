@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Control surface panel (virtual mixer / pad deck) | `feat/control-surface` | 2026-08-26 | Worktree `.worktrees/control-surface`. Backlog: [`docs/backlog/control-surface.md`](docs/backlog/control-surface.md). |
 
 ## Next up — unclaimed
 
@@ -91,6 +91,7 @@ Plan G4 (envelope-follower modulators); the native-GUI embed work.
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |
 | History, undo, automation, modulation | [`docs/backlog/history-and-automation.md`](docs/backlog/history-and-automation.md) |
 | Windows build (open in PR #62) | [`docs/backlog/windows-build.md`](docs/backlog/windows-build.md) |
+| Control surface (virtual mixer / pad deck) | [`docs/backlog/control-surface.md`](docs/backlog/control-surface.md) |
 | Everything else, by product area | [`docs/backlog/`](docs/backlog/) |
 
 ## Index
