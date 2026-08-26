@@ -6,7 +6,10 @@ import {
   addStrip,
   addWidget,
   applyTemplate,
+  bindOptions,
   bindWidget,
+  bindable,
+  cellOptions,
   emptyLayout,
   gridSizeForClips,
   groupWidgets,
@@ -285,5 +288,69 @@ describe("target keys", () => {
     expect(targetKey({ kind: "pluginParam", instanceId: "p1", paramId: 1 })).not.toBe(
       targetKey({ kind: "pluginParam", instanceId: "p1", paramId: 2 }),
     );
+  });
+});
+
+describe("bind options", () => {
+  it("offers levels, pans and automated plugin params to a knob", () => {
+    const opts = bindOptions("knob", ctx);
+    // automation tracks are not mixable, so t3 is absent
+    expect(opts.filter((o) => o.group === "LEVEL").map((o) => o.target)).toEqual([
+      { kind: "trackGain", trackId: "t1" },
+      { kind: "trackGain", trackId: "t2" },
+    ]);
+    expect(opts.filter((o) => o.group === "PAN")).toHaveLength(2);
+    const param = opts.find((o) => o.group === "PLUGIN PARAM");
+    expect(param?.target).toEqual({ kind: "pluginParam", instanceId: "p1", paramId: 7 });
+    expect(param?.widgetLabel).toBe("Cutoff");
+  });
+
+  it("does not offer the same target twice when it is both automated and cached", () => {
+    const withCache: SurfaceContext = {
+      ...ctx,
+      pluginParams: [
+        { instanceId: "p1", instanceName: "Filter", paramId: 7, paramName: "Cutoff" },
+        { instanceId: "p1", instanceName: "Filter", paramId: 9, paramName: "Res" },
+      ],
+    };
+    const params = bindOptions("fader", withCache).filter((o) => o.group === "PLUGIN PARAM");
+    expect(params).toHaveLength(2);
+    expect(params.map((o) => o.key)).toEqual(["pluginParam:p1:7", "pluginParam:p1:9"]);
+  });
+
+  it("gives a lamp the role that goes with its target", () => {
+    const opts = bindOptions("lamp", ctx);
+    const solo = opts.find((o) => o.target.kind === "trackSolo");
+    expect(solo?.lampRole).toBe("solo");
+    expect(solo?.widgetLabel).toBe("SOLO");
+    expect(new Set(opts.map((o) => o.group))).toEqual(new Set(["MUTE", "SOLO", "ARM"]));
+  });
+
+  it("has nothing to offer the widgets that read the whole project", () => {
+    expect(bindable("clipList")).toBe(false);
+    expect(bindable("padGrid")).toBe(false);
+    expect(bindOptions("clipList", ctx)).toEqual([]);
+    expect(bindOptions("padGrid", ctx)).toEqual([]);
+  });
+
+  it("offers only clips for a pad-grid cell", () => {
+    expect(cellOptions(ctx).map((o) => o.target)).toEqual([
+      { kind: "clipLaunch", clipId: "c1" },
+      { kind: "clipLaunch", clipId: "c2" },
+      { kind: "clipLaunch", clipId: "c3" },
+    ]);
+  });
+});
+
+describe("bindWidget", () => {
+  it("carries the rest of the patch, so a lamp gets its role", () => {
+    const lamp = unboundWidget("lamp");
+    const layout = bindWidget(addWidget(emptyLayout(), lamp), lamp.id, { kind: "trackArm", trackId: "t1" }, "ARM", {
+      lampRole: "arm",
+    });
+    const w = activePage(layout).widgets[0];
+    expect(w.target).toEqual({ kind: "trackArm", trackId: "t1" });
+    expect(w.lampRole).toBe("arm");
+    expect(w.label).toBe("ARM");
   });
 });

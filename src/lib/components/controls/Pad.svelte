@@ -58,6 +58,9 @@
     return () => cancelAnimationFrame(raf);
   });
 
+  // The pointer pair only drives the pressed visual. Firing happens on
+  // `click`, which a real <button> also delivers for Enter and Space — a
+  // pointerup-only pad cannot be played from the keyboard at all.
   function down(e: PointerEvent) {
     if (e.button !== 0 || disabled) return;
     pressed = true;
@@ -67,6 +70,9 @@
     if (!pressed) return;
     pressed = false;
     (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+  }
+  function fire() {
+    if (disabled) return;
     onpress?.();
   }
 </script>
@@ -84,6 +90,7 @@
   onpointerdown={down}
   onpointerup={up}
   onpointercancel={() => (pressed = false)}
+  onclick={fire}
 >
   <span class="led" bind:this={ledEl}></span>
   <span class="silk caption">{label}</span>

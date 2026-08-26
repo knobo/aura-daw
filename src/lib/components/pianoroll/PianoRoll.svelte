@@ -1022,8 +1022,6 @@
       onresize={(px) => (ui.rollHeight = px)}
     />
     <header class="head">
-      <!-- Bottom-panel tabs. The pitch side carries the mirror pair, so the
-           two panels swap from either one. -->
       <BottomPanelTabs current="roll" />
       <span class="dot" style:background={color}></span>
       <span class="title mono">{clip.name}</span>

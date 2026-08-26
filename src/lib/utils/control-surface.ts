@@ -87,10 +87,20 @@ export interface SurfaceAutomation {
   target: SurfaceTarget;
 }
 
+/** One bindable plugin parameter, from the params the panel has cached. */
+export interface SurfacePluginParam {
+  instanceId: string;
+  instanceName: string;
+  paramId: number;
+  paramName: string;
+}
+
 export interface SurfaceContext {
   tracks: readonly SurfaceTrack[];
   midiClips: readonly SurfaceClip[];
   automations: readonly SurfaceAutomation[];
+  /** Optional: only instances whose params have been read are bindable. */
+  pluginParams?: readonly SurfacePluginParam[];
 }
 
 export type AddMenuId =
@@ -369,7 +379,9 @@ export function applyTemplate(layout: SurfaceLayout, template: SurfaceTemplateId
     knobs.push({
       id: newId(),
       kind: "knob",
-      label: t ? `K${i + 1}` : `K${i + 1}`,
+      // Bound knobs wear the track they drive; the silkscreen K1..K8 stays
+      // on the ones that are still empty (the faceplate prints it as a ghost).
+      label: t ? t.name : `K${i + 1}`,
       target: t ? { kind: "trackGain", trackId: t.id } : null,
     });
   }
@@ -396,12 +408,18 @@ export function removeGroup(layout: SurfaceLayout, groupId: string): SurfaceLayo
   );
 }
 
-export function bindWidget(layout: SurfaceLayout, widgetId: string, target: SurfaceTarget | null, label?: string): SurfaceLayout {
+export function bindWidget(
+  layout: SurfaceLayout,
+  widgetId: string,
+  target: SurfaceTarget | null,
+  label?: string,
+  extra: Partial<SurfaceWidget> = {},
+): SurfaceLayout {
   const page = activePage(layout);
   return replaceActive(
     layout,
     page.widgets.map((w) =>
-      w.id === widgetId ? { ...w, target, label: label ?? w.label } : w,
+      w.id === widgetId ? { ...w, ...extra, target, label: label ?? w.label } : w,
     ),
     "custom",
   );
@@ -429,6 +447,96 @@ export function setGridCell(layout: SurfaceLayout, widgetId: string, index: numb
     }),
     "custom",
   );
+}
+
+/**
+ * What one widget can be pointed at, in menu order. The `+` menu inserts
+ * unbound knobs, faders, gauges, pads and lamps; this is the list the bind
+ * picker shows for them, so an inserted widget has a way to become useful
+ * other than being deleted again.
+ */
+export interface BindOption {
+  /** Stable per-option key — the target key plus the lamp role. */
+  key: string;
+  /** Heading the option sits under; consecutive equal groups share one. */
+  group: string;
+  /** Menu row. */
+  label: string;
+  /** Silkscreen the widget wears once bound. */
+  widgetLabel: string;
+  target: SurfaceTarget;
+  lampRole?: LampRole;
+}
+
+/** Kinds a single target can be picked for. Clip lists and pad grids read
+ * the whole project instead, so they have nothing to bind. */
+export function bindable(kind: SurfaceWidgetKind): boolean {
+  return kind === "knob" || kind === "fader" || kind === "gauge" || kind === "pad" || kind === "lamp";
+}
+
+export function bindOptions(kind: SurfaceWidgetKind, ctx: SurfaceContext): BindOption[] {
+  const tracks = mixableTracks(ctx.tracks);
+  const out: BindOption[] = [];
+  const add = (group: string, label: string, widgetLabel: string, target: SurfaceTarget, lampRole?: LampRole) => {
+    out.push({ key: `${targetKey(target)}${lampRole ? `:${lampRole}` : ""}`, group, label, widgetLabel, target, lampRole });
+  };
+
+  if (kind === "knob" || kind === "fader") {
+    for (const t of tracks) add("LEVEL", `${t.name} — level`, t.name, { kind: "trackGain", trackId: t.id });
+    for (const t of tracks) add("PAN", `${t.name} — pan`, `${t.name} PAN`, { kind: "trackPan", trackId: t.id });
+    for (const p of pluginParamOptions(ctx)) out.push(p);
+  } else if (kind === "gauge") {
+    for (const t of tracks) add("METER", t.name, t.name, { kind: "meter", trackId: t.id });
+  } else if (kind === "pad") {
+    for (const c of ctx.midiClips) add("CLIP", c.name, c.name, { kind: "clipLaunch", clipId: c.id });
+    for (const t of tracks) add("MUTE", `${t.name} — mute`, `${t.name} MUTE`, { kind: "trackMute", trackId: t.id });
+  } else if (kind === "lamp") {
+    for (const t of tracks) add("MUTE", t.name, "MUTE", { kind: "trackMute", trackId: t.id }, "mute");
+    for (const t of tracks) add("SOLO", t.name, "SOLO", { kind: "trackSolo", trackId: t.id }, "solo");
+    for (const t of tracks) add("ARM", t.name, "ARM", { kind: "trackArm", trackId: t.id }, "arm");
+  }
+
+  const seen = new Set<string>();
+  return out.filter((o) => (seen.has(o.key) ? false : (seen.add(o.key), true)));
+}
+
+/** Clips a pad-grid cell can hold. Same rows the pad picker shows, without
+ * the track-mute alternatives — a grid cell fires a clip or nothing. */
+export function cellOptions(ctx: SurfaceContext): BindOption[] {
+  return ctx.midiClips.map((c) => ({
+    key: `clipLaunch:${c.id}`,
+    group: "CLIP",
+    label: c.name,
+    widgetLabel: c.name,
+    target: { kind: "clipLaunch", clipId: c.id } as SurfaceTarget,
+  }));
+}
+
+/** Plugin params worth offering: the ones already automated (they have a
+ * readable label) plus whatever params the panel has cached. */
+function pluginParamOptions(ctx: SurfaceContext): BindOption[] {
+  const out: BindOption[] = [];
+  for (const a of ctx.automations) {
+    if (a.target.kind !== "pluginParam") continue;
+    out.push({
+      key: targetKey(a.target) as string,
+      group: "PLUGIN PARAM",
+      label: `${a.trackName} — ${a.paramLabel}`,
+      widgetLabel: a.paramLabel,
+      target: a.target,
+    });
+  }
+  for (const p of ctx.pluginParams ?? []) {
+    const target: SurfaceTarget = { kind: "pluginParam", instanceId: p.instanceId, paramId: p.paramId };
+    out.push({
+      key: targetKey(target) as string,
+      group: "PLUGIN PARAM",
+      label: `${p.instanceName} — ${p.paramName}`,
+      widgetLabel: p.paramName,
+      target,
+    });
+  }
+  return out;
 }
 
 export function parseLayout(raw: unknown): SurfaceLayout | null {

@@ -5,6 +5,7 @@
   import { project } from "../../state/project.svelte";
   import { surface } from "../../state/surface.svelte";
   import Pad from "../controls/Pad.svelte";
+  import BindPicker from "./BindPicker.svelte";
 
   const { widget, edit = false }: { widget: SurfaceWidget; edit?: boolean } = $props();
 
@@ -33,17 +34,31 @@
       {#each Array.from({ length: cols }, (_, c) => c) as c (c)}
         {@const index = padIndex(cols, rows, c, r)}
         {@const clip = clipOf(index)}
-        <Pad
-          label={clip?.name ?? `${r * cols + c + 1}`}
-          meterTrackId={clip ? meterTrackId({ ...widget, target: { kind: "clipLaunch", clipId: clip.id } }, midi.clips) : null}
-          lit={clip ? surface.isClipPlaying(clip.id) : false}
-          color={colorOf(clip?.id)}
-          disabled={!clip}
-          ariaLabel={clip ? `Play ${clip.name}` : "Empty pad"}
-          onpress={() => {
-            if (clip) void surface.fireClip(clip.id);
-          }}
-        />
+        <div class="slot">
+          <!-- In edit mode a pad assigns its cell instead of firing it; an
+               empty grid from the `+` menu is otherwise eight dead pads. -->
+          <Pad
+            label={clip?.name ?? `${index + 1}`}
+            meterTrackId={clip ? meterTrackId({ ...widget, target: { kind: "clipLaunch", clipId: clip.id } }, midi.clips) : null}
+            lit={clip ? surface.isClipPlaying(clip.id) : false}
+            color={colorOf(clip?.id)}
+            disabled={!clip && !edit}
+            ariaLabel={edit
+              ? clip
+                ? `Assign pad ${index + 1} — now ${clip.name}`
+                : `Assign pad ${index + 1}`
+              : clip
+                ? `Play ${clip.name}`
+                : "Empty pad"}
+            onpress={() => {
+              if (edit) surface.toggleBind(surface.cellKey(widget.id, index));
+              else if (clip) void surface.fireClip(clip.id);
+            }}
+          />
+          {#if edit && surface.bindFor === surface.cellKey(widget.id, index)}
+            <BindPicker {widget} cell={index} />
+          {/if}
+        </div>
       {/each}
     {/each}
   </div>
@@ -61,6 +76,9 @@
   .pads {
     display: grid;
     gap: 8px;
+  }
+  .slot {
+    position: relative;
   }
   .kill {
     position: absolute;

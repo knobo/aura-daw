@@ -7,6 +7,7 @@
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import {
     activePage,
+    bindable,
     groupWidgets,
     meterTrackId,
     type SurfaceWidget,
@@ -25,6 +26,7 @@
   import Lamp from "../controls/Lamp.svelte";
   import BottomPanelTabs from "./BottomPanelTabs.svelte";
   import AddMenu from "./AddMenu.svelte";
+  import BindPicker from "./BindPicker.svelte";
   import ChannelStrip from "./ChannelStrip.svelte";
   import ClipList from "./ClipList.svelte";
   import PadGrid from "./PadGrid.svelte";
@@ -67,8 +69,8 @@
   function writeNumeric(widget: SurfaceWidget, v: number) {
     const t = widget.target;
     if (!t) return;
-    if (t.kind === "trackGain") void surface.writeGain(t.trackId, v);
-    else if (t.kind === "trackPan") void surface.writePan(t.trackId, v);
+    if (t.kind === "trackGain") surface.writeGain(t.trackId, v);
+    else if (t.kind === "trackPan") surface.writePan(t.trackId, v);
     else if (t.kind === "pluginParam") surface.writePluginParam(t.instanceId, t.paramId, v);
   }
 
@@ -115,7 +117,7 @@
       class="mode mono"
       class:on={surface.editMode}
       type="button"
-      onclick={() => (surface.editMode = !surface.editMode)}
+      onclick={() => surface.setEdit(!surface.editMode)}
     >
       {surface.editMode ? "EDIT" : "PLAY"}
     </button>
@@ -131,22 +133,36 @@
         <div class="knob-row">
           {#each page.widgets.filter((w) => w.kind === "knob") as w, i (w.id)}
             {@const num = numericValue(w)}
-            <Knob
-              value={num?.value ?? 0}
-              min={num?.min ?? GAIN_MIN}
-              max={num?.max ?? GAIN_MAX}
-              resetTo={num?.resetTo}
-              label={w.label}
-              format={num?.format}
-              ariaLabel={w.label}
-              size={36}
-              oninput={(v) => writeNumeric(w, v)}
-              onstart={() => surface.openGesture("gain drag")}
-              onend={() => surface.closeGesture()}
-            />
-            {#if surface.editMode && !w.target}
-              <span class="silk ghost">K{i + 1}</span>
-            {/if}
+            <div class="knob-slot">
+              {#if surface.editMode}
+                <button
+                  class="tool"
+                  type="button"
+                  title="Bind this knob"
+                  aria-label="Bind knob {i + 1}"
+                  onclick={() => surface.toggleBind(w.id)}>⌖</button
+                >
+              {/if}
+              <Knob
+                value={num?.value ?? 0}
+                min={num?.min ?? GAIN_MIN}
+                max={num?.max ?? GAIN_MAX}
+                resetTo={num?.resetTo}
+                label={w.label}
+                format={num?.format}
+                ariaLabel={w.label}
+                size={36}
+                oninput={(v) => writeNumeric(w, v)}
+                onstart={() => surface.openGesture("gain drag")}
+                onend={() => surface.closeGesture()}
+              />
+              {#if surface.editMode && !w.target}
+                <span class="silk ghost">K{i + 1}</span>
+              {/if}
+              {#if surface.editMode && surface.bindFor === w.id}
+                <BindPicker widget={w} />
+              {/if}
+            </div>
           {/each}
         </div>
         {#each page.widgets.filter((w) => w.kind === "padGrid") as w (w.id)}
@@ -184,15 +200,34 @@
           {:else}
             <div class="cell">
               {#if surface.editMode}
-                <button class="kill" type="button" onclick={() => surface.remove(w.id)}>×</button>
+                {#if bindable(w.kind)}
+                  <button
+                    class="tool"
+                    type="button"
+                    title="Bind this {w.kind}"
+                    aria-label="Bind {w.label}"
+                    onclick={() => surface.toggleBind(w.id)}>⌖</button
+                  >
+                {/if}
+                <button
+                  class="kill"
+                  type="button"
+                  aria-label="Remove {w.label}"
+                  onclick={() => surface.remove(w.id)}>×</button
+                >
               {/if}
-              {#if w.kind === "gauge" && w.target && "trackId" in w.target}
-                <Gauge trackId={w.target.trackId} label={w.label} />
+              {#if w.kind === "gauge"}
+                {#if w.target && "trackId" in w.target}
+                  <Gauge trackId={w.target.trackId} label={w.label} />
+                {:else}
+                  <span class="silk ghost">{w.label}</span>
+                {/if}
               {:else if w.kind === "pad"}
                 <Pad
                   label={w.label}
                   meterTrackId={meterTrackId(w, midi.clips)}
                   lit={padLit(w)}
+                  disabled={!w.target}
                   ariaLabel={w.label}
                   onpress={() => pressPad(w)}
                 />
@@ -225,6 +260,8 @@
                     onstart={() => surface.openGesture("fader drag")}
                     onend={() => surface.closeGesture()}
                   />
+                {:else}
+                  <span class="silk ghost">{w.label}</span>
                 {/if}
               {:else if w.kind === "knob"}
                 {@const num = numericValue(w)}
@@ -245,6 +282,9 @@
                 {:else}
                   <span class="silk ghost">{w.label}</span>
                 {/if}
+              {/if}
+              {#if surface.editMode && surface.bindFor === w.id}
+                <BindPicker widget={w} />
               {/if}
             </div>
           {/if}
@@ -344,6 +384,29 @@
     background: transparent;
     color: var(--text-faint);
     cursor: pointer;
+  }
+  .tool {
+    position: absolute;
+    top: -6px;
+    left: -6px;
+    z-index: 1;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: var(--text-faint);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .tool:hover {
+    color: var(--cyan);
+  }
+  .knob-slot {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
   }
   .kill:hover {
     color: var(--red);

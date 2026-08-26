@@ -1,5 +1,7 @@
 <script lang="ts">
   import { ADD_MENU, type AddMenuId } from "../../utils/control-surface";
+  import { popoverBox } from "../../utils/popover.svelte";
+  import { portal } from "../../utils/portal";
   import { surface } from "../../state/surface.svelte";
 
   function pick(id: AddMenuId) {
@@ -12,10 +14,18 @@
       surface.addOpen = false;
     }
   }
+
+  // The panel is docked at the bottom of the window, so this menu opens
+  // upward — and it is tall enough that "upward" can overshoot the top too.
+  // `popoverBox` picks the side with room and caps the scroll box, so the
+  // templates at the end of the list are always reachable.
+  let plusEl: HTMLElement | undefined = $state();
+  const box = popoverBox(() => plusEl);
 </script>
 
 <div class="wrap">
   <button
+    bind:this={plusEl}
     class="plus raised"
     class:on={surface.addOpen}
     type="button"
@@ -29,7 +39,18 @@
   </button>
   {#if surface.addOpen}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <div class="menu glass" role="menu" tabindex="-1" onkeydown={onKey}>
+    <div
+      bind:this={box.node}
+      use:portal
+      class="menu glass"
+      style:left={box.placement ? `${box.placement.left}px` : undefined}
+      style:top={box.placement ? `${box.placement.top}px` : undefined}
+      style:max-height={box.placement ? `${box.placement.maxHeight}px` : undefined}
+      style:visibility={box.placement ? undefined : "hidden"}
+      role="menu"
+      tabindex="-1"
+      onkeydown={onKey}
+    >
       {#each ["widget", "recipe", "template"] as group (group)}
         <p class="silk heading">{group === "widget" ? "ADD" : group === "recipe" ? "FILL" : "TEMPLATE"}</p>
         {#each ADD_MENU.filter((i) => i.group === group) as item (item.id)}
@@ -59,12 +80,10 @@
     color: var(--cyan);
   }
   .menu {
-    position: absolute;
-    top: calc(100% + 6px);
-    left: 0;
-    z-index: 40;
+    position: fixed;
+    z-index: 60;
     min-width: 260px;
-    max-height: 70vh;
+    max-height: 70vh; /* replaced by the measured cap once placed */
     overflow: auto;
     padding: 8px;
     display: flex;

@@ -58,7 +58,7 @@
           color={track.color}
           format={formatDb}
           ariaLabel="{track.name} level"
-          oninput={(v) => void surface.writeGain(track.id, v)}
+          oninput={(v) => surface.writeGain(track.id, v)}
           onstart={() => surface.openGesture("gain drag")}
           onend={() => surface.closeGesture()}
         />
@@ -75,7 +75,7 @@
           format={formatPan}
           ariaLabel="{track.name} pan"
           size={32}
-          oninput={(v) => void surface.writePan(track.id, v)}
+          oninput={(v) => surface.writePan(track.id, v)}
           onstart={() => surface.openGesture("pan drag")}
           onend={() => surface.closeGesture()}
         />

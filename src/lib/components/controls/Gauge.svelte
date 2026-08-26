@@ -20,7 +20,7 @@
   const START = -SWEEP / 2;
 
   let needleEl: SVGGElement | undefined = $state();
-  let readout = $state("-∞");
+  let readoutEl: HTMLElement | undefined = $state();
   let clipped = $state(false);
 
   function angleOf(db: number): number {
@@ -28,12 +28,19 @@
     return START + n * SWEEP;
   }
 
+  // Needle AND dB readout are written imperatively inside the rAF loop.
+  // Neither may be `$state`: ruling S-3 is that the meter bus does not go on
+  // the reactivity graph, and add-all-tracks puts one gauge per mixable
+  // track on the page. `clipped` is the one exception — a rare latch, reset
+  // by a click, exactly as in Meter.svelte.
   $effect(() => {
     const id = trackId;
     const needle = needleEl;
+    const readout = readoutEl;
     if (!needle) return;
     let raf = 0;
     let disp = DB_MIN;
+    let shown = "";
     const tick = (now: number) => {
       raf = requestAnimationFrame(tick);
       void now;
@@ -42,7 +49,13 @@
       // Fast attack, slower release — a needle, not a bar.
       disp = peak > disp ? peak : disp + (peak - disp) * 0.18;
       needle.setAttribute("transform", `rotate(${angleOf(disp)} 50 78)`);
-      readout = formatDb(disp);
+      if (readout) {
+        const text = formatDb(disp);
+        if (text !== shown) {
+          readout.textContent = text;
+          shown = text;
+        }
+      }
       if (m?.clipped) clipped = true;
     };
     raf = requestAnimationFrame(tick);
@@ -82,7 +95,7 @@
     </div>
   </div>
   {#if label}<span class="silk gauge-label">{label}</span>{/if}
-  <output class="mono gauge-value">{readout}</output>
+  <output class="mono gauge-value" bind:this={readoutEl}>-∞</output>
 </div>
 
 <style>
