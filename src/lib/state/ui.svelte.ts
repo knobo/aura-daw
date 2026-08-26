@@ -16,7 +16,7 @@ export type DockTab =
   | "history";
 
 /** The bottom region shows one of these at a time. */
-export type BottomPanel = "roll" | "pitch";
+export type BottomPanel = "roll" | "pitch" | "surface";
 
 export const ui = $state({
   /** "WEBGPU" | "CANVAS2D" | "" until the first painter reports in */

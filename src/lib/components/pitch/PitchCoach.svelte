@@ -41,6 +41,7 @@
   import { view } from "../../state/view.svelte";
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
+  import BottomPanelTabs from "../surface/BottomPanelTabs.svelte";
   import RehearseButton from "./RehearseButton.svelte";
   import PitchReport from "./PitchReport.svelte";
   import type { PitchFrame, PitchScoreReport } from "../../types/ipc";
@@ -628,17 +629,7 @@
   />
 
   <header class="head">
-    <div class="tabs" role="group" aria-label="Bottom panel">
-      <button
-        class="tab mono"
-        disabled={!midi.openClip}
-        title={midi.openClip ? "Piano roll" : "Open a MIDI clip to edit notes"}
-        onclick={() => (ui.bottomPanel = "roll")}
-      >
-        ROLL
-      </button>
-      <button class="tab mono on" aria-current="page" onclick={() => (ui.bottomPanel = "pitch")}>PITCH</button>
-    </div>
+    <BottomPanelTabs current="pitch" />
 
     <label class="ref">
       <span class="silk">reference</span>
@@ -757,10 +748,6 @@
   }
   .spacer {
     flex: 1;
-  }
-  .tabs {
-    display: flex;
-    gap: 2px;
   }
   .tab {
     font-size: 9px;

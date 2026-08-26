@@ -48,6 +48,7 @@ re-litigate a decision and want to know what was already considered.
 | 09 | [Plugin isolation and UI scaling](09-plugin-isolation-and-ui-scaling.md) | Out-of-process plugin hosting, the plugin-GUI problem honestly stated, and the risk profile of a web-stack DAW UI on Linux. |
 | 10 | [AURA current state](10-aura-current-state.md) | Where we actually are: the engine, control plane, project model, frontend and debt register as they stand, with file references — and a consolidated list of the concrete defects this round found. |
 | 11 | [History UX and contracts](11-history-ux-and-contracts.md) | The interaction design for the history feature, and the 26 numbered contracts it imposes on the backend. The bridge between what the user experiences and what the engine must provide. |
+| 12 | [Control surfaces](12-control-surfaces.md) | Virtual mixers and pad decks. MCU/HUI, Push/Launchpad, CSI, OSC, the Akai LPD8, and why this is host chrome rather than a plugin. Written 2026-08-26 for the control-surface track. |
 
 ## Reading orders
 

@@ -254,6 +254,17 @@ gain and tail options:
 
 ![Export dialog: bounce done, export-complete toast](docs/screenshots/export-dialog.png)
 
+### Control surface
+
+The **SURFACE** bottom panel is a virtual mixer and pad deck: analog VU
+gauges, milled faders, mute/solo/arm lamps, and an N×M pad grid whose
+pads breathe with the track's waveform. **Add all** / **Add all tracks** /
+**Add all clips** / **Add all automations** populate it from the open
+project; anything unwanted is removable. An **AKAI LPD8** template stamps
+an 8-knob + 2×4 pad homage faceplate (the layout algebra is the foundation
+for a later hardware map). Pads fire MIDI clips through the existing
+launch map (shadow playhead — the arrangement loop stays put).
+
 ### Themes and accessibility
 
 Full tokenised styling with **eight built-in themes** (AURA Dark, AURA Light,

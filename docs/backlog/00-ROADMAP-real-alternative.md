@@ -90,6 +90,10 @@ described here only.
 - MIDI launch **sustain**: overlapping voices so retriggering a scene
   does not cut the previous one (`midi-launch.md`). Third play mode
   after GATE/ONE-SHOT. Wait until v0.1 has been used.
+- **Control surface** — a virtual mixer / pad deck (knobs, gauges,
+  mute/solo, N×M pads that breathe with the waveform, Add-all
+  recipes, LPD8 template). Host chrome, not a plugin. Track:
+  `control-surface.md`. v0.1 is in flight (PR #113).
 
 ## Sequencing notes
 

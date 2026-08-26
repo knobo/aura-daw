@@ -1,0 +1,134 @@
+<script lang="ts">
+  import type { SurfaceWidget } from "../../utils/control-surface";
+  import type { TrackState } from "../../types/ipc";
+  import { formatDb, formatPan } from "../../utils/format";
+  import { GAIN_MAX, GAIN_MIN, surface } from "../../state/surface.svelte";
+  import Fader from "../controls/Fader.svelte";
+  import Gauge from "../controls/Gauge.svelte";
+  import Knob from "../controls/Knob.svelte";
+  import Lamp from "../controls/Lamp.svelte";
+
+  const {
+    widgets,
+    track,
+    edit = false,
+  }: {
+    widgets: SurfaceWidget[];
+    track: TrackState | undefined;
+    edit?: boolean;
+  } = $props();
+
+  const groupId = $derived(widgets[0]?.groupId ?? "");
+  const missing = $derived(!track);
+</script>
+
+<section class="strip grain" class:missing aria-label={track ? `Strip ${track.name}` : "Missing track"}>
+  {#if edit}
+    <button class="kill" type="button" title="Remove strip" onclick={() => surface.removeStrip(groupId)}>×</button>
+  {/if}
+  <header class="silk name">{track?.name ?? "missing"}</header>
+  <div class="lamps">
+    {#each widgets.filter((w) => w.kind === "lamp") as w (w.id)}
+      <Lamp
+        on={w.lampRole === "mute" ? !!track?.muted : w.lampRole === "solo" ? !!track?.soloed : !!track?.armed}
+        label={w.label}
+        role={w.lampRole ?? "mute"}
+        ariaLabel="{track?.name ?? "track"} {w.label}"
+        onclick={() => {
+          if (!track || !w.lampRole) return;
+          if (w.lampRole === "mute") void surface.writeMute(track.id, !track.muted);
+          else if (w.lampRole === "solo") void surface.writeSolo(track.id, !track.soloed);
+          else void surface.writeArm(track.id, !track.armed);
+        }}
+      />
+    {/each}
+  </div>
+  {#if track}
+    {#each widgets.filter((w) => w.kind === "gauge") as w (w.id)}
+      <Gauge trackId={track.id} label={w.label} size={72} />
+    {/each}
+    <div class="pots">
+      {#each widgets.filter((w) => w.kind === "fader") as w (w.id)}
+        <Fader
+          value={track.gainDb}
+          min={GAIN_MIN}
+          max={GAIN_MAX}
+          resetTo={0}
+          label={w.label}
+          color={track.color}
+          format={formatDb}
+          ariaLabel="{track.name} level"
+          oninput={(v) => void surface.writeGain(track.id, v)}
+          onstart={() => surface.openGesture("gain drag")}
+          onend={() => surface.closeGesture()}
+        />
+      {/each}
+      {#each widgets.filter((w) => w.kind === "knob") as w (w.id)}
+        <Knob
+          value={track.pan}
+          min={-1}
+          max={1}
+          bipolar
+          resetTo={0}
+          label={w.label}
+          color={track.color}
+          format={formatPan}
+          ariaLabel="{track.name} pan"
+          size={32}
+          oninput={(v) => void surface.writePan(track.id, v)}
+          onstart={() => surface.openGesture("pan drag")}
+          onend={() => surface.closeGesture()}
+        />
+      {/each}
+    </div>
+  {/if}
+</section>
+
+<style>
+  .strip {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    width: 92px;
+    padding: 10px 8px 12px;
+    border-radius: calc(var(--ctrl-radius) + 2px);
+    background-color: var(--bg-1);
+    background-image: var(--sheen-face);
+    box-shadow: var(--bevel-raised), var(--relief-1);
+  }
+  .strip.missing {
+    opacity: 0.55;
+  }
+  .name {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-mid);
+  }
+  .lamps {
+    display: flex;
+    gap: 4px;
+  }
+  .pots {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+  }
+  .kill {
+    position: absolute;
+    top: 2px;
+    right: 4px;
+    border: none;
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+  }
+  .kill:hover {
+    color: var(--red);
+  }
+</style>

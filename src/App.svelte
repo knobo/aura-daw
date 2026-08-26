@@ -41,6 +41,7 @@
   import MasterBar from "./lib/components/MasterBar.svelte";
   import PianoRoll from "./lib/components/pianoroll/PianoRoll.svelte";
   import PitchCoach from "./lib/components/pitch/PitchCoach.svelte";
+  import SurfacePanel from "./lib/components/surface/SurfacePanel.svelte";
   import Dock from "./lib/components/Dock.svelte";
   import McpConfirmDialog from "./lib/components/mcp/McpConfirmDialog.svelte";
   import PreferencesDialog from "./lib/components/prefs/PreferencesDialog.svelte";
@@ -364,6 +365,8 @@
   </div>
   {#if ui.bottomPanel === "pitch"}
     <PitchCoach />
+  {:else if ui.bottomPanel === "surface"}
+    <SurfacePanel />
   {:else}
     <PianoRoll />
   {/if}
