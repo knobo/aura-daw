@@ -1,0 +1,84 @@
+name: RT engine
+
+# Its OWN workflow, and gated on paths, for one reason: `aura-engine` is a
+# standalone crate that nothing in the app depends on. Running its gate on
+# every PR spends ~1.5 min of runner time to re-prove something that cannot
+# have changed, because no PR outside `aura-engine/` can affect it.
+#
+# GitHub applies `paths:` per WORKFLOW, not per job, which is why this is a
+# separate file rather than a job in `tests.yml`.
+#
+# Safe to skip: `main` is not branch-protected, so no required status check
+# waits on this. If branch protection is ever added, do NOT list this job as
+# required — a path-filtered job reports "skipped", and a required check that
+# skips blocks the PR forever.
+on:
+  pull_request:
+    paths:
+      - 'aura-engine/**'
+      - '.github/workflows/engine.yml'
+  # ALSO on main, for the same cache reason `tests.yml` documents: a PR can
+  # only restore a cache its base branch saved, and only a run ON main can
+  # save one. Without this every aura-engine PR would recompile cranelift
+  # (~34 crates) from scratch.
+  push:
+    branches: [main]
+    paths:
+      - 'aura-engine/**'
+      - '.github/workflows/engine.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  engine:
+    name: RT engine (aura-engine)
+    runs-on: ubuntu-24.04
+    # Needs NONE of `tests.yml`'s apt list — no ALSA, no webkit, no ffmpeg.
+    # Pure Rust plus cranelift.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aura-engine -> target
+
+      # Clippy is gated here and not on `src-tauri` because this crate was
+      # written clean and can stay that way; `approx_constant` is deny-by-
+      # default and already caught a pan constant spelled `0.7071` instead of
+      # `FRAC_1_SQRT_2`.
+      - name: cargo clippy
+        working-directory: aura-engine
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The equivalence tests are the whole claim of this crate: the JIT kernel
+      # renders what `mixer::apply_fader_into` renders. They are worth nothing
+      # if nothing runs them, and the crate is outside the workspace the
+      # `rust` job builds — `cargo test` in `src-tauri` never touches it.
+      - name: cargo test
+        working-directory: aura-engine
+        run: cargo test --locked --all-targets
+
+      # Release too, and not for speed: `counting_is_active()` probes the
+      # allocator with a `Box` that LLVM deletes as dead once optimisation is
+      # on, so `the_guard_is_actually_armed` — the one test whose job is
+      # proving the suite CAN fail — was green in debug and red in release.
+      # An RT allocation check that only works unoptimised is not one. This
+      # step also caught a torn-read test that could be vacuous on a 2-core
+      # runner, within one run of being added.
+      - name: cargo test (release)
+        working-directory: aura-engine
+        run: cargo test --locked --release --all-targets
+
+      # Compiling the benches is not the same as running them (a runner's
+      # timings are noise), but a bench that stopped compiling is a real break
+      # and this is where it shows up cheaply.
+      - name: benches compile
+        working-directory: aura-engine
+        run: cargo bench --locked --no-run

@@ -62,12 +62,24 @@ Nothing in `src-tauri/` is touched by this track. Wiring the kernels into
 5. `benches/kernel.rs` — criterion: multi-pass vs. `apply_fader_into` vs.
    `fused_scalar` vs. JIT, plus the master-mix pass alone so a reader can
    subtract the constant every contender pays.
-6. CI job `engine` in `.github/workflows/tests.yml` — clippy `-D warnings`,
-   the tests, and a bench compile. The crate is outside the workspace the
-   `rust` job builds, so without this nothing would ever run the
-   equivalence proof again. (It earned its keep immediately: clippy's
-   deny-by-default `approx_constant` caught the centre-pan gain spelled
-   `0.7071` where the mixer's own tests use `FRAC_1_SQRT_2`.)
+6. CI workflow `.github/workflows/engine.yml` — clippy `-D warnings`, the
+   tests in debug AND release, and a bench compile. The crate is outside the
+   workspace the `rust` job builds (there is no root `Cargo.toml`, and
+   `src-tauri/Cargo.toml` has no `[workspace]`), so `cargo test` in
+   `src-tauri` never touches it and without this nothing would run the
+   equivalence proof again.
+
+   **Gated on `paths: aura-engine/**`**, and in its own file because GitHub
+   applies `paths:` per workflow rather than per job. No PR outside the crate
+   can affect its result, so spending ~1.5 min of runner time on every
+   unrelated PR was buying nothing. If branch protection is ever added to
+   `main`, do NOT list this job as a required check: a path-filtered job
+   reports *skipped*, and a required check that skips blocks the PR forever.
+
+   It earned its keep twice. Clippy's deny-by-default `approx_constant`
+   caught the centre-pan gain spelled `0.7071` where the mixer's own tests
+   use `FRAC_1_SQRT_2`; and the release step caught a torn-read test that
+   was vacuous on a 2-core runner, within one run of being added.
 
 ## What the review caught
 
