@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| LV2 port properties — stepped + expensive/non-automatable params | `fix/lv2-port-props` | 2026-08-26 | ZamVerb's "Room" is `lv2:integer` + `pprops:expensive` + `kx:NonAutomatable`; AURA drew it as a continuous knob and streamed fractional values. |
 
 ## Next up — unclaimed
 
