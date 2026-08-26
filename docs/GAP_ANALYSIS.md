@@ -88,6 +88,16 @@ design, and `free_memory` is `unsafe` — discharging its safety condition
 needs a *provably retired* table, on the control thread. The triple
 buffer is where that proof comes from (`tests/publish.rs`).
 
+**Which is also its limitation, and §8 acts on it.** That is the only
+concrete consumer this primitive has. If the JIT does not ship — the
+recommendation below — `TripleBuffer<T>` is correct, tested code with no
+call site: a sound answer to a question nothing in AURA is currently
+asking. The engine's *existing* RT seams are already right for the
+problems it does have (rtrb ownership transfer for graph swaps, atomics
+for params), which §3 confirms by audit. Nobody should read this section
+as "AURA has a dropout problem that a triple buffer fixes". It does
+not.
+
 ## 3. Gap: nothing enforces the RT rules
 
 The four rules are prose — `ARCHITECTURE.md` §2.1, §10 rules 1–6,
@@ -401,17 +411,101 @@ The work is a **standalone crate**, `aura-engine/`, with its own
   goes near a callback. A crate that can be tested and benchmarked alone
   is how that proof gets written.
 
-**Nothing in `src-tauri/` changes.** Wiring the kernels into
-`mixer::render` is a separate, owner-gated step, and the open questions
-are listed in [`backlog/jit-engine.md`](backlog/jit-engine.md): cranelift
-in the frozen manifest, and a fallback for the Windows release build
-(`cranelift-jit` needs a writable executable mapping; that worker builds
-`--no-default-features` and has never been tested with one). The kernel
-API is shaped so `apply_fader_into` stays as the fallback arm.
+**Nothing in `src-tauri/` changes**, and §8 recommends it stays that
+way for the JIT specifically. The kernel API is shaped so
+`apply_fader_into` remains the fallback arm if that is ever revisited.
 
 One consequence of standing outside the app: **the track is not
 ear-checkable.** No code path in AURA reaches this crate, so there is
 nothing to listen to. The equivalence tests are the substitute, and they
-are the reason the crate is now gated in CI (`.github/workflows/tests.yml`,
-job `engine`) — dossier 10's gap 19 noted there was no CI at all when it
-was written; there is now, and a proof nothing runs is not a proof.
+are the reason the crate is gated in CI
+(`.github/workflows/engine.yml`, gated on `paths: aura-engine/**`) —
+dossier 10's gap 19 noted there was no CI at all when it was written;
+there is now, and a proof nothing runs is not a proof.
+
+## 8. Recommendation
+
+The brief asked for a JIT. This report's recommendation is **not to ship
+one**, stated explicitly rather than left as an open question the next
+agent has to re-litigate.
+
+### 8.1 Cranelift into `src-tauri`: no
+
+Three reasons, in order of weight.
+
+**The marginal gain is ~0.2% of one core.** The JIT is 1.65x over
+`fused_scalar` (§4), and `fused_scalar` is itself most of the win. 1.65x
+of 0.8% of an i9-14900 core is what shipping cranelift would buy, on the
+*fader* — which §4 already establishes is not where a DAW spends CPU.
+
+**macOS makes it expensive, and this is read from the source rather than
+assumed.** `cranelift-jit` 0.134 obtains pages with
+`MmapMut::map_anon`/`region::alloc` and flips them W->X with
+`region::protect(READ_EXECUTE)` — plain `mprotect`/`VirtualProtect`.
+Grepping the whole cranelift 0.134 tree for `MAP_JIT`,
+`pthread_jit_write_protect_np`, or any Apple JIT-entitlement handling
+returns **nothing**. Notarization requires the hardened runtime, and
+without the sanctioned `MAP_JIT` path that means shipping
+`com.apple.security.cs.allow-unsigned-executable-memory` — the broad
+entitlement, not the narrow `com.apple.security.cs.allow-jit`. *Not
+verified on Apple hardware: the absence of `MAP_JIT` is a fact, the
+entitlement consequence is inference from it.*
+
+**Windows works but invites a support burden.** `VirtualProtect` is
+fine, but code generated and made executable at runtime is exactly what
+EDR and antivirus heuristics flag, and a DAW is not a process users
+expect to behave like a loader. The release worker also builds
+`--no-default-features` and has never been exercised with a writable
+executable mapping.
+
+AURA targets Windows today and macOS later. A per-platform, permanent
+cost for 0.2% of one core is a bad trade, and waiting does not improve
+it.
+
+**What would reopen it:** profiling that shows the *insert chain* is a
+real bottleneck. Fusing `[eq, comp, gain, ramp, pan]` without writing one
+function per permutation is a genuine case for runtime codegen in a way
+that fusing `[gain, ramp, pan]` is not. That case needs measurements
+nobody has taken, and it should be reconsidered on all three platforms at
+once.
+
+### 8.2 The plan into `src-tauri`: optional, and cheap
+
+`strip::plan` + `dsp::fused_scalar` is the half of this track worth
+having, if any:
+
+- **1.94x on automated blocks**, and it needs **no new dependency at
+  all** — `jit/mod.rs` is the only file in the crate that touches
+  cranelift; `strip.rs`, `dsp.rs`, `automation.rs` and `sync/` are pure
+  `std`. So `src-tauri/Cargo.toml` stays frozen *literally*, which was
+  the whole reason this crate stands outside the app.
+- Identical on every platform. No W^X, no entitlement, no EDR surface.
+- Already proven bit-identical to `apply_fader_into` in the flat case and
+  within 1e-5 once a ramp moves (§4).
+
+Sold honestly: it saves ~0.4% of one core on this machine, more on a
+weaker one (§4.1). That is ~900 lines into `src-tauri` for something no
+user will hear. Cheap, low-risk, not urgent, and **not** a reason to
+merge on its own.
+
+### 8.3 What this track actually earned
+
+The parts with value on the day they land are the ones that are not
+code: this report (three of the brief's six items already existed; the
+Carla bridge is declined) and the four entries added to
+[`TRAPS.md`](TRAPS.md). Both exist to stop someone spending a week
+building the wrong thing.
+
+The crate itself is worth keeping — CI is path-gated so it costs nothing
+per unrelated PR, and the equivalence proof is done if the plan is ever
+wanted — but it should be understood as a **proving ground, not a shipped
+component**.
+
+### 8.4 The honest next step
+
+This track optimised the fader. **The fader is not where the CPU goes;
+plugins are.** That was written as a caveat in §4 when it should have
+been the conclusion. Before any further engine performance work, profile
+a real session under a realistic plugin load and find out where the time
+actually is. Everything above is a well-measured answer to a question
+that was probably not the important one.

@@ -30,8 +30,9 @@ already use. Two reasons, and neither is stylistic:
   it is allowed anywhere near the callback. A crate that can be tested and
   benchmarked on its own is how that proof gets written.
 
-Nothing in `src-tauri/` is touched by this track. Wiring the kernels into
-`mixer::render` is a **separate, owner-gated step** — see below.
+Nothing in `src-tauri/` is touched by this track, and the recommendation
+is that the JIT half never is — see *Decided* below and `GAP_ANALYSIS.md`
+§8.
 
 ## Landed here
 
@@ -136,13 +137,44 @@ violation and neither touched, because both live in `src-tauri/`:
   block's audio to the master and to every send tapping that strip. Worth
   knowing before the wiring step below.
 
-## Not started — needs an owner decision
+## Decided — do not reopen without new measurements
 
-- **Wiring into `src-tauri`.** Requires cranelift in the frozen
-  `Cargo.toml`, and a fallback path for the Windows build (`cranelift-jit`
-  needs a writable executable mapping; the release worker builds with
-  `--no-default-features` and has never been tested with one). The kernel
-  API is deliberately shaped so `mixer::apply_fader_into` can stay as the
-  fallback arm.
-- **Ear-check.** Not ear-checkable while the crate is standalone: no code
-  path in the app reaches it.
+Full argument and the source-level evidence: `GAP_ANALYSIS.md` §8.
+
+- **Cranelift into `src-tauri`: NO.** The JIT is 1.65x over
+  `fused_scalar`, i.e. ~0.2% of one core on the fader, and the fader is
+  not where a DAW's CPU goes. Against that: `cranelift-jit` 0.134 flips
+  W->X with plain `region::protect` and has **no `MAP_JIT` path anywhere
+  in the 0.134 tree** (grepped), so macOS notarization under the hardened
+  runtime would need `allow-unsigned-executable-memory` — the broad
+  entitlement. On Windows, runtime-generated executable code is what
+  EDR/AV heuristics flag. AURA ships Windows now and wants macOS. Bad
+  trade, and it does not improve with waiting.
+
+  **Reopen only if** profiling shows the *insert chain* is a real
+  bottleneck — fusing `[eq, comp, gain, ramp, pan]` without one function
+  per permutation is a genuine codegen case in a way the fader is not.
+  Reconsider all three platforms at once.
+
+- **`strip::plan` + `dsp::fused_scalar` into `src-tauri`: optional.**
+  1.94x on automated blocks with **zero new dependencies** (`jit/mod.rs`
+  is the only file touching cranelift; everything else is pure `std`), so
+  the frozen manifest stays frozen literally. But it saves ~0.4% of one
+  core — cheap and low-risk, not urgent, and not a reason to merge on its
+  own.
+
+- **`TripleBuffer<T>` has no consumer without the JIT.** It was built
+  because `JITModule::free_memory` needs a provably-retired table. It is
+  correct and tested, but if the JIT does not ship it is a sound answer to
+  a question nothing in AURA is currently asking — the engine's existing
+  RT seams (rtrb ownership transfer, atomics) already fit the problems it
+  does have. This is NOT a dropout fix; §3's audit found the RT rules
+  already kept.
+
+- **Ear-check: not applicable.** No code path in the app reaches this
+  crate, so there is nothing to listen to. The equivalence tests are the
+  substitute.
+
+- **The honest next step is not in this track.** It optimised the fader;
+  plugins are where the CPU goes. Profile a real session under plugin
+  load before any further engine performance work.
