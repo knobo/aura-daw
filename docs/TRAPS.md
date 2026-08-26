@@ -14,6 +14,15 @@ session burns an hour on something a sentence would have prevented.
   `src/app.css`.** Do not re-implement them per component.
 - **`display: contents` is not safe here** (WebKitGTK). Use a real flex
   container.
+- **`position: fixed` inside `.glass` is NOT relative to the viewport.**
+  `.glass` sets `backdrop-filter`, which makes the element a containing
+  block for fixed descendants, so a popover computed in viewport
+  coordinates lands offset by the panel's own origin (`top: 8px` came out
+  ~560 px down inside the bottom-docked surface panel). Portal the popover
+  to `document.body` (`utils/portal.ts`) and place it with
+  `utils/popover.ts`; a scrolling ancestor such as the surface deck would
+  clip it in place anyway. Playwright's "element is outside of the
+  viewport" on a menu item is the symptom.
 - **A Svelte 5 `$effect` tracks reactive reads made anywhere inside its
   callback, including deep inside a function it merely calls.** Splitting
   a `$derived` so the effect only reads a narrower value is not enough by

@@ -93,7 +93,8 @@ described here only.
 - **Control surface** — a virtual mixer / pad deck (knobs, gauges,
   mute/solo, N×M pads that breathe with the waveform, Add-all
   recipes, LPD8 template). Host chrome, not a plugin. Track:
-  `control-surface.md`. v0.1 is in flight (PR #113).
+  `control-surface.md`. **v0.1 landed** (PR #113); v0.2+ (toggle-pad
+  stop, project-owned layout, hardware map) are open on that track.
 
 ## Sequencing notes
 

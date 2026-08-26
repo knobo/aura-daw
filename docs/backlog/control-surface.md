@@ -24,7 +24,7 @@ host chrome.
 
 | Cut | What | State |
 |---|---|---|
-| **v0.1 (this PR)** | Layout model, add/remove recipes, LPD8 + mixer templates, 3D widgets (knob reuse, new gauge / pad / fader / lamp), bottom-panel SURFACE, clip fire via existing launch preview, mute/solo/arm/gain/pan, pad RMS blink, session persist | **this branch** |
+| **v0.1** | Layout model, add/remove recipes, LPD8 + mixer templates, 3D widgets (knob reuse, new gauge / pad / fader / lamp), bottom-panel SURFACE, clip fire via existing launch preview, mute/solo/arm/gain/pan, pad RMS blink, session persist, bind picker (per-widget target, per-cell clip) | **landed, PR #113** |
 | v0.2 | Additive `launch_stop` so a toggle pad can cut the overlay; pad "on" = overlay id | open |
 | v0.3 | `Op::ControlSurfaceSet` (HarmonySet-shaped) so the layout is project-owned and undoable | open |
 | v0.4 | Hardware MIDI map: physical LPD8 CCs/notes ↔ widgets; LED out | open |
@@ -99,7 +99,41 @@ host chrome.
 | `src/lib/components/surface/ClipList.svelte` | Named clip launch |
 | `src/lib/components/surface/PadGrid.svelte` | N×M pads |
 | `src/lib/components/surface/BottomPanelTabs.svelte` | ROLL / PITCH / SURFACE |
-| `src/lib/components/surface/surface-panel.dom.test.ts` | Add/remove, recipes |
+| `src/lib/components/surface/BindPicker.svelte` | Bind picker (widget target, pad-grid cell) |
+| `src/lib/utils/popover.ts` + `popover.svelte.ts` | Viewport-aware popover placement |
+| `src/lib/utils/portal.ts` | Escape `.glass`/`overflow` for popovers |
+| `src/lib/components/surface/surface-panel.dom.test.ts` | Add/remove, recipes, mute/fire, bind |
+| `src/lib/state/surface-gesture.test.ts` | One drag = one undo entry (I-8) |
+| `src/lib/state/surface-persist.test.ts` | Deck keyed on the project it was edited in |
+
+## Review fixes on top of the first implementation
+
+An external review (Grok, 2026-08-26) plus a headless pass over the real
+panel found these; all are in PR #113:
+
+- **Gesture contract.** `writeGain`/`writePan` fired immediately while
+  `openGesture` only queued `beginGesture`, so a pointermove could land a
+  mix op outside the boundary and the trailing write after `gesture_end`
+  — one drag, several undo entries. Writes now ride the same
+  `gestureTail` as TrackHeader's, and `closeGesture` cancels the param
+  rAF, flushes it on the tail, then ends (I-8's ordering, which the
+  surface's private param queue had dropped).
+- **`Gauge` drove `$state` 60×/s** through its dB readout, one per
+  mixable track. It writes `textContent` inside the rAF loop now; only
+  the clip latch stays reactive (ruling S-3, same as `Meter.svelte`).
+- **Deck persistence** was keyed on the LIVE `project.projectDir`, so a
+  project switch inside the 80 ms debounce lost the last edit and could
+  write the old deck into the new project's key. Persist is keyed on
+  `hydratedKey` and `hydrate` flushes first.
+- **`Pad` fired from `pointerup` only** — keyboard users could not play
+  it. It fires on `click` (which Enter/Space also produce); the pointer
+  pair only drives the pressed visual.
+- **Bind picker** (see above): `bind()`/`setGridCell` had no UI, so the
+  `+` menu inserted widgets that could only be deleted.
+- **Popovers were unreachable at the bottom of the window.** The `+`
+  menu opened downward from a bottom-docked panel and its templates fell
+  off-screen; `position: fixed` did not fix it because `.glass` is a
+  containing block. See `docs/TRAPS.md`.
 
 ## Owner ear-check owed
 

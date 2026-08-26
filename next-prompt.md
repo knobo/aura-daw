@@ -53,14 +53,14 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Control surface panel (virtual mixer / pad deck) | `feat/control-surface` | 2026-08-26 | Worktree `.worktrees/control-surface`. Backlog: [`docs/backlog/control-surface.md`](docs/backlog/control-surface.md). |
 
 ## Next up — unclaimed
 
 1. **Owner ear-checks** are owed on several landed tracks. No suite
-   substitutes for them; each backlog file lists its own. The newest is
-   G2's: one reverb on a bus, several tracks sent into it, one room —
-   then export and confirm the WAV has it.
+   substitutes for them; each backlog file lists its own. The newest two
+   are the control surface's (open SURFACE, Add all, drag a fader, tap a
+   pad) and G2's: one reverb on a bus, several tracks sent into it, one
+   room — then export and confirm the WAV has it.
 2. **G3 — sidechain edges** (bass ducks the pads). The graph now has
    buses and sends; a sidechain is the third routing primitive.
    → [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)
