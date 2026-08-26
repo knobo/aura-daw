@@ -153,7 +153,7 @@ fn the_scalar_paths_do_not_allocate_either() {
     assert_no_alloc("fused_scalar", || {
         for s in &all {
             let p = plan(s, 1024, FRAMES, 0, FRAMES - 1);
-            fused_scalar(&p, &buf, &mut post, &mut acc);
+            assert!(fused_scalar(&p, &buf, &mut post, &mut acc));
         }
     });
     assert_no_alloc("multipass", || {

@@ -69,6 +69,44 @@ Nothing in `src-tauri/` is touched by this track. Wiring the kernels into
    deny-by-default `approx_constant` caught the centre-pan gain spelled
    `0.7071` where the mixer's own tests use `FRAC_1_SQRT_2`.)
 
+## What the review caught
+
+`/code-review` at `high` on PR #112 found seven issues; all seven are fixed
+in the branch, and the two that mattered were both cases where a test or a
+benchmark endorsed a bug rather than catching it.
+
+1. **`strip::plan` was O(the whole session's lane) per segment per block** —
+   `ramp.iter().find(...)`. Measured 40x SLOWER than the baseline it replaces
+   on a 48 000-point lane, degrading linearly. The benchmark used 64 points
+   and could not see it. Fixed with `partition_point` + a forward-only
+   cursor; `long-lane` is now a permanent benchmark case. Detail and numbers:
+   `GAP_ANALYSIS.md` §4.2.
+2. **The PDC clamp was applied to the run's start, not per sample.** The
+   mixer does `pos.saturating_add(i).saturating_sub(pdc_delay)` INSIDE its
+   loop; the plan did the subtraction once outside. Whenever
+   `pdc_delay > pos` the lane stands still while the plan ramped through it —
+   0.48 of gain, 48% wrong, at every block at the top of a session and after
+   every loop wrap on a latency-compensated track. Every existing PDC test
+   used `pos >= pdc_delay`, so nothing caught it. The held prefix is now its
+   own flat segment, with a regression test that was verified to FAIL against
+   the old code before being kept.
+3. **`counting_is_active()` returned false under optimisation** —
+   `Box::new([0u8; 64])` is a dead allocation LLVM deletes, so
+   `the_guard_is_actually_armed` was the only test that failed under
+   `--release`: the one test whose job is proving the suite can fail, broken
+   in exactly the build an RT allocation check wants. `black_box` fixes it,
+   and `cargo test --release` is now known-green.
+4. **`fused_scalar` ignored `plan.overflowed`** and silently under-rendered
+   (192 of 256 samples left stale). It returns `bool` now, `#[must_use]` like
+   `Kernels::run`, and its message names `apply_fader_into` specifically —
+   the crate ships two scalar paths and only one is a valid fallback.
+5. `KernelFn`'s ABI doc still said the kernel **adds** into its output; it
+   has stored since Plan G2.
+6. `target-lexicon` was a declared dependency and unused —
+   `cranelift_native::builder()` resolves the host triple itself.
+7. `"every odd block size from 1 to 511"` described a hand-picked list of
+   eight sizes, two of them even. The test now loops what the claim says.
+
 ## Found on the way, not fixed here
 
 Two notes from the audit (§3.1 of `GAP_ANALYSIS.md`), neither a rule

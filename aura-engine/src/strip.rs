@@ -176,7 +176,8 @@ impl PanQuad {
 /// block's, not the run's, because pan interpolates across the whole callback
 /// block while a loop wrap can split it into several runs.
 ///
-/// Bounded and allocation-free: at most one pass over the breakpoints that
+/// Bounded and allocation-free: one binary search to find the first
+/// breakpoint, then a single forward walk over the breakpoints that
 /// fall inside the run, and a fixed-size result.
 pub fn plan(strip: &Strip<'_>, pos: u64, frames: usize, pan_index: usize, pan_last: usize) -> Plan {
     let mut out = Plan {
@@ -219,20 +220,60 @@ pub fn plan(strip: &Strip<'_>, pos: u64, frames: usize, pan_index: usize, pan_la
         return out;
     }
 
-    // Ramp domain: the run reads the lane at `pos + i - pdc_delay`.
-    let read_from = pos.saturating_sub(strip.pdc_delay);
-    let read_to = read_from + frames as u64; // exclusive
+    // Ramp domain: frame `i` reads the lane at `pos + i - pdc_delay`, and the
+    // subtraction SATURATES PER SAMPLE — `dsp::apply_fader_into` does
+    // `pos.saturating_add(i).saturating_sub(pdc_delay)` inside the loop, not
+    // once outside it. Clamping the run's start instead is a real difference
+    // whenever `pdc_delay > pos`, which is every block at the top of a session
+    // and after any loop wrap to a low start, on any latency-compensated
+    // track: the lane stands still while the plan would ramp through it.
+    // Measured at `pos=0, pdc_delay=192`: 0.48 of gain, 48% wrong.
+    let lane_at = |o: usize| pos.saturating_add(o as u64).saturating_sub(strip.pdc_delay);
+    let read_to = lane_at(frames); // exclusive, in lane samples
 
     let mut offset = 0usize;
+    // The held prefix, where every frame reads lane sample 0 and the gain is
+    // therefore FLAT. `+ 1` because the lane is still 0 at the frame where
+    // `pos + i == pdc_delay`, not just before it.
+    if strip.pdc_delay > pos {
+        let held = ((strip.pdc_delay - pos) as usize).saturating_add(1).min(frames);
+        let v0 = value_at(strip.ramp, 0).unwrap_or(1.0);
+        let ok = out.push(Segment {
+            offset: 0,
+            frames: held,
+            coef: Coef {
+                g0: strip.gain * v0,
+                dg: 0.0,
+                gl0: gl_at_run,
+                dgl,
+                gr0: gr_at_run,
+                dgr,
+            },
+        });
+        if !ok || held >= frames {
+            return out;
+        }
+        offset = held;
+    }
+
+    // Cursor over the breakpoints, seeded ONCE by binary search and then only
+    // advanced. `iter().find(...)` here was O(the whole session's lane) per
+    // segment per block — `TrackRamps::gain` is compiled session-wide at
+    // graph rebuild, so on a 48 000-point lane the plan measured 40x SLOWER
+    // than the baseline it replaces, degrading linearly with lane length.
+    // The benchmark used 64 points and could not see it.
+    let mut brk = strip.ramp.partition_point(|e| e.sample <= lane_at(offset));
     while offset < frames {
-        let seg_start_sample = read_from + offset as u64;
+        let seg_start_sample = lane_at(offset);
         // The next breakpoint strictly after this stretch's first sample ends
         // it: from there on the interpolation uses a different pair of
         // points, so the affine form changes.
+        while brk < strip.ramp.len() && strip.ramp[brk].sample <= seg_start_sample {
+            brk += 1;
+        }
         let next_break = strip
             .ramp
-            .iter()
-            .find(|e| e.sample > seg_start_sample)
+            .get(brk)
             .map(|e| e.sample)
             .filter(|s| *s < read_to)
             .unwrap_or(read_to);

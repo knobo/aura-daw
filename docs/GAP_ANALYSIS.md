@@ -182,15 +182,22 @@ Full path (32 tracks rendered and mixed into the master), medians:
 
 | block | case | `multipass` | `apply_fader_into` | `fused_scalar` | `jit` | `master_mix_only` |
 |---|---|---|---|---|---|---|
-| 128 | flat | 12.6 µs | **11.6 µs** | 10.8 µs | 7.2 µs | 2.6 µs |
-| 128 | ramped | 20.4 µs | **18.3 µs** | 11.4 µs | 7.9 µs | 2.5 µs |
-| 128 | ramped+pan | 20.7 µs | **18.4 µs** | 11.5 µs | 8.2 µs | 2.5 µs |
-| 512 | flat | 51.1 µs | **50.1 µs** | 41.6 µs | 26.5 µs | 9.9 µs |
-| 512 | ramped | 81.2 µs | **71.4 µs** | 42.4 µs | 28.1 µs | 9.7 µs |
-| 512 | ramped+pan | 81.4 µs | **76.8 µs** | 42.2 µs | 27.8 µs | 9.7 µs |
-| 1024 | flat | 95.9 µs | **86.6 µs** | 82.3 µs | 50.3 µs | 19.7 µs |
-| 1024 | ramped | 190.2 µs | **147.2 µs** | 84.2 µs | 55.4 µs | 19.8 µs |
-| 1024 | ramped+pan | 160.2 µs | **145.8 µs** | 83.2 µs | 53.9 µs | 19.4 µs |
+| 128 | flat | 14.1 µs | **12.8 µs** | 11.9 µs | 7.8 µs | 2.8 µs |
+| 128 | ramped | 22.8 µs | **20.1 µs** | 14.6 µs | 9.4 µs | 2.8 µs |
+| 128 | ramped+pan | 22.8 µs | **20.3 µs** | 13.0 µs | 9.2 µs | 2.7 µs |
+| 128 | long-lane | 25.0 µs | **22.5 µs** | 15.6 µs | 11.7 µs | 2.9 µs |
+| 512 | flat | 55.5 µs | **49.1 µs** | 45.0 µs | 28.8 µs | 10.1 µs |
+| 512 | ramped | 90.5 µs | **81.2 µs** | 46.7 µs | 32.2 µs | 9.9 µs |
+| 512 | ramped+pan | 90.3 µs | **81.9 µs** | 47.1 µs | 32.7 µs | 10.8 µs |
+| 512 | long-lane | 98.3 µs | **89.1 µs** | 56.7 µs | 41.2 µs | 10.7 µs |
+| 1024 | flat | 106.0 µs | **97.8 µs** | 89.8 µs | 57.1 µs | 19.5 µs |
+| 1024 | ramped | 176.8 µs | **165.4 µs** | 92.1 µs | 61.1 µs | 19.5 µs |
+| 1024 | ramped+pan | 183.7 µs | **164.4 µs** | 92.1 µs | 64.9 µs | 20.5 µs |
+| 1024 | long-lane | 190.8 µs | **177.5 µs** | 110.5 µs | 80.3 µs | 21.1 µs |
+
+`long-lane` is a 12 000-breakpoint automation lane rendered near its end —
+a lane written across a whole song rather than a few seconds. It exists
+because its absence hid a bug; see §4.2.
 
 The fader alone, with `master_mix_only` subtracted — the constant every
 contender pays and none can avoid — and the win split into the part that
@@ -198,17 +205,20 @@ is the plan and the part that is the code generator:
 
 | block | case | baseline | `jit` | total | of which plan | of which codegen |
 |---|---|---|---|---|---|---|
-| 128 | flat | 9.0 µs | 4.5 µs | **1.98×** | 1.10× | 1.81× |
-| 128 | ramped | 15.8 µs | 5.4 µs | **2.92×** | 1.78× | 1.64× |
-| 128 | ramped+pan | 15.9 µs | 5.7 µs | **2.78×** | 1.76× | 1.58× |
-| 512 | flat | 40.2 µs | 16.6 µs | **2.42×** | 1.27× | 1.91× |
-| 512 | ramped | 61.7 µs | 18.4 µs | **3.35×** | 1.88× | 1.78× |
-| 512 | ramped+pan | 67.2 µs | 18.1 µs | **3.71×** | 2.07× | 1.79× |
-| 1024 | flat | 66.9 µs | 30.6 µs | **2.18×** | 1.07× | 2.04× |
-| 1024 | ramped | 127.4 µs | 35.7 µs | **3.57×** | 1.98× | 1.81× |
-| 1024 | ramped+pan | 126.4 µs | 34.5 µs | **3.66×** | 1.98× | 1.85× |
+| 128 | flat | 10.0 µs | 5.1 µs | **1.99×** | 1.10× | 1.80× |
+| 128 | ramped | 17.3 µs | 6.7 µs | **2.60×** | 1.46× | 1.78× |
+| 128 | ramped+pan | 17.6 µs | 6.5 µs | **2.71×** | 1.72× | 1.58× |
+| 128 | long-lane | 19.6 µs | 8.8 µs | **2.23×** | 1.54× | 1.44× |
+| 512 | flat | 39.0 µs | 18.6 µs | **2.09×** | 1.12× | 1.87× |
+| 512 | ramped | 71.3 µs | 22.3 µs | **3.20×** | 1.94× | 1.65× |
+| 512 | ramped+pan | 71.2 µs | 21.9 µs | **3.25×** | 1.96× | 1.66× |
+| 512 | long-lane | 78.4 µs | 30.4 µs | **2.58×** | 1.71× | 1.51× |
+| 1024 | flat | 78.4 µs | 37.6 µs | **2.08×** | 1.12× | 1.87× |
+| 1024 | ramped | 145.9 µs | 41.6 µs | **3.51×** | 2.01× | 1.75× |
+| 1024 | ramped+pan | 143.9 µs | 44.4 µs | **3.24×** | 2.01× | 1.61× |
+| 1024 | long-lane | 156.4 µs | 59.3 µs | **2.64×** | 1.75× | 1.51× |
 
-Compiling the whole table costs **190 µs**, once, on the control
+Compiling the whole table costs **234 µs**, once, on the control
 thread; nothing in the design lets a graph rebuild wait on it.
 
 Reported five ways on purpose. `multipass` is the un-fused node-graph
@@ -252,8 +262,8 @@ Equivalence, which is the actual claim:
 
 **The caveat this report has to carry, and it is the headline.** At 512
 frames and 48 kHz the block deadline is 10.67 ms. The baseline's worst
-case in that table is 76.8 µs — **0.7% of one i9-14900 core** for 32
-tracks. The JIT saves ~49 µs of it, which is **0.46% of that core**.
+case in that table is 89.1 µs — **0.8% of one i9-14900 core** for 32
+tracks. The JIT saves ~48 µs of it, which is **0.45% of that core**.
 
 The fader is not where a DAW's CPU goes; plugins are. Nobody should read
 `3.7×` as a fix for anything a user can hear today, and this track should
@@ -321,6 +331,38 @@ hit a slow path. So `TripleBuffer` and the zero-allocation guarantee are
 worth *more* on small hardware, while the JIT's speedup is worth roughly
 the same proportion everywhere. These two halves of the track should not
 be justified with one sentence.
+
+### 4.2 The benchmark was measuring a fixture smaller than production
+
+Recorded because it inverted this section's conclusion once already, and
+because the failure is a class of mistake rather than a typo.
+
+`benches/kernel.rs` used a 64-breakpoint automation lane. `TrackRamps::gain`
+is compiled **session-wide** at graph rebuild (`engine.rs`,
+`compile_gain_ramps`), so a real lane is thousands of breakpoints long, and
+`strip::plan` located a block's breakpoints with `ramp.iter().find(...)` — a
+linear scan from the start of the whole lane, per segment, per block. Cost
+was O(the session), not O(the block).
+
+Measured, single strip, 512 frames, rendered near the lane's end:
+
+| lane | `apply_fader_into` | `plan` + `fused_scalar` | |
+|---|---|---|---|
+| 64 points | 2.06 µs | 1.29 µs | 1.60× faster |
+| 6 000 | 1.94 µs | 10.85 µs | **5.60× slower** |
+| 12 000 | 1.89 µs | 21.13 µs | **11.20× slower** |
+| 48 000 | 1.84 µs | 73.25 µs | **39.84× slower** |
+
+So the headline "3.35× faster" was true of the benchmark and false of any
+real session with a long fader move on it. The benchmark could not see it,
+which is the actual defect: **a fixture smaller than production is not a
+measurement of production.**
+
+Fixed by seeding the breakpoint index with `partition_point` once and only
+walking it forward — the same shape `RampCursor` already used. Now flat in
+lane length (1.35–1.84× faster at every size measured), and the `long-lane`
+case above is a permanent benchmark so the regression cannot return
+quietly.
 
 ## 5. Declined: rebuilding the scheduler
 

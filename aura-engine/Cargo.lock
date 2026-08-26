@@ -51,7 +51,6 @@ dependencies = [
  "cranelift-module",
  "cranelift-native",
  "criterion",
- "target-lexicon",
 ]
 
 [[package]]

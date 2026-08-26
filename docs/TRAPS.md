@@ -88,6 +88,14 @@ session burns an hour on something a sentence would have prevented.
   is right to be — the mixer's own tests use
   `std::f32::consts::FRAC_1_SQRT_2`. Note the `rust` job does **not** run
   clippy on `src-tauri`, only the `engine` job does on `aura-engine`.
+- **A benchmark fixture smaller than production measures nothing.**
+  `TrackRamps::gain` is compiled **session-wide** at graph rebuild, so a real
+  automation lane is thousands of breakpoints. `benches/kernel.rs` used 64 and
+  reported `strip::plan` 1.9x faster than the mixer's loop while it was in
+  fact **40x slower** on a 48 000-point lane, because the plan scanned the
+  lane linearly per segment per block. Anything whose cost depends on
+  session-wide state needs a session-sized fixture, or the benchmark endorses
+  the bug. `aura-engine`'s `long-lane` case exists for exactly this.
 - **A stale `target/criterion/` silently mixes runs.** Criterion keys results
   by benchmark *name*, so renaming a benchmark leaves the old directory in
   place and `estimates.json` for the old name still parses fine. A report

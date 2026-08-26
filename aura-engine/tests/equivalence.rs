@@ -87,7 +87,10 @@ fn scalar(s: &Strip<'_>, buf: &[f32], frames: usize, pos: u64) -> Run {
     let p = plan(s, pos, frames, 0, frames - 1);
     let mut post = dirty(frames);
     let mut acc = Accum::default();
-    fused_scalar(&p, buf, &mut post, &mut acc);
+    assert!(
+        fused_scalar(&p, buf, &mut post, &mut acc),
+        "the scalar plan declined a plan this test expects it to take"
+    );
     Run { post, acc }
 }
 
@@ -204,13 +207,59 @@ fn ramped_and_panned_strips_track_the_mixer_within_rounding() {
 }
 
 #[test]
+fn a_pdc_delay_larger_than_the_position_holds_the_lane_at_zero() {
+    // Regression, found in review. The lane position is
+    // `pos + i - pdc_delay` SATURATING PER SAMPLE, so while `pos + i` is
+    // still below `pdc_delay` every frame reads lane sample 0 and the gain
+    // is flat. Clamping the run's START instead let the plan ramp through a
+    // region the mixer holds still: 48% of gain wrong at frame 192.
+    //
+    // This is not a corner case. `pos` is the absolute timeline position,
+    // so it fires on every block at the top of a session and after every
+    // loop wrap to a low start, on any latency-compensated track.
+    let r = vec![
+        AbsParamEvent { sample: 0, value: 1.0 },
+        AbsParamEvent { sample: 400, value: 0.0 },
+    ];
+    for (pos, pdc) in [(0u64, 192u64), (0, 512), (50, 192), (191, 192), (192, 192)] {
+        let buf = signal(512);
+        let s = Strip { gain: 1.0, ramp: &r, pan: flat_pan(), audible: true, pdc_delay: pdc };
+        let b = baseline(&s, &buf, 512, pos);
+        let j = jit(&s, &buf, 512, pos);
+        assert_samples_close(&b.post, &j.post, 1e-5, &format!("pos={pos} pdc={pdc}"));
+    }
+}
+
+#[test]
+fn a_long_automation_lane_does_not_change_the_result() {
+    // Companion to the perf fix: the breakpoint cursor is now seeded by
+    // binary search and only walked forward. Correctness has to be identical
+    // to the baseline no matter how far into the lane the block sits — a
+    // mis-seeded cursor would read the wrong pair of breakpoints and be
+    // silently wrong rather than slow.
+    let r: Vec<AbsParamEvent> = (0..12_000)
+        .map(|n| AbsParamEvent { sample: n * 100, value: if n % 2 == 0 { 1.0 } else { 0.3 } })
+        .collect();
+    let buf = signal(512);
+    for pos in [0u64, 100, 150, 50_000, 599_000, 1_199_000] {
+        let s = Strip { gain: 0.8, ramp: &r, pan: moving_pan(), audible: true, pdc_delay: 0 };
+        let b = baseline(&s, &buf, 512, pos);
+        let j = jit(&s, &buf, 512, pos);
+        assert_samples_close(&b.post, &j.post, 1e-5, &format!("pos={pos} on a 12k-point lane"));
+    }
+}
+
+#[test]
 fn odd_block_sizes_render_every_frame() {
     // The kernel handles frame pairs; the tail frame is finished in Rust. An
     // off-by-one there loses the last frame of every block, which is a click
     // at the block rate — audible, and invisible to a test that only uses
     // powers of two.
+    // EVERY odd size from 1 to 511, plus a few even ones for symmetry — the
+    // claim in `docs/GAP_ANALYSIS.md` is exactly this, and it used to be a
+    // hand-picked list of eight (two of them even) that did not match it.
     let r = fader_move();
-    for frames in [1, 2, 3, 7, 63, 127, 129, 511] {
+    for frames in (1..512).step_by(2).chain([2, 128, 512]) {
         let buf = signal(frames);
         let s = Strip { gain: 0.9, ramp: &r, pan: moving_pan(), audible: true, pdc_delay: 0 };
         let sc = scalar(&s, &buf, frames, 0);

@@ -57,8 +57,12 @@ use crate::strip::{Coef, Plan};
 /// The compiled kernel's ABI.
 ///
 /// * `inp` — interleaved stereo input, `frames` frames.
-/// * `outp` — interleaved output at the stretch's first frame; the kernel
-///   **adds** into it, like `mixer::mix_out`.
+/// * `outp` — the post-fader buffer at the stretch's first frame; the kernel
+///   **overwrites** it. Not `mixer::mix_out`'s accumulate: since Plan G2 the
+///   fader's destination is a per-strip stereo buffer that routing reads
+///   afterwards, so `emit` stores rather than read-modify-writes, and
+///   `equivalence.rs` asserts the overwrite. A caller wiring a raw
+///   [`KernelFn`] against the old wording would double-mix.
 /// * `frames` — must be even; the odd tail frame is finished in Rust (one
 ///   frame is not worth a second code path, and doing it in Rust keeps it
 ///   bit-identical to the scalar reference).

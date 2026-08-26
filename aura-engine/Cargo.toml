@@ -23,7 +23,10 @@ cranelift-frontend = "0.134"
 cranelift-jit = "0.134"
 cranelift-module = "0.134"
 cranelift-native = "0.134"
-target-lexicon = "0.13"
+# `target-lexicon` is deliberately NOT here: `cranelift_native::builder()`
+# resolves the host triple itself, so nothing in this crate names a target.
+# It was listed (per jit.md) and unused — a lockfile entry and a CI compile
+# for nothing.
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

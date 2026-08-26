@@ -131,6 +131,15 @@ jobs:
         working-directory: aura-engine
         run: cargo test --locked --all-targets
 
+      # Release too, and not for speed: `counting_is_active()` probes the
+      # allocator with a `Box` that LLVM deletes as dead once optimisation is
+      # on, so `the_guard_is_actually_armed` — the one test whose job is
+      # proving the suite CAN fail — was green in debug and red in release.
+      # An RT allocation check that only works unoptimised is not one.
+      - name: cargo test (release)
+        working-directory: aura-engine
+        run: cargo test --locked --release --all-targets
+
       # Compiling the benches is not the same as running them (a runner's
       # timings are noise), but a bench that stopped compiling is a real break
       # and this is where it shows up cheaply.

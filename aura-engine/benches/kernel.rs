@@ -48,6 +48,23 @@ fn fader_move() -> Vec<AbsParamEvent> {
     (0..64).map(|n| AbsParamEvent { sample: n * 397, value: if n % 2 == 0 { 1.0 } else { 0.3 } }).collect()
 }
 
+/// A lane the length of a real song, rendered near its END — which is where a
+/// session spends most of its time.
+///
+/// This case exists because its absence hid a bug. `TrackRamps::gain` is
+/// compiled SESSION-WIDE at graph rebuild, so the cost of locating a block's
+/// breakpoints is a function of the whole lane, not of the block. With only
+/// the 64-point `fader_move()` above, the benchmark reported the plan 1.9x
+/// faster while it was in fact 40x SLOWER on a 48 000-point lane, because
+/// `strip::plan` scanned the lane linearly per segment per block. A benchmark
+/// whose fixture is smaller than production is not a measurement of
+/// production.
+fn long_lane() -> Vec<AbsParamEvent> {
+    (0..12_000)
+        .map(|n| AbsParamEvent { sample: n * 100, value: if n % 2 == 0 { 1.0 } else { 0.3 } })
+        .collect()
+}
+
 fn flat_pan() -> PanQuad {
     PanQuad { gl0: CENTRE, gr0: CENTRE, gl1: CENTRE, gr1: CENTRE }
 }
@@ -56,15 +73,18 @@ fn moving_pan() -> PanQuad {
     PanQuad { gl0: 0.98, gr0: 0.19, gl1: 0.19, gr1: 0.98 }
 }
 
-/// The three strip shapes worth separating: what most tracks do, what an
-/// automated track does, and what a track being panned while automated does.
+/// The strip shapes worth separating: what most tracks do, what an automated
+/// track does, what a track being panned while automated does, and the same
+/// automation written across a whole song rather than a few seconds.
 fn strips<'a>(case: &str, ramp: &'a [AbsParamEvent]) -> Vec<Strip<'a>> {
     (0..TRACKS)
         .map(|n| {
             let gain = 0.3 + n as f32 * 0.01;
             match case {
                 "flat" => Strip { gain, ramp: &[], pan: flat_pan(), audible: true, pdc_delay: 0 },
-                "ramped" => Strip { gain, ramp, pan: flat_pan(), audible: true, pdc_delay: 0 },
+                "ramped" | "long-lane" => {
+                    Strip { gain, ramp, pan: flat_pan(), audible: true, pdc_delay: 0 }
+                }
                 _ => Strip { gain, ramp, pan: moving_pan(), audible: true, pdc_delay: 0 },
             }
         })
@@ -75,11 +95,14 @@ fn bench(c: &mut Criterion) {
     let kernels = Kernels::compile().expect("cranelift could not target this host");
     let ramp = fader_move();
 
-    for case in ["flat", "ramped", "ramped+pan"] {
+    let long = long_lane();
+    for case in ["flat", "ramped", "ramped+pan", "long-lane"] {
         for frames in [128usize, 512, 1024] {
-            let all = strips(case, &ramp);
+            let lane: &[AbsParamEvent] = if case == "long-lane" { &long } else { &ramp };
+            let all = strips(case, lane);
             let buf = signal(frames);
-            let pos = 4096u64;
+            // Near the END of the long lane; a few seconds in for the others.
+            let pos = if case == "long-lane" { 12_000 * 100 - 4096 } else { 4096u64 };
             let last = frames - 1;
 
             let mut group = c.benchmark_group(format!("{case}/{frames}"));
@@ -130,7 +153,7 @@ fn bench(c: &mut Criterion) {
                     let mut acc = Accum::default();
                     for s in &all {
                         let p = plan(s, pos, frames, 0, last);
-                        fused_scalar(&p, &buf, &mut post, &mut acc);
+                        assert!(fused_scalar(&p, &buf, &mut post, &mut acc));
                         mix_post_into(&mut master, 0, 2, &post, frames);
                     }
                     black_box(acc);

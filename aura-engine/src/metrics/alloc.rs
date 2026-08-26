@@ -148,6 +148,13 @@ pub fn assert_no_alloc<R>(what: &str, f: impl FnOnce() -> R) -> R {
 /// register the allocator, which is the failure mode that makes an
 /// allocation guard worse than none.
 pub fn counting_is_active() -> bool {
-    let (_boxed, stats) = measure(|| Box::new([0u8; 64]));
+    // `black_box`, and it is load-bearing rather than defensive: without it
+    // LLVM deletes this allocation as dead in a release build, the probe
+    // reports zero, and `the_guard_is_actually_armed` FAILS — the one test
+    // whose job is proving the suite can fail was the only one that broke
+    // under `--release`, which is exactly the build an RT allocation check
+    // would want to run in.
+    let (boxed, stats) = measure(|| std::hint::black_box(Box::new([0u8; 64])));
+    std::hint::black_box(&boxed);
     stats.allocs > 0
 }

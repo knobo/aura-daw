@@ -195,7 +195,18 @@ pub fn multipass(
 
 /// **The control.** The plan run as straight-line scalar Rust: same algorithm
 /// as the JIT kernels, compiled by rustc.
-pub fn fused_scalar(plan: &Plan, buf: &[f32], post: &mut [f32], acc: &mut Accum) {
+#[must_use = "false means the run was NOT rendered; use `apply_fader_into` instead"]
+pub fn fused_scalar(plan: &Plan, buf: &[f32], post: &mut [f32], acc: &mut Accum) -> bool {
+    if plan.overflowed {
+        // The same refusal `Kernels::run` makes, and for a sharper reason: an
+        // overflowed plan covers only the frames its segments reached, and
+        // `post` is an OVERWRITE target. Rendering it anyway leaves the tail
+        // at the previous run's contents, which routing then ships to the
+        // master — measured at 192 of 256 samples stale. Note that the crate
+        // ships TWO scalar paths and only `apply_fader_into` is a valid
+        // fallback here; this one shares the plan's limit.
+        return false;
+    }
     if plan.silent {
         // Not a no-op, and this is the one place the Plan G2 merge changed a
         // conclusion: `post` is an overwrite target read afterwards by the
@@ -203,7 +214,7 @@ pub fn fused_scalar(plan: &Plan, buf: &[f32], post: &mut [f32], acc: &mut Accum)
         // zeros into the meters, on the other hand, genuinely cannot move a
         // peak (`max` against a non-negative running value) or a sum.
         post.fill(0.0);
-        return;
+        return true;
     }
     for seg in plan.segments() {
         let c = seg.coef;
@@ -218,6 +229,7 @@ pub fn fused_scalar(plan: &Plan, buf: &[f32], post: &mut [f32], acc: &mut Accum)
             post[frame * 2 + 1] = r;
         }
     }
+    true
 }
 
 #[cfg(test)]
@@ -270,7 +282,7 @@ mod tests {
         let p = plan(strip, pos, frames, 0, pan_last);
         let mut post_c = dirty;
         let mut acc_c = Accum::default();
-        fused_scalar(&p, &buf, &mut post_c, &mut acc_c);
+        assert!(fused_scalar(&p, &buf, &mut post_c, &mut acc_c));
 
         [(post_a, acc_a), (post_b, acc_b), (post_c, acc_c)]
     }
