@@ -703,7 +703,12 @@ fn enumerate_params(
         let value = params_ext
             .get_value(&mut handle, info.id)
             .unwrap_or(default);
-        out.push(ParamInfo { id, name, min, max, default, value, steps });
+        // `non_automatable` is LV2-only for now: CLAP's flag set has no
+        // "changing this is expensive" bit, and mapping the absence of
+        // `IS_AUTOMATABLE` onto it would silently disable automation for
+        // every CLAP plugin that under-reports its flags. See the field's
+        // doc comment in `descriptor.rs` for the flags actually available.
+        out.push(ParamInfo { id, name, min, max, default, value, steps, non_automatable: false });
     }
     (out, cookies)
 }

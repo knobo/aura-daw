@@ -343,7 +343,7 @@ impl Lv2Host {
             let inst = inner.instances.get(&instance_id).ok_or_else(|| {
                 format!("LV2 instance not registered with the host: {instance_id}")
             })?;
-            let mut params = control_port_params(&inst.plugin);
+            let mut params = control_port_params(&inner.world, &inst.plugin);
             for p in &mut params {
                 if let Some(v) = inst.values.get(&p.id) {
                     p.value = *v as f64;
@@ -469,7 +469,7 @@ fn register(
         }
     }
     let latency_port = find_latency_port(&inner.world, &plugin);
-    let params = control_port_params(&plugin);
+    let params = control_port_params(&inner.world, &plugin);
     let values = params.iter().map(|p| (p.id, p.value as f32)).collect();
     let has_gui = super::lv2_ui::plugin_has_show_ui(&plugin);
     inner.instances.insert(
@@ -508,17 +508,92 @@ fn find_latency_port(world: &livi::World, plugin: &livi::Plugin) -> Option<livi:
         .map(|p| p.index)
 }
 
+/// Port-property URIs AURA reads straight out of the plugin's RDF.
+///
+/// `livi::Port` carries type/name/symbol/default/min/max/index and nothing
+/// else — checked against `livi-0.7.5/src/port.rs`, there is no property
+/// accessor to call. So the three "this is a discrete control" properties
+/// and the two "do not stream values at me" ones come from raw lilv, the
+/// same drop-below-livi move `super::state`'s `state:interface` glue makes
+/// and the same one `find_latency_port` above already makes.
+const URI_INTEGER: &str = "http://lv2plug.in/ns/lv2core#integer";
+const URI_ENUMERATION: &str = "http://lv2plug.in/ns/lv2core#enumeration";
+const URI_TOGGLED: &str = "http://lv2plug.in/ns/lv2core#toggled";
+const URI_EXPENSIVE: &str = "http://lv2plug.in/ns/ext/port-props#expensive";
+const URI_NON_AUTOMATABLE: &str = "http://kxstudio.sf.net/ns/lv2ext/props#NonAutomatable";
+
+/// Step count for a discrete port spanning `min..=max` in integer units:
+/// 0..6 is SEVEN positions, not six. `0` means "not usefully discrete" and
+/// leaves the param continuous.
+fn integer_steps(min: f64, max: f64) -> u32 {
+    let span = (max - min).abs().round();
+    if !span.is_finite() || span < 1.0 {
+        return 0;
+    }
+    // A degenerate .ttl can declare an integer port spanning millions; a
+    // step count that large is useless to a UI but must not wrap.
+    (span.min(u32::MAX as f64 - 1.0) as u32).saturating_add(1)
+}
+
 /// Real `ParamInfo` list from the plugin's control-input ports
 /// (`ParamId = port index`, contract §2.5). Missing range metadata falls
 /// back to a sane 0..=1-style span around the default.
-fn control_port_params(plugin: &livi::Plugin) -> Vec<ParamInfo> {
-    plugin
-        .ports_with_type(livi::PortType::ControlInput)
+///
+/// `steps` and `non_automatable` come from the port's declared properties
+/// (see the URI constants above). Getting this wrong is audible: ZamVerb
+/// declares "Room" as `lv2:integer` 0..6 **plus** `pprops:expensive` and
+/// `kx:NonAutomatable`, because the value selects the convolution impulse
+/// response. Reported as a continuous 0..6 param it gets a smooth knob, and
+/// a drag streams ~60 fractional values a second at a port that reloads an
+/// IR on every one of them — which is what the user heard as crackling.
+fn control_port_params(world: &livi::World, plugin: &livi::Plugin) -> Vec<ParamInfo> {
+    let lilv_world = world.raw();
+    let raw = plugin.raw();
+    // One node per URI for the whole plugin, not per port: `new_uri` takes
+    // the world lock and allocates.
+    let integer = lilv_world.new_uri(URI_INTEGER);
+    let enumeration = lilv_world.new_uri(URI_ENUMERATION);
+    let toggled = lilv_world.new_uri(URI_TOGGLED);
+    let expensive = lilv_world.new_uri(URI_EXPENSIVE);
+    let non_auto = lilv_world.new_uri(URI_NON_AUTOMATABLE);
+    // Collected, not chained: the closure below re-enters lilv through
+    // `port_by_index`, and nothing in livi's docs promises its port
+    // iterator is not holding the world lock while it yields.
+    let ports: Vec<livi::Port> = plugin.ports_with_type(livi::PortType::ControlInput).collect();
+    ports
+        .into_iter()
         .map(|p| {
             let default = p.default_value as f64;
             let min = p.min_value.map(f64::from).unwrap_or_else(|| default.min(0.0));
             let max = p.max_value.map(f64::from).unwrap_or_else(|| default.max(1.0));
             let max = if max > min { max } else { min + 1.0 };
+            let (steps, non_automatable) = match raw.port_by_index(p.index.0) {
+                Some(port) => {
+                    let steps = if port.has_property(&toggled) {
+                        2
+                    } else if port.has_property(&enumeration) {
+                        // An enumeration's positions are its scale points;
+                        // fall back to the integer span when a plugin
+                        // declares the property but lists no points.
+                        match port.scale_points().count() {
+                            n if n >= 2 => n as u32,
+                            _ => integer_steps(min, max),
+                        }
+                    } else if port.has_property(&integer) {
+                        integer_steps(min, max)
+                    } else {
+                        0
+                    };
+                    (
+                        steps,
+                        port.has_property(&expensive) || port.has_property(&non_auto),
+                    )
+                }
+                // Unreachable in practice (the index came from the same
+                // plugin) — degrade to "continuous, automatable" rather
+                // than guess.
+                None => (0, false),
+            };
             ParamInfo {
                 id: p.index.0 as u32,
                 name: p.name.clone(),
@@ -526,7 +601,8 @@ fn control_port_params(plugin: &livi::Plugin) -> Vec<ParamInfo> {
                 max,
                 default: default.clamp(min, max),
                 value: default.clamp(min, max),
-                steps: 0,
+                steps,
+                non_automatable,
             }
         })
         .collect()
@@ -1010,6 +1086,11 @@ mod tests {
 
     const ZYN_URI: &str = "http://zynaddsubfx.sourceforge.net";
     const EPIANO_URI: &str = "http://drobilla.net/plugins/mda/EPiano";
+    /// ZamVerb — a convolution reverb whose "Room" port declares
+    /// `lv2:integer` 0..6 AND `pprops:expensive` +
+    /// `kx:NonAutomatable`, because the value picks the impulse response.
+    /// (`/usr/lib/lv2/ZamVerb.lv2/ZamVerb_dsp.ttl`, port index 6.)
+    const ZAMVERB_URI: &str = "urn:zamaudio:ZamVerb";
 
     fn note_on(offset: u32, key: u8, velocity: u8) -> BlockNoteEvent {
         BlockNoteEvent { offset, key, velocity }
@@ -1123,6 +1204,74 @@ mod tests {
         let mut io = ProcessBlock { samples: &mut tiny, channels: 2, sample_rate: 48_000, steady: None };
         node.process(&mut io);
         host.unregister_instance("epiano-test");
+    }
+
+    /// `integer_steps` counts POSITIONS, not intervals: an `lv2:integer`
+    /// port declared 0..6 has seven of them.
+    #[test]
+    fn integer_steps_counts_positions_not_intervals() {
+        assert_eq!(integer_steps(0.0, 6.0), 7);
+        assert_eq!(integer_steps(0.0, 1.0), 2);
+        assert_eq!(integer_steps(-2.0, 2.0), 5);
+        // Not usefully discrete — leave the param continuous.
+        assert_eq!(integer_steps(0.0, 0.0), 0);
+        assert_eq!(integer_steps(0.0, 0.4), 0);
+        assert_eq!(integer_steps(0.0, f64::INFINITY), 0);
+        // A degenerate span must saturate, never wrap.
+        assert_eq!(integer_steps(0.0, 1e30), u32::MAX);
+    }
+
+    /// The bug this branch exists for. ZamVerb's "Room" is declared
+    /// `lv2:integer` 0..6 plus `pprops:expensive` and `kx:NonAutomatable`.
+    /// Before this change `control_port_params` hardcoded `steps: 0` for
+    /// every control port, so Room came back as a CONTINUOUS 0..6 param:
+    /// the UI drew a smooth knob and a drag streamed ~60 fractional values
+    /// a second at a port that reloads a convolution IR on each write.
+    ///
+    /// Skips politely when ZamVerb is not installed (repo convention — see
+    /// the EPiano test above).
+    #[test]
+    fn expensive_integer_port_is_reported_stepped_and_non_automatable() {
+        let host = global();
+        let params = match host.register_instance("zamverb-props", &lv2_uid(ZAMVERB_URI)) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("skipping: ZamVerb not installed ({e})");
+                return;
+            }
+        };
+        let room = params
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("room"))
+            .expect("ZamVerb exposes a Room control port");
+        assert_eq!((room.min, room.max), (0.0, 6.0), "the .ttl declares 0..6");
+        assert_eq!(
+            room.steps, 7,
+            "lv2:integer 0..6 is seven positions, not a continuous span"
+        );
+        assert!(
+            room.non_automatable,
+            "the .ttl declares pprops:expensive AND kx:NonAutomatable"
+        );
+        // The ordinary knobs on the same plugin stay continuous and
+        // automatable — the flags are per-port, not per-plugin.
+        let plain: Vec<&ParamInfo> = params
+            .iter()
+            .filter(|p| !p.name.eq_ignore_ascii_case("room"))
+            .collect();
+        assert!(!plain.is_empty(), "ZamVerb has more than one control port");
+        for p in plain {
+            assert_eq!(p.steps, 0, "{} is a continuous knob", p.name);
+            assert!(!p.non_automatable, "{} is automatable", p.name);
+        }
+        // `get_params` re-reads the same properties, not just `register`.
+        let again = host.get_params("zamverb-props").expect("re-enumerates");
+        let room_again = again
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case("room"))
+            .expect("Room survives re-enumeration");
+        assert_eq!((room_again.steps, room_again.non_automatable), (7, true));
+        host.unregister_instance("zamverb-props");
     }
 
     // ---- ZynAddSubFX acceptance (PHASE3-PLAN contract 7 — gates the round) --

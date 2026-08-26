@@ -8,6 +8,7 @@ import type { PluginParamInfo } from "../types/ipc";
 import {
   formatParamDisplay,
   formatParamValue,
+  nonAutomatableRefusal,
   paramGroupName,
   paramNormalized,
   paramUnit,
@@ -103,5 +104,25 @@ describe("paramNormalized", () => {
   it("uses the passed value override instead of p.value", () => {
     const p = param({ min: 0, max: 200, value: 50 });
     expect(paramNormalized(p, 100)).toBe(0.5);
+  });
+});
+
+describe("nonAutomatableRefusal", () => {
+  it("is null for an ordinary param, and for one that only omits the flag", () => {
+    expect(nonAutomatableRefusal(param())).toBeNull();
+    // A project saved before the field existed: absent means automatable.
+    const { nonAutomatable: _drop, ...legacy } = { ...param(), nonAutomatable: false };
+    expect(nonAutomatableRefusal(legacy as never)).toBeNull();
+    expect(nonAutomatableRefusal(undefined)).toBeNull();
+  });
+
+  it("names the param by its SHORT name and says why", () => {
+    // ZamVerb's real shape: lv2:integer 0..6 + pprops:expensive +
+    // kx:NonAutomatable, because Room picks the impulse response.
+    const room = param({ name: "ZamVerb / Room", min: 0, max: 6, steps: 7, nonAutomatable: true });
+    const msg = nonAutomatableRefusal(room);
+    expect(msg).toContain("Room");
+    expect(msg).not.toContain("ZamVerb /");
+    expect(msg).toMatch(/expensive/i);
   });
 });

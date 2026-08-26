@@ -6242,7 +6242,7 @@ mod tests {
                     max: 1.0,
                     default: 0.5,
                     value: 0.5,
-                    steps: 0,
+                    steps: 0, non_automatable: false,
                 }],
             );
             s.modulation.curves.push(Curve {
@@ -6411,7 +6411,7 @@ mod tests {
                     max: 1.0,
                     default: 0.5,
                     value: 0.5,
-                    steps: 0,
+                    steps: 0, non_automatable: false,
                 }],
             );
             s.midi.clips.push(crate::midi::MidiClip {

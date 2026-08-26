@@ -342,3 +342,58 @@ describe("PluginParamPanel pin toggle", () => {
     expect(setPinnedParams).not.toHaveBeenCalled();
   });
 });
+
+describe("PluginParamPanel on a param the plugin declared non-automatable", () => {
+  /** ZamVerb's "Room" as the .ttl actually declares it: `lv2:integer` 0..6
+   * plus `pprops:expensive` and `kx:NonAutomatable`, because the value
+   * selects the convolution impulse response. */
+  function room(): PluginParamInfo {
+    return {
+      id: 6,
+      name: "ZamVerb / Room",
+      min: 0,
+      max: 6,
+      default: 0,
+      value: 0,
+      steps: 7,
+      nonAutomatable: true,
+    };
+  }
+
+  it("renders a discrete select, not a continuous fader", () => {
+    plugins.params = [room()];
+    render(PluginParamPanel);
+    // 7 integer positions, 0..6 — not a smooth 0..6 knob whose drag would
+    // stream fractional values at a port that reloads an IR per write.
+    const select = screen.getByRole("combobox") as HTMLSelectElement;
+    expect([...select.options].map((o) => o.value)).toEqual(["0", "1", "2", "3", "4", "5", "6"]);
+    expect(screen.queryByRole("slider")).toBeNull();
+  });
+
+  it("does not offer the automate gesture, and says why on hover", () => {
+    plugins.params = [room()];
+    render(PluginParamPanel);
+    expect(screen.queryByTitle("Automate ZamVerb / Room")).toBeNull();
+    const btn = screen.getByTitle(/expensive/i) as HTMLButtonElement;
+    expect(btn.disabled).toBe(true);
+    expect(btn.title).toContain("Room");
+  });
+
+  it("keeps the button live for a param that already HAS a lane", () => {
+    // A project saved before the backend read these properties can carry a
+    // real binding here; the row must stay usable so the lane can be found.
+    plugins.params = [room()];
+    modulation.bindings = [bindingFor(6)];
+    render(PluginParamPanel);
+    const btn = screen.getByTitle("Automate ZamVerb / Room") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+  });
+
+  it("leaves an ordinary param's automate button alone", () => {
+    plugins.params = [param(1, "ZamVerb / Dry", 0.5)];
+    render(PluginParamPanel);
+    const btn = screen.getByTitle("Automate ZamVerb / Dry") as HTMLButtonElement;
+    expect(btn.disabled).toBe(false);
+    expect(btn.textContent?.trim()).toBe("A");
+  });
+});

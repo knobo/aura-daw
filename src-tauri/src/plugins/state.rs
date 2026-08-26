@@ -529,7 +529,7 @@ fn read_restored_rows(dir: &Path) -> Result<Option<Vec<RestoredRow>>, String> {
                 max: c.value.max(1.0),
                 default: c.value,
                 value: c.value,
-                steps: 0,
+                steps: 0, non_automatable: false,
             })
             .collect();
         let pending_state = if let Some(r) = &row.state_ref {
@@ -1308,7 +1308,7 @@ mod tests {
             max: 1.0,
             default: 0.0,
             value: 0.75,
-            steps: 0,
+            steps: 0, non_automatable: false,
         });
         // Instance b has a pending blob (as if restored for a missing host).
         let blob = StateBlob { kind: KIND_OPAQUE, data: vec![9; 100] };

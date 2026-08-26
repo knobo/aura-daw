@@ -31,6 +31,12 @@ gates.
   name button — a judgment call, not pixel-verified); and MATRIX mode
   (does grouping by parameter read as useful, does the fourth mode chip
   fit the row at 480 px).
+- **From PR #114 (LV2 port properties):** put ZamVerb on a bus, play, and
+  change "Room". Before, dragging it crackled continuously. It should now
+  be a 7-position selector, and each change should be ONE clean switch
+  between rooms — a click or a short gap is the IR reloading and is
+  expected; continuous crackle while changing is not. No suite can hear
+  this, and no agent has.
 - **From Step 7**, four things no suite can answer:
   - Does double-click-to-audition feel right at C3, and is 1200 ms the right
     decay for the row highlight?
@@ -47,6 +53,40 @@ gates.
     Shift+Enter, which *is* pref-gated while their mouse preview is not. Is
     that asymmetry acceptable, or should those rows get the gesture with the
     flam solved another way?
+
+## LV2 port properties — stepped, expensive, non-automatable (PR #114)
+
+The plugin can say "this one is a switch" and "do not stream values at
+me", and AURA was reading neither. `livi` 0.7 exposes no port properties
+at all (`livi::Port` carries type/name/symbol/default/min/max/index and
+nothing else), so `lv2_host::control_port_params` hardcoded `steps: 0`
+for every control port.
+
+Shipped: `control_port_params` now reads `lv2:toggled` /
+`lv2:enumeration` / `lv2:integer` into `ParamInfo.steps` and
+`pprops:expensive` / `kx:NonAutomatable` into the new additive
+`ParamInfo.non_automatable`, both through raw lilv (same drop-below-livi
+move as `state:interface` and `find_latency_port`). `pickTarget` refuses
+to MINT a lane on a flagged param — an existing one still opens, so a
+project saved before this can still be repaired — and the generic
+panel's `A` button goes dashed with the reason in its `title`.
+
+Open, deliberately:
+
+- **CLAP reports `non_automatable: false` always.** The nearest
+  neighbour is the ABSENCE of `IS_AUTOMATABLE` (verified against
+  clack-extensions 0.1.1: the flag set has `IS_AUTOMATABLE`,
+  `IS_READONLY`, `IS_HIDDEN`, `REQUIRES_PROCESS`, … and nothing meaning
+  "expensive"). Wiring `!IS_AUTOMATABLE` would disable automation for
+  every CLAP plugin that under-reports its flags — a real trade, not a
+  detail, so it is left for the owner to call.
+- **`LanePickerMenu.svelte` still lists flagged params.** Clicking one
+  reaches the same store refusal and toasts, so nothing is minted; the
+  row just does not say so before you click. A `selfInstrumentParam`
+  target is not checked at all — it carries no `instanceId` to look up.
+- **No engine-side clamp.** A flagged param can still be written at
+  frame rate through the ordinary `plugin_set_param` batch if some other
+  surface does it. The properties inform the UI, not the RT path.
 
 ## Scope calls already made — do not relitigate without a reason
 

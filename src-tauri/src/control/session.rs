@@ -1504,7 +1504,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                         max: 1.0,
                         default: 0.0,
                         value: clamped,
-                        steps: 0,
+                        steps: 0, non_automatable: false,
                     });
                     (0.0, clamped)
                 }
@@ -4347,7 +4347,7 @@ mod tests {
             max: 1.0,
             default: 0.5,
             value: 0.9,
-            steps: 0,
+            steps: 0, non_automatable: false,
         };
         {
             let mut g = m.lock();
@@ -4398,7 +4398,7 @@ mod tests {
             max: 1.0,
             default: 0.5,
             value: 0.9,
-            steps: 0,
+            steps: 0, non_automatable: false,
         };
         // Cold: the row exists (an earlier replayed `PluginAdd` put it
         // there) but NOTHING is parked in the params map.
@@ -4439,7 +4439,7 @@ mod tests {
             max: 1.0,
             default: 0.5,
             value: 0.1,
-            steps: 0,
+            steps: 0, non_automatable: false,
         };
         m.lock().plugins.params.insert(row.id.clone(), vec![live.clone()]);
         Session::transact(&m, TxMeta::user("remove again"), |tx| {
@@ -4480,7 +4480,7 @@ mod tests {
                     max: 1.0,
                     default: 0.5,
                     value: 0.5,
-                    steps: 0,
+                    steps: 0, non_automatable: false,
                 }],
             );
         }

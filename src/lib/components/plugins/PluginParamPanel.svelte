@@ -17,6 +17,7 @@
   import {
     formatParamDisplay,
     formatParamValue,
+    nonAutomatableRefusal,
     paramGroupName,
     paramNormalized,
     paramUnit,
@@ -101,6 +102,15 @@
       return;
     }
     plugins.setPinnedParams(inst.uid, [...current, p.id]);
+  }
+
+  /** The plugin declared this one expensive to change / non-automatable
+   * (LV2 `pprops:expensive`, `kx:NonAutomatable`). `pickTarget` is the one
+   * that actually refuses; this only stops the row offering the gesture,
+   * so the user is not clicking a button that always toasts. An EXISTING
+   * lane still has a live chip — it can be jumped to, and deleted. */
+  function noAuto(p: PluginParamInfo): boolean {
+    return !!p.nonAutomatable && !pluginBound(p.id);
   }
 
   function isToggle(p: PluginParamInfo): boolean {
@@ -340,10 +350,11 @@
         <button
           class="autobtn mono"
           class:on={pluginBound(p.id)}
-          title="Automate {p.name}"
+          disabled={noAuto(p)}
+          title={noAuto(p) ? (nonAutomatableRefusal(p) ?? "") : `Automate ${p.name}`}
           aria-pressed={pluginBound(p.id)}
           onclick={() => automateParam(p)}
-          >A</button
+          >{noAuto(p) ? "—" : "A"}</button
         >
       </div>
       {#if !isToggle(p) && !isEnum(p)}
@@ -631,6 +642,18 @@
     background: var(--violet);
     border-color: var(--violet);
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
+  }
+  /* Declared non-automatable by the plugin — the gesture is not on offer.
+     Kept in the layout (an em dash, not a hidden button) so the row still
+     lines up with its neighbours and the reason is one hover away. */
+  .autobtn:disabled {
+    cursor: not-allowed;
+    color: var(--text-faint);
+    border-style: dashed;
+  }
+  .autobtn:disabled:hover {
+    color: var(--text-faint);
+    border-color: rgb(var(--edge-rgb) / 0.2);
   }
 
   /* "Automation has this one" — magenta, the colour PR #32 gave the
