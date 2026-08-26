@@ -62,6 +62,27 @@ pub struct ParamInfo {
     /// Discrete step count (0 = continuous).
     #[serde(default)]
     pub steps: u32,
+    /// True when the plugin declared that CHANGING this parameter is
+    /// expensive, or that it must not be automated at all. AURA's rule for
+    /// a param flagged here: never stream values at it — the generic panel
+    /// gives it a discrete control and the frontend refuses to mint an
+    /// automation lane on it.
+    ///
+    /// * **LV2** sets it from `pprops:expensive` or
+    ///   `kx:NonAutomatable` (`lv2_host::control_port_params`). ZamVerb's
+    ///   "Room" carries both: it picks the convolution impulse response, so
+    ///   every write reloads an IR mid-block.
+    /// * **CLAP** leaves it `false`. The nearest neighbour in
+    ///   `clap_param_info_flags` is the ABSENCE of `IS_AUTOMATABLE`
+    ///   (verified against clack-extensions-0.1.1 `src/params.rs`: the
+    ///   flag set has `IS_AUTOMATABLE`, `IS_READONLY`, `IS_HIDDEN`,
+    ///   `REQUIRES_PROCESS`, ... but nothing meaning "changing this is
+    ///   expensive"). Wiring `!IS_AUTOMATABLE` into this field would flip
+    ///   behaviour for every CLAP plugin that simply under-reports its
+    ///   flags, so it stays unwired until someone decides that trade
+    ///   deliberately — no invented heuristic here.
+    #[serde(default)]
+    pub non_automatable: bool,
 }
 
 /// A live plugin instance registered in the host.
@@ -123,5 +144,28 @@ mod tests {
         });
         let parsed: PluginDescriptor = serde_json::from_value(with_extra).unwrap();
         assert_eq!(parsed.name, "Y");
+    }
+
+    /// `steps` and `non_automatable` are ADDITIVE (`#[serde(default)]`):
+    /// a `plugins[]` row written before either field existed still loads,
+    /// and the new field rides the wire as `nonAutomatable`.
+    #[test]
+    fn param_info_flags_are_additive_on_the_wire() {
+        let old_row = serde_json::json!({
+            "id": 6, "name": "Room", "min": 0.0, "max": 6.0,
+            "default": 0.0, "value": 3.0
+        });
+        let parsed: ParamInfo = serde_json::from_value(old_row).unwrap();
+        assert_eq!(parsed.steps, 0);
+        assert!(!parsed.non_automatable, "absent means automatable, as before");
+
+        let v = serde_json::to_value(ParamInfo {
+            non_automatable: true,
+            steps: 7,
+            ..parsed
+        })
+        .unwrap();
+        assert_eq!(v.get("nonAutomatable").and_then(|b| b.as_bool()), Some(true));
+        assert_eq!(v.get("steps").and_then(|n| n.as_u64()), Some(7));
     }
 }

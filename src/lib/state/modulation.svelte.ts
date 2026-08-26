@@ -7,6 +7,9 @@
  */
 
 import { backend } from "../tauri";
+import { nonAutomatableRefusal } from "../utils/plugin-params";
+import { plugins } from "./plugins.svelte";
+import { toasts } from "./toasts.svelte";
 import type {
   AutomationClip,
   AutomationPoint,
@@ -196,6 +199,21 @@ class ModulationStore {
         this.show(trackId, existing.id);
       }
       return existing;
+    }
+    // Nothing gets a lane on a param the plugin declared expensive to
+    // change / non-automatable (LV2 `pprops:expensive`,
+    // `kx:NonAutomatable`). This sits AFTER the `existing` branch on
+    // purpose: a lane already on disk — from a project saved before the
+    // backend read these properties — must still open, or the user cannot
+    // see it to delete it. Only MINTING a new one is refused, and it says
+    // so rather than returning silently, because all three callers treat
+    // `undefined` as "nothing happened".
+    if (target.kind === "pluginParam") {
+      const refusal = nonAutomatableRefusal(plugins.paramInfo(target.instanceId, target.paramId));
+      if (refusal) {
+        toasts.error("NOT AUTOMATABLE", refusal);
+        return undefined;
+      }
     }
     const value = initialNormalized ?? defaultNormalized(target);
     const before = new Set(this.curves.map((c) => c.id));

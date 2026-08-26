@@ -41,7 +41,12 @@
         "steps": {
           "type": "integer",
           "minimum": 0,
-          "description": "Discrete step count; 0 = continuous."
+          "description": "Discrete step count; 0 = continuous. CLAP: from ParamInfoFlags::IS_STEPPED. LV2: from the control port's lv2:toggled (2) / lv2:enumeration (scale-point count) / lv2:integer (positions across min..max) properties."
+        },
+        "nonAutomatable": {
+          "type": "boolean",
+          "default": false,
+          "description": "Additive (serde default false). True when the plugin declared that CHANGING this parameter is expensive, or that it must not be automated. LV2: pprops:expensive or kx:NonAutomatable — e.g. ZamVerb's 'Room' selects the convolution impulse response, so every write reloads an IR. CLAP: always false (its flag set has no 'expensive' bit; mapping the absence of IS_AUTOMATABLE would penalise plugins that under-report flags). Hosts must not stream values at a flagged param: render a discrete control and refuse an automation lane."
         }
       }
     },

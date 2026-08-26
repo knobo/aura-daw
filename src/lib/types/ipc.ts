@@ -1086,6 +1086,17 @@ export interface PluginParamInfo {
   value: number;
   /** Discrete step count; 0 = continuous. */
   steps?: number;
+  /**
+   * The plugin declared that CHANGING this parameter is expensive, or that
+   * it must not be automated at all. LV2 sets it from `pprops:expensive` /
+   * `kx:NonAutomatable`; CLAP always reports `false`. Additive — absent on
+   * projects saved before the field existed, which reads as automatable.
+   *
+   * Nothing may stream values at a flagged param: the generic panel gives
+   * it a discrete control, and `modulation.pickTarget` refuses to mint an
+   * automation lane on it.
+   */
+  nonAutomatable?: boolean;
 }
 
 /** One element of plugin_set_param's batched changes array. */

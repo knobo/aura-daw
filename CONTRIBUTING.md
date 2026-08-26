@@ -117,8 +117,14 @@ there (`cargo test --lib midi_out::tests`).
 Some tests are **gated** and skip politely when their requirements are absent:
 
 - **Plugin tests** (Zyn acceptance + state round-trip, CLAP lifecycle, LV2
-  params) need `zynaddsubfx-lv2`, `dpf-plugins-clap`/`dpf-plugins-lv2`,
-  `mda-lv2` installed via apt. A skipped plugin test prints why.
+  params, LV2 port properties) need `zynaddsubfx-lv2`,
+  `dpf-plugins-clap`/`dpf-plugins-lv2`, `mda-lv2` and `zam-plugins`
+  installed via apt. A skipped plugin test prints why. `zam-plugins` is
+  there for ZamVerb specifically: its "Room" port is the only installed
+  example of an `lv2:integer` port that also declares
+  `pprops:expensive` + `kx:NonAutomatable`, which is what
+  `lv2_host::tests::expensive_integer_port_is_reported_stepped_and_non_automatable`
+  pins.
 - **Real-model integration tests** (`src-tauri/tests/real_models.rs`) drive the
   actual Demucs/ACE-Step models:
 

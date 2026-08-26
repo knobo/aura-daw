@@ -7111,7 +7111,7 @@ mod tests {
         };
         let params = vec![crate::plugins::ParamInfo {
             id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
-            default: 0.5, value: 0.25, steps: 0,
+            default: 0.5, value: 0.25, steps: 0, non_automatable: false,
         }];
         cp.committer().apply_instantiate_writeback("inst-1", params, epoch);
 
@@ -7155,7 +7155,7 @@ mod tests {
         };
         let params = vec![crate::plugins::ParamInfo {
             id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
-            default: 0.5, value: 0.25, steps: 0,
+            default: 0.5, value: 0.25, steps: 0, non_automatable: false,
         }];
         cp.committer().apply_instantiate_writeback("inst-1", params, stale_epoch);
 
@@ -7467,7 +7467,7 @@ mod tests {
             });
             s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
                 id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
-                default: 0.0, value: 0.0, steps: 0,
+                default: 0.0, value: 0.0, steps: 0, non_automatable: false,
             }]);
         }
         let stored_value = |dir: &std::path::Path| -> Option<f64> {
@@ -7546,7 +7546,7 @@ mod tests {
             });
             s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
                 id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
-                default: 0.0, value: 0.0, steps: 0,
+                default: 0.0, value: 0.0, steps: 0, non_automatable: false,
             }]);
         }
         let has_plugins_key = |dir: &std::path::Path| -> bool {
@@ -7603,7 +7603,7 @@ mod tests {
             });
             s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
                 id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
-                default: 0.0, value: 0.0, steps: 0,
+                default: 0.0, value: 0.0, steps: 0, non_automatable: false,
             }]);
         }
         cp.gesture_begin("plugin param drag".into()).unwrap();
@@ -7646,7 +7646,7 @@ mod tests {
             });
             s.plugins.params.insert("inst-1".into(), vec![crate::plugins::ParamInfo {
                 id: 7, name: "cutoff".into(), min: 0.0, max: 1.0,
-                default: 0.0, value: 0.0, steps: 0,
+                default: 0.0, value: 0.0, steps: 0, non_automatable: false,
             }]);
         }
         cp.set_plugin_params(

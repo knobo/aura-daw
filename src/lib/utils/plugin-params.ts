@@ -45,6 +45,25 @@ export function formatParamDisplay(p: PluginParamInfo, value = p.value): string 
   return `${formatParamValue(p, value)}${paramUnit(p)}`;
 }
 
+/**
+ * Why this parameter must not get an automation lane, or `null` when it may.
+ *
+ * A plugin can declare that CHANGING a parameter is expensive
+ * (`pprops:expensive`) or that it must not be automated at all
+ * (`kx:NonAutomatable`); the backend folds both into
+ * `PluginParamInfo.nonAutomatable`. ZamVerb's "Room" carries both, because
+ * the value selects the convolution impulse response — a lane sweeping it
+ * would reload an IR per block and the user hears that as crackling.
+ *
+ * The wording lives here, not at the three surfaces that mint lanes (the
+ * param panel's `A` button, the pinned chips, the automation matrix), so
+ * they cannot drift.
+ */
+export function nonAutomatableRefusal(p: PluginParamInfo | undefined): string | null {
+  if (!p?.nonAutomatable) return null;
+  return `${shortParamName(p.name)} — the plugin says changing this one is expensive (it reloads something), so a lane would crackle. Set it by hand.`;
+}
+
 /** 0..1 position of `value` in the param's range; 0 when min === max. */
 export function paramNormalized(p: PluginParamInfo, value = p.value): number {
   return p.max === p.min ? 0 : (value - p.min) / (p.max - p.min);
