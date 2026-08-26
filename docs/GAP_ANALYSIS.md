@@ -172,7 +172,11 @@ per-sample lookup, the divide and the branch collapse into six
 coefficients, and what is left vectorises — two frames per iteration, no
 branch, no lookup, no divide.
 
-Measured on this box (32 tracks, medians, `cargo bench`):
+Measured on **one Intel Core i9-14900 core at boost** (32 tracks, medians,
+`cargo bench`, `target/criterion` wiped first). Naming the CPU is not
+boilerplate: it is close to the fastest single-thread machine available, so
+every absolute figure below is a best case and the percentages are the
+smallest they will ever be. §4.1 says what changes on a weaker one.
 
 Full path (32 tracks rendered and mixed into the master), medians:
 
@@ -248,8 +252,8 @@ Equivalence, which is the actual claim:
 
 **The caveat this report has to carry, and it is the headline.** At 512
 frames and 48 kHz the block deadline is 10.67 ms. The baseline's worst
-case in that table is 76.8 µs — **0.7% of one core** for 32 tracks. The
-JIT saves ~49 µs of it, which is **0.46% of one core**.
+case in that table is 76.8 µs — **0.7% of one i9-14900 core** for 32
+tracks. The JIT saves ~49 µs of it, which is **0.46% of that core**.
 
 The fader is not where a DAW's CPU goes; plugins are. Nobody should read
 `3.7×` as a fix for anything a user can hear today, and this track should
@@ -259,6 +263,64 @@ smallest honest rehearsal for fusing `[eq, comp, gain, ramp, pan]`
 without writing one function per permutation — and the machinery that
 makes it safe (the equivalence proof, the allocation counter, the
 retire-and-recycle publish) is worth more than the microseconds.
+
+### 4.1 What changes on a weaker CPU
+
+Worth separating, because the intuition "this must matter more on a slow
+machine" is half right and the half that is right does not credit the JIT.
+
+**Clock speed changes nothing about the ratios.** If every instruction is
+N× slower, baseline and kernel both scale by N: 3.7× stays 3.7× and 0.7%
+of a core stays 0.7% of a core. What changes is the *absolute* headroom,
+and only in the sense that everything else got slower too.
+
+**Microarchitecture can change the ratios, and plausibly in this
+direction:**
+
+- **In-order or narrowly out-of-order cores** (Cortex-A53, older Atom)
+  cannot extract the instruction-level parallelism that makes the scalar
+  baseline tolerable on a wide core. Explicit 4-lane SIMD hands them
+  parallelism they do not have to find, so vectorisation typically wins
+  *more* there, not less.
+- **The per-sample divide** in the baseline's pan lerp (`i as f32 /
+  last as f32`) is the single most microarchitecture-sensitive thing in
+  that loop; small cores have proportionally much weaker dividers. The
+  **plan** removes it outright — which is the `fused_scalar` column, and
+  needs no JIT at all.
+- **Near the deadline, cost stops being linear.** A machine at 80% load
+  does not experience 0.46% of a core as 0.46% of anything; it is either
+  under the deadline or it xruns. Savings are worth more the closer you
+  already are to the cliff.
+
+**Two things pull the other way, and they are specific:**
+
+- **The kernel is fixed at 128-bit vectors** (`types::F32X4`), so it
+  neither needs nor exploits anything above SSE2/NEON. Good for
+  portability — the win is available on any machine — but it also means
+  there is no "better CPU, better kernel" effect to lose.
+- **The `fcmp`+`bitselect` peak meter is an x86 tuning.** It exists
+  because cranelift's `fmax` lowers to a multi-instruction IEEE/NaN
+  sequence on x86. aarch64 has `FMAXNM` as a single instruction, so on
+  ARM the hand-rolled form may be a *pessimisation*. The archetypal weak
+  machine is ARM, and this has not been measured there.
+
+**Where that leaves it:** on a weak machine the honest recommendation is
+probably `fused_scalar`, not the JIT — it is most of the win on the blocks
+that have automation, it is plain rustc, and it costs neither 34 crates
+nor a writable executable mapping. The JIT's case rests on the insert
+chain (§4), not on slow hardware.
+
+**The lock-free work is a different argument, and a stronger one.** It
+does not scale with clock speed at all; it scales with **core scarcity**.
+Priority inversion requires the control thread to be descheduled while
+holding something the callback needs. On a 32-core box it almost always
+has a spare core and rarely is; on a 2-core machine the two threads
+genuinely compete, so the probability rises sharply. The same goes for
+allocation: on a memory-constrained machine `malloc` is far likelier to
+hit a slow path. So `TripleBuffer` and the zero-allocation guarantee are
+worth *more* on small hardware, while the JIT's speedup is worth roughly
+the same proportion everywhere. These two halves of the track should not
+be justified with one sentence.
 
 ## 5. Declined: rebuilding the scheduler
 
