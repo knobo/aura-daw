@@ -37,6 +37,14 @@ session burns an hour on something a sentence would have prevented.
 
 ## Backend
 
+- **A flood of `Sending key 'state' to UI failed, out of space` is NOT
+  harmless log noise.** It is ZynAddSubFX writing from inside `run()` on
+  the RT audio thread, and `plugins/stderr_guard.rs` only guards fd 2 while
+  that traffic arrives on fd 1 — so on a real terminal it is a blocking
+  write on the audio thread (an ALSA underrun follows). Check
+  `/proc/<pid>/fd/1` and `fd/2` before assuming the guard covers it. Open
+  defect, written up in [`backlog/plugin-manager.md`](backlog/plugin-manager.md).
+
 - **`Session::rev` is not "the current revision" for a history guard.**
   Transient commits — `transport play`, `transport stop`, `transport set
   loop`, every mid-gesture fold — go through `transact` and bump `rev`

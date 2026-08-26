@@ -95,6 +95,53 @@ The merged branches `feat/plugin-manager` (Step 5),
 | The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops — including in `ZynPatchBrowser`, whose double-click plays through the same shared store as every other browser and contributes only the note; its pre-existing single-click load (`zyn_load_patch`) remains a project edit, as it always was. |
 | Catalog plugins | A descriptor borrows a live, track-bound instance of the same plugin if one exists; otherwise silent with a reason. Instantiating to preview would commit `Op::PluginAdd` (ruling R-3). |
 
+## Open defect: `stderr_guard` covers fd 2, the spammer writes fd 1
+
+Found 2026-08-26 while diagnosing an unrelated startup problem, with the
+app running the owner's `TestProsjekt.aura` (seven restored LV2 instances:
+ZynAddSubFX ×3, Carla Rack, ZamVerb).
+
+**What happens.** `plugins/stderr_guard.rs` exists because ZynAddSubFX's
+LV2 wrapper calls `fprintf(stderr, …)` from inside `run()` — on AURA's RT
+audio thread, every DSP block, hosted headless. Its module doc is explicit
+that this is "a blocking write, on the RT thread, every callback", and
+`lv2_host.rs`'s own comment says a flood of those lines means the guard
+isn't doing its job. In an 80-minute session the log took **6000** copies
+of `Sending key 'state' to UI failed, out of space`, and **none** of the
+guard's own "(previous line repeated N times so far)" summaries.
+
+**Why.** The guard `dup2`s a pipe over **fd 2** only. Measured on the live
+process:
+
+```
+/proc/<pid>/fd/2 -> pipe:[53063831]     ← guarded, as designed
+/proc/<pid>/fd/1 -> (the log/terminal)  ← NOT guarded
+```
+
+No `stderr_guard: not installed` warning was logged, so installation
+succeeded — the guard is simply not on the stream that spams. Some of the
+6000 lines are also torn mid-string by our own `log::` writes, which is the
+signature of two unsynchronised writers on one fd.
+
+**Why it matters beyond noise.** The whole point of the guard is that the
+write must never block the RT thread. On fd 1 pointed at a real terminal
+(i.e. every time the owner starts the app themselves rather than
+redirecting to a file) that protection is absent, and the first spam line
+in the log is immediately preceded by `ALSA lib pcm.c: underrun occurred`.
+
+**Shape of the fix.** Guard fd 1 the same way as fd 2 — one drain thread
+per fd, or one pipe both are `dup2`'d onto so a single `Deduper` sees the
+merged stream (the second is better: it also fixes the tearing, and the
+dedupe run-detection stops being broken by the *other* fd's traffic).
+Keep the "never on the RT thread, installed once, lazily" contract.
+
+**Gate.** Host the owner's project, play for a minute, and assert the log
+holds at most a handful of summary lines instead of thousands of raw ones.
+`Deduper` is already pure and unit-tested; the fd plumbing needs the same
+`try_install` error path it has today. Note `Cargo.toml` is frozen — the
+existing code declares the libc syscalls locally rather than adding the
+crate, and the fix must keep doing that.
+
 ## Leftovers — do not start unless asked
 
 - **Native GUI:** X11 embed / Wayland embed; out-of-process isolation
