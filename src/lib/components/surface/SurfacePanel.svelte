@@ -142,7 +142,13 @@
           <span class="wordmark">AURA</span>
           <span class="model silk">LPD8</span>
         </div>
-        <div class="knob-row">
+        <div class="lpd8-body">
+        <div class="prog">
+          {#each ["PROG", "PAD", "CC", "NOTE"] as lamp (lamp)}
+            <span class="proglamp silk">{lamp}</span>
+          {/each}
+        </div>
+        <div class="knob-grid">
           {#each page.widgets.filter((w) => w.kind === "knob") as w, i (w.id)}
             {@const num = numericValue(w)}
             <div class="knob-slot">
@@ -180,10 +186,6 @@
         {#each page.widgets.filter((w) => w.kind === "padGrid") as w (w.id)}
           <PadGrid widget={w} edit={surface.editMode} />
         {/each}
-        <div class="prog">
-          {#each ["PROG", "PAD", "CC", "NOTE"] as lamp (lamp)}
-            <span class="proglamp silk">{lamp}</span>
-          {/each}
         </div>
       </div>
     {:else if empty}
@@ -436,7 +438,8 @@
     background-color: var(--bg-1);
     background-image: var(--sheen-face);
     box-shadow: var(--bevel-raised), var(--relief-3);
-    min-width: min(100%, 560px);
+    width: max-content;
+    max-width: 100%;
   }
   .brand {
     display: flex;
@@ -455,16 +458,25 @@
     letter-spacing: 0.32em;
     color: var(--text-dim);
   }
-  .knob-row {
+  /* The device is landscape: a column of mode buttons on the far left, 8
+     knobs in 2×4 beside them, the 4×2 pad block on the right. A single row
+     of eight knobs above the pads is a different instrument. */
+  .lpd8-body {
     display: flex;
-    gap: 10px;
-    justify-content: space-between;
+    align-items: center;
+    gap: 18px;
+  }
+  .knob-grid {
+    display: grid;
+    grid-template-columns: repeat(4, auto);
+    gap: 10px 12px;
+    justify-items: center;
   }
   .prog {
     display: flex;
-    gap: 12px;
-    justify-content: flex-end;
-    padding-right: 6px;
+    flex-direction: column;
+    gap: 6px;
+    flex: none;
   }
   .proglamp {
     padding: 3px 8px;

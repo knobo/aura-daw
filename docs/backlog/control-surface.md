@@ -7,6 +7,39 @@ Research: [`docs/research/12-control-surfaces.md`](../research/12-control-surfac
 Design: [`docs/superpowers/specs/2026-08-26-control-surface-design.md`](../superpowers/specs/2026-08-26-control-surface-design.md).
 Handoff (pickup notes): [`docs/handoff/control-surface.md`](../handoff/control-surface.md).
 
+## v0.2.1 — racks (unclaimed, next on this track)
+
+Owner report, 2026-08-26: *"når jeg klikker på + knappen, så blir innholdet
+replacet istedet for added"*, and: templates should live in their own list
+of MIDI gear, meant to grow.
+
+Both are one defect. A template is currently a **page mode**
+(`page.templateId === "lpd8"` drives a special case in
+`SurfacePanel.svelte`), so `applyTemplate` has nowhere to put a device
+except the whole page — it *must* replace, and two racks are impossible.
+
+The fix is the model, not a patch:
+
+- A rack is a widget **group** (`groupId: "rack:<id>"`) carrying its device
+  id, appended by `addRack(layout, device, ctx)`. `groupWidgets` grows a
+  `racks` bucket beside `strips`.
+- `Rack.svelte` owns the per-device geometry. The LPD8's landscape layout —
+  a column of mode buttons, 8 knobs in 2×4, the 4×2 pad block on the right
+  — moves there out of the panel's special case. (That geometry was fixed
+  in PR #113; before it, eight knobs sat in one row above the pads, which
+  is a different instrument.)
+- The device list is **data** (`DEVICE_RACKS`), so Launchpad 8×8, MCU
+  8-strip and nanoKONTROL are rows, not code. This is the shape Plan V's V8
+  hardware map binds to.
+- `Clear page` is an explicit menu action. `template:blank` stops being the
+  way to empty a deck.
+- `parseLayout` migrates a saved v1 deck whose `templateId` is `"lpd8"` by
+  wrapping its widgets in a rack group, so nobody's stored deck breaks.
+
+Gate: two LPD8 racks on one page, each removable on its own; a rack beside
+channel strips; `+` never destroys existing widgets; a saved v1 lpd8 deck
+opens as a rack.
+
 ## Where this track goes next
 
 The deck itself is done. Everything the owner asked for after v0.1 — a pad
@@ -36,6 +69,7 @@ host chrome.
 |---|---|---|
 | **v0.1** | Layout model, add/remove recipes, LPD8 + mixer templates, 3D widgets (knob reuse, new gauge / pad / fader / lamp), bottom-panel SURFACE, clip fire via existing launch preview, mute/solo/arm/gain/pan, pad RMS blink, session persist, bind picker (per-widget target, per-cell clip) | **landed, PR #113** |
 | **v0.2 (partial)** | Additive `launch_stop`: Escape stops every sound (arrangement, overlay, audition) and a toggle pad's second press cuts its own clip. Still open on this cut: overlapping voices (retrigger still cuts the single overlay) | **landed, PR #113** |
+| **v0.2.1 — racks** | A template becomes an **object on the page**, not a page mode: `+ → RACK` appends a device faceplate (removable as a unit, two allowed side by side, mixable with strips), the device list is data so a new device is a row rather than code, and `Clear page` becomes an explicit action instead of an implicit wipe. | **unclaimed — next** |
 | v0.3–v0.5 | **Moved to [Plan V](plan-v-players.md)** — project-owned layout is V7, the hardware map and further templates are V8. They need players underneath them, so they cannot be cut from this track any more. | see Plan V |
 | later | Selected-track follow, send/plugin encoder modes, scene-from-arrangement, aftertouch | open |
 

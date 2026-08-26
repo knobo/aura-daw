@@ -62,16 +62,22 @@ sentence got written — if you find a row whose branch is gone from
    are the control surface's (open SURFACE, Add all, drag a fader, tap a
    pad) and G2's: one reverb on a bus, several tracks sent into it, one
    room — then export and confirm the WAV has it.
-2. **Plan V — V1: `MixNode` as the compiler's input.** The owner's
+2. **Control surface v0.2.1 — racks.** The `+` menu REPLACES the deck
+   instead of adding to it, because a template is a page mode rather than
+   an object on the page. Fixing the model also gives the "add rack" device
+   list the owner asked for, and is the shape Plan V's V8 binds to. Small,
+   self-contained, UI only.
+   → [`docs/backlog/control-surface.md`](docs/backlog/control-surface.md)
+3. **Plan V — V1: `MixNode` as the compiler's input.** The owner's
    biggest ask (a pad that holds a raw WAV or its own instrument, knobs
    on no track, recording what you play) needs a second time base;
    V1 is the behaviour-neutral refactor everything else stands on.
    Read the design's rulings V-1…V-12 before touching code.
    → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md)
-3. **G3 — sidechain edges** (bass ducks the pads). The graph now has
+4. **G3 — sidechain edges** (bass ducks the pads). The graph now has
    buses and sends; a sidechain is the third routing primitive.
    → [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)
-4. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
+5. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
    is live in both the engine and the bounce.
    → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
 4. **Profile a real session under plugin load.** The JIT track measured
