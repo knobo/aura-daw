@@ -7,6 +7,16 @@ Research: [`docs/research/12-control-surfaces.md`](../research/12-control-surfac
 Design: [`docs/superpowers/specs/2026-08-26-control-surface-design.md`](../superpowers/specs/2026-08-26-control-surface-design.md).
 Handoff (pickup notes): [`docs/handoff/control-surface.md`](../handoff/control-surface.md).
 
+## Where this track goes next
+
+The deck itself is done. Everything the owner asked for after v0.1 — a pad
+holding a raw WAV or its own instrument, knobs that belong to no track,
+recording what you play — needs a second time base in the engine, not more
+panel code. That is [**Plan V**](plan-v-players.md); this track's remaining
+cuts live there as V7 and V8. **Audio clips on pads is V2, not a quick fix
+here**: `LaunchTarget::Clip` is MIDI-only in Rust, and the region path that
+would work today cannot light a pad or carry the pad's own gain.
+
 ## Why this exists
 
 A performable, high-wow panel for mixing and launching: knobs, faders,
@@ -26,9 +36,7 @@ host chrome.
 |---|---|---|
 | **v0.1** | Layout model, add/remove recipes, LPD8 + mixer templates, 3D widgets (knob reuse, new gauge / pad / fader / lamp), bottom-panel SURFACE, clip fire via existing launch preview, mute/solo/arm/gain/pan, pad RMS blink, session persist, bind picker (per-widget target, per-cell clip) | **landed, PR #113** |
 | **v0.2 (partial)** | Additive `launch_stop`: Escape stops every sound (arrangement, overlay, audition) and a toggle pad's second press cuts its own clip. Still open on this cut: overlapping voices (retrigger still cuts the single overlay) | **landed, PR #113** |
-| v0.3 | `Op::ControlSurfaceSet` (HarmonySet-shaped) so the layout is project-owned and undoable | open |
-| v0.4 | Hardware MIDI map: physical LPD8 CCs/notes ↔ widgets; LED out | open |
-| v0.5 | More templates (Launchpad 8×8, MCU 8-strip, NanoKontrol); spoken "give me an LPD8" | open |
+| v0.3–v0.5 | **Moved to [Plan V](plan-v-players.md)** — project-owned layout is V7, the hardware map and further templates are V8. They need players underneath them, so they cannot be cut from this track any more. | see Plan V |
 | later | Selected-track follow, send/plugin encoder modes, scene-from-arrangement, aftertouch | open |
 
 ## v0.1 product cut

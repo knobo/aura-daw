@@ -22,7 +22,7 @@ Frontend tests were green at 1321.
    `src/lib/utils/control-surface.ts`. If the tests in
    `control-surface.test.ts` fail, fix those before touching Svelte.
 3. Do not reopen this worktree after merge. Cut a fresh one from
-   `origin/main` for v0.2+.
+   `origin/main` for whatever comes next (Plan V's V1).
 
 ## What v0.1 must still be, if unfinished
 
@@ -32,14 +32,20 @@ that mute/gain through `project.setMute` / `project.setGain`, and
 pads that call `launch.preview` after `launch.mapClip`. Visual wow
 on Gauge/Pad/Fader using theme tokens only (`no-literals` is CI).
 
-## v0.2 is the first thing after merge
+## v0.2's stop slice went in with v0.1 — done, not pending
 
-`stop_drive_launch` already exists on `ControlPlane`
-(`src-tauri/src/midi/launch.rs`). It is not a Tauri command.
-Add `launch_stop` (additive; `lib.rs` generate_handler + `tauri.ts`
-+ `launch.svelte.ts.stop(id)`). A toggle pad that is currently the
-overlay then stops instead of retriggering. Hardware GATE
-(`midi-launch.md`) can share that command.
+`launch_stop` **exists** (PR #113): `SharedRt::end_launch` +
+`ControlPlane::stop_launch_overlay` + the command, Escape wired to a
+composed stop-all (`src/lib/state/stop-all.ts`), and a toggle pad's second
+press cuts its own clip. Hardware GATE (`midi-launch.md`) can share the
+command.
+
+**What comes after is not this track any more.** A pad that holds a raw WAV
+or its own instrument, knobs bound to no track, and recording what you play
+all need a second time base in the engine — see
+[`docs/backlog/plan-v-players.md`](../backlog/plan-v-players.md) (Plan V).
+This track's remaining cuts are V7 (pad inspector +
+`Op::ControlSurfaceSet`) and V8 (hardware map, templates). Start at V1.
 
 `lib.rs` is labelled FROZEN; every later track has still added
 commands there. New names are the allowed evolution. Do not rename

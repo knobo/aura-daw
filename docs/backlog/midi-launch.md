@@ -21,7 +21,19 @@ loops, and plays the region; note-off only clears the held-pad debounce.
 Hardware GATE (hold the pad to keep the scene, lift to stop) is not in
 v0.1.
 
-### Sustain (overlapping voices)
+### Sustain (overlapping voices) — SUPERSEDED by Plan V, cut V3
+
+**Do not implement this here.** As of 2026-08-26 overlapping voices are
+V3 of [`plan-v-players.md`](plan-v-players.md), because the same single
+atomic set (`launch_on`/`launch_pos` in `audio/rt.rs`) is what blocks a
+polyphonic pad deck, a per-player automation clock and everything else the
+owner asked the control surface for. Plan V **retires** this mechanism
+rather than adding a third play mode to it: see
+[the design's §2](../superpowers/specs/2026-08-26-plan-v-players-design.md)
+for the four properties (one playhead, transport hijack on hardware fire,
+MIDI-only clip target, automation read on the transport's clock) that make
+it a prototype. The text below is kept because the *behaviour* it describes
+is still what V3 must deliver.
 
 Today ONE-SHOT restarts the single shadow playhead, and GATE cuts on
 note-off. There is no way to trigger the same scene again and let the

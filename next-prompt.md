@@ -62,10 +62,16 @@ sentence got written — if you find a row whose branch is gone from
    are the control surface's (open SURFACE, Add all, drag a fader, tap a
    pad) and G2's: one reverb on a bus, several tracks sent into it, one
    room — then export and confirm the WAV has it.
-2. **G3 — sidechain edges** (bass ducks the pads). The graph now has
+2. **Plan V — V1: `MixNode` as the compiler's input.** The owner's
+   biggest ask (a pad that holds a raw WAV or its own instrument, knobs
+   on no track, recording what you play) needs a second time base;
+   V1 is the behaviour-neutral refactor everything else stands on.
+   Read the design's rulings V-1…V-12 before touching code.
+   → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md)
+3. **G3 — sidechain edges** (bass ducks the pads). The graph now has
    buses and sends; a sidechain is the third routing primitive.
    → [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md)
-3. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
+4. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
    is live in both the engine and the bounce.
    → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
 
@@ -85,6 +91,7 @@ Plan G4 (envelope-follower modulators); the native-GUI embed work.
 
 | Track | File |
 |---|---|
+| **Plan V — players (V1 unclaimed)** | [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
 | Plugin manager (preview slot open) | [`docs/backlog/plugin-manager.md`](docs/backlog/plugin-manager.md) |
 | Mixer graph — inserts, sends, sidechain (Plan G; G3 next) | [`docs/backlog/insert-fx-sends-sidechain.md`](docs/backlog/insert-fx-sends-sidechain.md) |
 | Insert FX / PDC task list (Plan G1) | [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md) |
