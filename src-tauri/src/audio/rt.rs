@@ -218,6 +218,18 @@ impl SharedRt {
         self.launch_on.store(false, Ordering::Relaxed);
     }
 
+    /// Cut a sounding overlay the way reaching its marked end cuts it: the
+    /// engine gets one `ended` frame, so FLAG_LAUNCH tracks all-notes-off at
+    /// the arrangement playhead instead of having the overlay pulled out from
+    /// under a held note. Returns false when nothing was on it.
+    pub fn end_launch(&self) -> bool {
+        if !self.launch_on.swap(false, Ordering::Relaxed) {
+            return false;
+        }
+        self.launch_ended.store(true, Ordering::Relaxed);
+        true
+    }
+
     pub fn take_launch_ended(&self) -> bool {
         self.launch_ended.swap(false, Ordering::Relaxed)
     }
@@ -964,6 +976,30 @@ mod tests {
         // at 1, it never goes to 0.
         let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(0)));
         assert_eq!(g.meter_scratch.len(), 1);
+    }
+
+    #[test]
+    fn ending_a_sounding_overlay_hands_the_engine_one_flush_frame() {
+        // What `launch_stop` relies on: cutting a launched clip mid-note must
+        // leave `launch_ended` set, because that frame is the only thing that
+        // makes FLAG_LAUNCH tracks all-notes-off (`mixer::track_playhead`).
+        // `clear_launch` alone would drop the overlay under a held note.
+        let s = SharedRt::default();
+        s.arm_launch(1_000, 5_000);
+        s.advance_launch(256);
+        assert!(s.launch_overlay().is_some());
+        assert!(s.end_launch());
+        assert!(s.launch_overlay().is_none());
+        assert!(s.take_launch_ended());
+    }
+
+    #[test]
+    fn ending_an_idle_overlay_is_a_no_op() {
+        // Escape with nothing launched must not fake an end: the flush frame
+        // would send all-notes-off to tracks that never went exclusive.
+        let s = SharedRt::default();
+        assert!(!s.end_launch());
+        assert!(!s.take_launch_ended());
     }
 
     #[test]

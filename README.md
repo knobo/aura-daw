@@ -55,6 +55,7 @@ carry punch-in/out and markers too:
 | Key | Does |
 |---|---|
 | `Space` | Play / pause |
+| `Esc` | **Stop every sound**: the arrangement, a clip launched from a pad or the launch map, and a browser audition. Keeps the playhead where it is |
 | `Home` / `End` | Jump to start / to the end of the material |
 | `←` / `→` | Move the playhead one **bar**, landing on the grid line |
 | `Shift` + `←` / `→` | Same, one **beat** |

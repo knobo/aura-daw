@@ -54,8 +54,6 @@ class SurfaceStore {
   /** Remove-buttons and the bind picker. Empty decks force this on. */
   editMode = $state(true);
   addOpen = $state(false);
-  /** Local latch for toggle pads that are not currently the launch overlay. */
-  latch = $state<Record<string, boolean>>({});
   /** Widget whose bind picker is open, if any. */
   bindFor = $state<string | null>(null);
 
@@ -349,15 +347,22 @@ class SurfaceStore {
     return b?.target.kind === "clip" && b.target.clipId === clipId;
   }
 
-  toggleLatch(widgetId: string): boolean {
-    const next = !this.latch[widgetId];
-    this.latch = { ...this.latch, [widgetId]: next };
-    return next;
+  /** Cut the shadow playhead if this clip is what is on it. */
+  async stopClip(clipId: string) {
+    if (!this.isClipPlaying(clipId)) return;
+    await launch.stopOverlay();
   }
 
-  latched(widgetId: string): boolean {
-    return !!this.latch[widgetId];
+  isBindingPlaying(bindingId: string): boolean {
+    return launch.overlay?.id === bindingId;
   }
+
+  /** Cut the shadow playhead if this scene is what is on it. */
+  async stopBinding(bindingId: string) {
+    if (!this.isBindingPlaying(bindingId)) return;
+    await launch.stopOverlay();
+  }
+
 }
 
 function clamp(v: number, lo: number, hi: number): number {

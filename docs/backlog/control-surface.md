@@ -25,7 +25,7 @@ host chrome.
 | Cut | What | State |
 |---|---|---|
 | **v0.1** | Layout model, add/remove recipes, LPD8 + mixer templates, 3D widgets (knob reuse, new gauge / pad / fader / lamp), bottom-panel SURFACE, clip fire via existing launch preview, mute/solo/arm/gain/pan, pad RMS blink, session persist, bind picker (per-widget target, per-cell clip) | **landed, PR #113** |
-| v0.2 | Additive `launch_stop` so a toggle pad can cut the overlay; pad "on" = overlay id | open |
+| **v0.2 (partial)** | Additive `launch_stop`: Escape stops every sound (arrangement, overlay, audition) and a toggle pad's second press cuts its own clip. Still open on this cut: overlapping voices (retrigger still cuts the single overlay) | **landed, PR #113** |
 | v0.3 | `Op::ControlSurfaceSet` (HarmonySet-shaped) so the layout is project-owned and undoable | open |
 | v0.4 | Hardware MIDI map: physical LPD8 CCs/notes ↔ widgets; LED out | open |
 | v0.5 | More templates (Launchpad 8×8, MCU 8-strip, NanoKontrol); spoken "give me an LPD8" | open |
@@ -43,9 +43,11 @@ host chrome.
 - Each widget has a remove control in edit mode.
 - Pads bound to a MIDI clip fire `launch.preview` (shadow playhead,
   arrangement loop untouched). If no binding exists, `launch.mapClip`
-  creates one first.
+  creates one first. A pad in **toggle** mode cuts its own clip on the
+  second press (v0.2's `launch_stop`); a **momentary** pad retriggers.
 - Pad LED: RMS of the bound track from the meter bus (rAF, not
-  reactive). Toggle pads light solid when latched.
+  reactive). A pad is lit when its clip is actually on the overlay — not
+  from a local latch, which could not know the clip had ended.
 - Clip list: named rows, one-press play, optional drive-clip chip
   (`launch.setClipLauncher`).
 - Gauges and faders use the same material tokens as `Knob.svelte`.
@@ -135,9 +137,32 @@ panel found these; all are in PR #113:
   off-screen; `position: fixed` did not fix it because `.glass` is a
   containing block. See `docs/TRAPS.md`.
 
+## Stopping sound (v0.2's first slice)
+
+A previewed clip is rendered EXCLUSIVELY while the transport is stopped, so
+`transport.stop()` does not silence it — before `launch_stop` there was no
+way to cut a pad-fired clip short of waiting for its end. Now:
+
+- `SharedRt::end_launch` ends the overlay the way reaching the clip's end
+  ends it, so the engine gets its one `ended` frame and FLAG_LAUNCH tracks
+  all-notes-off instead of losing the flag under a held note. The drive
+  thread's existing release path then clears the flags and emits
+  `launch://fired {playing:false}` — one code path for both endings.
+- `state/stop-all.ts` is the composed panic: pause the transport (never
+  seek — Escape must not cost you your place), cut the overlay, release the
+  audition stream. Every leg no-ops when its own source is silent.
+- Pad lamps now read real state instead of a local latch — the overlay for
+  clip and scene pads, the track's own `muted` for a mute pad. A clip that
+  ended by itself therefore leaves its pad ready to fire again, and Escape
+  cannot leave a pad lit over silence.
+- Escape is wired in `App.svelte`. The piano roll keeps its own Escape
+  (peel selection → region → close editor) while it has focus.
+
 ## Owner ear-check owed
 
 Open SURFACE, Add all, drag a gain knob, mute a strip, tap a pad on a
 MIDI clip, confirm the clip plays on the shadow playhead and the pad
 breathes with the meter. Switch to Console Noir and confirm the
-faceplate still reads as milled metal, not a flat overlay.
+faceplate still reads as milled metal, not a flat overlay. Then tap a pad
+and hit Escape mid-clip: the sound must stop cleanly, with no note left
+hanging on the instrument or on external MIDI gear.

@@ -77,12 +77,22 @@
   function pressPad(widget: SurfaceWidget) {
     const t = widget.target;
     if (!t) return;
+    // A toggle pad's second press CUTS what it started (`launch_stop`);
+    // whether it is lit comes from the overlay, not from a local latch, so
+    // a clip that ended on its own leaves the pad ready to fire again.
     if (t.kind === "clipLaunch") {
-      if (widget.padMode === "toggle") surface.toggleLatch(widget.id);
+      if (widget.padMode === "toggle" && surface.isClipPlaying(t.clipId)) {
+        void surface.stopClip(t.clipId);
+        return;
+      }
       void surface.fireClip(t.clipId);
       return;
     }
     if (t.kind === "launchBinding") {
+      if (widget.padMode === "toggle" && surface.isBindingPlaying(t.bindingId)) {
+        void surface.stopBinding(t.bindingId);
+        return;
+      }
       void surface.fireBinding(t.bindingId);
       return;
     }
@@ -92,10 +102,12 @@
     }
   }
 
+  /** Lit = actually sounding (or actually muted). Never a local guess. */
   function padLit(widget: SurfaceWidget): boolean {
     const t = widget.target;
     if (t?.kind === "clipLaunch") return surface.isClipPlaying(t.clipId);
-    if (widget.padMode === "toggle") return surface.latched(widget.id);
+    if (t?.kind === "launchBinding") return surface.isBindingPlaying(t.bindingId);
+    if (t?.kind === "trackMute") return !!project.trackById(t.trackId)?.muted;
     return false;
   }
 </script>

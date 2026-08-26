@@ -7,6 +7,7 @@
    */
   import { onMount } from "svelte";
   import { transport } from "./lib/state/transport.svelte";
+  import { stopAllSound } from "./lib/state/stop-all";
   import { project } from "./lib/state/project.svelte";
   import { midi } from "./lib/state/midi.svelte";
   import { instruments } from "./lib/state/instruments.svelte";
@@ -285,9 +286,12 @@
         dir,
       );
       if (target !== null) void transport.seek(target);
-    } else if (e.key === "Escape" && clipDrag.active) {
+    } else if (e.key === "Escape") {
       e.preventDefault();
-      clipDrag.cancel();
+      // A drag is modal: Escape belongs to it first (cancelling a clip move
+      // makes no sound either way).
+      if (clipDrag.active) clipDrag.cancel();
+      else void stopAllSound();
     } else if ((e.key === "Delete" || e.key === "Backspace") && !e.metaKey && !e.ctrlKey && !e.altKey) {
       // Pointer-select does not focus the clip, so the clip's own onkeydown
       // never fires after a plain click — this is the window-level
