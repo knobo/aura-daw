@@ -34,3 +34,4 @@ project.json.v1.bak
 # Editors / OS
 .DS_Store
 *.swp
+/aura-engine/target
