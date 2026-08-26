@@ -61,9 +61,10 @@ session burns an hour on something a sentence would have prevented.
   dev` against the same `src-tauri/target/`.
 - **Do not run `cargo fmt`.** This tree is not rustfmt-default-formatted:
   `cargo fmt --check` wants to rewrite ~40 files it has no business in,
-  and nothing gates on it (`.github/workflows/tests.yml` runs the four
-  suites, not fmt or clippy). Match the style of the code around you
-  instead — a formatting run would bury your diff.
+  and nothing gates on it: `.github/workflows/tests.yml` runs no fmt check
+  anywhere, and no clippy on `src-tauri` (its `engine` job does run clippy,
+  but only on the standalone `aura-engine` crate). Match the style of the
+  code around you instead — a formatting run would bury your diff.
 - **A controlled `<input>`/`<select>` fed a value that repeats does NOT get
   pushed back after the user moves it.** Svelte's `set_value` early-returns
   when the bound expression equals the last value it set (an `||`, so the
@@ -78,6 +79,39 @@ session burns an hour on something a sentence would have prevented.
   beside it is `"Filter / Level (0.50)"`. A `getByRole("slider", {name:
   /^Level/})` finds nothing, and the failure reads like the value being
   wrong rather than the query.
+
+## Tooling and gates
+
+- **Several clippy lints are deny-by-default and CI did not catch them**
+  until the `engine` job existed. `approx_constant` is the one that bites:
+  writing `0.7071` for a centre-pan gain is an *error*, not a warning, and it
+  is right to be — the mixer's own tests use
+  `std::f32::consts::FRAC_1_SQRT_2`. Note the `rust` job does **not** run
+  clippy on `src-tauri`, only the `engine` job does on `aura-engine`.
+- **A concurrency test that stops on the WRITER's count can be vacuous on a
+  small runner.** `triple_buffer`'s torn-read test published 50 000 values
+  then asserted the reader had read at least once. In release that takes well
+  under a millisecond, and on a 2-core GitHub runner with every other lib test
+  competing, the reader thread was never scheduled — so `reads == 0` failed
+  the assertion whose whole job was proving the test wasn't vacuous. Green on
+  a 32-core box, red on CI, and NOT reproducible locally even pinned to two
+  cores. Gate the stop condition on what the OTHER thread has observed, and
+  `yield_now()` so a single-core machine still progresses.
+- **A benchmark fixture smaller than production measures nothing.**
+  `TrackRamps::gain` is compiled **session-wide** at graph rebuild, so a real
+  automation lane is thousands of breakpoints. `benches/kernel.rs` used 64 and
+  reported `strip::plan` 1.9x faster than the mixer's loop while it was in
+  fact **40x slower** on a 48 000-point lane, because the plan scanned the
+  lane linearly per segment per block. Anything whose cost depends on
+  session-wide state needs a session-sized fixture, or the benchmark endorses
+  the bug. `aura-engine`'s `long-lane` case exists for exactly this.
+- **A stale `target/criterion/` silently mixes runs.** Criterion keys results
+  by benchmark *name*, so renaming a benchmark leaves the old directory in
+  place and `estimates.json` for the old name still parses fine. A report
+  built by globbing that tree can quote a number measured against code that
+  no longer exists — which happened here, with `apply_fader` and
+  `apply_fader_into` sitting side by side. `rm -rf target/criterion` before a
+  run whose numbers you intend to publish.
 
 ## Audio engine
 

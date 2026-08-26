@@ -67,9 +67,17 @@ sentence got written — if you find a row whose branch is gone from
 3. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
    is live in both the engine and the bounce.
    → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
+4. **Profile a real session under plugin load.** The JIT track measured
+   the fader carefully and then concluded the fader is not where a DAW's
+   CPU goes — plugins are. Nobody has measured that here. Any further
+   engine performance work should start from those numbers rather than
+   from a guess. → [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) §8.4
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
-Plan G4 (envelope-follower modulators); the native-GUI embed work.
+Plan G4 (envelope-follower modulators); the native-GUI embed work;
+wiring `aura-engine`'s JIT kernel into `mixer::render` — **decided
+against**, see [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) §8 before
+reopening it.
 
 ## Read before your first commit
 
@@ -91,6 +99,7 @@ Plan G4 (envelope-follower modulators); the native-GUI embed work.
 | MIDI in/out | [`docs/backlog/midi-io.md`](docs/backlog/midi-io.md) |
 | History, undo, automation, modulation | [`docs/backlog/history-and-automation.md`](docs/backlog/history-and-automation.md) |
 | Windows build (open in PR #62) | [`docs/backlog/windows-build.md`](docs/backlog/windows-build.md) |
+| RT engine / JIT fader kernel (`aura-engine/`, landed as a proving ground; shipping the JIT is decided against) | [`docs/backlog/jit-engine.md`](docs/backlog/jit-engine.md) |
 | Everything else, by product area | [`docs/backlog/`](docs/backlog/) |
 
 ## Index
