@@ -27,6 +27,7 @@ pub mod meters;
 pub mod metronome;
 pub mod midi_in;
 pub mod mixer;
+pub mod node;
 pub mod pdc;
 pub mod pitch;
 pub mod pitch_store;
