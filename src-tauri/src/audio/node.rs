@@ -29,7 +29,18 @@ use crate::ids::TrackId;
 /// it at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixNodeKind {
-    /// A source strip: audio or MIDI in, an instrument for MIDI.
+    /// Everything that is not a bus and not an automation track — the
+    /// mixer graph's own notion of "source", matching `From<&TrackState>`
+    /// below: `"audio"`/`"midi"` map here, and so does any unrecognised
+    /// `kind` string (a hand-edited or future-format track), on the same
+    /// "don't silently drop it from the mix" logic `is_mixer_track` uses.
+    ///
+    /// This is WIDER than `types::is_source_track` (`"audio" | "midi"`
+    /// only, used by `plugins/mod.rs` and `control/session.rs` to decide
+    /// what may carry clips and an instrument) — `kind == Source` does NOT
+    /// mean "may carry clips and an instrument". Reach for
+    /// `types::is_source_track` for that question; reach for this variant
+    /// only for "does this node take a mixer slot but isn't a bus".
     Source,
     /// A return strip (Plan G2): no source, fed by other nodes' sends.
     Bus,

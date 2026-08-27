@@ -108,6 +108,14 @@ pub fn build_graph(
     // zipping it against `store.tracks` by position below is exact (see
     // `node::mix_nodes`'s doc and `mix_nodes_is_total_and_order_preserving`).
     let nodes = crate::audio::node::mix_nodes(&store.tracks);
+    debug_assert_eq!(
+        store.tracks.len(),
+        nodes.len(),
+        "mix_nodes must be total and order-preserving over store.tracks — \
+         the zip below silently truncates to the shorter side if that ever \
+         stops holding, dropping the tail of store.tracks from the bounce \
+         with no warning"
+    );
     let mut tracks: Vec<RtTrack> = Vec::with_capacity(n_slots);
     for (t, node) in store.tracks.iter().zip(&nodes) {
         let Some(&slot) = slots.get(&t.id) else { continue };
@@ -1465,6 +1473,16 @@ mod tests {
     /// changes the mix* — do not "fix" this test to make a surprising
     /// number go away; today's behaviour is what it asserts.
     ///
+    /// A red hash on an unchanged tree has two possible causes, not one:
+    /// the mix really did change, OR this machine's libm disagrees with
+    /// CI's pinned `ubuntu-24.04` (the render reaches `powf`/`cos`/`sin`
+    /// via `mixer::db_to_linear`/`mixer::pan_gains`, neither of which is
+    /// contractually bit-reproducible across libm versions). To tell them
+    /// apart, check `audio::bus::tests::routing_plan_of_a_full_strip_is_stable`:
+    /// it asserts exact integers with no float math in the comparison, so
+    /// it is libm-independent. If it is green and only this hash is red,
+    /// suspect the maths library, not the mix.
+    ///
     /// The fixture walks every path `build_graph` reaches through those
     /// two compilers on an offline bounce:
     /// - `a1`: an audio clip, non-zero `gain_db` (-6) and `pan` (0.3), and
@@ -1593,7 +1611,10 @@ mod tests {
         assert_eq!(
             fnv1a64_hex(&out),
             EXPECTED_HASH,
-            "the mix changed by at least one sample — see this test's doc comment"
+            "the mix changed by at least one sample, OR this machine's libm \
+             (db_to_linear/pan_gains use powf/cos/sin, not bit-reproducible \
+             across glibc versions) differs from CI's pinned ubuntu-24.04 — \
+             see this test's doc comment for how to tell which"
         );
 
         let _ = std::fs::remove_dir_all(dir);
