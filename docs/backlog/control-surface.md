@@ -7,7 +7,7 @@ Research: [`docs/research/12-control-surfaces.md`](../research/12-control-surfac
 Design: [`docs/superpowers/specs/2026-08-26-control-surface-design.md`](../superpowers/specs/2026-08-26-control-surface-design.md).
 Handoff (pickup notes): [`docs/handoff/control-surface.md`](../handoff/control-surface.md).
 
-## v0.2.1 — racks (unclaimed, next on this track)
+## v0.2.1 — racks (landed, PR #116)
 
 Owner report, 2026-08-26: *"når jeg klikker på + knappen, så blir innholdet
 replacet istedet for added"*, and: templates should live in their own list
@@ -38,7 +38,23 @@ The fix is the model, not a patch:
 
 Gate: two LPD8 racks on one page, each removable on its own; a rack beside
 channel strips; `+` never destroys existing widgets; a saved v1 lpd8 deck
-opens as a rack.
+opens as a rack. All four hold — checked in the unit/DOM suites and in the
+running app.
+
+What the shape actually bought, beyond the reported defect: `DEVICE_RACKS`
+now carries Launchpad 8×8, MCU 8-strip and nanoKONTROL as rows, and all
+three render from `Rack.svelte` without a line of per-device code. Two
+neighbouring defects fell out of driving the real panel:
+
+- `addStrip` refused a strip whenever *anything* drove that track's gain,
+  so with a rack on the page the `Channel strip` menu item silently did
+  nothing. It refuses only a second **strip** now, and `choose("strip")`
+  picks the first track without one rather than always the first track.
+- A `Fader` label wider than its 36px unit overflowed onto its neighbour.
+  Invisible while every caller passed `"LEVEL"`; unmissable with eight
+  track names over an MCU. Clamped in `Fader.svelte` — `min-width: 0` is
+  the load-bearing half, since a flex item's automatic minimum size beats
+  `max-width` on its own — and a rack widens the unit via `--fader-w`.
 
 ## Where this track goes next
 
@@ -69,7 +85,7 @@ host chrome.
 |---|---|---|
 | **v0.1** | Layout model, add/remove recipes, LPD8 + mixer templates, 3D widgets (knob reuse, new gauge / pad / fader / lamp), bottom-panel SURFACE, clip fire via existing launch preview, mute/solo/arm/gain/pan, pad RMS blink, session persist, bind picker (per-widget target, per-cell clip) | **landed, PR #113** |
 | **v0.2 (partial)** | Additive `launch_stop`: Escape stops every sound (arrangement, overlay, audition) and a toggle pad's second press cuts its own clip. Still open on this cut: overlapping voices (retrigger still cuts the single overlay) | **landed, PR #113** |
-| **v0.2.1 — racks** | A template becomes an **object on the page**, not a page mode: `+ → RACK` appends a device faceplate (removable as a unit, two allowed side by side, mixable with strips), the device list is data so a new device is a row rather than code, and `Clear page` becomes an explicit action instead of an implicit wipe. | **unclaimed — next** |
+| **v0.2.1 — racks** | A template became an **object on the page**, not a page mode: `+ → RACK` appends a device faceplate (removable as a unit, two allowed side by side, mixable with strips), the device list is data so a new device is a row rather than code, and `Clear page` is an explicit action instead of an implicit wipe. Layout v2 with a v1 migration. | **landed, PR #116** |
 | v0.3–v0.5 | **Moved to [Plan V](plan-v-players.md)** — project-owned layout is V7, the hardware map and further templates are V8. They need players underneath them, so they cannot be cut from this track any more. | see Plan V |
 | later | Selected-track follow, send/plugin encoder modes, scene-from-arrangement, aftertouch | open |
 
@@ -202,7 +218,13 @@ way to cut a pad-fired clip short of waiting for its end. Now:
 
 ## Owner ear-check owed
 
-Open SURFACE, Add all, drag a gain knob, mute a strip, tap a pad on a
+**v0.2.1:** open SURFACE, add an AKAI LPD8, then add a second one and a
+channel strip — three objects side by side, each with its own `×`. Add an
+MCU 8-strip and confirm the faders read as a scribble strip rather than a
+pile of overlapping names. `Clear page` should be the only thing that
+empties the deck.
+
+**v0.1/v0.2:** Open SURFACE, Add all, drag a gain knob, mute a strip, tap a pad on a
 MIDI clip, confirm the clip plays on the shadow playhead and the pad
 breathes with the meter. Switch to Console Noir and confirm the
 faceplate still reads as milled metal, not a flat overlay. Then tap a pad
