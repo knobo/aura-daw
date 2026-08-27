@@ -401,7 +401,9 @@ pub fn would_cycle(tracks: &[TrackState], from: &TrackId, to: &TrackId) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::insert::{compile_inserts, GainHalfEffect, InsertNodeRegistry, LatencyDummy};
     use crate::audio::types::{derive_send_slots, derive_slots, SendSlot};
+    use crate::control::session::PluginDoc;
 
     fn track(id: &str, kind: &str) -> TrackState {
         let mut t = crate::control::ops::add_track(
@@ -679,6 +681,174 @@ mod tests {
             plan.buses[0].out_pdc.as_ref().map_or(0, |d| d.delay()),
             256,
             "the plugin is skipped, so the delay line owes the whole 256"
+        );
+    }
+
+    // ---- characterization gate (Plan V1 Task 1) --------------------------
+    //
+    // `compile_inserts` + `compile_routing` are about to be rewritten to
+    // take a `MixNode` instead of `&[TrackState]`. This test locks in
+    // TODAY's exact output — every integer `compile_routing` produces for a
+    // fixture that walks the full surface the refactor touches: a
+    // bus-into-bus edge, a send with a non-default `pre_fader`, and one
+    // BYPASSED insert alongside an active one so the declared/applied PDC
+    // split (G-5) is actually exercised, not just present in the code.
+    //
+    // A refactor that changes the routing plan by so much as one sample of
+    // delay, one bus position, or one send's destination fails here. A
+    // genuine future change to the routing rules updates the numbers below
+    // *deliberately, in the same commit that changes the routing* — do not
+    // "fix" a number that looks odd; today's behaviour is what this test
+    // asserts, odd or not.
+    #[test]
+    fn routing_plan_of_a_full_strip_is_stable() {
+        const RATE: u32 = 48_000;
+
+        // kick --(output)--> drums --(output)--> mix (master)
+        // vox  --(output)--> mix
+        // vox  --(send, pre_fader)--> verb --(nothing, falls to master)
+        let mut kick = routed("kick", "audio", Some("drums"));
+        kick.inserts.push(crate::audio::types::InsertSlot {
+            id: "k-ins1".into(),
+            instance_id: "kick-latency".into(),
+            bypassed: true, // declares 256 but applies 0 — the G-5 split
+        });
+
+        let mut vox = routed("vox", "audio", Some("mix"));
+        vox.sends.push(crate::audio::types::SendSlot {
+            id: "v-snd1".into(),
+            dest: "verb".into(),
+            amount_db: 0.0,
+            pre_fader: true,
+        });
+
+        let mut drums = routed("drums", "bus", Some("mix"));
+        drums.inserts.push(crate::audio::types::InsertSlot {
+            id: "d-ins1".into(),
+            instance_id: "drums-latency".into(),
+            bypassed: false,
+        });
+
+        let mix = track("mix", "bus");
+
+        let mut verb = track("verb", "bus");
+        verb.inserts.push(crate::audio::types::InsertSlot {
+            id: "v-ins1".into(),
+            instance_id: "verb-plain".into(),
+            bypassed: false,
+        });
+
+        let tracks = vec![kick, vox, drums, mix, verb];
+        let slots = derive_slots(&tracks);
+
+        // A hand-built PluginDoc + a pre-seeded InsertNodeRegistry, exactly
+        // the pattern `insert::compile_inserts_dedupes_a_duplicate_
+        // instance_id_within_one_track` uses — this exercises the REAL
+        // `compile_inserts` (registry keying included), not a hand-rolled
+        // chain map.
+        let mut plugins = PluginDoc::default();
+        for (id, track_id) in [
+            ("kick-latency", "kick"),
+            ("drums-latency", "drums"),
+            ("verb-plain", "verb"),
+        ] {
+            plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: id.into(),
+                uid: format!("test:/{id}"),
+                name: id.into(),
+                format: "test".into(),
+                status: "active".into(),
+                track_id: Some(track_id.into()),
+            });
+        }
+        let mut nodes = InsertNodeRegistry::default();
+        nodes
+            .resolve_with(
+                "kick-latency",
+                "insert:kick-latency@48000#0!active",
+                || Some(Box::new(LatencyDummy::new(256))),
+            )
+            .expect("seed the kick insert");
+        nodes
+            .resolve_with(
+                "drums-latency",
+                "insert:drums-latency@48000#0!active",
+                || Some(Box::new(LatencyDummy::new(64))),
+            )
+            .expect("seed the drums insert");
+        nodes
+            .resolve_with(
+                "verb-plain",
+                "insert:verb-plain@48000#0!active",
+                || Some(Box::new(GainHalfEffect { bypassed: false })),
+            )
+            .expect("seed the verb insert");
+
+        let (mut chains, failed) = compile_inserts(&tracks, &plugins, RATE, &mut nodes);
+        assert!(failed.is_empty(), "every instance above is pre-seeded in the registry");
+
+        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+
+        // ---- bus order: drums (a producer of mix) and verb (no producer)
+        // both have indegree 0 and come out in document order; mix comes
+        // last because drums feeds it.
+        assert_eq!(
+            plan.bus_ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
+            ["drums", "verb", "mix"],
+            "topological order: drums and verb first (indegree 0, document order), mix last"
+        );
+
+        // ---- source alignment (track_pdc): kick declares 256 (bypassed
+        // insert) but applies 0, so it sets the alignment ceiling for every
+        // mixer slot, source and bus alike — `compile_pdc` does not filter
+        // by track kind.
+        assert_eq!(
+            plan.track_pdc,
+            vec![256, 256, 256, 256, 256],
+            "max declared (256, from kick's bypassed insert) minus each slot's applied (0)"
+        );
+
+        // ---- per-source output routing + edge delay
+        assert_eq!(plan.output[slots["kick"]], Some(0), "kick -> drums (bus position 0)");
+        assert_eq!(plan.out_delay[slots["kick"]], 0, "kick's own target (t_src=256) is already met");
+        assert_eq!(plan.output[slots["vox"]], Some(2), "vox -> mix (bus position 2)");
+        assert_eq!(plan.out_delay[slots["vox"]], 64, "vox waits for drums's applied 64 arriving at mix");
+
+        // ---- vox's send into verb
+        let vox_sends = &plan.sends[&crate::ids::TrackId::from("vox")];
+        assert_eq!(vox_sends.len(), 1);
+        assert_eq!(vox_sends[0].id, "v-snd1");
+        assert_eq!(vox_sends[0].bus, 1, "verb is compiled bus position 1");
+        assert!(vox_sends[0].pre_fader, "pre_fader carries through unchanged");
+        assert_eq!(vox_sends[0].delay, 0, "verb has no producer raising its input target above t_src");
+        assert!(!plan.sends.contains_key(&crate::ids::TrackId::from("kick")), "kick has no sends");
+
+        // ---- compiled bus strips, in the topological order asserted above
+        assert_eq!(plan.buses[0].slot, slots["drums"]);
+        assert_eq!(plan.buses[0].inserts.len(), 1, "drums keeps its own chain");
+        assert_eq!(plan.buses[0].output, Some(2), "drums -> mix (bus position 2)");
+        assert_eq!(
+            plan.buses[0].out_pdc.as_ref().map_or(0, |d| d.delay()),
+            0,
+            "drums IS the slow path into mix, so it does not wait for itself"
+        );
+
+        assert_eq!(plan.buses[1].slot, slots["verb"]);
+        assert_eq!(plan.buses[1].inserts.len(), 1, "verb keeps its own chain");
+        assert_eq!(plan.buses[1].output, None, "verb falls to the master");
+        assert_eq!(
+            plan.buses[1].out_pdc.as_ref().map_or(0, |d| d.delay()),
+            64,
+            "verb (ready at 256) waits for the master target (320, set by drums->mix)"
+        );
+
+        assert_eq!(plan.buses[2].slot, slots["mix"]);
+        assert_eq!(plan.buses[2].inserts.len(), 0, "mix has no insert of its own");
+        assert_eq!(plan.buses[2].output, None, "mix falls to the master");
+        assert_eq!(
+            plan.buses[2].out_pdc.as_ref().map_or(0, |d| d.delay()),
+            0,
+            "mix (ready at 320) already meets the master target (320)"
         );
     }
 }

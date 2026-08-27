@@ -1424,4 +1424,170 @@ mod tests {
         assert!(bar1 > 1e-4, "the sampled offset is mid-ramp, not silent: {bar1}");
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    // ---- characterization gate (Plan V1 Task 1) --------------------------
+
+    /// FNV-1a 64 (hex) over the little-endian bytes of an `f32` sample
+    /// buffer. `bounce_of_a_full_strip_is_byte_stable` needs a hash as
+    /// sensitive to a one-sample or one-bit change as a cryptographic
+    /// digest, but this crate does not depend on a SHA-2 implementation
+    /// (`grep sha2 src-tauri/Cargo.toml` finds nothing) and adding one is
+    /// out of scope for a tests-only task — so this is a small,
+    /// deterministic, dependency-free stand-in instead.
+    fn fnv1a64_hex(samples: &[f32]) -> String {
+        const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = FNV_OFFSET;
+        for s in samples {
+            for b in s.to_le_bytes() {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(FNV_PRIME);
+            }
+        }
+        format!("{hash:016x}")
+    }
+
+    /// Plan V1 Task 1 — the bounce-identity gate, recorded BEFORE
+    /// `audio::insert::compile_inserts` and `audio::bus::compile_routing`
+    /// are refactored to take a `MixNode` value instead of `&[TrackState]`.
+    /// This test pins TODAY's rendered bytes so that refactor can be
+    /// proven behaviour-neutral: a mix that changes by so much as one
+    /// sample fails here. A genuine future change to the mix must update
+    /// `EXPECTED_HASH` below *deliberately, in the same commit that
+    /// changes the mix* — do not "fix" this test to make a surprising
+    /// number go away; today's behaviour is what it asserts.
+    ///
+    /// The fixture walks every path `build_graph` reaches through those
+    /// two compilers on an offline bounce:
+    /// - `a1`: an audio clip, non-zero `gain_db` (-6) and `pan` (0.3), and
+    ///   a SEND (a COPY) into the `verb` bus.
+    /// - `a2`: an audio clip, its own non-zero `gain_db`/`pan`, and its
+    ///   OUTPUT (a MOVE) routed through `verb` instead of the master.
+    /// - `a3`: an audio clip, MUTED. Mute is exercised for its own sake —
+    ///   `FLAG_MUTE` reaching the render — but `a3` is deliberately left
+    ///   UNSOLOED and nothing else is soloed either: `mixer::audible`'s
+    ///   `!any_solo || soloed` means soloing anything here would silence
+    ///   `a1`/`a2` too and defeat the point of exercising the send/output
+    ///   edges with audible material.
+    /// - `verb`: a `kind: "bus"` track fed by both the send and the output
+    ///   edge above.
+    ///
+    /// KNOWN GAP, same one `a_send_into_an_empty_bus_reaches_the_offline_
+    /// bounce` lives with: INSERTS are not reachable from here.
+    /// `build_graph` builds its own `InsertNodeRegistry` against the real
+    /// `plugins::insert_node_for`, which requires a live CLAP/LV2 host —
+    /// there is none in a unit test, so any `InsertSlot` on these tracks
+    /// would compile to a dry (no-op) chain no matter what this fixture
+    /// asked for, proving nothing. `compile_inserts`'s insert-chain
+    /// behaviour (including a bypassed insert, so the declared/applied PDC
+    /// split is live) is instead pinned directly, with exact integers, in
+    /// `audio::bus::tests::routing_plan_of_a_full_strip_is_stable`.
+    #[test]
+    fn bounce_of_a_full_strip_is_byte_stable() {
+        const RATE: u32 = 48_000;
+        const LEN: u64 = 4_000; // matches the other WAV-fixture tests here
+        let dir = std::env::temp_dir().join(format!(
+            "aura-offline-fullstrip-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("audio")).unwrap();
+        let write_tone = |name: &str, level: f32| {
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: RATE,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            };
+            let mut w =
+                hound::WavWriter::create(dir.join(format!("audio/{name}.wav")), spec).unwrap();
+            for _ in 0..LEN {
+                w.write_sample(level).unwrap();
+            }
+            w.finalize().unwrap();
+        };
+        write_tone("c1", 0.8);
+        write_tone("c2", 0.4);
+        write_tone("c3", 1.0);
+
+        let mut store = Store::default();
+        store.project_dir = Some(dir.clone());
+
+        let mut a1 = track("a1", "audio");
+        a1.gain_db = -6.0;
+        a1.pan = 0.3;
+        a1.sends.push(crate::audio::types::SendSlot {
+            id: "s1".into(),
+            dest: "verb".into(),
+            amount_db: -3.0,
+            pre_fader: false,
+        });
+        store.tracks.push(a1);
+
+        let mut a2 = track("a2", "audio");
+        a2.gain_db = 2.0;
+        a2.pan = -0.5;
+        a2.output = Some("verb".into());
+        store.tracks.push(a2);
+
+        let mut a3 = track("a3", "audio");
+        a3.muted = true;
+        store.tracks.push(a3);
+
+        store.tracks.push(track("verb", "bus"));
+
+        for (i, (tid, name)) in [("a1", "c1"), ("a2", "c2"), ("a3", "c3")].iter().enumerate() {
+            store.clips.push(crate::audio::types::Clip {
+                id: format!("c{i}").into(),
+                track_id: (*tid).into(),
+                name: (*name).into(),
+                source_path: format!("audio/{name}.wav"),
+                source_id: crate::ids::SourceId::default(),
+                source_channels: 1,
+                source_sample_rate: RATE,
+                source_length_samples: LEN,
+                timeline_start_samples: 0,
+                offset_samples: 0,
+                length_samples: LEN,
+                gain_db: 0.0,
+                fade_in_samples: 0,
+                fade_out_samples: 0,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track(tid),
+            });
+        }
+
+        let midi = MidiStore {
+            harmony: Default::default(),
+            ppq: 960,
+            tempo_events: vec![TempoEvent { tick: 0, bpm: 120.0 }],
+            meter_events: vec![MeterEvent { tick: 0, num: 4, den: 4 }],
+            clips: vec![],
+            launch_maps: Vec::new(),
+            loaded_dir: None,
+            dirty: false,
+        };
+
+        let mut og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            RATE,
+        );
+        let out = render(&mut og.graph, 0, LEN, RATE, 1.0, &mut |_, _| {});
+        assert_eq!(out.len(), LEN as usize * 2, "length exact");
+        assert!(peak(&out) > 0.01, "the bounce is audible to begin with");
+
+        const EXPECTED_HASH: &str = "3346038798783325";
+        assert_eq!(
+            fnv1a64_hex(&out),
+            EXPECTED_HASH,
+            "the mix changed by at least one sample — see this test's doc comment"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
