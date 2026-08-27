@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Control surface v0.2.1 — racks | `feat/surface-racks` | 2026-08-27 | `+ → RACK` appends a device faceplate instead of replacing the deck; device list becomes data. UI only. |
 
 ## Next up — unclaimed
 
