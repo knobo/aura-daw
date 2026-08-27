@@ -128,10 +128,20 @@
     flex-direction: column;
     align-items: center;
     gap: 4px;
-    width: 36px;
+    /* A rack's scribble strip wants more room than a strip's "LEVEL". */
+    width: var(--fader-w, 36px);
   }
   .fader-label {
     line-height: 1;
+    /* Without the clamp a long label overflows the unit's fixed width and
+       lands on top of the neighbouring fader's. `min-width: 0` is the
+       load-bearing half: a flex item's automatic minimum size is its
+       min-content width, and that beats `max-width` on its own. */
+    min-width: 0;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .fader {
     position: relative;
