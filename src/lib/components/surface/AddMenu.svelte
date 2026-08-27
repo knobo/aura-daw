@@ -51,8 +51,10 @@
       tabindex="-1"
       onkeydown={onKey}
     >
-      {#each ["widget", "recipe", "template"] as group (group)}
-        <p class="silk heading">{group === "widget" ? "ADD" : group === "recipe" ? "FILL" : "TEMPLATE"}</p>
+      {#each ["widget", "recipe", "rack", "page"] as group (group)}
+        <p class="silk heading">
+          {group === "widget" ? "ADD" : group === "recipe" ? "FILL" : group === "rack" ? "RACK" : "PAGE"}
+        </p>
         {#each ADD_MENU.filter((i) => i.group === group) as item (item.id)}
           <button class="item" role="menuitem" type="button" onclick={() => pick(item.id)}>
             <span class="name">{item.label}</span>

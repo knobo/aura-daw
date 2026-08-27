@@ -56,9 +56,9 @@ const { surface } = await import("../../state/surface.svelte");
 const { project } = await import("../../state/project.svelte");
 const { midi } = await import("../../state/midi.svelte");
 const { launch } = await import("../../state/launch.svelte");
-const { emptyLayout, addWidget, stripWidgets, unboundWidget } = await import(
-  "../../utils/control-surface"
-);
+const Rack = (await import("./Rack.svelte")).default;
+const { addWidget, deviceById, emptyLayout, rackWidgets, stripWidgets, unboundWidget } =
+  await import("../../utils/control-surface");
 
 const TRACK: TrackState = {
   id: "t1",
@@ -108,22 +108,71 @@ afterEach(() => {
 });
 
 describe("the add menu", () => {
-  it("lists the fill recipes and the LPD8 template", async () => {
+  it("lists the fill recipes and the device racks", async () => {
     render(AddMenu);
     await fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
     expect(screen.getByText("Add all tracks")).toBeTruthy();
     expect(screen.getByText("Add all clips")).toBeTruthy();
     expect(screen.getByText("Add all automations")).toBeTruthy();
     expect(screen.getByText("AKAI LPD8")).toBeTruthy();
+    expect(screen.getByText("Clear page")).toBeTruthy();
   });
 
-  it("stamps a blank page from the template item", async () => {
+  it("adds a rack to the deck instead of replacing it", async () => {
+    surface.layout = addWidget(emptyLayout(), unboundWidget("pad", { label: "KEEP ME" }));
     render(AddMenu);
     await fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
-    await fireEvent.click(screen.getByRole("menuitem", { name: /blank page/i }));
-    expect(surface.page.templateId).toBe("blank");
-    expect(surface.page.widgets).toEqual([]);
+    await fireEvent.click(screen.getByRole("menuitem", { name: /akai lpd8/i }));
+    // The reported defect: the `+` menu wiped whatever was on the page.
+    expect(surface.page.widgets.some((w) => w.label === "KEEP ME")).toBe(true);
+    expect(surface.page.widgets.filter((w) => w.deviceId === "lpd8")).toHaveLength(9);
     expect(surface.addOpen).toBe(false);
+  });
+
+  it("empties the deck only when asked to", async () => {
+    surface.layout = addWidget(emptyLayout(), unboundWidget("pad"));
+    render(AddMenu);
+    await fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: /clear page/i }));
+    expect(surface.page.widgets).toEqual([]);
+  });
+});
+
+describe("a rack", () => {
+  /** An LPD8 on the page, plus the props the panel would hand its faceplate. */
+  function lpd8() {
+    const device = deviceById("lpd8")!;
+    const widgets = rackWidgets(device, surface.context(), surface.page);
+    surface.layout = {
+      ...surface.layout,
+      pages: [{ ...surface.page, widgets }],
+    };
+    return { device, groupId: widgets[0].groupId!, widgets };
+  }
+
+  it("drives the track its knob is bound to", async () => {
+    render(Rack, lpd8());
+    const knob = screen.getByRole("slider", { name: "Drums" });
+    Object.assign(knob, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() });
+    await fireEvent.pointerDown(knob, { button: 0, clientY: 200, pointerId: 1 });
+    await fireEvent.pointerMove(knob, { clientY: 180, pointerId: 1 });
+    await fireEvent.pointerUp(knob, { pointerId: 1 });
+    await vi.waitFor(() => expect(calls.at(-1)).toBe("end:gid-1"));
+    expect(calls[0]).toBe("begin:knob drag");
+    expect(calls.filter((c) => c.startsWith("gain:t1:")).length).toBeGreaterThan(0);
+  });
+
+  it("comes off the page as one unit", async () => {
+    const props = lpd8();
+    render(Rack, { ...props, edit: true });
+    await fireEvent.click(screen.getByRole("button", { name: /remove akai lpd8/i }));
+    expect(surface.page.widgets).toEqual([]);
+  });
+
+  it("keeps its pad block: the block has no remove button of its own", () => {
+    render(Rack, { ...lpd8(), edit: true });
+    expect(screen.getByLabelText("Pad grid")).toBeTruthy();
+    expect(screen.queryByTitle("Remove pad grid")).toBeNull();
   });
 });
 

@@ -1,6 +1,6 @@
 /**
  * Control-surface layout algebra: widget kinds, targets, add-all recipes,
- * and hardware-homage templates. Pure TypeScript (no runes, no DOM, no
+ * and hardware-homage racks. Pure TypeScript (no runes, no DOM, no
  * stores) so the panel, the tests and a later "give me an LPD8" command
  * share one rule set.
  *
@@ -8,7 +8,13 @@
  * ids; they do not own mix or launch state.
  */
 
-export const SURFACE_LAYOUT_VERSION = 1 as const;
+export const SURFACE_LAYOUT_VERSION = 2 as const;
+
+/** v1 kept a device as a page mode (`page.templateId`); v2 makes it a group. */
+const LEGACY_LAYOUT_VERSION = 1;
+
+/** Widgets stamped by one device share a `rack:<id>` group. */
+export const RACK_GROUP_PREFIX = "rack:";
 
 export type SurfaceWidgetKind =
   | "knob"
@@ -23,7 +29,85 @@ export type LampRole = "mute" | "solo" | "arm";
 
 export type PadMode = "momentary" | "toggle";
 
-export type SurfaceTemplateId = "blank" | "lpd8" | "mixer";
+export type SurfaceDeviceId = "lpd8" | "launchpad" | "mcu" | "nanokontrol";
+
+/**
+ * A hardware homage, described as data. Everything the faceplate needs to
+ * lay itself out is here, so adding a device is a row in `DEVICE_RACKS`
+ * rather than a branch in a component. This is the shape Plan V's V8
+ * hardware map binds to.
+ */
+export interface SurfaceDevice {
+  id: SurfaceDeviceId;
+  /** Silkscreen on the faceplate; also the row in the `+` menu. */
+  name: string;
+  hint: string;
+  /** Mode buttons down the left edge. Silkscreen only — no behaviour yet. */
+  modes: readonly string[];
+  knobs: number;
+  /** Knobs are laid out in this many columns (the LPD8's eight sit 4×2). */
+  knobCols: number;
+  /** What a knob drives. A device with faders puts level on the fader. */
+  knobParam: "gain" | "pan";
+  faders: number;
+  padCols: number;
+  padRows: number;
+}
+
+export const DEVICE_RACKS: readonly SurfaceDevice[] = [
+  {
+    id: "lpd8",
+    name: "AKAI LPD8",
+    hint: "8 knobs, 4×2 pads, homage faceplate",
+    modes: ["PROG", "PAD", "CC", "NOTE"],
+    knobs: 8,
+    knobCols: 4,
+    knobParam: "gain",
+    faders: 0,
+    padCols: 4,
+    padRows: 2,
+  },
+  {
+    id: "launchpad",
+    name: "Launchpad 8×8",
+    hint: "64 clip pads, no pots",
+    modes: ["SESSION", "USER", "MIXER"],
+    knobs: 0,
+    knobCols: 0,
+    knobParam: "gain",
+    faders: 0,
+    padCols: 8,
+    padRows: 8,
+  },
+  {
+    id: "mcu",
+    name: "MCU 8-strip",
+    hint: "8 faders on level, 8 pots on pan",
+    modes: ["TRACK", "PAN", "SEND"],
+    knobs: 8,
+    knobCols: 8,
+    knobParam: "pan",
+    faders: 8,
+    padCols: 0,
+    padRows: 0,
+  },
+  {
+    id: "nanokontrol",
+    name: "nanoKONTROL",
+    hint: "8 compact faders and pots",
+    modes: ["CYCLE", "SET"],
+    knobs: 8,
+    knobCols: 8,
+    knobParam: "pan",
+    faders: 8,
+    padCols: 0,
+    padRows: 0,
+  },
+];
+
+export function deviceById(id: string | null | undefined): SurfaceDevice | undefined {
+  return DEVICE_RACKS.find((d) => d.id === id);
+}
 
 export type AddRecipe = "all" | "tracks" | "clips" | "automations";
 
@@ -43,8 +127,10 @@ export interface SurfaceWidget {
   kind: SurfaceWidgetKind;
   label: string;
   target: SurfaceTarget | null;
-  /** Shared by the widgets a channel-strip recipe inserts. */
+  /** Shared by the widgets a channel strip or a rack inserts. */
   groupId?: string;
+  /** Set on every widget of a rack: which faceplate draws it. */
+  deviceId?: SurfaceDeviceId;
   padMode?: PadMode;
   lampRole?: LampRole;
   cols?: number;
@@ -56,7 +142,6 @@ export interface SurfaceWidget {
 export interface SurfacePage {
   id: string;
   name: string;
-  templateId: SurfaceTemplateId | "custom";
   widgets: SurfaceWidget[];
 }
 
@@ -106,14 +191,15 @@ export interface SurfaceContext {
 export type AddMenuId =
   | SurfaceWidgetKind
   | "strip"
+  | "clear"
   | `recipe:${AddRecipe}`
-  | `template:${SurfaceTemplateId}`;
+  | `rack:${SurfaceDeviceId}`;
 
 export interface AddMenuItem {
   id: AddMenuId;
   label: string;
   hint: string;
-  group: "widget" | "recipe" | "template";
+  group: "widget" | "recipe" | "rack" | "page";
 }
 
 /** The `+` dropdown, in display order. */
@@ -130,9 +216,10 @@ export const ADD_MENU: readonly AddMenuItem[] = [
   { id: "recipe:tracks", label: "Add all tracks", hint: "A strip per track", group: "recipe" },
   { id: "recipe:clips", label: "Add all clips", hint: "Clip list + pad grid", group: "recipe" },
   { id: "recipe:automations", label: "Add all automations", hint: "A knob per moving param", group: "recipe" },
-  { id: "template:lpd8", label: "AKAI LPD8", hint: "8 knobs, 2×4 pads, homage faceplate", group: "template" },
-  { id: "template:mixer", label: "Mixer", hint: "Channel strips across the page", group: "template" },
-  { id: "template:blank", label: "Blank page", hint: "Empty faceplate", group: "template" },
+  ...DEVICE_RACKS.map(
+    (d): AddMenuItem => ({ id: `rack:${d.id}`, label: d.name, hint: d.hint, group: "rack" }),
+  ),
+  { id: "clear", label: "Clear page", hint: "Remove every widget on this deck", group: "page" },
 ];
 
 export function newId(): string {
@@ -148,7 +235,7 @@ export function emptyLayout(): SurfaceLayout {
 }
 
 export function emptyPage(name = "Deck"): SurfacePage {
-  return { id: newId(), name, templateId: "blank", widgets: [] };
+  return { id: newId(), name, widgets: [] };
 }
 
 export function activePage(layout: SurfaceLayout): SurfacePage {
@@ -270,6 +357,11 @@ export function unboundWidget(kind: SurfaceWidgetKind, extra: Partial<SurfaceWid
 
 export function padGridForClips(clips: readonly SurfaceClip[]): SurfaceWidget {
   const { cols, rows } = gridSizeForClips(clips.length);
+  return padGrid(cols, rows, clips);
+}
+
+/** A grid of a fixed size, filled from the bottom-left pad upward. */
+function padGrid(cols: number, rows: number, clips: readonly SurfaceClip[]): SurfaceWidget {
   const cells: Array<string | null> = Array(cols * rows).fill(null);
   for (let i = 0; i < clips.length && i < cells.length; i++) {
     const col = i % cols;
@@ -277,47 +369,35 @@ export function padGridForClips(clips: readonly SurfaceClip[]): SurfaceWidget {
     const rowFromTop = rows - 1 - rowFromBottom;
     cells[padIndex(cols, rows, col, rowFromTop)] = clips[i].id;
   }
-  return {
-    id: newId(),
-    kind: "padGrid",
-    label: "PADS",
-    target: null,
-    cols,
-    rows,
-    cells,
-  };
+  return { id: newId(), kind: "padGrid", label: "PADS", target: null, cols, rows, cells };
 }
 
-function replaceActive(
-  layout: SurfaceLayout,
-  widgets: SurfaceWidget[],
-  templateId?: SurfacePage["templateId"],
-): SurfaceLayout {
+function replaceActive(layout: SurfaceLayout, widgets: SurfaceWidget[]): SurfaceLayout {
   const page = activePage(layout);
-  const nextPage: SurfacePage = {
-    ...page,
-    widgets,
-    templateId: templateId ?? page.templateId,
-  };
   return {
     ...layout,
-    pages: layout.pages.map((p) => (p.id === page.id ? nextPage : p)),
+    pages: layout.pages.map((p) => (p.id === page.id ? { ...page, widgets } : p)),
   };
 }
 
 function appendActive(layout: SurfaceLayout, extra: SurfaceWidget[]): SurfaceLayout {
   if (extra.length === 0) return layout;
-  const page = activePage(layout);
-  return replaceActive(layout, [...page.widgets, ...extra], "custom");
+  return replaceActive(layout, [...activePage(layout).widgets, ...extra]);
 }
 
 export function addWidget(layout: SurfaceLayout, widget: SurfaceWidget): SurfaceLayout {
   return appendActive(layout, [widget]);
 }
 
+/** Is this track's channel strip already on the page? A rack knob pointed
+ * at the same gain is not a strip — the two coexist happily. */
+export function pageHasStrip(page: SurfacePage, trackId: string): boolean {
+  return page.widgets.some((w) => w.groupId === `strip:${trackId}`);
+}
+
 export function addStrip(layout: SurfaceLayout, track: SurfaceTrack): SurfaceLayout {
   const page = activePage(layout);
-  if (pageHasTarget(page, { kind: "trackGain", trackId: track.id })) return layout;
+  if (pageHasStrip(page, track.id)) return layout;
   return appendActive(layout, stripWidgets(track));
 }
 
@@ -363,30 +443,68 @@ export function addRecipe(layout: SurfaceLayout, recipe: AddRecipe, ctx: Surface
   return appendActive(layout, extra);
 }
 
-export function applyTemplate(layout: SurfaceLayout, template: SurfaceTemplateId, ctx: SurfaceContext): SurfaceLayout {
-  if (template === "blank") {
-    return replaceActive(layout, [], "blank");
-  }
-  if (template === "mixer") {
-    const filled = addRecipe(replaceActive(layout, [], "mixer"), "tracks", ctx);
-    return replaceActive(filled, activePage(filled).widgets, "mixer");
-  }
-  // lpd8
-  const tracks = mixableTracks(ctx.tracks);
-  const knobs: SurfaceWidget[] = [];
-  for (let i = 0; i < 8; i++) {
-    const t = tracks[i];
-    knobs.push({
+/**
+ * The widgets one device stamps. A rack is an object ON the page, not a
+ * page mode: it carries its own group so a second one can sit beside the
+ * first and either can be removed on its own. Targets already driven from
+ * this page are skipped — a second LPD8 is there to reach the next eight
+ * tracks and clips, not to shadow the first one's.
+ */
+export function rackWidgets(
+  device: SurfaceDevice,
+  ctx: SurfaceContext,
+  page: SurfacePage,
+): SurfaceWidget[] {
+  const groupId = `${RACK_GROUP_PREFIX}${newId()}`;
+  const base = { groupId, deviceId: device.id };
+  const freeTracks = mixableTracks(ctx.tracks).filter(
+    (t) => !pageHasTarget(page, { kind: "trackGain", trackId: t.id }),
+  );
+  const out: SurfaceWidget[] = [];
+
+  for (let i = 0; i < device.faders; i++) {
+    const t = freeTracks[i];
+    out.push({
+      ...base,
       id: newId(),
-      kind: "knob",
-      // Bound knobs wear the track they drive; the silkscreen K1..K8 stays
-      // on the ones that are still empty (the faceplate prints it as a ghost).
-      label: t ? t.name : `K${i + 1}`,
+      kind: "fader",
+      label: t ? t.name : `F${i + 1}`,
       target: t ? { kind: "trackGain", trackId: t.id } : null,
     });
   }
-  const grid = padGridForClips(ctx.midiClips.slice(0, 8));
-  return replaceActive(layout, [...knobs, grid], "lpd8");
+  for (let i = 0; i < device.knobs; i++) {
+    const t = freeTracks[i];
+    // Bound knobs wear the track they drive; the silkscreen K1..K8 stays on
+    // the ones that are still empty (the faceplate prints it as a ghost).
+    const label = !t ? `K${i + 1}` : device.knobParam === "pan" ? "PAN" : t.name;
+    out.push({
+      ...base,
+      id: newId(),
+      kind: "knob",
+      label,
+      target: t
+        ? device.knobParam === "pan"
+          ? { kind: "trackPan", trackId: t.id }
+          : { kind: "trackGain", trackId: t.id }
+        : null,
+    });
+  }
+  if (device.padCols > 0 && device.padRows > 0) {
+    const freeClips = ctx.midiClips.filter(
+      (c) => !pageHasTarget(page, { kind: "clipLaunch", clipId: c.id }),
+    );
+    out.push({ ...padGrid(device.padCols, device.padRows, freeClips), ...base });
+  }
+  return out;
+}
+
+export function addRack(layout: SurfaceLayout, device: SurfaceDevice, ctx: SurfaceContext): SurfaceLayout {
+  return appendActive(layout, rackWidgets(device, ctx, activePage(layout)));
+}
+
+/** Emptying the deck is its own menu action, never a side effect of adding. */
+export function clearPage(layout: SurfaceLayout): SurfaceLayout {
+  return replaceActive(layout, []);
 }
 
 export function removeWidget(layout: SurfaceLayout, widgetId: string): SurfaceLayout {
@@ -394,17 +512,15 @@ export function removeWidget(layout: SurfaceLayout, widgetId: string): SurfaceLa
   return replaceActive(
     layout,
     page.widgets.filter((w) => w.id !== widgetId),
-    page.widgets.some((w) => w.id === widgetId) ? "custom" : page.templateId,
   );
 }
 
-/** Remove every widget that shares this strip group. */
+/** Remove every widget that shares this group — one strip, or one rack. */
 export function removeGroup(layout: SurfaceLayout, groupId: string): SurfaceLayout {
   const page = activePage(layout);
   return replaceActive(
     layout,
     page.widgets.filter((w) => w.groupId !== groupId),
-    "custom",
   );
 }
 
@@ -421,7 +537,6 @@ export function bindWidget(
     page.widgets.map((w) =>
       w.id === widgetId ? { ...w, ...extra, target, label: label ?? w.label } : w,
     ),
-    "custom",
   );
 }
 
@@ -430,7 +545,6 @@ export function setPadMode(layout: SurfaceLayout, widgetId: string, padMode: Pad
   return replaceActive(
     layout,
     page.widgets.map((w) => (w.id === widgetId ? { ...w, padMode } : w)),
-    "custom",
   );
 }
 
@@ -445,7 +559,6 @@ export function setGridCell(layout: SurfaceLayout, widgetId: string, index: numb
       cells[index] = clipId;
       return { ...w, cells };
     }),
-    "custom",
   );
 }
 
@@ -539,25 +652,43 @@ function pluginParamOptions(ctx: SurfaceContext): BindOption[] {
   return out;
 }
 
+interface StoredPage {
+  id?: unknown;
+  name?: unknown;
+  /** v1 only: the device this page WAS, back when a device was a page mode. */
+  templateId?: unknown;
+  widgets?: unknown;
+}
+
 export function parseLayout(raw: unknown): SurfaceLayout | null {
   if (!raw || typeof raw !== "object") return null;
-  const o = raw as Partial<SurfaceLayout>;
-  if (o.version !== SURFACE_LAYOUT_VERSION) return null;
+  const o = raw as { version?: unknown; pages?: unknown; activePageId?: unknown };
+  const legacy = o.version === LEGACY_LAYOUT_VERSION;
+  if (o.version !== SURFACE_LAYOUT_VERSION && !legacy) return null;
   if (!Array.isArray(o.pages) || o.pages.length === 0) return null;
   if (typeof o.activePageId !== "string") return null;
   const pages: SurfacePage[] = [];
-  for (const p of o.pages) {
-    if (!p || typeof p.id !== "string" || typeof p.name !== "string") return null;
-    if (!Array.isArray(p.widgets)) return null;
-    pages.push({
-      id: p.id,
-      name: p.name,
-      templateId: p.templateId ?? "custom",
-      widgets: p.widgets.filter(isWidget),
-    });
+  for (const raw of o.pages as StoredPage[]) {
+    if (!raw || typeof raw.id !== "string" || typeof raw.name !== "string") return null;
+    if (!Array.isArray(raw.widgets)) return null;
+    const widgets = raw.widgets.filter(isWidget);
+    pages.push({ id: raw.id, name: raw.name, widgets: legacy ? migrateV1Page(raw, widgets) : widgets });
   }
   const activePageId = pages.some((p) => p.id === o.activePageId) ? o.activePageId : pages[0].id;
   return { version: SURFACE_LAYOUT_VERSION, pages, activePageId };
+}
+
+/**
+ * A v1 page whose `templateId` names a device WAS that device — the mode is
+ * why `+` had to replace the deck to stamp one. Wrap its widgets in a rack
+ * group and the same saved deck opens as an object on the page. Any other v1
+ * page (`custom`, `mixer`, `blank`) was already a plain widget list.
+ */
+function migrateV1Page(page: StoredPage, widgets: SurfaceWidget[]): SurfaceWidget[] {
+  const device = typeof page.templateId === "string" ? deviceById(page.templateId) : undefined;
+  if (!device || widgets.length === 0) return widgets;
+  const groupId = `${RACK_GROUP_PREFIX}${newId()}`;
+  return widgets.map((w) => ({ ...w, groupId, deviceId: device.id }));
 }
 
 function isWidget(w: unknown): w is SurfaceWidget {
@@ -579,23 +710,42 @@ export function storageKey(projectDir: string | null | undefined): string {
   return `aura.surface.v1:${projectDir && projectDir.length > 0 ? projectDir : "session"}`;
 }
 
+/** One device faceplate on the page, with the widgets it stamped. */
+export interface SurfaceRack {
+  groupId: string;
+  device: SurfaceDevice;
+  widgets: SurfaceWidget[];
+}
+
 export interface GroupedWidgets {
+  racks: SurfaceRack[];
   strips: SurfaceWidget[][];
   loose: SurfaceWidget[];
 }
 
-/** Channel-strip bundles first (stable groupId order), then free widgets. */
+/** Racks first, then channel-strip bundles (stable groupId order), then
+ * free widgets. */
 export function groupWidgets(page: SurfacePage): GroupedWidgets {
+  const rackGroups = new Map<string, SurfaceWidget[]>();
   const strips = new Map<string, SurfaceWidget[]>();
   const loose: SurfaceWidget[] = [];
   for (const w of page.widgets) {
-    if (w.groupId) {
-      const g = strips.get(w.groupId);
-      if (g) g.push(w);
-      else strips.set(w.groupId, [w]);
-    } else {
+    if (!w.groupId) {
       loose.push(w);
+      continue;
     }
+    const bucket = w.groupId.startsWith(RACK_GROUP_PREFIX) ? rackGroups : strips;
+    const g = bucket.get(w.groupId);
+    if (g) g.push(w);
+    else bucket.set(w.groupId, [w]);
   }
-  return { strips: [...strips.values()], loose };
+  const racks: SurfaceRack[] = [];
+  for (const [groupId, widgets] of rackGroups) {
+    const device = deviceById(widgets[0].deviceId);
+    // A deck saved against a device this build no longer knows still shows
+    // its controls — as loose widgets, never as a hole where a rack was.
+    if (device) racks.push({ groupId, device, widgets });
+    else loose.push(...widgets);
+  }
+  return { racks, strips: [...strips.values()], loose };
 }

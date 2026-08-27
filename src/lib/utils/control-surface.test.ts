@@ -3,13 +3,16 @@ import {
   ADD_MENU,
   activePage,
   addRecipe,
+  addRack,
   addStrip,
   addWidget,
-  applyTemplate,
   bindOptions,
   bindWidget,
   bindable,
   cellOptions,
+  clearPage,
+  DEVICE_RACKS,
+  deviceById,
   emptyLayout,
   gridSizeForClips,
   groupWidgets,
@@ -17,6 +20,7 @@ import {
   mixableTracks,
   padGridForClips,
   padIndex,
+  pageHasStrip,
   pageHasTarget,
   parseLayout,
   removeGroup,
@@ -29,6 +33,7 @@ import {
   unboundWidget,
   type SurfaceContext,
   type SurfaceLayout,
+  type SurfacePage,
 } from "./control-surface";
 
 const ctx: SurfaceContext = {
@@ -58,11 +63,10 @@ const ctx: SurfaceContext = {
 describe("empty layout", () => {
   it("starts with one blank page and no widgets", () => {
     const layout = emptyLayout();
-    expect(layout.version).toBe(1);
+    expect(layout.version).toBe(2);
     expect(layout.pages).toHaveLength(1);
     expect(layout.activePageId).toBe(layout.pages[0].id);
     expect(activePage(layout).widgets).toEqual([]);
-    expect(activePage(layout).templateId).toBe("blank");
   });
 });
 
@@ -113,6 +117,12 @@ describe("channel strips", () => {
     const twice = addStrip(once, ctx.tracks[0]);
     expect(activePage(twice).widgets).toHaveLength(activePage(once).widgets.length);
   });
+
+  it("still gives a track a strip when a rack knob already drives its gain", () => {
+    const withRack = addRack(emptyLayout(), deviceById("lpd8")!, ctx);
+    const layout = addStrip(withRack, ctx.tracks[0]);
+    expect(pageHasStrip(activePage(layout), "t1")).toBe(true);
+  });
 });
 
 describe("recipes", () => {
@@ -153,32 +163,88 @@ describe("recipes", () => {
   });
 });
 
-describe("templates", () => {
-  it("LPD8 stamps 8 knobs and a 2×4 pad grid", () => {
-    const layout = applyTemplate(emptyLayout(), "lpd8", ctx);
+describe("racks", () => {
+  const lpd8 = deviceById("lpd8")!;
+
+  it("appends a faceplate instead of replacing the deck", () => {
+    const withStrip = addStrip(emptyLayout(), ctx.tracks[0]);
+    const before = activePage(withStrip).widgets.length;
+    const layout = addRack(withStrip, lpd8, ctx);
     const page = activePage(layout);
-    expect(page.templateId).toBe("lpd8");
-    expect(page.widgets.filter((w) => w.kind === "knob")).toHaveLength(8);
-    const grid = page.widgets.find((w) => w.kind === "padGrid");
+    // The reported defect: `+` destroyed whatever was already on the page.
+    expect(page.widgets.length).toBeGreaterThan(before);
+    expect(pageHasTarget(page, { kind: "trackGain", trackId: "t1" })).toBe(true);
+    expect(page.widgets.filter((w) => w.kind === "lamp")).toHaveLength(3);
+  });
+
+  it("stamps 8 knobs and a 4x2 pad block into one group", () => {
+    const page = activePage(addRack(emptyLayout(), lpd8, ctx));
+    const rack = page.widgets.filter((w) => w.deviceId === "lpd8");
+    expect(rack).toHaveLength(9);
+    expect(new Set(rack.map((w) => w.groupId)).size).toBe(1);
+    expect(rack[0].groupId?.startsWith("rack:")).toBe(true);
+    expect(rack.filter((w) => w.kind === "knob")).toHaveLength(8);
+    const grid = rack.find((w) => w.kind === "padGrid");
     expect(grid?.cols).toBe(4);
     expect(grid?.rows).toBe(2);
     expect(grid?.cells?.[padIndex(4, 2, 0, 1)]).toBe("c1");
   });
 
-  it("mixer is the tracks recipe on a fresh page", () => {
-    const dirty = addWidget(emptyLayout(), unboundWidget("pad"));
-    const layout = applyTemplate(dirty, "mixer", ctx);
-    const page = activePage(layout);
-    expect(page.templateId).toBe("mixer");
-    expect(page.widgets.some((w) => w.kind === "pad")).toBe(false);
-    expect(page.widgets.filter((w) => w.kind === "fader")).toHaveLength(2);
+  it("gives the knobs the tracks and the pads the clips, in order", () => {
+    const page = activePage(addRack(emptyLayout(), lpd8, ctx));
+    const knobs = page.widgets.filter((w) => w.kind === "knob");
+    expect(knobs[0].target).toEqual({ kind: "trackGain", trackId: "t1" });
+    expect(knobs[0].label).toBe("Drums");
+    // No third mixable track, so the silkscreen stays on the empty knobs.
+    expect(knobs[2].target).toBeNull();
+    expect(knobs[2].label).toBe("K3");
   });
 
-  it("blank clears the page", () => {
+  it("puts two racks side by side, each on its own group", () => {
+    const layout = addRack(addRack(emptyLayout(), lpd8, ctx), lpd8, ctx);
+    const groups = new Set(activePage(layout).widgets.map((w) => w.groupId));
+    expect(groups.size).toBe(2);
+  });
+
+  it("removes one rack without touching the other", () => {
+    const layout = addRack(addRack(emptyLayout(), lpd8, ctx), lpd8, ctx);
+    const first = activePage(layout).widgets[0].groupId!;
+    const page = activePage(removeGroup(layout, first));
+    expect(page.widgets.some((w) => w.groupId === first)).toBe(false);
+    expect(page.widgets).toHaveLength(9);
+  });
+
+  it("reaches for the next tracks and clips rather than shadowing the first rack", () => {
+    const second = activePage(addRack(addRack(emptyLayout(), lpd8, ctx), lpd8, ctx))
+      .widgets.slice(9);
+    expect(second.filter((w) => w.kind === "knob").every((w) => w.target === null)).toBe(true);
+    expect(second.find((w) => w.kind === "padGrid")?.cells?.every((c) => c === null)).toBe(true);
+  });
+
+  it("lays a fader device out as faders on level and knobs on pan", () => {
+    const mcu = deviceById("mcu")!;
+    const rack = activePage(addRack(emptyLayout(), mcu, ctx)).widgets;
+    expect(rack.filter((w) => w.kind === "fader")).toHaveLength(8);
+    expect(rack.find((w) => w.kind === "fader")?.target).toEqual({ kind: "trackGain", trackId: "t1" });
+    expect(rack.find((w) => w.kind === "knob")?.target).toEqual({ kind: "trackPan", trackId: "t1" });
+    expect(rack.some((w) => w.kind === "padGrid")).toBe(false);
+  });
+
+  it("describes every device as data, not as code", () => {
+    const ids = DEVICE_RACKS.map((d) => d.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(ids).toContain("lpd8");
+    for (const d of DEVICE_RACKS) {
+      expect(d.name.length).toBeGreaterThan(0);
+      expect(d.knobs + d.faders + d.padCols * d.padRows).toBeGreaterThan(0);
+      if (d.knobs > 0) expect(d.knobCols).toBeGreaterThan(0);
+    }
+    expect(deviceById("nope")).toBeUndefined();
+  });
+
+  it("clears the page as an explicit action", () => {
     const dirty = addRecipe(emptyLayout(), "all", ctx);
-    const layout = applyTemplate(dirty, "blank", ctx);
-    expect(activePage(layout).widgets).toEqual([]);
-    expect(activePage(layout).templateId).toBe("blank");
+    expect(activePage(clearPage(dirty)).widgets).toEqual([]);
   });
 });
 
@@ -227,9 +293,36 @@ describe("parse and storage", () => {
   });
 
   it("rejects a wrong version or an empty page list", () => {
+    expect(parseLayout({ version: 3, pages: [], activePageId: "x" })).toBeNull();
     expect(parseLayout({ version: 2, pages: [], activePageId: "x" })).toBeNull();
-    expect(parseLayout({ version: 1, pages: [], activePageId: "x" })).toBeNull();
     expect(parseLayout(null)).toBeNull();
+  });
+
+  it("opens a saved v1 lpd8 deck as a rack", () => {
+    const knob = { id: "w1", kind: "knob", label: "Drums", target: { kind: "trackGain", trackId: "t1" } };
+    const grid = { id: "w2", kind: "padGrid", label: "PADS", target: null, cols: 4, rows: 2, cells: Array(8).fill(null) };
+    const parsed = parseLayout({
+      version: 1,
+      activePageId: "p1",
+      pages: [{ id: "p1", name: "Deck", templateId: "lpd8", widgets: [knob, grid] }],
+    });
+    expect(parsed?.version).toBe(2);
+    const grouped = groupWidgets(parsed!.pages[0]);
+    expect(grouped.racks).toHaveLength(1);
+    expect(grouped.racks[0].device.id).toBe("lpd8");
+    expect(grouped.racks[0].widgets.map((w) => w.id)).toEqual(["w1", "w2"]);
+    expect(grouped.loose).toHaveLength(0);
+  });
+
+  it("leaves a v1 deck that was never a device alone", () => {
+    const knob = { id: "w1", kind: "knob", label: "K1", target: null };
+    const parsed = parseLayout({
+      version: 1,
+      activePageId: "p1",
+      pages: [{ id: "p1", name: "Deck", templateId: "custom", widgets: [knob] }],
+    });
+    expect(groupWidgets(parsed!.pages[0]).loose).toHaveLength(1);
+    expect(groupWidgets(parsed!.pages[0]).racks).toHaveLength(0);
   });
 
   it("falls back to the first page when activePageId is stale", () => {
@@ -267,7 +360,11 @@ describe("add menu", () => {
       "recipe:clips",
       "recipe:automations",
     ]);
-    expect(ids).toContain("template:lpd8");
+    expect(ids).toContain("rack:lpd8");
+    expect(ids).toContain("clear");
+    // Every device is a menu row, so a new one is a row of data.
+    for (const d of DEVICE_RACKS) expect(ids).toContain(`rack:${d.id}`);
+    expect(ids.some((i) => i.startsWith("template:"))).toBe(false);
   });
 });
 
@@ -276,10 +373,33 @@ describe("groupWidgets", () => {
     let layout = addStrip(emptyLayout(), ctx.tracks[0]);
     layout = addWidget(layout, unboundWidget("pad"));
     const grouped = groupWidgets(activePage(layout));
+    expect(grouped.racks).toHaveLength(0);
     expect(grouped.strips).toHaveLength(1);
     expect(grouped.strips[0]).toHaveLength(6);
     expect(grouped.loose).toHaveLength(1);
     expect(grouped.loose[0].kind).toBe("pad");
+  });
+
+  it("keeps a rack out of the strip bucket and carries its device along", () => {
+    let layout = addStrip(emptyLayout(), ctx.tracks[0]);
+    layout = addRack(layout, deviceById("lpd8")!, ctx);
+    const grouped = groupWidgets(activePage(layout));
+    expect(grouped.racks).toHaveLength(1);
+    expect(grouped.racks[0].device.id).toBe("lpd8");
+    expect(grouped.racks[0].widgets).toHaveLength(9);
+    expect(grouped.strips).toHaveLength(1);
+    expect(grouped.loose).toHaveLength(0);
+  });
+
+  it("shows a rack whose device this build no longer knows as loose controls", () => {
+    const page: SurfacePage = {
+      id: "p",
+      name: "Deck",
+      widgets: [unboundWidget("knob", { groupId: "rack:x", deviceId: "gone" as never })],
+    };
+    const grouped = groupWidgets(page);
+    expect(grouped.racks).toHaveLength(0);
+    expect(grouped.loose).toHaveLength(1);
   });
 });
 

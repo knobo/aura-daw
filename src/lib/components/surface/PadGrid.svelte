@@ -7,7 +7,12 @@
   import Pad from "../controls/Pad.svelte";
   import BindPicker from "./BindPicker.svelte";
 
-  const { widget, edit = false }: { widget: SurfaceWidget; edit?: boolean } = $props();
+  /** `removable` off inside a rack: the pad block comes off with the rack. */
+  const {
+    widget,
+    edit = false,
+    removable = true,
+  }: { widget: SurfaceWidget; edit?: boolean; removable?: boolean } = $props();
 
   const cols = $derived(widget.cols ?? 4);
   const rows = $derived(widget.rows ?? 2);
@@ -26,7 +31,7 @@
 </script>
 
 <section class="grid-wrap grain" style:--cols={cols} style:--rows={rows} aria-label="Pad grid">
-  {#if edit}
+  {#if edit && removable}
     <button class="kill" type="button" title="Remove pad grid" onclick={() => surface.remove(widget.id)}>×</button>
   {/if}
   <div class="pads" style:grid-template-columns="repeat({cols}, 56px)">

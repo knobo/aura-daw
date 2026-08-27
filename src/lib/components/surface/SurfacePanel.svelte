@@ -1,8 +1,8 @@
 <script lang="ts">
   /**
-   * Control surface — the bottom-panel faceplate. Mix strips, analog
-   * gauges, pad grids that breathe with the meter bus, and homage
-   * templates (LPD8). Chrome: emits existing mix/launch commands.
+   * Control surface — the bottom-panel deck. Mix strips, analog gauges,
+   * pad grids that breathe with the meter bus, and homage racks (LPD8 and
+   * friends). Chrome: emits existing mix/launch commands.
    */
   import { ROLL_RESIZE } from "../../utils/panel-resize";
   import {
@@ -12,11 +12,9 @@
     meterTrackId,
     type SurfaceWidget,
   } from "../../utils/control-surface";
-  import { formatDb, formatPan } from "../../utils/format";
-  import { GAIN_MAX, GAIN_MIN, surface } from "../../state/surface.svelte";
+  import { surface } from "../../state/surface.svelte";
   import { midi } from "../../state/midi.svelte";
   import { project } from "../../state/project.svelte";
-  import { plugins } from "../../state/plugins.svelte";
   import { ui } from "../../state/ui.svelte";
   import PanelResizeHandle from "../PanelResizeHandle.svelte";
   import Knob from "../controls/Knob.svelte";
@@ -30,6 +28,7 @@
   import ChannelStrip from "./ChannelStrip.svelte";
   import ClipList from "./ClipList.svelte";
   import PadGrid from "./PadGrid.svelte";
+  import Rack from "./Rack.svelte";
 
   const page = $derived(activePage(surface.layout));
   const grouped = $derived(groupWidgets(page));
@@ -43,35 +42,6 @@
     const t = widget.target;
     if (!t || !("trackId" in t)) return undefined;
     return project.trackById(t.trackId);
-  }
-
-  function numericValue(widget: SurfaceWidget): { value: number; min: number; max: number; format?: (v: number) => string; bipolar?: boolean; resetTo?: number } | null {
-    const t = widget.target;
-    if (!t) return null;
-    if (t.kind === "trackGain") {
-      const tr = project.trackById(t.trackId);
-      if (!tr) return null;
-      return { value: tr.gainDb, min: GAIN_MIN, max: GAIN_MAX, format: formatDb, resetTo: 0 };
-    }
-    if (t.kind === "trackPan") {
-      const tr = project.trackById(t.trackId);
-      if (!tr) return null;
-      return { value: tr.pan, min: -1, max: 1, format: formatPan, bipolar: true, resetTo: 0 };
-    }
-    if (t.kind === "pluginParam") {
-      const p = plugins.paramCache[t.instanceId]?.find((x) => x.id === t.paramId);
-      if (!p) return null;
-      return { value: p.value, min: p.min, max: p.max, resetTo: p.default };
-    }
-    return null;
-  }
-
-  function writeNumeric(widget: SurfaceWidget, v: number) {
-    const t = widget.target;
-    if (!t) return;
-    if (t.kind === "trackGain") surface.writeGain(t.trackId, v);
-    else if (t.kind === "trackPan") surface.writePan(t.trackId, v);
-    else if (t.kind === "pluginParam") surface.writePluginParam(t.instanceId, t.paramId, v);
   }
 
   function pressPad(widget: SurfaceWidget) {
@@ -123,7 +93,7 @@
 
   <header class="head">
     <BottomPanelTabs current="surface" />
-    <span class="silk title">{page.templateId === "lpd8" ? "LPD8" : page.name}</span>
+    <span class="silk title">{page.name}</span>
     <AddMenu />
     <button
       class="mode mono"
@@ -135,70 +105,23 @@
     </button>
   </header>
 
-  <div class="deck" class:lpd8={page.templateId === "lpd8"}>
-    {#if page.templateId === "lpd8"}
-      <div class="lpd8-face grain">
-        <div class="brand">
-          <span class="wordmark">AURA</span>
-          <span class="model silk">LPD8</span>
-        </div>
-        <div class="lpd8-body">
-        <div class="prog">
-          {#each ["PROG", "PAD", "CC", "NOTE"] as lamp (lamp)}
-            <span class="proglamp silk">{lamp}</span>
-          {/each}
-        </div>
-        <div class="knob-grid">
-          {#each page.widgets.filter((w) => w.kind === "knob") as w, i (w.id)}
-            {@const num = numericValue(w)}
-            <div class="knob-slot">
-              {#if surface.editMode}
-                <button
-                  class="tool"
-                  type="button"
-                  title="Bind this knob"
-                  aria-label="Bind knob {i + 1}"
-                  onclick={() => surface.toggleBind(w.id)}>⌖</button
-                >
-              {/if}
-              <Knob
-                value={num?.value ?? 0}
-                min={num?.min ?? GAIN_MIN}
-                max={num?.max ?? GAIN_MAX}
-                resetTo={num?.resetTo}
-                label={w.label}
-                format={num?.format}
-                ariaLabel={w.label}
-                size={36}
-                oninput={(v) => writeNumeric(w, v)}
-                onstart={() => surface.openGesture("gain drag")}
-                onend={() => surface.closeGesture()}
-              />
-              {#if surface.editMode && !w.target}
-                <span class="silk ghost">K{i + 1}</span>
-              {/if}
-              {#if surface.editMode && surface.bindFor === w.id}
-                <BindPicker widget={w} />
-              {/if}
-            </div>
-          {/each}
-        </div>
-        {#each page.widgets.filter((w) => w.kind === "padGrid") as w (w.id)}
-          <PadGrid widget={w} edit={surface.editMode} />
-        {/each}
-        </div>
-      </div>
-    {:else if empty}
+  <div class="deck">
+    {#if empty}
       <div class="empty">
         <p class="lead">A mixer and a pad deck. Built from this project in one click.</p>
         <div class="cta">
           <button class="raised" type="button" onclick={() => surface.choose("recipe:all")}>Add all</button>
           <button class="raised" type="button" onclick={() => surface.choose("recipe:tracks")}>Add all tracks</button>
           <button class="raised" type="button" onclick={() => surface.choose("recipe:clips")}>Add all clips</button>
-          <button class="raised" type="button" onclick={() => surface.choose("template:lpd8")}>AKAI LPD8</button>
+          <button class="raised" type="button" onclick={() => surface.choose("rack:lpd8")}>AKAI LPD8</button>
         </div>
       </div>
     {:else}
+      <div class="racks">
+        {#each grouped.racks as rack (rack.groupId)}
+          <Rack device={rack.device} groupId={rack.groupId} widgets={rack.widgets} edit={surface.editMode} />
+        {/each}
+      </div>
       <div class="strips">
         {#each grouped.strips as widgets (widgets[0]?.groupId)}
           {@const t = trackOf(widgets.find((w) => w.target && "trackId" in w.target) ?? widgets[0])}
@@ -259,9 +182,11 @@
                     else void surface.writeArm(tr.id, !tr.armed);
                   }}
                 />
-              {:else if w.kind === "fader"}
-                {@const num = numericValue(w)}
-                {#if num}
+              {:else if w.kind === "fader" || w.kind === "knob"}
+                {@const num = surface.numeric(w)}
+                {#if !num}
+                  <span class="silk ghost">{w.label}</span>
+                {:else if w.kind === "fader"}
                   <Fader
                     value={num.value}
                     min={num.min}
@@ -270,16 +195,11 @@
                     label={w.label}
                     format={num.format}
                     ariaLabel={w.label}
-                    oninput={(v) => writeNumeric(w, v)}
+                    oninput={(v) => surface.write(w, v)}
                     onstart={() => surface.openGesture("fader drag")}
                     onend={() => surface.closeGesture()}
                   />
                 {:else}
-                  <span class="silk ghost">{w.label}</span>
-                {/if}
-              {:else if w.kind === "knob"}
-                {@const num = numericValue(w)}
-                {#if num}
                   <Knob
                     value={num.value}
                     min={num.min}
@@ -289,12 +209,10 @@
                     label={w.label}
                     format={num.format}
                     ariaLabel={w.label}
-                    oninput={(v) => writeNumeric(w, v)}
+                    oninput={(v) => surface.write(w, v)}
                     onstart={() => surface.openGesture("knob drag")}
                     onend={() => surface.closeGesture()}
                   />
-                {:else}
-                  <span class="silk ghost">{w.label}</span>
                 {/if}
               {/if}
               {#if surface.editMode && surface.bindFor === w.id}
@@ -356,6 +274,7 @@
     gap: 14px;
     align-items: flex-start;
   }
+  .racks,
   .strips,
   .loose {
     display: flex;
@@ -415,13 +334,6 @@
   .tool:hover {
     color: var(--cyan);
   }
-  .knob-slot {
-    position: relative;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-  }
   .kill:hover {
     color: var(--red);
   }
@@ -429,60 +341,4 @@
     color: var(--text-faint);
   }
 
-  .lpd8-face {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-    padding: 16px 20px 14px;
-    border-radius: 10px;
-    background-color: var(--bg-1);
-    background-image: var(--sheen-face);
-    box-shadow: var(--bevel-raised), var(--relief-3);
-    width: max-content;
-    max-width: 100%;
-  }
-  .brand {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding: 0 4px;
-  }
-  .wordmark {
-    font-family: var(--font-ui);
-    font-weight: 700;
-    letter-spacing: 0.28em;
-    font-size: 13px;
-    color: var(--text);
-  }
-  .model {
-    letter-spacing: 0.32em;
-    color: var(--text-dim);
-  }
-  /* The device is landscape: a column of mode buttons on the far left, 8
-     knobs in 2×4 beside them, the 4×2 pad block on the right. A single row
-     of eight knobs above the pads is a different instrument. */
-  .lpd8-body {
-    display: flex;
-    align-items: center;
-    gap: 18px;
-  }
-  .knob-grid {
-    display: grid;
-    grid-template-columns: repeat(4, auto);
-    gap: 10px 12px;
-    justify-items: center;
-  }
-  .prog {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    flex: none;
-  }
-  .proglamp {
-    padding: 3px 8px;
-    border-radius: 2px;
-    background: var(--bg-sunken);
-    box-shadow: var(--bevel-inset);
-    color: var(--text-faint);
-  }
 </style>

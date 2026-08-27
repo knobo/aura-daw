@@ -11,14 +11,17 @@ import { backend } from "../tauri";
 import type { TargetRef } from "../types/ipc";
 import {
   activePage,
+  addRack,
   addRecipe,
   bindOptions,
   cellOptions,
   addStrip,
   addWidget,
-  applyTemplate,
   bindWidget,
+  clearPage,
+  deviceById,
   emptyLayout,
+  pageHasStrip,
   parseLayout,
   removeGroup,
   removeWidget,
@@ -36,9 +39,10 @@ import {
   type SurfaceLayout,
   type SurfacePluginParam,
   type SurfaceTarget,
-  type SurfaceTemplateId,
+  type SurfaceWidget,
   type SurfaceWidgetKind,
 } from "../utils/control-surface";
+import { formatDb, formatPan } from "../utils/format";
 import { buildMatrix } from "../utils/automation-matrix";
 import { launch } from "./launch.svelte";
 import { midi } from "./midi.svelte";
@@ -167,13 +171,23 @@ class SurfaceStore {
       this.editMode = true;
       return;
     }
-    if (id.startsWith("template:")) {
-      this.commit(applyTemplate(this.layout, id.slice("template:".length) as SurfaceTemplateId, ctx));
-      this.editMode = id === "template:blank";
+    if (id.startsWith("rack:")) {
+      const device = deviceById(id.slice("rack:".length));
+      if (!device) return;
+      // Appended, never applied: a rack is an object on the page, so whatever
+      // was already there survives — and edit mode is left as the user set it.
+      this.commit(addRack(this.layout, device, ctx));
+      return;
+    }
+    if (id === "clear") {
+      this.commit(clearPage(this.layout));
+      this.editMode = true;
       return;
     }
     if (id === "strip") {
-      const first = ctx.tracks.find((t) => t.kind !== "automation");
+      // The first track that has no strip yet — not simply the first track,
+      // which would be a menu item that silently does nothing once it does.
+      const first = ctx.tracks.find((t) => t.kind !== "automation" && !pageHasStrip(this.page, t.id));
       if (!first) return;
       this.commit(addStrip(this.layout, first));
       this.editMode = true;
@@ -189,6 +203,11 @@ class SurfaceStore {
   }
 
   removeStrip(groupId: string) {
+    this.commit(removeGroup(this.layout, groupId));
+  }
+
+  /** A rack comes off as a unit, the same way a strip does. */
+  removeRack(groupId: string) {
     this.commit(removeGroup(this.layout, groupId));
   }
 
@@ -227,6 +246,39 @@ class SurfaceStore {
 
   setMode(widgetId: string, mode: PadMode) {
     this.commit(setPadMode(this.layout, widgetId, mode));
+  }
+
+  /**
+   * What a numeric widget shows, from whatever it points at. Lives here
+   * rather than in the panel because a rack faceplate reads the same knobs.
+   */
+  numeric(widget: SurfaceWidget): NumericBinding | null {
+    const t = widget.target;
+    if (!t) return null;
+    if (t.kind === "trackGain") {
+      const tr = project.trackById(t.trackId);
+      if (!tr) return null;
+      return { value: tr.gainDb, min: GAIN_MIN, max: GAIN_MAX, format: formatDb, resetTo: 0 };
+    }
+    if (t.kind === "trackPan") {
+      const tr = project.trackById(t.trackId);
+      if (!tr) return null;
+      return { value: tr.pan, min: -1, max: 1, format: formatPan, bipolar: true, resetTo: 0 };
+    }
+    if (t.kind === "pluginParam") {
+      const p = plugins.paramCache[t.instanceId]?.find((x) => x.id === t.paramId);
+      if (!p) return null;
+      return { value: p.value, min: p.min, max: p.max, resetTo: p.default };
+    }
+    return null;
+  }
+
+  write(widget: SurfaceWidget, v: number) {
+    const t = widget.target;
+    if (!t) return;
+    if (t.kind === "trackGain") this.writeGain(t.trackId, v);
+    else if (t.kind === "trackPan") this.writePan(t.trackId, v);
+    else if (t.kind === "pluginParam") this.writePluginParam(t.instanceId, t.paramId, v);
   }
 
   /**
@@ -363,6 +415,16 @@ class SurfaceStore {
     await launch.stopOverlay();
   }
 
+}
+
+/** Value plus range for whatever a knob or fader is pointed at. */
+export interface NumericBinding {
+  value: number;
+  min: number;
+  max: number;
+  format?: (v: number) => string;
+  bipolar?: boolean;
+  resetTo?: number;
 }
 
 function clamp(v: number, lo: number, hi: number): number {
