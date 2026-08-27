@@ -50,18 +50,18 @@ neighbouring defects fell out of driving the real panel:
   so with a rack on the page the `Channel strip` menu item silently did
   nothing. It refuses only a second **strip** now, and `choose("strip")`
   picks the first track without one rather than always the first track.
+- A `Fader` label wider than its 36px unit overflowed onto its neighbour.
+  Invisible while every caller passed `"LEVEL"`; unmissable with eight
+  track names over an MCU. Clamped in `Fader.svelte` — `min-width: 0` is
+  the load-bearing half, since a flex item's automatic minimum size beats
+  `max-width` on its own — and a rack widens the unit via `--fader-w`.
+
 Owner review on the branch: the device rows belong **one level down**. Four
 devices in a list meant to grow made the `+` menu seventeen rows against the
 bottom edge of the window, so `Add rack ›` drills into them and `‹ RACK`
 (or Escape) comes back. A drill-down rather than a side-opening flyout: the
 popover is already height-capped against that edge, and a second one hanging
 off its side would fight for the same room.
-
-- A `Fader` label wider than its 36px unit overflowed onto its neighbour.
-  Invisible while every caller passed `"LEVEL"`; unmissable with eight
-  track names over an MCU. Clamped in `Fader.svelte` — `min-width: 0` is
-  the load-bearing half, since a flex item's automatic minimum size beats
-  `max-width` on its own — and a rack widens the unit via `--fader-w`.
 
 ## Where this track goes next
 
