@@ -102,18 +102,24 @@ pub fn build_graph(
         n_slots,
         crate::audio::types::send_slot_count(&store.tracks),
     ));
+    // The compiler's one input (Plan V1): built once, before any compiler
+    // call, so `compile_inserts` below and `compile_routing` (Task 4) read
+    // the SAME slice. `mix_nodes` is total and order-preserving, so
+    // zipping it against `store.tracks` by position below is exact (see
+    // `node::mix_nodes`'s doc and `mix_nodes_is_total_and_order_preserving`).
+    let nodes = crate::audio::node::mix_nodes(&store.tracks);
     let mut tracks: Vec<RtTrack> = Vec::with_capacity(n_slots);
-    for t in &store.tracks {
+    for (t, node) in store.tracks.iter().zip(&nodes) {
         let Some(&slot) = slots.get(&t.id) else { continue };
-        params.set_gain_linear(slot, mixer::db_to_linear(t.gain_db));
-        params.set_pan(slot, t.pan as f32);
-        params.set_flag(slot, FLAG_MUTE, t.muted);
-        params.set_flag(slot, FLAG_SOLO, t.soloed);
-        for snd in &t.sends {
+        params.set_gain_linear(slot, mixer::db_to_linear(node.gain_db));
+        params.set_pan(slot, node.pan as f32);
+        params.set_flag(slot, FLAG_MUTE, node.muted);
+        params.set_flag(slot, FLAG_SOLO, node.soloed);
+        for snd in &node.sends {
             let Some(&idx) = send_slots.get(&snd.id) else { continue };
             params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
         }
-        if crate::audio::types::is_bus_track(t) {
+        if node.is_bus() {
             // Fed by sends, compiled into `RtGraph::buses` below — no
             // source row (Plan G2), exactly as in `engine::rebuild`.
             continue;
@@ -151,7 +157,9 @@ pub fn build_graph(
 
     // Midi tracks as LIVE instrument nodes — a private registry, so the
     // cells are fresh (deterministic voice state) and exclusively ours.
-    let mut nodes = LiveNodeRegistry::default();
+    // (Named `live_nodes`, not `nodes`: that name is now the compiled
+    // `MixNode` slice built above.)
+    let mut live_nodes = LiveNodeRegistry::default();
     append_from(
         &crate::control::snapshot::MidiSnapshot::from_store(midi),
         &store.tracks,
@@ -174,7 +182,7 @@ pub fn build_graph(
         // master entirely, MUTE the track — mute is document state and does
         // travel.
         &crate::midi_out::RoutedOut::default(),
-        &mut nodes,
+        &mut live_nodes,
         &mut tracks,
     );
 
@@ -201,7 +209,7 @@ pub fn build_graph(
     // concurrently.
     let mut insert_nodes = crate::audio::insert::InsertNodeRegistry::default();
     let (mut chains, failed) =
-        crate::audio::insert::compile_inserts(&store.tracks, plugins, rate, &mut insert_nodes);
+        crate::audio::insert::compile_inserts(&nodes, plugins, rate, &mut insert_nodes);
     if !failed.is_empty() {
         log::warn!(
             "offline render: {} insert instance(s) could not be hosted for this bounce and \

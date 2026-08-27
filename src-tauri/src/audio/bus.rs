@@ -402,6 +402,7 @@ pub fn would_cycle(tracks: &[TrackState], from: &TrackId, to: &TrackId) -> bool 
 mod tests {
     use super::*;
     use crate::audio::insert::{compile_inserts, GainHalfEffect, InsertNodeRegistry, LatencyDummy};
+    use crate::audio::node::mix_nodes;
     use crate::audio::types::{derive_send_slots, derive_slots, SendSlot};
     use crate::control::session::PluginDoc;
 
@@ -784,7 +785,8 @@ mod tests {
             )
             .expect("seed the verb insert");
 
-        let (mut chains, failed) = compile_inserts(&tracks, &plugins, RATE, &mut nodes);
+        let mix_nodes_list = mix_nodes(&tracks);
+        let (mut chains, failed) = compile_inserts(&mix_nodes_list, &plugins, RATE, &mut nodes);
         assert!(failed.is_empty(), "every instance above is pre-seeded in the registry");
 
         let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);

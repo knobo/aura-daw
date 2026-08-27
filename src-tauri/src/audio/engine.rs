@@ -1816,8 +1816,11 @@ impl Control {
             // row per track (G-7: one instance, one slot, one node — a
             // second attachment would run the same processor twice per
             // block).
+            // The compiler's one input (Plan V1): built once here so Task 4
+            // can hand the SAME slice to `compile_routing` a few lines down.
+            let nodes = crate::audio::node::mix_nodes(&s.tracks);
             let (mut compiled, failed) = crate::audio::insert::compile_inserts(
-                &s.tracks,
+                &nodes,
                 &s.plugins,
                 self.cache_rate,
                 &mut self.insert_nodes,
