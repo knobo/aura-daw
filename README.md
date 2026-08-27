@@ -516,9 +516,9 @@ npx svelte-check              # frontend type checking
 npm run build                 # production frontend build
 ```
 
-- **Counts, measured 2026-08-26:** 1440 backend (1397 lib + 43 integration,
-  2 `#[ignore]`d plugin repros, 16 plugin-gated tests skipped) and 1295
-  frontend across 118 files. Pin `PULSE_SINK` to an ALSA sink — see
+- **Counts, measured 2026-08-27:** 1450 backend (1407 lib + 43 integration,
+  2 `#[ignore]`d plugin repros, 16 plugin-gated tests skipped) and 1383
+  frontend across 126 files. Pin `PULSE_SINK` to an ALSA sink — see
   [`CONTRIBUTING.md`](CONTRIBUTING.md), a Bluetooth default sink fails 18
   engine tests in a way that does not look like an audio problem.
 - **Plugin-gated tests** (Zyn acceptance, CLAP lifecycle, state round-trips,

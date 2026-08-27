@@ -184,9 +184,12 @@ unchanged. Paste that line of output into the task report.
 - [ ] Update both call sites to pass the `nodes` slice built in Task 3.
 - [ ] Convert `bus.rs`'s tests to build `MixNode`s (a small local helper is
       fine). **Assertions unchanged** — the DAG/cycle tests especially.
-- [ ] Confirm no `TrackState` remains in either compiler's signature or
-      body: `grep -n TrackState src-tauri/src/audio/bus.rs
-      src-tauri/src/audio/insert.rs` returns nothing.
+- [ ] Confirm no `TrackState` remains in `compile_inserts`'s or
+      `compile_routing`'s signature or body — not a whole-file grep, since
+      `bus::would_cycle` legitimately still takes `&[TrackState]` (it is a
+      control-plane guard on document rows, not a graph compiler; see its
+      doc comment) and a `grep -n TrackState` over the whole file would
+      never return nothing. Read the two compiler functions instead.
 - [ ] Gate: full Rust suite green, hash test included, plus
       `timeout 300 npx vitest run` (expected untouched, run anyway — the
       backlog's gate says *every* existing test).

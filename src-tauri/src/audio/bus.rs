@@ -374,6 +374,14 @@ fn topological_order(
 /// only meaningful through an explicit one-block delay node
 /// (`SCALABILITY` §1) and there isn't one, so the answer is "reject", not
 /// "insert a delay".
+///
+/// Deliberately `&[TrackState]`, not `&[MixNode]` (Plan V V1). This answers
+/// "would writing this edge close a loop" about document rows, before the
+/// edge is written — a control-plane question. `MixNode` is what the graph
+/// compiler reads afterwards, once the document is settled. Converting this
+/// to `MixNode` would push a compiler type into the control plane and make
+/// every edge validation allocate a node list to answer a question about
+/// tracks. Plan V's V2 revisits this once players become edge endpoints.
 pub fn would_cycle(tracks: &[TrackState], from: &TrackId, to: &TrackId) -> bool {
     if from == to {
         return true;
