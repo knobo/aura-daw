@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Profile a real session under plugin load (§8.4) | `perf/plugin-load-profile` | 2026-08-27 | Headless harness in `src-tauri/tests/`; answer lands as `GAP_ANALYSIS.md` §9 |
 
 ## Next up — unclaimed
 
