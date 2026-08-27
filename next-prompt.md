@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Plan V — V1: `MixNode` as the compiler's input | `feat/mixnode-compile-input` | 2026-08-27 | Behaviour-neutral refactor; gate is the whole suite plus a byte-identical bounce. |
 
 ## Next up — unclaimed
 
