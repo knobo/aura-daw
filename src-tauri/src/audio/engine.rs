@@ -1832,7 +1832,7 @@ impl Control {
             // source-track chains that still want a row. See `audio::bus`
             // for why the dry path and the sends wait different amounts.
             let plan = crate::audio::bus::compile_routing(
-                &s.tracks,
+                &nodes,
                 &slots_s,
                 &mut compiled,
                 slots_s.len(),

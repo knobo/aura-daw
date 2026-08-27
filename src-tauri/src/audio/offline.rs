@@ -220,7 +220,7 @@ pub fn build_graph(
         );
     }
     let plan = crate::audio::bus::compile_routing(
-        &store.tracks,
+        &nodes,
         &slots,
         &mut chains,
         n_slots,

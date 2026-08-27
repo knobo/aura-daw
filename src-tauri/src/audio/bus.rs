@@ -59,9 +59,10 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::audio::insert::InsertNode;
+use crate::audio::node::MixNode;
 use crate::audio::pdc::{compile_pdc, DelayLine};
 use crate::audio::rt::{RtBus, RtSend};
-use crate::audio::types::{is_bus_track, is_mixer_track, TrackState};
+use crate::audio::types::TrackState;
 use crate::ids::TrackId;
 
 /// One send edge as PLANNED — still carrying its document identity.
@@ -140,16 +141,16 @@ struct Node {
 /// rows. `n_slots` sizes the per-slot vectors and `max_block` the delay
 /// lines (allocated here, on the control thread).
 pub fn compile_routing(
-    tracks: &[TrackState],
+    tracks: &[MixNode],
     slots: &HashMap<TrackId, usize>,
     chains: &mut HashMap<TrackId, Vec<InsertNode>>,
     n_slots: usize,
     max_block: usize,
 ) -> RoutingPlan {
     // ---- bus identity, in document order for now ------------------------
-    let bus_docs: Vec<&TrackState> = tracks
+    let bus_docs: Vec<&MixNode> = tracks
         .iter()
-        .filter(|t| is_bus_track(t) && slots.contains_key(&t.id))
+        .filter(|t| t.is_bus() && slots.contains_key(&t.id))
         .collect();
     let doc_index: HashMap<&TrackId, usize> =
         bus_docs.iter().enumerate().map(|(i, t)| (&t.id, i)).collect();
@@ -160,8 +161,8 @@ pub fn compile_routing(
     let resolve = |dest: Option<&TrackId>| dest.and_then(|d| doc_index.get(d).copied());
     let mut nodes: Vec<Node> = Vec::new();
     let mut node_of_bus: Vec<usize> = vec![usize::MAX; bus_docs.len()];
-    for t in tracks.iter().filter(|t| is_mixer_track(t) && slots.contains_key(&t.id)) {
-        if is_bus_track(t) {
+    for t in tracks.iter().filter(|t| t.takes_mixer_slot() && slots.contains_key(&t.id)) {
+        if t.is_bus() {
             node_of_bus[doc_index[&t.id]] = nodes.len();
         }
         nodes.push(Node {
@@ -199,7 +200,7 @@ pub fn compile_routing(
     // Source alignment (Plan G1's PDC) over the source tracks only.
     let mut declared = vec![0usize; n_slots];
     let mut applied = vec![0usize; n_slots];
-    for t in tracks.iter().filter(|t| is_mixer_track(t) && !is_bus_track(t)) {
+    for t in tracks.iter().filter(|t| t.takes_mixer_slot() && !t.is_bus()) {
         let Some(&slot) = slots.get(&t.id) else { continue };
         if slot >= n_slots {
             continue;
@@ -327,7 +328,7 @@ pub fn compile_routing(
 /// terminal strip. The control plane rejects cycles before they get here;
 /// this is the defence for a hand-edited `project.json`, not the policy.
 fn topological_order(
-    bus_docs: &[&TrackState],
+    bus_docs: &[&MixNode],
     nodes: &[Node],
     node_of_bus: &[usize],
 ) -> Vec<usize> {
@@ -448,7 +449,8 @@ mod tests {
         let slots = derive_slots(&tracks);
         let send_slots = derive_send_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.buses.len(), 1);
         assert_eq!(plan.buses[0].slot, slots["b"]);
         let edges = &plan.sends["a"];
@@ -465,7 +467,8 @@ mod tests {
         let tracks = vec![a, track("c", "audio")];
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert!(plan.buses.is_empty());
         assert!(plan.sends.is_empty(), "the row survives in the document, the wire does not");
     }
@@ -479,7 +482,8 @@ mod tests {
         let tracks = vec![b];
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.buses.len(), 1);
         assert_eq!(plan.buses[0].output, None, "the self-output falls back to the master");
         assert!(plan.sends.is_empty(), "and the self-send is not a wire");
@@ -495,7 +499,8 @@ mod tests {
         let mut chains = HashMap::new();
         chains.insert("a".into(), latency_chain(0, false));
         chains.insert("b".into(), latency_chain(0, false));
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.buses[0].inserts.len(), 1, "the bus keeps its chain");
         assert!(!chains.contains_key(&crate::ids::TrackId::from("b")), "and only the bus's");
         assert!(chains.contains_key(&crate::ids::TrackId::from("a")));
@@ -513,7 +518,8 @@ mod tests {
         ];
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.output[slots["a"]], Some(0), "a goes through the bus");
         assert_eq!(plan.output[slots["c"]], None, "a missing destination is the master");
         assert_eq!(plan.output[slots["d"]], None, "and so is a destination that is not a bus");
@@ -527,7 +533,8 @@ mod tests {
         let tracks = vec![track("mix", "bus"), routed("drums", "bus", Some("mix"))];
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(
             plan.bus_ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(),
             ["drums", "mix"],
@@ -545,7 +552,8 @@ mod tests {
         let tracks = vec![track("late", "bus"), early];
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.bus_ids.iter().map(|i| i.as_str()).collect::<Vec<_>>(), ["early", "late"]);
         assert_eq!(plan.sends["early"][0].bus, 1, "forward, into the later strip");
     }
@@ -562,7 +570,8 @@ mod tests {
         ];
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         let mut ids: Vec<&str> = plan.bus_ids.iter().map(|i| i.as_str()).collect();
         ids.sort();
         assert_eq!(ids, ["x", "y", "z"], "a permutation, no strip dropped or duplicated");
@@ -597,7 +606,8 @@ mod tests {
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
         chains.insert("verb".into(), latency_chain(256, false));
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.out_delay[slots["a"]], 256, "the dry path waits for the return");
         assert_eq!(plan.sends["a"][0].delay, 0, "the copy leaves immediately");
         assert_eq!(
@@ -618,7 +628,8 @@ mod tests {
         let mut chains = HashMap::new();
         chains.insert("slow".into(), latency_chain(256, false));
         chains.insert("fast".into(), latency_chain(64, false));
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         let pos = |id: &str| plan.bus_ids.iter().position(|b| b.as_str() == id).unwrap();
         assert_eq!(plan.out_delay[slots["a"]], 256, "the dry path waits for the slowest return");
         assert_eq!(
@@ -651,7 +662,8 @@ mod tests {
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
         chains.insert("drums".into(), latency_chain(256, false));
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         let pos = |id: &str| plan.bus_ids.iter().position(|b| b.as_str() == id).unwrap();
         assert_eq!(plan.out_delay[slots["kick"]], 0, "nothing at the drum bus's input is slow");
         assert_eq!(
@@ -676,7 +688,8 @@ mod tests {
         let slots = derive_slots(&tracks);
         let mut chains = HashMap::new();
         chains.insert("b".into(), latency_chain(256, true));
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let nodes = mix_nodes(&tracks);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
         assert_eq!(plan.out_delay[slots["a"]], 256, "declared latency sets the target");
         assert_eq!(
             plan.buses[0].out_pdc.as_ref().map_or(0, |d| d.delay()),
@@ -789,7 +802,7 @@ mod tests {
         let (mut chains, failed) = compile_inserts(&mix_nodes_list, &plugins, RATE, &mut nodes);
         assert!(failed.is_empty(), "every instance above is pre-seeded in the registry");
 
-        let plan = compile_routing(&tracks, &slots, &mut chains, slots.len(), 512);
+        let plan = compile_routing(&mix_nodes_list, &slots, &mut chains, slots.len(), 512);
 
         // ---- bus order: drums (a producer of mix) and verb (no producer)
         // both have indegree 0 and come out in document order; mix comes
