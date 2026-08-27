@@ -5,6 +5,14 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## Plan V — players (a pad that is an instrument)
+
+One cut landed, seven staged behind it: [`backlog/plan-v-players.md`](backlog/plan-v-players.md).
+
+| What | Where |
+|---|---|
+| **V1 — `MixNode` as the graph compiler's input.** `compile_inserts` and `compile_routing` stop reading `TrackState` and take `&[MixNode]` instead; tracks and buses become two producers of one node type (`audio/node.rs`, `From<&TrackState>` + `mix_nodes()`). Behaviour-neutral by construction: two characterization gates were written and hashed BEFORE the refactor and are still green, unedited, after it — `audio::offline::tests::bounce_of_a_full_strip_is_byte_stable` (a rendered bounce exercising clip + bus + send + output + gain/pan, FNV-1a-64 over the samples) and `audio::bus::tests::routing_plan_of_a_full_strip_is_stable` (the exact routing plan — `track_pdc`, `out_delay`, `output`, `bus_ids`, send delays — with a bypassed insert live so declared PDC ≠ applied PDC). `bus::would_cycle` deliberately keeps `&[TrackState]`: it is a control-plane guard answering "would this edge close a loop" about document rows before the edge is written, not a graph-compiler input; see its doc comment. No new IPC, no document change, no schema bump. | PR #118. Backlog: [`backlog/plan-v-players.md`](backlog/plan-v-players.md) |
+
 ## Plugin manager and native floating GUI
 
 Two PRs, one track. Details, scope calls and what is left:

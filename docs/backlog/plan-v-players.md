@@ -1,6 +1,6 @@
 # Backlog: Plan V — players (a pad that is an instrument)
 
-**Opened 2026-08-26.** No branch yet — V1 is unclaimed.
+**Opened 2026-08-26.** V1 landed 2026-08-27 (PR #118) — V2 is unclaimed.
 
 Design + rulings V-1…V-12: [`docs/superpowers/specs/2026-08-26-plan-v-players-design.md`](../superpowers/specs/2026-08-26-plan-v-players-design.md).
 Audit of what the engine already has: [`docs/research/13-players-and-performance.md`](../research/13-players-and-performance.md).
@@ -23,8 +23,8 @@ tracks (§8.5) and per-voice modulation (§8.8). Plan V builds those arms.
 
 | Cut | What | State |
 |---|---|---|
-| **V1** | `MixNode` as the compiler's input; tracks and buses become producers. Behaviour-neutral. | **unclaimed — start here** |
-| V2 | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | blocked on V1 |
+| **V1** | `MixNode` as the compiler's input; tracks and buses become producers. Behaviour-neutral. | landed — PR #118 |
+| **V2** | One player, real: document + ops, graph slot, audio/MIDI sources, own playhead, one-shot/gate/loop, `player_fire`/`player_stop`. Retires the overlay; migrates launch bindings. | **unclaimed — start here** |
 | V3 | Polyphony: voice cap, choke groups, quantized start, velocity → gain. | blocked on V2 |
 | V4 | Per-node automation clock; modulation §8.1 ports. | blocked on V2 (V3 not required) |
 | V5 | Macros (§8.3): document rows, cycle check, surface knobs bound through them. | blocked on V4 |
@@ -35,32 +35,40 @@ tracks (§8.5) and per-voice modulation (§8.8). Plan V builds those arms.
 **Do not merge cuts.** Each one is a foundation; V1 exists precisely so V2
 is not also a refactor.
 
-## V1 — `MixNode` (unclaimed, start here)
+## V1 — `MixNode` (landed, PR #118)
 
 **Goal.** One node type is what the graph compiler takes as input. `Track`,
-`Bus` and later `Player` are producers of it. Nothing observable changes.
+`Bus` and later `Player` are producers of it. Nothing observable changed.
 
 **Why first.** V2 needs a node that is not a track (ruling V-2), and the
-cheapest way to get one is to stop `compile_routing`, `compile_inserts` and
-`compile_pdc` from reading `TrackState` directly. Done alone, with the whole
-suite plus the bounce as the gate, it is provably behaviour-neutral — which
+cheapest way to get one was to stop `compile_routing` and `compile_inserts`
+from reading `TrackState` directly. Done alone, with the whole suite plus a
+bounce-identity hash as the gate, it is provably behaviour-neutral — which
 is exactly the property that makes V2 reviewable.
 
 **Shape.** `MixNode { id, kind, gain_db, pan, muted, soloed, inserts, sends,
-output, flags }` in `audio/`, produced by `From<&TrackState>` and the bus
-path. The RT graph, `ParamTable` and the mixer do **not** change: they
-already think in slots and flags.
+output }` in `audio/node.rs`, produced by `From<&TrackState>` and
+`mix_nodes()`. The RT graph, `ParamTable` and the mixer did **not** change:
+they already think in slots and flags. `compile_inserts` and
+`compile_routing` now take `&[MixNode]`; `bus::would_cycle` deliberately
+still takes `&[TrackState]` — see its doc comment.
 
-**Gate.**
-- Every existing Rust and frontend test green, unchanged.
-- A bounce of the demo project is **byte-identical** before and after (this
-  is the real gate; record the WAV hash in the PR).
-- `bus::compile_routing`'s DAG/cycle tests untouched and passing.
-- No new IPC, no document change, no schema bump.
+**Gate — V2's inherited gate.** Two characterization tests, written and
+hashed BEFORE the refactor, still green and unedited after it:
+- `audio::offline::tests::bounce_of_a_full_strip_is_byte_stable` — a
+  rendered bounce (clip + bus + send + output + gain/pan) hashed
+  FNV-1a-64, hardcoded in the test.
+- `audio::bus::tests::routing_plan_of_a_full_strip_is_stable` — the exact
+  routing plan (`track_pdc`, `out_delay`, `output`, `bus_ids`, send
+  delays), with a bypassed insert so declared PDC ≠ applied PDC is live.
 
-**Trap.** `TrackState` carries timeline fields (`automationMode`, clips, arm)
-that a `MixNode` must not inherit — if `MixNode` grows a `clips` field, V1
-has failed and V2 will inherit the hidden-track trap (research §4).
+Plus: every existing Rust and frontend test green, unchanged; no new IPC,
+no document change, no schema bump.
+
+**Trap (closed).** `TrackState` carries timeline fields (`automationMode`,
+clips, arm) that `MixNode` must not inherit — it does not: no `clips`
+field, no serde. If a later cut adds one, V1's guarantee is broken and V2
+inherits the hidden-track trap (research §4).
 
 ## V2 — one player, real
 

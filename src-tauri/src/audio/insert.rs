@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::audio::dsp::AudioProcessor;
 #[cfg(test)]
 use crate::audio::dsp::{Effect, ProcessBlock};
-use crate::audio::types::TrackState;
+use crate::audio::node::MixNode;
 use crate::control::session::PluginDoc;
 use crate::ids::TrackId;
 
@@ -145,7 +145,7 @@ impl InsertNodeRegistry {
 /// strip plays dry and the caller must surface this to the user (e.g. flip
 /// the row to `"crashed"`) rather than leaving a misleading green "active".
 pub fn compile_inserts(
-    tracks: &[TrackState],
+    tracks: &[MixNode],
     plugins: &PluginDoc,
     rate: u32,
     nodes: &mut InsertNodeRegistry,
@@ -330,7 +330,8 @@ mod tests {
             bypassed: false,
         });
         let mut nodes = InsertNodeRegistry::default();
-        let (map, _failed) = compile_inserts(&[t], &PluginDoc::default(), 48_000, &mut nodes);
+        let (map, _failed) =
+            compile_inserts(&[MixNode::from(&t)], &PluginDoc::default(), 48_000, &mut nodes);
         assert!(map.is_empty());
         assert!(nodes.is_empty());
     }
@@ -369,7 +370,7 @@ mod tests {
             bypassed: false,
         });
 
-        let (map, _failed) = compile_inserts(&[t], &plugins, 48_000, &mut nodes);
+        let (map, _failed) = compile_inserts(&[MixNode::from(&t)], &plugins, 48_000, &mut nodes);
         let chain = map.get("t1").expect("one chain for t1");
         assert_eq!(chain.len(), 1, "duplicate instance_id must compile to one node, not two");
         assert_eq!(chain[0].slot_id, "s1", "first slot in document order wins");
@@ -398,7 +399,7 @@ mod tests {
         });
 
         let mut nodes = InsertNodeRegistry::default();
-        let (map, failed) = compile_inserts(&[t], &plugins, 48_000, &mut nodes);
+        let (map, failed) = compile_inserts(&[MixNode::from(&t)], &plugins, 48_000, &mut nodes);
 
         assert!(map.is_empty(), "no node can be built for the unhostable instance");
         assert_eq!(
