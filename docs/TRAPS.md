@@ -159,6 +159,29 @@ session burns an hour on something a sentence would have prevented.
   someone wants "only through the bus", the answer is
   `TrackState.output`, not a send with the fader pulled down.
 
+- **A plugin can be silent at its own defaults, and it looks exactly like
+  a broken insert path.** `ZamEQ2` renders digital silence with no
+  parameters touched. The first run of `tests/plugin_load_profile.rs`
+  read that as "AURA's insert chain drops audio" — it is not:
+  `ZamComp`, `ZamCompX2`, `Calf Compressor`, `Calf Reverb` and `Audio
+  Gain (Stereo)` all pass audio through the same host, and
+  `lv2_host.rs` does honour `lv2:default` (there is a test asserting the
+  initial value IS the default). Before blaming the host, try a second
+  plugin.
+- **`compile_inserts` skips what it cannot host, and says so only in a
+  log line.** A refused instance leaves the strip DRY
+  (`plugins::insert_node_for` returns `None`) and a MIDI track whose
+  plugin instrument fails falls back to `PolySynth`. Both produce
+  plausible audio and plausible timings. If you are measuring anything,
+  count the compiled chains — do not trust that asking for a plugin got
+  you one.
+- **A `PluginDoc` row rebuilt by hand will resolve to no node at all.**
+  `insert_node_for` and `live_node_for` both branch on `info.format` to
+  pick the CLAP or LV2 host; a row carrying the right instance id but an
+  empty `format` matches neither, so every slot is skipped silently.
+  Pass the host's own `PluginInstanceInfo` through, do not reconstruct
+  it.
+
 ## Runtime noise that is not your bug
 
 - **If the dev log is 99% `[carla] lv2ui_extension_data(...)`, it is not

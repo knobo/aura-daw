@@ -5,6 +5,32 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## Where a block's time actually goes, under real plugin load
+
+`GAP_ANALYSIS.md` §8.4 asked for one measurement before any further
+engine performance work. It exists now:
+[`GAP_ANALYSIS.md`](GAP_ANALYSIS.md) §9, reproduced by
+`src-tauri/tests/plugin_load_profile.rs`.
+
+The premise held in direction and not in emphasis. At 32 tracks, 8 hosted
+instruments and 66 insert slots: plugin DSP **28%** of the block, AURA's
+own code **52%** — of which the per-insert host path is **25%** on its
+own, **~3 µs per insert slot**. The whole session uses **8.6% of the
+10.67 ms deadline**, so none of it is audible today (§9.3); the point is
+that the one large addressable line is ours, not the plugins'.
+
+Method: no instrumentation on the RT path. The same session renders four
+times with different plugins attached and the costs come out by
+subtraction — including a `cheap_fx` pass (same chain lengths, one
+multiply per sample) that separates host overhead from DSP without a
+profiler, which this machine cannot run (`kernel.perf_event_paranoid=4`).
+Figures are the median of three runs: §9.2 shows why the plugin-DSP
+column must never be quoted from one.
+
+| PR |
+|---|
+| PR #119 |
+
 ## Plan V — players (a pad that is an instrument)
 
 One cut landed, seven staged behind it: [`backlog/plan-v-players.md`](backlog/plan-v-players.md).

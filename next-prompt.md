@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Profile a real session under plugin load (§8.4) | `perf/plugin-load-profile` | 2026-08-27 | Headless harness in `src-tauri/tests/`; answer lands as `GAP_ANALYSIS.md` §9 |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -73,11 +73,14 @@ sentence got written — if you find a row whose branch is gone from
 4. **G1 Tasks 9–10** — insert UI polish and the handoff. The audio path
    is live in both the engine and the bounce.
    → [`docs/backlog/insert-fx-pdc.md`](docs/backlog/insert-fx-pdc.md)
-5. **Profile a real session under plugin load.** The JIT track measured
-   the fader carefully and then concluded the fader is not where a DAW's
-   CPU goes — plugins are. Nobody has measured that here. Any further
-   engine performance work should start from those numbers rather than
-   from a guess. → [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) §8.4
+5. **Profile on a weak machine.** [`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md)
+   §9 answered §8.4: on an i9-14900 a 32-track, 66-insert session uses
+   8.6% of the deadline, plugin DSP is 28% of a block and AURA's own code
+   52% — of which ~3 µs per insert slot is the one large addressable
+   line. Nothing is audible there, so the open question is not *what*
+   the time goes to but *which machine is the floor* (§9.3). Run the same
+   harness on a modest laptop. Only chase the insert path (§9.5's
+   flamegraph) if that run says a real session breaks.
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;
