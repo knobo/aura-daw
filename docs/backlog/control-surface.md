@@ -50,6 +50,13 @@ neighbouring defects fell out of driving the real panel:
   so with a rack on the page the `Channel strip` menu item silently did
   nothing. It refuses only a second **strip** now, and `choose("strip")`
   picks the first track without one rather than always the first track.
+Owner review on the branch: the device rows belong **one level down**. Four
+devices in a list meant to grow made the `+` menu seventeen rows against the
+bottom edge of the window, so `Add rack ›` drills into them and `‹ RACK`
+(or Escape) comes back. A drill-down rather than a side-opening flyout: the
+popover is already height-capped against that edge, and a second one hanging
+off its side would fight for the same room.
+
 - A `Fader` label wider than its 36px unit overflowed onto its neighbour.
   Invisible while every caller passed `"LEVEL"`; unmissable with eight
   track names over an MCU. Clamped in `Fader.svelte` — `min-width: 0` is
@@ -218,7 +225,7 @@ way to cut a pad-fired clip short of waiting for its end. Now:
 
 ## Owner ear-check owed
 
-**v0.2.1:** open SURFACE, add an AKAI LPD8, then add a second one and a
+**v0.2.1:** open SURFACE, `+ → Add rack › AKAI LPD8`, then add a second one and a
 channel strip — three objects side by side, each with its own `×`. Add an
 MCU 8-strip and confirm the faders read as a scribble strip rather than a
 pile of overlapping names. `Clear page` should be the only thing that

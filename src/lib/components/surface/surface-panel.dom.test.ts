@@ -108,20 +108,53 @@ afterEach(() => {
 });
 
 describe("the add menu", () => {
-  it("lists the fill recipes and the device racks", async () => {
+  const openMenu = async () =>
+    fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
+
+  it("lists the fill recipes, and keeps the devices one level down", async () => {
     render(AddMenu);
-    await fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
+    await openMenu();
     expect(screen.getByText("Add all tracks")).toBeTruthy();
     expect(screen.getByText("Add all clips")).toBeTruthy();
     expect(screen.getByText("Add all automations")).toBeTruthy();
-    expect(screen.getByText("AKAI LPD8")).toBeTruthy();
     expect(screen.getByText("Clear page")).toBeTruthy();
+    // Four devices — and the list is meant to grow — so the root stays short.
+    // (The opener names them in its hint; what must not be here is a row
+    // that STAMPS one, which is the row whose name starts with the device.)
+    expect(screen.queryByRole("menuitem", { name: /^AKAI LPD8/ })).toBeNull();
+    expect(screen.getByRole("menuitem", { name: /add rack/i })).toBeTruthy();
+  });
+
+  it("drills into the rack list and back out again", async () => {
+    render(AddMenu);
+    await openMenu();
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add rack/i }));
+    for (const name of [/akai lpd8/i, /launchpad/i, /mcu 8-strip/i, /nanokontrol/i]) {
+      expect(screen.getByRole("menuitem", { name })).toBeTruthy();
+    }
+    expect(screen.queryByText("Add all tracks")).toBeNull();
+    await fireEvent.click(screen.getByRole("menuitem", { name: /^\s*‹\s*RACK\s*$/ }));
+    expect(screen.getByText("Add all tracks")).toBeTruthy();
+    expect(surface.addOpen).toBe(true);
+  });
+
+  it("peels one level on Escape before it closes", async () => {
+    render(AddMenu);
+    await openMenu();
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add rack/i }));
+    const menu = screen.getByRole("menu");
+    await fireEvent.keyDown(menu, { key: "Escape" });
+    expect(screen.getByText("Add all tracks")).toBeTruthy();
+    expect(surface.addOpen).toBe(true);
+    await fireEvent.keyDown(menu, { key: "Escape" });
+    expect(surface.addOpen).toBe(false);
   });
 
   it("adds a rack to the deck instead of replacing it", async () => {
     surface.layout = addWidget(emptyLayout(), unboundWidget("pad", { label: "KEEP ME" }));
     render(AddMenu);
-    await fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
+    await openMenu();
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add rack/i }));
     await fireEvent.click(screen.getByRole("menuitem", { name: /akai lpd8/i }));
     // The reported defect: the `+` menu wiped whatever was on the page.
     expect(surface.page.widgets.some((w) => w.label === "KEEP ME")).toBe(true);
@@ -129,10 +162,19 @@ describe("the add menu", () => {
     expect(surface.addOpen).toBe(false);
   });
 
+  it("reopens at the root after a device was picked", async () => {
+    render(AddMenu);
+    await openMenu();
+    await fireEvent.click(screen.getByRole("menuitem", { name: /add rack/i }));
+    await fireEvent.click(screen.getByRole("menuitem", { name: /akai lpd8/i }));
+    await openMenu();
+    expect(screen.getByText("Add all tracks")).toBeTruthy();
+  });
+
   it("empties the deck only when asked to", async () => {
     surface.layout = addWidget(emptyLayout(), unboundWidget("pad"));
     render(AddMenu);
-    await fireEvent.click(screen.getByRole("button", { name: /add a control/i }));
+    await openMenu();
     await fireEvent.click(screen.getByRole("menuitem", { name: /clear page/i }));
     expect(surface.page.widgets).toEqual([]);
   });
