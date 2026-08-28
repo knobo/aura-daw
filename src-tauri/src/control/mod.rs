@@ -1834,53 +1834,58 @@ impl ControlPlane {
         true
     }
 
-    /// End one scene and hand its tracks back to the arrangement. Returns
-    /// whether this call is the one that stopped a running clock.
+    /// Cut one scene: stop its clock, and leave every slot it owns bound.
     ///
-    /// Called from the drive thread's RELEASE edge, a poll (~8 ms) after the
-    /// clock stopped, which is why releasing the slots here is safe: the
-    /// discontinuity `stop` leaves behind has long since been latched and
-    /// read by the nodes bound to it. `stop_launch_overlay` is the other
-    /// half of that pair and deliberately does NOT release — see its doc.
+    /// This is the brief's `stop_scene`, RENAMED when the release moved out
+    /// of it, because a method called "stop" invites putting the release
+    /// back — and the release is exactly what must not happen here.
+    /// `ClockTable::stop` latches one discontinuity for the live nodes bound
+    /// to this clock (the `all_notes_off` a cut note needs, or the voice
+    /// hangs with nothing left to release it), and a slot released in the
+    /// same breath never reads it. `release_finished_scenes` does the
+    /// release, once a rendered block has actually delivered the flush.
     ///
-    /// V-14 is the reason for `release_slot_if` rather than a plain release:
-    /// two scenes naming the same track is newly expressible, and stopping
-    /// the first must not take the track away from the second.
-    pub fn stop_scene(&self, binding_id: &str) -> bool {
+    /// Every ending goes through here — a clip running out, a Gate note-off
+    /// lifting mid-clip, stop-all, and the transport stopping. The Gate path
+    /// is why the old "the drive thread only releases a poll after the clock
+    /// already stopped" reasoning was not enough: it cuts a RUNNING clock.
+    ///
+    /// Returns whether this call is the one that stopped a running clock.
+    /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
+    /// read beside it: `advance` can turn the clock off between the two, and
+    /// the pair would then report "something was sounding" for a scene that
+    /// had already ended.
+    pub fn cut_scene(&self, binding_id: &str) -> bool {
         let tables = self.tables.lock();
         let Some(&clock) = tables.scene_clocks.get(binding_id) else { return false };
-        let stopped = tables.clocks.stop(clock);
-        for slot in 0..tables.params.len() {
-            tables.clocks.release_slot_if(slot, clock);
-        }
-        stopped
+        tables.clocks.stop(clock)
     }
 
-    /// Every scene's tracks back to the arrangement, every scene clock off.
-    /// The transport-stop path (`TransportAction::Stop`) and nothing else:
-    /// stopping the song ends the scenes with it.
+    /// Cut every scene, and forget the endings we owed the frontend — the
+    /// transport-stop path (`TransportAction::Stop`) and nothing else:
+    /// stopping the song ends the scenes with it, and the UI learns that from
+    /// `transport://state`, not from a `LaunchFired` per scene.
+    ///
+    /// Cut, NOT released: same reason as `cut_scene`. Before Task 8's fix
+    /// round this stopped and released in one breath, so a note sounding when
+    /// the user pressed Stop was left hanging in the live node.
     pub fn clear_launch_audible(&self) {
         crate::midi::launch::runtime().clear_sounding();
         let tables = self.tables.lock();
         for &clock in tables.scene_clocks.values() {
             tables.clocks.stop(clock);
-            for slot in 0..tables.params.len() {
-                tables.clocks.release_slot_if(slot, clock);
-            }
         }
     }
 
     /// Cut every sounding scene (Escape / stop-all). Ends them exactly the
-    /// way reaching a clip's end does, so the release path the drive thread
-    /// already owns releases the slots and emits
-    /// `LaunchFired { playing: false }` — one code path, one behaviour.
-    /// Returns true when something was actually sounding.
+    /// way reaching a clip's end does, so the drive thread's own release edge
+    /// announces each ending and `release_finished_scenes` hands the tracks
+    /// back — one code path, one behaviour. Returns true when something was
+    /// actually sounding.
     ///
-    /// It deliberately does NOT release the slots itself. `ClockTable::stop`
-    /// leaves one discontinuity behind, and a slot released in the same
-    /// breath would never read it — the live nodes would keep a cut note
-    /// hanging with nothing left to release them. That was `end_launch`'s
-    /// whole reason for existing next to `clear_launch`.
+    /// It deliberately does NOT release the slots itself, for the reason
+    /// spelled out on `cut_scene`: the discontinuity `ClockTable::stop`
+    /// latches has to reach the live nodes still bound here first.
     ///
     /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
     /// read beside it: `advance` can turn a clock off between the two, and

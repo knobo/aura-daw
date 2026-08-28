@@ -465,10 +465,12 @@ fn process_inserts(
 /// * A **stopped clock of its own** — the node REJOINS THE ARRANGEMENT until
 ///   the control plane releases its slot. This is the old `ended` frame
 ///   (`track_playhead` returned `(base_pos, lp, true)`), and it is load
-///   bearing at both ends of a launch: `arm_drive_launch` binds the slots
-///   and then fires, and the release runs a poll-interval after the clip
-///   ends, so without it a launched track would drop out for a block at the
-///   press and go silent for ~8 ms at the end instead of returning to the
+///   bearing at both ends of a launch: `ControlPlane::fire_scene` binds the
+///   slots and then fires, and the release
+///   (`GraphTables::release_finished_scenes`, on the drive thread's poll)
+///   runs after the clip ends AND after the flush block, so without this
+///   case a launched track would drop out for a block at the press and go
+///   silent for at least a poll at the end instead of returning to the
 ///   song. The discontinuity that comes with it is `ClockTable::stop`'s /
 ///   `advance`'s parting flush — the `all_notes_off` `launch_ended` bought —
 ///   OR'd with the TRANSPORT's, because this node is reading the transport's

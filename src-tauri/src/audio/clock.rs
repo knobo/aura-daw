@@ -257,6 +257,40 @@ impl ClockTable {
         self.clocks.iter().skip(1).any(|c| c.discont.load(Relaxed))
     }
 
+    /// Does THIS clock still owe its nodes a discontinuity no `begin_block`
+    /// has latched? The per-clock half of [`ClockTable::flush_pending`].
+    ///
+    /// The control plane holds a cut scene's slots bound until this goes
+    /// false. That is what makes "the release happens after the flush was
+    /// delivered" a fact about the table rather than a hope about timing:
+    /// the drive poll is 8 ms and a block can be 10 ms, so "a poll later" was
+    /// never a guarantee that a block had run in between (see
+    /// `ControlPlane::release_finished_scenes`).
+    pub fn flush_pending_for(&self, clock: u32) -> bool {
+        self.clocks
+            .get(clock as usize)
+            .is_some_and(|c| c.discont.load(Relaxed))
+    }
+
+    /// Mark a clock "stopped, owing its nodes one discontinuity" without it
+    /// ever having run — the state `stop` leaves behind, minted directly.
+    ///
+    /// This is deliberately the thing `stop`'s `swap` guard exists to
+    /// PREVENT (a flush fabricated for a clock that was not running, which
+    /// would `all_notes_off` tracks that never went exclusive). It is
+    /// legitimate here for one reason: `engine::rebuild` calls it only on a
+    /// clock it has just created, and binds to it only slots it has just
+    /// verified were sounding on a scene the new document no longer has.
+    /// Those nodes are owed exactly one `all_notes_off` and there is no
+    /// surviving clock left to carry it.
+    pub fn owe_flush(&self, clock: u32) {
+        let Some(c) = self.clocks.get(clock as usize) else { return };
+        if clock == TRANSPORT_CLOCK {
+            return;
+        }
+        c.discont.store(true, Relaxed);
+    }
+
     /// Is the transport clock running (V-13)? Read by
     /// `mixer::node_playhead` for a slot whose own clock has stopped: such a
     /// slot rejoins the arrangement, so what governs it is the transport's

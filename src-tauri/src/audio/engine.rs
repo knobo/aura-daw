@@ -1994,7 +1994,7 @@ impl Control {
             // thread exactly like the `ParamTable` above. Clock 0 is the
             // transport (V-13), then ONE PER PLAYER (Task 9 fills those; the
             // range is reserved here so the two cuts cannot collide), then
-            // one per scene binding.
+            // one per scene binding, then AT MOST ONE ORPHAN (below).
             //
             // Sizing from the DOCUMENT is what makes firing a pad an atomic
             // write into a lane that already exists: a pad press must never
@@ -2007,9 +2007,77 @@ impl Control {
                 .enumerate()
                 .map(|(i, id)| (id.clone(), first_scene_clock + i as u32))
                 .collect();
+            // Binding ids are the key of everything below — the clock map,
+            // the carry pairing, the drive thread's ledger — and nothing in
+            // `launch_set`/`launch_set_map` enforces that they are unique.
+            // Duplicates collapse silently: one map entry, one clock nothing
+            // reaches, and both bindings firing whichever won. Say so rather
+            // than let it look like a clock-allocation bug later.
+            debug_assert_eq!(
+                scene_clocks.len(),
+                scene_ids.len(),
+                "duplicate launch binding ids: the clock map is keyed by id"
+            );
+            if scene_clocks.len() != scene_ids.len() {
+                log::warn!(
+                    "launch: {} bindings share an id with another — they will share one clock",
+                    scene_ids.len() - scene_clocks.len()
+                );
+            }
+            // ONE guard, from the read of the retired tables to the publish.
+            // Dropping it in between would open a window in which a
+            // `fire_scene` writes its SLOT BINDINGS into the table this loop
+            // has already read: the clock state survives (adoption reconciles
+            // it), but the bindings do not, and that scene would then play the
+            // arrangement instead of its own material for the whole life of
+            // this graph. The publish has to happen under the session lock
+            // either way ([C1], see above); this makes it one critical
+            // section rather than two.
+            let mut published = self.tables.lock();
+            // Which of the retired table's scene-bound slots this graph can
+            // still account for. Computed BEFORE the clock table is built,
+            // because an orphan needs a clock of its own and therefore
+            // changes the size.
+            let (carried_slots, orphaned_slots) = {
+                let prev_binding_of: HashMap<u32, &String> =
+                    published.scene_clocks.iter().map(|(id, &c)| (c, id)).collect();
+                let mut carried: Vec<(usize, u32)> = Vec::new();
+                let mut orphaned: Vec<usize> = Vec::new();
+                for (tid, &slot) in slots.iter() {
+                    let Some(&prev_slot) = published.slots.get(tid) else { continue };
+                    let prev_clock = published.clocks.clock_of(prev_slot);
+                    // Not a scene clock: the transport, or (Task 9) a player's,
+                    // which is bound at graph build by the code that owns it.
+                    let Some(binding) = prev_binding_of.get(&prev_clock) else { continue };
+                    match scene_clocks.get(binding.as_str()) {
+                        Some(&dst) => carried.push((slot, dst)),
+                        // The binding was DELETED while its scene sounded.
+                        None if published.clocks.is_on(prev_clock) => orphaned.push(slot),
+                        // Deleted, but the scene had already ended: the node
+                        // has had its flush and rejoined the arrangement.
+                        // Fabricating a second `all_notes_off` here would cut
+                        // arrangement notes mid-song (`ClockTable::stop`'s
+                        // guard exists for exactly that).
+                        None => {}
+                    }
+                }
+                (carried, orphaned)
+            };
+            // The orphan clock: a stopped clock owing one discontinuity, and
+            // the only way the tracks of a deleted-while-sounding scene get
+            // the `all_notes_off` every other ending gets. Without it their
+            // slots default to the transport in the fresh table with no
+            // discontinuity anywhere, and a live node hangs the note it was
+            // holding. One clock serves all of them, because what they are
+            // owed is identical and none of them has an identity left. It is
+            // allocated ONLY when something is orphaned, so the common graph
+            // (and the perf harness) is not given a clock to iterate for a
+            // case that is not happening.
+            let orphan_clock = (!orphaned_slots.is_empty())
+                .then(|| first_scene_clock + scene_ids.len() as u32);
             let clocks = Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
                 n_slots,
-                1 + store.players.len() + scene_ids.len(),
+                1 + store.players.len() + scene_ids.len() + usize::from(orphan_clock.is_some()),
             ));
             clocks.set_transport_playing(self.shared.playing.load(Relaxed));
             // Every sounding scene survives the rebuild. The overlay this
@@ -2031,25 +2099,23 @@ impl Control {
             // is still rendering; `ClockTable::reconcile_adoption` re-takes
             // it on the audio thread at the moment the swap actually happens,
             // which is what makes it exact (see that method).
-            {
-                let prev = self.tables.lock();
-                clocks.set_carry_source(prev.generation);
-                for (id, &dst) in scene_clocks.iter() {
-                    let Some(&src) = prev.scene_clocks.get(id) else { continue };
-                    clocks.carry_over(&prev.clocks, src, dst);
-                }
-                let prev_binding_of: HashMap<u32, &String> =
-                    prev.scene_clocks.iter().map(|(id, &c)| (c, id)).collect();
-                for (tid, &slot) in slots.iter() {
-                    let Some(&prev_slot) = prev.slots.get(tid) else { continue };
-                    let prev_clock = prev.clocks.clock_of(prev_slot);
-                    let Some(binding) = prev_binding_of.get(&prev_clock) else { continue };
-                    let Some(&dst) = scene_clocks.get(binding.as_str()) else { continue };
-                    clocks.bind_slot(slot, dst);
+            clocks.set_carry_source(published.generation);
+            for (id, &dst) in scene_clocks.iter() {
+                let Some(&src) = published.scene_clocks.get(id) else { continue };
+                clocks.carry_over(&published.clocks, src, dst);
+            }
+            for (slot, dst) in carried_slots {
+                clocks.bind_slot(slot, dst);
+            }
+            if let Some(orphan) = orphan_clock {
+                clocks.owe_flush(orphan);
+                for slot in orphaned_slots {
+                    clocks.bind_slot(slot, orphan);
                 }
             }
-            // THE [C1] PUBLISH SITE — still under `session`, see above.
-            *self.tables.lock() = GraphTables {
+            // THE [C1] PUBLISH SITE — still under `session`, and through the
+            // same guard the carry above read from, see there.
+            *published = GraphTables {
                 generation: self.generation,
                 params: params.clone(),
                 clocks: clocks.clone(),
@@ -2057,6 +2123,7 @@ impl Control {
                 slots: slots.clone(),
                 send_slots: send_slots.clone(),
             };
+            drop(published);
             // Same generation, same slot map, published alongside the
             // tables (Task 6) — the meter fold resolves blocks under
             // whichever generation produced them, not the current tables.
@@ -5129,6 +5196,180 @@ mod tests {
             t.clocks.carry_source_for_tests(),
             before,
             "and the fresh clocks know which table they took their state from"
+        );
+    }
+
+    /// Fix round 1, finding 3. Deleting a binding while its scene sounds is
+    /// an ENDING, and every other ending hands the live nodes one
+    /// `all_notes_off`. The deleted binding has no clock in the fresh table to
+    /// carry that, so `rebuild` mints an orphan clock: stopped, owing one
+    /// discontinuity, with the stranded slots bound to it. Without it the
+    /// slot defaults to the transport with no discontinuity anywhere and the
+    /// node hangs whatever it was holding.
+    #[test]
+    fn deleting_a_binding_while_its_scene_sounds_still_flushes_its_nodes() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        let slot = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+            t.clocks.begin_block(); // the fire's own jump, delivered
+            slot
+        };
+
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        assert!(t.scene_clocks.is_empty(), "the binding is gone");
+        let orphan = t.clocks.clock_of(slot);
+        assert_ne!(
+            orphan,
+            crate::audio::clock::TRANSPORT_CLOCK,
+            "the stranded track is not simply handed back with nothing said"
+        );
+        assert!(!t.clocks.is_on(orphan), "the scene is over");
+        assert!(
+            t.clocks.flush_pending_for(orphan),
+            "and the node is owed the all-notes-off every other ending gives it"
+        );
+        // And the flush reaches the node exactly the way every other one
+        // does: a rendered block latches it, and the slot reads it. (Turning
+        // "a stopped clock" into "read the arrangement" is
+        // `mixer::node_playhead`'s third case, which this level cannot see.)
+        t.clocks.begin_block();
+        let ph = t.clocks.playhead(slot, 7_000, false);
+        assert!(ph.discontinuity, "delivered");
+        assert!(!ph.on, "and the node is not rendering the deleted scene");
+    }
+
+    /// The orphan clock is minted only when something is actually orphaned —
+    /// a clock every graph carries is a clock `begin_block` and `advance`
+    /// walk every block for a case that is not happening.
+    #[test]
+    fn a_rebuild_with_nothing_stranded_mints_no_orphan_clock() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+        assert_eq!(ctl.tables.lock().clocks.clocks(), 2, "transport + one scene");
+
+        // The scene runs to its END and its flush is delivered — but the
+        // slot is still bound to the (now stopped) clock, which is the state
+        // the drive poll's release pass takes ~8 ms to clear. NOW delete the
+        // binding. Nothing is owed here: the node had its `all_notes_off`
+        // when the clock ended and has already rejoined the arrangement, so
+        // minting an orphan would fabricate a second one and cut arrangement
+        // notes mid-song — `ClockTable::stop`'s guard, same rule.
+        {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100, false);
+            t.clocks.advance(128); // past its end: stops itself, owing a jump
+            t.clocks.begin_block(); // and the node reads it
+            assert!(!t.clocks.is_on(clock));
+            assert_eq!(t.clocks.clock_of(slot), clock, "not released yet");
+        }
+        session.lock().midi.launch_maps[0].bindings.clear();
+        ctl.rebuild();
+        let t = ctl.tables.lock();
+        assert_eq!(t.clocks.clocks(), 1, "the transport, and nothing else");
+        assert!(!t.clocks.flush_pending(), "no flush was fabricated");
+        assert_eq!(
+            t.clocks.clock_of(t.slots[&crate::ids::TrackId::from("t-1")]),
+            crate::audio::clock::TRANSPORT_CLOCK,
+            "the track is simply back on the arrangement"
+        );
+    }
+
+    /// Fix round 1, finding 2. `rebuild` holds ONE guard from the read of the
+    /// retired tables to the publish. Dropping it in between let a
+    /// `fire_scene` write its slot bindings into a table this loop had
+    /// already read — the clock state survived (adoption reconciles it) but
+    /// the bindings did not, so the scene played the arrangement instead of
+    /// its own material for the whole life of that graph.
+    ///
+    /// The window is two mutex operations wide and there is no seam a test
+    /// can wedge into it, so this asserts the SOURCE property that closes it,
+    /// the way `rt::tests::the_launch_overlay_is_gone_from_this_file` asserts
+    /// V-4. A second `self.tables.lock()` inside `rebuild` re-opens the gap,
+    /// and it re-opens it silently.
+    #[test]
+    fn rebuild_takes_the_tables_lock_exactly_once() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/engine.rs"),
+        )
+        .expect("read engine.rs");
+        let start = src.find("    fn rebuild(&mut self) {").expect("rebuild");
+        let body = &src[start..];
+        let end = body[1..].find("\n    fn ").map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("self.tables.lock()").count(),
+            1,
+            "rebuild must hold ONE tables guard from the carry read to the publish: \
+             a fire landing in a gap between two acquisitions writes its slot \
+             bindings into a table this rebuild has already read, and they are \
+             lost for the life of the graph (reconciliation recovers the clock \
+             state, not the bindings)"
+        );
+    }
+
+    /// The behavioural half of the above, at the closest seam a test can
+    /// stand: `after_assembly` fires with NO tables lock held, so this pins
+    /// that a fire landing next to a rebuild keeps both its clock AND the
+    /// tracks it claimed. It does not reproduce the old gap — nothing can —
+    /// which is why the source gate above exists beside it.
+    #[test]
+    fn a_fire_landing_during_a_rebuild_keeps_its_slot_bindings() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        // A fire lands mid-rebuild, into the tables as they stand then.
+        let tables = ctl.tables.clone();
+        ctl.after_assembly = Some(Arc::new(move || {
+            let t = tables.lock();
+            let clock = t.scene_clocks["b1"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 0, 100_000, false);
+        }));
+        ctl.rebuild();
+        ctl.after_assembly = None;
+
+        let t = ctl.tables.lock();
+        let clock = t.scene_clocks["b1"];
+        let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+        assert!(t.clocks.is_on(clock), "the press survived the rebuild");
+        assert_eq!(
+            t.clocks.clock_of(slot),
+            clock,
+            "and so did the track it claimed — a scene that keeps its clock \
+             but loses its tracks plays the arrangement instead"
         );
     }
 

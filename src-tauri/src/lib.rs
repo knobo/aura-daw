@@ -145,9 +145,12 @@ pub fn run() {
             midi_out.attach(midi_out_session, midi_out_shared);
             control_plane.attach_midi_out(midi_out);
 
-            // MIDI launch: hardware note-on → seek/loop/play. Installed
-            // here so the midir callback can fire without knowing the
-            // control plane. The callback is the midir thread, not RT.
+            // MIDI launch: hardware note-on → fire that binding's scene on
+            // its own clock (Plan V — V2, Task 8; it used to seek/loop/play
+            // the arrangement transport, which moved the user's playhead on
+            // every pad press). Installed here so the midir callback can fire
+            // without knowing the control plane. The callback is the midir
+            // thread, not RT.
             {
                 let cp = control_plane.clone();
                 crate::midi::launch::runtime().install_fire(std::sync::Arc::new(move |cmd| {

@@ -859,6 +859,50 @@ pub struct GraphTables {
 pub type SharedGraphTables = Arc<parking_lot::Mutex<GraphTables>>;
 
 impl GraphTables {
+    /// Hand back every track whose scene has ended AND has been told so.
+    /// One pass over the slots, run by the launch drive thread's poll — the
+    /// ONLY place a scene's slots are released. `ControlPlane::cut_scene`,
+    /// `stop_launch_overlay` and `clear_launch_audible` all deliberately stop
+    /// a clock without releasing what is bound to it.
+    ///
+    /// Two conditions, and both are load-bearing:
+    ///
+    /// * the clock is not running — the scene is over, so the node rejoins
+    ///   the arrangement (`mixer::node_playhead`'s third case);
+    /// * and it owes no unlatched discontinuity — a rendered block has
+    ///   delivered the `all_notes_off` the cut left behind. Releasing before
+    ///   that hangs the note, and "the drive poll came after the cut" does
+    ///   NOT imply "a block ran in between": the poll is 8 ms and a block at
+    ///   48 kHz / 512 frames is 10.7 ms.
+    ///
+    /// V-14 falls out of the shape: the clock released from is the one the
+    /// slot currently reads, so a track a second scene has since claimed is
+    /// skipped while that scene still runs, and `release_slot_if` covers the
+    /// write that lands between the read and the release.
+    ///
+    /// A slot on the ORPHAN clock (`engine::rebuild`, a binding deleted while
+    /// its scene sounded) is deliberately not matched — that clock is in no
+    /// `scene_clocks` map. It needs no release: a stopped clock already
+    /// returns its nodes to the arrangement, and the next rebuild finds
+    /// nothing to pair the binding with and leaves the slot on the transport.
+    pub fn release_finished_scenes(&self) {
+        if self.scene_clocks.is_empty() {
+            return;
+        }
+        let scenes: std::collections::HashSet<u32> =
+            self.scene_clocks.values().copied().collect();
+        for slot in 0..self.params.len() {
+            let clock = self.clocks.clock_of(slot);
+            if !scenes.contains(&clock)
+                || self.clocks.is_on(clock)
+                || self.clocks.flush_pending_for(clock)
+            {
+                continue;
+            }
+            self.clocks.release_slot_if(slot, clock);
+        }
+    }
+
     /// A fresh gen-0 table with no params and no slots — the shape every
     /// `AudioState::default()` and every control-module test fixture wants
     /// before the first real rebuild publishes something. Single source of

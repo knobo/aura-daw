@@ -446,6 +446,18 @@ impl LaunchRuntime {
                 let mut play_started = Instant::now();
                 let mut last_onset: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
+                // Ids we have already put on the fire channel as a Release
+                // and are waiting to see leave the ledger. This is what keeps
+                // the release EDGE-triggered. Without it the test below is
+                // level-triggered: an id sits in the ledger with its clock
+                // off until the worker drains, and every 8 ms poll in between
+                // enqueues another Release. `enqueue_release` is a `try_send`
+                // on an 8-slot channel SHARED with `FireCmd::Start`, so a
+                // worker stalled for ~64 ms would fill that channel with
+                // duplicates of one ending and silently drop the user's next
+                // pad press.
+                let mut release_sent: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
                     // The release edge, once per sounding scene. Task 8 made
@@ -453,24 +465,29 @@ impl LaunchRuntime {
                     // scenes each own a clock, so N of them can reach their
                     // end independently, and each owes the frontend its own
                     // `LaunchFired { playing: false }`.
-                    //
-                    // No edge state is kept here any more — the ledger IS
-                    // the edge. Two polls can enqueue the same release if the
-                    // worker has not drained the first yet; `stop_drive_launch`
-                    // takes the id out of the ledger before it emits, so the
-                    // ANNOUNCEMENT still happens exactly once. That guard was
-                    // `overlay_id == Some(id)` before scenes were plural.
-                    for id in runtime().sounding_ids() {
+                    let sounding = runtime().sounding_ids();
+                    // Anything the worker has since taken out of the ledger is
+                    // announced and done; forget it, so the same binding can
+                    // sound and end again.
+                    release_sent.retain(|id| sounding.contains(id));
+                    for id in sounding {
                         let still_on = {
                             let t = tables.lock();
                             t.scene_clocks
                                 .get(&id)
                                 .is_some_and(|&c| t.clocks.is_on(c))
                         };
-                        if !still_on {
+                        if !still_on && release_sent.insert(id.clone()) {
                             runtime().enqueue_release(id);
                         }
                     }
+                    // The other half of every ending: hand the tracks back,
+                    // but only once a rendered block has delivered the
+                    // `all_notes_off` the cut left behind. See
+                    // `GraphTables::release_finished_scenes` — this is the
+                    // only caller, and the only place a scene's slots are
+                    // released.
+                    tables.lock().release_finished_scenes();
                     let playing = shared.playing.load(Relaxed);
                     let pos = shared.position.load(Relaxed);
                     if !playing {
@@ -845,7 +862,12 @@ impl crate::control::ControlPlane {
             return;
         }
         launch_trace(format!("drive stop {id}"));
-        self.stop_scene(id);
+        // CUT, not released: the Gate path reaches here with the clock still
+        // RUNNING (a note-off lifting mid-clip), so `stop` latches a
+        // discontinuity the nodes have not read yet. The drive poll's
+        // `release_finished_scenes` hands the tracks back once a rendered
+        // block has delivered it.
+        self.cut_scene(id);
         self.emit_launch_fired(LaunchFired {
             id: id.to_string(),
             name: String::new(),
@@ -1682,6 +1704,135 @@ mod tests {
         cp.stop_drive_launch("b1");
         cp.stop_drive_launch("b1");
         assert!(!runtime().take_sounding("b1"), "taken once, by the first call");
+    }
+
+    /// Fix round 1, finding 1. The Gate path cuts a clock that is STILL
+    /// RUNNING (a note-off lifting mid-clip), so the flush `ClockTable::stop`
+    /// latches has not been read by anyone yet. Releasing the slot in the
+    /// same breath — which is what `stop_scene` did — means the live node
+    /// never sees the `all_notes_off` and keeps the note.
+    #[test]
+    fn cutting_a_running_scene_keeps_its_tracks_bound_until_the_flush_is_read() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        let clock = cp.scene_clock_for("b1").unwrap();
+
+        cp.stop_drive_launch("b1"); // the Gate note-off path
+
+        {
+            let t = cp.tables_for_tests();
+            let slot = t.slots[&crate::ids::TrackId::from("t1")];
+            assert!(!t.clocks.is_on(clock), "cut");
+            assert!(t.clocks.flush_pending_for(clock), "and owing one jump");
+            assert_eq!(
+                t.clocks.clock_of(slot),
+                clock,
+                "the track stays bound, or nothing ever reads that jump"
+            );
+            // The release pass must refuse while the flush is unread.
+            t.release_finished_scenes();
+            assert_eq!(t.clocks.clock_of(slot), clock, "still owed");
+            // A rendered block latches it, and the node has had its
+            // all-notes-off.
+            t.clocks.begin_block();
+            t.release_finished_scenes();
+            assert_eq!(
+                t.clocks.clock_of(slot),
+                crate::audio::clock::TRANSPORT_CLOCK,
+                "now the track goes back to the arrangement"
+            );
+        }
+    }
+
+    /// V-14 at the release pass, which is where the release lives now: two
+    /// scenes may name the same track, and handing back a track the other one
+    /// is still playing would silence it mid-clip.
+    #[test]
+    fn the_release_pass_leaves_a_track_a_second_scene_is_still_playing() {
+        let (cp, _rx, _ev) = plane(
+            &["shared"],
+            vec![
+                region_on("b1", 60, &["shared"]),
+                region_on("b2", 61, &["shared"]),
+            ],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+        let c2 = cp.scene_clock_for("b2").unwrap();
+        cp.stop_drive_launch("b1");
+
+        let t = cp.tables_for_tests();
+        t.clocks.begin_block();
+        t.release_finished_scenes();
+        let slot = t.slots[&crate::ids::TrackId::from("shared")];
+        assert_eq!(t.clocks.clock_of(slot), c2, "b2 is still sounding on it");
+    }
+
+    /// Fix round 1, finding 1 again, at the transport-stop path: pressing
+    /// Stop with a scene sounding used to release the slots in the same
+    /// breath as the cut, so a held note stayed held in the live node.
+    #[test]
+    fn stopping_the_transport_cuts_the_scenes_without_dropping_their_flush() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        let clock = cp.scene_clock_for("b1").unwrap();
+
+        cp.transport(crate::control::TransportAction::Stop).unwrap();
+
+        let t = cp.tables_for_tests();
+        let slot = t.slots[&crate::ids::TrackId::from("t1")];
+        assert!(!t.clocks.is_on(clock), "the scene ends with the song");
+        assert!(t.clocks.flush_pending_for(clock), "owing its node one jump");
+        assert_eq!(t.clocks.clock_of(slot), clock, "still bound to read it");
+    }
+
+    /// Fix round 1, finding 4. The release test is level-triggered — an id
+    /// sits in the ledger with its clock off until the worker drains it — so
+    /// the drive loop has to remember what it already sent. `enqueue_release`
+    /// is a `try_send` into an 8-slot channel SHARED with `FireCmd::Start`:
+    /// duplicates of one ending fill it and drop the user's next pad press.
+    ///
+    /// This drives the loop's edge logic directly; the loop itself is inside
+    /// a spawned thread with an 8 ms sleep.
+    #[test]
+    fn the_release_edge_enqueues_once_per_ending_not_once_per_poll() {
+        let rt = LaunchRuntime::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        rt.install_fire(std::sync::Arc::new(move |cmd| {
+            if let FireCmd::Release(id) = cmd {
+                let _ = tx.send(id);
+            }
+        }));
+        rt.mark_sounding("b1");
+        let mut release_sent: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
+        // Five polls with the clock off and the worker not yet draining.
+        for _ in 0..5 {
+            let sounding = rt.sounding_ids();
+            release_sent.retain(|id| sounding.contains(id));
+            for id in sounding {
+                if release_sent.insert(id.clone()) {
+                    rt.enqueue_release(id);
+                }
+            }
+        }
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)).as_deref(),
+            Ok("b1"),
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "one Release per ending — the channel is shared with pad presses"
+        );
+
+        // The worker announces it and takes it out of the ledger; the same
+        // binding must be able to sound and end again.
+        rt.take_sounding("b1");
+        let sounding = rt.sounding_ids();
+        release_sent.retain(|id| sounding.contains(id));
+        assert!(release_sent.is_empty(), "forgotten once the ledger is clear");
     }
 
 }
