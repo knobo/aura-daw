@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Plugin-window X error kills the process (next-up 6) | `fix/x-error-handler` | 2026-08-28 | `XSetErrorHandler` around `wm_stack`'s X11 calls. → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 5 |
 
 ## Next up — unclaimed
 
