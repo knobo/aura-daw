@@ -23,6 +23,7 @@
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use super::descriptor::PluginDescriptor;
@@ -108,7 +109,22 @@ impl WorkerCommand {
     /// two call sites: any test reaching the production scan path gets a
     /// real sacrificial worker, and no future one can reintroduce the
     /// recursion by calling [`scan_clap_subprocess`] innocently.
+    ///
+    /// `cfg(test)` covers lib tests only. An INTEGRATION test binary links
+    /// the lib without it, so it took the production branch and failed the
+    /// opposite way, which is worse than recursing: the child ran its own
+    /// tests and returned in 3 ms with zero protocol lines, the parent took
+    /// the `scanning == None` arm, and `scan::scan_all()` silently lost its
+    /// entire CLAP half. `perf_budget_gate` then found no instruments and
+    /// emitted `PERF-VERDICT: SKIP`, i.e. exit 125 — so PR #120's
+    /// plugin-load gate and the bisect recipe on top of it would have
+    /// called every commit unjudgeable instead of measuring it, without a
+    /// single log line saying so. Such a binary calls
+    /// [`set_worker_command`] with its own hidden entry.
     pub fn current_exe() -> Option<Self> {
+        if let Some(cmd) = worker_command_override() {
+            return Some(cmd);
+        }
         #[cfg(test)]
         {
             return Some(test_worker_command());
@@ -120,6 +136,30 @@ impl WorkerCommand {
                 .map(|exe| Self { exe, args: Vec::new() })
         }
     }
+}
+
+/// Set by a test binary that has no `AURA_SCAN_WORKER` guard in its `main`
+/// and is not covered by `cfg(test)` — see [`set_worker_command`].
+static WORKER_COMMAND: Mutex<Option<WorkerCommand>> = Mutex::new(None);
+
+fn worker_command_override() -> Option<WorkerCommand> {
+    WORKER_COMMAND.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Route every production scan path in THIS PROCESS through `cmd` instead
+/// of re-executing the binary bare.
+///
+/// For integration-test binaries, which link the lib without `cfg(test)`
+/// and have no worker guard in `main`. Point it at a hidden `worker_entry`
+/// test the same way [`test_worker_command`] does; a filtered child also
+/// contains the second hazard, which is that the child inherits the
+/// parent's `AURA_PROFILE_*` and would otherwise reach `scan_all()` itself
+/// with nothing bounding the depth.
+///
+/// Not for production code: `src/main.rs` honours the guard, so bare
+/// re-execution is already correct there.
+pub fn set_worker_command(cmd: WorkerCommand) {
+    *WORKER_COMMAND.lock().unwrap_or_else(|e| e.into_inner()) = Some(cmd);
 }
 
 /// Parent-side scan of the standard CLAP paths through the sacrificial

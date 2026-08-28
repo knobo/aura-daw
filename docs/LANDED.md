@@ -5,6 +5,38 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## A plugin window closing must not kill AURA
+
+Three process-death bugs on the plugin path, all of them shaped the same
+way: something outside our control ends, and AURA (or its test binary)
+disappears without a panic, a signal or a log line.
+
+- **`wm_stack` restacked window ids `xdotool` found a round trip earlier.**
+  When the window had closed in between, **Xlib's default error handler
+  called `exit(1)`** — in the app, the session's unsaved work. X errors
+  are asynchronous, so the guard has to sync BEFORE it restores the
+  previous handler; the other order protects nothing, measured both ways.
+  Ours answers only for our own display connection, so GTK's is untouched.
+- **`tests/plugin_load_profile.rs` re-executed itself as its scan worker.**
+  An integration binary has no `cfg(test)`, so it took the production
+  branch; the child ran its own tests, returned in 2.9 ms with no protocol
+  lines, and `scan_all()` lost its entire CLAP half in silence — 326
+  plugins where 363 were installed. On a box where the profiled plugins
+  are CLAP-only that is `PERF-VERDICT: SKIP`, i.e. exit 125, so PR #120's
+  gate and every bisect on it would call each commit unjudgeable.
+  `scan_worker::set_worker_command` is the runtime override.
+- **`zynaddsubfx-ext-gui` outlived a crashed AURA**, leaving a window the
+  user could not close. `PR_SET_PDEATHSIG` in `pre_exec` fixes it, and the
+  frozen `Cargo.toml` was never the blocker the backlog recorded: `prctl`
+  is reachable with a bare `extern "C"` block, no `libc` crate.
+
+Evidence in [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5;
+the two general lessons in [`TRAPS.md`](TRAPS.md) §Backend.
+
+| PR |
+|---|
+| PR #124 |
+
 ## The engine performance gate
 
 `scripts/perf-check.sh` — the measurement from §9 turned into something

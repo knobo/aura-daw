@@ -5,7 +5,7 @@
 //! Gtk parent, no Wayland embed. The generic param panel stays in Tauri.
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_ulong, c_void};
 use std::process::{Child, Command, Stdio};
 use std::ptr;
 
@@ -19,6 +19,25 @@ extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlclose(handle: *mut c_void) -> c_int;
 }
+
+// `prctl`/`getppid` are declared here rather than pulled in with the `libc`
+// crate: `Cargo.toml` is frozen, and both live in the glibc every Rust binary
+// on this target already links — same reasoning as `dlopen` above. Verified
+// by linking a bare `extern "C" fn prctl` with no new dependency.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong, arg4: c_ulong, arg5: c_ulong) -> c_int;
+    fn getppid() -> i32;
+}
+
+/// `linux/prctl.h`. SIGKILL rather than SIGTERM because this is the path
+/// that only runs when AURA died in a way it could not clean up after, and
+/// because [`OpenLv2Gui::kill_ext`] already uses SIGKILL for the ordinary
+/// close.
+#[cfg(target_os = "linux")]
+const PR_SET_PDEATHSIG: c_int = 1;
+#[cfg(target_os = "linux")]
+const SIGKILL: c_ulong = 9;
 
 const SHOW_URI: &CStr = c"http://lv2plug.in/ns/extensions/ui#showInterface";
 const IDLE_URI: &CStr = c"http://lv2plug.in/ns/extensions/ui#idleInterface";
@@ -175,6 +194,45 @@ pub struct OpenLv2Gui {
 // SAFETY: the GUI is only ever touched on the plugin main thread.
 unsafe impl Send for OpenLv2Gui {}
 
+/// Make the spawned GUI die with AURA however AURA dies.
+///
+/// `kill_ext` and `Drop` cover the ordinary closes, but neither runs under
+/// SIGKILL or a segfault — and a `zynaddsubfx-ext-gui` that outlives its DSP
+/// is a window the user cannot get rid of and that `pgrep` still finds, so
+/// `wm_stack` keeps trying to restack it.
+///
+/// `PR_SET_PDEATHSIG` is set in the child between fork and exec. Two things
+/// were measured on this kernel (6.8) rather than taken from the man page:
+///
+/// - it SURVIVES the `execve` that follows (it is cleared only for set-uid
+///   binaries, and `zynaddsubfx-ext-gui` is not one), so setting it in
+///   `pre_exec` is enough; and
+/// - a parent killed with SIGKILL does take the child with it, which is the
+///   case `Drop` cannot reach.
+///
+/// The `getppid` check closes the fork/prctl race: if AURA died in that
+/// window the child is already reparented, the signal will never come, and
+/// it should not become the orphan this exists to prevent.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent = std::process::id() as i32;
+    // SAFETY: async-signal-safe syscalls only, which is the contract for
+    // anything run between fork and exec in a threaded process.
+    unsafe {
+        cmd.pre_exec(move || {
+            prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+            if getppid() != parent {
+                std::process::exit(0);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut Command) {}
+
 impl OpenLv2Gui {
     pub fn idle(&mut self) -> bool {
         if let Some(child) = self.ext_child.as_mut() {
@@ -234,11 +292,10 @@ impl OpenLv2Gui {
         }
         self.kill_ext();
         let uri = format!("osc.udp://localhost:{port}/");
-        let child = Command::new("zynaddsubfx-ext-gui")
-            .arg(&uri)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+        let mut cmd = Command::new("zynaddsubfx-ext-gui");
+        cmd.arg(&uri).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        die_with_parent(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|e| {
                 format!(
@@ -516,3 +573,103 @@ fn try_open_ui(
 }
 
 
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    /// `Z`ombie or gone both count as dead: the grandchild's reaper is the
+    /// user session's, and we are racing it.
+    fn alive(pid: u32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // The comm field can contain spaces and parentheses; state is the
+        // first token after the LAST ')'.
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_some_and(|state| state != "Z")
+    }
+
+    /// HIDDEN ENTRY, in the shape `plugins::scan_worker::tests::worker_entry`
+    /// established: without the env var it is a no-op test. With it, this
+    /// process is the sacrificial PARENT — it spawns a guarded child, says
+    /// which pid, and waits to be killed.
+    #[test]
+    fn pdeathsig_parent_entry() {
+        if std::env::var_os("AURA_TEST_PDEATHSIG").is_none() {
+            return;
+        }
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        die_with_parent(&mut cmd);
+        // Deliberately never waited on: whether the kernel collects it when
+        // we die is the entire question this fixture exists to answer.
+        #[allow(clippy::zombie_processes)]
+        let child = cmd.spawn().expect("spawn the guarded child");
+        println!("AURA-PDEATHSIG-CHILD {}", child.id());
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        // Long enough for the test to kill us, short enough that a failed
+        // run cleans itself up — and when we exit, the guard collects the
+        // child either way.
+        std::thread::sleep(Duration::from_secs(20));
+    }
+
+    /// The contract `Drop` cannot honour: AURA dying by SIGKILL must still
+    /// take `zynaddsubfx-ext-gui` with it. An orphaned ext-gui is a window
+    /// the user cannot close, still owned by a DSP that no longer exists,
+    /// and `wm_stack` keeps finding it with `pgrep` and restacking it.
+    ///
+    /// This kills a real process and looks at a real `/proc` entry rather
+    /// than asserting that `pre_exec` was called, because the interesting
+    /// failures are all in the kernel's semantics, not ours: PDEATHSIG is
+    /// cleared by `fork`, and would be cleared by an `execve` of a set-uid
+    /// binary. `sleep` stands in for the GUI — same fork/exec shape, no X
+    /// server needed.
+    #[test]
+    fn the_guarded_child_does_not_outlive_a_parent_that_was_sigkilled() {
+        let exe = std::env::current_exe().expect("test exe");
+        let mut parent = Command::new(&exe)
+            .args(["--exact", "plugins::lv2_ui::tests::pdeathsig_parent_entry", "--nocapture"])
+            .env("AURA_TEST_PDEATHSIG", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the sacrificial parent");
+
+        let mut pid = None;
+        let reader = BufReader::new(parent.stdout.take().expect("piped stdout"));
+        for line in reader.lines().map_while(Result::ok) {
+            if let Some(rest) = line.strip_prefix("AURA-PDEATHSIG-CHILD ") {
+                pid = rest.trim().parse::<u32>().ok();
+                break;
+            }
+        }
+        let pid = pid.unwrap_or_else(|| {
+            let _ = parent.kill();
+            panic!(
+                "the sacrificial parent never announced its child — has \
+                 `pdeathsig_parent_entry` been renamed? The --exact filter \
+                 above must still name a test that exists."
+            )
+        });
+        assert!(alive(pid), "the guarded child should be running before we kill its parent");
+
+        parent.kill().expect("SIGKILL the parent");
+        let _ = parent.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !alive(pid),
+            "child {pid} outlived a SIGKILLed parent — PR_SET_PDEATHSIG did not \
+             take, so a crash would leave an ext-gui window behind"
+        );
+    }
+}

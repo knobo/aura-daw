@@ -82,22 +82,13 @@ sentence got written — if you find a row whose branch is gone from
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
 
-6. **A plugin-window X error still kills the process.** The `--lib`
-   SIGSEGV is diagnosed and fixed (PR #123 — a lib test's plugin scan was
-   re-executing the whole suite), and fixing it made the NEXT failure
-   reachable: `X Error of failed request: BadWindow` aborts a parallel run
-   in about half the runs, because `wm_stack` restacks an `xdotool`-found
-   window id after that window is gone and **Xlib's default error handler
-   calls `exit(1)`**. That is a product bug, not a test bug: a DAW must not
-   exit because a plugin editor closed a millisecond early. An
-   `XSetErrorHandler` through the module's existing runtime `dlopen` is the
-   fix; the care is that the handler is process-global and GTK installs its
-   own. Two smaller leftovers ride along: the same recursion hole in
-   **integration** test binaries (no `cfg(test)`, so
-   `tests/plugin_load_profile.rs` still gets a bare re-exec — gated, but
-   `perf-check.sh --run full` reaches it), and **`PR_SET_PDEATHSIG`** on
-   the `zynaddsubfx-ext-gui` spawn so no process death orphans a window
-   (needs `libc` in the FROZEN `Cargo.toml` — ask the owner).
+6. **Parallel `cargo test` still fails 1–4 tests**, and how many depends on
+   how loaded the audio server is. Every one passes in isolation and
+   `--test-threads=1` is green, so CI is unaffected; the family is the
+   `midi_out::tests::*` thread race plus `clap_host`'s
+   `post_params_returns_immediately_and_the_change_still_lands`. Root-cause
+   it and `--test-threads=1` can be dropped. The crash bugs underneath it
+   are gone (PRs #123, #124).
    → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) items 4–5
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
