@@ -64,10 +64,13 @@ PR, but two categories of tests are currently skipped rather than exercised:
    - `control::tests::plugin_add_of_an_insert_rehosts_as_effect`
    - `control::tests::reactivate_restored_hosts_an_insert_as_effect`
 
-   Each cost **29.7 s** of pure timeout and drove the PipeWire **daemon**
-   from 164 to 578 open file descriptors. `scan_worker`'s own tests never
-   hit it: they ask for `test_worker_command()` explicitly, whose doc
-   comment had described this exact hazard since it was written.
+   The cost varies, because how far the recursive suite gets before the
+   parent kills it is nondeterministic: measured on `main`, the two tests
+   took **6 s, 13 s and 29.7 s** across runs and drove the PipeWire
+   **daemon** from a 164-fd baseline to peaks of **335, 427 and 578**.
+   `scan_worker`'s own tests never hit any of it: they ask for
+   `test_worker_command()` explicitly, whose doc comment had described this
+   exact hazard since it was written.
 
    From there the chain is other people's software failing honestly under
    resource exhaustion:
@@ -102,7 +105,7 @@ PR, but two categories of tests are currently skipped rather than exercised:
    | full `--lib`, default parallelism | SIGSEGV in 2 of 3 runs | **0 of 5** |
    | daemon fd peak, full run | 1024 (its limit) | 578 |
    | `control::` alone, fd peak | 1024 | 469 |
-   | the two offending tests | 29.7 s each, +414 daemon fds | 0.33 s each, +0 |
+   | the two offending tests | 6–30 s each, +171…+414 daemon fds | 0.33 s each, +0 |
 
    **What is still open, and it is not the same bug:**
 

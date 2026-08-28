@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Parallel test-suite SIGSEGV | `fix/parallel-test-sigsegv` | 2026-08-28 | `ci-hardening.md` item 5: diagnose the crash, and make the zyn GUI child die with its parent. |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -82,11 +82,17 @@ sentence got written — if you find a row whose branch is gone from
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
 
-6. **The parallel test suite SIGSEGVs.** Not the documented `midi_out`
-   race — an actual crash, twice in three runs, where
-   `--test-threads=1` passes 1407/1407. It is also why zyn GUI windows
-   get left behind: a signal death skips the `Drop` that kills them.
-   Undiagnosed. → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 5
+6. **What the SIGSEGV fix left behind.** The crash itself is diagnosed and
+   fixed (PR #123): a lib test's plugin scan was re-executing the whole
+   suite. Three separable leftovers, smallest first —
+   the same hole in **integration** test binaries (they link the lib
+   without `cfg(test)`, so `tests/plugin_load_profile.rs` still gets a bare
+   re-exec; gated, but `perf-check.sh --run full` reaches it);
+   **`PR_SET_PDEATHSIG`** on the `zynaddsubfx-ext-gui` spawn, so a signal
+   death stops orphaning windows at all (needs `libc` in the FROZEN
+   `Cargo.toml` — ask the owner); and the **18 tests that still fail under
+   default parallelism**, which are engine starvation, not a crash.
+   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) items 4–5
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;

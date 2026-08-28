@@ -132,10 +132,11 @@ has the measurements. Parallel runs still FAIL ~18 tests on load (item 4),
 so single-threaded is still the gate — but a signal death, and the
 orphaned plugin windows it left behind, is no longer part of the picture.
 
-Counts, measured 2026-08-28 on `perf/plugin-load-profile` with a pinned
-ALSA sink: **1457 backend** (1407 lib + 50 integration, 2 `#[ignore]`d
-plugin repros, 16 plugin-gated tests skipped politely) in ~104 s, and
-**1383 frontend** across 126 files in ~5 s.
+Counts, measured 2026-08-28 on `fix/parallel-test-sigsegv`: **1458 backend**
+(1408 lib + 50 integration, 2 `#[ignore]`d plugin repros, 16 plugin-gated
+tests skipped politely) — 61 s for the lib half plus 70 s for the
+integration half, the latter including the link of its eleven binaries —
+and **1383 frontend** across 126 files in ~5 s.
 
 The lib half needs `-- --test-threads=1` to be measured at all: the
 `midi_out::tests` race below flakes 2–5 names out of a parallel run, and

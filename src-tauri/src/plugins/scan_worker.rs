@@ -90,13 +90,14 @@ impl WorkerCommand {
     /// out [`LINE_TIMEOUT`], kills it and respawns — twice. Meanwhile the
     /// recursive suite has opened every audio device its engine tests ask
     /// for. Measured on 2026-08-28: two lib tests reaching this path cost
-    /// ~30 s each in pure timeout, and drove the PipeWire daemon from 164 to
-    /// 578 open file descriptors against its soft `RLIMIT_NOFILE` of 1024.
-    /// Two of them plus the parallel suite's own engines exhausted the
-    /// daemon, at which point wireplumber died with SIGSEGV and the test
-    /// process segfaulted inside `libpipewire` on the broken connection —
-    /// the `--lib` SIGSEGV that `docs/backlog/ci-hardening.md` item 5 spent
-    /// three weeks blaming on LV2.
+    /// 6-30 s each in pure timeout (how far the recursive suite gets before
+    /// the parent kills it is nondeterministic), and drove the PipeWire
+    /// daemon from a 164-descriptor baseline to peaks of 335-578 against its
+    /// soft `RLIMIT_NOFILE` of 1024. Those two plus the parallel suite's own
+    /// engine streams exhausted the daemon, at which point wireplumber died
+    /// with SIGSEGV and the test process segfaulted inside `libpipewire` on
+    /// the broken connection - the `--lib` SIGSEGV that
+    /// `docs/backlog/ci-hardening.md` item 5 had blamed on LV2.
     ///
     /// So under `cfg(test)` this returns the hidden-entry command instead
     /// (see [`test_worker_command`]). That closes the class rather than the
@@ -312,9 +313,10 @@ pub mod tests {
     ///
     /// That is not a tidiness point. Two lib tests reached this path
     /// (`control::tests::plugin_add_of_an_insert_rehosts_as_effect` and
-    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost ~30 s of
-    /// pure timeout and drove the PipeWire daemon from 164 to 578 open file
-    /// descriptors against its soft `RLIMIT_NOFILE` of 1024. Under the
+    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost 6-30 s of
+    /// pure timeout and drove the PipeWire daemon from a 164-descriptor
+    /// baseline to peaks of 335-578, against its soft `RLIMIT_NOFILE` of
+    /// 1024. Under the
     /// parallel suite the two of them plus the real engine tests' streams
     /// exhausted the daemon, wireplumber died with SIGSEGV, and the test
     /// process segfaulted inside `libpipewire` on the resulting broken
