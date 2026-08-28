@@ -415,10 +415,15 @@ impl LaunchRuntime {
 
     /// Watch the transport and fire launch bindings from clips marked as
     /// launch-map instruments. Hardware `armed` is not involved.
+    /// `tables` is here for one line below: whether the scene is still
+    /// sounding is a property of the CURRENT graph's clock table now
+    /// (Plan V — V2), not of a `SharedRt` atomic, so the release edge has to
+    /// be read where the truth lives.
     pub fn attach_drive(
         &self,
         shared: Arc<crate::audio::rt::SharedRt>,
         session: Arc<parking_lot::Mutex<crate::control::Session>>,
+        tables: crate::audio::rt::SharedGraphTables,
     ) {
         if self.drive_started.swap(true, Relaxed) {
             return;
@@ -434,7 +439,8 @@ impl LaunchRuntime {
                 let mut overlay_was_on = false;
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
-                    let overlay_on = shared.launch_on.load(Relaxed);
+                    let overlay_on =
+                        tables.lock().clocks.is_on(crate::control::SCENE_CLOCK);
                     if overlay_was_on && !overlay_on {
                         if let Some(id) = runtime().overlay_id() {
                             runtime().enqueue_release(id);

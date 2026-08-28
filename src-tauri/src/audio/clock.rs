@@ -133,12 +133,59 @@ impl ClockTable {
         c.on.store(true, Relaxed);
     }
 
+    /// Stop a clock, leaving one pending discontinuity behind.
+    ///
+    /// That flag is the old `SharedRt::end_launch`/`launch_ended` flush
+    /// frame, generalized: cutting a sounding clip mid-note has to reach the
+    /// live nodes bound to this clock as an `all_notes_off`, or the voice
+    /// hangs with nothing left to release it (the control plane releases the
+    /// slot a poll later, and a released slot reads the transport, which
+    /// knows nothing about the note). `stop` therefore never just drops the
+    /// clock — the next `begin_block` latches the flag and every slot still
+    /// bound here sees the jump exactly once.
     pub fn stop(&self, clock: u32) {
         let Some(c) = self.clocks.get(clock as usize) else { return };
         if clock == TRANSPORT_CLOCK {
             return;
         }
+        c.discont.store(true, Relaxed);
         c.on.store(false, Relaxed);
+    }
+
+    /// Is the transport clock running (V-13)? Read by
+    /// `mixer::node_playhead` for a slot whose own clock has stopped: such a
+    /// slot rejoins the arrangement, so what governs it is the transport's
+    /// play state, not the dead clock's.
+    #[inline]
+    pub fn transport_on(&self) -> bool {
+        self.clocks.first().is_some_and(|c| c.on.load(Relaxed))
+    }
+
+    /// Copy one clock's whole running state out of the PREVIOUS graph's
+    /// table (`engine::rebuild`, control thread, before publication).
+    ///
+    /// The table is per-graph (V-4, the `ParamTable` discipline), but a
+    /// launched scene is not: the overlay this replaces lived on `SharedRt`
+    /// and therefore survived every rebuild, so a clip edit made while a pad
+    /// was sounding did not rewind it. Carrying the state forward is what
+    /// keeps that true now that the playhead is versioned with the snapshot.
+    ///
+    /// The PENDING discontinuity is carried, the latched one is not: if the
+    /// retired graph already latched and delivered the jump, re-delivering it
+    /// would be a second, spurious `all_notes_off`.
+    pub fn carry_over(&self, prev: &Self, clock: u32) {
+        let (Some(dst), Some(src)) = (
+            self.clocks.get(clock as usize),
+            prev.clocks.get(clock as usize),
+        ) else {
+            return;
+        };
+        dst.start.store(src.start.load(Relaxed), Relaxed);
+        dst.end.store(src.end.load(Relaxed), Relaxed);
+        dst.pos.store(src.pos.load(Relaxed), Relaxed);
+        dst.looping.store(src.looping.load(Relaxed), Relaxed);
+        dst.discont.store(src.discont.load(Relaxed), Relaxed);
+        dst.on.store(src.on.load(Relaxed), Relaxed);
     }
 
     pub fn is_on(&self, clock: u32) -> bool {
@@ -247,6 +294,11 @@ impl ClockTable {
                 c.discont.store(true, Relaxed);
             } else {
                 c.pos.store(end, Relaxed);
+                // Same flush frame `stop` leaves behind, for the same
+                // reason — reaching the end must all-notes-off the nodes
+                // bound here, which is what `advance_launch` setting
+                // `launch_ended` used to buy.
+                c.discont.store(true, Relaxed);
                 c.on.store(false, Relaxed);
             }
         }
@@ -383,6 +435,84 @@ mod tests {
             5_000,
             "the callback owns the transport position, not this table"
         );
+    }
+
+    /// The `launch_ended` flush frame, re-expressed: a clip cut mid-note
+    /// owes its live nodes an `all_notes_off`, and the only carrier for that
+    /// is a discontinuity on the clock they are still bound to.
+    #[test]
+    fn stopping_a_clock_leaves_one_discontinuity_for_the_nodes_on_it() {
+        let t = table();
+        t.fire(1, 0, 10_000, false);
+        t.bind_slot(1, 1);
+        t.begin_block();
+        assert!(t.playhead(1, 0, false).discontinuity, "the fire");
+
+        t.stop(1);
+        t.begin_block();
+        let ph = t.playhead(1, 0, false);
+        assert!(!ph.on, "stopped");
+        assert!(ph.discontinuity, "the cut is a jump the live node must hear");
+
+        t.begin_block();
+        assert!(!t.playhead(1, 0, false).discontinuity, "exactly once");
+    }
+
+    /// Reaching the marked end is the same event as being cut, so it carries
+    /// the same flush — `advance_launch` setting `launch_ended` is where this
+    /// requirement comes from.
+    #[test]
+    fn a_clock_reaching_its_end_leaves_the_same_discontinuity() {
+        let t = table();
+        t.fire(1, 0, 100, false);
+        t.bind_slot(1, 1);
+        t.advance(128);
+        t.begin_block();
+        let ph = t.playhead(1, 0, false);
+        assert!(!ph.on);
+        assert!(ph.discontinuity, "the end all-notes-offs the node");
+    }
+
+    #[test]
+    fn transport_on_reports_clock_zero() {
+        let t = table();
+        assert!(!t.transport_on());
+        t.set_transport_playing(true);
+        assert!(t.transport_on());
+    }
+
+    /// A rebuild must not rewind a sounding pad: the overlay lived on
+    /// `SharedRt` and survived rebuilds, so the per-graph table has to carry
+    /// the state across by hand (`engine::rebuild`).
+    #[test]
+    fn carry_over_moves_a_running_clock_into_the_next_graphs_table() {
+        let prev = table();
+        prev.fire(1, 400, 900, true);
+        prev.advance(64);
+        prev.begin_block(); // the retired graph already consumed the fire
+
+        let next = table();
+        next.carry_over(&prev, 1);
+        next.bind_slot(1, 1);
+        next.begin_block();
+        let ph = next.playhead(1, 0, false);
+        assert!(ph.on, "still sounding across the rebuild");
+        assert_eq!(ph.pos, 464, "and at the same position");
+        assert!(
+            !ph.discontinuity,
+            "the retired graph already delivered the fire's jump"
+        );
+    }
+
+    #[test]
+    fn carry_over_of_an_unconsumed_fire_still_delivers_its_discontinuity() {
+        let prev = table();
+        prev.fire(1, 400, 900, false); // no begin_block: nobody saw it yet
+        let next = table();
+        next.carry_over(&prev, 1);
+        next.bind_slot(1, 1);
+        next.begin_block();
+        assert!(next.playhead(1, 0, false).discontinuity);
     }
 
     /// V-14: two scenes may name the same track now that scenes are not

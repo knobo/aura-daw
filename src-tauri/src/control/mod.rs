@@ -40,11 +40,20 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use crate::audio::engine::{ControlMsg, EngineHandle, MeterSink};
-use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO};
+use crate::audio::rt::{SharedGraphTables, SharedRt, FLAG_MUTE, FLAG_SOLO};
 use crate::ids::TrackId;
 use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState};
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
+
+/// The one non-transport clock this slice of Plan V has: the scene the
+/// launch overlay used to be (`SharedRt::launch_*` + `FLAG_LAUNCH`).
+///
+/// Singular for exactly as long as the overlay was singular. Task 8 gives
+/// every Region binding its own index and Task 9 gives every player one, at
+/// which point this constant is replaced by a per-binding lookup — it is a
+/// waypoint in the swap, not a design.
+pub const SCENE_CLOCK: u32 = 1;
 
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter, UndoPath};
 pub use ops::{LaneArrangement, TrackMixChange};
@@ -1795,50 +1804,62 @@ impl ControlPlane {
         );
     }
 
+    /// Point the named tracks' mixer slots at [`SCENE_CLOCK`], and nothing
+    /// else at it. The set of bound slots is what the `FLAG_LAUNCH` bit used
+    /// to be — one binding instead of a flag plus a shadow playhead, so the
+    /// two can no longer disagree (V-4).
     pub fn apply_launch_audible(&self, track_ids: &[String]) {
         let tables = self.tables.lock();
         for slot in 0..tables.params.len() {
-            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+            tables.clocks.release_slot_if(slot, SCENE_CLOCK);
         }
         for id in track_ids {
             if let Some(&slot) = tables.slots.get(&TrackId::from(id.as_str())) {
-                tables.params.set_flag(slot, FLAG_LAUNCH, true);
+                tables.clocks.bind_slot(slot, SCENE_CLOCK);
             }
         }
     }
 
     pub fn clear_launch_audible(&self) {
         crate::midi::launch::runtime().clear_audible_tracks();
-        self.shared.clear_launch();
         let tables = self.tables.lock();
+        tables.clocks.stop(SCENE_CLOCK);
         for slot in 0..tables.params.len() {
-            tables.params.set_flag(slot, FLAG_LAUNCH, false);
+            tables.clocks.release_slot_if(slot, SCENE_CLOCK);
         }
     }
 
     pub fn arm_drive_launch(&self, track_ids: &[String], start: u64, end: u64) {
         self.apply_launch_audible(track_ids);
-        self.shared.arm_launch(start, end);
+        self.tables.lock().clocks.fire(SCENE_CLOCK, start, end, false);
     }
 
     pub fn drive_overlay_is(&self, id: &str) -> bool {
-        use std::sync::atomic::Ordering::Relaxed;
-        self.shared.launch_on.load(Relaxed)
+        self.tables.lock().clocks.is_on(SCENE_CLOCK)
             && crate::midi::launch::runtime().overlay_id().as_deref() == Some(id)
     }
 
     pub fn clear_drive_overlay(&self) {
         crate::midi::launch::runtime().set_overlay_id(None);
-        self.shared.clear_launch();
+        self.tables.lock().clocks.stop(SCENE_CLOCK);
     }
 
-    /// Cut whatever is on the launch overlay (Escape / stop-all). Ends it
+    /// Cut whatever the scene clock is playing (Escape / stop-all). Ends it
     /// exactly the way reaching the clip's end does, so the release path the
-    /// drive thread already owns clears FLAG_LAUNCH and emits
+    /// drive thread already owns releases the slots and emits
     /// `LaunchFired { playing: false }` — one code path, one behaviour.
     /// Returns true when something was actually sounding.
+    ///
+    /// It deliberately does NOT release the slots itself. `ClockTable::stop`
+    /// leaves one discontinuity behind, and a slot released in the same
+    /// breath would never read it — the live nodes would keep a cut note
+    /// hanging with nothing left to release them. That was `end_launch`'s
+    /// whole reason for existing next to `clear_launch`.
     pub fn stop_launch_overlay(&self) -> bool {
-        self.shared.end_launch()
+        let tables = self.tables.lock();
+        let was_on = tables.clocks.is_on(SCENE_CLOCK);
+        tables.clocks.stop(SCENE_CLOCK);
+        was_on
     }
 
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
@@ -5860,6 +5881,7 @@ mod tests {
             send_slots: Default::default(),
             generation: 1,
             params: Arc::new(ParamTable::default()),
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             slots: derive_slots(&session.lock().store.tracks),
         }));
         let (engine, engine_rx) = EngineHandle::for_tests();
@@ -6028,6 +6050,7 @@ mod tests {
         let tables: SharedGraphTables = Arc::new(Mutex::new(GraphTables {
             send_slots: Default::default(),
             generation: 1,
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             params: gen1_params.clone(),
             slots: gen1_slots,
         }));
@@ -6068,6 +6091,7 @@ mod tests {
             GraphTables {
                 generation: 2,
                 params: gen2_params.clone(),
+                clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
                 slots: gen2_slots,
                 send_slots: Default::default(),
             };

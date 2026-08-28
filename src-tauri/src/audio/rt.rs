@@ -22,9 +22,12 @@ use crate::plugins::automation::AbsParamEvent;
 
 pub const FLAG_MUTE: u32 = 1 << 0;
 pub const FLAG_SOLO: u32 = 1 << 1;
-/// Track is a live launch target — mixer must hear it even if another
-/// track is soloed or this one is muted.
-pub const FLAG_LAUNCH: u32 = 1 << 2;
+// Bit 2 is FREE. It carried "this track is a live launch target" until
+// Plan V — V2 replaced the overlay with `audio::clock`: which playhead a
+// node reads is now the clock its mixer slot is bound to, so "heard past
+// another track's solo" is DERIVED from that binding (`clock_of(slot) !=
+// TRANSPORT_CLOCK`) instead of stored a second time here. Do not reuse the
+// bit for a playhead concept — see ruling V-4.
 /// A live Write/Touch/Latch controller owns track gain. While set, the
 /// mixer bypasses the compiled gain lane so the fader value is heard
 /// exactly once (the lane remains a relative multiplier when read back).
@@ -51,19 +54,6 @@ pub fn advance_automation_pass(pass: &AtomicU64) -> u64 {
 /// or non-finite bases use the safe silence fallback.
 pub fn relative_gain_multiplier(live: f32, base: f32) -> f32 {
     if base.is_finite() && base > 0.0 { live / base } else { 0.0 }
-}
-
-/// One-shot shadow playhead for a drive-clip launch. Launched tracks
-/// render at `pos` instead of the arrangement playhead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LaunchPlayhead {
-    pub pos: u64,
-    pub discontinuity: bool,
-    /// When true (stopped preview), only FLAG_LAUNCH tracks render.
-    pub exclusive: bool,
-    /// Overlay just reached its marked end — FLAG_LAUNCH tracks must
-    /// all-notes-off; they render at the arrangement playhead.
-    pub ended: bool,
 }
 
 /// `SharedRt::park` sentinel: no parking position pending. (Sample 0 is a
@@ -149,16 +139,6 @@ pub struct SharedRt {
     pub countin_beat: AtomicU64,
     /// Beats in the bar the count-in started in (for downbeat accents).
     pub countin_beats_per_bar: AtomicU32,
-    /// Shadow playhead for a drive-clip launch. The main transport (loop,
-    /// seek, FOLLOW) is left alone; launched tracks render at `launch_pos`.
-    pub launch_on: AtomicBool,
-    pub launch_pos: AtomicU64,
-    pub launch_start: AtomicU64,
-    pub launch_end: AtomicU64,
-    pub launch_discont: AtomicBool,
-    /// Set when the overlay playhead crosses `launch_end`. Consumed by the
-    /// next mixer block so FLAG_LAUNCH tracks all-notes-off.
-    pub launch_ended: AtomicBool,
 }
 
 impl Default for SharedRt {
@@ -184,12 +164,6 @@ impl Default for SharedRt {
             countin_elapsed: AtomicU64::new(0),
             countin_beat: AtomicU64::new(0),
             countin_beats_per_bar: AtomicU32::new(4),
-            launch_on: AtomicBool::new(false),
-            launch_pos: AtomicU64::new(0),
-            launch_start: AtomicU64::new(0),
-            launch_end: AtomicU64::new(0),
-            launch_discont: AtomicBool::new(false),
-            launch_ended: AtomicBool::new(false),
         }
     }
 }
@@ -201,64 +175,6 @@ impl SharedRt {
             enabled: self.loop_enabled.load(Ordering::Relaxed),
             start: self.loop_start.load(Ordering::Relaxed),
             end: self.loop_end.load(Ordering::Relaxed),
-        }
-    }
-
-    pub fn arm_launch(&self, start: u64, end: u64) {
-        let end = end.max(start.saturating_add(1));
-        self.launch_start.store(start, Ordering::Relaxed);
-        self.launch_end.store(end, Ordering::Relaxed);
-        self.launch_pos.store(start, Ordering::Relaxed);
-        self.launch_discont.store(true, Ordering::Relaxed);
-        self.launch_ended.store(false, Ordering::Relaxed);
-        self.launch_on.store(true, Ordering::Relaxed);
-    }
-
-    pub fn clear_launch(&self) {
-        self.launch_on.store(false, Ordering::Relaxed);
-    }
-
-    /// Cut a sounding overlay the way reaching its marked end cuts it: the
-    /// engine gets one `ended` frame, so FLAG_LAUNCH tracks all-notes-off at
-    /// the arrangement playhead instead of having the overlay pulled out from
-    /// under a held note. Returns false when nothing was on it.
-    pub fn end_launch(&self) -> bool {
-        if !self.launch_on.swap(false, Ordering::Relaxed) {
-            return false;
-        }
-        self.launch_ended.store(true, Ordering::Relaxed);
-        true
-    }
-
-    pub fn take_launch_ended(&self) -> bool {
-        self.launch_ended.swap(false, Ordering::Relaxed)
-    }
-
-    pub fn launch_overlay(&self) -> Option<LaunchPlayhead> {
-        if !self.launch_on.load(Ordering::Relaxed) {
-            return None;
-        }
-        Some(LaunchPlayhead {
-            pos: self.launch_pos.load(Ordering::Relaxed),
-            discontinuity: self.launch_discont.swap(false, Ordering::Relaxed),
-            exclusive: false,
-            ended: false,
-        })
-    }
-
-    pub fn advance_launch(&self, frames: u64) {
-        if !self.launch_on.load(Ordering::Relaxed) {
-            return;
-        }
-        let pos = self.launch_pos.load(Ordering::Relaxed);
-        let end = self.launch_end.load(Ordering::Relaxed);
-        let next = pos.saturating_add(frames);
-        if next >= end {
-            self.launch_on.store(false, Ordering::Relaxed);
-            self.launch_ended.store(true, Ordering::Relaxed);
-            self.launch_pos.store(end, Ordering::Relaxed);
-        } else {
-            self.launch_pos.store(next, Ordering::Relaxed);
         }
     }
 }
@@ -756,6 +672,16 @@ pub struct RtGraph {
     /// driven). Empty when there is nothing to click. The RT mixer only
     /// reads it when `SharedRt::metro_on` is set.
     pub clicks: Arc<Vec<crate::audio::metronome::Click>>,
+    /// THIS graph's playheads (Plan V — V2). Versioned with the snapshot for
+    /// the same reason `params` is: a retired graph keeps reading the table
+    /// it was built with, so a rebuild that renumbers clocks cannot bleed
+    /// into a render already in flight.
+    ///
+    /// A running clock's state is CARRIED ACROSS a rebuild by
+    /// `ClockTable::carry_over` (`engine::rebuild`), because the overlay
+    /// this replaces lived on `SharedRt` and a clip edit made while a pad
+    /// sounded did not rewind it.
+    pub clocks: Arc<crate::audio::clock::ClockTable>,
 }
 
 impl RtGraph {
@@ -787,6 +713,15 @@ impl RtGraph {
                 b
             })
             .collect();
+        // Plan V — V2: a graph nobody has given a clock table to IS the
+        // transport, playing. That is what every caller of `mixer::render`
+        // meant before clocks existed (the offline bounce — V-15 — the
+        // headless previews, and every mixer test), so expressing it as the
+        // default keeps this swap behaviour-neutral for all of them.
+        // `engine::rebuild` overwrites the field with the real, scene-bearing
+        // table before the graph is published.
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(params.len(), 1);
+        clocks.set_transport_playing(true);
         Self {
             tracks,
             buses,
@@ -799,6 +734,7 @@ impl RtGraph {
             meter_scratch,
             track_ramps: Vec::new(),
             clicks: Arc::new(Vec::new()),
+            clocks: Arc::new(clocks),
         }
     }
 
@@ -871,6 +807,11 @@ unsafe impl Send for GraphPtr {}
 pub struct GraphTables {
     pub generation: u64,
     pub params: Arc<ParamTable>,
+    /// The CURRENT graph's playheads (Plan V — V2), published here for the
+    /// same reason `params` is: firing a pad must reach the table the
+    /// rendering graph actually reads, and a pad press must never rebuild
+    /// the graph.
+    pub clocks: Arc<crate::audio::clock::ClockTable>,
     pub slots: HashMap<TrackId, usize>,
     /// `SendSlot::id` -> index into `ParamTable::send_amount` (Plan G2),
     /// derived by `types::derive_send_slots` in the same rebuild that built
@@ -918,6 +859,13 @@ impl GraphTables {
         Arc::new(parking_lot::Mutex::new(GraphTables {
             generation: 0,
             params: Arc::new(ParamTable::default()),
+            // Sized to MATCH `params`, and with the scene clock present: a
+            // launch fired before the first real rebuild must not be
+            // silently dropped into a table with no slots to bind.
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
+                ParamTable::default().len(),
+                2,
+            )),
             slots: HashMap::new(),
             send_slots: HashMap::new(),
         }))
@@ -940,6 +888,39 @@ pub(crate) mod testutil {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// V-4's gate. The overlay's single atomic set is DELETED, not
+    /// deprecated: `audio::clock` is the only playhead mechanism now, and a
+    /// reintroduced `launch_*` atomic here would silently give the engine a
+    /// second, contradictory notion of where a node is — the exact defect
+    /// the clock table exists to make impossible.
+    #[test]
+    fn the_launch_overlay_is_gone_from_this_file() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/rt.rs"),
+        )
+        .expect("rt.rs is readable");
+        // Skip this test's own body, which necessarily names them.
+        let body = src
+            .split("fn the_launch_overlay_is_gone_from_this_file")
+            .next()
+            .expect("split always yields a first part");
+        for banned in [
+            "launch_on",
+            "launch_pos",
+            "launch_start",
+            "launch_end",
+            "launch_discont",
+            "launch_ended",
+            "LaunchPlayhead",
+            "FLAG_LAUNCH",
+        ] {
+            assert!(
+                !body.contains(banned),
+                "{banned} is back in rt.rs \u{2014} see audio::clock and ruling V-4"
+            );
+        }
+    }
 
     #[test]
     fn param_table_sizes_beyond_sixty_four() {
@@ -976,30 +957,6 @@ mod tests {
         // at 1, it never goes to 0.
         let g = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(0)));
         assert_eq!(g.meter_scratch.len(), 1);
-    }
-
-    #[test]
-    fn ending_a_sounding_overlay_hands_the_engine_one_flush_frame() {
-        // What `launch_stop` relies on: cutting a launched clip mid-note must
-        // leave `launch_ended` set, because that frame is the only thing that
-        // makes FLAG_LAUNCH tracks all-notes-off (`mixer::track_playhead`).
-        // `clear_launch` alone would drop the overlay under a held note.
-        let s = SharedRt::default();
-        s.arm_launch(1_000, 5_000);
-        s.advance_launch(256);
-        assert!(s.launch_overlay().is_some());
-        assert!(s.end_launch());
-        assert!(s.launch_overlay().is_none());
-        assert!(s.take_launch_ended());
-    }
-
-    #[test]
-    fn ending_an_idle_overlay_is_a_no_op() {
-        // Escape with nothing launched must not fake an end: the flush frame
-        // would send all-notes-off to tracks that never went exclusive.
-        let s = SharedRt::default();
-        assert!(!s.end_launch());
-        assert!(!s.take_launch_ended());
     }
 
     #[test]

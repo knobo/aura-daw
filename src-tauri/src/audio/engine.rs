@@ -720,32 +720,32 @@ impl OutputCb {
             return;
         }
 
-        let overlay_ended = self.shared.take_launch_ended();
-        let overlay = self
-            .shared
-            .launch_overlay()
-            .map(|mut ov| {
-                ov.exclusive = !playing;
-                ov
-            })
-            .or_else(|| {
-                overlay_ended.then_some(crate::audio::rt::LaunchPlayhead {
-                    pos: base,
-                    discontinuity: true,
-                    exclusive: false,
-                    ended: true,
-                })
-            });
-        let overlay_on = overlay.is_some();
-        match (&mut self.graph, playing, overlay_on) {
+        // V-13: clock 0's `on` flag IS the transport's play state, and this
+        // callback is the only reader of it — so it is also the writer. One
+        // relaxed store per block, taken from the same `playing` load every
+        // other decision in this block already uses, which makes the two
+        // provably identical without a lock and without caring which of the
+        // control plane's many transport paths wrote `SharedRt::playing`.
+        // `rebuild` seeds a fresh table with the same value so a graph is
+        // never published disagreeing with the transport.
+        if let Some(g) = self.graph.as_ref() {
+            g.clocks.set_transport_playing(playing);
+        }
+        // Any clock of its own running is what makes the graph render while
+        // the transport is stopped — the old `LaunchPlayhead::exclusive`
+        // preview, now read off the clock table instead of a flag.
+        let clocks_running = self.graph.as_ref().is_some_and(|g| g.clocks.any_running());
+        match (&mut self.graph, playing, clocks_running) {
             (Some(g), true, _) | (Some(g), false, true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
                 // (1..=⌈slots/64⌉ for a wide graph) and reports how many the
                 // ring couldn't take — telemetry, not data, so a dropped
                 // chunk is one xrun, not lost audio.
-                // Overlay-only (stopped + preview) still renders launched
-                // tracks so a double-click audition does not need Play.
-                let dropped = mixer::render_rt_launch(
+                // Clock-only (stopped + preview) still renders the nodes on
+                // that clock so a double-click audition does not need Play;
+                // every node still on the transport is silenced by clock 0's
+                // `on` flag inside `mixer::node_playhead`.
+                let dropped = mixer::render_rt_with_input(
                     g,
                     base,
                     &lp,
@@ -755,7 +755,6 @@ impl OutputCb {
                     discontinuity,
                     steady_base,
                     live_in,
-                    overlay,
                     Some(&mut self.meter_tx),
                 );
                 if dropped > 0 {
@@ -806,8 +805,13 @@ impl OutputCb {
             self.shared.position.store(next, Relaxed);
             self.next_pos = next;
         }
-        if overlay_on {
-            self.shared.advance_launch(frames);
+        // After the render, once per block — the mirror image of
+        // `begin_block`. The transport is advanced above, by the code that
+        // owns `SharedRt::position`; `advance` deliberately skips clock 0,
+        // because two writers on one playhead is the bug the table exists to
+        // make impossible.
+        if let Some(g) = self.graph.as_ref() {
+            g.clocks.advance(frames);
         }
         self.was_playing = playing;
     }
@@ -1914,7 +1918,7 @@ impl Control {
         // enumerated sites where a command swaps the document and
         // republishes a few statements later; there, live truth is what [C1]
         // requires and the image is momentarily behind it.
-        let (params, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
+        let (params, clocks, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
             let session = self.session.lock(); // read-only: param VALUES + slot map + automation compile — short, no assembly
             let store = &session.store;
             let slots = derive_slots(&store.tracks);
@@ -1942,19 +1946,48 @@ impl Control {
                     params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
                 }
             }
+            params.any_solo.store(store.any_solo(), Relaxed);
+            // Plan V — V2: this graph's playheads, sized here on the control
+            // thread exactly like the `ParamTable` above. ONE non-transport
+            // clock for now — the scene the launch overlay used to be; Task 8
+            // gives every Region binding its own and Task 9 gives every
+            // player one.
+            let clocks = Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
+                n_slots,
+                2,
+            ));
+            clocks.set_transport_playing(self.shared.playing.load(Relaxed));
+            // The scene survives the rebuild. The overlay this replaces lived
+            // on `SharedRt`, so editing a clip while a pad sounded did not
+            // rewind it; the table is per-graph, so that only stays true if
+            // the state is carried across by hand.
+            //
+            // The position is snapshotted HERE, not at adoption, so a scene
+            // sounding across a rebuild rewinds by however long the fresh
+            // graph sits in the queue — one callback block in practice. That
+            // is deliberate: reconciling at adoption would have to run on the
+            // RT thread and could not tell "the retired graph advanced past
+            // this" from "a pad was fired into the new table during the
+            // window", and clobbering a fresh fire is the worse failure. The
+            // skew is the same one a knob write in that window already has
+            // (round-2 §2.4).
+            clocks.carry_over(
+                &self.tables.lock().clocks,
+                crate::control::SCENE_CLOCK,
+            );
             let launch_ids = crate::midi::launch::runtime().audible_tracks();
             for t in store.tracks.iter() {
                 if !launch_ids.iter().any(|id| id == t.id.as_str()) {
                     continue;
                 }
                 let Some(&slot) = slots.get(&t.id) else { continue };
-                params.set_flag(slot, super::rt::FLAG_LAUNCH, true);
+                clocks.bind_slot(slot, crate::control::SCENE_CLOCK);
             }
-            params.any_solo.store(store.any_solo(), Relaxed);
             // THE [C1] PUBLISH SITE — still under `session`, see above.
             *self.tables.lock() = GraphTables {
                 generation: self.generation,
                 params: params.clone(),
+                clocks: clocks.clone(),
                 slots: slots.clone(),
                 send_slots: send_slots.clone(),
             };
@@ -1992,7 +2025,7 @@ impl Control {
                 self.cache_rate,
                 self.shared.song_end.load(Relaxed),
             );
-            (params, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks)
+            (params, clocks, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks)
         };
         // Task 10, pass-end trigger 2 (mode change — spec §4.5): a track
         // that WAS Write/Touch/Latch and no longer is has just ended its
@@ -2122,6 +2155,10 @@ impl Control {
         // like `params`.
         g.set_track_ramps(track_ramps);
         g.clicks = Arc::new(clicks);
+        // RCU, same as the ramps: the table is attached BEFORE publication,
+        // so the callback only ever sees a snapshot whose playheads already
+        // belong to it.
+        g.clocks = clocks;
         let graph = Box::new(g);
 
         let Some(out) = self.output.as_mut() else { return };
@@ -4707,6 +4744,7 @@ mod tests {
             send_slots: Default::default(),
             generation: 0,
             params: Arc::new(ParamTable::default()),
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
@@ -4747,6 +4785,7 @@ mod tests {
             send_slots: Default::default(),
             generation: 0,
             params: Arc::new(ParamTable::default()),
+            clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
@@ -5939,6 +5978,12 @@ mod tests {
 
         // Hard-left so the left channel carries the full (halved) signal.
         graph.params.set_pan(0, -1.0);
+        // Plan V — V2 (V-13): this renders a REBUILD's graph directly instead
+        // of through the output callback, and `rebuild` seeds clock 0 from
+        // `SharedRt::playing`, which this test never sets. The callback
+        // mirrors the transport onto the table every block, so production
+        // never sees the mismatch; a direct render has to say it itself.
+        graph.clocks.set_transport_playing(true);
         let mut out = vec![0.0f32; 64 * 2];
         let dropped = mixer::render(&mut graph, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
         assert_eq!(dropped, 0);

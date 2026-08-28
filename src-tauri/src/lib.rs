@@ -107,6 +107,10 @@ pub fn run() {
             // about to consume below.
             let midi_out_session = session.clone();
             let midi_out_shared = shared.clone();
+            // Plan V — V2: the launch drive thread watches the CURRENT
+            // graph's scene clock, so it needs the tables `ControlPlane::new`
+            // is about to consume too.
+            let drive_tables = tables.clone();
             let control_plane = Arc::new(control::ControlPlane::new(
                 session,
                 shared,
@@ -133,7 +137,11 @@ pub fn run() {
             // attach it to the control plane so the MIDI-out routing/port/
             // clock methods can reach it.
             let midi_out = app.state::<Arc<midi_out::MidiOut>>().inner().clone();
-            crate::midi::launch::runtime().attach_drive(midi_out_shared.clone(), midi_out_session.clone());
+            crate::midi::launch::runtime().attach_drive(
+                midi_out_shared.clone(),
+                midi_out_session.clone(),
+                drive_tables,
+            );
             midi_out.attach(midi_out_session, midi_out_shared);
             control_plane.attach_midi_out(midi_out);
 

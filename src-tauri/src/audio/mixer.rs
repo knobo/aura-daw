@@ -19,10 +19,8 @@ use std::sync::atomic::Ordering::Relaxed;
 use super::dsp::ProcessBlock;
 use super::meters::{RawMeterBlock, METER_CHUNK_SLOTS};
 use super::midi_in::{LiveMidiEvent, EV_ALL_OFF, EV_NOTE_ON};
-use super::rt::{
-    LaunchPlayhead, RtClip, RtGraph, RtSend, RtTrack, FLAG_LAUNCH, FLAG_MUTE, FLAG_SOLO,
-    MAX_LIVE_BLOCK,
-};
+use super::clock::{ClockTable, TRANSPORT_CLOCK};
+use super::rt::{RtClip, RtGraph, RtSend, RtTrack, FLAG_MUTE, FLAG_SOLO, MAX_LIVE_BLOCK};
 use super::transport::{frame_pos, LoopSpec};
 use crate::midi::synth::BlockNoteEvent;
 use crate::plugins::automation::{value_at, AbsParamEvent, RampCursor};
@@ -71,18 +69,22 @@ pub fn balance_gains(pan: f32) -> (f32, f32) {
 
 /// Solo/mute resolution: when any track is soloed only soloed tracks sound;
 /// mute always silences its own track (mute wins over its own solo, and
-/// over a live launch target — an explicitly muted track stays silent even
-/// while it drives a launched scene). `launch` only bypasses another
-/// track's solo, so a launched scene stays audible while auditioning
-/// across a solo elsewhere.
+/// over a node on its own clock — an explicitly muted track stays silent
+/// even while it drives a launched scene). `own_clock` only bypasses
+/// another track's solo, so a launched scene stays audible while
+/// auditioning across a solo elsewhere.
 #[inline]
 pub fn audible(muted: bool, soloed: bool, any_solo: bool) -> bool {
     audible_with_launch(muted, soloed, any_solo, false)
 }
 
+/// `own_clock` = "this node reads a clock of its own, not the transport"
+/// (Plan V — V2). Same predicate the deleted `FLAG_LAUNCH` bit carried,
+/// stated in the vocabulary that now owns it: a pad that goes silent
+/// because someone soloed a vocal is the deck cutting out mid-performance.
 #[inline]
-pub fn audible_with_launch(muted: bool, soloed: bool, any_solo: bool, launch: bool) -> bool {
-    !muted && (launch || !any_solo || soloed)
+pub fn audible_with_launch(muted: bool, soloed: bool, any_solo: bool, own_clock: bool) -> bool {
+    !muted && (own_clock || !any_solo || soloed)
 }
 
 /// Sample a clip at absolute timeline position `pos` (engine samples).
@@ -429,31 +431,55 @@ fn process_inserts(
     }
 }
 
-/// Where this track's playhead is for THIS block, and whether that position
-/// is a discontinuity. Factored out (Plan G2) because the windowed render
-/// needs the answer twice: once in the prologue, to decide whether the live
-/// node owes an `all_notes_off` before the block's first run, and again per
-/// window, to place the runs. A launched track renders at the drive-clip
-/// shadow playhead with no loop; a launch that just ended is itself a
-/// discontinuity back to the arrangement playhead.
+/// Where this node's playhead is for THIS block, whether that position is a
+/// discontinuity, and whether the node renders at all.
+///
+/// Returns `(pos, loop_spec, discontinuity, audible)`. Factored out (Plan
+/// G2) because the windowed render needs the answer twice: once in the
+/// prologue, to decide whether the live node owes an `all_notes_off` before
+/// the block's first run, and again per window, to place the runs. Calling
+/// it twice is safe because `ClockTable::begin_block` latched this block's
+/// discontinuity once, up front — `playhead` only ever reads that latch.
+///
+/// Costs one indexed atomic load more than the `FLAG_LAUNCH` test it
+/// replaces: the flag test became a clock lookup.
+///
+/// THREE cases, and the third is the one that keeps this swap
+/// behaviour-neutral:
+///
+/// * The **transport clock** — the arrangement's `LoopSpec` applies, and the
+///   clock's `on` flag IS the transport's play state (V-13). "Only launched
+///   nodes render while stopped" (`LaunchPlayhead::exclusive`) is now a
+///   consequence of that flag, not a special case.
+/// * A **running clock of its own** — its loop is the start/end pair the
+///   fire recorded and `ClockTable::advance` wraps it, so the arrangement's
+///   `LoopSpec` does not apply at all. That is exactly the `&LoopSpec::OFF`
+///   the overlay handed a launched track.
+/// * A **stopped clock of its own** — the node REJOINS THE ARRANGEMENT until
+///   the control plane releases its slot. This is the old `ended` frame
+///   (`track_playhead` returned `(base_pos, lp, true)`), and it is load
+///   bearing at both ends of a launch: `arm_drive_launch` binds the slots
+///   and then fires, and the release runs a poll-interval after the clip
+///   ends, so without it a launched track would drop out for a block at the
+///   press and go silent for ~8 ms at the end instead of returning to the
+///   song. The discontinuity that comes with it is `ClockTable::stop`'s /
+///   `advance`'s parting flush — the `all_notes_off` `launch_ended` bought.
 #[inline]
-fn track_playhead(
-    flags: u32,
-    launch: Option<LaunchPlayhead>,
+fn node_playhead(
+    clocks: &ClockTable,
+    slot: usize,
     base_pos: u64,
     lp: &LoopSpec,
     discontinuity: bool,
-) -> (u64, &LoopSpec, bool) {
-    let flagged = flags & FLAG_LAUNCH != 0;
-    if flagged {
-        if let Some(ov) = launch {
-            if !ov.ended {
-                return (ov.pos, &LoopSpec::OFF, ov.discontinuity);
-            }
-            return (base_pos, lp, true);
-        }
+) -> (u64, LoopSpec, bool, bool) {
+    let ph = clocks.playhead(slot, base_pos, discontinuity);
+    if ph.is_transport {
+        return (ph.pos, *lp, ph.discontinuity, ph.on);
     }
-    (base_pos, lp, discontinuity)
+    if ph.on {
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true);
+    }
+    (base_pos, *lp, ph.discontinuity, clocks.transport_on())
 }
 
 fn live_all_notes_off(tr: &RtTrack) {
@@ -513,7 +539,6 @@ pub fn render(
         discontinuity,
         None,
         None,
-        None,
         meter_tx,
     )
 }
@@ -548,7 +573,6 @@ pub fn render_rt(
         discontinuity,
         Some(steady_base),
         None,
-        None,
         meter_tx,
     )
 }
@@ -568,23 +592,6 @@ pub fn render_rt_with_input(
     live_in: Option<LiveInBlock<'_>>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
-    render_rt_launch(graph, base_pos, lp, out, out_ch, sample_rate, discontinuity, steady_base, live_in, None, meter_tx)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn render_rt_launch(
-    graph: &mut RtGraph,
-    base_pos: u64,
-    lp: &LoopSpec,
-    out: &mut [f32],
-    out_ch: usize,
-    sample_rate: u32,
-    discontinuity: bool,
-    steady_base: u64,
-    live_in: Option<LiveInBlock<'_>>,
-    launch: Option<LaunchPlayhead>,
-    meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
-) -> u32 {
     render_impl(
         graph,
         base_pos,
@@ -595,7 +602,6 @@ pub fn render_rt_launch(
         discontinuity,
         Some(steady_base),
         live_in,
-        launch,
         meter_tx,
     )
 }
@@ -611,7 +617,6 @@ fn render_impl(
     discontinuity: bool,
     steady_base: Option<u64>,
     live_in: Option<LiveInBlock<'_>>,
-    launch: Option<LaunchPlayhead>,
     meter_tx: Option<&mut rtrb::Producer<RawMeterBlock>>,
 ) -> u32 {
     let out_ch = out_ch.max(1);
@@ -624,6 +629,14 @@ fn render_impl(
     // the function. This is also how the O-13 alias window stays dead: a
     // retired graph always renders against the table it was built with.
     let params = graph.params.clone();
+    // Plan V — V2: this graph's playheads, taken the same way and for the
+    // same borrow-check reason as `params`.
+    let clocks = graph.clocks.clone();
+    // ONCE per block, before any `playhead()` call: latch every clock's
+    // pending discontinuity. A scene clock is bound to MANY slots, and a
+    // per-reader consume would hand the jump to whichever track read first
+    // and hang a note on all the others — see `ClockTable::begin_block`.
+    clocks.begin_block();
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
@@ -663,8 +676,7 @@ fn render_impl(
         if tr.slot >= n_slots {
             continue;
         }
-        let flags = params.flags[tr.slot].load(Relaxed);
-        let (_, _, track_disc) = track_playhead(flags, launch, base_pos, lp, discontinuity);
+        let (_, _, track_disc, _) = node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
         tr.win.disc = track_disc;
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
         prime_live(tr, track_disc, live_in_events);
@@ -705,20 +717,21 @@ fn render_impl(
             let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
             let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
             let flags = params.flags[tr.slot].load(Relaxed);
-            let flagged = flags & FLAG_LAUNCH != 0;
-            let exclusive = launch.as_ref().is_some_and(|ov| ov.exclusive && !ov.ended);
-            let on = if exclusive && !flagged {
-                false
-            } else {
-                audible_with_launch(
+            let (track_base, track_lp, _, clock_on) =
+                node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
+            let own_clock = clocks.clock_of(tr.slot) != TRANSPORT_CLOCK;
+            // Two gates, and they used to be three. `clock_on` false is a
+            // stopped transport (the old `exclusive`) or a clock that is not
+            // running; `own_clock` is what bypasses another track's solo
+            // (the old `FLAG_LAUNCH`). Both are now read off the same
+            // binding, so they cannot disagree.
+            let on = clock_on
+                && audible_with_launch(
                     flags & FLAG_MUTE != 0,
                     flags & FLAG_SOLO != 0,
                     any_solo,
-                    flagged,
-                )
-            };
-            let (track_base, track_lp, _) =
-                track_playhead(flags, launch, base_pos, lp, discontinuity);
+                    own_clock,
+                );
             let (gl_atomic, gr_atomic) = pan_gains(pan);
             let mut acc = TrackAccum::default();
 
@@ -740,8 +753,8 @@ fn render_impl(
                 ramps.and_then(|t| t.pan.as_ref()).map(|a| a.as_slice()),
                 pan,
                 (gl_atomic, gr_atomic),
-                frame_pos(track_base, 0, track_lp).saturating_sub(pdc_delay),
-                frame_pos(track_base, frames.saturating_sub(1) as u64, track_lp)
+                frame_pos(track_base, 0, &track_lp).saturating_sub(pdc_delay),
+                frame_pos(track_base, frames.saturating_sub(1) as u64, &track_lp)
                     .saturating_sub(pdc_delay),
                 pan_gains,
             );
@@ -752,7 +765,7 @@ fn render_impl(
             // LoopSpec); so is the window edge.
             let mut f = w0;
             while f < w_end {
-                let pos = frame_pos(track_base, f as u64, track_lp);
+                let pos = frame_pos(track_base, f as u64, &track_lp);
                 let mut run = (w_end - f).min(MAX_LIVE_BLOCK);
                 let mut wraps = false;
                 if track_lp.active() && pos < track_lp.end {
@@ -770,7 +783,7 @@ fn render_impl(
                 buf.fill(0.0);
                 if !tr.clips.is_empty() {
                     for i in 0..run {
-                        let p = frame_pos(track_base, (f + i) as u64, track_lp);
+                        let p = frame_pos(track_base, (f + i) as u64, &track_lp);
                         let mut l = 0.0f32;
                         let mut r = 0.0f32;
                         for clip in &tr.clips {
@@ -998,6 +1011,7 @@ pub fn render_live_input_only(
     let frames = out.len() / out_ch;
     out.fill(0.0);
     let params = graph.params.clone();
+    let clocks = graph.clocks.clone();
     let any_solo = params.any_solo.load(Relaxed);
     let n_slots = params.len();
     let generation = graph.generation;
@@ -1023,7 +1037,7 @@ pub fn render_live_input_only(
             flags & FLAG_MUTE != 0,
             flags & FLAG_SOLO != 0,
             any_solo,
-            flags & FLAG_LAUNCH != 0,
+            clocks.clock_of(tr.slot) != TRANSPORT_CLOCK,
         );
         let (gl_atomic, gr_atomic) = pan_gains(pan);
         let mut acc = TrackAccum::default();
@@ -1197,74 +1211,105 @@ mod tests {
         );
     }
 
+    /// The clock table this graph would get for a launch: `n` slots, the
+    /// transport plus one scene clock, transport play state as given.
+    fn scene_clocks(g: &RtGraph, playing: bool) -> ClockTable {
+        let c = ClockTable::with_slots_and_clocks(g.params.len(), 2);
+        c.set_transport_playing(playing);
+        c
+    }
+
+    /// The claim the overlay test made, now made of clocks: a node bound to
+    /// a running non-transport clock renders at THAT clock's position, not
+    /// the arrangement's.
     #[test]
-    fn launch_overlay_plays_the_scene_not_the_arrangement_playhead() {
+    fn a_node_on_a_scene_clock_plays_the_scene_not_the_arrangement_playhead() {
         let mut g = one_track_graph(0, clip(100, 0, 4, vec![1.0; 4], 1));
-        g.params.set_flag(0, FLAG_LAUNCH, true);
         g.params.set_pan(0, -1.0);
         let mut silent = vec![0.0f32; 8];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut silent, 2);
         assert!(
             silent.iter().all(|s| *s == 0.0),
-            "without overlay the clip is off the arrangement playhead"
+            "on the transport clock the clip is off the arrangement playhead"
         );
+
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 100, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
         let mut out = vec![0.0f32; 8];
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false, ended: false }),
-            None,
-        );
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!(
             (out[0] - 1.0).abs() < 1e-5,
-            "overlay hears the scene at its own position"
+            "the scene sounds at its own clock's position, got {}",
+            out[0]
         );
     }
 
+    /// V-13: with the transport stopped, a transport-clock node renders
+    /// nothing while a fired clock still sounds. This is what
+    /// `LaunchPlayhead::exclusive` used to say, and it is now a consequence
+    /// of clock 0's `on` flag rather than a separate concept.
     #[test]
-    fn exclusive_overlay_silences_tracks_without_the_launch_flag() {
+    fn a_stopped_transport_silences_arrangement_nodes_but_not_a_fired_one() {
         let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
         g.params.set_pan(0, -1.0);
+
+        g.clocks = Arc::new(scene_clocks(&g, false));
         let mut out = vec![0.0f32; 8];
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true, ended: false }),
-            None,
-        );
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!(
             out.iter().all(|s| *s == 0.0),
-            "parked arrangement must stay silent during stopped preview"
+            "parked arrangement must stay silent while the transport is stopped"
         );
-        g.params.set_flag(0, FLAG_LAUNCH, true);
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 0, discontinuity: false, exclusive: true, ended: false }),
-            None,
+
+        let clocks = scene_clocks(&g, false);
+        clocks.fire(1, 0, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(
+            (out[0] - 1.0).abs() < 1e-5,
+            "only the fired node contributes, got {}",
+            out[0]
         );
-        assert!((out[0] - 1.0).abs() < 1e-5, "launched track still plays");
+    }
+
+    /// The other half of `LaunchPlayhead::ended`: a scene that stops does
+    /// not silence its tracks — they rejoin the ARRANGEMENT until the
+    /// control plane releases their slots a poll later, and they get one
+    /// discontinuity on the way so a held note is released.
+    #[test]
+    fn a_stopped_scene_clock_returns_its_nodes_to_the_arrangement() {
+        let mut g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        g.params.set_pan(0, -1.0);
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 500, 10_000, false); // far from the clip
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(out.iter().all(|s| *s == 0.0), "the scene is past the clip");
+
+        g.clocks.stop(1); // Escape, or the clip reaching its end
+
+        // The flush frame `launch_ended` used to carry: `begin_block`
+        // latches the stop's discontinuity and every node still bound to the
+        // clock reads it, which is what makes the live node all-notes-off in
+        // `render_impl`'s prologue instead of hanging the cut voice.
+        g.clocks.begin_block();
+        let (pos, _, disc, on) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
+        assert_eq!(pos, 0, "back on the arrangement playhead");
+        assert!(on, "and audible: the transport is still running");
+        assert!(disc, "the return is a discontinuity");
+
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert!(
+            (out[0] - 1.0).abs() < 1e-5,
+            "and it is the arrangement that sounds, got {}",
+            out[0]
+        );
     }
 
     // ---- clip sampling ----
@@ -1896,28 +1941,19 @@ mod tests {
     }
 
     #[test]
-    fn launch_overlay_still_plays_the_scene_through_inserts() {
+    fn a_node_on_a_scene_clock_still_plays_the_scene_through_inserts() {
         let mut g = one_track_graph(0, clip(100, 0, 4, vec![1.0; 4], 1));
-        g.params.set_flag(0, FLAG_LAUNCH, true);
         g.params.set_pan(0, -1.0);
         insert_on(&mut g, 0, Box::new(GainHalfEffect { bypassed: false }), false);
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 100, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
         let mut out = vec![0.0f32; 8];
-        render_rt_launch(
-            &mut g,
-            0,
-            &LoopSpec::OFF,
-            &mut out,
-            2,
-            48_000,
-            false,
-            0,
-            None,
-            Some(LaunchPlayhead { pos: 100, discontinuity: true, exclusive: false, ended: false }),
-            None,
-        );
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         assert!(
             (out[0] - 0.5).abs() < 1e-5,
-            "overlay must hear the scene through the insert, got {}",
+            "the scene must be heard through the insert, got {}",
             out[0]
         );
     }
