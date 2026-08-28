@@ -10,6 +10,14 @@
 //! No extra crates (Cargo.toml is frozen): we dlopen libX11 at runtime
 //! (Linux) and shell out to xdotool for window discovery. Missing tools
 //! = no-op, never a failed show.
+//!
+//! Window discovery and restacking are two separate round trips, so an
+//! id `xdotool` reported can be gone by the time our request reaches the
+//! server. Xlib's DEFAULT error handler calls `exit(1)` for that, which
+//! would take a DAW down — with the session's unsaved work — because a
+//! plugin editor closed a millisecond early. `x11ewmh::Display` installs
+//! its own handler for as long as it lives; see the comment there for
+//! the two things that make it delicate.
 
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -204,6 +212,8 @@ mod x11ewmh {
     use std::ffi::CString;
     use std::os::raw::{c_char, c_int, c_long, c_ulong, c_void};
     use std::ptr;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     const RTLD_NOW: c_int = 2;
     const CLIENT_MESSAGE: c_int = 33;
@@ -235,6 +245,68 @@ mod x11ewmh {
         data: [c_long; 5],
     }
 
+    /// Field order is Xlib's, not the one the man page prints: the
+    /// resource id comes BEFORE the serial (`/usr/include/X11/Xlib.h`).
+    #[repr(C)]
+    struct XErrorEvent {
+        type_: c_int,
+        display: *mut c_void,
+        resourceid: c_ulong,
+        serial: c_ulong,
+        error_code: u8,
+        request_code: u8,
+        minor_code: u8,
+    }
+
+    /// The 17 core error codes (`/usr/include/X11/X.h`). Named here
+    /// rather than through `XGetErrorText`, which is Xlib re-entry from
+    /// inside an Xlib callback.
+    #[cfg(test)]
+    pub fn error_name_for_test(code: u8) -> &'static str {
+        error_name(code)
+    }
+
+    fn error_name(code: u8) -> &'static str {
+        const NAMES: [&str; 17] = [
+            "BadRequest", "BadValue", "BadWindow", "BadPixmap", "BadAtom",
+            "BadCursor", "BadFont", "BadMatch", "BadDrawable", "BadAccess",
+            "BadAlloc", "BadColor", "BadGC", "BadIDChoice", "BadName",
+            "BadLength", "BadImplementation",
+        ];
+        NAMES.get(code.wrapping_sub(1) as usize).copied().unwrap_or("extension error")
+    }
+
+    /// Only one `Display` at a time: the error handler is process-global,
+    /// so nested installs would restore in the wrong order.
+    static X11_LOCK: Mutex<()> = Mutex::new(());
+    static PREV_HANDLER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+    static OUR_DPY: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+    /// Swallow errors on OUR connection; hand every other one back to
+    /// whoever was handling errors before us (GTK/GDK installs its own,
+    /// and it is not ours to override for the rest of the process).
+    unsafe extern "C" fn swallow_error(dpy: *mut c_void, err: *mut XErrorEvent) -> c_int {
+        if dpy != OUR_DPY.load(Ordering::Acquire) {
+            let prev = PREV_HANDLER.load(Ordering::Acquire);
+            if !prev.is_null() {
+                let f: XErrorHandlerFn = std::mem::transmute(prev);
+                return f(dpy, err);
+            }
+            return 0;
+        }
+        let e = &*err;
+        log::warn!(
+            "wm_stack: ignoring X {} on window 0x{:x} (request {}.{}, serial {}) \
+             — the window most likely closed under us",
+            error_name(e.error_code),
+            e.resourceid,
+            e.request_code,
+            e.minor_code,
+            e.serial
+        );
+        0
+    }
+
     type XOpenDisplayFn = unsafe extern "C" fn(*const c_char) -> *mut c_void;
     type XCloseDisplayFn = unsafe extern "C" fn(*mut c_void) -> c_int;
     type XDefaultScreenFn = unsafe extern "C" fn(*mut c_void) -> c_int;
@@ -245,6 +317,10 @@ mod x11ewmh {
     type XRaiseWindowFn = unsafe extern "C" fn(*mut c_void, c_ulong) -> c_int;
     type XSetTransientForHintFn = unsafe extern "C" fn(*mut c_void, c_ulong, c_ulong) -> c_int;
     type XDeletePropertyFn = unsafe extern "C" fn(*mut c_void, c_ulong, c_ulong) -> c_int;
+    type XSyncFn = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
+    type XErrorHandlerFn = unsafe extern "C" fn(*mut c_void, *mut XErrorEvent) -> c_int;
+    type XSetErrorHandlerFn =
+        unsafe extern "C" fn(Option<XErrorHandlerFn>) -> Option<XErrorHandlerFn>;
 
     pub struct Display {
         dpy: *mut c_void,
@@ -255,11 +331,19 @@ mod x11ewmh {
         raise: XRaiseWindowFn,
         set_transient: XSetTransientForHintFn,
         delete_prop: XDeletePropertyFn,
+        sync: XSyncFn,
+        set_err: XSetErrorHandlerFn,
         root: c_ulong,
+        _lock: MutexGuard<'static, ()>,
     }
 
     impl Display {
+        /// `None` means the caller falls back to the `xdotool`/`xprop`
+        /// path, which is the safer one anyway: a stale id kills a child
+        /// process there, not us. So every symbol below is required —
+        /// including the two the error handler needs.
         pub fn open() -> Option<Self> {
+            let lock = X11_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             unsafe {
                 let lib = dlopen(c"libX11.so.6".as_ptr(), RTLD_NOW);
                 if lib.is_null() {
@@ -275,10 +359,17 @@ mod x11ewmh {
                 let raise: XRaiseWindowFn = sym(lib, "XRaiseWindow")?;
                 let set_transient: XSetTransientForHintFn = sym(lib, "XSetTransientForHint")?;
                 let delete_prop: XDeletePropertyFn = sym(lib, "XDeleteProperty")?;
+                let sync: XSyncFn = sym(lib, "XSync")?;
+                let set_err: XSetErrorHandlerFn = sym(lib, "XSetErrorHandler")?;
                 let dpy = open(ptr::null());
                 if dpy.is_null() {
                     return None;
                 }
+                // Order matters: the handler compares against OUR_DPY, so
+                // that has to be readable before the handler can run.
+                OUR_DPY.store(dpy, Ordering::Release);
+                let prev = set_err(Some(swallow_error));
+                PREV_HANDLER.store(std::mem::transmute(prev), Ordering::Release);
                 let root = root_window(dpy, default_screen(dpy));
                 Some(Self {
                     dpy,
@@ -289,7 +380,10 @@ mod x11ewmh {
                     raise,
                     set_transient,
                     delete_prop,
+                    sync,
+                    set_err,
                     root,
+                    _lock: lock,
                 })
             }
         }
@@ -349,8 +443,20 @@ mod x11ewmh {
     }
 
     impl Drop for Display {
+        /// X errors are ASYNCHRONOUS, so the sync is the whole point:
+        /// restoring the handler first and syncing after leaves the
+        /// deferred error to Xlib's default handler, i.e. `exit(1)`.
+        /// Measured both ways — see the PR.
         fn drop(&mut self) {
-            unsafe { (self.close)(self.dpy) };
+            unsafe {
+                (self.sync)(self.dpy, 0);
+                // XCloseDisplay syncs again, so it stays inside the guard.
+                (self.close)(self.dpy);
+                let prev: Option<XErrorHandlerFn> =
+                    std::mem::transmute(PREV_HANDLER.load(Ordering::Acquire));
+                (self.set_err)(prev);
+                OUR_DPY.store(ptr::null_mut(), Ordering::Release);
+            }
         }
     }
 
@@ -389,5 +495,38 @@ mod tests {
     fn ewmh_actions_match_spec() {
         assert_eq!(NET_WM_STATE_REMOVE, 0);
         assert_eq!(NET_WM_STATE_ADD, 1);
+    }
+
+    /// The regression this module exists to prevent. `xdotool` finds a
+    /// window id, the window closes, we restack it — and Xlib's default
+    /// error handler calls `exit(1)`.
+    ///
+    /// Note how this test fails if it regresses: not with a panic and an
+    /// assertion line, but with the whole test binary gone at rc=1 after
+    /// printing `X Error of failed request: BadWindow`. That is exactly
+    /// what it was doing to the DAW.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_dead_window_id_does_not_take_the_process_with_it() {
+        if std::env::var_os("DISPLAY").is_none() {
+            return; // no X server; the whole path is a no-op
+        }
+        // An id no server hands out: high enough to be outside every
+        // client's allocated range on a fresh session.
+        let dead = [0x00ff_ffffu64];
+        restack_windows(&dead, true); // XSetTransientForHint + XRaiseWindow
+        restack_windows(&dead, false); // XDeleteProperty
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn core_error_codes_are_named_and_the_rest_do_not_panic() {
+        assert_eq!(x11ewmh::error_name_for_test(3), "BadWindow");
+        assert_eq!(x11ewmh::error_name_for_test(1), "BadRequest");
+        assert_eq!(x11ewmh::error_name_for_test(17), "BadImplementation");
+        // 0 is "no error" and >17 belongs to an extension; both must be
+        // survivable, because this runs inside the error handler.
+        assert_eq!(x11ewmh::error_name_for_test(0), "extension error");
+        assert_eq!(x11ewmh::error_name_for_test(200), "extension error");
     }
 }
