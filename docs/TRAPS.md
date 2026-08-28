@@ -53,6 +53,28 @@ session burns an hour on something a sentence would have prevented.
   → `UndoPath::head()`) is the value that means "the history has not moved";
   it is what `history_undo_to` guards on.
 
+- **Xlib's DEFAULT error handler calls `exit(1)`.** X errors are also
+  ASYNCHRONOUS, so both halves of that bite. Any code that acts on a window
+  id discovered in a previous round trip — `wm_stack`'s `xdotool` search is
+  ours — can hand the server an id that has since died, and the process
+  simply vanishes: rc=1, no panic, no signal, no core, just
+  `X Error of failed request: BadWindow` on stderr. Under a parallel test
+  run it looks like a flaky harness; in the app it is the session's unsaved
+  work. `x11ewmh::Display` now installs a handler for its own connection.
+  If you add one anywhere else, note the second half: an error is delivered
+  when the connection is next read, so restoring the previous handler and
+  syncing afterwards protects NOTHING. Sync first, restore second —
+  measured both ways.
+
+- **`libc` is not required to call a libc function.** `prctl`, `getppid`
+  and friends live in the glibc every Rust binary on this target already
+  links, so a bare `extern "C"` block reaches them — which is how
+  `plugins/lv2_ui.rs` and `plugins/wm_stack.rs` do it. `ci-hardening.md`
+  had `PR_SET_PDEATHSIG` recorded as blocked on the frozen `Cargo.toml`
+  for weeks on the strength of "needs the `libc` crate", which was never
+  tested. Before parking work on a frozen manifest, try linking it.
+
+
 ## Tests
 
 - **Before any new `*.dom.test.ts`**, read

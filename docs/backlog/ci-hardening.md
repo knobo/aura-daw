@@ -127,27 +127,41 @@ PR, but two categories of tests are currently skipped rather than exercised:
    | the two offending tests | 6–30 s each, +171…+414 daemon fds | 0.33 s each, +0 |
    | `control::` at `--test-threads=1` | 401 passed in 34 s | 401 passed in 11 s |
 
-   **What is still open, and none of it is the same bug:**
+   **What that fix made reachable, and what is still open — none of it
+   the same bug.** The first two and the ext-gui paragraph at the end were
+   closed by PR #124 and are kept here because the reasoning is worth more
+   than the outcome; the middle three are open.
 
-   - **A parallel run now aborts on `X Error of failed request: BadWindow`
-     in about half the runs** (`rc=1`, no core, no signal). This is NEWLY
-     REACHABLE, not newly caused: `main` never got there because it
-     segfaulted first, and the A/B above is 0 of 4 on `main` against 2 of 4
-     here. It lands right after the three zyn GUI tests all report `ok`, at
-     a very low request serial, so the shape is a stale window id —
-     `wm_stack`'s `xdotool`-discovered ids get restacked (`XRaiseWindow` /
-     `XSetTransientForHint`) after another test has closed that window.
-     Xlib's DEFAULT error handler calls `exit(1)`, which is why it takes the
-     process with it.
+   - **The `X Error … BadWindow` abort — FIXED (2026-08-28, PR #124).**
+     It was newly REACHABLE, not newly caused: `main` segfaulted before it
+     got there, and the A/B above is 0 of 4 on `main` against 2 of 4 after
+     the SIGSEGV fix. `wm_stack` discovers window ids with `xdotool` and
+     restacks them in a second round trip, so the id can be dead by the
+     time the request lands, and **Xlib's default error handler calls
+     `exit(1)`** — which is a product bug before it is a test bug: a DAW
+     must not exit, losing the session, because a plugin editor closed a
+     millisecond early.
 
-     **That is a product bug, not only a test bug.** A DAW must not exit
-     because a plugin editor closed a millisecond before we restacked it —
-     that is unsaved work gone. The fix is an `XSetErrorHandler` that logs
-     and returns 0, resolved through the same runtime `dlopen` the module
-     already uses, so the frozen `Cargo.toml` is untouched. The care needed
-     is that the handler is process-GLOBAL and GTK/GDK installs its own:
-     save and restore the previous handler around our own calls rather than
-     installing ours for the process lifetime. `--test-threads=1` never hits it, so the gate is unaffected.
+     `x11ewmh::Display` now installs its own handler for exactly as long
+     as it lives, resolved through the module's existing runtime `dlopen`
+     so the frozen `Cargo.toml` is untouched. Two things made it delicate,
+     both measured with a standalone C probe rather than reasoned about:
+
+     - **X errors are asynchronous.** Restoring the previous handler and
+       syncing afterwards protects nothing — the deferred error goes to
+       whoever is installed *then*, i.e. the default handler again, and the
+       probe still dies at rc=1. `Drop` syncs (and closes, which syncs
+       again) before it restores.
+     - **The handler is process-global and GTK installs its own.** Ours
+       answers only for our own display connection and hands every other
+       error back to the previous handler, so GDK's behaviour is unchanged;
+       a static mutex stops two `Display`s nesting and restoring out of
+       order.
+
+     Result: 0 `X Error` aborts in 4 default-parallelism runs, all four
+     reaching `test result:`. The sharper A/B is the new regression test
+     alone — on `main` it prints `X Error of failed request: BadWindow` and
+     the test binary exits 1 mid-test; on the fix it passes.
 
    - **Tests still fail under default parallelism, and how many depends on
      how loaded the audio server is.** Under the fd pressure that preceded
@@ -167,29 +181,42 @@ PR, but two categories of tests are currently skipped rather than exercised:
      busier audio server can still reach it. The honest fix if it recurs is
      to bound how many engine tests hold a device at once, not to raise the
      limit.
-   - **The integration-test half of the same hole, which fails the OPPOSITE
-     way and is worse than "recursive".** An integration binary links the
-     lib WITHOUT `cfg(test)`, so `tests/plugin_load_profile.rs`'s two
-     `plugins::scan::scan_all()` calls still get a bare re-exec — and that
-     binary has no hidden worker case at all. Measured: the child runs its
-     own seven gated tests, returns in **3.5 ms with zero protocol lines**,
-     and the parent takes the `scanning == None` arm, logs "worker made no
-     progress; aborting CLAP scan" and returns. **`scan_all()` silently
-     loses its entire CLAP half.** If the wanted instrument or inserts exist
-     only as CLAP, `perf_budget_gate` finds `inst.instruments.is_empty()`
-     and emits `PERF-VERDICT: SKIP`, which `perf-check.sh` maps to exit
-     125 — so the plugin-load gate from PR #120, and the bisect recipe
-     built on it, would call every commit "unjudgeable" instead of
-     measuring it.
+   - **The integration-test half of the same hole — FIXED (2026-08-28,
+     PR #124).** It failed the OPPOSITE way and was worse for it. An
+     integration binary links the lib WITHOUT `cfg(test)`, so
+     `tests/plugin_load_profile.rs` took `current_exe()`'s production
+     branch — a bare re-exec, correct only for `src/main.rs` and its
+     guard. Measured: the child ran that file's own seven tests and
+     returned in **2.9 ms with zero protocol lines**, the parent took the
+     `scanning == None` arm, and `scan_all()` dropped its whole CLAP half
+     without a line of log saying so.
 
-     Both call sites are gated (`AURA_PROFILE_PLUGINS` /
-     `AURA_PROFILE_MAX_US`), so a plain run never reaches them and
-     `perf-check.sh`'s default `--run bare` does not either; `--run full`
-     does. **Note the hazard when it does:** the child inherits those same
-     `AURA_PROFILE_*` variables, so it would reach `scan_all()` itself, with
-     nothing bounding the depth. That path was NOT run on purpose. Fixing
-     this needs a hidden worker entry in that binary plus a way to install
-     it (a `set_worker_command` runtime override), which is its own change.
+     `scan_worker::set_worker_command` is the runtime override for such a
+     binary; `plugin_load_profile.rs` points it at a hidden `worker_entry`
+     the way `test_worker_command` does. The `--exact` filter also
+     contains the second hazard, which is that the child inherits
+     `AURA_PROFILE_*` and would otherwise reach `scan_all()` itself with
+     nothing bounding the depth.
+
+     The consequence was reproduced, not just predicted. With 35 CLAP
+     bundles installed, `scanned N plugins` went **326 → 363**. It needs
+     the wanted plugin to be CLAP-only, which the defaults are not on the
+     measuring machine, so the gate run below names one that is (`Kars`,
+     a DPF CLAP instrument):
+
+     ```sh
+     AURA_PROFILE_MAX_US=100000 AURA_PROFILE_RUN=full \
+     AURA_PROFILE_TRACKS=4 AURA_PROFILE_INSTRUMENT=Kars
+     ```
+
+     | | `main` | fixed |
+     |---|---|---|
+     | verdict | `PERF-VERDICT: SKIP … not installed` | `PERF-VERDICT: OK 138.5 us` |
+     | `perf-check.sh` exit | 125 — "cannot judge" | 0 |
+
+     So PR #120's plugin-load gate, and every bisect built on it, would
+     have called each commit unjudgeable instead of measuring it.
+
    - **Orphaned PipeWire clients survive a signal death.** A process killed
      by SIGSEGV never runs `Drop`, so its streams are left standing; the
      daemon's idle fd baseline crept 105 → 164 over a session of
@@ -197,12 +224,33 @@ PR, but two categories of tests are currently skipped rather than exercised:
      windows below. Recovery is
      `systemctl --user restart wireplumber pipewire-pulse pipewire`.
 
-   **Still worth doing, unchanged by this fix:** make the GUI child die
-   with its parent regardless of how the parent dies — `PR_SET_PDEATHSIG`
-   via `CommandExt::pre_exec` on the `zynaddsubfx-ext-gui` spawn
-   (`plugins/lv2_ui.rs`). `Drop` cannot help under SIGKILL. Needs `libc` as
-   a direct dependency of `src-tauri`, whose `Cargo.toml` is **FROZEN** —
-   ask the owner first. `libc` is already in the lockfile transitively.
+   **The leftover ext-gui windows — FIXED (2026-08-28, PR #124), and the
+   reason it sat here was wrong.** `kill_ext` and `Drop` cover the
+   ordinary closes; neither runs under SIGKILL or a segfault, so a crash
+   left a `zynaddsubfx-ext-gui` window the user could not close, owned by
+   a DSP that no longer existed — and `wm_stack` kept finding it with
+   `pgrep` and restacking it. `PR_SET_PDEATHSIG` via `CommandExt::pre_exec`
+   on the spawn in `plugins/lv2_ui.rs` is the fix, as recorded.
+
+   What was wrong is the blocker: this entry said it needed `libc` as a
+   direct dependency of the FROZEN `Cargo.toml`, so ask the owner. **It
+   does not.** `prctl` and `getppid` live in the glibc every Rust binary
+   on this target already links, so a bare `extern "C"` block reaches
+   them — which is exactly what that module already does for
+   `dlopen`/`dlsym` a few lines up. One `rustc` invocation would have said
+   so at any point. See `TRAPS.md` §Backend.
+
+   Three kernel-side facts were measured on 6.8 rather than taken from the
+   man page, since each would have made the fix silently useless: PDEATHSIG
+   survives the following `execve` (cleared only for set-uid binaries);
+   a SIGKILLed parent does take the child with it; and the spawning THREAD
+   exiting did *not* take it here, which the man page's BUGS section warns
+   it might — we spawn from the long-lived plugin main thread either way.
+   A `getppid` check closes the fork/prctl race.
+
+   The test kills a real process and reads a real `/proc` entry, and was
+   confirmed to have teeth by commenting out the single `die_with_parent`
+   call.
 
 ## Why deferred
 
