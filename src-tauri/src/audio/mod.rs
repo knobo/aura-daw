@@ -19,6 +19,7 @@
 //! `init` hook that starts the engine control thread.
 
 pub mod bus;
+pub mod clock;
 pub mod decimate;
 pub mod dsp;
 pub mod engine;
