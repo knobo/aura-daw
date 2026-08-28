@@ -946,10 +946,19 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown player: {id}"))?;
             let from_now = read_player_prop(p, *path)?; // truth, not caller's `from`
             let applied = write_player_prop(p, *path, to)?;
-            // Source, raw and the node's shape all change what the graph
-            // compiles; trigger mode does not (the RT side reads it off
-            // the live document per-trigger, not off the compiled graph).
-            effect.rebuild = !matches!(path, PropPath::TriggerMode);
+            // Source, raw and the node's strip fields change what the graph
+            // compiles or renders, so those rebuild. `Name` is a pure label
+            // (document-only, same as the Track arm's `Name`/`Group`
+            // treatment above) and `TriggerMode` is read off the live
+            // document per-trigger by the RT side, not off the compiled
+            // graph — neither needs a rebuild. Written as an explicit
+            // allow-list, not a negation, so a player path added later
+            // defaults to NOT rebuilding until this is looked at, rather
+            // than silently forcing one.
+            effect.rebuild = matches!(
+                path,
+                PropPath::Raw | PropPath::PlayerSource | PropPath::Gain | PropPath::Pan | PropPath::Muted
+            );
             Ok(Op::Set {
                 object: ObjectRef::Player(id.clone()),
                 path: *path,
@@ -2234,16 +2243,37 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
 /// strip (`player.rs`'s module doc), so those four arms read the same
 /// fields `write_player_prop` writes below.
 fn read_player_prop(p: &crate::audio::player::Player, path: PropPath) -> Result<serde_json::Value, String> {
-    Ok(match path {
-        PropPath::Raw => serde_json::json!(p.raw),
-        PropPath::TriggerMode => serde_json::to_value(p.trigger.mode).unwrap(),
-        PropPath::PlayerSource => serde_json::to_value(&p.source).unwrap(),
-        PropPath::Name => serde_json::json!(p.name),
-        PropPath::Gain => serde_json::json!(p.node.gain_db),
-        PropPath::Pan => serde_json::json!(p.node.pan),
-        PropPath::Muted => serde_json::json!(p.node.muted),
-        other => return Err(format!("player has no property {other:?}")),
-    })
+    match path {
+        PropPath::Raw => Ok(serde_json::json!(p.raw)),
+        PropPath::TriggerMode => Ok(serde_json::to_value(p.trigger.mode).unwrap()),
+        PropPath::PlayerSource => Ok(serde_json::to_value(&p.source).unwrap()),
+        PropPath::Name => Ok(serde_json::json!(p.name)),
+        PropPath::Gain => Ok(serde_json::json!(p.node.gain_db)),
+        PropPath::Pan => Ok(serde_json::json!(p.node.pan)),
+        PropPath::Muted => Ok(serde_json::json!(p.node.muted)),
+        PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::AutomationMode
+        | PropPath::InstrumentId
+        | PropPath::Group
+        | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Player property (it's a Track/Clip/MidiClip/Transport/Plugin path)"))
+        }
+    }
 }
 
 /// Returns the value ACTUALLY written (post-clamp, post-trim), so the
@@ -2289,7 +2319,28 @@ fn write_player_prop(
             p.node.muted = to.as_bool().ok_or("muted must be a bool")?;
             Ok(serde_json::json!(p.node.muted))
         }
-        other => Err(format!("player has no property {other:?}")),
+        PropPath::Soloed
+        | PropPath::Armed
+        | PropPath::AutomationMode
+        | PropPath::InstrumentId
+        | PropPath::Group
+        | PropPath::TimelineStartSamples
+        | PropPath::LengthSamples
+        | PropPath::OffsetSamples
+        | PropPath::TimelineStartTicks
+        | PropPath::LengthTicks
+        | PropPath::ContentLengthTicks
+        | PropPath::TransposeSemitones
+        | PropPath::VelocityOffset
+        | PropPath::TransportState
+        | PropPath::LoopEnabled
+        | PropPath::LoopStartSamples
+        | PropPath::LoopEndSamples
+        | PropPath::StopAtEnd
+        | PropPath::SampleRate
+        | PropPath::Param { .. } => {
+            Err(format!("path {path:?} is not a Player property (it's a Track/Clip/MidiClip/Transport/Plugin path)"))
+        }
     }
 }
 
@@ -5374,6 +5425,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("unknown player"), "got: {err}");
+    }
+
+    /// Pins the rebuild rule review round 1 found untested: a player's name
+    /// is a pure label (same treatment as the Track arm's `Name`/`Group`,
+    /// session.rs ~line 740) and must not rebuild, while `Raw` changes what
+    /// the graph compiles and must. Without this test, `effect.rebuild`
+    /// silently reverting to "rebuild on everything but TriggerMode" (the
+    /// bug review round 1 caught) would pass every other player test.
+    #[test]
+    fn player_rename_does_not_rebuild_but_raw_does() {
+        use crate::audio::player::Player;
+        use crate::ids::PlayerId;
+
+        let mut session = session_with_one_track("t-1");
+        session.store.players.push(Player::new(PlayerId::from("p1"), "PAD"));
+
+        let mut rename_effect = EngineEffect::default();
+        apply_raw(
+            &mut session,
+            &Op::Set {
+                object: ObjectRef::Player(PlayerId::from("p1")),
+                path: PropPath::Name,
+                from: serde_json::json!("PAD"),
+                to: serde_json::json!("KICK"),
+            },
+            &mut rename_effect,
+        )
+        .unwrap();
+        assert!(!rename_effect.rebuild, "a player rename is a label, not a graph change");
+
+        let mut raw_effect = EngineEffect::default();
+        apply_raw(
+            &mut session,
+            &Op::Set {
+                object: ObjectRef::Player(PlayerId::from("p1")),
+                path: PropPath::Raw,
+                from: serde_json::json!(false),
+                to: serde_json::json!(true),
+            },
+            &mut raw_effect,
+        )
+        .unwrap();
+        assert!(raw_effect.rebuild, "raw changes what the graph compiles");
     }
 
     /// F-3's panic-rollback path (`restore_from_snapshot`) must restore
