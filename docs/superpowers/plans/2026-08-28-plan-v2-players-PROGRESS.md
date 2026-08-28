@@ -15,7 +15,7 @@ what does.
 |---|---|---|---|---|
 | 1 | The `Player` document type | **done** | `3c42e4e` | 4/4 tests; review clean |
 | 2 | `Store::players` + project.json | **done** | `a508902` | schemaVersion unmoved; review clean |
-| 3 | Ops: PlayerAdd/Remove, ObjectRef::Player | pending | | |
+| 3 | Ops: PlayerAdd/Remove, ObjectRef::Player | **done** | `680b719`, `a375f42` | +SessionSnapshot::players; 1 fix round |
 | 4 | `MixNode` gains a Player producer | pending | | |
 | 5 | Slot derivation over tracks + players | pending | | |
 | 6 | The clock table | pending | | |
