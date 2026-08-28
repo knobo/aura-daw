@@ -1855,11 +1855,13 @@ impl ControlPlane {
     /// breath would never read it — the live nodes would keep a cut note
     /// hanging with nothing left to release them. That was `end_launch`'s
     /// whole reason for existing next to `clear_launch`.
+    ///
+    /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
+    /// read beside it: `advance` can turn the clock off between the two, and
+    /// the pair would then report "something was sounding" for a scene that
+    /// had already ended.
     pub fn stop_launch_overlay(&self) -> bool {
-        let tables = self.tables.lock();
-        let was_on = tables.clocks.is_on(SCENE_CLOCK);
-        tables.clocks.stop(SCENE_CLOCK);
-        was_on
+        self.tables.lock().clocks.stop(SCENE_CLOCK)
     }
 
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no

@@ -434,7 +434,14 @@ fn process_inserts(
 /// Where this node's playhead is for THIS block, whether that position is a
 /// discontinuity, and whether the node renders at all.
 ///
-/// Returns `(pos, loop_spec, discontinuity, audible)`. Factored out (Plan
+/// Returns `(pos, loop_spec, discontinuity, audible, own_clock)`, where
+/// `own_clock` is "this node reads a clock of its own" — the predicate that
+/// bypasses another track's solo, and exactly `clock_of(slot) !=
+/// TRANSPORT_CLOCK` (a slot can never hold an out-of-range clock index:
+/// `bind_slot` refuses one). Returned rather than re-derived so the strip
+/// does not pay a second indexed load for something this call already knows.
+///
+/// Factored out (Plan
 /// G2) because the windowed render needs the answer twice: once in the
 /// prologue, to decide whether the live node owes an `all_notes_off` before
 /// the block's first run, and again per window, to place the runs. Calling
@@ -463,7 +470,11 @@ fn process_inserts(
 ///   ends, so without it a launched track would drop out for a block at the
 ///   press and go silent for ~8 ms at the end instead of returning to the
 ///   song. The discontinuity that comes with it is `ClockTable::stop`'s /
-///   `advance`'s parting flush — the `all_notes_off` `launch_ended` bought.
+///   `advance`'s parting flush — the `all_notes_off` `launch_ended` bought —
+///   OR'd with the TRANSPORT's, because this node is reading the transport's
+///   position now: a seek or a Play edge in the same block is a jump for it
+///   just as it is for every other arrangement node, and dropping it would
+///   hang a held note until something else happened to jump.
 #[inline]
 fn node_playhead(
     clocks: &ClockTable,
@@ -471,15 +482,21 @@ fn node_playhead(
     base_pos: u64,
     lp: &LoopSpec,
     discontinuity: bool,
-) -> (u64, LoopSpec, bool, bool) {
+) -> (u64, LoopSpec, bool, bool, bool) {
     let ph = clocks.playhead(slot, base_pos, discontinuity);
     if ph.is_transport {
-        return (ph.pos, *lp, ph.discontinuity, ph.on);
+        return (ph.pos, *lp, ph.discontinuity, ph.on, false);
     }
     if ph.on {
-        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true);
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true);
     }
-    (base_pos, *lp, ph.discontinuity, clocks.transport_on())
+    (
+        base_pos,
+        *lp,
+        ph.discontinuity || discontinuity,
+        clocks.transport_on(),
+        true,
+    )
 }
 
 fn live_all_notes_off(tr: &RtTrack) {
@@ -676,7 +693,8 @@ fn render_impl(
         if tr.slot >= n_slots {
             continue;
         }
-        let (_, _, track_disc, _) = node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
+        let (_, _, track_disc, _, _) =
+            node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
         tr.win.disc = track_disc;
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
         prime_live(tr, track_disc, live_in_events);
@@ -717,9 +735,8 @@ fn render_impl(
             let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
             let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
             let flags = params.flags[tr.slot].load(Relaxed);
-            let (track_base, track_lp, _, clock_on) =
+            let (track_base, track_lp, _, clock_on, own_clock) =
                 node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
-            let own_clock = clocks.clock_of(tr.slot) != TRANSPORT_CLOCK;
             // Two gates, and they used to be three. `clock_on` false is a
             // stopped transport (the old `exclusive`) or a clock that is not
             // running; `own_clock` is what bypasses another track's solo
@@ -1299,7 +1316,8 @@ mod tests {
         // clock reads it, which is what makes the live node all-notes-off in
         // `render_impl`'s prologue instead of hanging the cut voice.
         g.clocks.begin_block();
-        let (pos, _, disc, on) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
+        let (pos, _, disc, on, own) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
+        assert!(own, "still bound to the scene clock, so still past a solo");
         assert_eq!(pos, 0, "back on the arrangement playhead");
         assert!(on, "and audible: the transport is still running");
         assert!(disc, "the return is a discontinuity");
@@ -1937,6 +1955,92 @@ mod tests {
             (out[0] - 0.25).abs() < 1e-6,
             "sum 0.50 then half = 0.25 (not per-source half). got {}",
             out[0]
+        );
+    }
+
+    /// Finding 3: a node that has rejoined the arrangement is reading the
+    /// TRANSPORT's position, so the transport's own jumps are its jumps. A
+    /// seek in the same block as the scene's death used to be swallowed —
+    /// `node_playhead` returned the clock's discontinuity alone — and the
+    /// note held across the seek hung until something else happened to jump.
+    #[test]
+    fn a_rejoined_node_still_hears_the_transports_own_discontinuity() {
+        let g = one_track_graph(0, clip(0, 0, 4, vec![1.0; 4], 1));
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 500, 10_000, false);
+        clocks.bind_slot(0, 1);
+        clocks.stop(1);
+        clocks.begin_block(); // consumes the stop's own flush
+        assert!(node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false).2, "the flush");
+
+        clocks.begin_block(); // a later block: nothing pending on the clock
+        let (_, _, disc, _, _) = node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false);
+        assert!(!disc, "nothing jumped");
+        let (_, _, disc, _, _) = node_playhead(&clocks, 0, 7_000, &LoopSpec::OFF, true);
+        assert!(disc, "but the transport's seek is this node's seek too");
+    }
+
+    /// The integrated half of the flush: `render_impl`'s prologue must turn
+    /// a stopped scene clock's discontinuity into a real `all_notes_off` on
+    /// the live node still bound to it. Nothing asserted this before —
+    /// `prime_live` is where the hanging note is actually prevented.
+    #[test]
+    fn a_stopped_scene_clock_all_notes_offs_the_live_node_bound_to_it() {
+        use super::super::dsp::{AudioProcessor, LiveInstrument};
+        use super::super::rt::{LiveNodeCell, LiveSource};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        /// Counts `all_notes_off` calls and nothing else.
+        struct OffCounter(Arc<AtomicUsize>);
+        impl AudioProcessor for OffCounter {
+            fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+            fn process(&mut self, _io: &mut ProcessBlock<'_>) {}
+            fn reset(&mut self) {}
+        }
+        impl LiveInstrument for OffCounter {
+            fn queue_event(&mut self, _ev: BlockNoteEvent) -> bool {
+                true
+            }
+            fn all_notes_off(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+
+        let offs = Arc::new(AtomicUsize::new(0));
+        let tr = RtTrack {
+            sends: Vec::new(),
+            out_pdc: None,
+            output: None,
+            win: Default::default(),
+            slot: 0,
+            clips: Vec::new(),
+            live: Some(LiveSource {
+                node: LiveNodeCell::new(Box::new(OffCounter(offs.clone()))),
+                events: Arc::new(Vec::new()),
+            }),
+            inserts: Vec::new(),
+            pdc: None,
+        };
+        let mut g = RtGraph::new(vec![tr], 1, Arc::new(ParamTable::default()));
+        let clocks = scene_clocks(&g, true);
+        clocks.fire(1, 0, 10_000, false);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 8];
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        let after_fire = offs.load(AtomicOrdering::Relaxed);
+        assert_eq!(after_fire, 1, "the fire itself is a jump");
+
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert_eq!(offs.load(AtomicOrdering::Relaxed), 1, "steady block");
+
+        g.clocks.stop(1);
+        render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
+        assert_eq!(
+            offs.load(AtomicOrdering::Relaxed),
+            2,
+            "the cut releases the held voice instead of freezing it"
         );
     }
 

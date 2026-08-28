@@ -734,7 +734,21 @@ impl OutputCb {
         // Any clock of its own running is what makes the graph render while
         // the transport is stopped — the old `LaunchPlayhead::exclusive`
         // preview, now read off the clock table instead of a flag.
-        let clocks_running = self.graph.as_ref().is_some_and(|g| g.clocks.any_running());
+        //
+        // `flush_pending` is the block AFTER that: a clock that ends or is
+        // cut is no longer running, but the discontinuity it left behind has
+        // to be latched by a `begin_block` and read by the nodes still bound
+        // to it, and only a rendered block does either. Neither
+        // `render_live_input_only` nor the silent arm calls `begin_block`, so
+        // without this the `all_notes_off` is simply dropped whenever the
+        // transport is stopped — which is exactly the mainline
+        // `FireOrigin::Preview` case, a pad auditioned without Play. This is
+        // the old `LaunchPlayhead { ended: true }`, which kept `overlay_on`
+        // true for one more block for the same reason.
+        let clocks_running = self
+            .graph
+            .as_ref()
+            .is_some_and(|g| g.clocks.any_running() || g.clocks.flush_pending());
         match (&mut self.graph, playing, clocks_running) {
             (Some(g), true, _) | (Some(g), false, true) => {
                 // Task 7: `render` pushes the graph's meter chunks itself
@@ -1964,13 +1978,18 @@ impl Control {
             //
             // The position is snapshotted HERE, not at adoption, so a scene
             // sounding across a rebuild rewinds by however long the fresh
-            // graph sits in the queue — one callback block in practice. That
-            // is deliberate: reconciling at adoption would have to run on the
-            // RT thread and could not tell "the retired graph advanced past
-            // this" from "a pad was fired into the new table during the
-            // window", and clobbering a fresh fire is the worse failure. The
-            // skew is the same one a knob write in that window already has
-            // (round-2 §2.4).
+            // graph sits in the queue — one callback block in practice, since
+            // the expensive assembly happens before this snapshot and what is
+            // left is adoption latency. Reconciling at adoption instead is
+            // possible and is NOT blocked by ambiguity: a monotonic fire
+            // counter on `ClockState`, bumped by `fire` and snapshotted by
+            // `carry_over`, would tell "the retired graph advanced past this"
+            // apart from "a pad was fired into the new table during the
+            // window" with one relaxed load. It is deferred to Task 8, which
+            // has to revisit reconciliation for per-binding clocks anyway — a
+            // complexity trade-off, not an impossibility. Until then the
+            // residual skew is the same one a knob write in that window
+            // already has (round-2 §2.4).
             clocks.carry_over(
                 &self.tables.lock().clocks,
                 crate::control::SCENE_CLOCK,
@@ -4177,6 +4196,60 @@ mod tests {
             evt_rx,
             (graph_tx, retire_rx, meter_rx),
         )
+    }
+
+    /// The deleted `ending_a_sounding_overlay_hands_the_engine_one_flush_frame`,
+    /// re-homed at the level that actually decides it.
+    ///
+    /// A scene fired with the transport STOPPED (`FireOrigin::Preview` — a
+    /// pad auditioned without pressing Play) that reaches its end leaves
+    /// `any_running` false. If that were the whole gate the callback would
+    /// render nothing that block, no `begin_block` would run, and the
+    /// `all_notes_off` owed to the live nodes still bound to the clock would
+    /// be dropped — freezing the voice in the node, to resurrect the next
+    /// time anything renders it (arming the track for monitoring, say).
+    /// `flush_pending` buys exactly the one extra block
+    /// `LaunchPlayhead { ended: true }` used to buy.
+    ///
+    /// A pushed meter chunk is the observable "this block was rendered":
+    /// nothing else in the callback pushes one, and the silent arm does not.
+    #[test]
+    fn a_scene_ending_while_stopped_still_gets_its_one_flush_block() {
+        let shared = Arc::new(SharedRt::default());
+        let (mut cb, _evt_rx, mut peers) = output_cb(shared.clone());
+        // Transport STOPPED throughout — this is the preview path.
+        shared.playing.store(false, Relaxed);
+
+        let mut graph = RtGraph::new(Vec::new(), 1, Arc::new(ParamTable::with_slots(1)));
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 2);
+        clocks.fire(1, 0, 64, false); // ends inside the very first block
+        clocks.bind_slot(0, 1);
+        graph.clocks = Arc::new(clocks);
+        peers
+            .0
+            .push(GraphPtr::new(Box::new(graph)))
+            .map_err(|_| "graph queue")
+            .expect("queue has room");
+
+        let mut out = vec![0.0f32; 128 * 2];
+        let mut rendered = |cb: &mut OutputCb, rx: &mut rtrb::Consumer<RawMeterBlock>| {
+            cb.render(&mut out);
+            let mut any = false;
+            while rx.pop().is_ok() {
+                any = true;
+            }
+            any
+        };
+
+        assert!(rendered(&mut cb, &mut peers.2), "the scene is sounding");
+        assert!(
+            rendered(&mut cb, &mut peers.2),
+            "the block after it ends is the flush frame, and must still render"
+        );
+        assert!(
+            !rendered(&mut cb, &mut peers.2),
+            "and exactly one: a stopped transport with nothing owed renders nothing"
+        );
     }
 
     /// The RT half of auto-stop, end to end and deterministic: the callback

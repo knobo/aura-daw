@@ -133,23 +133,54 @@ impl ClockTable {
         c.on.store(true, Relaxed);
     }
 
-    /// Stop a clock, leaving one pending discontinuity behind.
+    /// Stop a RUNNING clock, leaving one pending discontinuity behind.
+    /// Returns whether this call is the one that stopped it.
     ///
     /// That flag is the old `SharedRt::end_launch`/`launch_ended` flush
     /// frame, generalized: cutting a sounding clip mid-note has to reach the
     /// live nodes bound to this clock as an `all_notes_off`, or the voice
     /// hangs with nothing left to release it (the control plane releases the
     /// slot a poll later, and a released slot reads the transport, which
-    /// knows nothing about the note). `stop` therefore never just drops the
-    /// clock — the next `begin_block` latches the flag and every slot still
-    /// bound here sees the jump exactly once.
-    pub fn stop(&self, clock: u32) {
-        let Some(c) = self.clocks.get(clock as usize) else { return };
+    /// knows nothing about the note). The next
+    /// [`ClockTable::begin_block`] latches the flag and every slot still
+    /// bound here sees the jump exactly once — and because a stopped clock
+    /// leaves `any_running` false, the engine keeps rendering for one more
+    /// block on [`ClockTable::flush_pending`] so that `begin_block` actually
+    /// happens (`engine::OutputCb::render`).
+    ///
+    /// The `swap` is the guard the deleted `end_launch` had
+    /// (`if !self.launch_on.swap(false) { return false }`), and it is not
+    /// decoration: `launch_stop` is documented as safe to press with nothing
+    /// launched, and the frontend's stop-all does press it unconditionally.
+    /// A clock that was already off must fabricate NO discontinuity — the
+    /// slots may still be bound to it, and an `all_notes_off` they never
+    /// earned cuts arrangement notes mid-song. It is one atomic, so it is
+    /// also the answer to "was something sounding?": an `is_on`-then-`stop`
+    /// pair can report true for a clock `advance` turned off in between.
+    pub fn stop(&self, clock: u32) -> bool {
+        let Some(c) = self.clocks.get(clock as usize) else { return false };
         if clock == TRANSPORT_CLOCK {
-            return;
+            return false;
+        }
+        if !c.on.swap(false, Relaxed) {
+            return false;
         }
         c.discont.store(true, Relaxed);
-        c.on.store(false, Relaxed);
+        true
+    }
+
+    /// Any clock carrying a discontinuity no `begin_block` has latched yet.
+    ///
+    /// This is what makes the flush frame survive a stopped transport. A
+    /// clock that ends or is cut leaves `any_running` false, so without this
+    /// the engine would render nothing that block, `begin_block` would never
+    /// run, and the `all_notes_off` the flag exists to carry would be
+    /// dropped — leaving the voice frozen in the live node, to resurrect the
+    /// next time that node is rendered. The overlay this replaces bought the
+    /// same extra block with `LaunchPlayhead { ended: true }`, which made
+    /// `overlay_on` true for exactly one more block.
+    pub fn flush_pending(&self) -> bool {
+        self.clocks.iter().skip(1).any(|c| c.discont.load(Relaxed))
     }
 
     /// Is the transport clock running (V-13)? Read by
@@ -173,6 +204,13 @@ impl ClockTable {
     /// The PENDING discontinuity is carried, the latched one is not: if the
     /// retired graph already latched and delivered the jump, re-delivering it
     /// would be a second, spurious `all_notes_off`.
+    ///
+    /// One case is still not exact, and is accepted: a rebuild whose read
+    /// lands AFTER a `fire` but BEFORE the retired graph's next `begin_block`
+    /// leaves the flag pending in both tables, so the jump is delivered
+    /// twice, one block apart. An `all_notes_off` is idempotent on a node
+    /// that has just been re-triggered from its start, so the audible cost is
+    /// bounded to the first block of a fire that raced a rebuild.
     pub fn carry_over(&self, prev: &Self, clock: u32) {
         let (Some(dst), Some(src)) = (
             self.clocks.get(clock as usize),
@@ -471,6 +509,61 @@ mod tests {
         let ph = t.playhead(1, 0, false);
         assert!(!ph.on);
         assert!(ph.discontinuity, "the end all-notes-offs the node");
+    }
+
+    /// The deleted `ending_an_idle_overlay_is_a_no_op`, re-homed for real.
+    /// `launch_stop` is documented as safe to press with nothing launched,
+    /// and the frontend's stop-all does press it unconditionally — including
+    /// in the window between a scene ending and the drive thread releasing
+    /// its slots. A fabricated flush there sends `all_notes_off` to tracks
+    /// that never went exclusive, cutting arrangement notes mid-song.
+    #[test]
+    fn stopping_a_clock_that_was_not_running_fabricates_no_flush() {
+        let t = table();
+        t.bind_slot(1, 1);
+        assert!(!t.stop(1), "nothing was sounding");
+        t.begin_block();
+        assert!(
+            !t.playhead(1, 0, false).discontinuity,
+            "and no all-notes-off was invented for it"
+        );
+
+        // The same clock, having actually run and ended on its own: the
+        // second stop is the idle one, and must add nothing either.
+        t.fire(1, 0, 100, false);
+        t.advance(128);
+        assert!(!t.stop(1), "`advance` already stopped it");
+        t.begin_block();
+        assert!(t.playhead(1, 0, false).discontinuity, "the END's flush, once");
+        t.begin_block();
+        assert!(!t.playhead(1, 0, false).discontinuity);
+    }
+
+    #[test]
+    fn stop_reports_whether_it_was_the_one_that_stopped_the_clock() {
+        let t = table();
+        t.fire(1, 0, 1_000, false);
+        assert!(t.stop(1), "this call cut it");
+        assert!(!t.stop(1), "the second press is a no-op");
+    }
+
+    /// What keeps the flush frame alive across a stopped transport: a clock
+    /// that ended is no longer `any_running`, so `flush_pending` is the only
+    /// thing left telling the engine to render the block that latches it.
+    #[test]
+    fn flush_pending_outlives_the_clock_that_stopped() {
+        let t = table();
+        t.fire(1, 0, 100, false);
+        t.bind_slot(1, 1);
+        assert!(t.any_running());
+
+        t.advance(128);
+        assert!(!t.any_running(), "ended");
+        assert!(t.flush_pending(), "but it still owes its nodes a jump");
+
+        t.begin_block();
+        assert!(!t.flush_pending(), "latched — and only one block's worth");
+        assert!(t.playhead(1, 0, false).discontinuity);
     }
 
     #[test]
