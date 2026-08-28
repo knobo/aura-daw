@@ -361,6 +361,7 @@ impl Committer {
             ),
             tracks: s.tracks.clone(),
             clips: s.clips.clone(),
+            players: s.players.clone(),
             transport: Some(transport),
         }
     }
@@ -4472,6 +4473,7 @@ impl ControlPlane {
             // trivially satisfies.
             s.tracks.clear();
             s.clips.clear();
+            s.players.clear(); // blank-slate reset (V-1) — same reason as tracks/clips above
             s.project_dir = Some(dir.clone());
             s.project_name = Some(name.to_string());
             s.created_at = project.created_at.clone();
@@ -4559,6 +4561,10 @@ impl ControlPlane {
             let mut session = self.session.lock();
             session.store.tracks = project.tracks.clone();
             session.store.clips = project.clips.clone();
+            // Plan V players (V-1): a separate list from tracks/clips (V-2),
+            // swapped in the same place for the same reason — an open must
+            // replace the in-memory document wholesale, not merge into it.
+            session.store.players = project.players.clone();
             session.store.project_dir = Some(dir.clone());
             session.store.project_name = Some(project.name.clone());
             session.store.created_at = project.created_at.clone();

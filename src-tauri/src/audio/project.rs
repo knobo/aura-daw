@@ -57,6 +57,7 @@ pub fn create(parent: &Path, name: &str, sample_rate: u32, tempo_bpm: f64) -> Re
         time_signature: Some((4, 4)),
         tracks: Vec::new(),
         clips: Vec::new(),
+        players: Vec::new(),
         transport: Some(TransportState {
             sample_rate,
             tempo_bpm,
@@ -393,6 +394,7 @@ pub fn from_store(store: &Store, position_samples: u64, sample_rate: u32) -> Res
         time_signature: Some((4, 4)),
         tracks: store.tracks.clone(),
         clips: store.clips.clone(),
+        players: store.players.clone(),
         transport: Some(transport),
     })
 }
@@ -672,6 +674,7 @@ mod tests {
                 clip_n("c2", "audio/y.wav", ""),
                 clip_n("c3", "audio/z.wav", "pre-existing"),
             ],
+            players: Vec::new(),
             transport: None,
         };
         assign_source_ids(&mut p.clips);
@@ -755,6 +758,39 @@ mod tests {
         let (loaded, _) = load(&dir).unwrap();
         assert!(!loaded.clips[0].source_id.as_str().is_empty());
         assert_eq!(loaded.clips[0].source_id, loaded.clips[1].source_id);
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    /// The harmony rule (`midi/persist.rs:296`), applied to players: a project
+    /// that has never had one must resave byte-diff-free, so `schemaVersion`
+    /// never moves and nobody's stored project grows a key it does not use.
+    #[test]
+    fn a_project_without_players_writes_no_players_key() {
+        let parent = tmp_parent("players-absent");
+        let (project, _dir) = create(&parent, "NoPads", 48_000, 120.0).unwrap();
+        let v = serde_json::to_value(&project).unwrap();
+        assert!(
+            v.get("players").is_none(),
+            "an empty players list must not reach project.json: {v}"
+        );
+        let _ = fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn players_round_trip_through_project_json() {
+        use crate::audio::player::{Player, PlayerSource};
+        use crate::ids::{ClipId, PlayerId};
+
+        let parent = tmp_parent("players-roundtrip");
+        let (mut project, dir) = create(&parent, "Pads", 48_000, 120.0).unwrap();
+        let mut p = Player::new(PlayerId::from("p1"), "KICK");
+        p.source = PlayerSource::AudioClip { clip_id: ClipId::from("c1") };
+        p.raw = true;
+        project.players.push(p.clone());
+        save(&dir, &project).unwrap();
+
+        let (loaded, _) = load(&dir).unwrap();
+        assert_eq!(loaded.players, vec![p]);
         let _ = fs::remove_dir_all(&parent);
     }
 }

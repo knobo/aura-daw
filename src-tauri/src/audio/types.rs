@@ -351,6 +351,11 @@ pub struct Project {
     pub time_signature: Option<(u8, u8)>,
     pub tracks: Vec<TrackState>,
     pub clips: Vec<Clip>,
+    /// Plan V players (V-1). Additive and OPTIONAL, exactly like the
+    /// Composer's `harmony` block: a project that has never had a player
+    /// resaves byte-diff-free and `schemaVersion` does not move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub players: Vec<crate::audio::player::Player>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportState>,
 }
@@ -365,6 +370,9 @@ pub struct Store {
     pub transport: TransportState,
     pub tracks: Vec<TrackState>,
     pub clips: Vec<Clip>,
+    /// Plan V players (V-1). NOT tracks (V-2) — a separate list precisely
+    /// so no timeline code has to learn to skip them.
+    pub players: Vec<crate::audio::player::Player>,
     /// Absolute path of the open `.aura` directory (None = no project).
     pub project_dir: Option<PathBuf>,
     pub project_name: Option<String>,
