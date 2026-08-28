@@ -99,10 +99,14 @@ Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
 Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
 before filing an engine, transport, loopjam or meter failure as a regression.
 
-Counts, measured 2026-08-27 on `feat/mixnode-compile-input` with a pinned
-ALSA sink: **1450 backend** (1407 lib + 43 integration, 2 `#[ignore]`d
-plugin repros, 16 plugin-gated tests skipped politely) in ~80 s, and
+Counts, measured 2026-08-28 on `perf/plugin-load-profile` with a pinned
+ALSA sink: **1456 backend** (1407 lib + 49 integration, 2 `#[ignore]`d
+plugin repros, 16 plugin-gated tests skipped politely) in ~104 s, and
 **1383 frontend** across 126 files in ~5 s.
+
+The lib half needs `-- --test-threads=1` to be measured at all: the
+`midi_out::tests` race below flakes 2–5 names out of a parallel run, and
+a failed suite prints no count.
 
 The engine tests are not the only casualty. A Bluetooth sink also makes the
 engine open its output stream at **44 100 Hz** where an ALSA sink gives it

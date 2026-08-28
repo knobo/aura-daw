@@ -509,3 +509,136 @@ been the conclusion. Before any further engine performance work, profile
 a real session under a realistic plugin load and find out where the time
 actually is. Everything above is a well-measured answer to a question
 that was probably not the important one.
+
+**Done — see [§9](#9-the-measurement-84-asked-for).** The premise held up
+in direction and not in emphasis: plugin DSP is 28% of a 32-track block,
+and AURA's own code is 52%.
+
+## 9. The measurement §8.4 asked for
+
+Done. `src-tauri/tests/plugin_load_profile.rs`, on this machine
+(i9-14900, Linux, 48 kHz, 512-frame blocks — a **10.67 ms** deadline).
+
+```sh
+AURA_PROFILE_PLUGINS=1 cargo test --release \
+    --test plugin_load_profile -- --nocapture
+```
+
+The session: `n` MIDI tracks, one in four carrying a hosted **Surge XT**,
+the rest on AURA's built-in `PolySynth`; **ZamComp + Calf Equalizer 5
+Band** as inserts on every strip; every track sending at −12 dB into one
+**Calf Reverb** return. So `n = 32` means 32 strips, 8 hosted
+instruments, and 66 insert slots.
+
+### 9.1 Where a block's time actually goes
+
+Medians over 2000 timed blocks after 64 warm-up blocks, and then the
+**median of three whole runs** — a single run is not enough, see §9.2.
+
+| tracks | slots | block | plugin DSP | host overhead | instruments | AURA mixer/sends |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 10 | 142 µs | 60 µs (42%) | 29 µs (20%) | 22 µs (16%) | 31 µs (22%) |
+| 16 | 34 | 460 µs | 154 µs (33%) | 96 µs (21%) | 85 µs (19%) | 125 µs (27%) |
+| 32 | 66 | 918 µs | 255 µs (28%) | 227 µs (25%) | 189 µs (21%) | 247 µs (27%) |
+
+**§8.4's premise is right in direction and wrong in emphasis.** Plugins
+are indeed the largest single thing — but at realistic scale they are not
+dominant, and **the biggest addressable line in the table is ours.**
+
+At 32 tracks, actual plugin DSP is **28%** of the block. AURA's own code —
+the per-insert host path plus the mixer, sends and PDC — is **52%**.
+
+Note the shape: **host overhead grows as a share (20% → 21% → 25%) while
+plugin DSP shrinks (42% → 33% → 28%).** Per slot, DSP falls with scale
+(6.0 → 4.5 → 3.9 µs) as caches warm and the work amortises; the slot cost
+does not. The bigger the session, the more of it is plumbing.
+
+### 9.2 The number to act on: ~3 µs per insert slot
+
+The split between "the plugin computing" and "us calling it" needs no
+profiler. The harness renders a fourth pass, `cheap_fx`, with insert
+chains of exactly the same length filled with `Audio Gain (Stereo)` —
+one multiply per sample. Everything paid to *call* a plugin is paid
+identically in both; what is missing is the arithmetic.
+
+`cheap_fx − no_inserts` is therefore the cost of the slot itself:
+**2.8–3.4 µs per insert**, across 10, 34 and 66 slots. That is a quarter
+of a 32-track block spent on buffer copies, param flushes, event
+conversion and `Replace`-mode plumbing rather than on DSP.
+
+**Which column to trust.** Run-to-run spread on this machine is 5–7% per
+cell, and the columns do not inherit it equally:
+
+- `cheap_fx − no_inserts` (host overhead) subtracts two middling numbers
+  and is **stable** — 2.83, 2.90, 3.43 µs per slot across the sweep.
+- `full − cheap_fx` (plugin DSP) subtracts the **two largest** numbers in
+  the table, so it carries both their noise. One run during this work put
+  it at 391 µs where the median of three says 255 µs. Treat that column
+  as ±20% and never quote it from a single run.
+
+This is why §9.1's table is a median of three runs and not one, and it is
+the reason the actionable claim rests on the host-overhead column.
+
+Read honestly, that figure is *"the cost of having an insert slot at
+all"* — it includes the LV2 `run()` call machinery and the plugin's own
+port reads, not only AURA's code. It is not a 227 µs saving sitting
+there for the taking. But it is the only line in the table that is both
+large and ours, and it scales with a number users increase freely.
+
+### 9.3 There is no performance crisis
+
+32 tracks, 8 hosted instruments and 66 plugin instances use **8.6% of the
+deadline**. The p95 is 1.38 ms and the worst observed block 2.09 ms,
+against 10.67 ms. Nothing measured here is audible to anyone.
+
+Extrapolating the measured slope (~25 µs per track carrying two inserts,
+plus a small fixed cost) puts the ceiling near **400 tracks** on this CPU,
+or roughly 200 with the headroom an RT thread should keep. That is an
+extrapolation from three points and untested past 32 — but it says where
+the uncertainty is, and it is not "what does the time go to". It is
+"which machine is the floor": §4.1's reasoning about weaker cores applies
+unchanged, and a laptop 4× slower would meet that ceiling inside the
+range of sessions people actually build. **That, not a flamegraph, is the
+measurement worth taking next.**
+
+This is the same caveat §4 carried about the JIT, now confirmed from the
+other side: the engine is not close to its budget, and performance work
+on it should be justified by a session that actually breaks rather than
+by a ratio. The fader the JIT track optimised lives inside the "AURA
+mixer/sends" column — 27% of a block that is itself 9% of the deadline.
+
+### 9.4 What these numbers do not cover
+
+- **One machine, one CPU.** i9-14900, and the figures above are the
+  median of three runs taken after PR #118's `MixNode` refactor landed.
+  §4.1's reasoning about weaker cores applies unchanged.
+- **One plugin set.** The DSP column is ZamComp + Calf EQ + Calf Reverb +
+  Surge XT and nothing else; a convolution reverb or a lookahead limiter
+  would move it. The *host overhead* column is the portable one — it is
+  the same work whatever the plugin does.
+- **Offline render, not the live callback.** The harness drives
+  `mixer::render` through `audio::offline::build_graph`, which is the
+  same compiled graph and the same insert chains the engine uses
+  (`bus::compile_routing`, shared since PR #109), but it does not include
+  the cpal callback, the ring buffer, or the meter path.
+- **No automation moving.** Every ramp is flat. §4's table says a moving
+  ramp roughly doubles the fader's own cost, which is inside the smallest
+  column here.
+- **No plugin editor open.** GUI idle callbacks are a known cost
+  (`TRAPS.md` on Carla's `extension_data` spam) and are not measured.
+
+### 9.5 If someone wants the flamegraph anyway
+
+The subtraction says how much; only a profiler says which function. It
+needs a sysctl this machine does not have set:
+
+```sh
+sudo sysctl kernel.perf_event_paranoid=1        # 4 by default here
+cargo test --release --test plugin_load_profile --no-run   # note the path
+AURA_PROFILE_PLUGINS=1 perf record -g --call-graph dwarf \
+    target/release/deps/plugin_load_profile-<hash> where_the_block_time --nocapture
+perf report --stdio --sort dso,symbol | head -60
+```
+
+That is the way to find out *which* part of the 3.4 µs is a `memcpy` and
+which is a param flush — the next step if §9.2 is ever worth acting on.
