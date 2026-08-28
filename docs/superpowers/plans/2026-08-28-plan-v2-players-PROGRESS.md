@@ -13,7 +13,7 @@ what does.
 
 | # | Task | State | Commits | Note |
 |---|---|---|---|---|
-| 1 | The `Player` document type | pending | | |
+| 1 | The `Player` document type | **done** | `3c42e4e` | 4/4 tests; review clean |
 | 2 | `Store::players` + project.json | pending | | |
 | 3 | Ops: PlayerAdd/Remove, ObjectRef::Player | pending | | |
 | 4 | `MixNode` gains a Player producer | pending | | |
