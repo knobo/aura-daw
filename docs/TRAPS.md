@@ -45,6 +45,17 @@ session burns an hour on something a sentence would have prevented.
   `/proc/<pid>/fd/1` and `fd/2` before assuming the guard covers it. Open
   defect, written up in [`backlog/plugin-manager.md`](backlog/plugin-manager.md).
 
+- **A `"<name>#<index>"` MIDI port id is only as stable as the port list.**
+  `midir`'s ALSA-seq enumeration is ordered by client number, so a new port
+  lands at the end harmlessly, but a port *closing* renumbers every port
+  after it. Measured: `"…129:0#3"` becomes `"…129:0#2"` when an unrelated
+  earlier port goes away, and an exact-string lookup then reports "port not
+  found" for a port that never moved. Resolve through
+  `midi_input::resolve_port_id` — the index is a tiebreaker for same-named
+  ports, never the identity. Persisted routing was always safe here
+  (`midi_out::persist` keys by name and strips the ALSA address); the hazard
+  is holding an id across anything that closes a port.
+
 - **`Session::rev` is not "the current revision" for a history guard.**
   Transient commits — `transport play`, `transport stop`, `transport set
   loop`, every mid-gesture fold — go through `transact` and bump `rev`
@@ -100,6 +111,25 @@ session burns an hour on something a sentence would have prevented.
 
 
 ## Tests
+
+- **A test that drives `SharedRt::position` from its own thread is asserting
+  about the scheduler.** The `midi_out` loopback tests spawn a 2 ms loop that
+  advances `position` in wall-clock time. Spawn it before `open_port` and it
+  free-runs through the enumeration and connection, so a note at tick 0 is
+  gone before the output thread's first tick — the trace shows note-OFFs
+  with no note-ONs. Wait for `PortStatus::note_snapshots > 0` before letting
+  position move, and wait for the bytes you are asserting on rather than
+  sleeping a round number. Under enough load the same loop is descheduled
+  past the drift tolerance and the clock resyncs, which releases notes on
+  its own — a test that needs "no resync happened" cannot be made reliable,
+  only honest about when it cannot conclude.
+
+- **`plugin_main()` is one process-wide FIFO queue, shared by every CLAP and
+  LV2 test.** A `post`-then-sleep test is guessing at how much work other
+  tests have queued, and LV2 instantiation is slow enough to make the guess
+  wrong: one clap_host test failed 3/3 beside `plugins::lv2_host::` and
+  passed 3/3 beside `plugins::clap_host::` alone. `plugin_main().run(|_| ())`
+  is a barrier on the same channel — use it instead of a duration.
 
 - **Before any new `*.dom.test.ts`**, read
   [`2026-08-18-dom-test-environment.md`](superpowers/plans/2026-08-18-dom-test-environment.md).

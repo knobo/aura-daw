@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Parallel `cargo test` race (item 6) | `fix/parallel-test-race` | 2026-08-28 | `midi_out::tests::*` + `clap_host::post_params_…`; goal is dropping `--test-threads=1` |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -82,14 +82,15 @@ sentence got written — if you find a row whose branch is gone from
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
 
-6. **Parallel `cargo test` still fails 1–4 tests**, and how many depends on
-   how loaded the audio server is. Every one passes in isolation and
-   `--test-threads=1` is green, so CI is unaffected; the family is the
-   `midi_out::tests::*` thread race plus `clap_host`'s
-   `post_params_returns_immediately_and_the_change_still_lands`. Root-cause
-   it and `--test-threads=1` can be dropped. The crash bugs underneath it
-   are gone (PRs #123, #124).
-   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) items 4–5
+6. **One test still blocks dropping `--test-threads=1`.** The `midi_out`
+   and `clap_host` families are fixed — the first was a product bug, not a
+   thread race (see [`docs/LANDED.md`](docs/LANDED.md)), and the full
+   parallel suite went 0 of 8 fully green to 45 of 46. The remaining one is
+   PR #124's `lv2_ui` PDEATHSIG test: its child outlived a SIGKILLed parent
+   by over 30 s once in 46 runs, which is too long to be starvation. It
+   prints the surviving pid's `comm` and `ppid` on failure now; pid reuse is
+   the untested hypothesis.
+   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 6
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;
