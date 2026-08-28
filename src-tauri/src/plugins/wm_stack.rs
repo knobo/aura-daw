@@ -289,7 +289,7 @@ mod x11ewmh {
         if dpy != OUR_DPY.load(Ordering::Acquire) {
             let prev = PREV_HANDLER.load(Ordering::Acquire);
             if !prev.is_null() {
-                let f: XErrorHandlerFn = std::mem::transmute(prev);
+                let f = std::mem::transmute::<*mut c_void, XErrorHandlerFn>(prev);
                 return f(dpy, err);
             }
             return 0;
@@ -369,7 +369,13 @@ mod x11ewmh {
                 // that has to be readable before the handler can run.
                 OUR_DPY.store(dpy, Ordering::Release);
                 let prev = set_err(Some(swallow_error));
-                PREV_HANDLER.store(std::mem::transmute(prev), Ordering::Release);
+                // `Option<fn>` is niche-optimised to one pointer, so this is
+                // a pointer-to-pointer cast; the atomic is what lets the
+                // handler read it without taking the lock it runs under.
+                PREV_HANDLER.store(
+                    std::mem::transmute::<Option<XErrorHandlerFn>, *mut c_void>(prev),
+                    Ordering::Release,
+                );
                 let root = root_window(dpy, default_screen(dpy));
                 Some(Self {
                     dpy,
@@ -452,8 +458,9 @@ mod x11ewmh {
                 (self.sync)(self.dpy, 0);
                 // XCloseDisplay syncs again, so it stays inside the guard.
                 (self.close)(self.dpy);
-                let prev: Option<XErrorHandlerFn> =
-                    std::mem::transmute(PREV_HANDLER.load(Ordering::Acquire));
+                let prev = std::mem::transmute::<*mut c_void, Option<XErrorHandlerFn>>(
+                    PREV_HANDLER.load(Ordering::Acquire),
+                );
                 (self.set_err)(prev);
                 OUR_DPY.store(ptr::null_mut(), Ordering::Release);
             }

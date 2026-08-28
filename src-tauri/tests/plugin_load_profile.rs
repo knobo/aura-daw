@@ -822,7 +822,7 @@ fn perf_budget_gate() {
     };
 
     let inst = if b.load.needs_plugins() {
-        let scanned = plugins::scan::scan_all();
+        let scanned = scan_all_through_the_hidden_worker();
         let registry = Arc::new(Mutex::new(PluginRegistry { scanned: Some(scanned) }));
         let want = Wanted::default();
         let inst = instantiate_all(&registry, &want, b.tracks);
@@ -909,6 +909,118 @@ fn perf_budget_gate() {
 }
 
 // ---------------------------------------------------------------------------
+// Scan routing: this binary is its own scan worker
+// ---------------------------------------------------------------------------
+
+/// Every `scan_all()` in this file goes through here, so a new call site
+/// cannot forget the routing below and quietly lose the CLAP half again.
+fn scan_all_through_the_hidden_worker() -> Vec<aura_lib::plugins::descriptor::PluginDescriptor> {
+    install_hidden_worker_routing();
+    plugins::scan::scan_all()
+}
+
+fn install_hidden_worker_routing() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| plugins::scan_worker::set_worker_command(hidden_worker_command()));
+}
+
+/// Re-execute THIS binary filtered down to [`worker_entry`]. An integration
+/// binary links the lib without `cfg(test)`, so it takes
+/// `WorkerCommand::current_exe()`'s production branch — a bare re-exec,
+/// which is correct only for `src/main.rs` and its `AURA_SCAN_WORKER` guard.
+///
+/// The `--exact` filter is load-bearing twice over. It keeps the child from
+/// running this file's other tests, and it keeps the child from reaching
+/// `scan_all()` itself: the worker env is inherited and so are the
+/// `AURA_PROFILE_*` variables that gate the two scanning tests, so an
+/// unfiltered child would recurse with nothing bounding the depth.
+fn hidden_worker_command() -> plugins::scan_worker::WorkerCommand {
+    plugins::scan_worker::WorkerCommand {
+        exe: std::env::current_exe().expect("test exe"),
+        args: vec!["--exact".into(), "worker_entry".into(), "--nocapture".into()],
+    }
+}
+
+/// HIDDEN WORKER ENTRY. With the worker env set this "test" is the worker
+/// body; without it, a no-op. Same shape as the lib's
+/// `plugins::scan_worker::tests::worker_entry`, which this binary cannot
+/// reach because that module is `cfg(test)`.
+#[test]
+fn worker_entry() {
+    if plugins::scan_worker::is_worker_invocation() {
+        assert_eq!(plugins::scan_worker::worker_main(), 0);
+    }
+}
+
+/// THIS BINARY MUST NOT RE-EXECUTE ITSELF BARE AS A SCAN WORKER.
+///
+/// It failed the opposite way from the lib's recursion bug and was worse
+/// for it: measured on `main`, the bare child ran this file's own seven
+/// tests, returned in **2.9 ms with zero protocol lines**, and the parent
+/// took the `scanning == None` arm — logging "worker made no progress" and
+/// returning, so `scan_all()` lost its whole CLAP half in silence. With the
+/// wanted plugins available only as CLAP, `perf_budget_gate` then sees
+/// `instruments.is_empty()` and prints `PERF-VERDICT: SKIP`, which
+/// `scripts/perf-check.sh` maps to exit 125: PR #120's plugin-load gate and
+/// every bisect built on it would call each commit unjudgeable instead of
+/// measuring it.
+///
+/// So this RUNS the command instead of asserting on the strings it is built
+/// from — a literal-only assertion could not fail for the reason that
+/// matters, which is that `--exact worker_entry` still names a test that
+/// exists. A deliberately nonexistent bundle keeps it independent of what
+/// is installed: `worker_main` announces it, fails to read it, says `done`.
+#[test]
+fn the_profile_binary_scans_through_its_hidden_entry_not_its_own_suite() {
+    let cmd = hidden_worker_command();
+    let bogus = std::env::temp_dir().join(format!("aura-not-a-bundle-{}.clap", std::process::id()));
+
+    let out = std::process::Command::new(&cmd.exe)
+        .args(&cmd.args)
+        .env(plugins::scan_worker::ENV_WORKER, "1")
+        .env(plugins::scan_worker::ENV_BUNDLES, bogus.to_string_lossy().as_ref())
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("spawn the worker command");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        stdout.contains(r#""type":"done""#),
+        "the worker command must reach `worker_main` and speak the wire \
+         protocol; got {} bytes of stdout: {stdout:?}",
+        out.stdout.len()
+    );
+    assert!(
+        stdout.contains(r#""type":"scanning""#),
+        "the worker must announce the bundle before reading it; got {stdout:?}"
+    );
+    // A sacrificial scan, not a second suite. The hidden entry is itself one
+    // libtest case, so one `... ok` line is expected; a bare re-exec printed
+    // seven.
+    let ran = stdout.matches(" ... ok").count();
+    assert!(ran <= 2, "the worker child ran {ran} of this binary's own tests instead of scanning");
+}
+
+/// The routing has to be installed by the time a scan runs, and both
+/// scanning tests are gated off on most machines — so assert the wiring
+/// itself, ungated, without paying for a real scan: once
+/// [`install_hidden_worker_routing`] has run, the lib's OWN lookup (the
+/// one every production scan path reaches) must return our hidden entry
+/// rather than a bare re-exec.
+#[test]
+fn the_wrapper_installs_the_routing_the_lib_will_actually_use() {
+    install_hidden_worker_routing();
+    let cmd = plugins::scan_worker::WorkerCommand::current_exe()
+        .expect("a worker command after the override is installed");
+    assert_eq!(
+        cmd.args,
+        hidden_worker_command().args,
+        "production scan paths in this binary must route through `worker_entry`"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // The measurement
 // ---------------------------------------------------------------------------
 
@@ -918,7 +1030,7 @@ fn where_the_block_time_goes_under_plugin_load() {
         return;
     }
 
-    let scanned = plugins::scan::scan_all();
+    let scanned = scan_all_through_the_hidden_worker();
     println!("scanned {} plugins", scanned.len());
     let registry = Arc::new(Mutex::new(PluginRegistry { scanned: Some(scanned) }));
 
