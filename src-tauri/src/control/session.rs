@@ -217,6 +217,7 @@ impl Session {
         store.transport = snap.transport.clone();
         store.tracks = (*snap.tracks).clone();
         store.clips = (*snap.clips).clone();
+        store.players = (*snap.players).clone();
         store.project_dir = snap.project_dir.clone();
         store.project_name = snap.project_name.clone();
         store.created_at = snap.created_at.clone();
@@ -257,6 +258,12 @@ impl Session {
         self.store.transport = snap.transport.clone();
         self.store.tracks = (*snap.tracks).clone();
         self.store.clips = (*snap.clips).clone();
+        // Plan V (ruling V-1): players are content, restored with the rest
+        // of it — same reasoning as the harmony document two lines below.
+        // Missing here, a panicking `transact` closure would leave a
+        // mutated `store.players` behind while everything else rolled back,
+        // exactly the inconsistency F-3's containment exists to prevent.
+        self.store.players = (*snap.players).clone();
         self.store.project_dir = snap.project_dir.clone();
         self.store.project_name = snap.project_name.clone();
         self.store.created_at = snap.created_at.clone();
@@ -902,6 +909,52 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             Ok(Op::TrackAdd {
                 track: removed, index: pos, clips: removed_clips, clip_indices: removed_indices,
                 automation_clips: removed_auto_clips, bindings: removed_bindings,
+            })
+        }
+        // Plan V (ruling V-1): a player is a document object, not a track
+        // (V-2 keeps them out of the timeline) — so it gets its own
+        // structural add/remove pair rather than reusing TrackAdd/Remove,
+        // same reasoning `ObjectRef::Player`'s doc comment gives.
+        Op::PlayerAdd { player, index } => {
+            if session.store.players.iter().any(|p| p.id == player.id) {
+                return Err(format!("player exists: {}", player.id));
+            }
+            let at = (*index).min(session.store.players.len());
+            session.store.players.insert(at, player.clone());
+            effect.rebuild = true;
+            Ok(Op::PlayerRemove { player: player.clone(), index: at })
+        }
+        Op::PlayerRemove { player, .. } => {
+            // Found by id, not the caller's recorded index — store truth
+            // wins, mirroring `TrackRemove`.
+            let at = session
+                .store
+                .players
+                .iter()
+                .position(|p| p.id == player.id)
+                .ok_or_else(|| format!("unknown player: {}", player.id))?;
+            let removed = session.store.players.remove(at);
+            effect.rebuild = true;
+            Ok(Op::PlayerAdd { player: removed, index: at })
+        }
+        Op::Set { object: ObjectRef::Player(id), path, to, .. } => {
+            let p = session
+                .store
+                .players
+                .iter_mut()
+                .find(|p| &p.id == id)
+                .ok_or_else(|| format!("unknown player: {id}"))?;
+            let from_now = read_player_prop(p, *path)?; // truth, not caller's `from`
+            let applied = write_player_prop(p, *path, to)?;
+            // Source, raw and the node's shape all change what the graph
+            // compiles; trigger mode does not (the RT side reads it off
+            // the live document per-trigger, not off the compiled graph).
+            effect.rebuild = !matches!(path, PropPath::TriggerMode);
+            Ok(Op::Set {
+                object: ObjectRef::Player(id.clone()),
+                path: *path,
+                from: applied,
+                to: from_now,
             })
         }
         // Plan E Task 3 (inventory row 3): clip placement — the round-2
@@ -2061,8 +2114,11 @@ fn read_prop(t: &TrackState, path: PropPath) -> Result<serde_json::Value, String
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
         | PropPath::SampleRate
+        | PropPath::Raw
+        | PropPath::TriggerMode
+        | PropPath::PlayerSource
         | PropPath::Param { .. } => {
-            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin path)"))
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin/Player path)"))
         }
     }
 }
@@ -2163,9 +2219,77 @@ fn write_prop(t: &mut TrackState, path: PropPath, to: &serde_json::Value) -> Res
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
         | PropPath::SampleRate
+        | PropPath::Raw
+        | PropPath::TriggerMode
+        | PropPath::PlayerSource
         | PropPath::Param { .. } => {
-            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin path)"))
+            Err(format!("path {path:?} is not a Track property (it's a Clip/MidiClip/Transport/Plugin/Player path)"))
         }
+    }
+}
+
+/// Read a player property as its JSON-wire representation (mirrors
+/// `read_prop` for `TrackState`). `Player` and `TrackState` share four
+/// path names (`Name`/`Gain`/`Pan`/`Muted`) because both compile to a mixer
+/// strip (`player.rs`'s module doc), so those four arms read the same
+/// fields `write_player_prop` writes below.
+fn read_player_prop(p: &crate::audio::player::Player, path: PropPath) -> Result<serde_json::Value, String> {
+    Ok(match path {
+        PropPath::Raw => serde_json::json!(p.raw),
+        PropPath::TriggerMode => serde_json::to_value(p.trigger.mode).unwrap(),
+        PropPath::PlayerSource => serde_json::to_value(&p.source).unwrap(),
+        PropPath::Name => serde_json::json!(p.name),
+        PropPath::Gain => serde_json::json!(p.node.gain_db),
+        PropPath::Pan => serde_json::json!(p.node.pan),
+        PropPath::Muted => serde_json::json!(p.node.muted),
+        other => return Err(format!("player has no property {other:?}")),
+    })
+}
+
+/// Returns the value ACTUALLY written (post-clamp, post-trim), so the
+/// inverse observes what the document holds — the rule `write_prop`'s
+/// `LengthTicks` clamp established.
+fn write_player_prop(
+    p: &mut crate::audio::player::Player,
+    path: PropPath,
+    to: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    match path {
+        PropPath::Raw => {
+            p.raw = to.as_bool().ok_or("raw must be a bool")?;
+            Ok(serde_json::json!(p.raw))
+        }
+        PropPath::TriggerMode => {
+            p.trigger.mode = serde_json::from_value(to.clone())
+                .map_err(|e| format!("triggerMode: {e}"))?;
+            Ok(serde_json::to_value(p.trigger.mode).unwrap())
+        }
+        PropPath::PlayerSource => {
+            p.source = serde_json::from_value(to.clone())
+                .map_err(|e| format!("source: {e}"))?;
+            Ok(serde_json::to_value(&p.source).unwrap())
+        }
+        PropPath::Name => {
+            let n = to.as_str().ok_or("name must be a string")?.trim().to_string();
+            if n.is_empty() {
+                return Err("name must not be empty".into());
+            }
+            p.name = n;
+            Ok(serde_json::json!(p.name))
+        }
+        PropPath::Gain => {
+            p.node.gain_db = to.as_f64().ok_or("gainDb must be a number")?.clamp(-160.0, 12.0);
+            Ok(serde_json::json!(p.node.gain_db))
+        }
+        PropPath::Pan => {
+            p.node.pan = to.as_f64().ok_or("pan must be a number")?.clamp(-1.0, 1.0);
+            Ok(serde_json::json!(p.node.pan))
+        }
+        PropPath::Muted => {
+            p.node.muted = to.as_bool().ok_or("muted must be a bool")?;
+            Ok(serde_json::json!(p.node.muted))
+        }
+        other => Err(format!("player has no property {other:?}")),
     }
 }
 
@@ -2200,6 +2324,9 @@ fn read_midi_prop(c: &crate::midi::types::MidiClip, path: PropPath) -> Result<se
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
         | PropPath::SampleRate
+        | PropPath::Raw
+        | PropPath::TriggerMode
+        | PropPath::PlayerSource
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
@@ -2276,6 +2403,9 @@ fn write_midi_prop(
         | PropPath::LoopEndSamples
         | PropPath::StopAtEnd
         | PropPath::SampleRate
+        | PropPath::Raw
+        | PropPath::TriggerMode
+        | PropPath::PlayerSource
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a MidiClip property"))
         }
@@ -2314,6 +2444,9 @@ fn read_transport_prop(t: &TransportState, path: PropPath) -> Result<serde_json:
         | PropPath::ContentLengthTicks
         | PropPath::TransposeSemitones
         | PropPath::VelocityOffset
+        | PropPath::Raw
+        | PropPath::TriggerMode
+        | PropPath::PlayerSource
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -2388,6 +2521,9 @@ fn write_transport_prop(
         | PropPath::ContentLengthTicks
         | PropPath::TransposeSemitones
         | PropPath::VelocityOffset
+        | PropPath::Raw
+        | PropPath::TriggerMode
+        | PropPath::PlayerSource
         | PropPath::Param { .. } => {
             Err(format!("path {path:?} is not a Transport property"))
         }
@@ -5139,5 +5275,127 @@ mod tests {
         let cs = ChangeSet::from_ops(&[add]);
         assert!(cs.tracks, "insert list is on TrackState");
         assert!(!cs.plugins, "InsertAdd does not touch PluginDoc; PluginAdd beside it does");
+    }
+
+    /// Structural ops carry their own payload so the inverse restores the
+    /// row byte-identically — the rule every landed structural op follows
+    /// (`TrackAdd`'s doc comment).
+    #[test]
+    fn player_add_then_undo_restores_byte_identically() {
+        use crate::audio::player::{Player, PlayerSource};
+        use crate::ids::{ClipId, PlayerId};
+
+        let mut session = session_with_one_track("t-1");
+        let mut p = Player::new(PlayerId::from("p1"), "KICK");
+        p.source = PlayerSource::AudioClip { clip_id: ClipId::from("c1") };
+        p.raw = true;
+        let before = serde_json::to_string(&session.store.players).unwrap();
+
+        let mut effect = EngineEffect::default();
+        let inverse = apply_raw(
+            &mut session,
+            &Op::PlayerAdd { player: p.clone(), index: 0 },
+            &mut effect,
+        )
+        .unwrap();
+        assert_eq!(session.store.players, vec![p.clone()]);
+        assert!(effect.rebuild, "a new node changes the graph");
+
+        apply_raw(&mut session, &inverse, &mut EngineEffect::default()).unwrap();
+        assert_eq!(serde_json::to_string(&session.store.players).unwrap(), before);
+    }
+
+    /// `PlayerRemove`'s payload is advisory beyond the id — store truth
+    /// wins, mirroring `TrackRemove`.
+    #[test]
+    fn player_remove_takes_its_payload_from_the_store_not_the_caller() {
+        use crate::audio::player::Player;
+        use crate::ids::PlayerId;
+
+        let mut session = session_with_one_track("t-1");
+        let real = Player::new(PlayerId::from("p1"), "REAL NAME");
+        session.store.players.push(real.clone());
+
+        let mut lie = real.clone();
+        lie.name = "WRONG".into();
+        let inverse = apply_raw(
+            &mut session,
+            &Op::PlayerRemove { player: lie, index: 0 },
+            &mut EngineEffect::default(),
+        )
+        .unwrap();
+
+        match inverse {
+            Op::PlayerAdd { player, index } => {
+                assert_eq!(player, real, "the inverse restores store truth");
+                assert_eq!(index, 0);
+            }
+            other => panic!("expected PlayerAdd, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_on_a_player_writes_raw_and_inverts() {
+        use crate::audio::player::Player;
+        use crate::ids::PlayerId;
+
+        let mut session = session_with_one_track("t-1");
+        session.store.players.push(Player::new(PlayerId::from("p1"), "PAD"));
+
+        let inverse = apply_raw(
+            &mut session,
+            &Op::Set {
+                object: ObjectRef::Player(PlayerId::from("p1")),
+                path: PropPath::Raw,
+                from: serde_json::json!(false),
+                to: serde_json::json!(true),
+            },
+            &mut EngineEffect::default(),
+        )
+        .unwrap();
+        assert!(session.store.players[0].raw);
+
+        apply_raw(&mut session, &inverse, &mut EngineEffect::default()).unwrap();
+        assert!(!session.store.players[0].raw);
+    }
+
+    #[test]
+    fn set_on_an_unknown_player_is_an_error_not_a_silent_noop() {
+        let mut session = session_with_one_track("t-1");
+        let err = apply_raw(
+            &mut session,
+            &Op::Set {
+                object: ObjectRef::Player(crate::ids::PlayerId::from("ghost")),
+                path: PropPath::Raw,
+                from: serde_json::json!(false),
+                to: serde_json::json!(true),
+            },
+            &mut EngineEffect::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown player"), "got: {err}");
+    }
+
+    /// F-3's panic-rollback path (`restore_from_snapshot`) must restore
+    /// EVERY document field, players included — mirrors the harmony
+    /// document's own round-trip test
+    /// (`restore_from_snapshot_round_trips_the_harmony_document` in
+    /// `snapshot.rs`). Missing here, a panicking `transact` closure would
+    /// leave a mutated `store.players` behind while everything else rolled
+    /// back — the same hole harmony's doc comment warns about.
+    #[test]
+    fn restore_from_snapshot_round_trips_players() {
+        use crate::audio::player::Player;
+        use crate::ids::PlayerId;
+
+        let mut session = session_with_one_track("t-1");
+        let before = session.republish_full();
+        assert!(session.store.players.is_empty());
+
+        session.store.players.push(Player::new(PlayerId::from("p1"), "PAD"));
+        assert_eq!(session.store.players.len(), 1);
+
+        session.restore_from_snapshot(&before);
+        assert!(session.store.players.is_empty(), "restored to the pre-edit document");
     }
 }

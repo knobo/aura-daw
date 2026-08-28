@@ -419,7 +419,7 @@ fn meta_bytes(meta: &TxMeta) -> usize {
 /// that can cost 2x.
 pub fn ops_bytes(ops: &[Op]) -> usize {
     use super::snapshot::{
-        clip_heap, launch_binding_heap, launch_map_heap, midi_clip_heap, track_heap,
+        clip_heap, launch_binding_heap, launch_map_heap, midi_clip_heap, player_heap, track_heap,
     };
     use std::mem::size_of;
     let mut bytes = std::mem::size_of_val(ops);
@@ -517,6 +517,11 @@ pub fn ops_bytes(ops: &[Op]) -> usize {
                 order.len() * size_of::<crate::ids::TrackId>()
                     + order.iter().map(|id| id.as_str().len()).sum::<usize>()
             }
+            // Plan V (ruling V-1): same shape as ClipAdd/ClipRemove above —
+            // the payload is the whole row, charged via the shared helper.
+            Op::PlayerAdd { player, .. } | Op::PlayerRemove { player, .. } => {
+                player_heap(player)
+            }
         };
     }
     bytes
@@ -530,6 +535,7 @@ fn objectref_heap(object: &super::op::ObjectRef) -> usize {
         ObjectRef::Clip(id) | ObjectRef::MidiClip(id) => id.as_str().len(),
         ObjectRef::Transport => 0,
         ObjectRef::Plugin(id) => id.len(),
+        ObjectRef::Player(id) => id.as_str().len(),
     }
 }
 

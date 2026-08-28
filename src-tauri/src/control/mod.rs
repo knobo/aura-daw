@@ -499,6 +499,10 @@ impl Committer {
                     // `param_writes` either (they travel through
                     // `host_forward::ParamWrite` instead, resolved by
                     // instance id, not by a `GraphTables` slot).
+                    // Plan V (ruling V-1): same reasoning again for the
+                    // three Player paths — `apply_raw`'s `Set{Player, ...}`
+                    // arm never pushes into `param_writes` (players are not
+                    // `TrackId`-keyed, and there is no player param table).
                     // Rename: document-only, no ParamTable counterpart and
                     // no rebuild — `apply_raw` never pushes it here either.
                     op::PropPath::Name
@@ -520,7 +524,10 @@ impl Committer {
                     | op::PropPath::LoopEndSamples
                     | op::PropPath::StopAtEnd
                     | op::PropPath::SampleRate
-                    | op::PropPath::Param { .. } => {}
+                    | op::PropPath::Param { .. }
+                    | op::PropPath::Raw
+                    | op::PropPath::TriggerMode
+                    | op::PropPath::PlayerSource => {}
                 }
             }
             // Plan G2: send amounts, resolved through the CURRENT

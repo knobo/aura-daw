@@ -371,6 +371,13 @@ pub enum Op {
     /// Structural: sets `rebuild`, so the next `GraphTables` renumbers
     /// slots. Additive; does not bump `OP_FORMAT_VERSION`.
     TrackReorder { order: Vec<crate::ids::TrackId> },
+    /// Structural: create a player (payload = the full row, so the inverse
+    /// is `PlayerRemove`). Plan V, ruling V-1. Additive; does not bump
+    /// `OP_FORMAT_VERSION`.
+    PlayerAdd { player: crate::audio::player::Player, index: usize },
+    /// Structural: remove a player. `player` is advisory beyond `player.id`
+    /// and `index` is advisory — store truth wins, mirroring `TrackRemove`.
+    PlayerRemove { player: crate::audio::player::Player, index: usize },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -386,6 +393,10 @@ pub enum ObjectRef {
     Transport,
     /// Plugin instance id (`plugins::PluginInstanceInfo::id`).
     Plugin(String),
+    /// A Plan V player (V-1). Its own family, not `Track`: a player is not
+    /// a track (V-2), and `ObjectRef` is what disambiguates which document
+    /// list a `PropPath` addresses.
+    Player(crate::ids::PlayerId),
 }
 
 /// Property paths are a closed enum, not strings — renaming a variant is a
@@ -466,6 +477,15 @@ pub enum PropPath {
     /// numbers (the param's value). Coalescable (§4.4): a knob drag folds
     /// to net `Set`s per (instance, index), same as `Gain`.
     Param { index: u32 },
+    /// Player: V-6's absolute raw flag (wire: JSON bool).
+    Raw,
+    /// Player: `"oneShot" | "gate" | "loop"` (wire: JSON string).
+    TriggerMode,
+    /// Player: the whole tagged `PlayerSource` object. One path rather than
+    /// three, because changing a pad's source changes `kind` and its fields
+    /// together — two ops could leave a `midiClip` source carrying an
+    /// `audioClip`'s id between them.
+    PlayerSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
