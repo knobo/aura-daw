@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Make the perf harness a pass/fail gate, bisectable | `perf/bisectable-gate` | 2026-08-28 | Exit 0/1/125 + `scripts/perf-check.sh`; standing rule to check it |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
@@ -81,6 +81,12 @@ sentence got written — if you find a row whose branch is gone from
    the time goes to but *which machine is the floor* (§9.3). Run the same
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
+
+6. **The parallel test suite SIGSEGVs.** Not the documented `midi_out`
+   race — an actual crash, twice in three runs, where
+   `--test-threads=1` passes 1407/1407. It is also why zyn GUI windows
+   get left behind: a signal death skips the `Drop` that kills them.
+   Undiagnosed. → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 5
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;

@@ -90,6 +90,67 @@ Historical plans called this `next-prompt.md` §2.
   fix) — if a track adds a new gesture-shaped commit path, follow this
   order or reintroduce the TOCTOU that fix closed.
 
+## Performance
+
+- **If you touch the render path, run the gate before you open the PR.**
+  That means `src-tauri/src/audio/mixer.rs`, `rt.rs`, `insert.rs`,
+  `bus.rs`, `pdc.rs`, `offline.rs`, `midi/playback.rs`, or anything they
+  call per block. Also: adding work to a per-sample or per-block loop,
+  changing what the graph compiler emits, or adding a plugin-host call.
+
+  ```sh
+  scripts/perf-check.sh --measure                 # on origin/main first
+  scripts/perf-check.sh --budget <that x 1.3>     # then on your branch
+  ```
+
+  The point is the comparison, not the absolute number. Measure `main`
+  and your branch **in the same sitting on the same machine**, and quote
+  both in the PR. A number on its own is not evidence: on the machine
+  this was built on, ten invocations of unchanged code read 388–408 µs —
+  and one batch of four read 260–275, for a reason never identified.
+  Whatever that was, it is bigger than most regressions worth finding,
+  and only a same-sitting pair rules it out.
+
+  This is a rule you follow, not a CI job. A perf gate on a shared
+  runner flakes, and a flaky gate gets deleted — so the check lives
+  where a human or an agent can see the two numbers side by side and
+  judge. `docs/GAP_ANALYSIS.md` §9 is what "normal" looks like and §9.2
+  says which column is trustworthy.
+
+- **`bare` is the default target because it needs no plugins.** It is
+  AURA's own mixer, fader, sends, bus pass and built-in synth — the code
+  we actually write — and it runs on any machine, including one with an
+  empty plugin catalogue.
+
+  **What it does not cover:** with no inserts there is no insert chain
+  and no PDC, so a regression in `insert.rs` or `pdc.rs` is invisible to
+  it. Those need `--run full` or `--run cheap_fx`, which need plugins
+  installed. A plugin-free stand-in is possible in principle
+  (`insert::GainHalfEffect`, `LatencyDummy`) but would have to bypass
+  `compile_inserts`/`compile_routing` and rebuild the compiler's output
+  by hand — a test that drifts from what production does is worse than
+  a documented gap.
+
+- **A regression that already landed is a bisect**, not an
+  investigation:
+
+  ```sh
+  cp scripts/perf-check.sh /tmp/perf-check.sh
+  git bisect start <bad> <good>
+  git bisect run /tmp/perf-check.sh --budget <n> --harness-from main
+  ```
+
+  `--harness-from` is what makes this work across commits that predate
+  the harness; without it every one of them fails to build and is
+  marked BAD. Confirm the commit bisect names by hand before believing
+  it — see the noise section in the script's `--help`.
+
+- **Do not add timing assertions to the RT path** to get a number. It
+  breaks the RT contract, and it has to come out again afterwards,
+  which means nobody can ever reproduce the measurement. The harness
+  gets its numbers by subtraction from outside instead; §9 explains
+  how.
+
 ## Tests and docs
 
 - **The dated-count convention**: any task that changes test counts

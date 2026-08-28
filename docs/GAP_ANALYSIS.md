@@ -642,3 +642,31 @@ perf report --stdio --sort dso,symbol | head -60
 
 That is the way to find out *which* part of the 3.4 µs is a `memcpy` and
 which is a param flush — the next step if §9.2 is ever worth acting on.
+
+### 9.6 Checking this later
+
+§9 is a snapshot. `scripts/perf-check.sh` is how you find out whether it
+still holds:
+
+```sh
+scripts/perf-check.sh --measure                 # what does this machine do
+scripts/perf-check.sh --budget 520              # exit 0 under, 1 over, 125 unjudgeable
+```
+
+It defaults to the `bare` column — AURA's own mixer, fader, sends and
+built-in synth — because that needs no plugins installed and is the code
+we actually write. `--run full` measures the whole session instead, and
+needs the catalogue in §9's session description.
+
+The exit codes are the point: they let `git bisect run` drive it, so a
+regression that already landed is a search rather than an investigation.
+`docs/STANDING-CONSTRAINTS.md` §Performance has the recipe, and the
+script's `--help` has the caveats — chiefly that a single number is not
+evidence. Ten invocations over unchanged code on the development machine
+read 388–408 µs and one batch of four read 260–275, for a reason never
+identified. Compare `main` and your branch in one sitting; do not compare
+either against the table in §9.1, which was measured in a different
+process shape.
+
+**What `bare` does not cover:** with no inserts there is no insert chain
+and no PDC. A regression in `insert.rs` or `pdc.rs` needs `--run full`.

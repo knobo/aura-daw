@@ -31,6 +31,42 @@ PR, but two categories of tests are currently skipped rather than exercised:
    pre-existing test-isolation/flakiness issue in the test suite, independent
    of CI; forcing `--test-threads=1` makes CI deterministic without touching
    the tests or the code they exercise.
+5. **The parallel `--lib` run does not just flake, it CRASHES** (found
+   2026-08-28, while answering a question about leftover plugin windows).
+   Three consecutive default-parallelism runs on a developer machine:
+
+   ```
+   run 1: signal: 11, SIGSEGV: invalid memory reference
+   run 2: test result: FAILED. 1406 passed; 1 failed
+   run 3: signal: 11, SIGSEGV
+   ```
+
+   The same suite passes 1407/1407 under `--test-threads=1`, repeatedly.
+   This is a different and worse failure than item 4's races: a SIGSEGV is
+   memory unsafety, not a lost race, and no assertion catches it. Prime
+   suspect is LV2 hosting — `lilv`/`livi` are not thread-safe and
+   `plugins::host::plugin_main()` is a single thread, while parallel tests
+   register and drop LV2 instances concurrently. **Not diagnosed.**
+
+   **It has a visible consequence.** `zynaddsubfx-ext-gui` is a separate
+   PROCESS that Zyn's DPF ExternalWindow UI spawns, and the only thing that
+   kills it is `OpenLv2Gui::drop` -> `hide()` -> `kill_ext()`
+   (`plugins/lv2_ui.rs`). `Drop` does not run when a process dies by
+   signal, so every crash after a GUI test orphans a window on the
+   developer's desktop. That is the "one or two zyn windows left behind"
+   people see.
+
+   Two separable pieces of work:
+
+   - **Diagnose the SIGSEGV.** The real bug. Start by running the lib
+     suite under a debugger or `RUST_TEST_THREADS=2` bisecting the module
+     set; the LV2 tests are the first thing to isolate.
+   - **Make the GUI child die with its parent** regardless of how the
+     parent dies: `PR_SET_PDEATHSIG` via `CommandExt::pre_exec` on the
+     `zynaddsubfx-ext-gui` spawn. That fixes the orphan even under
+     SIGKILL, where no amount of `Drop` discipline can. Needs `libc` as a
+     direct dependency of `src-tauri`, whose `Cargo.toml` is **FROZEN** —
+     ask the owner first. `libc` is already in the lockfile transitively.
 
 ## Why deferred
 

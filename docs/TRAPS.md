@@ -182,6 +182,33 @@ session burns an hour on something a sentence would have prevented.
   Pass the host's own `PluginInstanceInfo` through, do not reconstruct
   it.
 
+- **Run the local suite under `xvfb-run`, and single-threaded.**
+
+  ```sh
+  xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+  ```
+
+  Two separate problems, one command. Zyn's LV2 UI is DPF ExternalWindow:
+  it draws nothing itself and instead spawns `zynaddsubfx-ext-gui` as its
+  own process, so the GUI tests put real windows on your desktop.
+  `xvfb-run` gives them a throwaway display that dies with the run.
+  `--test-threads=1` avoids the parallel crash below — which is what
+  leaves windows behind, because a process killed by a signal never runs
+  `Drop`, and `Drop` is the only thing that kills the GUI child.
+
+  **Do not "fix" this by unsetting `DISPLAY`.** The three GUI tests gate
+  on it and return early, so they go green having asserted nothing —
+  including `zyn_show_gui_starts_ext_gui_against_the_hosted_osc_port`,
+  whose entire point is that the process appears. Verified both ways:
+  under `xvfb-run` all five zyn tests run and pass; with no display they
+  pass while printing "skipping: no display".
+
+- **A parallel `cargo test --lib` can SIGSEGV**, not merely flake. Single
+  threaded it passes 1407/1407. If a full run dies with `signal: 11`, you
+  have not broken anything — see
+  [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5, which has
+  the evidence and the two pieces of work it implies.
+
 ## Runtime noise that is not your bug
 
 - **If the dev log is 99% `[carla] lv2ui_extension_data(...)`, it is not

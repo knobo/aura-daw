@@ -5,6 +5,34 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## The engine performance gate
+
+`scripts/perf-check.sh` — the measurement from §9 turned into something
+that answers yes or no. Exit **0** under budget, **1** over, **125**
+unjudgeable (did not build, harness absent at that commit, plugins
+missing), which is the protocol `git bisect run` needs. Bisect SKIPs on
+125 instead of blaming a commit that merely failed to compile.
+
+Defaults to the `bare` column, which needs **no plugins installed** and
+runs anywhere; `--run full` covers the plugin path. `--harness-from
+<ref>` injects the harness at commits that predate it, so a bisect can
+cross the commit that introduced it — verified end to end across
+b7fb583, which has no harness of its own.
+
+The budget is passed in rather than committed: an absolute µs baseline in
+a file is a property of one CPU. Best-of-N, not median — benchmark noise
+is one-sided. A reference-workload ratio was built and then removed: the
+thermal drift it was meant to cancel did not survive a cold-vs-hot
+measurement, and the ratio was noisier than the absolute it replaced.
+
+Rules in [`STANDING-CONSTRAINTS.md`](STANDING-CONSTRAINTS.md)
+§Performance and [`../CLAUDE.md`](../CLAUDE.md); caveats in
+[`GAP_ANALYSIS.md`](GAP_ANALYSIS.md) §9.6.
+
+| PR |
+|---|
+| PR #120 |
+
 ## Where a block's time actually goes, under real plugin load
 
 `GAP_ANALYSIS.md` §8.4 asked for one measurement before any further

@@ -60,6 +60,27 @@ git ls-remote --heads origin
 git worktree list
 ```
 
+## If you touch the render path, measure it
+
+`src-tauri/src/audio/` — `mixer.rs`, `rt.rs`, `insert.rs`, `bus.rs`,
+`pdc.rs`, `offline.rs` — and `midi/playback.rs` are the per-block path.
+Adding work there, or to what the graph compiler emits, means running
+the gate on `origin/main` and on your branch **in the same sitting**,
+and quoting both numbers in the PR:
+
+```sh
+scripts/perf-check.sh --measure                 # on origin/main
+scripts/perf-check.sh --budget <that x 1.3>     # on your branch
+```
+
+It needs no plugins installed and takes about ten seconds. The pair is
+the evidence; a single number is not, because the same unchanged code has
+measured 260–408 µs on one machine across a day.
+[`docs/STANDING-CONSTRAINTS.md`](docs/STANDING-CONSTRAINTS.md)
+§Performance has the bisect recipe and the reasoning;
+[`docs/GAP_ANALYSIS.md`](docs/GAP_ANALYSIS.md) §9 is what normal looks
+like.
+
 ## Keep `next-prompt.md` small
 
 Detail belongs in [`docs/backlog/`](docs/backlog/), one file per track;
