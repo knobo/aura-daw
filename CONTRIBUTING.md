@@ -99,8 +99,21 @@ Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
 Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
 before filing an engine, transport, loopjam or meter failure as a regression.
 
+Run the local suite under a virtual display and single-threaded:
+
+```sh
+xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
+```
+
+Zyn's LV2 UI spawns `zynaddsubfx-ext-gui` as a separate process, so the GUI
+tests open real windows; `xvfb-run` sends them to a display that dies with
+the run. `--test-threads=1` is what CI uses and avoids a parallel SIGSEGV
+(`backlog/ci-hardening.md` item 5) that leaves those windows orphaned.
+Unsetting `DISPLAY` instead makes the three GUI tests pass without
+asserting anything — see [`docs/TRAPS.md`](docs/TRAPS.md).
+
 Counts, measured 2026-08-28 on `perf/plugin-load-profile` with a pinned
-ALSA sink: **1456 backend** (1407 lib + 49 integration, 2 `#[ignore]`d
+ALSA sink: **1457 backend** (1407 lib + 50 integration, 2 `#[ignore]`d
 plugin repros, 16 plugin-gated tests skipped politely) in ~104 s, and
 **1383 frontend** across 126 files in ~5 s.
 

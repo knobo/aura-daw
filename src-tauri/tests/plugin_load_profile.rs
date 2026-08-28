@@ -283,6 +283,21 @@ impl Load {
     fn has_inserts(self) -> bool {
         matches!(self, Load::Full | Load::CheapInserts)
     }
+
+    fn from_label(s: &str) -> Option<Self> {
+        Some(match s {
+            "full" => Load::Full,
+            "cheap_fx" => Load::CheapInserts,
+            "no_inserts" => Load::NoInserts,
+            "bare" => Load::Bare,
+            _ => return None,
+        })
+    }
+
+    /// Whether this run needs a plugin catalogue to exist.
+    fn needs_plugins(self) -> bool {
+        self != Load::Bare
+    }
 }
 
 /// Instances handed out by [`instantiate_all`], in the order the session
@@ -308,6 +323,21 @@ struct Instances {
     /// with an effect that barely computes. See [`Load::CheapInserts`].
     cheap: Vec<Vec<PluginInstanceInfo>>,
     cheap_bus: Option<PluginInstanceInfo>,
+}
+
+impl Instances {
+    /// No plugins at all. [`Load::Bare`] consumes nothing from here, so the
+    /// budget gate can measure AURA's own code on a machine with an empty
+    /// plugin catalogue — which is most machines, and every CI runner.
+    fn none() -> Self {
+        Instances {
+            instruments: Vec::new(),
+            inserts: Vec::new(),
+            bus_fx: None,
+            cheap: Vec::new(),
+            cheap_bus: None,
+        }
+    }
 }
 
 /// Build the session document. The routing is the same in every run —
@@ -721,6 +751,161 @@ fn routing_is_identical_across_every_run() {
     assert_eq!(shape(Load::Full), shape(Load::CheapInserts));
     assert_eq!(shape(Load::Full), shape(Load::NoInserts));
     assert_eq!(shape(Load::Full), shape(Load::Bare));
+}
+
+// ---------------------------------------------------------------------------
+// The budget gate — what `git bisect run` drives
+// ---------------------------------------------------------------------------
+
+/// One machine-readable line, always printed by the budget gate.
+///
+/// `scripts/perf-check.sh` parses this rather than guessing from an exit
+/// code, because `cargo test` cannot distinguish "the test failed" from
+/// "the crate did not compile" — both are 101, and conflating them makes a
+/// bisect blame the wrong commit.
+const VERDICT: &str = "PERF-VERDICT:";
+
+struct Budget {
+    max_us: f64,
+    load: Load,
+    tracks: usize,
+    runs: usize,
+}
+
+/// Read the budget from the environment. `None` means "not in budget mode".
+///
+/// The threshold is passed IN rather than committed to a file on purpose.
+/// An absolute microsecond baseline is a property of one CPU, and a
+/// committed one would be wrong for everybody else the day it lands. A
+/// bisect runs on ONE machine in one sitting: measure at a known-good
+/// commit, pass that number plus headroom, and the comparison is valid for
+/// exactly as long as it needs to be.
+fn budget_from_env() -> Option<Budget> {
+    let max_us: f64 = std::env::var("AURA_PROFILE_MAX_US").ok()?.trim().parse().ok()?;
+    let load = std::env::var("AURA_PROFILE_RUN")
+        .ok()
+        .and_then(|v| Load::from_label(v.trim()))
+        // `bare` by default: it needs no plugins, and it is both the least
+        // noisy column (see §9.2) and the one made entirely of code we
+        // write. A regression in AURA lands there; a slow reverb does not.
+        .unwrap_or(Load::Bare);
+    Some(Budget {
+        max_us,
+        load,
+        tracks: env_usize("AURA_PROFILE_TRACKS", 32),
+        // Three runs, of which the FASTEST is taken — see `best_of`.
+        runs: env_usize("AURA_PROFILE_RUNS", 3).max(1),
+    })
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// Skip, loudly and machine-readably. Bisect turns this into 125 ("cannot
+/// judge this commit") rather than marking it bad — which is the difference
+/// between a bisect that survives a refactor and one that blames it.
+fn verdict_skip(reason: &str) {
+    println!("{VERDICT} SKIP {reason}");
+}
+
+#[test]
+fn perf_budget_gate() {
+    let Some(b) = budget_from_env() else {
+        eprintln!(
+            "skipping: AURA_PROFILE_MAX_US not set (budget gate).\n\
+             \x20   AURA_PROFILE_MAX_US=350 cargo test --release \\\n\
+             \x20       --test plugin_load_profile perf_budget_gate -- --nocapture\n\
+             \x20 or, for a bisect: scripts/perf-check.sh --help"
+        );
+        return;
+    };
+
+    let inst = if b.load.needs_plugins() {
+        let scanned = plugins::scan::scan_all();
+        let registry = Arc::new(Mutex::new(PluginRegistry { scanned: Some(scanned) }));
+        let want = Wanted::default();
+        let inst = instantiate_all(&registry, &want, b.tracks);
+        // Missing plugins make this commit unjudgeable, not slow. Marking it
+        // bad here would hand the bisect a false answer.
+        if inst.instruments.is_empty() || inst.inserts.first().map_or(0, |v| v.len()) == 0 {
+            verdict_skip("the plugins this run needs are not installed");
+            return;
+        }
+        inst
+    } else {
+        Instances::none()
+    };
+    let doc = doc_for(&inst);
+
+    let mut medians = Vec::with_capacity(b.runs);
+    for _ in 0..b.runs {
+        let (store, midi) = build_session(b.tracks, &inst, b.load);
+        let mut og = offline::build_graph(
+            &store,
+            &midi,
+            &doc,
+            &Default::default(),
+            &Default::default(),
+            None,
+            RATE,
+        );
+        let expected = if b.load.has_inserts() {
+            b.tracks + usize::from(b.load.bus_fx(&inst).is_some())
+        } else {
+            0
+        };
+        assert_graph_really_has_the_plugins(&og.graph, expected, b.load.label());
+        let t = measure(&mut og.graph);
+        assert!(
+            t.peak > 0.001,
+            "{}/{} tracks rendered silence — a silent graph is fast and proves nothing",
+            b.load.label(),
+            b.tracks
+        );
+        medians.push(t.median());
+    }
+    // The FASTEST run, not the median or the mean.
+    //
+    // Benchmark noise is one-sided: another process, a migrated thread, a
+    // cold cache or a clock that has not ramped can only make a run slower,
+    // never faster. The minimum is therefore the best estimate of what this
+    // code costs, and every other estimator drags contention into the
+    // number.
+    //
+    // It matters more here than in most benchmarks because of how the gate
+    // is USED: `git bisect run` compiles at every step and measures
+    // immediately after, so every sample is taken on a busy machine.
+    //
+    // Best-of-three tightened the within-invocation spread from 4.7-11.4%
+    // to 1.5-5.0% on the machine this was developed on. It does NOT make
+    // the number absolute: one batch of four invocations there read
+    // 260-275 us where ten others, cold and hot alike, read 388-408, and
+    // the cause was never identified. Compare in one sitting, and give a
+    // budget real headroom.
+    medians.sort_by(|a, c| a.partial_cmp(c).unwrap());
+    let got = medians[0];
+    let spread = (medians.last().unwrap() - got) / got * 100.0;
+
+    println!(
+        "{VERDICT} {} {got:.1} us (budget {:.1}, {} at {} tracks, best of {} runs, \
+         spread {spread:.1}%)",
+        if got <= b.max_us { "OK" } else { "OVER" },
+        b.max_us,
+        b.load.label(),
+        b.tracks,
+        b.runs,
+    );
+    assert!(
+        got <= b.max_us,
+        "{} at {} tracks took {got:.1} us per block, over the {:.1} us budget \
+         ({:+.1}%). Run-to-run spread was {spread:.1}%; if that is close to the \
+         overage, raise AURA_PROFILE_RUNS before believing this.",
+        b.load.label(),
+        b.tracks,
+        b.max_us,
+        (got - b.max_us) / b.max_us * 100.0,
+    );
 }
 
 // ---------------------------------------------------------------------------
