@@ -30,6 +30,15 @@ disappears without a panic, a signal or a log line.
   frozen `Cargo.toml` was never the blocker the backlog recorded: `prctl`
   is reachable with a bare `extern "C"` block, no `libc` crate.
 
+**Checked in the running app, so nobody owes this one an ear-check.** Two
+sessions on 2026-08-28: three real `zynaddsubfx-ext-gui` GUIs spawned and
+closed (so `die_with_parent`'s `pre_exec` does not break the spawn), and
+the changed X path ran `pin` on a real plugin window three times and
+`unpin` five times, with no `X Error` and no exit. What that does NOT show
+is the fix working — the stale-id race cannot be hit by hand. It shows the
+absence of a regression; the fix itself is proved by the deterministic
+test, which sidesteps the race with an id that cannot exist.
+
 Evidence in [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 5;
 the two general lessons in [`TRAPS.md`](TRAPS.md) §Backend.
 

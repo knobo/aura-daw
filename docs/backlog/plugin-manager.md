@@ -135,6 +135,58 @@ The merged branches `feat/plugin-manager` (Step 5),
 | The dispatch | `utils/audition-target.ts` resolves a row to an `AuditionTarget`; `state/audition.svelte.ts` plays it through `sampler_preview_note` / `plugin_preview_note` / `library_audition`. No new IPC, no ops — including in `ZynPatchBrowser`, whose double-click plays through the same shared store as every other browser and contributes only the note; its pre-existing single-click load (`zyn_load_patch`) remains a project edit, as it always was. |
 | Catalog plugins | A descriptor borrows a live, track-bound instance of the same plugin if one exists; otherwise silent with a reason. Instantiating to preview would commit `Op::PluginAdd` (ruling R-3). |
 
+## Open defect: our `PATH` reaches plugin UI children and breaks Carla's
+
+Found 2026-08-28 while ear-checking PR #124, with the owner's project open
+(the same seven restored LV2 instances as the defect below). Carla Rack
+opens no window at all.
+
+**What happens.** `run-aura` launches with `.venv-sidecars/bin` prepended
+to `PATH`, which is correct and deliberate — `resolve_python()` picks the
+first `python3` it finds, and leaving the venv off silently gives the AI
+sidecars a Python without `torch`/`demucs`/`mido`. But that `PATH` is the
+process's, so anything a plugin forks inherits it. Carla's LV2 UI is a
+Python program (`/usr/lib/lv2/carla.lv2/resources/carla-plugin`,
+`#!/usr/bin/env python3`), so it resolves to `.venv-sidecars/bin/python3`
+and dies immediately:
+
+```
+Traceback (most recent call last):
+  File "/usr/lib/lv2/carla.lv2/resources/carla-plugin", line 22, in <module>
+    from PyQt5.QtGui import QKeySequence, QMouseEvent
+ModuleNotFoundError: No module named 'PyQt5'
+```
+
+PyQt5 here is the apt package `python3-pyqt5`, which installs into
+`/usr/lib/python3/dist-packages` — reachable from `/usr/bin/python3` and
+from nothing else. Verified both ways.
+
+**Why it took a while to see.** The symptom points at the wrong thing.
+AURA's own line is `lv2 ui: …carlarack has no osc_port yet; showInterface
+window may stay empty` — true, and irrelevant: `osc_port` is Zyn's
+mechanism, not Carla's. The traceback is in the same log but unprefixed,
+because it is a child's raw stderr, so it reads as noise. Carla then loops
+`waitForClientFirstMessage() - read returned 0` forever.
+
+**What to decide when this is picked up.** Three levels, and the cheap one
+may be enough:
+
+1. **Say so in the log.** When a `showInterface` window never maps, we
+   already warn; the warning could name the child's stderr as the place to
+   look instead of pointing at `osc_port`.
+2. **Fix the launch.** `run-aura` could put the venv on `PATH` only for the
+   sidecar spawns rather than the whole process. That is where the
+   constraint actually belongs — but check `resolve_python()` first, since
+   the skill's warning about system Python exists for a reason.
+3. **Scrub `PATH` for plugin children.** The honest fix and the biggest:
+   Carla's UI is not spawned by us — the bundle is `dlopen`ed and forks its
+   own bridge — so we would have to change the environment the whole
+   process hands out. Weigh that against how many plugins ship Python UIs.
+
+Not urgent: it costs one plugin its editor on one machine, and the DSP
+hosts fine. It is written down because the next person to meet it will
+also start by suspecting Carla.
+
 ## Open defect: `stderr_guard` covers fd 2, the spammer writes fd 1
 
 Found 2026-08-26 while diagnosing an unrelated startup problem, with the

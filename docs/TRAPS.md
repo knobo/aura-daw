@@ -53,6 +53,23 @@ session burns an hour on something a sentence would have prevented.
   → `UndoPath::head()`) is the value that means "the history has not moved";
   it is what `history_undo_to` guards on.
 
+- **AURA's `PATH` reaches plugin UI children, and the sidecar venv on it
+  breaks them.** `run-aura` prepends `.venv-sidecars/bin` (correct — the AI
+  sidecars need it), but a plugin that runs a Python UI inherits that
+  `PATH`. Carla's does: `/usr/lib/lv2/carla.lv2/resources/carla-plugin` is
+  `#!/usr/bin/env python3`, so it picks up `.venv-sidecars/bin/python3`,
+  which has no PyQt5 — that is the apt package `python3-pyqt5`, installed
+  only for `/usr/bin/python3`. It dies on the import and **no window ever
+  appears**. Same shape as the pyenv trap, different venv.
+
+  What makes it expensive is that the symptom points elsewhere. AURA's own
+  line is `lv2 ui: …carlarack has no osc_port yet; showInterface window may
+  stay empty`, which is true and irrelevant — `osc_port` is Zyn's
+  mechanism. The cause is a bare `ModuleNotFoundError: No module named
+  'PyQt5'` further up the log, unprefixed, because it is a child's raw
+  stderr. Read the whole log, not our own WARN lines, before concluding a
+  plugin "has no GUI".
+
 - **Xlib's DEFAULT error handler calls `exit(1)`.** X errors are also
   ASYNCHRONOUS, so both halves of that bite. Any code that acts on a window
   id discovered in a previous round trip — `wm_stack`'s `xdotool` search is
@@ -65,6 +82,13 @@ session burns an hour on something a sentence would have prevented.
   when the connection is next read, so restoring the previous handler and
   syncing afterwards protects NOTHING. Sync first, restore second —
   measured both ways.
+
+  The race is much wider than "a millisecond": discovery shells out, so
+  between `windows_of_pid` returning an id and the X call landing on it
+  there are 2–3 process spawns. Measured on the owner's box, `xdotool
+  search` alone is **70 ms** and `getwindowname` 7 ms — call it ~80 ms of
+  exposure per restack. Rare enough to look like chance, frequent enough
+  to happen.
 
 - **`libc` is not required to call a libc function.** `prctl`, `getppid`
   and friends live in the glibc every Rust binary on this target already
