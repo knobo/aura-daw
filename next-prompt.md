@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Make the perf harness a pass/fail gate, bisectable | `perf/bisectable-gate` | 2026-08-28 | Exit 0/1/125 + `scripts/perf-check.sh`; standing rule to check it |
 
 ## Next up — unclaimed
 
