@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Parallel test-suite SIGSEGV | `fix/parallel-test-sigsegv` | 2026-08-28 | `ci-hardening.md` item 5: diagnose the crash, and make the zyn GUI child die with its parent. |
 
 ## Next up — unclaimed
 
