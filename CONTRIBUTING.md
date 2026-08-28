@@ -82,22 +82,33 @@ npx svelte-check             # frontend types
 npm run build                # production frontend build must stay green
 ```
 
-**A Bluetooth default output sink fails 18 engine tests, and it does not look
-like an audio problem.** The engine opens a stream and publishes a sample rate
-— so it appears to have started — and then no callback ever arrives: the
-transport stays at 0, no meter frames appear, and every `control::loopjam`
-test reports `"audio engine did not respond"`. Point the test process at a
-real ALSA sink instead. This changes nothing globally, so your own audio stays
-where it is:
+**"audio engine did not respond" is usually the environment, not your
+change.** The engine opens a stream and publishes a sample rate — so it
+appears to have started — and then no callback arrives: the transport stays
+at 0, no meter frames appear, and every `control::loopjam` test reports
+`"audio engine did not respond"`. Two different causes produce that same
+line, and the timeouts are the runtime either way:
+
+- **A Bluetooth default sink.** Check `pactl get-default-sink` before
+  filing an engine, transport, loopjam or meter failure as a regression.
+- **Parallel load.** The same ~18 tests fail deterministically under
+  default parallelism and pass in isolation — engines starved of callbacks
+  while ~25 of them hold a device at once
+  (`backlog/ci-hardening.md` item 4). `--test-threads=1` is the answer,
+  not a sink change.
+
+To pin a sink, override the ALSA PCM. **`PULSE_SINK` does not work here**:
+ALSA's `default` resolves to the *pipewire* plugin on this box, not the
+pulse one, so the pulse client variable is never consulted (verified
+2026-08-28 — see [`docs/TRAPS.md`](docs/TRAPS.md)).
 
 ```sh
-PULSE_SINK=$(pactl list short sinks | grep alsa_output | head -1 | cut -f2) \
-  cargo test -- --test-threads=1
+cat > /tmp/asound-pin.conf <<'EOF'
+</usr/share/alsa/alsa.conf>
+pcm.!default { type pipewire playback_node "REPLACE_WITH_A_SINK_NAME" }
+EOF
+ALSA_CONFIG_PATH=/tmp/asound-pin.conf cargo test -- --test-threads=1
 ```
-
-Measured: 1024/1024 in 73 s that way, against 1002/1020 in 882 s over
-Bluetooth — the timeouts are the runtime. Check `pactl get-default-sink`
-before filing an engine, transport, loopjam or meter failure as a regression.
 
 Run the local suite under a virtual display and single-threaded:
 
@@ -107,10 +118,19 @@ xvfb-run -a cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 
 Zyn's LV2 UI spawns `zynaddsubfx-ext-gui` as a separate process, so the GUI
 tests open real windows; `xvfb-run` sends them to a display that dies with
-the run. `--test-threads=1` is what CI uses and avoids a parallel SIGSEGV
-(`backlog/ci-hardening.md` item 5) that leaves those windows orphaned.
-Unsetting `DISPLAY` instead makes the three GUI tests pass without
-asserting anything — see [`docs/TRAPS.md`](docs/TRAPS.md).
+the run. `--test-threads=1` is what CI uses. Unsetting `DISPLAY` instead
+makes the three GUI tests pass without asserting anything — see
+[`docs/TRAPS.md`](docs/TRAPS.md).
+
+The parallel SIGSEGV that used to make `--test-threads=1` mandatory is
+**fixed** (2026-08-28): a lib test's plugin scan was re-executing the whole
+suite as its own subprocess worker, and the resulting flood of audio
+streams exhausted the PipeWire daemon's file descriptors until wireplumber
+died and took our client's connection with it. Five consecutive
+default-parallelism runs are now clean. `backlog/ci-hardening.md` item 5
+has the measurements. Parallel runs still FAIL ~18 tests on load (item 4),
+so single-threaded is still the gate — but a signal death, and the
+orphaned plugin windows it left behind, is no longer part of the picture.
 
 Counts, measured 2026-08-28 on `perf/plugin-load-profile` with a pinned
 ALSA sink: **1457 backend** (1407 lib + 50 integration, 2 `#[ignore]`d

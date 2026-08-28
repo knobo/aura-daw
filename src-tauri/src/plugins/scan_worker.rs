@@ -80,13 +80,40 @@ pub struct WorkerCommand {
 }
 
 impl WorkerCommand {
-    /// The production launch: re-execute the current binary; the
-    /// `AURA_SCAN_WORKER=1` guard at the top of `main` routes it into
-    /// [`worker_main`].
+    /// The launch for whoever is asking. Bare re-execution of the current
+    /// binary is only correct for a binary whose `main` HONOURS the
+    /// `AURA_SCAN_WORKER` guard — that is `src/main.rs`, and nothing else.
+    ///
+    /// A libtest binary has no such guard, so re-executing it bare starts a
+    /// second copy of the whole suite: it prints test output where the
+    /// parent expects NDJSON, the parent ignores it as harness noise, waits
+    /// out [`LINE_TIMEOUT`], kills it and respawns — twice. Meanwhile the
+    /// recursive suite has opened every audio device its engine tests ask
+    /// for. Measured on 2026-08-28: two lib tests reaching this path cost
+    /// ~30 s each in pure timeout, and drove the PipeWire daemon from 164 to
+    /// 578 open file descriptors against its soft `RLIMIT_NOFILE` of 1024.
+    /// Two of them plus the parallel suite's own engines exhausted the
+    /// daemon, at which point wireplumber died with SIGSEGV and the test
+    /// process segfaulted inside `libpipewire` on the broken connection —
+    /// the `--lib` SIGSEGV that `docs/backlog/ci-hardening.md` item 5 spent
+    /// three weeks blaming on LV2.
+    ///
+    /// So under `cfg(test)` this returns the hidden-entry command instead
+    /// (see [`test_worker_command`]). That closes the class rather than the
+    /// two call sites: any test reaching the production scan path gets a
+    /// real sacrificial worker, and no future one can reintroduce the
+    /// recursion by calling [`scan_clap_subprocess`] innocently.
     pub fn current_exe() -> Option<Self> {
-        std::env::current_exe()
-            .ok()
-            .map(|exe| Self { exe, args: Vec::new() })
+        #[cfg(test)]
+        {
+            return Some(test_worker_command());
+        }
+        #[cfg(not(test))]
+        {
+            std::env::current_exe()
+                .ok()
+                .map(|exe| Self { exe, args: Vec::new() })
+        }
     }
 }
 
@@ -248,6 +275,12 @@ pub fn scan_with_worker(bundles: &[PathBuf], cmd: &WorkerCommand) -> Vec<PluginD
 /// through a sacrificial child instead of dlopening them into the shared
 /// test process (Cardinal's exit-time teardown corrupts the heap — observed
 /// intermittently killing full-suite runs when scanned in-process).
+///
+/// This is what [`WorkerCommand::current_exe`] returns under `cfg(test)`, so
+/// a test no longer has to know to ask for it — the two that did not know
+/// are what `ci-hardening.md` item 5 turned out to be. Calling it directly
+/// is still right when a test wants an explicit command (see
+/// `worker_scan_matches_in_process_scan`).
 #[cfg(test)]
 pub fn test_worker_command() -> WorkerCommand {
     WorkerCommand {
@@ -264,6 +297,47 @@ pub fn test_worker_command() -> WorkerCommand {
 pub mod tests {
     use super::*;
     use crate::plugins::scan::{clap_search_paths, find_clap_bundles};
+
+    /// A LIB TEST MUST NEVER RE-EXECUTE THE SUITE AS ITS SCAN WORKER.
+    ///
+    /// `WorkerCommand::current_exe()` is the launch every production scan
+    /// path reaches ([`scan_clap_subprocess`], `scan::scan_all`,
+    /// `scan::scan_incremental`). Bare re-execution is correct only for
+    /// `src/main.rs`, which has the `AURA_SCAN_WORKER` guard; a libtest
+    /// binary has none, so a bare re-exec starts a second copy of the whole
+    /// suite. It prints test output where the parent expects NDJSON, the
+    /// parent ignores it as harness noise and waits out `LINE_TIMEOUT`
+    /// twice, and in the meantime the recursive suite opens every audio
+    /// device its engine tests ask for.
+    ///
+    /// That is not a tidiness point. Two lib tests reached this path
+    /// (`control::tests::plugin_add_of_an_insert_rehosts_as_effect` and
+    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost ~30 s of
+    /// pure timeout and drove the PipeWire daemon from 164 to 578 open file
+    /// descriptors against its soft `RLIMIT_NOFILE` of 1024. Under the
+    /// parallel suite the two of them plus the real engine tests' streams
+    /// exhausted the daemon, wireplumber died with SIGSEGV, and the test
+    /// process segfaulted inside `libpipewire` on the resulting broken
+    /// connection — `ci-hardening.md` item 5's `--lib` SIGSEGV.
+    ///
+    /// So this asserts the ROUTING, not the symptom: whatever a lib test
+    /// reaches, it must carry the hidden entry's args.
+    #[test]
+    fn the_lib_test_worker_command_never_re_executes_the_suite() {
+        let cmd = WorkerCommand::current_exe().expect("a worker command under cfg(test)");
+        assert!(
+            cmd.args.iter().any(|a| a == "--exact"),
+            "a lib test's worker must be filtered to the hidden entry, not the whole suite; got {:?}",
+            cmd.args
+        );
+        assert!(
+            cmd.args
+                .iter()
+                .any(|a| a == "plugins::scan_worker::tests::worker_entry"),
+            "the filtered test must be the hidden worker entry; got {:?}",
+            cmd.args
+        );
+    }
 
     /// HIDDEN WORKER ENTRY for subprocess tests: when the test binary is
     /// re-executed with `--exact <this test> --nocapture` and the worker env
