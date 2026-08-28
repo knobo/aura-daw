@@ -51,12 +51,21 @@ PR, but two categories of tests are currently skipped rather than exercised:
    **What it actually was.** `WorkerCommand::current_exe()` re-executes the
    current binary and relies on the `AURA_SCAN_WORKER` guard at the top of
    `main` to route the child into `worker_main`. A libtest binary has no
-   such guard, so the child ran **the entire test suite again**. It printed
-   test output where the parent expected NDJSON; the parent ignored it as
-   harness noise (a deliberate part of the wire protocol), waited out the
-   15 s `LINE_TIMEOUT`, killed it, respawned, and waited again. Meanwhile
-   the recursive suite opened every audio device its engine tests asked
-   for.
+   such guard, so the child ran **the entire test suite again**, and the
+   parent BLOCKED until it finished: `recv_timeout` is reset by every line
+   the child prints, a running suite prints constantly, so the 15 s
+   `LINE_TIMEOUT` never fires and there is exactly one spawn — no respawn.
+   Meanwhile the recursive suite opened every audio device its engine tests
+   asked for.
+
+   **Why nothing complained.** The worker env is INHERITED, so the recursive
+   suite's own `worker_entry` case became a worker and emitted real NDJSON.
+   Measured directly: a bare re-exec of the lib binary with the worker env
+   set prints 1464 libtest lines *and* 71 valid protocol lines, then exits
+   on its own after 13.5 s. So the parent got a CORRECT descriptor list,
+   slowly, having run the suite twice to get it — the two tests passed
+   rather than skipped, and no log line said anything was wrong. That is why
+   this survived three weeks of being looked at.
 
    Two lib tests reached that path, both calling
    `scan_clap_subprocess(&clap_search_paths())` directly:
@@ -107,7 +116,7 @@ PR, but two categories of tests are currently skipped rather than exercised:
    | SIGSEGV (`rc=139`) | **3 of 4** | **0 of 12** |
    | `X Error … BadWindow` abort (`rc=1`) | 0 of 4 | 2 of 4 — see below |
    | ordinary test failure | 1 of 4 | 2 of 4 |
-   | `--test-threads=1` | — | 1408 passed, twice, ~58 s |
+   | `--test-threads=1` | — | 1409 passed, ~64 s |
 
    and the narrower measurements behind it:
 
@@ -138,8 +147,7 @@ PR, but two categories of tests are currently skipped rather than exercised:
      already uses, so the frozen `Cargo.toml` is untouched. The care needed
      is that the handler is process-GLOBAL and GTK/GDK installs its own:
      save and restore the previous handler around our own calls rather than
-     installing ours for the process lifetime. `--test-threads=1` never hits
-     it (1408 passed, twice), so the gate is unaffected.
+     installing ours for the process lifetime. `--test-threads=1` never hits it, so the gate is unaffected.
 
    - **Tests still fail under default parallelism, and how many depends on
      how loaded the audio server is.** Under the fd pressure that preceded
@@ -159,16 +167,29 @@ PR, but two categories of tests are currently skipped rather than exercised:
      busier audio server can still reach it. The honest fix if it recurs is
      to bound how many engine tests hold a device at once, not to raise the
      limit.
-   - **The integration-test half of the same hole.**
-     `tests/plugin_load_profile.rs` calls `plugins::scan::scan_all()` twice, and an
-     integration test binary links the lib WITHOUT `cfg(test)` — so it
-     still gets a bare re-exec and will run its own suite recursively.
+   - **The integration-test half of the same hole, which fails the OPPOSITE
+     way and is worse than "recursive".** An integration binary links the
+     lib WITHOUT `cfg(test)`, so `tests/plugin_load_profile.rs`'s two
+     `plugins::scan::scan_all()` calls still get a bare re-exec — and that
+     binary has no hidden worker case at all. Measured: the child runs its
+     own seven gated tests, returns in **3.5 ms with zero protocol lines**,
+     and the parent takes the `scanning == None` arm, logs "worker made no
+     progress; aborting CLAP scan" and returns. **`scan_all()` silently
+     loses its entire CLAP half.** If the wanted instrument or inserts exist
+     only as CLAP, `perf_budget_gate` finds `inst.instruments.is_empty()`
+     and emits `PERF-VERDICT: SKIP`, which `perf-check.sh` maps to exit
+     125 — so the plugin-load gate from PR #120, and the bisect recipe
+     built on it, would call every commit "unjudgeable" instead of
+     measuring it.
+
      Both call sites are gated (`AURA_PROFILE_PLUGINS` /
-     `AURA_PROFILE_MAX_US`), so a plain run never reaches them, but
-     `scripts/perf-check.sh --run full` does. Fixing it needs a hidden
-     worker entry in that binary plus a way to install it (a
-     `set_worker_command` override), which is a separate change from this
-     one.
+     `AURA_PROFILE_MAX_US`), so a plain run never reaches them and
+     `perf-check.sh`'s default `--run bare` does not either; `--run full`
+     does. **Note the hazard when it does:** the child inherits those same
+     `AURA_PROFILE_*` variables, so it would reach `scan_all()` itself, with
+     nothing bounding the depth. That path was NOT run on purpose. Fixing
+     this needs a hidden worker entry in that binary plus a way to install
+     it (a `set_worker_command` runtime override), which is its own change.
    - **Orphaned PipeWire clients survive a signal death.** A process killed
      by SIGSEGV never runs `Drop`, so its streams are left standing; the
      daemon's idle fd baseline crept 105 → 164 over a session of

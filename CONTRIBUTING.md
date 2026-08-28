@@ -107,7 +107,9 @@ cat > /tmp/asound-pin.conf <<'EOF'
 </usr/share/alsa/alsa.conf>
 pcm.!default { type pipewire playback_node "REPLACE_WITH_A_SINK_NAME" }
 EOF
-ALSA_CONFIG_PATH=/tmp/asound-pin.conf cargo test -- --test-threads=1
+# `pactl list short sinks | grep alsa_output` names the candidates.
+ALSA_CONFIG_PATH=/tmp/asound-pin.conf \
+  cargo test --manifest-path src-tauri/Cargo.toml -- --test-threads=1
 ```
 
 Run the local suite under a virtual display and single-threaded:
@@ -124,17 +126,22 @@ makes the three GUI tests pass without asserting anything — see
 
 The parallel SIGSEGV that used to make `--test-threads=1` mandatory is
 **fixed** (2026-08-28): a lib test's plugin scan was re-executing the whole
-suite as its own subprocess worker, and the resulting flood of audio
-streams exhausted the PipeWire daemon's file descriptors until wireplumber
-died and took our client's connection with it. Five consecutive
-default-parallelism runs are now clean. `backlog/ci-hardening.md` item 5
-has the measurements. Parallel runs still FAIL ~18 tests on load (item 4),
-so single-threaded is still the gate — but a signal death, and the
-orphaned plugin windows it left behind, is no longer part of the picture.
+suite as its own subprocess worker, and the resulting flood of audio streams
+exhausted the PipeWire daemon's file descriptors until wireplumber died and
+took our client's connection with it. Zero signal deaths in twelve
+default-parallelism runs, against three in four on the parent commit.
 
-Counts, measured 2026-08-28 on `fix/parallel-test-sigsegv`: **1458 backend**
-(1408 lib + 50 integration, 2 `#[ignore]`d plugin repros, 16 plugin-gated
-tests skipped politely) — 61 s for the lib half plus 70 s for the
+**Do not read that as "parallel runs are fine now."** They still fail 1–18
+tests depending on how loaded the audio server is (item 4's engine
+starvation), and about half of them still ABORT — `X Error of failed
+request: BadWindow`, exit 1, no test summary — because Xlib's default error
+handler calls `exit(1)` when we restack an already-closed plugin window
+(item 5's open list). Single-threaded remains the gate.
+`backlog/ci-hardening.md` items 4–5 have the measurements.
+
+Counts, measured 2026-08-28 on `fix/parallel-test-sigsegv`: **1459 backend**
+(1409 lib + 50 integration, 2 `#[ignore]`d plugin repros, 16 plugin-gated
+tests skipped politely) — 64 s for the lib half plus 70 s for the
 integration half, the latter including the link of its eleven binaries —
 and **1383 frontend** across 126 files in ~5 s.
 

@@ -85,19 +85,23 @@ impl WorkerCommand {
     /// `AURA_SCAN_WORKER` guard — that is `src/main.rs`, and nothing else.
     ///
     /// A libtest binary has no such guard, so re-executing it bare starts a
-    /// second copy of the whole suite: it prints test output where the
-    /// parent expects NDJSON, the parent ignores it as harness noise, waits
-    /// out [`LINE_TIMEOUT`], kills it and respawns — twice. Meanwhile the
-    /// recursive suite has opened every audio device its engine tests ask
-    /// for. Measured on 2026-08-28: two lib tests reaching this path cost
-    /// 6–30 s each in pure timeout (how far the recursive suite gets before
-    /// the parent kills it is nondeterministic), and drove the PipeWire
-    /// daemon from a 164-descriptor baseline to peaks of 335–578 against its
-    /// soft `RLIMIT_NOFILE` of 1024. Those two plus the parallel suite's own
-    /// engine streams exhausted the daemon, at which point wireplumber died
-    /// with SIGSEGV and the test process segfaulted inside `libpipewire` on
-    /// the broken connection — the `--lib` SIGSEGV that
+    /// second copy of the whole suite. `recv_timeout` is reset by every line
+    /// the child prints, and a running suite prints constantly, so
+    /// [`LINE_TIMEOUT`] never fires: the parent simply BLOCKS until the
+    /// recursive suite reaches EOF. Measured on 2026-08-28, the two lib
+    /// tests that reached this path cost 6–30 s each (the recursive suite's
+    /// own runtime, which varies with load) and drove the PipeWire daemon
+    /// from a 164-descriptor baseline to peaks of 335–578, against the soft
+    /// `RLIMIT_NOFILE` of 1024 systemd gives it. Those two plus the parallel
+    /// suite's own engine streams exhausted the daemon; wireplumber then
+    /// died with SIGSEGV and the test process segfaulted inside
+    /// `libpipewire` on the broken connection — the `--lib` SIGSEGV that
     /// `docs/backlog/ci-hardening.md` item 5 had blamed on LV2.
+    ///
+    /// Nothing complained, because the worker ENV is inherited: the
+    /// recursive suite's own `worker_entry` case ran `worker_main` and
+    /// returned real descriptors. The parent got a correct answer, slowly,
+    /// having run the suite twice to get it.
     ///
     /// So under `cfg(test)` this returns the hidden-entry command instead
     /// (see [`test_worker_command`]). That closes the class rather than the
@@ -306,38 +310,110 @@ pub mod tests {
     /// `scan::scan_incremental`). Bare re-execution is correct only for
     /// `src/main.rs`, which has the `AURA_SCAN_WORKER` guard; a libtest
     /// binary has none, so a bare re-exec starts a second copy of the whole
-    /// suite. It prints test output where the parent expects NDJSON, the
-    /// parent ignores it as harness noise and waits out `LINE_TIMEOUT`
-    /// twice, and in the meantime the recursive suite opens every audio
-    /// device its engine tests ask for.
+    /// suite, and the parent blocks until that suite ends — every line it
+    /// prints resets `LINE_TIMEOUT`, so the timeout never fires. In the
+    /// meantime the recursive suite opens every audio device its engine
+    /// tests ask for.
     ///
     /// That is not a tidiness point. Two lib tests reached this path
     /// (`control::tests::plugin_add_of_an_insert_rehosts_as_effect` and
-    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost 6–30 s of
-    /// pure timeout and drove the PipeWire daemon from a 164-descriptor
-    /// baseline to peaks of 335–578, against its soft `RLIMIT_NOFILE` of
-    /// 1024. Under the
+    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost 6–30 s
+    /// waiting on a recursive suite and drove the PipeWire daemon from a
+    /// 164-descriptor baseline to peaks of 335–578, against its soft
+    /// `RLIMIT_NOFILE` of 1024. Under the
     /// parallel suite the two of them plus the real engine tests' streams
     /// exhausted the daemon, wireplumber died with SIGSEGV, and the test
     /// process segfaulted inside `libpipewire` on the resulting broken
     /// connection — `ci-hardening.md` item 5's `--lib` SIGSEGV.
     ///
-    /// So this asserts the ROUTING, not the symptom: whatever a lib test
-    /// reaches, it must carry the hidden entry's args.
+    /// So this RUNS the command rather than asserting on the string it is
+    /// built from. Asserting `args` alone would be tautological — the same
+    /// literals are hardcoded a few lines up in `test_worker_command` — and
+    /// it could not fail for the reason that matters: that the filter still
+    /// names a test which EXISTS. Rename `worker_entry` or move `mod tests`
+    /// and a literal-only assertion stays green while the child matches zero
+    /// tests, emits no NDJSON, and every scanning lib test silently finds no
+    /// plugins (they all skip politely when the list comes back empty).
+    ///
+    /// A deliberately nonexistent bundle keeps this independent of what is
+    /// installed: `worker_main` announces it, fails to read it, and still
+    /// says `done`.
+    ///
+    /// The `ran <= 2` assertion is the one with teeth, and the reason is
+    /// counter-intuitive: a whole-suite child DOES emit valid NDJSON. The
+    /// worker env is inherited, so the recursive suite's own `worker_entry`
+    /// case becomes a worker and speaks the protocol — which is exactly why
+    /// the two offending tests PASSED instead of skipping, and why the bug
+    /// hid for as long as it did. Only the test count separates a scan from
+    /// a suite. Verified by reverting the fix: this test then fails with
+    /// "ran 1404 tests", after 127 s.
     #[test]
     fn the_lib_test_worker_command_never_re_executes_the_suite() {
         let cmd = WorkerCommand::current_exe().expect("a worker command under cfg(test)");
+        let bogus = std::env::temp_dir().join(format!(
+            "aura-not-a-bundle-{}-{}.clap",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+
+        let out = std::process::Command::new(&cmd.exe)
+            .args(&cmd.args)
+            .env(ENV_WORKER, "1")
+            .env(ENV_BUNDLES, bogus.to_string_lossy().as_ref())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("spawn the worker command");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
         assert!(
-            cmd.args.iter().any(|a| a == "--exact"),
-            "a lib test's worker must be filtered to the hidden entry, not the whole suite; got {:?}",
-            cmd.args
+            stdout.contains(r#""type":"done""#),
+            "the worker command must reach `worker_main` and speak the wire \
+             protocol; got {} bytes of stdout: {stdout:?}",
+            out.stdout.len()
         );
         assert!(
-            cmd.args
-                .iter()
-                .any(|a| a == "plugins::scan_worker::tests::worker_entry"),
-            "the filtered test must be the hidden worker entry; got {:?}",
-            cmd.args
+            stdout.contains(r#""type":"scanning""#),
+            "the worker must announce the bundle before reading it; got {stdout:?}"
+        );
+        // The whole point: this is a SACRIFICIAL SCAN, not a second suite.
+        // The hidden entry is itself one libtest case, so one `... ok` line
+        // is expected; a bare re-exec prints one per test in the crate.
+        let ran = stdout.matches(" ... ok").count();
+        assert!(
+            ran <= 2,
+            "the worker child ran {ran} tests — it is re-executing the suite, \
+             not scanning bundles"
+        );
+    }
+
+    /// The OTHER half of the same contract, and the half `cfg(test)` cannot
+    /// see: `WorkerCommand::current_exe()`'s production branch is a bare
+    /// re-exec, which is only safe because `src/main.rs` turns
+    /// `AURA_SCAN_WORKER=1` into `worker_main` before it does anything else.
+    /// Divert that guard and the shipped app would launch full AURA
+    /// instances — webview, audio engine and all — as scan workers, while
+    /// this suite stayed green, because every test now takes the `cfg(test)`
+    /// branch instead. So assert the guard is still there, at compile time.
+    #[test]
+    fn the_app_binary_still_routes_worker_invocations_before_anything_else() {
+        let main_rs = include_str!("../main.rs");
+        let guard = main_rs
+            .find("is_worker_invocation()")
+            .expect("src/main.rs must still route AURA_SCAN_WORKER into worker_main");
+        assert!(
+            main_rs[guard..].contains("worker_main()"),
+            "the guard in src/main.rs must still call worker_main"
+        );
+        // "Before anything else" is the load-bearing part: a worker that has
+        // already built a webview or opened an audio device is not
+        // sacrificial any more, and that is what exhausted the PipeWire
+        // daemon when a libtest binary played the part.
+        let fn_main = main_rs.find("fn main()").expect("src/main.rs has a main");
+        let prefix = &main_rs[fn_main..guard];
+        assert!(
+            !prefix.contains("Builder::default"),
+            "the worker guard must come before any Tauri setup in src/main.rs"
         );
     }
 

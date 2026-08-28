@@ -77,15 +77,27 @@ session burns an hour on something a sentence would have prevented.
   `plugins::scan_worker::WorkerCommand::current_exe()` re-runs the current
   binary and depends on the `AURA_SCAN_WORKER` guard in `src/main.rs` to
   route the child into `worker_main`. A libtest binary has no such guard,
-  so the child runs **the whole suite again** — silently, because the wire
-  protocol deliberately ignores non-JSON lines as harness noise. The parent
-  then waits out the 15 s `LINE_TIMEOUT` twice per call while the recursive
-  suite opens every audio device its engine tests ask for. Fixed under
-  `cfg(test)` (2026-08-28), but the same trap is live for **integration**
-  test binaries, which link the lib without `cfg(test)`:
-  `tests/plugin_load_profile.rs` still gets a bare re-exec. If you add a
-  subprocess worker of any kind, ask what happens when the parent is
-  libtest.
+  so the child runs **the whole suite again**, and the parent BLOCKS until
+  that suite ends: every line the child prints resets `LINE_TIMEOUT`, and a
+  running suite prints constantly, so the timeout never fires. Meanwhile the
+  recursive suite opens every audio device its engine tests ask for.
+
+  **What made it invisible for weeks** is worth knowing before you build any
+  subprocess worker: the worker env is INHERITED, so the recursive suite's
+  own hidden worker case ran the worker body and returned correct
+  descriptors. The parent got the right answer — after running the suite
+  twice to get it — so no test failed and no log complained. The only thing
+  that separates a scan from a suite is how many tests the child ran; that
+  is what the regression test asserts.
+
+  Fixed under `cfg(test)` (2026-08-28). **The same trap is live for
+  integration test binaries**, which link the lib without `cfg(test)`, and
+  there it fails the opposite way: `tests/plugin_load_profile.rs` has no
+  hidden worker case, so its child runs its own seven gated tests, returns
+  in 3.5 ms with no NDJSON at all, and the parent aborts the CLAP scan
+  ("worker made no progress") — `scan_all()` silently loses every CLAP
+  plugin. If you add a subprocess worker of any kind, ask what happens when
+  the parent is libtest.
 - **A SIGSEGV inside `libpipewire` is not your memory bug — count the
   daemon's file descriptors first.** `pipewire` and `wireplumber` run under
   systemd's `LimitNOFILESoft=1024`. A test process holding ~25 concurrent
