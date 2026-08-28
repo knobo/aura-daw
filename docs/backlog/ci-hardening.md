@@ -98,25 +98,61 @@ PR, but two categories of tests are currently skipped rather than exercised:
    worker, and `the_lib_test_worker_command_never_re_executes_the_suite`
    asserts the routing so it cannot come back.
 
-   Result, measured on the same machine in the same sitting:
+   Result. The A/B is four default-parallelism runs of each binary, built
+   from `main` and from this branch, alternated on one machine in one
+   sitting:
+
+   | | `main` | this branch |
+   |---|---|---|
+   | SIGSEGV (`rc=139`) | **3 of 4** | **0 of 12** |
+   | `X Error … BadWindow` abort (`rc=1`) | 0 of 4 | 2 of 4 — see below |
+   | ordinary test failure | 1 of 4 | 2 of 4 |
+   | `--test-threads=1` | — | 1408 passed, twice, ~58 s |
+
+   and the narrower measurements behind it:
 
    | | before | after |
    |---|---|---|
-   | full `--lib`, default parallelism | SIGSEGV in 2 of 3 runs | **0 of 5** |
-   | daemon fd peak, full run | 1024 (its limit) | 578 |
+   | daemon fd peak, full parallel run | 1024 (its limit) | 412–578 |
    | `control::` alone, fd peak | 1024 | 469 |
    | the two offending tests | 6–30 s each, +171…+414 daemon fds | 0.33 s each, +0 |
+   | `control::` at `--test-threads=1` | 401 passed in 34 s | 401 passed in 11 s |
 
-   **What is still open, and it is not the same bug:**
+   **What is still open, and none of it is the same bug:**
 
-   - **18 tests still fail under default parallelism** — the same 18 names
-     before and after the fix, identical across runs. They are the
-     engine-starvation family — `control::loopjam::*` reporting "audio
-     engine did not respond", plus
+   - **A parallel run now aborts on `X Error of failed request: BadWindow`
+     in about half the runs** (`rc=1`, no core, no signal). This is NEWLY
+     REACHABLE, not newly caused: `main` never got there because it
+     segfaulted first, and the A/B above is 0 of 4 on `main` against 2 of 4
+     here. It lands right after the three zyn GUI tests all report `ok`, at
+     a very low request serial, so the shape is a stale window id —
+     `wm_stack`'s `xdotool`-discovered ids get restacked (`XRaiseWindow` /
+     `XSetTransientForHint`) after another test has closed that window.
+     Xlib's DEFAULT error handler calls `exit(1)`, which is why it takes the
+     process with it.
+
+     **That is a product bug, not only a test bug.** A DAW must not exit
+     because a plugin editor closed a millisecond before we restacked it —
+     that is unsaved work gone. The fix is an `XSetErrorHandler` that logs
+     and returns 0, resolved through the same runtime `dlopen` the module
+     already uses, so the frozen `Cargo.toml` is untouched. The care needed
+     is that the handler is process-GLOBAL and GTK/GDK installs its own:
+     save and restore the previous handler around our own calls rather than
+     installing ours for the process lifetime. `--test-threads=1` never hits
+     it (1408 passed, twice), so the gate is unaffected.
+
+   - **Tests still fail under default parallelism, and how many depends on
+     how loaded the audio server is.** Under the fd pressure that preceded
+     the fix it was a stable **18** — identical names before and after, so
+     not caused by this change: the engine-starvation family
+     (`control::loopjam::*` reporting "audio engine did not respond", plus
      `audio::engine::tests::engine_pumps_meter_frames_at_60hz` and
-     `mcp::server::tests::read_meters_hears_the_headless_engine` — and each
-     passes in isolation. That is item 4's territory, not a crash.
-     `--test-threads=1` is still what CI should use.
+     `mcp::server::tests::read_meters_hears_the_headless_engine`). On a calm
+     box, with the daemon peaking at 412–453 instead of 1024, the same runs
+     fail **1–2**: `plugins::clap_host::tests::post_params_returns_immediately_and_the_change_still_lands` and the documented
+     `midi_out::tests::*` race. Every one of them passes in isolation. That
+     is item 4's territory, not a crash; `--test-threads=1` is still what
+     CI should use.
    - **The headroom is ~2.4×, not comfortable.** A clean parallel run now
      costs the daemon ~300–420 fds on top of whatever else the desktop is
      playing, against a 1024 soft limit. A box with a bigger `nproc` or a
