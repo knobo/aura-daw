@@ -261,11 +261,19 @@ impl ClockTable {
     /// has latched? The per-clock half of [`ClockTable::flush_pending`].
     ///
     /// The control plane holds a cut scene's slots bound until this goes
-    /// false. That is what makes "the release happens after the flush was
-    /// delivered" a fact about the table rather than a hope about timing:
-    /// the drive poll is 8 ms and a block can be 10 ms, so "a poll later" was
-    /// never a guarantee that a block had run in between (see
-    /// `ControlPlane::release_finished_scenes`).
+    /// false (`GraphTables::release_finished_scenes`), which is what replaced
+    /// "release a poll after the cut" — the drive poll is 8 ms and a block
+    /// can be 10.7 ms, so a poll was never a guarantee that a block had run
+    /// in between.
+    ///
+    /// What it proves is bounded, and the callers say so: `begin_block` clears
+    /// this at the START of a block, so a false answer means that block has
+    /// BEGUN, not that any particular node has read `block_disc` yet. A drive
+    /// poll landing inside one callback can still release a slot before that
+    /// slot's own `playhead()` call. Sub-millisecond, and strictly narrower
+    /// than releasing in the same breath as the cut; closing it entirely needs
+    /// a blocks-rendered counter the release could wait on, which is booked as
+    /// a follow-up rather than built here.
     pub fn flush_pending_for(&self, clock: u32) -> bool {
         self.clocks
             .get(clock as usize)

@@ -820,6 +820,17 @@ pub struct GraphTables {
     /// fire naming it is dropped with a warn rather than firing whichever
     /// clock happens to sit at that index.
     pub scene_clocks: HashMap<String, u32>,
+    /// The clock `engine::rebuild` minted for tracks stranded by a binding
+    /// DELETED while its scene sounded (or cut with its flush still unread):
+    /// stopped, owing one discontinuity, and in no `scene_clocks` map because
+    /// it has no binding left. Present only when something was actually
+    /// stranded — a clock every graph carried would be one `begin_block` and
+    /// `advance` walk every block for a case that is not happening.
+    ///
+    /// Published so `release_finished_scenes` can hand those tracks back once
+    /// the flush has been delivered; see there for why leaving them bound
+    /// indefinitely is not an option.
+    pub orphan_clock: Option<u32>,
     pub slots: HashMap<TrackId, usize>,
     /// `SendSlot::id` -> index into `ParamTable::send_amount` (Plan G2),
     /// derived by `types::derive_send_slots` in the same rebuild that built
@@ -869,34 +880,43 @@ impl GraphTables {
     ///
     /// * the clock is not running — the scene is over, so the node rejoins
     ///   the arrangement (`mixer::node_playhead`'s third case);
-    /// * and it owes no unlatched discontinuity — a rendered block has
-    ///   delivered the `all_notes_off` the cut left behind. Releasing before
-    ///   that hangs the note, and "the drive poll came after the cut" does
-    ///   NOT imply "a block ran in between": the poll is 8 ms and a block at
-    ///   48 kHz / 512 frames is 10.7 ms.
+    /// * and the block that latches its parting discontinuity has BEGUN
+    ///   (`ClockTable::flush_pending_for`). Releasing before that drops the
+    ///   `all_notes_off` the cut left behind and the note hangs, and "the
+    ///   drive poll came after the cut" does NOT imply "a block ran in
+    ///   between": the poll is 8 ms and a block at 48 kHz / 512 frames is
+    ///   10.7 ms.
+    ///
+    ///   BEGUN, not "read by this node". `begin_block` clears the pending flag
+    ///   at the top of a block, so a poll landing between that and this
+    ///   slot's own `node_playhead` call inside the SAME callback can still
+    ///   release early. Sub-millisecond, strictly narrower than what it
+    ///   replaced, and closing it needs a blocks-rendered counter the release
+    ///   waits on — booked as a follow-up, not built here.
     ///
     /// V-14 falls out of the shape: the clock released from is the one the
     /// slot currently reads, so a track a second scene has since claimed is
     /// skipped while that scene still runs, and `release_slot_if` covers the
     /// write that lands between the read and the release.
     ///
-    /// A slot on the ORPHAN clock (`engine::rebuild`, a binding deleted while
-    /// its scene sounded) is deliberately not matched — that clock is in no
-    /// `scene_clocks` map. It needs no release: a stopped clock already
-    /// returns its nodes to the arrangement, and the next rebuild finds
-    /// nothing to pair the binding with and leaves the slot on the transport.
+    /// The ORPHAN clock (`engine::rebuild`, a binding deleted while its scene
+    /// sounded) is released here too, by the same two rules. It has to be:
+    /// `mixer::node_playhead` reports a slot on any non-transport clock as
+    /// `own_clock`, which `audible_with_launch` lets override another track's
+    /// SOLO — and unlike a normal ending, nothing else would ever release
+    /// this one (mute/solo are plain `Set`s that schedule no rebuild), so
+    /// soloing a track would silently fail to silence the stranded one until
+    /// some unrelated edit happened to rebuild the graph.
     pub fn release_finished_scenes(&self) {
-        if self.scene_clocks.is_empty() {
+        if self.scene_clocks.is_empty() && self.orphan_clock.is_none() {
             return;
         }
         let scenes: std::collections::HashSet<u32> =
             self.scene_clocks.values().copied().collect();
         for slot in 0..self.params.len() {
             let clock = self.clocks.clock_of(slot);
-            if !scenes.contains(&clock)
-                || self.clocks.is_on(clock)
-                || self.clocks.flush_pending_for(clock)
-            {
+            let ours = scenes.contains(&clock) || self.orphan_clock == Some(clock);
+            if !ours || self.clocks.is_on(clock) || self.clocks.flush_pending_for(clock) {
                 continue;
             }
             self.clocks.release_slot_if(slot, clock);
@@ -922,6 +942,7 @@ impl GraphTables {
                 1,
             )),
             scene_clocks: HashMap::new(),
+            orphan_clock: None,
             slots: HashMap::new(),
             send_slots: HashMap::new(),
         }))

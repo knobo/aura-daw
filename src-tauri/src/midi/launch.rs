@@ -178,6 +178,54 @@ pub fn drive_in_window(sample: u64, last: u64, pos: u64, play_edge: bool) -> boo
     }
 }
 
+/// Which endings this poll owes the worker a `Release`, and the memory that
+/// keeps the edge an EDGE. `sounding` is the runtime's ledger; `still_on`
+/// answers whether that binding's clock is running.
+///
+/// The drive loop calls this and its test calls this — the same three lines,
+/// not a copy. The first version of the edge memory lived inline in the loop
+/// and its test re-implemented it; the copy had the identical defect, so the
+/// test passed while production was broken (fix round 2, finding 2). A test
+/// that cannot fail for the reason it exists is worse than no test.
+///
+/// TWO rules, and only one of them is about correctness:
+///
+/// * `sent.remove` on the ON EDGE. A binding that is sounding again has spent
+///   whatever we sent for its previous ending. Without this, an id that is
+///   announced and re-fired inside one 8 ms poll gap is still in the ledger
+///   when the next poll runs, so the memory keeps it, and every LATER ending
+///   of that binding is swallowed: no `LaunchFired { playing: false }` ever
+///   reaches the frontend, the pad stays lit, and the id sticks in the ledger
+///   until a transport stop clears it. Retriggering a pad as its clip ends is
+///   ordinary launcher use, and a drive clip with a repeating note does it by
+///   itself.
+/// * `retain` against the ledger is hygiene, not correctness: it bounds the
+///   set to what is actually sounding rather than to every binding ever
+///   fired. It is NOT what makes the edge work — it cannot be, because it
+///   sees the re-fired id as still present.
+///
+/// One `Release` per ending matters because `enqueue_release` is a `try_send`
+/// into an 8-slot channel SHARED with `FireCmd::Start`: duplicates of one
+/// ending fill it and silently drop the user's next pad press.
+pub fn releases_to_enqueue(
+    sent: &mut std::collections::HashSet<String>,
+    sounding: &[String],
+    mut still_on: impl FnMut(&str) -> bool,
+) -> Vec<String> {
+    sent.retain(|id| sounding.iter().any(|s| s == id));
+    let mut out = Vec::new();
+    for id in sounding {
+        if still_on(id) {
+            sent.remove(id);
+            continue;
+        }
+        if sent.insert(id.clone()) {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
 /// Clip-as-instrument: match the written key only. Binding `channel` is a
 /// hardware MIDI-in filter; a drive clip must still fire `channel: Some(n)`.
 pub fn resolve_drive<'a>(bindings: &'a [LaunchBinding], key: u8) -> Option<&'a LaunchBinding> {
@@ -446,16 +494,9 @@ impl LaunchRuntime {
                 let mut play_started = Instant::now();
                 let mut last_onset: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
-                // Ids we have already put on the fire channel as a Release
-                // and are waiting to see leave the ledger. This is what keeps
-                // the release EDGE-triggered. Without it the test below is
-                // level-triggered: an id sits in the ledger with its clock
-                // off until the worker drains, and every 8 ms poll in between
-                // enqueues another Release. `enqueue_release` is a `try_send`
-                // on an 8-slot channel SHARED with `FireCmd::Start`, so a
-                // worker stalled for ~64 ms would fill that channel with
-                // duplicates of one ending and silently drop the user's next
-                // pad press.
+                // Ids already put on the fire channel as a Release — see
+                // `releases_to_enqueue`, which owns the edge logic so that
+                // this loop and its test run the same code.
                 let mut release_sent: std::collections::HashSet<String> =
                     std::collections::HashSet::new();
                 loop {
@@ -466,20 +507,11 @@ impl LaunchRuntime {
                     // end independently, and each owes the frontend its own
                     // `LaunchFired { playing: false }`.
                     let sounding = runtime().sounding_ids();
-                    // Anything the worker has since taken out of the ledger is
-                    // announced and done; forget it, so the same binding can
-                    // sound and end again.
-                    release_sent.retain(|id| sounding.contains(id));
-                    for id in sounding {
-                        let still_on = {
-                            let t = tables.lock();
-                            t.scene_clocks
-                                .get(&id)
-                                .is_some_and(|&c| t.clocks.is_on(c))
-                        };
-                        if !still_on && release_sent.insert(id.clone()) {
-                            runtime().enqueue_release(id);
-                        }
+                    for id in releases_to_enqueue(&mut release_sent, &sounding, |id| {
+                        let t = tables.lock();
+                        t.scene_clocks.get(id).is_some_and(|&c| t.clocks.is_on(c))
+                    }) {
+                        runtime().enqueue_release(id);
                     }
                     // The other half of every ending: hand the tracks back,
                     // but only once a rendered block has delivered the
@@ -1527,6 +1559,7 @@ mod tests {
             params: Arc::new(crate::audio::rt::ParamTable::with_slots_and_sends(n_slots, 0)),
             clocks: Arc::new(clocks),
             scene_clocks,
+            orphan_clock: None,
             slots,
             send_slots: Default::default(),
         }));
@@ -1787,52 +1820,97 @@ mod tests {
         assert_eq!(t.clocks.clock_of(slot), clock, "still bound to read it");
     }
 
-    /// Fix round 1, finding 4. The release test is level-triggered — an id
-    /// sits in the ledger with its clock off until the worker drains it — so
-    /// the drive loop has to remember what it already sent. `enqueue_release`
-    /// is a `try_send` into an 8-slot channel SHARED with `FireCmd::Start`:
+    /// Fix round 1, finding 4. The ledger test is level-triggered — an id
+    /// sits there with its clock off until the worker drains it — so the
+    /// drive loop has to remember what it already sent. `enqueue_release` is
+    /// a `try_send` into an 8-slot channel SHARED with `FireCmd::Start`:
     /// duplicates of one ending fill it and drop the user's next pad press.
     ///
-    /// This drives the loop's edge logic directly; the loop itself is inside
-    /// a spawned thread with an 8 ms sleep.
+    /// Drives `releases_to_enqueue`, which is what the drive loop calls.
+    /// Round 2 finding 2: the first version of this test re-implemented those
+    /// three lines inline and the copy carried the same defect production
+    /// had, so it passed while the loop was broken.
     #[test]
     fn the_release_edge_enqueues_once_per_ending_not_once_per_poll() {
-        let rt = LaunchRuntime::default();
-        let (tx, rx) = std::sync::mpsc::channel();
-        rt.install_fire(std::sync::Arc::new(move |cmd| {
-            if let FireCmd::Release(id) = cmd {
-                let _ = tx.send(id);
-            }
-        }));
-        rt.mark_sounding("b1");
-        let mut release_sent: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut sent = std::collections::HashSet::new();
+        let sounding = vec!["b1".to_string()];
 
-        // Five polls with the clock off and the worker not yet draining.
-        for _ in 0..5 {
-            let sounding = rt.sounding_ids();
-            release_sent.retain(|id| sounding.contains(id));
-            for id in sounding {
-                if release_sent.insert(id.clone()) {
-                    rt.enqueue_release(id);
-                }
-            }
+        let first = releases_to_enqueue(&mut sent, &sounding, |_| false);
+        assert_eq!(first, vec!["b1".to_string()], "the ending, announced");
+        for _ in 0..4 {
+            assert!(
+                releases_to_enqueue(&mut sent, &sounding, |_| false).is_empty(),
+                "one Release per ending — the channel is shared with pad presses"
+            );
         }
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(1)).as_deref(),
-            Ok("b1"),
-        );
-        assert!(
-            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
-            "one Release per ending — the channel is shared with pad presses"
-        );
+    }
 
-        // The worker announces it and takes it out of the ledger; the same
-        // binding must be able to sound and end again.
-        rt.take_sounding("b1");
-        let sounding = rt.sounding_ids();
-        release_sent.retain(|id| sounding.contains(id));
-        assert!(release_sent.is_empty(), "forgotten once the ledger is clear");
+    /// Round 2, finding 1. `take_sounding` (worker) and `mark_sounding`
+    /// (re-fire) both land between two polls, so the memory cannot be cleared
+    /// by watching the ledger: the id is still in it. Clearing on the ON EDGE
+    /// is what makes a re-fired pad announce its NEXT ending — without it the
+    /// binding is silently mute to the frontend forever after, the pad stays
+    /// lit, and the id never leaves the ledger.
+    ///
+    /// Retriggering a pad as its clip ends is ordinary launcher use.
+    #[test]
+    fn a_binding_refired_inside_one_poll_gap_still_announces_its_next_ending() {
+        let mut sent = std::collections::HashSet::new();
+        let sounding = vec!["b1".to_string()];
+
+        // Poll N: b1 has ended. One Release goes out.
+        assert_eq!(
+            releases_to_enqueue(&mut sent, &sounding, |_| false),
+            vec!["b1".to_string()]
+        );
+        // Between the polls: the worker announces it and empties the ledger,
+        // then the user re-fires the same pad and it goes back in. The ledger
+        // looks identical from here — which is the whole trap.
+        // Poll N+1: sounding again.
+        assert!(releases_to_enqueue(&mut sent, &sounding, |_| true).is_empty());
+        // Poll N+2: the SECOND ending must be announced too.
+        assert_eq!(
+            releases_to_enqueue(&mut sent, &sounding, |_| false),
+            vec!["b1".to_string()],
+            "an ending after a re-fire is still an ending"
+        );
+    }
+
+    /// The other half: an id the worker took out of the ledger and that never
+    /// came back must not stay in the memory. Correctness comes from the ON
+    /// edge above; this is what bounds the set to what is sounding rather than
+    /// to every binding ever fired.
+    #[test]
+    fn the_release_memory_does_not_grow_with_every_binding_ever_fired() {
+        let mut sent = std::collections::HashSet::new();
+        releases_to_enqueue(&mut sent, &["b1".to_string()], |_| false);
+        assert_eq!(sent.len(), 1);
+        releases_to_enqueue(&mut sent, &[], |_| false);
+        assert!(sent.is_empty(), "gone with the ledger entry");
+    }
+
+    /// The loop and the runtime meet here: what the drive thread actually
+    /// feeds `releases_to_enqueue` is the ledger and a clock-table lookup.
+    #[test]
+    fn the_drive_loops_release_edge_reads_the_ledger_and_the_clock_table() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        let mut sent = std::collections::HashSet::new();
+        let still_on = |id: &str| {
+            let t = cp.tables_for_tests();
+            t.scene_clocks.get(id).is_some_and(|&c| t.clocks.is_on(c))
+        };
+
+        let sounding = runtime().sounding_ids();
+        assert!(
+            releases_to_enqueue(&mut sent, &sounding, still_on).is_empty(),
+            "still sounding"
+        );
+        cp.stop_launch_overlay(); // Escape
+        assert_eq!(
+            releases_to_enqueue(&mut sent, &sounding, still_on),
+            vec!["b1".to_string()]
+        );
     }
 
 }

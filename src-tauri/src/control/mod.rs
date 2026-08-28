@@ -5934,6 +5934,7 @@ mod tests {
             params: Arc::new(ParamTable::default()),
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             scene_clocks: Default::default(),
+            orphan_clock: None,
             slots: derive_slots(&session.lock().store.tracks),
         }));
         let (engine, engine_rx) = EngineHandle::for_tests();
@@ -6104,6 +6105,7 @@ mod tests {
             generation: 1,
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             scene_clocks: Default::default(),
+            orphan_clock: None,
             params: gen1_params.clone(),
             slots: gen1_slots,
         }));
@@ -6146,6 +6148,7 @@ mod tests {
                 params: gen2_params.clone(),
                 clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
                 scene_clocks: Default::default(),
+                orphan_clock: None,
                 slots: gen2_slots,
                 send_slots: Default::default(),
             };
