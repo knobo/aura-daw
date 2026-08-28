@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Note how to run the app from a worktree | `docs/run-from-worktree` | 2026-08-28 | One note in the `run-aura` skill. |
 
 ## Next up — unclaimed
 
