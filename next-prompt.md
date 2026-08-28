@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Parallel `cargo test` race (item 6) | `fix/parallel-test-race` | 2026-08-28 | `midi_out::tests::*` + `clap_host::post_params_…`; goal is dropping `--test-threads=1` |
 
 ## Next up — unclaimed
 
