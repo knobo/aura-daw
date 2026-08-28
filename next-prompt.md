@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Plan V — V2: one player, real | `feat/plan-v2-players` | 2026-08-28 | Per-node clocks replace the launch overlay; `session.players[]`, ops, graph slot, `player_fire`/`player_stop`. → [`docs/backlog/plan-v-players.md`](docs/backlog/plan-v-players.md) |
 
 ## Next up — unclaimed
 
