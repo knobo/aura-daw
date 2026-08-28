@@ -49,6 +49,12 @@ string_id!(/// A lane within a track (round-2 §5, ADR 0004). Every track
     /// its track (`LaneId -> TrackId`). Multi-lane UI and takes stay
     /// deferred; only the indirection ships.
     LaneId);
+string_id!(/// A player (Plan V): a mixer node with its own playhead, fired
+    /// from a pad. Family of `audio::player::Player::id`. NOT a `TrackId`
+    /// — ruling V-2 keeps players out of the timeline — though a player's
+    /// compiled `MixNode::id` borrows the `TrackId` newtype, which is the
+    /// mixer graph's node-identity family (see `audio::node`).
+    PlayerId);
 
 /// Fixed namespace for [`LaneId::default_for_track`]'s deterministic
 /// minting — a project-specific constant, minted once and frozen forever

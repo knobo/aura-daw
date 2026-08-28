@@ -32,6 +32,7 @@ pub mod pdc;
 pub mod pitch;
 pub mod pitch_store;
 pub mod pitch_thread;
+pub mod player;
 pub mod project;
 pub mod recorder;
 pub mod rt;
