@@ -90,13 +90,13 @@ impl WorkerCommand {
     /// out [`LINE_TIMEOUT`], kills it and respawns — twice. Meanwhile the
     /// recursive suite has opened every audio device its engine tests ask
     /// for. Measured on 2026-08-28: two lib tests reaching this path cost
-    /// 6-30 s each in pure timeout (how far the recursive suite gets before
+    /// 6–30 s each in pure timeout (how far the recursive suite gets before
     /// the parent kills it is nondeterministic), and drove the PipeWire
-    /// daemon from a 164-descriptor baseline to peaks of 335-578 against its
+    /// daemon from a 164-descriptor baseline to peaks of 335–578 against its
     /// soft `RLIMIT_NOFILE` of 1024. Those two plus the parallel suite's own
     /// engine streams exhausted the daemon, at which point wireplumber died
     /// with SIGSEGV and the test process segfaulted inside `libpipewire` on
-    /// the broken connection - the `--lib` SIGSEGV that
+    /// the broken connection — the `--lib` SIGSEGV that
     /// `docs/backlog/ci-hardening.md` item 5 had blamed on LV2.
     ///
     /// So under `cfg(test)` this returns the hidden-entry command instead
@@ -313,9 +313,9 @@ pub mod tests {
     ///
     /// That is not a tidiness point. Two lib tests reached this path
     /// (`control::tests::plugin_add_of_an_insert_rehosts_as_effect` and
-    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost 6-30 s of
+    /// `reactivate_restored_hosts_an_insert_as_effect`); each cost 6–30 s of
     /// pure timeout and drove the PipeWire daemon from a 164-descriptor
-    /// baseline to peaks of 335-578, against its soft `RLIMIT_NOFILE` of
+    /// baseline to peaks of 335–578, against its soft `RLIMIT_NOFILE` of
     /// 1024. Under the
     /// parallel suite the two of them plus the real engine tests' streams
     /// exhausted the daemon, wireplumber died with SIGSEGV, and the test
