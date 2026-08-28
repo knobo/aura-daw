@@ -87,10 +87,11 @@ class LaunchStore {
       this.accept(snap);
     });
     backend.on?.("launch://fired", (ev: LaunchFired) => {
-      if (ev.origin === "hardware") {
-        this.overlay = null;
-        return;
-      }
+      // Every origin sounds the same way now (Plan V — V2, Task 8): a
+      // hardware press used to seize the arrangement transport instead of
+      // running the shadow playhead, so this handler cleared the indicator
+      // for it. A pad press is a scene on its own clock now, so it shows
+      // like any other fire.
       if (ev.playing === false) {
         if (this.overlay?.id === ev.id) this.overlay = null;
         return;

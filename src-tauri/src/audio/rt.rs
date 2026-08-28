@@ -812,6 +812,14 @@ pub struct GraphTables {
     /// rendering graph actually reads, and a pad press must never rebuild
     /// the graph.
     pub clocks: Arc<crate::audio::clock::ClockTable>,
+    /// Launch binding id -> its clock in `clocks` (Plan V — V2, Task 8).
+    /// The scene half of `slots`: it is what turns a pad press into an
+    /// atomic write into a lane that already exists, instead of a graph
+    /// rebuild. Sized and numbered by `engine::rebuild` from the document,
+    /// so a binding added since the last rebuild is simply absent — and a
+    /// fire naming it is dropped with a warn rather than firing whichever
+    /// clock happens to sit at that index.
+    pub scene_clocks: HashMap<String, u32>,
     pub slots: HashMap<TrackId, usize>,
     /// `SendSlot::id` -> index into `ParamTable::send_amount` (Plan G2),
     /// derived by `types::derive_send_slots` in the same rebuild that built
@@ -859,13 +867,17 @@ impl GraphTables {
         Arc::new(parking_lot::Mutex::new(GraphTables {
             generation: 0,
             params: Arc::new(ParamTable::default()),
-            // Sized to MATCH `params`, and with the scene clock present: a
-            // launch fired before the first real rebuild must not be
-            // silently dropped into a table with no slots to bind.
+            // Sized to MATCH `params`. Only the transport clock: with
+            // per-binding scene clocks (Task 8) there is no such thing as
+            // "the" scene clock to pre-create, and `scene_clocks` below is
+            // correspondingly empty — a fire before the first real rebuild
+            // is dropped with a warn, which is the same "unknown index means
+            // drop the write" rule `ParamTable`'s setters follow.
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
                 ParamTable::default().len(),
-                2,
+                1,
             )),
+            scene_clocks: HashMap::new(),
             slots: HashMap::new(),
             send_slots: HashMap::new(),
         }))

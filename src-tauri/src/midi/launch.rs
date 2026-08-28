@@ -287,8 +287,16 @@ pub struct LaunchRuntime {
     last_learn: Mutex<Option<(u8, u8)>>,
     gen: AtomicU64,
     drive_started: AtomicBool,
-    audible_tracks: Mutex<Vec<String>>,
-    overlay_id: Mutex<Option<String>>,
+    /// Every binding whose scene is currently sounding, as far as the
+    /// FRONTEND has been told. Plural since Task 8: scenes each own a clock
+    /// now, so any number of them can sound at once — this was
+    /// `overlay_id: Option<String>` for exactly as long as there was one
+    /// shadow playhead to be in.
+    ///
+    /// It is not the truth about what is playing (the clock table is); it is
+    /// the drive thread's ledger of which endings it still owes a
+    /// `LaunchFired { playing: false }`, so an ending is announced once.
+    sounding: Mutex<std::collections::HashSet<String>>,
     drive_focus: Mutex<Option<String>>,
 }
 
@@ -304,8 +312,7 @@ impl Default for LaunchRuntime {
             last_learn: Mutex::new(None),
             gen: AtomicU64::new(0),
             drive_started: AtomicBool::new(false),
-            audible_tracks: Mutex::new(Vec::new()),
-            overlay_id: Mutex::new(None),
+            sounding: Mutex::new(std::collections::HashSet::new()),
             drive_focus: Mutex::new(None),
         }
     }
@@ -360,25 +367,28 @@ impl LaunchRuntime {
         *self.fire_tx.lock() = Some(tx);
     }
 
-    pub fn set_audible_tracks(&self, ids: Vec<String>) {
-        *self.audible_tracks.lock() = ids;
+    /// Record that this binding's scene has been fired. Called AFTER the
+    /// clock is actually running, so the drive thread's release edge — "in
+    /// the ledger, but its clock is off" — cannot fire on the gap between
+    /// the two and announce an ending that never happened.
+    pub fn mark_sounding(&self, id: &str) {
+        self.sounding.lock().insert(id.to_string());
     }
 
-    pub fn audible_tracks(&self) -> Vec<String> {
-        self.audible_tracks.lock().clone()
+    /// Take this binding out of the ledger, reporting whether it was in it.
+    /// False means its ending has already been announced, which is what
+    /// makes `stop_drive_launch` idempotent — the guard
+    /// `overlay_id == Some(id)` used to be.
+    pub fn take_sounding(&self, id: &str) -> bool {
+        self.sounding.lock().remove(id)
     }
 
-    pub fn clear_audible_tracks(&self) {
-        self.audible_tracks.lock().clear();
-        *self.overlay_id.lock() = None;
+    pub fn sounding_ids(&self) -> Vec<String> {
+        self.sounding.lock().iter().cloned().collect()
     }
 
-    pub fn set_overlay_id(&self, id: Option<String>) {
-        *self.overlay_id.lock() = id;
-    }
-
-    pub fn overlay_id(&self) -> Option<String> {
-        self.overlay_id.lock().clone()
+    pub fn clear_sounding(&self) {
+        self.sounding.lock().clear();
     }
 
     pub fn set_drive_focus(&self, id: Option<String>) {
@@ -415,10 +425,10 @@ impl LaunchRuntime {
 
     /// Watch the transport and fire launch bindings from clips marked as
     /// launch-map instruments. Hardware `armed` is not involved.
-    /// `tables` is here for one line below: whether the scene is still
+    /// `tables` is here for the release edge below: whether a scene is still
     /// sounding is a property of the CURRENT graph's clock table now
-    /// (Plan V — V2), not of a `SharedRt` atomic, so the release edge has to
-    /// be read where the truth lives.
+    /// (Plan V — V2), not of a `SharedRt` atomic, so it has to be read where
+    /// the truth lives.
     pub fn attach_drive(
         &self,
         shared: Arc<crate::audio::rt::SharedRt>,
@@ -436,17 +446,31 @@ impl LaunchRuntime {
                 let mut play_started = Instant::now();
                 let mut last_onset: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
-                let mut overlay_was_on = false;
                 loop {
                     std::thread::sleep(Duration::from_millis(8));
-                    let overlay_on =
-                        tables.lock().clocks.is_on(crate::control::SCENE_CLOCK);
-                    if overlay_was_on && !overlay_on {
-                        if let Some(id) = runtime().overlay_id() {
+                    // The release edge, once per sounding scene. Task 8 made
+                    // this a set rather than one `overlay_was_on` bool: N
+                    // scenes each own a clock, so N of them can reach their
+                    // end independently, and each owes the frontend its own
+                    // `LaunchFired { playing: false }`.
+                    //
+                    // No edge state is kept here any more — the ledger IS
+                    // the edge. Two polls can enqueue the same release if the
+                    // worker has not drained the first yet; `stop_drive_launch`
+                    // takes the id out of the ledger before it emits, so the
+                    // ANNOUNCEMENT still happens exactly once. That guard was
+                    // `overlay_id == Some(id)` before scenes were plural.
+                    for id in runtime().sounding_ids() {
+                        let still_on = {
+                            let t = tables.lock();
+                            t.scene_clocks
+                                .get(&id)
+                                .is_some_and(|&c| t.clocks.is_on(c))
+                        };
+                        if !still_on {
                             runtime().enqueue_release(id);
                         }
                     }
-                    overlay_was_on = overlay_on;
                     let playing = shared.playing.load(Relaxed);
                     let pos = shared.position.load(Relaxed);
                     if !playing {
@@ -776,35 +800,29 @@ impl crate::control::ControlPlane {
         let end = map
             .tick_to_samples(start_ticks.saturating_add(length_ticks))
             .max(start + 1);
-        runtime().set_audible_tracks(track_ids.clone());
         log::info!(
             "launch: fire id={id} name={name} origin={origin:?} start={start} end={end} tracks={track_ids:?}"
         );
-        match origin {
-            FireOrigin::Drive => {
-                // Keep the arrangement loop and playhead on the clip.
-                // Retrigger rewinds the single overlay (v0.1 has no overlap).
-                runtime().set_overlay_id(Some(id.to_string()));
-                self.arm_drive_launch(&track_ids, start, end);
-            }
-            FireOrigin::Preview => {
-                runtime().set_overlay_id(Some(id.to_string()));
-                self.arm_drive_launch(&track_ids, start, end);
-            }
-            FireOrigin::Hardware => {
-                self.clear_drive_overlay();
-                self.apply_launch_audible(&track_ids);
-                self.transport(crate::control::TransportAction::SetLoop {
-                    enabled: true,
-                    start_samples: start,
-                    end_samples: end,
-                })?;
-                self.transport(crate::control::TransportAction::Seek {
-                    position_samples: start,
-                })?;
-                self.transport(crate::control::TransportAction::Play)?;
-            }
+        // Every origin now does the same thing, because the reason they
+        // differed is gone: `Hardware` used to SetLoop + Seek + Play on the
+        // arrangement transport (design §2.2), which moved the user's
+        // playhead every time they touched a pad. It only ever did that
+        // because there was ONE shadow playhead to share and the transport's
+        // was it. A scene has its own clock now, so firing one is firing one,
+        // whoever pressed it.
+        if !self.fire_scene(id, &track_ids, start, end) {
+            // Dropped, because the graph has not been rebuilt since this
+            // binding was added. Say nothing to the frontend either: a
+            // `LaunchFired { playing: true }` for a scene that is not
+            // sounding lights the launcher up with no ending to switch it
+            // off, since nothing releases a scene that never entered the
+            // ledger. The warn in `fire_scene` is the whole report.
+            return Ok(());
         }
+        // AFTER the clock is running: the drive thread's release edge is
+        // "in the ledger, clock off", and marking first would let a poll
+        // landing in between announce an ending that never happened.
+        runtime().mark_sounding(id);
         self.emit_launch_fired(LaunchFired {
             id: id.to_string(),
             name,
@@ -818,12 +836,16 @@ impl crate::control::ControlPlane {
         Ok(())
     }
 
+    /// One scene has ended (its clip ran out, a gate note lifted, or a
+    /// stop-all cut it): hand its tracks back to the arrangement and tell the
+    /// frontend. The ledger take is the idempotence guard — the drive thread
+    /// may enqueue the same release twice, and the frontend must be told once.
     pub fn stop_drive_launch(&self, id: &str) {
-        if runtime().overlay_id().as_deref() != Some(id) {
+        if !runtime().take_sounding(id) {
             return;
         }
         launch_trace(format!("drive stop {id}"));
-        self.clear_launch_audible();
+        self.stop_scene(id);
         self.emit_launch_fired(LaunchFired {
             id: id.to_string(),
             name: String::new(),
@@ -1399,4 +1421,267 @@ mod tests {
             "exactly two fires — one per play edge"
         );
     }
+    // -----------------------------------------------------------------
+    // Plan V — V2, Task 8: a scene owns its clock. These drive a real
+    // `ControlPlane` (no engine thread) with the `GraphTables` a rebuild
+    // would have published for the same document — see `plane`.
+    // -----------------------------------------------------------------
+
+    fn region_on(id: &str, note: u8, tracks: &[&str]) -> LaunchBinding {
+        LaunchBinding {
+            id: id.into(),
+            name: id.into(),
+            note,
+            channel: None,
+            target: LaunchTarget::Region {
+                start_ticks: 0,
+                length_ticks: 960,
+                track_ids: tracks.iter().map(|t| (*t).to_string()).collect(),
+            },
+        }
+    }
+
+    /// A `ControlPlane` over `tracks` and `bindings`, plus the `GraphTables`
+    /// `engine::rebuild` would have published for that document: params and
+    /// clocks sized to the mixer slots, the slot map, and one clock per
+    /// Region binding numbered exactly as `rebuild` numbers them.
+    ///
+    /// Building the tables by hand is not a shortcut — there is no engine
+    /// thread in a unit test, so nothing would ever publish one, and every
+    /// clock write would silently drop (`fire_scene` warns and returns false
+    /// on a binding with no clock). Same reasoning as
+    /// `control::mod::tests::test_plane_with_tracks`, which cannot be reused
+    /// here: it is private to that module's `#[cfg(test)] mod tests`.
+    ///
+    /// The `EngineHandle` receiver is returned, not dropped: `transport`
+    /// commits send on that channel, and a disconnected one silently eats
+    /// them. The emitted-events sink is returned for the same reason — a
+    /// fire's whole visible output to the frontend is `launch://fired`.
+    ///
+    /// `LaunchRuntime` is a PROCESS-WIDE singleton, so its sounding ledger
+    /// outlives any one test; the fixture clears it, which is what keeps
+    /// these independent of each other's leftovers.
+    /// What [`plane`] hands back: the plane itself, the engine channel's
+    /// receiver (kept alive so `transport` commits are not sent into a
+    /// disconnected channel) and the emitted-events sink.
+    type Plane = (
+        crate::control::ControlPlane,
+        crossbeam_channel::Receiver<crate::audio::engine::ControlMsg>,
+        Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    );
+
+    fn plane(tracks: &[&str], bindings: Vec<LaunchBinding>) -> Plane {
+        use crate::audio::engine::EngineHandle;
+        use crate::audio::rt::{GraphTables, SharedRt};
+        use crate::audio::types::{derive_slots, mixer_slot_count, Store};
+        use crate::control::Session;
+
+        let mut store = Store::default();
+        for &id in tracks {
+            store.tracks.push(crate::audio::types::testutil::test_track(id));
+        }
+        let mut session = Session::new(store, crate::midi::MidiStore::default());
+        let mut map = LaunchMap::default_map();
+        map.bindings = bindings;
+        session.midi.launch_maps = vec![map];
+
+        let n_slots = mixer_slot_count(&session.store.tracks);
+        let slots = derive_slots(&session.store.tracks);
+        let scene_ids: Vec<String> = crate::audio::engine::scene_binding_ids(&session.midi.launch_maps);
+        let first = 1 + session.store.players.len() as u32;
+        let scene_clocks: std::collections::HashMap<String, u32> = scene_ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), first + i as u32))
+            .collect();
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(
+            n_slots,
+            1 + session.store.players.len() + scene_ids.len(),
+        );
+        let shared = Arc::new(SharedRt::default());
+        shared.sample_rate.store(48_000, Relaxed);
+        let tables = Arc::new(Mutex::new(GraphTables {
+            generation: 1,
+            params: Arc::new(crate::audio::rt::ParamTable::with_slots_and_sends(n_slots, 0)),
+            clocks: Arc::new(clocks),
+            scene_clocks,
+            slots,
+            send_slots: Default::default(),
+        }));
+        let (engine, engine_rx) = EngineHandle::for_tests();
+        let events: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let cp = crate::control::ControlPlane::new(
+            Arc::new(Mutex::new(session)),
+            shared,
+            tables,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(move |e, p| sink.lock().push((e.to_string(), p))),
+            Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
+        );
+        runtime().clear_sounding();
+        (cp, engine_rx, events)
+    }
+
+    /// Design §2.2's defect, killed: pressing a pad must not move the user's
+    /// arrangement. This is the whole reason `FireOrigin::Hardware` existed
+    /// as a separate arm — it did SetLoop + Seek + Play on the transport,
+    /// because the transport's playhead was the only one there was.
+    #[test]
+    fn firing_from_hardware_does_not_move_the_transport() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.transport(crate::control::TransportAction::Seek { position_samples: 96_000 })
+            .unwrap();
+        cp.transport(crate::control::TransportAction::Play).unwrap();
+        let before = cp.transport_state();
+
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let after = cp.transport_state();
+        assert_eq!(after.position_samples, before.position_samples);
+        assert_eq!(after.loop_enabled, before.loop_enabled);
+        assert!(!after.loop_enabled, "and no loop was invented over the region");
+        assert_eq!(after.state, "playing");
+        let tables = cp.tables_for_tests();
+        let clock = tables.scene_clocks["b1"];
+        assert!(tables.clocks.is_on(clock), "the scene sounds on its own clock");
+    }
+
+    /// A hardware press still tells the VIEW to follow — that distinction is
+    /// all `FireOrigin` carries now, and it is why the type survives the
+    /// collapse of the three fire arms into one.
+    #[test]
+    fn follow_view_still_separates_a_hardware_press_from_a_drive_fire() {
+        let (cp, _rx, events) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+
+        let fired: Vec<bool> = events
+            .lock()
+            .iter()
+            .filter(|(name, _)| name == "launch://fired")
+            .map(|(_, p)| p["followView"].as_bool().unwrap_or(false))
+            .collect();
+        assert_eq!(fired, vec![true, false], "the hardware press moves the view; the drive fire does not");
+    }
+
+    /// Two scenes sounding at once is what the single overlay could never do
+    /// — and it is the reason a scene needs its OWN clock rather than a
+    /// shared one.
+    #[test]
+    fn two_scenes_sound_at_once_on_different_clocks() {
+        let (cp, _rx, _ev) = plane(
+            &["t1", "t2"],
+            vec![region_on("b1", 60, &["t1"]), region_on("b2", 61, &["t2"])],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+
+        let c1 = cp.scene_clock_for("b1").expect("b1 has a clock");
+        let c2 = cp.scene_clock_for("b2").expect("b2 has a clock");
+        assert_ne!(c1, c2);
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(c1));
+        assert!(tables.clocks.is_on(c2), "firing b2 must not have stopped b1");
+        assert_eq!(tables.clocks.clock_of(tables.slots[&crate::ids::TrackId::from("t1")]), c1);
+        assert_eq!(tables.clocks.clock_of(tables.slots[&crate::ids::TrackId::from("t2")]), c2);
+    }
+
+    /// V-14. Two scenes naming the same track is newly expressible; ending
+    /// the first must not take the track away from the second.
+    #[test]
+    fn stopping_one_scene_does_not_steal_a_track_the_other_now_owns() {
+        let (cp, _rx, _ev) = plane(
+            &["shared"],
+            vec![
+                region_on("b1", 60, &["shared"]),
+                region_on("b2", 61, &["shared"]),
+            ],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+        let c2 = cp.scene_clock_for("b2").unwrap();
+
+        cp.stop_drive_launch("b1");
+
+        let tables = cp.tables_for_tests();
+        let slot = tables.slots[&crate::ids::TrackId::from("shared")];
+        assert_eq!(tables.clocks.clock_of(slot), c2, "b2 still owns it");
+        assert!(tables.clocks.is_on(c2), "and is still sounding");
+    }
+
+    /// A binding the graph has never seen (added since the last rebuild) has
+    /// no clock, and a fire naming it must drop rather than land on whichever
+    /// index happens to be free — the same rule `ParamTable`'s setters follow
+    /// for an unknown slot.
+    #[test]
+    fn firing_a_binding_with_no_clock_yet_drops_instead_of_firing_another() {
+        let (cp, _rx, ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.session().lock().midi.launch_maps[0]
+            .bindings
+            .push(region_on("b-new", 62, &["t1"]));
+
+        assert_eq!(cp.scene_clock_for("b-new"), None);
+        cp.launch_fire_from("b-new", FireOrigin::Drive).unwrap();
+
+        assert!(
+            !runtime().take_sounding("b-new"),
+            "a dropped fire must not enter the ledger — nothing would ever release it"
+        );
+        assert!(
+            !ev.lock().iter().any(|(name, _)| name == "launch://fired"),
+            "and the frontend is not told a scene is playing when none is"
+        );
+        let tables = cp.tables_for_tests();
+        assert!(
+            !tables.clocks.is_on(tables.scene_clocks["b1"]),
+            "b1's clock is not b-new's to fire"
+        );
+    }
+
+    /// Stop-all cuts every sounding scene, not just the last one fired —
+    /// `launch_stop` is one frozen command over what is now N clocks.
+    #[test]
+    fn stop_all_cuts_every_sounding_scene() {
+        let (cp, _rx, _ev) = plane(
+            &["t1", "t2"],
+            vec![region_on("b1", 60, &["t1"]), region_on("b2", 61, &["t2"])],
+        );
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        cp.launch_fire_from("b2", FireOrigin::Drive).unwrap();
+
+        assert!(cp.stop_launch_overlay(), "something was sounding");
+
+        let c1 = cp.scene_clock_for("b1").unwrap();
+        let c2 = cp.scene_clock_for("b2").unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(!tables.clocks.is_on(c1));
+        assert!(!tables.clocks.is_on(c2));
+        assert!(
+            tables.clocks.flush_pending(),
+            "both cuts still owe their live nodes an all-notes-off"
+        );
+        assert_eq!(
+            tables.clocks.clock_of(tables.slots[&crate::ids::TrackId::from("t1")]),
+            c1,
+            "and the slots stay bound so they can read it (the drive thread releases)"
+        );
+    }
+
+    /// The frontend must be told a scene ended exactly once, however many
+    /// times the drive poller enqueues the release.
+    #[test]
+    fn a_scene_ending_is_announced_once() {
+        let (cp, _rx, _ev) = plane(&["t1"], vec![region_on("b1", 60, &["t1"])]);
+        cp.launch_fire_from("b1", FireOrigin::Drive).unwrap();
+        assert!(runtime().take_sounding("b1"), "fired, and in the ledger");
+        runtime().mark_sounding("b1");
+
+        cp.stop_drive_launch("b1");
+        cp.stop_drive_launch("b1");
+        assert!(!runtime().take_sounding("b1"), "taken once, by the first call");
+    }
+
 }

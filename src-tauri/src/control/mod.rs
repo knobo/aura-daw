@@ -46,15 +46,6 @@ use crate::audio::types::{Clip, MeterFrame, Project, TrackState, TransportState}
 use crate::audio::project;
 use crate::sidecars::jobs::{EventSink, JobManager};
 
-/// The one non-transport clock this slice of Plan V has: the scene the
-/// launch overlay used to be (`SharedRt::launch_*` + `FLAG_LAUNCH`).
-///
-/// Singular for exactly as long as the overlay was singular. Task 8 gives
-/// every Region binding its own index and Task 9 gives every player one, at
-/// which point this constant is replaced by a per-binding lookup — it is a
-/// waypoint in the swap, not a design.
-pub const SCENE_CLOCK: u32 = 1;
-
 pub use history::{EpochEvent, History, HistoryEntry, HistoryLog, HistoryMode, JournalWriter, UndoPath};
 pub use ops::{LaneArrangement, TrackMixChange};
 pub use session::{Committed, EngineEffect, PersistEffect, Session, Tx};
@@ -1804,49 +1795,84 @@ impl ControlPlane {
         );
     }
 
-    /// Point the named tracks' mixer slots at [`SCENE_CLOCK`], and nothing
-    /// else at it. The set of bound slots is what the `FLAG_LAUNCH` bit used
-    /// to be — one binding instead of a flag plus a shadow playhead, so the
-    /// two can no longer disagree (V-4).
-    pub fn apply_launch_audible(&self, track_ids: &[String]) {
+    /// The clock a scene binding fires, or `None` when the graph has not been
+    /// rebuilt since the binding was added. A missing clock drops the fire
+    /// with a warn rather than firing the wrong one — the same "unknown index
+    /// means drop the write" rule `ParamTable`'s setters use.
+    pub fn scene_clock_for(&self, binding_id: &str) -> Option<u32> {
+        self.tables.lock().scene_clocks.get(binding_id).copied()
+    }
+
+    /// Start one scene: point the tracks its region names at ITS clock, then
+    /// fire that clock. Returns whether the scene actually has one.
+    ///
+    /// This is the whole fire path now, for every `FireOrigin`. It never
+    /// touches the transport (design §2.2's defect) and never touches another
+    /// scene's clock, which is what lets two scenes sound at once — the
+    /// single overlay this replaces could express neither.
+    ///
+    /// The release-then-bind pass is per-clock and deliberate: re-firing a
+    /// binding whose region has since lost a track must not leave that track
+    /// stranded on this scene's playhead. It releases only what THIS clock
+    /// still owns (V-14), so a track another scene has claimed in the
+    /// meantime stays with that scene.
+    pub fn fire_scene(&self, binding_id: &str, track_ids: &[String], start: u64, end: u64) -> bool {
         let tables = self.tables.lock();
+        let Some(&clock) = tables.scene_clocks.get(binding_id) else {
+            log::warn!("launch: no clock for binding {binding_id} — dropping the fire");
+            return false;
+        };
         for slot in 0..tables.params.len() {
-            tables.clocks.release_slot_if(slot, SCENE_CLOCK);
+            tables.clocks.release_slot_if(slot, clock);
         }
         for id in track_ids {
             if let Some(&slot) = tables.slots.get(&TrackId::from(id.as_str())) {
-                tables.clocks.bind_slot(slot, SCENE_CLOCK);
+                tables.clocks.bind_slot(slot, clock);
+            }
+        }
+        tables.clocks.fire(clock, start, end, false);
+        true
+    }
+
+    /// End one scene and hand its tracks back to the arrangement. Returns
+    /// whether this call is the one that stopped a running clock.
+    ///
+    /// Called from the drive thread's RELEASE edge, a poll (~8 ms) after the
+    /// clock stopped, which is why releasing the slots here is safe: the
+    /// discontinuity `stop` leaves behind has long since been latched and
+    /// read by the nodes bound to it. `stop_launch_overlay` is the other
+    /// half of that pair and deliberately does NOT release — see its doc.
+    ///
+    /// V-14 is the reason for `release_slot_if` rather than a plain release:
+    /// two scenes naming the same track is newly expressible, and stopping
+    /// the first must not take the track away from the second.
+    pub fn stop_scene(&self, binding_id: &str) -> bool {
+        let tables = self.tables.lock();
+        let Some(&clock) = tables.scene_clocks.get(binding_id) else { return false };
+        let stopped = tables.clocks.stop(clock);
+        for slot in 0..tables.params.len() {
+            tables.clocks.release_slot_if(slot, clock);
+        }
+        stopped
+    }
+
+    /// Every scene's tracks back to the arrangement, every scene clock off.
+    /// The transport-stop path (`TransportAction::Stop`) and nothing else:
+    /// stopping the song ends the scenes with it.
+    pub fn clear_launch_audible(&self) {
+        crate::midi::launch::runtime().clear_sounding();
+        let tables = self.tables.lock();
+        for &clock in tables.scene_clocks.values() {
+            tables.clocks.stop(clock);
+            for slot in 0..tables.params.len() {
+                tables.clocks.release_slot_if(slot, clock);
             }
         }
     }
 
-    pub fn clear_launch_audible(&self) {
-        crate::midi::launch::runtime().clear_audible_tracks();
-        let tables = self.tables.lock();
-        tables.clocks.stop(SCENE_CLOCK);
-        for slot in 0..tables.params.len() {
-            tables.clocks.release_slot_if(slot, SCENE_CLOCK);
-        }
-    }
-
-    pub fn arm_drive_launch(&self, track_ids: &[String], start: u64, end: u64) {
-        self.apply_launch_audible(track_ids);
-        self.tables.lock().clocks.fire(SCENE_CLOCK, start, end, false);
-    }
-
-    pub fn drive_overlay_is(&self, id: &str) -> bool {
-        self.tables.lock().clocks.is_on(SCENE_CLOCK)
-            && crate::midi::launch::runtime().overlay_id().as_deref() == Some(id)
-    }
-
-    pub fn clear_drive_overlay(&self) {
-        crate::midi::launch::runtime().set_overlay_id(None);
-        self.tables.lock().clocks.stop(SCENE_CLOCK);
-    }
-
-    /// Cut whatever the scene clock is playing (Escape / stop-all). Ends it
-    /// exactly the way reaching the clip's end does, so the release path the
-    /// drive thread already owns releases the slots and emits
+    /// Cut every sounding scene (Escape / stop-all). Ends them exactly the
+    /// way reaching a clip's end does, so the release path the drive thread
+    /// already owns releases the slots and emits
     /// `LaunchFired { playing: false }` — one code path, one behaviour.
     /// Returns true when something was actually sounding.
     ///
@@ -1857,11 +1883,17 @@ impl ControlPlane {
     /// whole reason for existing next to `clear_launch`.
     ///
     /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
-    /// read beside it: `advance` can turn the clock off between the two, and
+    /// read beside it: `advance` can turn a clock off between the two, and
     /// the pair would then report "something was sounding" for a scene that
     /// had already ended.
     pub fn stop_launch_overlay(&self) -> bool {
-        self.tables.lock().clocks.stop(SCENE_CLOCK)
+        let tables = self.tables.lock();
+        // Fold with `|`, not `any`: every scene must be cut, and `any`
+        // short-circuits on the first one that was running.
+        tables
+            .scene_clocks
+            .values()
+            .fold(false, |acc, &clock| tables.clocks.stop(clock) | acc)
     }
 
     /// All automation lanes (Plan E Task 10). PURE session-lock read — no
@@ -4420,6 +4452,18 @@ impl ControlPlane {
         &self.session
     }
 
+    /// Test-only view of the published `GraphTables` — the clock table, the
+    /// slot map and the scene-clock map a rebuild would have published. Tests
+    /// that assert on what a fire DID (which clock is on, which slot reads
+    /// it) need to see the same table the fire wrote into.
+    ///
+    /// Returns the guard, so a caller holding it must not call back into the
+    /// control plane: every helper here takes this same lock.
+    #[cfg(test)]
+    pub(crate) fn tables_for_tests(&self) -> parking_lot::MutexGuard<'_, crate::audio::rt::GraphTables> {
+        self.tables.lock()
+    }
+
     /// Test-only accessor to the `Committer` (review round 1, Important-2):
     /// `ControlPlane` no longer has its own `execute_persist` — the only
     /// production caller is `Committer::commit_with_rebuild` itself, calling
@@ -5884,6 +5928,7 @@ mod tests {
             generation: 1,
             params: Arc::new(ParamTable::default()),
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
             slots: derive_slots(&session.lock().store.tracks),
         }));
         let (engine, engine_rx) = EngineHandle::for_tests();
@@ -6053,6 +6098,7 @@ mod tests {
             send_slots: Default::default(),
             generation: 1,
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
             params: gen1_params.clone(),
             slots: gen1_slots,
         }));
@@ -6094,6 +6140,7 @@ mod tests {
                 generation: 2,
                 params: gen2_params.clone(),
                 clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+                scene_clocks: Default::default(),
                 slots: gen2_slots,
                 send_slots: Default::default(),
             };

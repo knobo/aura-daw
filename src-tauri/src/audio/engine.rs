@@ -63,6 +63,22 @@ fn audio_row_for(tracks: &[RtTrack], slot: usize) -> Option<usize> {
         .or_else(|| tracks.iter().position(|r| r.slot == slot))
 }
 
+/// Every launch binding that needs a clock of its own, in DOCUMENT order —
+/// which is what makes a clock index stable between one rebuild and the next
+/// for an unchanged map, and why `rebuild` still pairs the two ends by
+/// binding id when it is not (adding a binding shifts every later index).
+///
+/// Region targets only: a Clip target names a clip, not a set of tracks, and
+/// becomes a player after the migration (Task 13) — a player's clock is
+/// allocated ahead of these, from the reserved player range.
+pub(crate) fn scene_binding_ids(maps: &[crate::midi::launch::LaunchMap]) -> Vec<String> {
+    maps.iter()
+        .flat_map(|m| m.bindings.iter())
+        .filter(|b| matches!(b.target, crate::midi::launch::LaunchTarget::Region { .. }))
+        .map(|b| b.id.clone())
+        .collect()
+}
+
 /// Meter frame cadence (~60 Hz).
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_600);
 /// Recording ring headroom, seconds of audio per track.
@@ -518,6 +534,19 @@ impl OutputCb {
             match self.graph_rx.pop() {
                 Ok(gp) => {
                     let fresh = gp.into_box();
+                    // Plan V — V2: the fresh table's clocks were snapshotted
+                    // when the rebuild BUILT it, and the graph being retired
+                    // here has been advancing its own copy ever since. Re-take
+                    // those positions now, at the instant of the swap, or a
+                    // scene sounding across a rebuild restarts a callback
+                    // block behind — a backwards jump with no discontinuity
+                    // flag, which is a click for audio and a re-emitted
+                    // note-on for MIDI. `reconcile_adoption` is bounded,
+                    // lock-free and allocation-free; it leaves alone any
+                    // clock fired or stopped since the snapshot.
+                    if let Some(old) = self.graph.as_ref() {
+                        fresh.clocks.reconcile_adoption(&old.clocks, old.generation);
+                    }
                     if let Some(old) = self.graph.replace(fresh) {
                         // slots() > 0 was checked: push cannot fail (and no
                         // dealloc can happen here on the RT thread).
@@ -1962,51 +1991,69 @@ impl Control {
             }
             params.any_solo.store(store.any_solo(), Relaxed);
             // Plan V — V2: this graph's playheads, sized here on the control
-            // thread exactly like the `ParamTable` above. ONE non-transport
-            // clock for now — the scene the launch overlay used to be; Task 8
-            // gives every Region binding its own and Task 9 gives every
-            // player one.
+            // thread exactly like the `ParamTable` above. Clock 0 is the
+            // transport (V-13), then ONE PER PLAYER (Task 9 fills those; the
+            // range is reserved here so the two cuts cannot collide), then
+            // one per scene binding.
+            //
+            // Sizing from the DOCUMENT is what makes firing a pad an atomic
+            // write into a lane that already exists: a pad press must never
+            // rebuild the graph (the RT contract), so every binding that
+            // could be fired needs its clock before it is.
+            let scene_ids = scene_binding_ids(&session.midi.launch_maps);
+            let first_scene_clock = 1 + store.players.len() as u32;
+            let scene_clocks: HashMap<String, u32> = scene_ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| (id.clone(), first_scene_clock + i as u32))
+                .collect();
             let clocks = Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
                 n_slots,
-                2,
+                1 + store.players.len() + scene_ids.len(),
             ));
             clocks.set_transport_playing(self.shared.playing.load(Relaxed));
-            // The scene survives the rebuild. The overlay this replaces lived
-            // on `SharedRt`, so editing a clip while a pad sounded did not
-            // rewind it; the table is per-graph, so that only stays true if
-            // the state is carried across by hand.
+            // Every sounding scene survives the rebuild. The overlay this
+            // replaces lived on `SharedRt`, so editing a clip while a pad
+            // sounded did not rewind it; the table is per-graph, so that only
+            // stays true if the state is carried across by hand.
             //
-            // The position is snapshotted HERE, not at adoption, so a scene
-            // sounding across a rebuild rewinds by however long the fresh
-            // graph sits in the queue — one callback block in practice, since
-            // the expensive assembly happens before this snapshot and what is
-            // left is adoption latency. Reconciling at adoption instead is
-            // possible and is NOT blocked by ambiguity: a monotonic fire
-            // counter on `ClockState`, bumped by `fire` and snapshotted by
-            // `carry_over`, would tell "the retired graph advanced past this"
-            // apart from "a pad was fired into the new table during the
-            // window" with one relaxed load. It is deferred to Task 8, which
-            // has to revisit reconciliation for per-binding clocks anyway — a
-            // complexity trade-off, not an impossibility. Until then the
-            // residual skew is the same one a knob write in that window
-            // already has (round-2 §2.4).
-            clocks.carry_over(
-                &self.tables.lock().clocks,
-                crate::control::SCENE_CLOCK,
-            );
-            let launch_ids = crate::midi::launch::runtime().audible_tracks();
-            for t in store.tracks.iter() {
-                if !launch_ids.iter().any(|id| id == t.id.as_str()) {
-                    continue;
+            // BY BINDING ID, never by index: an index is "the i-th Region
+            // binding in document order", and this rebuild may be running
+            // *because* a binding was added or removed. Pairing by index
+            // there would move one scene's playhead onto another scene.
+            //
+            // The SLOT bindings are carried the same way, by track id — the
+            // set of tracks a scene has claimed lives in the retired table's
+            // `slot_clock`, which is the only place that knows it per scene
+            // now that scenes are not singular.
+            //
+            // What is copied here is a SNAPSHOT taken while the retired graph
+            // is still rendering; `ClockTable::reconcile_adoption` re-takes
+            // it on the audio thread at the moment the swap actually happens,
+            // which is what makes it exact (see that method).
+            {
+                let prev = self.tables.lock();
+                clocks.set_carry_source(prev.generation);
+                for (id, &dst) in scene_clocks.iter() {
+                    let Some(&src) = prev.scene_clocks.get(id) else { continue };
+                    clocks.carry_over(&prev.clocks, src, dst);
                 }
-                let Some(&slot) = slots.get(&t.id) else { continue };
-                clocks.bind_slot(slot, crate::control::SCENE_CLOCK);
+                let prev_binding_of: HashMap<u32, &String> =
+                    prev.scene_clocks.iter().map(|(id, &c)| (c, id)).collect();
+                for (tid, &slot) in slots.iter() {
+                    let Some(&prev_slot) = prev.slots.get(tid) else { continue };
+                    let prev_clock = prev.clocks.clock_of(prev_slot);
+                    let Some(binding) = prev_binding_of.get(&prev_clock) else { continue };
+                    let Some(&dst) = scene_clocks.get(binding.as_str()) else { continue };
+                    clocks.bind_slot(slot, dst);
+                }
             }
             // THE [C1] PUBLISH SITE — still under `session`, see above.
             *self.tables.lock() = GraphTables {
                 generation: self.generation,
                 params: params.clone(),
                 clocks: clocks.clone(),
+                scene_clocks,
                 slots: slots.clone(),
                 send_slots: send_slots.clone(),
             };
@@ -4818,6 +4865,7 @@ mod tests {
             generation: 0,
             params: Arc::new(ParamTable::default()),
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
@@ -4859,6 +4907,7 @@ mod tests {
             generation: 0,
             params: Arc::new(ParamTable::default()),
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
+            scene_clocks: Default::default(),
             slots: HashMap::new(),
         }));
         let session = Arc::new(Mutex::new(Session::new(Store::default(), crate::midi::MidiStore::default())));
@@ -4963,6 +5012,124 @@ mod tests {
                 AutomationPoint { tick: 3840, value: 0.0 },
             ],
         }
+    }
+
+    // ---- Plan V — V2, Task 8: the clock table is sized by the document ----
+
+    fn region_binding(id: &str, note: u8, tracks: &[&str]) -> crate::midi::launch::LaunchBinding {
+        crate::midi::launch::LaunchBinding {
+            id: id.into(),
+            name: id.into(),
+            note,
+            channel: None,
+            target: crate::midi::launch::LaunchTarget::Region {
+                start_ticks: 0,
+                length_ticks: 960,
+                track_ids: tracks.iter().map(|t| (*t).to_string()).collect(),
+            },
+        }
+    }
+
+    /// The allocation the whole cut rests on: clock 0 is the transport,
+    /// `1 ..= players.len()` is RESERVED for players (Task 9 fills it), and
+    /// the scenes start after that. Reserving the player range even with no
+    /// player row rendering yet is what keeps the two cuts from colliding.
+    ///
+    /// A Clip binding gets NO clock — it names a clip, not a set of tracks,
+    /// and becomes a player at the migration (Task 13).
+    #[test]
+    fn rebuild_gives_every_region_binding_a_clock_after_the_reserved_player_range() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.players.push(crate::audio::player::Player::new(
+                crate::ids::PlayerId::from("p-1"),
+                "Player 1",
+            ));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![
+                region_binding("b1", 60, &["t-1"]),
+                crate::midi::launch::LaunchBinding {
+                    target: crate::midi::launch::LaunchTarget::Clip { clip_id: "c-1".into() },
+                    ..region_binding("b-clip", 61, &["t-1"])
+                },
+                region_binding("b2", 62, &["t-1"]),
+            ];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        assert_eq!(t.scene_clocks.get("b1"), Some(&2), "after transport + one player");
+        assert_eq!(t.scene_clocks.get("b2"), Some(&3));
+        assert_eq!(t.scene_clocks.get("b-clip"), None, "a Clip target is not a scene");
+        assert_eq!(t.clocks.clocks(), 4, "transport + player + two scenes");
+    }
+
+    /// A clock index means "the i-th Region binding in document order", so
+    /// adding a binding ahead of a sounding one RENUMBERS it. Carrying the
+    /// state across by index would hand one scene's playhead to another;
+    /// `rebuild` pairs the two tables by binding id instead, and carries the
+    /// tracks the scene has claimed by track id for the same reason.
+    #[test]
+    fn a_rebuild_carries_a_sounding_scene_by_binding_id_not_by_index() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b-late", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        // Fire it, exactly as `ControlPlane::fire_scene` would.
+        let (slot, clock) = {
+            let t = ctl.tables.lock();
+            let clock = t.scene_clocks["b-late"];
+            let slot = t.slots[&crate::ids::TrackId::from("t-1")];
+            t.clocks.bind_slot(slot, clock);
+            t.clocks.fire(clock, 1_000, 9_000, false);
+            t.clocks.advance(64);
+            (slot, clock)
+        };
+        assert_eq!(clock, 1, "the only scene, right after the transport");
+
+        // Now a binding is added AHEAD of it and the graph rebuilds.
+        session.lock().midi.launch_maps[0]
+            .bindings
+            .insert(0, region_binding("b-early", 61, &["t-1"]));
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let moved = t.scene_clocks["b-late"];
+        assert_eq!(moved, 2, "renumbered by the insertion");
+        assert!(t.clocks.is_on(moved), "and still sounding, at its new index");
+        assert!(!t.clocks.is_on(t.scene_clocks["b-early"]), "the new binding is idle");
+        assert_eq!(
+            t.clocks.clock_of(slot),
+            moved,
+            "the track it claimed followed it, rather than being handed back to the arrangement"
+        );
+    }
+
+    /// The rebuild must leave the fresh table able to reconcile at adoption:
+    /// it records WHICH published table it snapshotted, so
+    /// `ClockTable::reconcile_adoption` can refuse a graph it was not built
+    /// from (a rebuild retried after a full graph queue — [I1]).
+    #[test]
+    fn rebuild_records_the_generation_it_carried_from() {
+        let (mut ctl, _session) = bare_control();
+        let before = ctl.tables.lock().generation;
+        ctl.rebuild();
+        let t = ctl.tables.lock();
+        assert_eq!(t.generation, before + 1, "a rebuild is a new generation");
+        assert_eq!(
+            t.clocks.carry_source_for_tests(),
+            before,
+            "and the fresh clocks know which table they took their state from"
+        );
     }
 
     /// Track D: a rebuild compiles the session's plugin-param lanes into the
