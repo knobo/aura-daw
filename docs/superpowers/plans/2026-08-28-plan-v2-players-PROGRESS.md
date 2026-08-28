@@ -1,0 +1,35 @@
+# Plan V — V2: progress log
+
+Live progress for [`2026-08-28-plan-v2-players.md`](2026-08-28-plan-v2-players.md),
+executed with the subagent loop on branch `feat/plan-v2-players` (PR #121).
+
+**If you are picking this up cold:** read the plan, then this file's table.
+A task marked `done` is committed — check `git log --oneline` against the
+commit range in its row. The controller's full ledger (pre-flight scan,
+rulings, review findings) lives in
+`.superpowers/sdd/2026-08-28-plan-v2-players/progress.md`, which is
+git-ignored and therefore does NOT survive a fresh clone — this file is
+what does.
+
+| # | Task | State | Commits | Note |
+|---|---|---|---|---|
+| 1 | The `Player` document type | pending | | |
+| 2 | `Store::players` + project.json | pending | | |
+| 3 | Ops: PlayerAdd/Remove, ObjectRef::Player | pending | | |
+| 4 | `MixNode` gains a Player producer | pending | | |
+| 5 | Slot derivation over tracks + players | pending | | |
+| 6 | The clock table | pending | | |
+| 7 | Mixer reads clocks; overlay deleted | pending | | behaviour-neutral swap; perf gate |
+| 8 | Per-scene clocks; no transport hijack | pending | | |
+| 9 | Audio-clip players in the live graph | pending | | |
+| 10 | MIDI players with their own instrument | pending | | |
+| 11 | Trigger modes | pending | | |
+| 12 | Migrating launch bindings | pending | | |
+| 13 | Renderer: a pad is a player | pending | | |
+| 14 | The performance gate | pending | | baseline vs branch, same sitting |
+| 15 | Docs + release the claim | pending | | |
+
+## Baselines
+
+- `scripts/perf-check.sh --measure` on `origin/main`: _not yet run_
+- Same on the branch: _not yet run_
