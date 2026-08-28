@@ -19,7 +19,7 @@ what does.
 | 4 | `MixNode` gains a Player producer | **done** | `f0bfef2` | reviewed with task 5 |
 | 5 | Slot derivation over tracks + players | **done** | `eb00b42` | V-6 agreement verified both halves |
 | 6 | The clock table | **done** | `f4e171b`, `9a75eb3` | begin_block() latch; 1 fix round |
-| 7 | Mixer reads clocks; overlay deleted | pending | | behaviour-neutral swap; perf gate |
+| 7 | Mixer reads clocks; overlay deleted | **done** | `d188210`, `5c7ef0a` | 1448 tests green; 1 fix round (3 flush-frame deltas) |
 | 8 | Per-scene clocks; no transport hijack | pending | | |
 | 9 | Audio-clip players in the live graph | pending | | |
 | 10 | MIDI players with their own instrument | pending | | |
@@ -32,4 +32,4 @@ what does.
 ## Baselines
 
 - `scripts/perf-check.sh --measure` on `origin/main` @ 6fe1112: **404.2 us** (bare, 32 tracks, best of 3, spread 4.2%). Branch budget 525.
-- Same on the branch: _not yet run_
+- Same on the branch @ 5c7ef0a: **231.8 us** (budget 525, spread 1.7%). No regression — both numbers sit inside the documented 260-408 us same-code spread for this machine.
