@@ -18,7 +18,7 @@ what does.
 | 3 | Ops: PlayerAdd/Remove, ObjectRef::Player | **done** | `680b719`, `a375f42` | +SessionSnapshot::players; 1 fix round |
 | 4 | `MixNode` gains a Player producer | **done** | `f0bfef2` | reviewed with task 5 |
 | 5 | Slot derivation over tracks + players | **done** | `eb00b42` | V-6 agreement verified both halves |
-| 6 | The clock table | pending | | |
+| 6 | The clock table | **done** | `f4e171b`, `9a75eb3` | begin_block() latch; 1 fix round |
 | 7 | Mixer reads clocks; overlay deleted | pending | | behaviour-neutral swap; perf gate |
 | 8 | Per-scene clocks; no transport hijack | pending | | |
 | 9 | Audio-clip players in the live graph | pending | | |
@@ -31,5 +31,5 @@ what does.
 
 ## Baselines
 
-- `scripts/perf-check.sh --measure` on `origin/main`: _not yet run_
+- `scripts/perf-check.sh --measure` on `origin/main` @ 6fe1112: **404.2 us** (bare, 32 tracks, best of 3, spread 4.2%). Branch budget 525.
 - Same on the branch: _not yet run_
