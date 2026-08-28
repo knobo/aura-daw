@@ -73,9 +73,69 @@ session burns an hour on something a sentence would have prevented.
   formatting instead of the plain `toFixed(2)` you were expecting — pick
   a fixture name without those substrings unless you're testing the
   frequency path on purpose.
-- **Parallel `cargo test` intermittently SIGSEGVs** (Cardinal CLAP
-  teardown). Use `-- --test-threads=1`. Never run `cargo test` and `tauri
-  dev` against the same `src-tauri/target/`.
+- **A libtest binary must never be re-executed as a subprocess worker.**
+  `plugins::scan_worker::WorkerCommand::current_exe()` re-runs the current
+  binary and depends on the `AURA_SCAN_WORKER` guard in `src/main.rs` to
+  route the child into `worker_main`. A libtest binary has no such guard,
+  so the child runs **the whole suite again**, and the parent BLOCKS until
+  that suite ends: every line the child prints resets `LINE_TIMEOUT`, and a
+  running suite prints constantly, so the timeout never fires. Meanwhile the
+  recursive suite opens every audio device its engine tests ask for.
+
+  **What made it invisible for weeks** is worth knowing before you build any
+  subprocess worker: the worker env is INHERITED, so the recursive suite's
+  own hidden worker case ran the worker body and returned correct
+  descriptors. The parent got the right answer — after running the suite
+  twice to get it — so no test failed and no log complained. The only thing
+  that separates a scan from a suite is how many tests the child ran; that
+  is what the regression test asserts.
+
+  Fixed under `cfg(test)` (2026-08-28). **The same trap is live for
+  integration test binaries**, which link the lib without `cfg(test)`, and
+  there it fails the opposite way: `tests/plugin_load_profile.rs` has no
+  hidden worker case, so its child runs its own seven gated tests, returns
+  in 3.5 ms with no NDJSON at all, and the parent aborts the CLAP scan
+  ("worker made no progress") — `scan_all()` silently loses every CLAP
+  plugin. If you add a subprocess worker of any kind, ask what happens when
+  the parent is libtest.
+- **A SIGSEGV inside `libpipewire` is not your memory bug — count the
+  daemon's file descriptors first.** `pipewire` and `wireplumber` run under
+  systemd's `LimitNOFILESoft=1024`. A test process holding ~25 concurrent
+  engine streams gets close on its own; anything that multiplies that
+  reaches it, and at `EMFILE` the daemon cannot finish a client handshake,
+  wireplumber dies with SIGSEGV, and YOUR process segfaults inside
+  `libpipewire-module-protocol-native.so` on the broken connection. The
+  faulting thread is called `alsa-pipewire` and no AURA frame appears in
+  its stack. Two commands settle it in a minute:
+
+  ```sh
+  grep 'open files' /proc/$(pgrep -x pipewire)/limits
+  while :; do ls /proc/$(pgrep -x pipewire)/fd | wc -l; sleep 0.2; done
+  ```
+
+  A clean parallel `--lib` run peaks around 578 against that 1024. Reaching
+  1024 means something is multiplying the streams, not that the audio path
+  is corrupt. `journalctl --user -u pipewire -u wireplumber` says
+  `Too many open files` outright. Recovery when the server is left wedged
+  (`pactl info` hangs): `systemctl --user restart wireplumber
+  pipewire-pulse pipewire`, then re-check `pactl get-default-sink` — it can
+  flip to Bluetooth.
+- **`PULSE_SINK` does not redirect this app's audio, whatever CONTRIBUTING
+  used to imply.** ALSA's `default` PCM resolves to the **pipewire** plugin
+  here (`libasound_module_pcm_pipewire.so` — you can see it in a backtrace,
+  and clients show up as `PipeWire ALSA [<binary>]`), and the pulse client
+  variable is never consulted on that path. To pin a sink for a test run,
+  override the PCM instead:
+
+  ```sh
+  # asound-pin.conf
+  </usr/share/alsa/alsa.conf>
+  pcm.!default { type pipewire playback_node "alsa_output.pci-…analog-stereo" }
+  ```
+
+  `ALSA_CONFIG_PATH=asound-pin.conf cargo test …`. Verified 2026-08-28.
+- **Never run `cargo test` and `tauri dev` against the same
+  `src-tauri/target/`.**
 - **Do not run `cargo fmt`.** This tree is not rustfmt-default-formatted:
   `cargo fmt --check` wants to rewrite ~40 files it has no business in,
   and nothing gates on it: `.github/workflows/tests.yml` runs no fmt check
