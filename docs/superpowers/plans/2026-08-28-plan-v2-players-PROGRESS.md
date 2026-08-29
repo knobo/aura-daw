@@ -33,7 +33,7 @@ survive; keep syncing them.
 | 7 | Mixer reads clocks; overlay deleted | done | `d188210`, `5c7ef0a` |
 | 8 | Per-scene clocks; no transport hijack | done | `2115f73`, `2cf1597`, `d62ee5f` |
 | 9 | Audio-clip players in the live graph | done (4 fix rounds) | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58`, `2542640` |
-| 10 | MIDI players with their own instrument | **fix round 3 dispatched, session paused mid-round** | `f7ab47e`, `3da1437`, `9c1c9cc` |
+| 10 | MIDI players with their own instrument | **fix round 3 half-written; `4c15651` is UNVERIFIED custody** | `f7ab47e`, `3da1437`, `9c1c9cc`, `4c15651`? |
 | 11 | Trigger modes | not started | |
 | 12 | Migrating launch bindings | not started | |
 | 13 | Renderer: a pad is a player | not started | |
@@ -73,31 +73,37 @@ restart.
 
 ### First: find out whether round 3's work survived
 
+It partly did, and it is **in git as `4c15651`, labelled UNVERIFIED**.
+
+The round-3 implementer was still writing when the limit hit. The
+controller took custody of its tree the way this branch has done once
+before (`d1f8cdd`): committed it, labelled UNVERIFIED, because uncommitted
+work is one `git clean` from gone and custody is not implementation.
+
+**What is known about `4c15651`:** `cargo check --lib` is clean at that
+tree. That is all.
+
+**What is NOT known:** whether the tests compile; whether the round's own
+RED was ever written or seen to fail; whether the two-press test *with an
+insert chain* exists; whether the rate-true half is finished or
+half-plumbed; whether `the_live_node_allowance_is_a_floor_not_an_addition`
+was retargeted into a sum test. There is no report and no self-review — the
+implementer never reported.
+
+It also may not be the implementer's final state: it was still writing
+`midi/playback.rs` as the custody commit was being made, so the snapshot is
+wherever it happened to be, not a finished round.
+
+**So your first job is a FRESH implementer that reads `4c15651` critically
+against round 3's brief before trusting a line of it** — its job starts
+with reading, not with assuming the work is right. Tell it explicitly that
+the commit is unreviewed. That is exactly how `d1f8cdd` was handled, and
+that inherited draft turned out sound; this one may or may not.
+
 ```sh
-git log --oneline -3
-git status --short
+git show 4c15651 --stat
+git diff 9c1c9cc..4c15651
 ```
-
-Round 3's implementer was still writing when the session paused, with
-**uncommitted edits to `src-tauri/src/audio/{engine,mixer,offline,rt}.rs`
-and `src-tauri/src/control/loopjam.rs`**. Three cases:
-
-- **HEAD is past `9c1c9cc` and the tree is clean.** The implementer
-  committed before it died. Go to "then: re-review round 3".
-- **HEAD is `9c1c9cc` and the tree is dirty.** Its work is half-written and
-  unverified. This branch has been here before (`d1f8cdd`): the controller
-  committed the orphaned work labelled UNVERIFIED in the commit message,
-  because uncommitted work is one `git clean` from gone, and custody is not
-  implementation. Do the same, then have a FRESH implementer read the diff
-  critically against the brief before trusting a line of it — its job starts
-  with reading, not with assuming the work is right.
-- **HEAD is `9c1c9cc` and the tree is clean.** Nothing survived.
-  Re-dispatch round 3 from its brief.
-
-Round 3's brief is committed at
-[`…-BRIEFS/task-10-fix-3-brief.md`](2026-08-28-plan-v2-players-BRIEFS/task-10-fix-3-brief.md).
-It existed only inside a message to a subagent until the pause; it is in git
-now precisely so this handoff works.
 
 ### What round 3 is, in one paragraph
 
