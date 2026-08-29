@@ -6178,6 +6178,7 @@ mod tests {
 
     use crate::control::op::{ObjectRef, Op, PropPath, TxMeta};
 
+    use crate::audio::player::TriggerMode;
     use crate::audio::types::testutil::{test_clip, test_track};
     use crate::control::op::testutil::set_gain;
 
@@ -6312,6 +6313,33 @@ mod tests {
             .unwrap();
         republish_tables(cp);
         p.id.to_string()
+    }
+
+    /// Two audio tracks, each carrying one clip — the fixture Task 11's
+    /// retrigger test needs: two players independent enough that nothing
+    /// about their source ties them together.
+    fn test_control_plane_with_two_audio_clips() -> ControlPlane {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1", "t-2"]);
+        cp.session.lock().store.clips.push(test_clip("c1", "t-1"));
+        cp.session.lock().store.clips.push(test_clip("c2", "t-2"));
+        republish_tables(&cp);
+        cp
+    }
+
+    /// `TriggerMode` through the same door the frontend will use once Task
+    /// 13 wires a command to it: a plain `Op::Set`. Document-only (`Task 3`'s
+    /// ruling: read live off `p.trigger.mode` per press, not off the
+    /// compiled graph), so no republish is needed after this.
+    fn set_trigger_mode(cp: &ControlPlane, id: &str, mode: TriggerMode) {
+        cp.commit(op::TxMeta::user("trigger mode"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Player(PlayerId::from(id)),
+                path: PropPath::TriggerMode,
+                from: serde_json::Value::Null,
+                to: serde_json::to_value(mode).unwrap(),
+            })
+        })
+        .unwrap();
     }
 
     /// The V2 gate's first line: a pad fires a WAV while the arrangement
@@ -6600,6 +6628,59 @@ mod tests {
         // The clip is 48000 long; run past it and it must still be on.
         tables.clocks.advance(48_000 + 512);
         assert!(tables.clocks.is_on(clock), "a loop does not end at the clip's end");
+    }
+
+    // ---- Task 11: trigger modes ------------------------------------------
+
+    /// `TriggerMode::OneShot` is the default, and needs no looping flag: a
+    /// non-looping clock already ends itself at its own `end` (`advance`,
+    /// pinned by `clock::tests::advance_moves_running_clocks_and_stops_one_at_its_end`).
+    /// This pins the BEHAVIOUR through `player_fire`, not the clock's own
+    /// arithmetic a second time.
+    #[test]
+    fn one_shot_plays_to_its_end_and_stops_itself() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", false);
+        set_trigger_mode(&cp, &id, TriggerMode::OneShot);
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(clock));
+        tables.clocks.advance(48_000); // the clip's own length (test_clip)
+        assert!(!tables.clocks.is_on(clock), "a one-shot ends on its own");
+    }
+
+    /// `TriggerMode::Gate` needs an explicit release: nothing about the
+    /// clock stops it early, so the only thing standing between "sounding"
+    /// and "silent" here is `player_stop`.
+    #[test]
+    fn gate_stops_on_release_before_the_source_ends() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", false);
+        set_trigger_mode(&cp, &id, TriggerMode::Gate);
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+        assert!(cp.tables_for_tests().clocks.is_on(clock));
+        cp.player_stop(&id).unwrap();
+        assert!(
+            !cp.tables_for_tests().clocks.is_on(clock),
+            "the release, not the clip's end, cut it"
+        );
+    }
+
+    /// A retrigger rewinds THIS player and nothing else — the property the
+    /// single overlay this branch replaced could not have (V-4).
+    #[test]
+    fn retriggering_one_player_leaves_another_sounding() {
+        let cp = test_control_plane_with_two_audio_clips();
+        let a = add_audio_player(&cp, "c1", false);
+        let b = add_audio_player(&cp, "c2", false);
+        cp.player_fire(&a).unwrap();
+        cp.player_fire(&b).unwrap();
+        cp.tables_for_tests().clocks.advance(128);
+        cp.player_fire(&a).unwrap();
+        let cb = cp.player_clock_for(&b).unwrap();
+        assert!(cp.tables_for_tests().clocks.is_on(cb), "b untouched by a's retrigger");
     }
 
     /// §10, and the reason this moved off `effect.rebuild`: a fader drag on
