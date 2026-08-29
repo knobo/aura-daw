@@ -132,6 +132,20 @@ session burns an hour on something a sentence would have prevented.
 
 ## Audio engine
 
+- **`binding_self_triggers` is a pure function, and nothing enforces that the
+  drive loop calls it.** `midi/launch.rs`'s drive poll must skip a binding
+  that fires the pad playing the very clip driving it; that predicate was
+  once inline and non-exhaustive, so a migrated `Player` target slipped past
+  it and the clip re-fired its own player on every note-on — doubled,
+  restarted material, with the frontend's matching warning silent at the
+  same time. It is now extracted and pinned four ways as a function, but
+  **reverting the call site at `launch.rs:751` to the old inline `if let`
+  leaves all 43 `midi::launch` tests green.** The loop body lives inside a
+  `thread::spawn` closure with no test seam, so pinning the call itself needs
+  a rig that does not exist. The doc comment at `:380` claims the loop and
+  the test call the same match; that claim is true today and is enforced by
+  nothing.
+
 - **`ControlPlane`'s test accessors take a non-reentrant lock, so nesting two
   of them in one expression HANGS the whole test binary.** `parking_lot`'s
   mutex is not reentrant and does not panic on a second acquire from the

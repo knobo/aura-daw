@@ -1101,7 +1101,7 @@
         <div
           class="launchmark"
           class:sel={launch.selectedId === mark.binding.id}
-          class:clip={mark.binding.target.kind === "clip"}
+          class:clip={mark.binding.target.kind !== "region"}
           role="button"
           tabindex="0"
           title="{mark.binding.name} — drag to move, edges to resize"
