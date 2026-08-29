@@ -5,6 +5,43 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## Brushed Steel, a 3D frame, and four meter faces
+
+A sixth material token, `brush`: the anisotropic streak a wire wheel leaves,
+as distinct from `grain`'s direction-less speckle. Its own token because a
+real panel carries both at different strengths — bead-blasted metal is
+speckled and not brushed, brushed steel is streaked and only faintly
+speckled, moulded plastic is neither. It is layered in through
+`.grain::before`, so every surface that already declares what it is made of
+picks up the finish with no markup change and no visual difference at
+`brush: 0`, which is where all eleven pre-existing built-ins are left.
+
+The texture needs a filter chain `--grain-tex` does not, and the first cut
+proved it: raw feTurbulence is colour noise with a noisy alpha, and blended
+`overlay` at 0.85 it painted rainbow streaks across every panel. It is now
+desaturated, its alpha flattened, and its range squeezed into 0.35–0.65 —
+a narrow band around the value `overlay` leaves the backdrop alone at.
+
+`--bevel-frame` is a four-sided moulded rim for the things that are BOXES —
+instrument racks, module blocks, channel strips, pad decks, the clip list.
+At that size two horizontal lips read as a card with a highlight; four read
+as a bezel with thickness. Small controls keep the two lips.
+
+The knob is redrawn as a ring of LEDs around a collared cap with a raised
+inner dome, the indicator a single lit lamp rather than a painted line. The
+leading lamp lights fractionally, so a slow drag reads as continuous rather
+than stepping between 31 positions.
+
+Two new built-ins the token exists for: **Brushed Steel Dark** and **Brushed
+Steel Light**. The light half is not the dark half inverted — its ramp runs
+upward and its `sheen` is held *below* the dark half's, because a white dome
+highlight on a near-white knob cap reads as plastic rather than as metal.
+
+And the round gauge went from one face to four (`meterFace` preference):
+LED ARC, DIAL, LADDER, ANALOG VU. Three of them gained a peak hold; the VU
+cannot have one, because a needle *is* the peak.
+
+→ [`themes.md`](themes.md) §6 (material), §8 (meter faces).
 ## The layout ran out of room in five places, and the track rail can be dragged
 
 Started from a headless overflow scan (Chrome, browser demo mode) at
