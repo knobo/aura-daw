@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Investigate WebKitGTK full-viewport repaint persisting despite `contain`/canvas (PR #131) | `investigate/surface-repaint` | 2026-08-29 | Testing `will-change: transform` on the meter/gauge canvases for real GPU layer promotion, since `contain` alone didn't stop the whole window repainting on every meter tick. |
 
 ## Next up — unclaimed
 
