@@ -252,6 +252,112 @@ PR, but two categories of tests are currently skipped rather than exercised:
    confirmed to have teeth by commenting out the single `die_with_parent`
    call.
 
+6. **The `midi_out::tests::*` race — DIAGNOSED AND FIXED (2026-08-28).**
+   Item 4 called it "several `midi_out` tests spawn real background threads
+   and race". The threads were a red herring. **It was a product bug**, and
+   it reproduces with no test parallelism at all.
+
+   A port id is minted as `"<name>#<index>"` by `list_output_ports` /
+   `midi_input::list_ports`, and `open_port` / `select_port` resolved it by
+   exact string match. That index is a position in `midir`'s enumeration,
+   which is ordered by ALSA client number — so a NEW port lands at the end
+   and disturbs nothing, but a port CLOSING renumbers every port after it.
+
+   Measured directly with a two-port probe: a virtual port sitting at
+   `"probe-survivor:probe-survivor-port 129:0#3"` becomes `"…#2"` when an
+   unrelated, *earlier* port goes away, and opening the id captured a moment
+   before fails with `MIDI output port not found` — for a port that is
+   plainly still present, same client, same name, same ALSA address. Only
+   its place in a list moved.
+
+   That is why the failing set kept changing name from run to run: the tests
+   create and tear down virtual ports constantly, so whichever test happened
+   to be holding an id when another's port closed was the one that failed.
+
+   **Scope in the product.** Persistence was never exposed to it —
+   `midi_out::persist` keys by port *name* and strips the ALSA address on
+   purpose, and its doc comment already called the id "volatile". The window
+   is inside one session: list the ports, hold an id, open it after
+   something else on the box has closed a port. Unplugging a keyboard or
+   quitting another synth between opening the port menu and clicking is
+   enough.
+
+   **The fix.** `resolve_port_id` treats the index as a tiebreaker rather
+   than an identity: exact match first (nothing moved — the common case, and
+   the only path that can distinguish same-named ports), then the *unique*
+   port carrying that name. Same-named ports are real on backends whose
+   names carry no device address, which is the only reason the index exists;
+   there it refuses rather than connecting the wrong device.
+
+   **What was left over, and it was a different bug each time.** Fixing the
+   ids exposed three timing assumptions that the port failures had been
+   masking:
+
+   - Three loopback tests spawned the thread that drives `position` BEFORE
+     `open_port`, so position free-ran through the enumeration and
+     connection. A note at tick 0 is then missed outright — the failure
+     trace shows note-OFFs with no note-ONs. `ThreadShared::note_snapshots`
+     (additive, on `PortStatus`, unread by the UI) counts successful 250 ms
+     snapshot windows so a test can wait for the output thread to have notes
+     before letting position advance.
+   - The same tests slept a fixed 400 ms before asserting; they wait for the
+     bytes now.
+   - `clap_host::post_params_returns_immediately_and_the_change_still_lands`
+     slept 300 ms between the fire-and-forget write and the `render_blocks`
+     that makes the plugin adopt it. `plugin_main()` is a process-wide FIFO
+     queue, so an LV2 test alongside it blows the budget: 3/3 failures next
+     to `plugins::lv2_host::`, 3/3 passes next to `plugins::clap_host::`
+     alone. It uses `plugin_main().run(|_| ())` as a barrier now.
+
+   **Result.** Default parallelism, one machine, one sitting, `main` against
+   this branch:
+
+   | | `main` | this branch |
+   |---|---|---|
+   | `midi_out::` filtered, fully green | **0 of 10** | **25 of 25** |
+   | full `--lib` suite, fully green | **0 of 8** | **45 of 46** |
+   | distinct `midi_out` tests seen failing | 10 | 0 |
+   | `--test-threads=1` | — | 1420 passed, 65 s |
+
+7. **The PDEATHSIG survivor — ON HOLD (owner's call, 2026-08-29).** This is
+   what keeps `--test-threads=1` in CI, and it is deferred deliberately
+   rather than left open by accident.
+
+   `plugins::lv2_ui::tests::the_guarded_child_does_not_outlive_a_parent_that_was_sigkilled`
+   (PR #124's regression test) was the single failure in the 46
+   default-parallelism runs above. Raising its poll deadline from 5 s to
+   30 s did **not** settle it: the child was still alive after 30 s, which
+   is far too long to be scheduler starvation. It did not recur in 30 runs
+   after that.
+
+   **Which of two bugs it is, is not known, and they differ completely:**
+
+   - *Test artefact.* The check reads `/proc/<pid>`, so a recycled pid makes
+     a long-dead child look alive. The product would be fine. **Untested
+     hypothesis** — the test now prints the surviving pid's `comm` and
+     `ppid` on failure precisely to confirm or kill it.
+   - *Real product bug.* `PR_SET_PDEATHSIG` genuinely does not take
+     sometimes, and the consequence is the one PR #124 set out to fix: a
+     `zynaddsubfx-ext-gui` window the user cannot close, owned by a DSP that
+     no longer exists, which `wm_stack` keeps finding and restacking.
+
+   **Why holding is reasonable.** CI pins `--test-threads=1`, so nothing is
+   flaky there today. The product symptom only appears after AURA dies by
+   SIGKILL or segfault — rare now that PRs #123/#124 closed the crash
+   classes underneath it — and at ~1 in 46 even then.
+
+   **Take it off hold when any of these happens:**
+
+   - An ext-gui window survives a crashed AURA in real use. That is the
+     product bug, observed, and it stops being theoretical.
+   - Someone wants `--test-threads=1` gone (a ~5× faster suite: 65 s → 12 s).
+   - The diagnostic line above is ever captured. Do not re-derive the
+     hypothesis — read the `comm`/`ppid` it prints.
+
+   Cheapest way to catch it deliberately: loop the full `--lib` binary at
+   default parallelism and keep the output of any run that is not
+   `test result: ok`. It took ~46 runs to see once.
+
 ## Why deferred
 
 Getting a first green CI pipeline landed mattered more than full coverage.
@@ -271,5 +377,7 @@ non-trivial runtime/complexity to the workflow, so they were left out of v1.
   snd_seq snd_seq_dummy` — untested whether GitHub-hosted runners permit
   this) so the two `--skip`ped MIDI tests can run for real, then drop the
   `--skip` flags.
-- Root-cause the `midi_out::tests::*` thread race so `--test-threads=1` can
-  be dropped and the suite runs at full parallelism again in CI.
+- The PDEATHSIG survivor is **on hold**, not unclaimed work — item 7 has the
+  hypotheses and the conditions for picking it back up. It is the last thing
+  between CI and dropping `--test-threads=1`; the `midi_out` and `clap_host`
+  families are done.

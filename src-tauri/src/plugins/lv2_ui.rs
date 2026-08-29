@@ -662,14 +662,32 @@ mod tests {
         parent.kill().expect("SIGKILL the parent");
         let _ = parent.wait();
 
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // PDEATHSIG is delivered on the parent's death, but the child still
+        // has to be scheduled to act on it and then be reaped before
+        // `alive` (which excludes zombies) goes false. Under a full parallel
+        // `cargo test` that took longer than the original 5 s once in 12
+        // runs. The loop exits the moment the child is gone, so a generous
+        // deadline costs a calm box nothing and stops a busy one reporting a
+        // starved scheduler as a missing PR_SET_PDEATHSIG.
+        let deadline = Instant::now() + Duration::from_secs(30);
         while alive(pid) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
+        let diag = || {
+            let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+            let ppid = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+                .unwrap_or("?")
+                .to_string();
+            format!("comm={:?} ppid={}", comm.trim(), ppid)
+        };
         assert!(
             !alive(pid),
             "child {pid} outlived a SIGKILLed parent — PR_SET_PDEATHSIG did not \
-             take, so a crash would leave an ext-gui window behind"
+             take, so a crash would leave an ext-gui window behind [{}]",
+            diag()
         );
     }
 }

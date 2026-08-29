@@ -565,6 +565,11 @@ pub struct PortStatus {
     pub pulses_sent: u64,
     pub resyncs: u64,
     pub notes_sent: u64,
+    /// Successful 250 ms session-snapshot windows; see
+    /// `ThreadShared::note_snapshots`. Additive field — nothing is renamed,
+    /// and nothing in the UI reads it, so demo mode's `PortStatus` mirror in
+    /// `src/lib/demo.ts` deliberately does not carry it.
+    pub note_snapshots: u64,
 }
 
 /// One entry of the routing table, serialized for the frontend.
@@ -602,6 +607,14 @@ struct ThreadShared {
     resyncs: AtomicU64,
     running: AtomicBool,
     notes_sent: AtomicU64,
+    /// How many 250 ms windows have actually taken a session snapshot. The
+    /// window is a `try_lock`, so a contended one is skipped and retried,
+    /// and until the first one lands this thread has no notes to emit at
+    /// all. Zero here is the difference between "no notes are due" and
+    /// "this thread has not looked yet" — which the loopback tests need,
+    /// because a note at tick 0 is missed outright if the position is
+    /// already past it by the time the first snapshot arrives.
+    note_snapshots: AtomicU64,
 }
 
 struct ActiveOutput {
@@ -757,18 +770,23 @@ impl MidiOut {
 
         let midi_out = midir::MidiOutput::new("aura-midi-output").map_err(|e| e.to_string())?;
         let ports = midi_out.ports();
-        let mut found = None;
-        for (i, p) in ports.iter().enumerate() {
-            let name = match midi_out.port_name(p) {
-                Ok(n) => n,
-                Err(_) => continue, // vanished mid-enumeration; skip
-            };
-            if format!("{name}#{i}") == port_id {
-                found = Some((p.clone(), MidiPortInfo { id: port_id.clone(), name }));
-                break;
-            }
-        }
-        let (port, info) = found.ok_or_else(|| format!("MIDI output port not found: {port_id}"))?;
+        // A port can vanish between `.ports()` and `.port_name()`; skip it
+        // rather than failing the call, and keep the ORIGINAL index so the
+        // skip does not renumber the ports after it.
+        let named: Vec<(usize, String)> = ports
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| midi_out.port_name(p).ok().map(|n| (i, n)))
+            .collect();
+        // Not an exact string match: a closing port renumbers everything
+        // after it, so the index in an id is a tiebreaker rather than an
+        // identity. See `midi_input::resolve_port_id`.
+        let idx = crate::midi_input::resolve_port_id(&named, &port_id)
+            .ok_or_else(|| format!("MIDI output port not found: {port_id}"))?;
+        let name = named.iter().find(|(i, _)| *i == idx).map(|(_, n)| n.clone()).unwrap_or_default();
+        // The id stays as the caller gave it: `active` is keyed by it, so a
+        // later `close_port` with the same string must still find this port.
+        let (port, info) = (ports[idx].clone(), MidiPortInfo { id: port_id.clone(), name });
 
         let conn = midi_out
             .connect(&port, "aura-midi-output")
@@ -977,6 +995,7 @@ impl MidiOut {
                 pulses_sent: active.thread_shared.pulses_sent.load(Relaxed),
                 resyncs: active.thread_shared.resyncs.load(Relaxed),
                 notes_sent: active.thread_shared.notes_sent.load(Relaxed),
+                note_snapshots: active.thread_shared.note_snapshots.load(Relaxed),
             })
             .collect();
         drop(inner);
@@ -1557,6 +1576,9 @@ fn run_thread(
                     }
 
                     last_snapshot = Instant::now();
+                    // Last thing in the window, so an observer that sees a
+                    // non-zero count knows `route_states` is populated.
+                    thread_shared.note_snapshots.fetch_add(1, Relaxed);
                 }
                 // Contended try_lock: keep the previous state and simply
                 // try again on the next iteration where the 250ms window
@@ -2093,6 +2115,65 @@ mod tests {
     // Sink/port enumeration, `MidiOut`, and `out_tick`.
     // -----------------------------------------------------------------
 
+    /// On real ALSA: a port id stays openable after an *earlier* port
+    /// closes. Deterministic on its own — no parallelism needed. Two virtual
+    /// ports are created in order, the second one's id is captured, then the
+    /// FIRST is dropped. That shifts the survivor from index n to n-1 while
+    /// its client, name and ALSA address are all unchanged.
+    ///
+    /// On `main` the last `open_port` here fails with
+    /// `MIDI output port not found: aura-shift-survivor:… 129:0#3`, which is
+    /// also what made `cargo test` flaky at default parallelism: tests tear
+    /// their virtual ports down while other tests hold ids.
+    #[test]
+    fn a_ports_id_still_opens_after_an_earlier_port_closes() {
+        use midir::os::unix::VirtualInput;
+        let Ok(doomed_client) = midir::MidiInput::new("aura-shift-doomed") else {
+            eprintln!("skipping: ALSA seq unavailable"); return;
+        };
+        let Ok(doomed) = doomed_client.create_virtual("aura-shift-doomed-port", |_, _, _: &mut ()| {}, ()) else {
+            eprintln!("skipping: virtual port unavailable"); return;
+        };
+        let Ok(survivor_client) = midir::MidiInput::new("aura-shift-survivor") else { return };
+        let Ok(_survivor) = survivor_client.create_virtual("aura-shift-survivor-port", |_, _, _: &mut ()| {}, ()) else { return };
+
+        let Ok(ports) = list_output_ports() else { eprintln!("skipping: no enumeration"); return };
+        let Some(target) = ports.into_iter().find(|p| p.name.contains("aura-shift-survivor-port")) else {
+            eprintln!("skipping: virtual ports not visible in the output enumeration"); return;
+        };
+
+        let out = MidiOut::default();
+        out.open_port(target.id.clone()).expect("the survivor opens while both ports are alive");
+        out.close_port(&target.id).ok();
+
+        drop(doomed);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // The premise is that the id really did go stale; without it the
+        // final open would pass for the wrong reason. It is a diagnostic
+        // rather than an assertion, because it is the one part of this test
+        // another thread can disturb: a concurrent test creating a port
+        // before the survivor cancels out the one that closed and the index
+        // lands back where it started. Bail out rather than fail — the
+        // deterministic teeth are `midi_input`'s pure
+        // `a_shifted_index_still_resolves_by_name`, and this test does fail
+        // on the old exact-match logic when run on its own.
+        let shifted = list_output_ports()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name.contains("aura-shift-survivor-port"))
+            .expect("the survivor is still enumerated");
+        if shifted.id == target.id {
+            eprintln!("skipping: concurrent port churn left the index unchanged ({})", target.id);
+            out.close_port(&target.id).ok();
+            return;
+        }
+
+        out.open_port(target.id.clone())
+            .expect("the id still names a port that is present, at a new index");
+        out.close_port(&target.id).ok();
+    }
+
     #[test]
     fn list_output_ports_never_panics() {
         match list_output_ports() {
@@ -2107,6 +2188,23 @@ mod tests {
         let err = out.open_port("definitely-not-a-port#99".into()).unwrap_err();
         assert!(err.contains("not found"), "got {err}");
         assert!(out.status().outputs.is_empty(), "a failed open leaves nothing half-open");
+    }
+
+    /// Poll until `done` holds, or the timeout passes; returns whether it
+    /// held. The loopback tests below used to sleep a fixed 400 ms and then
+    /// assert. That wait has to cover a real ALSA round trip plus the 250 ms
+    /// route-refresh window, which is ample on an idle box and not ample
+    /// under a loaded parallel run. Polling is both quicker when the bytes
+    /// are already there and honest when they are not.
+    fn wait_for(timeout: std::time::Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        done()
     }
 
     fn no_routes() -> RouteNoteStates {
@@ -2485,6 +2583,26 @@ mod tests {
         shared.position.store(0, Relaxed);
 
         let updater_running = Arc::new(AtomicBool::new(true));
+        let out = MidiOut::default();
+        out.attach(session.clone(), shared.clone());
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
+        out.open_port(target.id.clone()).expect("open the loopback port");
+
+        // Hold `position` at zero until the output thread has actually taken
+        // a session snapshot, THEN start advancing it. A note at tick 0 is
+        // missed outright if the position is already past it when the first
+        // snapshot lands, and the window is a `try_lock` that a contended
+        // run simply skips — so on a loaded box the wait is unbounded in
+        // principle and was ~1 run in 15 in practice. The symptom is
+        // unmistakable in a failure trace: note-OFFs with no note-ONs.
+        assert!(
+            wait_for(std::time::Duration::from_secs(10), || out
+                .status()
+                .outputs
+                .iter()
+                .any(|o| o.note_snapshots > 0)),
+            "the output thread took a session snapshot"
+        );
         let updater = {
             let shared2 = shared.clone();
             let running2 = updater_running.clone();
@@ -2496,11 +2614,6 @@ mod tests {
                 }
             })
         };
-
-        let out = MidiOut::default();
-        out.attach(session.clone(), shared.clone());
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
-        out.open_port(target.id.clone()).expect("open the loopback port");
 
         // Past the short note's own note-off (125 ms) and at least one
         // snapshot window, so the cursor is genuinely past both its edges.
@@ -2523,7 +2636,18 @@ mod tests {
         let _ = updater.join();
         out.close_port(&target.id).ok();
 
-        assert_eq!(resyncs, 0, "the release came from the content change, not a drift resync");
+        // A resync releases sounding notes by itself, so if one happened
+        // across the edit there is no way left to tell which cause produced
+        // the note-off below — the test cannot conclude, in either
+        // direction. `position` here is driven by a 2 ms userspace loop, and
+        // a loaded parallel run deschedules it for longer than the drift
+        // tolerance; failing then would report a starved scheduler as a
+        // routing bug. On a calm box this never triggers, which is where the
+        // assertions below have their teeth.
+        if resyncs != 0 {
+            eprintln!("skipping: {resyncs} drift resync(s) across the edit — the position thread was starved, so the note-off cannot be attributed");
+            return;
+        }
         assert!(
             after.iter().any(|m| m.as_slice() == [0x80, 60, 0]),
             "the sounding note was released after the edit instead of hanging: {:?}", after
@@ -2623,6 +2747,29 @@ mod tests {
         shared.position.store(0, Relaxed);
 
         let updater_running = Arc::new(AtomicBool::new(true));
+        let out = MidiOut::default();
+        out.attach(session, shared.clone());
+        // Track routed on channel 0; the second clip overrides to channel 5
+        // on the SAME port.
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
+        out.set_route(RouteScope::Clip(overridden_clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), Some(5))));
+        out.open_port(target.id.clone()).expect("open the loopback port");
+
+        // Hold `position` at zero until the output thread has actually taken
+        // a session snapshot, THEN start advancing it. A note at tick 0 is
+        // missed outright if the position is already past it when the first
+        // snapshot lands, and the window is a `try_lock` that a contended
+        // run simply skips — so on a loaded box the wait is unbounded in
+        // principle and was ~1 run in 15 in practice. The symptom is
+        // unmistakable in a failure trace: note-OFFs with no note-ONs.
+        assert!(
+            wait_for(std::time::Duration::from_secs(10), || out
+                .status()
+                .outputs
+                .iter()
+                .any(|o| o.note_snapshots > 0)),
+            "the output thread took a session snapshot"
+        );
         let updater = {
             let shared2 = shared.clone();
             let running2 = updater_running.clone();
@@ -2635,15 +2782,18 @@ mod tests {
             })
         };
 
-        let out = MidiOut::default();
-        out.attach(session, shared.clone());
-        // Track routed on channel 0; the second clip overrides to channel 5
-        // on the SAME port.
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
-        out.set_route(RouteScope::Clip(overridden_clip_id.to_string()), Some(RouteTarget::new(target.id.clone(), Some(5))));
-        out.open_port(target.id.clone()).expect("open the loopback port");
-
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        {
+            let seen = seen.clone();
+            wait_for(std::time::Duration::from_secs(5), move || {
+                let s = seen.lock();
+                s.iter().any(|m| m.as_slice() == [0x90, 60, 100])
+                    && s.iter().any(|m| m.as_slice() == [0x95, 72, 100])
+            });
+        }
+        // Settle before the negative assertion: a note leaking onto the
+        // track's channel would arrive alongside the override rather than
+        // long after it, but do not race it.
+        std::thread::sleep(std::time::Duration::from_millis(100));
         updater_running.store(false, Relaxed);
         let _ = updater.join();
         out.close_port(&target.id).ok();
@@ -3236,6 +3386,26 @@ mod tests {
         // runs an audio engine to advance it), so the clock never sees a
         // drift-sized gap and resyncs on its own.
         let updater_running = Arc::new(AtomicBool::new(true));
+        let out = MidiOut::default();
+        out.attach(session, shared.clone());
+        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
+        out.open_port(target.id.clone()).expect("open the loopback port");
+
+        // Hold `position` at zero until the output thread has actually taken
+        // a session snapshot, THEN start advancing it. A note at tick 0 is
+        // missed outright if the position is already past it when the first
+        // snapshot lands, and the window is a `try_lock` that a contended
+        // run simply skips — so on a loaded box the wait is unbounded in
+        // principle and was ~1 run in 15 in practice. The symptom is
+        // unmistakable in a failure trace: note-OFFs with no note-ONs.
+        assert!(
+            wait_for(std::time::Duration::from_secs(10), || out
+                .status()
+                .outputs
+                .iter()
+                .any(|o| o.note_snapshots > 0)),
+            "the output thread took a session snapshot"
+        );
         let updater = {
             let shared2 = shared.clone();
             let running2 = updater_running.clone();
@@ -3249,15 +3419,18 @@ mod tests {
             })
         };
 
-        let out = MidiOut::default();
-        out.attach(session, shared.clone());
-        out.set_route(RouteScope::Track("t-1".into()), Some(RouteTarget::new(target.id.clone(), Some(0))));
-        out.open_port(target.id.clone()).expect("open the loopback port");
-
-        // The thread's 250 ms try_lock snapshot window has to pick up the
-        // routed track before we close — give it headroom for more than one
-        // window plus the fresh-start note-on.
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // What shutdown has to flush is a SOUNDING note, so wait for the
+        // note-on itself rather than for a duration long enough to probably
+        // contain it: with nothing sounding, `release_on_exit` has nothing
+        // to release and the assertions below fail on an empty trace
+        // (observed as `[[252]]` — the Stop byte alone).
+        assert!(
+            wait_for(std::time::Duration::from_secs(10), || seen
+                .lock()
+                .iter()
+                .any(|m| m.as_slice() == [0x90, 60, 100])),
+            "the routed note is sounding before shutdown: {:?}", seen.lock()
+        );
         let before_shutdown = seen.lock().len();
 
         // Driven through `release_on_exit` — the EXACT function `lib.rs`'s

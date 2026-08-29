@@ -5,6 +5,35 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## A MIDI port id must not encode its place in a list
+
+The `midi_out::tests::*` "thread race" that had kept `--test-threads=1` in
+CI was not a thread race and was not confined to tests. A port id is minted
+as `"<name>#<index>"` and was resolved by exact string match; the index is a
+position in `midir`'s ALSA-seq enumeration, which renumbers every port after
+one that CLOSES. Measured with no test parallelism at all: a port at
+`"…129:0#3"` becomes `"…#2"` when an unrelated earlier port goes away, and
+the id handed out a moment earlier stops resolving — for a port with the
+same client, name and ALSA address, still plainly there.
+
+`resolve_port_id` makes the index a tiebreaker rather than an identity, on
+both the input and output side. Persisted routing was never exposed
+(`midi_out::persist` keys by name); the hazard is holding an id across
+anything that closes a port. Fixing it exposed three timing assumptions the
+port failures had been masking — loopback tests whose position thread
+outran the port being opened, and a clap_host test guessing at the depth of
+the process-wide `plugin_main()` queue.
+
+Default parallelism, one machine, one sitting: `midi_out::` went 0 of 10
+fully green to 25 of 25, the full `--lib` suite 0 of 8 to 45 of 46. **CI
+keeps `--test-threads=1`**: the one remaining failure is PR #124's
+PDEATHSIG test, whose child survived a SIGKILLed parent for over 30 s once.
+It is **on hold by the owner's decision**, with the two candidate causes and
+the conditions for reopening written down — it is not an unclaimed job.
+
+→ [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 6,
+[`TRAPS.md`](TRAPS.md) §Backend and §Tests.
+
 ## A plugin window closing must not kill AURA
 
 Three process-death bugs on the plugin path, all of them shaped the same
