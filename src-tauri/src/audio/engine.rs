@@ -7992,6 +7992,66 @@ mod tests {
         );
     }
 
+    /// Task 10 fix round 4, item 1: the rate `rebuild` hands to
+    /// `RtGraph::with_buses` has to be the ENGINE's, not a literal.
+    ///
+    /// Nothing else can catch it being wrong. Since round 3 the live-node
+    /// flush allowance is a duration, so a graph built at a hardcoded 48 kHz
+    /// on a 96 kHz device covers half of the release ramp and strands the
+    /// rest — and it fails SILENTLY, because `render_impl`'s `debug_assert`
+    /// re-derives the tail from `graph.rate`, which would carry the same
+    /// wrong number and agree with the bug. That consistency is deliberate
+    /// (it is what makes the device-rate-change window safe), which is
+    /// exactly why the one argument carrying the real rate needs its own pin.
+    ///
+    /// Driven through a whole `rebuild` rather than by poking `cache_rate`:
+    /// `ensure_loaded` derives it from `shared.sample_rate`, so setting the
+    /// engine rate is what pins the WIRING and not just the last hop.
+    #[test]
+    fn a_rebuilt_graph_carries_the_engine_rate_into_every_live_rows_window() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        ctl.shared.sample_rate.store(96_000, Relaxed);
+        {
+            let mut s = session.lock();
+            let mut t = test_track("t-1");
+            t.kind = "midi".into();
+            s.store.tracks.push(t);
+            s.republish_full();
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+
+        ctl.live_in_hub.set_target_track(Some("t-1".into()));
+        tx.send(ControlMsg::Subscribe(Box::new(CountingSink(
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(Mutex::new(Vec::new())),
+        ))))
+        .unwrap();
+        drop(tx);
+        ctl.run();
+
+        let graph = graph_rx.pop().expect("the tick published a graph").into_box();
+        let live = graph
+            .tracks
+            .iter()
+            .find(|t| t.live.is_some())
+            .expect("the armed midi track is the live row");
+        assert_ne!(
+            crate::audio::rt::live_tail_frames(96_000),
+            crate::audio::rt::live_tail_frames(48_000),
+            "the two rates must differ, or the assertion below cannot bite"
+        );
+        assert_eq!(
+            live.tail_frames,
+            crate::audio::rt::live_tail_frames(96_000),
+            "85 ms of release at the DEVICE's rate, not at 48 kHz"
+        );
+        assert_eq!(graph.rate, 96_000, "and the graph carries it for the tail debug_assert");
+    }
+
     /// Plan G1 Task 7 — the bug this closes: a plugin on an AUDIO track must
     /// actually process the track's audio. Before Task 7 the insert chain was
     /// never compiled into the graph (`compile_inserts` resolved every slot to

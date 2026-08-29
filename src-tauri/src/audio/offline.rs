@@ -577,6 +577,44 @@ mod tests {
         );
     }
 
+    /// Task 10 fix round 4, item 1, the bounce's half: `build_graph` takes a
+    /// `rate` and must hand THAT to `RtGraph::with_buses`.
+    ///
+    /// A 96 kHz bounce built with a 48 kHz window covers half of every
+    /// instrument's release and hard-cuts the rest, and nothing else in the
+    /// suite would see it — `render_impl`'s tail `debug_assert` re-derives
+    /// from `graph.rate`, so it would carry the same wrong number and agree.
+    #[test]
+    fn a_bounce_sizes_its_live_windows_at_the_bounce_rate() {
+        use crate::audio::rt::live_tail_frames;
+        const RATE: u32 = 96_000;
+        let (store, midi) = demo_project();
+        let og = build_graph(
+            &store,
+            &midi,
+            &crate::control::session::PluginDoc::default(),
+            &Default::default(),
+            &Default::default(),
+            None,
+            RATE,
+        );
+        assert_ne!(
+            live_tail_frames(RATE),
+            live_tail_frames(48_000),
+            "the two rates must differ, or the assertion below cannot bite"
+        );
+        // The demo tracks carry no inserts, no `pdc` and no sends, so the
+        // strip contributes nothing and the window IS the allowance.
+        let live: Vec<usize> =
+            og.graph.tracks.iter().filter(|t| t.live.is_some()).map(|t| t.tail_frames).collect();
+        assert_eq!(live.len(), 2, "both midi tracks render live");
+        assert!(
+            live.iter().all(|&f| f == live_tail_frames(RATE)),
+            "every live row's flush window is 85 ms at the BOUNCE rate, got {live:?}"
+        );
+        assert_eq!(og.graph.rate, RATE, "and the graph carries it for the tail debug_assert");
+    }
+
     /// Plan G2: the BOUNCE walks the same routing the live engine does. A
     /// unity post-fader send into an empty return doubles the material — if
     /// export ignored sends, the exported song would be missing exactly the

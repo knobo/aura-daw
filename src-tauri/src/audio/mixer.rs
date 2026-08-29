@@ -2586,6 +2586,61 @@ mod tests {
         buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))
     }
 
+    /// Task 10 fix round 4, item 2: the raised tail is inert PER ROW KIND.
+    ///
+    /// Since round 3 a live row's `tail_frames` is `strip + allowance`, and
+    /// `with_buses` recomputes it for every row — a live MIDI TRACK included,
+    /// which now writes a much larger `flush_left` than it ever did before.
+    /// Nothing may read it: `flushing` is `exclusive_idle`, and only a
+    /// player's row is that. An ordinary track on a stopped transport still
+    /// has something feeding it, so a window that opened its fader would hold
+    /// whatever sits under the frozen playhead — here, a note the synth is
+    /// still sustaining.
+    ///
+    /// `a_raw_pad_owns_no_tail_and_takes_the_bare_skip` pins the row kind that
+    /// gets no window; this pins the row kind that gets one and must not use
+    /// it. The branch has already shipped a gate that opened every track's
+    /// fader for `tail_frames` after a stop, with the whole suite green — a
+    /// per-kind assertion is the only thing that saw it.
+    #[test]
+    fn a_live_midi_track_row_never_flushes_after_a_stop_however_long_its_tail() {
+        const RATE: u32 = 48_000;
+        let held = vec![AbsNoteEvent { sample: 0, key: 69, velocity: 100, channel: 0 }];
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut g =
+            RtGraph::with_buses(vec![live_track(0, held, RATE)], Vec::new(), 1, params, RATE);
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 1);
+        clocks.set_transport_playing(true);
+        g.clocks = Arc::new(clocks);
+        assert!(
+            g.tracks[0].tail_frames >= crate::audio::rt::live_tail_frames(RATE),
+            "premise: a live row does carry a window now — without one this              test would pass for want of a tail rather than for the gate"
+        );
+
+        let mut out = vec![0.0f32; 128 * 2];
+        for _ in 0..4 {
+            out.fill(0.0);
+            render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
+        }
+        assert!(peak(&out) > 0.0, "the sustained note has to sound while the transport rolls");
+
+        // Well past the window: at 128 frames a block, 8 blocks is 1024 and
+        // the window is at least 4096, so every one of these is inside it.
+        g.clocks.set_transport_playing(false);
+        for i in 0..8 {
+            out.fill(0.0);
+            render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, RATE, false, None);
+            assert_eq!(
+                peak(&out),
+                0.0,
+                "block {i} after the stop: a track is not a pad, and its \
+                 flush window must stay unread"
+            );
+        }
+    }
+
     /// The headless seam proof: a live PolySynth node inside the RCU graph
     /// renders audible audio through `render`, sample-positioned, and the
     /// note's release leaves silence.
