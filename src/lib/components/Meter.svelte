@@ -183,5 +183,11 @@
     width: 100%;
     display: block;
     cursor: pointer;
+    /* Redrawn every frame from the meter bus. Without paint containment,
+       WebKitGTK's compositor has been observed folding this canvas's own
+       damage into a full-viewport repaint instead of isolating it to the
+       canvas's own box (WebKit Timelines: ~600ms/paint, full-page quad,
+       on every meter tick). */
+    contain: paint;
   }
 </style>

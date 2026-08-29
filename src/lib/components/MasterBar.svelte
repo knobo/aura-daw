@@ -242,6 +242,8 @@
     width: 48px;
     color: var(--text);
     text-align: right;
+    /* textContent is rewritten every frame from the rAF loop above. */
+    contain: content;
   }
 
   .lanesbulk {

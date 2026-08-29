@@ -644,6 +644,9 @@
     font-weight: 500;
     letter-spacing: 0.04em;
     color: var(--text);
+    /* textContent is rewritten every frame from the rAF loop above — this
+       one runs unconditionally, the whole time the app is open. */
+    contain: content;
   }
   .timecode.live .clock {
     color: var(--cyan);
@@ -652,6 +655,8 @@
   .bars {
     font-size: 12px;
     color: var(--text-dim);
+    /* textContent is rewritten every frame from the rAF loop above. */
+    contain: content;
   }
 
   .right {

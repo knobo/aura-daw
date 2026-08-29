@@ -151,6 +151,30 @@ Historical plans called this `next-prompt.md` §2.
   gets its numbers by subtraction from outside instead; §9 explains
   how.
 
+- **No continuously-animated SVG.** A WebKit Timelines capture on the
+  native (Tauri/WebKitGTK) build showed a `requestAnimationFrame` loop
+  mutating SVG attributes (`Gauge.svelte`'s needle/arc rotation) getting
+  folded into a full-viewport repaint — `quad: [0,0,3840,0,3840,1384,...]`,
+  ~600ms per paint, on every meter tick. Browser demo mode
+  (Chromium/Gecko) hid this; only profiling the real webview surfaced it.
+  `Gauge.svelte` is due a canvas rewrite for exactly this reason — its SVG
+  faces only have `contain: content` as an interim mitigation, not the
+  fix. SVG stays fine for static vector art (icons, one-shot
+  illustrations). Anything redrawn every frame — meters, VU needles,
+  playhead markers, gauges — is one of:
+  - **canvas 2D**, imperative draw calls inside the rAF tick (`Meter.svelte`
+    is the reference shape: read the state, clear, redraw, no DOM/CSSOM
+    involved at all).
+  - **a plain HTML element moved via `style.transform`**, with
+    `will-change: transform` on it (`Timeline.svelte`'s `.marker`).
+
+  Either way the element needs `contain: paint` (or `contain: content` if
+  it has non-canvas children, like `Gauge.svelte`'s root) so its own
+  redraw can't escape into the surrounding page even once the technique
+  is right — containment and technique are two separate fixes, verify
+  both. If a WebKit Timelines re-capture ever shows a full-page quad
+  again, this is the first section to reread.
+
 ## Tests and docs
 
 - **The dated-count convention**: any task that changes test counts

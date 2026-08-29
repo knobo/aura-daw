@@ -1357,6 +1357,8 @@
     width: 100%;
     height: 100%;
     pointer-events: none;
+    /* Redrawn from a rAF loop while a selection/note-flash is active. */
+    contain: paint;
   }
   .gridwrap {
     flex: 1;

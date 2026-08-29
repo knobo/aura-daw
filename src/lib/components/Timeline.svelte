@@ -1241,6 +1241,10 @@
     margin-left: -5px;
     filter: drop-shadow(0 0 calc(4px * var(--glow-scale)) var(--cyan-dim));
     pointer-events: none;
+    /* Moved every frame via `transform` (see the rAF tick above) — promote
+       it to its own layer so that move doesn't get folded into a
+       full-viewport repaint on a weaker compositor (WebKitGTK). */
+    will-change: transform;
   }
 
   /* loop region: band + pins in the ruler's top strip */
