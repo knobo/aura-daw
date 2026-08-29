@@ -922,6 +922,10 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
             let at = (*index).min(session.store.players.len());
             session.store.players.insert(at, player.clone());
             effect.rebuild = true;
+            // Players live in `project.json` (Task 2, `Project::players`), so
+            // adding one is durable exactly like adding a track — without
+            // this the pad is gone on the next load.
+            effect.persist.project = true;
             Ok(Op::PlayerRemove { player: player.clone(), index: at })
         }
         Op::PlayerRemove { player, .. } => {
@@ -935,6 +939,7 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown player: {}", player.id))?;
             let removed = session.store.players.remove(at);
             effect.rebuild = true;
+            effect.persist.project = true;
             Ok(Op::PlayerAdd { player: removed, index: at })
         }
         Op::Set { object: ObjectRef::Player(id), path, to, .. } => {
@@ -946,19 +951,55 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                 .ok_or_else(|| format!("unknown player: {id}"))?;
             let from_now = read_player_prop(p, *path)?; // truth, not caller's `from`
             let applied = write_player_prop(p, *path, to)?;
-            // Source, raw and the node's strip fields change what the graph
-            // compiles or renders, so those rebuild. `Name` is a pure label
+            effect.persist.project = true;
+            // `Raw` and `PlayerSource` change what the graph COMPILES — the
+            // set of inserts, sends and clips the assembly emits — so they
+            // rebuild. Nothing else here does. `Name` is a pure label
             // (document-only, same as the Track arm's `Name`/`Group`
             // treatment above) and `TriggerMode` is read off the live
-            // document per-trigger by the RT side, not off the compiled
-            // graph — neither needs a rebuild. Written as an explicit
-            // allow-list, not a negation, so a player path added later
-            // defaults to NOT rebuilding until this is looked at, rather
-            // than silently forcing one.
-            effect.rebuild = matches!(
-                path,
-                PropPath::Raw | PropPath::PlayerSource | PropPath::Gain | PropPath::Pan | PropPath::Muted
-            );
+            // document per-trigger, not off the compiled graph. Written as an
+            // explicit allow-list, not a negation, so a player path added
+            // later defaults to NOT rebuilding until this is looked at,
+            // rather than silently forcing one.
+            effect.rebuild = matches!(path, PropPath::Raw | PropPath::PlayerSource);
+            // Plan V — V2 (Task 9): the strip fields are PARAM WRITES now
+            // that a player owns a mixer slot (`engine::rebuild`'s
+            // `derive_slots_with_players`). Rebuilding the whole graph for a
+            // fader drag is the defect the project's §10 rule exists to
+            // prevent, and this is the same path — and the same key — the
+            // Track arm has always used: `param_writes` is `TrackId`-keyed,
+            // and a player's compiled `MixNode::id` IS its `PlayerId`
+            // borrowed into that newtype, so `commit` resolves it through
+            // `GraphTables::slots` with no special case.
+            //
+            // All three are rewritten on any of the three, exactly as the
+            // Track arm rewrites all four — the last write in a transaction
+            // is truth, and the cost is three atomics.
+            //
+            // NOT for a RAW player, and that is the point rather than an
+            // omission: V-6 means `From<&Player>` emits unity, centre and
+            // unmuted for a raw one whatever the document holds, so writing
+            // the document's value into the table would make the fader take
+            // effect on a strip the compiler says is at unity — V-16's
+            // bit-exact pad, broken until the next unrelated rebuild put it
+            // back. While `raw` is set these fields are inert; unticking it
+            // is a `PropPath::Raw` write, which rebuilds and recompiles them
+            // from the node.
+            if matches!(path, PropPath::Gain | PropPath::Pan | PropPath::Muted) && p.chain_applies()
+            {
+                let node_id = crate::ids::TrackId::from(p.id.as_str());
+                effect.param_writes.push((
+                    node_id.clone(),
+                    PropPath::Gain,
+                    crate::audio::mixer::db_to_linear(p.node.gain_db),
+                ));
+                effect.param_writes.push((node_id.clone(), PropPath::Pan, p.node.pan as f32));
+                effect.param_writes.push((
+                    node_id,
+                    PropPath::Muted,
+                    if p.node.muted { 1.0 } else { 0.0 },
+                ));
+            }
             Ok(Op::Set {
                 object: ObjectRef::Player(id.clone()),
                 path: *path,

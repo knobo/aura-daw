@@ -1559,6 +1559,7 @@ mod tests {
             params: Arc::new(crate::audio::rt::ParamTable::with_slots_and_sends(n_slots, 0)),
             clocks: Arc::new(clocks),
             scene_clocks,
+            player_clocks: Default::default(),
             orphan_clock: None,
             slots,
             send_slots: Default::default(),

@@ -491,6 +491,73 @@ mod tests {
         assert_eq!(peak(&a[tail_start..]), 0.0, "release tail decays to silence");
     }
 
+    /// V-15, and ruling V-2's own argument made executable: the bounce has
+    /// no concept of a pad press, so a player in the document must contribute
+    /// NOTHING to it. Rendering one would put a pad's clip at bar 1 of the
+    /// export — a performance leaking into arrangement material.
+    ///
+    /// Both halves are asserted, because the audible one alone would pass for
+    /// the wrong reason (a MIDI player has no live node until Task 10): the
+    /// samples are identical AND the player took no mixer slot.
+    #[test]
+    fn a_player_contributes_nothing_to_the_bounce() {
+        const RATE: u32 = 48_000;
+        let (store, midi) = demo_project();
+        let render_all = |store: &Store| {
+            let mut og = build_graph(
+                store,
+                &midi,
+                &crate::control::session::PluginDoc::default(),
+                &Default::default(),
+                &Default::default(),
+                None,
+                RATE,
+            );
+            let out = render(&mut og.graph, 0, og.end_samples, RATE, 1.0, &mut |_, _| {});
+            (out, og.graph.params.len(), og.graph.tracks.len(), og.end_samples)
+        };
+        let (without, slots_without, rows_without, end_without) = render_all(&store);
+
+        let (mut padded, _) = demo_project();
+        let mut p = crate::audio::player::Player::new(crate::ids::PlayerId::from("p1"), "PAD");
+        p.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: midi.clips[0].id.clone(),
+            instrument_id: None,
+        };
+        p.node.gain_db = 6.0; // loud enough that a leak could not be missed
+        padded.players.push(p);
+        let (with, slots_with, rows_with, end_with) = render_all(&padded);
+
+        assert_eq!(with, without, "a player must not reach the bounce");
+        assert_eq!(slots_with, slots_without, "and it must take no mixer slot");
+        assert_eq!(rows_with, rows_without, "and produce no row");
+        assert_eq!(end_with, end_without, "and not move the song's end");
+    }
+
+    /// V-15's gate, at the line that decides it. `build_graph` compiles
+    /// `mix_nodes(&store.tracks)` — tracks only — while `engine::rebuild`
+    /// compiles `mix_nodes_with_players`. The difference IS the ruling, and
+    /// it is one identifier wide, so it is pinned on the source rather than
+    /// left to be re-derived from a render.
+    #[test]
+    fn the_bounce_compiles_tracks_only_never_players() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/offline.rs"),
+        )
+        .expect("offline.rs is readable");
+        // The PRODUCTION half only: the tests below necessarily name both
+        // functions, in prose and in assertions.
+        let prod = &src[..src.find("\nmod tests {").unwrap_or(src.len())];
+        assert!(
+            !prod.contains("mix_nodes_with_players"),
+            "V-15: the offline bounce must never compile a player into the graph"
+        );
+        assert!(
+            prod.contains("mix_nodes(&store.tracks)"),
+            "the tracks-only compiler input is what V-15 rests on"
+        );
+    }
+
     /// Plan G2: the BOUNCE walks the same routing the live engine does. A
     /// unity post-fader send into an empty return doubles the material — if
     /// export ignored sends, the exported song would be missing exactly the

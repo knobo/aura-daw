@@ -45,7 +45,7 @@ use super::rt::{
     SharedRt, TrackRamps, NO_PARK,
 };
 use super::transport;
-use super::types::{derive_slots, mixer_slot_count, Clip, MeterFrame, Store};
+use super::types::{Clip, MeterFrame, Store};
 use super::waveform::{pyramid_exists, Pyramid};
 use crate::control::{op, Committed, Committer, Session};
 use crate::ids::SourceId;
@@ -61,6 +61,42 @@ fn audio_row_for(tracks: &[RtTrack], slot: usize) -> Option<usize> {
         .iter()
         .position(|r| r.slot == slot && r.live.is_some())
         .or_else(|| tracks.iter().position(|r| r.slot == slot))
+}
+
+/// The one `RtClip` a player's audio source becomes: the clip's SOURCE
+/// region, rebased to position 0.
+///
+/// Position 0 is what "an ephemeral placement" means to the renderer — a
+/// player's playhead starts at 0 on press (V-2: a player has no absolute
+/// placement, so it cannot sit anywhere else).
+///
+/// V-16 lives here. A RAW player takes the source's samples for the clip's
+/// region at unity — no clip gain, no fades — so a raw pad is the same
+/// signal as auditioning the file in the browser. A non-raw player keeps
+/// the clip's own gain and fades, because then the pad is playing the CLIP,
+/// not the file.
+///
+/// A source that is not decoded yet is silence (an empty row), not a panic:
+/// `ensure_loaded` caches by `SourceId` over `s.clips`, so this only happens
+/// when the file failed to load — the same tolerance the track loop's
+/// `filter_map` has.
+fn player_clip_row(
+    c: &Clip,
+    raw: bool,
+    cache: &HashMap<SourceId, CachedSource>,
+) -> Vec<RtClip> {
+    let Some(samples) = cache.get(&c.source_id).map(|e| e.data.clone()) else {
+        return Vec::new();
+    };
+    vec![RtClip {
+        start: 0,
+        offset: c.offset_samples,
+        len: c.length_samples,
+        gain: if raw { 1.0 } else { mixer::db_to_linear(c.gain_db) },
+        fade_in: if raw { 0 } else { c.fade_in_samples },
+        fade_out: if raw { 0 } else { c.fade_out_samples },
+        samples,
+    }]
 }
 
 /// Every launch binding that needs a clock of its own, in DOCUMENT order —
@@ -1794,8 +1830,11 @@ impl Control {
             // structural commit in the whole backend test suite runs through
             // here) would be a silent behavior change this refactor must not
             // smuggle in.
-            let slots_s = derive_slots(&s.tracks);
-            let mut tracks = Vec::with_capacity(s.tracks.len());
+            // Plan V — V2: players take mixer slots AFTER every track's, so
+            // the map a track's row is keyed by is unchanged by their
+            // presence (`types::derive_slots_with_players`' prefix property).
+            let slots_s = crate::audio::types::derive_slots_with_players(&s.tracks, &s.players);
+            let mut tracks = Vec::with_capacity(s.tracks.len() + s.players.len());
             for t in s.tracks.iter() {
                 let Some(&slot) = slots_s.get(&t.id) else {
                     continue; // automation tracks own no mixer slot or RtTrack
@@ -1865,7 +1904,12 @@ impl Control {
             // block).
             // The compiler's one input (Plan V1): built once here so Task 4
             // can hand the SAME slice to `compile_routing` a few lines down.
-            let nodes = crate::audio::node::mix_nodes(&s.tracks);
+            // Plan V — V2: players are compiled by the SAME call. V-6 is
+            // already enforced inside `From<&Player>`, so a raw player
+            // arrives here with no inserts and no sends and the two
+            // compilers below produce nothing for it without ever testing
+            // the word "raw".
+            let nodes = crate::audio::node::mix_nodes_with_players(&s.tracks, &s.players);
             let (mut compiled, failed) = crate::audio::insert::compile_inserts(
                 &nodes,
                 &s.plugins,
@@ -1919,7 +1963,6 @@ impl Control {
                 }
                 tracks[i].output = plan.output.get(slot).copied().flatten();
             }
-            routing = Some(plan);
             // The timeline boundary belongs to the material, so it is
             // derived exactly where the material is assembled — same helper
             // the offline bounce uses, so live and export agree on where the
@@ -1927,6 +1970,68 @@ impl Control {
             self.shared
                 .song_end
                 .store(offline::song_end(&tracks), Relaxed);
+            // PLAYERS (Plan V — V2, ruling V-1/V-2). One row per player,
+            // appended LAST — and specifically after `song_end` above, which
+            // is the whole reason they are not pushed with the tracks.
+            // `song_end` is the TIMELINE boundary, and a player's clip sits
+            // at position 0 by construction; folding it in would let a pad's
+            // 30-second sample declare the song 30 seconds long on an empty
+            // arrangement, and would lengthen every export. A pad
+            // performance is not arrangement material (V-15's argument,
+            // applied to the live graph's one timeline-shaped output).
+            //
+            // The chain, the two PDC lines and the output are attached here
+            // rather than in the loop above for the same ordering reason —
+            // the row has to exist first. Everything they read
+            // (`compiled`, `plan`) was compiled from the SAME `nodes` slice
+            // the tracks were, so a non-raw player gets exactly what a track
+            // with the same strip would; a raw one gets nothing, because
+            // `From<&Player>` gave the compilers nothing (V-6).
+            for p in s.players.iter() {
+                let node_id = crate::ids::TrackId::from(p.id.as_str());
+                let Some(&slot) = slots_s.get(&node_id) else { continue };
+                let clips = match &p.source {
+                    crate::audio::player::PlayerSource::AudioClip { clip_id } => {
+                        match s.clips.iter().find(|c| &c.id == clip_id) {
+                            Some(c) => player_clip_row(c, p.raw, &self.cache),
+                            // A source the document no longer has is
+                            // SILENCE, not a panic: the pad stays on the
+                            // page, it just has nothing to sound.
+                            None => Vec::new(),
+                        }
+                    }
+                    // MIDI sources need a live instrument node of their own
+                    // (Task 10); `PlayerSource::None` is a knobs-only pad
+                    // (R5) and renders silence by definition.
+                    _ => Vec::new(),
+                };
+                let i = tracks.len();
+                tracks.push(RtTrack::clips(slot, clips));
+                if let Some(chain) = compiled.remove(&node_id) {
+                    if !chain.is_empty() {
+                        tracks[i].inserts = chain;
+                    }
+                }
+                if let Some(&delay) = plan.track_pdc.get(slot) {
+                    if delay > 0 {
+                        tracks[i].pdc = Some(crate::audio::pdc::DelayLine::new(
+                            delay,
+                            crate::audio::rt::MAX_LIVE_BLOCK,
+                            2,
+                        ));
+                    }
+                }
+                let out_delay = plan.out_delay.get(slot).copied().unwrap_or(0);
+                if out_delay > 0 {
+                    tracks[i].out_pdc = Some(crate::audio::pdc::DelayLine::new(
+                        out_delay,
+                        crate::audio::rt::MAX_LIVE_BLOCK,
+                        2,
+                    ));
+                }
+                tracks[i].output = plan.output.get(slot).copied().flatten();
+            }
+            routing = Some(plan);
             assembled = Some((slots_s, tracks));
         }
         #[cfg(test)]
@@ -1964,18 +2069,27 @@ impl Control {
         let (params, clocks, slots, send_slots, track_ramps, param_driver, tempo_map, automation_modes, base_gains, document_epoch, clicks) = {
             let session = self.session.lock(); // read-only: param VALUES + slot map + automation compile — short, no assembly
             let store = &session.store;
-            let slots = derive_slots(&store.tracks);
+            // Plan V — V2: tracks THEN players, in that order, everywhere.
+            // The player entries are appended after every track's, so adding
+            // a pad never renumbers a track's slot and a fader knob written
+            // against the old numbering can never land on a different strip
+            // (`types::derive_slots_with_players`' prefix property).
+            let slots = crate::audio::types::derive_slots_with_players(&store.tracks, &store.players);
             // Plan G2: the send-amount lanes are derived from the LIVE
             // document for the same reason the slot map is — a send added
             // during phase 1 must reach this rebuild's table, or its knob
             // would resolve into a lane no graph reads.
-            let send_slots = crate::audio::types::derive_send_slots(&store.tracks);
+            let send_slots = crate::audio::types::derive_send_slots_with_players(
+                &store.tracks,
+                &store.players,
+            );
             // Sized to mixer slots, not store track count: automation tracks
             // take no slot (design §3.6) and must not shift later rows.
-            let n_slots = mixer_slot_count(&store.tracks);
+            let n_slots =
+                crate::audio::types::mixer_slot_count_with_players(&store.tracks, &store.players);
             let params = Arc::new(ParamTable::with_slots_and_sends(
                 n_slots,
-                crate::audio::types::send_slot_count(&store.tracks),
+                crate::audio::types::send_slot_count_with_players(&store.tracks, &store.players),
             ));
             for t in store.tracks.iter() {
                 let Some(&slot) = slots.get(&t.id) else { continue };
@@ -1985,6 +2099,27 @@ impl Control {
                 params.set_flag(slot, super::rt::FLAG_MUTE, t.muted);
                 params.set_flag(slot, super::rt::FLAG_SOLO, t.soloed);
                 for snd in &t.sends {
+                    let Some(&idx) = send_slots.get(&snd.id) else { continue };
+                    params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
+                }
+            }
+            // Plan V — V2: a player's fader values come from its COMPILED
+            // node, never from the document directly, so V-6 is applied here
+            // without this loop knowing the word "raw" — a raw player is
+            // unity/centre/unmuted because that is what it compiled to.
+            //
+            // Solo is deliberately absent: `From<&Player>` reports every
+            // player unsoloed (a pad that goes quiet because someone soloed
+            // a track is the deck cutting out mid-performance), and the
+            // player's slot reads its own clock, which `audible_with_launch`
+            // already lets override another track's solo.
+            for p in store.players.iter() {
+                let node = crate::audio::node::MixNode::from(p);
+                let Some(&slot) = slots.get(&node.id) else { continue };
+                params.set_gain_pair_linear(slot, mixer::db_to_linear(node.gain_db));
+                params.set_pan(slot, node.pan as f32);
+                params.set_flag(slot, super::rt::FLAG_MUTE, node.muted);
+                for snd in &node.sends {
                     let Some(&idx) = send_slots.get(&snd.id) else { continue };
                     params.set_send_amount_linear(idx, mixer::db_to_linear(snd.amount_db));
                 }
@@ -2002,6 +2137,17 @@ impl Control {
             // could be fired needs its clock before it is.
             let scene_ids = scene_binding_ids(&session.midi.launch_maps);
             let first_scene_clock = 1 + store.players.len() as u32;
+            // The reserved range itself, `1 ..= players.len()`, in document
+            // order. Duplicate player ids collapse in the map exactly as
+            // duplicate binding ids do below, and for the same reason the
+            // warn there exists — but a duplicate cannot arise from user
+            // data here: `Op::PlayerAdd` refuses an id the store already has.
+            let player_clocks: HashMap<crate::ids::PlayerId, u32> = store
+                .players
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.id.clone(), 1 + i as u32))
+                .collect();
             let scene_clocks: HashMap<String, u32> = scene_ids
                 .iter()
                 .enumerate()
@@ -2079,6 +2225,16 @@ impl Control {
                     // graph is adopted before the retired one renders another
                     // block, NOBODY latches it — the same hung note, reached
                     // through a one-block door.
+                    //
+                    // THE PRICE, named rather than left for the next reader
+                    // to find: the retired graph normally does render one
+                    // more block after the publish, and delivers that pending
+                    // flush itself — so the orphan minted here can hand the
+                    // SAME live node a SECOND `all_notes_off` one block
+                    // later, cutting any arrangement note started in between.
+                    // One clipped note is accepted over a hung one, which is
+                    // unbounded; closing it needs the blocks-rendered counter
+                    // `flush_pending_for`'s doc already books as a follow-up.
                     if published.clocks.is_on(prev_clock)
                         || published.clocks.flush_pending_for(prev_clock)
                     {
@@ -2108,11 +2264,30 @@ impl Control {
             // nobody happened to edit anything.
             let orphan_clock = (!orphaned_slots.is_empty())
                 .then(|| first_scene_clock + scene_ids.len() as u32);
-            let clocks = Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(
-                n_slots,
-                1 + store.players.len() + scene_ids.len() + usize::from(orphan_clock.is_some()),
-            ));
+            let clocks = Arc::new(
+                crate::audio::clock::ClockTable::with_slots_clocks_and_players(
+                    n_slots,
+                    1 + store.players.len() + scene_ids.len() + usize::from(orphan_clock.is_some()),
+                    store.players.len(),
+                ),
+            );
             clocks.set_transport_playing(self.shared.playing.load(Relaxed));
+            // Each player's slot is bound to its clock for the LIFE of this
+            // graph, and nothing ever releases it — unlike a scene, a player
+            // does not BORROW a timeline track's slot, it owns its own. That
+            // is why the range is marked exclusive above: an idle player
+            // renders silence rather than the arrangement (V-2, and see
+            // `ClockTable::with_slots_clocks_and_players`).
+            //
+            // Binding here, at graph build, is what makes a pad press a
+            // single atomic write: `player_fire` finds a lane that already
+            // exists, so it never rebuilds the graph (the RT contract).
+            for (id, &clock) in player_clocks.iter() {
+                let Some(&slot) = slots.get(&crate::ids::TrackId::from(id.as_str())) else {
+                    continue;
+                };
+                clocks.bind_slot(slot, clock);
+            }
             // Every sounding scene survives the rebuild. The overlay this
             // replaces lived on `SharedRt`, so editing a clip while a pad
             // sounded did not rewind it; the table is per-graph, so that only
@@ -2133,6 +2308,16 @@ impl Control {
             // it on the audio thread at the moment the swap actually happens,
             // which is what makes it exact (see that method).
             clocks.set_carry_source(published.generation);
+            // A SOUNDING PAD survives the rebuild, by the same argument and
+            // the same mechanism as a sounding scene: the table is per-graph,
+            // so editing anything while a pad plays would otherwise rewind
+            // it. By PLAYER ID, never by index — the index is "the i-th
+            // player in document order", and adding or removing a pad ahead
+            // of a sounding one renumbers it.
+            for (id, &dst) in player_clocks.iter() {
+                let Some(&src) = published.player_clocks.get(id) else { continue };
+                clocks.carry_over(&published.clocks, src, dst);
+            }
             for (id, &dst) in scene_clocks.iter() {
                 let Some(&src) = published.scene_clocks.get(id) else { continue };
                 clocks.carry_over(&published.clocks, src, dst);
@@ -2153,6 +2338,7 @@ impl Control {
                 params: params.clone(),
                 clocks: clocks.clone(),
                 scene_clocks,
+                player_clocks,
                 orphan_clock,
                 slots: slots.clone(),
                 send_slots: send_slots.clone(),
@@ -4273,6 +4459,9 @@ pub fn load_wav(path: &Path) -> Result<(u16, u32, Vec<f32>), String> {
 mod tests {
     use super::*;
     use crate::audio::types::AutomationMode;
+    // Task 9 moved `rebuild` onto the `_with_players` variants; the tests
+    // below still exercise the track-only helpers directly.
+    use crate::audio::types::{derive_slots, mixer_slot_count};
     use std::sync::atomic::AtomicUsize;
 
     struct NullEvents;
@@ -4967,6 +5156,7 @@ mod tests {
             params: Arc::new(ParamTable::default()),
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             scene_clocks: Default::default(),
+            player_clocks: Default::default(),
             orphan_clock: None,
             slots: HashMap::new(),
         }));
@@ -5010,6 +5200,7 @@ mod tests {
             params: Arc::new(ParamTable::default()),
             clocks: Arc::new(crate::audio::clock::ClockTable::with_slots_and_clocks(64, 2)),
             scene_clocks: Default::default(),
+            player_clocks: Default::default(),
             orphan_clock: None,
             slots: HashMap::new(),
         }));
@@ -5168,6 +5359,276 @@ mod tests {
         assert_eq!(t.scene_clocks.get("b2"), Some(&3));
         assert_eq!(t.scene_clocks.get("b-clip"), None, "a Clip target is not a scene");
         assert_eq!(t.clocks.clocks(), 4, "transport + player + two scenes");
+    }
+
+    // ---- Plan V — V2, Task 9: audio-clip players in the live graph ----
+
+    fn test_player(id: &str, clip: &str, raw: bool) -> crate::audio::player::Player {
+        let mut p = crate::audio::player::Player::new(crate::ids::PlayerId::from(id), id);
+        p.source = crate::audio::player::PlayerSource::AudioClip { clip_id: clip.into() };
+        p.raw = raw;
+        p
+    }
+
+    /// A source whose every sample is distinguishable, so an offset or a
+    /// length error shows up as the WRONG samples rather than as silence.
+    fn ramp_source(frames: usize) -> Arc<RtClipData> {
+        Arc::new(RtClipData {
+            channels: 1,
+            data: (0..frames).map(|i| (i + 1) as f32 / 1000.0).collect(),
+        })
+    }
+
+    fn cache_with(sid: &SourceId, data: Arc<RtClipData>) -> HashMap<SourceId, CachedSource> {
+        let mut cache = HashMap::new();
+        cache.insert(
+            sid.clone(),
+            CachedSource { source_path: "audio/x.wav".into(), data },
+        );
+        cache
+    }
+
+    /// A trimmed, gained, faded clip — everything V-16 says a RAW player
+    /// must ignore.
+    fn trimmed_clip() -> (Clip, SourceId) {
+        let sid = SourceId::mint();
+        let mut c = crate::audio::types::testutil::test_clip("c1", "t-1");
+        c.source_id = sid.clone();
+        c.timeline_start_samples = 500_000; // the placement's bar-40 position
+        c.offset_samples = 10;
+        c.length_samples = 100;
+        c.gain_db = -6.0;
+        c.fade_in_samples = 20;
+        c.fade_out_samples = 20;
+        (c, sid)
+    }
+
+    /// V-16: a raw player is the SOURCE region at unity. Not the clip's gain,
+    /// not its fades — and not its timeline position either, because a player
+    /// has no absolute placement (V-2): the row's clip sits at 0, which is
+    /// where a pad's playhead starts on press.
+    #[test]
+    fn a_raw_players_row_is_the_source_region_at_unity_placed_at_zero() {
+        let (c, sid) = trimmed_clip();
+        let cache = cache_with(&sid, ramp_source(200));
+        let row = player_clip_row(&c, true, &cache);
+        assert_eq!(row.len(), 1);
+        assert_eq!(row[0].start, 0, "the ephemeral placement, not bar 40");
+        assert_eq!(row[0].offset, 10, "the clip's trim IS the source region");
+        assert_eq!(row[0].len, 100);
+        assert_eq!(row[0].gain, 1.0, "unity: no clip gain");
+        assert_eq!(row[0].fade_in, 0);
+        assert_eq!(row[0].fade_out, 0);
+    }
+
+    /// The other half of V-16: not raw means the pad is playing the CLIP, so
+    /// the clip's own gain and fades come with it.
+    #[test]
+    fn a_non_raw_players_row_keeps_the_clips_gain_and_fades() {
+        let (c, sid) = trimmed_clip();
+        let cache = cache_with(&sid, ramp_source(200));
+        let row = player_clip_row(&c, false, &cache);
+        assert_eq!(row[0].start, 0, "still no absolute placement (V-2)");
+        assert!((row[0].gain - mixer::db_to_linear(-6.0)).abs() < 1e-6);
+        assert_eq!(row[0].fade_in, 20);
+        assert_eq!(row[0].fade_out, 20);
+    }
+
+    /// A source that never decoded is SILENCE, not a panic — the same
+    /// tolerance the track loop's `filter_map` has.
+    #[test]
+    fn a_player_whose_source_never_decoded_is_an_empty_row() {
+        let (c, _sid) = trimmed_clip();
+        assert!(player_clip_row(&c, true, &HashMap::new()).is_empty());
+    }
+
+    /// The whole cut, at the level that decides it. Players take mixer slots
+    /// AFTER every track's (so no track is renumbered), each owns one clock
+    /// from the reserved range, and its slot is bound to it at graph build so
+    /// a pad press is one atomic store rather than a rebuild.
+    #[test]
+    fn rebuild_gives_every_player_a_slot_a_clock_and_a_binding() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.tracks.push(test_track("t-2"));
+            s.store.players.push(test_player("p-1", "c1", false));
+            s.store.players.push(test_player("p-2", "c1", true));
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        assert_eq!(t.slots[&crate::ids::TrackId::from("t-1")], 0);
+        assert_eq!(t.slots[&crate::ids::TrackId::from("t-2")], 1);
+        assert_eq!(t.slots[&crate::ids::TrackId::from("p-1")], 2, "after every track");
+        assert_eq!(t.slots[&crate::ids::TrackId::from("p-2")], 3);
+        assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-1")], 1);
+        assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-2")], 2);
+        assert_eq!(t.clocks.clocks(), 3, "transport + two players, no scenes");
+        assert_eq!(t.clocks.clock_of(2), 1, "p-1's slot reads p-1's clock");
+        assert_eq!(t.clocks.clock_of(3), 2);
+        assert_eq!(t.clocks.clock_of(0), 0, "and a track still reads the transport");
+        assert_eq!(t.params.len(), 4, "the param table grew with them");
+    }
+
+    /// V-6, at the one place the graph's fader values are written: a raw
+    /// player's strip is unity/centre/unmuted whatever the document holds,
+    /// because that is what `From<&Player>` compiled it to.
+    #[test]
+    fn rebuild_writes_a_raw_players_fader_at_unity_whatever_the_document_says() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            let mut raw = test_player("p-raw", "c1", true);
+            raw.node.gain_db = -24.0;
+            raw.node.pan = -1.0;
+            raw.node.muted = true;
+            let mut norm = test_player("p-norm", "c1", false);
+            norm.node.gain_db = -6.0;
+            norm.node.pan = 0.5;
+            s.store.players.push(raw);
+            s.store.players.push(norm);
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let raw_slot = t.slots[&crate::ids::TrackId::from("p-raw")];
+        assert!((f32::from_bits(t.params.gain[raw_slot].load(Relaxed)) - 1.0).abs() < 1e-6);
+        assert_eq!(f32::from_bits(t.params.pan[raw_slot].load(Relaxed)), 0.0);
+        assert_eq!(
+            t.params.flags[raw_slot].load(Relaxed) & super::super::rt::FLAG_MUTE,
+            0,
+            "a stale mute does not silence a raw pad"
+        );
+
+        let norm_slot = t.slots[&crate::ids::TrackId::from("p-norm")];
+        let g = f32::from_bits(t.params.gain[norm_slot].load(Relaxed));
+        assert!((g - mixer::db_to_linear(-6.0)).abs() < 1e-4, "got {g}");
+        assert_eq!(f32::from_bits(t.params.pan[norm_slot].load(Relaxed)), 0.5);
+    }
+
+    /// A SOUNDING pad survives a rebuild, by player id — the same argument
+    /// as a sounding scene. Adding a pad ahead of one that is playing
+    /// renumbers its clock, so pairing by index would hand one pad's
+    /// playhead to another; and without carrying at all, editing anything
+    /// would rewind whatever was playing.
+    #[test]
+    fn a_rebuild_carries_a_sounding_player_by_id_not_by_index() {
+        let (mut ctl, session) = bare_control();
+        session.lock().store.players.push(test_player("p-late", "c1", true));
+        ctl.rebuild();
+
+        {
+            let t = ctl.tables.lock();
+            assert_eq!(t.player_clocks[&crate::ids::PlayerId::from("p-late")], 1);
+            t.clocks.fire(1, 0, 100_000, false);
+            t.clocks.advance(64);
+        }
+
+        session
+            .lock()
+            .store
+            .players
+            .insert(0, test_player("p-early", "c1", true));
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let moved = t.player_clocks[&crate::ids::PlayerId::from("p-late")];
+        assert_eq!(moved, 2, "renumbered by the insertion");
+        assert!(t.clocks.is_on(moved), "still sounding, at its new index");
+        assert!(!t.clocks.is_on(t.player_clocks[&crate::ids::PlayerId::from("p-early")]));
+        assert_eq!(
+            t.clocks.clock_of(t.slots[&crate::ids::TrackId::from("p-late")]),
+            moved,
+            "and its slot followed it"
+        );
+    }
+
+    /// The one that makes a player make a sound, end to end at the mixer.
+    ///
+    /// Two claims in one render, because they are the same wiring seen from
+    /// both sides:
+    ///
+    /// * V-2 — while the pad is IDLE and the transport rolls straight over
+    ///   position 0, the row is silent. Its clip sits at 0, so without the
+    ///   exclusive player range (`ClockTable::with_slots_clocks_and_players`)
+    ///   every pad's sample would sound at bar 1 of every playthrough.
+    /// * V-16 — once fired, the output IS the source's samples from the
+    ///   clip's offset, at unity. The only thing between them is the centre
+    ///   pan law every unity-gain source goes through, which is exactly what
+    ///   makes the pad the same signal as auditioning the file.
+    #[test]
+    fn a_fired_raw_player_renders_the_sources_samples_and_is_silent_until_it_is() {
+        use crate::audio::transport::LoopSpec;
+        const K: f32 = std::f32::consts::FRAC_1_SQRT_2; // centre pan
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let cache = cache_with(&sid, source.clone());
+        let row = player_clip_row(&c, true, &cache);
+
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        // What `rebuild` publishes for one player: one slot, one player
+        // clock, bound.
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert_eq!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0,
+            "V-2: the arrangement rolled over position 0 and the pad stayed silent"
+        );
+
+        g.clocks.fire(1, 0, c.length_samples, false);
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        for i in 0..64 {
+            let want = source.data[c.offset_samples as usize + i] * K;
+            assert!(
+                (out[i * 2] - want).abs() < 1e-6 && (out[i * 2 + 1] - want).abs() < 1e-6,
+                "frame {i}: got {}, want {want} (the source's own samples, at unity)",
+                out[i * 2]
+            );
+        }
+    }
+
+    /// V-2/V-15, in the LIVE graph's one timeline-shaped output.
+    /// `SharedRt::song_end` is the arrangement's boundary — it drives
+    /// stop-at-end, the export length and the ruler — and a player's clip
+    /// sits at position 0 by construction, so folding player rows into it
+    /// would let a pad's 30-second sample declare an empty song 30 seconds
+    /// long. The rows therefore have to be pushed AFTER `song_end` is taken.
+    ///
+    /// Phase 1 does not run headlessly (`self.output.is_none()`) and there is
+    /// no seam a test can wedge between the two statements, so this asserts
+    /// the SOURCE order that keeps them apart — the same device
+    /// `rebuild_takes_the_tables_lock_exactly_once` uses, and for the same
+    /// reason: reordering these two lines breaks it silently.
+    #[test]
+    fn rebuild_takes_song_end_before_it_appends_any_player_row() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/engine.rs"),
+        )
+        .expect("read engine.rs");
+        let start = src.find("    fn rebuild(&mut self) {").expect("rebuild");
+        let body = &src[start..];
+        let end = body[1..].find("\n    fn ").map_or(body.len(), |i| i + 1);
+        let body = &body[..end];
+        let song_end = body.find(".song_end").expect("rebuild stores song_end");
+        let players = body.find("for p in s.players.iter()").expect("rebuild appends player rows");
+        assert!(
+            song_end < players,
+            "the timeline boundary must be taken from the TRACK rows only: a \
+             player's clip is placed at 0, so a pad appended before this line \
+             would set the song's end from a pad's sample length"
+        );
     }
 
     /// A clock index means "the i-th Region binding in document order", so

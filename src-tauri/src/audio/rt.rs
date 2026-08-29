@@ -820,6 +820,22 @@ pub struct GraphTables {
     /// fire naming it is dropped with a warn rather than firing whichever
     /// clock happens to sit at that index.
     pub scene_clocks: HashMap<String, u32>,
+    /// `PlayerId` -> its clock in `clocks` (Plan V — V2, Task 9). The player
+    /// half of `scene_clocks`, and the same argument: firing a pad has to be
+    /// an atomic write into a lane that already exists, because a pad press
+    /// must never rebuild the graph (the RT contract).
+    ///
+    /// The clocks it names are the RESERVED range `1 ..= players.len()`,
+    /// allocated by `engine::rebuild` in document order and bound to each
+    /// player's mixer slot for the life of the graph — a player, unlike a
+    /// scene, never borrows another node's slot, so nothing ever releases it
+    /// (`ClockTable::with_slots_clocks_and_players` is what makes the idle
+    /// state silence rather than "rejoin the arrangement", V-2).
+    ///
+    /// A player added since the last rebuild is simply absent, and
+    /// `ControlPlane::player_fire` reports that rather than firing whichever
+    /// clock happens to sit at that index.
+    pub player_clocks: HashMap<crate::ids::PlayerId, u32>,
     /// The clock `engine::rebuild` minted for tracks stranded by a binding
     /// DELETED while its scene sounded (or cut with its flush still unread):
     /// stopped, owing one discontinuity, and in no `scene_clocks` map because
@@ -942,6 +958,7 @@ impl GraphTables {
                 1,
             )),
             scene_clocks: HashMap::new(),
+            player_clocks: HashMap::new(),
             orphan_clock: None,
             slots: HashMap::new(),
             send_slots: HashMap::new(),

@@ -492,6 +492,16 @@ fn node_playhead(
     if ph.on {
         return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true);
     }
+    if ph.exclusive {
+        // Plan V — V-2: a PLAYER's slot has no arrangement to rejoin. Its row
+        // carries one clip at position 0 (the ephemeral placement), so the
+        // fallback below would sound the pad's sample at bar 1 of the song
+        // for as long as the transport rolled past it. `on = false` renders
+        // it silent instead — but the discontinuity is still delivered, so a
+        // player's live node (V3's MIDI sources) gets the `all_notes_off` its
+        // clip's end owes it.
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity || discontinuity, false, true);
+    }
     (
         base_pos,
         *lp,

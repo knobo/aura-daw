@@ -50,6 +50,18 @@ pub struct Playhead {
     /// start/end govern its playback, and the arrangement's loop does not
     /// apply to it at all.
     pub is_transport: bool,
+    /// This clock's slots never fall back to the arrangement when it stops
+    /// (V-2). Only the PLAYER range sets it — see
+    /// [`ClockTable::with_slots_clocks_and_players`].
+    ///
+    /// A scene's track is a timeline track that a pad borrowed, so when the
+    /// scene ends it rejoins the song and `mixer::node_playhead` gives it
+    /// `base_pos`. A PLAYER is not in the song at all: its row's one clip
+    /// sits at position 0 (the ephemeral placement), so handing it the
+    /// transport's position would sound the pad's sample at bar 1 of the
+    /// arrangement, every time the song rolled past it. An idle player
+    /// renders nothing instead.
+    pub exclusive: bool,
 }
 
 struct ClockState {
@@ -123,6 +135,15 @@ impl ClockState {
 pub struct ClockTable {
     clocks: Vec<ClockState>,
     slot_clock: Vec<AtomicU32>,
+    /// How many clocks after [`TRANSPORT_CLOCK`] belong to PLAYERS, i.e. the
+    /// size of the reserved range `1 ..= n_player_clocks` (`engine::rebuild`
+    /// allocates it; scenes start above it). Immutable after construction,
+    /// so reading it costs an integer compare and no atomic.
+    ///
+    /// It exists because [`Playhead::exclusive`] has to be answerable on the
+    /// audio thread from the clock index alone — the table is the only thing
+    /// the RT side holds that knows which clock a slot reads.
+    n_player_clocks: u32,
     /// The `GraphTables::generation` of the table `carry_over` read from,
     /// or [`NO_GENERATION`]. [`ClockTable::reconcile_adoption`] refuses to
     /// run unless the graph being retired is that exact table: graphs are
@@ -145,11 +166,33 @@ impl ClockTable {
     /// A table for `n_slots` mixer slots and `n_clocks` clocks (at least
     /// one, which is the transport's). Every slot starts on the transport.
     pub fn with_slots_and_clocks(n_slots: usize, n_clocks: usize) -> Self {
+        Self::with_slots_clocks_and_players(n_slots, n_clocks, 0)
+    }
+
+    /// [`ClockTable::with_slots_and_clocks`] plus the size of the reserved
+    /// PLAYER range: clocks `1 ..= n_players` are players', and their slots
+    /// report [`Playhead::exclusive`]. Clamped to what actually exists, so a
+    /// caller cannot mark clocks the table does not have.
+    pub fn with_slots_clocks_and_players(
+        n_slots: usize,
+        n_clocks: usize,
+        n_players: usize,
+    ) -> Self {
+        let clocks: Vec<ClockState> = (0..n_clocks.max(1)).map(|_| ClockState::idle()).collect();
+        let n_player_clocks = n_players.min(clocks.len().saturating_sub(1)) as u32;
         Self {
-            clocks: (0..n_clocks.max(1)).map(|_| ClockState::idle()).collect(),
+            clocks,
             slot_clock: (0..n_slots).map(|_| AtomicU32::new(TRANSPORT_CLOCK)).collect(),
+            n_player_clocks,
             carry_generation: AtomicU64::new(NO_GENERATION),
         }
+    }
+
+    /// Is `clock` in the reserved player range? The RT-side half of V-2 —
+    /// see [`Playhead::exclusive`].
+    #[inline]
+    pub fn is_player_clock(&self, clock: u32) -> bool {
+        clock != TRANSPORT_CLOCK && clock <= self.n_player_clocks
     }
 
     pub fn clocks(&self) -> usize {
@@ -468,15 +511,33 @@ impl ClockTable {
     #[inline]
     pub fn playhead(&self, slot: usize, base_pos: u64, disc: bool) -> Playhead {
         if slot >= self.slot_clock.len() {
-            return Playhead { pos: base_pos, discontinuity: disc, on: false, is_transport: true };
+            return Playhead {
+                pos: base_pos,
+                discontinuity: disc,
+                on: false,
+                is_transport: true,
+                exclusive: false,
+            };
         }
         let idx = self.clock_of(slot);
         let Some(c) = self.clocks.get(idx as usize) else {
-            return Playhead { pos: base_pos, discontinuity: disc, on: false, is_transport: true };
+            return Playhead {
+                pos: base_pos,
+                discontinuity: disc,
+                on: false,
+                is_transport: true,
+                exclusive: false,
+            };
         };
         let on = c.on.load(Relaxed);
         if idx == TRANSPORT_CLOCK {
-            return Playhead { pos: base_pos, discontinuity: disc, on, is_transport: true };
+            return Playhead {
+                pos: base_pos,
+                discontinuity: disc,
+                on,
+                is_transport: true,
+                exclusive: false,
+            };
         }
         Playhead {
             pos: c.pos.load(Relaxed),
@@ -485,6 +546,9 @@ impl ClockTable {
             discontinuity: c.block_disc.load(Relaxed),
             on,
             is_transport: false,
+            // An integer compare against a field fixed at construction: no
+            // atomic, no branch on shared state (V-2, see `Playhead`).
+            exclusive: idx <= self.n_player_clocks,
         }
     }
 
@@ -987,6 +1051,72 @@ mod tests {
         assert!(!t.release_slot_if(99, 1));
         let ph = t.playhead(99, 1_234, false);
         assert!(!ph.on, "a slot outside the table renders nothing");
+    }
+
+    /// V-2, the RT half. A player's slot is bound to its clock for the
+    /// LIFE of the graph — nothing releases it, unlike a scene's — so the
+    /// idle state has to be silence, not "rejoin the arrangement". Were it
+    /// the latter, `mixer::node_playhead` would hand the player's row the
+    /// transport's position and its one clip (placed at 0) would sound at
+    /// bar 1 of every playthrough.
+    #[test]
+    fn an_idle_player_clock_is_exclusive_so_its_slot_never_rejoins_the_transport() {
+        let t = ClockTable::with_slots_clocks_and_players(4, 3, 1);
+        t.set_transport_playing(true);
+        t.bind_slot(1, 1); // the player's slot, bound at graph build
+        t.bind_slot(2, 2); // a scene's track, borrowed from the timeline
+
+        let player = t.playhead(1, 5_000, false);
+        assert!(!player.on, "idle");
+        assert!(player.exclusive, "and it has no arrangement to fall back to");
+
+        let scene = t.playhead(2, 5_000, false);
+        assert!(
+            !scene.exclusive,
+            "a scene's track IS a timeline track and does rejoin the song"
+        );
+    }
+
+    /// The range is `1 ..= n_players`, and clock 0 is never in it whatever
+    /// the caller passes — the transport is the arrangement.
+    #[test]
+    fn the_player_range_starts_at_one_and_excludes_the_transport() {
+        let t = ClockTable::with_slots_clocks_and_players(2, 4, 2);
+        assert!(!t.is_player_clock(TRANSPORT_CLOCK));
+        assert!(t.is_player_clock(1));
+        assert!(t.is_player_clock(2));
+        assert!(!t.is_player_clock(3), "scenes start above the reserved range");
+        assert!(
+            !t.playhead(0, 9, false).exclusive,
+            "a slot on the transport is the arrangement itself"
+        );
+    }
+
+    /// A firing player clock behaves exactly like any other non-transport
+    /// clock — `exclusive` only decides what happens when it is OFF.
+    #[test]
+    fn a_running_player_clock_plays_from_its_own_position() {
+        let t = ClockTable::with_slots_clocks_and_players(4, 3, 1);
+        t.set_transport_playing(true);
+        t.bind_slot(1, 1);
+        t.fire(1, 0, 1_000, false);
+        t.begin_block();
+        let ph = t.playhead(1, 5_000, false);
+        assert!(ph.on);
+        assert_eq!(ph.pos, 0, "its own playhead, not the transport's 5000");
+        assert!(ph.discontinuity, "the press is a jump");
+    }
+
+    /// The clamp: a caller cannot reserve clocks the table does not have,
+    /// or every index would answer `exclusive` and no scene would ever
+    /// rejoin the arrangement.
+    #[test]
+    fn the_reserved_player_range_is_clamped_to_the_clocks_that_exist() {
+        let t = ClockTable::with_slots_clocks_and_players(2, 2, 9);
+        assert!(t.is_player_clock(1));
+        assert!(!t.is_player_clock(2), "clock 2 does not exist");
+        let d = ClockTable::default();
+        assert!(!d.is_player_clock(1), "a transport-only table reserves nothing");
     }
 
     /// What the offline bounce builds: no non-transport clocks at all.

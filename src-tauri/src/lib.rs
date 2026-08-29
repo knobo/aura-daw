@@ -322,6 +322,12 @@ pub fn run() {
             midi::launch::launch_stop,
             midi::launch::launch_learn_arm,
             midi::launch::launch_learn_take,
+            // ---- Plan V — V2: players (a pad that is an instrument) ----
+            control::players_get,
+            control::player_add,
+            control::player_remove,
+            control::player_fire,
+            control::player_stop,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,

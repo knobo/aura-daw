@@ -1,6 +1,6 @@
 //! `MixNode`: the audio graph compiler's one input type (V-3).
 //!
-//! Tracks, buses and (a future cut's) players all compile to a `MixNode`.
+//! Tracks, buses and players all compile to a `MixNode`.
 //! Compiler code (`bus::compile_routing`, `insert::compile_inserts`) is
 //! written against `&[MixNode]` and never learns a new producer exists —
 //! that is the point of this indirection: V-2 rules a player OUT of the
@@ -23,10 +23,10 @@ use crate::ids::TrackId;
 /// [`mix_nodes`] can be TOTAL over a document's tracks — an automation
 /// track drives bindings, not audio, and is filtered out downstream via
 /// [`MixNode::takes_mixer_slot`] exactly as `types::is_mixer_track` filters
-/// it today. A future `Player` producer (V2) adds a fourth kind; that is
-/// also why [`MixNode::id`] is the node's own identity rather than "the
-/// track's id" — a player's `MixNode` will not have a `TrackState` behind
-/// it at all.
+/// it today. [`MixNodeKind::Player`] is the fourth kind — implemented in
+/// this file (`From<&Player> for MixNode`, Plan V — V2), not pending. That
+/// is also why [`MixNode::id`] is the node's own identity rather than "the
+/// track's id": a player's `MixNode` has no `TrackState` behind it at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MixNodeKind {
     /// Everything that is not a bus and not an automation track — the
