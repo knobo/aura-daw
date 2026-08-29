@@ -2616,7 +2616,8 @@ mod tests {
         g.clocks = Arc::new(clocks);
         assert!(
             g.tracks[0].tail_frames >= crate::audio::rt::live_tail_frames(RATE),
-            "premise: a live row does carry a window now — without one this              test would pass for want of a tail rather than for the gate"
+            "premise: a live row does carry a window now — without one this \
+             test would pass for want of a tail rather than for the gate"
         );
 
         let mut out = vec![0.0f32; 128 * 2];
@@ -2626,8 +2627,9 @@ mod tests {
         }
         assert!(peak(&out) > 0.0, "the sustained note has to sound while the transport rolls");
 
-        // Well past the window: at 128 frames a block, 8 blocks is 1024 and
-        // the window is at least 4096, so every one of these is inside it.
+        // Every one of these blocks is INSIDE the window — 8 x 128 frames
+        // against a window of at least 4096 — which is where a wrongly
+        // opened fader would sound.
         g.clocks.set_transport_playing(false);
         for i in 0..8 {
             out.fill(0.0);
