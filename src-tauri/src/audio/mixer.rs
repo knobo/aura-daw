@@ -369,30 +369,69 @@ fn prime_live(tr: &RtTrack, discontinuity: bool, live_in_events: &[LiveMidiEvent
     }
 }
 
+/// What one run of the strip is, for the live node that renders into it. A
+/// callback block is split into runs by the loop wrap and by
+/// `MAX_LIVE_BLOCK`, so `pos`, `run` and `discontinuity` all vary WITHIN a
+/// block; `flushing` is a property of the row and does not.
+#[derive(Clone, Copy)]
+struct LiveRun {
+    /// Absolute engine position of the run's first frame.
+    pos: u64,
+    /// Frames in the run.
+    run: usize,
+    /// The playhead jumped into `pos` (seek, loop wrap, launch).
+    discontinuity: bool,
+    /// The row is draining its tail after its clock stopped, so it has
+    /// stopped being FED — see below.
+    flushing: bool,
+}
+
 /// ADD one run of the track's live instrument into `buf` (already holding
 /// the clip sum). No gain/pan — the shared fader runs after inserts.
+///
+/// `flushing` splits the two halves of this function, and they answer to
+/// different rules. A flushing row has stopped being FED but has not stopped
+/// SOUNDING (V-17 (b)), so:
+///
+/// * The event queue is FEEDING, exactly as the clip read is, and is skipped.
+///   A flushing row's `pos` is frozen, so an event inside `[pos, pos + run)`
+///   would be re-queued once per flush block — a MIDI pad whose clock stops
+///   with a note-on at the frozen position would re-trigger that note
+///   `ceil(tail_frames / block)` times. That is the same shape as fix round
+///   1's re-read clip fragment, through the other source.
+/// * `node.process` is NOT skipped: the node's own pipeline is part of what
+///   the flush window exists to drain. Skipping it wholesale would truncate a
+///   synth's release and replay it at the next press's onset — the very
+///   defect the window was added to fix.
+///
+/// `set_block_context` still runs, and it gets the FROZEN `pos`, because that
+/// is where the row's playhead honestly is: it is the automation seam's
+/// "absolute base position of this run", and an off clock does not advance.
+/// Feeding it a fabricated advancing position would walk the node's ramp
+/// cursors across material nobody is playing.
 fn render_live_into(
     tr: &RtTrack,
     buf: &mut [f32],
-    pos: u64,
-    run: usize,
+    r: LiveRun,
     sample_rate: u32,
-    discontinuity: bool,
     steady_base: Option<u64>,
 ) {
     let Some(live) = &tr.live else { return };
     // SAFETY: RCU discipline — exactly one graph snapshot is rendered at a
     // time, on this (the only RT) thread; see `LiveNodeCell`.
     let node = unsafe { live.node.rt_mut() };
-    let end = pos + run as u64;
-    let evs = &live.events[..];
-    let lo = evs.partition_point(|e| e.sample < pos);
-    for e in evs[lo..].iter().take_while(|e| e.sample < end) {
-        node.queue_event(BlockNoteEvent {
-            offset: (e.sample - pos) as u32,
-            key: e.key,
-            velocity: e.velocity,
-        });
+    let LiveRun { pos, run, discontinuity, flushing } = r;
+    if !flushing {
+        let end = pos + run as u64;
+        let evs = &live.events[..];
+        let lo = evs.partition_point(|e| e.sample < pos);
+        for e in evs[lo..].iter().take_while(|e| e.sample < end) {
+            node.queue_event(BlockNoteEvent {
+                offset: (e.sample - pos) as u32,
+                key: e.key,
+                velocity: e.velocity,
+            });
+        }
     }
     // Automation seam (ARCHITECTURE §15.1): the run's absolute base
     // position + discontinuity reach the node BEFORE it processes, so
@@ -771,6 +810,20 @@ fn render_impl(
             if tr.slot >= n_slots {
                 continue;
             }
+            // `RtGraph::with_buses`'s funnel holds only if nothing adds a
+            // line to a row AFTER the graph is built. Production never
+            // does; test rigs do (assigning `pdc` or pushing an insert onto
+            // an already-built graph), and such a row would silently keep
+            // `tail_frames = 0` — a flush window of nothing, which is the
+            // very defect fix round 3 closed. Debug-only, and an internal
+            // invariant rather than data arriving from outside.
+            debug_assert_eq!(
+                tr.tail_frames,
+                tr.computed_tail_frames(),
+                "row {} carries lines its tail_frames does not know about — \
+                 call RtTrack::recompute_tail_frames after changing them",
+                tr.slot
+            );
             let (track_base, track_lp, _, clock_on, own_clock, exclusive_idle) =
                 node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
             // Plan V — V-2, the cost half (fix round 1, finding 1). An
@@ -811,11 +864,17 @@ fn render_impl(
             // still inside the plugin).
             //
             // So while `flush_left` is non-zero the ORDINARY strip runs, with
-            // two differences below: the clip read is skipped (an off clock
-            // does not advance, so reading clips would re-read the head of
-            // the sample forever — fix round 1's defect), and the fader's
-            // gate is the tail rather than the clock. Mute and solo still
-            // apply; a muted pad's tail stays muted.
+            // two differences below, and the first of them is one rule rather
+            // than one line: the row stops being FED. An off clock does not
+            // advance, so every SOURCE reading the frozen position would
+            // repeat itself once per flush block — the clip read re-reading
+            // the same fragment (fix round 1's defect), and
+            // `render_live_into` re-queueing every scheduled event inside the
+            // frozen window (see there). What the row already HOLDS is not a
+            // source and keeps running: the insert chain, the delay lines,
+            // and the live node's own `process`. The second difference is
+            // that the fader's gate is the tail rather than the clock. Mute
+            // and solo still apply; a muted pad's tail stays muted.
             //
             // Only when the tail is out does the row take the BARE skip —
             // which is what every raw pad takes on every block (V-6 leaves it
@@ -920,7 +979,8 @@ fn render_impl(
                         buf[i * 2 + 1] = r;
                     }
                 }
-                render_live_into(tr, buf, pos, run, sample_rate, run_disc, steady_base);
+                let live_run = LiveRun { pos, run, discontinuity: run_disc, flushing };
+                render_live_into(tr, buf, live_run, sample_rate, steady_base);
                 process_inserts(tr, buf, sample_rate, steady_base);
                 // PRE-fader taps leave here: post-insert, source-aligned by
                 // `RtTrack::pdc`, before the fader and before `out_pdc`.
@@ -1519,6 +1579,11 @@ mod tests {
             latency,
             proc: InsertNodeCell::new(node),
         });
+        // This helper adds a line to a row that is already built, which
+        // production never does — `RtGraph::with_buses` is the funnel. The
+        // row's flush window has to follow, or `render_impl`'s
+        // `debug_assert` catches the rig rather than the code.
+        tr.recompute_tail_frames();
     }
 
     #[test]
@@ -1594,6 +1659,9 @@ mod tests {
         insert_on(&mut g, 0, Box::new(dummy), false);
         g.tracks[0].pdc = None; // wet path: plugin supplies the 256
         g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        for tr in g.tracks.iter_mut() {
+            tr.recompute_tail_frames();
+        }
         let mut out = vec![0.0f32; 512 * 2];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();
@@ -1629,6 +1697,9 @@ mod tests {
         // (A's plugin does not delay; A's DelayLine does).
         g.tracks[0].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
         g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
+        for tr in g.tracks.iter_mut() {
+            tr.recompute_tail_frames();
+        }
         let mut out = vec![0.0f32; 512 * 2];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
         let left: Vec<f32> = out.iter().step_by(2).copied().collect();

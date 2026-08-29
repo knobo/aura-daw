@@ -203,6 +203,22 @@ session burns an hour on something a sentence would have prevented.
   under `xvfb-run` all five zyn tests run and pass; with no display they
   pass while printing "skipping: no display".
 
+- **A pad's flush window does NOT survive a graph rebuild.** A player
+  row that has stopped being triggered keeps running its whole strip for
+  `RtTrack::tail_frames` so its tail leaves the row (V-17 (b)) — but
+  `flush_left` is a field on `RtTrack`, `RtTrack::clips` sets it to 0 and
+  `RtGraph::with_buses` does not seed it, while the insert NODES
+  themselves are reused across rebuilds by `LiveNodeRegistry` precisely
+  so plugin state survives. So a rebuild landing INSIDE a pad's flush
+  window strands whatever is still in that plugin pipeline, and the next
+  press replays it at its onset. The window is a few milliseconds wide
+  and this is no worse than the behaviour before the window existed, so
+  it is not a regression and was deliberately left alone — but it is the
+  one remaining hole in "nothing on this row is skipped until its whole
+  tail has left it". If you hear a pad's previous hit at the start of the
+  next one, check whether a rebuild happened in between before you go
+  looking at the mixer.
+
 - **A parallel `cargo test --lib` can SIGSEGV**, not merely flake. Single
   threaded it passes 1407/1407. If a full run dies with `signal: 11`, you
   have not broken anything — see

@@ -5918,10 +5918,18 @@ mod tests {
     /// sample of a press is still inside the chain by the time the clock
     /// stops, which is the whole point of the scenario.
     fn latency_chain_pad(latency: usize) -> (RtGraph, u64) {
+        latency_chain_pad_len(latency, 100)
+    }
+
+    /// [`latency_chain_pad`] with the clip's length under the caller's
+    /// control, so a press can be cut MID-clip and compared against one that
+    /// is only that long and ends by itself.
+    fn latency_chain_pad_len(latency: usize, clip_len: u64) -> (RtGraph, u64) {
         use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
         use crate::audio::dsp::AudioProcessor;
 
-        let (c, sid) = trimmed_clip();
+        let (mut c, sid) = trimmed_clip();
+        c.length_samples = clip_len;
         let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
         let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
         for slot in 0..2 {
@@ -5984,6 +5992,176 @@ mod tests {
         assert_eq!(second, first, "the second press replays the first's tail");
     }
 
+    /// Fix round 4, item 1. The flush strip suppresses the clip read
+    /// (`!flushing`), and until now nothing distinguished that from the
+    /// ordinary strip: both round-3 rigs let the clip run to its NATURAL
+    /// end, where the frozen position is already past `length_samples` and
+    /// `clip_sample` returns zeros whether the read runs or not.
+    ///
+    /// Stopping MID-clip is the case that bites. Escape → `stopAllSound` →
+    /// `ClockTable::stop` freezes the clock INSIDE the clip, so a flush block
+    /// that still read clips would re-read the same fragment every block,
+    /// through the chain and out the fader — fix round 1's defect, bounded to
+    /// `tail_frames`.
+    ///
+    /// The invariant is conservation: a pad cut after one block delivers the
+    /// frames of that block and nothing else — exactly what a clip only that
+    /// long, ending by itself, delivers.
+    ///
+    /// Two presses, because one cannot see it. `tail_frames` is the row's
+    /// whole path latency, so material entering the chain at the START of the
+    /// flush leaves exactly as the window CLOSES: a re-read fragment is
+    /// stranded in the chain for the rest of the press and surfaces at the
+    /// onset of the next one, which is the audible half of the same defect.
+    #[test]
+    fn a_pad_stopped_mid_clip_delivers_only_the_frames_it_read() {
+        use crate::audio::transport::LoopSpec;
+        const FRAMES: usize = 64;
+
+        let energy = |clip_len: u64, cut: bool| -> f64 {
+            let (mut g, len) = latency_chain_pad_len(256, clip_len);
+            let mut out = vec![0.0f32; FRAMES * 2];
+            let mut sum = 0.0f64;
+            for _press in 0..2 {
+                g.clocks.fire(1, 0, len, false);
+                for b in 0..10 {
+                    out.fill(0.0);
+                    mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+                    g.clocks.advance(FRAMES as u64);
+                    if cut && b == 0 {
+                        g.clocks.stop(1);
+                    }
+                    sum += out.iter().map(|s| (*s as f64).abs()).sum::<f64>();
+                }
+            }
+            sum
+        };
+        let stopped = energy(100, true);
+        let whole = energy(FRAMES as u64, false);
+        assert!(whole > 0.0, "the rig has to deliver something at all");
+        assert!(
+            (stopped - whole).abs() < 1e-6,
+            "a pad cut after one block delivered {stopped} where the frames it \
+             actually read are worth {whole}: the frozen fragment was re-read \
+             on every block of the flush window"
+        );
+    }
+
+    /// Fix round 4, item 2. `render_live_into` queues every scheduled event
+    /// inside `[pos, pos + run)` before the node processes. A flushing row's
+    /// `pos` is FROZEN, so without a gate an event inside the frozen window is
+    /// re-queued once per flush block: a MIDI pad whose clock stops with a
+    /// note-on under it re-triggers that note `ceil(tail_frames / block)`
+    /// times.
+    ///
+    /// The stop lands between the render and the `advance` — which is when a
+    /// control-thread `stopAllSound` naturally lands, and `advance` skips a
+    /// clock it finds already off. The position therefore freezes on the
+    /// window the row has just played, and the flush replays exactly the
+    /// events that window already delivered.
+    ///
+    /// The graph COMPILER cannot build this row yet: `mix_nodes` gives a
+    /// player slot no live node (`_ => Vec::new()`), and task 10 — "MIDI
+    /// players with an instrument no track owns" — is what makes it reachable.
+    /// The RT half is real today, so it is pinned here rather than left to be
+    /// discovered by the next task.
+    #[test]
+    fn a_flushing_row_does_not_re_queue_the_events_under_its_frozen_playhead() {
+        use crate::audio::dsp::{AudioProcessor, LiveInstrument, ProcessBlock};
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::rt::{LiveNodeCell, LiveSource};
+        use crate::audio::transport::LoopSpec;
+        use crate::midi::schedule::AbsNoteEvent;
+        use crate::midi::synth::BlockNoteEvent;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct EventCounter {
+            queued: Arc<AtomicUsize>,
+            processed: Arc<AtomicUsize>,
+        }
+        impl AudioProcessor for EventCounter {
+            fn prepare(&mut self, _sample_rate: u32, _max_block: usize) {}
+            fn process(&mut self, _io: &mut ProcessBlock<'_>) {
+                self.processed.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+            fn reset(&mut self) {}
+        }
+        impl LiveInstrument for EventCounter {
+            fn queue_event(&mut self, _ev: BlockNoteEvent) -> bool {
+                self.queued.fetch_add(1, AtomicOrdering::Relaxed);
+                true
+            }
+            fn all_notes_off(&mut self) {}
+        }
+
+        const FRAMES: usize = 64;
+        let queued = Arc::new(AtomicUsize::new(0));
+        let processed = Arc::new(AtomicUsize::new(0));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        let mut dummy = LatencyDummy::new(256);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(1, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(EventCounter {
+                queued: queued.clone(),
+                processed: processed.clone(),
+            })),
+            events: Arc::new(vec![AbsNoteEvent { sample: 32, key: 60, velocity: 100, channel: 0 }]),
+        });
+        // A tail, so the row actually flushes rather than taking the bare skip.
+        pad.inserts = vec![InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency: 256,
+            proc: InsertNodeCell::new(Box::new(dummy)),
+        }];
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, Vec::new()), pad], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        assert_eq!(g.tracks[1].tail_frames, 256, "the row has to have a tail");
+
+        let mut out = vec![0.0f32; FRAMES * 2];
+        g.clocks.fire(1, 0, 10_000, false);
+        for b in 0..6 {
+            out.fill(0.0);
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            if b == 0 {
+                assert_eq!(
+                    queued.load(AtomicOrdering::Relaxed),
+                    1,
+                    "the note under the live block has to be delivered once"
+                );
+                g.clocks.stop(1);
+            }
+            g.clocks.advance(FRAMES as u64);
+        }
+        assert_eq!(
+            queued.load(AtomicOrdering::Relaxed),
+            1,
+            "the flush drains what the row HOLDS; it must not re-feed it the \
+             note its frozen playhead is still sitting on"
+        );
+        // The other half of the same split, and the reason the gate is on the
+        // event queue rather than on `render_live_into` as a whole: the node's
+        // own pipeline is part of what the window drains, so it keeps
+        // processing for the live block plus the four blocks of the 256-frame
+        // window, and stops only when the row takes the bare skip.
+        assert_eq!(
+            processed.load(AtomicOrdering::Relaxed),
+            5,
+            "the live node must keep PROCESSING through the flush window — \
+             skipping it would truncate its tail and replay it at the next \
+             press, which is the defect the window exists to fix"
+        );
+    }
+
     /// The flush window belongs to a PAD whose trigger ended, and to nothing
     /// else. An ordinary timeline track on a stopped transport also has its
     /// clock off — but nothing has stopped feeding it: its clip read still
@@ -6038,6 +6216,37 @@ mod tests {
         let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
         let g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
         assert_eq!(g.tracks[0].tail_frames, 0);
+    }
+
+    /// Fix round 4, items 3 and 4. `tail_frames` follows the STRIP. Inserts
+    /// and `pdc` are in series with everything after them, so they add; the
+    /// send taps leave BEFORE `out_pdc.process`, so `out_pdc` and the send
+    /// delays are parallel branches off the same point and the worst path is
+    /// the longer of the two.
+    ///
+    /// The `pdc` term is otherwise unreachable — V-17 forces `track_pdc` to 0
+    /// for a player, and only player rows flush — so it is set here directly,
+    /// the way `out_pdc_pad` sets `out_pdc`.
+    #[test]
+    fn a_rows_tail_is_its_series_lines_plus_the_longer_parallel_branch() {
+        use crate::audio::pdc::DelayLine;
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 1));
+        let mut tr = RtTrack::clips(0, Vec::new());
+        tr.pdc = Some(DelayLine::new(32, 64, 2));
+        tr.out_pdc = Some(DelayLine::new(64, 64, 2));
+        tr.sends = vec![crate::audio::rt::RtSend {
+            bus: 0,
+            amount: 0,
+            pre_fader: true,
+            delay: Some(DelayLine::new(128, 64, 2)),
+        }];
+        let g = RtGraph::new(vec![tr], 1, params);
+        assert_eq!(
+            g.tracks[0].tail_frames,
+            32 + 128,
+            "the source-alignment line is in series; the dry compensation and \
+             the send edge are not in series with each other"
+        );
     }
 
     /// Fix round 2 gave a bus-routed pad an `out_pdc` line (V-17), and fix

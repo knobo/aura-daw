@@ -20,7 +20,7 @@ The working copies live in `.superpowers/sdd/2026-08-28-plan-v2-players/`,
 which is **git-ignored**. The four committed files above are the copies that
 survive; keep syncing them.
 
-## State: 9 of 15 tasks, task 9 in fix round 4 of 5
+## State: 9 of 15 tasks, task 9 fix round 4 committed
 
 | # | Task | State | Commits |
 |---|---|---|---|
@@ -32,7 +32,7 @@ survive; keep syncing them.
 | 6 | The clock table | done | `f4e171b`, `9a75eb3` |
 | 7 | Mixer reads clocks; overlay deleted | done | `d188210`, `5c7ef0a` |
 | 8 | Per-scene clocks; no transport hijack | done | `2115f73`, `2cf1597`, `d62ee5f` |
-| 9 | Audio-clip players in the live graph | **fix round 4 in flight** | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58` |
+| 9 | Audio-clip players in the live graph | **fix round 4 done, round 5 (review) owed** | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58`, round 4 |
 | 10 | MIDI players with their own instrument | not started | |
 | 11 | Trigger modes | not started | |
 | 12 | Migrating launch bindings | not started | |
@@ -40,11 +40,22 @@ survive; keep syncing them.
 | 14 | The performance gate | not started | |
 | 15 | Docs + release the claim | not started | |
 
-Suite at `bf0cb58`: `cargo test --lib -- --test-threads=1` 1524 passed / 0
-failed / 3 ignored. Clippy `--all-targets` unmoved for the whole branch
-(quote the per-target split, not a total — the carried figure "130" has
-accounting nobody has reproduced). Perf `--budget 525`: OK 377.1 µs cold.
-`idle_players_block_cost` (release, `#[ignore]`d): 1.89 µs for 32 idle pads.
+Suite after fix round 4: `cargo test --lib -- --test-threads=1` 1527 passed
+/ 0 failed / 3 ignored (1524 at `bf0cb58`, plus round 4's three). Clippy
+`--all-targets` unmoved for the whole branch — the per-target split, which is
+the only figure anyone has reproduced, is lib **68**, lib test **122** (66
+duplicates), `channel_properties` **1**, `journal_replay` **1**; identical on
+the branch and on the base measured in the same sitting. (The carried total
+"130" has accounting nobody has reproduced. Ignore it.)
+
+**Both perf numbers need their null control in the same sitting, and round 4
+is the proof.** Perf `--budget 525`: OK **434.0** µs on the branch against
+**422.6** µs on the base, same sitting, cold, harness spread 5–7% — the
+carried 377.1 µs was another sitting and comparing against it would have read
+as a 15% regression. `idle_players_block_cost` (release, `#[ignore]`d):
+**2.27** µs on the branch against **2.22** µs on the base, same sitting —
+where the carried figure is 1.89 µs. Unmoved in both cases; the absolute
+numbers are not portable between sittings.
 
 **Always use `--test-threads=1`.** The parallel run SIGSEGVs in
 `midi_out::tests` — a pre-existing project crash,
@@ -53,16 +64,21 @@ this branch's.
 
 ## Pick up here
 
-**If fix round 4 is still uncommitted**, its brief is
-[`…-BRIEFS/task-9-fix-4-brief.md`](2026-08-28-plan-v2-players-BRIEFS/task-9-fix-4-brief.md):
-seven items, no Critical. Two Important — the `!flushing` clip-read
-suppression at `mixer.rs:909` is entirely untested (the reviewer deleted it
-and 1524/0 still passed), and `render_live_into` is not suppressed during the
-flush, which is unreachable today but goes live the moment task 10 gives a
-player row a live node.
+**Fix round 4 is committed.** All seven items landed: the `!flushing` clip
+read is pinned by a conservation test that stops the pad MID-clip;
+`render_live_into` now gates only its EVENT QUEUE on the flush and keeps
+calling `node.process`, pinned both ways by
+`a_flushing_row_does_not_re_queue_the_events_under_its_frozen_playhead`;
+`tail_frames` maxes `out_pdc` against the send edges instead of summing them
+(they are parallel branches off one tap point) and its `pdc` term is pinned;
+`mixer::render_impl` now `debug_assert`s each row's `tail_frames` against a
+recompute, which caught two real test rigs immediately; and `flush_left` not
+surviving a graph rebuild is written up in `docs/TRAPS.md` rather than fixed.
 
-**If it is committed**, review it (opus — see the model policy below), then
-run tasks 10–15 in order. Their briefs are pre-extracted in `…-BRIEFS/`.
+Next: review it (opus — see the model policy below), then run tasks 10–15 in
+order. Their briefs are pre-extracted in `…-BRIEFS/`. Task 10 is the one that
+makes round 4's item 2 reachable: it gives a player row a live node, which
+`mix_nodes` cannot build today (`_ => Vec::new()`).
 
 ## Model policy (owner's, 2026-08-29)
 
@@ -128,8 +144,10 @@ and V-15 excludes players from it.
   one); a note that the six `launch.rs` tests share the process-global
   `LaunchRuntime` ledger and are correct only under `--test-threads=1`; the
   blocks-rendered counter deferred from task 8 (`flush_pending_for` proves a
-  block *began*, not that a node *read*); and `flush_left` not surviving a
-  graph rebuild while `LiveNodeRegistry` reuses the insert nodes.
+  block *began*, not that a node *read*). `flush_left` not surviving a graph
+  rebuild while `LiveNodeRegistry` reuses the insert nodes is now written up
+  in [`docs/TRAPS.md`](../../TRAPS.md) §Audio engine and needs no further
+  handling here.
 - **Two pre-existing defects found but not fixed**, both for the final review:
   `TransportAction::Stop` releases slots in the same breath as the stop,
   dropping the flush frame; and `stop_drive_launch` lets a stale
@@ -151,3 +169,10 @@ and V-15 excludes players from it.
 - Where a RED is impossible (a regression test for code already right),
   mutate the production line the test covers, show it failing, and revert.
   That is the standard on this branch now.
+- **A conservation test over ONE press cannot see a flush-time source
+  read.** `tail_frames` IS the row's whole path latency, so anything that
+  enters the strip at the start of the flush leaves exactly as the window
+  closes — a re-read fragment is stranded for the rest of that press and
+  surfaces only at the onset of the NEXT one. Fix round 4's brief asked for
+  a single-press energy assertion; it would have passed against the deleted
+  gate. Two presses is the shortest thing that bites.

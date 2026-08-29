@@ -561,10 +561,30 @@ impl RtTrack {
     }
 
     /// Re-derive [`Self::tail_frames`] from the row as it now stands.
-    /// CONTROL THREAD, before publication. Adding, not maxing: the number
-    /// bounds a flush window, and over-running it by a few blocks of
-    /// silence costs nothing while under-running it truncates audio.
+    /// CONTROL THREAD, before publication.
+    ///
+    /// The arithmetic follows the STRIP, which is inserts → `pdc` →
+    /// pre-fader taps → fader → post-fader taps → `out_pdc` → `route_out`
+    /// (`mixer::render_impl`). Inserts and `pdc` are in series with
+    /// everything after them, so they add. The send taps are taken from the
+    /// strip BEFORE `out_pdc.process`, so `out_pdc` and the send delays are
+    /// PARALLEL branches out of the same point: the worst path through the
+    /// row is the longer of the two, not their sum.
+    ///
+    /// Over-counting never truncates, but it is not free either. V-17 makes
+    /// a bus-routed pad's `out_pdc` and its send edge into that same bus
+    /// EQUAL, so summing them would double the window — and the window is
+    /// blocks of FULL-STRIP processing, inserts included, after every
+    /// release. With one linear-phase EQ in that bus that is ~4096 extra
+    /// frames, 85 ms, of it.
     pub fn recompute_tail_frames(&mut self) {
+        self.tail_frames = self.computed_tail_frames();
+    }
+
+    /// What [`Self::tail_frames`] would be for the row as it now stands.
+    /// Split out so `mixer::render_impl` can `debug_assert` the stored value
+    /// against it — see the funnel note on [`RtGraph::with_buses`].
+    pub fn computed_tail_frames(&self) -> usize {
         let inserts: usize = self
             .inserts
             .iter()
@@ -578,7 +598,7 @@ impl RtTrack {
             .map(|s| line(&s.delay))
             .max()
             .unwrap_or(0);
-        self.tail_frames = inserts + line(&self.pdc) + line(&self.out_pdc) + sends;
+        inserts + line(&self.pdc) + line(&self.out_pdc).max(sends)
     }
 }
 
@@ -741,8 +761,16 @@ impl RtGraph {
     ) -> Self {
         // The one place every graph — engine rebuild, offline bounce, every
         // test rig — passes through, so a row's flush window is derived from
-        // the lines it actually carries and cannot fall out of step with
-        // them.
+        // the lines it actually carries.
+        //
+        // The funnel only covers what the row carries WHEN IT IS BUILT.
+        // Production never adds a line afterwards; test rigs do, and such a
+        // row would keep `tail_frames = 0` — a flush window of nothing,
+        // which is exactly the defect fix round 3 closed, arriving silently
+        // through a rig instead of through the code. `mixer::render_impl`
+        // therefore `debug_assert`s the stored value against
+        // `RtTrack::computed_tail_frames` on every row it renders, so the
+        // convention is checked rather than merely documented.
         let mut tracks = tracks;
         for tr in tracks.iter_mut() {
             tr.recompute_tail_frames();
