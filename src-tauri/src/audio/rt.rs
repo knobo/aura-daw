@@ -542,6 +542,43 @@ pub struct RtTrack {
     pub win: TrackWindow,
 }
 
+/// The flush window a row carrying a LIVE NODE gets at minimum, in FRAMES
+/// (Plan V — V2, Task 10, fix round 2).
+///
+/// Every other term in [`RtTrack::computed_tail_frames`] is a line the row
+/// can be asked how long it is. An instrument's own release is not: it lives
+/// inside the node, and `all_notes_off` does not perform it — it only MARKS
+/// the voices released (`midi::synth::PolySynth`, `SamplerNode`, and both
+/// plugin hosts, which merely QUEUE a CC 123 for the next `process`). The
+/// ramp to zero runs inside `process`. So a row that stops being processed
+/// the block after its clock ends does not truncate a decaying tail; it
+/// strands a voice at whatever amplitude it had — full sustain, if the pad
+/// was cut mid-note — and dumps it into the onset of the next press.
+///
+/// Why a fixed allowance rather than asking the node
+/// (`LiveInstrument::tail_samples()`): it could not be honest for the nodes
+/// that matter most. LV2 has no tail concept at all and CLAP's is advisory,
+/// so such an accessor would return a confident number for `PolySynth` and a
+/// guess for a plugin — a second source of truth that lies exactly where the
+/// cost is highest. And why not a hard kill at the freeze point: not
+/// implementable generically for the same reason. `PolySynth` and
+/// `SamplerNode` could reset their voices; LV2 and CLAP have no generic
+/// reset short of deactivate/reactivate, which is not an RT-path operation.
+/// A bounded allowance is what V-17 (b) already commits to — an unbounded
+/// tail is hard-cut at the end of the window, exactly as a transport stop
+/// cuts a track's inserts.
+///
+/// FRAMES, NOT MILLISECONDS, and deliberately so: this is read by
+/// [`RtGraph::with_buses`], which has no sample rate in hand and gets no
+/// plumbing path added just to carry one here. 4096 frames is 85 ms at
+/// 48 kHz — comfortably past `PolySynth::RELEASE_SECS` (80 ms, 3840 frames)
+/// — but only 43 ms at 96 kHz, where that same 80 ms ramp is 7680 frames and
+/// is therefore cut about halfway. That is a bounded, deliberate under-count
+/// of the V-17 (b) kind, not an oversight: it turns a full-amplitude stranded
+/// voice into a half-amplitude one. Making it rate-true is the fix if a
+/// 96 kHz ear-check ever hears it.
+pub const LIVE_TAIL_FRAMES: usize = 4096;
+
 impl RtTrack {
     /// Clip-only track (audio tracks; also keeps tests terse).
     pub fn clips(slot: usize, clips: Vec<RtClip>) -> Self {
@@ -598,7 +635,21 @@ impl RtTrack {
             .map(|s| line(&s.delay))
             .max()
             .unwrap_or(0);
-        inserts + line(&self.pdc) + line(&self.out_pdc).max(sends)
+        let strip = inserts + line(&self.pdc) + line(&self.out_pdc).max(sends);
+        // ...and the one term that is not a line on the strip: the
+        // instrument's own release, which runs INSIDE the node and therefore
+        // BEFORE every line counted above. A `max`, never a sum — the strip's
+        // own lines already carry the node's output through them, so adding
+        // the two would double-count the very window they share. See
+        // [`LIVE_TAIL_FRAMES`] for why the allowance is fixed.
+        //
+        // ONE rule, applied to any row with a live node, not just a player's.
+        // It is inert for a track — `tail_frames` is only ever consumed under
+        // `flushing`, and `flushing` is `exclusive_idle`, which no track row
+        // is — so scoping it to players would buy nothing and would put a
+        // second condition on a funnel whose whole value is having one.
+        let live = if self.live.is_some() { LIVE_TAIL_FRAMES } else { 0 };
+        strip.max(live)
     }
 }
 

@@ -6254,11 +6254,19 @@ mod tests {
         clocks.set_transport_playing(true);
         clocks.bind_slot(1, 1);
         g.clocks = Arc::new(clocks);
-        assert_eq!(g.tracks[1].tail_frames, 256, "the row has to have a tail");
+        // Task 10 fix round 2: the row carries a LIVE node, so its window is
+        // `max(insert chain, LIVE_TAIL_FRAMES)` — the 256-frame chain no
+        // longer decides it. The premise this test needs is "the row has a
+        // window and therefore flushes rather than taking the bare skip",
+        // which is unchanged; only its LENGTH moved, so the block counts
+        // below follow it rather than the other way round.
+        let window = crate::audio::rt::LIVE_TAIL_FRAMES;
+        assert_eq!(g.tracks[1].tail_frames, window, "the row has to have a tail");
+        let flush_blocks = window / FRAMES;
 
         let mut out = vec![0.0f32; FRAMES * 2];
         g.clocks.fire(1, 0, 10_000, false);
-        for b in 0..6 {
+        for b in 0..flush_blocks + 5 {
             out.fill(0.0);
             mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
             if b == 0 {
@@ -6280,11 +6288,14 @@ mod tests {
         // The other half of the same split, and the reason the gate is on the
         // event queue rather than on `render_live_into` as a whole: the node's
         // own pipeline is part of what the window drains, so it keeps
-        // processing for the live block plus the four blocks of the 256-frame
-        // window, and stops only when the row takes the bare skip.
+        // processing for the live block plus every block of the window, and
+        // STOPS when the row takes the bare skip. The loop deliberately runs
+        // past the end of the window so that "stops" is still asserted — a
+        // count equal to the number of blocks rendered would prove only that
+        // the node never stopped.
         assert_eq!(
             processed.load(AtomicOrdering::Relaxed),
-            5,
+            1 + flush_blocks,
             "the live node must keep PROCESSING through the flush window — \
              skipping it would truncate its tail and replay it at the next \
              press, which is the defect the window exists to fix"
@@ -6344,7 +6355,61 @@ mod tests {
         let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
         let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
         let g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        // Task 10 fix round 2 added a fourth term to `computed_tail_frames`,
+        // and this is the row it must NOT reach. A raw pad is an audio clip
+        // (V-6 gives it no instrument), so it carries no live node, gets no
+        // `LIVE_TAIL_FRAMES` allowance, and keeps the bare skip and the
+        // measured idle cost that the owner's ear-check path rests on.
+        assert!(g.tracks[0].live.is_none(), "V-6: a raw pad has no instrument");
         assert_eq!(g.tracks[0].tail_frames, 0);
+    }
+
+    /// Task 10 fix round 2, the arithmetic half: the live-node allowance is a
+    /// `max` against the strip, never a sum. The instrument's release runs
+    /// INSIDE the node and therefore before every line the strip terms count,
+    /// so a row whose chain is already longer than the allowance must have
+    /// exactly the chain's tail — adding the two would double-count the
+    /// window they share, and the window is blocks of FULL-STRIP processing.
+    #[test]
+    fn the_live_node_allowance_is_a_floor_not_an_addition() {
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::rt::{LiveNodeCell, LiveSource, LIVE_TAIL_FRAMES};
+
+        use crate::audio::dsp::AudioProcessor;
+
+        let long = LIVE_TAIL_FRAMES * 2;
+        let mut dummy = LatencyDummy::new(long);
+        dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut synth = crate::midi::synth::PolySynth::new();
+        synth.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(0, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth)),
+            events: Arc::new(Vec::new()),
+        });
+        pad.inserts = vec![InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency: long,
+            proc: InsertNodeCell::new(Box::new(dummy)),
+        }];
+        let g = RtGraph::new(vec![pad], 1, Arc::new(ParamTable::with_slots_and_sends(1, 0)));
+        assert_eq!(
+            g.tracks[0].tail_frames, long,
+            "the chain already outlasts the allowance; the allowance is a floor"
+        );
+
+        // ...and the floor is real when the chain is shorter than it.
+        let mut bare = RtTrack::clips(0, Vec::new());
+        let mut synth2 = crate::midi::synth::PolySynth::new();
+        synth2.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        bare.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth2)),
+            events: Arc::new(Vec::new()),
+        });
+        let g2 = RtGraph::new(vec![bare], 1, Arc::new(ParamTable::with_slots_and_sends(1, 0)));
+        assert_eq!(g2.tracks[0].tail_frames, LIVE_TAIL_FRAMES);
     }
 
     /// Fix round 4, items 3 and 4. `tail_frames` follows the STRIP. Inserts

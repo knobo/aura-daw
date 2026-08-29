@@ -2170,6 +2170,84 @@ mod tests {
         assert!(disc, "but the transport's seek is this node's seek too");
     }
 
+    /// Task 10, fix round 2. A cut pad's stranded voices must not land on
+    /// the NEXT press.
+    ///
+    /// TWO PRESSES, because one cannot see it: whatever is stranded in the
+    /// node stays stranded for the rest of that press and only surfaces at
+    /// the next onset — the same lesson fix round 4 paid for.
+    ///
+    /// What was measured before the allowance existed: `all_notes_off` only
+    /// MARKS a voice released (`midi/synth.rs`, and the same for the sampler
+    /// and both plugin hosts — the trait contract at `dsp.rs` says "release,
+    /// not hard kill"); the ramp to zero runs inside `process`. A bare pad's
+    /// `tail_frames` was 0, so the row took the bare skip and its node was
+    /// never processed again — leaving a voice stranded at FULL SUSTAIN
+    /// amplitude, which then resumed on top of the next press's onset. Press
+    /// 2 began at 0.1096 instead of 0.0 (a step discontinuity at sample 0 —
+    /// a click) and peaked at 0.208 against press 1's 0.106.
+    #[test]
+    fn a_cut_pads_frozen_release_does_not_land_on_the_next_press() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::rt::{LiveNodeCell, LiveSource, MAX_LIVE_BLOCK};
+        use crate::midi::schedule::AbsNoteEvent;
+        use crate::midi::synth::PolySynth;
+
+        const FRAMES: usize = 128;
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut synth = PolySynth::new();
+        synth.prepare(48_000, MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(0, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth)),
+            // Held past the pad's end, so the cut lands mid-note.
+            events: Arc::new(vec![AbsNoteEvent { sample: 0, key: 69, velocity: 100, channel: 0 }]),
+        });
+        let mut g = RtGraph::new(vec![pad], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(0, 1);
+        g.clocks = Arc::new(clocks);
+
+        let peak = |b: &[f32]| b.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        let mut out = vec![0.0f32; FRAMES * 2];
+
+        // PRESS 1 — one block long, so the clock ends under a held note.
+        g.clocks.fire(1, 0, FRAMES as u64, false);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        let first_press = out.clone();
+        assert!(peak(&first_press) > 0.0, "the press has to sound at all");
+        assert_eq!(first_press[0], 0.0, "a clean onset attacks from silence");
+        g.clocks.advance(FRAMES as u64);
+
+        // The pad is cut. `prime_live` all-notes-offs the node; the flush
+        // window is what lets the node RENDER that release instead of
+        // freezing mid-note. 40 blocks is 5120 frames — past both the
+        // allowance and PolySynth's own 80 ms ramp.
+        for _ in 0..40 {
+            out.fill(0.0);
+            render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            g.clocks.advance(FRAMES as u64);
+        }
+
+        // PRESS 2 — identical clock, identical events, from zero.
+        g.clocks.fire(1, 0, FRAMES as u64, false);
+        out.fill(0.0);
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert_eq!(out[0], 0.0, "press 2 attacks from silence too, with no click");
+        let worst = first_press
+            .iter()
+            .zip(out.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "the second press is not the same sound as the first: worst frame differs by {worst}"
+        );
+    }
+
     /// The integrated half of the flush: `render_impl`'s prologue must turn
     /// a stopped scene clock's discontinuity into a real `all_notes_off` on
     /// the live node still bound to it. Nothing asserted this before —
