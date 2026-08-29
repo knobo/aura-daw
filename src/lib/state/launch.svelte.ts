@@ -234,12 +234,21 @@ class LaunchStore {
   async reload() {
     // Runs on `project://changed` too (see `init`), which is the very
     // event `open_project_epoch` fires right after the clip→player
-    // migration — so this is the earliest point `players` can be correct
-    // for the maps being loaded in the same call.
-    void this.reloadPlayers();
-    if (!backend.launchGet) return;
+    // migration. Fix round 2: `players` and `maps` are fetched
+    // CONCURRENTLY but this method does not resolve until both have
+    // landed, so `this.players` is guaranteed current by the time
+    // `reload()`'s caller (or anything awaiting `init()`) proceeds — a
+    // pad press racing this window used to see a stale/empty `players`
+    // and take `mapClip`'s CREATE path for a clip that already had a
+    // migrated binding, minting a duplicate.
+    const playersDone = this.reloadPlayers();
+    if (!backend.launchGet) {
+      await playersDone;
+      return;
+    }
     try {
-      this.accept(await backend.launchGet());
+      const [snap] = await Promise.all([backend.launchGet(), playersDone]);
+      this.accept(snap);
     } catch (err) {
       this.error = String(err);
     }

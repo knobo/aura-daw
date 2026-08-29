@@ -21,13 +21,17 @@ vi.mock("../tauri", () => ({
       return Promise.resolve({ maps: [] } as LaunchSnapshot);
     },
     playersGet: () => Promise.resolve([] as PlayerInfo[]),
-    transportSeek: () => Promise.resolve(undefined),
+    transportSeek: (samples: number) => {
+      calls.push({ name: "transportSeek", args: [samples] });
+      return Promise.resolve(undefined);
+    },
   },
 }));
 
 const { launch } = await import("./launch.svelte");
 const { midi } = await import("./midi.svelte");
 const { surface } = await import("./surface.svelte");
+const { view } = await import("./view.svelte");
 
 const playerBinding = (id: string, note: number, playerId: string) => ({
   id,
@@ -116,5 +120,62 @@ describe("surface.isClipPlaying for a migrated player binding", () => {
     launch.overlay = null;
 
     expect(surface.isClipPlaying("mc1")).toBe(false);
+  });
+});
+
+describe("surface.fireClip against an already-bound clip (fix round 2, Item 1)", () => {
+  it("does not seek the transport or scroll the view for a clip binding", async () => {
+    launch.maps = [
+      { ...launch.maps[0], bindings: [{ id: "b1", name: "Verse", note: 36, channel: null, target: { kind: "clip", clipId: "mc1" } }] },
+    ] as unknown as typeof launch.maps;
+    const viewStartBefore = view.viewStart;
+
+    await surface.fireClip("mc1");
+
+    expect(calls.find((c) => c.name === "transportSeek")).toBeUndefined();
+    expect(view.viewStart).toBe(viewStartBefore);
+    // `preview()` DOES select the pad it fires — that's its own,
+    // deliberate, unrelated-to-this-round behaviour (the panel highlights
+    // whatever is currently playing); the regression this round fixed was
+    // only the SEEK/SCROLL side effect `mapClip`'s internal `focus()` call
+    // added when `fireClip` started delegating to it unconditionally.
+    expect(launch.selectedId).toBe("b1");
+  });
+
+  it("does not seek the transport for a migrated player binding either", async () => {
+    launch.players = [{ id: "p1", name: "Verse", source: { kind: "midiClip", clipId: "mc1" } }];
+    launch.maps = [{ ...launch.maps[0], bindings: [playerBinding("b1", 36, "p1")] }] as unknown as typeof launch.maps;
+    const viewStartBefore = view.viewStart;
+
+    await surface.fireClip("mc1");
+
+    expect(calls.find((c) => c.name === "transportSeek")).toBeUndefined();
+    expect(view.viewStart).toBe(viewStartBefore);
+    expect(launch.selectedId).toBe("b1");
+  });
+});
+
+describe("launch.reload's players/maps ordering (fix round 2, Item 2)", () => {
+  it("has players loaded by the time reload() resolves, even when playersGet is slower than launchGet", async () => {
+    // A REAL delay (setTimeout), not just an unresolved Promise resolved
+    // manually before the `await` below — that version of this test
+    // passed even against `void this.reloadPlayers()` (fire-and-forget,
+    // never awaited): the assignment inside `reloadPlayers()` still got a
+    // microtask turn to run before `await reloadDone` returned, either
+    // way. A timer forces `playersGet` onto a LATER tick than
+    // `launchGet`'s already-resolved Promise, so only the path that
+    // actually AWAITS it can still be pending when `reload()` resolves.
+    const { backend } = await import("../tauri");
+    const originalPlayersGet = backend.playersGet;
+    const resolved: PlayerInfo[] = [{ id: "p1", name: "Verse", source: { kind: "midiClip", clipId: "mc1" } }];
+    backend.playersGet = () =>
+      new Promise<PlayerInfo[]>((res) => {
+        setTimeout(() => res(resolved), 5);
+      });
+
+    await launch.reload();
+
+    expect(launch.players).toEqual(resolved);
+    backend.playersGet = originalPlayersGet;
   });
 });
