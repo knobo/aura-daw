@@ -20,7 +20,7 @@ The working copies live in `.superpowers/sdd/2026-08-28-plan-v2-players/`,
 which is **git-ignored**. The four committed files above are the copies that
 survive; keep syncing them.
 
-## State: 9 of 15 done; task 10 in fix round 3, MID-FLIGHT
+## State: 10 of 15 done; task 11 dispatched
 
 | # | Task | State | Commits |
 |---|---|---|---|
@@ -33,29 +33,40 @@ survive; keep syncing them.
 | 7 | Mixer reads clocks; overlay deleted | done | `d188210`, `5c7ef0a` |
 | 8 | Per-scene clocks; no transport hijack | done | `2115f73`, `2cf1597`, `d62ee5f` |
 | 9 | Audio-clip players in the live graph | done (4 fix rounds) | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58`, `2542640` |
-| 10 | MIDI players with their own instrument | **fix round 3 half-written; `4c15651` is UNVERIFIED custody** | `f7ab47e`, `3da1437`, `9c1c9cc`, `4c15651`? |
-| 11 | Trigger modes | not started | |
+| 10 | MIDI players with their own instrument | done (4 fix rounds) | `f7ab47e`, `3da1437`, `9c1c9cc`, `2439ff5`, `5963e47`, `49b6b4b` |
+| 11 | Trigger modes | dispatched (sonnet) | |
 | 12 | Migrating launch bindings | not started | |
 | 13 | Renderer: a pad is a player | not started | |
 | 14 | The performance gate | not started | |
 | 15 | Docs + release the claim | not started | |
 
-Suite after fix round 4: `cargo test --lib -- --test-threads=1` 1527 passed
-/ 0 failed / 3 ignored (1524 at `bf0cb58`, plus round 4's three). Clippy
-`--all-targets` unmoved for the whole branch — the per-target split, which is
-the only figure anyone has reproduced, is lib **68**, lib test **122** (66
-duplicates), `channel_properties` **1**, `journal_replay` **1**; identical on
-the branch and on the base measured in the same sitting. (The carried total
-"130" has accounting nobody has reproduced. Ignore it.)
+Gates green at `49b6b4b`, with rounds 2, 3 and 4 of task 10 gated together
+(they had been ungated since `f7ab47e`): lib **1542** passed / 0 failed / 3
+ignored, `--tests` every target 0 failed, npm **1383** in 126 files.
 
-**Both perf numbers need their null control in the same sitting, and round 4
-is the proof.** Perf `--budget 525`: OK **434.0** µs on the branch against
-**422.6** µs on the base, same sitting, cold, harness spread 5–7% — the
-carried 377.1 µs was another sitting and comparing against it would have read
-as a 15% regression. `idle_players_block_cost` (release, `#[ignore]`d):
-**2.27** µs on the branch against **2.22** µs on the base, same sitting —
-where the carried figure is 1.89 µs. Unmoved in both cases; the absolute
-numbers are not portable between sittings.
+**Clippy's baseline must be the MERGE-BASE, not a mid-branch commit.**
+Measured against `6fe1112` the branch was **+1** on the lib target — 68
+against 67 — and the carried "identical 68/68" had been measured against
+`3dabad0`, a commit on this branch, which smuggled the branch's own drift
+into the baseline. The one addition was real: `derivable_impls` on
+`PlayerSource`'s manual `Default`, added by task 4, fixed in `49b6b4b`. The
+per-target split is now lib **67**, lib test **121**, `channel_properties`
+**1**, `journal_replay` **1**, identical to the merge-base.
+
+**Perf: only the direction is readable.** `--budget 525`: branch 273.5 /
+278.7 / 296.7 µs (spread 8.5%) against base `6fe1112` at 503.2 / 499.4 /
+502.0 µs (spread 0.8%), same sitting, perf before the suites. The branch
+reads 45% *faster* than the base. Passed without a re-measure — a
+regression cannot hide under a base that measured slower — but note that
+503 sits above the 224–445 band this gate has produced for unchanged code
+all branch long. That is the fourth distinct way this gate has surprised
+someone here.
+
+**`idle_players_block_cost` has no base side, and a brief that asks for one
+is wrong.** The test is one this branch ADDED, so at the merge-base it does
+not exist. Branch min **2.01** µs — comparable only against this branch's
+own earlier sittings (1.89 at `bf0cb58`, 2.27 at round 4's, 3.26 at task
+10's), i.e. unmoved within a spread that does not travel between sittings.
 
 **Always use `--test-threads=1`.** The parallel run SIGSEGVs in
 `midi_out::tests` — a pre-existing project crash,
@@ -64,113 +75,42 @@ this branch's.
 
 ## Pick up here
 
-**Read this whole section before you touch anything.** The session was
-paused by a usage limit at 18:12 CEST on 2026-08-29, in the middle of task
-10's fix round 3. The ledger
-(`.superpowers/sdd/…/progress.md`, git-ignored but present in the worktree)
-has every ruling with its reasoning; this section has what you need to
-restart.
+**Task 10 is closed** — commits `f7ab47e..49b6b4b`, four fix rounds, review
+clean, gates green. Task 11 is dispatched to a sonnet implementer; its
+review is owed on **opus** per the model policy below.
 
-### First: find out whether round 3's work survived
+### How task 10 actually ended, so you do not re-open it
 
-It partly did, and it is **in git as `4c15651`, labelled UNVERIFIED**.
+Round 3 was inherited as two UNVERIFIED custody commits (`4c15651`, and
+`19d8c44` for 37 lines still uncommitted on top of it) from an implementer
+killed by a usage limit. A fresh implementer read them critically against
+the round-3 brief and found all three items genuinely present and finished
+— it deleted nothing as wrong, fixed four defects in the doc/comment layer,
+and observed three REDs itself rather than inheriting the ghost's claims.
+The opus re-review then reproduced every one of those mutation claims
+byte-for-byte and added one the implementer had not run: `LIVE_TAIL_FRAMES_AT_48K`
+4096 → 2048 fails two `mixer.rs` tests, so the allowance's *magnitude* is
+pinned behaviourally and not only by arithmetic.
 
-The round-3 implementer was still writing when the limit hit. The
-controller took custody of its tree the way this branch has done once
-before (`d1f8cdd`): committed it, labelled UNVERIFIED, because uncommitted
-work is one `git clean` from gone and custody is not implementation.
+Round 4 closed the re-review's one Important — nothing pinned the single
+argument carrying the rate into `with_buses`, and replacing
+`self.cache_rate` at `engine.rs:2531` with a literal left 1058 tests green.
+It fails silently by construction, because `render_impl`'s `debug_assert`
+reads `graph.rate` and would agree with the bug. Round 4 was test-only: 153
+insertions, zero deletions, no production line touched.
 
-**What is known about `4c15651`:** `cargo check --lib` is clean at that
-tree. That is all.
+### Two things task 10 leaves for later
 
-**What is NOT known:** whether the tests compile; whether the round's own
-RED was ever written or seen to fail; whether the two-press test *with an
-insert chain* exists; whether the rate-true half is finished or
-half-plumbed; whether `the_live_node_allowance_is_a_floor_not_an_addition`
-was retargeted into a sum test. There is no report and no self-review — the
-implementer never reported.
-
-It also may not be the implementer's final state: it was still writing
-`midi/playback.rs` as the custody commit was being made, so the snapshot is
-wherever it happened to be, not a finished round.
-
-**So your first job is a FRESH implementer that reads `4c15651` critically
-against round 3's brief before trusting a line of it** — its job starts
-with reading, not with assuming the work is right. Tell it explicitly that
-the commit is unreviewed. That is exactly how `d1f8cdd` was handled, and
-that inherited draft turned out sound; this one may or may not.
-
-```sh
-git show 4c15651 --stat
-git diff 9c1c9cc..4c15651
-```
-
-### What round 3 is, in one paragraph
-
-**The controller's own round-2 ruling was wrong, and round 3 reverses it.**
-It ordered `computed_tail_frames` to be `strip.max(live)`, reasoning that
-the instrument's release runs *before* the inserts that the other terms
-already cover. Running before, in series, is exactly why they **add**. With
-a 2048-frame insert chain the release finishes inside the node at 3840
-frames but its last material needs 2048 more to leave the chain — it is
-still in the pipeline when the window closes at 4096. Stranded tail,
-contaminated next onset: the fourth instance of the pair this branch keeps
-producing, and the pair the round was opened to fix. The expression becomes
-`strip + live`, the allowance becomes rate-true (store the rate on
-`RtGraph`; the `debug_assert` must read `graph.rate`, never `render_impl`'s
-own `sample_rate` argument, or a device rate change fires it on the RT
-thread), and the RED is a two-press test **with an insert chain**.
-
-### Then: re-review round 3, then tasks 11–15
-
-Re-review is scoped to round 3's diff, on **opus** — everything under
-`src-tauri/src/audio/` or `midi/` gets an opus review regardless of who
-implemented it. After task 10 closes, tasks 11–15 run in order; their briefs
-are pre-extracted in `…-BRIEFS/`. **Sonnet implements from task 11 on**, per
-the owner's model policy below.
-
-### Task 10's state, so you do not re-litigate it
-
-Committed and reviewed clean: `f7ab47e` (the task), `3da1437` (fix round 1),
-`9c1c9cc` (fix round 2). The round-2 re-review verdicted every finding
-ADDRESSED with no new Critical/Important, and traced by hand that a MIDI
-*track* now carrying `tail_frames == 4096` is genuinely inert — `tail_frames`
-has exactly two production reads, and for a track row the second is a dead
-store, because every read of `flush_left` is gated on `flushing =
-exclusive_idle`, which needs a clock property only player slots have.
-
-Gates were green at `f7ab47e`: lib 1535/0/3, `--tests` all green, npm 1383,
-clippy per-target identical to base in the same sitting, perf 262 µs against
-a 525 budget. **They have not been run since**, so round 2 and round 3 are
-both ungated. The gate-runner brief is in the ledger; run it on **sonnet**,
-and see the warning below.
-
-### Two things carried out of task 10
-
-- **Two pads on one plugin instance instantiate two plugin instances.**
-  Parked as correct-as-built: the mixer processes one live node per ROW,
-  once per block, so two rows cannot share a node without double-advancing
-  it. Sharing would mean the pads become one row — a deck concept, V3+. Not
-  a regression; two tracks sharing an `instrument_id` already do this. Goes
-  to the design doc as a known limit and to the final review.
-- **A MIDI pad's release is hard-cut at the allowance.** V-17(b)'s accepted
-  consequence, and an ordinary MIDI track already sounds the same at
-  transport stop. V3 item.
-
-### The gate-runner deadlocks if you let it sleep
-
-The first gate-runner ended its turn "waiting silently for the background
-90-second idle sleep and the Monitor task" and reported nothing after 457
-seconds — the documented background/monitor deadlock, hit despite a brief
-that said FOREGROUND ONLY. **Forbid the Monitor/wait task by name, and do
-not ask for a shell cool-down at all**: ask for three perf runs and the
-spread instead. A spread across three runs is better evidence than one
-number behind a guessed idle interval, and it removes the only thing the
-agent is tempted to background.
-
-Its orphaned `perf-check.sh` processes then contaminated the next run's base
-side (three of them, concurrent). Check `ps` for stray `perf-check`
-processes before believing any perf pair.
+- **`loopjam.rs:913` is correct for a reason that could stop being true.**
+  Its row is `RtTrack::clips(...)` with no live node, so the rate reaches
+  only `graph.rate` and nothing on that path consumes it; a test there
+  could assert code *shape* and nothing else, which is the kind of test
+  this branch keeps being burned by. If that row ever gains a live node the
+  site goes silently wrong with no test to say so. Task 15 and the final
+  review.
+- **`live_tail_frames(0)` is a debug-only guard.** `recompute_tail_frames`
+  is `pub`, and in a release build a 0 rate returns a 0 flush window — the
+  original defect. Only reachable from test code today. Task 15.
 
 ## Model policy (owner's, 2026-08-29)
 
