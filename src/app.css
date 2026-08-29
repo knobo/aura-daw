@@ -85,6 +85,7 @@
   --relief: 0.55;
   --sheen: 0.3;
   --grain: 0.1;
+  --brush: 0;
   --ctrl-radius: 6px;
 
   /* ────────────────────────────────────────────────────────────────────────
@@ -124,6 +125,35 @@
       rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.7)),
     inset 0 calc(-1 * var(--border-width)) 0 0 var(--bevel-hi);
 
+  /* ── the 3D frame ────────────────────────────────────────────────────
+     `--bevel-raised` is two lips, top and bottom. A frame is four: a moulded
+     rim that runs all the way round an object, lit along its top and left
+     and shadowed along its bottom and right, with a dark seam where the rim
+     meets the ground it stands on.
+
+     The difference matters at the size a module or an instrument rack is
+     drawn. Two horizontal lips read as a card with a highlight; four read as
+     a bezel you could get a fingernail under — and the vertical pair is what
+     the eye uses to decide an object has THICKNESS rather than an edge.
+
+     An inset box-shadow with a positive offset lands on the top-left inside
+     edge and a negative one on the bottom-right, which is the whole trick:
+     no extra element, no border eating into the box, and at `bevel: 0` every
+     colour here is fully transparent, so a flat theme is untouched. */
+  --frame-lip: calc(1px + 2px * var(--bevel));
+  --bevel-frame:
+    /* the seam first, so it draws OVER the lips at the very edge */
+    inset 0 0 0 var(--border-width) rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.45)),
+    inset var(--frame-lip) var(--frame-lip) 0 0 var(--bevel-hi),
+    inset calc(-1 * var(--frame-lip)) calc(-1 * var(--frame-lip)) 0 0 var(--bevel-lo);
+  /* the same rim inverted: a panel cut INTO the surface rather than standing
+     on it — the light now runs along the bottom-right, as it does inside a
+     real routed pocket. */
+  --bevel-frame-inset:
+    inset 0 0 0 var(--border-width) rgb(var(--shadow-rgb) / calc(var(--bevel) * 0.45)),
+    inset var(--frame-lip) var(--frame-lip) 0 0 var(--bevel-lo),
+    inset calc(-1 * var(--frame-lip)) calc(-1 * var(--frame-lip)) 0 0 var(--bevel-hi);
+
   /* cast shadow at three heights: sitting on, lifted off, floating above */
   --relief-1: 0 1px 1px rgb(var(--shadow-rgb) / calc(var(--relief) * 0.35));
   --relief-2:
@@ -155,6 +185,26 @@
      stays crisp at any interface zoom. Applied via `.grain`, which blends it
      over the surface rather than painting grey on top of it. */
   --grain-tex: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='120' height='120' filter='url(%23n)'/%3E%3C/svg%3E");
+
+  /* Brushed metal: the same feTurbulence trick as `--grain-tex`, with two
+     differences that are both load-bearing.
+
+     ANISOTROPIC base frequency — 0.008 across, 0.85 down — so the noise
+     stretches into long fine horizontal scratches instead of speckle. That
+     asymmetry IS the finish: a wire wheel leaves parallel lines, and a
+     surface with the same noise in both axes is bead-blasted, not brushed.
+
+     And then a filter chain the speckle does not need, because this layer is
+     drawn at up to `opacity: 1` where the speckle never passes 0.4. Raw
+     feTurbulence is COLOUR noise with a noisy alpha; blended `overlay` at
+     that strength it paints rainbow streaks across the whole panel, which is
+     what the first cut of this actually shipped as. `saturate 0` takes the
+     hue out, `feFuncA` flattens the alpha to opaque, and the three linear
+     transfers squeeze the range into 0.35–0.65 — a narrow band around the
+     0.5 that `overlay` treats as "leave the backdrop alone", so the streaks
+     modulate the surface instead of replacing it. Applied via
+     `.grain::before` at `opacity: var(--brush)`. */
+  --brush-tex: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='b' color-interpolation-filters='sRGB'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.008 0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3CfeComponentTransfer%3E%3CfeFuncR type='linear' slope='0.3' intercept='0.35'/%3E%3CfeFuncG type='linear' slope='0.3' intercept='0.35'/%3E%3CfeFuncB type='linear' slope='0.3' intercept='0.35'/%3E%3CfeFuncA type='linear' slope='0' intercept='1'/%3E%3C/feComponentTransfer%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23b)'/%3E%3C/svg%3E");
 
   /* type */
   --font-mono:
@@ -245,7 +295,7 @@ body {
   border-radius: var(--ctrl-radius);
   background-color: var(--bg-2);
   background-image: var(--sheen-face);
-  box-shadow: var(--bevel-raised), var(--relief-2);
+  box-shadow: var(--bevel-frame), var(--relief-2);
 }
 
 /* Pressed: the face drops into the panel and its cast shadow collapses.
@@ -262,7 +312,7 @@ body {
 .inset {
   border-radius: var(--ctrl-radius);
   background-color: var(--bg-sunken);
-  box-shadow: var(--bevel-inset);
+  box-shadow: var(--bevel-frame-inset), var(--bevel-inset);
 }
 
 /* ── module blocks ────────────────────────────────────────────────────────
@@ -308,7 +358,7 @@ body {
      gutter strips between blocks read. */
   background-color: var(--bg-2);
   background-image: var(--sheen-face);
-  box-shadow: var(--bevel-raised), var(--relief-2);
+  box-shadow: var(--bevel-frame), var(--relief-2);
 }
 
 /* The name tab. `align-self: flex-start` is what makes it a TAB rather than
@@ -373,6 +423,44 @@ body {
   border-radius: inherit;
   background-image: var(--grain-tex);
   opacity: var(--grain);
+  mix-blend-mode: overlay;
+  pointer-events: none;
+}
+
+/* Brushed streaks. Deliberately the SAME class as the speckle rather than a
+   second one to add to markup: every surface that already declares itself
+   made of something gets its finish from whichever theme is loaded, and a
+   theme with `brush: 0` renders exactly as before.
+
+   `::before` rather than a second `::after`, so the streaks sit under the
+   element's own children while the speckle sits over them — which is also
+   the physically right order: the brushing is IN the metal, the speckle is
+   the light scattering off its surface.
+
+   The reserved pseudo-element is the cost. A component that puts a `::before`
+   on an element it also marks `.grain` will fight this rule; put it on an
+   inner element instead. */
+.grain::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-image: var(--brush-tex);
+  opacity: var(--brush);
+  mix-blend-mode: overlay;
+  pointer-events: none;
+}
+
+/* The module face is the largest expanse of metal on screen and is drawn by
+   app.css rather than by a component, so it brushes itself. (`.module` is
+   already `position: relative` where it is defined above.) */
+.module::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background-image: var(--brush-tex);
+  opacity: var(--brush);
   mix-blend-mode: overlay;
   pointer-events: none;
 }

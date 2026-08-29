@@ -96,7 +96,7 @@ export interface ThemeTokens {
    * what let one palette ship as both a flat theme and a hardware theme. The
    * virtual key light is fixed at top-centre, the convention every real
    * front panel is photographed under, so a raised face is lighter along its
-   * top edge and casts downward. All four scalars are 0..1 and all four at
+   * top edge and casts downward. All five scalars are 0..1 and all five at
    * `0` collapse to exactly the flat look AURA had before they existed —
    * which is what the high-contrast themes rely on. */
   /** Strength of the lit top edge and shadowed bottom edge on a raised face
@@ -114,6 +114,18 @@ export interface ThemeTokens {
    * metal or moulded plastic. Cheap to ignore, and the single cue that most
    * separates "photograph of hardware" from "rectangle with a gradient". */
   grain: string;
+  /**
+   * Strength of the ANISOTROPIC streak of brushed metal — the long, fine
+   * horizontal scratches a wire wheel leaves, as opposed to `grain`'s
+   * direction-less speckle.
+   *
+   * It is its own token rather than a mode of `grain` because the two are
+   * different finishes on the same object and a real panel often carries
+   * both: bead-blasted metal is speckled and not brushed, brushed steel is
+   * streaked and only faintly speckled, and moulded plastic is neither. A
+   * theme picks a point in that square.
+   */
+  brush: string;
   /** Corner radius of controls — buttons, chips, wells. A length, because it
    * is a physical dimension rather than a strength: hard-edged rack gear and
    * soft-cornered consumer plastic differ here and nowhere else. */
@@ -130,10 +142,10 @@ export const COLOR_KEYS = [
 ] as const satisfies readonly (keyof ThemeTokens)[];
 
 /** The material group, named separately because it is the axis a theme
- * author tunes as a set: all five together are one material, and mixing
+ * author tunes as a set: all six together are one material, and mixing
  * half of one with half of another is how a panel stops looking real. */
 export const MATERIAL_KEYS = [
-  "bevel", "relief", "sheen", "grain", "ctrlRadius",
+  "bevel", "relief", "sheen", "grain", "brush", "ctrlRadius",
 ] as const satisfies readonly (keyof ThemeTokens)[];
 
 export const AFFORDANCE_KEYS = [
@@ -145,8 +157,8 @@ export const AFFORDANCE_KEYS = [
 /** The affordances measured as a bare number rather than a CSS length. */
 export const UNITLESS_AFFORDANCE_KEYS: readonly (keyof ThemeTokens)[] = [
   "glassAlpha", "glowScale", "bodyGlow", "panelAlpha",
-  // The four material strengths are ratios; `ctrlRadius` alone is a length.
-  "bevel", "relief", "sheen", "grain",
+  // The five material strengths are ratios; `ctrlRadius` alone is a length.
+  "bevel", "relief", "sheen", "grain", "brush",
 ];
 
 /** Every key a theme must define — the runtime half of the interface. */

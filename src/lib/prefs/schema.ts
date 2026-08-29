@@ -61,6 +61,10 @@ export interface PrefValues {
   theme: string;
   /** Whether the right panel takes layout space or floats over the timeline. */
   dockSide: "overlay" | "docked";
+  /** Which face the round meters on the control surface wear. */
+  meterFace: "led" | "dial" | "ladder" | "needle";
+  /** The shape of a channel strip's mute/solo/arm keys. */
+  stripKeys: "key" | "bar";
   /** Keep native plugin editor windows above the AURA window. */
   pluginGuiOnTop: boolean;
 }
@@ -317,6 +321,32 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     label: "Side panel",
     blurb:
       "Whether the right panel floats over the timeline or takes its own column beside it. Docking suits an opaque panel — with a translucent theme you can see the timeline through it, so floating costs you nothing.",
+  },
+  meterFace: {
+    kind: "enum",
+    default: "led",
+    options: [
+      { value: "led", label: "LED ARC" },
+      { value: "dial", label: "DIAL" },
+      { value: "ladder", label: "LADDER" },
+      { value: "needle", label: "ANALOG VU" },
+    ],
+    category: "interface",
+    label: "Meter face",
+    blurb:
+      "How the meters on the control surface read out. LED ARC is a ring of segments matching the knobs; DIAL is one continuous arc with a fine needle on its head; LADDER is the horizontal bargraph, the fastest face for comparing a row of strips; ANALOG VU is a swinging needle over a printed scale. All four are drawn from the theme, so any of them follows whichever theme is loaded.",
+  },
+  stripKeys: {
+    kind: "enum",
+    default: "key",
+    options: [
+      { value: "key", label: "KEYS" },
+      { value: "bar", label: "SEGMENTED" },
+    ],
+    category: "interface",
+    label: "Mute / solo / arm",
+    blurb:
+      "The shape of a channel strip's three function keys. KEYS are three moulded buttons that press in when lit; SEGMENTED is one routed switch divided into three, each part filling solid when lit. Both fit the strip at any width, and both are drawn from the theme.",
   },
   theme: {
     kind: "choice",

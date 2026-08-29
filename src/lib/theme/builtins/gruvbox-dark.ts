@@ -53,5 +53,7 @@ export const GRUVBOX_DARK_TOKENS: ThemeTokens = {
   relief: "0.5",
   sheen: "0.28",
   grain: "0.16",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "4px",
 };

@@ -89,5 +89,7 @@ export const RACK_SLATE_TOKENS: ThemeTokens = {
   relief: "0.75",
   sheen: "0.85",
   grain: "0.12",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "4px",
 };
