@@ -6630,8 +6630,6 @@ mod tests {
         assert!(tables.clocks.is_on(clock), "a loop does not end at the clip's end");
     }
 
-    // ---- Task 11: trigger modes ------------------------------------------
-
     /// `TriggerMode::OneShot` is the default, and needs no looping flag: a
     /// non-looping clock already ends itself at its own `end` (`advance`,
     /// pinned by `clock::tests::advance_moves_running_clocks_and_stops_one_at_its_end`).

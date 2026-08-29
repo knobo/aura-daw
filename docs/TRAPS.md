@@ -132,6 +132,17 @@ session burns an hour on something a sentence would have prevented.
 
 ## Audio engine
 
+- **`ControlPlane`'s test accessors take a non-reentrant lock, so nesting two
+  of them in one expression HANGS the whole test binary.** `parking_lot`'s
+  mutex is not reentrant and does not panic on a second acquire from the
+  same thread — it simply waits, forever. Written as
+  `cp.tables_for_tests().clocks.is_on(cp.player_clock_for(&b).unwrap())` the
+  inner call runs while the outer temporary still holds the guard, and
+  `cargo test` sits there producing nothing: a silent multi-minute stall
+  with no panic and no failing test to point at. Bind each accessor's result
+  to a `let` first. Cost when this was found: task 11's retrigger test, and
+  several minutes spent suspecting the suite rather than the expression.
+
 - **`ParamTable::default()` has 64 mixer slots and ZERO send lanes.** An
   unknown send index reads back as UNITY (`send_amount_linear`'s
   fallback), so a mixer test that builds its graph with the default
