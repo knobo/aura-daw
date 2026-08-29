@@ -209,7 +209,7 @@ casts downward, and a recessed well is that same edge inverted.
 | AURA Dark | 0.4 | 0.55 | 0.3 | 0.1 | 0 | 6px |
 | AURA Light | 0.35 | 0.4 | 0.35 | 0.08 | 0 | 6px |
 | Brushed Steel Dark | 0.9 | 0.8 | 0.6 | 0.14 | 0.85 | 3px |
-| Brushed Steel Light | 0.8 | 0.6 | 0.45 | 0.12 | 0.8 | 3px |
+| Brushed Steel Light | 0.8 | 0.6 | 0.45 | 0.12 | 0.6 | 3px |
 | Console Noir | 0.95 | 0.9 | 0.7 | 0.38 | 0 | 3px |
 | Studio Ivory | 0.85 | 0.65 | 0.55 | 0.28 | 0 | 9px |
 | High Contrast (both) | 0 | 0 | 0 | 0 | 0 | 4px |
@@ -341,7 +341,33 @@ variants, no per-theme markup.
 
 ---
 
-## 8. Exporting Themes
+## 8. Meter Faces
+
+The round meters on the control surface (`Gauge.svelte`) come in four faces,
+chosen by **Preferences → Interface → Meter face**. It is a preference rather
+than a theme token because it is a reading preference, not a look: which one
+suits you depends on what you are doing with the meter, and all four are drawn
+entirely from the theme, so any of them follows whichever theme is loaded.
+
+| Face | What it is | What it is for |
+|---|---|---|
+| **LED ARC** (default) | A ring of 44 segments around a sunken well, the number inside it. | Matching the knobs — same 270° travel, same lamps, so a rack of knobs and meters reads as one instrument rather than as two widgets that happen to be round. |
+| **DIAL** | One continuous arc filling round the same well, a fine needle riding its head. | Reading a small change. A continuous arc has no step size, so it is the most precise face of the four. |
+| **LADDER** | The horizontal PPM bargraph in a routed slot. | Balancing a mix. It is the only face that is not round, and that is the point: across a row of channel strips the eye compares bar LENGTHS far faster than it compares angles. |
+| **ANALOG VU** | The swinging needle over a printed scale. | Ballistics. You see the *shape* of a transient rather than a number that already happened. |
+
+Every face carries a **peak hold** — the highest reading of the last second,
+shown ahead of the level — except ANALOG VU, which by construction cannot: a
+needle *is* the peak, and once it has fallen back the peak is gone. That is
+the one thing the original face could not show you.
+
+No face carries a colour of its own. The lamp ramp is
+`green → amber → red` off the palette at −12 dB and 0 dB, so a theme with no
+green in it is not a meter with the wrong green in it.
+
+---
+
+## 9. Exporting Themes
 
 To quickly create a custom theme, navigate to **Preferences** → **Interface** and click **EXPORT CURRENT THEME…**.
 
@@ -351,7 +377,7 @@ Exporting never overwrites: if that name is taken, the next free one is used (`a
 
 ---
 
-## 9. Reloading & Error Handling
+## 10. Reloading & Error Handling
 
 - **Discovery**: When AURA launches, it scans the themes directory and registers all valid user themes. Adding or deleting a `.json` file requires restarting AURA to discover the file.
 - **Robust Validation**: The theme parser never crashes. If a file contains invalid JSON or lacks a `name`, it is skipped, and a toast notification informs you of the failure. If an individual token has an invalid color or unknown name, only that key is ignored while the rest of the theme loads safely against its base.

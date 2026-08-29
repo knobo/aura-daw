@@ -195,3 +195,33 @@ describe("the choice kind (runtime-catalogued options)", () => {
   });
 });
 
+
+/**
+ * The meter face is the one preference whose options are also a list inside a
+ * component: Gauge.svelte branches on each of them, and a value the schema
+ * offers but the component has no branch for renders as an empty square in a
+ * channel strip with nothing anywhere saying why.
+ */
+describe("the meter face", () => {
+  const def = PREF_SCHEMA.meterFace;
+
+  it("offers exactly the four faces Gauge.svelte draws", () => {
+    expect(def.kind).toBe("enum");
+    expect(def.kind === "enum" && def.options.map((o) => o.value)).toEqual([
+      "led",
+      "dial",
+      "ladder",
+      "needle",
+    ]);
+  });
+
+  // LED ARC is the face that matches the knob's dot ring, which is the whole
+  // reason the surface reads as one instrument. It is the default on purpose.
+  it("defaults to the face that matches the knobs", () => {
+    expect(def.default).toBe("led");
+  });
+
+  it("rejects a face that does not exist rather than storing it", () => {
+    expect(coercePref(def, "vu-plus")).toBeUndefined();
+  });
+});

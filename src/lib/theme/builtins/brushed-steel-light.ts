@@ -80,6 +80,9 @@ export const BRUSHED_STEEL_LIGHT_TOKENS: ThemeTokens = {
   relief: "0.6",
   sheen: "0.45",
   grain: "0.12",
-  brush: "0.8",
+  // Lower than the dark half: `overlay` blending brightens more than it
+  // darkens on a light backdrop, so the same number reads as a busier
+  // surface here than it does on anodised grey.
+  brush: "0.6",
   ctrlRadius: "3px",
 };
