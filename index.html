@@ -4,9 +4,49 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>AURA</title>
+    <style>
+      /* Paint the shell before Svelte mounts — and before app.css, which in
+         dev is injected by JS — so the very first frame is dark and
+         branded instead of a white flash. Colours mirror --bg-0 / --text
+         and the TransportBar wordmark (src/app.css, src/lib/components/
+         TransportBar.svelte); this is intentionally NOT reading those CSS
+         vars, since they don't exist yet at this point. src/main.ts clears
+         #app's children before mount() — Svelte 5's mount() appends rather
+         than replacing, so this markup would otherwise sit behind the app. */
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #05070d;
+      }
+      #app {
+        height: 100%;
+      }
+      /* The wordmark centres ITSELF (fixed, not a flex parent): #app is the
+         real app's mount point, and any layout rule left on it here would
+         still apply after mount — a centred flex parent shrink-wraps .app
+         instead of letting it fill the window. */
+      #app .boot-wordmark {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: 0.55em;
+        padding-left: 0.55em;
+        color: #d8e3f2;
+        text-shadow:
+          0 0 14px rgba(82, 229, 255, 0.35),
+          1px 0 0 rgba(255, 79, 216, 0.55),
+          -1px 0 0 rgba(82, 229, 255, 0.55);
+      }
+    </style>
   </head>
   <body>
-    <div id="app"></div>
+    <div id="app"><span class="boot-wordmark">AURA</span></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

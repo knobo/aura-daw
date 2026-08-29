@@ -643,7 +643,24 @@ pub fn reactivate_restored_with(
     session: &Arc<Mutex<Session>>,
     bridge: Option<&dyn HostStateBridge>,
 ) {
-    let stubs: Vec<(String, String, String, Vec<ParamChange>)> = {
+    reactivate_restored_with_progress(session, bridge, &|_, _, _| {})
+}
+
+/// [`reactivate_restored_with`] plus a per-instance progress callback
+/// (startup-progress task): each restored instance is instantiated SERIALLY
+/// and SYNCHRONOUSLY through `plugin_main().run(...)` (`host.rs`'s
+/// `recv_timeout(30s)`), and the FIRST lv2 one in the process pays for a
+/// full system-wide bundle scan (`livi::World::new()`, `lv2_host.rs`) — this
+/// is the single heaviest stretch of `ControlPlane::open_project_epoch`.
+/// `on(done_so_far, total, display_name)` fires right BEFORE the instance at
+/// index `done_so_far` is instantiated, so a caller can report "loading
+/// plugin N of M" instead of a single opaque "adopting plugins" step.
+pub fn reactivate_restored_with_progress(
+    session: &Arc<Mutex<Session>>,
+    bridge: Option<&dyn HostStateBridge>,
+    on: &dyn Fn(usize, usize, &str),
+) {
+    let stubs: Vec<(String, String, String, String, Vec<ParamChange>)> = {
         let s = session.lock();
         s.plugins
             .instances
@@ -660,11 +677,13 @@ pub fn reactivate_restored_with(
                             .collect()
                     })
                     .unwrap_or_default();
-                (i.id.clone(), i.uid.clone(), i.format.clone(), snapshot)
+                (i.id.clone(), i.uid.clone(), i.format.clone(), i.name.clone(), snapshot)
             })
             .collect()
     };
-    for (id, uid, format, snapshot) in stubs {
+    let total = stubs.len();
+    for (done_so_far, (id, uid, format, name, snapshot)) in stubs.into_iter().enumerate() {
+        on(done_so_far, total, &name);
         let as_effect = session.lock().instance_is_insert(&id);
         let hosted = match format.as_str() {
             "clap" if as_effect => super::clap_host::instantiate_effect(&id, &uid),
@@ -768,6 +787,15 @@ pub fn reactivate_restored_with(
 /// brief, separate relocks to write back param mirrors, never spanning a
 /// host call).
 pub fn adopt_open_project(dir: &Path) {
+    adopt_open_project_with_progress(dir, &|_, _, _| {})
+}
+
+/// [`adopt_open_project`] plus a per-instance progress callback, forwarded
+/// straight through to [`reactivate_restored_with_progress`] — see that
+/// function's doc for why this is the stage worth reporting on
+/// (`ControlPlane::open_project_epoch`'s "plugins" step, startup-progress
+/// task).
+pub fn adopt_open_project_with_progress(dir: &Path, on: &dyn Fn(usize, usize, &str)) {
     let Some(session) = crate::midi::playback::registered_store() else { return };
     // `Ok(None)` (no `plugins` field) is treated as an explicit EMPTY row
     // set, not "leave the document alone" (I-7): this function only ever
@@ -826,7 +854,7 @@ pub fn adopt_open_project(dir: &Path) {
             }
         }
     }
-    reactivate_restored(session);
+    reactivate_restored_with_progress(session, registered_state_bridge().map(|b| b.as_ref()), on);
     log::info!(
         "plugins: adopted {} persisted instance(s) from {}",
         restored,

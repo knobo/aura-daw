@@ -27,8 +27,15 @@ document.documentElement.style.setProperty(
   String(GROUP_HEADER_PX) + "px",
 );
 
+const appTarget = document.getElementById("app")!;
+// Svelte 5's mount() appends an anchor to the target rather than replacing
+// its contents (verified against node_modules/svelte/src/internal/client/
+// render.js: `target.appendChild(create_text())`) — so the pre-mount
+// wordmark from index.html would otherwise linger behind the real app.
+appTarget.replaceChildren();
+
 const app = mount(App, {
-  target: document.getElementById("app")!,
+  target: appTarget,
 });
 
 // Dev aid: expose the live singletons for console poking / UI automation.

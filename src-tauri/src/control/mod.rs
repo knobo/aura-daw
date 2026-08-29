@@ -4548,12 +4548,52 @@ impl ControlPlane {
     /// (5) emit `project://changed`. Absorbs `audio::open_project_impl`'s
     /// former body; the Tauri `open_project` command is now a one-line
     /// delegate.
+    ///
+    /// PROGRESS (startup-progress task): this whole method runs on a
+    /// `spawn_blocking` thread the frontend `await`s (`audio::mod.rs`'s
+    /// `open_project` command) with nothing on screen otherwise — the
+    /// silent stretch can run into seconds (a big `journal.ndjson`, several
+    /// LV2 instances each triggering a first-touch `livi::World::new()`
+    /// bundle scan, see `plugins::lv2_host`). `emit_progress` fires
+    /// `project://open-progress` BEFORE each of the 9 stages so the
+    /// frontend can show what is currently happening rather than a frozen
+    /// spinner; `log::info!` lines below record the same stages' elapsed
+    /// time PERMANENTLY (not scaffolding) so a future slow open is
+    /// diagnosable from the log alone, without reproducing it live.
     pub fn open_project_epoch(&self, dir: &Path) -> Result<Project, String> {
+        let t_open = std::time::Instant::now();
+        // `step`/`index`/`total` are the frontend's exact wire contract —
+        // see the event's doc at the call sites below. `total` is fixed at
+        // 9 (8 real stages + the final `done` marker), so index and total
+        // are both plain literals per call rather than derived.
+        let emit_progress = |step: &str, index: u32, label: &str, detail: Option<&str>| {
+            (self.emit)(
+                "project://open-progress",
+                serde_json::json!({
+                    "step": step,
+                    "index": index,
+                    "total": 9,
+                    "label": label,
+                    "detail": detail,
+                }),
+            );
+        };
+
+        emit_progress("load", 1, "Reading project file", None);
+        let t = std::time::Instant::now();
         let (project, dir) = project::load(dir)?;
         // Validate BEFORE mutating any in-memory state (review fix carried
         // over: a project with duplicate track ids must fail cleanly, not
         // after tracks/clips were replaced).
         project::validate(&project)?;
+        log::info!("open: project loaded in {} ms", t.elapsed().as_millis());
+
+        // Announced BEFORE the lock is taken, not inside it: `(self.emit)`
+        // is an `AppHandle::emit` round-trip, and the session lock is the
+        // one every other command contends on — nothing that touches the
+        // webview belongs under it. The stage covers the whole locked
+        // store-swap + midi adopt below.
+        emit_progress("midi", 2, "Adopting MIDI state", None);
         let new_epoch;
         {
             let mut session = self.session.lock();
@@ -4587,8 +4627,10 @@ impl ControlPlane {
             // Eager midi adopt (Task 6: no more lazy resync on the first
             // midi command after an open) — same lock as the store swap
             // above, no separate re-acquisition.
+            let t = std::time::Instant::now();
             let bpm = session.store.transport.tempo_bpm;
             crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+            log::info!("open: midi adopted in {} ms", t.elapsed().as_millis());
             // snapshot republish: document swap (open) — a non-op writer,
             // so nothing captured this. Full re-derive before the guard
             // drops, so the published image is never behind the live doc.
@@ -4612,16 +4654,65 @@ impl ControlPlane {
         // always empty: File▸Open A, edit, File▸Open B, File▸Open A used to
         // report nothing with two unsaved batches sitting on disk. Reading
         // needs neither the boundary nor the adopts below.
+        //
+        // Progress-wise this reads the WHOLE journal.ndjson (7.6 MB in one
+        // observed project) before `epoch_boundary` appends one line to it,
+        // so both share the single "journal" stage rather than each getting
+        // its own step in the 9-step contract.
+        emit_progress("journal", 3, "Checking journal for unsaved changes", None);
+        let t = std::time::Instant::now();
         replay::detect_unsaved_tail(&dir);
         self.committer.log().epoch_boundary(&dir, history::EpochEvent::Open, new_epoch);
-        crate::plugins::state::adopt_open_project(&dir);
+        log::info!("open: journal checked in {} ms", t.elapsed().as_millis());
+
+        // Plugins is the heaviest stage in practice: every restored instance
+        // is instantiated SERIALLY and SYNCHRONOUSLY, and the first LV2 one
+        // touches `livi::World::new()` (a full system bundle scan) — see
+        // `plugins::state::reactivate_restored`'s doc. The progress callback
+        // re-emits the SAME "plugins" stage with a per-instance `detail` so
+        // the frontend can show which plugin is loading, not just that the
+        // stage is running.
+        emit_progress("plugins", 4, "Instantiating plugins", None);
+        let t = std::time::Instant::now();
+        crate::plugins::state::adopt_open_project_with_progress(&dir, &|done, total, name| {
+            emit_progress(
+                "plugins",
+                4,
+                "Instantiating plugins",
+                Some(&format!("{name} ({}/{total})", done + 1)),
+            );
+        });
+        log::info!("open: plugins adopted in {} ms", t.elapsed().as_millis());
+
+        emit_progress("automation", 5, "Restoring automation", None);
+        let t = std::time::Instant::now();
         crate::plugins::automation::adopt_open_project(&dir);
+        log::info!("open: automation adopted in {} ms", t.elapsed().as_millis());
+
+        emit_progress("midiOut", 6, "Reconnecting MIDI outputs", None);
+        let t = std::time::Instant::now();
         if let Some(out) = self.midi_out.get() {
             out.adopt_project(&dir);
         }
+        log::info!("open: midi outputs adopted in {} ms", t.elapsed().as_millis());
+
+        emit_progress("modulation", 7, "Loading modulation routes", None);
+        let t = std::time::Instant::now();
         self.adopt_modulation_from_dir(&dir);
+        log::info!("open: modulation adopted in {} ms", t.elapsed().as_millis());
+
+        // `Rebuild` is fire-and-forget (the real media-decode cost lands
+        // later, silently, on the engine control thread's `ensure_loaded` —
+        // see that method's own `project://media-progress` emits), so this
+        // stage's timing is just dispatch cost, not the rebuild itself.
+        emit_progress("rebuild", 8, "Rebuilding audio graph", None);
+        let t = std::time::Instant::now();
         self.engine.send(ControlMsg::Rebuild);
+        log::info!("open: rebuild dispatched in {} ms", t.elapsed().as_millis());
+
         (self.emit)("project://changed", serde_json::to_value(&project).unwrap_or_default());
+        emit_progress("done", 9, "Ready", None);
+        log::info!("open: project opened in {} ms total", t_open.elapsed().as_millis());
         Ok(project)
     }
 

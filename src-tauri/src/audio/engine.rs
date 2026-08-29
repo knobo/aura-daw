@@ -2697,6 +2697,25 @@ impl Control {
     /// precisely the shape that must not sit under the document's lock. An
     /// image one commit behind can only cost this pass a decode it redoes
     /// next rebuild — the commit that added the clip queued one.
+    /// `project://media-progress` emit, mirroring `EventSink`'s other app
+    /// events (`transport://state` etc.) — see `ensure_loaded`'s doc for why
+    /// this stage in particular needs one. A free function (not a closure
+    /// over `self`) so a call is a single statement that borrows `self`
+    /// immutably and releases it before the next line mutates
+    /// `self.cache` — `ensure_loaded` interleaves emits with cache writes.
+    fn emit_media_progress(&self, loaded: usize, total: usize, name: Option<&str>, phase: &str, done: bool) {
+        self.events.emit(
+            "project://media-progress",
+            serde_json::json!({
+                "loaded": loaded,
+                "total": total,
+                "name": name,
+                "phase": phase,
+                "done": done,
+            }),
+        );
+    }
+
     fn ensure_loaded(&mut self, s: &crate::control::snapshot::SessionSnapshot) {
         let rate = self.engine_rate();
         if self.cache_rate != rate {
@@ -2707,18 +2726,27 @@ impl Control {
         // deduped); pyramid dirs are still resolved per clip below (the
         // visual cache stays clip-id-keyed — dedup opportunity ledgered,
         // not taken here).
-        let (project_dir, todo, live_sources, clips_by_source) = {
+        //
+        // PROGRESS (startup-progress task): `source_names`/`clip_names` are
+        // collected in this same pass purely to label the
+        // `project://media-progress` events below — the decode/pyramid
+        // decisions themselves are unchanged.
+        let (project_dir, todo, live_sources, clips_by_source, source_names, clip_names) = {
             let todo = stale_sources(&s.clips, &self.cache);
             let mut live_sources: std::collections::HashSet<SourceId> = std::collections::HashSet::new();
             let mut clips_by_source: HashMap<SourceId, Vec<String>> = HashMap::new();
+            let mut source_names: HashMap<SourceId, String> = HashMap::new();
+            let mut clip_names: HashMap<String, String> = HashMap::new();
             for c in s.clips.iter() {
                 if c.source_id.as_str().is_empty() {
                     continue; // stale_sources already warned about this
                 }
                 live_sources.insert(c.source_id.clone());
                 clips_by_source.entry(c.source_id.clone()).or_default().push(c.id.to_string());
+                source_names.entry(c.source_id.clone()).or_insert_with(|| c.name.clone());
+                clip_names.insert(c.id.to_string(), c.name.clone());
             }
-            (s.project_dir.clone(), todo, live_sources, clips_by_source)
+            (s.project_dir.clone(), todo, live_sources, clips_by_source, source_names, clip_names)
         };
         // GC by source (round-2 §2.2's "sane asset GC" half of O-12): an
         // asset shared by two clips survives one clip's deletion, since the
@@ -2726,7 +2754,36 @@ impl Control {
         self.cache.retain(|sid, _| live_sources.contains(sid));
 
         let Some(project_dir) = project_dir else { return };
+
+        // PROGRESS: both totals are known BEFORE either loop below runs, so
+        // the very first event already carries an accurate `total` instead
+        // of growing as work is discovered. `missing_by_source` is the same
+        // "does this clip already have a pyramid dir" check the pyramid
+        // loop needs anyway (moved up so it is computed once, not
+        // recomputed per source when that loop runs); nothing between here
+        // and that loop writes a pyramid dir, so the answer cannot go stale
+        // in between.
+        let missing_by_source: HashMap<SourceId, Vec<String>> = clips_by_source
+            .iter()
+            .map(|(sid, clip_ids)| {
+                let missing: Vec<String> = clip_ids
+                    .iter()
+                    .filter(|clip_id| !pyramid_exists(&Store::cache_dir_for(&project_dir, clip_id)))
+                    .cloned()
+                    .collect();
+                (sid.clone(), missing)
+            })
+            .collect();
+        let decode_total = todo.len();
+        let peaks_total: usize = missing_by_source.values().map(Vec::len).sum();
+        let total = decode_total + peaks_total;
+        let t_media = Instant::now();
+        let mut loaded = 0usize;
+
         for (source_id, source_path) in todo {
+            let name = source_names.get(&source_id).map(String::as_str);
+            self.emit_media_progress(loaded, total, name, "decode", false);
+            log::debug!("media: decoding {source_path} ({name:?})");
             let path = project_dir.join(&source_path);
             match load_wav(&path) {
                 Ok((channels, file_rate, samples)) => {
@@ -2738,6 +2795,7 @@ impl Control {
                 }
                 Err(e) => log::warn!("audio: cannot load {}: {e}", path.display()),
             }
+            loaded += 1;
         }
 
         // Reviewer finding 2: pyramid building is DECOUPLED from the decode
@@ -2758,12 +2816,9 @@ impl Control {
         // that actually has missing pyramids, which is rare (first open /
         // new clip) — the hot decode loop above, which builds the
         // play-critical `RtClipData`, is untouched.
-        for (source_id, clip_ids) in &clips_by_source {
+        for source_id in clips_by_source.keys() {
             let Some(cached) = self.cache.get(source_id) else { continue };
-            let missing: Vec<&String> = clip_ids
-                .iter()
-                .filter(|clip_id| !pyramid_exists(&Store::cache_dir_for(&project_dir, clip_id)))
-                .collect();
+            let missing = missing_by_source.get(source_id).map(Vec::as_slice).unwrap_or(&[]);
             if missing.is_empty() {
                 continue;
             }
@@ -2781,11 +2836,24 @@ impl Control {
                 }
             };
             for clip_id in missing {
+                let name = clip_names.get(clip_id).map(String::as_str);
+                self.emit_media_progress(loaded, total, name, "peaks", false);
+                log::debug!("media: building peaks for clip {clip_id} ({name:?})");
                 let cache_dir = Store::cache_dir_for(&project_dir, clip_id);
                 if let Err(e) = pyr.write_dir(&cache_dir) {
                     log::warn!("waveform cache for {clip_id}: {e}");
                 }
+                loaded += 1;
             }
+        }
+
+        if total > 0 {
+            self.emit_media_progress(total, total, None, "decode", true);
+            log::info!(
+                "media: prepared {} file(s)/clip(s) in {} ms",
+                total,
+                t_media.elapsed().as_millis()
+            );
         }
     }
 
