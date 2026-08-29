@@ -766,6 +766,14 @@ fn render_impl(
     // queues THIS BLOCK's hardware MIDI-in events into the node and may fire
     // `all_notes_off`. Left inside the window loop it would deliver every
     // live-in event once per window.
+    //
+    // It is also the ONE deliberate exception to "an idle pad is fed
+    // nothing", and the reason the row loop's early-out sits inside that loop
+    // rather than up here: both things `prime_live` delivers must reach a row
+    // the strip loop skips — hardware MIDI-in, which is how a pad's
+    // instrument is PLAYED from a keyboard with no clock running at all, and
+    // the `all_notes_off` a cut pad's discontinuity owes its node, which is
+    // precisely what a row that has just stopped no longer runs to collect.
     for tr in tracks.iter_mut() {
         tr.win = super::rt::TrackWindow::default();
         if tr.slot >= n_slots {

@@ -1954,21 +1954,50 @@ impl ControlPlane {
     /// has nothing to sound, so it is 0 rather than an error — a control pad
     /// that reports a failure every time it is pressed is worse than one that
     /// silently does what it is.
+    /// The MIDI arm reads `session.midi`, which is why this takes the whole
+    /// session rather than the store: a MIDI player's placement is a
+    /// `MidiClip`, and its length is TICKS. `rate` is the engine's, and a
+    /// rate of 0 (no device yet) yields 0 — the same "nothing to sound"
+    /// answer a knobs-only pad gives, rather than a length computed at a
+    /// fabricated rate.
     fn player_source_length(
-        store: &crate::audio::types::Store,
+        session: &Session,
         p: &crate::audio::player::Player,
+        rate: u32,
     ) -> Result<u64, String> {
         match &p.source {
-            crate::audio::player::PlayerSource::AudioClip { clip_id } => store
+            crate::audio::player::PlayerSource::AudioClip { clip_id } => session
+                .store
                 .clips
                 .iter()
                 .find(|c| &c.id == clip_id)
                 .map(|c| c.length_samples)
                 .ok_or_else(|| format!("player {}: unknown clip {clip_id}", p.id)),
-            // Task 10 converts the MIDI clip's tick length through the tempo
-            // map; until it does, a MIDI player has no live node to sound
-            // through and firing it would only spin a clock nothing reads.
-            crate::audio::player::PlayerSource::MidiClip { .. } => Ok(0),
+            // The PLACEMENT's span, tick-converted through the tempo map the
+            // arrangement uses — the difference of the two ends rather than
+            // `length_ticks` converted from zero, so a placement under a
+            // tempo change is as long as it actually sounds there.
+            crate::audio::player::PlayerSource::MidiClip { clip_id, .. } => {
+                let clip = session
+                    .midi
+                    .clips
+                    .iter()
+                    .find(|c| &c.id == clip_id)
+                    .ok_or_else(|| format!("player {}: unknown midi clip {clip_id}", p.id))?;
+                if rate == 0 {
+                    return Ok(0);
+                }
+                let map = crate::midi::TempoMap::new(
+                    session.midi.ppq,
+                    session.midi.tempo_events.clone(),
+                    rate,
+                )
+                .map_err(|e| format!("player {}: {e}", p.id))?;
+                let start = map.tick_to_samples(clip.timeline_start_ticks);
+                let end =
+                    map.tick_to_samples(clip.timeline_start_ticks + clip.length_ticks);
+                Ok(end.saturating_sub(start))
+            }
             crate::audio::player::PlayerSource::None => Ok(0),
         }
     }
@@ -1985,6 +2014,8 @@ impl ControlPlane {
     /// scene's clock — which is what lets a pad fire under a rolling
     /// arrangement, and two pads sound at once (V-4).
     pub fn player_fire(&self, id: &str) -> Result<(), String> {
+        // Read before the lock: an atomic load has no business under it.
+        let rate = self.shared.sample_rate.load(Relaxed);
         let (len, looping) = {
             let session = self.session.lock();
             let p = session
@@ -1994,7 +2025,7 @@ impl ControlPlane {
                 .find(|p| p.id.as_str() == id)
                 .ok_or_else(|| format!("unknown player: {id}"))?;
             (
-                Self::player_source_length(&session.store, p)?,
+                Self::player_source_length(&session, p, rate)?,
                 p.trigger.mode == crate::audio::player::TriggerMode::Loop,
             )
         };
@@ -6374,6 +6405,79 @@ mod tests {
         cp.player_fire(p.id.as_str()).unwrap();
         let clock = cp.player_clock_for(p.id.as_str()).unwrap();
         assert!(!cp.tables_for_tests().clocks.is_on(clock), "nothing to play");
+    }
+
+    /// Task 10: a MIDI pad's press has a LENGTH, which before it was 0 — so
+    /// `player_fire`'s zero-length short-circuit swallowed the press and the
+    /// pad never sounded at all. The length is the PLACEMENT's, tick-converted
+    /// through the tempo map, exactly as the audio arm uses `length_samples`.
+    #[test]
+    fn firing_a_midi_player_sounds_for_the_clips_tick_converted_length() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        cp.shared.sample_rate.store(48_000, Relaxed);
+        // Bar 5, one bar long. 960 ticks at 120 bpm / 48 kHz is 24000 samples,
+        // and the bar-5 origin must not leak into the length.
+        cp.session.lock().midi.clips.push(crate::midi::types::MidiClip {
+            id: "mc1".into(),
+            track_id: "t-1".into(),
+            name: "pad".into(),
+            timeline_start_ticks: 15_360,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t-1"),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        });
+        let p = cp
+            .add_player(
+                Some("PAD".into()),
+                crate::audio::player::PlayerSource::MidiClip {
+                    clip_id: "mc1".into(),
+                    instrument_id: Some("plugin:i1".into()),
+                },
+                false,
+                op::TxMeta::user("add"),
+            )
+            .unwrap();
+        republish_tables(&cp);
+
+        cp.player_fire(p.id.as_str()).unwrap();
+        let clock = cp.player_clock_for(p.id.as_str()).unwrap();
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(clock), "the pad is sounding");
+        tables.clocks.advance(23_999);
+        assert!(tables.clocks.is_on(clock), "still inside the bar");
+        tables.clocks.advance(1);
+        assert!(
+            !tables.clocks.is_on(clock),
+            "one bar at 120 bpm / 48 kHz is 24000 samples, and the bar-5 \
+             origin is not part of it"
+        );
+    }
+
+    /// The same tolerance the audio arm has, for the same reason: a source
+    /// the document no longer has is an error the press reports rather than a
+    /// clock spun over a length nobody can compute.
+    #[test]
+    fn firing_a_midi_player_whose_clip_is_gone_is_an_error() {
+        let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1"]);
+        cp.shared.sample_rate.store(48_000, Relaxed);
+        let p = cp
+            .add_player(
+                Some("PAD".into()),
+                crate::audio::player::PlayerSource::MidiClip {
+                    clip_id: "ghost".into(),
+                    instrument_id: Some("plugin:i1".into()),
+                },
+                false,
+                op::TxMeta::user("add"),
+            )
+            .unwrap();
+        republish_tables(&cp);
+        assert!(cp.player_fire(p.id.as_str()).unwrap_err().contains("unknown midi clip"));
     }
 
     /// A pad added since the last rebuild has no lane yet. Say so, rather

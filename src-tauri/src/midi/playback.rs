@@ -112,8 +112,26 @@ impl LiveNodeRegistry {
     }
 
     /// Drop entries for tracks that no longer render live.
+    ///
+    /// The player namespace is EXEMPT (Plan V — V2, Task 10). Player nodes
+    /// live in the same map under [`player_node_key`], and this prune runs
+    /// inside `append_from`, which `engine::rebuild` calls BEFORE it builds
+    /// the player rows — so sweeping them here would retire every pad's
+    /// instrument on every rebuild and re-instantiate it a few statements
+    /// later, cutting its voices and re-doing the expensive load. Players are
+    /// pruned by [`retain_players`](Self::retain_players) after their own
+    /// pass, where the live set is actually known.
     pub fn retain_tracks(&mut self, live: &HashSet<String>) {
-        self.entries.retain(|id, _| live.contains(id));
+        self.entries
+            .retain(|id, _| id.starts_with(PLAYER_NS) || live.contains(id));
+    }
+
+    /// Drop entries for players that no longer render live — the player half
+    /// of [`retain_tracks`](Self::retain_tracks), keyed by
+    /// [`player_node_key`]. Track entries are untouched.
+    pub fn retain_players(&mut self, live: &HashSet<String>) {
+        self.entries
+            .retain(|id, _| !id.starts_with(PLAYER_NS) || live.contains(id));
     }
 
     pub fn len(&self) -> usize {
@@ -338,7 +356,50 @@ fn node_for_track(
     rate: u32,
     nodes: &mut LiveNodeRegistry,
 ) -> Arc<LiveNodeCell> {
-    if let Some(id) = t.instrument_id.as_deref() {
+    node_for_instrument(
+        t.id.as_str(),
+        &format!("track {}", t.id),
+        t.instrument_id.as_deref(),
+        plugins,
+        bank,
+        rate,
+        nodes,
+    )
+}
+
+/// The registry namespace player nodes live in, so one map can hold both
+/// owners and [`LiveNodeRegistry::retain_tracks`] can tell them apart. A
+/// track id containing this prefix would collide — no producer of track ids
+/// makes one, and the slot map has the same shape of assumption already
+/// (`TrackId::from(player.id)`).
+const PLAYER_NS: &str = "player:";
+
+/// The registry key a player's instrument node is cached under.
+pub fn player_node_key(player_id: &str) -> String {
+    format!("{PLAYER_NS}{player_id}")
+}
+
+/// Resolve the live node for ONE owner of an instrument — a track, or (Plan
+/// V — V2, Task 10) a player. `owner_key` is what the node is cached under
+/// in the registry; `label` is how the owner is named in a log line.
+///
+/// Deliberately ONE function rather than a track copy and a player copy: the
+/// node key is a correctness surface, not a formatting detail. It carries the
+/// instance's `state_rev` (so a loaded zyn patch reaches the RT node) and its
+/// `status` (so an activation retires the cached silent stub); a second copy
+/// of that formula would let a player quietly keep either defect after the
+/// track's copy was fixed.
+#[allow(clippy::too_many_arguments)]
+fn node_for_instrument(
+    owner_key: &str,
+    label: &str,
+    instrument_id: Option<&str>,
+    plugins: &crate::control::session::PluginDoc,
+    bank: Option<&SamplerBank>,
+    rate: u32,
+    nodes: &mut LiveNodeRegistry,
+) -> Arc<LiveNodeCell> {
+    if let Some(id) = instrument_id {
         if let Some(pid) = id.strip_prefix("plugin:") {
             // The state revision is part of the key: a plugin's loaded state
             // (a zyn patch) reaches an instance only at instantiation, so a
@@ -362,17 +423,16 @@ fn node_for_track(
                 .map_or("absent", |r| r.status.as_str());
             let key = format!("plugin:{pid}@{rate}#{rev}!{status}");
             if let Some(cell) = nodes
-                .resolve_with(t.id.as_str(), &key, || crate::plugins::live_node_for(plugins, pid, rate))
+                .resolve_with(owner_key, &key, || crate::plugins::live_node_for(plugins, pid, rate))
             {
                 return cell;
             }
             log::warn!(
-                "midi playback: track {} plugin instance {pid} is unavailable; using PolySynth",
-                t.id
+                "midi playback: {label} plugin instance {pid} is unavailable; using PolySynth"
             );
         } else if let Some(compiled) = bank.and_then(|b| b.compiled(id)) {
             let key = format!("sampler:{id}@{rate}");
-            if let Some(cell) = nodes.resolve_with(t.id.as_str(), &key, move || {
+            if let Some(cell) = nodes.resolve_with(owner_key, &key, move || {
                 let mut node = SamplerNode::new((*compiled).clone());
                 node.prepare(rate, MAX_LIVE_BLOCK);
                 Some(Box::new(node))
@@ -381,19 +441,80 @@ fn node_for_track(
             }
         } else {
             log::warn!(
-                "midi playback: track {} instrument {id} is not loaded; using PolySynth",
-                t.id
+                "midi playback: {label} instrument {id} is not loaded; using PolySynth"
             );
         }
     }
     let key = format!("synth@{rate}");
     nodes
-        .resolve_with(t.id.as_str(), &key, || {
+        .resolve_with(owner_key, &key, || {
             let mut synth = PolySynth::new();
             synth.prepare(rate, MAX_LIVE_BLOCK);
             Some(Box::new(synth))
         })
         .expect("PolySynth construction is infallible")
+}
+
+// ---------------------------------------------------------------------------
+// Players (Plan V — V2, Task 10)
+// ---------------------------------------------------------------------------
+
+/// The live source for a MIDI player (Plan V, R3).
+///
+/// Two differences from the per-track path, both consequences of a player
+/// having its own playhead:
+///
+/// * The node is keyed by PLAYER id, not track id ([`player_node_key`]). The
+///   instance it hosts is owned by no track — `PluginInstanceInfo::track_id`
+///   is already optional, so an untracked instance has always been legal; it
+///   simply had nowhere to render until there was a player.
+/// * Events are rebased so the clip's start is sample 0. A player's playhead
+///   starts at 0 on press, so absolute arrangement positions would put every
+///   note in the future and the pad would sound silent.
+///
+/// `None` — no live row at all — for the three ways a MIDI pad has nothing to
+/// sound: not a MIDI source, no instrument bound yet (V-4's "silent until one
+/// is bound"), or a clip the document no longer has. That last one is
+/// SILENCE, not an error, exactly as the audio-clip row treats a missing
+/// clip.
+pub fn live_source_for_player(
+    session: &crate::control::snapshot::SessionSnapshot,
+    player: &crate::audio::player::Player,
+    rate: u32,
+    bank: Option<&SamplerBank>,
+    nodes: &mut LiveNodeRegistry,
+) -> Option<LiveSource> {
+    let crate::audio::player::PlayerSource::MidiClip { clip_id, instrument_id } = &player.source
+    else {
+        return None;
+    };
+    let instrument_id = instrument_id.as_deref()?;
+    if rate == 0 {
+        return None; // no engine rate yet: every tick would convert to nonsense
+    }
+    let clip = session.midi.clips.iter().find(|c| &c.id == clip_id)?;
+    let map = TempoMap::new(session.midi.ppq, (*session.midi.tempo_events).clone(), rate).ok()?;
+    let node = node_for_instrument(
+        &player_node_key(player.id.as_str()),
+        &format!("player {}", player.id),
+        Some(instrument_id),
+        &session.plugins,
+        bank,
+        rate,
+        nodes,
+    );
+    // The clip's ARRANGEMENT origin, subtracted rather than assumed zero: the
+    // placement keeps whatever tempo curve it sits under, so bar 9's notes
+    // keep bar 9's spacing — only their base moves to the press.
+    let origin = map.tick_to_samples(clip.timeline_start_ticks);
+    let events: Vec<AbsNoteEvent> = schedule::clip_events(clip, &map)
+        .into_iter()
+        .map(|mut e| {
+            e.sample = e.sample.saturating_sub(origin);
+            e
+        })
+        .collect();
+    Some(LiveSource { node, events: Arc::new(events) })
 }
 
 #[cfg(test)]
@@ -942,5 +1063,165 @@ mod tests {
             stub_node,
             "the track must get a DIFFERENT node — the same Arc back is the silent-forever bug"
         );
+    }
+
+    // ---- Plan V — V2, Task 10: MIDI-clip players (R3) --------------------
+
+    use crate::audio::player::{Player, PlayerSource};
+    use crate::control::snapshot::SessionSnapshot;
+    use crate::ids::PlayerId;
+
+    /// A published image carrying one MIDI clip and one plugin instance that
+    /// NO track owns. `PluginInstanceInfo::track_id` has always been optional
+    /// — such an instance was legal and simply had nowhere to render (design
+    /// §4). A player is that somewhere.
+    fn image_with(clip_start_ticks: u64) -> SessionSnapshot {
+        let mut c = clip(
+            "no-track",
+            clip_start_ticks,
+            960,
+            vec![MidiNote {
+                tick: 0,
+                length_ticks: 480,
+                key: 60,
+                velocity: 100,
+                channel: 0,
+                note_id: NoteId(0),
+            }],
+        );
+        c.id = "mc1".into();
+        let midi = midi_store_with(vec![c]);
+        let mut plugins = crate::control::session::PluginDoc::default();
+        plugins.instances.push(crate::plugins::descriptor::PluginInstanceInfo {
+            id: "i1".into(),
+            uid: "lv2:http://zynaddsubfx.sourceforge.net".into(),
+            name: "ZynAddSubFX".into(),
+            format: "lv2".into(),
+            status: "stub".into(),
+            track_id: None, // owned by no track — that is the whole point
+        });
+        let mut img = SessionSnapshot::empty();
+        img.midi = crate::control::snapshot::MidiSnapshot::from_store(&midi);
+        img.plugins = Arc::new(plugins);
+        img
+    }
+
+    fn session_with_an_untracked_instrument() -> SessionSnapshot {
+        image_with(0)
+    }
+
+    /// Bar 9 in 4/4 at ppq 960 is tick 8 * 4 * 960 = 30720, which at
+    /// 120 bpm / 48 kHz is sample 768000 — nowhere near zero.
+    fn session_with_a_midi_clip_at_bar_nine() -> SessionSnapshot {
+        image_with(30_720)
+    }
+
+    fn player_with_midi_clip(clip_id: &str, instrument: &str) -> Player {
+        let mut p = Player::new(PlayerId::from("p1"), "PAD");
+        p.source = PlayerSource::MidiClip {
+            clip_id: clip_id.into(),
+            instrument_id: Some(instrument.into()),
+        };
+        p
+    }
+
+    /// R3: a plugin instance owned by no track renders somewhere. The
+    /// somewhere is a player.
+    #[test]
+    fn a_player_gets_a_live_node_for_an_instance_no_track_owns() {
+        let session = session_with_an_untracked_instrument();
+        let player = player_with_midi_clip("mc1", "plugin:i1");
+        let mut nodes = LiveNodeRegistry::default();
+        let src = live_source_for_player(&session, &player, 48_000, None, &mut nodes)
+            .expect("a live source");
+        assert!(!src.events.is_empty());
+        assert_eq!(
+            nodes.key_of("player:p1"),
+            Some("plugin:i1@48000#0!stub"),
+            "the node is keyed by PLAYER, and carries the same state/status key a track's does"
+        );
+    }
+
+    /// The whole point of a player's own playhead: its events are LOCAL.
+    /// A clip that sits at bar 9 of the arrangement still starts at sample
+    /// 0 when a pad fires it.
+    #[test]
+    fn a_players_events_are_rebased_so_the_first_note_is_at_sample_zero() {
+        let session = session_with_a_midi_clip_at_bar_nine();
+        let player = player_with_midi_clip("mc1", "plugin:i1");
+        let src =
+            live_source_for_player(&session, &player, 48_000, None, &mut LiveNodeRegistry::default())
+                .unwrap();
+        assert_eq!(
+            src.events[0].sample, 0,
+            "the press is time zero, not the clip's arrangement position"
+        );
+        assert_eq!(src.events[1].sample, 12_000, "and the off keeps its distance");
+    }
+
+    #[test]
+    fn a_player_with_no_instrument_has_no_live_source() {
+        let session = session_with_a_midi_clip_at_bar_nine();
+        let mut player = player_with_midi_clip("mc1", "plugin:i1");
+        if let PlayerSource::MidiClip { instrument_id, .. } = &mut player.source {
+            *instrument_id = None;
+        }
+        assert!(
+            live_source_for_player(&session, &player, 48_000, None, &mut LiveNodeRegistry::default())
+                .is_none()
+        );
+    }
+
+    /// A source the document no longer has is SILENCE, not a panic — the
+    /// same tolerance the audio-player row has.
+    #[test]
+    fn a_player_whose_midi_clip_is_gone_has_no_live_source() {
+        let session = session_with_an_untracked_instrument();
+        let player = player_with_midi_clip("ghost", "plugin:i1");
+        assert!(
+            live_source_for_player(&session, &player, 48_000, None, &mut LiveNodeRegistry::default())
+                .is_none()
+        );
+    }
+
+    /// The registry half, and it is not decoration: a player's node holds the
+    /// instrument's VOICES and its loaded patch. `append_from`'s own prune
+    /// runs BEFORE the player rows are built on every rebuild, so a prune
+    /// that swept the player namespace would re-instantiate the plugin on
+    /// every structural edit — cutting the sound and dropping the state
+    /// `state_rev` exists to deliver.
+    #[test]
+    fn a_players_node_survives_a_rebuild_and_is_pruned_only_when_the_player_goes() {
+        let session = session_with_an_untracked_instrument();
+        let player = player_with_midi_clip("mc1", "plugin:i1");
+        let mut nodes = LiveNodeRegistry::default();
+        let first = live_source_for_player(&session, &player, 48_000, None, &mut nodes)
+            .unwrap()
+            .node;
+
+        // A rebuild: the track pass prunes its own namespace, then the player
+        // pass runs. The pad keeps its node.
+        let store = Store::default();
+        let mut out = Vec::new();
+        append_from(
+            &session.midi,
+            &store.tracks,
+            &store.clips,
+            &session.plugins,
+            &Default::default(),
+            48_000,
+            None,
+            &crate::midi_out::RoutedOut::default(),
+            &mut nodes,
+            &mut out,
+        );
+        let second = live_source_for_player(&session, &player, 48_000, None, &mut nodes)
+            .unwrap()
+            .node;
+        assert!(Arc::ptr_eq(&first, &second), "the pad's instrument survived the rebuild");
+
+        // The player is deleted: nothing keeps its node alive.
+        nodes.retain_players(&HashSet::new());
+        assert!(nodes.key_of("player:p1").is_none(), "a deleted pad releases its node");
     }
 }

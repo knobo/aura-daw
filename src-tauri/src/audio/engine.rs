@@ -1987,9 +1987,12 @@ impl Control {
             // the tracks were, so a non-raw player gets exactly what a track
             // with the same strip would; a raw one gets nothing, because
             // `From<&Player>` gave the compilers nothing (V-6).
+            let mut live_players: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for p in s.players.iter() {
                 let node_id = crate::ids::TrackId::from(p.id.as_str());
                 let Some(&slot) = slots_s.get(&node_id) else { continue };
+                let mut live = None;
                 let clips = match &p.source {
                     crate::audio::player::PlayerSource::AudioClip { clip_id } => {
                         match s.clips.iter().find(|c| &c.id == clip_id) {
@@ -2000,13 +2003,30 @@ impl Control {
                             None => Vec::new(),
                         }
                     }
-                    // MIDI sources need a live instrument node of their own
-                    // (Task 10); `PlayerSource::None` is a knobs-only pad
-                    // (R5) and renders silence by definition.
-                    _ => Vec::new(),
+                    // R3 (Task 10): a MIDI pad's instrument is a live node no
+                    // TRACK owns, so the row carries no clips at all — the
+                    // instrument IS the source, fed the clip's notes rebased
+                    // onto the pad's own playhead. `PlayerSource::None` is a
+                    // knobs-only pad (R5) and renders silence by definition.
+                    crate::audio::player::PlayerSource::MidiClip { .. } => {
+                        live = crate::midi::playback::live_source_for_player(
+                            &s,
+                            p,
+                            self.cache_rate,
+                            bank.as_deref(),
+                            &mut self.live_nodes,
+                        );
+                        if live.is_some() {
+                            live_players
+                                .insert(crate::midi::playback::player_node_key(p.id.as_str()));
+                        }
+                        Vec::new()
+                    }
+                    crate::audio::player::PlayerSource::None => Vec::new(),
                 };
                 let i = tracks.len();
                 tracks.push(RtTrack::clips(slot, clips));
+                tracks[i].live = live;
                 if let Some(chain) = compiled.remove(&node_id) {
                     if !chain.is_empty() {
                         tracks[i].inserts = chain;
@@ -2031,6 +2051,13 @@ impl Control {
                 }
                 tracks[i].output = plan.output.get(slot).copied().flatten();
             }
+            // A pad that stopped rendering live releases its instrument. This
+            // is the player half of `append_from`'s `retain_tracks` and has to
+            // run HERE rather than there: `append_from` runs before this loop,
+            // so pruning the player namespace inside it would retire every
+            // pad's node on every rebuild and re-instantiate it a few
+            // statements later — the sound cut, and the loaded patch redone.
+            self.live_nodes.retain_players(&live_players);
             routing = Some(plan);
             assembled = Some((slots_s, tracks));
         }
@@ -5478,6 +5505,105 @@ mod tests {
         assert_eq!(t.params.len(), 4, "the param table grew with them");
     }
 
+    /// Task 10, R3, at the seam that decides it: a MIDI player's row in the
+    /// PUBLISHED graph carries a live node — an instrument instance no track
+    /// owns — with the clip's notes rebased onto the pad's own playhead.
+    ///
+    /// Through the real non-headless `rebuild` on purpose. The unit tests in
+    /// `midi::playback` cover `live_source_for_player` itself; this is the
+    /// only thing that can say the compiler ATTACHES it, which is exactly the
+    /// hole Task 9 left behind (`_ => Vec::new()`).
+    #[test]
+    fn a_midi_players_row_carries_the_live_node_its_instrument_renders_through() {
+        let (mut ctl, session, tx) = bare_control_with_tx();
+        ctl.shared.sample_rate.store(48_000, Relaxed);
+        {
+            let mut s = session.lock();
+            let mut p = crate::audio::player::Player::new(
+                crate::ids::PlayerId::from("p-1"),
+                "PAD",
+            );
+            p.source = crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc1".into(),
+                instrument_id: Some("plugin:i1".into()),
+            };
+            s.store.players.push(p);
+            // The clip sits at bar 5 of an arrangement whose track it names
+            // does not even exist — a pad's clip is not arrangement material.
+            s.midi.clips.push(crate::midi::types::MidiClip {
+                id: "mc1".into(),
+                track_id: "no-track".into(),
+                name: "pad".into(),
+                timeline_start_ticks: 15_360,
+                length_ticks: 960,
+                notes: vec![crate::midi::types::MidiNote {
+                    tick: 0,
+                    length_ticks: 480,
+                    key: 60,
+                    velocity: 100,
+                    channel: 0,
+                    note_id: crate::ids::NoteId(0),
+                }],
+                next_note_id: 1,
+                content_id: crate::ids::ContentId::mint(),
+                lane_id: crate::ids::LaneId::default_for_track("no-track"),
+                content_length_ticks: None,
+                transpose_semitones: 0,
+                velocity_offset: 0,
+            });
+            // R3 itself: the instance belongs to NO track.
+            s.plugins.instances.push(crate::plugins::PluginInstanceInfo {
+                id: "i1".into(),
+                uid: "lv2:http://zynaddsubfx.sourceforge.net".into(),
+                name: "ZynAddSubFX".into(),
+                format: "lv2".into(),
+                status: "stub".into(),
+                track_id: None,
+            });
+            s.republish_full();
+        }
+        let (graph_tx, mut graph_rx) = rtrb::RingBuffer::new(8);
+        let (_retire_tx, retire_rx) = rtrb::RingBuffer::new(8);
+        let (_meter_tx, meter_rx) = rtrb::RingBuffer::new(8);
+        let (_evt_tx, evt_rx) = rtrb::RingBuffer::new(8);
+        ctl.output = Some(OutputBundle { _stream: None, graph_tx, retire_rx, meter_rx, evt_rx });
+        tx.send(ControlMsg::Rebuild).unwrap();
+        drop(tx);
+        ctl.run();
+
+        let graph = graph_rx.pop().expect("the tick published a graph").into_box();
+        let slot = ctl.tables.lock().slots[&crate::ids::TrackId::from("p-1")];
+        let row = graph
+            .tracks
+            .iter()
+            .find(|t| t.slot == slot)
+            .expect("the player has a row");
+        let live = row.live.as_ref().expect("a MIDI pad has an instrument to play");
+        assert_eq!(
+            live.events[0].sample, 0,
+            "the pad's playhead starts at 0, not at the clip's bar-5 position"
+        );
+        assert_eq!(live.events[0].velocity, 100);
+        assert_eq!(live.events[1].sample, 12_000, "and the note keeps its length");
+        assert!(row.clips.is_empty(), "the instrument IS the source; there is no clip row");
+        assert_eq!(
+            ctl.live_nodes.len(),
+            1,
+            "and the node is REGISTERED, so the next rebuild reuses it"
+        );
+
+        // Delete the pad: its instrument is released. The prune has to live on
+        // the player side of `rebuild` — `append_from`'s track prune runs
+        // before the player rows exist and deliberately skips the namespace.
+        {
+            let mut s = session.lock();
+            s.store.players.clear();
+            s.republish_full();
+        }
+        ctl.rebuild();
+        assert!(ctl.live_nodes.is_empty(), "a deleted pad does not leak its instrument");
+    }
+
     /// V-6, at the one place the graph's fader values are written: a raw
     /// player's strip is unity/centre/unmuted whatever the document holds,
     /// because that is what `From<&Player>` compiled it to.
@@ -6060,11 +6186,14 @@ mod tests {
     /// window the row has just played, and the flush replays exactly the
     /// events that window already delivered.
     ///
-    /// The graph COMPILER cannot build this row yet: `mix_nodes` gives a
-    /// player slot no live node (`_ => Vec::new()`), and task 10 — "MIDI
-    /// players with an instrument no track owns" — is what makes it reachable.
-    /// The RT half is real today, so it is pinned here rather than left to be
-    /// discovered by the next task.
+    /// The graph compiler could not build this row when the case was found:
+    /// `rebuild`'s player loop gave a MIDI player no live node at all. Task 10
+    /// — "MIDI players with an instrument no track owns" — is what made it
+    /// reachable, and
+    /// `a_midi_players_row_carries_the_live_node_its_instrument_renders_through`
+    /// is where that half is now pinned. This one stays what it always was:
+    /// the RT half, on a hand-built row, independent of how the compiler
+    /// happens to reach it.
     #[test]
     fn a_flushing_row_does_not_re_queue_the_events_under_its_frozen_playhead() {
         use crate::audio::dsp::{AudioProcessor, LiveInstrument, ProcessBlock};
