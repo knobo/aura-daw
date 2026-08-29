@@ -398,7 +398,7 @@
       </div>
 
       <div class="metadata-row" class:named={track.kind === "midi" && !isAutomation} role="gridcell" aria-label="Routing and FX for {track.name}">
-        <span class="picker group-picker">
+        <span class="picker" class:name-picker={group !== null}>
           <!-- Owner note (2026-08-24): the word "Group" was on every lane
                whether or not the lane had one. The VALUE is the news; the
                word is what the tooltip is for. Ungrouped shows a dim
@@ -445,7 +445,7 @@
               <InsertChain {track} onclose={() => (fxPopoverOpen = false)} />
             {/if}
           </span>
-          <span class="picker">
+          <span class="picker" class:name-picker={!!track.output}>
             <button
               class="status outchip"
               class:on={outPopoverOpen}
@@ -987,20 +987,36 @@
     min-width: 48px;
     height: 17px;
   }
-  /* The cap belongs on the WRAPPER, because the wrapper is what the row
-     sizes. On the chip it fought the wrapper: a row squeezed the picker to
-     31px, the chip held its own 96px cap, and the group name was drawn
-     straight across the chips beside it (measured, and it is what the
-     owner photographed). */
-  .metadata-row .group-picker {
-    /* The base `.picker` rule is `flex: none`. On a row that cannot wrap,
-       a long group name then held 96px open and shoved the tail of the row
-       out past the header's right edge — scrollWidth 309 in a 288px row,
-       `Lanes` hanging outside. It is the one item here with a name in it,
-       so it is the one that gives. */
+  /* One rule for every chip in this row that carries a NAME — the group
+     it is in, and the bus it outputs to. Both are shrinkable, both have a
+     floor, and both are governed on the WRAPPER rather than the chip.
+
+     Governing the chip does not work: the row sizes the `.picker`, so a
+     picker squeezed to 31px around a chip holding its own 96px cap drew
+     the group name straight across its neighbours (measured; it is what
+     the owner photographed first).
+
+     The floor is not decoration either. With a long group name AND an
+     output routed to a long bus name, the group chip was allotted 0px —
+     present in the DOM, invisible, and impossible to click, while the row
+     still overflowed by 11px. A control you cannot see is a control you
+     cannot use, so nothing here shrinks past a target you can hit; the
+     names ellipse instead. 38 + 38 for these two, 22 for the plugin dots
+     and 132 for the three fixed chips leaves the 288px row 58px of slack
+     even in that worst case.
+
+     Applied per-lane, not blanket: an ungrouped lane's dim "GRP" and an
+     unrouted lane's bare "→" carry no name to protect, and floored at 38px
+     they were 21px of empty box each — dead space on the calm lanes, taken
+     out of the instrument name beside them. */
+  .metadata-row .name-picker {
     flex: 0 1 auto;
-    min-width: 0;
+    min-width: 38px;
     max-width: 96px;
+  }
+  .metadata-row .name-picker > * {
+    min-width: 0;
+    max-width: 100%;
   }
   /* Shrink priority for this row is stated in LanePluginStrip's own CSS,
      not here: Svelte scopes styles per component, so a `.strip` selector
@@ -1008,12 +1024,11 @@
      nothing. It cost a measurement pass to notice — the rule was there,
      the layout ignored it. */
   .metadata-row .groupchip {
-    /* `min-width: 0` too: a flex item's automatic minimum is its
-       min-content width, so shrinking alone would stop at the longest
-       word and start overflowing again. */
+    /* Shrink, and `min-width: 0` with it: a flex item's automatic minimum
+       is its min-content width, so shrinking alone would stop at the
+       longest word and start overflowing again. The cap and the floor are
+       the wrapper's job, above. */
     flex: 0 1 auto;
-    min-width: 0;
-    max-width: 100%;
   }
   .metadata-row .instchip {
     /* basis 0, not auto: the chip must never be the item that decides the
@@ -1131,13 +1146,18 @@
        straight out of the instrument name next to it. */
     min-width: 0;
     padding-inline: 5px;
-    max-width: 96px;
+    /* `100%`, governed by `.name-picker`'s 96px cap on the wrapper. A 96px
+       cap HERE tied that rule on specificity and won on source order, so a
+       wrapper squeezed to 38px still painted a 96px chip — straight over
+       the SEND chip beside it. Caps belong on the box the row sizes. */
+    max-width: 100%;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
   .status.outchip.routed {
-    min-width: 40px;
+    /* No `min-width` here any more — `.name-picker` owns the floor, and a
+       40px floor on the chip inside a 38px wrapper only overflowed it. */
     padding-inline: 7px;
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.45);
