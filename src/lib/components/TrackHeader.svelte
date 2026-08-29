@@ -398,7 +398,7 @@
       </div>
 
       <div class="metadata-row" class:named={track.kind === "midi" && !isAutomation} role="gridcell" aria-label="Routing and FX for {track.name}">
-        <span class="picker">
+        <span class="picker group-picker">
           <!-- Owner note (2026-08-24): the word "Group" was on every lane
                whether or not the lane had one. The VALUE is the news; the
                word is what the tooltip is for. Ungrouped shows a dim
@@ -420,7 +420,12 @@
         {:else if track.kind === "bus"}
           <span class="kindchip bus-kind mono" title="Return bus — fed by other tracks' sends and outputs">B</span>
         {:else}
-          <span class="kindchip mono" title="Audio track">A</span>
+          <!-- Nothing for a plain audio lane. "A" was on every audio track,
+               which is to say it marked the default — the same thing the
+               owner removed from the group chip and shrank the kind chip
+               for on 2026-08-24. A bus still says B and an automation lane
+               still says ⌁, because those ARE the news; the waveform in
+               the lane says "audio" better than a letter can. -->
         {/if}
         {#if !isAutomation}
           <LanePluginStrip {track} onoverflow={() => (fxPopoverOpen = true)} />
@@ -887,6 +892,17 @@
 
   .picker {
     position: relative;
+    /* `inline-flex` with `min-width: 0`, not a bare inline box. The row
+       sizes the WRAPPER, and an inline box does not pass that width down —
+       so a shrunken `.picker` still rendered its chip at full width, and
+       the chip's own `text-overflow: ellipsis` never fired because the
+       chip was never narrow. What you saw instead was a group name drawn
+       straight across the chips beside it. */
+    display: inline-flex;
+    min-width: 0;
+  }
+  .picker > * {
+    max-width: 100%;
   }
   .tog {
     width: 20px;
@@ -930,12 +946,20 @@
     align-items: center;
     min-width: 0;
     flex: none;
-    /* A safety valve, not the layout: everything fits one line on a normal
-       lane, but a midi track carries an extra MIDI OUT control in this row
-       and a narrow lane would otherwise push the automation chips out of
-       the header entirely. */
-    flex-wrap: wrap;
-    row-gap: 2px;
+    /* `nowrap`, and it has to be. This was `flex-wrap: wrap`, called "a
+       safety valve" — but the rows sit in a `.header` of fixed
+       `var(--track-height)` (it must match the lane column row for row),
+       so a wrapped line has nowhere to go and renders straight on top of
+       the row beneath it. Measured on a grouped lane with two plugins:
+       `.metadata-row` 17px tall, scrollHeight 48, three chips landing at
+       y=52 over a `.status-row` at y=45.
+       Worse, the wrap DEFEATED the belt it was meant to back up.
+       `LanePluginStrip` already carries `min-width: 0; overflow: hidden`
+       (Ruling P-6) so a long chain gives way instead of pushing the FX
+       chip out — but a wrapping container breaks the line on an item's
+       CONTENT width, before any shrinking is considered, so the strip was
+       never asked to shrink. With `nowrap` the belt does its job. */
+    flex-wrap: nowrap;
   }
   .identity-row {
     height: 17px;
@@ -963,8 +987,33 @@
     min-width: 48px;
     height: 17px;
   }
-  .metadata-row .groupchip {
+  /* The cap belongs on the WRAPPER, because the wrapper is what the row
+     sizes. On the chip it fought the wrapper: a row squeezed the picker to
+     31px, the chip held its own 96px cap, and the group name was drawn
+     straight across the chips beside it (measured, and it is what the
+     owner photographed). */
+  .metadata-row .group-picker {
+    /* The base `.picker` rule is `flex: none`. On a row that cannot wrap,
+       a long group name then held 96px open and shoved the tail of the row
+       out past the header's right edge — scrollWidth 309 in a 288px row,
+       `Lanes` hanging outside. It is the one item here with a name in it,
+       so it is the one that gives. */
+    flex: 0 1 auto;
+    min-width: 0;
     max-width: 96px;
+  }
+  /* Shrink priority for this row is stated in LanePluginStrip's own CSS,
+     not here: Svelte scopes styles per component, so a `.strip` selector
+     written in this file gets this component's hash and silently matches
+     nothing. It cost a measurement pass to notice — the rule was there,
+     the layout ignored it. */
+  .metadata-row .groupchip {
+    /* `min-width: 0` too: a flex item's automatic minimum is its
+       min-content width, so shrinking alone would stop at the longest
+       word and start overflowing again. */
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 100%;
   }
   .metadata-row .instchip {
     /* basis 0, not auto: the chip must never be the item that decides the
