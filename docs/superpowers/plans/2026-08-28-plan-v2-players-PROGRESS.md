@@ -20,7 +20,7 @@ The working copies live in `.superpowers/sdd/2026-08-28-plan-v2-players/`,
 which is **git-ignored**. The four committed files above are the copies that
 survive; keep syncing them.
 
-## State: 9 of 15 tasks, task 9 fix round 4 committed
+## State: 9 of 15 tasks done, task 10 next
 
 | # | Task | State | Commits |
 |---|---|---|---|
@@ -32,7 +32,7 @@ survive; keep syncing them.
 | 6 | The clock table | done | `f4e171b`, `9a75eb3` |
 | 7 | Mixer reads clocks; overlay deleted | done | `d188210`, `5c7ef0a` |
 | 8 | Per-scene clocks; no transport hijack | done | `2115f73`, `2cf1597`, `d62ee5f` |
-| 9 | Audio-clip players in the live graph | **fix round 4 done, round 5 (review) owed** | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58`, round 4 |
+| 9 | Audio-clip players in the live graph | done (4 fix rounds) | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58`, `2542640` |
 | 10 | MIDI players with their own instrument | not started | |
 | 11 | Trigger modes | not started | |
 | 12 | Migrating launch bindings | not started | |
@@ -64,21 +64,35 @@ this branch's.
 
 ## Pick up here
 
-**Fix round 4 is committed.** All seven items landed: the `!flushing` clip
-read is pinned by a conservation test that stops the pad MID-clip;
-`render_live_into` now gates only its EVENT QUEUE on the flush and keeps
-calling `node.process`, pinned both ways by
-`a_flushing_row_does_not_re_queue_the_events_under_its_frozen_playhead`;
-`tail_frames` maxes `out_pdc` against the send edges instead of summing them
-(they are parallel branches off one tap point) and its `pdc` term is pinned;
-`mixer::render_impl` now `debug_assert`s each row's `tail_frames` against a
-recompute, which caught two real test rigs immediately; and `flush_left` not
-surviving a graph rebuild is written up in `docs/TRAPS.md` rather than fixed.
+**Task 9 is closed.** Fix round 4's re-review (opus, diff
+`3801c72..2542640`) verdicted all seven findings ADDRESSED with no new
+breakage, and it did not take "a test exists" for the two Importants: it
+traced why the new rigs bite (item 1: `stop()` leaves `pos` alone and
+`advance` skips off clocks, so the playhead freezes INSIDE a 100-frame
+clip, where the 64-frame control ends at the same position and
+`clip_sample` returns zeros either way — the two arms are identical with
+the gate and diverge by four re-read blocks without it, surfacing at the
+second press; item 2: both directions, `queued` 5-vs-1 without the guard
+and `processed` 1-vs-5 if `render_live_into` were skipped wholesale). It
+also verified item 5's `debug_assert` cannot fire for an ordinary
+timeline row and audited every post-construction assignment site for
+recompute coverage.
 
-Next: review it (opus — see the model policy below), then run tasks 10–15 in
-order. Their briefs are pre-extracted in `…-BRIEFS/`. Task 10 is the one that
-makes round 4's item 2 reachable: it gives a player row a live node, which
-`mix_nodes` cannot build today (`_ => Vec::new()`).
+**Next: task 10**, MIDI players with their own instrument (opus
+implementer, opus review — see the model policy below). It is the task
+that makes a player row reachable from the compiler: `mix_nodes` cannot
+build a live node for one today (`engine.rs` `_ => Vec::new()`), which is
+why round 4's item-2 test has to build the `RtTrack` by hand. Its brief is
+pre-extracted in `…-BRIEFS/task-10-brief.md`, and tasks 11–15 follow in
+order.
+
+**One deferred minor lands in task 10's area:** `prime_live`
+(`mixer.rs:347`, called before the row loop) still queues hardware
+MIDI-in events and can fire `all_notes_off` for a flushing row. That is
+correct — live input is not derived from the frozen position, so it
+cannot repeat — but it is a deliberate exception to the gate's "the row
+stops being FED" rule that no comment names. Give it a sentence when
+task 10 lands.
 
 ## Model policy (owner's, 2026-08-29)
 
