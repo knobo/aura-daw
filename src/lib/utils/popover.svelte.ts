@@ -8,8 +8,18 @@
  * looked again, which put the last items off-screen — exactly the bug the flip
  * exists to prevent. A `ResizeObserver` on the popover re-places it whenever
  * its own content box changes.
+ *
+ * The anchor's `getBoundingClientRect()` is VISUAL px (already multiplied by
+ * interface zoom — ui-zoom.ts). The popover node itself is portalled to
+ * `document.body` (portal.ts), which is where App.svelte applies that same
+ * zoom, so a `left`/`top` written on it gets multiplied by the zoom factor
+ * AGAIN when the browser renders it. Converting the anchor rect — and the
+ * viewport, which `size` is already measured against via `offsetWidth`/
+ * `scrollHeight` (LAYOUT px, unaffected by the node's own zoomed ancestor)
+ * — into layout px before calling `placePopover` cancels that out.
  */
 import { placePopover, type PopoverPlacement } from "./popover";
+import { uiZoomFactor } from "./ui-zoom";
 
 export interface PopoverBox {
   /** Bind with `bind:this={box.node}`. */
@@ -32,10 +42,11 @@ export function popoverBox(anchor: () => HTMLElement | null | undefined): Popove
     const measure = () => {
       const rect = anchor()?.getBoundingClientRect();
       if (!rect) return;
+      const zoom = uiZoomFactor();
       placement = placePopover(
-        rect,
+        { top: rect.top / zoom, bottom: rect.bottom / zoom, left: rect.left / zoom },
         { width: el.offsetWidth, height: el.scrollHeight },
-        { width: window.innerWidth, height: window.innerHeight },
+        { width: window.innerWidth / zoom, height: window.innerHeight / zoom },
       );
     };
     measure();

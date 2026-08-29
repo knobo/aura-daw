@@ -8,6 +8,7 @@
    * press on the empty track centers the thumb there and keeps dragging.
    */
   import { startFromThumbX, thumbGeometry, totalExtent } from "../utils/hscroll";
+  import { uiZoomFactor } from "../utils/ui-zoom";
 
   let {
     start,
@@ -51,7 +52,10 @@
   });
 
   function trackX(e: PointerEvent): number {
-    return e.clientX - trackEl!.getBoundingClientRect().left;
+    // e.clientX and the rect are VISUAL px; trackW (below) is clientWidth,
+    // i.e. LAYOUT px — divide out the interface zoom so the thumb tracks
+    // the pointer 1:1 at any zoom level.
+    return (e.clientX - trackEl!.getBoundingClientRect().left) / uiZoomFactor();
   }
 
   function onDown(e: PointerEvent) {

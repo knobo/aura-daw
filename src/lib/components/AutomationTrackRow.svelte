@@ -10,6 +10,7 @@
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { canvasPos } from "../utils/canvas-pos";
+  import { uiZoomFactor } from "../utils/ui-zoom";
   import { deletePoint, hitTest, movePoint } from "../utils/automation-edit";
   import { automationClipGesture } from "../utils/automation-clip-gesture";
 
@@ -214,7 +215,9 @@
       modulation.preview(curve.id, moved.points);
       return;
     }
-    const dx = e.clientX - dragStartX;
+    // clientX is VISUAL px; view.spp is samples-per-LAYOUT-px — divide out
+    // the interface zoom before scaling (same fix as clip-drag.svelte.ts).
+    const dx = (e.clientX - dragStartX) / uiZoomFactor();
     if (Math.abs(dx) > 2) dragMoved = true;
     if (!dragMoved) return;
     if (dragMode === "resize") {
