@@ -406,12 +406,12 @@ class SurfaceStore {
     if (!overlay) return false;
     const b = launch.bindings.find((x) => x.id === overlay.id);
     if (!b) return false;
-    // Fix round 1, Critical 2: a migrated binding's target is `player`,
-    // not `clip` — without this, the pad grid's "lit" indicator went
-    // permanently dark for every migrated pad, and its toggle-off click
-    // (padMode "toggle") stopped hitting `stopClip` at all.
-    if (b.target.kind === "player") return launch.clipIdForPlayer(b.target.playerId) === clipId;
-    return b.target.kind === "clip" && b.target.clipId === clipId;
+    // Fix round 3: shares `launch.bindingMatchesClip` with
+    // `existingBindingForClip` instead of its own copy of the same
+    // clip/player-target check — round 1, Critical 2 was exactly this
+    // kind of matching drifting apart across files; round 2 closed
+    // `fireClip`'s copy, this was the one left.
+    return launch.bindingMatchesClip(b, clipId);
   }
 
   /** Cut the shadow playhead if this clip is what is on it. */

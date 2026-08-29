@@ -56,6 +56,8 @@ beforeEach(() => {
       notes: [{ tick: 0, lengthTicks: 240, key: 36, velocity: 100 }],
     },
   ] as unknown as typeof midi.clips;
+  midi.sectionTable = [];
+  view.viewStart = 0;
 });
 
 describe("launch.mapClip against a migrated player binding", () => {
@@ -124,10 +126,35 @@ describe("surface.isClipPlaying for a migrated player binding", () => {
 });
 
 describe("surface.fireClip against an already-bound clip (fix round 2, Item 1)", () => {
+  // Fix round 3, Item 1: `view.viewStart` starts at 0, and `focus()`
+  // scrolls to `Math.max(0, samples - pad)`, which is 0 either way when
+  // the clip sits at tick 0 — so `expect(view.viewStart).toBe(0)` passed
+  // whether or not `focus()` ran, a vacuous pin. A one-row section table
+  // plus a clip that starts well past the scroll lead (`view.width *
+  // view.spp * 0.15` = 172_800 samples at the defaults) makes a scroll
+  // actually move `viewStart` if `focus()` fires, so the assertion can
+  // fail for the reason it claims to check.
+  const farClip = () =>
+    ([
+      {
+        id: "mc1",
+        trackId: "t1",
+        name: "Verse",
+        timelineStartTicks: 10_000,
+        lengthTicks: 960,
+        notes: [{ tick: 0, lengthTicks: 240, key: 36, velocity: 100 }],
+      },
+    ] as unknown) as typeof midi.clips;
+  const oneToOneSection = [
+    { startTick: 0, startSample: 0, startBeat: 0, startBar: 0, period: 508_032_000 },
+  ] as unknown as typeof midi.sectionTable;
+
   it("does not seek the transport or scroll the view for a clip binding", async () => {
     launch.maps = [
       { ...launch.maps[0], bindings: [{ id: "b1", name: "Verse", note: 36, channel: null, target: { kind: "clip", clipId: "mc1" } }] },
     ] as unknown as typeof launch.maps;
+    midi.clips = farClip();
+    midi.sectionTable = oneToOneSection;
     const viewStartBefore = view.viewStart;
 
     await surface.fireClip("mc1");
@@ -145,6 +172,8 @@ describe("surface.fireClip against an already-bound clip (fix round 2, Item 1)",
   it("does not seek the transport for a migrated player binding either", async () => {
     launch.players = [{ id: "p1", name: "Verse", source: { kind: "midiClip", clipId: "mc1" } }];
     launch.maps = [{ ...launch.maps[0], bindings: [playerBinding("b1", 36, "p1")] }] as unknown as typeof launch.maps;
+    midi.clips = farClip();
+    midi.sectionTable = oneToOneSection;
     const viewStartBefore = view.viewStart;
 
     await surface.fireClip("mc1");
@@ -173,9 +202,15 @@ describe("launch.reload's players/maps ordering (fix round 2, Item 2)", () => {
         setTimeout(() => res(resolved), 5);
       });
 
-    await launch.reload();
-
-    expect(launch.players).toEqual(resolved);
-    backend.playersGet = originalPlayersGet;
+    // Fix round 3, Item 2: restore in `finally` — a failed assertion used
+    // to leave the 5ms stub in place for whatever ran next. Harmless
+    // today only because this is the last describe block in the file;
+    // that stops being true the moment someone appends below it.
+    try {
+      await launch.reload();
+      expect(launch.players).toEqual(resolved);
+    } finally {
+      backend.playersGet = originalPlayersGet;
+    }
   });
 });

@@ -332,12 +332,20 @@ class LaunchStore {
    * ask without the side effect of jumping the timeline/seeking the
    * transport on every press of an already-mapped pad. */
   existingBindingForClip(clipId: string): LaunchBinding | null {
+    return this.bindings.find((b) => this.bindingMatchesClip(b, clipId)) ?? null;
+  }
+
+  /** Does `binding`'s target resolve to `clipId` — a `clip` target
+   * directly, or a migrated `player` target via `clipIdForPlayer`? Fix
+   * round 3: the single matching rule underneath both
+   * `existingBindingForClip` (above) and `surface.isClipPlaying`, which
+   * had drifted into its own copy of the same two-line check — the exact
+   * duplication Critical 2 was, left half-closed after round 2 removed
+   * the other copy (`fireClip`'s). */
+  bindingMatchesClip(binding: LaunchBinding, clipId: string): boolean {
     return (
-      this.bindings.find(
-        (b) =>
-          (b.target.kind === "clip" && b.target.clipId === clipId) ||
-          (b.target.kind === "player" && this.clipIdForPlayer(b.target.playerId) === clipId),
-      ) ?? null
+      (binding.target.kind === "clip" && binding.target.clipId === clipId) ||
+      (binding.target.kind === "player" && this.clipIdForPlayer(binding.target.playerId) === clipId)
     );
   }
 
