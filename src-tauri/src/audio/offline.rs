@@ -287,7 +287,7 @@ pub fn build_graph(
     }
 
     let end_samples = song_end(&tracks);
-    let mut graph = RtGraph::with_buses(tracks, buses, 0, params);
+    let mut graph = RtGraph::with_buses(tracks, buses, 0, params, rate);
     // RCU: attach the table BEFORE the graph is handed to the renderer,
     // matching `engine::rebuild` (Track D ruling 1).
     graph.set_track_ramps(compile_track_ramps(

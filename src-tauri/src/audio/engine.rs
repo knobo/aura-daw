@@ -2528,7 +2528,7 @@ impl Control {
             }
         }
 
-        let mut g = RtGraph::with_buses(tracks, buses, self.generation, params);
+        let mut g = RtGraph::with_buses(tracks, buses, self.generation, params, self.cache_rate);
         // RCU: the ramp table is attached BEFORE the graph is published, so
         // the callback only ever sees a snapshot whose ramps already belong
         // to it — and a retired graph keeps reading its own table, exactly
@@ -5899,7 +5899,7 @@ mod tests {
             out_pdc: None,
             win: Default::default(),
         };
-        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params);
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params, 48_000);
         let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
         clocks.set_transport_playing(true);
         clocks.bind_slot(1, 1);
@@ -5959,7 +5959,7 @@ mod tests {
             out_pdc: None,
             win: Default::default(),
         };
-        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params);
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params, 48_000);
         let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
         clocks.set_transport_playing(true);
         clocks.bind_slot(1, 1);
@@ -6254,13 +6254,14 @@ mod tests {
         clocks.set_transport_playing(true);
         clocks.bind_slot(1, 1);
         g.clocks = Arc::new(clocks);
-        // Task 10 fix round 2: the row carries a LIVE node, so its window is
-        // `max(insert chain, LIVE_TAIL_FRAMES)` — the 256-frame chain no
-        // longer decides it. The premise this test needs is "the row has a
-        // window and therefore flushes rather than taking the bare skip",
-        // which is unchanged; only its LENGTH moved, so the block counts
-        // below follow it rather than the other way round.
-        let window = crate::audio::rt::LIVE_TAIL_FRAMES;
+        // Task 10 fix round 3: the row carries a LIVE node, so its window is
+        // its 256-frame chain PLUS the live allowance — the release runs
+        // inside the node and its output still has to traverse that chain.
+        // The premise this test needs is "the row has a window and therefore
+        // flushes rather than taking the bare skip", which is unchanged; only
+        // its LENGTH moved, so the block counts below follow it rather than
+        // the other way round.
+        let window = 256 + crate::audio::rt::live_tail_frames(48_000);
         assert_eq!(g.tracks[1].tail_frames, window, "the row has to have a tail");
         let flush_blocks = window / FRAMES;
 
@@ -6364,20 +6365,25 @@ mod tests {
         assert_eq!(g.tracks[0].tail_frames, 0);
     }
 
-    /// Task 10 fix round 2, the arithmetic half: the live-node allowance is a
-    /// `max` against the strip, never a sum. The instrument's release runs
-    /// INSIDE the node and therefore before every line the strip terms count,
-    /// so a row whose chain is already longer than the allowance must have
-    /// exactly the chain's tail — adding the two would double-count the
-    /// window they share, and the window is blocks of FULL-STRIP processing.
+    /// Task 10 fix round 3, the arithmetic half, REVERSED from round 2.
+    ///
+    /// The allowance ADDS to the strip, it does not float on top of it.
+    /// `tail_frames` is the row's whole path latency, so a fragment entering
+    /// the strip at flush start leaves exactly as the window closes — but
+    /// release material keeps ENTERING for the whole release, so the last of
+    /// it enters at `allowance` and needs `strip` more frames to traverse the
+    /// inserts, the `pdc` and the longer output branch. Round 2's `max`
+    /// closed the window with that material still inside the chain;
+    /// `a_cut_pads_insert_chain_is_drained_before_the_next_press` is what
+    /// hears it.
     #[test]
-    fn the_live_node_allowance_is_a_floor_not_an_addition() {
-        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
-        use crate::audio::rt::{LiveNodeCell, LiveSource, LIVE_TAIL_FRAMES};
-
+    fn the_live_node_allowance_adds_to_the_strip() {
         use crate::audio::dsp::AudioProcessor;
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::rt::{live_tail_frames, LiveNodeCell, LiveSource};
 
-        let long = LIVE_TAIL_FRAMES * 2;
+        let allowance = live_tail_frames(48_000);
+        let long = allowance * 2;
         let mut dummy = LatencyDummy::new(long);
         dummy.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
         let mut synth = crate::midi::synth::PolySynth::new();
@@ -6396,8 +6402,10 @@ mod tests {
         }];
         let g = RtGraph::new(vec![pad], 1, Arc::new(ParamTable::with_slots_and_sends(1, 0)));
         assert_eq!(
-            g.tracks[0].tail_frames, long,
-            "the chain already outlasts the allowance; the allowance is a floor"
+            g.tracks[0].tail_frames,
+            long + allowance,
+            "the release runs inside the node and its output still has to get \
+             through the chain: series, so the two add"
         );
 
         // ...and the floor is real when the chain is shorter than it.
@@ -6409,7 +6417,29 @@ mod tests {
             events: Arc::new(Vec::new()),
         });
         let g2 = RtGraph::new(vec![bare], 1, Arc::new(ParamTable::with_slots_and_sends(1, 0)));
-        assert_eq!(g2.tracks[0].tail_frames, LIVE_TAIL_FRAMES);
+        assert_eq!(
+            g2.tracks[0].tail_frames, allowance,
+            "and with no strip to traverse, the allowance is the whole window"
+        );
+
+        // Rate-true (fix round 3, item 2): the allowance is a DURATION, so at
+        // 96 kHz it is twice the frames. `RtGraph::new` builds at the
+        // fallback rate, so this goes through `with_buses`.
+        let mut hi = RtTrack::clips(0, Vec::new());
+        let mut synth3 = crate::midi::synth::PolySynth::new();
+        synth3.prepare(96_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        hi.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth3)),
+            events: Arc::new(Vec::new()),
+        });
+        let g3 = RtGraph::with_buses(
+            vec![hi],
+            Vec::new(),
+            1,
+            Arc::new(ParamTable::with_slots_and_sends(1, 0)),
+            96_000,
+        );
+        assert_eq!(g3.tracks[0].tail_frames, allowance * 2, "85 ms at 96 kHz too");
     }
 
     /// Fix round 4, items 3 and 4. `tail_frames` follows the STRIP. Inserts
@@ -6469,7 +6499,7 @@ mod tests {
             out_pdc: None,
             win: Default::default(),
         };
-        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params);
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params, 48_000);
         let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
         clocks.set_transport_playing(true);
         clocks.bind_slot(1, 1);

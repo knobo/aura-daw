@@ -542,8 +542,9 @@ pub struct RtTrack {
     pub win: TrackWindow,
 }
 
-/// The flush window a row carrying a LIVE NODE gets at minimum, in FRAMES
-/// (Plan V — V2, Task 10, fix round 2).
+/// The flush allowance a row carrying a LIVE NODE gets on top of its strip,
+/// expressed at 48 kHz (Plan V — V2, Task 10; rate-true since fix round 3).
+/// Use [`live_tail_frames`], never this constant directly.
 ///
 /// Every other term in [`RtTrack::computed_tail_frames`] is a line the row
 /// can be asked how long it is. An instrument's own release is not: it lives
@@ -568,16 +569,28 @@ pub struct RtTrack {
 /// tail is hard-cut at the end of the window, exactly as a transport stop
 /// cuts a track's inserts.
 ///
-/// FRAMES, NOT MILLISECONDS, and deliberately so: this is read by
-/// [`RtGraph::with_buses`], which has no sample rate in hand and gets no
-/// plumbing path added just to carry one here. 4096 frames is 85 ms at
-/// 48 kHz — comfortably past `PolySynth::RELEASE_SECS` (80 ms, 3840 frames)
-/// — but only 43 ms at 96 kHz, where that same 80 ms ramp is 7680 frames and
-/// is therefore cut about halfway. That is a bounded, deliberate under-count
-/// of the V-17 (b) kind, not an oversight: it turns a full-amplitude stranded
-/// voice into a half-amplitude one. Making it rate-true is the fix if a
-/// 96 kHz ear-check ever hears it.
-pub const LIVE_TAIL_FRAMES: usize = 4096;
+/// 4096 frames at 48 kHz is 85 ms, comfortably past
+/// `PolySynth::RELEASE_SECS` (80 ms, 3840 frames).
+const LIVE_TAIL_FRAMES_AT_48K: usize = 4096;
+
+/// The sample rate a graph falls back to when it is built without one — a
+/// test rig, or `Control::rebuild` before a device has opened and set
+/// `cache_rate`. See [`RtGraph::with_buses`], the ONE place that clamps.
+pub const FALLBACK_RATE: u32 = 48_000;
+
+/// [`LIVE_TAIL_FRAMES_AT_48K`] scaled to `rate`, in frames.
+///
+/// The allowance is a DURATION — an instrument's release ramp is 80 ms at
+/// every sample rate — so it has to be counted in that rate's frames. Fixing
+/// it at 4096 frames covered the ramp at 48 kHz and only half of it at
+/// 96 kHz, which turned a full-amplitude stranded voice into a
+/// half-amplitude one rather than into none.
+///
+/// Integer math, exact at the reference rate (48 kHz → 4096, 96 kHz → 8192).
+pub fn live_tail_frames(rate: u32) -> usize {
+    let rate = if rate == 0 { FALLBACK_RATE } else { rate };
+    (LIVE_TAIL_FRAMES_AT_48K as u64 * rate as u64 / FALLBACK_RATE as u64) as usize
+}
 
 impl RtTrack {
     /// Clip-only track (audio tracks; also keeps tests terse).
@@ -614,14 +627,14 @@ impl RtTrack {
     /// blocks of FULL-STRIP processing, inserts included, after every
     /// release. With one linear-phase EQ in that bus that is ~4096 extra
     /// frames, 85 ms, of it.
-    pub fn recompute_tail_frames(&mut self) {
-        self.tail_frames = self.computed_tail_frames();
+    pub fn recompute_tail_frames(&mut self, rate: u32) {
+        self.tail_frames = self.computed_tail_frames(rate);
     }
 
     /// What [`Self::tail_frames`] would be for the row as it now stands.
     /// Split out so `mixer::render_impl` can `debug_assert` the stored value
     /// against it — see the funnel note on [`RtGraph::with_buses`].
-    pub fn computed_tail_frames(&self) -> usize {
+    pub fn computed_tail_frames(&self, rate: u32) -> usize {
         let inserts: usize = self
             .inserts
             .iter()
@@ -637,19 +650,27 @@ impl RtTrack {
             .unwrap_or(0);
         let strip = inserts + line(&self.pdc) + line(&self.out_pdc).max(sends);
         // ...and the one term that is not a line on the strip: the
-        // instrument's own release, which runs INSIDE the node and therefore
-        // BEFORE every line counted above. A `max`, never a sum — the strip's
-        // own lines already carry the node's output through them, so adding
-        // the two would double-count the very window they share. See
-        // [`LIVE_TAIL_FRAMES`] for why the allowance is fixed.
+        // instrument's own release, which runs INSIDE the node.
+        //
+        // It ADDS, and running first is exactly why. `tail_frames` is the
+        // row's whole path latency, so a fragment ENTERING the strip when the
+        // flush starts leaves precisely as the window closes. Release
+        // material is not one fragment: it keeps entering for the whole
+        // release, so the LAST of it enters at `allowance` and still needs
+        // `strip` more frames to traverse the inserts, the `pdc` and the
+        // longer output branch. A `max` closes the window while that material
+        // is still inside the chain — with a 2048-frame chain the tail of a
+        // 3840-frame release is stranded at 4096 and replayed at the next
+        // onset. Over-counting costs flush blocks; under-counting swallows
+        // audio, and this row has swallowed it three times already.
         //
         // ONE rule, applied to any row with a live node, not just a player's.
         // It is inert for a track — `tail_frames` is only ever consumed under
         // `flushing`, and `flushing` is `exclusive_idle`, which no track row
         // is — so scoping it to players would buy nothing and would put a
         // second condition on a funnel whose whole value is having one.
-        let live = if self.live.is_some() { LIVE_TAIL_FRAMES } else { 0 };
-        strip.max(live)
+        let live = if self.live.is_some() { live_tail_frames(rate) } else { 0 };
+        strip + live
     }
 }
 
@@ -792,13 +813,31 @@ pub struct RtGraph {
     /// this replaces lived on `SharedRt` and a clip edit made while a pad
     /// sounded did not rewind it.
     pub clocks: Arc<crate::audio::clock::ClockTable>,
+    /// The engine rate this graph was BUILT at, and the single source of
+    /// truth for anything derived from a rate at build time — today
+    /// [`live_tail_frames`], through `RtTrack::computed_tail_frames`.
+    ///
+    /// `mixer::render_impl` re-derives every row's tail in a `debug_assert`
+    /// and MUST read this, never its own `sample_rate` argument: the two
+    /// disagree across a device rate change until the next rebuild, and a
+    /// row built at one rate and checked against another would fire the
+    /// assert on the RT thread for a graph that is perfectly correct.
+    pub rate: u32,
 }
 
 impl RtGraph {
     /// Build a snapshot, always allocating the strip `track_buf`
     /// (unified clip/live/insert path).
+    /// Build a snapshot at the [`FALLBACK_RATE`].
+    ///
+    /// For TEST RIGS. Every production path has its real rate in hand —
+    /// `offline::build_graph` takes one, `Control::rebuild` has
+    /// `self.cache_rate`, `loopjam::render_region_stereo` has `engine_rate` —
+    /// and passes it through [`Self::with_buses`]. A production caller that
+    /// reaches for this instead silently sizes its live rows' flush windows
+    /// at 48 kHz whatever the device is doing.
     pub fn new(tracks: Vec<RtTrack>, generation: u64, params: Arc<ParamTable>) -> Self {
-        Self::with_buses(tracks, Vec::new(), generation, params)
+        Self::with_buses(tracks, Vec::new(), generation, params, FALLBACK_RATE)
     }
 
     /// [`Self::new`] plus compiled bus strips (Plan G2). Sizes the per-bus
@@ -809,7 +848,15 @@ impl RtGraph {
         buses: Vec<RtBus>,
         generation: u64,
         params: Arc<ParamTable>,
+        rate: u32,
     ) -> Self {
+        // THE one clamp. `Control::rebuild` runs with `cache_rate == 0` until
+        // a device opens, and a rate of 0 would size every live row's flush
+        // window at 0 — the bare skip, i.e. exactly the defect the window
+        // exists to prevent. Clamped here, where the value is STORED, so
+        // `graph.rate` is the single sane number every later reader sees and
+        // `live_tail_frames` never has to guess.
+        let rate = if rate == 0 { FALLBACK_RATE } else { rate };
         // The one place every graph — engine rebuild, offline bounce, every
         // test rig — passes through, so a row's flush window is derived from
         // the lines it actually carries.
@@ -824,7 +871,7 @@ impl RtGraph {
         // convention is checked rather than merely documented.
         let mut tracks = tracks;
         for tr in tracks.iter_mut() {
-            tr.recompute_tail_frames();
+            tr.recompute_tail_frames(rate);
         }
         let track_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let post_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
@@ -861,6 +908,7 @@ impl RtGraph {
             track_ramps: Vec::new(),
             clicks: Arc::new(Vec::new()),
             clocks: Arc::new(clocks),
+            rate,
         }
     }
 

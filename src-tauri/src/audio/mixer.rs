@@ -727,6 +727,12 @@ fn render_impl(
     // Plan V — V2: this graph's playheads, taken the same way and for the
     // same borrow-check reason as `params`.
     let clocks = graph.clocks.clone();
+    // The rate the graph was BUILT at — not this call's `sample_rate`. The
+    // `debug_assert` below re-derives every row's tail, and the allowance in
+    // it is rate-dependent; checking a row built at one rate against another
+    // would fire on the RT thread for a graph that is perfectly correct. One
+    // source of truth, and it travels with the graph.
+    let graph_rate = graph.rate;
     // ONCE per block, before any `playhead()` call: latch every clock's
     // pending discontinuity. A scene clock is bound to MANY slots, and a
     // per-reader consume would hand the jump to whichever track read first
@@ -827,7 +833,7 @@ fn render_impl(
             // invariant rather than data arriving from outside.
             debug_assert_eq!(
                 tr.tail_frames,
-                tr.computed_tail_frames(),
+                tr.computed_tail_frames(graph_rate),
                 "row {} carries lines its tail_frames does not know about — \
                  call RtTrack::recompute_tail_frames after changing them",
                 tr.slot
@@ -1591,7 +1597,7 @@ mod tests {
         // production never does — `RtGraph::with_buses` is the funnel. The
         // row's flush window has to follow, or `render_impl`'s
         // `debug_assert` catches the rig rather than the code.
-        tr.recompute_tail_frames();
+        tr.recompute_tail_frames(48_000);
     }
 
     #[test]
@@ -1668,7 +1674,7 @@ mod tests {
         g.tracks[0].pdc = None; // wet path: plugin supplies the 256
         g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
         for tr in g.tracks.iter_mut() {
-            tr.recompute_tail_frames();
+            tr.recompute_tail_frames(48_000);
         }
         let mut out = vec![0.0f32; 512 * 2];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
@@ -1706,7 +1712,7 @@ mod tests {
         g.tracks[0].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
         g.tracks[1].pdc = Some(DelayLine::new(256, crate::audio::rt::MAX_LIVE_BLOCK, 2));
         for tr in g.tracks.iter_mut() {
-            tr.recompute_tail_frames();
+            tr.recompute_tail_frames(48_000);
         }
         let mut out = vec![0.0f32; 512 * 2];
         render_simple(&mut g, 0, &LoopSpec::OFF, &mut out, 2);
@@ -1727,7 +1733,7 @@ mod tests {
     /// reads back as unity — which would make every amount assertion below
     /// pass for the wrong reason.
     fn graph_with_bus(tracks: Vec<RtTrack>, buses: Vec<RtBus>) -> RtGraph {
-        RtGraph::with_buses(tracks, buses, 1, Arc::new(ParamTable::with_slots_and_sends(64, 1)))
+        RtGraph::with_buses(tracks, buses, 1, Arc::new(ParamTable::with_slots_and_sends(64, 1)), 48_000)
     }
 
     fn empty_bus(slot: usize) -> RtBus {
@@ -2245,6 +2251,103 @@ mod tests {
         assert!(
             worst < 1e-6,
             "the second press is not the same sound as the first: worst frame differs by {worst}"
+        );
+    }
+
+    /// Task 10, fix round 3 — the case round 2's `max` got wrong.
+    ///
+    /// The release happens INSIDE the node; its output then has to traverse
+    /// the insert chain, the `pdc` and the output branch. Those are in
+    /// SERIES, which is exactly why they add rather than dominate. With a
+    /// 2048-frame chain the last of a 3840-frame release enters the strip at
+    /// 3840 and does not leave until 5888 — still in the pipeline when a
+    /// `max(2048, 4096)` window closes at 4096. Stranded in the insert chain,
+    /// truncated tail, contaminated next onset: the same pair, a fourth time,
+    /// through the one path round 2 left open.
+    ///
+    /// Two presses again, and the whole press is compared rather than one
+    /// block, because a delaying chain makes the first block of a press
+    /// silent — a one-block assertion would pass for the wrong reason.
+    #[test]
+    fn a_cut_pads_insert_chain_is_drained_before_the_next_press() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use super::super::rt::{LiveNodeCell, LiveSource, MAX_LIVE_BLOCK};
+        use crate::midi::schedule::AbsNoteEvent;
+        use crate::midi::synth::PolySynth;
+
+        const FRAMES: usize = 128;
+        const CHAIN: usize = 2048;
+        const BLOCKS: usize = 80; // 10240 frames: past the release AND the chain
+
+        let build = || {
+            let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+            params.set_gain_pair_linear(0, 1.0);
+            params.set_pan(0, 0.0);
+            let mut synth = PolySynth::new();
+            synth.prepare(48_000, MAX_LIVE_BLOCK);
+            let mut dummy = LatencyDummy::new(CHAIN);
+            dummy.prepare(48_000, MAX_LIVE_BLOCK);
+            let mut pad = RtTrack::clips(0, Vec::new());
+            pad.live = Some(LiveSource {
+                node: LiveNodeCell::new(Box::new(synth)),
+                events: Arc::new(vec![AbsNoteEvent {
+                    sample: 0,
+                    key: 69,
+                    velocity: 100,
+                    channel: 0,
+                }]),
+            });
+            pad.inserts = vec![InsertNode {
+                slot_id: "s".into(),
+                instance_id: "i".into(),
+                bypassed: false,
+                latency: CHAIN,
+                proc: InsertNodeCell::new(Box::new(dummy)),
+            }];
+            let mut g = RtGraph::new(vec![pad], 1, params);
+            let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(1, 2, 1);
+            clocks.set_transport_playing(true);
+            clocks.bind_slot(0, 1);
+            g.clocks = Arc::new(clocks);
+            g
+        };
+
+        // One press, rendered to exhaustion: fire for a single block, then
+        // keep rendering while the row drains.
+        let press = |g: &mut RtGraph| -> Vec<f32> {
+            let mut all = Vec::with_capacity(BLOCKS * FRAMES * 2);
+            let mut out = vec![0.0f32; FRAMES * 2];
+            g.clocks.fire(1, 0, FRAMES as u64, false);
+            for _ in 0..BLOCKS {
+                out.fill(0.0);
+                render(g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+                all.extend_from_slice(&out);
+                g.clocks.advance(FRAMES as u64);
+            }
+            all
+        };
+
+        let mut g = build();
+        let first = press(&mut g);
+        assert!(
+            first.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "the press has to sound at all"
+        );
+
+        // A pristine graph pressed once is the reference: whatever the second
+        // press on the USED graph produces must be the same sound.
+        let mut fresh = build();
+        let reference = press(&mut fresh);
+        let second = press(&mut g);
+        let worst = reference
+            .iter()
+            .zip(second.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            worst < 1e-6,
+            "the second press differs from a first press by {worst}: material was              stranded in the row and replayed at the next onset"
         );
     }
 

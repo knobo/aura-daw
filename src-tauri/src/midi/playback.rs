@@ -1212,6 +1212,16 @@ mod tests {
         assert!(live_source_for_player(&session, &ok, 0, None, &mut nodes).is_none());
         assert!(nodes.is_empty(), "nor must a rate of 0");
 
+        // An unusable tempo map — `ppq == 0` is the cheapest of
+        // `TempoMap::from_periods`' guards to trip, and it is one field on the
+        // image rather than a contorted fixture. This is the LAST bail before
+        // the node resolution, so it is the one a careless reorder would
+        // reach first.
+        let mut bad_map = session_with_an_untracked_instrument();
+        bad_map.midi.ppq = 0;
+        assert!(live_source_for_player(&bad_map, &ok, 48_000, None, &mut nodes).is_none());
+        assert!(nodes.is_empty(), "nor must a tempo map that will not build");
+
         // ...and the same registry DOES take the node on the path that works,
         // so the assertions above are not passing for want of a live case.
         assert!(live_source_for_player(&session, &ok, 48_000, None, &mut nodes).is_some());
