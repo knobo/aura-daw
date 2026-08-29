@@ -452,7 +452,16 @@
               aria-expanded={outPopoverOpen}
               onclick={() => (outPopoverOpen = !outPopoverOpen)}
             >
-              →{outTarget ? ` ${outTarget.name}` : " MASTER"}
+              <!-- Owner note (2026-08-24) a third time: the value is the
+                   news, the word is what the tooltip is for. Every track
+                   reaches the master unless it says otherwise, so
+                   "→ MASTER" spent 57px of a 298px row saying "normal" —
+                   and the row was exactly full, so it was spending it
+                   against the instrument name. The bare arrow keeps the
+                   control findable, the way an ungrouped lane keeps a dim
+                   "GRP"; the destination reappears the moment there is one
+                   worth naming. -->
+              →{outTarget ? ` ${outTarget.name}` : ""}
             </button>
             {#if outPopoverOpen}
               <OutputPicker {track} onclose={() => (outPopoverOpen = false)} />
@@ -972,6 +981,7 @@
   .metadata-row.named .metadata-lanes {
     margin-left: 0;
   }
+
   .kindchip {
     /* A one-letter badge now (owner note, 2026-08-24), so it sizes like
        one instead of reserving room for "Automation track". */
@@ -1067,13 +1077,19 @@
     box-shadow: 0 0 calc(8px * var(--glow-scale)) rgb(var(--violet-rgb) / 0.35);
   }
   .status.outchip {
-    min-width: 40px;
+    /* 40px is the room a destination NAME needs. Kept for `.routed` below;
+       the bare-arrow state reserves nothing, because the reservation came
+       straight out of the instrument name next to it. */
+    min-width: 0;
+    padding-inline: 5px;
     max-width: 96px;
     overflow: hidden;
     white-space: nowrap;
     text-overflow: ellipsis;
   }
   .status.outchip.routed {
+    min-width: 40px;
+    padding-inline: 7px;
     color: var(--amber);
     border-color: rgb(var(--amber-rgb) / 0.45);
   }
