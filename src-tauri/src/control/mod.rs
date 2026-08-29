@@ -1876,20 +1876,44 @@ impl ControlPlane {
     pub fn clear_launch_audible(&self) {
         crate::midi::launch::runtime().clear_sounding();
         let tables = self.tables.lock();
+        // SCENES ONLY, and that is a ruling, not an oversight. A scene is a
+        // region of the arrangement that a pad borrowed, so stopping the song
+        // ends it. A PLAYER is not in the song at all (V-2), and cutting a
+        // performance because someone stopped the transport is the deck
+        // going quiet mid-set. `stop_launch_overlay` (Escape / stop-all) is
+        // the call that cuts pads; see `docs/backlog/plan-v-players.md`.
         for &clock in tables.scene_clocks.values() {
             tables.clocks.stop(clock);
         }
     }
 
-    /// Cut every sounding scene (Escape / stop-all). Ends them exactly the
-    /// way reaching a clip's end does, so the drive thread's own release edge
-    /// announces each ending and `release_finished_scenes` hands the tracks
-    /// back — one code path, one behaviour. Returns true when something was
-    /// actually sounding.
+    /// Cut everything sounding — every scene AND every player (Escape /
+    /// stop-all). Ends them exactly the way reaching a clip's end does, so
+    /// the drive thread's own release edge announces each ending and
+    /// `release_finished_scenes` hands the scenes' tracks back — one code
+    /// path, one behaviour. Returns true when something was actually
+    /// sounding.
+    ///
+    /// PLAYERS were missing here until fix round 1, and their absence made
+    /// this the only escape from a hung deck. `TriggerMode::Loop` fires a
+    /// looping clock; a looping clock never ends itself
+    /// (`ClockTable::advance` wraps it instead), and `any_running()` keeps
+    /// the output callback rendering with the transport stopped — so a
+    /// looping pad sounded indefinitely with nothing in reach able to cut
+    /// it. `player_stop(id)` could, but no caller exists yet, and this
+    /// method's own doc already claimed to stop everything.
+    ///
+    /// This is NOT the transport-stop path. Stopping the song deliberately
+    /// leaves pads sounding (V-2: a pad is not arrangement material, and
+    /// stopping the arrangement should not cut a performance) — see
+    /// `clear_launch_audible`, and `docs/backlog/plan-v-players.md` for the
+    /// ruling.
     ///
     /// It deliberately does NOT release the slots itself, for the reason
     /// spelled out on `cut_scene`: the discontinuity `ClockTable::stop`
-    /// latches has to reach the live nodes still bound here first.
+    /// latches has to reach the live nodes still bound here first. A
+    /// player's slot is never released at all — it owns it for the life of
+    /// the graph.
     ///
     /// `ClockTable::stop`'s own return value is the answer, not an `is_on`
     /// read beside it: `advance` can turn a clock off between the two, and
@@ -1897,11 +1921,12 @@ impl ControlPlane {
     /// had already ended.
     pub fn stop_launch_overlay(&self) -> bool {
         let tables = self.tables.lock();
-        // Fold with `|`, not `any`: every scene must be cut, and `any`
-        // short-circuits on the first one that was running.
+        // Fold with `|`, not `any`: every scene and every pad must be cut,
+        // and `any` short-circuits on the first one that was running.
         tables
             .scene_clocks
             .values()
+            .chain(tables.player_clocks.values())
             .fold(false, |acc, &clock| tables.clocks.stop(clock) | acc)
     }
 
@@ -1973,19 +1998,24 @@ impl ControlPlane {
                 p.trigger.mode == crate::audio::player::TriggerMode::Loop,
             )
         };
+        // BEFORE the clock lookup, and that order is the whole point (fix
+        // round 1). A zero-length source (a knobs-only pad, or a MIDI one
+        // before Task 10) would fire a clock that ends on the block it
+        // started — `ClockTable::fire` widens `end` to `start + 1` rather
+        // than divide by zero — so there is nothing to fire. Below the
+        // lookup, a knobs-only pad the graph had not been rebuilt for
+        // returned `Err("player has no clock yet")` instead of the
+        // documented no-op: an R5 control pad reporting a failure for
+        // being exactly what it is.
+        if len == 0 {
+            return Ok(());
+        }
         let tables = self.tables.lock();
         let clock = tables
             .player_clocks
             .get(&PlayerId::from(id))
             .copied()
             .ok_or_else(|| format!("player has no clock yet: {id}"))?;
-        // A zero-length source (a knobs-only pad, or a MIDI one before Task
-        // 10) would fire a clock that ends on the block it started —
-        // `ClockTable::fire` widens `end` to `start + 1` rather than divide
-        // by zero. Refusing to fire at all keeps the pad honest instead.
-        if len == 0 {
-            return Ok(());
-        }
         tables.clocks.fire(clock, 0, len, looping);
         Ok(())
     }
@@ -2051,6 +2081,14 @@ impl ControlPlane {
     /// Remove a player through the transaction channel (`Op::PlayerRemove`).
     /// The op takes its payload from store truth, so undo restores the pad
     /// byte-identically.
+    ///
+    /// `index` is passed as `usize::MAX` rather than `0` on purpose. The
+    /// `apply_raw` arm ignores the caller's value entirely and finds the real
+    /// position by id — a literal `0` in a declared field reads like an
+    /// assertion that the pad is first, and would be believed by the next
+    /// person to touch this. `usize::MAX` cannot be mistaken for a claim.
+    /// The inverse op the arm returns carries the TRUE index, which is what
+    /// undo re-inserts at.
     pub fn remove_player(&self, id: &str, meta: op::TxMeta) -> Result<(), String> {
         let player = {
             let session = self.session.lock();
@@ -2062,7 +2100,9 @@ impl ControlPlane {
                 .cloned()
                 .ok_or_else(|| format!("unknown player: {id}"))?
         };
-        self.commit(meta, |tx| tx.apply(op::Op::PlayerRemove { player: player.clone(), index: 0 }))?;
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::PlayerRemove { player: player.clone(), index: usize::MAX })
+        })?;
         Ok(())
     }
 
@@ -6352,6 +6392,60 @@ mod tests {
             .unwrap(); // deliberately NOT republished
         let err = cp.player_fire(p.id.as_str()).unwrap_err();
         assert!(err.contains("no clock yet"), "got: {err}");
+    }
+
+    /// Fix round 1, finding 3. Nothing could stop a looping pad.
+    ///
+    /// `TriggerMode::Loop` fires a looping clock; `ClockTable::advance` wraps
+    /// such a clock instead of ending it, and `any_running()` keeps the output
+    /// callback rendering with the transport stopped. So a looping pad sounded
+    /// indefinitely, and the only thing in reach that could cut it was
+    /// `player_stop(id)` — which no TypeScript calls yet. `stop_launch_overlay`
+    /// is Escape / stop-all, and its own doc already claimed to end everything
+    /// that was sounding.
+    #[test]
+    fn stop_all_cuts_a_looping_pad_and_not_only_scenes() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        cp.commit(op::TxMeta::user("loop"), |tx| {
+            tx.apply(Op::Set {
+                object: ObjectRef::Player(PlayerId::from(id.as_str())),
+                path: PropPath::TriggerMode,
+                from: serde_json::Value::Null,
+                to: serde_json::json!("loop"),
+            })
+        })
+        .unwrap();
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+
+        // It really is unstoppable by time alone: run it far past the clip.
+        cp.tables_for_tests().clocks.advance(48_000 * 10);
+        assert!(cp.tables_for_tests().clocks.is_on(clock), "a loop never ends itself");
+
+        assert!(cp.stop_launch_overlay(), "stop-all reports it cut something");
+        assert!(!cp.tables_for_tests().clocks.is_on(clock), "and the pad is silent");
+    }
+
+    /// The other side of the same ruling, and it is a ruling: stopping the
+    /// TRANSPORT leaves pads sounding. A scene is a region of the arrangement
+    /// that a pad borrowed, so the song ending ends it; a player is not in the
+    /// song at all (V-2), and cutting a performance because someone stopped
+    /// the transport is the deck going quiet mid-set.
+    /// See `docs/backlog/plan-v-players.md`.
+    #[test]
+    fn stopping_the_transport_leaves_a_sounding_pad_alone() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let id = add_audio_player(&cp, "c1", true);
+        cp.transport(TransportAction::Play).unwrap();
+        cp.player_fire(&id).unwrap();
+        let clock = cp.player_clock_for(&id).unwrap();
+
+        cp.transport(TransportAction::Stop).unwrap();
+        assert!(
+            cp.tables_for_tests().clocks.is_on(clock),
+            "the song stopped; the performance did not"
+        );
     }
 
     /// `player_stop` and `player_fire` must agree about WHY a pad cannot be

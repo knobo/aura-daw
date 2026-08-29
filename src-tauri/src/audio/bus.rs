@@ -59,7 +59,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::audio::insert::InsertNode;
-use crate::audio::node::MixNode;
+use crate::audio::node::{MixNode, MixNodeKind};
 use crate::audio::pdc::{compile_pdc, DelayLine};
 use crate::audio::rt::{RtBus, RtSend};
 use crate::audio::types::TrackState;
@@ -198,18 +198,46 @@ pub fn compile_routing(
     };
 
     // Source alignment (Plan G1's PDC) over the source tracks only.
+    //
+    // PLAYERS ARE EXCLUDED — Plan V ruling V-17, and the exclusion has two
+    // halves that are easy to conflate. Leaving a player OUT of `declared` is
+    // not enough on its own: `compile_pdc` pads every slot up to the maximum,
+    // so a raw player's empty chain (declared 0) would come back with the
+    // LARGEST delay of all. Its slot has to be zeroed after the fact, which
+    // is what `player_slots` below is for.
+    //
+    // Why at all: PDC aligns material that shares a TIMELINE POSITION. A
+    // player's row reads its own clock and has no timeline position; its
+    // reference for "on time" is the performer's hand and the arrangement
+    // audio already leaving the speakers. Padding it by the graph maximum
+    // puts the pad AFTER the beat it was aimed at. One linear-phase EQ
+    // anywhere in the session is 2048–4096 samples, 43–85 ms — two to four
+    // times past where a triggered hit stops feeling attached to the press.
+    //
+    // Keeping players out of `declared` also keeps `t_src` honest: a pad's
+    // own insert latency must not become the floor every TRACK waits for.
     let mut declared = vec![0usize; n_slots];
     let mut applied = vec![0usize; n_slots];
+    let mut player_slots = vec![false; n_slots];
     for t in tracks.iter().filter(|t| t.takes_mixer_slot() && !t.is_bus()) {
         let Some(&slot) = slots.get(&t.id) else { continue };
         if slot >= n_slots {
+            continue;
+        }
+        if t.kind == MixNodeKind::Player {
+            player_slots[slot] = true;
             continue;
         }
         let (d, a) = latency(chains.get(&t.id));
         declared[slot] = d;
         applied[slot] = a;
     }
-    let track_pdc = compile_pdc(&declared, &applied);
+    let mut track_pdc = compile_pdc(&declared, &applied);
+    for (slot, &is_player) in player_slots.iter().enumerate() {
+        if is_player {
+            track_pdc[slot] = 0;
+        }
+    }
     // Every source leaves its strip at this latency, taps included.
     let t_src = declared.iter().copied().max().unwrap_or(0);
 
@@ -278,15 +306,48 @@ pub fn compile_routing(
     let mut sends: HashMap<TrackId, Vec<PlannedSend>> = HashMap::new();
     for node in &nodes {
         let is_bus = doc_index.contains_key(&node.id);
+        let node_slot = slots.get(&node.id).copied().unwrap_or(usize::MAX);
+        let is_player = node_slot < n_slots && player_slots[node_slot];
+        // WHEN this node's material is ready to leave its strip, which is what
+        // every edge delay below is measured from.
+        //
+        // `t_src` is the right answer for a TRACK precisely because
+        // `track_pdc` padded it to exactly there — every source leaves
+        // together, which is what makes most edge delays zero. V-17 takes
+        // that padding away from a player, so `t_src` becomes a lie for one:
+        // the pad really does leave at its own applied chain latency, which
+        // for a raw player is 0. Left as `t_src`, a pad's send arrived at a
+        // shared bus `t_src` samples EARLY — the ruling would have broken
+        // the one alignment it explicitly preserves.
         let ready = match doc_index.get(&node.id) {
             Some(&doc) => ready_appl[doc],
+            None if is_player => latency(chains.get(&node.id)).1,
             None => t_src,
         };
         if !is_bus {
             let slot = slots[&node.id];
             if slot < n_slots {
                 output[slot] = node.output.map(|d| pos_of_doc[d]);
-                out_delay[slot] = target_of(node.output).saturating_sub(ready);
+                // V-17 again, through the OTHER door. `out_delay` pads the
+                // dry path up to the slowest return, so leaving it alive for
+                // a player would re-impose the very latency `track_pdc` was
+                // just zeroed to avoid — the linear-phase EQ on some return
+                // would still land 43–85 ms of delay on the pad. Its routing
+                // (`output`, one line up) is untouched, and so is send-edge
+                // compensation (`RtSend::delay`, below): a player's send into
+                // a shared bus still has to arrive in step with that bus's
+                // other inputs, which is a different question from where the
+                // pad's own dry signal belongs in time.
+                //
+                // It is also what makes `mixer`'s exclusive-idle early-out
+                // safe: with no `out_pdc` line on the row there is nothing
+                // holding the tail of the last press, so skipping the strip
+                // cannot leak it into the next one.
+                out_delay[slot] = if is_player {
+                    0
+                } else {
+                    target_of(node.output).saturating_sub(ready)
+                };
             }
         }
         // Send edges, in document order, matched back to their rows.
@@ -601,6 +662,95 @@ mod tests {
     }
 
     // ---- delay compensation ----
+
+    /// Plan V ruling V-17: a player is not PDC-padded, on either path.
+    ///
+    /// PDC aligns material that shares a TIMELINE POSITION. A player's row
+    /// reads its own clock and has no timeline position; its reference for
+    /// "on time" is the performer's hand and the arrangement audio already
+    /// leaving the speakers, so padding it by the graph maximum puts the pad
+    /// AFTER the beat it was aimed at. The scenario here is the mild one —
+    /// one 512-sample plugin, ~11 ms. One linear-phase EQ is 2048–4096
+    /// samples, 43–85 ms, well past where a triggered hit stops feeling
+    /// attached to the press.
+    ///
+    /// Both doors are checked. `track_pdc` is not zero merely because the pad
+    /// is absent from `declared`: `compile_pdc` pads every slot up to the
+    /// maximum, so an omitted player would come back with the LARGEST delay
+    /// in the graph. And `out_delay` would re-impose the same latency from
+    /// the return side if it were left alive.
+    #[test]
+    fn a_player_is_not_pdc_padded_on_either_path() {
+        let mut vox = track("vox", "audio");
+        vox.sends.push(send("s1", "verb"));
+        let tracks = vec![vox, track("verb", "bus")];
+        let players = vec![{
+            let mut p = crate::audio::player::Player::new(crate::ids::PlayerId::from("pad"), "PAD");
+            p.raw = true;
+            p
+        }];
+        let slots = crate::audio::types::derive_slots_with_players(&tracks, &players);
+        let mut chains = HashMap::new();
+        chains.insert("vox".into(), latency_chain(512, false)); // a slow source
+        chains.insert("verb".into(), latency_chain(256, false)); // and a slow return
+        let nodes = crate::audio::node::mix_nodes_with_players(&tracks, &players);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
+
+        let pad = slots[&crate::ids::TrackId::from("pad")];
+        assert_eq!(plan.track_pdc[pad], 0, "V-17: the pad is not source-aligned");
+        assert_eq!(plan.out_delay[pad], 0, "V-17: nor is its dry path");
+        assert_eq!(
+            plan.output[pad], None,
+            "and its ROUTING is untouched — only the padding was removed"
+        );
+
+        // The tracks still get theirs, so this removed a rule for players
+        // rather than breaking PDC.
+        assert_eq!(
+            plan.track_pdc[slots[&crate::ids::TrackId::from("vox")]], 0,
+            "vox is the slowest source, so it sets the floor"
+        );
+        assert!(
+            plan.out_delay[slots[&crate::ids::TrackId::from("vox")]] > 0,
+            "and its dry path still waits for the return"
+        );
+    }
+
+    /// The other half of V-17, stated where it is easy to get wrong: a pad's
+    /// SEND into a shared bus still has to arrive in step with that bus's
+    /// other inputs. That is edge compensation (`RtSend::delay`), a different
+    /// mechanism from the row's own padding, and the ruling leaves it alone —
+    /// where the pad's dry signal belongs in time is not the same question as
+    /// when a copy of it must reach a summing point.
+    #[test]
+    fn v17_leaves_a_players_send_edge_compensation_alone() {
+        let mut vox = track("vox", "audio");
+        vox.sends.push(send("s1", "verb"));
+        let tracks = vec![vox, track("verb", "bus")];
+        let players = vec![{
+            let mut p = crate::audio::player::Player::new(crate::ids::PlayerId::from("pad"), "PAD");
+            p.node.sends.push(crate::audio::types::SendSlot {
+                id: "ps1".into(),
+                dest: "verb".into(),
+                amount_db: 0.0,
+                pre_fader: false,
+            });
+            p // NOT raw: V-6 would strip the send off a raw player
+        }];
+        let slots = crate::audio::types::derive_slots_with_players(&tracks, &players);
+        let mut chains = HashMap::new();
+        chains.insert("vox".into(), latency_chain(512, false));
+        let nodes = crate::audio::node::mix_nodes_with_players(&tracks, &players);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
+
+        let edge = &plan.sends[&crate::ids::TrackId::from("pad")][0];
+        assert_eq!(
+            edge.delay, 512,
+            "the pad's copy waits for vox's chain, or the two hit the reverb \
+             512 samples apart"
+        );
+        assert_eq!(plan.track_pdc[slots[&crate::ids::TrackId::from("pad")]], 0, "still unpadded");
+    }
 
     /// Latency is compensated PER EDGE. A track that both sends into a slow
     /// reverb and goes straight to the master must delay only its OUTPUT

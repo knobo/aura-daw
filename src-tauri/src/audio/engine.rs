@@ -5622,6 +5622,12 @@ mod tests {
         let end = body[1..].find("\n    fn ").map_or(body.len(), |i| i + 1);
         let body = &body[..end];
         let song_end = body.find(".song_end").expect("rebuild stores song_end");
+        // A LITERAL match on the loop header, which is the weakness of this
+        // device: extracting the player loop into a helper preserves the
+        // ordering this test is about and still fails it. If you do extract
+        // it, re-point this needle at whatever the call site reads (e.g.
+        // `self.append_player_rows(`) rather than deleting the test — the
+        // ordering is the invariant, the string is only how it is reached.
         let players = body.find("for p in s.players.iter()").expect("rebuild appends player rows");
         assert!(
             song_end < players,
@@ -5714,6 +5720,160 @@ mod tests {
         assert!(
             out.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
             "a solo elsewhere in the mixer must not cut the pad"
+        );
+    }
+
+    /// Fix round 1, finding 1. An idle pad must cost NOTHING and, more to the
+    /// point, must PRODUCE nothing — including into its own pre-fader send.
+    ///
+    /// `on = false` was not enough. It is consumed inside `apply_fader_into`,
+    /// which runs after the clip read, after the inserts and after the
+    /// pre-fader taps; and because an off clock never advances, an unpressed
+    /// pad sat at `pos = 0` and re-read the first `frames` of its own sample
+    /// on every block, forever. Pre-fader taps are deliberately NOT gated by
+    /// `on` — a muted track's reverb should keep ringing — so that fragment
+    /// went into the bus continuously: "every pad sounds at bar 1" reached
+    /// through the send path instead of the master path.
+    ///
+    /// The bus is the assertion because it is the leak that was audible. The
+    /// master is checked too, since it was already silent and must stay so.
+    #[test]
+    fn an_idle_pad_leaks_nothing_into_its_pre_fader_bus() {
+        use crate::audio::transport::LoopSpec;
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let row = player_clip_row(&c, false, &cache_with(&sid, source));
+
+        // Slot 0 = a return bus, slot 1 = the pad, tapping it PRE-fader.
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 1));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        params.set_send_amount_linear(0, 1.0);
+        let mut pad = RtTrack::clips(1, row);
+        pad.sends = vec![crate::audio::rt::RtSend {
+            bus: 0,
+            amount: 0,
+            pre_fader: true,
+            delay: None,
+        }];
+        let bus = crate::audio::rt::RtBus {
+            slot: 0,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            output: None,
+            out_pdc: None,
+            win: Default::default(),
+        };
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+
+        // Two blocks, because the defect was per-block and forever.
+        let mut out = vec![0.0f32; 64 * 2];
+        for _ in 0..2 {
+            out.fill(0.0);
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            assert_eq!(
+                out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+                0.0,
+                "an unpressed pad reaches neither the master nor, through the \
+                 bus it sends to, anything else"
+            );
+        }
+
+        // ...and the row is not merely muted: firing it still works, so the
+        // early-out skipped a row that had nothing to give, not a live one.
+        g.clocks.fire(1, 0, c.length_samples, false);
+        out.fill(0.0);
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "and the pad still sounds when it IS pressed"
+        );
+    }
+
+    /// The cost datum for Plan V's idle pads — the number the whole "an idle
+    /// player is about one atomic load per block" claim rests on, and which
+    /// nobody had measured before fix round 1 (finding 1). `scripts/perf-check.sh`
+    /// cannot produce it: its harness builds the OFFLINE graph, and V-15 keeps
+    /// players out of that entirely, so there is no configuration of it in
+    /// which an idle pad appears at all.
+    ///
+    /// 32 pads, each with a decoded clip, none pressed, timed the way the
+    /// plugin-load harness times a block. Ignored by default because it is a
+    /// measurement, not an assertion — a timing threshold here would be a
+    /// flake on a loaded machine. Run it deliberately:
+    ///
+    /// ```text
+    /// cargo test --lib -- --ignored --nocapture idle_players_block_cost
+    /// ```
+    #[test]
+    #[ignore]
+    fn idle_players_block_cost() {
+        use crate::audio::transport::LoopSpec;
+        use std::time::Instant;
+        const PADS: usize = 32;
+        const FRAMES: usize = 512;
+        const BLOCKS: usize = 2_000;
+
+        let source = Arc::new(RtClipData {
+            channels: 2,
+            data: (0..48_000 * 2).map(|i| (i % 977) as f32 / 977.0).collect(),
+        });
+        let params = Arc::new(ParamTable::with_slots_and_sends(PADS, 0));
+        let mut rows = Vec::with_capacity(PADS);
+        for slot in 0..PADS {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+            rows.push(RtTrack::clips(
+                slot,
+                vec![RtClip {
+                    start: 0,
+                    offset: 0,
+                    len: 48_000,
+                    gain: 1.0,
+                    fade_in: 0,
+                    fade_out: 0,
+                    samples: source.clone(),
+                }],
+            ));
+        }
+        let mut g = RtGraph::new(rows, 1, params);
+        let clocks =
+            crate::audio::clock::ClockTable::with_slots_clocks_and_players(PADS, PADS + 1, PADS);
+        clocks.set_transport_playing(true);
+        for slot in 0..PADS {
+            clocks.bind_slot(slot, 1 + slot as u32);
+        }
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; FRAMES * 2];
+        for _ in 0..200 {
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        }
+        let mut micros: Vec<f64> = Vec::with_capacity(BLOCKS);
+        for _ in 0..BLOCKS {
+            let t0 = Instant::now();
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            micros.push(t0.elapsed().as_secs_f64() * 1e6);
+        }
+        micros.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "IDLE-PADS: {PADS} pads, {FRAMES}-frame block — min {:.2} us, median {:.2} us, p95 {:.2} us",
+            micros[0],
+            micros[BLOCKS / 2],
+            micros[BLOCKS * 95 / 100],
+        );
+        assert_eq!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+            0.0,
+            "and every one of them is silent, which is what makes the cost \
+             pure waste rather than work"
         );
     }
 

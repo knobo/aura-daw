@@ -150,6 +150,30 @@ The old control-surface v0.4/v0.5, now pointed at players: physical LPD8
 CC/notes ↔ pads and knobs, LED out, Launchpad 8×8 and MCU templates, and
 "give me an LPD8" as a spoken command.
 
+## Decided while building V2 (Task 9)
+
+**Stopping the transport does NOT cut a sounding pad. Escape / stop-all
+does.** Two calls, and the split is deliberate:
+
+* `ControlPlane::clear_launch_audible` is the transport-stop path. It cuts
+  every SCENE and no player. A scene is a region of the arrangement that a
+  pad borrowed, so ending the song ends it. A player is not in the song at
+  all (V-2), and cutting a performance because someone stopped the
+  transport is the deck going quiet mid-set.
+* `ControlPlane::stop_launch_overlay` is Escape / stop-all. It cuts
+  everything sounding, scenes and players alike.
+
+Players were missing from the second one until Task 9's first fix round,
+and their absence made a `TriggerMode::Loop` pad unstoppable: a looping
+clock never ends itself (`ClockTable::advance` wraps it), and
+`ClockTable::any_running` keeps the output callback rendering with the
+transport stopped, so the pad sounded indefinitely. The only thing that
+could reach it was `player_stop(id)`, which no frontend calls yet.
+
+The consequence to keep in view: **while V2 has no UI (Task 13), a pad can
+only be stopped from the backend.** Whatever surface Task 13 builds must
+bind stop-all, not only per-pad stop.
+
 ## Open questions (owner)
 
 Recorded in the design doc §8 with recommendations: voice cap, choke-group

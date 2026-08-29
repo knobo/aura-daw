@@ -434,8 +434,14 @@ fn process_inserts(
 /// Where this node's playhead is for THIS block, whether that position is a
 /// discontinuity, and whether the node renders at all.
 ///
-/// Returns `(pos, loop_spec, discontinuity, audible, own_clock)`, where
-/// `own_clock` is "this node reads a clock of its own" — the predicate that
+/// Returns `(pos, loop_spec, discontinuity, audible, own_clock,
+/// exclusive_idle)`. `exclusive_idle` is "this node can produce NOTHING this
+/// block, by construction" — true only in the exclusive-and-off case below,
+/// which is a player whose pad is not pressed. It exists so the strip can
+/// skip such a row outright rather than render it and zero it at the fader;
+/// see the early-out in `render_windowed`, and fix round 1 finding 1 for the
+/// three things that cost. `own_clock` is "this node reads a clock of its
+/// own" — the predicate that
 /// bypasses another track's solo, and exactly `clock_of(slot) !=
 /// TRANSPORT_CLOCK` (a slot can never hold an out-of-range clock index:
 /// `bind_slot` refuses one). Returned rather than re-derived so the strip
@@ -484,13 +490,13 @@ fn node_playhead(
     base_pos: u64,
     lp: &LoopSpec,
     discontinuity: bool,
-) -> (u64, LoopSpec, bool, bool, bool) {
+) -> (u64, LoopSpec, bool, bool, bool, bool) {
     let ph = clocks.playhead(slot, base_pos, discontinuity);
     if ph.is_transport {
-        return (ph.pos, *lp, ph.discontinuity, ph.on, false);
+        return (ph.pos, *lp, ph.discontinuity, ph.on, false, false);
     }
     if ph.on {
-        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true);
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity, true, true, false);
     }
     if ph.exclusive {
         // Plan V — V-2: a PLAYER's slot has no arrangement to rejoin. Its row
@@ -500,7 +506,25 @@ fn node_playhead(
         // it silent instead — but the discontinuity is still delivered, so a
         // player's live node (V3's MIDI sources) gets the `all_notes_off` its
         // clip's end owes it.
-        return (ph.pos, LoopSpec::OFF, ph.discontinuity || discontinuity, false, true);
+        //
+        // The last element says the strip may skip this row ENTIRELY, and
+        // `on = false` alone was not enough (fix round 1, finding 1): `on` is
+        // consumed inside `apply_fader_into`, which zeroes only AFTER the
+        // clip read, the inserts and the pre-fader taps have already run. An
+        // off clock never advances, so an unpressed pad sat at `pos = 0` and
+        // re-read the first `frames` of its own clip every block, forever —
+        // feeding its inserts and leaking into its pre-fader buses.
+        //
+        // The transport's `discontinuity` is OR'd in, which strictly speaking
+        // is a flush an idle pad does not owe: it reads its own position, so
+        // a seek is not a jump for it. Harmless while player rows carry no
+        // live node, and deliberately left that way — TASK 10 makes it live
+        // work, and the choice then is between one spurious `all_notes_off`
+        // on a silent pad (this) and inventing a second discontinuity
+        // channel. A sounding pad is unaffected either way: it takes the
+        // `ph.on` branch above, which does NOT OR the transport's in, so a
+        // seek can never cut a pad mid-press.
+        return (ph.pos, LoopSpec::OFF, ph.discontinuity || discontinuity, false, true, true);
     }
     (
         base_pos,
@@ -508,6 +532,7 @@ fn node_playhead(
         ph.discontinuity || discontinuity,
         clocks.transport_on(),
         true,
+        false,
     )
 }
 
@@ -705,7 +730,7 @@ fn render_impl(
         if tr.slot >= n_slots {
             continue;
         }
-        let (_, _, track_disc, _, _) =
+        let (_, _, track_disc, _, _, _) =
             node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
         tr.win.disc = track_disc;
         let live_in_events = live_in.filter(|b| b.slot == tr.slot).map(|b| b.events).unwrap_or(&[]);
@@ -744,11 +769,37 @@ fn render_impl(
             if tr.slot >= n_slots {
                 continue;
             }
+            let (track_base, track_lp, _, clock_on, own_clock, exclusive_idle) =
+                node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
+            // Plan V — V-2, the cost half (fix round 1, finding 1). An
+            // exclusive-and-off slot is a pad nobody is pressing, and it can
+            // produce nothing BY CONSTRUCTION — not "produces something the
+            // fader will zero". Everything below it is therefore waste, and
+            // three kinds of waste at that: the per-sample clip read (an off
+            // clock never advances, so the row re-read the first `frames` of
+            // its own sample every block, forever), the insert chain (fed
+            // that repeating fragment continuously, so a pad with a reverb
+            // fired from polluted state), and the PRE-fader taps, which are
+            // deliberately NOT gated by `on` — that gate is for a muted
+            // track, whose reverb send should keep ringing, and it made an
+            // idle pad leak its own first 10 ms into its bus on every block.
+            // That last one is "every pad sounds at bar 1" reached through
+            // the send path instead of the master path.
+            //
+            // Skipping is unconditionally safe HERE and only here. `prime_live`
+            // above already ran, so a cut pad's `all_notes_off` is delivered
+            // whatever this branch does (that is why the early-out is not
+            // hoisted into the prologue). Nothing else in the block body has
+            // state that must advance: `acc` would stay zero, so
+            // `tr.win.pk_*.max(0)` and `+= 0` leave the meters exactly where
+            // rendering-then-zeroing left them, and V-17 means a player row
+            // carries no `pdc` and no `out_pdc` delay line to drain.
+            if exclusive_idle {
+                continue;
+            }
             let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
             let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
             let flags = params.flags[tr.slot].load(Relaxed);
-            let (track_base, track_lp, _, clock_on, own_clock) =
-                node_playhead(&clocks, tr.slot, base_pos, lp, discontinuity);
             // Two gates, and they used to be three. `clock_on` false is a
             // stopped transport (the old `exclusive`) or a clock that is not
             // running; `own_clock` is what bypasses another track's solo
@@ -1328,7 +1379,7 @@ mod tests {
         // clock reads it, which is what makes the live node all-notes-off in
         // `render_impl`'s prologue instead of hanging the cut voice.
         g.clocks.begin_block();
-        let (pos, _, disc, on, own) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
+        let (pos, _, disc, on, own, _) = node_playhead(&g.clocks, 0, 0, &LoopSpec::OFF, false);
         assert!(own, "still bound to the scene clock, so still past a solo");
         assert_eq!(pos, 0, "back on the arrangement playhead");
         assert!(on, "and audible: the transport is still running");
@@ -1986,9 +2037,9 @@ mod tests {
         assert!(node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false).2, "the flush");
 
         clocks.begin_block(); // a later block: nothing pending on the clock
-        let (_, _, disc, _, _) = node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false);
+        let (_, _, disc, _, _, _) = node_playhead(&clocks, 0, 0, &LoopSpec::OFF, false);
         assert!(!disc, "nothing jumped");
-        let (_, _, disc, _, _) = node_playhead(&clocks, 0, 7_000, &LoopSpec::OFF, true);
+        let (_, _, disc, _, _, _) = node_playhead(&clocks, 0, 7_000, &LoopSpec::OFF, true);
         assert!(disc, "but the transport's seek is this node's seek too");
     }
 
