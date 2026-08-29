@@ -102,6 +102,15 @@ regardless of who implemented it, because the failure this branch keeps
 repeating is a test that re-implements the logic it covers and passes while
 production is broken.
 
+**Gate running splits off the implementer.** Through round 4 the opus
+implementer ran all four gates itself — sitting through a 110-second suite, a
+clippy run and a thermal cool-down, with every line of that output landing in
+opus context. From now on: the implementer iterates to green and **commits**;
+a **sonnet gate-runner** then runs the four gates against the committed tree
+and reports only the numbers, base and branch in the same sitting. It may not
+conclude — a perf failure is reported and stopped on, and the null control and
+the judgement stay with the controller.
+
 ## The two things that outlive this PR
 
 ### The perf gate cannot bisect in this area
@@ -169,6 +178,12 @@ and V-15 excludes players from it.
 - Where a RED is impossible (a regression test for code already right),
   mutate the production line the test covers, show it failing, and revert.
   That is the standard on this branch now.
+- **A conservation test on one press cannot catch a stranded fragment.**
+  `tail_frames` is the row's whole path latency, so anything entering the
+  strip as the flush opens leaves exactly as it closes; a wrongly re-read
+  fragment is stranded for the rest of that press and surfaces only at the
+  **next** press's onset. Round 4's brief asked for a one-press assertion and
+  it passed against the deliberately broken gate. Two presses, or no bite.
 - **A conservation test over ONE press cannot see a flush-time source
   read.** `tail_frames` IS the row's whole path latency, so anything that
   enters the strip at the start of the flush leaves exactly as the window
