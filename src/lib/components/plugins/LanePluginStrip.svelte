@@ -143,7 +143,12 @@
 </script>
 
 {#if fit.shown.length > 0}
-  <div class="strip" class:folded role="group" aria-label="Plugin chain for {track.name}">
+  <div class="strip" class:folded class:hasmore={fit.overflow > 0 && !!onoverflow} role="group" aria-label="Plugin chain for {track.name}">
+    <!-- The devices clip, the `+N` does not. `overflow: hidden` on the
+         strip is the belt (Ruling P-6), but now that `.metadata-row` is
+         `nowrap` the belt actually tightens — and it would have cut off
+         the one control that says there is more chain to see. -->
+    <div class="devices">
     {#each fit.shown as d (d.instanceId)}
       {#if folded}
         <!-- Winner spec §3.4: "Folded lane: dots only, no chips." The
@@ -157,7 +162,11 @@
         ></span>
       {:else}
         <span class="device" class:bypassed={d.bypassed}>
-          <span class="dot {d.status}" title={d.status} aria-hidden="true"></span>
+          <!-- The name, not just the status. On a crowded lane the strip is
+               clipped down to its dots (`overflow: hidden`, Ruling P-6), and
+               the name button that carried this title is the first thing
+               gone — so the dot has to answer "which plugin is that". -->
+          <span class="dot {d.status}" title="{d.name} — {d.status}" aria-hidden="true"></span>
           <button type="button" class="name mono" title={nameTitle(d)} onclick={(e) => onNameClick(d, e)}>
             {d.name}
           </button>
@@ -178,6 +187,11 @@
          winner spec) is deliberately given no `onoverflow` handler, so a
          folded lane with more than `maxEntries` devices just caps at the
          dots it can show — intentional, not a missed affordance. -->
+  </div>
+    <!-- Gated on `onoverflow` too: the folded strip (dots only, per the
+         winner spec) is deliberately given no `onoverflow` handler, so a
+         folded lane with more than `maxEntries` devices just caps at the
+         dots it can show — intentional, not a missed affordance. -->
     {#if fit.overflow > 0 && onoverflow}
       <button type="button" class="overflow mono" title="Show the rest of the chain" onclick={() => onoverflow?.()}>
         +{fit.overflow}
@@ -191,9 +205,51 @@
     display: flex;
     align-items: center;
     flex-wrap: nowrap;
+    /* `auto`, not 0. `auto` resolves to min-content, and because
+       `.devices` below is a scroll container its min-content is just its
+       own floor — so this floors the strip at "the dots, plus `+N` if
+       there is one" and no more. At 0 the row squeezed the whole strip
+       away and a lane with a plugin chain looked like a lane without one. */
+    /* An explicit floor, because `auto` (min-content) would be the full
+       chain and defeat the point. 22px is the two dots an unfolded strip
+       shows (`maxEntries` 2, a 7px dot, a 4px gap — Ruling P-6's constant,
+       spent here); `.hasmore` adds the `+N` button, which cannot shrink and
+       would otherwise be the thing the clip cut off. */
     overflow: hidden;
-    min-width: 0;
+    min-width: 22px;
     gap: 4px;
+  }
+  .strip.hasmore {
+    min-width: 48px;
+  }
+  .overflow {
+    flex: none;
+  }
+  /* First to give way in the lane header's routing row. That row cannot
+     wrap and cannot grow (`.header` is a fixed `--track-height` and has to
+     match the lane column row for row), so when it is over-subscribed the
+     order matters: plugin NAMES go before the group name, because a dot
+     still shows status, the FX chip beside it still shows the count, and
+     both carry the name in a tooltip — while the group name has no other
+     home on screen once the group header has scrolled out of view. */
+  .strip:not(.folded) {
+    flex-shrink: 100;
+  }
+
+  .devices {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    overflow: hidden;
+    /* The dots and nothing else: `maxEntries` is 2 unfolded (Ruling P-6),
+       a `.dot` is 7px and the gap is 4. The names inside carry
+       `min-width: 0` with an ellipsis, so they are what gives way — and
+       the status dots, which are the strip's whole point, survive any
+       width. Clipping these away left a lane reading "+1" with nothing
+       beside it to be one more THAN. */
+    min-width: 22px;
+    flex: 0 1 auto;
+    gap: inherit;
   }
   .strip.folded {
     gap: 3px;

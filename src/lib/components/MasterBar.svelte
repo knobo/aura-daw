@@ -194,7 +194,12 @@
   .master {
     display: flex;
     align-items: center;
-    gap: 26px;
+    /* Was a flat 26px. The strip is a row of fixed-width parts (meter 320,
+       readout 48, two 190px selects, a 214px MIDI chip) and at 1280 the
+       gaps alone were what pushed `jobs`/`idle` past the right edge — they
+       landed at x=1293 in a 1280px window, with nothing to scroll them
+       back. The gap is now the first thing that gives. */
+    gap: clamp(10px, 2vw, 26px);
     height: 58px;
     padding: 0 16px;
     border-left: none;
@@ -216,13 +221,21 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    /* Without this a flex item never shrinks below its content, which is
+       how a strip of ellipsis-ready chips still overflowed the window. */
+    min-width: 0;
   }
 
+  /* `flex: none` here made 320px of meter immovable, so every pixel the
+     strip was short came out of whatever sat furthest right. It shrinks to
+     a floor now — a narrow meter still reads, a clipped one does not. */
   .meterblock {
-    flex: none;
+    flex: 0 1 auto;
+    min-width: 0;
   }
   .meterwrap {
-    width: 320px;
+    flex: 0 1 320px;
+    min-width: 96px;
   }
   .db {
     font-size: 13px;
@@ -292,6 +305,8 @@
     gap: 7px;
   }
   .dev select {
+    flex: 0 1 190px;
+    min-width: 0;
     max-width: 190px;
     background: rgb(var(--bg-0-rgb) / 0.7);
     color: var(--text-dim);
@@ -316,6 +331,8 @@
   /* One chip, fixed width: the 500 ms poll changes the text inside it, never
      the strip's layout. Focus ring comes from the global :focus-visible. */
   .midistat {
+    flex: 0 1 214px;
+    min-width: 0;
     width: 214px;
     padding: 3px 7px;
     border-radius: 4px;
@@ -352,7 +369,7 @@
   }
 
   .jobsbox {
-    flex: 1;
+    flex: 1 0 auto;
     min-width: 0;
     justify-content: flex-end;
   }

@@ -34,6 +34,39 @@ session burns an hour on something a sentence would have prevented.
   and `LanePluginStrip.svelte` both hit this with `plugins.ensureParams`
   reading `paramCache`; both now follow the same
   read-then-`untrack`-the-call shape.)
+- **A CSS selector for a CHILD COMPONENT's element matches nothing.**
+  Svelte scopes styles per component, so `.metadata-row .strip { … }`
+  written in `TrackHeader.svelte` gets that file's hash while `.strip`
+  carries `LanePluginStrip`'s. The rule compiles, ships and is silently
+  ignored. It cost a measurement pass to notice — the rule was right
+  there in the file and the layout did not move. Put the rule in the
+  component that owns the element.
+- **Style the box the parent SIZES, not the box inside it.** A `.picker`
+  that is only `position: relative` is an inline box: a flex row sizes
+  the wrapper, the wrapper does not pass that width down, and the chip
+  inside renders at its own `max-width` straight across its neighbours —
+  its `text-overflow: ellipsis` never fires because the chip is never
+  narrow. Caps and floors belong on the wrapper (`inline-flex;
+  min-width: 0`), and the child gets `max-width: 100%`. Watch the
+  specificity too: `.status.outchip { max-width: 96px }` and
+  `.metadata-row .name-picker > * { max-width: 100% }` are the SAME
+  specificity, so the one further down the file wins.
+- **`flex-wrap: wrap` inside a fixed-height box does not relieve
+  pressure, it stacks content on top of the row below.** `TrackHeader`'s
+  `.header` is `height: var(--track-height)` and has to match the lane
+  column row for row, so it cannot grow. Worse, wrapping DEFEATS a
+  `min-width: 0; overflow: hidden` belt on a child: a wrapping container
+  breaks the line on an item's CONTENT width, before shrinking is ever
+  considered, so the child is never asked to shrink. Use `nowrap` and
+  give every item a floor.
+- **A flex item's automatic minimum is its min-content width, so
+  `flex-shrink` alone stops at the longest word** and then overflows.
+  `min-width: 0` is what actually lets a name ellipse — and a floor is
+  what keeps it from vanishing entirely, which it will: a chip allotted
+  0px is present in the DOM, invisible, and impossible to click.
+- **An `auto` margin eats the row's free space BEFORE `flex-grow` runs.**
+  `.metadata-lanes { margin-left: auto }` is why a `flex: 1` chip beside
+  it measured its basis and never grew.
 
 ## Backend
 
