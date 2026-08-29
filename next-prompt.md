@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Layout: tomt roll-panel, master-bar overflow, instrument-chip | `fix/layout-overflow` | 2026-08-29 | Headless overflow-scan på 1280/1440/1920 |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 

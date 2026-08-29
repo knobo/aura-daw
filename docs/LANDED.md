@@ -5,6 +5,43 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## The layout ran out of room in five places, and the track rail can be dragged
+
+Started from a headless overflow scan (Chrome, browser demo mode) at
+1280x800, 1440x900 and 1920x1080 with every dock panel open, comparing
+each element's scroll size against its client box and its rect against
+the viewport; continued from two owner screenshots of a real project
+that the scan's demo data could not produce.
+
+- **The empty piano roll held 340px to say one sentence** — 42% of an
+  800px window, at every size. Collapsed to its tab strip; the height is
+  remembered, not spent. The track rail went from 3 of 7 lanes visible
+  at 1280x800 to all 7 at 1920x1080. This was the single biggest reason
+  everything else felt cramped.
+- **The master strip pushed `jobs`/`idle` to x=1293 in a 1280px window**,
+  unreachable. The gap gives first now, the meter shrinks to a floor,
+  and the sections carry `min-width: 0`.
+- **The lane routing row wrapped inside a box that cannot grow.**
+  `.header` is a fixed `--track-height` and must match the lane column
+  row for row, so a wrapped line rendered on top of the row beneath it
+  (measured: row 17px tall, scrollHeight 48, chips at y=52 over a
+  status row at y=45). `nowrap`, with a stated shrink order and a floor
+  under every chip — a chip allotted 0px is invisible and unclickable.
+- **Three chips stopped saying the default out loud**, following the
+  owner's own 2026-08-24 pattern: `Instrument · ` off the instrument
+  chip, `MASTER` off an output chip that is routed to the master, and
+  the `A` kind chip off plain audio lanes. That is the space the names
+  now use.
+- **The track rail is draggable** (`ui.railWidth`, 312px…45vw). 312 is
+  derived from the routing row's own floors, not chosen; below it the
+  chips would have to overlap again.
+
+Five frontend traps came out of it and are in
+[`TRAPS.md`](TRAPS.md) §Frontend — the sharpest being that a CSS
+selector written for a child component's element matches nothing at all.
+
+→ PR #128. No backlog file: this was reported live, not planned.
+
 ## A MIDI port id must not encode its place in a list
 
 The `midi_out::tests::*` "thread race" that had kept `--test-threads=1` in
