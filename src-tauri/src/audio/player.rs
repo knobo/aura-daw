@@ -154,6 +154,17 @@ mod tests {
         assert_eq!(back, p);
     }
 
+    /// The wire form the frontend sends to `player_set_trigger_mode`. The
+    /// default's `"oneShot"` is covered above; these two are the modes that
+    /// command exists to make reachable, and a symmetric Rust round trip
+    /// cannot see a rename — `#[serde(rename = "GATE_XX")]` on `Gate` leaves
+    /// every Rust test green and breaks only the TS caller, at runtime.
+    #[test]
+    fn the_other_trigger_modes_have_the_wire_names_the_design_specifies() {
+        assert_eq!(serde_json::to_value(TriggerMode::Gate).unwrap(), "gate");
+        assert_eq!(serde_json::to_value(TriggerMode::Loop).unwrap(), "loop");
+    }
+
     #[test]
     fn audio_source_round_trips() {
         let mut p = Player::new(PlayerId::from("p1"), "KICK");

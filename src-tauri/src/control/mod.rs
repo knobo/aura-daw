@@ -6702,9 +6702,11 @@ mod tests {
     }
 
     /// A retrigger rewinds THIS player and nothing else — the property the
-    /// single overlay this branch replaced could not have (V-4). Checks
-    /// BOTH halves: `a`'s own playhead is back at 0 (a no-op retrigger would
-    /// leave it running from wherever it was), and `b` is untouched.
+    /// single overlay this branch replaced could not have (V-4). Both halves
+    /// need a PLAYHEAD, not an on/off flag: a no-op retrigger leaves `a`
+    /// running from wherever it was, and a press that rewinds EVERY player —
+    /// the overlay behaviour itself — leaves `b` on while silently
+    /// restarting it.
     #[test]
     fn retriggering_one_player_leaves_another_sounding() {
         let cp = test_control_plane_with_two_audio_clips();
@@ -6723,6 +6725,12 @@ mod tests {
             tables.clocks.playhead(slot_a, 0, false).pos,
             0,
             "a's second press rewound ITS OWN playhead back to 0"
+        );
+        let slot_b = tables.slots[&TrackId::from(b.as_str())];
+        assert_eq!(
+            tables.clocks.playhead(slot_b, 0, false).pos,
+            128,
+            "b kept playing from where it was — a's press did not rewind it"
         );
     }
 
