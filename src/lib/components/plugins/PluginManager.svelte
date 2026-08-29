@@ -6,6 +6,7 @@
    * surface; the lane strip is the Bitwig job (next pass).
    */
   import { onMount } from "svelte";
+  import { uiZoomFactor } from "../../utils/ui-zoom";
   import { plugins } from "../../state/plugins.svelte";
   import { project } from "../../state/project.svelte";
   import { lanes } from "../../state/lanes.svelte";
@@ -253,7 +254,9 @@
     const el = e.currentTarget as HTMLElement;
     el.setPointerCapture?.(e.pointerId);
     const onMove = (ev: PointerEvent) => {
-      persist({ splitPx: Math.max(96, startH + ev.clientY - startY) });
+      // clientY is VISUAL px; startH/splitPx are LAYOUT px — divide out the
+      // interface zoom or the split moves more than the pointer did.
+      persist({ splitPx: Math.max(96, startH + (ev.clientY - startY) / uiZoomFactor()) });
     };
     const onUp = () => {
       el.removeEventListener("pointermove", onMove);

@@ -149,7 +149,9 @@
     selectedId = clip.id;
     const el = e.currentTarget as HTMLElement;
     const rect = el.getBoundingClientRect();
-    const nearRight = rect.right - e.clientX <= EDGE_PX;
+    // rect/clientX are VISUAL px; EDGE_PX is meant as a LAYOUT-px hit zone
+    // (so it scales with the UI like everything else under zoom).
+    const nearRight = (rect.right - e.clientX) / uiZoomFactor() <= EDGE_PX;
     const curve = curveOf(clip);
     const canvas = canvases.get(clip.id);
 
@@ -201,7 +203,7 @@
     const el = e.currentTarget as HTMLElement;
     if (!dragging) {
       const rect = el.getBoundingClientRect();
-      hoverEdge = selectedId === clip.id && rect.right - e.clientX <= EDGE_PX;
+      hoverEdge = selectedId === clip.id && (rect.right - e.clientX) / uiZoomFactor() <= EDGE_PX;
       return;
     }
     if (dragClipId !== clip.id) return;

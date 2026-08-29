@@ -70,6 +70,11 @@
   /** Rungs on the ladder. Fewer, because each one has to stay a rung at the
    * 72px a channel strip gives it. */
   const RUNGS = 26;
+  /** The rung bar's own height — the old CSS `.rungs { height: 13px }`.
+   * The canvas is taller than this (see `.ladder-canvas`) so a lit rung's
+   * glow has room to bleed, matching the old box-shadow's headroom in the
+   * slot's padding. */
+  const RUNG_H = 13;
   /** 100×100 viewBox the old SVG drew in — every geometry constant above is
    * inherited from it unchanged, so the canvas is redrawn in the same local
    * coordinate space (see `draw`'s `ctx.scale`) rather than re-derived. */
@@ -112,12 +117,6 @@
 
   function resetClip() {
     clipped = false;
-  }
-  function onClipKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      resetClip();
-    }
   }
 
   // Every face is written imperatively inside the rAF loop; none of its
@@ -266,6 +265,9 @@
       const pivotY = 78;
       // printed scale — the upper semicircle above the pivot (old SVG:
       // `M18 78 A32 32 0 0 1 82 78`, i.e. 180°..360° through straight up).
+      // `lineCap` reset explicitly: canvas state persists across draw()
+      // calls, and the needle below sets it to "round" every frame.
+      c.lineCap = "butt";
       c.beginPath();
       c.arc(pivotX, pivotY, 32, Math.PI, Math.PI * 2);
       c.strokeStyle = alpha(t.line, 0.35);
@@ -312,7 +314,12 @@
       const rw = (w - gap * (RUNGS - 1)) / RUNGS;
       const lit = Math.max(0, Math.min(RUNGS, Math.round(n * RUNGS)));
       const mark = Math.max(0, Math.min(RUNGS - 1, Math.round(p * (RUNGS - 1))));
-      const r = Math.min(1, rw / 2, h / 2);
+      // The canvas is taller than the rung bar itself (see .ladder-canvas'
+      // negative-margin overshoot) so a lit rung's glow has room to bleed
+      // into the slot's padding the way the old CSS box-shadow did —
+      // center the RUNG_H-tall bar in the middle of that extra height.
+      const ry = (h - RUNG_H) / 2;
+      const r = Math.min(1, rw / 2, RUNG_H / 2);
       for (let i = 0; i < RUNGS; i++) {
         const x = i * (rw + gap);
         const at = i / (RUNGS - 1);
@@ -329,8 +336,8 @@
           glowColor = fill;
         }
         c.beginPath();
-        if (typeof c.roundRect === "function") c.roundRect(x, 0, rw, h, r);
-        else c.rect(x, 0, rw, h);
+        if (typeof c.roundRect === "function") c.roundRect(x, ry, rw, RUNG_H, r);
+        else c.rect(x, ry, rw, RUNG_H);
         c.fillStyle = fill;
         if (glowColor) {
           c.shadowColor = glowColor;
@@ -371,9 +378,14 @@
       if (currentFace === "ladder") {
         drawLadder(n, p);
       } else {
-        // Round faces share the old SVG's 100×100 local coordinate space.
+        // Round faces share the old SVG's 100×100 local coordinate space,
+        // centered the way the SVG's default `preserveAspectRatio`
+        // (xMidYMid) centered it — a no-op today since `.bezel` is always
+        // square, but not if that ever stops being true.
         const scale = Math.min(w, h) / VIEWBOX;
-        c.setTransform(dpr * scale, 0, 0, dpr * scale, 0, 0);
+        const tx = (w - VIEWBOX * scale) / 2;
+        const ty = (h - VIEWBOX * scale) / 2;
+        c.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * tx, dpr * ty);
         if (currentFace === "led") drawLed(n, p);
         else if (currentFace === "dial") drawDial(n, p);
         else drawVu(disp);
@@ -386,11 +398,24 @@
           shown = text;
         }
       }
-      if (m?.clipped) clipped = true;
     };
 
     const stop = runWhileVisible(el, draw);
+
+    // Clip detection must not depend on visibility — the LED exists to
+    // catch an overload on a track you were not currently looking at, so
+    // this runs even while the canvas above is paused off-screen. One Map
+    // lookup, no draw work; `clipped` only writes on the rare true-going
+    // transition, so this doesn't reintroduce 60Hz reactivity.
+    let clipRaf = 0;
+    const checkClip = () => {
+      clipRaf = requestAnimationFrame(checkClip);
+      if (latestMeter(id)?.clipped) clipped = true;
+    };
+    clipRaf = requestAnimationFrame(checkClip);
+
     return () => {
+      cancelAnimationFrame(clipRaf);
       stop();
       ro.disconnect();
     };
@@ -401,7 +426,7 @@
   {#if round}
     <div class="bezel led grain">
       <div class="window">
-        <canvas bind:this={canvas} class="face-canvas"></canvas>
+        <canvas bind:this={canvas} class="face-canvas" aria-hidden="true"></canvas>
         <div class="glass"></div>
         <button
           class="clip"
@@ -409,7 +434,6 @@
           type="button"
           aria-label="Clip indicator — click to reset"
           onclick={resetClip}
-          onkeydown={onClipKeydown}
         ></button>
         <!-- The number lives INSIDE the well on the round faces: the ring is
              the glanceable reading and the digits the exact one, and putting
@@ -419,20 +443,19 @@
     </div>
   {:else if face === "ladder"}
     <div class="slot grain">
-      <canvas bind:this={canvas} class="ladder-canvas"></canvas>
+      <canvas bind:this={canvas} class="ladder-canvas" aria-hidden="true"></canvas>
       <button
         class="clip"
         class:on={clipped}
         type="button"
         aria-label="Clip indicator — click to reset"
         onclick={resetClip}
-        onkeydown={onClipKeydown}
       ></button>
     </div>
   {:else}
     <div class="bezel grain">
       <div class="window">
-        <canvas bind:this={canvas} class="face-canvas"></canvas>
+        <canvas bind:this={canvas} class="face-canvas" aria-hidden="true"></canvas>
         <div class="glass"></div>
         <button
           class="clip"
@@ -440,7 +463,6 @@
           type="button"
           aria-label="Clip indicator — click to reset"
           onclick={resetClip}
-          onkeydown={onClipKeydown}
         ></button>
       </div>
     </div>
@@ -504,7 +526,12 @@
   }
   .ladder-canvas {
     width: 100%;
-    height: 13px;
+    /* Taller than the 13px rung bar it draws, with the extra height pulled
+       back by an equal negative margin so it doesn't grow .slot's flow
+       height — the overshoot is headroom for a lit rung's glow to bleed
+       into, same room the old box-shadow had in .slot's padding. */
+    height: 25px;
+    margin: -6px 0;
     display: block;
     contain: paint;
   }

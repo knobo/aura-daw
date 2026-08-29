@@ -358,7 +358,7 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     category: "interface",
     label: "Hide track meters when surface is open",
     blurb:
-      "Each track header has its own level meter, and the control surface's channel strips read the same levels again — a second live redraw of every track, on top of the first. Turning this on blanks the track-header meters while the surface panel is open; they come back the moment you switch away from it.",
+      "Each track header has its own level meter, and a channel strip on the control surface reads the same levels again — a second live redraw on top of the first, for any track that has one. Turning this on blanks EVERY track-header meter while the surface panel is open, whether or not that particular track actually has a strip there — they all come back the moment you switch away from it.",
   },
   theme: {
     kind: "choice",

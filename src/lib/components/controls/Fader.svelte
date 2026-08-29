@@ -4,6 +4,8 @@
    * Same gesture contract as Knob — vertical drag, Shift fine, double-click
    * reset, begin/end brackets for one undo entry.
    */
+  import { uiZoomFactor } from "../../utils/ui-zoom";
+
   interface Props {
     value: number;
     min: number;
@@ -60,7 +62,9 @@
 
   function onPointerMove(e: PointerEvent) {
     if (!dragging) return;
-    const dy = originY - e.clientY;
+    // clientY is VISUAL px; FULL_TRAVEL_PX is a LAYOUT-px constant — divide
+    // out the interface zoom or the fader gets more sensitive as zoom rises.
+    const dy = (originY - e.clientY) / uiZoomFactor();
     const scale = e.shiftKey ? 0.2 : 1;
     oninput?.(clamp(originValue + (dy / FULL_TRAVEL_PX) * span * scale));
   }

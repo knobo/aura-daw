@@ -13,6 +13,7 @@
     type PanelEdge,
     type ResizeSpec,
   } from "../utils/panel-resize";
+  import { uiZoomFactor } from "../utils/ui-zoom";
 
   let {
     axis,
@@ -41,8 +42,12 @@
   let drag: PanelDrag | null = null;
   let dragging = $state(false);
 
-  const coord = (e: PointerEvent) => (axis === "y" ? e.clientY : e.clientX);
-  const viewport = () => (axis === "y" ? window.innerHeight : window.innerWidth);
+  // clientX/Y and window.inner{Width,Height} are VISUAL px; `size`/`spec`
+  // (panel-resize.ts) are LAYOUT px ("current panel size in CSS px") —
+  // divide out the interface zoom so a drag doesn't resize the panel by
+  // more than the pointer actually moved.
+  const coord = (e: PointerEvent) => (axis === "y" ? e.clientY : e.clientX) / uiZoomFactor();
+  const viewport = () => (axis === "y" ? window.innerHeight : window.innerWidth) / uiZoomFactor();
 
   function onDown(e: PointerEvent) {
     if (e.button !== 0) return;

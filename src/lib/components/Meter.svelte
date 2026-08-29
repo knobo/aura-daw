@@ -81,7 +81,6 @@
         { peak: m?.peakL ?? 0, rms: m?.rmsL ?? 0 },
         { peak: m?.peakR ?? 0, rms: m?.rmsR ?? 0 },
       ];
-      if (m?.clipped) clipLatched = true;
 
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
@@ -159,7 +158,22 @@
     };
 
     const stop = runWhileVisible(canvas, draw);
+
+    // Clip detection is the one thing this widget exists to never miss —
+    // gating it with the canvas redraw would drop a clip on any track
+    // scrolled out of view, which is the common case past a screenful of
+    // tracks, not the edge case. Cheap enough (one Map lookup) to run
+    // unconditionally; `clipLatched` only ever writes on the rare
+    // true-going transition, so this doesn't reintroduce 60Hz reactivity.
+    let clipRaf = 0;
+    const checkClip = () => {
+      clipRaf = requestAnimationFrame(checkClip);
+      if (latestMeter(id)?.clipped) clipLatched = true;
+    };
+    clipRaf = requestAnimationFrame(checkClip);
+
     return () => {
+      cancelAnimationFrame(clipRaf);
       stop();
       ro.disconnect();
     };

@@ -19,7 +19,10 @@
 
 import { prefs } from "../prefs/prefs.svelte";
 
-/** Structural slice of HTMLElement so the helper is testable without a DOM. */
+/** Structural slice of HTMLElement so `applyUiZoom` is testable without a
+ * DOM. `uiZoomFactor` below, unlike `applyUiZoom`, reads `prefs` directly
+ * rather than the DOM — the two halves of this module have different
+ * dependencies, not a shared testability property. */
 type ZoomTarget = {
   style: {
     setProperty(name: string, value: string): void;

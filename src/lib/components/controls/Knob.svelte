@@ -30,6 +30,7 @@
    * range, and 200px is deliberately long: a knob you can slam end to end
    * in a flick is unusable for the 0.1 dB adjustments this is for.
    */
+  import { uiZoomFactor } from "../../utils/ui-zoom";
 
   interface Props {
     value: number;
@@ -150,8 +151,10 @@
 
   function onPointerMove(e: PointerEvent) {
     if (!dragging) return;
-    // Up is more, which is why the delta is negated.
-    const dy = originY - e.clientY;
+    // Up is more, which is why the delta is negated. clientY is VISUAL px;
+    // FULL_TRAVEL_PX is a LAYOUT-px constant — divide out the interface
+    // zoom or the knob gets more sensitive as zoom rises.
+    const dy = (originY - e.clientY) / uiZoomFactor();
     const scale = e.shiftKey ? 0.2 : 1;
     oninput?.(clamp(originValue + (dy / FULL_TRAVEL_PX) * span * scale));
   }
