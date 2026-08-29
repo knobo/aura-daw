@@ -2351,6 +2351,43 @@ mod tests {
         );
     }
 
+    /// Fix round 3, item 2's trap. The tail `debug_assert` re-derives a row's
+    /// window, and the allowance in it is now RATE-DEPENDENT — so the rate it
+    /// re-derives with has to be the one the row was BUILT at, never this
+    /// call's `sample_rate`.
+    ///
+    /// The two disagree for real: a device rate change moves what
+    /// `render_impl` is handed immediately, and the graph is only rebuilt
+    /// afterwards. In that window a perfectly correct graph would fail its
+    /// own invariant check and panic on the RT thread. One source of truth,
+    /// and it travels with the graph.
+    #[test]
+    fn a_graphs_tail_check_uses_the_rate_it_was_built_at_not_the_callers() {
+        use super::super::dsp::AudioProcessor;
+        use super::super::rt::{live_tail_frames, LiveNodeCell, LiveSource, MAX_LIVE_BLOCK};
+        use crate::midi::synth::PolySynth;
+
+        let mut synth = PolySynth::new();
+        synth.prepare(96_000, MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(0, Vec::new());
+        pad.live = Some(LiveSource {
+            node: LiveNodeCell::new(Box::new(synth)),
+            events: Arc::new(Vec::new()),
+        });
+        let mut g = RtGraph::with_buses(
+            vec![pad],
+            Vec::new(),
+            1,
+            Arc::new(ParamTable::with_slots_and_sends(1, 0)),
+            96_000,
+        );
+        assert_eq!(g.tracks[0].tail_frames, live_tail_frames(96_000));
+
+        // The device dropped to 48 kHz; the rebuild has not landed yet.
+        let mut out = vec![0.0f32; 64 * 2];
+        render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+    }
+
     /// The integrated half of the flush: `render_impl`'s prologue must turn
     /// a stopped scene clock's discontinuity into a real `all_notes_off` on
     /// the live node still bound to it. Nothing asserted this before —
