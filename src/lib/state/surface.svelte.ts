@@ -378,12 +378,17 @@ class SurfaceStore {
   }
 
   async fireClip(clipId: string) {
-    // Fix round 1, Critical 2: a migrated binding's target is `player`,
-    // not `clip` — `launch.mapClip` already resolves that case (via
-    // `launch.players`), so delegate straight to it rather than
-    // duplicating a `kind === "clip"` scan here that would miss every
-    // migrated pad and (before `mapClip`'s own fix) mint a duplicate.
-    const binding = await launch.mapClip(clipId);
+    // Fix round 1, Critical 2 (re-fixed): `launch.mapClip` resolves a
+    // migrated `player` target via `launch.players`, so it CAN be
+    // delegated to unconditionally for correctness — but `mapClip` also
+    // focuses/seeks the transport on a hit, which `fireClip` must not do
+    // for the ordinary case of firing a pad that already has a binding
+    // (that would move the user's timeline/transport on every press,
+    // exactly the class of defect Task 8 killed on the Rust side).
+    // `existingBindingForClip` is the same lookup with no side effect;
+    // `mapClip` runs only to CREATE one, whose own focus is the "jump to
+    // what you just made" behaviour that predates this fix round.
+    const binding = launch.existingBindingForClip(clipId) ?? (await launch.mapClip(clipId));
     if (!binding) return;
     await launch.preview(binding.id);
   }

@@ -43,6 +43,10 @@ vi.mock("../../tauri", () => ({
       calls.push(`fire:${id}`);
       return Promise.resolve();
     },
+    transportSeek: (samples: number) => {
+      calls.push(`seek:${samples}`);
+      return Promise.resolve();
+    },
     pluginGetParams: () => Promise.resolve([]),
     pluginList: () => Promise.resolve({ plugins: [], scanned: true, instances: [] }),
   },
@@ -248,6 +252,13 @@ describe("a pad grid", () => {
     render(PadGrid, { widget });
     await pressPad(screen.getByRole("button", { name: /play verse/i }));
     await vi.waitFor(() => expect(calls).toContain("fire:b1"));
+    // Fix round 1 regression, caught mutation-testing the Critical-2 fix:
+    // `fireClip` briefly delegated straight to `launch.mapClip`, which
+    // also focuses/seeks on a HIT — so firing a pad that already has a
+    // binding started moving the transport on every press, the same
+    // class of defect Task 8 killed on the Rust side. A pad already
+    // mapped must only fire, never seek.
+    expect(calls.some((c) => c.startsWith("seek:"))).toBe(false);
   });
 
   it("assigns an empty cell from the picker in edit mode", async () => {

@@ -316,21 +316,33 @@ class LaunchStore {
     return this.create({ kind: "region", startTicks, lengthTicks, trackIds });
   }
 
+  /** The binding already mapping `clipId`, `clip`-target or migrated
+   * `player`-target (via `clipIdForPlayer`), or null. Side-effect-free —
+   * unlike `mapClip`, which also focuses/selects on a hit — so a caller
+   * that only wants to know "is this clip already bound" (fireClip) can
+   * ask without the side effect of jumping the timeline/seeking the
+   * transport on every press of an already-mapped pad. */
+  existingBindingForClip(clipId: string): LaunchBinding | null {
+    return (
+      this.bindings.find(
+        (b) =>
+          (b.target.kind === "clip" && b.target.clipId === clipId) ||
+          (b.target.kind === "player" && this.clipIdForPlayer(b.target.playerId) === clipId),
+      ) ?? null
+    );
+  }
+
   async mapClip(clipId: string, name?: string): Promise<LaunchBinding | null> {
     const clip = midi.clipById(clipId);
     if (!clip) return null;
-    // Fix round 1, Critical 2: a migrated binding's target is `player`,
-    // not `clip` — resolve it back to a clip id via `this.players` (see
-    // `clipIdForPlayer`) so a clip that already has a migrated pad is
-    // still found here. Without this a second binding used to get minted
-    // on a fresh note every time — silently, since Rust's by-clip
-    // migration dedup would reunite both onto one player on the next
-    // open, hiding the duplicate note until then.
-    const existing = this.bindings.find(
-      (b) =>
-        (b.target.kind === "clip" && b.target.clipId === clipId) ||
-        (b.target.kind === "player" && this.clipIdForPlayer(b.target.playerId) === clipId),
-    );
+    // Fix round 1, Critical 2: `existingBindingForClip` resolves a
+    // migrated `player` target back to its clip via `this.players`, so a
+    // clip that already has a migrated pad is still found here. Without
+    // this a second binding used to get minted on a fresh note every
+    // time — silently, since Rust's by-clip migration dedup would
+    // reunite both onto one player on the next open, hiding the
+    // duplicate note until then.
+    const existing = this.existingBindingForClip(clipId);
     if (existing) {
       this.selectedId = existing.id;
       this.focus(existing.id);
