@@ -52,5 +52,7 @@ export const NORD_TOKENS: ThemeTokens = {
   relief: "0.45",
   sheen: "0.3",
   grain: "0.08",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "6px",
 };

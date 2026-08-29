@@ -53,5 +53,7 @@ export const HIGH_CONTRAST_LIGHT_TOKENS: ThemeTokens = {
   relief: "0",
   sheen: "0",
   grain: "0",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "4px",
 };

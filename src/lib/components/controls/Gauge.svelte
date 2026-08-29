@@ -113,7 +113,7 @@
     border-radius: 50%;
     background-color: var(--bg-3);
     background-image: var(--sheen-dome);
-    box-shadow: var(--bevel-raised), var(--relief-2);
+    box-shadow: var(--bevel-frame), var(--relief-2);
     padding: 7px;
   }
   .window {

@@ -96,7 +96,7 @@
     border-radius: calc(var(--ctrl-radius) + 2px);
     background-color: var(--bg-1);
     background-image: var(--sheen-face);
-    box-shadow: var(--bevel-raised), var(--relief-1);
+    box-shadow: var(--bevel-frame), var(--relief-1);
   }
   .strip.missing {
     opacity: 0.55;

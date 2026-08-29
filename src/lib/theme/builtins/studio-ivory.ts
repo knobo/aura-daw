@@ -70,5 +70,7 @@ export const STUDIO_IVORY_TOKENS: ThemeTokens = {
   relief: "0.65",
   sheen: "0.55",
   grain: "0.28",
+  // Not brushed: this surface has no direction to it.
+  brush: "0",
   ctrlRadius: "9px",
 };

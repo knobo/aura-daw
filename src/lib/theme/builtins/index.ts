@@ -10,6 +10,8 @@ import { AURA_LIGHT_TOKENS } from "./aura-light";
 import { CONSOLE_NOIR_TOKENS } from "./console-noir";
 import { STUDIO_IVORY_TOKENS } from "./studio-ivory";
 import { RACK_SLATE_TOKENS } from "./rack-slate";
+import { BRUSHED_STEEL_DARK_TOKENS } from "./brushed-steel-dark";
+import { BRUSHED_STEEL_LIGHT_TOKENS } from "./brushed-steel-light";
 import { HIGH_CONTRAST_DARK_TOKENS } from "./high-contrast-dark";
 import { HIGH_CONTRAST_LIGHT_TOKENS } from "./high-contrast-light";
 import { SOLARIZED_DARK_TOKENS } from "./solarized-dark";
@@ -38,6 +40,16 @@ export const AURA_LIGHT = builtin("aura-light", "AURA Light", AURA_LIGHT_TOKENS)
 export const CONSOLE_NOIR = builtin("console-noir", "Console Noir", CONSOLE_NOIR_TOKENS);
 export const STUDIO_IVORY = builtin("studio-ivory", "Studio Ivory", STUDIO_IVORY_TOKENS);
 export const RACK_SLATE = builtin("rack-slate", "Rack Slate", RACK_SLATE_TOKENS);
+export const BRUSHED_STEEL_DARK = builtin(
+  "brushed-steel-dark",
+  "Brushed Steel Dark",
+  BRUSHED_STEEL_DARK_TOKENS,
+);
+export const BRUSHED_STEEL_LIGHT = builtin(
+  "brushed-steel-light",
+  "Brushed Steel Light",
+  BRUSHED_STEEL_LIGHT_TOKENS,
+);
 export const HIGH_CONTRAST_DARK = builtin(
   "high-contrast-dark",
   "High Contrast Dark",
@@ -53,13 +65,17 @@ export const SOLARIZED_LIGHT = builtin("solarized-light", "Solarized Light", SOL
 export const NORD = builtin("nord", "Nord", NORD_TOKENS);
 export const GRUVBOX_DARK = builtin("gruvbox-dark", "Gruvbox Dark", GRUVBOX_DARK_TOKENS);
 
-// Picker order: the house themes, then the two material themes — they are
-// the showcase for the material tokens and the first thing worth trying —
-// then the two accessibility themes, which are why this exists and should
-// not be buried, and finally the borrowed palettes.
+// Picker order: the house themes, then the material themes — they are the
+// showcase for the material tokens and the first thing worth trying — then
+// the two accessibility themes, which are why this exists and should not be
+// buried, and finally the borrowed palettes. The brushed pair sits next to
+// Rack Slate because the three are the same idiom at three finishes, and a
+// picker that separates them makes that hard to see.
 export const BUILTIN_THEMES: readonly Theme[] = [
   AURA_DARK,
   AURA_LIGHT,
+  BRUSHED_STEEL_DARK,
+  BRUSHED_STEEL_LIGHT,
   RACK_SLATE,
   CONSOLE_NOIR,
   STUDIO_IVORY,
@@ -86,6 +102,8 @@ export type BuiltinId =
   | "console-noir"
   | "studio-ivory"
   | "rack-slate"
+  | "brushed-steel-dark"
+  | "brushed-steel-light"
   | "high-contrast-dark"
   | "high-contrast-light"
   | "solarized-dark"
