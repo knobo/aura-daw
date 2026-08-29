@@ -29,7 +29,19 @@
   import { lanes } from "../state/lanes.svelte";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
   import { library } from "../state/library.svelte";
+
+  // `--rail-width` is what every consumer reads — `.rail`, `.corner`,
+  // `.lanes`' padding, the transport bar's left group, and the lane
+  // painter's geometry. main.ts seeds it from RAIL_WIDTH_PX before mount;
+  // this keeps it in step with the drag. Set on the root, not on an
+  // element, because those consumers live in four different components.
+  $effect(() => {
+    document.documentElement.style.setProperty("--rail-width", `${ui.railWidth}px`);
+  });
   import TrackHeader from "./TrackHeader.svelte";
+  import PanelResizeHandle from "./PanelResizeHandle.svelte";
+  import { RAIL_RESIZE } from "../utils/panel-resize";
+  import { ui } from "../state/ui.svelte";
   import LaneGroupHeader from "./LaneGroupHeader.svelte";
   import HScrollbar from "./HScrollbar.svelte";
   import ClipView from "./ClipView.svelte";
@@ -963,6 +975,19 @@
         <button class="add auto mono" onclick={addAutomationTrack}>+ AUTO</button>
         <button class="add bus mono" onclick={addBusTrack} title="Add a return bus — send tracks into it and put one shared reverb on it">+ BUS</button>
       </div>
+      <!-- Right edge, not left: the rail is anchored to the window, so this
+           is the panel's "end" and every direction in the gesture flips.
+           Inside `.rail` so it spans the whole track list, and it stops its
+           own pointerdown — the rail is a grid that treats a press as a
+           lane selection. -->
+      <PanelResizeHandle
+        axis="x"
+        edge="end"
+        size={ui.railWidth}
+        spec={RAIL_RESIZE}
+        label="Resize track rail"
+        onresize={(px) => (ui.railWidth = px)}
+      />
       {#if project.tracks.length > 1}
         <div class="foldrow">
           <button
@@ -1388,6 +1413,8 @@
   .rail {
     width: var(--rail-width);
     flex: none;
+    /* Anchors the resize handle absolutely positioned on the right edge. */
+    position: relative;
     border-right: 1px solid var(--glass-border);
     background: rgb(var(--bg-1-rgb) / 0.6);
     display: flex;
