@@ -21,7 +21,7 @@ what does.
 | 6 | The clock table | **done** | `f4e171b`, `9a75eb3` | begin_block() latch; 1 fix round |
 | 7 | Mixer reads clocks; overlay deleted | **done** | `d188210`, `5c7ef0a` | 1448 tests green; 1 fix round (3 flush-frame deltas) |
 | 8 | Per-scene clocks; no transport hijack | **done** | `2115f73`, `2cf1597`, `d62ee5f` | transport hijack dead; +rebuild reconciliation; 2 fix rounds |
-| 9 | Audio-clip players in the live graph | pending | | |
+| 9 | Audio-clip players in the live graph | **wip, unverified** | `d1f8cdd` | implementer killed by a rate limit; committed as custody, not reviewed |
 | 10 | MIDI players with their own instrument | pending | | |
 | 11 | Trigger modes | pending | | |
 | 12 | Migrating launch bindings | pending | | |
