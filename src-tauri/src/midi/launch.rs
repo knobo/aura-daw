@@ -396,7 +396,14 @@ pub fn binding_self_triggers(
 ) -> bool {
     match target {
         LaunchTarget::Clip { clip_id } => clip_id.as_str() == driving_clip_id,
-        LaunchTarget::Player { .. } => false, // MUTATED: player self-trigger guard removed
+        LaunchTarget::Player { player_id } => players.iter().any(|p| {
+            &p.id == player_id
+                && matches!(
+                    &p.source,
+                    crate::audio::player::PlayerSource::MidiClip { clip_id, .. }
+                        if clip_id.as_str() == driving_clip_id
+                )
+        }),
         LaunchTarget::Region { .. } => false,
     }
 }
