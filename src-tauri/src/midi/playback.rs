@@ -236,6 +236,8 @@ pub fn append_from_with_input(
                         pdc: None,
                         out_pdc: None,
                         output: None,
+                        tail_frames: 0,
+                        flush_left: 0,
                         win: Default::default(),
                     });
                 }
@@ -273,6 +275,8 @@ pub fn append_from_with_input(
                         pdc: None,
                         out_pdc: None,
                         output: None,
+                        tail_frames: 0,
+                        flush_left: 0,
                         win: Default::default(),
                     });
                 }

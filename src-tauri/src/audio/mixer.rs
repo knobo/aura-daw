@@ -435,12 +435,14 @@ fn process_inserts(
 /// discontinuity, and whether the node renders at all.
 ///
 /// Returns `(pos, loop_spec, discontinuity, audible, own_clock,
-/// exclusive_idle)`. `exclusive_idle` is "this node can produce NOTHING this
-/// block, by construction" — true only in the exclusive-and-off case below,
-/// which is a player whose pad is not pressed. It exists so the strip can
-/// skip such a row outright rather than render it and zero it at the fader;
-/// see the early-out in `render_impl`, and fix round 1 finding 1 for the
-/// three things that cost. `own_clock` is "this node reads a clock of its
+/// exclusive_idle)`. `exclusive_idle` is "nothing is FEEDING this node this
+/// block" — true only in the exclusive-and-off case below, which is a player
+/// whose pad is not being pressed. It is not yet "produces nothing": a row
+/// stops being fed the moment its clock does, while whatever is still inside
+/// its chain and its delay lines has to come out. So the strip stops the
+/// CLIP READ on it immediately and skips the row outright only once its tail
+/// is out; see the early-out in `render_impl`, and fix round 1 finding 1 for
+/// the three things that cost. `own_clock` is "this node reads a clock of its
 /// own" — the predicate that
 /// bypasses another track's solo, and exactly `clock_of(slot) !=
 /// TRANSPORT_CLOCK` (a slot can never hold an out-of-range clock index:
@@ -660,46 +662,6 @@ pub fn render_rt_with_input(
     )
 }
 
-/// One window of SILENCE through an idle player row's tail stages, so the
-/// delay lines the row carries keep running while its strip is skipped.
-///
-/// See the early-out in `render_impl` for why this exists. Silence is not an
-/// approximation of what the full strip would have produced: an idle pad has
-/// `on = false`, and `apply_fader_into` zeroes `post` for it anyway.
-///
-/// `#[cold]` and out of line deliberately. The common idle row carries no
-/// delay line at all and never reaches here, and the caller is the per-block
-/// track loop — this must not cost the hot path a register.
-#[cold]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn flush_idle_tail(
-    tr: &mut RtTrack,
-    params: &super::rt::ParamTable,
-    post_buf: &mut [f32],
-    bus_buf: &mut [f32],
-    tap_buf: &mut [f32],
-    out: &mut [f32],
-    out_ch: usize,
-    w0: usize,
-    w_len: usize,
-) {
-    let Some(post) = post_buf.get_mut(..w_len * 2) else { return };
-    post.fill(0.0);
-    for snd in tr.sends.iter_mut().filter(|s| s.pre_fader) {
-        let amount = params.send_amount_linear(snd.amount);
-        tap_into_bus(snd, bus_buf, tap_buf, 0, post, w_len, amount);
-    }
-    for snd in tr.sends.iter_mut().filter(|s| !s.pre_fader) {
-        let amount = params.send_amount_linear(snd.amount);
-        tap_into_bus(snd, bus_buf, tap_buf, 0, post, w_len, amount);
-    }
-    if let Some(d) = tr.out_pdc.as_mut() {
-        d.process(post);
-    }
-    route_out(tr.output, out, out_ch, bus_buf, w0, 0, post, w_len);
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_impl(
     graph: &mut RtGraph,
@@ -833,30 +795,45 @@ fn render_impl(
             // and `+= 0` leave the meters exactly where rendering-then-zeroing
             // left them.
             //
-            // What is NOT safe is skipping a DELAY LINE. `d.process` inside
-            // `tap_into_bus` is the only thing that advances a send edge's
-            // compensation, `out_pdc` is the same story on the dry path, and
-            // `DelayLine` has no reset — so a bare `continue` left the last
-            // `delay` samples of every press sitting in the line: the copy
-            // into the bus was truncated at its tail, and the next press
-            // replayed that tail at its own onset, the previous hit on top of
-            // the new one. V-17 leaves both lines alive on a player: the send
-            // edge always, and `out_pdc` whenever the pad is routed into a
-            // bus rather than the master.
+            // The rule, and it is ONE rule rather than a list of hazards:
+            // NOTHING on this row is skipped until the row's whole tail has
+            // left it. A pad that has stopped being TRIGGERED is still
+            // SOUNDING for `tail_frames` — its insert chain's pipeline, its
+            // source-alignment line, its `out_pdc`, its send edges' delays.
+            // None of those has a reset and none of them advances by itself,
+            // so a row skipped while it still holds material both TRUNCATES
+            // that material and replays it at the onset of the next press.
+            // Enumerating the lines by name is how that defect got in twice:
+            // the guard named `out_pdc` and the send edges, and missed a
+            // plugin's own latency, which is the case that swallows a whole
+            // press (a 2048-sample linear-phase EQ over an 800-sample
+            // one-shot: the clock is off from block 2 with every real sample
+            // still inside the plugin).
             //
-            // So a row with a line still gets its tail stages, fed SILENCE —
-            // which is exactly what the full strip would have produced here,
-            // because `on` is false for an idle pad and `apply_fader_into`
-            // zeroes `post` anyway. A row with no line — every raw pad, and
-            // the measured 1.98 µs idle case — still takes the bare skip.
-            if exclusive_idle {
-                if tr.out_pdc.is_some() || tr.sends.iter().any(|s| s.delay.is_some()) {
-                    flush_idle_tail(
-                        tr, &params, post_buf, bus_buf, tap_buf, out, out_ch, w0, w_len,
-                    );
-                }
+            // So while `flush_left` is non-zero the ORDINARY strip runs, with
+            // two differences below: the clip read is skipped (an off clock
+            // does not advance, so reading clips would re-read the head of
+            // the sample forever — fix round 1's defect), and the fader's
+            // gate is the tail rather than the clock. Mute and solo still
+            // apply; a muted pad's tail stays muted.
+            //
+            // Only when the tail is out does the row take the BARE skip —
+            // which is what every raw pad takes on every block (V-6 leaves it
+            // no inserts, no sends and no `out_pdc`, so `tail_frames` is 0),
+            // and what the measured 1.98 µs idle case is.
+            //
+            // Consequence, stated rather than fixed: an insert with an
+            // UNBOUNDED tail — a reverb on a pad — is hard-cut when
+            // `flush_left` reaches 0. That is exactly what a transport stop
+            // already does to a track's inserts, and "when does a pad stop
+            // ringing" is a separate question this does not answer.
+            if clock_on {
+                tr.flush_left = tr.tail_frames;
+            }
+            if exclusive_idle && tr.flush_left == 0 {
                 continue;
             }
+            let flushing = exclusive_idle;
             let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
             let pan = f32::from_bits(params.pan[tr.slot].load(Relaxed));
             let flags = params.flags[tr.slot].load(Relaxed);
@@ -865,7 +842,15 @@ fn render_impl(
             // running; `own_clock` is what bypasses another track's solo
             // (the old `FLAG_LAUNCH`). Both are now read off the same
             // binding, so they cannot disagree.
-            let on = clock_on
+            //
+            // The second disjunct is the flush window, and it is qualified by
+            // `flushing` for a reason: an ordinary track on a STOPPED
+            // transport also has `clock_on` false, but nothing stops feeding
+            // it — its clip read still runs, at a frozen `base_pos`. Opening
+            // its fader for `tail_frames` after a stop would hold whatever
+            // sits under the playhead. A stop is a stop; only a pad whose
+            // trigger has ended is flushing.
+            let on = (clock_on || (flushing && tr.flush_left > 0))
                 && audible_with_launch(
                     flags & FLAG_MUTE != 0,
                     flags & FLAG_SOLO != 0,
@@ -921,7 +906,7 @@ fn render_impl(
                 let run_disc = tr.win.disc;
                 let buf = &mut track_buf[..run * 2];
                 buf.fill(0.0);
-                if !tr.clips.is_empty() {
+                if !tr.clips.is_empty() && !flushing {
                     for i in 0..run {
                         let p = frame_pos(track_base, (f + i) as u64, &track_lp);
                         let mut l = 0.0f32;
@@ -966,6 +951,9 @@ fn render_impl(
                 }
                 tr.win.disc = wraps;
                 f += run;
+            }
+            if flushing {
+                tr.flush_left = tr.flush_left.saturating_sub(w_len);
             }
 
             tr.win.pk_l = tr.win.pk_l.max(acc.pk_l);
@@ -2134,6 +2122,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),
@@ -2280,6 +2270,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot,
             clips: Vec::new(),
@@ -2452,6 +2444,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),

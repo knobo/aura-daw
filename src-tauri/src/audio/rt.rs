@@ -518,6 +518,22 @@ pub struct RtTrack {
     /// Where this track's fader output goes: an index into
     /// `RtGraph::buses`, or `None` for the master.
     pub output: Option<usize>,
+    /// How long this row keeps SOUNDING after it stops being fed: the
+    /// applied insert-chain latency plus every delay line the row owns
+    /// (`pdc`, `out_pdc`, the widest send edge). Derived from the row by
+    /// [`RtTrack::recompute_tail_frames`], which every `RtGraph`
+    /// constructor calls — a number kept in step with the lines by
+    /// recomputing it from them, not by remembering to update it.
+    ///
+    /// A raw player is 0 by construction (V-6 gives it no inserts and no
+    /// sends, and `node.rs` forces `output: None`, so no `out_pdc`), which
+    /// is what keeps the idle-pad skip in `mixer` free.
+    pub tail_frames: usize,
+    /// Frames of [`Self::tail_frames`] not yet flushed out of the row. Held
+    /// at `tail_frames` while the row's clock is on; counted down by the
+    /// window length once it goes off. RT-owned; see the exclusive-idle
+    /// early-out in `mixer`.
+    pub flush_left: usize,
     /// Carry state across the `MAX_LIVE_BLOCK` windows of ONE callback block
     /// (Plan G2). It lives on the ROW, not in a parallel vector on the
     /// graph: a parallel vector has to be sized at construction, and every
@@ -538,8 +554,31 @@ impl RtTrack {
             pdc: None,
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: TrackWindow::default(),
         }
+    }
+
+    /// Re-derive [`Self::tail_frames`] from the row as it now stands.
+    /// CONTROL THREAD, before publication. Adding, not maxing: the number
+    /// bounds a flush window, and over-running it by a few blocks of
+    /// silence costs nothing while under-running it truncates audio.
+    pub fn recompute_tail_frames(&mut self) {
+        let inserts: usize = self
+            .inserts
+            .iter()
+            .filter(|i| !i.bypassed)
+            .map(|i| i.latency)
+            .sum();
+        let line = |d: &Option<DelayLine>| d.as_ref().map_or(0, |d| d.delay());
+        let sends = self
+            .sends
+            .iter()
+            .map(|s| line(&s.delay))
+            .max()
+            .unwrap_or(0);
+        self.tail_frames = inserts + line(&self.pdc) + line(&self.out_pdc) + sends;
     }
 }
 
@@ -700,6 +739,14 @@ impl RtGraph {
         generation: u64,
         params: Arc<ParamTable>,
     ) -> Self {
+        // The one place every graph — engine rebuild, offline bounce, every
+        // test rig — passes through, so a row's flush window is derived from
+        // the lines it actually carries and cannot fall out of step with
+        // them.
+        let mut tracks = tracks;
+        for tr in tracks.iter_mut() {
+            tr.recompute_tail_frames();
+        }
         let track_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let post_buf = vec![0.0; MAX_LIVE_BLOCK * 2];
         let bus_buf = vec![0.0; buses.len() * MAX_LIVE_BLOCK * 2];

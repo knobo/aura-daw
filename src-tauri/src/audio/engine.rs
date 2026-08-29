@@ -4699,6 +4699,8 @@ mod tests {
             sends: Vec::new(),
             out_pdc: None,
             output: None,
+            tail_frames: 0,
+            flush_left: 0,
             win: Default::default(),
             slot: 0,
             clips: Vec::new(),
@@ -4756,6 +4758,8 @@ mod tests {
                 sends: Vec::new(),
                 out_pdc: None,
                 output: None,
+                tail_frames: 0,
+                flush_left: 0,
                 win: Default::default(),
                 slot,
                 clips: Vec::new(),
@@ -4785,6 +4789,8 @@ mod tests {
                 sends: Vec::new(),
                 out_pdc: None,
                 output: None,
+                tail_frames: 0,
+                flush_left: 0,
                 win: Default::default(),
                 slot,
                 clips: Vec::new(),
@@ -5903,6 +5909,204 @@ mod tests {
             second[0], first[0],
             "the second press's first block is contaminated by the tail the \
              idle early-out stranded in the send's delay line"
+        );
+    }
+
+    /// A pad on slot 1 whose insert chain holds `latency` samples of REAL
+    /// pipeline — `LatencyDummy` is a delay line, not a declaration — routed
+    /// straight to the master. With `latency` longer than the clip, every
+    /// sample of a press is still inside the chain by the time the clock
+    /// stops, which is the whole point of the scenario.
+    fn latency_chain_pad(latency: usize) -> (RtGraph, u64) {
+        use crate::audio::insert::{InsertNode, InsertNodeCell, LatencyDummy};
+        use crate::audio::dsp::AudioProcessor;
+
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        let mut node = LatencyDummy::new(latency);
+        node.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);
+        let mut pad = RtTrack::clips(1, row);
+        pad.inserts = vec![InsertNode {
+            slot_id: "s".into(),
+            instance_id: "i".into(),
+            bypassed: false,
+            latency,
+            proc: InsertNodeCell::new(Box::new(node)),
+        }];
+        let mut g = RtGraph::new(vec![RtTrack::clips(0, Vec::new()), pad], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        (g, c.length_samples)
+    }
+
+    /// Fix round 3, item 1. `ClockTable::advance` turns a one-shot's clock
+    /// off at the clip end, so the row is `exclusive_idle` from the next
+    /// block — while every real sample of the press is still inside the
+    /// insert chain's pipeline. A bare skip therefore swallowed THE WHOLE
+    /// PRESS: nothing ever reached the master, and the samples surfaced at
+    /// the onset of a later press instead.
+    #[test]
+    fn a_pad_whose_chain_outlasts_its_clip_still_reaches_the_master() {
+        let (mut g, len) = latency_chain_pad(256);
+        let blocks = press_and_collect(&mut g, len, 10);
+        let energy: f64 = blocks
+            .iter()
+            .flat_map(|b| b.iter())
+            .map(|s| (*s as f64).abs())
+            .sum();
+        assert!(
+            energy > 0.0,
+            "a press whose audio is still in the insert chain when the clock \
+             stops must still leave the row — the whole press was inaudible"
+        );
+    }
+
+    /// The other half: what the flush window guarantees is that the NEXT
+    /// press is not the previous one's leftovers. Two identical presses of
+    /// the same one-shot through the same chain must render identically,
+    /// block for block.
+    #[test]
+    fn a_second_press_through_a_long_chain_is_not_the_first_press_s_audio() {
+        let (mut g, len) = latency_chain_pad(256);
+        let first = press_and_collect(&mut g, len, 10);
+        let second = press_and_collect(&mut g, len, 10);
+        assert!(
+            first.iter().flat_map(|b| b.iter()).any(|s| *s != 0.0),
+            "the first press has to reach the master at all"
+        );
+        assert_eq!(second, first, "the second press replays the first's tail");
+    }
+
+    /// The flush window belongs to a PAD whose trigger ended, and to nothing
+    /// else. An ordinary timeline track on a stopped transport also has its
+    /// clock off — but nothing has stopped feeding it: its clip read still
+    /// runs, at a frozen position. A flush gate that only asked "is the tail
+    /// out" would hold whatever sits under the playhead for `tail_frames`
+    /// after every stop.
+    #[test]
+    fn a_stopped_transport_still_silences_a_track_that_owns_a_tail() {
+        use crate::audio::transport::LoopSpec;
+
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        params.set_gain_pair_linear(0, 1.0);
+        params.set_pan(0, 0.0);
+        let mut track = RtTrack::clips(0, row);
+        track.pdc = Some(crate::audio::pdc::DelayLine::new(32, 64, 2));
+        let mut g = RtGraph::new(vec![track], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(1, 1);
+        clocks.set_transport_playing(true);
+        g.clocks = Arc::new(clocks);
+
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert!(
+            out.iter().any(|s| *s != 0.0),
+            "the rig has to sound while the transport rolls"
+        );
+
+        g.clocks.set_transport_playing(false);
+        for _ in 0..2 {
+            out.fill(0.0);
+            mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            assert_eq!(
+                out.iter().fold(0.0f32, |m, s| m.max(s.abs())),
+                0.0,
+                "a stop is a stop: no flush window opens the fader on a track \
+                 that is still being fed"
+            );
+        }
+    }
+
+    /// The other side of the same rule, and the one the idle-pad cost rests
+    /// on: a RAW pad owns no tail at all, so it takes the BARE skip on every
+    /// block. V-6 gives it no inserts and no sends, and `node.rs` forces its
+    /// output to the master, so there is nothing for `recompute_tail_frames`
+    /// to add up.
+    #[test]
+    fn a_raw_pad_owns_no_tail_and_takes_the_bare_skip() {
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(1, 0));
+        let g = RtGraph::new(vec![RtTrack::clips(0, row)], 1, params);
+        assert_eq!(g.tracks[0].tail_frames, 0);
+    }
+
+    /// Fix round 2 gave a bus-routed pad an `out_pdc` line (V-17), and fix
+    /// round 3 made the flush window general. This is the DRY half of the
+    /// same conservation argument the send test makes: `out_pdc` sits after
+    /// the fader, on the path into the bus, and a delay moves energy in time
+    /// rather than destroying it — so the compensated pad must deliver the
+    /// same total into the master as an uncompensated one, given blocks
+    /// enough for the line to clear.
+    fn out_pdc_pad(delay: Option<usize>) -> (RtGraph, u64) {
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        let mut pad = RtTrack::clips(1, row);
+        pad.output = Some(0);
+        pad.out_pdc = delay.map(|d| crate::audio::pdc::DelayLine::new(d, 64, 2));
+        let bus = crate::audio::rt::RtBus {
+            slot: 0,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            output: None,
+            out_pdc: None,
+            win: Default::default(),
+        };
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        (g, c.length_samples)
+    }
+
+    #[test]
+    fn an_idle_pad_still_flushes_its_out_pdc_tail_into_the_bus() {
+        let total = |delay: Option<usize>| -> f64 {
+            let (mut g, len) = out_pdc_pad(delay);
+            press_and_collect(&mut g, len, 8)
+                .iter()
+                .flat_map(|b| b.iter())
+                .map(|s| *s as f64)
+                .sum()
+        };
+        let compensated = total(Some(32));
+        let straight = total(None);
+        assert!(straight > 0.0, "the rig has to deliver something at all");
+        assert!(
+            (compensated - straight).abs() < 1e-6,
+            "the compensated DRY path must deliver the whole press into the \
+             bus: {compensated} vs {straight}"
+        );
+    }
+
+    #[test]
+    fn a_second_press_does_not_carry_the_first_press_s_out_pdc_tail() {
+        let (mut g, len) = out_pdc_pad(Some(32));
+        let first = press_and_collect(&mut g, len, 4);
+        let second = press_and_collect(&mut g, len, 4);
+        assert!(
+            first[0].iter().any(|s| *s != 0.0),
+            "the first press has to reach the bus at all"
+        );
+        assert_eq!(
+            second[0], first[0],
+            "the second press's first block is contaminated by the tail left \
+             in `out_pdc`"
         );
     }
 
