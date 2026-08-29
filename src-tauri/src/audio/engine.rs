@@ -5631,6 +5631,92 @@ mod tests {
         );
     }
 
+    /// V-2's other half, on the release side. A player OWNS its mixer slot
+    /// for the life of the graph — unlike a scene, which BORROWS a timeline
+    /// track's and has to hand it back — so the drive thread's poll must
+    /// never unbind one. Were a player's clock ever folded into
+    /// `release_finished_scenes`' set, the poll after a one-shot ended would
+    /// put the pad's slot back on the transport, and its clip (placed at 0
+    /// by construction) would then sound at bar 1 of every playthrough: the
+    /// exact defect `Playhead::exclusive` exists to prevent, reached through
+    /// the release path instead of the render path.
+    ///
+    /// A scene binding has to exist for this to prove anything:
+    /// `release_finished_scenes` returns early when there is nothing of its
+    /// own to release, which would mask the very fold this pins.
+    #[test]
+    fn the_scene_poll_never_hands_a_players_slot_back_to_the_transport() {
+        let (mut ctl, session) = bare_control();
+        {
+            let mut s = session.lock();
+            s.store.tracks.push(test_track("t-1"));
+            s.store.players.push(test_player("p-1", "c1", true));
+            let mut map = crate::midi::launch::LaunchMap::default_map();
+            map.bindings = vec![region_binding("b1", 60, &["t-1"])];
+            s.midi.launch_maps = vec![map];
+        }
+        ctl.rebuild();
+
+        let t = ctl.tables.lock();
+        let clock = t.player_clocks[&crate::ids::PlayerId::from("p-1")];
+        let slot = t.slots[&crate::ids::TrackId::from("p-1")];
+        t.clocks.fire(clock, 0, 64, false);
+        t.clocks.begin_block();
+        // Run the one-shot off its end: the clock stops itself and leaves a
+        // flush behind, which is precisely the state a scene gets released in.
+        t.clocks.advance(128);
+        assert!(!t.clocks.is_on(clock), "the one-shot ended");
+        t.clocks.begin_block(); // the flush block a scene's release waits for
+        t.release_finished_scenes();
+        assert_eq!(
+            t.clocks.clock_of(slot),
+            clock,
+            "a pad keeps its own playhead; nothing releases it"
+        );
+        assert_ne!(t.clocks.clock_of(slot), crate::audio::clock::TRANSPORT_CLOCK);
+    }
+
+    /// A pad is a performance, not a track: soloing a vocal must not cut the
+    /// deck. `mixer::audible_with_launch`'s `own_clock` argument is what buys
+    /// that, and a player's slot reports it in BOTH states — running (its
+    /// clock is on) and idle (`Playhead::exclusive`) — so this is the one
+    /// place the two halves are checked against a real render rather than
+    /// against the predicate in isolation.
+    #[test]
+    fn a_soloed_track_does_not_silence_a_sounding_pad() {
+        use crate::audio::transport::LoopSpec;
+
+        let (c, sid) = trimmed_clip();
+        let source = ramp_source(200);
+        let row = player_clip_row(&c, true, &cache_with(&sid, source.clone()));
+
+        // Slot 0 is a soloed timeline track, slot 1 the pad.
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 0));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        params.set_flag(0, super::super::rt::FLAG_SOLO, true);
+        params.any_solo.store(true, Relaxed);
+        let mut g = RtGraph::new(
+            vec![RtTrack::clips(0, Vec::new()), RtTrack::clips(1, row)],
+            2,
+            params,
+        );
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+
+        g.clocks.fire(1, 0, c.length_samples, false);
+        let mut out = vec![0.0f32; 64 * 2];
+        mixer::render(&mut g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+        assert!(
+            out.iter().fold(0.0f32, |m, s| m.max(s.abs())) > 0.0,
+            "a solo elsewhere in the mixer must not cut the pad"
+        );
+    }
+
     /// A clock index means "the i-th Region binding in document order", so
     /// adding a binding ahead of a sounding one RENUMBERS it. Carrying the
     /// state across by index would hand one scene's playhead to another;

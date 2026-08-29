@@ -1998,15 +1998,29 @@ impl ControlPlane {
     /// Returns `Ok(())` for a pad that was not sounding: stop-all presses
     /// every pad unconditionally, and `ClockTable::stop`'s guard already
     /// makes an idle stop fabricate no flush.
+    ///
+    /// The session is consulted only on the FAILURE path, and deliberately so.
+    /// The clock map alone cannot tell "no such pad" from "a pad the graph has
+    /// not been rebuilt for yet", and reporting the first for the second sends
+    /// the reader hunting a document bug that is not there — the press side
+    /// already distinguishes them (`player_fire`). Doing it here costs the
+    /// happy path nothing: a release takes one uncontended table lock and no
+    /// session lock at all, and the two locks are never held together.
     pub fn player_stop(&self, id: &str) -> Result<(), String> {
-        let tables = self.tables.lock();
-        let clock = tables
-            .player_clocks
-            .get(&PlayerId::from(id))
-            .copied()
-            .ok_or_else(|| format!("unknown player: {id}"))?;
-        tables.clocks.stop(clock);
-        Ok(())
+        {
+            let tables = self.tables.lock();
+            if let Some(&clock) = tables.player_clocks.get(&PlayerId::from(id)) {
+                tables.clocks.stop(clock);
+                return Ok(());
+            }
+        }
+        Err(
+            if self.session.lock().store.players.iter().any(|p| p.id.as_str() == id) {
+                format!("player has no clock yet: {id}")
+            } else {
+                format!("unknown player: {id}")
+            },
+        )
     }
 
     /// Add a player through the transaction channel (`Op::PlayerAdd`), so it
@@ -6338,6 +6352,31 @@ mod tests {
             .unwrap(); // deliberately NOT republished
         let err = cp.player_fire(p.id.as_str()).unwrap_err();
         assert!(err.contains("no clock yet"), "got: {err}");
+    }
+
+    /// `player_stop` and `player_fire` must agree about WHY a pad cannot be
+    /// reached. Before this, `player_stop` had only the clock map to consult,
+    /// so a pad the graph had not seen yet — added and not rebuilt, the state
+    /// `firing_a_player_the_graph_has_not_seen_yet_reports_it` pins for the
+    /// press — reported "unknown player" and sent the reader looking for a
+    /// document bug that was not there.
+    #[test]
+    fn stopping_a_player_the_graph_has_not_seen_yet_says_so_not_unknown() {
+        let cp = test_control_plane_with_an_audio_clip();
+        let p = cp
+            .add_player(
+                None,
+                crate::audio::player::PlayerSource::AudioClip { clip_id: "c1".into() },
+                true,
+                op::TxMeta::user("add"),
+            )
+            .unwrap(); // deliberately NOT republished
+        let err = cp.player_stop(p.id.as_str()).unwrap_err();
+        assert!(err.contains("no clock yet"), "got: {err}");
+        assert!(
+            cp.player_stop("ghost").unwrap_err().contains("unknown player"),
+            "and a pad that is not in the document at all still says that"
+        );
     }
 
     /// `TriggerMode::Loop` is what `ClockTable::fire`'s `looping` flag is
