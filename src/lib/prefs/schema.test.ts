@@ -225,3 +225,21 @@ describe("the meter face", () => {
     expect(coercePref(def, "vu-plus")).toBeUndefined();
   });
 });
+
+/**
+ * The strip keys are the same shape of contract as the meter face: an option
+ * the schema offers that Lamp.svelte has no branch for renders as an
+ * unstyled button in a channel strip.
+ */
+describe("the strip keys", () => {
+  const def = PREF_SCHEMA.stripKeys;
+
+  it("offers exactly the two shapes Lamp.svelte draws", () => {
+    expect(def.kind).toBe("enum");
+    expect(def.kind === "enum" && def.options.map((o) => o.value)).toEqual(["key", "bar"]);
+  });
+
+  it("defaults to the moulded keys", () => {
+    expect(def.default).toBe("key");
+  });
+});

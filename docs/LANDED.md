@@ -41,7 +41,18 @@ And the round gauge went from one face to four (`meterFace` preference):
 LED ARC, DIAL, LADDER, ANALOG VU. Three of them gained a peak hold; the VU
 cannot have one, because a needle *is* the peak.
 
-→ [`themes.md`](themes.md) §6 (material), §8 (meter faces).
+The channel strip's mute/solo/arm row was **overflowing its own strip**:
+3 × 28px keys plus 2 × 4px gaps is 92px of content inside a 76px box, so the
+outer keys sat on the strip's bevel and the row began at x=0 of a strip with
+8px padding — measured in the browser, not eyeballed. It is now a `1fr` grid
+with `min-width: 0` (a grid item's default `min-width: auto` is what would
+otherwise let it grow straight back), inset by its own margin so it is not
+the one thing on the strip touching the walls, and in two shapes behind a
+`stripKeys` preference: moulded KEYS or one SEGMENTED switch. The compact key
+says **A**, matching the track header — `R` was already spent on automation
+Read in the same header row.
+
+→ [`themes.md`](themes.md) §6 (material), §8 (meter faces), §9 (strip keys).
 ## The layout ran out of room in five places, and the track rail can be dragged
 
 Started from a headless overflow scan (Chrome, browser demo mode) at

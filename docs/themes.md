@@ -367,7 +367,46 @@ green in it is not a meter with the wrong green in it.
 
 ---
 
-## 9. Exporting Themes
+## 9. Strip Keys
+
+The mute / solo / arm keys on a channel strip come in two shapes, chosen by
+**Preferences → Interface → Mute / solo / arm**:
+
+| Variant | What it is |
+|---|---|
+| **KEYS** (default) | Three keys standing proud of the panel, moulded on all four sides. Lit, a key presses *in* and its legend lights with a bar along its bottom lip — the `.module.lit` idiom, where the legend carries the state and the face does not. |
+| **SEGMENTED** | One routed slot divided into three by hairlines. Lit, a segment fills solid with the legend knocked out. It reads as one switch rather than three buttons, which is the truer description: they belong to the same channel. |
+
+Three things about them are decisions rather than styling, and all three
+came out of the row that shipped before them:
+
+1. **The row is a `1fr` grid with `min-width: 0`, not three fixed widths.**
+   The old row was 3 × 28px + 2 × 4px = 92px of content inside a 76px box,
+   so the outer keys sat on the strip's own bevel. A grid item defaults to
+   `min-width: auto` — its content's width — and a `1fr` track will still
+   refuse to go under that, so the `min-width: 0` is the line that makes the
+   overflow *impossible* rather than merely unlikely.
+2. **The row keeps a margin.** Not overflowing is not the same as looking
+   right: everything else on the strip sits inside a margin (a 72px gauge in
+   a 76px box), so a key row running exactly to the padding edge is the only
+   thing on the strip touching the walls.
+3. **A compact key says A, not R.** Not because A is an industry convention
+   — it is not; most DAWs draw record-arm as a red dot and hardware surfaces
+   print REC. It is A because AURA's own track header and lane group header
+   already say A M S, and because `R` is spent: `AutomationModeSelector`
+   prints R for automation *Read*, in the same track header row. The full
+   word stays on the key's `title` and its accessible name.
+
+Neither lit state uses `--text-on-accent` for a legend on a solid accent
+fill. That token is one value per theme, and the value that reads on red does
+not read on amber. KEYS lights the legend in the accent instead; SEGMENTED
+knocks it out in `--bg-sunken`, which is safe on both a light and a dark
+theme because the well sits on the same side of the surface ramp as the
+panel, and an accent is by construction chosen to contrast with the panel.
+
+---
+
+## 10. Exporting Themes
 
 To quickly create a custom theme, navigate to **Preferences** → **Interface** and click **EXPORT CURRENT THEME…**.
 
@@ -377,7 +416,7 @@ Exporting never overwrites: if that name is taken, the next free one is used (`a
 
 ---
 
-## 10. Reloading & Error Handling
+## 11. Reloading & Error Handling
 
 - **Discovery**: When AURA launches, it scans the themes directory and registers all valid user themes. Adding or deleting a `.json` file requires restarting AURA to discover the file.
 - **Robust Validation**: The theme parser never crashes. If a file contains invalid JSON or lacks a `name`, it is skipped, and a toast notification informs you of the failure. If an individual token has an invalid color or unknown name, only that key is ignored while the rest of the theme loads safely against its base.

@@ -22,6 +22,7 @@
   import Gauge from "../controls/Gauge.svelte";
   import Pad from "../controls/Pad.svelte";
   import Lamp from "../controls/Lamp.svelte";
+  import { prefs } from "../../prefs/prefs.svelte";
   import BottomPanelTabs from "./BottomPanelTabs.svelte";
   import AddMenu from "./AddMenu.svelte";
   import BindPicker from "./BindPicker.svelte";
@@ -174,6 +175,7 @@
                   on={w.lampRole === "mute" ? !!tr?.muted : w.lampRole === "solo" ? !!tr?.soloed : !!tr?.armed}
                   label={w.label}
                   role={w.lampRole ?? "mute"}
+                  variant={prefs.values.stripKeys}
                   ariaLabel={w.label}
                   onclick={() => {
                     if (!tr || !w.lampRole) return;
