@@ -397,7 +397,7 @@
         <button class="del" title="Remove track" aria-label="Remove track {track.name}" onclick={() => project.removeTrack(track.id)}>×</button>
       </div>
 
-      <div class="metadata-row" role="gridcell" aria-label="Routing and FX for {track.name}">
+      <div class="metadata-row" class:named={track.kind === "midi" && !isAutomation} role="gridcell" aria-label="Routing and FX for {track.name}">
         <span class="picker">
           <!-- Owner note (2026-08-24): the word "Group" was on every lane
                whether or not the lane had one. The VALUE is the news; the
@@ -410,7 +410,12 @@
           <span class="kindchip automation-kind mono" title="Automation track — drives bindings, renders no audio">⌁</span>
         {:else if track.kind === "midi"}
           <button class="instchip mono" class:bound={!!instrument} class:plugin={!!pluginInst} class:stub={pluginInst?.status === "stub"} class:crashed={pluginInst?.status === "crashed"} title={pluginInst ? "Open plugin parameters for " + pluginInst.name : instrument ? "Open instrument browser for " + instrument.name : "Assign an instrument"} onclick={openInstrumentPanel}>
-            {#if pluginInst}Instrument · {patch?.name ?? pluginInst.name}{:else if instrument}Instrument · {instrument.name}{:else}Instrument · polysynth{/if}
+            <!-- Owner note (2026-08-24) applied to this chip too: the VALUE
+                 is the news, the word is what the tooltip is for. The
+                 "Instrument · " prefix was 13 characters of the ~5 the chip
+                 actually gets in a 298px rail, so every lane read "Inst…"
+                 and named nothing. The title still spells it out. -->
+            {#if pluginInst}{patch?.name ?? pluginInst.name}{:else if instrument}{instrument.name}{:else}polysynth{/if}
           </button>
         {:else if track.kind === "bus"}
           <span class="kindchip bus-kind mono" title="Return bus — fed by other tracks' sends and outputs">B</span>
@@ -931,6 +936,10 @@
     color: var(--text-faint);
   }
   .metadata-row {
+    /* Fixed, not `min-height`: `.header` is `height: var(--track-height)`
+       and must match the lane column row for row, so a row that grows
+       overlaps the level slider below it instead of making room. Fitting
+       on one line is therefore the requirement, not a preference. */
     height: 17px;
     gap: 6px;
     padding-left: 20px;
@@ -949,8 +958,19 @@
     max-width: 96px;
   }
   .metadata-row .instchip {
-    flex: 1;
+    /* basis 0, not auto: the chip must never be the item that decides the
+       line breaks, only the one that soaks up what is left. */
+    flex: 1 1 0;
+    min-width: 0;
     max-width: none;
+  }
+  /* `.metadata-lanes` has `margin-left: auto`, and an auto margin consumes
+     the row's free space BEFORE flex-grow ever runs — which is why the
+     instrument chip measured 42px while 33px of the row sat empty beside
+     it. On a lane that has an instrument to name, the chips read as one
+     left-aligned group and the slack goes to the name instead. */
+  .metadata-row.named .metadata-lanes {
+    margin-left: 0;
   }
   .kindchip {
     /* A one-letter badge now (owner note, 2026-08-24), so it sizes like
