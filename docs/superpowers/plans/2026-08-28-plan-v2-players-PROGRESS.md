@@ -20,7 +20,7 @@ The working copies live in `.superpowers/sdd/2026-08-28-plan-v2-players/`,
 which is **git-ignored**. The four committed files above are the copies that
 survive; keep syncing them.
 
-## State: 10 of 15 done; task 11 dispatched
+## State: 11 of 15 done; task 12 dispatched
 
 | # | Task | State | Commits |
 |---|---|---|---|
@@ -34,8 +34,8 @@ survive; keep syncing them.
 | 8 | Per-scene clocks; no transport hijack | done | `2115f73`, `2cf1597`, `d62ee5f` |
 | 9 | Audio-clip players in the live graph | done (4 fix rounds) | `d1f8cdd`, `a6403af`, `67ebe50`, `95a17ed`, `bf0cb58`, `2542640` |
 | 10 | MIDI players with their own instrument | done (4 fix rounds) | `f7ab47e`, `3da1437`, `9c1c9cc`, `2439ff5`, `5963e47`, `49b6b4b` |
-| 11 | Trigger modes | dispatched (sonnet) | |
-| 12 | Migrating launch bindings | not started | |
+| 11 | Trigger modes | done (1 fix round) | `0837972`, `7ee1abd`, `09c72b2` |
+| 12 | Migrating launch bindings | dispatched (sonnet) | |
 | 13 | Renderer: a pad is a player | not started | |
 | 14 | The performance gate | not started | |
 | 15 | Docs + release the claim | not started | |
@@ -75,9 +75,45 @@ this branch's.
 
 ## Pick up here
 
-**Task 10 is closed** — commits `f7ab47e..49b6b4b`, four fix rounds, review
-clean, gates green. Task 11 is dispatched to a sonnet implementer; its
-review is owed on **opus** per the model policy below.
+**Task 11 is closed** — `0837972`, `7ee1abd`, `09c72b2`. Task 12 is
+dispatched to a sonnet implementer; its review is owed on **opus**.
+
+**Task 11 changed almost no production code, and that was correct.**
+`player_fire` already read `p.trigger.mode` off the live session every
+press, and `ClockTable::advance` already ended a non-looping clock at its
+own `end`. What the task actually owed was assertions — and one thing
+nobody had noticed.
+
+**The seam that would have shipped missing.** There is no generic `Op::Set`
+pipeline from the frontend: every mutation crosses via a bespoke
+`#[tauri::command]`, and the player commands were `players_get` /
+`player_add` / `player_remove` / `player_fire` / `player_stop` only. Task
+13's brief only *reads* `trigger.mode`; tasks 12, 14 and 15 never mention
+it. **V2 would have shipped with Loop and Gate unreachable by any user**,
+every player stuck at the `OneShot` default, and nothing in the plan would
+have caught it. `player_set_trigger_mode` now exists (`lib.rs:331`). The
+pad inspector that exposes it is V-12's and stays task 13's.
+
+**`Gate` and `OneShot` are byte-identical in the engine, by design.** The
+design's gate — "sounds while held; release cuts it" — is entirely about
+who calls `player_stop`, a pointerup the engine cannot see. Production says
+so now, at `player_fire`'s `== Loop`. Task 13 owes the pointerup binding.
+
+### Task 11's failure mode was the opposite of this branch's usual one
+
+Not a test that re-implements its logic — none did — but **under-assertion**:
+a test that passes against a mutation breaking the very thing it is named
+for. Three of them, each proved by mutation rather than by reading. And it
+**survived the fix round convened to remove it**: `retriggering_one_player_leaves_another_sounding`
+checked `b` with `is_on` only, so a press that rewinds *every* player — the
+single-overlay behaviour V-4 deleted — left all 126 `control::tests` green.
+An on/off flag cannot see it; only a playhead can.
+
+**A symmetric serialize/deserialize test pins nothing about the wire
+contract with a non-Rust caller.** `#[serde(rename = "GATE_XX")]` on
+`TriggerMode::Gate` left every Rust test green; only task 13's TS caller
+would have found it, at runtime. `"gate"` and `"loop"` are now pinned
+explicitly.
 
 ### How task 10 actually ended, so you do not re-open it
 
