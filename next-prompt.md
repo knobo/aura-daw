@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Startup progress: no white screen, tell the user what boot is doing | `feat/startup-progress` | 2026-08-29 | Splash/progress over the whole boot (backend setup + project restore), plus timings for what is actually slow |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 

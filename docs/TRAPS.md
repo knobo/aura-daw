@@ -142,6 +142,34 @@ session burns an hour on something a sentence would have prevented.
   for weeks on the strength of "needs the `libc` crate", which was never
   tested. Before parking work on a frozen manifest, try linking it.
 
+- **Project-open time is almost entirely one thing: plugin instantiation,
+  not project loading.** `plugins::state::reactivate_restored_with_progress`
+  instantiates every restored instance SERIALLY and SYNCHRONOUSLY through
+  `plugin_main().run(...)` (`host.rs`'s `recv_timeout(30s)`), and the FIRST
+  LV2 instance in the process pays for `livi::World::new()` — a full
+  system-wide LV2 bundle scan (326 hostable plugins on this box). Measured
+  restoring a 6-plugin project on this machine: `plugins adopted in 2221 ms`
+  against `project opened in 2247 ms total` — every other stage is 0–21 ms.
+  It is not a hang and there is no bug to chase; it is unparallelised
+  first-touch work with no cache across process starts, paid again on
+  every launch.
+
+- **The audio sample cache is in-memory only and is never persisted.**
+  `AudioEngine::ensure_loaded` re-decodes every clip's WAV from disk on
+  EVERY process start. Waveform pyramids ARE cached on disk, under
+  `<project>/cache/waveforms/` — the decoded samples backing them are not.
+  It also runs on the engine control thread AFTER `open_project` has
+  already returned, which is exactly why "await the open command" could
+  never have reported it: measured, `media: prepared 6 file(s)/clip(s) in
+  2121 ms` lands entirely outside the 2247 ms the open command itself
+  took. PR #130's `project://media-progress` event now carries it to the
+  UI, but nothing about the wait itself got shorter.
+
+  Both numbers above came from a log, not a debugger: the `open:` and
+  `media:` `log::info!` lines PR #130 added are permanent, not scaffolding
+  — a slow start is now diagnosable by reading a log, without reproducing
+  it live.
+
 
 ## Tests
 
@@ -298,6 +326,12 @@ session burns an hour on something a sentence would have prevented.
   no longer exists — which happened here, with `apply_fader` and
   `apply_fader_into` sitting side by side. `rm -rf target/criterion` before a
   run whose numbers you intend to publish.
+- **`import -window` / `xwd` screenshots of the AURA window come back
+  blank white on this Xwayland box, whatever is actually on screen** — they
+  are not evidence about the UI, so do not read one as "nothing rendered".
+  Drive the vite dev server with Playwright and system Chrome instead, the
+  same approach [`LANDED.md`](LANDED.md)'s layout scan used ("headless
+  overflow scan (Chrome, browser demo mode)").
 
 ## Audio engine
 

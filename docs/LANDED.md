@@ -5,6 +5,44 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## Startup progress: the boot has two clocks, and the slower one is invisible to the caller
+
+Opening the last project on launch took seconds and looked identical to a
+hang: the window painted white in dev, then an empty shell, with nothing to
+tell "loading" from "wedged". Two events now carry real progress to the UI.
+`project://open-progress` fires before each of the nine stages of
+`ControlPlane::open_project_epoch`, with a per-instance detail while
+plugins instantiate. `project://media-progress` fires per file from the
+engine control thread's `ensure_loaded` — which is the SECOND clock: it
+runs after `open_project` has already returned, which is exactly why the
+old "await the open command" model could never have reported it.
+`index.html` now paints a dark branded first frame before Svelte mounts (in
+dev, `app.css` is injected by JS, so the flash was genuinely white), and
+`main.ts` clears its mount target first, since Svelte 5's `mount()` appends
+rather than replaces.
+
+Measured on this machine restoring `~/Music/AURA/TestProsjekt.aura` (6
+restored plugin instances, ~2 GB project dir, 7.6 MB journal):
+
+    open: project loaded in 0 ms
+    open: midi adopted in 0 ms
+    open: journal checked in 21 ms
+    open: plugins adopted in 2221 ms
+    open: automation adopted in 0 ms
+    open: midi outputs adopted in 1 ms
+    open: modulation adopted in 1 ms
+    open: rebuild dispatched in 0 ms
+    open: project opened in 2247 ms total
+    media: prepared 6 file(s)/clip(s) in 2121 ms
+
+Plugin instantiation is essentially the whole first clock and media decode
+is a second, near-equal one hiding after it — both are why, not just that;
+see [`TRAPS.md`](TRAPS.md) §Backend. The `open:`/`media:` `log::info!`
+lines are permanent, so the next slow start is readable from a log without
+reproducing it live.
+
+→ PR #130. No backlog file: this was reported live, not planned.
+
 ## Brushed Steel, a 3D frame, and four meter faces
 
 A sixth material token, `brush`: the anisotropic streak a wire wheel leaves,
