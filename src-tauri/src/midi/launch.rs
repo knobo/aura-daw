@@ -377,6 +377,30 @@ pub fn clip_would_self_trigger(
         .any(|(key, ch)| *key == trigger_note && trigger_channel.map(|c| c == *ch).unwrap_or(true))
 }
 
+/// The live drive-loop guard: does firing `target` fire the clip that is
+/// driving it right now? A same-clip `Clip` target names the clip
+/// directly; a `Player` target (what `Clip` becomes on migration) has to
+/// be resolved through `players` to its `PlayerSource::MidiClip`'s
+/// `clip_id` instead. `Region` never self-triggers — a scene names
+/// tracks, never the driving clip.
+///
+/// Extracted so the drive loop and its test call the SAME match, not a
+/// copy (this file's own rule, see `releases_to_enqueue`'s doc): fix
+/// round 1, Important 3 found this guard as an inline `if let` matching
+/// only `Clip`, so a migrated `Player` target never hit it and re-fired
+/// its own player on every drive note-on for the clip it plays.
+pub fn binding_self_triggers(
+    target: &LaunchTarget,
+    players: &[crate::audio::player::Player],
+    driving_clip_id: &str,
+) -> bool {
+    match target {
+        LaunchTarget::Clip { clip_id } => clip_id.as_str() == driving_clip_id,
+        LaunchTarget::Player { .. } => false, // MUTATED: player self-trigger guard removed
+        LaunchTarget::Region { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FireOrigin {
@@ -658,7 +682,7 @@ impl LaunchRuntime {
                         last = pos;
                         continue;
                     }
-                    let (clips, ppq, tempo, live_tracks) = {
+                    let (clips, ppq, tempo, live_tracks, players) = {
                         let s = session.lock();
                         let live_tracks: std::collections::HashSet<String> = s
                             .store
@@ -666,7 +690,13 @@ impl LaunchRuntime {
                             .iter()
                             .map(|t| t.id.to_string())
                             .collect();
-                        (s.midi.clips.clone(), s.midi.ppq, s.midi.tempo_events.clone(), live_tracks)
+                        (
+                            s.midi.clips.clone(),
+                            s.midi.ppq,
+                            s.midi.tempo_events.clone(),
+                            live_tracks,
+                            s.store.players.clone(),
+                        )
                     };
                     let Ok(tempo_map) =
                         crate::midi::TempoMap::new(ppq, tempo, shared.sample_rate.load(Relaxed).max(1))
@@ -711,10 +741,8 @@ impl LaunchRuntime {
                                 let Some(b) = resolve_drive(&launcher.bindings, ev.key) else {
                                     continue;
                                 };
-                                if let LaunchTarget::Clip { clip_id } = &b.target {
-                                    if clip_id == clip.id.as_str() {
-                                        continue;
-                                    }
+                                if binding_self_triggers(&b.target, &players, clip.id.as_str()) {
+                                    continue;
                                 }
                                 if ev.velocity == 0 {
                                     if launcher.play_mode == LaunchPlayMode::Gate
@@ -2189,6 +2217,61 @@ mod tests {
         assert_eq!(n, 0);
         assert!(players.is_empty());
         assert!(matches!(maps[0].bindings[0].target, LaunchTarget::Region { .. }));
+    }
+
+    /// Fix round 1, Important 3: the guard that used to be an inline
+    /// `if let LaunchTarget::Clip` in the drive loop, non-exhaustive by
+    /// construction. A `Player` target whose source names the driving
+    /// clip must self-trigger exactly like a `Clip` target naming it
+    /// directly did before migration.
+    #[test]
+    fn binding_self_triggers_resolves_a_player_target_through_its_source_clip() {
+        let mut sounding =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("p1"), "PAD");
+        sounding.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc1".into(),
+            instrument_id: None,
+        };
+        let mut other =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("p2"), "OTHER");
+        other.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc2".into(),
+            instrument_id: None,
+        };
+        let players = vec![sounding, other];
+
+        assert!(
+            binding_self_triggers(
+                &LaunchTarget::Player { player_id: crate::ids::PlayerId::from("p1") },
+                &players,
+                "mc1",
+            ),
+            "the player's own source clip is the one driving it"
+        );
+        assert!(
+            !binding_self_triggers(
+                &LaunchTarget::Player { player_id: crate::ids::PlayerId::from("p2") },
+                &players,
+                "mc1",
+            ),
+            "a DIFFERENT clip driving must not suppress a player it does not play"
+        );
+        assert!(
+            !binding_self_triggers(
+                &LaunchTarget::Region {
+                    start_ticks: 0,
+                    length_ticks: 960,
+                    track_ids: vec!["t1".into()],
+                },
+                &players,
+                "mc1",
+            ),
+            "a scene never self-triggers — it names tracks, not the driving clip"
+        );
+        assert!(
+            binding_self_triggers(&LaunchTarget::Clip { clip_id: "mc1".into() }, &[], "mc1"),
+            "the pre-migration shape still works too"
+        );
     }
 
     /// Point 4 of the migration's own brief: a `Player` target must reach

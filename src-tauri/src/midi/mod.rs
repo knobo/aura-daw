@@ -210,8 +210,24 @@ impl From<&section_table::Section> for SectionRow {
 /// Same M-5 dirty-guard semantics as the retired `sync_midi_store` this
 /// replaces: a previous auto-persist failure leaves memory as the ONLY
 /// authoritative copy, so this refuses to overwrite it from disk.
-pub(crate) fn adopt_midi_from_dir(midi: &mut MidiStore, dir: &Path, fallback_bpm: f64) {
-    if midi.loaded_dir.as_deref() == Some(dir) {
+pub(crate) fn adopt_midi_from_dir(
+    midi: &mut MidiStore,
+    dir: &Path,
+    fallback_bpm: f64,
+    force: bool,
+) {
+    // `force`: an explicit open (`open_project_epoch`) must always re-read
+    // midi state, the same as the store fields it swaps in the same lock —
+    // this cache hit exists for this fn's now-retired READ-path callers
+    // (Task 6's own doc, above), not for a genuine document open. Bypassing
+    // it must not touch the `Ok(None)` branch below, which has its OWN,
+    // unrelated `loaded_dir.is_some()` check ("was any project loaded
+    // before", not "is it the same dir") — that is what clears a PREVIOUS
+    // project's clips/harmony/launch_maps when the newly-opened one has
+    // never had a midi save (fix round 1, Critical 1: forcing this by
+    // clearing `loaded_dir` itself made that guard permanently false, so
+    // the reset never ran and B silently inherited A's midi document).
+    if !force && midi.loaded_dir.as_deref() == Some(dir) {
         return;
     }
     if midi.dirty {
@@ -941,7 +957,7 @@ mod tests {
         std::fs::create_dir_all(&parent).unwrap();
 
         let mut midi = MidiStore::default();
-        adopt_midi_from_dir(&mut midi, &parent, 120.0);
+        adopt_midi_from_dir(&mut midi, &parent, 120.0, false);
         assert_eq!(midi.loaded_dir, None, "H-2: a failed load must not mark the store synced");
 
         let _ = std::fs::remove_dir_all(&parent);
@@ -968,7 +984,7 @@ mod tests {
         midi.loaded_dir = Some(std::path::PathBuf::from("/old/project"));
 
         let new_dir = std::path::PathBuf::from("/new/project");
-        adopt_midi_from_dir(&mut midi, &new_dir, 120.0);
+        adopt_midi_from_dir(&mut midi, &new_dir, 120.0, false);
 
         assert_eq!(midi.clips.len(), 1, "M-5: dirty memory is not silently discarded");
         assert_eq!(
@@ -1009,10 +1025,10 @@ mod tests {
         let launch_maps_before = crate::midi::launch::runtime().maps();
 
         let mut midi = MidiStore::default();
-        adopt_midi_from_dir(&mut midi, &with_harmony, 120.0);
+        adopt_midi_from_dir(&mut midi, &with_harmony, 120.0, false);
         assert_eq!(midi.harmony.progression_string(), "Am", "adopted from disk");
 
-        adopt_midi_from_dir(&mut midi, &without, 120.0);
+        adopt_midi_from_dir(&mut midi, &without, 120.0, false);
         assert!(
             midi.harmony.is_empty(),
             "a project with no harmony must not inherit the previous one's: {}",
@@ -1062,7 +1078,7 @@ mod tests {
         {
             let mut s = session.lock();
             s.store.project_dir = Some(dir_a.clone());
-            adopt_midi_from_dir(&mut s.midi, &dir_a, 120.0);
+            adopt_midi_from_dir(&mut s.midi, &dir_a, 120.0, false);
         }
         (audio, midi_state, dir_a, dir_b)
     }

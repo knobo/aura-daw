@@ -4938,23 +4938,24 @@ impl ControlPlane {
             // midi command after an open) — same lock as the store swap
             // above, no separate re-acquisition.
             //
-            // `loaded_dir` reset first: `adopt_midi_from_dir`'s same-dir
-            // skip exists for the lazy READ paths it used to serve
-            // (H-2/M-5's own doc), not for an explicit open — and this IS
-            // one, of a document just freshly re-read and validated above.
-            // Left set, re-opening the very directory already open would
-            // skip the midi reload while the store fields just above
-            // (tracks/clips/PLAYERS) are refreshed unconditionally, same
-            // call, same lock — leaving a `LaunchTarget::Player` binding
-            // (Task 12) pointing at a player id `store.players` had just
-            // been reset out from under it: a silently dead pad, caught by
-            // `player_migration.rs`'s two-open test. The `dirty` guard
-            // inside `adopt_midi_from_dir` still runs after this and still
-            // refuses to clobber a failed-persist's unsaved midi state —
-            // this only removes the same-dir cache hit, not that check.
-            session.midi.loaded_dir = None;
+            // `force: true` — an explicit open must always re-read midi
+            // state, the same as the store fields just above
+            // (tracks/clips/PLAYERS), which are refreshed unconditionally.
+            // `adopt_midi_from_dir`'s same-dir skip exists for the lazy
+            // READ paths it used to serve (Task 6's own doc), not for an
+            // explicit open of a document just freshly re-read and
+            // validated above. Fix round 1, Critical 1: an EARLIER version
+            // of this forced the reload by clearing `session.midi.loaded_dir`
+            // itself, which ALSO defeated the `Ok(None)` branch's own,
+            // unrelated `loaded_dir.is_some()` check inside
+            // `adopt_midi_from_dir` — the guard that clears a PREVIOUS
+            // project's clips/harmony/launch_maps when the newly-opened one
+            // has never had a midi save (every project that has never been
+            // midi-saved takes that branch). `force` bypasses only the
+            // same-dir cache hit, leaving that check, and the `dirty`
+            // guard, exactly as `adopt_midi_from_dir` already has them.
             let bpm = session.store.transport.tempo_bpm;
-            crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+            crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm, true);
             // Plan V — V2 Task 12: retires the launch overlay's `Clip`
             // targets in favor of players, now that both the just-adopted
             // launch maps and the just-swapped players/tracks are in place.

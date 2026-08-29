@@ -309,6 +309,40 @@ fn opening_the_same_project_twice_does_not_double_the_player() {
     );
 }
 
+/// Fix round 1, Critical 1: `adopt_midi_from_dir`'s `Ok(None)` branch —
+/// taken by every project that has never had a midi save, which is every
+/// freshly created one — is guarded by `midi.loaded_dir.is_some()`, and
+/// THAT guard is what clears the previous project's clips/harmony/launch
+/// maps. Open A (clips + launch bindings), then open B, a project that has
+/// never been midi-saved: B must show none of A's midi state, and the
+/// migration must not mint players from A's bindings into B's store.
+#[test]
+fn opening_a_never_midi_saved_project_after_one_with_bindings_does_not_inherit_its_midi_state() {
+    let (cp, dir_a) = control_plane_with_a_saved_project_containing_a_clip_binding();
+    cp.open_project_epoch(Path::new(&dir_a)).unwrap();
+    assert_eq!(cp.players().len(), 1, "A migrated its own binding");
+
+    let parent = tmp_parent("never-midi-saved-b");
+    let (mut proj_b, dir_b) = project::create(&parent, "B", 48_000, 120.0).unwrap();
+    proj_b.tracks = vec![test_track("t1", None)];
+    project::save(&dir_b, &proj_b).unwrap();
+    // No `persist::save_into_project` call: B's project.json carries no
+    // v2+ midi fields at all — `load_from_project` returns `Ok(None)` for
+    // it, the branch Critical 1 found unguarded.
+
+    cp.open_project_epoch(Path::new(&dir_b)).unwrap();
+
+    assert!(
+        cp.players().is_empty(),
+        "B must not inherit A's migrated player"
+    );
+    let maps = cp.launch_snapshot().maps;
+    assert!(
+        maps.iter().all(|m| m.bindings.is_empty()),
+        "B must not inherit A's launch bindings: {maps:?}"
+    );
+}
+
 /// The real double-mint risk: a project that ALREADY carries a migrated
 /// player (as if an earlier session migrated it and saved) must not gain a
 /// second one on open. This is the scenario `PlayerId::mint`'s randomness

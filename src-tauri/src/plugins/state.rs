@@ -1899,7 +1899,7 @@ mod tests {
         // `ControlPlane::open_project_epoch`: adopt midi under the session
         // lock, then adopt plugins AFTER it drops — both against `registered`
         // so this test is race-proof even when it loses `register_store`.
-        crate::midi::adopt_midi_from_dir(&mut registered.lock().midi, &dir, 120.0);
+        crate::midi::adopt_midi_from_dir(&mut registered.lock().midi, &dir, 120.0, false);
         adopt_open_project(&dir);
 
         let s = registered.lock();
