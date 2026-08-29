@@ -22,7 +22,7 @@ use crate::ids::{ClipId, PlayerId, TrackId};
 /// the source binding, and V-16 defines raw playback in exactly those
 /// terms. Content-keyed sources are V4's business, once envelopes are
 /// evaluated at the player's own position.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PlayerSource {
     /// An audio clip. With `Player::raw` set this is V-16's bit-exact path.
@@ -38,13 +38,8 @@ pub enum PlayerSource {
         instrument_id: Option<String>,
     },
     /// A pad that carries knobs and nothing else (R5). Renders silence.
+    #[default]
     None,
-}
-
-impl Default for PlayerSource {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// How a press behaves. V3 adds `quantize`, `chokeGroup` and
