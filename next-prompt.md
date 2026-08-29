@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| Fix pointer drag/popover math under UI zoom | `fix/pointer-zoom-scaling` | 2026-08-29 | Raw `clientX`/rect math not zoom-compensated in clip-drag, AutomationTrackRow, HScrollbar, Timeline ruler drag, and portalled popovers (AddMenu/BindPicker). |
+| _(none)_ | | | |
 
 ## Next up — unclaimed
 
