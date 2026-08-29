@@ -503,8 +503,8 @@
   function onLaneDblClick(track: TrackState, e: MouseEvent) {
     if (track.kind === "automation") {
       if ((e.target as HTMLElement).closest(".aclip, .clip, .mclip")) return;
-      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-      const samples = view.snapSamples(Math.max(0, view.samplesAt(e.clientX - rect.left)));
+      const el = e.currentTarget as HTMLElement;
+      const samples = view.snapSamples(Math.max(0, view.samplesAt(canvasPos(el, e.clientX, e.clientY).x)));
       const startTicks = Math.round(midi.samplesToTicks(samples) / midi.ppq) * midi.ppq;
       void modulation.addClip(track.id, Math.max(0, startTicks), 2 * midi.ticksPerBar);
       return;
@@ -514,8 +514,8 @@
       toasts.info("NOT A MIDI LANE", `"${track.name}" is an audio track — midi clips need a midi lane`);
       return;
     }
-    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-    const samples = view.snapSamples(Math.max(0, view.samplesAt(e.clientX - rect.left)));
+    const el = e.currentTarget as HTMLElement;
+    const samples = view.snapSamples(Math.max(0, view.samplesAt(canvasPos(el, e.clientX, e.clientY).x)));
     const startTicks = Math.round(midi.samplesToTicks(samples) / midi.ppq) * midi.ppq;
     void midi
       .addClip(track.id, Math.max(0, startTicks), 2 * midi.ticksPerBar)
@@ -1241,6 +1241,10 @@
     margin-left: -5px;
     filter: drop-shadow(0 0 calc(4px * var(--glow-scale)) var(--cyan-dim));
     pointer-events: none;
+    /* Moved every frame via `transform` (see the rAF tick above) — promote
+       it to its own layer so that move doesn't get folded into a
+       full-viewport repaint on a weaker compositor (WebKitGTK). */
+    will-change: transform;
   }
 
   /* loop region: band + pins in the ruler's top strip */

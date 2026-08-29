@@ -65,6 +65,10 @@ export interface PrefValues {
   meterFace: "led" | "dial" | "ladder" | "needle";
   /** The shape of a channel strip's mute/solo/arm keys. */
   stripKeys: "key" | "bar";
+  /** Hide every track header's own level meter while the control surface
+   * panel is open — its channel strips already show the same reading, so
+   * this drops a second redraw of it per track. */
+  surfaceHidesTrackMeters: boolean;
   /** Keep native plugin editor windows above the AURA window. */
   pluginGuiOnTop: boolean;
 }
@@ -347,6 +351,14 @@ export const PREF_SCHEMA: { readonly [K in PrefId]: DefFor<PrefValues[K]> } = {
     label: "Mute / solo / arm",
     blurb:
       "The shape of a channel strip's three function keys. KEYS are three moulded buttons that press in when lit; SEGMENTED is one routed switch divided into three, each part filling solid when lit. Both fit the strip at any width, and both are drawn from the theme.",
+  },
+  surfaceHidesTrackMeters: {
+    kind: "boolean",
+    default: false,
+    category: "interface",
+    label: "Hide track meters when surface is open",
+    blurb:
+      "Each track header has its own level meter, and a channel strip on the control surface reads the same levels again — a second live redraw on top of the first, for any track that has one. Turning this on blanks EVERY track-header meter while the surface panel is open, whether or not that particular track actually has a strip there — they all come back the moment you switch away from it.",
   },
   theme: {
     kind: "choice",

@@ -5,6 +5,53 @@ start appears here, you are about to redo it. Open the pointer instead.
 
 Newest first.
 
+## Pointer/zoom drift and duplicate meter rendering, found by profiling the real app under load
+
+Not from the backlog — surfaced by asking "why does the native build feel
+laggy compared to the browser demo" and following the evidence. Two
+unrelated problems, fixed in the same branch because the second was found
+while chasing the first.
+
+**Pointer math under interface zoom.** `clientX`/`getBoundingClientRect()`
+report VISUAL px (already multiplied by `prefs.uiZoom`), but drag deltas
+and hit-zone constants across the codebase assumed CSS `zoom` keeps
+everything in one coordinate space — it doesn't; `clientWidth`/layout
+constants stay in LAYOUT px. At 150% zoom this meant clips, automation
+clips, panel resizes, faders, knobs, the H-scrollbar thumb, and the
+floating launch-map window all moved 1.5× the pointer distance; portalled
+popovers (`+` menu, bind picker) landed off their anchor because their
+`left`/`top` got multiplied by the zoom a second time inside the zoomed
+`document.body`. Fixed with a new `uiZoomFactor()` (`utils/ui-zoom.ts`)
+divided in at every mixed site. Verified empirically: unpatched clip drag
+measured exactly 1.5000 in a Playwright ratio test at 150% zoom; patched,
+1.0000.
+
+**Duplicate/expensive meter rendering.** A WebKit Timelines capture on the
+native (Tauri/WebKitGTK) build — not visible in browser demo mode, which
+uses Chromium/Gecko — showed per-frame DOM/SVG mutation (the control
+surface's `Gauge.svelte`, up to 44 SVG segments or 26 `<i>` rungs toggled
+every frame) folding into full-viewport repaints, ~600ms each. Rewrote
+`Gauge.svelte` to canvas (matching `Meter.svelte`'s existing architecture,
+now the standing pattern — see `STANDING-CONSTRAINTS.md` "No
+continuously-animated SVG"), added `contain`/`will-change` isolation
+across every other continuous rAF site, added `runWhileVisible()`
+(`utils/visible-raf.ts`, IntersectionObserver-gated) so an off-screen
+meter/gauge stops scheduling entirely, and fixed the resulting duplicate
+render when the control surface and a track header show the same track's
+level at once (opt-in `surfaceHidesTrackMeters` pref, off by default).
+Paint duration dropped ~3.8× on re-measurement (611ms → 161ms avg) but the
+full-viewport-quad pattern itself persisted at reduced cost — logged as
+still-open in `STANDING-CONSTRAINTS.md` rather than claimed fixed.
+
+An Opus review of the branch before merge caught a real regression in the
+visibility-gating fix (clip detection was gated along with the redraw, so
+a clipped track scrolled out of view never latched its LED) and a
+containment-scope bug (TransportBar's always-on clock lost its shared
+baseline with the bar counter and had its playing-state glow clipped) —
+both fixed in the same branch; see the PR for the full list.
+
+PR: `fix/pointer-zoom-scaling` → #131.
+
 ## Startup progress: the boot has two clocks, and the slower one is invisible to the caller
 
 Opening the last project on launch took seconds and looked identical to a

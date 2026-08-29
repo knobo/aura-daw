@@ -25,6 +25,7 @@ import { backend } from "../tauri";
 import { project } from "./project.svelte";
 import { midi } from "./midi.svelte";
 import { view } from "./view.svelte";
+import { uiZoomFactor } from "../utils/ui-zoom";
 import { clipSelection } from "./clip-selection.svelte";
 import type { ClipRef } from "../utils/clip-selection";
 import type { ClipPlacement } from "../types/ipc";
@@ -128,7 +129,10 @@ class ClipDragController {
 
   /** The one delta pair the whole group moves by. Pure given the snapshot. */
   computeDelta(clientX: number, altKey: boolean): { deltaSamples: number; deltaTicks: number } {
-    const dx = (clientX - this.startClientX) * view.spp;
+    // clientX deltas are VISUAL px; view.spp is samples-per-LAYOUT-px
+    // (view.width comes from clientWidth) — divide out the interface zoom
+    // before scaling, or the clip runs ahead of the pointer under zoom.
+    const dx = ((clientX - this.startClientX) / uiZoomFactor()) * view.spp;
     let target = this.anchorOrigSamples + dx;
     if (!altKey) target = view.snapSamples(target);
     let deltaSamples = Math.round(target - this.anchorOrigSamples);

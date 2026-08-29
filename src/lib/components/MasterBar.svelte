@@ -242,6 +242,10 @@
     width: 48px;
     color: var(--text);
     text-align: right;
+    /* textContent is rewritten every frame from the rAF loop above.
+       `paint`, not `content`: layout containment would hard-clip a
+       reading wider than 48px instead of letting it overflow visibly. */
+    contain: paint;
   }
 
   .lanesbulk {

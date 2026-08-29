@@ -30,10 +30,21 @@
    * not a meter with the wrong green in it.
    *
    * Range matches Meter.svelte (−60..+6 dBFS). Read-only.
+   *
+   * CANVAS, not SVG (STANDING-CONSTRAINTS.md "No continuously-animated
+   * SVG"): the previous SVG build mutated up to 44 segment elements'
+   * classes/attributes every frame, and a WebKit Timelines capture on the
+   * native (WebKitGTK) build showed that folded into a full-viewport
+   * repaint — ~600ms/paint, on every meter tick, for every gauge on the
+   * page. One canvas per gauge, redrawn imperatively like Meter.svelte,
+   * touches no DOM/CSSOM at all once mounted.
    */
   import { latestMeter } from "../../state/meters.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { formatDb, linToDb } from "../../utils/format";
+  import { runWhileVisible } from "../../utils/visible-raf";
+  import { theme } from "../../theme/theme.svelte";
+  import { alpha } from "../../theme/tokens";
 
   interface Props {
     trackId: string;
@@ -51,9 +62,6 @@
 
   /** The round faces' sweep — the knob's, so the two agree by construction. */
   const SWEEP = 270;
-  /** A circle's dash arithmetic in hundredths, via `pathLength="100"`. */
-  const PATH = 100;
-  const ARC = (PATH * SWEEP) / 360;
   /** Segments around the LED ring. Denser than the knob's, because a meter is
    * read at a glance and a coarser ring steps visibly under a fade. */
   const SEGS = 44;
@@ -62,17 +70,19 @@
   /** Rungs on the ladder. Fewer, because each one has to stay a rung at the
    * 72px a channel strip gives it. */
   const RUNGS = 26;
+  /** The rung bar's own height — the old CSS `.rungs { height: 13px }`.
+   * The canvas is taller than this (see `.ladder-canvas`) so a lit rung's
+   * glow has room to bleed, matching the old box-shadow's headroom in the
+   * slot's padding. */
+  const RUNG_H = 13;
+  /** 100×100 viewBox the old SVG drew in — every geometry constant above is
+   * inherited from it unchanged, so the canvas is redrawn in the same local
+   * coordinate space (see `draw`'s `ctx.scale`) rather than re-derived. */
   const CX = 50;
+  const VIEWBOX = 100;
 
   const face = $derived(prefs.values.meterFace);
   const round = $derived(face === "led" || face === "dial");
-
-  /** Each lamp's angle from 12 o'clock and its position along the scale. */
-  const segs = Array.from({ length: SEGS }, (_, i) => ({
-    deg: -SWEEP / 2 + (i / (SEGS - 1)) * SWEEP,
-    at: i / (SEGS - 1),
-  }));
-  const rungs = Array.from({ length: RUNGS }, (_, i) => i / (RUNGS - 1));
 
   /**
    * The lamp ramp. Green up to −12 dB, amber to 0, red above — the
@@ -90,113 +100,295 @@
   function vuAngle(db: number): number {
     return VU_START + normal(db) * VU_SWEEP;
   }
-
-  let needleEl: SVGGElement | undefined = $state();
-  let readoutEl: HTMLElement | undefined = $state();
-  let segsEl: SVGGElement | undefined = $state();
-  let peakEl: SVGGElement | undefined = $state();
-  let dialArcEl: SVGCircleElement | undefined = $state();
-  let dialNeedleEl: SVGGElement | undefined = $state();
-  let dialPeakEl: SVGGElement | undefined = $state();
-  let ladderEl: HTMLElement | undefined = $state();
-  let clipped = $state(false);
-
-  /** The zone a level is in, as the class name every face paints it with. */
-  function zoneOf(n: number): string {
+  /** The zone a level is in. */
+  function zoneOf(n: number): "ok" | "warm" | "hot" {
     return n >= HOT ? "hot" : n >= WARM ? "warm" : "ok";
   }
+  /** Degrees-clockwise-from-straight-up (the SVG build's rotation
+   * convention throughout) → radians in canvas's from-positive-x-axis
+   * convention. Both wind clockwise, so this is a constant 90° offset. */
+  function toCanvasRad(degFromUp: number): number {
+    return ((degFromUp - 90) * Math.PI) / 180;
+  }
 
-  // Every face is written imperatively inside the rAF loop, and none of the
-  // values it writes may be `$state`: ruling S-3 is that the meter bus does
-  // not go on the reactivity graph, and add-all-tracks puts one gauge per
-  // mixable track on the page. `clipped` is the one exception — a rare latch,
-  // reset by a click, exactly as in Meter.svelte.
+  let canvas: HTMLCanvasElement | undefined = $state();
+  let readoutEl: HTMLElement | undefined = $state();
+  let clipped = $state(false);
+
+  function resetClip() {
+    clipped = false;
+  }
+
+  // Every face is written imperatively inside the rAF loop; none of its
+  // per-frame values may be `$state` (ruling S-3: the meter bus does not go
+  // on the reactivity graph, and add-all-tracks puts one gauge per mixable
+  // track on the page). `clipped` is the one exception — a rare latch, reset
+  // by a click, exactly as in Meter.svelte.
   $effect(() => {
     const id = trackId;
+    const el = canvas;
     const readout = readoutEl;
-    const ring = segsEl;
-    const peakLamp = peakEl;
-    const swing = needleEl;
-    const dialArc = dialArcEl;
-    const dialNeedle = dialNeedleEl;
-    const dialPeak = dialPeakEl;
-    const ladder = ladderEl;
-    let raf = 0;
+    const currentFace = face;
+    if (!el) return;
+    const ctx = el.getContext("2d");
+    if (!ctx) return;
+    const c = ctx;
+
     let disp = DB_MIN;
     let peakHold = DB_MIN;
     let peakUntil = 0;
     let shown = "";
-    let litShown = -1;
-    let peakShown = -1;
-    let zoneShown = "";
+    let w = 0;
+    let h = 0;
+    let dpr = 1;
 
-    const tick = (now: number) => {
-      raf = requestAnimationFrame(tick);
+    const ro = new ResizeObserver(() => {
+      w = el.clientWidth;
+      h = el.clientHeight;
+      dpr = Math.min(3, window.devicePixelRatio || 1);
+      el.width = Math.max(1, Math.round(w * dpr));
+      el.height = Math.max(1, Math.round(h * dpr));
+    });
+    ro.observe(el);
+
+    /** A radial line from `r1` to `r2` at `degFromUp`, about (CX, CX). */
+    function radial(deg: number, r1: number, r2: number) {
+      const a = toCanvasRad(deg);
+      const cos = Math.cos(a);
+      const sin = Math.sin(a);
+      c.moveTo(CX + r1 * cos, CX + r1 * sin);
+      c.lineTo(CX + r2 * cos, CX + r2 * sin);
+    }
+
+    function zoneColor(zone: "ok" | "warm" | "hot"): string {
+      const t = theme.tokens;
+      return zone === "hot" ? t.red : zone === "warm" ? t.amber : t.green;
+    }
+
+    function drawLed(n: number, p: number) {
+      const t = theme.tokens;
+      const glow = 2.5 * (parseFloat(t.glowScale) || 0);
+      const lit = Math.max(0, Math.min(SEGS, Math.round(n * SEGS)));
+      // Dim printed-scale pass, no glow — the whole ring, cheaply, in one path.
+      c.beginPath();
+      for (let i = 0; i < SEGS; i++) {
+        const deg = -SWEEP / 2 + (i / (SEGS - 1)) * SWEEP;
+        radial(deg, SEG_R - SEG_W * 2, SEG_R + SEG_W * 2);
+      }
+      c.strokeStyle = alpha(t.line, 0.24);
+      c.lineWidth = SEG_W;
+      c.lineCap = "round";
+      c.stroke();
+      // Lit segments, grouped by zone so each zone pays for one glow pass.
+      if (lit > 0) {
+        for (const zone of ["ok", "warm", "hot"] as const) {
+          c.beginPath();
+          let any = false;
+          for (let i = 0; i < lit; i++) {
+            const at = i / (SEGS - 1);
+            const segZone = at >= HOT ? "hot" : at >= WARM ? "warm" : "ok";
+            if (segZone !== zone) continue;
+            const deg = -SWEEP / 2 + at * SWEEP;
+            radial(deg, SEG_R - SEG_W * 2, SEG_R + SEG_W * 2);
+            any = true;
+          }
+          if (!any) continue;
+          c.strokeStyle = zoneColor(zone);
+          c.shadowColor = zoneColor(zone);
+          c.shadowBlur = glow;
+          c.stroke();
+        }
+        c.shadowBlur = 0;
+      }
+      // Peak mark, drawn in the text colour so a peak that touched red does
+      // not keep reading as "you are in the red".
+      if (peakHold > DB_MIN) {
+        const mark = Math.max(0, Math.min(SEGS - 1, Math.round(p * (SEGS - 1))));
+        const deg = -SWEEP / 2 + (mark / (SEGS - 1)) * SWEEP;
+        c.beginPath();
+        radial(deg, SEG_R - SEG_W * 2, SEG_R + SEG_W * 2);
+        c.strokeStyle = t.text;
+        c.lineWidth = SEG_W * 1.1;
+        c.shadowColor = t.text;
+        c.shadowBlur = 3 * (parseFloat(t.glowScale) || 0);
+        c.stroke();
+        c.shadowBlur = 0;
+      }
+    }
+
+    function drawDial(n: number, p: number) {
+      const t = theme.tokens;
+      const start = toCanvasRad(-SWEEP / 2 + 0); // -135° from up == the LED ring's own start
+      // static track
+      c.beginPath();
+      c.arc(CX, CX, SEG_R, start, start + (SWEEP * Math.PI) / 180);
+      c.strokeStyle = alpha(t.line, 0.28);
+      c.lineWidth = 4;
+      c.lineCap = "butt";
+      c.stroke();
+      // live arc
+      if (n > 0) {
+        const zone = zoneOf(n);
+        c.beginPath();
+        c.arc(CX, CX, SEG_R, start, start + (n * SWEEP * Math.PI) / 180);
+        c.strokeStyle = zoneColor(zone);
+        c.shadowColor = zoneColor(zone);
+        c.shadowBlur = 3 * (parseFloat(t.glowScale) || 0);
+        c.stroke();
+        c.shadowBlur = 0;
+      }
+      // needle riding the arc's head — a longer line than the peak tick,
+      // reaching from just outside the ring to well inside it (matches the
+      // old SVG's y1={CX-SEG_R-SEG_W*2}/y2={CX-SEG_R+SEG_W*4}).
+      c.beginPath();
+      radial(-SWEEP / 2 + n * SWEEP, SEG_R - SEG_W * 4, SEG_R + SEG_W * 2);
+      c.strokeStyle = t.text;
+      c.lineWidth = 1.8;
+      c.lineCap = "round";
+      c.stroke();
+      // peak tick, continuous (no rung quantisation on this face)
+      if (peakHold > DB_MIN) {
+        c.beginPath();
+        radial(-SWEEP / 2 + p * SWEEP, SEG_R - SEG_W, SEG_R + SEG_W);
+        c.strokeStyle = t.text;
+        c.globalAlpha = 0.55;
+        c.lineWidth = 1.4;
+        c.lineCap = "round";
+        c.stroke();
+        c.globalAlpha = 1;
+      }
+    }
+
+    function drawVu(db: number) {
+      const t = theme.tokens;
+      const pivotX = 50;
+      const pivotY = 78;
+      // printed scale — the upper semicircle above the pivot (old SVG:
+      // `M18 78 A32 32 0 0 1 82 78`, i.e. 180°..360° through straight up).
+      // `lineCap` reset explicitly: canvas state persists across draw()
+      // calls, and the needle below sets it to "round" every frame.
+      c.lineCap = "butt";
+      c.beginPath();
+      c.arc(pivotX, pivotY, 32, Math.PI, Math.PI * 2);
+      c.strokeStyle = alpha(t.line, 0.35);
+      c.lineWidth = 1.6;
+      c.stroke();
+      for (const tickDb of [-60, -24, -12, -6, 0, 6]) {
+        const a = toCanvasRad(vuAngle(tickDb));
+        const r1 = 30;
+        const r2 = tickDb >= 0 ? 34 : 32;
+        c.beginPath();
+        c.moveTo(pivotX + r1 * Math.cos(a), pivotY + r1 * Math.sin(a));
+        c.lineTo(pivotX + r2 * Math.cos(a), pivotY + r2 * Math.sin(a));
+        c.strokeStyle = tickDb >= 0 ? t.red : alpha(t.line, 0.55);
+        c.lineWidth = 1.4;
+        c.stroke();
+      }
+      // needle
+      const deg = vuAngle(db);
+      const a = toCanvasRad(deg);
+      const glow = 3 * (parseFloat(t.glowScale) || 0);
+      c.beginPath();
+      c.moveTo(pivotX, pivotY);
+      c.lineTo(pivotX + 32 * Math.cos(a), pivotY + 32 * Math.sin(a));
+      c.strokeStyle = t.amber;
+      c.lineWidth = 1.6;
+      c.lineCap = "round";
+      c.shadowColor = t.amber;
+      c.shadowBlur = glow;
+      c.stroke();
+      c.shadowBlur = 0;
+      // hub
+      c.beginPath();
+      c.arc(pivotX, pivotY, 4.5, 0, Math.PI * 2);
+      c.fillStyle = t.bg3;
+      c.fill();
+      c.strokeStyle = t.edge;
+      c.lineWidth = 0.8;
+      c.stroke();
+    }
+
+    function drawLadder(n: number, p: number) {
+      const t = theme.tokens;
+      const gap = 1;
+      const rw = (w - gap * (RUNGS - 1)) / RUNGS;
+      const lit = Math.max(0, Math.min(RUNGS, Math.round(n * RUNGS)));
+      const mark = Math.max(0, Math.min(RUNGS - 1, Math.round(p * (RUNGS - 1))));
+      // The canvas is taller than the rung bar itself (see .ladder-canvas'
+      // negative-margin overshoot) so a lit rung's glow has room to bleed
+      // into the slot's padding the way the old CSS box-shadow did —
+      // center the RUNG_H-tall bar in the middle of that extra height.
+      const ry = (h - RUNG_H) / 2;
+      const r = Math.min(1, rw / 2, RUNG_H / 2);
+      for (let i = 0; i < RUNGS; i++) {
+        const x = i * (rw + gap);
+        const at = i / (RUNGS - 1);
+        const isPeak = peakHold > DB_MIN && i === mark;
+        const on = i < lit;
+        let fill = alpha(t.line, 0.2);
+        let glowColor: string | null = null;
+        if (isPeak) {
+          fill = t.text;
+          glowColor = t.text;
+        } else if (on) {
+          const zone = at >= HOT ? "hot" : at >= WARM ? "warm" : "ok";
+          fill = zoneColor(zone);
+          glowColor = fill;
+        }
+        c.beginPath();
+        if (typeof c.roundRect === "function") c.roundRect(x, ry, rw, RUNG_H, r);
+        else c.rect(x, ry, rw, RUNG_H);
+        c.fillStyle = fill;
+        if (glowColor) {
+          c.shadowColor = glowColor;
+          c.shadowBlur = 4 * (parseFloat(t.glowScale) || 0);
+        } else {
+          c.shadowBlur = 0;
+        }
+        c.fill();
+      }
+      c.shadowBlur = 0;
+    }
+
+    const draw = () => {
+      if (w === 0 || h === 0) return;
       const m = latestMeter(id);
+      const now = performance.now();
       const peak = m ? linToDb(Math.max(m.peakL, m.peakR)) : DB_MIN;
       // Fast attack, slower release — a needle, not a bar.
       disp = peak > disp ? peak : disp + (peak - disp) * 0.18;
-      const n = normal(disp);
 
-      // Peak hold: the highest reading of the last second, shown ahead of the
-      // level as its own mark. 1000ms is the AES convention, and it is long
-      // enough to catch a transient you were not watching for.
-      if (peak >= peakHold || now > peakUntil) {
-        peakHold = peak;
-        peakUntil = now + 1000;
+      // Peak hold: the highest reading of the last second, shown ahead of
+      // the level as its own mark. 1000ms is the AES convention, and it is
+      // long enough to catch a transient you were not watching for. The VU
+      // face carries no peak hold by construction (a needle IS the peak).
+      if (currentFace !== "needle") {
+        if (peak >= peakHold || now > peakUntil) {
+          peakHold = peak;
+          peakUntil = now + 1000;
+        }
       }
+
+      const n = normal(disp);
       const p = normal(peakHold);
 
-      if (swing) swing.setAttribute("transform", `rotate(${vuAngle(disp)} 50 78)`);
+      c.setTransform(dpr, 0, 0, dpr, 0, 0);
+      c.clearRect(0, 0, w, h);
 
-      if (dialArc) {
-        dialArc.setAttribute("stroke-dasharray", `${(n * ARC).toFixed(2)} ${PATH}`);
-        const zone = zoneOf(n);
-        if (zone !== zoneShown) {
-          dialArc.classList.remove("ok", "warm", "hot");
-          dialArc.classList.add(zone);
-          zoneShown = zone;
-        }
-      }
-      if (dialNeedle) {
-        dialNeedle.setAttribute(
-          "transform",
-          `rotate(${-SWEEP / 2 + n * SWEEP} ${CX} ${CX})`,
-        );
-      }
-      // The dial's peak is a tick sitting further round the same arc. It is
-      // free of the rung quantisation the segment faces have, so it moves
-      // continuously and gets written every frame rather than on a change.
-      if (dialPeak) {
-        dialPeak.setAttribute("transform", `rotate(${-SWEEP / 2 + p * SWEEP} ${CX} ${CX})`);
-        dialPeak.style.opacity = peakHold > DB_MIN ? "1" : "0";
-      }
-
-      // The segment faces count rungs rather than tracking a fraction, so the
-      // DOM write is skipped whenever the count has not changed — which is
-      // most frames of most tracks.
-      const cells = ring ?? ladder;
-      const total = ring ? SEGS : RUNGS;
-      if (cells) {
-        const lit = Math.max(0, Math.min(total, Math.round(n * total)));
-        if (lit !== litShown) {
-          for (let i = 0; i < total; i++) {
-            (cells.children[i] as HTMLElement).classList.toggle("on", i < lit);
-          }
-          litShown = lit;
-        }
-      }
-
-      const mark = Math.max(0, Math.min(total - 1, Math.round(p * (total - 1))));
-      if (mark !== peakShown) {
-        if (peakLamp) {
-          peakLamp.setAttribute("transform", `rotate(${segs[mark].deg} ${CX} ${CX})`);
-          peakLamp.style.opacity = peakHold > DB_MIN ? "1" : "0";
-        } else if (ladder) {
-          if (peakShown >= 0) (ladder.children[peakShown] as HTMLElement).classList.remove("peak");
-          if (peakHold > DB_MIN) (ladder.children[mark] as HTMLElement).classList.add("peak");
-        }
-        peakShown = mark;
+      if (currentFace === "ladder") {
+        drawLadder(n, p);
+      } else {
+        // Round faces share the old SVG's 100×100 local coordinate space,
+        // centered the way the SVG's default `preserveAspectRatio`
+        // (xMidYMid) centered it — a no-op today since `.bezel` is always
+        // square, but not if that ever stops being true.
+        const scale = Math.min(w, h) / VIEWBOX;
+        const tx = (w - VIEWBOX * scale) / 2;
+        const ty = (h - VIEWBOX * scale) / 2;
+        c.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * tx, dpr * ty);
+        if (currentFace === "led") drawLed(n, p);
+        else if (currentFace === "dial") drawDial(n, p);
+        else drawVu(disp);
       }
 
       if (readout) {
@@ -206,10 +398,27 @@
           shown = text;
         }
       }
-      if (m?.clipped) clipped = true;
     };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+
+    const stop = runWhileVisible(el, draw);
+
+    // Clip detection must not depend on visibility — the LED exists to
+    // catch an overload on a track you were not currently looking at, so
+    // this runs even while the canvas above is paused off-screen. One Map
+    // lookup, no draw work; `clipped` only writes on the rare true-going
+    // transition, so this doesn't reintroduce 60Hz reactivity.
+    let clipRaf = 0;
+    const checkClip = () => {
+      clipRaf = requestAnimationFrame(checkClip);
+      if (latestMeter(id)?.clipped) clipped = true;
+    };
+    clipRaf = requestAnimationFrame(checkClip);
+
+    return () => {
+      cancelAnimationFrame(clipRaf);
+      stop();
+      ro.disconnect();
+    };
   });
 </script>
 
@@ -217,67 +426,14 @@
   {#if round}
     <div class="bezel led grain">
       <div class="window">
-        <svg class="face" viewBox="0 0 100 100" aria-hidden="true">
-          {#if face === "led"}
-            <!-- Segments are `<line>`s pointing outward rather than dots, so
-                 the ring reads as a bar graph bent round a circle: at a glance
-                 the LENGTH of the lit run is the level, which a ring of equal
-                 dots does not give you. -->
-            <g bind:this={segsEl} class="segs">
-              {#each segs as s (s.deg)}
-                <line
-                  class="seg"
-                  class:warm={s.at >= WARM && s.at < HOT}
-                  class:hot={s.at >= HOT}
-                  x1={CX}
-                  y1={CX - SEG_R + SEG_W * 2}
-                  x2={CX}
-                  y2={CX - SEG_R - SEG_W * 2}
-                  transform="rotate({s.deg} {CX} {CX})"
-                />
-              {/each}
-            </g>
-            <g bind:this={peakEl} class="peak" opacity="0">
-              <line x1={CX} y1={CX - SEG_R + SEG_W * 2} x2={CX} y2={CX - SEG_R - SEG_W * 2} />
-            </g>
-          {:else}
-            <!-- `pathLength="100"` turns the dash arithmetic into hundredths
-                 of a turn, so the sweep is a constant and the fill is one
-                 multiplication — no circumference, no radius in the maths. -->
-            <g transform="rotate(135 {CX} {CX})">
-              <circle
-                class="dial-track"
-                cx={CX}
-                cy={CX}
-                r={SEG_R}
-                pathLength={PATH}
-                stroke-dasharray="{ARC} {PATH}"
-              />
-              <circle
-                bind:this={dialArcEl}
-                class="dial-arc ok"
-                cx={CX}
-                cy={CX}
-                r={SEG_R}
-                pathLength={PATH}
-                stroke-dasharray="0 {PATH}"
-              />
-            </g>
-            <g bind:this={dialPeakEl} class="dial-peak" opacity="0">
-              <line x1={CX} y1={CX - SEG_R - SEG_W} x2={CX} y2={CX - SEG_R + SEG_W} />
-            </g>
-            <g bind:this={dialNeedleEl} class="dial-needle">
-              <line x1={CX} y1={CX - SEG_R - SEG_W * 2} x2={CX} y2={CX - SEG_R + SEG_W * 4} />
-            </g>
-          {/if}
-        </svg>
+        <canvas bind:this={canvas} class="face-canvas" aria-hidden="true"></canvas>
         <div class="glass"></div>
         <button
           class="clip"
           class:on={clipped}
           type="button"
           aria-label="Clip indicator — click to reset"
-          onclick={() => (clipped = false)}
+          onclick={resetClip}
         ></button>
         <!-- The number lives INSIDE the well on the round faces: the ring is
              the glanceable reading and the digits the exact one, and putting
@@ -287,47 +443,26 @@
     </div>
   {:else if face === "ladder"}
     <div class="slot grain">
-      <div class="rungs" bind:this={ladderEl}>
-        {#each rungs as at (at)}
-          <i class="rung" class:warm={at >= WARM && at < HOT} class:hot={at >= HOT}></i>
-        {/each}
-      </div>
+      <canvas bind:this={canvas} class="ladder-canvas" aria-hidden="true"></canvas>
       <button
         class="clip"
         class:on={clipped}
         type="button"
         aria-label="Clip indicator — click to reset"
-        onclick={() => (clipped = false)}
+        onclick={resetClip}
       ></button>
     </div>
   {:else}
     <div class="bezel grain">
       <div class="window">
-        <svg class="face" viewBox="0 0 100 100" aria-hidden="true">
-          <path class="arc" d="M18 78 A32 32 0 0 1 82 78" />
-          {#each [-60, -24, -12, -6, 0, 6] as db (db)}
-            <line
-              class="tick"
-              class:hot={db >= 0}
-              x1="50"
-              y1="48"
-              x2="50"
-              y2={db >= 0 ? 44 : 46}
-              transform="rotate({vuAngle(db)} 50 78)"
-            />
-          {/each}
-          <g bind:this={needleEl} class="needle">
-            <line x1="50" y1="78" x2="50" y2="46" />
-          </g>
-          <circle class="hub" cx="50" cy="78" r="4.5" />
-        </svg>
+        <canvas bind:this={canvas} class="face-canvas" aria-hidden="true"></canvas>
         <div class="glass"></div>
         <button
           class="clip"
           class:on={clipped}
           type="button"
           aria-label="Clip indicator — click to reset"
-          onclick={() => (clipped = false)}
+          onclick={resetClip}
         ></button>
       </div>
     </div>
@@ -374,167 +509,31 @@
   /* On the lit faces the sunken part is the DISC INSIDE the ring, not the
      whole window — the ring sits on the rim, level with the bezel, and the
      well is what it is ranged around. An inset ring rather than a smaller
-     element, so the ring still has the full viewBox to draw in. */
+     element, so the ring still has the full canvas to draw in. */
   .bezel.led .window {
     background: var(--bg-2);
     box-shadow:
       inset 0 0 0 calc(11% + 1px) var(--bg-sunken),
       var(--bevel-inset);
   }
-  .face {
+  .face-canvas {
     width: 100%;
     height: 100%;
     display: block;
+    /* Redrawn every frame from the meter bus, off the DOM entirely — see
+       Meter.svelte's .meter rule and STANDING-CONSTRAINTS.md. */
+    contain: paint;
   }
-
-  /* ── LED ARC ──
-     An unlit segment is a dark lens, not an absence: it is the printed scale,
-     and it has to survive on a theme whose ground already IS the shadow
-     colour, which is why it is `--line` and not `--shadow`. */
-  .seg {
-    stroke: rgb(var(--line-rgb) / 0.24);
-    stroke-width: 2.3;
-    stroke-linecap: round;
-    transition: stroke 60ms linear;
-  }
-  /* The three zones are only ever WORN by a segment that is lit, so the whole
-     ramp stays visible as printed scale while the track is silent.
-
-     `:global(.on)` because the class is added by `classList.toggle` inside
-     the rAF loop rather than by the template — Svelte cannot see that, and
-     prunes the rule as unused if it is written plainly. */
-  .seg:global(.on) {
-    stroke: var(--green);
-  }
-  .seg.warm:global(.on) {
-    stroke: var(--amber);
-  }
-  .seg.hot:global(.on) {
-    stroke: var(--red);
-  }
-  /* One filter for the whole ring rather than one per segment — 44 of them
-     re-evaluated every frame is a different component. The bloom is the
-     colour of the meter, not of the moment, because a filter cannot read a
-     child's own stroke. */
-  .segs {
-    filter: drop-shadow(0 0 calc(2.5px * var(--glow-scale)) rgb(var(--green-rgb) / 0.55));
-  }
-  /* Drawn in the text colour rather than in a zone colour, so a peak that
-     touched the red does not keep reading as "you are in the red". */
-  .peak line {
-    stroke: var(--text);
-    stroke-width: 2.6;
-    stroke-linecap: round;
-    filter: drop-shadow(0 0 calc(3px * var(--glow-scale)) rgb(var(--text-rgb) / 0.7));
-    transition: opacity 120ms;
-  }
-
-  /* ── DIAL ── */
-  .dial-track,
-  .dial-arc {
-    fill: none;
-    stroke-width: 4;
-    stroke-linecap: butt;
-  }
-  .dial-track {
-    stroke: rgb(var(--line-rgb) / 0.28);
-  }
-  /* 40ms, not 90: the stroke crossfades while the level is falling through a
-     zone boundary, and a slow one leaves the arc amber long enough after the
-     reading has dropped back into the green that it reads as a bug. It looked
-     like one for a while, which is how this comment got written. */
-  .dial-arc {
-    stroke: var(--green);
-    transition: stroke 40ms linear;
-    filter: drop-shadow(0 0 calc(3px * var(--glow-scale)) rgb(var(--green-rgb) / 0.5));
-  }
-  .dial-arc:global(.warm) {
-    stroke: var(--amber);
-  }
-  .dial-arc:global(.hot) {
-    stroke: var(--red);
-  }
-  /* A short needle riding the head of the arc rather than a full radius from
-     the hub: the arc already says how far along the travel you are, so a
-     needle across the whole face would say it twice and hide the number. */
-  .dial-needle line {
-    stroke: var(--text);
-    stroke-width: 1.8;
-    stroke-linecap: round;
-  }
-  .dial-peak line {
-    stroke: var(--text);
-    stroke-width: 1.4;
-    stroke-linecap: round;
-    opacity: 0.55;
-    transition: opacity 120ms;
-  }
-
-  /* ── LADDER ──
-     A routed slot with the rungs lying in it. `--bevel-frame-inset` rather
-     than a border: the bar has to read as sunk into the panel, or it is a
-     progress bar drawn on top of one. */
-  .slot {
-    position: relative;
+  .ladder-canvas {
     width: 100%;
-    padding: 4px 5px;
-    border-radius: var(--ctrl-radius);
-    background: var(--bg-sunken);
-    box-shadow: var(--bevel-frame-inset), var(--bevel-inset);
-  }
-  .rungs {
-    display: flex;
-    gap: 1px;
-    height: 13px;
-  }
-  .rung {
-    flex: 1;
-    border-radius: 1px;
-    background: rgb(var(--line-rgb) / 0.2);
-    transition: background 60ms linear;
-  }
-  .rung:global(.on) {
-    background: var(--green);
-    box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--green-rgb) / 0.6);
-  }
-  .rung.warm:global(.on) {
-    background: var(--amber);
-    box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--amber-rgb) / 0.6);
-  }
-  .rung.hot:global(.on) {
-    background: var(--red);
-    box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--red-rgb) / 0.6);
-  }
-  /* The peak rung wins over its zone colour whether it is lit or not — it is
-     ahead of the bar most of the time, which is the whole point of it. */
-  .rungs .rung:global(.peak) {
-    background: var(--text);
-    box-shadow: 0 0 calc(4px * var(--glow-scale)) rgb(var(--text-rgb) / 0.7);
-  }
-
-  /* ── the VU face ── */
-  .arc {
-    fill: none;
-    stroke: rgb(var(--line-rgb) / 0.35);
-    stroke-width: 1.6;
-  }
-  .tick {
-    stroke: rgb(var(--line-rgb) / 0.55);
-    stroke-width: 1.4;
-  }
-  .tick.hot {
-    stroke: var(--red);
-  }
-  .needle line {
-    stroke: var(--amber);
-    stroke-width: 1.6;
-    stroke-linecap: round;
-    filter: drop-shadow(0 0 calc(3px * var(--glow-scale)) var(--amber));
-  }
-  .hub {
-    fill: var(--bg-3);
-    stroke: var(--edge);
-    stroke-width: 0.8;
+    /* Taller than the 13px rung bar it draws, with the extra height pulled
+       back by an equal negative margin so it doesn't grow .slot's flow
+       height — the overshoot is headroom for a lit rung's glow to bleed
+       into, same room the old box-shadow had in .slot's padding. */
+    height: 25px;
+    margin: -6px 0;
+    display: block;
+    contain: paint;
   }
 
   /* ── shared trim ── */
@@ -600,5 +599,18 @@
     font-size: 10px;
     color: var(--text-mid);
     line-height: 1;
+  }
+
+  /* ── LADDER ──
+     A routed slot with the canvas lying in it. `--bevel-frame-inset` rather
+     than a border: the bar has to read as sunk into the panel, or it is a
+     progress bar drawn on top of one. */
+  .slot {
+    position: relative;
+    width: 100%;
+    padding: 4px 5px;
+    border-radius: var(--ctrl-radius);
+    background: var(--bg-sunken);
+    box-shadow: var(--bevel-frame-inset), var(--bevel-inset);
   }
 </style>

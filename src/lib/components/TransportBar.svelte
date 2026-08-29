@@ -638,6 +638,14 @@
     background: rgb(var(--bg-0-rgb) / 0.75);
     /* A recessed display window: the lip runs the other way round. */
     box-shadow: var(--bevel-inset);
+    /* .clock/.bars textContent is rewritten every frame from the rAF loop
+       below (.clock unconditionally, the whole time the app is open) —
+       containment goes HERE, not on either child directly: `contain` on
+       .clock broke its shared `align-items: baseline` with .bars (layout
+       containment gives a contained box no baseline to share), and clipped
+       the playing-state glow below at the glyph edge. This padded box has
+       room for both. */
+    contain: paint;
   }
   .clock {
     font-size: 21px;

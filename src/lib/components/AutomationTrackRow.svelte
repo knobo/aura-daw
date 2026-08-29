@@ -10,6 +10,7 @@
   import { project } from "../state/project.svelte";
   import { view } from "../state/view.svelte";
   import { canvasPos } from "../utils/canvas-pos";
+  import { uiZoomFactor } from "../utils/ui-zoom";
   import { deletePoint, hitTest, movePoint } from "../utils/automation-edit";
   import { automationClipGesture } from "../utils/automation-clip-gesture";
 
@@ -148,7 +149,9 @@
     selectedId = clip.id;
     const el = e.currentTarget as HTMLElement;
     const rect = el.getBoundingClientRect();
-    const nearRight = rect.right - e.clientX <= EDGE_PX;
+    // rect/clientX are VISUAL px; EDGE_PX is meant as a LAYOUT-px hit zone
+    // (so it scales with the UI like everything else under zoom).
+    const nearRight = (rect.right - e.clientX) / uiZoomFactor() <= EDGE_PX;
     const curve = curveOf(clip);
     const canvas = canvases.get(clip.id);
 
@@ -200,7 +203,7 @@
     const el = e.currentTarget as HTMLElement;
     if (!dragging) {
       const rect = el.getBoundingClientRect();
-      hoverEdge = selectedId === clip.id && rect.right - e.clientX <= EDGE_PX;
+      hoverEdge = selectedId === clip.id && (rect.right - e.clientX) / uiZoomFactor() <= EDGE_PX;
       return;
     }
     if (dragClipId !== clip.id) return;
@@ -214,7 +217,9 @@
       modulation.preview(curve.id, moved.points);
       return;
     }
-    const dx = e.clientX - dragStartX;
+    // clientX is VISUAL px; view.spp is samples-per-LAYOUT-px — divide out
+    // the interface zoom before scaling (same fix as clip-drag.svelte.ts).
+    const dx = (e.clientX - dragStartX) / uiZoomFactor();
     if (Math.abs(dx) > 2) dragMoved = true;
     if (!dragMoved) return;
     if (dragMode === "resize") {

@@ -9,6 +9,7 @@
   import { linToDb } from "../utils/format";
   import { theme } from "../theme/theme.svelte";
   import { alpha } from "../theme/tokens";
+  import { runWhileVisible } from "../utils/visible-raf";
 
   let {
     trackId,
@@ -51,7 +52,6 @@
       { disp: DB_MIN, rms: DB_MIN, holdDb: DB_MIN, holdUntil: 0 },
       { disp: DB_MIN, rms: DB_MIN, holdDb: DB_MIN, holdUntil: 0 },
     ];
-    let raf = 0;
     let last = performance.now();
     let w = 0;
     let h = 0;
@@ -72,7 +72,6 @@
     const gap = 2;
 
     const draw = (now: number) => {
-      raf = requestAnimationFrame(draw);
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       if (w === 0 || h === 0) return;
@@ -82,7 +81,6 @@
         { peak: m?.peakL ?? 0, rms: m?.rmsL ?? 0 },
         { peak: m?.peakR ?? 0, rms: m?.rmsR ?? 0 },
       ];
-      if (m?.clipped) clipLatched = true;
 
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       ctx.clearRect(0, 0, w, h);
@@ -159,9 +157,24 @@
       }
     };
 
-    raf = requestAnimationFrame(draw);
+    const stop = runWhileVisible(canvas, draw);
+
+    // Clip detection is the one thing this widget exists to never miss —
+    // gating it with the canvas redraw would drop a clip on any track
+    // scrolled out of view, which is the common case past a screenful of
+    // tracks, not the edge case. Cheap enough (one Map lookup) to run
+    // unconditionally; `clipLatched` only ever writes on the rare
+    // true-going transition, so this doesn't reintroduce 60Hz reactivity.
+    let clipRaf = 0;
+    const checkClip = () => {
+      clipRaf = requestAnimationFrame(checkClip);
+      if (latestMeter(id)?.clipped) clipLatched = true;
+    };
+    clipRaf = requestAnimationFrame(checkClip);
+
     return () => {
-      cancelAnimationFrame(raf);
+      cancelAnimationFrame(clipRaf);
+      stop();
       ro.disconnect();
     };
   });
@@ -184,5 +197,11 @@
     width: 100%;
     display: block;
     cursor: pointer;
+    /* Redrawn every frame from the meter bus. Without paint containment,
+       WebKitGTK's compositor has been observed folding this canvas's own
+       damage into a full-viewport repaint instead of isolating it to the
+       canvas's own box (WebKit Timelines: ~600ms/paint, full-page quad,
+       on every meter tick). */
+    contain: paint;
   }
 </style>

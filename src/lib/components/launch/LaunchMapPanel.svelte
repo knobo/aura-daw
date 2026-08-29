@@ -8,21 +8,27 @@
   import { project } from "../../state/project.svelte";
   import { MIDI_NOTES, midiNoteName } from "../../utils/launch-map";
   import type { LaunchBinding } from "../../types/ipc";
+  import { uiZoomFactor } from "../../utils/ui-zoom";
 
   let pos = $state({ x: 24, y: 72 });
-  let drag: { dx: number; dy: number } | null = null;
+  let drag: { startX: number; startY: number; origX: number; origY: number } | null = null;
 
   function onTitleDown(e: PointerEvent) {
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest("button")) return;
-    drag = { dx: e.clientX - pos.x, dy: e.clientY - pos.y };
+    drag = { startX: e.clientX, startY: e.clientY, origX: pos.x, origY: pos.y };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
   }
   function onTitleMove(e: PointerEvent) {
     if (!drag) return;
+    // clientX/Y are VISUAL px; pos.x/y are LAYOUT px (written straight into
+    // left/top inside the zoomed body) — divide the pointer delta by the
+    // interface zoom before applying it, or the window runs ahead of the
+    // pointer (same fix as clip-drag.svelte.ts).
+    const zoom = uiZoomFactor();
     pos = {
-      x: Math.max(8, e.clientX - drag.dx),
-      y: Math.max(8, e.clientY - drag.dy),
+      x: Math.max(8, drag.origX + (e.clientX - drag.startX) / zoom),
+      y: Math.max(8, drag.origY + (e.clientY - drag.startY) / zoom),
     };
   }
   function onTitleUp() {
