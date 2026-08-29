@@ -2026,6 +2026,11 @@ impl ControlPlane {
                 .ok_or_else(|| format!("unknown player: {id}"))?;
             (
                 Self::player_source_length(&session, p, rate)?,
+                // `Gate` and `OneShot` are byte-identical here, by design:
+                // the design's `gate` ("sounds while held; release cuts it")
+                // is entirely a matter of WHO calls `player_stop` and WHEN —
+                // a pointerup, not anything the engine can see — so this is
+                // the one and only place trigger mode does anything at all.
                 p.trigger.mode == crate::audio::player::TriggerMode::Loop,
             )
         };
@@ -2082,6 +2087,30 @@ impl ControlPlane {
                 format!("unknown player: {id}")
             },
         )
+    }
+
+    /// Set a player's trigger mode through the transaction channel
+    /// (`Op::Set { path: PropPath::TriggerMode, .. }`) — the seam a user
+    /// needs to reach anything but the `OneShot` default (fix round 1: the
+    /// plan otherwise shipped Loop and Gate unreachable by any caller).
+    /// Document-only (Task 3's ruling: `player_fire` reads `p.trigger.mode`
+    /// off the live session on every press, not off the compiled graph), so
+    /// this never rebuilds and never touches `GraphTables`.
+    pub fn set_trigger_mode(
+        &self,
+        id: &str,
+        mode: crate::audio::player::TriggerMode,
+        meta: op::TxMeta,
+    ) -> Result<(), String> {
+        self.commit(meta, |tx| {
+            tx.apply(op::Op::Set {
+                object: op::ObjectRef::Player(PlayerId::from(id)),
+                path: op::PropPath::TriggerMode,
+                from: serde_json::Value::Null,
+                to: serde_json::to_value(mode).unwrap(),
+            })
+        })?;
+        Ok(())
     }
 
     /// Add a player through the transaction channel (`Op::PlayerAdd`), so it
@@ -5891,6 +5920,18 @@ pub fn player_stop(player_id: String, control: State<'_, Arc<ControlPlane>>) -> 
     control.player_stop(&player_id)
 }
 
+/// Set a player's trigger mode — thin delegate over
+/// [`ControlPlane::set_trigger_mode`]. Fix round 1 (Task 11): the command
+/// surface that makes Gate and Loop reachable by anyone but a unit test.
+#[tauri::command]
+pub fn player_set_trigger_mode(
+    player_id: String,
+    mode: crate::audio::player::TriggerMode,
+    control: State<'_, Arc<ControlPlane>>,
+) -> Result<(), String> {
+    control.set_trigger_mode(&player_id, mode, op::TxMeta::user("set trigger mode"))
+}
+
 /// Open a gesture boundary (Plan E Task 14 — round-2 inventory row 31, ADR
 /// 0003) — thin delegate over [`ControlPlane::gesture_begin`]. Returns the
 /// new gesture's id so a later `gesture_end` can refuse to close a
@@ -6315,31 +6356,16 @@ mod tests {
         p.id.to_string()
     }
 
-    /// Two audio tracks, each carrying one clip — the fixture Task 11's
-    /// retrigger test needs: two players independent enough that nothing
-    /// about their source ties them together.
+    /// Two audio tracks, each carrying one clip. Two players do NOT need
+    /// distinct clips to be independent — `two_players_sound_at_once_on_their_own_clocks`
+    /// already fires two off the SAME clip — this exists only because the
+    /// retrigger test wants two clearly-distinct players to reason about.
     fn test_control_plane_with_two_audio_clips() -> ControlPlane {
         let (cp, _rx, _ev) = test_plane_with_tracks(&["t-1", "t-2"]);
         cp.session.lock().store.clips.push(test_clip("c1", "t-1"));
         cp.session.lock().store.clips.push(test_clip("c2", "t-2"));
         republish_tables(&cp);
         cp
-    }
-
-    /// `TriggerMode` through the same door the frontend will use once Task
-    /// 13 wires a command to it: a plain `Op::Set`. Document-only (`Task 3`'s
-    /// ruling: read live off `p.trigger.mode` per press, not off the
-    /// compiled graph), so no republish is needed after this.
-    fn set_trigger_mode(cp: &ControlPlane, id: &str, mode: TriggerMode) {
-        cp.commit(op::TxMeta::user("trigger mode"), |tx| {
-            tx.apply(Op::Set {
-                object: ObjectRef::Player(PlayerId::from(id)),
-                path: PropPath::TriggerMode,
-                from: serde_json::Value::Null,
-                to: serde_json::to_value(mode).unwrap(),
-            })
-        })
-        .unwrap();
     }
 
     /// The V2 gate's first line: a pad fires a WAV while the arrangement
@@ -6633,41 +6659,52 @@ mod tests {
     /// `TriggerMode::OneShot` is the default, and needs no looping flag: a
     /// non-looping clock already ends itself at its own `end` (`advance`,
     /// pinned by `clock::tests::advance_moves_running_clocks_and_stops_one_at_its_end`).
-    /// This pins the BEHAVIOUR through `player_fire`, not the clock's own
-    /// arithmetic a second time.
+    /// This pins the BEHAVIOUR through `player_fire` at the exact boundary —
+    /// on through the last frame, off past it — not merely "off eventually",
+    /// which a clock fired for a fraction of the real length would also
+    /// satisfy. Sets Loop first so the OneShot write actually changes
+    /// something, through the real command (fix round 1, item 4).
     #[test]
     fn one_shot_plays_to_its_end_and_stops_itself() {
         let cp = test_control_plane_with_an_audio_clip();
         let id = add_audio_player(&cp, "c1", false);
-        set_trigger_mode(&cp, &id, TriggerMode::OneShot);
+        cp.set_trigger_mode(&id, TriggerMode::Loop, op::TxMeta::user("loop")).unwrap();
+        cp.set_trigger_mode(&id, TriggerMode::OneShot, op::TxMeta::user("one-shot")).unwrap();
         cp.player_fire(&id).unwrap();
         let clock = cp.player_clock_for(&id).unwrap();
         let tables = cp.tables_for_tests();
         assert!(tables.clocks.is_on(clock));
-        tables.clocks.advance(48_000); // the clip's own length (test_clip)
-        assert!(!tables.clocks.is_on(clock), "a one-shot ends on its own");
+        tables.clocks.advance(47_999); // the clip is 48000 long (test_clip)
+        assert!(tables.clocks.is_on(clock), "still inside the clip");
+        tables.clocks.advance(1);
+        assert!(!tables.clocks.is_on(clock), "one-shot ends AT the clip's end, not before or after");
     }
 
-    /// `TriggerMode::Gate` needs an explicit release: nothing about the
-    /// clock stops it early, so the only thing standing between "sounding"
-    /// and "silent" here is `player_stop`.
+    /// `Gate` and `OneShot` are byte-identical in the engine (`player_fire`'s
+    /// own comment on its `== Loop` check) — the design's "release cuts it"
+    /// is a pointerup calling `player_stop`, which the engine cannot see.
+    /// So this pins the ONE thing `set_trigger_mode` (fix round 1's new
+    /// command) can be asked to prove: the value it writes reaches the
+    /// document and reads back, round-tripped through real `TriggerMode`
+    /// serde — not that anything about playback changes, because nothing
+    /// does. `player_stop` cutting a sounding pad is already pinned by
+    /// `two_players_sound_at_once_on_their_own_clocks`.
     #[test]
-    fn gate_stops_on_release_before_the_source_ends() {
+    fn set_trigger_mode_reaches_the_document() {
         let cp = test_control_plane_with_an_audio_clip();
         let id = add_audio_player(&cp, "c1", false);
-        set_trigger_mode(&cp, &id, TriggerMode::Gate);
-        cp.player_fire(&id).unwrap();
-        let clock = cp.player_clock_for(&id).unwrap();
-        assert!(cp.tables_for_tests().clocks.is_on(clock));
-        cp.player_stop(&id).unwrap();
-        assert!(
-            !cp.tables_for_tests().clocks.is_on(clock),
-            "the release, not the clip's end, cut it"
+        cp.set_trigger_mode(&id, TriggerMode::Gate, op::TxMeta::user("gate")).unwrap();
+        assert_eq!(
+            cp.players().iter().find(|p| p.id.as_str() == id).unwrap().trigger.mode,
+            TriggerMode::Gate,
+            "the write reached the document"
         );
     }
 
     /// A retrigger rewinds THIS player and nothing else — the property the
-    /// single overlay this branch replaced could not have (V-4).
+    /// single overlay this branch replaced could not have (V-4). Checks
+    /// BOTH halves: `a`'s own playhead is back at 0 (a no-op retrigger would
+    /// leave it running from wherever it was), and `b` is untouched.
     #[test]
     fn retriggering_one_player_leaves_another_sounding() {
         let cp = test_control_plane_with_two_audio_clips();
@@ -6677,8 +6714,16 @@ mod tests {
         cp.player_fire(&b).unwrap();
         cp.tables_for_tests().clocks.advance(128);
         cp.player_fire(&a).unwrap();
+
         let cb = cp.player_clock_for(&b).unwrap();
-        assert!(cp.tables_for_tests().clocks.is_on(cb), "b untouched by a's retrigger");
+        let tables = cp.tables_for_tests();
+        assert!(tables.clocks.is_on(cb), "b untouched by a's retrigger");
+        let slot_a = tables.slots[&TrackId::from(a.as_str())];
+        assert_eq!(
+            tables.clocks.playhead(slot_a, 0, false).pos,
+            0,
+            "a's second press rewound ITS OWN playhead back to 0"
+        );
     }
 
     /// §10, and the reason this moved off `effect.rebuild`: a fader drag on

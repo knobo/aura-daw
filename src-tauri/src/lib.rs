@@ -328,6 +328,7 @@ pub fn run() {
             control::player_remove,
             control::player_fire,
             control::player_stop,
+            control::player_set_trigger_mode,
             // ---- library & browser (Track E, additive) ----
             library::library_scan,
             library::library_default_root,
