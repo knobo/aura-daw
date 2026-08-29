@@ -366,6 +366,25 @@ non-trivial runtime/complexity to the workflow, so they were left out of v1.
 
 ## Next steps (when picked up)
 
+- **Split the `rust` job out of `tests.yml` into a path-gated `rust.yml`.**
+  Its inputs are exactly `src-tauri/**` — `Cargo.toml` and `Cargo.lock` live
+  in there, and `cargo test` cannot see frontend code at all — yet it runs on
+  every PR. A frontend-only PR spends ~10 minutes of runner time (apt for
+  webkit/lilv/ffmpeg, then `cargo test --test-threads=1`) re-proving
+  something that could not have changed. Measured on PR #128, an 11-file
+  diff entirely under `src/` and `docs/`.
+
+  It has to be its own FILE, not a `paths:` on the job: GitHub applies
+  `paths:` per workflow. `engine.yml` already does exactly this and carries
+  the reasoning, the shape to copy, and the `push: branches: [main]` mirror
+  the job needs or it loses its `rust-cache` base.
+
+  Leave the frontend job ungated — it costs a minute, and gating both would
+  leave a docs-only PR with no checks at all. And keep `engine.yml`'s
+  warning in view: `main` is not branch-protected today, but if it ever is,
+  a path-gated job must NOT be listed as required — a skipped job blocks the
+  PR forever.
+
 - Add `zynaddsubfx-lv2 dpf-plugins-clap dpf-plugins-lv2 mda-lv2` to the apt
   install step in the `rust` job so the plugin-gated tests actually run
   instead of skipping.
