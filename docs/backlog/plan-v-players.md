@@ -170,9 +170,13 @@ clock never ends itself (`ClockTable::advance` wraps it), and
 transport stopped, so the pad sounded indefinitely. The only thing that
 could reach it was `player_stop(id)`, which no frontend calls yet.
 
-The consequence to keep in view: **while V2 has no UI (Task 13), a pad can
-only be stopped from the backend.** Whatever surface Task 13 builds must
-bind stop-all, not only per-pad stop.
+The consequence to keep in view: **while V2 has no UI (Task 13), there is no
+PER-PAD stop a user can reach.** Stop-ALL already reaches a pad — Escape runs
+`stopAllSound` → `launchStop` → the `launch_stop` command →
+`stop_launch_overlay` — so a runaway pad is recoverable today. What has no
+surface is stopping one pad while the others keep sounding, which is
+`player_stop(id)`, and Task 13 owes both it and a stop-all binding of its
+own.
 
 ## Open questions (owner)
 

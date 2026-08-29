@@ -328,22 +328,30 @@ pub fn compile_routing(
             let slot = slots[&node.id];
             if slot < n_slots {
                 output[slot] = node.output.map(|d| pos_of_doc[d]);
-                // V-17 again, through the OTHER door. `out_delay` pads the
-                // dry path up to the slowest return, so leaving it alive for
-                // a player would re-impose the very latency `track_pdc` was
-                // just zeroed to avoid — the linear-phase EQ on some return
-                // would still land 43–85 ms of delay on the pad. Its routing
-                // (`output`, one line up) is untouched, and so is send-edge
-                // compensation (`RtSend::delay`, below): a player's send into
-                // a shared bus still has to arrive in step with that bus's
-                // other inputs, which is a different question from where the
-                // pad's own dry signal belongs in time.
+                // V-17 again, through the OTHER door, and the answer depends
+                // on WHERE the pad is routed.
                 //
-                // It is also what makes `mixer`'s exclusive-idle early-out
-                // safe: with no `out_pdc` line on the row there is nothing
-                // holding the tail of the last press, so skipping the strip
-                // cannot leak it into the next one.
-                out_delay[slot] = if is_player {
+                // To the MASTER (`None`, the default and the path the ear
+                // check uses): no delay. `out_delay` would pad the dry path
+                // up to the slowest return, re-imposing the very latency
+                // `track_pdc` was just zeroed to avoid — a linear-phase EQ on
+                // some return would still land 43–85 ms on the pad, and the
+                // pad has to answer the press.
+                //
+                // Into a BUS (`Some`): compensated to that bus's `t_in`,
+                // exactly as the pad's SEND edge into the same bus is, and
+                // measured from the same `ready`. Inside a bus everything
+                // has to arrive together or the mix smears; zeroing only this
+                // half put the pad's dry `t_in` samples ahead of its own send
+                // copy at the same summing point, so the pad smeared against
+                // ITSELF. The price is that a pad routed into a bus holding a
+                // linear-phase-EQ'd track inherits that latency — accepted,
+                // because the alternative is a smeared bus and master stays
+                // at zero.
+                //
+                // `ready` for a player is its own applied chain latency, not
+                // `t_src`; see the comment above it.
+                out_delay[slot] = if is_player && node.output.is_none() {
                     0
                 } else {
                     target_of(node.output).saturating_sub(ready)
@@ -351,6 +359,17 @@ pub fn compile_routing(
             }
         }
         // Send edges, in document order, matched back to their rows.
+        //
+        // `t_in[dest] - ready` SATURATES, and for a player that is a case
+        // with no fix rather than a bug: a pad whose own applied chain
+        // latency exceeds what the bus is waiting for gets 0, so its copy
+        // leaves as early as it can and is still late by the excess, and
+        // nothing waits for it. Making the bus wait would delay every other
+        // input for one pad — the padding V-17 exists to refuse — and the
+        // pad's dry path is unpadded for the same reason, so the two halves
+        // stay consistent. Pinned by
+        // `a_player_slower_than_its_bus_gets_no_compensation_and_is_late`,
+        // so changing it has to be deliberate.
         let Some(doc_track) = tracks.iter().find(|t| t.id == node.id) else { continue };
         let mut planned = Vec::with_capacity(doc_track.sends.len());
         for s in &doc_track.sends {
@@ -750,6 +769,121 @@ mod tests {
              512 samples apart"
         );
         assert_eq!(plan.track_pdc[slots[&crate::ids::TrackId::from("pad")]], 0, "still unpadded");
+    }
+
+    /// V-17, master half: a pad routed to the MASTER waits for nothing.
+    ///
+    /// This is the default and the path the owner's ear-check uses — the pad
+    /// has to answer the press, not the slowest return in the session.
+    #[test]
+    fn v17_a_player_routed_to_master_has_no_dry_delay() {
+        let mut vox = track("vox", "audio");
+        vox.sends.push(send("s1", "verb"));
+        let tracks = vec![vox, track("verb", "bus")];
+        let players =
+            vec![crate::audio::player::Player::new(crate::ids::PlayerId::from("pad"), "PAD")];
+        let slots = crate::audio::types::derive_slots_with_players(&tracks, &players);
+        let mut chains = HashMap::new();
+        chains.insert("vox".into(), latency_chain(512, false));
+        chains.insert("verb".into(), latency_chain(256, false));
+        let nodes = crate::audio::node::mix_nodes_with_players(&tracks, &players);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
+
+        let pad = slots[&crate::ids::TrackId::from("pad")];
+        assert_eq!(plan.output[pad], None, "the default routing");
+        assert_eq!(plan.out_delay[pad], 0, "V-17: to master, the pad answers the press");
+        assert!(
+            plan.out_delay[slots[&crate::ids::TrackId::from("vox")]] > 0,
+            "while a track on the same master still waits for the return"
+        );
+    }
+
+    /// V-17, bus half: a pad routed INTO a bus is compensated to that bus's
+    /// `t_in`, by exactly the number its SEND edge into the same bus gets.
+    ///
+    /// The equality is the ruling. Zeroing the dry path here while the send
+    /// edge stayed compensated made the pad smear against ITSELF: one copy
+    /// arriving `t_in` samples ahead of the other, into the same summing
+    /// point. Inside a bus, everything must land together or the mix smears;
+    /// master is where "the pad answers the press" governs instead.
+    #[test]
+    fn v17_a_player_routed_into_a_bus_is_compensated_like_its_send() {
+        let mut vox = track("vox", "audio");
+        vox.sends.push(send("s1", "verb"));
+        let tracks = vec![vox, track("verb", "bus")];
+        let players = vec![{
+            let mut p =
+                crate::audio::player::Player::new(crate::ids::PlayerId::from("pad"), "PAD");
+            p.node.output = Some("verb".into());
+            p.node.sends.push(crate::audio::types::SendSlot {
+                id: "ps1".into(),
+                dest: "verb".into(),
+                amount_db: 0.0,
+                pre_fader: false,
+            });
+            p // NOT raw: V-6 would strip the send off a raw player
+        }];
+        let slots = crate::audio::types::derive_slots_with_players(&tracks, &players);
+        let mut chains = HashMap::new();
+        chains.insert("vox".into(), latency_chain(512, false));
+        let nodes = crate::audio::node::mix_nodes_with_players(&tracks, &players);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
+
+        let pad = slots[&crate::ids::TrackId::from("pad")];
+        let edge = &plan.sends[&crate::ids::TrackId::from("pad")][0];
+        assert_eq!(plan.output[pad], Some(0), "routed into the bus, not the master");
+        assert_eq!(
+            plan.out_delay[pad], 512,
+            "the bus waits for vox's chain, so the pad's dry does too"
+        );
+        assert_eq!(
+            plan.out_delay[pad], edge.delay,
+            "dry and send reach the SAME bus, so they must reach it together"
+        );
+        assert_eq!(plan.track_pdc[pad], 0, "source padding stays off either way");
+    }
+
+    /// The one case edge compensation cannot serve, pinned rather than fixed.
+    ///
+    /// A player's edge delay is `t_in[dest] - ready`, where `ready` is the
+    /// pad's OWN applied chain latency (V-17 took `t_src` away from it). When
+    /// that latency exceeds what the bus is waiting for, the subtraction
+    /// saturates at zero: the pad's copy leaves as soon as it can and is late
+    /// by the excess, and nothing waits for it. Compensating would mean
+    /// delaying the whole bus for one pad, which is the padding V-17 exists to
+    /// refuse. It is self-consistent with the dry path, which is also
+    /// unpadded, and it is a chain the performer chose to put on a pad.
+    #[test]
+    fn a_player_slower_than_its_bus_gets_no_compensation_and_is_late() {
+        let mut vox = track("vox", "audio");
+        vox.sends.push(send("s1", "verb"));
+        let tracks = vec![vox, track("verb", "bus")];
+        let players = vec![{
+            let mut p =
+                crate::audio::player::Player::new(crate::ids::PlayerId::from("pad"), "PAD");
+            p.node.output = Some("verb".into());
+            p.node.sends.push(crate::audio::types::SendSlot {
+                id: "ps1".into(),
+                dest: "verb".into(),
+                amount_db: 0.0,
+                pre_fader: false,
+            });
+            p
+        }];
+        let slots = crate::audio::types::derive_slots_with_players(&tracks, &players);
+        let mut chains = HashMap::new();
+        chains.insert("vox".into(), latency_chain(512, false));
+        chains.insert("pad".into(), latency_chain(1024, false)); // slower than the whole graph
+        let nodes = crate::audio::node::mix_nodes_with_players(&tracks, &players);
+        let plan = compile_routing(&nodes, &slots, &mut chains, slots.len(), 512);
+
+        let pad = slots[&crate::ids::TrackId::from("pad")];
+        assert_eq!(
+            plan.sends[&crate::ids::TrackId::from("pad")][0].delay, 0,
+            "512 - 1024 saturates: the copy is 512 samples LATE into the bus"
+        );
+        assert_eq!(plan.out_delay[pad], 0, "and the dry path is late by the same amount");
+        assert_eq!(plan.track_pdc[pad], 0);
     }
 
     /// Latency is compensated PER EDGE. A track that both sends into a slow

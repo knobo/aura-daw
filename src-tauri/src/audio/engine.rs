@@ -5797,6 +5797,115 @@ mod tests {
         );
     }
 
+    /// A pad whose PRE-fader send into bus 0 carries `delay` samples of edge
+    /// compensation (V-17's surviving half). The pad is MUTED, so its dry
+    /// path contributes nothing and everything reaching the master came
+    /// through the send and the bus — which is what makes the sums below
+    /// measure the send copy and only the send copy.
+    fn compensated_send_pad(delay: Option<usize>) -> (RtGraph, u64) {
+        let (c, sid) = trimmed_clip();
+        let row = player_clip_row(&c, true, &cache_with(&sid, ramp_source(200)));
+        let params = Arc::new(ParamTable::with_slots_and_sends(2, 1));
+        for slot in 0..2 {
+            params.set_gain_pair_linear(slot, 1.0);
+            params.set_pan(slot, 0.0);
+        }
+        params.set_send_amount_linear(0, 1.0);
+        params.set_flag(1, super::super::rt::FLAG_MUTE, true);
+        let mut pad = RtTrack::clips(1, row);
+        pad.sends = vec![crate::audio::rt::RtSend {
+            bus: 0,
+            amount: 0,
+            pre_fader: true,
+            delay: delay.map(|d| crate::audio::pdc::DelayLine::new(d, 64, 2)),
+        }];
+        let bus = crate::audio::rt::RtBus {
+            slot: 0,
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            output: None,
+            out_pdc: None,
+            win: Default::default(),
+        };
+        let mut g = RtGraph::with_buses(vec![pad], vec![bus], 1, params);
+        let clocks = crate::audio::clock::ClockTable::with_slots_clocks_and_players(2, 2, 1);
+        clocks.set_transport_playing(true);
+        clocks.bind_slot(1, 1);
+        g.clocks = Arc::new(clocks);
+        (g, c.length_samples)
+    }
+
+    /// One press through `compensated_send_pad`, block by block, exactly as
+    /// the stream callback drives it: render, then advance the clocks.
+    fn press_and_collect(g: &mut RtGraph, len: u64, blocks: usize) -> Vec<Vec<f32>> {
+        use crate::audio::transport::LoopSpec;
+        const FRAMES: usize = 64;
+        g.clocks.fire(1, 0, len, false);
+        let mut out = vec![0.0f32; FRAMES * 2];
+        let mut blocks_out = Vec::with_capacity(blocks);
+        for _ in 0..blocks {
+            out.fill(0.0);
+            mixer::render(g, 0, &LoopSpec::OFF, &mut out, 2, 48_000, false, None);
+            g.clocks.advance(FRAMES as u64);
+            blocks_out.push(out.clone());
+        }
+        blocks_out
+    }
+
+    /// Fix round 2, finding A. The exclusive-idle early-out skips
+    /// `tap_into_bus`, and `DelayLine::process` inside it is the ONLY thing
+    /// that advances a send edge's compensating delay. `DelayLine` has no
+    /// reset, so the last `delay` samples of every press used to sit in the
+    /// line and never reach the bus: the send copy of a one-shot was
+    /// TRUNCATED at its tail.
+    ///
+    /// The invariant is conservation — a delay moves energy in time, it does
+    /// not destroy it — so the same press through a compensated edge and
+    /// through an uncompensated one must deliver the same total into the bus,
+    /// given enough blocks for the delay to clear.
+    #[test]
+    fn an_idle_pad_still_flushes_its_compensated_send_tail_into_the_bus() {
+        let total = |delay: Option<usize>| -> f64 {
+            let (mut g, len) = compensated_send_pad(delay);
+            press_and_collect(&mut g, len, 8)
+                .iter()
+                .flat_map(|b| b.iter())
+                .map(|s| *s as f64)
+                .sum()
+        };
+        let compensated = total(Some(32));
+        let straight = total(None);
+        assert!(straight > 0.0, "the rig has to deliver something at all");
+        assert!(
+            (compensated - straight).abs() < 1e-6,
+            "the compensated send must deliver the WHOLE press into the bus, \
+             not stop 32 samples short of its tail: {compensated} vs {straight}"
+        );
+    }
+
+    /// The other half of the same defect, and the audible one. Whatever the
+    /// line still held when the pad went idle was replayed at the ONSET of
+    /// the next press — the previous hit's tail on top of the new one.
+    ///
+    /// Two identical presses of the same one-shot must produce identical
+    /// audio, block for block. They do not if the second one starts by
+    /// emptying the first one's leftovers.
+    #[test]
+    fn a_second_press_does_not_carry_the_first_press_s_tail_into_its_bus() {
+        let (mut g, len) = compensated_send_pad(Some(32));
+        let first = press_and_collect(&mut g, len, 4);
+        let second = press_and_collect(&mut g, len, 4);
+        assert!(
+            first[0].iter().any(|s| *s != 0.0),
+            "the first press has to reach the bus at all"
+        );
+        assert_eq!(
+            second[0], first[0],
+            "the second press's first block is contaminated by the tail the \
+             idle early-out stranded in the send's delay line"
+        );
+    }
+
     /// The cost datum for Plan V's idle pads — the number the whole "an idle
     /// player is about one atomic load per block" claim rests on, and which
     /// nobody had measured before fix round 1 (finding 1). `scripts/perf-check.sh`
@@ -5810,7 +5919,7 @@ mod tests {
     /// flake on a loaded machine. Run it deliberately:
     ///
     /// ```text
-    /// cargo test --lib -- --ignored --nocapture idle_players_block_cost
+    /// cargo test --release --lib -- --ignored --nocapture idle_players_block_cost
     /// ```
     #[test]
     #[ignore]

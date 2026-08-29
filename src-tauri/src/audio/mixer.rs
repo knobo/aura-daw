@@ -439,7 +439,7 @@ fn process_inserts(
 /// block, by construction" — true only in the exclusive-and-off case below,
 /// which is a player whose pad is not pressed. It exists so the strip can
 /// skip such a row outright rather than render it and zero it at the fader;
-/// see the early-out in `render_windowed`, and fix round 1 finding 1 for the
+/// see the early-out in `render_impl`, and fix round 1 finding 1 for the
 /// three things that cost. `own_clock` is "this node reads a clock of its
 /// own" — the predicate that
 /// bypasses another track's solo, and exactly `clock_of(slot) !=
@@ -660,6 +660,46 @@ pub fn render_rt_with_input(
     )
 }
 
+/// One window of SILENCE through an idle player row's tail stages, so the
+/// delay lines the row carries keep running while its strip is skipped.
+///
+/// See the early-out in `render_impl` for why this exists. Silence is not an
+/// approximation of what the full strip would have produced: an idle pad has
+/// `on = false`, and `apply_fader_into` zeroes `post` for it anyway.
+///
+/// `#[cold]` and out of line deliberately. The common idle row carries no
+/// delay line at all and never reaches here, and the caller is the per-block
+/// track loop — this must not cost the hot path a register.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn flush_idle_tail(
+    tr: &mut RtTrack,
+    params: &super::rt::ParamTable,
+    post_buf: &mut [f32],
+    bus_buf: &mut [f32],
+    tap_buf: &mut [f32],
+    out: &mut [f32],
+    out_ch: usize,
+    w0: usize,
+    w_len: usize,
+) {
+    let Some(post) = post_buf.get_mut(..w_len * 2) else { return };
+    post.fill(0.0);
+    for snd in tr.sends.iter_mut().filter(|s| s.pre_fader) {
+        let amount = params.send_amount_linear(snd.amount);
+        tap_into_bus(snd, bus_buf, tap_buf, 0, post, w_len, amount);
+    }
+    for snd in tr.sends.iter_mut().filter(|s| !s.pre_fader) {
+        let amount = params.send_amount_linear(snd.amount);
+        tap_into_bus(snd, bus_buf, tap_buf, 0, post, w_len, amount);
+    }
+    if let Some(d) = tr.out_pdc.as_mut() {
+        d.process(post);
+    }
+    route_out(tr.output, out, out_ch, bus_buf, w0, 0, post, w_len);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_impl(
     graph: &mut RtGraph,
@@ -786,15 +826,35 @@ fn render_impl(
             // That last one is "every pad sounds at bar 1" reached through
             // the send path instead of the master path.
             //
-            // Skipping is unconditionally safe HERE and only here. `prime_live`
-            // above already ran, so a cut pad's `all_notes_off` is delivered
-            // whatever this branch does (that is why the early-out is not
-            // hoisted into the prologue). Nothing else in the block body has
-            // state that must advance: `acc` would stay zero, so
-            // `tr.win.pk_*.max(0)` and `+= 0` leave the meters exactly where
-            // rendering-then-zeroing left them, and V-17 means a player row
-            // carries no `pdc` and no `out_pdc` delay line to drain.
+            // Skipping is safe HERE and only here. `prime_live` above already
+            // ran, so a cut pad's `all_notes_off` is delivered whatever this
+            // branch does (that is why the early-out is not hoisted into the
+            // prologue), and `acc` would stay zero, so `tr.win.pk_*.max(0)`
+            // and `+= 0` leave the meters exactly where rendering-then-zeroing
+            // left them.
+            //
+            // What is NOT safe is skipping a DELAY LINE. `d.process` inside
+            // `tap_into_bus` is the only thing that advances a send edge's
+            // compensation, `out_pdc` is the same story on the dry path, and
+            // `DelayLine` has no reset — so a bare `continue` left the last
+            // `delay` samples of every press sitting in the line: the copy
+            // into the bus was truncated at its tail, and the next press
+            // replayed that tail at its own onset, the previous hit on top of
+            // the new one. V-17 leaves both lines alive on a player: the send
+            // edge always, and `out_pdc` whenever the pad is routed into a
+            // bus rather than the master.
+            //
+            // So a row with a line still gets its tail stages, fed SILENCE —
+            // which is exactly what the full strip would have produced here,
+            // because `on` is false for an idle pad and `apply_fader_into`
+            // zeroes `post` anyway. A row with no line — every raw pad, and
+            // the measured 1.98 µs idle case — still takes the bare skip.
             if exclusive_idle {
+                if tr.out_pdc.is_some() || tr.sends.iter().any(|s| s.delay.is_some()) {
+                    flush_idle_tail(
+                        tr, &params, post_buf, bus_buf, tap_buf, out, out_ch, w0, w_len,
+                    );
+                }
                 continue;
             }
             let gain = f32::from_bits(params.gain[tr.slot].load(Relaxed));
