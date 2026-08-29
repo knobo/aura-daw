@@ -82,15 +82,14 @@ sentence got written — if you find a row whose branch is gone from
    harness on a modest laptop. Only chase the insert path (§9.5's
    flamegraph) if that run says a real session breaks.
 
-6. **One test still blocks dropping `--test-threads=1`.** The `midi_out`
-   and `clap_host` families are fixed — the first was a product bug, not a
-   thread race (see [`docs/LANDED.md`](docs/LANDED.md)), and the full
-   parallel suite went 0 of 8 fully green to 45 of 46. The remaining one is
-   PR #124's `lv2_ui` PDEATHSIG test: its child outlived a SIGKILLed parent
-   by over 30 s once in 46 runs, which is too long to be starvation. It
-   prints the surviving pid's `comm` and `ppid` on failure now; pid reuse is
-   the untested hypothesis.
-   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 6
+6. **Dropping `--test-threads=1` — blocked on one ON-HOLD bug.** The
+   `midi_out` and `clap_host` families are fixed; the first was a product
+   bug, not a thread race (see [`docs/LANDED.md`](docs/LANDED.md)), and the
+   full parallel suite went 0 of 8 fully green to 45 of 46. What remains is
+   PR #124's `lv2_ui` PDEATHSIG test, **deliberately deferred** — either a
+   pid-reuse artefact or a real orphaned-plugin-window bug, and nobody knows
+   which. Do not start it as a job; item 7 lists what should bring it back.
+   → [`docs/backlog/ci-hardening.md`](docs/backlog/ci-hardening.md) item 7
 
 **Do not start unless asked:** Composer H2+ (deprioritised);
 Plan G4 (envelope-follower modulators); the native-GUI embed work;

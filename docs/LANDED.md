@@ -27,8 +27,9 @@ the process-wide `plugin_main()` queue.
 Default parallelism, one machine, one sitting: `midi_out::` went 0 of 10
 fully green to 25 of 25, the full `--lib` suite 0 of 8 to 45 of 46. **CI
 keeps `--test-threads=1`**: the one remaining failure is PR #124's
-PDEATHSIG test, whose child survived a SIGKILLed parent for over 30 s once
-and is not yet understood.
+PDEATHSIG test, whose child survived a SIGKILLed parent for over 30 s once.
+It is **on hold by the owner's decision**, with the two candidate causes and
+the conditions for reopening written down — it is not an unclaimed job.
 
 → [`backlog/ci-hardening.md`](backlog/ci-hardening.md) item 6,
 [`TRAPS.md`](TRAPS.md) §Backend and §Tests.

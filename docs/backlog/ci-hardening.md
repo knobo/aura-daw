@@ -319,17 +319,44 @@ PR, but two categories of tests are currently skipped rather than exercised:
    | distinct `midi_out` tests seen failing | 10 | 0 |
    | `--test-threads=1` | — | 1420 passed, 65 s |
 
-   **`--test-threads=1` is still in CI, and one test is why.**
+7. **The PDEATHSIG survivor — ON HOLD (owner's call, 2026-08-29).** This is
+   what keeps `--test-threads=1` in CI, and it is deferred deliberately
+   rather than left open by accident.
+
    `plugins::lv2_ui::tests::the_guarded_child_does_not_outlive_a_parent_that_was_sigkilled`
-   (PR #124's PDEATHSIG regression test) is the single failure in those 46
-   runs. Raising its poll deadline from 5 s to 30 s did not settle it — the
-   child was still alive after 30 s, which is far too long to be scheduler
-   starvation, so the cause is not yet known. It now prints the surviving
-   pid's `comm` and `ppid` on failure; **pid reuse is the untested
-   hypothesis** and the diagnostic exists to confirm or kill it. It did not
-   recur in 30 runs after that, so catching it needs patience. Until it is
-   understood, a ~2% flake is not something to put in a PR-blocking
-   workflow.
+   (PR #124's regression test) was the single failure in the 46
+   default-parallelism runs above. Raising its poll deadline from 5 s to
+   30 s did **not** settle it: the child was still alive after 30 s, which
+   is far too long to be scheduler starvation. It did not recur in 30 runs
+   after that.
+
+   **Which of two bugs it is, is not known, and they differ completely:**
+
+   - *Test artefact.* The check reads `/proc/<pid>`, so a recycled pid makes
+     a long-dead child look alive. The product would be fine. **Untested
+     hypothesis** — the test now prints the surviving pid's `comm` and
+     `ppid` on failure precisely to confirm or kill it.
+   - *Real product bug.* `PR_SET_PDEATHSIG` genuinely does not take
+     sometimes, and the consequence is the one PR #124 set out to fix: a
+     `zynaddsubfx-ext-gui` window the user cannot close, owned by a DSP that
+     no longer exists, which `wm_stack` keeps finding and restacking.
+
+   **Why holding is reasonable.** CI pins `--test-threads=1`, so nothing is
+   flaky there today. The product symptom only appears after AURA dies by
+   SIGKILL or segfault — rare now that PRs #123/#124 closed the crash
+   classes underneath it — and at ~1 in 46 even then.
+
+   **Take it off hold when any of these happens:**
+
+   - An ext-gui window survives a crashed AURA in real use. That is the
+     product bug, observed, and it stops being theoretical.
+   - Someone wants `--test-threads=1` gone (a ~5× faster suite: 65 s → 12 s).
+   - The diagnostic line above is ever captured. Do not re-derive the
+     hypothesis — read the `comm`/`ppid` it prints.
+
+   Cheapest way to catch it deliberately: loop the full `--lib` binary at
+   default parallelism and keep the output of any run that is not
+   `test result: ok`. It took ~46 runs to see once.
 
 ## Why deferred
 
@@ -350,7 +377,7 @@ non-trivial runtime/complexity to the workflow, so they were left out of v1.
   snd_seq snd_seq_dummy` — untested whether GitHub-hosted runners permit
   this) so the two `--skip`ped MIDI tests can run for real, then drop the
   `--skip` flags.
-- Find out why `lv2_ui`'s PDEATHSIG child survived a SIGKILLed parent for
-  over 30 s in 1 run of 46 (item 6). That is the last thing between CI and
-  dropping `--test-threads=1`; the `midi_out` and `clap_host` families are
-  done.
+- The PDEATHSIG survivor is **on hold**, not unclaimed work — item 7 has the
+  hypotheses and the conditions for picking it back up. It is the last thing
+  between CI and dropping `--test-threads=1`; the `midi_out` and `clap_host`
+  families are done.
