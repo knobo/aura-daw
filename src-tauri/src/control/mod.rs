@@ -4937,8 +4937,41 @@ impl ControlPlane {
             // Eager midi adopt (Task 6: no more lazy resync on the first
             // midi command after an open) — same lock as the store swap
             // above, no separate re-acquisition.
+            //
+            // `loaded_dir` reset first: `adopt_midi_from_dir`'s same-dir
+            // skip exists for the lazy READ paths it used to serve
+            // (H-2/M-5's own doc), not for an explicit open — and this IS
+            // one, of a document just freshly re-read and validated above.
+            // Left set, re-opening the very directory already open would
+            // skip the midi reload while the store fields just above
+            // (tracks/clips/PLAYERS) are refreshed unconditionally, same
+            // call, same lock — leaving a `LaunchTarget::Player` binding
+            // (Task 12) pointing at a player id `store.players` had just
+            // been reset out from under it: a silently dead pad, caught by
+            // `player_migration.rs`'s two-open test. The `dirty` guard
+            // inside `adopt_midi_from_dir` still runs after this and still
+            // refuses to clobber a failed-persist's unsaved midi state —
+            // this only removes the same-dir cache hit, not that check.
+            session.midi.loaded_dir = None;
             let bpm = session.store.transport.tempo_bpm;
             crate::midi::adopt_midi_from_dir(&mut session.midi, &dir, bpm);
+            // Plan V — V2 Task 12: retires the launch overlay's `Clip`
+            // targets in favor of players, now that both the just-adopted
+            // launch maps and the just-swapped players/tracks are in place.
+            // In-memory only, like the schema migrations `adopt_midi_from_dir`
+            // itself performs (persist.rs's own doc) — the next save writes
+            // it back; nothing here forces disk I/O under the session lock.
+            let sess = &mut *session;
+            let migrated = crate::midi::launch::migrate_clip_targets_to_players(
+                &mut sess.midi.launch_maps,
+                &sess.midi.clips,
+                &sess.store.tracks,
+                &mut sess.store.players,
+            );
+            if migrated > 0 {
+                log::info!("launch: migrated {migrated} clip binding(s) to players on open");
+                crate::midi::launch::runtime().set_maps(session.midi.launch_maps.clone());
+            }
             // snapshot republish: document swap (open) — a non-op writer,
             // so nothing captured this. Full re-derive before the guard
             // drops, so the published image is never behind the live doc.

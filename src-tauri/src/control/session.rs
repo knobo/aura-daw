@@ -1656,6 +1656,11 @@ fn apply_raw(session: &mut Session, op: &Op, effect: &mut EngineEffect) -> Resul
                             return Err("launch clip target is empty".into());
                         }
                     }
+                    crate::midi::launch::LaunchTarget::Player { player_id } => {
+                        if player_id.as_str().is_empty() {
+                            return Err("launch player target is empty".into());
+                        }
+                    }
                 }
             }
             let previous = match pos {

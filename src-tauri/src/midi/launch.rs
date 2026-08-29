@@ -27,9 +27,17 @@ pub enum LaunchTarget {
         #[serde(alias = "track_ids")]
         track_ids: Vec<String>,
     },
+    /// Kept so a project saved before Task 12's migration still
+    /// deserializes; nothing in this crate constructs one any more.
     Clip {
         #[serde(alias = "clip_id")]
         clip_id: String,
+    },
+    /// Plan V: the binding fires a player. What a `Clip` target becomes on
+    /// open — see [`migrate_clip_targets_to_players`].
+    Player {
+        #[serde(alias = "player_id")]
+        player_id: crate::ids::PlayerId,
     },
 }
 
@@ -110,6 +118,88 @@ pub fn migrate_legacy_maps(
     m.bindings = bindings;
     m.drive_clip_ids = drive_clip_ids;
     vec![m]
+}
+
+/// The instrument the clip's source track rendered through, in
+/// `TrackState::instrument_id`'s own vocabulary — what a migrated player
+/// must keep so the pad sounds the same as it did through the track.
+fn instrument_of_track(
+    tracks: &[crate::audio::types::TrackState],
+    track_id: &crate::ids::TrackId,
+) -> Option<String> {
+    tracks.iter().find(|t| &t.id == track_id).and_then(|t| t.instrument_id.clone())
+}
+
+/// Turn every resolvable `LaunchTarget::Clip` into a player (Plan V, V2's
+/// migration gate — Task 12). Idempotent: a binding already pointing at a
+/// player is left alone, so running this twice over the same maps/players
+/// (an unsaved re-open, or a stray double call) mints no second player —
+/// the second pass finds nothing left to convert.
+///
+/// Bindings that name the SAME clip share ONE player — a drum kit's two
+/// pads on one clip is one instrument, and a player that already exists for
+/// that clip (loaded from a previously-saved migration) is reused rather
+/// than re-minted, which is what keeps identity stable across a save/reload
+/// instead of just the count.
+///
+/// A binding whose clip is gone is left EXACTLY as it was — still a `Clip`
+/// target, still dangling — rather than dropped. Before this migration
+/// existed, pressing such a pad did nothing but `log::warn!` (see
+/// `launch_fire_from`'s `Clip` arm); dropping the binding here would be
+/// LOUDER at open time (this same `log::warn!`, moved earlier) but far
+/// LESS recoverable, since the user's note-to-pad mapping would be gone
+/// rather than sitting there, still editable, waiting for a rebind. Failing
+/// the whole open over one dangling reference is worse still — that loses
+/// every OTHER binding in the project too.
+pub fn migrate_clip_targets_to_players(
+    maps: &mut [LaunchMap],
+    midi_clips: &[crate::midi::MidiClip],
+    tracks: &[crate::audio::types::TrackState],
+    players: &mut Vec<crate::audio::player::Player>,
+) -> usize {
+    use crate::audio::player::{Player, PlayerSource};
+
+    let mut by_clip: std::collections::HashMap<String, crate::ids::PlayerId> = players
+        .iter()
+        .filter_map(|p| match &p.source {
+            PlayerSource::MidiClip { clip_id, .. } => Some((clip_id.to_string(), p.id.clone())),
+            _ => None,
+        })
+        .collect();
+    let mut migrated = 0usize;
+
+    for map in maps.iter_mut() {
+        for b in map.bindings.iter_mut() {
+            let LaunchTarget::Clip { clip_id } = &b.target else {
+                continue;
+            };
+            let Some(clip) = midi_clips.iter().find(|c| c.id.as_str() == clip_id.as_str()) else {
+                log::warn!(
+                    "launch: binding {} ({}) names a clip that is gone ({clip_id}); leaving it unbound",
+                    b.id,
+                    b.name
+                );
+                continue;
+            };
+            let clip_id = clip_id.clone();
+            let player_id = by_clip
+                .entry(clip_id)
+                .or_insert_with(|| {
+                    let mut p = Player::new(crate::ids::PlayerId::mint(), b.name.clone());
+                    p.source = PlayerSource::MidiClip {
+                        clip_id: clip.id.clone(),
+                        instrument_id: instrument_of_track(tracks, &clip.track_id),
+                    };
+                    let id = p.id.clone();
+                    players.push(p);
+                    id
+                })
+                .clone();
+            b.target = LaunchTarget::Player { player_id };
+            migrated += 1;
+        }
+    }
+    migrated
 }
 
 pub fn all_bindings(maps: &[LaunchMap]) -> Vec<LaunchBinding> {
@@ -809,6 +899,22 @@ impl crate::control::ControlPlane {
     }
 
     pub fn launch_fire_from(&self, id: &str, origin: FireOrigin) -> Result<(), String> {
+        let player_target = {
+            let s = self.session().lock();
+            let (_, b) = find_binding(&s.midi.launch_maps, id)
+                .ok_or_else(|| format!("unknown launch binding: {id}"))?;
+            match &b.target {
+                LaunchTarget::Player { player_id } => Some(player_id.clone()),
+                _ => None,
+            }
+        };
+        if let Some(player_id) = player_target {
+            // A player owns its own clock and playhead (V-1) and is fired
+            // through `player_fire`, not `fire_scene` — none of the
+            // scene bookkeeping below (tick resolution, track hijack,
+            // `LaunchFired`) applies to it.
+            return self.player_fire(player_id.as_str());
+        }
         let rate = self.transport_state().sample_rate;
         let (start_ticks, length_ticks, ppq, events, track_ids, name) = {
             let s = self.session().lock();
@@ -834,6 +940,7 @@ impl crate::control::ControlPlane {
                         vec![c.track_id.to_string()],
                     )
                 }
+                LaunchTarget::Player { .. } => unreachable!("handled by the early return above"),
             };
             (
                 start_ticks,
@@ -1128,6 +1235,24 @@ mod tests {
                 length_ticks: 2,
                 track_ids: vec!["t".into()],
             }
+        );
+
+        // Player crosses to TypeScript (Task 12): the wire form is pinned
+        // explicitly, not just proven symmetric under Rust's own
+        // serialize/deserialize — a round-trip through this crate alone
+        // would pass even if the frontend expected a different key.
+        let player: LaunchTarget =
+            serde_json::from_str(r#"{"kind":"player","playerId":"p-1"}"#).unwrap();
+        assert_eq!(
+            player,
+            LaunchTarget::Player {
+                player_id: crate::ids::PlayerId::from("p-1")
+            }
+        );
+        let player_wire = serde_json::to_value(&player).unwrap();
+        assert_eq!(
+            player_wire,
+            serde_json::json!({"kind": "player", "playerId": "p-1"})
         );
     }
 
@@ -1914,4 +2039,236 @@ mod tests {
         );
     }
 
+    // ---- Plan V — V2, Task 12: migrating clip bindings to players ----
+
+    fn test_midi_clip(id: &str, track_id: &str) -> crate::midi::types::MidiClip {
+        crate::midi::types::MidiClip {
+            id: id.into(),
+            track_id: track_id.into(),
+            name: id.into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track(track_id),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        }
+    }
+
+    fn one_binding_map(binding: LaunchBinding) -> LaunchMap {
+        LaunchMap {
+            bindings: vec![binding],
+            ..LaunchMap::default_map()
+        }
+    }
+
+    #[test]
+    fn migrate_turns_a_clip_target_into_a_player_naming_the_track_instrument() {
+        let mut track = crate::audio::types::testutil::test_track("t1");
+        track.instrument_id = Some("plugin:i1".into());
+        let tracks = vec![track];
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &tracks, &mut players);
+
+        assert_eq!(n, 1);
+        assert_eq!(players.len(), 1, "the binding became one player");
+        assert_eq!(
+            players[0].source,
+            crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc1".into(),
+                instrument_id: Some("plugin:i1".into()),
+            },
+            "the player plays what the binding played, through the clip's own instrument"
+        );
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Player { player_id: players[0].id.clone() }
+        );
+        assert_eq!(maps[0].bindings[0].note, 36, "the note it was learned on is untouched");
+    }
+
+    #[test]
+    fn migrate_shares_one_player_across_two_bindings_on_the_same_clip() {
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut players = Vec::new();
+        let mut maps = vec![LaunchMap {
+            bindings: vec![clip("b1", 36, "mc1"), clip("b2", 37, "mc1")],
+            ..LaunchMap::default_map()
+        }];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+
+        assert_eq!(n, 2);
+        assert_eq!(players.len(), 1, "one clip, one player");
+        assert_eq!(maps[0].bindings[0].target, maps[0].bindings[1].target);
+    }
+
+    /// The exact shape task 12's brief names as the risky one: run the
+    /// migration twice over the SAME maps/players (an unsaved reopen looks
+    /// like this at the function level) and check identity, not just a
+    /// flag — a bug that re-mints on the second pass would still leave
+    /// `players.len()` looking plausible if the assertion stopped there.
+    #[test]
+    fn migrate_is_idempotent_across_two_runs_over_the_same_maps_and_players() {
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+
+        let first = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+        assert_eq!(first, 1);
+        let player_id_after_first = match &maps[0].bindings[0].target {
+            LaunchTarget::Player { player_id } => player_id.clone(),
+            other => panic!("expected a Player target, got {other:?}"),
+        };
+
+        let second = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+
+        assert_eq!(second, 0, "nothing left to migrate — the binding already names a player");
+        assert_eq!(players.len(), 1, "a second run must not mint a second player");
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Player { player_id: player_id_after_first },
+            "and it is still the SAME player, not a fresh one"
+        );
+    }
+
+    #[test]
+    fn migrate_reuses_an_existing_player_already_on_the_same_clip() {
+        // A project reopened after an earlier migration was saved: the
+        // player already exists, but a second binding on the same clip
+        // (added since) is still a bare `Clip` target.
+        let clips = vec![test_midi_clip("mc1", "t1")];
+        let mut existing =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("existing-p"), "PAD");
+        existing.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc1".into(),
+            instrument_id: None,
+        };
+        let mut players = vec![existing];
+        let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
+
+        assert_eq!(n, 1);
+        assert_eq!(players.len(), 1, "reused, not duplicated");
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Player { player_id: crate::ids::PlayerId::from("existing-p") }
+        );
+    }
+
+    #[test]
+    fn migrate_leaves_a_dangling_clip_binding_unbound_rather_than_dropping_it() {
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(clip("b1", 36, "gone"))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &[], &[], &mut players);
+
+        assert_eq!(n, 0);
+        assert!(players.is_empty());
+        assert_eq!(maps[0].bindings.len(), 1, "the binding stays — the pad mapping is not lost");
+        assert_eq!(
+            maps[0].bindings[0].target,
+            LaunchTarget::Clip { clip_id: "gone".into() }
+        );
+    }
+
+    #[test]
+    fn migrate_leaves_a_region_binding_untouched() {
+        let mut players = Vec::new();
+        let mut maps = vec![one_binding_map(region("b1", 60, None))];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &[], &[], &mut players);
+
+        assert_eq!(n, 0);
+        assert!(players.is_empty());
+        assert!(matches!(maps[0].bindings[0].target, LaunchTarget::Region { .. }));
+    }
+
+    /// Point 4 of the migration's own brief: a `Player` target must reach
+    /// `player_fire`, not fall through to the scene path (which would
+    /// panic on the `unreachable!()` guarding the old Region/Clip match, or
+    /// silently do nothing at all). The clock actually turning on is the
+    /// only proof that is not just "did it return Ok".
+    #[test]
+    fn launch_fire_from_a_player_target_routes_to_player_fire() {
+        use crate::audio::engine::EngineHandle;
+        use crate::audio::player::{Player, PlayerSource};
+        use crate::audio::rt::{GraphTables, SharedRt};
+        use crate::audio::types::{derive_slots, mixer_slot_count, Store};
+        use crate::control::Session;
+
+        let mut store = Store::default();
+        store.tracks.push(crate::audio::types::testutil::test_track("t1"));
+        let player_id = crate::ids::PlayerId::from("p1");
+        let mut player = Player::new(player_id.clone(), "PAD");
+        player.source = PlayerSource::MidiClip { clip_id: "mc1".into(), instrument_id: None };
+        store.players.push(player);
+
+        let mut session = Session::new(store, crate::midi::MidiStore::default());
+        session.midi.clips.push(crate::midi::types::MidiClip {
+            id: "mc1".into(),
+            track_id: "t1".into(),
+            name: "pad".into(),
+            timeline_start_ticks: 0,
+            length_ticks: 960,
+            notes: Vec::new(),
+            next_note_id: 1,
+            content_id: crate::ids::ContentId::mint(),
+            lane_id: crate::ids::LaneId::default_for_track("t1"),
+            content_length_ticks: None,
+            transpose_semitones: 0,
+            velocity_offset: 0,
+        });
+        session.midi.launch_maps = vec![one_binding_map(LaunchBinding {
+            id: "b1".into(),
+            name: "b1".into(),
+            note: 36,
+            channel: None,
+            target: LaunchTarget::Player { player_id: player_id.clone() },
+        })];
+
+        let n_slots = mixer_slot_count(&session.store.tracks);
+        let slots = derive_slots(&session.store.tracks);
+        let clocks = crate::audio::clock::ClockTable::with_slots_and_clocks(n_slots, 2);
+        let shared = Arc::new(SharedRt::default());
+        shared.sample_rate.store(48_000, Relaxed);
+        let mut player_clocks = std::collections::HashMap::new();
+        player_clocks.insert(player_id, 1u32);
+        let tables = Arc::new(Mutex::new(GraphTables {
+            generation: 1,
+            params: Arc::new(crate::audio::rt::ParamTable::with_slots_and_sends(n_slots, 0)),
+            clocks: Arc::new(clocks),
+            scene_clocks: Default::default(),
+            player_clocks,
+            orphan_clock: None,
+            slots,
+            send_slots: Default::default(),
+        }));
+        let (engine, _engine_rx) = EngineHandle::for_tests();
+        let cp = crate::control::ControlPlane::new(
+            Arc::new(Mutex::new(session)),
+            shared,
+            tables,
+            engine,
+            Arc::new(crate::sidecars::jobs::JobManager::new(2, Duration::ZERO)),
+            Box::new(|_e, _p| {}),
+            Arc::new(crate::control::HistoryLog::new()),
+            Arc::new(crate::control::GestureState::new()),
+        );
+
+        cp.launch_fire_from("b1", FireOrigin::Hardware).unwrap();
+
+        let t = cp.tables_for_tests();
+        assert!(
+            t.clocks.is_on(1),
+            "the player's own clock is running — launch_fire_from routed the Player target to player_fire"
+        );
+    }
 }

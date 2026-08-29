@@ -577,6 +577,7 @@ fn launch_target_heap(t: &crate::midi::launch::LaunchTarget) -> usize {
             track_ids.iter().map(String::len).sum()
         }
         crate::midi::launch::LaunchTarget::Clip { clip_id } => clip_id.len(),
+        crate::midi::launch::LaunchTarget::Player { player_id } => player_id.as_str().len(),
     }
 }
 
