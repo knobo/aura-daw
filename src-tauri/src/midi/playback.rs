@@ -78,12 +78,17 @@ pub fn registered_store() -> Option<&'static Arc<Mutex<Session>>> {
 // Live-node registry (control-thread state, owned by engine::Control)
 // ---------------------------------------------------------------------------
 
-/// Live instrument nodes keyed by track id, shared across successive graph
-/// snapshots so voice/plugin state survives rebuilds. `key` describes what
-/// the node was built from (`"synth@48000"`, `"sampler:<id>@48000"`,
+/// Live instrument nodes shared across successive graph snapshots so
+/// voice/plugin state survives rebuilds. `key` describes what the node was
+/// built from (`"synth@48000"`, `"sampler:<id>@48000"`,
 /// `"plugin:<instanceId>@48000"`); a key change (instrument rebound, engine
 /// rate change) replaces the node — the retired cell is freed control-side
 /// when the last snapshot referencing it is dropped.
+///
+/// TWO namespaces share the map (Plan V — V2, Task 10): a track's entry is
+/// its bare track id, a player's is [`player_node_key`]'s `player:<id>`. They
+/// are pruned separately and at different points of a rebuild — see
+/// [`retain_tracks`](Self::retain_tracks).
 #[derive(Default)]
 pub struct LiveNodeRegistry {
     entries: HashMap<String, (String, Arc<LiveNodeCell>)>,
@@ -488,6 +493,15 @@ pub fn live_source_for_player(
     else {
         return None;
     };
+    // ORDER IS LOAD-BEARING: every `None` return below must come BEFORE
+    // `node_for_instrument`. Resolving the node REGISTERS it, and the caller
+    // (`engine::rebuild`) only adds a player to `live_players` when a source
+    // comes back — so a node created on a path that then returns `None` is
+    // retired by `retain_players` on the very same rebuild. For an LV2 or
+    // CLAP instrument that is an instantiate-and-destroy per rebuild, on the
+    // control thread, against the plugin main thread's `run`. A pad whose
+    // clip is momentarily missing is exactly that path.
+    // `a_bailed_out_player_registers_no_node` is the pin.
     let instrument_id = instrument_id.as_deref()?;
     if rate == 0 {
         return None; // no engine rate yet: every tick would convert to nonsense
@@ -1174,14 +1188,34 @@ mod tests {
 
     /// A source the document no longer has is SILENCE, not a panic — the
     /// same tolerance the audio-player row has.
+    ///
+    /// And it registers NO NODE. That second half is the one with teeth: the
+    /// node is what an LV2/CLAP instantiation costs, `engine::rebuild` only
+    /// records `live_players` for a player that RETURNED a source, and
+    /// `retain_players` retires everything else on the same rebuild — so a
+    /// node created on a path that then bails would be instantiated and
+    /// destroyed once per rebuild, on the control thread, silently. The
+    /// registry is shared across both calls here precisely so the assertion
+    /// can see it; a fresh `LiveNodeRegistry::default()` per call cannot.
     #[test]
-    fn a_player_whose_midi_clip_is_gone_has_no_live_source() {
+    fn a_bailed_out_player_registers_no_node() {
         let session = session_with_an_untracked_instrument();
-        let player = player_with_midi_clip("ghost", "plugin:i1");
-        assert!(
-            live_source_for_player(&session, &player, 48_000, None, &mut LiveNodeRegistry::default())
-                .is_none()
-        );
+        let mut nodes = LiveNodeRegistry::default();
+
+        // The clip is gone.
+        let gone = player_with_midi_clip("ghost", "plugin:i1");
+        assert!(live_source_for_player(&session, &gone, 48_000, None, &mut nodes).is_none());
+        assert!(nodes.is_empty(), "a missing clip must not instantiate an instrument");
+
+        // No engine rate yet.
+        let ok = player_with_midi_clip("mc1", "plugin:i1");
+        assert!(live_source_for_player(&session, &ok, 0, None, &mut nodes).is_none());
+        assert!(nodes.is_empty(), "nor must a rate of 0");
+
+        // ...and the same registry DOES take the node on the path that works,
+        // so the assertions above are not passing for want of a live case.
+        assert!(live_source_for_player(&session, &ok, 48_000, None, &mut nodes).is_some());
+        assert_eq!(nodes.len(), 1);
     }
 
     /// The registry half, and it is not decoration: a player's node holds the

@@ -496,9 +496,12 @@ mod tests {
     /// NOTHING to it. Rendering one would put a pad's clip at bar 1 of the
     /// export — a performance leaking into arrangement material.
     ///
-    /// Both halves are asserted, because the audible one alone would pass for
-    /// the wrong reason (a MIDI player has no live node until Task 10): the
-    /// samples are identical AND the player took no mixer slot.
+    /// Both halves are asserted, because the audible one alone could pass for
+    /// the wrong reason — a player that took a slot but happened to render
+    /// silence. Since Task 10 a MIDI player DOES have a live node in the live
+    /// graph, so the audible half is no longer even circumstantially safe on
+    /// its own: the samples must be identical AND the player must take no
+    /// mixer slot.
     #[test]
     fn a_player_contributes_nothing_to_the_bounce() {
         const RATE: u32 = 48_000;
