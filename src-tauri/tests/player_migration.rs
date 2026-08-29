@@ -200,6 +200,20 @@ fn control_plane_with_two_bindings_on_one_clip() -> (ControlPlane, PathBuf) {
     (cp, dir)
 }
 
+fn control_plane_with_two_bindings_on_two_distinct_clips() -> (ControlPlane, PathBuf) {
+    let (cp, _eng) = fixture();
+    let dir = write_project(
+        "two-bindings-two-clips",
+        vec![test_track("t1", Some("plugin:i1")), test_track("t2", Some("plugin:i2"))],
+        vec![test_midi_clip("mc1", "t1"), test_midi_clip("mc2", "t2")],
+        LaunchMap {
+            bindings: vec![clip_binding("b1", 36, "mc1"), clip_binding("b2", 37, "mc2")],
+            ..LaunchMap::default_map()
+        },
+    );
+    (cp, dir)
+}
+
 fn control_plane_with_a_binding_pointing_at_a_deleted_clip() -> (ControlPlane, PathBuf) {
     let (cp, _eng) = fixture();
     let dir = write_project(
@@ -258,6 +272,51 @@ fn two_bindings_on_the_same_clip_share_one_player() {
     assert_eq!(players.len(), 1, "one clip, one player");
     let maps = cp.launch_snapshot().maps;
     assert_eq!(maps[0].bindings[0].target, maps[0].bindings[1].target);
+}
+
+/// Fix round 1, Important 4: the reviewer replaced the target assignment
+/// with `players[0].id.clone()` and every existing test here still
+/// passed — no fixture had two distinct clips, so `players[0]` was
+/// trivially right everywhere. This is the test that can only pass if
+/// each binding resolves to ITS OWN clip's player.
+#[test]
+fn two_bindings_on_distinct_clips_get_distinct_players_matching_their_own_clip() {
+    let (cp, dir) = control_plane_with_two_bindings_on_two_distinct_clips();
+    cp.open_project_epoch(Path::new(&dir)).unwrap();
+
+    let players = cp.players();
+    assert_eq!(players.len(), 2, "two distinct clips, two distinct players");
+
+    let maps = cp.launch_snapshot().maps;
+    let player_for = |target: &LaunchTarget| {
+        let LaunchTarget::Player { player_id } = target else {
+            panic!("expected a Player target, got {target:?}");
+        };
+        players
+            .iter()
+            .find(|p| &p.id == player_id)
+            .expect("the referenced player exists")
+    };
+
+    let p1 = player_for(&maps[0].bindings[0].target);
+    let p2 = player_for(&maps[0].bindings[1].target);
+    assert_eq!(
+        p1.source,
+        PlayerSource::MidiClip {
+            clip_id: ClipId::from("mc1"),
+            instrument_id: Some("plugin:i1".into()),
+        },
+        "b1 must resolve to mc1's player, not merely SOME player"
+    );
+    assert_eq!(
+        p2.source,
+        PlayerSource::MidiClip {
+            clip_id: ClipId::from("mc2"),
+            instrument_id: Some("plugin:i2".into()),
+        },
+        "b2 must resolve to mc2's player, not merely SOME player"
+    );
+    assert_ne!(p1.id, p2.id, "distinct clips must not share a player");
 }
 
 #[test]

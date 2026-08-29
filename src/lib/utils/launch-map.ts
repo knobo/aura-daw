@@ -138,12 +138,20 @@ export function bindingFocusSamples(
   binding: LaunchBinding,
   clips: { id: string; timelineStartTicks: number }[],
   ticksToSamples: (ticks: number) => number,
+  getPlayerClipId?: (playerId: string) => string | null,
 ): number | null {
   const target = binding.target;
   if (target.kind === "region") {
     return ticksToSamples(target.startTicks);
   }
-  const clip = clips.find((c) => c.id === target.clipId);
+  // Fix round 1, Critical 2: a migrated binding's target is `player`, not
+  // `clip` — `getPlayerClipId` is the caller's player registry (a `Clip`
+  // target names its clip directly and needs no lookup at all). Absent
+  // or unresolved, this is an explicit null rather than an accidental
+  // `find(c => c.id === undefined)` matching nothing.
+  const clipId = target.kind === "player" ? (getPlayerClipId?.(target.playerId) ?? null) : target.clipId;
+  if (clipId === null) return null;
+  const clip = clips.find((c) => c.id === clipId);
   if (!clip) return null;
   return ticksToSamples(clip.timelineStartTicks);
 }
@@ -178,6 +186,7 @@ export function overlayBox(
   tracks: { id: string }[],
   clips: { id: string; trackId: string; timelineStartTicks: number; lengthTicks: number }[],
   ticksToSamples: (ticks: number) => number,
+  getPlayerClipId?: (playerId: string) => string | null,
 ): OverlayBox | null {
   const laneOf = (trackId: string) => tracks.findIndex((t) => t.id === trackId);
   const target = binding.target;
@@ -194,7 +203,12 @@ export function overlayBox(
       laneHi: lanes[lanes.length - 1],
     };
   }
-  const clip = clips.find((c) => c.id === target.clipId);
+  // Same reasoning as `bindingFocusSamples` above: resolve a `player`
+  // target through the caller's registry rather than silently dropping
+  // the overlay for every migrated pad.
+  const clipId = target.kind === "player" ? (getPlayerClipId?.(target.playerId) ?? null) : target.clipId;
+  if (clipId === null) return null;
+  const clip = clips.find((c) => c.id === clipId);
   if (!clip) return null;
   const lane = laneOf(clip.trackId);
   if (lane < 0) return null;

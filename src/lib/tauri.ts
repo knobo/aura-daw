@@ -57,6 +57,7 @@ import type {
   LaunchMap,
   LaunchSnapshot,
   OpenSidecarEvent,
+  PlayerInfo,
   PluginCatalog,
   PluginCatalogPatch,
   PluginDescriptor,
@@ -514,6 +515,11 @@ export interface Backend {
   launchStop?(): Promise<void>;
   launchLearnArm?(id: string | null): Promise<void>;
   launchLearnTake?(): Promise<{ note: number; channel: number } | null>;
+
+  // ── players (Plan V — V2, Task 9) ──
+  /** Every player in the document. Read-only; fix round 1, Critical 2
+   * uses it to resolve a `LaunchTarget::Player` back to its clip. */
+  playersGet?(): Promise<PlayerInfo[]>;
 
   // ── library & browser (Track E, additive; desktop only) ──
   /** List ONE directory level of the sample library. */
@@ -1164,6 +1170,10 @@ class TauriBackend implements Backend {
   }
   launchLearnTake() {
     return invoke<{ note: number; channel: number } | null>("launch_learn_take");
+  }
+
+  playersGet() {
+    return invoke<PlayerInfo[]>("players_get");
   }
 
   libraryScan(dir: string) {

@@ -8,7 +8,7 @@ import { backend } from "../tauri";
 import { midi } from "./midi.svelte";
 import { transport } from "./transport.svelte";
 import { view } from "./view.svelte";
-import type { LaunchFired } from "../types/ipc";
+import type { LaunchFired, PlayerInfo } from "../types/ipc";
 import {
   bindingFocusSamples,
   clipWouldSelfTrigger,
@@ -33,6 +33,20 @@ class LaunchStore {
   /** Drive-clip scene currently sounding on the shadow playhead. */
   overlay = $state<{ id: string; name: string } | null>(null);
   error = $state<string | null>(null);
+  /** Fix round 1, Critical 2: the only way to resolve a `LaunchTarget::Player`
+   * back to the clip it plays — the frontend has no other player registry.
+   * Best-effort; stays empty in demo mode (`backend.playersGet` is optional)
+   * or on a failed fetch, same as every other optional backend call here. */
+  players = $state<PlayerInfo[]>([]);
+
+  /** The clip id a player target names, or null (a knobs-only pad, an
+   * audio-clip player — not reachable from a MIDI launch binding today —
+   * or a player id `players` hasn't loaded yet). */
+  clipIdForPlayer(playerId: string): string | null {
+    const p = this.players.find((p) => p.id === playerId);
+    if (!p || p.source.kind !== "midiClip") return null;
+    return p.source.clipId;
+  }
 
   get activeMap(): LaunchMap {
     return this.maps.find((m) => m.id === this.activeMapId) ?? this.maps[0] ?? defaultLaunchMap();
@@ -218,9 +232,23 @@ class LaunchStore {
   }
 
   async reload() {
+    // Runs on `project://changed` too (see `init`), which is the very
+    // event `open_project_epoch` fires right after the clip→player
+    // migration — so this is the earliest point `players` can be correct
+    // for the maps being loaded in the same call.
+    void this.reloadPlayers();
     if (!backend.launchGet) return;
     try {
       this.accept(await backend.launchGet());
+    } catch (err) {
+      this.error = String(err);
+    }
+  }
+
+  private async reloadPlayers() {
+    if (!backend.playersGet) return;
+    try {
+      this.players = await backend.playersGet();
     } catch (err) {
       this.error = String(err);
     }
@@ -258,7 +286,9 @@ class LaunchStore {
     const b = this.bindings.find((x) => x.id === id);
     if (!b) return;
     this.selectedId = id;
-    const samples = bindingFocusSamples(b, midi.clips, (t) => midi.ticksToSamples(t));
+    const samples = bindingFocusSamples(b, midi.clips, (t) => midi.ticksToSamples(t), (id) =>
+      this.clipIdForPlayer(id),
+    );
     if (samples == null) return;
     const pad = view.width * view.spp * 0.15;
     view.scrollToSamples(Math.max(0, samples - pad));
@@ -289,7 +319,18 @@ class LaunchStore {
   async mapClip(clipId: string, name?: string): Promise<LaunchBinding | null> {
     const clip = midi.clipById(clipId);
     if (!clip) return null;
-    const existing = this.bindings.find((b) => b.target.kind === "clip" && b.target.clipId === clipId);
+    // Fix round 1, Critical 2: a migrated binding's target is `player`,
+    // not `clip` — resolve it back to a clip id via `this.players` (see
+    // `clipIdForPlayer`) so a clip that already has a migrated pad is
+    // still found here. Without this a second binding used to get minted
+    // on a fresh note every time — silently, since Rust's by-clip
+    // migration dedup would reunite both onto one player on the next
+    // open, hiding the duplicate note until then.
+    const existing = this.bindings.find(
+      (b) =>
+        (b.target.kind === "clip" && b.target.clipId === clipId) ||
+        (b.target.kind === "player" && this.clipIdForPlayer(b.target.playerId) === clipId),
+    );
     if (existing) {
       this.selectedId = existing.id;
       this.focus(existing.id);
@@ -299,8 +340,18 @@ class LaunchStore {
   }
 
   clipSelfTriggers(binding: LaunchBinding): boolean {
-    if (binding.target.kind !== "clip") return false;
-    const clip = midi.clipById(binding.target.clipId);
+    // Fix round 1, Critical 2: resolve a `player` target back to its
+    // clip via `this.players`, the same as `mapClip` above, so the
+    // self-trigger warning still fires for a migrated binding instead of
+    // going silently quiet.
+    const clipId =
+      binding.target.kind === "clip"
+        ? binding.target.clipId
+        : binding.target.kind === "player"
+          ? this.clipIdForPlayer(binding.target.playerId)
+          : null;
+    if (clipId === null) return false;
+    const clip = midi.clipById(clipId);
     if (!clip) return false;
     return clipWouldSelfTrigger(clip.notes, binding.note, binding.channel);
   }

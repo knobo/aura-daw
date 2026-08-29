@@ -648,6 +648,7 @@
           project.tracks,
           midi.clips,
           (t) => midi.ticksToSamples(t),
+          (id) => launch.clipIdForPlayer(id),
         );
         if (!box) return null;
         return { binding: b, box };

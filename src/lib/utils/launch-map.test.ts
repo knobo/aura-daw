@@ -177,6 +177,28 @@ describe("bindingFocusSamples", () => {
     ).toBe(480);
     expect(bindingFocusSamples(b, [], ticksToSamples)).toBeNull();
   });
+
+  describe("a player target (fix round 1, Critical 2)", () => {
+    const b = region("p", 60, { target: { kind: "player", playerId: "pl-1" } });
+    const clips = [{ id: "clip-1", timelineStartTicks: 240 }];
+
+    it("resolves through the caller's player→clip lookup", () => {
+      const getPlayerClipId = (id: string) => (id === "pl-1" ? "clip-1" : null);
+      expect(bindingFocusSamples(b, clips, ticksToSamples, getPlayerClipId)).toBe(480);
+    });
+
+    it("is null with no lookup — NOT the old accidental clip-id match", () => {
+      // Before the fix, a non-"region" target fell straight through to
+      // `target.clipId`, which is `undefined` on a player target — that
+      // silently matched nothing rather than resolving anything. This
+      // pins the explicit, honest null a missing/absent lookup gives.
+      expect(bindingFocusSamples(b, clips, ticksToSamples)).toBeNull();
+    });
+
+    it("is null when the lookup can't resolve the player", () => {
+      expect(bindingFocusSamples(b, clips, ticksToSamples, () => null)).toBeNull();
+    });
+  });
 });
 
 describe("nextLauncherName", () => {
@@ -240,6 +262,25 @@ describe("overlayBox", () => {
   it("returns null when the target is gone", () => {
     const b = region("c", 60, { target: { kind: "clip", clipId: "missing" } });
     expect(overlayBox(b, tracks, [], ticksToSamples)).toBeNull();
+  });
+
+  describe("a player target (fix round 1, Critical 2)", () => {
+    const b = region("p", 60, { target: { kind: "player", playerId: "pl-1" } });
+    const clips = [{ id: "clip-1", trackId: "b", timelineStartTicks: 10, lengthTicks: 40 }];
+
+    it("resolves through the caller's player→clip lookup", () => {
+      const getPlayerClipId = (id: string) => (id === "pl-1" ? "clip-1" : null);
+      expect(overlayBox(b, tracks, clips, ticksToSamples, getPlayerClipId)).toEqual({
+        startSamples: 10,
+        endSamples: 50,
+        laneLo: 1,
+        laneHi: 1,
+      });
+    });
+
+    it("is null with no lookup — NOT the old accidental clip-id match", () => {
+      expect(overlayBox(b, tracks, clips, ticksToSamples)).toBeNull();
+    });
   });
 });
 

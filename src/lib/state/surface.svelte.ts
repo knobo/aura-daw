@@ -378,8 +378,12 @@ class SurfaceStore {
   }
 
   async fireClip(clipId: string) {
-    const existing = launch.bindings.find((b) => b.target.kind === "clip" && b.target.clipId === clipId);
-    const binding = existing ?? (await launch.mapClip(clipId));
+    // Fix round 1, Critical 2: a migrated binding's target is `player`,
+    // not `clip` — `launch.mapClip` already resolves that case (via
+    // `launch.players`), so delegate straight to it rather than
+    // duplicating a `kind === "clip"` scan here that would miss every
+    // migrated pad and (before `mapClip`'s own fix) mint a duplicate.
+    const binding = await launch.mapClip(clipId);
     if (!binding) return;
     await launch.preview(binding.id);
   }
@@ -396,7 +400,13 @@ class SurfaceStore {
     const overlay = launch.overlay;
     if (!overlay) return false;
     const b = launch.bindings.find((x) => x.id === overlay.id);
-    return b?.target.kind === "clip" && b.target.clipId === clipId;
+    if (!b) return false;
+    // Fix round 1, Critical 2: a migrated binding's target is `player`,
+    // not `clip` — without this, the pad grid's "lit" indicator went
+    // permanently dark for every migrated pad, and its toggle-off click
+    // (padMode "toggle") stopped hitting `stopClip` at all.
+    if (b.target.kind === "player") return launch.clipIdForPlayer(b.target.playerId) === clipId;
+    return b.target.kind === "clip" && b.target.clipId === clipId;
   }
 
   /** Cut the shadow playhead if this clip is what is on it. */

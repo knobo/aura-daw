@@ -34,6 +34,15 @@
       const clip = midi.clipById(b.target.clipId);
       return clip ? `clip · ${clip.name}` : "clip · missing";
     }
+    if (b.target.kind === "player") {
+      // Fix round 1, Critical 2: resolve through `launch.players` (the
+      // same registry `mapClip`/`clipSelfTriggers` use) rather than
+      // showing a bare id, or throwing on `b.target.trackIds` below —
+      // this was the exact crash the panel had on every migrated pad.
+      const clipId = launch.clipIdForPlayer(b.target.playerId);
+      const clip = clipId ? midi.clipById(clipId) : null;
+      return clip ? `player · ${clip.name}` : "player · unresolved";
+    }
     const names = b.target.trackIds
       .map((id) => project.trackById(id)?.name ?? "?")
       .join(", ");

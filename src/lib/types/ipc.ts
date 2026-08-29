@@ -92,7 +92,9 @@ export interface MidiOutputStatus {
 
 export type LaunchTarget =
   | { kind: "region"; startTicks: number; lengthTicks: number; trackIds: string[] }
-  | { kind: "clip"; clipId: string };
+  /** Kept so a project saved before Plan V's player migration still deserializes; nothing produces one any more. */
+  | { kind: "clip"; clipId: string }
+  | { kind: "player"; playerId: string };
 
 export interface LaunchBinding {
   id: string;
@@ -117,6 +119,23 @@ export interface LaunchMap {
 
 export interface LaunchSnapshot {
   maps: LaunchMap[];
+}
+
+// ── players (Plan V — V2) ────────────────────────────────────────────────
+// Minimal mirror of `crate::audio::player::{Player, PlayerSource}` —
+// just enough for the launch seam (fix round 1, Critical 2) to resolve a
+// `LaunchTarget::Player`'s underlying clip. Not the full player registry
+// task 13's control surface will need.
+
+export type PlayerSource =
+  | { kind: "audioClip"; clipId: string }
+  | { kind: "midiClip"; clipId: string; instrumentId?: string | null }
+  | { kind: "none" };
+
+export interface PlayerInfo {
+  id: string;
+  name: string;
+  source: PlayerSource;
 }
 
 export type LaunchFireOrigin = "hardware" | "drive" | "preview";

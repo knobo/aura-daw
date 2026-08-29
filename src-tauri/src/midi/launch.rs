@@ -2144,6 +2144,64 @@ mod tests {
         assert_eq!(maps[0].bindings[0].target, maps[0].bindings[1].target);
     }
 
+    /// Fix round 1, Important 4: the reviewer replaced the assignment with
+    /// `players[0].id.clone()` — always the first player — and every
+    /// existing test still passed, because no fixture in this file had two
+    /// DISTINCT clips. `players[0]` cannot be wrong when there is only ever
+    /// one player to index. This is the test that can only pass if each
+    /// binding resolves to ITS OWN clip's player.
+    #[test]
+    fn migrate_assigns_each_binding_the_player_for_its_own_clip() {
+        let mut t1 = crate::audio::types::testutil::test_track("t1");
+        t1.instrument_id = Some("plugin:i1".into());
+        let mut t2 = crate::audio::types::testutil::test_track("t2");
+        t2.instrument_id = Some("plugin:i2".into());
+        let tracks = vec![t1, t2];
+        let clips = vec![test_midi_clip("mc1", "t1"), test_midi_clip("mc2", "t2")];
+        let mut players = Vec::new();
+        let mut maps = vec![LaunchMap {
+            bindings: vec![clip("b1", 36, "mc1"), clip("b2", 37, "mc2")],
+            ..LaunchMap::default_map()
+        }];
+
+        let n = migrate_clip_targets_to_players(&mut maps, &clips, &tracks, &mut players);
+
+        assert_eq!(n, 2);
+        assert_eq!(players.len(), 2, "two distinct clips, two distinct players");
+
+        let player_for = |binding_idx: usize| {
+            let LaunchTarget::Player { player_id } = &maps[0].bindings[binding_idx].target else {
+                panic!("expected a Player target");
+            };
+            players
+                .iter()
+                .find(|p| &p.id == player_id)
+                .expect("the referenced player exists")
+        };
+
+        assert_eq!(
+            player_for(0).source,
+            crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc1".into(),
+                instrument_id: Some("plugin:i1".into()),
+            },
+            "b1 must resolve to mc1's player, not merely SOME player"
+        );
+        assert_eq!(
+            player_for(1).source,
+            crate::audio::player::PlayerSource::MidiClip {
+                clip_id: "mc2".into(),
+                instrument_id: Some("plugin:i2".into()),
+            },
+            "b2 must resolve to mc2's player, not merely SOME player"
+        );
+        assert_ne!(
+            player_for(0).id,
+            player_for(1).id,
+            "distinct clips must not share a player"
+        );
+    }
+
     /// The exact shape task 12's brief names as the risky one: run the
     /// migration twice over the SAME maps/players (an unsaved reopen looks
     /// like this at the function level) and check identity, not just a
@@ -2177,24 +2235,34 @@ mod tests {
     fn migrate_reuses_an_existing_player_already_on_the_same_clip() {
         // A project reopened after an earlier migration was saved: the
         // player already exists, but a second binding on the same clip
-        // (added since) is still a bare `Clip` target.
-        let clips = vec![test_midi_clip("mc1", "t1")];
+        // (added since) is still a bare `Clip` target. A DECOY player for
+        // a different clip sits first in the vec — fix round 1, Important
+        // 4 — so a `players[0]` shortcut resolves to the wrong player
+        // instead of trivially passing.
+        let clips = vec![test_midi_clip("mc1", "t1"), test_midi_clip("mc-decoy", "t1")];
+        let mut decoy =
+            crate::audio::player::Player::new(crate::ids::PlayerId::from("decoy-p"), "DECOY");
+        decoy.source = crate::audio::player::PlayerSource::MidiClip {
+            clip_id: "mc-decoy".into(),
+            instrument_id: None,
+        };
         let mut existing =
             crate::audio::player::Player::new(crate::ids::PlayerId::from("existing-p"), "PAD");
         existing.source = crate::audio::player::PlayerSource::MidiClip {
             clip_id: "mc1".into(),
             instrument_id: None,
         };
-        let mut players = vec![existing];
+        let mut players = vec![decoy, existing];
         let mut maps = vec![one_binding_map(clip("b1", 36, "mc1"))];
 
         let n = migrate_clip_targets_to_players(&mut maps, &clips, &[], &mut players);
 
         assert_eq!(n, 1);
-        assert_eq!(players.len(), 1, "reused, not duplicated");
+        assert_eq!(players.len(), 2, "reused, not duplicated — the decoy is untouched");
         assert_eq!(
             maps[0].bindings[0].target,
-            LaunchTarget::Player { player_id: crate::ids::PlayerId::from("existing-p") }
+            LaunchTarget::Player { player_id: crate::ids::PlayerId::from("existing-p") },
+            "b1 must resolve to the EXISTING mc1 player, not players[0] (the decoy)"
         );
     }
 
