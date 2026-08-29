@@ -11,6 +11,7 @@
   import { openPluginParams } from "../state/plugin-panel";
   import { modulation } from "../state/modulation.svelte";
   import { ui } from "../state/ui.svelte";
+  import { prefs } from "../prefs/prefs.svelte";
   import { lanes } from "../state/lanes.svelte";
   import { library } from "../state/library.svelte";
   import { decodeLibraryDrag, hasLibraryDrag } from "../utils/library";
@@ -544,7 +545,12 @@
         </div>
 
         <div class="level-area" role="gridcell" aria-label="Level controls for {track.name}">
-          <div class="level-head"><span class="section-label mono">Level</span><Meter trackId={track.id} height={8} /></div>
+          <div class="level-head">
+            <span class="section-label mono">Level</span>
+            {#if !(prefs.values.surfaceHidesTrackMeters && ui.bottomPanel === "surface")}
+              <Meter trackId={track.id} height={8} />
+            {/if}
+          </div>
           <div class="level-controls">
             <label class="level-control gain-control">
               <span class="control-label">Gain</span>

@@ -34,6 +34,7 @@
   import { latestMeter } from "../../state/meters.svelte";
   import { prefs } from "../../prefs/prefs.svelte";
   import { formatDb, linToDb } from "../../utils/format";
+  import { runWhileVisible } from "../../utils/visible-raf";
 
   interface Props {
     trackId: string;
@@ -91,6 +92,7 @@
     return VU_START + normal(db) * VU_SWEEP;
   }
 
+  let rootEl: HTMLDivElement | undefined = $state();
   let needleEl: SVGGElement | undefined = $state();
   let readoutEl: HTMLElement | undefined = $state();
   let segsEl: SVGGElement | undefined = $state();
@@ -113,6 +115,7 @@
   // reset by a click, exactly as in Meter.svelte.
   $effect(() => {
     const id = trackId;
+    const root = rootEl;
     const readout = readoutEl;
     const ring = segsEl;
     const peakLamp = peakEl;
@@ -121,7 +124,7 @@
     const dialNeedle = dialNeedleEl;
     const dialPeak = dialPeakEl;
     const ladder = ladderEl;
-    let raf = 0;
+    if (!root) return;
     let disp = DB_MIN;
     let peakHold = DB_MIN;
     let peakUntil = 0;
@@ -131,7 +134,6 @@
     let zoneShown = "";
 
     const tick = (now: number) => {
-      raf = requestAnimationFrame(tick);
       const m = latestMeter(id);
       const peak = m ? linToDb(Math.max(m.peakL, m.peakR)) : DB_MIN;
       // Fast attack, slower release — a needle, not a bar.
@@ -208,12 +210,11 @@
       }
       if (m?.clipped) clipped = true;
     };
-    raf = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(raf);
+    return runWhileVisible(root, tick);
   });
 </script>
 
-<div class="gauge-unit" class:wide={face === "ladder"} style:--gauge-size="{size}px">
+<div bind:this={rootEl} class="gauge-unit" class:wide={face === "ladder"} style:--gauge-size="{size}px">
   {#if round}
     <div class="bezel led grain">
       <div class="window">

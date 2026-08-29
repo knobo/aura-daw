@@ -9,6 +9,7 @@
   import { linToDb } from "../utils/format";
   import { theme } from "../theme/theme.svelte";
   import { alpha } from "../theme/tokens";
+  import { runWhileVisible } from "../utils/visible-raf";
 
   let {
     trackId,
@@ -51,7 +52,6 @@
       { disp: DB_MIN, rms: DB_MIN, holdDb: DB_MIN, holdUntil: 0 },
       { disp: DB_MIN, rms: DB_MIN, holdDb: DB_MIN, holdUntil: 0 },
     ];
-    let raf = 0;
     let last = performance.now();
     let w = 0;
     let h = 0;
@@ -72,7 +72,6 @@
     const gap = 2;
 
     const draw = (now: number) => {
-      raf = requestAnimationFrame(draw);
       const dt = Math.min(0.1, (now - last) / 1000);
       last = now;
       if (w === 0 || h === 0) return;
@@ -159,9 +158,9 @@
       }
     };
 
-    raf = requestAnimationFrame(draw);
+    const stop = runWhileVisible(canvas, draw);
     return () => {
-      cancelAnimationFrame(raf);
+      stop();
       ro.disconnect();
     };
   });
