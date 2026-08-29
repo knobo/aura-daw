@@ -53,7 +53,7 @@ sentence got written — if you find a row whose branch is gone from
 
 | Job | Branch | Claimed | Notes |
 |---|---|---|---|
-| _(none)_ | | | |
+| Brushed Steel themes + LED-ring knob | `feat/brushed-steel-theme` | 2026-08-29 | New `brush` material token, a 3D frame on modules/boxes, and the knob redrawn as a dot ring. → [`docs/themes.md`](docs/themes.md) |
 
 ## Next up — unclaimed
 
