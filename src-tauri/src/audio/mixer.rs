@@ -2347,7 +2347,8 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(
             worst < 1e-6,
-            "the second press differs from a first press by {worst}: material was              stranded in the row and replayed at the next onset"
+            "the second press differs from a first press by {worst}: material was \
+             stranded in the row and replayed at the next onset"
         );
     }
 

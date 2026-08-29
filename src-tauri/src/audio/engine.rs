@@ -6359,7 +6359,7 @@ mod tests {
         // Task 10 fix round 2 added a fourth term to `computed_tail_frames`,
         // and this is the row it must NOT reach. A raw pad is an audio clip
         // (V-6 gives it no instrument), so it carries no live node, gets no
-        // `LIVE_TAIL_FRAMES` allowance, and keeps the bare skip and the
+        // `live_tail_frames` allowance, and keeps the bare skip and the
         // measured idle cost that the owner's ear-check path rests on.
         assert!(g.tracks[0].live.is_none(), "V-6: a raw pad has no instrument");
         assert_eq!(g.tracks[0].tail_frames, 0);
@@ -6408,7 +6408,8 @@ mod tests {
              through the chain: series, so the two add"
         );
 
-        // ...and the floor is real when the chain is shorter than it.
+        // ...and the other direction: no strip to traverse, so the window is
+        // the allowance alone.
         let mut bare = RtTrack::clips(0, Vec::new());
         let mut synth2 = crate::midi::synth::PolySynth::new();
         synth2.prepare(48_000, crate::audio::rt::MAX_LIVE_BLOCK);

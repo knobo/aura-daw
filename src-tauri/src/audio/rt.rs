@@ -588,7 +588,7 @@ pub const FALLBACK_RATE: u32 = 48_000;
 ///
 /// Integer math, exact at the reference rate (48 kHz → 4096, 96 kHz → 8192).
 pub fn live_tail_frames(rate: u32) -> usize {
-    let rate = if rate == 0 { FALLBACK_RATE } else { rate };
+    debug_assert!(rate > 0, "a graph's rate is clamped by RtGraph::with_buses");
     (LIVE_TAIL_FRAMES_AT_48K as u64 * rate as u64 / FALLBACK_RATE as u64) as usize
 }
 
@@ -826,9 +826,8 @@ pub struct RtGraph {
 }
 
 impl RtGraph {
-    /// Build a snapshot, always allocating the strip `track_buf`
-    /// (unified clip/live/insert path).
-    /// Build a snapshot at the [`FALLBACK_RATE`].
+    /// Build a snapshot at the [`FALLBACK_RATE`], always allocating the
+    /// strip `track_buf` (unified clip/live/insert path).
     ///
     /// For TEST RIGS. Every production path has its real rate in hand —
     /// `offline::build_graph` takes one, `Control::rebuild` has
