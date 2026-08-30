@@ -296,6 +296,30 @@ session burns an hour on something a sentence would have prevented.
 
 ## Tooling and gates
 
+- **Measuring UI CPU is dominated by things that are not the code.** A day of
+  A/B numbers in #136 was worthless until every one of these was pinned, and
+  each was found by a baseline that disagreed with itself:
+  an open Web Inspector *recording* costs ~40 points of web-process CPU (it
+  rasters and PNG-encodes a screenshot per frame, visible as `png_write_row`
+  in `perf`); the playhead's position costs ~40, because different material
+  means different content on screen; window size and whether the surface
+  panel is open change it again; and editing a `.ts` file triggers a full
+  page reload, so a measurement taken seconds later is measuring boot, not
+  steady state (this app decodes ~19 media files at startup). The working
+  protocol: restart per configuration, maximise with `xdotool`, pin the
+  bottom panel by editing its default (`ui.svelte.ts` keeps `bottomPanel`
+  session-only), seek to a fixed position and play over MCP, settle 45 s,
+  then sample `/proc/<pid>/stat` for 25 s. That got the noise floor to
+  +/-11 points. Anything smaller than that is not a result.
+
+- **`pgrep -f <pattern>` matches the shell running it.** Three separate
+  waits and one `pkill` in #136 hit this: the backgrounded `bash -c` carries
+  the pattern in its own command line, so `until pgrep -f "target/debug/aura"`
+  exits immediately, and `pkill -f "target/debug/aura"` kills the script
+  before it can start anything. Symptoms are a watcher that fires instantly
+  and a launcher that dies with exit 144. Use `pgrep -x <name>` for a
+  process name, or match on something the wrapper cannot contain.
+
 - **Every worktree shares one Cargo target directory.** `~/.bashrc` on the
   dev machine exports `CARGO_TARGET_DIR=/home/knobo/prog/dav/target`, so
   every shell inherits it and `CLAUDE.md`'s worktree-per-branch isolation
